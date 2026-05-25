@@ -10,5 +10,6 @@ diff-coverage.html
 *.pdf
 .DS_Store
 **/.DS_Store
+testdb
 #忽略AGENT
 AGENTS.md
