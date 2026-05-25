@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 env:
-  RMDB_DIR: rmdb
+  RMDB_DIR: .
 
 jobs:
   style:
@@ -36,8 +36,8 @@ jobs:
           mapfile -t files < <(
             git diff --name-only --diff-filter=ACMRT "$base_sha" "$head_sha" -- \
               "$RMDB_DIR/src" "$RMDB_DIR/rmdb_client" \
-              ':(exclude)rmdb/src/parser/lex.yy.*' \
-              ':(exclude)rmdb/src/parser/yacc.tab.*' |
+              ':(exclude)src/parser/lex.yy.*' \
+              ':(exclude)src/parser/yacc.tab.*' |
               grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
           )
 
@@ -81,8 +81,8 @@ jobs:
           mapfile -t files < <(
             git diff --name-only --diff-filter=ACMRT "$base_sha" "$head_sha" -- \
               "$RMDB_DIR/src" "$RMDB_DIR/rmdb_client" \
-              ':(exclude)rmdb/src/parser/lex.yy.*' \
-              ':(exclude)rmdb/src/parser/yacc.tab.*' |
+              ':(exclude)src/parser/lex.yy.*' \
+              ':(exclude)src/parser/yacc.tab.*' |
               grep -E '\.(c|cc|cpp|cxx)$' || true
           )
 

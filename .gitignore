@@ -1,11 +1,14 @@
 #忽略编译产物
-rmdb/build
-rmdb/rmdb_client/build
-rmdb/build-*
+build
+rmdb_client/build
+build-*
 coverage.info
 coverage.filtered.info
 coverage-html/
 coverage.xml
 diff-coverage.html
+*.pdf
+.DS_Store
+**/.DS_Store
 #忽略AGENT
 AGENTS.md
