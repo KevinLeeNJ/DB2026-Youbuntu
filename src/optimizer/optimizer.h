@@ -22,16 +22,14 @@ See the Mulan PSL v2 for more details. */
 #include "plan.h"
 
 class Optimizer {
-   private:
-    SmManager *sm_manager_;
-    Planner *planner_;
+private:
+    SmManager* sm_manager_;
+    Planner* planner_;
 
-   public:
-    Optimizer(SmManager *sm_manager,  Planner *planner) 
-        : sm_manager_(sm_manager),  planner_(planner)
-        {}
-    
-    std::shared_ptr<Plan> plan_query(std::shared_ptr<Query> query, Context *context) {
+public:
+    Optimizer(SmManager* sm_manager, Planner* planner) : sm_manager_(sm_manager), planner_(planner) {}
+
+    std::shared_ptr<Plan> plan_query(std::shared_ptr<Query> query, Context* context) {
         if (auto x = std::dynamic_pointer_cast<ast::Help>(query->parse)) {
             // help;
             return std::make_shared<OtherPlan>(T_Help, std::string());
@@ -60,5 +58,4 @@ class Optimizer {
             return planner_->do_planner(query, context);
         }
     }
-
 };

@@ -18,25 +18,19 @@ namespace ast {
 
 // Base class for tree nodes
 struct TreeNode {
-    virtual ~TreeNode() = default;  // enable polymorphism
+    virtual ~TreeNode() = default; // enable polymorphism
 };
 
-struct Help : public TreeNode {
-};
+struct Help : public TreeNode {};
 
-struct ShowTables : public TreeNode {
-};
+struct ShowTables : public TreeNode {};
 
-struct TxnBegin : public TreeNode {
-};
+struct TxnBegin : public TreeNode {};
 
-struct TxnCommit : public TreeNode {
-};
+struct TxnCommit : public TreeNode {};
 
-struct TxnAbort : public TreeNode {
-};
+struct TxnAbort : public TreeNode {};
 
-struct TxnRollback : public TreeNode {
-};
+struct TxnRollback : public TreeNode {};
 
-}
+} // namespace ast

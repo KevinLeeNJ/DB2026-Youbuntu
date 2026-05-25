@@ -34,7 +34,7 @@ int main() {
         "help;",
         "",
     };
-    for (auto &sql : sqls) {
+    for (auto& sql : sqls) {
         std::cout << sql << std::endl;
         YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
         assert(yyparse() == 0);

@@ -17,9 +17,11 @@
 #define MAX_MEM_BUFFER_SIZE 8192
 #define PORT_DEFAULT 8765
 
-bool is_exit_command(std::string &cmd) { return cmd == "exit" || cmd == "exit;" || cmd == "bye" || cmd == "bye;"; }
+bool is_exit_command(std::string& cmd) {
+    return cmd == "exit" || cmd == "exit;" || cmd == "bye" || cmd == "bye;";
+}
 
-int init_unix_sock(const char *unix_sock_path) {
+int init_unix_sock(const char* unix_sock_path) {
     int sockfd = socket(PF_UNIX, SOCK_STREAM, 0);
     if (sockfd < 0) {
         fprintf(stderr, "failed to create unix socket. %s", strerror(errno));
@@ -31,7 +33,7 @@ int init_unix_sock(const char *unix_sock_path) {
     sockaddr.sun_family = PF_UNIX;
     snprintf(sockaddr.sun_path, sizeof(sockaddr.sun_path), "%s", unix_sock_path);
 
-    if (connect(sockfd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0) {
+    if (connect(sockfd, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) < 0) {
         fprintf(stderr, "failed to connect to server. unix socket path '%s'. error %s", sockaddr.sun_path,
                 strerror(errno));
         close(sockfd);
@@ -40,8 +42,8 @@ int init_unix_sock(const char *unix_sock_path) {
     return sockfd;
 }
 
-int init_tcp_sock(const char *server_host, int server_port) {
-    struct hostent *host;
+int init_tcp_sock(const char* server_host, int server_port) {
+    struct hostent* host;
     struct sockaddr_in serv_addr;
 
     if ((host = gethostbyname(server_host)) == NULL) {
@@ -57,10 +59,10 @@ int init_tcp_sock(const char *server_host, int server_port) {
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(server_port);
-    serv_addr.sin_addr = *((struct in_addr *)host->h_addr);
+    serv_addr.sin_addr = *((struct in_addr*)host->h_addr);
     bzero(&(serv_addr.sin_zero), 8);
 
-    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(struct sockaddr)) == -1) {
+    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(struct sockaddr)) == -1) {
         fprintf(stderr, "Failed to connect. errmsg=%d:%s\n", errno, strerror(errno));
         close(sockfd);
         return -1;
@@ -68,32 +70,32 @@ int init_tcp_sock(const char *server_host, int server_port) {
     return sockfd;
 }
 
-int main(int argc, char *argv[]) {
-    int ret = 0;  // set_terminal_noncanonical();
-                  //    if (ret < 0) {
-                  //        printf("Warning: failed to set terminal non canonical. Long command may be "
-                  //               "handled incorrect\n");
-                  //    }
+int main(int argc, char* argv[]) {
+    int ret = 0; // set_terminal_noncanonical();
+                 //    if (ret < 0) {
+                 //        printf("Warning: failed to set terminal non canonical. Long command may be "
+                 //               "handled incorrect\n");
+                 //    }
 
-    const char *unix_socket_path = nullptr;
-    const char *server_host = "127.0.0.1";  // 127.0.0.1 192.168.31.25
+    const char* unix_socket_path = nullptr;
+    const char* server_host = "127.0.0.1"; // 127.0.0.1 192.168.31.25
     int server_port = PORT_DEFAULT;
     int opt;
 
     while ((opt = getopt(argc, argv, "s:h:p:")) > 0) {
         switch (opt) {
-            case 's':
-                unix_socket_path = optarg;
-                break;
-            case 'p':
-                char *ptr;
-                server_port = (int)strtol(optarg, &ptr, 10);
-                break;
-            case 'h':
-                server_host = optarg;
-                break;
-            default:
-                break;
+        case 's':
+            unix_socket_path = optarg;
+            break;
+        case 'p':
+            char* ptr;
+            server_port = (int)strtol(optarg, &ptr, 10);
+            break;
+        case 'h':
+            server_host = optarg;
+            break;
+        default:
+            break;
         }
     }
 
@@ -114,7 +116,7 @@ int main(int argc, char *argv[]) {
     char recv_buf[MAX_MEM_BUFFER_SIZE];
 
     while (1) {
-        char *line_read = readline("Rucbase> ");
+        char* line_read = readline("Rucbase> ");
         if (line_read == nullptr) {
             // EOF encountered
             break;

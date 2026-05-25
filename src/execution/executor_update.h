@@ -16,18 +16,18 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 
 class UpdateExecutor : public AbstractExecutor {
-   private:
+private:
     TabMeta tab_;
     std::vector<Condition> conds_;
-    RmFileHandle *fh_;
+    RmFileHandle* fh_;
     std::vector<Rid> rids_;
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
-    SmManager *sm_manager_;
+    SmManager* sm_manager_;
 
-   public:
-    UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conds, std::vector<Rid> rids, Context *context) {
+public:
+    UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
+                   std::vector<Condition> conds, std::vector<Rid> rids, Context* context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         set_clauses_ = set_clauses;
@@ -38,9 +38,11 @@ class UpdateExecutor : public AbstractExecutor {
         context_ = context;
     }
     std::unique_ptr<RmRecord> Next() override {
-        
+
         return nullptr;
     }
 
-    Rid &rid() override { return _abstract_rid; }
+    Rid& rid() override {
+        return _abstract_rid;
+    }
 };

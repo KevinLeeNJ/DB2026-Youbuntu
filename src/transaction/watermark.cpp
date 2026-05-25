@@ -10,10 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction/watermark.h"
 
+auto Watermark::AddTxn(timestamp_t read_ts) -> void {}
 
-auto Watermark::AddTxn(timestamp_t read_ts) -> void {
-}
-
-auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {
-
-}
+auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {}

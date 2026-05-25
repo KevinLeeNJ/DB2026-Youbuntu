@@ -16,7 +16,7 @@ See the Mulan PSL v2 for more details. */
  * Replacer is an abstract class that tracks page usage.
  */
 class Replacer {
-   public:
+public:
     Replacer() = default;
     virtual ~Replacer() = default;
 
@@ -25,7 +25,7 @@ class Replacer {
      * @param[out] frame_id id of frame that was removed, nullptr if no victim was found
      * @return true if a victim frame was found, false otherwise
      */
-    virtual bool victim(frame_id_t *frame_id) = 0;
+    virtual bool victim(frame_id_t* frame_id) = 0;
 
     /**
      * Pins a frame, indicating that it should not be victimized until it is unpinned.

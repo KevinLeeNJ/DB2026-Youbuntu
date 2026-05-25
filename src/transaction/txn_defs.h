@@ -23,7 +23,7 @@ enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SERIALIZABLE };
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
-enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};
+enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE };
 
 /**
  * @brief 事务的写操作记录，用于事务的回滚
@@ -37,28 +37,36 @@ enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};
  * ----------------------------------------------
  */
 class WriteRecord {
-   public:
+public:
     WriteRecord() = default;
 
     // constructor for insert operation
-    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid)
+    WriteRecord(WType wtype, const std::string& tab_name, const Rid& rid)
         : wtype_(wtype), tab_name_(tab_name), rid_(rid) {}
 
     // constructor for delete & update operation
-    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record)
+    WriteRecord(WType wtype, const std::string& tab_name, const Rid& rid, const RmRecord& record)
         : wtype_(wtype), tab_name_(tab_name), rid_(rid), record_(record) {}
 
     ~WriteRecord() = default;
 
-    inline RmRecord &GetRecord() { return record_; }
+    inline RmRecord& GetRecord() {
+        return record_;
+    }
 
-    inline Rid &GetRid() { return rid_; }
+    inline Rid& GetRid() {
+        return rid_;
+    }
 
-    inline WType &GetWriteType() { return wtype_; }
+    inline WType& GetWriteType() {
+        return wtype_;
+    }
 
-    inline std::string &GetTableName() { return tab_name_; }
+    inline std::string& GetTableName() {
+        return tab_name_;
+    }
 
-   private:
+private:
     WType wtype_;
     std::string tab_name_;
     Rid rid_;
@@ -72,7 +80,7 @@ enum class LockDataType { TABLE = 0, RECORD = 1 };
  * @description: 加锁对象的唯一标识
  */
 class LockDataId {
-   public:
+public:
     /* 表级锁 */
     LockDataId(int fd, LockDataType type) {
         assert(type == LockDataType::TABLE);
@@ -83,7 +91,7 @@ class LockDataId {
     }
 
     /* 行级锁 */
-    LockDataId(int fd, const Rid &rid, LockDataType type) {
+    LockDataId(int fd, const Rid& rid, LockDataType type) {
         assert(type == LockDataType::RECORD);
         fd_ = fd;
         rid_ = rid;
@@ -101,9 +109,11 @@ class LockDataId {
         }
     }
 
-    bool operator==(const LockDataId &other) const {
-        if (type_ != other.type_) return false;
-        if (fd_ != other.fd_) return false;
+    bool operator==(const LockDataId& other) const {
+        if (type_ != other.type_)
+            return false;
+        if (fd_ != other.fd_)
+            return false;
         return rid_ == other.rid_;
     }
     int fd_;
@@ -111,9 +121,10 @@ class LockDataId {
     LockDataType type_;
 };
 
-template <>
-struct std::hash<LockDataId> {
-    size_t operator()(const LockDataId &obj) const { return std::hash<int64_t>()(obj.Get()); }
+template <> struct std::hash<LockDataId> {
+    size_t operator()(const LockDataId& obj) const {
+        return std::hash<int64_t>()(obj.Get());
+    }
 };
 
 /* 事务回滚原因 */
@@ -124,31 +135,35 @@ class TransactionAbortException : public std::exception {
     txn_id_t txn_id_;
     AbortReason abort_reason_;
 
-   public:
+public:
     explicit TransactionAbortException(txn_id_t txn_id, AbortReason abort_reason)
         : txn_id_(txn_id), abort_reason_(abort_reason) {}
 
-    txn_id_t get_transaction_id() { return txn_id_; }
-    AbortReason GetAbortReason() { return abort_reason_; }
+    txn_id_t get_transaction_id() {
+        return txn_id_;
+    }
+    AbortReason GetAbortReason() {
+        return abort_reason_;
+    }
     std::string GetInfo() {
         switch (abort_reason_) {
-            case AbortReason::LOCK_ON_SHIRINKING: {
-                return "Transaction " + std::to_string(txn_id_) +
-                       " aborted because it cannot request locks on SHRINKING phase\n";
-            } break;
+        case AbortReason::LOCK_ON_SHIRINKING: {
+            return "Transaction " + std::to_string(txn_id_) +
+                   " aborted because it cannot request locks on SHRINKING phase\n";
+        } break;
 
-            case AbortReason::UPGRADE_CONFLICT: {
-                return "Transaction " + std::to_string(txn_id_) +
-                       " aborted because another transaction is waiting for upgrading\n";
-            } break;
+        case AbortReason::UPGRADE_CONFLICT: {
+            return "Transaction " + std::to_string(txn_id_) +
+                   " aborted because another transaction is waiting for upgrading\n";
+        } break;
 
-            case AbortReason::DEADLOCK_PREVENTION: {
-                return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention\n";
-            } break;
+        case AbortReason::DEADLOCK_PREVENTION: {
+            return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention\n";
+        } break;
 
-            default: {
-                return "Transaction aborted\n";
-            } break;
+        default: {
+            return "Transaction aborted\n";
+        } break;
         }
     }
 };
