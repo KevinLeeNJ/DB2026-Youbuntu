@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RMDB_DIR: rmdb
+
+jobs:
+  style:
+    name: Style
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install style tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Check changed C/C++ files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMRT "$base_sha" "$head_sha" -- \
+              "$RMDB_DIR/src" "$RMDB_DIR/rmdb_client" \
+              ':(exclude)rmdb/src/parser/lex.yy.*' \
+              ':(exclude)rmdb/src/parser/yacc.tab.*' |
+              grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
+          )
+
+          if (( ${#files[@]} == 0 )); then
+            echo "No changed C/C++ files to format-check."
+            exit 0
+          fi
+
+          printf 'Style-checking changed files:\n'
+          printf '  %s\n' "${files[@]}"
+          clang-format --dry-run --Werror "${files[@]}"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install RMDB dependencies and lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake flex bison libreadline-dev clang-tidy
+
+      - name: Configure CMake
+        working-directory: ${{ env.RMDB_DIR }}
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Lint changed C/C++ source files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMRT "$base_sha" "$head_sha" -- \
+              "$RMDB_DIR/src" "$RMDB_DIR/rmdb_client" \
+              ':(exclude)rmdb/src/parser/lex.yy.*' \
+              ':(exclude)rmdb/src/parser/yacc.tab.*' |
+              grep -E '\.(c|cc|cpp|cxx)$' || true
+          )
+
+          if (( ${#files[@]} == 0 )); then
+            echo "No changed C/C++ source files to lint."
+            exit 0
+          fi
+
+          printf 'Linting changed source files:\n'
+          printf '  %s\n' "${files[@]}"
+          clang-tidy -p "$RMDB_DIR/build" "${files[@]}"
+
+  ut:
+    name: Unit Tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install RMDB dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake flex bison libreadline-dev
+
+      - name: Configure CMake
+        working-directory: ${{ env.RMDB_DIR }}
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        working-directory: ${{ env.RMDB_DIR }}
+        run: |
+          cmake --build build --parallel
+
+      - name: Run CTest
+        working-directory: ${{ env.RMDB_DIR }}/build
+        run: |
+          ctest --output-on-failure
+
+      - name: Run unit_test directly
+        working-directory: ${{ env.RMDB_DIR }}/build
+        run: |
+          ./bin/unit_test
