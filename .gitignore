@@ -1,0 +1,3 @@
+#忽略编译产物
+rmdb/build
+rmdb/rmdb_client/build
