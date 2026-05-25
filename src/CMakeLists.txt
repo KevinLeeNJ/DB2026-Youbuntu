@@ -23,3 +23,6 @@ target_link_libraries(rmdb parser execution readline pthread planner analyze)
 # unit_test
 add_executable(unit_test unit_test.cpp)
 target_link_libraries(unit_test storage lru_replacer record gtest_main)  # add gtest
+
+include(GoogleTest)
+gtest_discover_tests(unit_test)
