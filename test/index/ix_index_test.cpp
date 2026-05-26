@@ -140,6 +140,35 @@ public:
         }
     }
 
+    int key_at_iid(IxIndexHandle* ih, const Iid& iid) {
+        IxNodeHandle* node = ih->fetch_node(iid.page_no);
+        int key = *(int*)node->get_key(iid.slot_no);
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        return key;
+    }
+
+    IxNodeHandle* create_test_node(IxIndexHandle* ih, bool is_leaf, page_id_t parent) {
+        IxNodeHandle* node = ih->create_node();
+        node->page_hdr->is_leaf = is_leaf;
+        node->page_hdr->parent = parent;
+        node->page_hdr->num_key = 0;
+        node->page_hdr->prev_leaf = IX_LEAF_HEADER_PAGE;
+        node->page_hdr->next_leaf = IX_LEAF_HEADER_PAGE;
+        return node;
+    }
+
+    page_id_t create_child_page(IxIndexHandle* ih, page_id_t parent, int key) {
+        IxNodeHandle* child = create_test_node(ih, true, parent);
+        child->insert_pair(0, int_key(key), make_rid(key, key));
+        page_id_t page_no = child->get_page_no();
+        buffer_pool_manager_->unpin_page(child->get_page_id(), true);
+        return page_no;
+    }
+
+    void append_child_ref(IxNodeHandle* internal, int key, page_id_t child_page_no) {
+        internal->insert_pair(internal->get_size(), int_key(key), make_rid(child_page_no, -1));
+    }
+
     /* 全索引扫描，返回有序的 (key, Rid) 对列表 */
     std::vector<std::pair<int, Rid>> full_scan(IxIndexHandle* ih) {
         std::vector<std::pair<int, Rid>> result;
@@ -337,6 +366,102 @@ TEST_F(IxIndexTest, MassiveInsertForcesMultiLevelSplit) {
     close_and_destroy(ih.get());
 }
 
+TEST_F(IxIndexTest, SplitMiddleLeafUpdatesNeighborLinks) {
+    auto ih = create_int_index();
+
+    int max_size = ih->file_hdr_->btree_order_ + 1;
+    std::set<int> inserted_keys;
+
+    for (int i = 0; i < max_size + 20; i++) {
+        ih->insert_entry(int_key(i), make_rid(i, i), nullptr);
+        inserted_keys.insert(i);
+    }
+
+    page_id_t original_first_leaf = ih->file_hdr_->first_leaf_;
+    IxNodeHandle* first_leaf = ih->fetch_node(original_first_leaf);
+    ASSERT_NE(first_leaf->get_next_leaf(), IX_LEAF_HEADER_PAGE);
+    page_id_t original_second_leaf = first_leaf->get_next_leaf();
+    buffer_pool_manager_->unpin_page(first_leaf->get_page_id(), false);
+
+    for (int i = 1; i <= max_size + 20; i++) {
+        int key = -i;
+        ih->insert_entry(int_key(key), make_rid(i, key), nullptr);
+        inserted_keys.insert(key);
+    }
+
+    first_leaf = ih->fetch_node(original_first_leaf);
+    page_id_t inserted_middle_leaf = first_leaf->get_next_leaf();
+    ASSERT_NE(inserted_middle_leaf, IX_LEAF_HEADER_PAGE);
+    buffer_pool_manager_->unpin_page(first_leaf->get_page_id(), false);
+
+    IxNodeHandle* middle_leaf = ih->fetch_node(inserted_middle_leaf);
+    EXPECT_NE(middle_leaf->get_next_leaf(), IX_NO_PAGE);
+    buffer_pool_manager_->unpin_page(middle_leaf->get_page_id(), false);
+
+    IxNodeHandle* second_leaf = ih->fetch_node(original_second_leaf);
+    EXPECT_NE(second_leaf->get_prev_leaf(), IX_NO_PAGE);
+    buffer_pool_manager_->unpin_page(second_leaf->get_page_id(), false);
+
+    verify_all_keys(ih.get(), inserted_keys);
+    auto scanned = full_scan(ih.get());
+    ASSERT_EQ(scanned.size(), inserted_keys.size());
+    for (size_t i = 1; i < scanned.size(); i++) {
+        EXPECT_LT(scanned[i - 1].first, scanned[i].first);
+    }
+
+    close_and_destroy(ih.get());
+}
+
+TEST_F(IxIndexTest, FindFirstWalksToLeftmostLeaf) {
+    auto ih = create_int_index();
+
+    int max_size = ih->file_hdr_->btree_order_ + 1;
+    for (int i = 0; i < max_size * 2; i++) {
+        ih->insert_entry(int_key(i), make_rid(i, i), nullptr);
+    }
+
+    auto [leaf, root_is_latched] = ih->find_leaf_page(int_key(max_size * 2 - 1), Operation::FIND, nullptr, true);
+    ASSERT_NE(leaf, nullptr);
+    EXPECT_TRUE(root_is_latched);
+    EXPECT_EQ(leaf->get_page_no(), ih->file_hdr_->first_leaf_);
+    EXPECT_EQ(leaf->get_prev_leaf(), IX_LEAF_HEADER_PAGE);
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+
+    close_and_destroy(ih.get());
+}
+
+TEST_F(IxIndexTest, PublicLowerUpperBoundOnPopulatedAndEmptyTree) {
+    auto ih = create_int_index();
+
+    int keys[] = {10, 20, 30, 40};
+    for (int key : keys) {
+        ih->insert_entry(int_key(key), make_rid(key, key), nullptr);
+    }
+
+    Iid lower = ih->lower_bound(int_key(25));
+    ASSERT_NE(lower.page_no, -1);
+    EXPECT_EQ(key_at_iid(ih.get(), lower), 30);
+
+    Iid upper = ih->upper_bound(int_key(20));
+    ASSERT_NE(upper.page_no, -1);
+    EXPECT_EQ(key_at_iid(ih.get(), upper), 30);
+
+    for (int key : keys) {
+        ASSERT_TRUE(ih->delete_entry(int_key(key), nullptr));
+    }
+    EXPECT_TRUE(ih->is_empty());
+
+    lower = ih->lower_bound(int_key(25));
+    EXPECT_EQ(lower.page_no, -1);
+    EXPECT_EQ(lower.slot_no, -1);
+
+    upper = ih->upper_bound(int_key(25));
+    EXPECT_EQ(upper.page_no, -1);
+    EXPECT_EQ(upper.slot_no, -1);
+
+    close_and_destroy(ih.get());
+}
+
 // =============================================================================
 // 结构变更测试：节点合并 (Coalesce)
 // =============================================================================
@@ -436,6 +561,113 @@ TEST_F(IxIndexTest, InsertDeleteInsertCycle) {
         }
         verify_all_keys(ih.get(), keys);
     }
+
+    close_and_destroy(ih.get());
+}
+
+TEST_F(IxIndexTest, SplitInternalNodeUpdatesMovedChildrenParent) {
+    auto ih = create_int_index();
+
+    IxNodeHandle* internal = create_test_node(ih.get(), false, IX_NO_PAGE);
+    int total_children = internal->get_max_size();
+    std::vector<page_id_t> child_pages;
+    child_pages.reserve(total_children);
+
+    for (int i = 0; i < total_children; i++) {
+        page_id_t child_page = create_child_page(ih.get(), internal->get_page_no(), i);
+        child_pages.push_back(child_page);
+        append_child_ref(internal, i, child_page);
+    }
+
+    IxNodeHandle* sibling = ih->split(internal);
+    ASSERT_FALSE(sibling->is_leaf_page());
+
+    for (int i = 0; i < internal->get_size(); i++) {
+        IxNodeHandle* child = ih->fetch_node(internal->value_at(i));
+        EXPECT_EQ(child->get_parent_page_no(), internal->get_page_no());
+        buffer_pool_manager_->unpin_page(child->get_page_id(), false);
+    }
+
+    for (int i = 0; i < sibling->get_size(); i++) {
+        IxNodeHandle* child = ih->fetch_node(sibling->value_at(i));
+        EXPECT_EQ(child->get_parent_page_no(), sibling->get_page_no());
+        buffer_pool_manager_->unpin_page(child->get_page_id(), false);
+    }
+
+    buffer_pool_manager_->unpin_page(sibling->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(internal->get_page_id(), true);
+
+    close_and_destroy(ih.get());
+}
+
+TEST_F(IxIndexTest, RedistributeInternalNodeFromRightSiblingMaintainsMovedChild) {
+    auto ih = create_int_index();
+
+    IxNodeHandle* parent = create_test_node(ih.get(), false, IX_NO_PAGE);
+    IxNodeHandle* left = create_test_node(ih.get(), false, parent->get_page_no());
+    IxNodeHandle* right = create_test_node(ih.get(), false, parent->get_page_no());
+
+    page_id_t left_child0 = create_child_page(ih.get(), left->get_page_no(), 10);
+    page_id_t left_child1 = create_child_page(ih.get(), left->get_page_no(), 20);
+    page_id_t moved_child = create_child_page(ih.get(), right->get_page_no(), 30);
+    page_id_t right_child1 = create_child_page(ih.get(), right->get_page_no(), 40);
+    page_id_t right_child2 = create_child_page(ih.get(), right->get_page_no(), 50);
+
+    append_child_ref(left, 10, left_child0);
+    append_child_ref(left, 20, left_child1);
+    append_child_ref(right, 30, moved_child);
+    append_child_ref(right, 40, right_child1);
+    append_child_ref(right, 50, right_child2);
+    append_child_ref(parent, 10, left->get_page_no());
+    append_child_ref(parent, 30, right->get_page_no());
+
+    ih->redistribute(right, left, parent, 0);
+
+    EXPECT_EQ(left->value_at(left->get_size() - 1), moved_child);
+    IxNodeHandle* moved = ih->fetch_node(moved_child);
+    EXPECT_EQ(moved->get_parent_page_no(), left->get_page_no());
+    buffer_pool_manager_->unpin_page(moved->get_page_id(), false);
+    EXPECT_EQ(*(int*)parent->get_key(1), 40);
+
+    buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(left->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(right->get_page_id(), true);
+
+    close_and_destroy(ih.get());
+}
+
+TEST_F(IxIndexTest, RedistributeInternalNodeFromLeftSiblingMaintainsMovedChild) {
+    auto ih = create_int_index();
+
+    IxNodeHandle* parent = create_test_node(ih.get(), false, IX_NO_PAGE);
+    IxNodeHandle* left = create_test_node(ih.get(), false, parent->get_page_no());
+    IxNodeHandle* right = create_test_node(ih.get(), false, parent->get_page_no());
+
+    page_id_t left_child0 = create_child_page(ih.get(), left->get_page_no(), 10);
+    page_id_t left_child1 = create_child_page(ih.get(), left->get_page_no(), 20);
+    page_id_t moved_child = create_child_page(ih.get(), left->get_page_no(), 30);
+    page_id_t right_child0 = create_child_page(ih.get(), right->get_page_no(), 40);
+    page_id_t right_child1 = create_child_page(ih.get(), right->get_page_no(), 50);
+
+    append_child_ref(left, 10, left_child0);
+    append_child_ref(left, 20, left_child1);
+    append_child_ref(left, 30, moved_child);
+    append_child_ref(right, 40, right_child0);
+    append_child_ref(right, 50, right_child1);
+    append_child_ref(parent, 10, left->get_page_no());
+    append_child_ref(parent, 40, right->get_page_no());
+
+    ih->redistribute(left, right, parent, 1);
+
+    EXPECT_EQ(right->value_at(0), moved_child);
+    IxNodeHandle* moved = ih->fetch_node(moved_child);
+    EXPECT_EQ(moved->get_parent_page_no(), right->get_page_no());
+    buffer_pool_manager_->unpin_page(moved->get_page_id(), false);
+    EXPECT_EQ(*(int*)parent->get_key(1), 30);
+
+    buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(left->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(right->get_page_id(), true);
 
     close_and_destroy(ih.get());
 }
