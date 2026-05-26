@@ -397,8 +397,13 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
 page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction) {
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::INSERT, transaction);
 
+    bool first_key_may_change =
+        leaf->get_size() > 0 && ix_compare(key, leaf->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) < 0;
+    int old_size = leaf->get_size();
+
     // 在叶子结点中插入键值对
     leaf->insert(key, value);
+    bool inserted = leaf->get_size() > old_size;
 
     // 若叶子结点已满，分裂并向上递归插入
     if (leaf->get_size() > leaf->get_max_size()) {
@@ -409,6 +414,9 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
         }
 
         insert_into_parent(leaf, new_leaf->get_key(0), new_leaf, transaction);
+        if (inserted && first_key_may_change) {
+            maintain_parent(leaf);
+        }
 
         // 若当前叶子节点不再是最右叶子，但最右指针可能已在上层更新，这里再确认一次
         if (file_hdr_->last_leaf_ == leaf->get_page_no()) {
@@ -416,6 +424,8 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
         }
 
         buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
+    } else if (inserted && first_key_may_change) {
+        maintain_parent(leaf);
     }
 
     page_id_t page_no = leaf->get_page_no();
@@ -436,6 +446,8 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
     }
 
     int old_size = leaf->get_size();
+    bool first_key_may_change =
+        old_size > 0 && ix_compare(key, leaf->get_key(0), file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
     leaf->remove(key);
     int new_size = leaf->get_size();
 
@@ -443,6 +455,10 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
     if (old_size == new_size) {
         buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
         return false;
+    }
+
+    if (new_size > 0 && first_key_may_change) {
+        maintain_parent(leaf);
     }
 
     // 删除成功，调用 coalesce_or_redistribute 维持 B+ 树性质

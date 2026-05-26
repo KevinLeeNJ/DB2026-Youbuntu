@@ -78,7 +78,7 @@ public:
     }
 
     int get_max_size() {
-        return file_hdr->btree_order_ + 1;
+        return file_hdr->btree_order_;
     }
 
     int get_min_size() {

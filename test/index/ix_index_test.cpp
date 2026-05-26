@@ -134,8 +134,7 @@ public:
     void verify_all_keys(IxIndexHandle* ih, const std::set<int>& keys) {
         for (int k : keys) {
             std::vector<Rid> result;
-            ASSERT_TRUE(ih->get_value(int_key(k), &result, nullptr))
-                << "key " << k << " should exist after insert";
+            ASSERT_TRUE(ih->get_value(int_key(k), &result, nullptr)) << "key " << k << " should exist after insert";
             ASSERT_EQ(result.size(), 1u);
         }
     }
@@ -297,7 +296,7 @@ TEST_F(IxIndexTest, NodeSplitOnSequentialInsert) {
 
     // 计算触发分裂所需的 key 数量
     int max_size = ih->file_hdr_->btree_order_ + 1; // 每个节点最大键值对数
-    int split_threshold = max_size + 10;              // 确保触发至少一次分裂
+    int split_threshold = max_size + 10;            // 确保触发至少一次分裂
     std::set<int> inserted_keys;
 
     for (int i = 0; i < split_threshold; i++) {
@@ -486,8 +485,7 @@ TEST_F(IxIndexTest, NodeCoalesceAfterDeletion) {
     // 阶段 2：删除大部分数据，触发合并
     int delete_count = total - max_size / 2; // 只保留约半个节点的数据
     for (int i = 0; i < delete_count; i++) {
-        ASSERT_TRUE(ih->delete_entry(int_key(i), nullptr))
-            << "delete_entry should succeed for key " << i;
+        ASSERT_TRUE(ih->delete_entry(int_key(i), nullptr)) << "delete_entry should succeed for key " << i;
         remaining_keys.erase(i);
     }
 
@@ -497,14 +495,12 @@ TEST_F(IxIndexTest, NodeCoalesceAfterDeletion) {
     // 验证已删除的 key 不存在
     for (int i = 0; i < delete_count; i++) {
         std::vector<Rid> result;
-        EXPECT_FALSE(ih->get_value(int_key(i), &result, nullptr))
-            << "key " << i << " should not exist after deletion";
+        EXPECT_FALSE(ih->get_value(int_key(i), &result, nullptr)) << "key " << i << " should not exist after deletion";
     }
 
     // 删除后页面数应减少
     int pages_after = ih->file_hdr_->num_pages_;
-    EXPECT_LT(pages_after, pages_before)
-        << "page count should decrease after deleting most entries";
+    EXPECT_LT(pages_after, pages_before) << "page count should decrease after deleting most entries";
 
     close_and_destroy(ih.get());
 }
@@ -520,8 +516,7 @@ TEST_F(IxIndexTest, DeleteAllEntries) {
 
     // 逐个删除所有数据
     for (int i = 0; i < 50; i++) {
-        ASSERT_TRUE(ih->delete_entry(int_key(i), nullptr))
-            << "delete_entry should succeed for key " << i;
+        ASSERT_TRUE(ih->delete_entry(int_key(i), nullptr)) << "delete_entry should succeed for key " << i;
     }
 
     // 全部删除后，B+ 树应为空
@@ -701,8 +696,7 @@ TEST_F(IxIndexTest, SequentialScanAscending) {
         ASSERT_EQ(scanned[i].first, *(std::next(expected_keys.begin(), i)))
             << "scan result at index " << i << " should match sorted key order";
         if (i > 0) {
-            EXPECT_LT(scanned[i - 1].first, scanned[i].first)
-                << "scan keys must be strictly increasing";
+            EXPECT_LT(scanned[i - 1].first, scanned[i].first) << "scan keys must be strictly increasing";
         }
     }
 
@@ -730,8 +724,7 @@ TEST_F(IxIndexTest, SequentialScanAfterSplits) {
 
     // 验证完整性：每个插入的 key 都在扫描结果中
     for (int k : expected_keys) {
-        auto it = std::find_if(scanned.begin(), scanned.end(),
-                               [k](const auto& p) { return p.first == k; });
+        auto it = std::find_if(scanned.begin(), scanned.end(), [k](const auto& p) { return p.first == k; });
         ASSERT_NE(it, scanned.end()) << "key " << k << " should appear in scan";
     }
 
@@ -778,8 +771,7 @@ TEST_F(IxIndexTest, DeleteNonExistentKey) {
     auto ih = create_int_index();
 
     // 空树删除
-    EXPECT_FALSE(ih->delete_entry(int_key(42), nullptr))
-        << "deleting from empty tree should return false";
+    EXPECT_FALSE(ih->delete_entry(int_key(42), nullptr)) << "deleting from empty tree should return false";
 
     // 插入少量数据
     for (int i = 0; i < 10; i++) {
@@ -788,10 +780,8 @@ TEST_F(IxIndexTest, DeleteNonExistentKey) {
     }
 
     // 删除不存在的 key
-    EXPECT_FALSE(ih->delete_entry(int_key(100), nullptr))
-        << "deleting non-existent key should return false";
-    EXPECT_FALSE(ih->delete_entry(int_key(-5), nullptr))
-        << "deleting negative key should return false";
+    EXPECT_FALSE(ih->delete_entry(int_key(100), nullptr)) << "deleting non-existent key should return false";
+    EXPECT_FALSE(ih->delete_entry(int_key(-5), nullptr)) << "deleting negative key should return false";
 
     // 现有数据应不受影响
     for (int i = 0; i < 10; i++) {
@@ -853,10 +843,7 @@ TEST_F(IxIndexTest, LargeKeyRange) {
 
     std::set<int> inserted;
     // 插入大范围离散 key（INT_MIN / INT_MAX 附近）
-    int test_keys[] = {
-        -2000000000, -1000000000, 0,
-        1000000000,  2000000000
-    };
+    int test_keys[] = {-2000000000, -1000000000, 0, 1000000000, 2000000000};
     for (int k : test_keys) {
         Rid rid = make_rid(k & 0xFF, (k >> 8) & 0xFF);
         ih->insert_entry(int_key(k), rid, nullptr);
@@ -907,6 +894,5 @@ TEST_F(IxIndexTest, ReopenIndexPreservesData) {
 
 TEST_F(IxIndexTest, CleanStateAfterEachTest) {
     // 验证测试夹具正确清理了上一测试的残留文件
-    EXPECT_FALSE(disk_manager_->is_file(ix_name_))
-        << "index file should not exist at start of test";
+    EXPECT_FALSE(disk_manager_->is_file(ix_name_)) << "index file should not exist at start of test";
 }
