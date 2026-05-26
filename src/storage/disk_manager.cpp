@@ -33,6 +33,27 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
     // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
     // 2.调用write()函数
     // 注意write返回值与num_bytes不等时 throw InternalError("DiskManager::write_page Error");
+    if (!fd2path_.count(fd)) {
+        throw FileNotOpenError(fd);
+    }
+    if (page_no < 0 || offset == nullptr || num_bytes < 0) {
+        throw InternalError("DiskManager::write_page Error");
+    }
+    if (lseek(fd, static_cast<off_t>(page_no) * PAGE_SIZE, SEEK_SET) < 0) {
+        throw InternalError("DiskManager::write_page Error");
+    }
+
+    int bytes_written = 0;
+    while (bytes_written < num_bytes) {
+        ssize_t bytes_write = write(fd, offset + bytes_written, num_bytes - bytes_written);
+        if (bytes_write < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_write <= 0) {
+            throw InternalError("DiskManager::write_page Error");
+        }
+        bytes_written += bytes_write;
+    }
 }
 
 /**
@@ -47,6 +68,27 @@ void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_byt
     // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
     // 2.调用read()函数
     // 注意read返回值与num_bytes不等时，throw InternalError("DiskManager::read_page Error");
+    if (!fd2path_.count(fd)) {
+        throw FileNotOpenError(fd);
+    }
+    if (page_no < 0 || offset == nullptr || num_bytes < 0) {
+        throw InternalError("DiskManager::read_page Error");
+    }
+    if (lseek(fd, static_cast<off_t>(page_no) * PAGE_SIZE, SEEK_SET) < 0) {
+        throw InternalError("DiskManager::read_page Error");
+    }
+
+    int bytes_read_total = 0;
+    while (bytes_read_total < num_bytes) {
+        ssize_t bytes_read = read(fd, offset + bytes_read_total, num_bytes - bytes_read_total);
+        if (bytes_read < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_read <= 0) {
+            throw InternalError("DiskManager::read_page Error");
+        }
+        bytes_read_total += bytes_read;
+    }
 }
 
 /**
@@ -102,6 +144,16 @@ void DiskManager::create_file(const std::string& path) {
     // Todo:
     // 调用open()函数，使用O_CREAT模式
     // 注意不能重复创建相同文件
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            throw FileExistsError(path);
+        }
+        throw UnixError();
+    }
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
 }
 
 /**
@@ -112,6 +164,15 @@ void DiskManager::destroy_file(const std::string& path) {
     // Todo:
     // 调用unlink()函数
     // 注意不能删除未关闭的文件
+    if (!is_file(path)) {
+        throw FileNotFoundError(path);
+    }
+    if (path2fd_.count(path)) {
+        throw FileNotClosedError(path);
+    }
+    if (unlink(path.c_str()) < 0) {
+        throw UnixError();
+    }
 }
 
 /**
@@ -123,6 +184,33 @@ int DiskManager::open_file(const std::string& path) {
     // Todo:
     // 调用open()函数，使用O_RDWR模式
     // 注意不能重复打开相同文件，并且需要更新文件打开列表
+    if (!is_file(path)) {
+        throw FileNotFoundError(path);
+    }
+    if (path2fd_.count(path)) {
+        throw FileNotClosedError(path);
+    }
+
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+        throw UnixError();
+    }
+    if (fd >= MAX_FD) {
+        close(fd);
+        throw InternalError("DiskManager::open_file Error");
+    }
+
+    path2fd_[path] = fd;
+    fd2path_[fd] = path;
+    int file_size = get_file_size(path);
+    if (file_size < 0) {
+        path2fd_.erase(path);
+        fd2path_.erase(fd);
+        close(fd);
+        throw UnixError();
+    }
+    fd2pageno_[fd] = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    return fd;
 }
 
 /**
@@ -133,6 +221,22 @@ void DiskManager::close_file(int fd) {
     // Todo:
     // 调用close()函数
     // 注意不能关闭未打开的文件，并且需要更新文件打开列表
+    auto iter = fd2path_.find(fd);
+    if (iter == fd2path_.end()) {
+        throw FileNotOpenError(fd);
+    }
+
+    std::string path = iter->second;
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
+
+    fd2path_.erase(iter);
+    path2fd_.erase(path);
+    fd2pageno_[fd] = 0;
+    if (log_fd_ == fd) {
+        log_fd_ = -1;
+    }
 }
 
 /**
