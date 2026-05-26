@@ -41,6 +41,16 @@ jobs:
               grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
           )
 
+          existing_files=()
+          for file in "${files[@]}"; do
+            if [[ -f "$file" ]]; then
+              existing_files+=("$file")
+            else
+              echo "Skipping changed path not present in checkout: $file"
+            fi
+          done
+          files=("${existing_files[@]}")
+
           if (( ${#files[@]} == 0 )); then
             echo "No changed C/C++ files to format-check."
             exit 0
@@ -86,6 +96,16 @@ jobs:
               grep -E '\.(c|cc|cpp|cxx)$' || true
           )
 
+          existing_files=()
+          for file in "${files[@]}"; do
+            if [[ -f "$file" ]]; then
+              existing_files+=("$file")
+            else
+              echo "Skipping changed path not present in checkout: $file"
+            fi
+          done
+          files=("${existing_files[@]}")
+
           if (( ${#files[@]} == 0 )); then
             echo "No changed C/C++ source files to lint."
             exit 0
@@ -122,8 +142,3 @@ jobs:
         working-directory: ${{ env.RMDB_DIR }}/build
         run: |
           ctest --output-on-failure
-
-      - name: Run unit_test directly
-        working-directory: ${{ env.RMDB_DIR }}/build
-        run: |
-          ./bin/unit_test
