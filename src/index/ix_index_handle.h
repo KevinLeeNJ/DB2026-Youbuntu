@@ -69,7 +69,7 @@ public:
         rids = reinterpret_cast<Rid*>(keys + file_hdr->keys_size_);
     }
 
-    int get_size() {
+    int get_size() const {
         return page_hdr->num_key;
     }
 
@@ -90,7 +90,7 @@ public:
     }
 
     /* 得到第i个孩子结点的page_no */
-    page_id_t value_at(int i) {
+    page_id_t value_at(int i) const {
         return get_rid(i)->page_no;
     }
 
