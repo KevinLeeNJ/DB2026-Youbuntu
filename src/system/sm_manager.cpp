@@ -84,7 +84,32 @@ void SmManager::drop_db(const std::string& db_name) {
  * @description: 打开数据库，找到数据库对应的文件夹，并加载数据库元数据和相关文件
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
-void SmManager::open_db(const std::string& db_name) {}
+void SmManager::open_db(const std::string& db_name) {
+    if (!is_dir(db_name)) {
+        throw DatabaseNotFoundError(db_name);
+    }
+    // 进入数据库目录
+    if (chdir(db_name.c_str()) < 0) {
+        throw UnixError();
+    }
+    // 加载数据库元数据
+    std::ifstream ifs(DB_META_NAME);
+    if (!ifs.is_open()) {
+        throw InternalError("Failed to open db.meta");
+    }
+    ifs >> db_;
+    // 打开日志文件
+    disk_manager_->open_file(LOG_FILE_NAME);
+    // 打开所有表的数据文件和索引文件
+    for (auto& entry : db_.tabs_) {
+        auto& tab = entry.second;
+        fhs_.emplace(tab.name, rm_manager_->open_file(tab.name));
+        for (auto& index : tab.indexes) {
+            std::string ix_name = ix_manager_->get_index_name(tab.name, index.cols);
+            ihs_.emplace(ix_name, ix_manager_->open_index(tab.name, index.cols));
+        }
+    }
+}
 
 /**
  * @description: 把数据库相关的元数据刷入磁盘中
@@ -98,7 +123,31 @@ void SmManager::flush_meta() {
 /**
  * @description: 关闭数据库并把数据落盘
  */
-void SmManager::close_db() {}
+void SmManager::close_db() {
+    // 关闭所有索引文件
+    for (auto& entry : ihs_) {
+        ix_manager_->close_index(entry.second.get());
+    }
+    ihs_.clear();
+    // 关闭所有表数据文件
+    for (auto& entry : fhs_) {
+        rm_manager_->close_file(entry.second.get());
+    }
+    fhs_.clear();
+    // 关闭日志文件
+    if (disk_manager_->is_file(LOG_FILE_NAME)) {
+        int log_fd = disk_manager_->get_file_fd(LOG_FILE_NAME);
+        if (log_fd >= 0) {
+            disk_manager_->close_file(log_fd);
+        }
+    }
+    // 刷新元数据到磁盘
+    flush_meta();
+    // 回到上级目录
+    if (chdir("..") < 0) {
+        throw UnixError();
+    }
+}
 
 /**
  * @description: 显示所有的表,通过测试需要将其结果写入到output.txt,详情看题目文档
@@ -183,7 +232,32 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
  * @param {string&} tab_name 表的名称
  * @param {Context*} context
  */
-void SmManager::drop_table(const std::string& tab_name, Context* context) {}
+void SmManager::drop_table(const std::string& tab_name, Context* context) {
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    auto& tab = db_.get_table(tab_name);
+    // 先删除表上的所有索引
+    for (auto& index : tab.indexes) {
+        std::string ix_name = ix_manager_->get_index_name(tab_name, index.cols);
+        auto it = ihs_.find(ix_name);
+        if (it != ihs_.end()) {
+            ix_manager_->close_index(it->second.get());
+            ihs_.erase(it);
+        }
+        ix_manager_->destroy_index(tab_name, index.cols);
+    }
+    // 关闭并销毁表数据文件
+    auto it = fhs_.find(tab_name);
+    if (it != fhs_.end()) {
+        rm_manager_->close_file(it->second.get());
+        fhs_.erase(it);
+    }
+    rm_manager_->destroy_file(tab_name);
+    // 从元数据中移除表
+    db_.tabs_.erase(tab_name);
+    flush_meta();
+}
 
 /**
  * @description: 创建索引
@@ -192,7 +266,52 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {}
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    auto& tab = db_.get_table(tab_name);
+    if (tab.is_index(col_names)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+    // 验证所有列存在，并收集列元数据
+    std::vector<ColMeta> index_cols;
+    for (auto& col_name : col_names) {
+        index_cols.push_back(*tab.get_col(col_name));
+    }
+    // 构建索引元数据并关联到表
+    int col_tot_len = 0;
+    for (auto& col : index_cols) {
+        col_tot_len += col.len;
+    }
+    IndexMeta index_meta;
+    index_meta.tab_name = tab_name;
+    index_meta.col_num = static_cast<int>(col_names.size());
+    index_meta.col_tot_len = col_tot_len;
+    index_meta.cols = index_cols;
+    tab.indexes.push_back(index_meta);
+    // 创建物理索引文件并打开
+    ix_manager_->create_index(tab_name, index_cols);
+    auto ih = ix_manager_->open_index(tab_name, index_cols);
+    // 扫描表中已有数据，插入索引条目
+    auto fh_it = fhs_.find(tab_name);
+    if (fh_it != fhs_.end()) {
+        RmScan scan(fh_it->second.get());
+        std::vector<char> key_buf(col_tot_len);
+        while (!scan.is_end()) {
+            Rid rid = scan.rid();
+            auto record = fh_it->second->get_record(rid, context);
+            int offset = 0;
+            for (auto& col : index_cols) {
+                memcpy(key_buf.data() + offset, record->data + col.offset, col.len);
+                offset += col.len;
+            }
+            ih->insert_entry(key_buf.data(), rid, context->txn_);
+            scan.next();
+        }
+    }
+    std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);
+    ihs_.emplace(ix_name, std::move(ih));
+    flush_meta();
 }
 
 /**
@@ -201,7 +320,24 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {vector<string>&} col_names 索引包含的字段名称
  * @param {Context*} context
  */
-void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {}
+void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    auto& tab = db_.get_table(tab_name);
+    auto index_iter = tab.get_index_meta(col_names);
+    // 关闭并销毁索引文件
+    std::string ix_name = ix_manager_->get_index_name(tab_name, index_iter->cols);
+    auto ih_it = ihs_.find(ix_name);
+    if (ih_it != ihs_.end()) {
+        ix_manager_->close_index(ih_it->second.get());
+        ihs_.erase(ih_it);
+    }
+    ix_manager_->destroy_index(tab_name, col_names);
+    // 从表元数据中移除索引
+    tab.indexes.erase(index_iter);
+    flush_meta();
+}
 
 /**
  * @description: 删除索引
@@ -209,4 +345,10 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @param {vector<ColMeta>&} 索引包含的字段元数据
  * @param {Context*} context
  */
-void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {}
+void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
+    std::vector<std::string> col_names;
+    for (auto& col : cols) {
+        col_names.push_back(col.name);
+    }
+    drop_index(tab_name, col_names, context);
+}
