@@ -3,7 +3,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 include(GoogleTest)
 
-file(GLOB SUBDIRS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *)
+file(GLOB SUBDIRS CONFIGURE_DEPENDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *)
 
 foreach(DIR ${SUBDIRS})
     if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${DIR})
@@ -16,7 +16,7 @@ foreach(DIR ${SUBDIRS})
             
             set_target_properties(${TEST_TARGET} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/test")
             
-            target_link_libraries(${TEST_TARGET} storage lru_replacer record gtest_main pthread)
+            target_link_libraries(${TEST_TARGET} storage lru_replacer record system index gtest_main pthread)
             gtest_discover_tests(${TEST_TARGET})
         endif()
     endif()
