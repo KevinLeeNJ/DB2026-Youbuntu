@@ -66,10 +66,6 @@ void check_equal(const RmFileHandle* file_handle,
     assert(num_records == mock.size());
 }
 
-std::ostream& operator<<(std::ostream& os, const Rid& rid) {
-    return os << '(' << rid.page_no << ", " << rid.slot_no << ')';
-}
-
 } // namespace
 
 class RecordManagerTest : public ::testing::Test {

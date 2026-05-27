@@ -10,9 +10,9 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "ast.h"
-#include <cassert>
 #include <iostream>
 #include <map>
+#include <stdexcept>
 
 namespace ast {
 
@@ -67,90 +67,152 @@ private:
     static void print_node(const std::shared_ptr<TreeNode>& node, int offset) {
         std::cout << offset2string(offset);
         offset += 2;
-        if (auto x = std::dynamic_pointer_cast<Help>(node)) {
+        switch (node->kind) {
+        case AstNodeKind::Help:
             std::cout << "HELP\n";
-        } else if (auto x = std::dynamic_pointer_cast<ShowTables>(node)) {
+            break;
+        case AstNodeKind::ShowTables:
             std::cout << "SHOW_TABLES\n";
-        } else if (auto x = std::dynamic_pointer_cast<CreateTable>(node)) {
+            break;
+        case AstNodeKind::CreateTable: {
+            auto x = std::static_pointer_cast<CreateTable>(node);
             std::cout << "CREATE_TABLE\n";
             print_val(x->tab_name, offset);
             print_node_list(x->fields, offset);
-        } else if (auto x = std::dynamic_pointer_cast<DropTable>(node)) {
+            break;
+        }
+        case AstNodeKind::DropTable: {
+            auto x = std::static_pointer_cast<DropTable>(node);
             std::cout << "DROP_TABLE\n";
             print_val(x->tab_name, offset);
-        } else if (auto x = std::dynamic_pointer_cast<DescTable>(node)) {
+            break;
+        }
+        case AstNodeKind::DescTable: {
+            auto x = std::static_pointer_cast<DescTable>(node);
             std::cout << "DESC_TABLE\n";
             print_val(x->tab_name, offset);
-        } else if (auto x = std::dynamic_pointer_cast<CreateIndex>(node)) {
+            break;
+        }
+        case AstNodeKind::CreateIndex: {
+            auto x = std::static_pointer_cast<CreateIndex>(node);
             std::cout << "CREATE_INDEX\n";
             print_val(x->tab_name, offset);
-            // print_val(x->col_name, offset);
             for (auto col_name : x->col_names)
                 print_val(col_name, offset);
-        } else if (auto x = std::dynamic_pointer_cast<DropIndex>(node)) {
+            break;
+        }
+        case AstNodeKind::DropIndex: {
+            auto x = std::static_pointer_cast<DropIndex>(node);
             std::cout << "DROP_INDEX\n";
             print_val(x->tab_name, offset);
-            // print_val(x->col_name, offset);
             for (auto col_name : x->col_names)
                 print_val(col_name, offset);
-        } else if (auto x = std::dynamic_pointer_cast<ColDef>(node)) {
+            break;
+        }
+        case AstNodeKind::ColDef: {
+            auto x = std::static_pointer_cast<ColDef>(node);
             std::cout << "COL_DEF\n";
             print_val(x->col_name, offset);
             print_node(x->type_len, offset);
-        } else if (auto x = std::dynamic_pointer_cast<Col>(node)) {
+            break;
+        }
+        case AstNodeKind::Col: {
+            auto x = std::static_pointer_cast<Col>(node);
             std::cout << "COL\n";
             print_val(x->tab_name, offset);
             print_val(x->col_name, offset);
-        } else if (auto x = std::dynamic_pointer_cast<TypeLen>(node)) {
+            break;
+        }
+        case AstNodeKind::TypeLen: {
+            auto x = std::static_pointer_cast<TypeLen>(node);
             std::cout << "TYPE_LEN\n";
             print_val(type2str(x->type), offset);
             print_val(x->len, offset);
-        } else if (auto x = std::dynamic_pointer_cast<IntLit>(node)) {
+            break;
+        }
+        case AstNodeKind::IntLit: {
+            auto x = std::static_pointer_cast<IntLit>(node);
             std::cout << "INT_LIT\n";
             print_val(x->val, offset);
-        } else if (auto x = std::dynamic_pointer_cast<FloatLit>(node)) {
+            break;
+        }
+        case AstNodeKind::FloatLit: {
+            auto x = std::static_pointer_cast<FloatLit>(node);
             std::cout << "FLOAT_LIT\n";
             print_val(x->val, offset);
-        } else if (auto x = std::dynamic_pointer_cast<StringLit>(node)) {
+            break;
+        }
+        case AstNodeKind::StringLit: {
+            auto x = std::static_pointer_cast<StringLit>(node);
             std::cout << "STRING_LIT\n";
             print_val(x->val, offset);
-        } else if (auto x = std::dynamic_pointer_cast<SetClause>(node)) {
+            break;
+        }
+        case AstNodeKind::BoolLit: {
+            auto x = std::static_pointer_cast<BoolLit>(node);
+            std::cout << "BOOL_LIT\n";
+            print_val(x->val, offset);
+            break;
+        }
+        case AstNodeKind::SetClause: {
+            auto x = std::static_pointer_cast<SetClause>(node);
             std::cout << "SET_CLAUSE\n";
             print_val(x->col_name, offset);
             print_node(x->val, offset);
-        } else if (auto x = std::dynamic_pointer_cast<BinaryExpr>(node)) {
+            break;
+        }
+        case AstNodeKind::BinaryExpr: {
+            auto x = std::static_pointer_cast<BinaryExpr>(node);
             std::cout << "BINARY_EXPR\n";
             print_node(x->lhs, offset);
             print_val(op2str(x->op), offset);
             print_node(x->rhs, offset);
-        } else if (auto x = std::dynamic_pointer_cast<InsertStmt>(node)) {
+            break;
+        }
+        case AstNodeKind::InsertStmt: {
+            auto x = std::static_pointer_cast<InsertStmt>(node);
             std::cout << "INSERT\n";
             print_val(x->tab_name, offset);
             print_node_list(x->vals, offset);
-        } else if (auto x = std::dynamic_pointer_cast<DeleteStmt>(node)) {
+            break;
+        }
+        case AstNodeKind::DeleteStmt: {
+            auto x = std::static_pointer_cast<DeleteStmt>(node);
             std::cout << "DELETE\n";
             print_val(x->tab_name, offset);
             print_node_list(x->conds, offset);
-        } else if (auto x = std::dynamic_pointer_cast<UpdateStmt>(node)) {
+            break;
+        }
+        case AstNodeKind::UpdateStmt: {
+            auto x = std::static_pointer_cast<UpdateStmt>(node);
             std::cout << "UPDATE\n";
             print_val(x->tab_name, offset);
             print_node_list(x->set_clauses, offset);
             print_node_list(x->conds, offset);
-        } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
+            break;
+        }
+        case AstNodeKind::SelectStmt: {
+            auto x = std::static_pointer_cast<SelectStmt>(node);
             std::cout << "SELECT\n";
             print_node_list(x->cols, offset);
             print_val_list(x->tabs, offset);
             print_node_list(x->conds, offset);
-        } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
+            break;
+        }
+        case AstNodeKind::TxnBegin:
             std::cout << "BEGIN\n";
-        } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {
+            break;
+        case AstNodeKind::TxnCommit:
             std::cout << "COMMIT\n";
-        } else if (auto x = std::dynamic_pointer_cast<TxnAbort>(node)) {
+            break;
+        case AstNodeKind::TxnAbort:
             std::cout << "ABORT\n";
-        } else if (auto x = std::dynamic_pointer_cast<TxnRollback>(node)) {
+            break;
+        case AstNodeKind::TxnRollback:
             std::cout << "ROLLBACK\n";
-        } else {
-            assert(0);
+            break;
+        default:
+            throw std::logic_error("Unknown AST node kind in printer");
         }
     }
 };
