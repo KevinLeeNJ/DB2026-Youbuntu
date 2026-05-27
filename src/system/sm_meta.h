@@ -56,6 +56,7 @@ struct IndexMeta {
 
     friend std::istream& operator>>(std::istream& is, IndexMeta& index) {
         is >> index.tab_name >> index.col_tot_len >> index.col_num;
+        index.cols.reserve(index.col_num);
         for (size_t i = 0; i < index.col_num; ++i) {
             ColMeta col;
             is >> col;
@@ -75,6 +76,7 @@ struct TabMeta {
 
     TabMeta(const TabMeta& other) {
         name = other.name;
+        cols.reserve(other.cols.size());
         for (auto col : other.cols)
             cols.push_back(col);
     }
@@ -143,12 +145,14 @@ struct TabMeta {
     friend std::istream& operator>>(std::istream& is, TabMeta& tab) {
         size_t n;
         is >> tab.name >> n;
+        tab.cols.reserve(n);
         for (size_t i = 0; i < n; i++) {
             ColMeta col;
             is >> col;
             tab.cols.push_back(col);
         }
         is >> n;
+        tab.indexes.reserve(n);
         for (size_t i = 0; i < n; ++i) {
             IndexMeta index;
             is >> index;

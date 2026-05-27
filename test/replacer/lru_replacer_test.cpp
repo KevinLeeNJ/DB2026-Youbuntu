@@ -1,6 +1,9 @@
 #include "gtest/gtest.h"
 #include "replacer/lru_replacer.h"
 
+#include <thread>
+#include <vector>
+
 TEST(LRUReplacerTest, SampleTest) {
     LRUReplacer lru_replacer(7);
 
@@ -39,4 +42,27 @@ TEST(LRUReplacerTest, SampleTest) {
     EXPECT_EQ(6, value);
     lru_replacer.victim(&value);
     EXPECT_EQ(4, value);
+}
+
+// 验证 Size() 在并发环境下不会因缺锁而 data race
+TEST(LRUReplacerTest, SizeThreadSafe) {
+    LRUReplacer lru_replacer(100);
+    for (int i = 0; i < 50; ++i)
+        lru_replacer.unpin(i);
+
+    std::atomic<bool> running{true};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&] {
+            while (running)
+                lru_replacer.Size();
+        });
+    }
+    // let threads run for a short while
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    running = false;
+    for (auto& th : threads)
+        th.join();
+    // 如果没有 data race，到这里不崩溃即为通过
+    SUCCEED();
 }

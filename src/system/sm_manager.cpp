@@ -99,6 +99,7 @@ void SmManager::open_db(const std::string& db_name) {
     // 打开日志文件
     disk_manager_->open_file(LOG_FILE_NAME);
     // 打开所有表的数据文件和索引文件
+    fhs_.reserve(db_.tabs_.size());
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
         fhs_.emplace(tab.name, rm_manager_->open_file(tab.name));
@@ -205,6 +206,7 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     int curr_offset = 0;
     TabMeta tab;
     tab.name = tab_name;
+    tab.cols.reserve(col_defs.size());
     for (auto& col_def : col_defs) {
         ColMeta col = {.tab_name = tab_name,
                        .name = col_def.name,
@@ -273,6 +275,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     }
     // 验证所有列存在，并收集列元数据
     std::vector<ColMeta> index_cols;
+    index_cols.reserve(col_names.size());
     for (auto& col_name : col_names) {
         index_cols.push_back(*tab.get_col(col_name));
     }
@@ -283,7 +286,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     }
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;
-    index_meta.col_num = static_cast<int>(col_names.size());
+    index_meta.col_num = col_names.size();
     index_meta.col_tot_len = col_tot_len;
     index_meta.cols = index_cols;
     tab.indexes.push_back(index_meta);
@@ -345,6 +348,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
     std::vector<std::string> col_names;
+    col_names.reserve(cols.size());
     for (auto& col : cols) {
         col_names.push_back(col.name);
     }

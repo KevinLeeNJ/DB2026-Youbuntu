@@ -299,6 +299,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context*
     if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(query->parse)) {
         // create table;
         std::vector<ColDef> col_defs;
+        col_defs.reserve(x->fields.size());
         for (auto& field : x->fields) {
             if (auto sv_col_def = std::dynamic_pointer_cast<ast::ColDef>(field)) {
                 ColDef col_def = {.name = sv_col_def->col_name,

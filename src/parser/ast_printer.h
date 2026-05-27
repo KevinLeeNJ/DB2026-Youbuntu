@@ -11,8 +11,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "ast.h"
 #include <iostream>
-#include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace ast {
 
@@ -40,7 +40,7 @@ private:
     }
 
     static std::string type2str(SvType type) {
-        static std::map<SvType, std::string> m{
+        static std::unordered_map<SvType, std::string> m{
             {SV_TYPE_INT, "INT"},
             {SV_TYPE_FLOAT, "FLOAT"},
             {SV_TYPE_STRING, "STRING"},
@@ -49,7 +49,7 @@ private:
     }
 
     static std::string op2str(SvCompOp op) {
-        static std::map<SvCompOp, std::string> m{
+        static std::unordered_map<SvCompOp, std::string> m{
             {SV_OP_EQ, "=="}, {SV_OP_NE, "!="}, {SV_OP_LT, "<"}, {SV_OP_GT, ">"}, {SV_OP_LE, "<="}, {SV_OP_GE, ">="},
         };
         return m.at(op);

@@ -189,3 +189,37 @@ TEST_F(RecordManagerTest, SimpleTest) {
     rm_manager->close_file(file_handle.get());
     rm_manager->destroy_file(filename);
 }
+
+// 验证 is_record 调用后正确 unpin buffer pool page
+TEST(RecordManagerIsRecordTest, is_record_unpins_page) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    const size_t bpm_size = 10;
+    auto bpm = std::make_unique<BufferPoolManager>(bpm_size, disk_manager.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), bpm.get());
+
+    std::string filename = "is_record_test.txt";
+    if (disk_manager->is_file(filename))
+        disk_manager->destroy_file(filename);
+
+    int record_size = 64;
+    rm_manager->create_file(filename, record_size);
+    auto fh = rm_manager->open_file(filename);
+
+    // 插入一条记录
+    char buf[64] = {};
+    Rid rid = fh->insert_record(buf, nullptr);
+
+    // insert_record 的 unpin 应该已经把 pin_count 归零，
+    // 现在调用 is_record 后再检查 pin_count
+    fh->is_record(rid);
+
+    // 通过 BPM 内部检查 page 的 pin_count 已归零
+    PageId page_id = {.fd = fh->GetFd(), .page_no = rid.page_no};
+    auto it = bpm->page_table_.find(page_id);
+    ASSERT_NE(it, bpm->page_table_.end());
+    Page& page = bpm->pages_[it->second];
+    EXPECT_EQ(0, page.pin_count_);
+
+    rm_manager->close_file(fh.get());
+    rm_manager->destroy_file(filename);
+}

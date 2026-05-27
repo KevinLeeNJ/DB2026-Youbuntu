@@ -25,6 +25,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         /** TODO: 检查表是否存在 */
 
         // 处理target list，再target list中添加上表名，例如 a.id
+        query->cols.reserve(x->cols.size());
         for (auto& sv_sel_col : x->cols) {
             TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
             query->cols.push_back(sel_col);
@@ -34,6 +35,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         get_all_cols(query->tables, all_cols);
         if (query->cols.empty()) {
             // select all columns
+            query->cols.reserve(all_cols.size());
             for (auto& col : all_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
@@ -63,6 +65,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     case ast::AstNodeKind::InsertStmt: {
         auto x = std::static_pointer_cast<ast::InsertStmt>(parse);
         // 处理insert 的values值
+        query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val));
         }
@@ -118,6 +121,7 @@ void Analyze::get_all_cols(const std::vector<std::string>& tab_names, std::vecto
 
 void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds) {
     conds.clear();
+    conds.reserve(sv_conds.size());
     for (auto& expr : sv_conds) {
         Condition cond;
         cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};

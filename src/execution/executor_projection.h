@@ -28,6 +28,8 @@ public:
 
         size_t curr_offset = 0;
         auto& prev_cols = prev_->cols();
+        sel_idxs_.reserve(sel_cols.size());
+        cols_.reserve(sel_cols.size());
         for (auto& sel_col : sel_cols) {
             auto pos = get_col(prev_cols, sel_col);
             sel_idxs_.push_back(pos - prev_cols.begin());

@@ -11,7 +11,6 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <iostream>
-#include <map>
 #include <unordered_map>
 
 // 此处重载了<<操作符，在ColMeta中进行了调用
