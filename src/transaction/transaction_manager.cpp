@@ -28,7 +28,17 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     // 4. 返回当前事务指针
     // 如果需要支持MVCC请在上述过程中添加代码
 
-    return nullptr;
+    // NOTE: 以下为临时实现，确保DB基本运行（DDL/DML/DQL），后续完善事务系统时需替换
+    if (txn != nullptr) {
+        return txn;
+    }
+    txn_id_t new_txn_id = next_txn_id_.fetch_add(1);
+    Transaction* new_txn = new Transaction(new_txn_id);
+    {
+        std::unique_lock<std::mutex> lock(latch_);
+        txn_map[new_txn_id] = new_txn;
+    }
+    return new_txn;
 }
 
 /**
@@ -44,6 +54,16 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
+
+    // NOTE: 以下为临时实现，确保DB基本运行，后续完善事务系统时需替换
+    if (txn == nullptr)
+        return;
+    txn->set_state(TransactionState::COMMITTED);
+    {
+        std::unique_lock<std::mutex> lock(latch_);
+        txn_map.erase(txn->get_transaction_id());
+    }
+    delete txn;
 }
 
 /**
@@ -59,4 +79,14 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
+
+    // NOTE: 以下为临时实现，确保DB基本运行，后续完善事务系统时需替换
+    if (txn == nullptr)
+        return;
+    txn->set_state(TransactionState::ABORTED);
+    {
+        std::unique_lock<std::mutex> lock(latch_);
+        txn_map.erase(txn->get_transaction_id());
+    }
+    delete txn;
 }

@@ -146,6 +146,7 @@ void* client_handler(void* sock_fd) {
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
+                    txn_id = INVALID_TXN_ID;
                     std::cout << e.GetInfo() << std::endl;
 
                     std::fstream outfile;
@@ -181,6 +182,7 @@ void* client_handler(void* sock_fd) {
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
         if (context->txn_->get_txn_mode() == false) {
             txn_manager->commit(context->txn_, context->log_mgr_);
+            txn_id = INVALID_TXN_ID;
         }
     }
 

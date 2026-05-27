@@ -173,7 +173,12 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
             rhs_type = rhs_col->type;
         }
         if (lhs_type != rhs_type) {
-            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            // 允许 INT 和 FLOAT 之间的隐式类型转换（实际比较在 eval_conds 中统一提升为 FLOAT）
+            if ((lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) || (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT)) {
+                // 不做截断转换，交给 eval_conds 处理
+            } else {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            }
         }
     }
 }
