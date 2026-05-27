@@ -17,12 +17,15 @@ See the Mulan PSL v2 for more details. */
  */
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse) {
     std::shared_ptr<Query> query = std::make_shared<Query>();
-    if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse)) {
+    switch (parse->kind) {
+    case ast::AstNodeKind::SelectStmt: {
+        auto x = std::static_pointer_cast<ast::SelectStmt>(parse);
         // 处理表名
         query->tables = std::move(x->tabs);
         /** TODO: 检查表是否存在 */
 
         // 处理target list，再target list中添加上表名，例如 a.id
+        query->cols.reserve(x->cols.size());
         for (auto& sv_sel_col : x->cols) {
             TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
             query->cols.push_back(sel_col);
@@ -32,6 +35,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         get_all_cols(query->tables, all_cols);
         if (query->cols.empty()) {
             // select all columns
+            query->cols.reserve(all_cols.size());
             for (auto& col : all_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
@@ -45,20 +49,31 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 处理where条件
         get_clause(x->conds, query->conds);
         check_clause(query->tables, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
+        break;
+    }
+    case ast::AstNodeKind::UpdateStmt: {
         /** TODO: */
-
-    } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
+        break;
+    }
+    case ast::AstNodeKind::DeleteStmt: {
+        auto x = std::static_pointer_cast<ast::DeleteStmt>(parse);
         // 处理where条件
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
+        break;
+    }
+    case ast::AstNodeKind::InsertStmt: {
+        auto x = std::static_pointer_cast<ast::InsertStmt>(parse);
         // 处理insert 的values值
+        query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val));
         }
-    } else {
+        break;
+    }
+    default:
         // do nothing
+        break;
     }
     query->parse = std::move(parse);
     return query;
@@ -81,7 +96,17 @@ TabCol Analyze::check_column(const std::vector<ColMeta>& all_cols, TabCol target
         }
         target.tab_name = tab_name;
     } else {
-        /** TODO: Make sure target column exists */
+        // 显式指定了表名，校验列在该表中确实存在
+        bool found = false;
+        for (auto& col : all_cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw ColumnNotFoundError(target.col_name);
+        }
     }
     return target;
 }
@@ -96,16 +121,29 @@ void Analyze::get_all_cols(const std::vector<std::string>& tab_names, std::vecto
 
 void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds) {
     conds.clear();
+    conds.reserve(sv_conds.size());
     for (auto& expr : sv_conds) {
         Condition cond;
         cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
         cond.op = convert_sv_comp_op(expr->op);
-        if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs)) {
+        switch (expr->rhs->kind) {
+        case ast::AstNodeKind::IntLit:
+        case ast::AstNodeKind::FloatLit:
+        case ast::AstNodeKind::StringLit:
+        case ast::AstNodeKind::BoolLit: {
+            auto rhs_val = std::static_pointer_cast<ast::Value>(expr->rhs);
             cond.is_rhs_val = true;
             cond.rhs_val = convert_sv_value(rhs_val);
-        } else if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs)) {
+            break;
+        }
+        case ast::AstNodeKind::Col: {
+            auto rhs_col = std::static_pointer_cast<ast::Col>(expr->rhs);
             cond.is_rhs_val = false;
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
+            break;
+        }
+        default:
+            throw InternalError("Unexpected rhs expression type in where clause");
         }
         conds.push_back(cond);
     }
@@ -142,20 +180,35 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
 Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value>& sv_val) {
     Value val;
-    if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(sv_val)) {
+    switch (sv_val->kind) {
+    case ast::AstNodeKind::IntLit: {
+        auto int_lit = std::static_pointer_cast<ast::IntLit>(sv_val);
         val.set_int(int_lit->val);
-    } else if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(sv_val)) {
+        break;
+    }
+    case ast::AstNodeKind::FloatLit: {
+        auto float_lit = std::static_pointer_cast<ast::FloatLit>(sv_val);
         val.set_float(float_lit->val);
-    } else if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(sv_val)) {
+        break;
+    }
+    case ast::AstNodeKind::StringLit: {
+        auto str_lit = std::static_pointer_cast<ast::StringLit>(sv_val);
         val.set_str(str_lit->val);
-    } else {
+        break;
+    }
+    case ast::AstNodeKind::BoolLit: {
+        auto bool_lit = std::static_pointer_cast<ast::BoolLit>(sv_val);
+        val.set_int(bool_lit->val ? 1 : 0);
+        break;
+    }
+    default:
         throw InternalError("Unexpected sv value type");
     }
     return val;
 }
 
 CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
-    std::map<ast::SvCompOp, CompOp> m = {
+    static const std::unordered_map<ast::SvCompOp, CompOp> m = {
         {ast::SV_OP_EQ, OP_EQ}, {ast::SV_OP_NE, OP_NE}, {ast::SV_OP_LT, OP_LT},
         {ast::SV_OP_GT, OP_GT}, {ast::SV_OP_LE, OP_LE}, {ast::SV_OP_GE, OP_GE},
     };

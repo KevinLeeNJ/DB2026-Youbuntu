@@ -23,7 +23,7 @@ jobs:
       - name: Install style tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format
+          sudo apt-get install -y clang-format-18
 
       - name: Check changed C/C++ files
         shell: bash
@@ -58,7 +58,7 @@ jobs:
 
           printf 'Style-checking changed files:\n'
           printf '  %s\n' "${files[@]}"
-          clang-format --dry-run --Werror "${files[@]}"
+          clang-format-18 --dry-run --Werror "${files[@]}"
 
   lint:
     name: Lint

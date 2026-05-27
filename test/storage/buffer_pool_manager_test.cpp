@@ -112,6 +112,16 @@ TEST_F(BufferPoolManagerTest, SampleTest) {
     bpm->flush_all_pages(fd);
 }
 
+// 验证 BufferPoolManager 构造时 replacer 被正确创建
+TEST_F(BufferPoolManagerTest, ReplacerCreatedCorrectly) {
+    const size_t buffer_pool_size = 10;
+    auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
+    auto bpm = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager);
+    ASSERT_NE(nullptr, bpm->replacer_);
+    // 验证 replacer 可正常使用（非空且功能正确）
+    EXPECT_EQ(0, bpm->replacer_->Size());
+}
+
 class BufferPoolManagerConcurrencyTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;

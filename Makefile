@@ -51,8 +51,8 @@ release: clean
 	@$(CMAKE) --build $(BUILD_DIR) --parallel $(JOBS)
 
 format:
-	@find src -name '*.cpp' -o -name '*.h' | xargs clang-format -i
-	@find test -name '*.cpp' -o -name '*.h' | xargs clang-format -i
+	@find src -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
+	@find test -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
 	@echo "Code formatted."
 
 client:

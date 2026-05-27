@@ -45,10 +45,22 @@ typedef enum PlanTag {
     T_Projection
 } PlanTag;
 
+enum class PlanKind {
+    Scan,
+    Join,
+    Projection,
+    Sort,
+    DML,
+    DDL,
+    Other,
+    SetKnob,
+};
+
 // 查询执行计划
 class Plan {
 public:
     PlanTag tag;
+    PlanKind kind = PlanKind::Other;
     virtual ~Plan() = default;
 };
 
@@ -57,6 +69,7 @@ public:
     ScanPlan(PlanTag tag, SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
              std::vector<std::string> index_col_names) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::Scan;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
         TabMeta& tab = sm_manager->db_.get_table(tab_name_);
@@ -79,6 +92,7 @@ class JoinPlan : public Plan {
 public:
     JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::Join;
         left_ = std::move(left);
         right_ = std::move(right);
         conds_ = std::move(conds);
@@ -99,6 +113,7 @@ class ProjectionPlan : public Plan {
 public:
     ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> sel_cols) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::Projection;
         subplan_ = std::move(subplan);
         sel_cols_ = std::move(sel_cols);
     }
@@ -111,6 +126,7 @@ class SortPlan : public Plan {
 public:
     SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, TabCol sel_col, bool is_desc) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::Sort;
         subplan_ = std::move(subplan);
         sel_col_ = sel_col;
         is_desc_ = is_desc;
@@ -127,6 +143,7 @@ public:
     DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::string tab_name, std::vector<Value> values,
             std::vector<Condition> conds, std::vector<SetClause> set_clauses) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::DML;
         subplan_ = std::move(subplan);
         tab_name_ = std::move(tab_name);
         values_ = std::move(values);
@@ -146,6 +163,7 @@ class DDLPlan : public Plan {
 public:
     DDLPlan(PlanTag tag, std::string tab_name, std::vector<std::string> col_names, std::vector<ColDef> cols) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::DDL;
         tab_name_ = std::move(tab_name);
         cols_ = std::move(cols);
         tab_col_names_ = std::move(col_names);
@@ -161,6 +179,7 @@ class OtherPlan : public Plan {
 public:
     OtherPlan(PlanTag tag, std::string tab_name) {
         Plan::tag = tag;
+        Plan::kind = PlanKind::Other;
         tab_name_ = std::move(tab_name);
     }
     ~OtherPlan() {}
@@ -172,6 +191,7 @@ class SetKnobPlan : public Plan {
 public:
     SetKnobPlan(ast::SetKnobType knob_type, bool bool_value) {
         Plan::tag = T_SetKnob;
+        Plan::kind = PlanKind::SetKnob;
         set_knob_type_ = knob_type;
         bool_value_ = bool_value;
     }
