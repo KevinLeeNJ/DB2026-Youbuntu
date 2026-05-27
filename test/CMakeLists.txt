@@ -16,7 +16,7 @@ foreach(DIR ${SUBDIRS})
             
             set_target_properties(${TEST_TARGET} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/test")
             
-            target_link_libraries(${TEST_TARGET} analyze parser system storage lru_replacer record index gtest_main pthread)
+            target_link_libraries(${TEST_TARGET} analyze parser system storage lru_replacer record index transaction planner execution gtest_main pthread)
             gtest_discover_tests(${TEST_TARGET})
         endif()
     endif()
