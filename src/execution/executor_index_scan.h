@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "index/ix_scan.h"
+#include "execution_common.h"
 #include "system/sm.h"
 
 class IndexScanExecutor : public AbstractExecutor {
@@ -64,15 +66,113 @@ public:
         fed_conds_ = conds_;
     }
 
-    void beginTuple() override {}
+    size_t tupleLen() const override {
+        return len_;
+    }
 
-    void nextTuple() override {}
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+
+    bool is_end() const override {
+        return !scan_ || scan_->is_end();
+    }
+
+    void beginTuple() override {
+        // Build key buffers for lower and upper bound
+        char* lower_key = new char[index_meta_.col_tot_len]();
+        char* upper_key = new char[index_meta_.col_tot_len]();
+        bool has_lower = false, has_upper = false;
+        bool gt_lower = false, lt_upper = false;
+
+        for (auto& cond : fed_conds_) {
+            if (!cond.is_rhs_val)
+                continue;
+            for (size_t j = 0; j < index_col_names_.size(); j++) {
+                if (cond.lhs_col.col_name == index_col_names_[j]) {
+                    auto& idx_col = index_meta_.cols[j];
+                    cond.rhs_val.init_raw(idx_col.len);
+                    switch (cond.op) {
+                    case OP_EQ:
+                        memcpy(lower_key + idx_col.offset, cond.rhs_val.raw->data, idx_col.len);
+                        memcpy(upper_key + idx_col.offset, cond.rhs_val.raw->data, idx_col.len);
+                        has_lower = true;
+                        has_upper = true;
+                        break;
+                    case OP_GE:
+                        memcpy(lower_key + idx_col.offset, cond.rhs_val.raw->data, idx_col.len);
+                        has_lower = true;
+                        break;
+                    case OP_GT:
+                        memcpy(lower_key + idx_col.offset, cond.rhs_val.raw->data, idx_col.len);
+                        has_lower = true;
+                        gt_lower = true;
+                        break;
+                    case OP_LE:
+                        memcpy(upper_key + idx_col.offset, cond.rhs_val.raw->data, idx_col.len);
+                        has_upper = true;
+                        break;
+                    case OP_LT:
+                        memcpy(upper_key + idx_col.offset, cond.rhs_val.raw->data, idx_col.len);
+                        has_upper = true;
+                        lt_upper = true;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+        }
+
+        IxIndexHandle* ih =
+            sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
+
+        Iid lower_iid;
+        if (has_lower) {
+            lower_iid = gt_lower ? ih->upper_bound(lower_key) : ih->lower_bound(lower_key);
+        } else {
+            lower_iid = ih->leaf_begin();
+        }
+
+        Iid upper_iid;
+        if (has_upper) {
+            upper_iid = lt_upper ? ih->lower_bound(upper_key) : ih->upper_bound(upper_key);
+        } else {
+            upper_iid = ih->leaf_end();
+        }
+
+        delete[] lower_key;
+        delete[] upper_key;
+
+        scan_ = std::make_unique<IxScan>(ih, lower_iid, upper_iid, sm_manager_->get_bpm());
+        advance_to_valid();
+    }
+
+    void nextTuple() override {
+        scan_->next();
+        advance_to_valid();
+    }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        rid_ = scan_->rid();
+        return fh_->get_record(rid_, context_);
     }
 
     Rid& rid() override {
         return rid_;
+    }
+
+private:
+    void advance_to_valid() {
+        while (!scan_->is_end()) {
+            Rid current_rid = scan_->rid();
+            if (fh_->is_record(current_rid)) {
+                auto rec = fh_->get_record(current_rid, context_);
+                if (eval_conds(fed_conds_, cols_, *rec)) {
+                    return; // Found a valid, matching record
+                }
+            }
+            scan_->next();
+        }
     }
 };

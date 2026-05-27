@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include "execution_common.h"
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -37,6 +38,23 @@ public:
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        for (auto& rid : rids_) {
+            // Read record before deletion for index key extraction
+            auto rec = fh_->get_record(rid, context_);
+
+            // Delete from all indexes
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto& index = tab_.indexes[i];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char* key = extract_index_key(*rec, index);
+                ih->delete_entry(key, context_->txn_);
+                delete[] key;
+            }
+
+            // Delete from heap file
+            fh_->delete_record(rid, context_);
+        }
         return nullptr;
     }
 

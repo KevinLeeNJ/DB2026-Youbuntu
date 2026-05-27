@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "record/rm_scan.h"
 
 class SeqScanExecutor : public AbstractExecutor {
 private:
@@ -45,12 +46,35 @@ public:
         fed_conds_ = conds_;
     }
 
-    void beginTuple() override {}
+    size_t tupleLen() const override {
+        return len_;
+    }
 
-    void nextTuple() override {}
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+
+    bool is_end() const override {
+        return !scan_ || scan_->is_end();
+    }
+
+    void beginTuple() override {
+        scan_ = std::make_unique<RmScan>(fh_);
+        while (!scan_->is_end() && !eval_conds(fed_conds_, cols_, *fh_->get_record(scan_->rid(), context_))) {
+            scan_->next();
+        }
+    }
+
+    void nextTuple() override {
+        scan_->next();
+        while (!scan_->is_end() && !eval_conds(fed_conds_, cols_, *fh_->get_record(scan_->rid(), context_))) {
+            scan_->next();
+        }
+    }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        rid_ = scan_->rid();
+        return fh_->get_record(rid_, context_);
     }
 
     Rid& rid() override {

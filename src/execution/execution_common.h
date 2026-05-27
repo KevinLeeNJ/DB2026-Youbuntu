@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <vector>
 #include <optional>
+#include <cstring>
 
 #include "transaction/transaction.h"
 #include "transaction/transaction_manager.h"
@@ -21,3 +22,13 @@ auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const T
                       const std::vector<UndoLog>& undo_logs) -> std::optional<RmRecord>;
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction* txn) -> bool;
+
+inline char* extract_index_key(const RmRecord& rec, const IndexMeta& index) {
+    char* key = new char[index.col_tot_len];
+    int offset = 0;
+    for (size_t i = 0; i < index.col_num; ++i) {
+        memcpy(key + offset, rec.data + index.cols[i].offset, index.cols[i].len);
+        offset += index.cols[i].len;
+    }
+    return key;
+}

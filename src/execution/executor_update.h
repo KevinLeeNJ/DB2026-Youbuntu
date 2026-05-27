@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "execution_common.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -38,7 +39,56 @@ public:
         context_ = context;
     }
     std::unique_ptr<RmRecord> Next() override {
+        int record_size = fh_->get_file_hdr().record_size;
 
+        // Initialize raw data for SetClause values (once before loop)
+        for (auto& sc : set_clauses_) {
+            if (sc.rhs.raw == nullptr) {
+                auto col_it = get_col(tab_.cols, sc.lhs);
+                auto& col = *col_it;
+                if (col.type != sc.rhs.type) {
+                    throw IncompatibleTypeError(coltype2str(col.type), coltype2str(sc.rhs.type));
+                }
+                sc.rhs.init_raw(col.len);
+            }
+        }
+
+        for (auto& rid : rids_) {
+            // Read old record
+            auto old_rec = fh_->get_record(rid, context_);
+
+            // Delete old index entries
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto& index = tab_.indexes[i];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char* old_key = extract_index_key(*old_rec, index);
+                ih->delete_entry(old_key, context_->txn_);
+                delete[] old_key;
+            }
+
+            // Build new record: copy old, then apply SetClauses
+            auto new_rec = std::make_unique<RmRecord>(record_size);
+            memcpy(new_rec->data, old_rec->data, record_size);
+            for (auto& sc : set_clauses_) {
+                auto col_it = get_col(tab_.cols, sc.lhs);
+                auto& col = *col_it;
+                memcpy(new_rec->data + col.offset, sc.rhs.raw->data, col.len);
+            }
+
+            // Insert new index entries
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto& index = tab_.indexes[i];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char* new_key = extract_index_key(*new_rec, index);
+                ih->insert_entry(new_key, rid, context_->txn_);
+                delete[] new_key;
+            }
+
+            // Update heap record
+            fh_->update_record(rid, new_rec->data, context_);
+        }
         return nullptr;
     }
 

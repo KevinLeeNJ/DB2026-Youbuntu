@@ -41,15 +41,38 @@ public:
         len_ = curr_offset;
     }
 
-    void beginTuple() override {}
+    size_t tupleLen() const override {
+        return len_;
+    }
 
-    void nextTuple() override {}
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+
+    bool is_end() const override {
+        return !prev_ || prev_->is_end();
+    }
+
+    void beginTuple() override {
+        prev_->beginTuple();
+    }
+
+    void nextTuple() override {
+        prev_->nextTuple();
+    }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        auto src_rec = prev_->Next();
+        auto dst_rec = std::make_unique<RmRecord>(len_);
+        for (size_t i = 0; i < sel_idxs_.size(); i++) {
+            auto& src_col = prev_->cols()[sel_idxs_[i]];
+            auto& dst_col = cols_[i];
+            memcpy(dst_rec->data + dst_col.offset, src_rec->data + src_col.offset, src_col.len);
+        }
+        return dst_rec;
     }
 
     Rid& rid() override {
-        return _abstract_rid;
+        return prev_->rid();
     }
 };

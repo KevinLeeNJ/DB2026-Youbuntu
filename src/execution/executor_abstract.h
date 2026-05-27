@@ -52,7 +52,7 @@ public:
         return ColMeta();
     };
 
-    std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
+    static std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;
         });
@@ -60,5 +60,173 @@ public:
             throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
         }
         return pos;
+    }
+
+    static bool is_numeric(ColType type) {
+        return type == TYPE_INT || type == TYPE_FLOAT;
+    }
+
+    static bool eval_conds(const std::vector<Condition>& conds, const std::vector<ColMeta>& cols, const RmRecord& rec) {
+        for (auto& cond : conds) {
+            auto lhs_it = get_col(cols, cond.lhs_col);
+            auto& lhs_col = *lhs_it;
+            char* lhs_data = rec.data + lhs_col.offset;
+
+            int cmp = 0;
+            if (cond.is_rhs_val) {
+                // 支持 INT 和 FLOAT 之间的跨类型比较，统一提升为 FLOAT
+                if (is_numeric(lhs_col.type) && is_numeric(cond.rhs_val.type)) {
+                    float lhs_val = (lhs_col.type == TYPE_INT) ? static_cast<float>(*reinterpret_cast<int*>(lhs_data))
+                                                               : *reinterpret_cast<float*>(lhs_data);
+                    float rhs_val = (cond.rhs_val.type == TYPE_INT) ? static_cast<float>(cond.rhs_val.int_val)
+                                                                    : cond.rhs_val.float_val;
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_INT) {
+                    int lhs_val = *reinterpret_cast<int*>(lhs_data);
+                    cmp = (lhs_val < cond.rhs_val.int_val) ? -1 : (lhs_val > cond.rhs_val.int_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_FLOAT) {
+                    float lhs_val = *reinterpret_cast<float*>(lhs_data);
+                    cmp = (lhs_val < cond.rhs_val.float_val) ? -1 : (lhs_val > cond.rhs_val.float_val) ? 1 : 0;
+                } else {
+                    cmp = strncmp(lhs_data, cond.rhs_val.str_val.c_str(), lhs_col.len);
+                }
+            } else {
+                auto rhs_it = get_col(cols, cond.rhs_col);
+                char* rhs_data = rec.data + rhs_it->offset;
+                // 支持 INT 和 FLOAT 之间的跨类型比较
+                if (is_numeric(lhs_col.type) && is_numeric(rhs_it->type)) {
+                    float lhs_val = (lhs_col.type == TYPE_INT) ? static_cast<float>(*reinterpret_cast<int*>(lhs_data))
+                                                               : *reinterpret_cast<float*>(lhs_data);
+                    float rhs_val = (rhs_it->type == TYPE_INT) ? static_cast<float>(*reinterpret_cast<int*>(rhs_data))
+                                                               : *reinterpret_cast<float*>(rhs_data);
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_INT) {
+                    int lhs_val = *reinterpret_cast<int*>(lhs_data);
+                    int rhs_val = *reinterpret_cast<int*>(rhs_data);
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_FLOAT) {
+                    float lhs_val = *reinterpret_cast<float*>(lhs_data);
+                    float rhs_val = *reinterpret_cast<float*>(rhs_data);
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else {
+                    cmp = strncmp(lhs_data, rhs_data, lhs_col.len);
+                }
+            }
+
+            switch (cond.op) {
+            case OP_EQ:
+                if (cmp != 0)
+                    return false;
+                break;
+            case OP_NE:
+                if (cmp == 0)
+                    return false;
+                break;
+            case OP_LT:
+                if (cmp >= 0)
+                    return false;
+                break;
+            case OP_GT:
+                if (cmp <= 0)
+                    return false;
+                break;
+            case OP_LE:
+                if (cmp > 0)
+                    return false;
+                break;
+            case OP_GE:
+                if (cmp < 0)
+                    return false;
+                break;
+            default:
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool eval_conds(const std::vector<Condition>& conds, const std::vector<ColMeta>& cols,
+                           const RmRecord& left_rec, const RmRecord& right_rec, size_t left_len) {
+        for (auto& cond : conds) {
+            auto lhs_it = get_col(cols, cond.lhs_col);
+            auto& lhs_col = *lhs_it;
+            char* lhs_data = (static_cast<size_t>(lhs_col.offset) < left_len)
+                                 ? left_rec.data + lhs_col.offset
+                                 : right_rec.data + (lhs_col.offset - static_cast<int>(left_len));
+
+            int cmp = 0;
+            if (cond.is_rhs_val) {
+                // 支持 INT 和 FLOAT 之间的跨类型比较，统一提升为 FLOAT
+                if (is_numeric(lhs_col.type) && is_numeric(cond.rhs_val.type)) {
+                    float lhs_val = (lhs_col.type == TYPE_INT) ? static_cast<float>(*reinterpret_cast<int*>(lhs_data))
+                                                               : *reinterpret_cast<float*>(lhs_data);
+                    float rhs_val = (cond.rhs_val.type == TYPE_INT) ? static_cast<float>(cond.rhs_val.int_val)
+                                                                    : cond.rhs_val.float_val;
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_INT) {
+                    int lhs_val = *reinterpret_cast<int*>(lhs_data);
+                    cmp = (lhs_val < cond.rhs_val.int_val) ? -1 : (lhs_val > cond.rhs_val.int_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_FLOAT) {
+                    float lhs_val = *reinterpret_cast<float*>(lhs_data);
+                    cmp = (lhs_val < cond.rhs_val.float_val) ? -1 : (lhs_val > cond.rhs_val.float_val) ? 1 : 0;
+                } else {
+                    cmp = strncmp(lhs_data, cond.rhs_val.str_val.c_str(), lhs_col.len);
+                }
+            } else {
+                auto rhs_it = get_col(cols, cond.rhs_col);
+                auto& rhs_col = *rhs_it;
+                char* rhs_data = (static_cast<size_t>(rhs_col.offset) < left_len)
+                                     ? left_rec.data + rhs_col.offset
+                                     : right_rec.data + (rhs_col.offset - static_cast<int>(left_len));
+                // 支持 INT 和 FLOAT 之间的跨类型比较
+                if (is_numeric(lhs_col.type) && is_numeric(rhs_col.type)) {
+                    float lhs_val = (lhs_col.type == TYPE_INT) ? static_cast<float>(*reinterpret_cast<int*>(lhs_data))
+                                                               : *reinterpret_cast<float*>(lhs_data);
+                    float rhs_val = (rhs_col.type == TYPE_INT) ? static_cast<float>(*reinterpret_cast<int*>(rhs_data))
+                                                               : *reinterpret_cast<float*>(rhs_data);
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_INT) {
+                    int lhs_val = *reinterpret_cast<int*>(lhs_data);
+                    int rhs_val = *reinterpret_cast<int*>(rhs_data);
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else if (lhs_col.type == TYPE_FLOAT) {
+                    float lhs_val = *reinterpret_cast<float*>(lhs_data);
+                    float rhs_val = *reinterpret_cast<float*>(rhs_data);
+                    cmp = (lhs_val < rhs_val) ? -1 : (lhs_val > rhs_val) ? 1 : 0;
+                } else {
+                    cmp = strncmp(lhs_data, rhs_data, lhs_col.len);
+                }
+            }
+
+            switch (cond.op) {
+            case OP_EQ:
+                if (cmp != 0)
+                    return false;
+                break;
+            case OP_NE:
+                if (cmp == 0)
+                    return false;
+                break;
+            case OP_LT:
+                if (cmp >= 0)
+                    return false;
+                break;
+            case OP_GT:
+                if (cmp <= 0)
+                    return false;
+                break;
+            case OP_LE:
+                if (cmp > 0)
+                    return false;
+                break;
+            case OP_GE:
+                if (cmp < 0)
+                    return false;
+                break;
+            default:
+                return false;
+            }
+        }
+        return true;
     }
 };
