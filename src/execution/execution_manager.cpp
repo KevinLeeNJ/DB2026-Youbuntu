@@ -46,7 +46,8 @@ const char* help_info = "Supported SQL syntax:\n"
 
 // 主要负责执行DDL语句
 void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context* context) {
-    if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
+    if (plan->kind == PlanKind::DDL) {
+        auto x = std::static_pointer_cast<DDLPlan>(plan);
         switch (x->tag) {
         case T_CreateTable: {
             sm_manager_->create_table(x->tab_name_, x->cols_, context);
@@ -73,7 +74,9 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context* context) {
 
 // 执行help; show tables; desc table; begin; commit; abort;语句
 void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Context* context) {
-    if (auto x = std::dynamic_pointer_cast<OtherPlan>(plan)) {
+    switch (plan->kind) {
+    case PlanKind::Other: {
+        auto x = std::static_pointer_cast<OtherPlan>(plan);
         switch (x->tag) {
         case T_Help: {
             memcpy(context->data_send_ + *(context->offset_), help_info, strlen(help_info));
@@ -112,8 +115,10 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             throw InternalError("Unexpected field type");
             break;
         }
-
-    } else if (auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
+        break;
+    }
+    case PlanKind::SetKnob: {
+        auto x = std::static_pointer_cast<SetKnobPlan>(plan);
         switch (x->set_knob_type_) {
         case ast::SetKnobType::EnableNestLoop: {
             planner_->set_enable_nestedloop_join(x->bool_value_);
@@ -128,6 +133,10 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             break;
         }
         }
+        break;
+    }
+    default:
+        break;
     }
 }
 
