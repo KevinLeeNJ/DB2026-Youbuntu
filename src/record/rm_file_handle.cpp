@@ -40,11 +40,7 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     // 3. 将buf复制到空闲slot位置
     // 4. 更新page_handle.page_hdr中的数据结构
     // 注意考虑插入一条记录后页面已满的情况，需要更新file_hdr_.first_free_page_no
-    if (file_hdr_.first_free_page_no == -1) {
-        create_new_page_handle();
-    }
-    RmPageHandle insertpage_handle = fetch_page_handle(file_hdr_.first_free_page_no);
-    Rid rid_;
+    RmPageHandle insertpage_handle = create_page_handle();
     int slot_no = Bitmap::first_bit(false, insertpage_handle.bitmap, file_hdr_.num_records_per_page);
     if (slot_no != file_hdr_.num_records_per_page) {
         memcpy(insertpage_handle.get_slot(slot_no), buf, file_hdr_.record_size);

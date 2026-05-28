@@ -231,7 +231,8 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     if (!db_.is_table(tab_name))
         throw TableNotFoundError(tab_name);
     TabMeta& tab = db_.get_table(tab_name);
-    for (auto& index : tab.indexes)
+    auto indexes = tab.indexes;
+    for (auto& index : indexes)
         drop_index(tab_name, index.cols, context);
     rm_manager_->close_file(fhs_[tab_name].get());
     rm_manager_->destroy_file(tab_name); // 删除表的磁盘文件
