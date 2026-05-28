@@ -61,4 +61,91 @@ public:
         }
         return pos;
     }
+
+protected:
+    /**
+     * @brief 比较条件cond与记录rec是否匹配
+     * @param cond 条件
+     * @param rec 记录
+     * @return true if rec matches cond, false otherwise
+     */
+    bool compare(const Condition& cond, const RmRecord& rec) {
+        ColMeta lhs_col_meta = get_col_offset(cond.lhs_col);
+        ColMeta rhs_col_meta;
+        char* lhs_data = rec.data + lhs_col_meta.offset;
+        ColType lhs_type, rhs_type;
+        lhs_type = get_col_offset(cond.lhs_col).type;
+        char* rhs_data = nullptr;
+        if (!cond.is_rhs_val) {
+            rhs_col_meta = get_col_offset(cond.rhs_col);
+            char* rhs_data = rec.data + rhs_col_meta.offset;
+            rhs_type = rhs_col_meta.type;
+        } else {
+            rhs_type = cond.rhs_val.type;
+        }
+        if (can_cast(lhs_type, rhs_type) == false) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+        }
+        switch (lhs_type) {
+        case TYPE_INT:
+        case TYPE_FLOAT: {
+            float lhs_val = lhs_type == TYPE_INT ? (float)*(int*)lhs_data : *(float*)lhs_data;
+            float rhs_val;
+            if (cond.is_rhs_val) {
+                rhs_val = rhs_type == TYPE_INT ? (float)cond.rhs_val.int_val : cond.rhs_val.float_val;
+            } else {
+                rhs_val = rhs_type == TYPE_INT ? (float)*(int*)rhs_data : *(float*)rhs_data;
+            }
+            switch (cond.op) {
+            case OP_EQ:
+                return lhs_val == rhs_val;
+            case OP_NE:
+                return lhs_val != rhs_val;
+            case OP_LT:
+                return lhs_val < rhs_val;
+            case OP_GT:
+                return lhs_val > rhs_val;
+            case OP_LE:
+                return lhs_val <= rhs_val;
+            case OP_GE:
+                return lhs_val >= rhs_val;
+            }
+        }
+        case TYPE_STRING: {
+            std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
+            std::string rhs_val =
+                cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta.len));
+            std::cout << "lhs_val: " << lhs_val << ", rhs_val: " << rhs_val << std::endl;
+            switch (cond.op) {
+            case OP_EQ:
+                return lhs_val == rhs_val;
+            case OP_NE:
+                return lhs_val != rhs_val;
+            case OP_LT:
+                return lhs_val < rhs_val;
+            case OP_GT:
+                return lhs_val > rhs_val;
+            case OP_LE:
+                return lhs_val <= rhs_val;
+            case OP_GE:
+                return lhs_val >= rhs_val;
+            }
+        }
+        }
+    }
+    /**
+     * @brief 判断两个列类型是否可以进行转换
+     * @param lhs 左侧列类型
+     * @param rhs 右侧列类型
+     * @return true if can cast, false otherwise
+     */
+    static inline bool can_cast(const ColType& lhs, const ColType& rhs) {
+        if (lhs == rhs)
+            return true;
+        if (lhs == TYPE_INT && rhs == TYPE_FLOAT)
+            return true;
+        if (lhs == TYPE_FLOAT && rhs == TYPE_INT)
+            return true;
+        return false;
+    }
 };

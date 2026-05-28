@@ -117,7 +117,7 @@ void* client_handler(void* sock_fd) {
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         Context* context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
-        SetTransaction(&txn_id, context);
+        // SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
@@ -179,9 +179,10 @@ void* client_handler(void* sock_fd) {
             break;
         }
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if (context->txn_->get_txn_mode() == false) {
-            txn_manager->commit(context->txn_, context->log_mgr_);
-        }
+        // if(context->txn_->get_txn_mode() == false)
+        // {
+        //     txn_manager->commit(context->txn_, context->log_mgr_);
+        // }
     }
 
     // Clear
@@ -199,7 +200,7 @@ void start_server() {
 
     int sockfd_server;
     int fd_temp;
-    struct sockaddr_in s_addr_in{};
+    struct sockaddr_in s_addr_in {};
 
     // 初始化连接
     sockfd_server = socket(AF_INET, SOCK_STREAM, 0); // ipv4,TCP
@@ -227,7 +228,7 @@ void start_server() {
     while (!should_exit) {
         std::cout << "Waiting for new connection..." << std::endl;
         pthread_t thread_id;
-        struct sockaddr_in s_addr_client{};
+        struct sockaddr_in s_addr_client {};
         int client_length = sizeof(s_addr_client);
 
         if (setjmp(jmpbuf)) {

@@ -44,16 +44,83 @@ public:
 
         fed_conds_ = conds_;
     }
-
-    void beginTuple() override {}
-
-    void nextTuple() override {}
-
+    /**
+     * @brief 构建表迭代器scan_,并开始迭代扫描,直到扫描到第一个满足谓词条件的元组停止,并赋值给rid_
+     *
+     */
+    void beginTuple() override {
+        scan_ = std::make_unique<RmScan>(fh_);
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            bool match = true;
+            for (const auto& cond : fed_conds_) {
+                if (!compare(cond, *rec)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                break; // 找到第一个满足条件的记录
+            }
+            scan_->next();
+        }
+    }
+    /**
+     * @brief 从当前scan_指向的记录开始迭代扫描,直到扫描到第一个满足谓词条件的元组停止,并赋值给rid_
+     *
+     */
+    void nextTuple() override {
+        scan_->next();
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            bool match = true;
+            for (const auto& cond : fed_conds_) {
+                if (!compare(cond, *rec)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                break; // 找到第一个满足条件的记录
+            }
+            scan_->next();
+        }
+    }
+    /**
+     * @brief 返回下一个满足扫描条件的记录
+     *
+     * @return std::unique_ptr<RmRecord>
+     */
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (!is_end()) {
+            return fh_->get_record(rid_, context_);
+        }
+        return nullptr; // 没有更多记录
     }
 
     Rid& rid() override {
         return rid_;
+    }
+
+    bool is_end() const override {
+        return scan_->is_end();
+    }
+    std::string getType() override {
+        return "SeqScanExecutor"; // 返回执行器的名称
+    }
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+    ColMeta get_col_offset(const TabCol& target) override {
+        for (const auto& col : cols_) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                return col;
+            }
+        }
+    }
+    size_t tupleLen() const override {
+        return len_;
     }
 };
