@@ -115,7 +115,6 @@ protected:
             std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
             std::string rhs_val =
                 cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta.len));
-            std::cout << "lhs_val: " << lhs_val << ", rhs_val: " << rhs_val << std::endl;
             switch (cond.op) {
             case OP_EQ:
                 return lhs_val == rhs_val;

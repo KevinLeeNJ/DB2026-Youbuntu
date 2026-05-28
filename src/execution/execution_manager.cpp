@@ -156,11 +156,13 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Print records
     size_t num_rec = 0;
+    const auto& result_cols = executorTreeRoot->cols();
     // 执行query_plan
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
         std::vector<std::string> columns;
-        for (auto& col : executorTreeRoot->cols()) {
+        columns.reserve(result_cols.size());
+        for (auto& col : result_cols) {
             std::string col_str;
             char* rec_buf = Tuple->data + col.offset;
             if (col.type == TYPE_INT) {

@@ -56,14 +56,14 @@ public:
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            char* key = new char[index.col_tot_len];
+            std::vector<char> key(index.col_tot_len);
             int offset = 0;
             for (size_t i = 0; i < index.col_num; ++i) {
-                memcpy(key + offset, rec.data + index.cols[i].offset, index.cols[i].len);
+                memcpy(key.data() + offset, rec.data + index.cols[i].offset, index.cols[i].len);
                 offset += index.cols[i].len;
             }
             try {
-                ih->insert_entry(key, rid_, context_->txn_);
+                ih->insert_entry(key.data(), rid_, context_->txn_);
             } catch (IndexEntryExistsError&) {
                 fh_->delete_record(rid_, context_); // 如果有重复则删除
                 throw;

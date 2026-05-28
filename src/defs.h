@@ -11,7 +11,9 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <iostream>
-#include <map>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 
 // 此处重载了<<操作符，在ColMeta中进行了调用
 template <typename T, typename = typename std::enable_if<std::is_enum<T>::value, T>::type>
@@ -44,8 +46,15 @@ struct Rid {
 enum ColType { TYPE_INT, TYPE_FLOAT, TYPE_STRING };
 
 inline std::string coltype2str(ColType type) {
-    std::map<ColType, std::string> m = {{TYPE_INT, "INT"}, {TYPE_FLOAT, "FLOAT"}, {TYPE_STRING, "STRING"}};
-    return m.at(type);
+    switch (type) {
+    case TYPE_INT:
+        return "INT";
+    case TYPE_FLOAT:
+        return "FLOAT";
+    case TYPE_STRING:
+        return "STRING";
+    }
+    throw std::out_of_range("map::at");
 }
 
 class RecScan {

@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds,
                              std::vector<std::string>& index_col_names) {
     index_col_names.clear();
+    index_col_names.reserve(curr_conds.size());
     for (auto& cond : curr_conds) {
         if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
             index_col_names.push_back(cond.lhs_col.col_name);
@@ -48,6 +49,7 @@ std::vector<Condition> pop_conds(std::vector<Condition>& conds, std::string tab_
     //     return std::find(tab_names.begin(), tab_names.end(), tab_name) != tab_names.end();
     // };
     std::vector<Condition> solved_conds;
+    solved_conds.reserve(conds.size());
     auto it = conds.begin();
     while (it != conds.end()) {
         if ((tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val) ||
@@ -88,11 +90,8 @@ int push_conds(Condition* cond, std::shared_ptr<Plan> plan) {
         // 左子节点匹配到条件的右边
         if (left_res == 2) {
             // 需要将左右两边的条件变换位置
-            std::map<CompOp, CompOp> swap_op = {
-                {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-            };
             std::swap(cond->lhs_col, cond->rhs_col);
-            cond->op = swap_op.at(cond->op);
+            cond->op = swap_comp_op(cond->op);
         }
         x->conds_.emplace_back(std::move(*cond));
         return 3;
@@ -167,7 +166,8 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query) {
         // 有连接条件
 
         // 根据连接条件，生成第一层join
-        std::vector<std::string> joined_tables(tables.size());
+        std::vector<std::string> joined_tables;
+        joined_tables.reserve(tables.size());
         auto it = conds.begin();
         while (it != conds.end()) {
             std::shared_ptr<Plan> left, right;
@@ -222,11 +222,8 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query) {
                                                std::move(table_join_executors), std::vector<Condition>());
             } else if (left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
                 if (isneedreverse) {
-                    std::map<CompOp, CompOp> swap_op = {
-                        {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-                    };
                     std::swap(it->lhs_col, it->rhs_col);
-                    it->op = swap_op.at(it->op);
+                    it->op = swap_comp_op(it->op);
                     left_need_to_join_executors = std::move(right_need_to_join_executors);
                 }
                 std::vector<Condition> join_conds{*it};
@@ -299,6 +296,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context*
     if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(query->parse)) {
         // create table;
         std::vector<ColDef> col_defs;
+        col_defs.reserve(x->fields.size());
         for (auto& field : x->fields) {
             if (auto sv_col_def = std::dynamic_pointer_cast<ast::ColDef>(field)) {
                 ColDef col_def = {.name = sv_col_def->col_name,

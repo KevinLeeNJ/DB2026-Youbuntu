@@ -48,9 +48,6 @@ public:
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
         len_ = cols_.back().offset + cols_.back().len;
-        std::map<CompOp, CompOp> swap_op = {
-            {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-        };
 
         for (auto& cond : conds_) {
             if (cond.lhs_col.tab_name != tab_name_) {
@@ -58,7 +55,7 @@ public:
                 assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
-                cond.op = swap_op.at(cond.op);
+                cond.op = swap_comp_op(cond.op);
             }
         }
         fed_conds_ = conds_;
