@@ -39,15 +39,50 @@ public:
         len_ = curr_offset;
     }
 
-    void beginTuple() override {}
+    void beginTuple() override {
+        prev_->beginTuple();          // 调用儿子节点的beginTuple方法，准备开始遍历记录
+        _abstract_rid = prev_->rid(); // 初始化抽象记录号
+    }
 
-    void nextTuple() override {}
+    void nextTuple() override {
+        prev_->nextTuple();           // 调用儿子节点的nextTuple方法，获取下一条记录
+        _abstract_rid = prev_->rid(); // 更新抽象记录号
+    }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (prev_->is_end()) {
+            return nullptr; // 如果儿子节点已经结束，则返回nullptr
+        }
+        auto rec = prev_->Next();
+        if (!rec) {
+            return nullptr; // 如果儿子节点没有记录，则返回nullptr
+        }
+
+        // 创建一个新的记录，用于存储投影后的结果
+        auto new_rec = std::make_unique<RmRecord>(len_);
+        // 将投影的字段从儿子节点的记录中复制到新的记录中
+        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
+            auto& col = cols_[i];
+            auto& src_col = prev_->cols()[sel_idxs_[i]];
+            std::memcpy(new_rec->data + col.offset, rec->data + src_col.offset, col.len);
+        }
+        return new_rec;
     }
 
     Rid& rid() override {
         return _abstract_rid;
+    }
+
+    bool is_end() const override {
+        return prev_->is_end(); // 判断儿子节点是否结束
+    }
+    std::string getType() override {
+        return "ProjectionExecutor"; // 返回执行器的名称
+    }
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+    size_t tupleLen() const override {
+        return len_;
     }
 };

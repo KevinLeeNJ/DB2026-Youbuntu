@@ -20,11 +20,16 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse)) {
         // 处理表名
         query->tables = std::move(x->tabs);
-        /** TODO: 检查表是否存在 */
-
+        /**检查表是否存在 */
+        for (const auto& tab_name : query->tables) {
+            if (!sm_manager_->db_.is_table(tab_name)) {
+                throw TableNotFoundError(tab_name);
+            }
+        }
         // 处理target list，再target list中添加上表名，例如 a.id
         for (auto& sv_sel_col : x->cols) {
             TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
+
             query->cols.push_back(sel_col);
         }
 
@@ -47,7 +52,14 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_clause(query->tables, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         /** TODO: */
-
+        for (auto set_clause : x->set_clauses) {
+            SetClause clause;
+            clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
+            clause.rhs = convert_sv_value(set_clause->val);
+            query->set_clauses.push_back(clause);
+        }
+        get_clause(x->conds, query->conds);
+        check_clause({x->tab_name}, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         // 处理where条件
         get_clause(x->conds, query->conds);
@@ -81,7 +93,17 @@ TabCol Analyze::check_column(const std::vector<ColMeta>& all_cols, TabCol target
         }
         target.tab_name = tab_name;
     } else {
-        /** TODO: Make sure target column exists */
+        /** Make sure target column exists */
+        bool found = false;
+        for (auto& col : all_cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw ColumnNotFoundError(target.col_name);
+        }
     }
     return target;
 }
@@ -134,7 +156,7 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }
-        if (lhs_type != rhs_type) {
+        if (!can_cast(lhs_type, rhs_type)) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
     }

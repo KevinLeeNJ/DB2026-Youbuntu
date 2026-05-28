@@ -37,10 +37,50 @@ public:
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        if (rids_.empty()) {
+            return nullptr; // 没有更多记录可以删除
+        }
+        // 删除记录
+        for (Rid rid : rids_) {
+            auto rec = fh_->get_record(rid, context_);
+            char* rec_data = rec->data;
+            bool match = true;
+            for (const auto& cond : conds_) {
+                if (!compare(cond, *rec)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) {
+                std::cout << "Record does not match delete conditions, skipping." << std::endl;
+                continue; // 如果记录不匹配条件，则跳过删除
+            }
+            for (auto& index : tab_.indexes) {
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char* key = new char[index.col_tot_len];
+                int offset = 0;
+                for (int i = 0; i < index.col_num; ++i) {
+                    std::memcpy(key + offset, rec_data + index.cols[i].offset, index.cols[i].len);
+                    offset += index.cols[i].len;
+                }
+                ih->delete_entry(key, context_->txn_);
+            }
+            fh_->delete_record(rid, context_);
+        }
         return nullptr;
     }
-
+    std::string getType() override {
+        return "DeleteExecutor"; // 返回执行器的名称
+    }
     Rid& rid() override {
         return _abstract_rid;
+    }
+    ColMeta get_col_offset(const TabCol& target) override {
+        for (const auto& col : tab_.cols) {
+            if (col.tab_name == tab_name_ && col.name == target.col_name) {
+                return col;
+            }
+        }
     }
 };

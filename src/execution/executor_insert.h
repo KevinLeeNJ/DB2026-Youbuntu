@@ -62,7 +62,12 @@ public:
                 memcpy(key + offset, rec.data + index.cols[i].offset, index.cols[i].len);
                 offset += index.cols[i].len;
             }
-            ih->insert_entry(key, rid_, context_->txn_);
+            try {
+                ih->insert_entry(key, rid_, context_->txn_);
+            } catch (IndexEntryExistsError&) {
+                fh_->delete_record(rid_, context_); // 如果有重复则删除
+                throw;
+            }
         }
         return nullptr;
     }
