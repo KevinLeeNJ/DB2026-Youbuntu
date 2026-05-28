@@ -149,9 +149,9 @@ public:
         std::cout << "table name: " << table_name_ << '\n';
     }
 
-    RmRecord insert_value_;  // 插入的记录
-    Rid rid_;                // 记录插入的位置
-    std::string table_name_; // 插入记录的表名称
+    RmRecord insert_value_;     // 插入的记录
+    Rid rid_;                   // 记录插入的位置
+    std::string table_name_;    // 插入记录的表名称
     size_t table_name_size_{0}; // 表名称的大小
 };
 
