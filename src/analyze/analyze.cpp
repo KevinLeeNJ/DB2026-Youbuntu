@@ -27,6 +27,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             }
         }
         // 处理target list，再target list中添加上表名，例如 a.id
+        query->cols.reserve(x->cols.size());
         for (auto& sv_sel_col : x->cols) {
             TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
 
@@ -37,6 +38,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         get_all_cols(query->tables, all_cols);
         if (query->cols.empty()) {
             // select all columns
+            query->cols.reserve(all_cols.size());
             for (auto& col : all_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
@@ -52,6 +54,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_clause(query->tables, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         /** TODO: */
+        query->set_clauses.reserve(x->set_clauses.size());
         for (auto set_clause : x->set_clauses) {
             SetClause clause;
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
@@ -66,6 +69,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_clause({x->tab_name}, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         // 处理insert 的values值
+        query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val));
         }
@@ -118,6 +122,7 @@ void Analyze::get_all_cols(const std::vector<std::string>& tab_names, std::vecto
 
 void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds) {
     conds.clear();
+    conds.reserve(sv_conds.size());
     for (auto& expr : sv_conds) {
         Condition cond;
         cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
@@ -177,9 +182,19 @@ Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value>& sv_val) {
 }
 
 CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
-    std::map<ast::SvCompOp, CompOp> m = {
-        {ast::SV_OP_EQ, OP_EQ}, {ast::SV_OP_NE, OP_NE}, {ast::SV_OP_LT, OP_LT},
-        {ast::SV_OP_GT, OP_GT}, {ast::SV_OP_LE, OP_LE}, {ast::SV_OP_GE, OP_GE},
-    };
-    return m.at(op);
+    switch (op) {
+    case ast::SV_OP_EQ:
+        return OP_EQ;
+    case ast::SV_OP_NE:
+        return OP_NE;
+    case ast::SV_OP_LT:
+        return OP_LT;
+    case ast::SV_OP_GT:
+        return OP_GT;
+    case ast::SV_OP_LE:
+        return OP_LE;
+    case ast::SV_OP_GE:
+        return OP_GE;
+    }
+    throw InternalError("Unexpected comparison operator");
 }

@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 #include "defs.h"
+#include "errors.h"
 #include "record/rm_defs.h"
 
 struct TabCol {
@@ -72,6 +73,23 @@ struct Value {
 };
 
 enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
+
+inline CompOp swap_comp_op(CompOp op) {
+    switch (op) {
+    case OP_EQ:
+    case OP_NE:
+        return op;
+    case OP_LT:
+        return OP_GT;
+    case OP_GT:
+        return OP_LT;
+    case OP_LE:
+        return OP_GE;
+    case OP_GE:
+        return OP_LE;
+    }
+    throw InternalError("Unexpected comparison operator");
+}
 
 struct Condition {
     TabCol lhs_col;  // left-hand side column

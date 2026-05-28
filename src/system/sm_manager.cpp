@@ -202,6 +202,7 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     int curr_offset = 0;
     TabMeta tab;
     tab.name = tab_name;
+    tab.cols.reserve(col_defs.size());
     for (auto& col_def : col_defs) {
         ColMeta col = {.tab_name = tab_name,
                        .name = col_def.name,
@@ -231,7 +232,8 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     if (!db_.is_table(tab_name))
         throw TableNotFoundError(tab_name);
     TabMeta& tab = db_.get_table(tab_name);
-    for (auto& index : tab.indexes)
+    auto indexes = tab.indexes;
+    for (auto& index : indexes)
         drop_index(tab_name, index.cols, context);
     rm_manager_->close_file(fhs_[tab_name].get());
     rm_manager_->destroy_file(tab_name); // 删除表的磁盘文件
@@ -255,6 +257,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     }
     // 获取索引包含的字段元数据
     std::vector<ColMeta> cols;
+    cols.reserve(col_names.size());
     int total_len = 0;
     for (const auto& col_name : col_names) {
         auto col_meta = tab.get_col(col_name);
@@ -321,6 +324,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
     TabMeta& tab = db_.get_table(tab_name);
     std::vector<std::string> col_names;
+    col_names.reserve(cols.size());
     for (const auto& col : cols) {
         col_names.emplace_back(col.name);
     }

@@ -13,7 +13,7 @@ all: build
 help:
 	@echo "Available targets:"
 	@echo "  make build         - Configure and build the project with cmake (8 threads)"
-	@echo "  make test          - Run tests with ctest"
+	@echo "  make test          - Run unit tests only"
 	@echo "  make run           - Build and run the rmdb binary"
 	@echo "  make clean         - Remove build directory"
 	@echo "  make debug         - Build with debug flags (default)"
@@ -34,7 +34,7 @@ test: build
 	@cd $(BUILD_DIR) && $(CTEST) --output-on-failure
 
 run: build
-	@$(BINARY) test
+	@$(BINARY) testdb
 
 clean:
 	@rm -rf $(BUILD_DIR)
@@ -52,6 +52,7 @@ release: clean
 
 format:
 	@find src -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
+	@find test -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
 	@echo "Code formatted."
 
 client:
@@ -59,7 +60,7 @@ client:
 	@cd rmdb_client/build && $(CMAKE) .. -DCMAKE_BUILD_TYPE=Release
 	@$(CMAKE) --build rmdb_client/build --target rmdb_client --parallel $(CLIENT_JOBS)
 
-client-debug:
+client-debug: clean-client
 	@mkdir -p rmdb_client/build
 	@cd rmdb_client/build && $(CMAKE) .. -DCMAKE_BUILD_TYPE=Debug
 	@$(CMAKE) --build rmdb_client/build --target rmdb_client --parallel $(CLIENT_JOBS)
@@ -67,6 +68,9 @@ client-debug:
 clean-client:
 	@rm -rf rmdb_client/build
 	@echo "Client build directory removed."
+
+run-client: client
+	@./rmdb_client/build/rmdb_client
 
 parser:
 	@cd $(PARSER_DIR) && flex --header-file=lex.yy.hpp -o lex.yy.cpp lex.l
