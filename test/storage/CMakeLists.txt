@@ -1,0 +1,7 @@
+add_executable(buffer_pool_manager_test buffer_pool_manager_test.cpp)
+target_link_libraries(buffer_pool_manager_test storage gtest_main)
+gtest_discover_tests(buffer_pool_manager_test)
+
+add_executable(storage_test storage_test.cpp)
+target_link_libraries(storage_test storage gtest_main)
+gtest_discover_tests(storage_test)

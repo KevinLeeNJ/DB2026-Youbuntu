@@ -1,0 +1,3 @@
+add_executable(lru_replacer_test lru_replacer_test.cpp)
+target_link_libraries(lru_replacer_test lru_replacer gtest_main)
+gtest_discover_tests(lru_replacer_test)

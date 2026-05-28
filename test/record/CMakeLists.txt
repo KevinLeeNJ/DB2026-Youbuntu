@@ -1,0 +1,3 @@
+add_executable(record_manager_test record_manager_test.cpp)
+target_link_libraries(record_manager_test record gtest_main)
+gtest_discover_tests(record_manager_test)

@@ -1,4 +1,4 @@
-.PHONY: all build test clean run debug release format help client client-debug clean-client parser
+.PHONY: all build test clean run debug release format help client client-debug clean-client run-client parser
 
 BUILD_DIR := build
 BINARY := $(BUILD_DIR)/bin/rmdb
@@ -21,6 +21,7 @@ help:
 	@echo "  make format        - Format code with clang-format"
 	@echo "  make client        - Build rmdb_client (Release, 4 threads)"
 	@echo "  make client-debug  - Build rmdb_client (Debug, 4 threads)"
+	@echo "  make run-client    - Build and run rmdb_client"
 	@echo "  make parser        - Regenerate parser from flex/bison sources"
 
 build:
@@ -34,7 +35,7 @@ test: build
 	@cd $(BUILD_DIR) && $(CTEST) --output-on-failure
 
 run: build
-	@$(BINARY) test
+	@$(BINARY) testdb
 
 clean:
 	@rm -rf $(BUILD_DIR)
@@ -67,6 +68,9 @@ client-debug:
 clean-client:
 	@rm -rf rmdb_client/build
 	@echo "Client build directory removed."
+
+run-client: client
+	@rmdb_client/build/rmdb_client
 
 parser:
 	@cd $(PARSER_DIR) && flex --header-file=lex.yy.hpp -o lex.yy.cpp lex.l
