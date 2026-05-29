@@ -165,6 +165,38 @@ void SmManager::show_tables(Context* context) {
     outfile.close();
 }
 
+void SmManager::show_index(const std::string& tab_name, Context* context) {
+    TabMeta& tab = db_.get_table(tab_name);
+    std::vector<std::string> captions = {"Tables", "Type", "Column"};
+    RecordPrinter printer(captions.size());
+
+    printer.print_separator(context);
+    printer.print_record(captions, context);
+    printer.print_separator(context);
+
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    for (const auto& index : tab.indexes) {
+        std::string cols = "(";
+        outfile << "| " << tab_name << " | unique | (";
+        for (int i = 0; i < index.col_num; ++i) {
+            if (i != 0) {
+                cols += ",";
+                outfile << ",";
+            }
+            cols += index.cols[i].name;
+            outfile << index.cols[i].name;
+        }
+        cols += ")";
+        outfile << ") |\n";
+
+        printer.print_record({tab_name, "unique", cols}, context);
+    }
+    outfile.close();
+
+    printer.print_separator(context);
+}
+
 /**
  * @description: 显示表的元数据
  * @param {string&} tab_name 表名称
@@ -276,17 +308,23 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     auto index_name = ix_manager_->get_index_name(tab_name, col_names);
     auto file_handle = fhs_[tab_name].get();
 
-    for (RmScan scan(file_handle); !scan.is_end(); scan.next()) {
-        // 对每条记录插入索引
-        auto record = file_handle->get_record(scan.rid(), context);
-        char key[total_len]; // 所有索引字段的值拼接在一起作为键
-        int offset = 0;
-        for (const auto& col : cols) {
-            std::memcpy(key + offset, record->data + col.offset, col.len);
-            offset += col.len;
+    try {
+        for (RmScan scan(file_handle); !scan.is_end(); scan.next()) {
+            // 对每条记录插入索引
+            auto record = file_handle->get_record(scan.rid(), context);
+            std::vector<char> key(total_len); // 所有索引字段的值拼接在一起作为键
+            int offset = 0;
+            for (const auto& col : cols) {
+                std::memcpy(key.data() + offset, record->data + col.offset, col.len);
+                offset += col.len;
+            }
+            // 插入索引
+            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_);
         }
-        // 插入索引
-        index_handle->insert_entry(key, scan.rid(), context->txn_);
+    } catch (...) {
+        ix_manager_->close_index(index_handle.get());
+        ix_manager_->destroy_index(tab_name, cols);
+        throw;
     }
     // 更新表的元数据
     tab.indexes.emplace_back(index_meta);

@@ -22,19 +22,99 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
-bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds,
+// 使用最左匹配原则选择索引：等值前缀后最多接一个范围列，其他条件留给执行器过滤。
+bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_conds,
                              std::vector<std::string>& index_col_names) {
     index_col_names.clear();
-    index_col_names.reserve(curr_conds.size());
-    for (auto& cond : curr_conds) {
-        if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
-            index_col_names.push_back(cond.lhs_col.col_name);
+    if (curr_conds.empty()) {
+        return false;
     }
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    if (tab.is_index(index_col_names))
-        return true;
-    return false;
+    if (tab.indexes.empty()) {
+        return false;
+    }
+
+    for (auto& cond : curr_conds) {
+        if (cond.lhs_col.tab_name != tab_name && !cond.is_rhs_val && cond.rhs_col.tab_name == tab_name) {
+            std::swap(cond.lhs_col, cond.rhs_col);
+            cond.op = swap_comp_op(cond.op);
+        }
+    }
+
+    int best_index = -1;
+    int best_prefix_len = 0;
+    int best_condition_count = 0;
+    std::vector<int> best_condition_order;
+
+    for (size_t index_no = 0; index_no < tab.indexes.size(); ++index_no) {
+        const auto& index = tab.indexes[index_no];
+        std::vector<int> condition_order;
+        bool used_range = false;
+        int prefix_len = 0;
+
+        for (const auto& index_col : index.cols) {
+            std::vector<int> eq_conds;
+            std::vector<int> range_conds;
+            for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
+                const auto& cond = curr_conds[cond_no];
+                if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name || cond.lhs_col.col_name != index_col.name ||
+                    cond.op == OP_NE) {
+                    continue;
+                }
+                if (cond.op == OP_EQ) {
+                    eq_conds.push_back(static_cast<int>(cond_no));
+                } else {
+                    range_conds.push_back(static_cast<int>(cond_no));
+                }
+            }
+
+            if (!eq_conds.empty() && !used_range) {
+                condition_order.insert(condition_order.end(), eq_conds.begin(), eq_conds.end());
+                ++prefix_len;
+                continue;
+            }
+            if (!range_conds.empty() && !used_range) {
+                condition_order.insert(condition_order.end(), range_conds.begin(), range_conds.end());
+                ++prefix_len;
+                used_range = true;
+            }
+            break;
+        }
+
+        if (prefix_len > best_prefix_len ||
+            (prefix_len == best_prefix_len && static_cast<int>(condition_order.size()) > best_condition_count)) {
+            best_index = static_cast<int>(index_no);
+            best_prefix_len = prefix_len;
+            best_condition_count = static_cast<int>(condition_order.size());
+            best_condition_order = std::move(condition_order);
+        }
+    }
+
+    if (best_index < 0 || best_prefix_len == 0) {
+        return false;
+    }
+
+    const auto& best_meta = tab.indexes[best_index];
+    for (const auto& col : best_meta.cols) {
+        index_col_names.push_back(col.name);
+    }
+
+    std::vector<bool> used(curr_conds.size(), false);
+    std::vector<Condition> reordered;
+    reordered.reserve(curr_conds.size());
+    for (int cond_no : best_condition_order) {
+        if (!used[cond_no]) {
+            reordered.push_back(curr_conds[cond_no]);
+            used[cond_no] = true;
+        }
+    }
+    for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
+        if (!used[cond_no]) {
+            reordered.push_back(curr_conds[cond_no]);
+        }
+    }
+    curr_conds = std::move(reordered);
+    return true;
 }
 
 /**
