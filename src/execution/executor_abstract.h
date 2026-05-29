@@ -78,7 +78,7 @@ protected:
         char* rhs_data = nullptr;
         if (!cond.is_rhs_val) {
             rhs_col_meta = get_col_offset(cond.rhs_col);
-            char* rhs_data = rec.data + rhs_col_meta.offset;
+            rhs_data = rec.data + rhs_col_meta.offset;
             rhs_type = rhs_col_meta.type;
         } else {
             rhs_type = cond.rhs_val.type;
@@ -131,6 +131,7 @@ protected:
             }
         }
         }
+        return false;
     }
     /**
      * @brief 判断两个列类型是否可以进行转换

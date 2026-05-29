@@ -24,6 +24,16 @@ private:
     Rid rid_; // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
     SmManager* sm_manager_;
 
+    static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
+        std::vector<char> key(index.col_tot_len);
+        int offset = 0;
+        for (int i = 0; i < index.col_num; ++i) {
+            memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
+            offset += index.cols[i].len;
+        }
+        return key;
+    }
+
 public:
     InsertExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Value> values, Context* context) {
         sm_manager_ = sm_manager;
@@ -49,25 +59,39 @@ public:
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
+        std::vector<std::vector<char>> index_keys;
+        index_keys.reserve(tab_.indexes.size());
+        for (const auto& index : tab_.indexes) {
+            auto key = make_index_key(index, rec.data);
+            auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+            std::vector<Rid> result;
+            if (ih->get_value(key.data(), &result, context_ == nullptr ? nullptr : context_->txn_)) {
+                throw IndexEntryExistsError();
+            }
+            index_keys.push_back(std::move(key));
+        }
+
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
 
-        // Insert into index
-        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-            auto& index = tab_.indexes[i];
-            auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            std::vector<char> key(index.col_tot_len);
-            int offset = 0;
-            for (size_t i = 0; i < index.col_num; ++i) {
-                memcpy(key.data() + offset, rec.data + index.cols[i].offset, index.cols[i].len);
-                offset += index.cols[i].len;
+        std::vector<size_t> inserted_indexes;
+        try {
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto& index = tab_.indexes[i];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->insert_entry(index_keys[i].data(), rid_, context_ == nullptr ? nullptr : context_->txn_);
+                inserted_indexes.push_back(i);
             }
-            try {
-                ih->insert_entry(key.data(), rid_, context_->txn_);
-            } catch (IndexEntryExistsError&) {
-                fh_->delete_record(rid_, context_); // 如果有重复则删除
-                throw;
+        } catch (...) {
+            for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
+                auto& index = tab_.indexes[*it];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->delete_entry(index_keys[*it].data(), context_ == nullptr ? nullptr : context_->txn_);
             }
+            fh_->delete_record(rid_, context_);
+            throw;
         }
         return nullptr;
     }

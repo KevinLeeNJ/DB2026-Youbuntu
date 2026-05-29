@@ -63,7 +63,7 @@ public:
                     std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
                     offset += index.cols[i].len;
                 }
-                ih->delete_entry(key.data(), context_->txn_);
+                ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
             }
             fh_->delete_record(rid, context_);
         }
@@ -81,5 +81,6 @@ public:
                 return col;
             }
         }
+        throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
     }
 };

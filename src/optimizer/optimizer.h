@@ -36,6 +36,9 @@ public:
         } else if (auto x = std::dynamic_pointer_cast<ast::ShowTables>(query->parse)) {
             // show tables;
             return std::make_shared<OtherPlan>(T_ShowTable, std::string());
+        } else if (auto x = std::dynamic_pointer_cast<ast::ShowIndex>(query->parse)) {
+            // show index from table;
+            return std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
         } else if (auto x = std::dynamic_pointer_cast<ast::DescTable>(query->parse)) {
             // desc table;
             return std::make_shared<OtherPlan>(T_DescTable, x->tab_name);
