@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include <algorithm>
 
 class UpdateExecutor : public AbstractExecutor {
 private:
@@ -24,6 +25,16 @@ private:
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager* sm_manager_;
+
+    static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
+        std::vector<char> key(index.col_tot_len);
+        int offset = 0;
+        for (int i = 0; i < index.col_num; ++i) {
+            std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
+            offset += index.cols[i].len;
+        }
+        return key;
+    }
 
 public:
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
@@ -49,37 +60,65 @@ public:
                 }
             }
             if (match) {
-                auto staged_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
-                std::vector<IndexMeta> deleted_indexes;
-                std::vector<IndexMeta> updated_indexes;
-                update_record(rec.get()); // 对记录更新
+                auto new_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
+                update_record(new_rec.get());                    // 对记录更新
+
+                struct IndexUpdate {
+                    const IndexMeta* index;
+                    std::vector<char> old_key;
+                    std::vector<char> new_key;
+                };
+                std::vector<IndexUpdate> index_updates;
+                auto txn = context_ == nullptr ? nullptr : context_->txn_;
+
+                for (const auto& index : tab_.indexes) {
+                    auto old_key = make_index_key(index, rec->data);
+                    auto new_key = make_index_key(index, new_rec->data);
+                    if (old_key == new_key) {
+                        continue;
+                    }
+                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
+                                  .get();
+                    std::vector<Rid> result;
+                    if (ih->get_value(new_key.data(), &result, txn) &&
+                        std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
+                        throw IndexEntryExistsError();
+                    }
+                    index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
+                }
+
+                std::vector<size_t> deleted_indexes;
+                std::vector<size_t> inserted_indexes;
                 try {
-                    for (const auto& index : tab_.indexes) {
-                        auto ih =
-                            sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                .get();
-                        ih->delete_entry(staged_rec->data, context_->txn_); // 删除旧索引
-                        deleted_indexes.push_back(index);
-                        ih->insert_entry(rec->data, rid, context_->txn_); // 插入新索引
-                        updated_indexes.push_back(index);
+                    for (size_t i = 0; i < index_updates.size(); ++i) {
+                        const auto& update = index_updates[i];
+                        auto ih = sm_manager_->ihs_
+                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
+                                      .get();
+                        ih->delete_entry(update.old_key.data(), txn); // 删除旧索引
+                        deleted_indexes.push_back(i);
+                        ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
+                        inserted_indexes.push_back(i);
                     }
-                } catch (IndexEntryExistsError&) // 有重复的话则回滚
+                } catch (...) // 失败时回滚已经修改过的索引
                 {
-                    for (const auto& index : deleted_indexes) {
-                        auto ih =
-                            sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                .get();
-                        ih->insert_entry(staged_rec->data, rid, context_->txn_); // 恢复旧索引
+                    for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
+                        const auto& update = index_updates[*it];
+                        auto ih = sm_manager_->ihs_
+                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
+                                      .get();
+                        ih->delete_entry(update.new_key.data(), txn); // 删除新索引
                     }
-                    for (const auto& index : updated_indexes) {
-                        auto ih =
-                            sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                .get();
-                        ih->delete_entry(rec->data, context_->txn_); // 删除新索引
+                    for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
+                        const auto& update = index_updates[*it];
+                        auto ih = sm_manager_->ihs_
+                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
+                                      .get();
+                        ih->insert_entry(update.old_key.data(), rid, txn); // 恢复旧索引
                     }
                     throw; // 仍然抛出错误
                 }
-                fh_->update_record(rid, rec->data, context_);
+                fh_->update_record(rid, new_rec->data, context_);
             }
         }
         return nullptr;
@@ -134,5 +173,6 @@ public:
                 return col;
             }
         }
+        throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
     }
 };
