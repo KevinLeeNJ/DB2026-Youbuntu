@@ -46,16 +46,14 @@ void SmManager::create_db(const std::string& db_name) {
         throw UnixError();
     }
     // 创建系统目录
-    DbMeta* new_db = new DbMeta();
-    new_db->name_ = db_name;
+    DbMeta new_db = DbMeta();
+    new_db.name_ = db_name;
 
     // 注意，此处ofstream会在当前目录创建(如果没有此文件先创建)和打开一个名为DB_META_NAME的文件
     std::ofstream ofs(DB_META_NAME);
 
     // 将new_db中的信息，按照定义好的operator<<操作符，写入到ofs打开的DB_META_NAME文件中
-    ofs << *new_db; // 注意：此处重载了操作符<<
-
-    delete new_db;
+    ofs << new_db; // 注意：此处重载了操作符<<
 
     // 创建日志文件
     disk_manager_->create_file(LOG_FILE_NAME);
@@ -366,12 +364,12 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
     for (const auto& col : cols) {
         col_names.emplace_back(col.name);
     }
-    std::string index_name = ix_manager_->get_index_name(tab_name, cols);
+    std::string index_name = ix_manager_->get_index_name(tab_name, col_names);
     auto index_meta = tab.get_index_meta(col_names);
     tab.indexes.erase(index_meta);
     auto index_handle = ihs_[index_name].get();
     ix_manager_->close_index(index_handle);
-    ix_manager_->destroy_index(tab_name, cols);
+    ix_manager_->destroy_index(tab_name, col_names);
     ihs_.erase(index_name);
     flush_meta();
 }

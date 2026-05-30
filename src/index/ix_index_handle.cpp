@@ -152,12 +152,10 @@ int IxNodeHandle::remove(const char* key) {
 IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd)
     : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), fd_(fd) {
     // init file_hdr_
-    char* buf = new char[PAGE_SIZE];
-    memset(buf, 0, PAGE_SIZE);
-    disk_manager_->read_page(fd, IX_FILE_HDR_PAGE, buf, PAGE_SIZE);
-    file_hdr_ = new IxFileHdr();
-    file_hdr_->deserialize(buf);
-    delete[] buf;
+    std::vector<char> buf(PAGE_SIZE, 0);
+    disk_manager_->read_page(fd, IX_FILE_HDR_PAGE, buf.data(), PAGE_SIZE);
+    file_hdr_ = std::make_unique<IxFileHdr>();
+    file_hdr_->deserialize(buf.data());
 
     // disk_manager管理的fd对应的文件中，设置从file_hdr_->num_pages开始分配page_no
     int now_page_no = disk_manager_->get_fd2pageno(fd);
@@ -494,10 +492,14 @@ bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, 
 Rid IxIndexHandle::get_rid(const Iid& iid) const {
     IxNodeHandle* node = fetch_node(iid.page_no);
     if (iid.slot_no >= node->get_size()) {
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        delete node;
         throw IndexEntryNotFoundError();
     }
     buffer_pool_manager_->unpin_page(node->get_page_id(), false); // unpin it!
-    return *node->get_rid(iid.slot_no);
+    Rid rid = *node->get_rid(iid.slot_no);
+    delete node;
+    return rid;
 }
 
 /**
@@ -548,6 +550,7 @@ Iid IxIndexHandle::leaf_end() const {
     IxNodeHandle* node = fetch_node(file_hdr_->last_leaf_);
     Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node->get_size()};
     buffer_pool_manager_->unpin_page(node->get_page_id(), false); // unpin it!
+    delete node;
     return iid;
 }
 
@@ -571,7 +574,7 @@ Iid IxIndexHandle::leaf_begin() const {
  */
 IxNodeHandle* IxIndexHandle::fetch_node(int page_no) const {
     Page* page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
-    IxNodeHandle* node = new IxNodeHandle(file_hdr_, page);
+    IxNodeHandle* node = new IxNodeHandle(file_hdr_.get(), page);
 
     return node;
 }
@@ -593,7 +596,7 @@ IxNodeHandle* IxIndexHandle::create_node() {
     PageId new_page_id = {.fd = fd_, .page_no = INVALID_PAGE_ID};
     // 从3开始分配page_no，第一次分配之后，new_page_id.page_no=3，file_hdr_.num_pages=4
     Page* page = buffer_pool_manager_->new_page(&new_page_id);
-    node = new IxNodeHandle(file_hdr_, page);
+    node = new IxNodeHandle(file_hdr_.get(), page);
     return node;
 }
 
@@ -612,12 +615,19 @@ void IxIndexHandle::maintain_parent(IxNodeHandle* node) {
         char* child_first_key = curr->get_key(0);
         if (memcmp(parent_key, child_first_key, file_hdr_->col_tot_len_) == 0) {
             assert(buffer_pool_manager_->unpin_page(parent->get_page_id(), true));
+            delete parent;
             break;
         }
         memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_); // 修改了parent node
+        if (curr != node) {
+            delete curr;
+        }
         curr = parent;
 
         assert(buffer_pool_manager_->unpin_page(parent->get_page_id(), true));
+    }
+    if (curr != node) {
+        delete curr;
     }
 }
 
@@ -632,10 +642,12 @@ void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
     IxNodeHandle* prev = fetch_node(leaf->get_prev_leaf());
     prev->set_next_leaf(leaf->get_next_leaf());
     buffer_pool_manager_->unpin_page(prev->get_page_id(), true);
+    delete prev;
 
     IxNodeHandle* next = fetch_node(leaf->get_next_leaf());
     next->set_prev_leaf(leaf->get_prev_leaf()); // 注意此处是SetPrevLeaf()
     buffer_pool_manager_->unpin_page(next->get_page_id(), true);
+    delete next;
 }
 
 /**
@@ -657,5 +669,6 @@ void IxIndexHandle::maintain_child(IxNodeHandle* node, int child_idx) {
         IxNodeHandle* child = fetch_node(child_page_no);
         child->set_parent_page_no(node->get_page_no());
         buffer_pool_manager_->unpin_page(child->get_page_id(), true);
+        delete child;
     }
 }
