@@ -446,8 +446,12 @@ private:
         }
         case LocalAggType::SUM: {
             CellValue value;
-            value.type = TYPE_FLOAT;
-            value.float_val = static_cast<float>(state.sum);
+            value.type = spec.input_type;
+            if (spec.input_type == TYPE_INT) {
+                value.int_val = static_cast<int>(state.sum);
+            } else {
+                value.float_val = static_cast<float>(state.sum);
+            }
             return value;
         }
         case LocalAggType::AVG: {
@@ -605,6 +609,9 @@ private:
                 output_col.len = static_cast<int>(sizeof(int));
                 break;
             case LocalAggType::SUM:
+                output_col.type = spec.input_type;
+                output_col.len = spec.input_len;
+                break;
             case LocalAggType::AVG:
                 output_col.type = TYPE_FLOAT;
                 output_col.len = static_cast<int>(sizeof(float));

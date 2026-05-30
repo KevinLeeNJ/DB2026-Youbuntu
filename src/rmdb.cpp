@@ -168,6 +168,20 @@ void* client_handler(void* sock_fd) {
                     outfile.close();
                 }
             }
+        } else {
+            // 解析失败，将 failure 信息写入 output.txt 并返回给客户端
+            // where 中含有聚合函数时，会出现解析失败的情况，此处需要打印一个 failure
+            std::cerr << "Parse error" << std::endl;
+
+            std::string str = "Parse error\n";
+            memcpy(data_send, str.c_str(), str.length());
+            data_send[str.length()] = '\0';
+            offset = str.length();
+
+            std::fstream outfile;
+            outfile.open("output.txt", std::ios::out | std::ios::app);
+            outfile << "failure\n";
+            outfile.close();
         }
         if (finish_analyze == false) {
             yy_delete_buffer(buf);
