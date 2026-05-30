@@ -1,0 +1,65 @@
+# errors.slt — Error-condition tests covering edge cases and exception paths
+
+statement ok
+CREATE TABLE t (a INT, b CHAR(10));
+
+statement ok
+INSERT INTO t VALUES (1, 'one');
+
+# --- DDL errors ---
+
+# Duplicate table name
+statement error
+CREATE TABLE t (x INT);
+
+# Table not found
+statement error
+DROP TABLE nonexistent;
+
+statement error
+DESC nonexistent;
+
+# --- DML errors ---
+
+# INSERT with wrong number of values (too few)
+statement error
+INSERT INTO t VALUES (1);
+
+# INSERT with wrong number of values (too many)
+statement error
+INSERT INTO t VALUES (1, 'x', 3);
+
+# --- Query errors ---
+
+# SELECT from non-existent table
+statement error
+SELECT * FROM ghost;
+
+# SELECT non-existent column
+statement error
+SELECT nonexistent FROM t;
+
+# SELECT with WHERE on non-existent column
+statement error
+SELECT * FROM t WHERE ghost = 1;
+
+# --- Index errors ---
+
+# CREATE INDEX on non-existent table
+statement error
+CREATE INDEX ghost (a);
+
+# CREATE INDEX on non-existent column
+statement error
+CREATE INDEX t (ghost);
+
+# CREATE INDEX with duplicate specification
+statement ok
+CREATE INDEX t (a);
+
+statement error
+CREATE INDEX t (a);
+
+# DROP INDEX that doesn't exist
+statement error
+DROP INDEX t (b);
