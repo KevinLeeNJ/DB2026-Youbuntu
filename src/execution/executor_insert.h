@@ -54,7 +54,15 @@ public:
             auto& col = tab_.cols[i];
             auto& val = values_[i];
             if (col.type != val.type) {
-                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+                if (!can_cast(col.type, val.type)) {
+                    throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+                }
+                // Convert value type for storage (e.g., INT literal into FLOAT column)
+                if (col.type == TYPE_FLOAT && val.type == TYPE_INT) {
+                    val.set_float(static_cast<float>(val.int_val));
+                } else if (col.type == TYPE_INT && val.type == TYPE_FLOAT) {
+                    val.set_int(static_cast<int>(val.float_val));
+                }
             }
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);

@@ -1,0 +1,114 @@
+# basic_update_delete.slt — DML tests: UPDATE and DELETE
+
+statement ok
+CREATE TABLE employees (id INT, name CHAR(20), salary FLOAT);
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 5000.0);
+
+statement ok
+INSERT INTO employees VALUES (2, 'Bob', 6000.0);
+
+statement ok
+INSERT INTO employees VALUES (3, 'Charlie', 7000.0);
+
+statement ok
+INSERT INTO employees VALUES (4, 'Diana', 5500.0);
+
+# Verify initial data
+query
+SELECT * FROM employees WHERE id = 1;
+----
++------------------+------------------+------------------+
+|               id |             name |           salary |
++------------------+------------------+------------------+
+|                1 |            Alice |      5000.000000 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+# UPDATE a single row
+statement ok
+UPDATE employees SET salary = 6500.0 WHERE id = 2;
+
+# Verify the update
+query
+SELECT name, salary FROM employees WHERE id = 2;
+----
++------------------+------------------+
+|             name |           salary |
++------------------+------------------+
+|              Bob |      6500.000000 |
++------------------+------------------+
+Total record(s): 1
+
+# UPDATE without WHERE (all rows)
+statement ok
+UPDATE employees SET salary = 10000.0;
+
+query
+SELECT id, salary FROM employees WHERE id = 1;
+----
++------------------+------------------+
+|               id |           salary |
++------------------+------------------+
+|                1 |     10000.000000 |
++------------------+------------------+
+Total record(s): 1
+
+# DELETE a single row
+statement ok
+DELETE FROM employees WHERE id = 3;
+
+query
+SELECT id, name FROM employees WHERE id = 1;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                1 |            Alice |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, name FROM employees WHERE id = 2;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                2 |              Bob |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, name FROM employees WHERE id = 4;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                4 |            Diana |
++------------------+------------------+
+Total record(s): 1
+
+# DELETE remaining rows
+statement ok
+DELETE FROM employees WHERE id = 1;
+
+statement ok
+DELETE FROM employees WHERE id = 2;
+
+statement ok
+DELETE FROM employees WHERE id = 4;
+
+# Verify empty table
+query
+SELECT * FROM employees;
+----
++------------------+------------------+------------------+
+|               id |             name |           salary |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+Total record(s): 0
+
+# DELETE from empty table should succeed (no rows to delete)
+statement ok
+DELETE FROM employees WHERE id = 1;

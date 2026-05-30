@@ -1,0 +1,177 @@
+# index_large.slt — Large-scale index tests: bulk insert + point/range queries
+
+statement ok
+CREATE TABLE items (id INT, name CHAR(10), value FLOAT);
+
+# --- Bulk insert 30 rows ---
+statement ok
+INSERT INTO items VALUES (1, 'u01', 10.5);
+
+statement ok
+INSERT INTO items VALUES (2, 'u02', 20.5);
+
+statement ok
+INSERT INTO items VALUES (3, 'u03', 30.5);
+
+statement ok
+INSERT INTO items VALUES (4, 'u04', 40.5);
+
+statement ok
+INSERT INTO items VALUES (5, 'u05', 50.5);
+
+statement ok
+INSERT INTO items VALUES (6, 'u06', 60.5);
+
+statement ok
+INSERT INTO items VALUES (7, 'u07', 70.5);
+
+statement ok
+INSERT INTO items VALUES (8, 'u08', 80.5);
+
+statement ok
+INSERT INTO items VALUES (9, 'u09', 90.5);
+
+statement ok
+INSERT INTO items VALUES (10, 'u10', 100.5);
+
+statement ok
+INSERT INTO items VALUES (11, 'u11', 110.5);
+
+statement ok
+INSERT INTO items VALUES (12, 'u12', 120.5);
+
+statement ok
+INSERT INTO items VALUES (13, 'u13', 130.5);
+
+statement ok
+INSERT INTO items VALUES (14, 'u14', 140.5);
+
+statement ok
+INSERT INTO items VALUES (15, 'u15', 150.5);
+
+statement ok
+INSERT INTO items VALUES (16, 'u16', 160.5);
+
+statement ok
+INSERT INTO items VALUES (17, 'u17', 170.5);
+
+statement ok
+INSERT INTO items VALUES (18, 'u18', 180.5);
+
+statement ok
+INSERT INTO items VALUES (19, 'u19', 190.5);
+
+statement ok
+INSERT INTO items VALUES (20, 'u20', 200.5);
+
+statement ok
+INSERT INTO items VALUES (21, 'u21', 210.5);
+
+statement ok
+INSERT INTO items VALUES (22, 'u22', 220.5);
+
+statement ok
+INSERT INTO items VALUES (23, 'u23', 230.5);
+
+statement ok
+INSERT INTO items VALUES (24, 'u24', 240.5);
+
+statement ok
+INSERT INTO items VALUES (25, 'u25', 250.5);
+
+statement ok
+INSERT INTO items VALUES (26, 'u26', 260.5);
+
+statement ok
+INSERT INTO items VALUES (27, 'u27', 270.5);
+
+statement ok
+INSERT INTO items VALUES (28, 'u28', 280.5);
+
+statement ok
+INSERT INTO items VALUES (29, 'u29', 290.5);
+
+statement ok
+INSERT INTO items VALUES (30, 'u30', 300.5);
+
+# --- Create index on id ---
+statement ok
+CREATE INDEX items (id);
+
+# Verify index metadata
+query
+SHOW INDEX FROM items;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
+|            items |           unique |             (id) |
++------------------+------------------+------------------+
+
+# --- Point query via index ---
+query
+SELECT * FROM items WHERE id = 15;
+----
++------------------+------------------+------------------+
+|               id |             name |            value |
++------------------+------------------+------------------+
+|               15 |              u15 |       150.500000 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+query
+SELECT name, value FROM items WHERE id = 25;
+----
++------------------+------------------+
+|             name |            value |
++------------------+------------------+
+|              u25 |       250.500000 |
++------------------+------------------+
+Total record(s): 1
+
+# --- Range query: id > 25 ---
+query
+SELECT id, name FROM items WHERE id > 25;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|               26 |              u26 |
+|               27 |              u27 |
+|               28 |              u28 |
+|               29 |              u29 |
+|               30 |              u30 |
++------------------+------------------+
+Total record(s): 5
+
+# --- Range query: id >= 20 AND id <= 23 ---
+query
+SELECT id, name, value FROM items WHERE id >= 20 AND id <= 23;
+----
++------------------+------------------+------------------+
+|               id |             name |            value |
++------------------+------------------+------------------+
+|               20 |              u20 |       200.500000 |
+|               21 |              u21 |       210.500000 |
+|               22 |              u22 |       220.500000 |
+|               23 |              u23 |       230.500000 |
++------------------+------------------+------------------+
+Total record(s): 4
+
+# --- Range query: id < 5 ---
+query
+SELECT id, name FROM items WHERE id < 5;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                1 |              u01 |
+|                2 |              u02 |
+|                3 |              u03 |
+|                4 |              u04 |
++------------------+------------------+
+Total record(s): 4
+
+# --- Duplicate key still rejected ---
+statement error
+INSERT INTO items VALUES (15, 'dup', 999.0);

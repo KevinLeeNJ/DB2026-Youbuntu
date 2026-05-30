@@ -1,0 +1,201 @@
+# basic_insert_select.slt — DML/DQL tests: INSERT, SELECT with WHERE, operators, and type coercion
+
+statement ok
+CREATE TABLE products (id INT, name CHAR(20), price FLOAT);
+
+# Insert single row
+statement ok
+INSERT INTO products VALUES (1, 'apple', 3.5);
+
+# SELECT *
+query
+SELECT * FROM products;
+----
++------------------+------------------+------------------+
+|               id |             name |            price |
++------------------+------------------+------------------+
+|                1 |            apple |         3.500000 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+# SELECT specific columns
+query
+SELECT id, name FROM products;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                1 |            apple |
++------------------+------------------+
+Total record(s): 1
+
+# Insert more rows
+statement ok
+INSERT INTO products VALUES (2, 'banana', 2.0);
+
+statement ok
+INSERT INTO products VALUES (3, 'cherry', 5.5);
+
+statement ok
+INSERT INTO products VALUES (4, 'date', 4.25);
+
+statement ok
+INSERT INTO products VALUES (5, 'elderberry', 6.0);
+
+# ===== Comparison operators =====
+
+# equality (=)
+query
+SELECT name FROM products WHERE id = 2;
+----
++------------------+
+|             name |
++------------------+
+|           banana |
++------------------+
+Total record(s): 1
+
+# less than (<)
+query
+SELECT name, price FROM products WHERE price < 4.0;
+----
++------------------+------------------+
+|             name |            price |
++------------------+------------------+
+|            apple |         3.500000 |
+|           banana |         2.000000 |
++------------------+------------------+
+Total record(s): 2
+
+# less than or equal (<=)
+query
+SELECT name, price FROM products WHERE price <= 3.5;
+----
++------------------+------------------+
+|             name |            price |
++------------------+------------------+
+|            apple |         3.500000 |
+|           banana |         2.000000 |
++------------------+------------------+
+Total record(s): 2
+
+# greater than (>)
+query
+SELECT name, price FROM products WHERE price > 5.0;
+----
++------------------+------------------+
+|             name |            price |
++------------------+------------------+
+|           cherry |         5.500000 |
+|       elderberry |         6.000000 |
++------------------+------------------+
+Total record(s): 2
+
+# greater than or equal (>=)
+query
+SELECT name, price FROM products WHERE price >= 4.25;
+----
++------------------+------------------+
+|             name |            price |
++------------------+------------------+
+|           cherry |         5.500000 |
+|             date |         4.250000 |
+|       elderberry |         6.000000 |
++------------------+------------------+
+Total record(s): 3
+
+# not equal (<>)
+query
+SELECT name FROM products WHERE id <> 3;
+----
++------------------+
+|             name |
++------------------+
+|            apple |
+|           banana |
+|             date |
+|       elderberry |
++------------------+
+Total record(s): 4
+
+# ===== Multi-condition WHERE (AND) =====
+
+query
+SELECT name, price FROM products WHERE price > 3.0 AND price < 5.0;
+----
++------------------+------------------+
+|             name |            price |
++------------------+------------------+
+|            apple |         3.500000 |
+|             date |         4.250000 |
++------------------+------------------+
+Total record(s): 2
+
+# multi-condition with string and numeric
+query
+SELECT id, name FROM products WHERE name = 'cherry' AND price > 5.0;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                3 |           cherry |
++------------------+------------------+
+Total record(s): 1
+
+# ===== Table-qualified columns =====
+
+query
+SELECT products.name, products.price FROM products WHERE products.id = 1;
+----
++------------------+------------------+
+|             name |            price |
++------------------+------------------+
+|            apple |         3.500000 |
++------------------+------------------+
+Total record(s): 1
+
+# ===== Type coercion =====
+
+# INSERT INT into FLOAT column
+statement ok
+CREATE TABLE mixed (x FLOAT);
+
+statement ok
+INSERT INTO mixed VALUES (42);
+
+query
+SELECT * FROM mixed;
+----
++------------------+
+|                x |
++------------------+
+|        42.000000 |
++------------------+
+Total record(s): 1
+
+# INSERT FLOAT into INT column (truncation)
+statement ok
+CREATE TABLE trunc_test (v INT);
+
+statement ok
+INSERT INTO trunc_test VALUES (7.9);
+
+query
+SELECT * FROM trunc_test;
+----
++------------------+
+|                v |
++------------------+
+|                7 |
++------------------+
+Total record(s): 1
+
+# SELECT * WHERE no rows match
+query
+SELECT * FROM products WHERE id = 999;
+----
++------------------+------------------+------------------+
+|               id |             name |            price |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+Total record(s): 0

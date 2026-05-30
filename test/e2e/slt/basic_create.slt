@@ -1,0 +1,71 @@
+# basic_create.slt — DDL tests: CREATE TABLE, DROP TABLE, DESC, SHOW TABLES
+
+statement ok
+CREATE TABLE t1 (a INT, b FLOAT, c CHAR(20));
+
+# Verify SHOW TABLES output
+query
+SHOW TABLES;
+----
++------------------+
+|           Tables |
++------------------+
+|               t1 |
++------------------+
+
+# Verify DESC output
+query
+DESC t1;
+----
++------------------+------------------+------------------+
+|            Field |             Type |            Index |
++------------------+------------------+------------------+
+|                a |              INT |               NO |
+|                b |            FLOAT |               NO |
+|                c |           STRING |               NO |
++------------------+------------------+------------------+
+
+# Create another table
+statement ok
+CREATE TABLE t2 (id INT, name CHAR(10), score FLOAT);
+
+# SHOW TABLES should now list both
+query
+SHOW TABLES;
+----
++------------------+
+|           Tables |
++------------------+
+|               t1 |
+|               t2 |
++------------------+
+
+# Drop a table
+statement ok
+DROP TABLE t2;
+
+# Only t1 remains
+query
+SHOW TABLES;
+----
++------------------+
+|           Tables |
++------------------+
+|               t1 |
++------------------+
+
+# DESC the remaining table
+query
+DESC t1;
+----
++------------------+------------------+------------------+
+|            Field |             Type |            Index |
++------------------+------------------+------------------+
+|                a |              INT |               NO |
+|                b |            FLOAT |               NO |
+|                c |           STRING |               NO |
++------------------+------------------+------------------+
+
+# Drop non-existent table should error
+statement error
+DROP TABLE nonexistent;

@@ -1,0 +1,131 @@
+# basic_index.slt — Index tests: CREATE/DROP INDEX, SHOW INDEX, composite index, duplicate key
+
+statement ok
+CREATE TABLE students (id INT, name CHAR(20), score FLOAT);
+
+statement ok
+INSERT INTO students VALUES (1, 'Alice', 85.5);
+
+statement ok
+INSERT INTO students VALUES (2, 'Bob', 92.0);
+
+statement ok
+INSERT INTO students VALUES (3, 'Charlie', 78.0);
+
+statement ok
+INSERT INTO students VALUES (4, 'Diana', 88.5);
+
+# Show indexes before creating any
+query
+SHOW INDEX FROM students;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+
+# Create index on id column
+statement ok
+CREATE INDEX students (id);
+
+query
+SHOW INDEX FROM students;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
+|         students |           unique |             (id) |
++------------------+------------------+------------------+
+
+# ===== Duplicate key rejection on unique index =====
+statement error
+INSERT INTO students VALUES (1, 'Duplicate', 99.0);
+
+# Verify original data unchanged
+query
+SELECT id, name FROM students WHERE id = 1;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
+|                1 |            Alice |
++------------------+------------------+
+Total record(s): 1
+
+# ===== Composite index (multi-column) =====
+statement ok
+CREATE INDEX students (name, score);
+
+query
+SHOW INDEX FROM students;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
+|         students |           unique |             (id) |
+|         students |           unique |     (name,score) |
++------------------+------------------+------------------+
+
+# Queries still work with composite index
+query
+SELECT * FROM students WHERE id = 2;
+----
++------------------+------------------+------------------+
+|               id |             name |            score |
++------------------+------------------+------------------+
+|                2 |              Bob |        92.000000 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+# Range query using indexed column
+query
+SELECT id, score FROM students WHERE id > 2;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                3 |        78.000000 |
+|                4 |        88.500000 |
++------------------+------------------+
+Total record(s): 2
+
+# Range query with >= on indexed column
+query
+SELECT name FROM students WHERE id >= 3;
+----
++------------------+
+|             name |
++------------------+
+|          Charlie |
+|            Diana |
++------------------+
+Total record(s): 2
+
+# ===== Drop composite index =====
+statement ok
+DROP INDEX students (name, score);
+
+query
+SHOW INDEX FROM students;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
+|         students |           unique |             (id) |
++------------------+------------------+------------------+
+
+# Drop remaining index
+statement ok
+DROP INDEX students (id);
+
+query
+SHOW INDEX FROM students;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+
+# DROP INDEX on non-existent index should error
+statement error
+DROP INDEX students (id);

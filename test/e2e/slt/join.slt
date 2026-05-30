@@ -1,0 +1,111 @@
+# join.slt — Multi-table SELECT: cross-product, JOIN keyword, equality join, multi-condition
+
+statement ok
+CREATE TABLE left_t (lid INT, lval CHAR(10));
+
+statement ok
+CREATE TABLE right_t (rid INT, rval CHAR(10));
+
+statement ok
+INSERT INTO left_t VALUES (1, 'L1');
+
+statement ok
+INSERT INTO left_t VALUES (2, 'L2');
+
+statement ok
+INSERT INTO right_t VALUES (1, 'R1');
+
+statement ok
+INSERT INTO right_t VALUES (3, 'R3');
+
+# --- Cross-product (comma syntax) ---
+# Join order: for each right_t row, iterate all left_t rows
+query
+SELECT * FROM left_t, right_t;
+----
++------------------+------------------+------------------+------------------+
+|              lid |             lval |              rid |             rval |
++------------------+------------------+------------------+------------------+
+|                1 |               L1 |                1 |               R1 |
+|                2 |               L2 |                1 |               R1 |
+|                1 |               L1 |                3 |               R3 |
+|                2 |               L2 |                3 |               R3 |
++------------------+------------------+------------------+------------------+
+Total record(s): 4
+
+# --- JOIN keyword (same semantics as comma) ---
+query
+SELECT lid, rid FROM left_t JOIN right_t;
+----
++------------------+------------------+
+|              lid |              rid |
++------------------+------------------+
+|                1 |                1 |
+|                2 |                1 |
+|                1 |                3 |
+|                2 |                3 |
++------------------+------------------+
+Total record(s): 4
+
+# --- Join with equality condition ---
+query
+SELECT lid, lval, rval FROM left_t, right_t WHERE lid = rid;
+----
++------------------+------------------+------------------+
+|              lid |             lval |             rval |
++------------------+------------------+------------------+
+|                1 |               L1 |               R1 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+# --- Join with multi-condition WHERE ---
+statement ok
+INSERT INTO right_t VALUES (1, 'R1b');
+
+query
+SELECT * FROM left_t, right_t WHERE lid = rid AND lval = 'L1';
+----
++------------------+------------------+------------------+------------------+
+|              lid |             lval |              rid |             rval |
++------------------+------------------+------------------+------------------+
+|                1 |               L1 |                1 |               R1 |
+|                1 |               L1 |                1 |              R1b |
++------------------+------------------+------------------+------------------+
+Total record(s): 2
+
+# --- Cross-product with single-table filter ---
+query
+SELECT lid, rid, rval FROM left_t, right_t WHERE lid = 2;
+----
++------------------+------------------+------------------+
+|              lid |              rid |             rval |
++------------------+------------------+------------------+
+|                2 |                1 |               R1 |
+|                2 |                3 |               R3 |
+|                2 |                1 |              R1b |
++------------------+------------------+------------------+
+Total record(s): 3
+
+# --- Table-qualified columns in join ---
+query
+SELECT left_t.lid, right_t.rval FROM left_t, right_t WHERE left_t.lid = right_t.rid;
+----
++------------------+------------------+
+|              lid |             rval |
++------------------+------------------+
+|                1 |               R1 |
+|                1 |              R1b |
++------------------+------------------+
+Total record(s): 2
+
+# --- Mixed condition: join + single-table filter ---
+query
+SELECT * FROM left_t, right_t WHERE lid = rid AND rid > 0;
+----
++------------------+------------------+------------------+------------------+
+|              lid |             lval |              rid |             rval |
++------------------+------------------+------------------+------------------+
+|                1 |               L1 |                1 |               R1 |
+|                1 |               L1 |                1 |              R1b |
++------------------+------------------+------------------+------------------+
+Total record(s): 2
