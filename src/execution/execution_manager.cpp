@@ -151,16 +151,20 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
 }
 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
-void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
+void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
                             Context* context) {
-    std::vector<std::string> captions;
-    captions.reserve(sel_cols.size());
-    for (auto& sel_col : sel_cols) {
-        captions.push_back(sel_col.col_name);
+    const auto& result_cols = executorTreeRoot->cols();
+    std::vector<std::string> captions = std::move(output_names);
+    if (captions.size() != result_cols.size()) {
+        captions.clear();
+        captions.reserve(result_cols.size());
+        for (const auto& col : result_cols) {
+            captions.push_back(col.name);
+        }
     }
 
     // Print header into buffer
-    RecordPrinter rec_printer(sel_cols.size());
+    RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
@@ -175,7 +179,6 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Print records
     size_t num_rec = 0;
-    const auto& result_cols = executorTreeRoot->cols();
     // 执行query_plan
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
@@ -209,6 +212,16 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_separator(context);
     // Print record count into buffer
     RecordPrinter::print_record_count(num_rec, context);
+}
+
+void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
+                            Context* context) {
+    std::vector<std::string> output_names;
+    output_names.reserve(sel_cols.size());
+    for (const auto& sel_col : sel_cols) {
+        output_names.push_back(sel_col.col_name);
+    }
+    select_from(std::move(executorTreeRoot), std::move(output_names), context);
 }
 
 // 执行DML语句

@@ -43,7 +43,9 @@ typedef enum PlanTag {
     T_NestLoop,
     T_SortMerge, // sort merge join
     T_Sort,
-    T_Projection
+    T_Projection,
+    T_Aggregate,
+    T_Limit
 } PlanTag;
 
 // 查询执行计划
@@ -98,28 +100,58 @@ public:
 
 class ProjectionPlan : public Plan {
 public:
-    ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> sel_cols) {
+    ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<SelectItem> select_items,
+                   std::vector<std::string> output_names) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
-        sel_cols_ = std::move(sel_cols);
+        select_items_ = std::move(select_items);
+        output_names_ = std::move(output_names);
     }
     ~ProjectionPlan() {}
     std::shared_ptr<Plan> subplan_;
-    std::vector<TabCol> sel_cols_;
+    std::vector<SelectItem> select_items_;
+    std::vector<std::string> output_names_;
+};
+
+class AggregatePlan : public Plan {
+public:
+    AggregatePlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> group_by_cols,
+                  std::vector<AggExpr> agg_exprs, std::vector<HavingCondition> having_conds) {
+        Plan::tag = tag;
+        subplan_ = std::move(subplan);
+        group_by_cols_ = std::move(group_by_cols);
+        agg_exprs_ = std::move(agg_exprs);
+        having_conds_ = std::move(having_conds);
+    }
+    ~AggregatePlan() {}
+    std::shared_ptr<Plan> subplan_;
+    std::vector<TabCol> group_by_cols_;
+    std::vector<AggExpr> agg_exprs_;
+    std::vector<HavingCondition> having_conds_;
 };
 
 class SortPlan : public Plan {
 public:
-    SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, TabCol sel_col, bool is_desc) {
+    SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<OrderByItem> order_by_items) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
-        sel_col_ = sel_col;
-        is_desc_ = is_desc;
+        order_by_items_ = std::move(order_by_items);
     }
     ~SortPlan() {}
     std::shared_ptr<Plan> subplan_;
-    TabCol sel_col_;
-    bool is_desc_;
+    std::vector<OrderByItem> order_by_items_;
+};
+
+class LimitPlan : public Plan {
+public:
+    LimitPlan(PlanTag tag, std::shared_ptr<Plan> subplan, int limit) {
+        Plan::tag = tag;
+        subplan_ = std::move(subplan);
+        limit_ = limit;
+    }
+    ~LimitPlan() {}
+    std::shared_ptr<Plan> subplan_;
+    int limit_;
 };
 
 // dml语句，包括insert; delete; update; select语句　

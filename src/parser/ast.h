@@ -22,6 +22,8 @@ enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE };
 
 enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 
+enum AggFuncType { AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
+
 enum SetKnobType { EnableNestLoop, EnableSortMerge };
 
 enum class AstType {
@@ -44,6 +46,10 @@ enum class AstType {
     StringLit,
     BoolLit,
     Col,
+    AggExpr,
+    SelectItem,
+    HavingExpr,
+    OrderByItem,
     SetClause,
     BinaryExpr,
     OrderBy,
@@ -191,6 +197,23 @@ struct Col : public Expr {
         : Expr(AstType::Col), tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+struct AggExpr : public Expr {
+    AggFuncType func;
+    bool is_star;
+    std::shared_ptr<Col> col;
+
+    AggExpr(AggFuncType func_, bool is_star_, std::shared_ptr<Col> col_)
+        : Expr(AstType::AggExpr), func(func_), is_star(is_star_), col(std::move(col_)) {}
+};
+
+struct SelectItem : public TreeNode {
+    std::shared_ptr<Expr> expr;
+    std::string alias;
+
+    SelectItem(std::shared_ptr<Expr> expr_, std::string alias_)
+        : TreeNode(AstType::SelectItem), expr(std::move(expr_)), alias(std::move(alias_)) {}
+};
+
 struct SetClause : public TreeNode {
     std::string col_name;
     std::shared_ptr<Value> val;
@@ -208,11 +231,28 @@ struct BinaryExpr : public TreeNode {
         : TreeNode(AstType::BinaryExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
 };
 
+struct HavingExpr : public TreeNode {
+    std::shared_ptr<Expr> lhs;
+    SvCompOp op;
+    std::shared_ptr<Expr> rhs;
+
+    HavingExpr(std::shared_ptr<Expr> lhs_, SvCompOp op_, std::shared_ptr<Expr> rhs_)
+        : TreeNode(AstType::HavingExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
+};
+
 struct OrderBy : public TreeNode {
     std::shared_ptr<Col> cols;
     OrderByDir orderby_dir;
     OrderBy(std::shared_ptr<Col> cols_, OrderByDir orderby_dir_)
         : TreeNode(AstType::OrderBy), cols(std::move(cols_)), orderby_dir(orderby_dir_) {}
+};
+
+struct OrderByItem : public TreeNode {
+    std::shared_ptr<Expr> expr;
+    OrderByDir orderby_dir;
+
+    OrderByItem(std::shared_ptr<Expr> expr_, OrderByDir orderby_dir_)
+        : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_) {}
 };
 
 struct InsertStmt : public TreeNode {
@@ -255,18 +295,58 @@ struct JoinExpr : public TreeNode {
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Col>> cols;
+    std::vector<std::shared_ptr<SelectItem>> select_items;
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
 
+    bool has_select_star;
+    std::vector<std::shared_ptr<Col>> group_by_cols;
+    std::vector<std::shared_ptr<HavingExpr>> having_conds;
     bool has_sort;
     std::shared_ptr<OrderBy> order;
+    std::vector<std::shared_ptr<OrderByItem>> order_by_items;
+    bool has_limit;
+    int limit;
 
     SelectStmt(std::vector<std::shared_ptr<Col>> cols_, std::vector<std::string> tabs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_, std::shared_ptr<OrderBy> order_)
         : TreeNode(AstType::SelectStmt), cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
-          order(std::move(order_)) {
-        has_sort = (bool)order;
+          has_select_star(cols.empty()), order(std::move(order_)), has_limit(false), limit(0) {
+        for (const auto& col : cols) {
+            select_items.push_back(std::make_shared<SelectItem>(std::static_pointer_cast<Expr>(col), ""));
+        }
+        if (order != nullptr) {
+            order_by_items.push_back(
+                std::make_shared<OrderByItem>(std::static_pointer_cast<Expr>(order->cols), order->orderby_dir));
+        }
+        has_sort = !order_by_items.empty();
+    }
+
+    SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_, std::vector<std::string> tabs_,
+               std::vector<std::shared_ptr<BinaryExpr>> conds_, std::vector<std::shared_ptr<Col>> group_by_cols_,
+               std::vector<std::shared_ptr<HavingExpr>> having_conds_,
+               std::vector<std::shared_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
+               bool has_select_star_)
+        : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
+          conds(std::move(conds_)), has_select_star(has_select_star_), group_by_cols(std::move(group_by_cols_)),
+          having_conds(std::move(having_conds_)), has_sort(!order_by_items_.empty()),
+          order_by_items(std::move(order_by_items_)), has_limit(has_limit_), limit(limit_) {
+        for (const auto& item : select_items) {
+            if (item == nullptr) {
+                continue;
+            }
+            auto col = std::dynamic_pointer_cast<Col>(item->expr);
+            if (col != nullptr) {
+                cols.push_back(col);
+            }
+        }
+        if (order_by_items.size() == 1) {
+            auto order_col = std::dynamic_pointer_cast<Col>(order_by_items.front()->expr);
+            if (order_col != nullptr) {
+                order = std::make_shared<OrderBy>(order_col, order_by_items.front()->orderby_dir);
+            }
+        }
     }
 };
 
@@ -285,6 +365,7 @@ struct SemValue {
     float sv_float;
     std::string sv_str;
     bool sv_bool;
+    AggFuncType sv_agg_func;
     OrderByDir sv_orderby_dir;
     std::vector<std::string> sv_strs;
 
@@ -305,13 +386,21 @@ struct SemValue {
     std::shared_ptr<Col> sv_col;
     std::vector<std::shared_ptr<Col>> sv_cols;
 
+    std::shared_ptr<SelectItem> sv_select_item;
+    std::vector<std::shared_ptr<SelectItem>> sv_select_items;
+
     std::shared_ptr<SetClause> sv_set_clause;
     std::vector<std::shared_ptr<SetClause>> sv_set_clauses;
 
     std::shared_ptr<BinaryExpr> sv_cond;
     std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
 
+    std::shared_ptr<HavingExpr> sv_having_cond;
+    std::vector<std::shared_ptr<HavingExpr>> sv_having_conds;
+
     std::shared_ptr<OrderBy> sv_orderby;
+    std::shared_ptr<OrderByItem> sv_orderby_item;
+    std::vector<std::shared_ptr<OrderByItem>> sv_orderby_items;
 
     SetKnobType sv_setKnobType;
 };
