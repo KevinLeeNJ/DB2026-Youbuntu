@@ -74,12 +74,21 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "UPDATE" { return UPDATE; }
 "SET" { return SET; }
 "SELECT" { return SELECT; }
+"AS" { return AS; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }
 "INDEX" { return INDEX; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
+"COUNT" { return COUNT; }
+"MAX" { return MAX; }
+"MIN" { return MIN; }
+"SUM" { return SUM; }
+"AVG" { return AVG; }
+"GROUP" { return GROUP; }
+"HAVING" { return HAVING; }
+"LIMIT" { return LIMIT; }
 "EXIT" { return EXIT; }
 "HELP" { return HELP; }
 "ORDER" { return ORDER; }

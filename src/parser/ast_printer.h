@@ -55,6 +55,22 @@ private:
         return m.at(op);
     }
 
+    static std::string agg_func2str(AggFuncType func) {
+        static std::map<AggFuncType, std::string> m{
+            {AGG_COUNT, "COUNT"}, {AGG_MAX, "MAX"}, {AGG_MIN, "MIN"}, {AGG_SUM, "SUM"}, {AGG_AVG, "AVG"},
+        };
+        return m.at(func);
+    }
+
+    static std::string orderby_dir2str(OrderByDir dir) {
+        static std::map<OrderByDir, std::string> m{
+            {OrderBy_DEFAULT, "DEFAULT"},
+            {OrderBy_ASC, "ASC"},
+            {OrderBy_DESC, "DESC"},
+        };
+        return m.at(dir);
+    }
+
     template <typename T> static void print_node_list(std::vector<T> nodes, int offset) {
         std::cout << offset2string(offset);
         offset += 2;
@@ -131,6 +147,23 @@ private:
             print_val(x->col_name, offset);
             break;
         }
+        case AstType::AggExpr: {
+            auto x = std::static_pointer_cast<AggExpr>(node);
+            std::cout << "AGG_EXPR\n";
+            print_val(agg_func2str(x->func), offset);
+            print_val(x->is_star, offset);
+            if (x->col != nullptr) {
+                print_node(x->col, offset);
+            }
+            break;
+        }
+        case AstType::SelectItem: {
+            auto x = std::static_pointer_cast<SelectItem>(node);
+            std::cout << "SELECT_ITEM\n";
+            print_node(x->expr, offset);
+            print_val(x->alias, offset);
+            break;
+        }
         case AstType::TypeLen: {
             auto x = std::static_pointer_cast<TypeLen>(node);
             std::cout << "TYPE_LEN\n";
@@ -177,11 +210,26 @@ private:
             print_node(x->rhs, offset);
             break;
         }
+        case AstType::HavingExpr: {
+            auto x = std::static_pointer_cast<HavingExpr>(node);
+            std::cout << "HAVING_EXPR\n";
+            print_node(x->lhs, offset);
+            print_val(op2str(x->op), offset);
+            print_node(x->rhs, offset);
+            break;
+        }
         case AstType::OrderBy: {
             auto x = std::static_pointer_cast<OrderBy>(node);
             std::cout << "ORDER_BY\n";
             print_node(x->cols, offset);
-            print_val(x->orderby_dir, offset);
+            print_val(orderby_dir2str(x->orderby_dir), offset);
+            break;
+        }
+        case AstType::OrderByItem: {
+            auto x = std::static_pointer_cast<OrderByItem>(node);
+            std::cout << "ORDER_BY_ITEM\n";
+            print_node(x->expr, offset);
+            print_val(orderby_dir2str(x->orderby_dir), offset);
             break;
         }
         case AstType::InsertStmt: {
@@ -212,9 +260,17 @@ private:
         case AstType::SelectStmt: {
             auto x = std::static_pointer_cast<SelectStmt>(node);
             std::cout << "SELECT\n";
-            print_node_list(x->cols, offset);
+            print_val(x->has_select_star, offset);
+            print_node_list(x->select_items, offset);
             print_val_list(x->tabs, offset);
             print_node_list(x->conds, offset);
+            print_node_list(x->group_by_cols, offset);
+            print_node_list(x->having_conds, offset);
+            print_node_list(x->order_by_items, offset);
+            print_val(x->has_limit, offset);
+            if (x->has_limit) {
+                print_val(x->limit, offset);
+            }
             break;
         }
         case AstType::TxnBegin:

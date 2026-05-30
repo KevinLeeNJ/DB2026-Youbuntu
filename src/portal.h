@@ -13,17 +13,20 @@ See the Mulan PSL v2 for more details. */
 #include <cerrno>
 #include <cstring>
 #include <string>
-#include "optimizer/plan.h"
+#include <utility>
 #include "execution/executor_abstract.h"
+#include "execution/executor_aggregate.h"
+#include "execution/executor_delete.h"
+#include "execution/executor_index_scan.h"
+#include "execution/executor_insert.h"
+#include "execution/executor_limit.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_projection.h"
 #include "execution/executor_seq_scan.h"
-#include "execution/executor_index_scan.h"
 #include "execution/executor_update.h"
-#include "execution/executor_insert.h"
-#include "execution/executor_delete.h"
 #include "execution/execution_sort.h"
 #include "common/common.h"
+#include "optimizer/plan.h"
 
 typedef enum portalTag {
     PORTAL_Invalid_Query = 0,
@@ -36,18 +39,153 @@ typedef enum portalTag {
 struct PortalStmt {
     portalTag tag;
 
-    std::vector<TabCol> sel_cols;
+    std::vector<std::string> output_names;
     std::unique_ptr<AbstractExecutor> root;
     std::shared_ptr<Plan> plan;
 
-    PortalStmt(portalTag tag_, std::vector<TabCol> sel_cols_, std::unique_ptr<AbstractExecutor> root_,
+    PortalStmt(portalTag tag_, std::vector<std::string> output_names_, std::unique_ptr<AbstractExecutor> root_,
                std::shared_ptr<Plan> plan_)
-        : tag(tag_), sel_cols(std::move(sel_cols_)), root(std::move(root_)), plan(std::move(plan_)) {}
+        : tag(tag_), output_names(std::move(output_names_)), root(std::move(root_)), plan(std::move(plan_)) {}
 };
 
 class Portal {
 private:
     SmManager* sm_manager_;
+
+    struct ExecutorQueryExpr {
+        QueryExprType type = QueryExprType::COLUMN;
+        TabCol col;
+        AggExpr agg;
+        Value val;
+        Value value;
+        std::string display_name;
+    };
+
+    struct ExecutorSelectItem {
+        ExecutorQueryExpr expr;
+        std::string alias;
+        std::string display_name;
+        std::string output_name;
+    };
+
+    struct ExecutorHavingCondition {
+        ExecutorQueryExpr lhs;
+        CompOp op = OP_EQ;
+        bool is_rhs_val = false;
+        bool is_rhs_value = false;
+        ExecutorQueryExpr rhs_expr;
+        Value rhs_val;
+    };
+
+    static ExecutorQueryExpr to_executor_query_expr(const QueryExpr& expr) {
+        ExecutorQueryExpr executor_expr;
+        executor_expr.type = expr.type;
+        executor_expr.col = expr.col;
+        executor_expr.agg = expr.agg;
+        executor_expr.val = expr.value;
+        executor_expr.value = expr.value;
+        executor_expr.display_name = expr.display_name;
+        return executor_expr;
+    }
+
+    static std::vector<ExecutorSelectItem> to_executor_select_items(const std::vector<SelectItem>& select_items) {
+        std::vector<ExecutorSelectItem> executor_items;
+        executor_items.reserve(select_items.size());
+        for (const auto& item : select_items) {
+            ExecutorSelectItem executor_item;
+            executor_item.expr = to_executor_query_expr(item.expr);
+            executor_item.alias = item.alias;
+            executor_item.display_name = item.output_name.empty() ? item.expr.display_name : item.output_name;
+            executor_item.output_name = item.output_name;
+            executor_items.push_back(std::move(executor_item));
+        }
+        return executor_items;
+    }
+
+    static std::vector<ExecutorHavingCondition>
+    to_executor_having_conds(const std::vector<HavingCondition>& having_conds) {
+        std::vector<ExecutorHavingCondition> executor_conds;
+        executor_conds.reserve(having_conds.size());
+        for (const auto& cond : having_conds) {
+            ExecutorHavingCondition executor_cond;
+            executor_cond.lhs = to_executor_query_expr(cond.lhs);
+            executor_cond.op = cond.op;
+            executor_cond.is_rhs_val = cond.is_rhs_val;
+            executor_cond.is_rhs_value = cond.is_rhs_val;
+            executor_cond.rhs_expr = to_executor_query_expr(cond.rhs_expr);
+            executor_cond.rhs_val = cond.rhs_val;
+            executor_conds.push_back(std::move(executor_cond));
+        }
+        return executor_conds;
+    }
+
+    static std::vector<std::string> build_projection_output_names(const ProjectionPlan& plan) {
+        if (!plan.output_names_.empty()) {
+            return plan.output_names_;
+        }
+
+        std::vector<std::string> output_names;
+        output_names.reserve(plan.select_items_.size());
+        for (const auto& item : plan.select_items_) {
+            if (!item.output_name.empty()) {
+                output_names.push_back(item.output_name);
+            } else if (!item.alias.empty()) {
+                output_names.push_back(item.alias);
+            } else if (!item.expr.display_name.empty()) {
+                output_names.push_back(item.expr.display_name);
+            } else if (item.expr.type == QueryExprType::AGGREGATE) {
+                output_names.push_back(item.expr.agg.display_name);
+            } else {
+                output_names.push_back(item.expr.col.col_name);
+            }
+        }
+        return output_names;
+    }
+
+    static std::vector<std::string> build_aggregate_output_names(const AggregatePlan& plan) {
+        std::vector<std::string> output_names;
+        output_names.reserve(plan.group_by_cols_.size() + plan.agg_exprs_.size());
+        for (const auto& group_col : plan.group_by_cols_) {
+            output_names.push_back(group_col.col_name);
+        }
+        for (const auto& agg_expr : plan.agg_exprs_) {
+            output_names.push_back(agg_expr.display_name);
+        }
+        return output_names;
+    }
+
+    std::vector<std::string> get_plan_output_names(const std::shared_ptr<Plan>& plan) const {
+        switch (plan->tag) {
+        case T_Projection:
+            return build_projection_output_names(*std::static_pointer_cast<ProjectionPlan>(plan));
+        case T_Sort:
+            return get_plan_output_names(std::static_pointer_cast<SortPlan>(plan)->subplan_);
+        case T_Limit:
+            return get_plan_output_names(std::static_pointer_cast<LimitPlan>(plan)->subplan_);
+        case T_Aggregate:
+            return build_aggregate_output_names(*std::static_pointer_cast<AggregatePlan>(plan));
+        case T_SeqScan:
+        case T_IndexScan: {
+            std::vector<std::string> output_names;
+            const auto& cols = std::static_pointer_cast<ScanPlan>(plan)->cols_;
+            output_names.reserve(cols.size());
+            for (const auto& col : cols) {
+                output_names.push_back(col.name);
+            }
+            return output_names;
+        }
+        case T_NestLoop:
+        case T_SortMerge: {
+            auto join_plan = std::static_pointer_cast<JoinPlan>(plan);
+            auto output_names = get_plan_output_names(join_plan->left_);
+            auto right_output_names = get_plan_output_names(join_plan->right_);
+            output_names.insert(output_names.end(), right_output_names.begin(), right_output_names.end());
+            return output_names;
+        }
+        default:
+            return {};
+        }
+    }
 
 public:
     Portal(SmManager* sm_manager) : sm_manager_(sm_manager) {}
@@ -65,16 +203,16 @@ public:
         case T_Transaction_commit:
         case T_Transaction_abort:
         case T_Transaction_rollback:
-            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(),
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
         case T_SetKnob:
-            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(),
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
         case T_CreateTable:
         case T_DropTable:
         case T_CreateIndex:
         case T_DropIndex:
-            return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(),
+            return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
         case T_select:
         case T_Update:
@@ -83,9 +221,9 @@ public:
             auto x = std::static_pointer_cast<DMLPlan>(plan);
             switch (x->tag) {
             case T_select: {
-                std::shared_ptr<ProjectionPlan> p = std::static_pointer_cast<ProjectionPlan>(x->subplan_);
-                std::unique_ptr<AbstractExecutor> root = convert_plan_executor(p, context);
-                return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(p->sel_cols_), std::move(root), plan);
+                std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_, context);
+                std::vector<std::string> output_names = get_plan_output_names(x->subplan_);
+                return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names), std::move(root), plan);
             }
 
             case T_Update: {
@@ -96,8 +234,8 @@ public:
                 }
                 std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
                     sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
-                return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root),
-                                                    plan);
+                return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                    std::move(root), plan);
             }
             case T_Delete: {
                 std::unique_ptr<AbstractExecutor> scan = convert_plan_executor(x->subplan_, context);
@@ -109,16 +247,16 @@ public:
                 std::unique_ptr<AbstractExecutor> root =
                     std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
 
-                return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root),
-                                                    plan);
+                return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                    std::move(root), plan);
             }
 
             case T_Insert: {
                 std::unique_ptr<AbstractExecutor> root =
                     std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
 
-                return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root),
-                                                    plan);
+                return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                    std::move(root), plan);
             }
 
             default:
@@ -136,7 +274,7 @@ public:
     void run(std::shared_ptr<PortalStmt> portal, QlManager* ql, txn_id_t* txn_id, Context* context) {
         switch (portal->tag) {
         case PORTAL_ONE_SELECT: {
-            ql->select_from(std::move(portal->root), std::move(portal->sel_cols), context);
+            ql->select_from(std::move(portal->root), std::move(portal->output_names), context);
             break;
         }
 
@@ -165,7 +303,14 @@ public:
         switch (plan->tag) {
         case T_Projection: {
             auto x = std::static_pointer_cast<ProjectionPlan>(plan);
-            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), x->sel_cols_);
+            auto select_items = to_executor_select_items(x->select_items_);
+            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), select_items);
+        }
+        case T_Aggregate: {
+            auto x = std::static_pointer_cast<AggregatePlan>(plan);
+            auto having_conds = to_executor_having_conds(x->having_conds_);
+            return std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_, context), x->group_by_cols_,
+                                                       x->agg_exprs_, having_conds);
         }
         case T_SeqScan:
         case T_IndexScan: {
@@ -188,8 +333,12 @@ public:
         }
         case T_Sort: {
             auto x = std::static_pointer_cast<SortPlan>(plan);
-            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), x->sel_col_,
-                                                  x->is_desc_);
+            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), x->order_by_items_);
+        }
+        case T_Limit: {
+            auto x = std::static_pointer_cast<LimitPlan>(plan);
+            return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context),
+                                                   static_cast<size_t>(x->limit_));
         }
         default:
             break;

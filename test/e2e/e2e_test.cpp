@@ -405,3 +405,7 @@ TEST_F(SltFileTest, IndexLarge) {
 TEST_F(SltFileTest, Errors) {
     run_slt_file("errors.slt");
 }
+
+TEST_F(SltFileTest, Aggregate) {
+    run_slt_file("aggregate.slt");
+}

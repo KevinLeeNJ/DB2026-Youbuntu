@@ -35,8 +35,8 @@
    especially those whose name start with YY_ or yy_.  They are
    private implementation details that can be changed or removed.  */
 
-#ifndef YY_YY_MNT_D_PHD1_DATABASE_COMPETITION_DB2024_RMDB_SRC_PARSER_YACC_TAB_H_INCLUDED
-#define YY_YY_MNT_D_PHD1_DATABASE_COMPETITION_DB2024_RMDB_SRC_PARSER_YACC_TAB_H_INCLUDED
+#ifndef YY_YY_YACC_TAB_H_INCLUDED
+#define YY_YY_YACC_TAB_H_INCLUDED
 /* Debug traces.  */
 #ifndef YYDEBUG
 #define YYDEBUG 0
@@ -67,34 +67,42 @@ enum yytokentype {
     ASC = 269,              /* ASC  */
     ORDER = 270,            /* ORDER  */
     BY = 271,               /* BY  */
-    WHERE = 272,            /* WHERE  */
-    UPDATE = 273,           /* UPDATE  */
-    SET = 274,              /* SET  */
-    SELECT = 275,           /* SELECT  */
-    INT = 276,              /* INT  */
-    CHAR = 277,             /* CHAR  */
-    FLOAT = 278,            /* FLOAT  */
-    INDEX = 279,            /* INDEX  */
-    AND = 280,              /* AND  */
-    JOIN = 281,             /* JOIN  */
-    EXIT = 282,             /* EXIT  */
-    HELP = 283,             /* HELP  */
-    TXN_BEGIN = 284,        /* TXN_BEGIN  */
-    TXN_COMMIT = 285,       /* TXN_COMMIT  */
-    TXN_ABORT = 286,        /* TXN_ABORT  */
-    TXN_ROLLBACK = 287,     /* TXN_ROLLBACK  */
-    ORDER_BY = 288,         /* ORDER_BY  */
-    ENABLE_NESTLOOP = 289,  /* ENABLE_NESTLOOP  */
-    ENABLE_SORTMERGE = 290, /* ENABLE_SORTMERGE  */
-    LEQ = 291,              /* LEQ  */
-    NEQ = 292,              /* NEQ  */
-    GEQ = 293,              /* GEQ  */
-    T_EOF = 294,            /* T_EOF  */
-    IDENTIFIER = 295,       /* IDENTIFIER  */
-    VALUE_STRING = 296,     /* VALUE_STRING  */
-    VALUE_INT = 297,        /* VALUE_INT  */
-    VALUE_FLOAT = 298,      /* VALUE_FLOAT  */
-    VALUE_BOOL = 299        /* VALUE_BOOL  */
+    GROUP = 272,            /* GROUP  */
+    HAVING = 273,           /* HAVING  */
+    LIMIT = 274,            /* LIMIT  */
+    AS = 275,               /* AS  */
+    WHERE = 276,            /* WHERE  */
+    UPDATE = 277,           /* UPDATE  */
+    SET = 278,              /* SET  */
+    SELECT = 279,           /* SELECT  */
+    INT = 280,              /* INT  */
+    CHAR = 281,             /* CHAR  */
+    FLOAT = 282,            /* FLOAT  */
+    INDEX = 283,            /* INDEX  */
+    AND = 284,              /* AND  */
+    JOIN = 285,             /* JOIN  */
+    COUNT = 286,            /* COUNT  */
+    MAX = 287,              /* MAX  */
+    MIN = 288,              /* MIN  */
+    SUM = 289,              /* SUM  */
+    AVG = 290,              /* AVG  */
+    EXIT = 291,             /* EXIT  */
+    HELP = 292,             /* HELP  */
+    TXN_BEGIN = 293,        /* TXN_BEGIN  */
+    TXN_COMMIT = 294,       /* TXN_COMMIT  */
+    TXN_ABORT = 295,        /* TXN_ABORT  */
+    TXN_ROLLBACK = 296,     /* TXN_ROLLBACK  */
+    ENABLE_NESTLOOP = 297,  /* ENABLE_NESTLOOP  */
+    ENABLE_SORTMERGE = 298, /* ENABLE_SORTMERGE  */
+    LEQ = 299,              /* LEQ  */
+    NEQ = 300,              /* NEQ  */
+    GEQ = 301,              /* GEQ  */
+    T_EOF = 302,            /* T_EOF  */
+    IDENTIFIER = 303,       /* IDENTIFIER  */
+    VALUE_STRING = 304,     /* VALUE_STRING  */
+    VALUE_INT = 305,        /* VALUE_INT  */
+    VALUE_FLOAT = 306,      /* VALUE_FLOAT  */
+    VALUE_BOOL = 307        /* VALUE_BOOL  */
 };
 typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -116,4 +124,4 @@ struct YYLTYPE {
 
 int yyparse(void);
 
-#endif /* !YY_YY_MNT_D_PHD1_DATABASE_COMPETITION_DB2024_RMDB_SRC_PARSER_YACC_TAB_H_INCLUDED  */
+#endif /* !YY_YY_YACC_TAB_H_INCLUDED  */

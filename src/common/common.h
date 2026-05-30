@@ -74,6 +74,10 @@ struct Value {
 
 enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
 
+enum class AggType { COUNT, MAX, MIN, SUM, AVG };
+
+enum class QueryExprType { COLUMN, AGGREGATE, VALUE };
+
 inline CompOp swap_comp_op(CompOp op) {
     switch (op) {
     case OP_EQ:
@@ -90,6 +94,41 @@ inline CompOp swap_comp_op(CompOp op) {
     }
     throw InternalError("Unexpected comparison operator");
 }
+
+struct AggExpr {
+    AggType type = AggType::COUNT;
+    bool is_star = false;
+    TabCol col;
+    std::string display_name;
+};
+
+struct QueryExpr {
+    QueryExprType type = QueryExprType::COLUMN;
+    TabCol col;
+    AggExpr agg;
+    Value value;
+    std::string display_name;
+};
+
+struct SelectItem {
+    QueryExpr expr;
+    std::string alias;
+    std::string output_name;
+};
+
+struct OrderByItem {
+    QueryExpr expr;
+    bool is_desc = false;
+    std::string order_name;
+};
+
+struct HavingCondition {
+    QueryExpr lhs;
+    CompOp op = OP_EQ;
+    bool is_rhs_val = false;
+    QueryExpr rhs_expr;
+    Value rhs_val;
+};
 
 struct Condition {
     TabCol lhs_col;  // left-hand side column

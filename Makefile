@@ -73,6 +73,6 @@ run-client: client
 	@./rmdb_client/build/rmdb_client
 
 parser:
-	@cd $(PARSER_DIR) && flex --header-file=lex.yy.hpp -o lex.yy.cpp lex.l
-	@cd $(PARSER_DIR) && bison --defines=yacc.tab.hpp -o yacc.tab.cpp yacc.y
+	@cd $(PARSER_DIR) && flex -o lex.yy.cpp lex.l
+	@cd $(PARSER_DIR) && bison --defines=yacc.tab.h -o yacc.tab.cpp yacc.y
 	@echo "Parser regenerated."

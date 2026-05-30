@@ -28,6 +28,16 @@ public:
     std::vector<Condition> conds;
     // 投影列
     std::vector<TabCol> cols;
+    // 聚合/分组查询的执行期输出描述
+    std::vector<SelectItem> select_items;
+    std::vector<TabCol> group_by_cols;
+    std::vector<HavingCondition> having_conds;
+    std::vector<OrderByItem> order_by_items;
+    bool has_limit = false;
+    int limit = 0;
+    bool has_aggregate = false;
+    bool has_select_star = false;
+    std::vector<std::string> output_names;
     // 表名
     std::vector<std::string> tables;
     // update 的set 值

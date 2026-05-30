@@ -1,0 +1,165 @@
+# aggregate.slt — aggregate functions, GROUP BY, HAVING, ORDER BY and LIMIT
+
+statement ok
+CREATE TABLE grade (course CHAR(20), id INT, score FLOAT);
+
+statement ok
+INSERT INTO grade VALUES ('DataStructure', 1, 95);
+
+statement ok
+INSERT INTO grade VALUES ('DataStructure', 2, 93.5);
+
+statement ok
+INSERT INTO grade VALUES ('DataStructure', 3, 94.5);
+
+statement ok
+INSERT INTO grade VALUES ('ComputerNetworks', 1, 99);
+
+statement ok
+INSERT INTO grade VALUES ('ComputerNetworks', 2, 88.5);
+
+statement ok
+INSERT INTO grade VALUES ('ComputerNetworks', 3, 92.5);
+
+statement ok
+INSERT INTO grade VALUES ('C++', 1, 92);
+
+statement ok
+INSERT INTO grade VALUES ('C++', 2, 89);
+
+statement ok
+INSERT INTO grade VALUES ('C++', 3, 89.5);
+
+query
+SELECT MAX(id) AS max_id FROM grade;
+----
++------------------+
+|           max_id |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+query
+SELECT MIN(score) AS min_score FROM grade WHERE course = 'ComputerNetworks';
+----
++------------------+
+|        min_score |
++------------------+
+|        88.500000 |
++------------------+
+Total record(s): 1
+
+query
+SELECT AVG(score) AS avg_score FROM grade WHERE course = 'DataStructure';
+----
++------------------+
+|        avg_score |
++------------------+
+|        94.333336 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(course) AS course_num FROM grade;
+----
++------------------+
+|       course_num |
++------------------+
+|                9 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) AS row_num FROM grade WHERE score < 60;
+----
++------------------+
+|          row_num |
++------------------+
+|                0 |
++------------------+
+Total record(s): 1
+
+query
+SELECT SUM(score) AS sum_score FROM grade WHERE id = 1;
+----
++------------------+
+|        sum_score |
++------------------+
+|       286.000000 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id, MAX(score) AS max_score, MIN(score) AS min_score, SUM(score) AS sum_score FROM grade GROUP BY id;
+----
++------------------+------------------+------------------+------------------+
+|               id |        max_score |        min_score |        sum_score |
++------------------+------------------+------------------+------------------+
+|                1 |        99.000000 |        92.000000 |       286.000000 |
+|                2 |        93.500000 |        88.500000 |       271.000000 |
+|                3 |        94.500000 |        89.500000 |       276.500000 |
++------------------+------------------+------------------+------------------+
+Total record(s): 3
+
+query
+SELECT id, MAX(score) AS max_score FROM grade GROUP BY id HAVING COUNT(*) > 3;
+----
++------------------+------------------+
+|               id |        max_score |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+statement ok
+INSERT INTO grade VALUES ('ParallelCompute', 1, 100);
+
+query
+SELECT id, MAX(score) AS max_score FROM grade GROUP BY id HAVING COUNT(*) > 3;
+----
++------------------+------------------+
+|               id |        max_score |
++------------------+------------------+
+|                1 |       100.000000 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT course, id, score FROM grade ORDER BY score DESC LIMIT 3;
+----
++------------------+------------------+------------------+
+|           course |               id |            score |
++------------------+------------------+------------------+
+|  ParallelCompute |                1 |       100.000000 |
+| ComputerNetworks |                1 |        99.000000 |
+|    DataStructure |                1 |        95.000000 |
++------------------+------------------+------------------+
+Total record(s): 3
+
+query
+SELECT course, id, score FROM grade ORDER BY course ASC, score DESC LIMIT 4;
+----
++------------------+------------------+------------------+
+|           course |               id |            score |
++------------------+------------------+------------------+
+|              C++ |                1 |        92.000000 |
+|              C++ |                3 |        89.500000 |
+|              C++ |                2 |        89.000000 |
+| ComputerNetworks |                1 |        99.000000 |
++------------------+------------------+------------------+
+Total record(s): 4
+
+statement error
+SELECT id, score FROM grade GROUP BY course;
+
+statement error
+SELECT id, MAX(score) AS max_score FROM grade WHERE MAX(score) > 90 GROUP BY id;
+
+statement error
+SELECT *, MAX(score) FROM grade;
+
+statement error
+SELECT SUM(course) FROM grade;
+
+statement ok
+DROP TABLE grade;

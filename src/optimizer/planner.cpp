@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "planner.h"
 
+#include <algorithm>
 #include <memory>
 
 #include "execution/executor_delete.h"
@@ -21,6 +22,50 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_update.h"
 #include "index/ix.h"
 #include "record_printer.h"
+
+namespace {
+
+bool same_tab_col(const TabCol& lhs, const TabCol& rhs) {
+    return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
+}
+
+bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
+    return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.display_name == rhs.display_name &&
+           (lhs.is_star || same_tab_col(lhs.col, rhs.col));
+}
+
+void append_agg_expr_if_needed(std::vector<AggExpr>& agg_exprs, const QueryExpr& expr) {
+    if (expr.type != QueryExprType::AGGREGATE) {
+        return;
+    }
+    auto pos = std::find_if(agg_exprs.begin(), agg_exprs.end(),
+                            [&](const AggExpr& agg_expr) { return same_agg_expr(agg_expr, expr.agg); });
+    if (pos == agg_exprs.end()) {
+        agg_exprs.push_back(expr.agg);
+    }
+}
+
+std::vector<AggExpr> collect_aggregate_exprs(const Query& query) {
+    std::vector<AggExpr> agg_exprs;
+    agg_exprs.reserve(query.select_items.size() + query.having_conds.size() * 2);
+
+    for (const auto& item : query.select_items) {
+        append_agg_expr_if_needed(agg_exprs, item.expr);
+    }
+    for (const auto& cond : query.having_conds) {
+        append_agg_expr_if_needed(agg_exprs, cond.lhs);
+        if (!cond.is_rhs_val) {
+            append_agg_expr_if_needed(agg_exprs, cond.rhs_expr);
+        }
+    }
+    return agg_exprs;
+}
+
+bool needs_aggregate_plan(const Query& query) {
+    return query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty();
+}
+
+} // namespace
 
 // 使用最左匹配原则选择索引：等值前缀后最多接一个范围列，其他条件留给执行器过滤。
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_conds,
@@ -213,9 +258,6 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
 
     // 其他物理优化
 
-    // 处理orderby
-    plan = generate_sort_plan(query, std::move(plan));
-
     return plan;
 }
 
@@ -338,23 +380,17 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query) {
 }
 
 std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan) {
-    auto x = std::static_pointer_cast<ast::SelectStmt>(query->parse);
-    if (!x->has_sort) {
+    if (query->order_by_items.empty()) {
         return plan;
     }
-    std::vector<std::string> tables = query->tables;
-    std::vector<ColMeta> all_cols;
-    for (auto& sel_tab_name : tables) {
-        // 这里db_不能写成get_db(), 注意要传指针
-        const auto& sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
-        all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
+    return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_items);
+}
+
+std::shared_ptr<Plan> Planner::generate_limit_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan) {
+    if (!query->has_limit) {
+        return plan;
     }
-    TabCol sel_col;
-    for (auto& col : all_cols) {
-        if (col.name.compare(x->order->cols->col_name) == 0)
-            sel_col = {.tab_name = col.tab_name, .col_name = col.name};
-    }
-    return std::make_shared<SortPlan>(T_Sort, std::move(plan), sel_col, x->order->orderby_dir == ast::OrderBy_DESC);
+    return std::make_shared<LimitPlan>(T_Limit, std::move(plan), query->limit);
 }
 
 /**
@@ -368,10 +404,24 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     // 逻辑优化
     query = logical_optimization(std::move(query), context);
 
-    // 物理优化
-    auto sel_cols = query->cols;
+    // scan / join
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
-    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), std::move(sel_cols));
+
+    // aggregate / group by / having
+    if (needs_aggregate_plan(*query)) {
+        plannerRoot = std::make_shared<AggregatePlan>(T_Aggregate, std::move(plannerRoot), query->group_by_cols,
+                                                      collect_aggregate_exprs(*query), query->having_conds);
+    }
+
+    // final select projection
+    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), query->select_items,
+                                                   query->output_names);
+
+    // final order by
+    plannerRoot = generate_sort_plan(query, std::move(plannerRoot));
+
+    // final limit
+    plannerRoot = generate_limit_plan(query, std::move(plannerRoot));
 
     return plannerRoot;
 }
