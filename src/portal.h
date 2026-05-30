@@ -56,19 +56,34 @@ public:
     // 将查询执行计划转换成对应的算子树
     std::shared_ptr<PortalStmt> start(std::shared_ptr<Plan> plan, Context* context) {
         // 这里可以将select进行拆分，例如：一个select，带有return的select等
-        if (auto x = std::dynamic_pointer_cast<OtherPlan>(plan)) {
+        switch (plan->tag) {
+        case T_Help:
+        case T_ShowTable:
+        case T_ShowIndex:
+        case T_DescTable:
+        case T_Transaction_begin:
+        case T_Transaction_commit:
+        case T_Transaction_abort:
+        case T_Transaction_rollback:
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
-        } else if (auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
+        case T_SetKnob:
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
-        } else if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
+        case T_CreateTable:
+        case T_DropTable:
+        case T_CreateIndex:
+        case T_DropIndex:
             return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
-        } else if (auto x = std::dynamic_pointer_cast<DMLPlan>(plan)) {
+        case T_select:
+        case T_Update:
+        case T_Delete:
+        case T_Insert: {
+            auto x = std::static_pointer_cast<DMLPlan>(plan);
             switch (x->tag) {
             case T_select: {
-                std::shared_ptr<ProjectionPlan> p = std::dynamic_pointer_cast<ProjectionPlan>(x->subplan_);
+                std::shared_ptr<ProjectionPlan> p = std::static_pointer_cast<ProjectionPlan>(x->subplan_);
                 std::unique_ptr<AbstractExecutor> root = convert_plan_executor(p, context);
                 return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(p->sel_cols_), std::move(root), plan);
             }
@@ -110,7 +125,8 @@ public:
                 throw InternalError("Unexpected field type");
                 break;
             }
-        } else {
+        }
+        default:
             throw InternalError("Unexpected field type");
         }
         return nullptr;
@@ -146,24 +162,37 @@ public:
     void drop() {}
 
     std::unique_ptr<AbstractExecutor> convert_plan_executor(std::shared_ptr<Plan> plan, Context* context) {
-        if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        switch (plan->tag) {
+        case T_Projection: {
+            auto x = std::static_pointer_cast<ProjectionPlan>(plan);
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), x->sel_cols_);
-        } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        }
+        case T_SeqScan:
+        case T_IndexScan: {
+            auto x = std::static_pointer_cast<ScanPlan>(plan);
             if (x->tag == T_SeqScan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
             } else {
                 return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_, x->index_col_names_,
                                                            context);
             }
-        } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        }
+        case T_NestLoop:
+        case T_SortMerge: {
+            auto x = std::static_pointer_cast<JoinPlan>(plan);
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
             std::unique_ptr<AbstractExecutor> join =
                 std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), std::move(x->conds_));
             return join;
-        } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        }
+        case T_Sort: {
+            auto x = std::static_pointer_cast<SortPlan>(plan);
             return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), x->sel_col_,
                                                   x->is_desc_);
+        }
+        default:
+            break;
         }
         return nullptr;
     }

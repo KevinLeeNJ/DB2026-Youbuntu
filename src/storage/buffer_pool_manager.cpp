@@ -107,7 +107,6 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         if (is_empty == false) {
             fid = free_list_.front();
             free_list_.pop_front();
-            Page* p = &pages_[fid];
             found = true;
         } else {
             // 1.2 已满使用lru_replacer中的方法选择淘汰页面
@@ -126,7 +125,6 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             // 为了解决此问题，将flush_page()函数展开
             PageId old_page_id = targetPage->get_page_id();
             if (page_table_.count(old_page_id) > 0) {
-                frame_id_t fid = page_table_[old_page_id];
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, targetPage->data_, PAGE_SIZE);
             }
             targetPage->is_dirty_ = false;
@@ -253,7 +251,6 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     if (is_empty == false) {
         fid = free_list_.front();
         free_list_.pop_front();
-        Page* p = &pages_[fid];
         found = true;
     } else {
         // 1.3 已满使用lru_replacer中的方法选择淘汰页面

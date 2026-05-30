@@ -46,35 +46,43 @@ const char* help_info = "Supported SQL syntax:\n"
 
 // 主要负责执行DDL语句
 void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context* context) {
-    if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
-        switch (x->tag) {
-        case T_CreateTable: {
-            sm_manager_->create_table(x->tab_name_, x->cols_, context);
-            break;
-        }
-        case T_DropTable: {
-            sm_manager_->drop_table(x->tab_name_, context);
-            break;
-        }
-        case T_CreateIndex: {
-            sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
-            break;
-        }
-        case T_DropIndex: {
-            sm_manager_->drop_index(x->tab_name_, x->tab_col_names_, context);
-            break;
-        }
-        default:
-            throw InternalError("Unexpected field type");
-            break;
-        }
+    auto x = std::static_pointer_cast<DDLPlan>(plan);
+    switch (plan->tag) {
+    case T_CreateTable: {
+        sm_manager_->create_table(x->tab_name_, x->cols_, context);
+        break;
+    }
+    case T_DropTable: {
+        sm_manager_->drop_table(x->tab_name_, context);
+        break;
+    }
+    case T_CreateIndex: {
+        sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
+        break;
+    }
+    case T_DropIndex: {
+        sm_manager_->drop_index(x->tab_name_, x->tab_col_names_, context);
+        break;
+    }
+    default:
+        throw InternalError("Unexpected field type");
+        break;
     }
 }
 
 // 执行help; show tables; desc table; begin; commit; abort;语句
 void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Context* context) {
-    if (auto x = std::dynamic_pointer_cast<OtherPlan>(plan)) {
-        switch (x->tag) {
+    switch (plan->tag) {
+    case T_Help:
+    case T_ShowTable:
+    case T_ShowIndex:
+    case T_DescTable:
+    case T_Transaction_begin:
+    case T_Transaction_commit:
+    case T_Transaction_abort:
+    case T_Transaction_rollback: {
+        auto x = std::static_pointer_cast<OtherPlan>(plan);
+        switch (plan->tag) {
         case T_Help: {
             memcpy(context->data_send_ + *(context->offset_), help_info, strlen(help_info));
             *(context->offset_) = strlen(help_info);
@@ -116,8 +124,10 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             throw InternalError("Unexpected field type");
             break;
         }
-
-    } else if (auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
+        break;
+    }
+    case T_SetKnob: {
+        auto x = std::static_pointer_cast<SetKnobPlan>(plan);
         switch (x->set_knob_type_) {
         case ast::SetKnobType::EnableNestLoop: {
             planner_->set_enable_nestedloop_join(x->bool_value_);
@@ -132,6 +142,11 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             break;
         }
         }
+        break;
+    }
+    default:
+        throw InternalError("Unexpected field type");
+        break;
     }
 }
 
@@ -153,7 +168,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
     outfile << "|";
-    for (int i = 0; i < captions.size(); ++i) {
+    for (size_t i = 0; i < captions.size(); ++i) {
         outfile << " " << captions[i] << " |";
     }
     outfile << "\n";
@@ -183,7 +198,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         rec_printer.print_record(columns, context);
         // print record into file
         outfile << "|";
-        for (int i = 0; i < columns.size(); ++i) {
+        for (size_t i = 0; i < columns.size(); ++i) {
             outfile << " " << columns[i] << " |";
         }
         outfile << "\n";

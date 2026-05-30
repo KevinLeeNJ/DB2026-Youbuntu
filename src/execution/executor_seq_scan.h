@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "errors.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -119,6 +120,7 @@ public:
                 return col;
             }
         }
+        throw ColumnNotFoundError(target.col_name);
     }
     size_t tupleLen() const override {
         return len_;
