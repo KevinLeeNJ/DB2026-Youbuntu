@@ -17,7 +17,9 @@ See the Mulan PSL v2 for more details. */
  */
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse) {
     std::shared_ptr<Query> query = std::make_shared<Query>();
-    if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse)) {
+    switch (parse->type) {
+    case ast::AstType::SelectStmt: {
+        auto x = std::static_pointer_cast<ast::SelectStmt>(parse);
         // 处理表名
         query->tables = std::move(x->tabs);
         /**检查表是否存在 */
@@ -52,7 +54,10 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 处理where条件
         get_clause(x->conds, query->conds);
         check_clause(query->tables, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
+        break;
+    }
+    case ast::AstType::UpdateStmt: {
+        auto x = std::static_pointer_cast<ast::UpdateStmt>(parse);
         /** TODO: */
         query->set_clauses.reserve(x->set_clauses.size());
         for (auto set_clause : x->set_clauses) {
@@ -63,18 +68,27 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
+        break;
+    }
+    case ast::AstType::DeleteStmt: {
+        auto x = std::static_pointer_cast<ast::DeleteStmt>(parse);
         // 处理where条件
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
-    } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
+        break;
+    }
+    case ast::AstType::InsertStmt: {
+        auto x = std::static_pointer_cast<ast::InsertStmt>(parse);
         // 处理insert 的values值
         query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val));
         }
-    } else {
+        break;
+    }
+    default:
         // do nothing
+        break;
     }
     query->parse = std::move(parse);
     return query;
@@ -127,12 +141,22 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv
         Condition cond;
         cond.lhs_col = {.tab_name = expr->lhs->tab_name, .col_name = expr->lhs->col_name};
         cond.op = convert_sv_comp_op(expr->op);
-        if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs)) {
+        switch (expr->rhs->type) {
+        case ast::AstType::IntLit:
+        case ast::AstType::FloatLit:
+        case ast::AstType::StringLit:
+        case ast::AstType::BoolLit:
             cond.is_rhs_val = true;
-            cond.rhs_val = convert_sv_value(rhs_val);
-        } else if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs)) {
+            cond.rhs_val = convert_sv_value(std::static_pointer_cast<ast::Value>(expr->rhs));
+            break;
+        case ast::AstType::Col: {
+            auto rhs_col = std::static_pointer_cast<ast::Col>(expr->rhs);
             cond.is_rhs_val = false;
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
+            break;
+        }
+        default:
+            throw InternalError("Unexpected expression type");
         }
         conds.push_back(cond);
     }
@@ -169,13 +193,24 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
 Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value>& sv_val) {
     Value val;
-    if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(sv_val)) {
+    switch (sv_val->type) {
+    case ast::AstType::IntLit: {
+        auto int_lit = std::static_pointer_cast<ast::IntLit>(sv_val);
         val.set_int(int_lit->val);
-    } else if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(sv_val)) {
+        break;
+    }
+    case ast::AstType::FloatLit: {
+        auto float_lit = std::static_pointer_cast<ast::FloatLit>(sv_val);
         val.set_float(float_lit->val);
-    } else if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(sv_val)) {
+        break;
+    }
+    case ast::AstType::StringLit: {
+        auto str_lit = std::static_pointer_cast<ast::StringLit>(sv_val);
         val.set_str(str_lit->val);
-    } else {
+        break;
+    }
+    case ast::AstType::BoolLit:
+    default:
         throw InternalError("Unexpected sv value type");
     }
     return val;

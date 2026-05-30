@@ -12,7 +12,8 @@ diff-coverage.html
 **/.DS_Store
 testdb
 #忽略AGENT的init文档
-*.md
+AGENTS.md
+CLAUDE.md
 #忽略测试数据库
 test_e2e_db
 testdb

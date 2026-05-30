@@ -61,7 +61,7 @@ public:
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                   ix_manager_.get());
+                                                  ix_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
@@ -116,7 +116,7 @@ public:
         }
         if (ast::parse_tree == nullptr) {
             yy_delete_buffer(buf);
-            return "";  // EXIT or EOF
+            return ""; // EXIT or EOF
         }
         yy_delete_buffer(buf);
 
@@ -183,8 +183,8 @@ enum class SltDirective {
 struct SltTestCase {
     SltDirective directive;
     std::string sql;
-    std::string expected;  // for QUERY: expected output; for STATEMENT_OK/ERROR: unused
-    int line_no;           // line number in .slt file (for error reporting)
+    std::string expected; // for QUERY: expected output; for STATEMENT_OK/ERROR: unused
+    int line_no;          // line number in .slt file (for error reporting)
 };
 
 /// Parse an .slt file and return the list of test cases.
@@ -200,7 +200,7 @@ static std::vector<SltTestCase> parse_slt_file(const std::string& path) {
     SltDirective current_directive = SltDirective::STATEMENT_OK;
     std::string current_sql;
     std::string current_expected;
-    bool in_result = false;   // true when reading expected output after ----
+    bool in_result = false; // true when reading expected output after ----
     int start_line = 0;
 
     auto flush_case = [&]() {
@@ -316,10 +316,10 @@ static std::string resolve_slt_path(const std::string& relative_path) {
 #endif
     // Fallback: try relative paths from common CWD locations
     const char* candidates[] = {
-        "../../../",  // from build/test/<db>/
-        "../../",     // from build/<db>/ or project_root/<db>/
-        "../",        // from build/ or project_root/<db>/
-        "",           // from project root
+        "../../../", // from build/test/<db>/
+        "../../",    // from build/<db>/ or project_root/<db>/
+        "../",       // from build/ or project_root/<db>/
+        "",          // from project root
     };
     for (const auto* base : candidates) {
         std::string full = std::string(base) + relative_path;
@@ -354,21 +354,20 @@ protected:
                 break;
             }
             case SltDirective::STATEMENT_ERROR: {
-                EXPECT_THROW({ db_->exec_sql(tc.sql); }, RMDBError)
-                    << "Expected RMDBError but no exception thrown";
+                EXPECT_THROW({ db_->exec_sql(tc.sql); }, RMDBError) << "Expected RMDBError but no exception thrown";
                 db_->clean_output_txt();
                 break;
             }
             case SltDirective::QUERY: {
                 std::string output;
-                EXPECT_NO_THROW({ output = db_->exec_sql(tc.sql); })
-                    << "Query threw unexpected exception";
+                EXPECT_NO_THROW({ output = db_->exec_sql(tc.sql); }) << "Query threw unexpected exception";
                 // Strip trailing newline from both sides for consistent comparison
-                while (!output.empty() && output.back() == '\n') output.pop_back();
+                while (!output.empty() && output.back() == '\n')
+                    output.pop_back();
                 std::string expected = tc.expected;
-                while (!expected.empty() && expected.back() == '\n') expected.pop_back();
-                EXPECT_EQ(output, expected)
-                    << "Query output mismatch";
+                while (!expected.empty() && expected.back() == '\n')
+                    expected.pop_back();
+                EXPECT_EQ(output, expected) << "Query output mismatch";
                 db_->clean_output_txt();
                 break;
             }
