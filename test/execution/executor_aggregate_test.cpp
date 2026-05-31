@@ -34,7 +34,8 @@ struct TestExecutorHavingCondition {
 
 class FakeExecutor : public AbstractExecutor {
 public:
-    FakeExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> rows) : cols_(std::move(cols)), rows_(std::move(rows)) {
+    FakeExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> rows)
+        : cols_(std::move(cols)), rows_(std::move(rows)) {
         for (const auto& col : cols_) {
             tuple_len_ = std::max(tuple_len_, static_cast<size_t>(col.offset + col.len));
         }

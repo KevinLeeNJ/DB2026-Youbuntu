@@ -103,9 +103,9 @@ std::vector<OrderByItem> bind_order_by_output_names(const Query& query) {
         if (!item.order_name.empty()) {
             continue;
         }
-        auto pos = std::find_if(query.select_items.begin(), query.select_items.end(), [&](const SelectItem& select_item) {
-            return same_query_expr(select_item.expr, item.expr);
-        });
+        auto pos =
+            std::find_if(query.select_items.begin(), query.select_items.end(),
+                         [&](const SelectItem& select_item) { return same_query_expr(select_item.expr, item.expr); });
         if (pos != query.select_items.end()) {
             item.order_name = get_select_item_output_name(*pos);
         }

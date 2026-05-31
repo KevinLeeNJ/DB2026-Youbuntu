@@ -84,4 +84,3 @@ TEST(ExecutionScalarTest, HashesTreatEquivalentMixedNumericValuesConsistently) {
     GroupKey float_key{{as_float}};
     EXPECT_EQ(GroupKeyHash{}(int_key), GroupKeyHash{}(float_key));
 }
-

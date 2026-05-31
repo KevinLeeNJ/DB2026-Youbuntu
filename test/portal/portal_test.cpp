@@ -82,7 +82,9 @@ protected:
                                                std::vector<std::string>{});
 
         std::vector<AggExpr> agg_exprs = {
-            {.type = AggType::MAX, .is_star = false, .col = {.tab_name = "grade", .col_name = "score"},
+            {.type = AggType::MAX,
+             .is_star = false,
+             .col = {.tab_name = "grade", .col_name = "score"},
              .display_name = "MAX(score)"},
         };
         std::vector<TabCol> group_by_cols = {
@@ -105,9 +107,9 @@ protected:
         agg_item.alias = "max_score";
         agg_item.output_name = "max_score";
 
-        auto projection = std::make_shared<ProjectionPlan>(T_Projection, aggregate,
-                                                           std::vector<SelectItem>{group_item, agg_item},
-                                                           std::vector<std::string>{"id", "max_score"});
+        auto projection =
+            std::make_shared<ProjectionPlan>(T_Projection, aggregate, std::vector<SelectItem>{group_item, agg_item},
+                                             std::vector<std::string>{"id", "max_score"});
 
         OrderByItem order_by;
         order_by.expr = make_agg_expr(AggType::MAX, "score", "MAX(score)");
@@ -126,9 +128,8 @@ TEST_F(PortalAggregateTest, get_plan_output_names_handles_aggregate_and_projecti
     auto sort = std::static_pointer_cast<SortPlan>(plan);
 
     auto projection_output_names = portal_->get_plan_output_names(sort->subplan_);
-    auto aggregate_output_names =
-        portal_->build_aggregate_output_names(*std::static_pointer_cast<AggregatePlan>(
-            std::static_pointer_cast<ProjectionPlan>(sort->subplan_)->subplan_));
+    auto aggregate_output_names = portal_->build_aggregate_output_names(
+        *std::static_pointer_cast<AggregatePlan>(std::static_pointer_cast<ProjectionPlan>(sort->subplan_)->subplan_));
 
     EXPECT_EQ(projection_output_names, (std::vector<std::string>{"id", "max_score"}));
     EXPECT_EQ(aggregate_output_names, (std::vector<std::string>{"id", "MAX(score)"}));

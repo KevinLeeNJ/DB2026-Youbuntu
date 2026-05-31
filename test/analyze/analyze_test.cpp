@@ -178,9 +178,9 @@ std::shared_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::shared_ptr<as
                                                   std::vector<std::shared_ptr<ast::Col>> group_by_cols = {},
                                                   std::vector<std::shared_ptr<ast::HavingExpr>> having_conds = {}) {
     return std::make_shared<ast::SelectStmt>(std::move(select_items), std::vector<std::string>{"grade"},
-                                             std::vector<std::shared_ptr<ast::BinaryExpr>>{},
-                                             std::move(group_by_cols), std::move(having_conds),
-                                             std::vector<std::shared_ptr<ast::OrderByItem>>{}, false, 0, false);
+                                             std::vector<std::shared_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols),
+                                             std::move(having_conds), std::vector<std::shared_ptr<ast::OrderByItem>>{},
+                                             false, 0, false);
 }
 
 } // namespace
@@ -266,8 +266,9 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_mixed_aggregate_without_group_by
         (void)analyze_.do_analyze(stmt);
         FAIL() << "expected aggregate mixing validation failure";
     } catch (const RMDBError& err) {
-        EXPECT_NE(std::string(err.what()).find("SELECT list cannot mix aggregate and non-aggregate columns without "
-                                               "GROUP BY"),
+        EXPECT_NE(std::string(err.what())
+                      .find("SELECT list cannot mix aggregate and non-aggregate columns without "
+                            "GROUP BY"),
                   std::string::npos);
     }
 }

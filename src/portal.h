@@ -96,8 +96,9 @@ private:
             ExecutorSelectItem executor_item;
             executor_item.expr = to_executor_query_expr(item.expr);
             executor_item.alias = item.alias;
-            executor_item.display_name =
-                !item.output_name.empty() ? item.output_name : (!item.alias.empty() ? item.alias : item.expr.display_name);
+            executor_item.display_name = !item.output_name.empty()
+                                             ? item.output_name
+                                             : (!item.alias.empty() ? item.alias : item.expr.display_name);
             executor_item.output_name = item.output_name;
             executor_items.push_back(std::move(executor_item));
         }
@@ -168,10 +169,9 @@ private:
             if (!item.order_name.empty()) {
                 continue;
             }
-            auto pos =
-                std::find_if(projection->select_items_.begin(), projection->select_items_.end(), [&](const SelectItem& select_item) {
-                    return same_query_expr(select_item.expr, item.expr);
-                });
+            auto pos = std::find_if(
+                projection->select_items_.begin(), projection->select_items_.end(),
+                [&](const SelectItem& select_item) { return same_query_expr(select_item.expr, item.expr); });
             if (pos != projection->select_items_.end()) {
                 item.order_name = get_select_item_output_name(*pos);
             }
