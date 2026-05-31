@@ -117,7 +117,7 @@ void* client_handler(void* sock_fd) {
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         Context* context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
-        // SetTransaction(&txn_id, context);
+        SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
@@ -137,6 +137,11 @@ void* client_handler(void* sock_fd) {
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context);
                     portal->drop();
+                    if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+                        context->txn_->get_state() != TransactionState::COMMITTED &&
+                        context->txn_->get_state() != TransactionState::ABORTED) {
+                        txn_manager->commit(context->txn_, context->log_mgr_);
+                    }
                 } catch (TransactionAbortException& e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     std::string str = "abort\n";
@@ -145,7 +150,10 @@ void* client_handler(void* sock_fd) {
                     offset = str.length();
 
                     // 回滚事务
-                    txn_manager->abort(context->txn_, log_manager.get());
+                    if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
+                        context->txn_->get_state() != TransactionState::COMMITTED) {
+                        txn_manager->abort(context->txn_, log_manager.get());
+                    }
                     std::cout << e.GetInfo() << std::endl;
 
                     std::fstream outfile;
@@ -161,6 +169,12 @@ void* client_handler(void* sock_fd) {
                     data_send[e.get_msg_len() + 1] = '\0';
                     offset = e.get_msg_len() + 1;
 
+                    if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+                        context->txn_->get_state() != TransactionState::COMMITTED &&
+                        context->txn_->get_state() != TransactionState::ABORTED) {
+                        txn_manager->abort(context->txn_, context->log_mgr_);
+                    }
+
                     // 将报错信息写入output.txt
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
@@ -172,6 +186,12 @@ void* client_handler(void* sock_fd) {
             // 解析失败，将 failure 信息写入 output.txt 并返回给客户端
             // where 中含有聚合函数时，会出现解析失败的情况，此处需要打印一个 failure
             std::cerr << "Parse error" << std::endl;
+
+            if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+                context->txn_->get_state() != TransactionState::COMMITTED &&
+                context->txn_->get_state() != TransactionState::ABORTED) {
+                txn_manager->abort(context->txn_, context->log_mgr_);
+            }
 
             std::string str = "Parse error\n";
             memcpy(data_send, str.c_str(), str.length());
@@ -192,11 +212,6 @@ void* client_handler(void* sock_fd) {
         if (write(fd, data_send, offset + 1) == -1) {
             break;
         }
-        // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        // if(context->txn_->get_txn_mode() == false)
-        // {
-        //     txn_manager->commit(context->txn_, context->log_mgr_);
-        // }
     }
 
     // Clear

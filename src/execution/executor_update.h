@@ -86,6 +86,9 @@ public:
                     }
                     index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
                 }
+                if (context_ != nullptr && context_->txn_ != nullptr) {
+                    context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
+                }
 
                 std::vector<size_t> deleted_indexes;
                 std::vector<size_t> inserted_indexes;

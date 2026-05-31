@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
  * @return {unique_ptr<RmRecord>} rid对应的记录对象指针
  */
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
+    (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
@@ -24,6 +25,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     int size_ = tmp_page_handle.file_hdr->record_size;
     char* data_ = tmp_page_handle.get_slot(rid.slot_no);
     std::unique_ptr<RmRecord> record_ptr(new RmRecord(size_, data_));
+    buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
     return record_ptr;
 }
 
@@ -60,14 +62,18 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
-    if (rid.page_no < file_hdr_.num_pages) {
-        create_new_page_handle();
+    while (rid.page_no >= file_hdr_.num_pages) {
+        auto new_page = create_new_page_handle();
+        buffer_pool_manager_->unpin_page(new_page.page->get_page_id(), true);
     }
     RmPageHandle pageHandle = fetch_page_handle(rid.page_no);
-    Bitmap::set(pageHandle.bitmap, rid.slot_no);
-    pageHandle.page_hdr->num_records++;
-    if (pageHandle.page_hdr->num_records == file_hdr_.num_records_per_page) {
-        file_hdr_.first_free_page_no = pageHandle.page_hdr->next_free_page_no;
+    bool was_free = !Bitmap::is_set(pageHandle.bitmap, rid.slot_no);
+    if (was_free) {
+        Bitmap::set(pageHandle.bitmap, rid.slot_no);
+        pageHandle.page_hdr->num_records++;
+        if (pageHandle.page_hdr->num_records == file_hdr_.num_records_per_page) {
+            file_hdr_.first_free_page_no = pageHandle.page_hdr->next_free_page_no;
+        }
     }
 
     char* slot = pageHandle.get_slot(rid.slot_no);
@@ -88,6 +94,7 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
     RmPageHandle deletepage_handle = fetch_page_handle(rid.page_no);
     if (!Bitmap::is_set(deletepage_handle.bitmap, rid.slot_no)) {
+        buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), false);
         return;
     }
     Bitmap::reset(deletepage_handle.bitmap, rid.slot_no);
@@ -105,11 +112,13 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @param {Context*} context
  */
 void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
+    (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 更新记录
     RmPageHandle updatepage_handle = fetch_page_handle(rid.page_no);
     memcpy(updatepage_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), true);
 }
 
 /**
