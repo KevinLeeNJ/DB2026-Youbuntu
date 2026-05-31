@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -22,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "errors.h"
 #include "execution_defs.h"
+#include "execution_scalar.h"
 #include "executor_abstract.h"
 
 class AggregateExecutor : public AbstractExecutor {
@@ -29,45 +31,8 @@ private:
     enum class LocalAggType { COUNT = 0, MAX = 1, MIN = 2, SUM = 3, AVG = 4 };
     enum class OperandKind { GROUP_COL, AGG_RESULT, VALUE };
 
-    struct CellValue {
-        ColType type = TYPE_INT;
-        int int_val = 0;
-        float float_val = 0.0f;
-        std::string str_val;
-
-        bool operator==(const CellValue& other) const {
-            if (type != other.type) {
-                return false;
-            }
-            switch (type) {
-            case TYPE_INT:
-                return int_val == other.int_val;
-            case TYPE_FLOAT:
-                return float_val == other.float_val;
-            case TYPE_STRING:
-                return str_val == other.str_val;
-            }
-            return false;
-        }
-    };
-
-    struct CellValueHash {
-        size_t operator()(const CellValue& value) const {
-            size_t seed = std::hash<int>()(static_cast<int>(value.type));
-            switch (value.type) {
-            case TYPE_INT:
-                seed ^= std::hash<int>()(value.int_val) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-                break;
-            case TYPE_FLOAT:
-                seed ^= std::hash<float>()(value.float_val) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-                break;
-            case TYPE_STRING:
-                seed ^= std::hash<std::string>()(value.str_val) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-                break;
-            }
-            return seed;
-        }
-    };
+    using CellValue = execution_scalar::CellValue;
+    using CellValueHash = execution_scalar::CellValueHash;
 
     struct GroupKey {
         std::vector<CellValue> values;
@@ -82,7 +47,7 @@ private:
             size_t seed = 0;
             CellValueHash hash_cell;
             for (const auto& value : key.values) {
-                seed ^= hash_cell(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+                execution_scalar::hash_combine(seed, hash_cell(value));
             }
             return seed;
         }
@@ -95,6 +60,7 @@ private:
         std::string output_name;
         ColType input_type = TYPE_INT;
         int input_len = static_cast<int>(sizeof(int));
+        ColMeta input_col;
     };
 
     struct AggregateState {
@@ -121,10 +87,15 @@ private:
         HavingOperand rhs;
     };
 
-    template <typename T, typename = void> struct has_member_expr : std::false_type {};
+    template <typename T, typename = void> struct has_member_val : std::false_type {};
 
     template <typename T>
-    struct has_member_expr<T, std::void_t<decltype(std::declval<const T&>().expr)>> : std::true_type {};
+    struct has_member_val<T, std::void_t<decltype(std::declval<const T&>().val)>> : std::true_type {};
+
+    template <typename T, typename = void> struct has_member_value : std::false_type {};
+
+    template <typename T>
+    struct has_member_value<T, std::void_t<decltype(std::declval<const T&>().value)>> : std::true_type {};
 
     template <typename T, typename = void> struct has_member_agg : std::false_type {};
 
@@ -137,13 +108,13 @@ private:
     std::vector<ColMeta> group_cols_;
     std::vector<AggregateSpec> aggregates_;
     std::vector<HavingSpec> having_conds_;
-    std::vector<RmRecord> results_;
+    std::vector<GroupState> groups_;
     size_t cursor_ = 0;
     bool materialized_ = false;
     bool has_group_by_ = false;
 
     static std::string trim_string(const char* data, int len) {
-        return std::string(data, strnlen(data, len));
+        return execution_scalar::trim_string(data, len);
     }
 
     static LocalAggType normalize_agg_type(int type_code) {
@@ -182,56 +153,7 @@ private:
     }
 
     static int compare_cells(const CellValue& lhs, const CellValue& rhs) {
-        if (lhs.type == TYPE_INT && rhs.type == TYPE_FLOAT) {
-            float lhs_val = static_cast<float>(lhs.int_val);
-            if (lhs_val < rhs.float_val) {
-                return -1;
-            }
-            if (lhs_val > rhs.float_val) {
-                return 1;
-            }
-            return 0;
-        }
-        if (lhs.type == TYPE_FLOAT && rhs.type == TYPE_INT) {
-            float rhs_val = static_cast<float>(rhs.int_val);
-            if (lhs.float_val < rhs_val) {
-                return -1;
-            }
-            if (lhs.float_val > rhs_val) {
-                return 1;
-            }
-            return 0;
-        }
-        if (lhs.type != rhs.type) {
-            throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
-        }
-        switch (lhs.type) {
-        case TYPE_INT:
-            if (lhs.int_val < rhs.int_val) {
-                return -1;
-            }
-            if (lhs.int_val > rhs.int_val) {
-                return 1;
-            }
-            return 0;
-        case TYPE_FLOAT:
-            if (lhs.float_val < rhs.float_val) {
-                return -1;
-            }
-            if (lhs.float_val > rhs.float_val) {
-                return 1;
-            }
-            return 0;
-        case TYPE_STRING:
-            if (lhs.str_val < rhs.str_val) {
-                return -1;
-            }
-            if (lhs.str_val > rhs.str_val) {
-                return 1;
-            }
-            return 0;
-        }
-        throw InternalError("Unexpected cell type");
+        return execution_scalar::compare_cells(lhs, rhs);
     }
 
     static bool compare_with_op(CompOp op, int cmp) {
@@ -253,14 +175,18 @@ private:
     }
 
     static CellValue zero_value(ColType type) {
-        CellValue value;
-        value.type = type;
-        if (type == TYPE_INT) {
-            value.int_val = 0;
-        } else if (type == TYPE_FLOAT) {
-            value.float_val = 0.0f;
+        return execution_scalar::zero_value(type);
+    }
+
+    template <typename ExprT> static const Value& get_expr_literal_value(const ExprT& expr) {
+        if constexpr (has_member_val<ExprT>::value) {
+            return expr.val;
+        } else if constexpr (has_member_value<ExprT>::value) {
+            return expr.value;
+        } else {
+            static_assert(has_member_val<ExprT>::value || has_member_value<ExprT>::value,
+                          "Expression type must expose val or value");
         }
-        return value;
     }
 
     void write_cell(char* dest, const ColMeta& col, const CellValue& value) const {
@@ -310,9 +236,9 @@ private:
             spec.input_type = TYPE_INT;
             spec.input_len = static_cast<int>(sizeof(int));
         } else {
-            ColMeta input_col = find_input_col(spec.col);
-            spec.input_type = input_col.type;
-            spec.input_len = input_col.len;
+            spec.input_col = find_input_col(spec.col);
+            spec.input_type = spec.input_col.type;
+            spec.input_len = spec.input_col.len;
         }
         return spec;
     }
@@ -329,15 +255,16 @@ private:
         HavingOperand operand;
         const int expr_type = static_cast<int>(expr.type);
         if (expr_type == 2) {
+            const Value& literal = get_expr_literal_value(expr);
             operand.kind = OperandKind::VALUE;
-            operand.literal = zero_value(expr.val.type);
-            operand.literal.type = expr.val.type;
-            if (expr.val.type == TYPE_INT) {
-                operand.literal.int_val = expr.val.int_val;
-            } else if (expr.val.type == TYPE_FLOAT) {
-                operand.literal.float_val = expr.val.float_val;
+            operand.literal = zero_value(literal.type);
+            operand.literal.type = literal.type;
+            if (literal.type == TYPE_INT) {
+                operand.literal.int_val = literal.int_val;
+            } else if (literal.type == TYPE_FLOAT) {
+                operand.literal.float_val = literal.float_val;
             } else {
-                operand.literal.str_val = expr.val.str_val;
+                operand.literal.str_val = literal.str_val;
             }
             return operand;
         }
@@ -405,7 +332,7 @@ private:
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec) const {
         CellValue current_value;
         if (!spec.is_star) {
-            current_value = read_cell(rec, find_input_col(spec.col));
+            current_value = read_cell(rec, spec.input_col);
         }
 
         switch (spec.type) {
@@ -434,6 +361,15 @@ private:
             }
             break;
         }
+    }
+
+    std::vector<CellValue> finalize_aggregate_values(const GroupState& group_state) const {
+        std::vector<CellValue> aggregate_values;
+        aggregate_values.reserve(aggregates_.size());
+        for (size_t i = 0; i < aggregates_.size(); ++i) {
+            aggregate_values.push_back(finalize_aggregate(aggregates_[i], group_state.aggregate_states[i]));
+        }
+        return aggregate_values;
     }
 
     CellValue finalize_aggregate(const AggregateSpec& spec, const AggregateState& state) const {
@@ -496,16 +432,13 @@ private:
         return true;
     }
 
-    void emit_group_result(const GroupState& group_state) {
-        std::vector<CellValue> aggregate_values;
-        aggregate_values.reserve(aggregates_.size());
-        for (size_t i = 0; i < aggregates_.size(); ++i) {
-            aggregate_values.push_back(finalize_aggregate(aggregates_[i], group_state.aggregate_states[i]));
-        }
-        if (!passes_having(group_state.group_values, aggregate_values)) {
-            return;
-        }
+    bool passes_having(const GroupState& group_state) const {
+        std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
+        return passes_having(group_state.group_values, aggregate_values);
+    }
 
+    std::unique_ptr<RmRecord> materialize_group_result(const GroupState& group_state) const {
+        std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
         RmRecord rec(static_cast<int>(len_));
         std::memset(rec.data, 0, len_);
         for (size_t i = 0; i < group_state.group_values.size(); ++i) {
@@ -514,7 +447,7 @@ private:
         for (size_t i = 0; i < aggregate_values.size(); ++i) {
             write_cell(rec.data, cols_[group_state.group_values.size() + i], aggregate_values[i]);
         }
-        results_.push_back(rec);
+        return std::make_unique<RmRecord>(rec);
     }
 
     GroupState make_group_state(const std::vector<CellValue>& group_values) const {
@@ -527,11 +460,10 @@ private:
         return state;
     }
 
-    void materialize_results() {
-        results_.clear();
+    void materialize_groups() {
+        groups_.clear();
         if (has_group_by_) {
-            std::unordered_map<GroupKey, GroupState, GroupKeyHash> groups;
-            std::vector<GroupKey> group_order;
+            std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 auto rec = prev_->Next();
                 if (rec == nullptr) {
@@ -544,36 +476,42 @@ private:
                     key.values.push_back(read_cell(*rec, col));
                 }
 
-                auto [it, inserted] = groups.emplace(key, make_group_state(key.values));
+                auto [it, inserted] = group_indexes.emplace(key, groups_.size());
                 if (inserted) {
-                    group_order.push_back(key);
+                    groups_.push_back(make_group_state(key.values));
                 }
                 for (size_t i = 0; i < aggregates_.size(); ++i) {
-                    update_aggregate_state(it->second.aggregate_states[i], aggregates_[i], *rec);
+                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec);
                 }
             }
 
-            for (const auto& key : group_order) {
-                emit_group_result(groups.at(key));
+            size_t kept = 0;
+            for (size_t i = 0; i < groups_.size(); ++i) {
+                if (!passes_having(groups_[i])) {
+                    continue;
+                }
+                if (kept != i) {
+                    groups_[kept] = std::move(groups_[i]);
+                }
+                ++kept;
             }
+            groups_.resize(kept);
             return;
         }
 
         GroupState global_state = make_group_state({});
-        bool saw_input = false;
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = prev_->Next();
             if (rec == nullptr) {
                 continue;
             }
-            saw_input = true;
             for (size_t i = 0; i < aggregates_.size(); ++i) {
                 update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], *rec);
             }
         }
 
-        if (saw_input || !aggregates_.empty() || !has_group_by_) {
-            emit_group_result(global_state);
+        if (passes_having(global_state)) {
+            groups_.push_back(std::move(global_state));
         }
     }
 
@@ -582,7 +520,7 @@ private:
         for (const auto& group_by_col : group_by_cols) {
             ColMeta input_col = find_input_col(group_by_col);
             group_cols_.push_back(input_col);
-            append_output_col(input_col, input_col.name);
+            append_output_col(input_col, "");
         }
     }
 
@@ -645,7 +583,7 @@ public:
 
     void beginTuple() override {
         if (!materialized_) {
-            materialize_results();
+            materialize_groups();
             materialized_ = true;
         }
         cursor_ = 0;
@@ -661,11 +599,11 @@ public:
         if (is_end()) {
             return nullptr;
         }
-        return std::make_unique<RmRecord>(results_[cursor_]);
+        return materialize_group_result(groups_[cursor_]);
     }
 
     bool is_end() const override {
-        return cursor_ >= results_.size();
+        return cursor_ >= groups_.size();
     }
 
     Rid& rid() override {

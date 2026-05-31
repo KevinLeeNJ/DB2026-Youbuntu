@@ -9,6 +9,8 @@
 #include "execution/executor_update.h"
 #undef private
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include "gtest/gtest.h"
 #include "system/sm_manager.h"
@@ -19,6 +21,86 @@
 #include "common/config.h"
 
 const std::string TEST_DB_NAME = "executor_test_db";
+
+namespace {
+
+ColMeta make_test_col(const std::string& tab_name, const std::string& name, ColType type, int len, int offset) {
+    return ColMeta{tab_name, name, type, len, offset, false};
+}
+
+RmRecord make_join_record(int value) {
+    RmRecord rec(sizeof(int));
+    std::memcpy(rec.data, &value, sizeof(int));
+    return rec;
+}
+
+class CountingExecutor : public AbstractExecutor {
+public:
+    CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records)
+        : cols_(std::move(cols)), records_(std::move(records)) {
+        len_ = 0;
+        for (const auto& col : cols_) {
+            len_ = std::max(len_, static_cast<size_t>(col.offset + col.len));
+        }
+    }
+
+    void beginTuple() override {
+        ++begin_calls_;
+        cursor_ = 0;
+    }
+
+    void nextTuple() override {
+        ++next_calls_;
+        if (!is_end()) {
+            ++cursor_;
+        }
+    }
+
+    std::unique_ptr<RmRecord> Next() override {
+        ++next_record_calls_;
+        if (is_end()) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(records_[cursor_]);
+    }
+
+    Rid& rid() override {
+        return _abstract_rid;
+    }
+
+    bool is_end() const override {
+        return cursor_ >= records_.size();
+    }
+
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+
+    size_t tupleLen() const override {
+        return len_;
+    }
+
+    ColMeta get_col_offset(const TabCol& target) override {
+        for (const auto& col : cols_) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                return col;
+            }
+        }
+        throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+    }
+
+    int begin_calls_ = 0;
+    int next_calls_ = 0;
+    int next_record_calls_ = 0;
+
+private:
+    std::vector<ColMeta> cols_;
+    std::vector<RmRecord> records_;
+    size_t len_ = 0;
+    size_t cursor_ = 0;
+};
+
+} // namespace
 
 class ExecutorTest : public ::testing::Test {
 public:
@@ -825,4 +907,106 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
     auto rec = scan.Next();
     int id = *reinterpret_cast<int*>(rec->data);
     EXPECT_EQ(id, 5);
+}
+
+TEST(ExecutorJoinFocusedTest, PrecomputesConditionMetadataWithAdjustedRightOffsets) {
+    auto left = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("left_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(1)});
+    auto right = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("right_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(1)});
+
+    Condition cond;
+    cond.lhs_col = {"left_t", "id"};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = false;
+    cond.rhs_col = {"right_t", "id"};
+
+    NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond});
+
+    ASSERT_EQ(exec.cols_.size(), 2U);
+    ASSERT_EQ(exec.cols_map.size(), 2U);
+    EXPECT_EQ(exec.cols_map.at("left_t.id")->offset, 0);
+    EXPECT_EQ(exec.cols_map.at("right_t.id")->offset, sizeof(int));
+    EXPECT_EQ(exec.fed_conds_.size(), 1U);
+    EXPECT_EQ(exec.fed_conds_[0].lhs_col.tab_name, "left_t");
+    EXPECT_EQ(exec.fed_conds_[0].rhs_col.tab_name, "right_t");
+}
+
+TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches) {
+    auto left = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("left_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(7)});
+    auto right = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("right_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(7), make_join_record(7)});
+
+    Condition cond;
+    cond.lhs_col = {"left_t", "id"};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = false;
+    cond.rhs_col = {"right_t", "id"};
+
+    NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond});
+
+    exec.beginTuple();
+    ASSERT_FALSE(exec.is_end());
+    ASSERT_NE(exec.current_left_rec_, nullptr);
+    ASSERT_NE(exec._buffered_record, nullptr);
+    const RmRecord* first_left_ptr = exec.current_left_rec_.get();
+
+    auto first = exec.Next();
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(first->data), 7);
+    EXPECT_EQ(*reinterpret_cast<int*>(first->data + sizeof(int)), 7);
+
+    exec.nextTuple();
+    ASSERT_FALSE(exec.is_end());
+    ASSERT_NE(exec.current_left_rec_, nullptr);
+    EXPECT_EQ(exec.current_left_rec_.get(), first_left_ptr);
+    ASSERT_NE(exec._buffered_record, nullptr);
+
+    auto second = exec.Next();
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(second->data), 7);
+    EXPECT_EQ(*reinterpret_cast<int*>(second->data + sizeof(int)), 7);
+
+    exec.nextTuple();
+    EXPECT_TRUE(exec.is_end());
+    EXPECT_EQ(exec.current_left_rec_, nullptr);
+}
+
+TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
+    auto left = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("left_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(1), make_join_record(2)});
+    auto right = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("right_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(1), make_join_record(1), make_join_record(2)});
+    auto* left_ptr = left.get();
+    auto* right_ptr = right.get();
+
+    Condition cond;
+    cond.lhs_col = {"left_t", "id"};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = false;
+    cond.rhs_col = {"right_t", "id"};
+
+    NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond});
+
+    int produced = 0;
+    for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
+        auto rec = exec.Next();
+        ASSERT_NE(rec, nullptr);
+        ++produced;
+    }
+
+    EXPECT_EQ(produced, 3);
+    EXPECT_EQ(left_ptr->begin_calls_, 1);
+    EXPECT_EQ(left_ptr->next_record_calls_, 3);
+    EXPECT_EQ(left_ptr->next_calls_, 2);
+    EXPECT_EQ(right_ptr->begin_calls_, 3);
+    EXPECT_EQ(right_ptr->next_record_calls_, 8);
+    EXPECT_EQ(right_ptr->next_calls_, 6);
 }

@@ -34,6 +34,22 @@ bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
            (lhs.is_star || same_tab_col(lhs.col, rhs.col));
 }
 
+bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
+    if (lhs.type != rhs.type) {
+        return false;
+    }
+    switch (lhs.type) {
+    case QueryExprType::COLUMN:
+        return same_tab_col(lhs.col, rhs.col);
+    case QueryExprType::VALUE:
+        return false;
+    case QueryExprType::AGGREGATE:
+        return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
+               (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+    }
+    return false;
+}
+
 void append_agg_expr_if_needed(std::vector<AggExpr>& agg_exprs, const QueryExpr& expr) {
     if (expr.type != QueryExprType::AGGREGATE) {
         return;
@@ -63,6 +79,38 @@ std::vector<AggExpr> collect_aggregate_exprs(const Query& query) {
 
 bool needs_aggregate_plan(const Query& query) {
     return query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty();
+}
+
+std::string get_select_item_output_name(const SelectItem& item) {
+    if (!item.output_name.empty()) {
+        return item.output_name;
+    }
+    if (!item.alias.empty()) {
+        return item.alias;
+    }
+    if (!item.expr.display_name.empty()) {
+        return item.expr.display_name;
+    }
+    if (item.expr.type == QueryExprType::AGGREGATE) {
+        return item.expr.agg.display_name;
+    }
+    return item.expr.col.col_name;
+}
+
+std::vector<OrderByItem> bind_order_by_output_names(const Query& query) {
+    auto order_by_items = query.order_by_items;
+    for (auto& item : order_by_items) {
+        if (!item.order_name.empty()) {
+            continue;
+        }
+        auto pos = std::find_if(query.select_items.begin(), query.select_items.end(), [&](const SelectItem& select_item) {
+            return same_query_expr(select_item.expr, item.expr);
+        });
+        if (pos != query.select_items.end()) {
+            item.order_name = get_select_item_output_name(*pos);
+        }
+    }
+    return order_by_items;
 }
 
 } // namespace
@@ -383,11 +431,15 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
     if (query->order_by_items.empty()) {
         return plan;
     }
-    return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_items);
+    int sort_limit = query->has_limit ? query->limit : -1;
+    return std::make_shared<SortPlan>(T_Sort, std::move(plan), bind_order_by_output_names(*query), sort_limit);
 }
 
 std::shared_ptr<Plan> Planner::generate_limit_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan) {
     if (!query->has_limit) {
+        return plan;
+    }
+    if (!query->order_by_items.empty()) {
         return plan;
     }
     return std::make_shared<LimitPlan>(T_Limit, std::move(plan), query->limit);

@@ -152,3 +152,122 @@ TEST(AnalyzeGetClauseTest, single_cond_with_col) {
     EXPECT_EQ(conds[0].rhs_col.tab_name, "t2");
     EXPECT_EQ(conds[0].rhs_col.col_name, "y");
 }
+
+namespace {
+
+TabMeta make_grade_tab() {
+    TabMeta tab;
+    tab.name = "grade";
+    tab.cols = {
+        {.tab_name = "grade", .name = "id", .type = TYPE_INT, .len = 4, .offset = 0, .index = false},
+        {.tab_name = "grade", .name = "course", .type = TYPE_STRING, .len = 16, .offset = 4, .index = false},
+        {.tab_name = "grade", .name = "score", .type = TYPE_INT, .len = 4, .offset = 20, .index = false},
+    };
+    return tab;
+}
+
+std::shared_ptr<ast::AggExpr> make_ast_agg(ast::AggFuncType func, const std::string& col_name) {
+    return std::make_shared<ast::AggExpr>(func, false, std::make_shared<ast::Col>("", col_name));
+}
+
+std::shared_ptr<ast::AggExpr> make_ast_count_star() {
+    return std::make_shared<ast::AggExpr>(ast::AGG_COUNT, true, nullptr);
+}
+
+std::shared_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::shared_ptr<ast::SelectItem>> select_items,
+                                                  std::vector<std::shared_ptr<ast::Col>> group_by_cols = {},
+                                                  std::vector<std::shared_ptr<ast::HavingExpr>> having_conds = {}) {
+    return std::make_shared<ast::SelectStmt>(std::move(select_items), std::vector<std::string>{"grade"},
+                                             std::vector<std::shared_ptr<ast::BinaryExpr>>{},
+                                             std::move(group_by_cols), std::move(having_conds),
+                                             std::vector<std::shared_ptr<ast::OrderByItem>>{}, false, 0, false);
+}
+
+} // namespace
+
+class AnalyzeAggregateTest : public ::testing::Test {
+protected:
+    SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr};
+    Analyze analyze_{&sm_manager_};
+
+    void SetUp() override {
+        sm_manager_.db_.SetTabMeta("grade", make_grade_tab());
+    }
+};
+
+TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
+    auto stmt = make_select_stmt(
+        {
+            std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "id"), ""),
+            std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "max_score"),
+        },
+        {std::make_shared<ast::Col>("", "id")},
+        {std::make_shared<ast::HavingExpr>(make_ast_count_star(), ast::SV_OP_GT, std::make_shared<ast::IntLit>(1))});
+
+    auto query = analyze_.do_analyze(stmt);
+
+    ASSERT_EQ(query->select_items.size(), 2);
+    EXPECT_TRUE(query->has_aggregate);
+    EXPECT_EQ(query->group_by_cols.size(), 1);
+    EXPECT_EQ(query->group_by_cols[0].tab_name, "grade");
+    EXPECT_EQ(query->group_by_cols[0].col_name, "id");
+    EXPECT_EQ(query->select_items[0].expr.col.tab_name, "grade");
+    EXPECT_EQ(query->select_items[1].expr.agg.col.tab_name, "grade");
+    EXPECT_EQ(query->select_items[1].expr.agg.display_name, "MAX(score)");
+    ASSERT_EQ(query->having_conds.size(), 1);
+    EXPECT_EQ(query->having_conds[0].lhs.type, QueryExprType::AGGREGATE);
+    EXPECT_EQ(query->having_conds[0].lhs.agg.display_name, "COUNT(*)");
+    EXPECT_EQ(query->output_names, (std::vector<std::string>{"id", "max_score"}));
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_select_column_not_in_group_by) {
+    auto stmt = make_select_stmt(
+        {
+            std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "course"), ""),
+            std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), ""),
+        },
+        {std::make_shared<ast::Col>("", "id")});
+
+    try {
+        (void)analyze_.do_analyze(stmt);
+        FAIL() << "expected group-by validation failure";
+    } catch (const RMDBError& err) {
+        EXPECT_NE(std::string(err.what()).find("SELECT list contains a non-aggregated column that is not in GROUP BY"),
+                  std::string::npos);
+    }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_having_column_not_in_group_by) {
+    auto stmt = make_select_stmt(
+        {
+            std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "id"), ""),
+            std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), ""),
+        },
+        {std::make_shared<ast::Col>("", "id")},
+        {std::make_shared<ast::HavingExpr>(std::make_shared<ast::Col>("", "score"), ast::SV_OP_GT,
+                                           std::make_shared<ast::IntLit>(90))});
+
+    try {
+        (void)analyze_.do_analyze(stmt);
+        FAIL() << "expected having validation failure";
+    } catch (const RMDBError& err) {
+        EXPECT_NE(std::string(err.what()).find("HAVING contains a non-aggregated column that is not in GROUP BY"),
+                  std::string::npos);
+    }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_mixed_aggregate_without_group_by) {
+    auto stmt = make_select_stmt({
+        std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "id"), ""),
+        std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), ""),
+    });
+
+    try {
+        (void)analyze_.do_analyze(stmt);
+        FAIL() << "expected aggregate mixing validation failure";
+    } catch (const RMDBError& err) {
+        EXPECT_NE(std::string(err.what()).find("SELECT list cannot mix aggregate and non-aggregate columns without "
+                                               "GROUP BY"),
+                  std::string::npos);
+    }
+}
