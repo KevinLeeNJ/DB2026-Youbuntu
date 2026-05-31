@@ -61,7 +61,9 @@ public:
             return std::make_shared<OtherPlan>(T_Transaction_rollback, std::string());
         case ast::AstType::SetStmt: {
             auto x = std::static_pointer_cast<ast::SetStmt>(query->parse);
-            // Set Knob Plan
+            if (x->set_type_ == ast::SetIsolation) {
+                return std::make_shared<SetIsolationPlan>(x->isolation_level_);
+            }
             return std::make_shared<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
         }
         default:

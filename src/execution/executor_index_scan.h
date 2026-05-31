@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <optional>
@@ -38,6 +39,15 @@ private:
     std::unique_ptr<RecScan> scan_;
 
     SmManager* sm_manager_;
+    bool predicate_recorded_{false};
+    bool materialized_mode_{false};
+
+    struct MatchedTuple {
+        Rid rid;
+        RmRecord record;
+    };
+    std::vector<MatchedTuple> materialized_;
+    size_t materialized_pos_{0};
 
     struct BoundValue {
         std::vector<char> data;
@@ -108,6 +118,70 @@ private:
 
     static int compare_key_part(const std::vector<char>& lhs, const std::vector<char>& rhs, const ColMeta& col) {
         return ix_compare(lhs.data(), rhs.data(), col.type, col.len);
+    }
+
+    int compare_index_record(const RmRecord& lhs, const RmRecord& rhs) const {
+        for (const auto& col : index_meta_.cols) {
+            int cmp = ix_compare(lhs.data + col.offset, rhs.data + col.offset, col.type, col.len);
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        return 0;
+    }
+
+    bool need_snapshot_safe_scan() const {
+        if (context_ == nullptr || context_->txn_ == nullptr) {
+            return false;
+        }
+        auto level = context_->txn_->get_isolation_level();
+        return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE;
+    }
+
+    void begin_materialized_scan() {
+        materialized_mode_ = true;
+        scan_.reset();
+        materialized_.clear();
+        materialized_pos_ = 0;
+
+        RmScan scan(fh_);
+        while (!scan.is_end()) {
+            auto current_rid = scan.rid();
+            auto rec = fh_->get_record(current_rid, context_);
+            scan.next();
+            if (rec == nullptr) {
+                continue;
+            }
+            bool match = true;
+            for (const auto& cond : fed_conds_) {
+                if (!compare(cond, *rec)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) {
+                continue;
+            }
+            materialized_.push_back(MatchedTuple{current_rid, *rec});
+        }
+
+        std::sort(materialized_.begin(), materialized_.end(), [this](const MatchedTuple& lhs, const MatchedTuple& rhs) {
+            int cmp = compare_index_record(lhs.record, rhs.record);
+            if (cmp != 0) {
+                return cmp < 0;
+            }
+            if (lhs.rid.page_no != rhs.rid.page_no) {
+                return lhs.rid.page_no < rhs.rid.page_no;
+            }
+            return lhs.rid.slot_no < rhs.rid.slot_no;
+        });
+
+        if (!materialized_.empty()) {
+            rid_ = materialized_[0].rid;
+            if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                context_->txn_mgr_->SsiRecordRead(context_->txn_, tab_name_, rid_);
+            }
+        }
     }
 
     std::map<std::string, ColumnConstraint> build_constraints() const {
@@ -185,6 +259,16 @@ public:
     }
 
     void beginTuple() override {
+        if (!predicate_recorded_ && context_ != nullptr && context_->txn_mgr_ != nullptr) {
+            context_->txn_mgr_->SsiRecordPredicateRead(context_->txn_, tab_name_, fed_conds_);
+            predicate_recorded_ = true;
+        }
+        if (need_snapshot_safe_scan()) {
+            begin_materialized_scan();
+            return;
+        }
+        materialized_mode_ = false;
+
         auto ih =
             sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
         auto constraints = build_constraints();
@@ -250,6 +334,16 @@ public:
     }
 
     void nextTuple() override {
+        if (materialized_mode_) {
+            ++materialized_pos_;
+            if (!is_end()) {
+                rid_ = materialized_[materialized_pos_].rid;
+                if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->SsiRecordRead(context_->txn_, tab_name_, rid_);
+                }
+            }
+            return;
+        }
         scan_->next();
         advance_to_match();
     }
@@ -258,6 +352,10 @@ public:
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
+            if (rec == nullptr) {
+                scan_->next();
+                continue;
+            }
             bool match = true;
             for (const auto& cond : fed_conds_) {
                 if (!compare(cond, *rec)) {
@@ -266,6 +364,9 @@ public:
                 }
             }
             if (match) {
+                if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->SsiRecordRead(context_->txn_, tab_name_, rid_);
+                }
                 break;
             }
             scan_->next();
@@ -276,6 +377,9 @@ public:
         if (is_end()) {
             return nullptr;
         }
+        if (materialized_mode_) {
+            return std::make_unique<RmRecord>(materialized_[materialized_pos_].record);
+        }
         return fh_->get_record(rid_, context_);
     }
 
@@ -284,6 +388,9 @@ public:
     }
 
     bool is_end() const override {
+        if (materialized_mode_) {
+            return materialized_pos_ >= materialized_.size();
+        }
         return scan_ == nullptr || scan_->is_end();
     }
 

@@ -9,6 +9,43 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
+#include "transaction/transaction_manager.h"
+
+#include <mutex>
+#include <shared_mutex>
+
+namespace {
+
+std::mutex record_write_latch;
+
+enum class VisibilityResult { VISIBLE, DELETED, NEED_OLDER };
+
+VisibilityResult CheckVisibility(const TupleMeta& meta, Transaction* txn) {
+    if (txn != nullptr && meta.owner_txn_ == txn->get_transaction_id()) {
+        return meta.is_deleted_ ? VisibilityResult::DELETED : VisibilityResult::VISIBLE;
+    }
+    if (meta.owner_txn_ != INVALID_TXN_ID) {
+        return VisibilityResult::NEED_OLDER;
+    }
+    if (txn == nullptr || meta.ts_ <= txn->get_start_ts()) {
+        return meta.is_deleted_ ? VisibilityResult::DELETED : VisibilityResult::VISIBLE;
+    }
+    return VisibilityResult::NEED_OLDER;
+}
+
+std::optional<UndoLog> GetUndoLogFromLink(const UndoLink& link) {
+    if (!link.IsValid()) {
+        return std::nullopt;
+    }
+    std::shared_lock<std::shared_mutex> lock(TransactionManager::txn_map_mutex_);
+    auto iter = TransactionManager::txn_map.find(link.prev_txn_);
+    if (iter == TransactionManager::txn_map.end() || iter->second == nullptr) {
+        return std::nullopt;
+    }
+    return iter->second->GetUndoLog(link.prev_log_idx_);
+}
+
+} // namespace
 
 /**
  * @description: 获取当前表中记录号为rid的记录
@@ -17,16 +54,68 @@ See the Mulan PSL v2 for more details. */
  * @return {unique_ptr<RmRecord>} rid对应的记录对象指针
  */
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
-    (void)context;
-    // Todo:
-    // 1. 获取指定记录所在的page handle
-    // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
     RmPageHandle tmp_page_handle = fetch_page_handle(rid.page_no);
-    int size_ = tmp_page_handle.file_hdr->record_size;
-    char* data_ = tmp_page_handle.get_slot(rid.slot_no);
-    std::unique_ptr<RmRecord> record_ptr(new RmRecord(size_, data_));
+    if (!Bitmap::is_set(tmp_page_handle.bitmap, rid.slot_no)) {
+        buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
+        return nullptr;
+    }
+
+    Transaction* txn = context == nullptr ? nullptr : context->txn_;
+    TupleMeta meta = *tmp_page_handle.get_tuple_meta(rid.slot_no);
+    UndoLink undo_link = *tmp_page_handle.get_undo_link(rid.slot_no);
+    std::unique_ptr<RmRecord> record_ptr;
+    auto visibility = CheckVisibility(meta, txn);
+    if (visibility == VisibilityResult::VISIBLE) {
+        record_ptr = std::make_unique<RmRecord>(tmp_page_handle.file_hdr->record_size,
+                                                tmp_page_handle.get_record_data(rid.slot_no));
+    } else if (visibility == VisibilityResult::DELETED) {
+        buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
+        return nullptr;
+    }
     buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
+
+    while (record_ptr == nullptr && undo_link.IsValid()) {
+        auto undo_log = GetUndoLogFromLink(undo_link);
+        if (!undo_log.has_value()) {
+            break;
+        }
+        auto undo_visibility = CheckVisibility(undo_log->meta_, txn);
+        if (undo_visibility == VisibilityResult::VISIBLE) {
+            record_ptr = std::make_unique<RmRecord>(undo_log->tuple_);
+            break;
+        }
+        if (undo_visibility == VisibilityResult::DELETED) {
+            break;
+        }
+        undo_link = undo_log->prev_version_;
+    }
     return record_ptr;
+}
+
+std::unique_ptr<RmRecord> RmFileHandle::get_latest_record(const Rid& rid) const {
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        return nullptr;
+    }
+    auto record =
+        std::make_unique<RmRecord>(page_handle.file_hdr->record_size, page_handle.get_record_data(rid.slot_no));
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    return record;
+}
+
+TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    TupleMeta meta = *page_handle.get_tuple_meta(rid.slot_no);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    return meta;
+}
+
+UndoLink RmFileHandle::get_undo_link(const Rid& rid) const {
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    UndoLink link = *page_handle.get_undo_link(rid.slot_no);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    return link;
 }
 
 /**
@@ -36,16 +125,16 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
  * @return {Rid} 插入的记录的记录号（位置）
  */
 Rid RmFileHandle::insert_record(char* buf, Context* context) {
-    // Todo:
-    // 1. 获取当前未满的page handle
-    // 2. 在page handle中找到空闲slot位置
-    // 3. 将buf复制到空闲slot位置
-    // 4. 更新page_handle.page_hdr中的数据结构
-    // 注意考虑插入一条记录后页面已满的情况，需要更新file_hdr_.first_free_page_no
+    std::scoped_lock<std::mutex> lock(record_write_latch);
     RmPageHandle insertpage_handle = create_page_handle();
     int slot_no = Bitmap::first_bit(false, insertpage_handle.bitmap, file_hdr_.num_records_per_page);
     if (slot_no != file_hdr_.num_records_per_page) {
-        memcpy(insertpage_handle.get_slot(slot_no), buf, file_hdr_.record_size);
+        Transaction* txn = context == nullptr ? nullptr : context->txn_;
+        TupleMeta meta{txn == nullptr ? 0 : INVALID_TS, false,
+                       txn == nullptr ? INVALID_TXN_ID : txn->get_transaction_id()};
+        *insertpage_handle.get_tuple_meta(slot_no) = meta;
+        *insertpage_handle.get_undo_link(slot_no) = UndoLink{};
+        memcpy(insertpage_handle.get_record_data(slot_no), buf, file_hdr_.record_size);
         Bitmap::set(insertpage_handle.bitmap, slot_no);
         insertpage_handle.page_hdr->num_records++;
         if (insertpage_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
@@ -62,6 +151,7 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
+    std::scoped_lock<std::mutex> lock(record_write_latch);
     while (rid.page_no >= file_hdr_.num_pages) {
         auto new_page = create_new_page_handle();
         buffer_pool_manager_->unpin_page(new_page.page->get_page_id(), true);
@@ -76,8 +166,9 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
         }
     }
 
-    char* slot = pageHandle.get_slot(rid.slot_no);
-    memcpy(slot, buf, file_hdr_.record_size);
+    *pageHandle.get_tuple_meta(rid.slot_no) = TupleMeta{0, false, INVALID_TXN_ID};
+    *pageHandle.get_undo_link(rid.slot_no) = UndoLink{};
+    memcpy(pageHandle.get_record_data(rid.slot_no), buf, file_hdr_.record_size);
 
     buffer_pool_manager_->unpin_page(pageHandle.page->get_page_id(), true);
 }
@@ -88,19 +179,37 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  * @param {Context*} context
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
-    // Todo:
-    // 1. 获取指定记录所在的page handle
-    // 2. 更新page_handle.page_hdr中的数据结构
-    // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
+    std::scoped_lock<std::mutex> lock(record_write_latch);
     RmPageHandle deletepage_handle = fetch_page_handle(rid.page_no);
     if (!Bitmap::is_set(deletepage_handle.bitmap, rid.slot_no)) {
         buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), false);
         return;
     }
-    Bitmap::reset(deletepage_handle.bitmap, rid.slot_no);
-    deletepage_handle.page_hdr->num_records--;
-    if (deletepage_handle.page_hdr->num_records == (file_hdr_.num_records_per_page - 1)) {
-        release_page_handle(deletepage_handle);
+    Transaction* txn = context == nullptr ? nullptr : context->txn_;
+    if (txn == nullptr) {
+        Bitmap::reset(deletepage_handle.bitmap, rid.slot_no);
+        deletepage_handle.page_hdr->num_records--;
+        if (deletepage_handle.page_hdr->num_records == (file_hdr_.num_records_per_page - 1)) {
+            release_page_handle(deletepage_handle);
+        }
+    } else {
+        auto meta = deletepage_handle.get_tuple_meta(rid.slot_no);
+        if (meta->owner_txn_ != INVALID_TXN_ID && meta->owner_txn_ != txn->get_transaction_id()) {
+            buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), false);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+        }
+        if (meta->owner_txn_ == INVALID_TXN_ID && meta->ts_ > txn->get_start_ts()) {
+            buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), false);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+        }
+        UndoLog undo_log;
+        undo_log.meta_ = *meta;
+        undo_log.tuple_ = RmRecord(file_hdr_.record_size, deletepage_handle.get_record_data(rid.slot_no));
+        undo_log.prev_version_ = *deletepage_handle.get_undo_link(rid.slot_no);
+        *deletepage_handle.get_undo_link(rid.slot_no) = txn->AppendUndoLog(undo_log);
+        meta->is_deleted_ = true;
+        meta->owner_txn_ = txn->get_transaction_id();
+        meta->ts_ = INVALID_TS;
     }
     buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), true);
 }
@@ -112,13 +221,89 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @param {Context*} context
  */
 void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
-    (void)context;
-    // Todo:
-    // 1. 获取指定记录所在的page handle
-    // 2. 更新记录
+    std::scoped_lock<std::mutex> lock(record_write_latch);
     RmPageHandle updatepage_handle = fetch_page_handle(rid.page_no);
-    memcpy(updatepage_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    Transaction* txn = context == nullptr ? nullptr : context->txn_;
+    if (txn != nullptr) {
+        auto meta = updatepage_handle.get_tuple_meta(rid.slot_no);
+        if (meta->owner_txn_ != INVALID_TXN_ID && meta->owner_txn_ != txn->get_transaction_id()) {
+            buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), false);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+        }
+        if (meta->owner_txn_ == INVALID_TXN_ID && meta->ts_ > txn->get_start_ts()) {
+            buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), false);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+        }
+        UndoLog undo_log;
+        undo_log.meta_ = *meta;
+        undo_log.tuple_ = RmRecord(file_hdr_.record_size, updatepage_handle.get_record_data(rid.slot_no));
+        undo_log.prev_version_ = *updatepage_handle.get_undo_link(rid.slot_no);
+        *updatepage_handle.get_undo_link(rid.slot_no) = txn->AppendUndoLog(undo_log);
+        meta->owner_txn_ = txn->get_transaction_id();
+        meta->ts_ = INVALID_TS;
+        meta->is_deleted_ = false;
+    }
+    memcpy(updatepage_handle.get_record_data(rid.slot_no), buf, file_hdr_.record_size);
     buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), true);
+}
+
+void RmFileHandle::finalize_record(const Rid& rid, txn_id_t txn_id, timestamp_t commit_ts) {
+    std::scoped_lock<std::mutex> lock(record_write_latch);
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    if (Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        auto meta = page_handle.get_tuple_meta(rid.slot_no);
+        if (meta->owner_txn_ == txn_id) {
+            meta->owner_txn_ = INVALID_TXN_ID;
+            meta->ts_ = commit_ts;
+        }
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+}
+
+void RmFileHandle::finalize_records_owned_by(txn_id_t txn_id, timestamp_t commit_ts) {
+    std::scoped_lock<std::mutex> lock(record_write_latch);
+    for (int page_no = RM_FIRST_RECORD_PAGE; page_no < file_hdr_.num_pages; ++page_no) {
+        RmPageHandle page_handle = fetch_page_handle(page_no);
+        bool dirty = false;
+        for (int slot_no = 0; slot_no < file_hdr_.num_records_per_page; ++slot_no) {
+            if (!Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                continue;
+            }
+            auto meta = page_handle.get_tuple_meta(slot_no);
+            if (meta->owner_txn_ == txn_id) {
+                meta->owner_txn_ = INVALID_TXN_ID;
+                meta->ts_ = commit_ts;
+                dirty = true;
+            }
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), dirty);
+    }
+}
+
+void RmFileHandle::rollback_insert(const Rid& rid) {
+    std::scoped_lock<std::mutex> lock(record_write_latch);
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    if (Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        Bitmap::reset(page_handle.bitmap, rid.slot_no);
+        page_handle.page_hdr->num_records--;
+        if (page_handle.page_hdr->num_records == (file_hdr_.num_records_per_page - 1)) {
+            release_page_handle(page_handle);
+        }
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+}
+
+void RmFileHandle::restore_record(const Rid& rid, const UndoLog& undo_log) {
+    std::scoped_lock<std::mutex> lock(record_write_latch);
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        Bitmap::set(page_handle.bitmap, rid.slot_no);
+        page_handle.page_hdr->num_records++;
+    }
+    *page_handle.get_tuple_meta(rid.slot_no) = undo_log.meta_;
+    *page_handle.get_undo_link(rid.slot_no) = undo_log.prev_version_;
+    memcpy(page_handle.get_record_data(rid.slot_no), undo_log.tuple_.data, file_hdr_.record_size);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
 
 /**

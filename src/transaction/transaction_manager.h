@@ -12,10 +12,13 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <functional>
 #include <shared_mutex>
+#include <vector>
 
+#include "common/common.h"
 #include "transaction.h"
 #include "watermark.h"
 #include "recovery/log_manager.h"
@@ -86,7 +89,7 @@ public:
         if (txn_id == INVALID_TXN_ID)
             return nullptr;
 
-        std::unique_lock<std::mutex> lock(latch_);
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
         assert(TransactionManager::txn_map.find(txn_id) != TransactionManager::txn_map.end());
         auto* res = TransactionManager::txn_map[txn_id];
         lock.unlock();
@@ -97,7 +100,7 @@ public:
     }
 
     static std::unordered_map<txn_id_t, Transaction*> txn_map; // 全局事务表，存放事务ID与事务对象的映射关系
-    std::shared_mutex txn_map_mutex_;
+    static std::shared_mutex txn_map_mutex_;
     /** ------------------------以下函数仅可能在MVCC当中使用------------------------------------------*/
 
     /**
@@ -134,6 +137,13 @@ public:
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
+    void SsiRecordPredicateRead(Transaction* txn, const std::string& tab_name, const std::vector<Condition>& conds);
+
+    void SsiRecordRead(Transaction* txn, const std::string& tab_name, const Rid& rid);
+
+    void SsiCheckWrite(Transaction* txn, const std::string& tab_name, std::optional<Rid> rid,
+                       const std::optional<RmRecord>& old_rec, const std::optional<RmRecord>& new_rec);
+
     struct PageVersionInfo {
         std::shared_mutex mutex_;
         /** 存储所有槽的先前版本信息。注意：不要使用 `[x]` 来访问它，因为
@@ -148,6 +158,43 @@ public:
     std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
 
 private:
+    struct SsiPredicateReadEntry {
+        txn_id_t txn_id_;
+        std::string tab_name_;
+        std::vector<Condition> conds_;
+    };
+
+    struct SsiRecordReadEntry {
+        txn_id_t txn_id_;
+        std::string tab_name_;
+        Rid rid_;
+    };
+
+    struct SsiWriteEntry {
+        txn_id_t txn_id_;
+        std::string tab_name_;
+        std::optional<RmRecord> old_rec_;
+        std::optional<RmRecord> new_rec_;
+    };
+
+    bool TupleMatches(const std::string& tab_name, const std::vector<Condition>& conds, const RmRecord& rec);
+
+    bool AddRwEdge(txn_id_t reader, txn_id_t writer, txn_id_t current_txn);
+
+    bool HasDangerousStructure(txn_id_t current_txn);
+
+    bool TransactionsOverlap(Transaction* lhs, Transaction* rhs);
+
+    bool CommittedBefore(txn_id_t lhs, txn_id_t rhs);
+
+    bool HasDangerousStructureUnlocked(txn_id_t current_txn);
+
+    bool CommittedBeforeUnlocked(txn_id_t lhs, txn_id_t rhs);
+
+    void CleanupSsiState(txn_id_t txn_id);
+
+    void PruneSsiState();
+
     ConcurrencyMode concurrency_mode_;           // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
@@ -157,4 +204,9 @@ private:
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+    std::mutex ssi_latch_;
+    std::vector<SsiPredicateReadEntry> ssi_predicate_reads_;
+    std::vector<SsiRecordReadEntry> ssi_record_reads_;
+    std::vector<SsiWriteEntry> ssi_writes_;
+    std::unordered_map<txn_id_t, std::unordered_set<txn_id_t>> rw_edges_;
 };

@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "bitmap.h"
 #include "common/context.h"
 #include "rm_defs.h"
+#include "transaction/transaction.h"
 
 class RmManager;
 
@@ -26,7 +27,7 @@ struct RmPageHandle {
     Page* page;                // 页面的实际数据，包括页面存储的数据、元信息等
     RmPageHdr* page_hdr; // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
     char* bitmap; // page->data的第二部分，存储页面的bitmap，指针指向首地址，长度为file_hdr->bitmap_size
-    char* slots; // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
+    char* slots; // page->data的第三部分，存储表的记录，slot包含MVCC元数据和用户记录
 
     RmPageHandle(const RmFileHdr* fhdr_, Page* page_) : file_hdr(fhdr_), page(page_) {
         page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + page->OFFSET_PAGE_HDR);
@@ -36,7 +37,19 @@ struct RmPageHandle {
 
     // 返回指定slot_no的slot存储收地址
     char* get_slot(int slot_no) const {
-        return slots + slot_no * file_hdr->record_size; // slots的首地址 + slot个数 * 每个slot的大小(每个record的大小)
+        return slots + slot_no * (sizeof(TupleMeta) + sizeof(UndoLink) + file_hdr->record_size);
+    }
+
+    TupleMeta* get_tuple_meta(int slot_no) const {
+        return reinterpret_cast<TupleMeta*>(get_slot(slot_no));
+    }
+
+    UndoLink* get_undo_link(int slot_no) const {
+        return reinterpret_cast<UndoLink*>(get_slot(slot_no) + sizeof(TupleMeta));
+    }
+
+    char* get_record_data(int slot_no) const {
+        return get_slot(slot_no) + sizeof(TupleMeta) + sizeof(UndoLink);
     }
 };
 
@@ -79,6 +92,12 @@ public:
 
     std::unique_ptr<RmRecord> get_record(const Rid& rid, Context* context) const;
 
+    std::unique_ptr<RmRecord> get_latest_record(const Rid& rid) const;
+
+    TupleMeta get_tuple_meta(const Rid& rid) const;
+
+    UndoLink get_undo_link(const Rid& rid) const;
+
     Rid insert_record(char* buf, Context* context);
 
     void insert_record(const Rid& rid, char* buf);
@@ -86,6 +105,14 @@ public:
     void delete_record(const Rid& rid, Context* context);
 
     void update_record(const Rid& rid, char* buf, Context* context);
+
+    void finalize_record(const Rid& rid, txn_id_t txn_id, timestamp_t commit_ts);
+
+    void finalize_records_owned_by(txn_id_t txn_id, timestamp_t commit_ts);
+
+    void rollback_insert(const Rid& rid);
+
+    void restore_record(const Rid& rid, const UndoLog& undo_log);
 
     RmPageHandle create_new_page_handle();
 

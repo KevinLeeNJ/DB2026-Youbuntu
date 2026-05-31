@@ -21,9 +21,10 @@ constexpr int RM_MAX_RECORD_SIZE = 512;
 struct TupleMeta {
     timestamp_t ts_;
     bool is_deleted_;
+    txn_id_t owner_txn_;
 
     friend auto operator==(const TupleMeta& a, const TupleMeta& b) {
-        return a.ts_ == b.ts_ && a.is_deleted_ == b.is_deleted_;
+        return a.ts_ == b.ts_ && a.is_deleted_ == b.is_deleted_ && a.owner_txn_ == b.owner_txn_;
     }
 
     friend auto operator!=(const TupleMeta& a, const TupleMeta& b) {

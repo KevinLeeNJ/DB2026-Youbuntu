@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <sstream>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include "analyze/analyze.h"
@@ -101,12 +102,18 @@ public:
     /// Execute a single SQL statement (must include trailing ';').
     /// Returns the captured text output. Throws RMDBError on failure.
     std::string exec_sql(const std::string& sql) {
+        return exec_sql_as(0, sql);
+    }
+
+    std::string exec_sql_as(int session_id, const std::string& sql) {
         char data_send[BUFFER_LENGTH];
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
-        Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset);
-        set_transaction(&context);
+        ensure_session(session_id);
+        Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset,
+                        &session_isolation_levels_[session_id], txn_manager_.get());
+        set_transaction(&context, session_txn_ids_[session_id]);
 
         // Parse
         YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
@@ -127,7 +134,7 @@ public:
             std::shared_ptr<Query> query = analyze_->do_analyze(ast::parse_tree);
             std::shared_ptr<Plan> plan = optimizer_->plan_query(query, &context);
             std::shared_ptr<PortalStmt> portal_stmt = portal_->start(plan, &context);
-            portal_->run(portal_stmt, ql_manager_.get(), &txn_id_, &context);
+            portal_->run(portal_stmt, ql_manager_.get(), &session_txn_ids_[session_id], &context);
             portal_->drop();
             finish_statement(&context);
         } catch (...) {
@@ -143,8 +150,12 @@ public:
     /// Execute SQL that is expected to throw.
     /// Returns the exception message. Throws std::runtime_error if no exception.
     std::string exec_sql_expect_error(const std::string& sql) {
+        return exec_sql_expect_error_as(0, sql);
+    }
+
+    std::string exec_sql_expect_error_as(int session_id, const std::string& sql) {
         try {
-            exec_sql(sql);
+            exec_sql_as(session_id, sql);
         } catch (RMDBError& e) {
             return std::string(e.what());
         } catch (TransactionAbortException& e) {
@@ -160,12 +171,20 @@ public:
     }
 
 private:
-    void set_transaction(Context* context) {
-        context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
+    void ensure_session(int session_id) {
+        if (session_txn_ids_.find(session_id) == session_txn_ids_.end()) {
+            session_txn_ids_[session_id] = INVALID_TXN_ID;
+            session_isolation_levels_[session_id] = IsolationLevel::SERIALIZABLE;
+        }
+    }
+
+    void set_transaction(Context* context, txn_id_t& txn_id) {
+        context->txn_ = txn_id == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id);
         if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
             context->txn_->get_state() == TransactionState::ABORTED) {
             context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_);
-            txn_id_ = context->txn_->get_transaction_id();
+            context->txn_->set_isolation_level(context->get_default_isolation_level());
+            txn_id = context->txn_->get_transaction_id();
             context->txn_->set_txn_mode(false);
         }
     }
@@ -188,7 +207,8 @@ private:
 
     std::string db_name_;
     std::string original_cwd_;
-    txn_id_t txn_id_{INVALID_TXN_ID};
+    std::unordered_map<int, txn_id_t> session_txn_ids_{{0, INVALID_TXN_ID}};
+    std::unordered_map<int, IsolationLevel> session_isolation_levels_{{0, IsolationLevel::SERIALIZABLE}};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<RmManager> rm_manager_;
@@ -433,6 +453,10 @@ TEST_F(SltFileTest, Transaction) {
     run_slt_file("transaction.slt");
 }
 
+TEST_F(SltFileTest, Isolation) {
+    run_slt_file("isolation.slt");
+}
+
 TEST_F(SltFileTest, Join) {
     run_slt_file("join.slt");
 }
@@ -455,4 +479,148 @@ TEST_F(SltFileTest, Union) {
 
 TEST_F(SltFileTest, QueryOptimize) {
     run_slt_file("query_optimize.slt");
+}
+
+TEST_F(E2ETest, SnapshotIsolationKeepsTransactionSnapshot) {
+    db_->exec_sql("CREATE TABLE si_counter (id INT, val INT);");
+    db_->exec_sql("INSERT INTO si_counter VALUES (1, 100);");
+
+    db_->exec_sql_as(1, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(2, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(1, "BEGIN;");
+    std::string first_read = db_->exec_sql_as(1, "SELECT * FROM si_counter WHERE id = 1;");
+
+    db_->exec_sql_as(2, "BEGIN;");
+    db_->exec_sql_as(2, "UPDATE si_counter SET val = 200 WHERE id = 1;");
+    db_->exec_sql_as(2, "COMMIT;");
+
+    std::string second_read = db_->exec_sql_as(1, "SELECT * FROM si_counter WHERE id = 1;");
+    db_->exec_sql_as(1, "COMMIT;");
+
+    EXPECT_NE(first_read.find("|                1 |              100 |"), std::string::npos);
+    EXPECT_EQ(first_read, second_read);
+}
+
+TEST_F(E2ETest, ImplicitDeleteRemovesCommittedRow) {
+    db_->exec_sql("CREATE TABLE delete_smoke (id INT, val INT);");
+    db_->exec_sql("INSERT INTO delete_smoke VALUES (1, 10);");
+    db_->exec_sql("DELETE FROM delete_smoke WHERE id = 1;");
+
+    std::string final_read = db_->exec_sql("SELECT * FROM delete_smoke;");
+    EXPECT_NE(final_read.find("Total record(s): 0"), std::string::npos) << final_read;
+}
+
+TEST_F(E2ETest, SnapshotIsolationAbortsConcurrentWriteWriteConflict) {
+    db_->exec_sql("CREATE TABLE si_account (id INT, balance INT);");
+    db_->exec_sql("INSERT INTO si_account VALUES (1, 100);");
+
+    db_->exec_sql_as(1, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(2, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(1, "BEGIN;");
+    db_->exec_sql_as(1, "UPDATE si_account SET balance = 120 WHERE id = 1;");
+
+    db_->exec_sql_as(2, "BEGIN;");
+    EXPECT_NE(db_->exec_sql_expect_error_as(2, "UPDATE si_account SET balance = 90 WHERE id = 1;")
+                  .find("Transaction aborted"),
+              std::string::npos);
+
+    db_->exec_sql_as(1, "COMMIT;");
+    db_->exec_sql_as(2, "COMMIT;");
+
+    std::string final_read = db_->exec_sql("SELECT * FROM si_account WHERE id = 1;");
+    EXPECT_NE(final_read.find("|                1 |              120 |"), std::string::npos);
+}
+
+TEST_F(E2ETest, SnapshotIsolationAbortsStaleSnapshotWrite) {
+    db_->exec_sql("CREATE TABLE si_stale (id INT, val INT);");
+    db_->exec_sql("INSERT INTO si_stale VALUES (1, 10);");
+
+    db_->exec_sql_as(1, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(2, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(1, "BEGIN;");
+    db_->exec_sql_as(1, "SELECT * FROM si_stale WHERE id = 1;");
+
+    db_->exec_sql_as(2, "BEGIN;");
+    db_->exec_sql_as(2, "UPDATE si_stale SET val = 20 WHERE id = 1;");
+    db_->exec_sql_as(2, "COMMIT;");
+
+    EXPECT_NE(
+        db_->exec_sql_expect_error_as(1, "UPDATE si_stale SET val = 30 WHERE id = 1;").find("Transaction aborted"),
+        std::string::npos);
+    db_->exec_sql_as(1, "COMMIT;");
+
+    std::string final_read = db_->exec_sql("SELECT * FROM si_stale WHERE id = 1;");
+    EXPECT_NE(final_read.find("|                1 |               20 |"), std::string::npos);
+}
+
+TEST_F(E2ETest, SnapshotIsolationIndexedOldKeyRemainsVisible) {
+    db_->exec_sql("CREATE TABLE si_idx_old (id INT, val INT);");
+    db_->exec_sql("INSERT INTO si_idx_old VALUES (1, 10);");
+    db_->exec_sql("CREATE INDEX si_idx_old (id);");
+
+    db_->exec_sql_as(1, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(2, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(1, "BEGIN;");
+    db_->exec_sql_as(1, "SELECT * FROM si_idx_old WHERE id = 1;");
+    db_->exec_sql_as(2, "BEGIN;");
+    db_->exec_sql_as(2, "UPDATE si_idx_old SET id = 2 WHERE id = 1;");
+    db_->exec_sql_as(2, "COMMIT;");
+
+    std::string old_key_read = db_->exec_sql_as(1, "SELECT * FROM si_idx_old WHERE id = 1;");
+    db_->exec_sql_as(1, "COMMIT;");
+
+    EXPECT_NE(old_key_read.find("|                1 |               10 |"), std::string::npos);
+}
+
+TEST_F(E2ETest, CreateIndexSkipsCommittedDeleteMarkers) {
+    db_->exec_sql("CREATE TABLE deleted_then_indexed (id INT, val INT);");
+    db_->exec_sql("INSERT INTO deleted_then_indexed VALUES (1, 10);");
+    db_->exec_sql("DELETE FROM deleted_then_indexed WHERE id = 1;");
+
+    EXPECT_NO_THROW(db_->exec_sql("CREATE INDEX deleted_then_indexed (id);"));
+    std::string output = db_->exec_sql("SELECT * FROM deleted_then_indexed WHERE id = 1;");
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos);
+}
+
+TEST_F(E2ETest, SnapshotIsolationAllowsWriteSkew) {
+    db_->exec_sql("CREATE TABLE si_shift (id INT, on_call INT);");
+    db_->exec_sql("INSERT INTO si_shift VALUES (1, 1);");
+    db_->exec_sql("INSERT INTO si_shift VALUES (2, 1);");
+
+    db_->exec_sql_as(1, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(2, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;");
+    db_->exec_sql_as(1, "BEGIN;");
+    db_->exec_sql_as(2, "BEGIN;");
+    db_->exec_sql_as(1, "SELECT * FROM si_shift WHERE on_call = 1;");
+    db_->exec_sql_as(2, "SELECT * FROM si_shift WHERE on_call = 1;");
+    db_->exec_sql_as(1, "UPDATE si_shift SET on_call = 0 WHERE id = 1;");
+    db_->exec_sql_as(1, "COMMIT;");
+    db_->exec_sql_as(2, "UPDATE si_shift SET on_call = 0 WHERE id = 2;");
+    db_->exec_sql_as(2, "COMMIT;");
+
+    std::string final_read = db_->exec_sql("SELECT * FROM si_shift WHERE on_call = 1;");
+    EXPECT_NE(final_read.find("Total record(s): 0"), std::string::npos);
+}
+
+TEST_F(E2ETest, SerializableAbortsWriteSkew) {
+    db_->exec_sql("CREATE TABLE ser_shift (id INT, on_call INT);");
+    db_->exec_sql("INSERT INTO ser_shift VALUES (1, 1);");
+    db_->exec_sql("INSERT INTO ser_shift VALUES (2, 1);");
+
+    db_->exec_sql_as(1, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;");
+    db_->exec_sql_as(2, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;");
+    db_->exec_sql_as(1, "BEGIN;");
+    db_->exec_sql_as(2, "BEGIN;");
+    db_->exec_sql_as(1, "SELECT * FROM ser_shift WHERE on_call = 1;");
+    db_->exec_sql_as(2, "SELECT * FROM ser_shift WHERE on_call = 1;");
+    db_->exec_sql_as(1, "UPDATE ser_shift SET on_call = 0 WHERE id = 1;");
+    db_->exec_sql_as(1, "COMMIT;");
+
+    EXPECT_NE(
+        db_->exec_sql_expect_error_as(2, "UPDATE ser_shift SET on_call = 0 WHERE id = 2;").find("Transaction aborted"),
+        std::string::npos);
+    db_->exec_sql_as(2, "COMMIT;");
+
+    std::string final_read = db_->exec_sql("SELECT * FROM ser_shift WHERE on_call = 1;");
+    EXPECT_NE(final_read.find("|                2 |                1 |"), std::string::npos);
 }

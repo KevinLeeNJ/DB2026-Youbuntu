@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <optional>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -78,6 +80,9 @@ public:
             }
             index_keys.push_back(std::move(key));
         }
+        if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+            context_->txn_mgr_->SsiCheckWrite(context_->txn_, tab_name_, std::nullopt, std::nullopt, rec);
+        }
 
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
@@ -98,11 +103,15 @@ public:
                     sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 ih->delete_entry(index_keys[*it].data(), context_ == nullptr ? nullptr : context_->txn_);
             }
-            fh_->delete_record(rid_, context_);
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                fh_->rollback_insert(rid_);
+            } else {
+                fh_->delete_record(rid_, context_);
+            }
             throw;
         }
         if (context_ != nullptr && context_->txn_ != nullptr) {
-            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
+            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, rec));
         }
         return nullptr;
     }

@@ -51,6 +51,17 @@ public:
     std::unique_ptr<RmRecord> Next() override {
         for (Rid& rid : rids_) {
             std::unique_ptr<RmRecord> rec = fh_->get_record(rid, context_);
+            if (rec == nullptr) {
+                continue;
+            }
+            auto txn = context_ == nullptr ? nullptr : context_->txn_;
+            if (txn != nullptr) {
+                auto meta = fh_->get_tuple_meta(rid);
+                if ((meta.owner_txn_ != INVALID_TXN_ID && meta.owner_txn_ != txn->get_transaction_id()) ||
+                    (meta.owner_txn_ == INVALID_TXN_ID && meta.ts_ > txn->get_start_ts())) {
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+                }
+            }
             bool match = true;
             for (auto cond : conds_) // 判断是否匹配
             {
@@ -62,14 +73,6 @@ public:
             if (match) {
                 auto new_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
                 update_record(new_rec.get());                    // 对记录更新
-
-                struct IndexUpdate {
-                    const IndexMeta* index;
-                    std::vector<char> old_key;
-                    std::vector<char> new_key;
-                };
-                std::vector<IndexUpdate> index_updates;
-                auto txn = context_ == nullptr ? nullptr : context_->txn_;
 
                 for (const auto& index : tab_.indexes) {
                     auto old_key = make_index_key(index, rec->data);
@@ -84,44 +87,46 @@ public:
                         std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
                         throw IndexEntryExistsError();
                     }
-                    index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
                 }
+                if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->SsiCheckWrite(context_->txn_, tab_name_, rid, *rec, *new_rec);
+                }
+                if (txn == nullptr) {
+                    struct AppliedIndexChange {
+                        IndexMeta index;
+                        std::vector<char> old_key;
+                        std::vector<char> new_key;
+                    };
+                    std::vector<AppliedIndexChange> applied;
+                    try {
+                        for (const auto& index : tab_.indexes) {
+                            auto old_key = make_index_key(index, rec->data);
+                            auto new_key = make_index_key(index, new_rec->data);
+                            if (old_key == new_key) {
+                                continue;
+                            }
+                            auto ih = sm_manager_->ihs_
+                                          .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
+                                          .get();
+                            ih->delete_entry(old_key.data(), nullptr);
+                            ih->insert_entry(new_key.data(), rid, nullptr);
+                            applied.push_back(AppliedIndexChange{index, old_key, new_key});
+                        }
+                    } catch (...) {
+                        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+                            auto ih = sm_manager_->ihs_
+                                          .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, it->index.cols))
+                                          .get();
+                            ih->delete_entry(it->new_key.data(), nullptr);
+                            ih->insert_entry(it->old_key.data(), rid, nullptr);
+                        }
+                        throw;
+                    }
+                }
+                fh_->update_record(rid, new_rec->data, context_);
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
                 }
-
-                std::vector<size_t> deleted_indexes;
-                std::vector<size_t> inserted_indexes;
-                try {
-                    for (size_t i = 0; i < index_updates.size(); ++i) {
-                        const auto& update = index_updates[i];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        ih->delete_entry(update.old_key.data(), txn); // 删除旧索引
-                        deleted_indexes.push_back(i);
-                        ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
-                        inserted_indexes.push_back(i);
-                    }
-                } catch (...) // 失败时回滚已经修改过的索引
-                {
-                    for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
-                        const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        ih->delete_entry(update.new_key.data(), txn); // 删除新索引
-                    }
-                    for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
-                        const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        ih->insert_entry(update.old_key.data(), rid, txn); // 恢复旧索引
-                    }
-                    throw; // 仍然抛出错误
-                }
-                fh_->update_record(rid, new_rec->data, context_);
             }
         }
         return nullptr;

@@ -245,11 +245,22 @@ class SetKnobPlan : public Plan {
 public:
     SetKnobPlan(ast::SetKnobType knob_type, bool bool_value) {
         Plan::tag = T_SetKnob;
+        set_type_ = ast::SetKnob;
         set_knob_type_ = knob_type;
         bool_value_ = bool_value;
     }
+    ast::SetStmtType set_type_;
     ast::SetKnobType set_knob_type_;
     bool bool_value_;
+};
+
+class SetIsolationPlan : public SetKnobPlan {
+public:
+    explicit SetIsolationPlan(ast::IsolationLevelType isolation_level) : SetKnobPlan(ast::EnableNestLoop, false) {
+        set_type_ = ast::SetIsolation;
+        isolation_level_ = isolation_level;
+    }
+    ast::IsolationLevelType isolation_level_;
 };
 
 class plannerInfo {

@@ -20,6 +20,21 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
+namespace {
+
+IsolationLevel ToTxnIsolationLevel(ast::IsolationLevelType isolation_level) {
+    switch (isolation_level) {
+    case ast::SnapshotIsolation:
+        return IsolationLevel::SNAPSHOT_ISOLATION;
+    case ast::Serializable:
+        return IsolationLevel::SERIALIZABLE;
+    default:
+        throw RMDBError("Not implemented!\n");
+    }
+}
+
+} // namespace
+
 const char* help_info = "Supported SQL syntax:\n"
                         "  command ;\n"
                         "command:\n"
@@ -104,6 +119,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             // 显示开启一个事务
             if (context->txn_ == nullptr) {
                 context->txn_ = txn_mgr_->begin(nullptr, context->log_mgr_);
+                context->txn_->set_isolation_level(context->get_default_isolation_level());
                 *txn_id = context->txn_->get_transaction_id();
             }
             context->txn_->set_txn_mode(true);
@@ -138,6 +154,11 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
     }
     case T_SetKnob: {
         auto x = std::static_pointer_cast<SetKnobPlan>(plan);
+        if (x->set_type_ == ast::SetIsolation) {
+            auto isolation_plan = std::static_pointer_cast<SetIsolationPlan>(plan);
+            context->set_default_isolation_level(ToTxnIsolationLevel(isolation_plan->isolation_level_));
+            break;
+        }
         switch (x->set_knob_type_) {
         case ast::SetKnobType::EnableNestLoop: {
             planner_->set_enable_nestedloop_join(x->bool_value_);

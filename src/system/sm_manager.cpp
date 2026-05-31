@@ -310,6 +310,9 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         for (RmScan scan(file_handle); !scan.is_end(); scan.next()) {
             // 对每条记录插入索引
             auto record = file_handle->get_record(scan.rid(), context);
+            if (record == nullptr) {
+                continue;
+            }
             std::vector<char> key(total_len); // 所有索引字段的值拼接在一起作为键
             int offset = 0;
             for (const auto& col : cols) {

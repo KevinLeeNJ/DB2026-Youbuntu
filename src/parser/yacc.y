@@ -24,6 +24,7 @@ using namespace ast;
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY GROUP HAVING LIMIT AS UNION
 WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON COUNT MAX MIN SUM AVG
 EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SORTMERGE
+TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -60,6 +61,7 @@ EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SOR
 %type <sv_orderby_items>  order_clause opt_order_clause
 %type <sv_orderby_dir> opt_asc_desc
 %type <sv_setKnobType> set_knob_type
+%type <sv_isolationLevelType> isolation_level
 
 %%
 start:
@@ -127,6 +129,10 @@ setStmt:
         SET set_knob_type '=' VALUE_BOOL
     {
         $$ = std::make_shared<SetStmt>($2, std::static_pointer_cast<BoolLit>($4)->val);
+    }
+    |   SET TRANSACTION ISOLATION LEVEL isolation_level
+    {
+        $$ = std::make_shared<SetStmt>($5);
     }
     ;
 
@@ -618,6 +624,11 @@ opt_limit_clause:
 set_knob_type:
     ENABLE_NESTLOOP { $$ = EnableNestLoop; }
     |   ENABLE_SORTMERGE { $$ = EnableSortMerge; }
+    ;
+
+isolation_level:
+    SNAPSHOT ISOLATION { $$ = SnapshotIsolation; }
+    |   SERIALIZABLE { $$ = Serializable; }
     ;
 
 tbName: IDENTIFIER;

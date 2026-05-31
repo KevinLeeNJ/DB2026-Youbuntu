@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -38,21 +39,14 @@ struct UndoLink {
     }
 
     /* Checks if the undo link points to something. */
-    bool IsValid() {
+    bool IsValid() const {
         return prev_txn_ != INVALID_TXN_ID;
     }
 };
 
 struct UndoLog {
-    /* 此日志是否为删除标记 */
-    bool is_deleted_;
-    /* 此撤销日志修改的字段 */
-    std::vector<bool> modified_fields_;
-    /* 修改后的字段 */
-    std::vector<Value> tuple_;
-    RmRecord* tuple_test_;
-    /* 此撤销日志的时间戳 */
-    timestamp_t ts_{INVALID_TS};
+    TupleMeta meta_{INVALID_TS, false, INVALID_TXN_ID};
+    RmRecord tuple_;
     /* 撤销日志的前一个版本 */
     UndoLink prev_version_{};
 };
@@ -95,6 +89,9 @@ public:
 
     inline IsolationLevel get_isolation_level() {
         return isolation_level_;
+    }
+    inline void set_isolation_level(IsolationLevel isolation_level) {
+        isolation_level_ = isolation_level;
     }
 
     inline TransactionState get_state() {
@@ -141,6 +138,9 @@ public:
     }
     inline timestamp_t get_commit_ts() const {
         return commit_ts_;
+    }
+    inline void set_commit_ts(timestamp_t commit_ts) {
+        commit_ts_ = commit_ts;
     }
 
     /** 修改现有的撤销日志 */

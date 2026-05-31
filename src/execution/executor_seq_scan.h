@@ -30,6 +30,7 @@ private:
     std::unique_ptr<RecScan> scan_; // table_iterator
 
     SmManager* sm_manager_;
+    bool predicate_recorded_{false};
 
 public:
     SeqScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds, Context* context) {
@@ -50,10 +51,18 @@ public:
      *
      */
     void beginTuple() override {
+        if (!predicate_recorded_ && context_ != nullptr && context_->txn_mgr_ != nullptr) {
+            context_->txn_mgr_->SsiRecordPredicateRead(context_->txn_, tab_name_, fed_conds_);
+            predicate_recorded_ = true;
+        }
         scan_ = std::make_unique<RmScan>(fh_);
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
+            if (rec == nullptr) {
+                scan_->next();
+                continue;
+            }
             bool match = true;
             for (const auto& cond : fed_conds_) {
                 if (!compare(cond, *rec)) {
@@ -62,6 +71,9 @@ public:
                 }
             }
             if (match) {
+                if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->SsiRecordRead(context_->txn_, tab_name_, rid_);
+                }
                 break; // 找到第一个满足条件的记录
             }
             scan_->next();
@@ -76,6 +88,10 @@ public:
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
+            if (rec == nullptr) {
+                scan_->next();
+                continue;
+            }
             bool match = true;
             for (const auto& cond : fed_conds_) {
                 if (!compare(cond, *rec)) {
@@ -84,6 +100,9 @@ public:
                 }
             }
             if (match) {
+                if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->SsiRecordRead(context_->txn_, tab_name_, rid_);
+                }
                 break; // 找到第一个满足条件的记录
             }
             scan_->next();

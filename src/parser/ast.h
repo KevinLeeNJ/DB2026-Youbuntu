@@ -26,6 +26,10 @@ enum AggFuncType { AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
 
 enum SetKnobType { EnableNestLoop, EnableSortMerge };
 
+enum SetStmtType { SetKnob, SetIsolation };
+
+enum IsolationLevelType { SnapshotIsolation, Serializable };
+
 enum class AstType {
     Help,
     ShowTables,
@@ -386,11 +390,18 @@ struct ExplainAnalyze : public TreeNode {
 
 // set enable_nestloop
 struct SetStmt : public TreeNode {
+    SetStmtType set_type_;
     SetKnobType set_knob_type_;
     bool bool_val_;
+    IsolationLevelType isolation_level_;
 
     SetStmt(SetKnobType& type, bool bool_value)
-        : TreeNode(AstType::SetStmt), set_knob_type_(type), bool_val_(bool_value) {}
+        : TreeNode(AstType::SetStmt), set_type_(SetKnob), set_knob_type_(type), bool_val_(bool_value),
+          isolation_level_(Serializable) {}
+
+    explicit SetStmt(IsolationLevelType isolation_level)
+        : TreeNode(AstType::SetStmt), set_type_(SetIsolation), set_knob_type_(EnableNestLoop), bool_val_(false),
+          isolation_level_(isolation_level) {}
 };
 
 struct FromClause {
@@ -444,6 +455,7 @@ struct SemValue {
     std::vector<std::shared_ptr<OrderByItem>> sv_orderby_items;
 
     SetKnobType sv_setKnobType;
+    IsolationLevelType sv_isolationLevelType;
 };
 
 extern std::shared_ptr<ast::TreeNode> parse_tree;

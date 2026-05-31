@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <optional>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -23,6 +25,16 @@ private:
     std::vector<Rid> rids_;        // 需要删除的记录的位置
     std::string tab_name_;         // 表名称
     SmManager* sm_manager_;
+
+    static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
+        std::vector<char> key(index.col_tot_len);
+        int offset = 0;
+        for (int i = 0; i < index.col_num; ++i) {
+            std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
+            offset += index.cols[i].len;
+        }
+        return key;
+    }
 
 public:
     DeleteExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Condition> conds,
@@ -43,7 +55,17 @@ public:
         // 删除记录
         for (Rid rid : rids_) {
             auto rec = fh_->get_record(rid, context_);
-            char* rec_data = rec->data;
+            if (rec == nullptr) {
+                continue;
+            }
+            auto txn = context_ == nullptr ? nullptr : context_->txn_;
+            if (txn != nullptr) {
+                auto meta = fh_->get_tuple_meta(rid);
+                if ((meta.owner_txn_ != INVALID_TXN_ID && meta.owner_txn_ != txn->get_transaction_id()) ||
+                    (meta.owner_txn_ == INVALID_TXN_ID && meta.ts_ > txn->get_start_ts())) {
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+                }
+            }
             bool match = true;
             for (const auto& cond : conds_) {
                 if (!compare(cond, *rec)) {
@@ -54,42 +76,21 @@ public:
             if (!match) {
                 continue; // 如果记录不匹配条件，则跳过删除
             }
-            auto* undo_record = context_ != nullptr && context_->txn_ != nullptr
-                                    ? new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec)
-                                    : nullptr;
-            struct DeletedIndex {
-                const IndexMeta* index;
-                std::vector<char> key;
-            };
-            std::vector<DeletedIndex> deleted_indexes;
-            try {
-                for (auto& index : tab_.indexes) {
+            if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                context_->txn_mgr_->SsiCheckWrite(context_->txn_, tab_name_, rid, *rec, std::nullopt);
+            }
+            if (txn == nullptr) {
+                for (const auto& index : tab_.indexes) {
+                    auto key = make_index_key(index, rec->data);
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
                                   .get();
-                    std::vector<char> key(index.col_tot_len);
-                    int offset = 0;
-                    for (int i = 0; i < index.col_num; ++i) {
-                        std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
-                        offset += index.cols[i].len;
-                    }
-                    ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
-                    deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
+                    ih->delete_entry(key.data(), nullptr);
                 }
-            } catch (...) {
-                for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
-                    auto ih =
-                        sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, it->index->cols))
-                            .get();
-                    ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
-                }
-                delete undo_record;
-                throw;
-            }
-            if (undo_record != nullptr) {
-                context_->txn_->append_write_record(undo_record);
-                undo_record = nullptr;
             }
             fh_->delete_record(rid, context_);
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec));
+            }
         }
         return nullptr;
     }

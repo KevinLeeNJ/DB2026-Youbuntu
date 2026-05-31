@@ -43,9 +43,10 @@ public:
         file_hdr.record_size = record_size;
         file_hdr.num_pages = 1;
         file_hdr.first_free_page_no = RM_NO_PAGE;
-        // We have: sizeof(hdr) + (n + 7) / 8 + n * record_size <= PAGE_SIZE
+        int physical_record_size = record_size + static_cast<int>(sizeof(TupleMeta) + sizeof(UndoLink));
+        // We have: sizeof(hdr) + (n + 7) / 8 + n * physical_record_size <= PAGE_SIZE
         file_hdr.num_records_per_page =
-            (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + record_size * BITMAP_WIDTH);
+            (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + physical_record_size * BITMAP_WIDTH);
         file_hdr.bitmap_size = (file_hdr.num_records_per_page + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
 
         // 将file header写入磁盘文件（名为file name，文件描述符为fd）中的第0页
