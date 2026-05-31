@@ -105,27 +105,35 @@ public:
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
-        txn_id_t txn_id = INVALID_TXN_ID;
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset);
+        set_transaction(&context);
 
         // Parse
         YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
         if (yyparse() != 0) {
             yy_delete_buffer(buf);
+            abort_implicit_statement(&context);
             throw RMDBError("Parse error for: " + sql);
         }
         if (ast::parse_tree == nullptr) {
             yy_delete_buffer(buf);
+            finish_statement(&context);
             return ""; // EXIT or EOF
         }
         yy_delete_buffer(buf);
 
         // Analyze → Optimize → Portal → Execute
-        std::shared_ptr<Query> query = analyze_->do_analyze(ast::parse_tree);
-        std::shared_ptr<Plan> plan = optimizer_->plan_query(query, &context);
-        std::shared_ptr<PortalStmt> portal_stmt = portal_->start(plan, &context);
-        portal_->run(portal_stmt, ql_manager_.get(), &txn_id, &context);
-        portal_->drop();
+        try {
+            std::shared_ptr<Query> query = analyze_->do_analyze(ast::parse_tree);
+            std::shared_ptr<Plan> plan = optimizer_->plan_query(query, &context);
+            std::shared_ptr<PortalStmt> portal_stmt = portal_->start(plan, &context);
+            portal_->run(portal_stmt, ql_manager_.get(), &txn_id_, &context);
+            portal_->drop();
+            finish_statement(&context);
+        } catch (...) {
+            abort_implicit_statement(&context);
+            throw;
+        }
 
         // Capture output from data_send buffer
         std::string result(data_send, offset);
@@ -152,8 +160,35 @@ public:
     }
 
 private:
+    void set_transaction(Context* context) {
+        context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
+        if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
+            context->txn_->get_state() == TransactionState::ABORTED) {
+            context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_);
+            txn_id_ = context->txn_->get_transaction_id();
+            context->txn_->set_txn_mode(false);
+        }
+    }
+
+    void finish_statement(Context* context) {
+        if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager_->commit(context->txn_, context->log_mgr_);
+        }
+    }
+
+    void abort_implicit_statement(Context* context) {
+        if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager_->abort(context->txn_, context->log_mgr_);
+        }
+    }
+
     std::string db_name_;
     std::string original_cwd_;
+    txn_id_t txn_id_{INVALID_TXN_ID};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<RmManager> rm_manager_;
@@ -392,6 +427,10 @@ TEST_F(SltFileTest, BasicUpdateDelete) {
 
 TEST_F(SltFileTest, BasicIndex) {
     run_slt_file("basic_index.slt");
+}
+
+TEST_F(SltFileTest, Transaction) {
+    run_slt_file("transaction.slt");
 }
 
 TEST_F(SltFileTest, Join) {

@@ -54,16 +54,40 @@ public:
             if (!match) {
                 continue; // 如果记录不匹配条件，则跳过删除
             }
-            for (auto& index : tab_.indexes) {
-                auto ih =
-                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                std::vector<char> key(index.col_tot_len);
-                int offset = 0;
-                for (int i = 0; i < index.col_num; ++i) {
-                    std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
-                    offset += index.cols[i].len;
+            auto* undo_record = context_ != nullptr && context_->txn_ != nullptr
+                                    ? new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec)
+                                    : nullptr;
+            struct DeletedIndex {
+                const IndexMeta* index;
+                std::vector<char> key;
+            };
+            std::vector<DeletedIndex> deleted_indexes;
+            try {
+                for (auto& index : tab_.indexes) {
+                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
+                                  .get();
+                    std::vector<char> key(index.col_tot_len);
+                    int offset = 0;
+                    for (int i = 0; i < index.col_num; ++i) {
+                        std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
+                        offset += index.cols[i].len;
+                    }
+                    ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
+                    deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }
-                ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
+            } catch (...) {
+                for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
+                    auto ih =
+                        sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, it->index->cols))
+                            .get();
+                    ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
+                }
+                delete undo_record;
+                throw;
+            }
+            if (undo_record != nullptr) {
+                context_->txn_->append_write_record(undo_record);
+                undo_record = nullptr;
             }
             fh_->delete_record(rid, context_);
         }

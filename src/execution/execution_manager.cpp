@@ -102,22 +102,32 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
         }
         case T_Transaction_begin: {
             // 显示开启一个事务
+            if (context->txn_ == nullptr) {
+                context->txn_ = txn_mgr_->begin(nullptr, context->log_mgr_);
+                *txn_id = context->txn_->get_transaction_id();
+            }
             context->txn_->set_txn_mode(true);
             break;
         }
         case T_Transaction_commit: {
             context->txn_ = txn_mgr_->get_transaction(*txn_id);
-            txn_mgr_->commit(context->txn_, context->log_mgr_);
+            if (context->txn_ != nullptr) {
+                txn_mgr_->commit(context->txn_, context->log_mgr_);
+            }
             break;
         }
         case T_Transaction_rollback: {
             context->txn_ = txn_mgr_->get_transaction(*txn_id);
-            txn_mgr_->abort(context->txn_, context->log_mgr_);
+            if (context->txn_ != nullptr) {
+                txn_mgr_->abort(context->txn_, context->log_mgr_);
+            }
             break;
         }
         case T_Transaction_abort: {
             context->txn_ = txn_mgr_->get_transaction(*txn_id);
-            txn_mgr_->abort(context->txn_, context->log_mgr_);
+            if (context->txn_ != nullptr) {
+                txn_mgr_->abort(context->txn_, context->log_mgr_);
+            }
             break;
         }
         default:
