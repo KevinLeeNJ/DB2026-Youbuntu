@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_projection.h"
 #include "execution/executor_seq_scan.h"
+#include "execution/executor_union.h"
 #include "execution/executor_update.h"
 #include "execution/execution_sort.h"
 #include "common/common.h"
@@ -224,6 +225,18 @@ private:
             return get_plan_output_names(std::static_pointer_cast<LimitPlan>(plan)->subplan_);
         case T_Aggregate:
             return build_aggregate_output_names(*std::static_pointer_cast<AggregatePlan>(plan));
+        case T_Union: {
+            auto union_plan = std::static_pointer_cast<UnionPlan>(plan);
+            if (!union_plan->output_names_.empty()) {
+                return union_plan->output_names_;
+            }
+            std::vector<std::string> output_names;
+            output_names.reserve(union_plan->cols_.size());
+            for (const auto& col : union_plan->cols_) {
+                output_names.push_back(col.name);
+            }
+            return output_names;
+        }
         case T_SeqScan:
         case T_IndexScan: {
             std::vector<std::string> output_names;
@@ -400,6 +413,15 @@ public:
             auto x = std::static_pointer_cast<LimitPlan>(plan);
             return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context),
                                                    static_cast<size_t>(x->limit_));
+        }
+        case T_Union: {
+            auto x = std::static_pointer_cast<UnionPlan>(plan);
+            std::vector<std::unique_ptr<AbstractExecutor>> branches;
+            branches.reserve(x->branches_.size());
+            for (const auto& branch_plan : x->branches_) {
+                branches.push_back(convert_plan_executor(branch_plan, context));
+            }
+            return std::make_unique<UnionExecutor>(std::move(branches), x->cols_);
         }
         default:
             break;

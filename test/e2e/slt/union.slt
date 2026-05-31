@@ -1,0 +1,146 @@
+# union.slt - Union derived table, duplicate elimination, ordering, and schema validation
+
+statement ok
+CREATE TABLE u_orders1 (order_id INT, amount FLOAT, region CHAR(10));
+
+statement ok
+CREATE TABLE u_orders2 (order_id INT, amount FLOAT, region CHAR(10));
+
+statement ok
+CREATE TABLE u_orders3 (order_id INT, amount FLOAT, region CHAR(10));
+
+statement ok
+INSERT INTO u_orders1 VALUES (1, 150.0, 'Beijing');
+
+statement ok
+INSERT INTO u_orders1 VALUES (2, 230.5, 'Shanghai');
+
+statement ok
+INSERT INTO u_orders1 VALUES (3, 89.99, 'Guangzhou');
+
+statement ok
+INSERT INTO u_orders2 VALUES (1, 150.0, 'Beijing');
+
+statement ok
+INSERT INTO u_orders2 VALUES (4, 120.0, 'Shenzhen');
+
+statement ok
+INSERT INTO u_orders2 VALUES (5, 560.0, 'Chengdu');
+
+statement ok
+INSERT INTO u_orders3 VALUES (1, 150.0, 'Beijing');
+
+statement ok
+INSERT INTO u_orders3 VALUES (6, 199.99, 'Wuhan');
+
+query
+SELECT * FROM (
+    SELECT * FROM u_orders1
+    UNION
+    SELECT * FROM u_orders2
+    UNION
+    SELECT * FROM u_orders3
+) AS all_orders
+ORDER BY amount DESC;
+----
++------------------+------------------+------------------+
+|         order_id |           amount |           region |
++------------------+------------------+------------------+
+|                5 |       560.000000 |          Chengdu |
+|                2 |       230.500000 |         Shanghai |
+|                6 |       199.990005 |            Wuhan |
+|                1 |       150.000000 |          Beijing |
+|                4 |       120.000000 |         Shenzhen |
+|                3 |        89.989998 |        Guangzhou |
++------------------+------------------+------------------+
+Total record(s): 6
+
+statement ok
+CREATE TABLE u_promote1 (order_id INT, amount INT, region CHAR(10));
+
+statement ok
+CREATE TABLE u_promote2 (order_id INT, amount FLOAT, region CHAR(20));
+
+statement ok
+INSERT INTO u_promote1 VALUES (1, 10, 'A');
+
+statement ok
+INSERT INTO u_promote1 VALUES (2, 30, 'BBB');
+
+statement ok
+INSERT INTO u_promote2 VALUES (3, 30.0, 'CCCCCCCCCCCC');
+
+statement ok
+INSERT INTO u_promote2 VALUES (4, 20.5, 'DD');
+
+query
+SELECT * FROM (
+    SELECT * FROM u_promote1
+    UNION
+    SELECT * FROM u_promote2
+) AS promoted
+ORDER BY promoted.amount DESC, promoted.order_id ASC;
+----
++------------------+------------------+------------------+
+|         order_id |           amount |           region |
++------------------+------------------+------------------+
+|                2 |        30.000000 |              BBB |
+|                3 |        30.000000 |     CCCCCCCCCCCC |
+|                4 |        20.500000 |               DD |
+|                1 |        10.000000 |                A |
++------------------+------------------+------------------+
+Total record(s): 4
+
+query
+SELECT * FROM (
+    SELECT order_id FROM u_orders1
+    UNION
+    SELECT order_id FROM u_orders2
+) AS order_ids;
+----
++------------------+
+|         order_id |
++------------------+
+|                1 |
+|                2 |
+|                3 |
+|                4 |
+|                5 |
++------------------+
+Total record(s): 5
+
+statement error
+SELECT * FROM (
+    SELECT amount FROM u_promote1
+    UNION
+    SELECT * FROM u_promote2
+) AS bad_union;
+
+statement error
+SELECT * FROM (
+    SELECT amount FROM u_promote1
+    UNION
+    SELECT region FROM u_promote2
+) AS bad_union;
+
+statement error
+SELECT * FROM (
+    SELECT amount FROM u_promote1
+    UNION
+    SELECT amount FROM u_promote2
+) AS bad_union
+ORDER BY order_id ASC;
+
+statement error
+SELECT * FROM (
+    SELECT * FROM u_orders1 ORDER BY amount DESC
+    UNION
+    SELECT * FROM u_orders2
+) AS bad_union;
+
+statement error
+SELECT * FROM (
+    SELECT * FROM u_orders1 LIMIT 1
+    UNION
+    SELECT * FROM u_orders2
+) AS bad_union;

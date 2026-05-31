@@ -45,7 +45,8 @@ typedef enum PlanTag {
     T_Sort,
     T_Projection,
     T_Aggregate,
-    T_Limit
+    T_Limit,
+    T_Union
 } PlanTag;
 
 // 查询执行计划
@@ -154,6 +155,21 @@ public:
     ~LimitPlan() {}
     std::shared_ptr<Plan> subplan_;
     int limit_;
+};
+
+class UnionPlan : public Plan {
+public:
+    UnionPlan(PlanTag tag, std::vector<std::shared_ptr<Plan>> branches, std::vector<ColMeta> cols,
+              std::vector<std::string> output_names) {
+        Plan::tag = tag;
+        branches_ = std::move(branches);
+        cols_ = std::move(cols);
+        output_names_ = std::move(output_names);
+    }
+    ~UnionPlan() {}
+    std::vector<std::shared_ptr<Plan>> branches_;
+    std::vector<ColMeta> cols_;
+    std::vector<std::string> output_names_;
 };
 
 // dml语句，包括insert; delete; update; select语句　

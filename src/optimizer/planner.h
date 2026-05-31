@@ -56,6 +56,7 @@ private:
     std::shared_ptr<Plan> generate_limit_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
     std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context* context);
+    std::shared_ptr<Plan> generate_union_plan(std::shared_ptr<Query> query, Context* context);
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     bool get_index_cols(std::string tab_name, std::vector<Condition>& curr_conds,
