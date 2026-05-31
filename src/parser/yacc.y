@@ -21,7 +21,7 @@ using namespace ast;
 %define parse.error verbose
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY GROUP HAVING LIMIT AS
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY GROUP HAVING LIMIT AS UNION
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN COUNT MAX MIN SUM AVG
 EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SORTMERGE
 // non-keywords
@@ -47,7 +47,10 @@ EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SOR
 %type <sv_col> col
 %type <sv_cols> colList opt_group_clause
 %type <sv_select_item> select_item
-%type <sv_select_items> select_item_list selector
+%type <sv_select_items> select_item_list
+%type <sv_select_stmt> select_stmt
+%type <sv_union_stmt> union_query
+%type <sv_select_stmts> union_branch_list
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
@@ -164,11 +167,45 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    |   select_stmt
+    {
+        $$ = $1;
+    }
+    |   SELECT '*' FROM '(' union_query ')' AS tbName opt_order_clause
+    {
+        $$ = std::make_shared<SelectFromUnionStmt>($5, $8, $9);
+    }
+    ;
+
+select_stmt:
+        SELECT '*' FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    {
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<SelectItem>>{}, $4, $5, $6, $7, $8,
+                                          $9 != nullptr,
+                                          $9 != nullptr ? std::static_pointer_cast<IntLit>($9)->val : 0, true);
+    }
+    |   SELECT select_item_list FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
         $$ = std::make_shared<SelectStmt>($2, $4, $5, $6, $7, $8, $9 != nullptr,
-                                          $9 != nullptr ? std::static_pointer_cast<IntLit>($9)->val : 0,
-                                          $2.empty());
+                                          $9 != nullptr ? std::static_pointer_cast<IntLit>($9)->val : 0, false);
+    }
+    ;
+
+union_query:
+        union_branch_list
+    {
+        $$ = std::make_shared<UnionStmt>($1);
+    }
+    ;
+
+union_branch_list:
+        select_stmt UNION select_stmt
+    {
+        $$ = std::vector<std::shared_ptr<SelectStmt>>{$1, $3};
+    }
+    |   union_branch_list UNION select_stmt
+    {
+        $$.push_back($3);
     }
     ;
 
@@ -351,14 +388,6 @@ setClause:
     {
         $$ = std::make_shared<SetClause>($1, $3);
     }
-    ;
-
-selector:
-        '*'
-    {
-        $$ = {};
-    }
-    |   select_item_list
     ;
 
 select_item_list:

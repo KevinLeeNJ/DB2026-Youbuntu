@@ -58,6 +58,8 @@ enum class AstType {
     UpdateStmt,
     JoinExpr,
     SelectStmt,
+    UnionStmt,
+    SelectFromUnionStmt,
     SetStmt
 };
 
@@ -350,6 +352,25 @@ struct SelectStmt : public TreeNode {
     }
 };
 
+struct UnionStmt : public TreeNode {
+    std::vector<std::shared_ptr<SelectStmt>> branches;
+
+    explicit UnionStmt(std::vector<std::shared_ptr<SelectStmt>> branches_)
+        : TreeNode(AstType::UnionStmt), branches(std::move(branches_)) {}
+};
+
+struct SelectFromUnionStmt : public TreeNode {
+    std::shared_ptr<UnionStmt> union_stmt;
+    std::string alias;
+    std::vector<std::shared_ptr<OrderByItem>> order_by_items;
+    bool has_sort;
+
+    SelectFromUnionStmt(std::shared_ptr<UnionStmt> union_stmt_, std::string alias_,
+                        std::vector<std::shared_ptr<OrderByItem>> order_by_items_)
+        : TreeNode(AstType::SelectFromUnionStmt), union_stmt(std::move(union_stmt_)), alias(std::move(alias_)),
+          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {}
+};
+
 // set enable_nestloop
 struct SetStmt : public TreeNode {
     SetKnobType set_knob_type_;
@@ -388,6 +409,9 @@ struct SemValue {
 
     std::shared_ptr<SelectItem> sv_select_item;
     std::vector<std::shared_ptr<SelectItem>> sv_select_items;
+    std::shared_ptr<SelectStmt> sv_select_stmt;
+    std::shared_ptr<UnionStmt> sv_union_stmt;
+    std::vector<std::shared_ptr<SelectStmt>> sv_select_stmts;
 
     std::shared_ptr<SetClause> sv_set_clause;
     std::vector<std::shared_ptr<SetClause>> sv_set_clauses;

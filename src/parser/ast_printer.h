@@ -273,6 +273,20 @@ private:
             }
             break;
         }
+        case AstType::UnionStmt: {
+            auto x = std::static_pointer_cast<UnionStmt>(node);
+            std::cout << "UNION\n";
+            print_node_list(x->branches, offset);
+            break;
+        }
+        case AstType::SelectFromUnionStmt: {
+            auto x = std::static_pointer_cast<SelectFromUnionStmt>(node);
+            std::cout << "SELECT_FROM_UNION\n";
+            print_node(x->union_stmt, offset);
+            print_val(x->alias, offset);
+            print_node_list(x->order_by_items, offset);
+            break;
+        }
         case AstType::TxnBegin:
             std::cout << "BEGIN\n";
             break;

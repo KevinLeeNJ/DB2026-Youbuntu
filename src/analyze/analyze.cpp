@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 #include "analyze_expr_internal.h"
 #include "analyze_select_internal.h"
 
+#include <algorithm>
+
 using namespace analyze_internal;
 
 /**
@@ -20,32 +22,15 @@ using namespace analyze_internal;
  * @return {shared_ptr<Query>} Query
  */
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse) {
+    if (parse->type == ast::AstType::SelectStmt) {
+        return analyze_select_stmt(std::static_pointer_cast<ast::SelectStmt>(parse));
+    }
+    if (parse->type == ast::AstType::SelectFromUnionStmt) {
+        return analyze_select_from_union_stmt(std::static_pointer_cast<ast::SelectFromUnionStmt>(parse));
+    }
+
     std::shared_ptr<Query> query = std::make_shared<Query>();
     switch (parse->type) {
-    case ast::AstType::SelectStmt: {
-        auto x = std::static_pointer_cast<ast::SelectStmt>(parse);
-        query->tables = x->tabs;
-
-        for (const auto& tab_name : query->tables) {
-            if (!sm_manager_->db_.is_table(tab_name)) {
-                throw TableNotFoundError(tab_name);
-            }
-        }
-
-        std::vector<ColMeta> all_cols;
-        get_all_cols(query->tables, all_cols);
-
-        populate_select_items_from_ast(*query, *x, all_cols);
-        populate_group_by_from_ast(*query, *x);
-        populate_having_from_ast(*query, *x);
-        populate_order_by_from_ast(*query, *x);
-        populate_limit_from_ast(*query, *x);
-
-        get_clause(x->conds, query->conds);
-        check_clause(query->tables, query->conds);
-        validate_select_query(*query, all_cols);
-        break;
-    }
     case ast::AstType::UpdateStmt: {
         auto x = std::static_pointer_cast<ast::UpdateStmt>(parse);
         query->set_clauses.reserve(x->set_clauses.size());
@@ -77,6 +62,152 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         break;
     }
     query->parse = std::move(parse);
+    return query;
+}
+
+std::shared_ptr<Query> Analyze::analyze_select_stmt(const std::shared_ptr<ast::SelectStmt>& x) {
+    std::shared_ptr<Query> query = std::make_shared<Query>();
+    query->tables = x->tabs;
+
+    for (const auto& tab_name : query->tables) {
+        if (!sm_manager_->db_.is_table(tab_name)) {
+            throw TableNotFoundError(tab_name);
+        }
+    }
+
+    std::vector<ColMeta> all_cols;
+    get_all_cols(query->tables, all_cols);
+
+    populate_select_items_from_ast(*query, *x, all_cols);
+    populate_group_by_from_ast(*query, *x);
+    populate_having_from_ast(*query, *x);
+    populate_order_by_from_ast(*query, *x);
+    populate_limit_from_ast(*query, *x);
+
+    get_clause(x->conds, query->conds);
+    check_clause(query->tables, query->conds);
+    validate_select_query(*query, all_cols);
+    query->parse = x;
+    return query;
+}
+
+std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query) {
+    std::vector<ColMeta> all_cols;
+    get_all_cols(query.tables, all_cols);
+
+    std::vector<ColMeta> result;
+    result.reserve(query.select_items.size());
+    size_t offset = 0;
+    for (size_t i = 0; i < query.select_items.size(); ++i) {
+        const auto& item = query.select_items[i];
+        ColType type = infer_expr_type(item.expr, all_cols);
+        int len = sizeof(int);
+        if (type == TYPE_FLOAT) {
+            len = sizeof(float);
+        } else if (type == TYPE_STRING) {
+            if (item.expr.type != QueryExprType::COLUMN) {
+                throw RMDBError("UNION only supports string output from columns");
+            }
+            TabCol resolved_col = item.expr.col;
+            const ColMeta* col_meta = resolve_column_meta(all_cols, resolved_col);
+            len = col_meta->len;
+        }
+
+        ColMeta col;
+        col.tab_name.clear();
+        col.name = query.output_names[i];
+        col.type = type;
+        col.len = len;
+        col.offset = static_cast<int>(offset);
+        offset += static_cast<size_t>(len);
+        result.push_back(std::move(col));
+    }
+    return result;
+}
+
+ColMeta Analyze::make_union_col_meta(const ColMeta& current, const ColMeta& next) {
+    ColMeta result = current;
+    result.tab_name.clear();
+
+    if (current.type == next.type) {
+        if (current.type == TYPE_STRING) {
+            result.len = std::max(current.len, next.len);
+        }
+        return result;
+    }
+
+    if ((current.type == TYPE_INT && next.type == TYPE_FLOAT) ||
+        (current.type == TYPE_FLOAT && next.type == TYPE_INT)) {
+        result.type = TYPE_FLOAT;
+        result.len = sizeof(float);
+        return result;
+    }
+
+    throw IncompatibleTypeError(coltype2str(current.type), coltype2str(next.type));
+}
+
+void Analyze::validate_union_order_by(Query& query) {
+    for (auto& item : query.order_by_items) {
+        if (item.expr.type != QueryExprType::COLUMN) {
+            throw RMDBError("ORDER BY must reference Union output columns");
+        }
+        if (!item.expr.col.tab_name.empty() && item.expr.col.tab_name != query.union_alias) {
+            throw ColumnNotFoundError(item.expr.col.tab_name + "." + item.expr.col.col_name);
+        }
+        std::string name = !item.order_name.empty() ? item.order_name : item.expr.col.col_name;
+        auto pos = std::find_if(query.union_cols.begin(), query.union_cols.end(),
+                                [&](const ColMeta& col) { return col.name == name; });
+        if (pos == query.union_cols.end()) {
+            throw ColumnNotFoundError(name);
+        }
+
+        item.expr = make_column_expr({.tab_name = "", .col_name = pos->name});
+        item.expr.display_name = pos->name;
+        item.order_name = pos->name;
+    }
+}
+
+std::shared_ptr<Query> Analyze::analyze_select_from_union_stmt(const std::shared_ptr<ast::SelectFromUnionStmt>& x) {
+    if (x->union_stmt == nullptr || x->union_stmt->branches.size() < 2) {
+        throw RMDBError("UNION requires at least two SELECT branches");
+    }
+
+    auto query = std::make_shared<Query>();
+    query->is_union = true;
+    query->parse = x;
+    query->union_alias = x->alias;
+    populate_order_by_from_ast(*query, *x);
+
+    query->union_branches.reserve(x->union_stmt->branches.size());
+    for (const auto& branch : x->union_stmt->branches) {
+        auto branch_query = analyze_select_stmt(branch);
+        if (!branch_query->order_by_items.empty() || branch_query->has_limit) {
+            throw RMDBError("UNION branches do not support ORDER BY or LIMIT");
+        }
+        query->union_branches.push_back(std::move(branch_query));
+    }
+
+    query->union_cols = get_query_output_metas(*query->union_branches.front());
+    for (size_t branch_idx = 1; branch_idx < query->union_branches.size(); ++branch_idx) {
+        auto branch_cols = get_query_output_metas(*query->union_branches[branch_idx]);
+        if (branch_cols.size() != query->union_cols.size()) {
+            throw RMDBError("UNION branches must return the same number of columns");
+        }
+        for (size_t col_idx = 0; col_idx < query->union_cols.size(); ++col_idx) {
+            query->union_cols[col_idx] = make_union_col_meta(query->union_cols[col_idx], branch_cols[col_idx]);
+        }
+    }
+
+    size_t offset = 0;
+    query->output_names.clear();
+    query->output_names.reserve(query->union_cols.size());
+    for (auto& col : query->union_cols) {
+        col.offset = static_cast<int>(offset);
+        offset += static_cast<size_t>(col.len);
+        query->output_names.push_back(col.name);
+    }
+
+    validate_union_order_by(*query);
     return query;
 }
 

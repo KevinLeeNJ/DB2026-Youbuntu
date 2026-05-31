@@ -478,6 +478,22 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     return plannerRoot;
 }
 
+std::shared_ptr<Plan> Planner::generate_union_plan(std::shared_ptr<Query> query, Context* context) {
+    std::vector<std::shared_ptr<Plan>> branch_plans;
+    branch_plans.reserve(query->union_branches.size());
+    for (auto& branch_query : query->union_branches) {
+        branch_plans.push_back(generate_select_plan(branch_query, context));
+    }
+
+    std::shared_ptr<Plan> plannerRoot =
+        std::make_shared<UnionPlan>(T_Union, std::move(branch_plans), query->union_cols, query->output_names);
+
+    if (!query->order_by_items.empty()) {
+        plannerRoot = std::make_shared<SortPlan>(T_Sort, std::move(plannerRoot), query->order_by_items);
+    }
+    return plannerRoot;
+}
+
 // 生成DDL语句和DML语句的查询执行计划
 std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context* context) {
     std::shared_ptr<Plan> plannerRoot;
@@ -576,6 +592,12 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context*
         // 生成select语句的查询执行计划
         std::shared_ptr<Plan> projection = generate_select_plan(std::move(query), context);
         plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
+                                                std::vector<Condition>(), std::vector<SetClause>());
+        break;
+    }
+    case ast::AstType::SelectFromUnionStmt: {
+        std::shared_ptr<Plan> union_plan = generate_union_plan(std::move(query), context);
+        plannerRoot = std::make_shared<DMLPlan>(T_select, union_plan, std::string(), std::vector<Value>(),
                                                 std::vector<Condition>(), std::vector<SetClause>());
         break;
     }

@@ -409,3 +409,7 @@ TEST_F(SltFileTest, Errors) {
 TEST_F(SltFileTest, Aggregate) {
     run_slt_file("aggregate.slt");
 }
+
+TEST_F(SltFileTest, Union) {
+    run_slt_file("union.slt");
+}

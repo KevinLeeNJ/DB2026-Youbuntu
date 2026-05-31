@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <cassert>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -38,6 +39,10 @@ public:
     bool has_aggregate = false;
     bool has_select_star = false;
     std::vector<std::string> output_names;
+    bool is_union = false;
+    std::vector<std::shared_ptr<Query>> union_branches;
+    std::vector<ColMeta> union_cols;
+    std::string union_alias;
     // 表名
     std::vector<std::string> tables;
     // update 的set 值
@@ -75,4 +80,10 @@ private:
         }
         return false;
     }
+
+    std::shared_ptr<Query> analyze_select_stmt(const std::shared_ptr<ast::SelectStmt>& select);
+    std::shared_ptr<Query> analyze_select_from_union_stmt(const std::shared_ptr<ast::SelectFromUnionStmt>& select);
+    std::vector<ColMeta> get_query_output_metas(const Query& query);
+    ColMeta make_union_col_meta(const ColMeta& current, const ColMeta& next);
+    void validate_union_order_by(Query& query);
 };
