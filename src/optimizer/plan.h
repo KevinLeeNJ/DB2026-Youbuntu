@@ -132,14 +132,16 @@ public:
 
 class SortPlan : public Plan {
 public:
-    SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<OrderByItem> order_by_items) {
+    SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<OrderByItem> order_by_items, int limit = -1) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         order_by_items_ = std::move(order_by_items);
+        limit_ = limit;
     }
     ~SortPlan() {}
     std::shared_ptr<Plan> subplan_;
     std::vector<OrderByItem> order_by_items_;
+    int limit_ = -1;
 };
 
 class LimitPlan : public Plan {

@@ -79,19 +79,18 @@ public:
         assert(btree_order > 2);
 
         // Create file header and write to file
-        IxFileHdr* fhdr =
-            new IxFileHdr(IX_NO_PAGE, IX_INIT_NUM_PAGES, IX_INIT_ROOT_PAGE, col_num, col_tot_len, btree_order,
-                          (btree_order + 1) * col_tot_len, IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
+        IxFileHdr fhdr = IxFileHdr(IX_NO_PAGE, IX_INIT_NUM_PAGES, IX_INIT_ROOT_PAGE, col_num, col_tot_len, btree_order,
+                                   (btree_order + 1) * col_tot_len, IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
         for (int i = 0; i < col_num; ++i) {
-            fhdr->col_types_.push_back(index_cols[i].type);
-            fhdr->col_lens_.push_back(index_cols[i].len);
+            fhdr.col_types_.push_back(index_cols[i].type);
+            fhdr.col_lens_.push_back(index_cols[i].len);
         }
-        fhdr->update_tot_len();
+        fhdr.update_tot_len();
 
-        char* data = new char[fhdr->tot_len_];
-        fhdr->serialize(data);
+        std::vector<char> data(fhdr.tot_len_);
+        fhdr.serialize(data.data());
 
-        disk_manager_->write_page(fd, IX_FILE_HDR_PAGE, data, fhdr->tot_len_);
+        disk_manager_->write_page(fd, IX_FILE_HDR_PAGE, data.data(), fhdr.tot_len_);
 
         char page_buf[PAGE_SIZE]; // 在内存中初始化page_buf中的内容，然后将其写入磁盘
         memset(page_buf, 0, PAGE_SIZE);
@@ -157,9 +156,9 @@ public:
     }
 
     void close_index(const IxIndexHandle* ih) {
-        char* data = new char[ih->file_hdr_->tot_len_];
-        ih->file_hdr_->serialize(data);
-        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
+        std::vector<char> data(ih->file_hdr_->tot_len_);
+        ih->file_hdr_->serialize(data.data());
+        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data.data(), ih->file_hdr_->tot_len_);
         // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
         buffer_pool_manager_->flush_all_pages(ih->fd_);
         buffer_pool_manager_->delete_all_pages(ih->fd_);

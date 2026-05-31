@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <string>
@@ -95,7 +96,9 @@ private:
             ExecutorSelectItem executor_item;
             executor_item.expr = to_executor_query_expr(item.expr);
             executor_item.alias = item.alias;
-            executor_item.display_name = item.output_name.empty() ? item.expr.display_name : item.output_name;
+            executor_item.display_name = !item.output_name.empty()
+                                             ? item.output_name
+                                             : (!item.alias.empty() ? item.alias : item.expr.display_name);
             executor_item.output_name = item.output_name;
             executor_items.push_back(std::move(executor_item));
         }
@@ -117,6 +120,63 @@ private:
             executor_conds.push_back(std::move(executor_cond));
         }
         return executor_conds;
+    }
+
+    static bool same_tab_col(const TabCol& lhs, const TabCol& rhs) {
+        return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
+    }
+
+    static bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
+        if (lhs.type != rhs.type) {
+            return false;
+        }
+        switch (lhs.type) {
+        case QueryExprType::COLUMN:
+            return same_tab_col(lhs.col, rhs.col);
+        case QueryExprType::VALUE:
+            return false;
+        case QueryExprType::AGGREGATE:
+            return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
+                   (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+        }
+        return false;
+    }
+
+    static std::string get_select_item_output_name(const SelectItem& item) {
+        if (!item.output_name.empty()) {
+            return item.output_name;
+        }
+        if (!item.alias.empty()) {
+            return item.alias;
+        }
+        if (!item.expr.display_name.empty()) {
+            return item.expr.display_name;
+        }
+        if (item.expr.type == QueryExprType::AGGREGATE) {
+            return item.expr.agg.display_name;
+        }
+        return item.expr.col.col_name;
+    }
+
+    static std::vector<OrderByItem> bind_sort_output_names(const SortPlan& plan) {
+        auto order_by_items = plan.order_by_items_;
+        auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan.subplan_);
+        if (projection == nullptr) {
+            return order_by_items;
+        }
+
+        for (auto& item : order_by_items) {
+            if (!item.order_name.empty()) {
+                continue;
+            }
+            auto pos = std::find_if(
+                projection->select_items_.begin(), projection->select_items_.end(),
+                [&](const SelectItem& select_item) { return same_query_expr(select_item.expr, item.expr); });
+            if (pos != projection->select_items_.end()) {
+                item.order_name = get_select_item_output_name(*pos);
+            }
+        }
+        return order_by_items;
     }
 
     static std::vector<std::string> build_projection_output_names(const ProjectionPlan& plan) {
@@ -333,7 +393,8 @@ public:
         }
         case T_Sort: {
             auto x = std::static_pointer_cast<SortPlan>(plan);
-            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), x->order_by_items_);
+            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context),
+                                                  bind_sort_output_names(*x), x->limit_);
         }
         case T_Limit: {
             auto x = std::static_pointer_cast<LimitPlan>(plan);

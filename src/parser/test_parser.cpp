@@ -41,11 +41,11 @@ int main() {
         assert(yyparse() == 0);
         if (ast::parse_tree != nullptr) {
             ast::TreePrinter::print(ast::parse_tree);
-            yy_delete_buffer(buf);
             std::cout << std::endl;
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
+        yy_delete_buffer(buf);
     }
     ast::parse_tree.reset();
     return 0;

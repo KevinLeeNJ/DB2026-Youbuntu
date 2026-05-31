@@ -11,19 +11,29 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 #include <algorithm>
 #include <cstring>
+#include <queue>
 #include <type_traits>
 
 #include "execution_defs.h"
 #include "execution_manager.h"
+#include "execution_scalar.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
 class SortExecutor : public AbstractExecutor {
 private:
+    using CompareFn = int (*)(const RmRecord&, const RmRecord&, const ColMeta&);
+
     struct SortKey {
         ColMeta col;
         bool is_desc = false;
+        CompareFn compare_fn = nullptr;
+    };
+
+    struct MaterializedTuple {
+        RmRecord record;
+        size_t ordinal = 0;
     };
 
     std::unique_ptr<AbstractExecutor> prev_;
@@ -33,48 +43,58 @@ private:
     std::vector<RmRecord> tuples_;
     size_t cursor_ = 0;
     bool materialized_ = false;
+    int limit_ = -1;
 
-    static std::string read_string(const char* data, int len) {
-        return std::string(data, strnlen(data, len));
-    }
-
-    static int compare_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
+    static int compare_int_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
-        switch (col.type) {
-        case TYPE_INT: {
-            int lhs_val = *reinterpret_cast<const int*>(lhs_data);
-            int rhs_val = *reinterpret_cast<const int*>(rhs_data);
-            if (lhs_val < rhs_val) {
-                return -1;
-            }
-            if (lhs_val > rhs_val) {
-                return 1;
-            }
-            return 0;
+        int lhs_val = *reinterpret_cast<const int*>(lhs_data);
+        int rhs_val = *reinterpret_cast<const int*>(rhs_data);
+        if (lhs_val < rhs_val) {
+            return -1;
         }
-        case TYPE_FLOAT: {
-            float lhs_val = *reinterpret_cast<const float*>(lhs_data);
-            float rhs_val = *reinterpret_cast<const float*>(rhs_data);
-            if (lhs_val < rhs_val) {
-                return -1;
-            }
-            if (lhs_val > rhs_val) {
-                return 1;
-            }
-            return 0;
+        if (lhs_val > rhs_val) {
+            return 1;
         }
-        case TYPE_STRING: {
-            const auto lhs_val = read_string(lhs_data, col.len);
-            const auto rhs_val = read_string(rhs_data, col.len);
-            if (lhs_val < rhs_val) {
-                return -1;
-            }
-            if (lhs_val > rhs_val) {
-                return 1;
-            }
-            return 0;
+        return 0;
+    }
+
+    static int compare_float_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
+        const char* lhs_data = lhs.data + col.offset;
+        const char* rhs_data = rhs.data + col.offset;
+        float lhs_val = *reinterpret_cast<const float*>(lhs_data);
+        float rhs_val = *reinterpret_cast<const float*>(rhs_data);
+        if (lhs_val < rhs_val) {
+            return -1;
         }
+        if (lhs_val > rhs_val) {
+            return 1;
+        }
+        return 0;
+    }
+
+    static int compare_string_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
+        const char* lhs_data = lhs.data + col.offset;
+        const char* rhs_data = rhs.data + col.offset;
+        const auto lhs_val = execution_scalar::trim_string_view(lhs_data, col.len);
+        const auto rhs_val = execution_scalar::trim_string_view(rhs_data, col.len);
+        if (lhs_val < rhs_val) {
+            return -1;
+        }
+        if (lhs_val > rhs_val) {
+            return 1;
+        }
+        return 0;
+    }
+
+    static CompareFn bind_compare_fn(ColType type) {
+        switch (type) {
+        case TYPE_INT:
+            return &compare_int_cell;
+        case TYPE_FLOAT:
+            return &compare_float_cell;
+        case TYPE_STRING:
+            return &compare_string_cell;
         }
         throw InternalError("Unexpected column type in SortExecutor");
     }
@@ -104,10 +124,38 @@ private:
     }
 
     void add_sort_key(const ColMeta& col, bool is_desc) {
-        sort_keys_.push_back({col, is_desc});
+        sort_keys_.push_back({col, is_desc, bind_compare_fn(col.type)});
     }
 
-    void materialize_and_sort() {
+    int compare_records(const RmRecord& lhs, const RmRecord& rhs) const {
+        for (const auto& key : sort_keys_) {
+            int cmp = key.compare_fn(lhs, rhs, key.col);
+            if (cmp != 0) {
+                return key.is_desc ? -cmp : cmp;
+            }
+        }
+        return 0;
+    }
+
+    int compare_materialized(const MaterializedTuple& lhs, const MaterializedTuple& rhs) const {
+        int cmp = compare_records(lhs.record, rhs.record);
+        if (cmp != 0) {
+            return cmp;
+        }
+        if (lhs.ordinal < rhs.ordinal) {
+            return -1;
+        }
+        if (lhs.ordinal > rhs.ordinal) {
+            return 1;
+        }
+        return 0;
+    }
+
+    bool comes_before(const MaterializedTuple& lhs, const MaterializedTuple& rhs) const {
+        return compare_materialized(lhs, rhs) < 0;
+    }
+
+    void materialize_all() {
         tuples_.clear();
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = prev_->Next();
@@ -115,9 +163,64 @@ private:
                 tuples_.emplace_back(*rec);
             }
         }
+    }
+
+    void materialize_top_k(size_t top_k) {
+        struct HeapCompare {
+            const SortExecutor* self = nullptr;
+
+            bool operator()(const MaterializedTuple& lhs, const MaterializedTuple& rhs) const {
+                return self->comes_before(lhs, rhs);
+            }
+        };
+
+        tuples_.clear();
+        if (top_k == 0) {
+            return;
+        }
+
+        std::priority_queue<MaterializedTuple, std::vector<MaterializedTuple>, HeapCompare> heap(HeapCompare{this});
+        size_t ordinal = 0;
+        for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+            auto rec = prev_->Next();
+            if (rec == nullptr) {
+                continue;
+            }
+
+            MaterializedTuple tuple{*rec, ordinal++};
+            if (heap.size() < top_k) {
+                heap.push(std::move(tuple));
+                continue;
+            }
+            if (comes_before(tuple, heap.top())) {
+                heap.pop();
+                heap.push(std::move(tuple));
+            }
+        }
+
+        std::vector<MaterializedTuple> top_tuples;
+        top_tuples.reserve(heap.size());
+        while (!heap.empty()) {
+            top_tuples.push_back(heap.top());
+            heap.pop();
+        }
+        std::sort(top_tuples.begin(), top_tuples.end(),
+                  [&](const MaterializedTuple& lhs, const MaterializedTuple& rhs) { return comes_before(lhs, rhs); });
+        tuples_.reserve(top_tuples.size());
+        for (const auto& tuple : top_tuples) {
+            tuples_.push_back(tuple.record);
+        }
+    }
+
+    void materialize_and_sort() {
+        if (limit_ >= 0 && !sort_keys_.empty()) {
+            materialize_top_k(static_cast<size_t>(limit_));
+        } else {
+            materialize_all();
+        }
         std::stable_sort(tuples_.begin(), tuples_.end(), [&](const RmRecord& lhs, const RmRecord& rhs) {
             for (const auto& key : sort_keys_) {
-                int cmp = compare_cell(lhs, rhs, key.col);
+                int cmp = key.compare_fn(lhs, rhs, key.col);
                 if (cmp == 0) {
                     continue;
                 }
@@ -150,32 +253,38 @@ private:
                     add_sort_key(col, item.is_desc);
                     continue;
                 } catch (const ColumnNotFoundError&) {
-                    try_resolve_by_name(expr.col.col_name);
+                    try_resolve_by_name(item.order_name) || try_resolve_by_name(expr.col.col_name);
                 }
             } else {
-                try_resolve_by_name(expr.display_name) || try_resolve_by_name(expr.agg.display_name);
+                try_resolve_by_name(item.order_name) || try_resolve_by_name(expr.display_name) ||
+                    try_resolve_by_name(expr.agg.display_name);
             }
 
             if (resolved == nullptr) {
-                throw ColumnNotFoundError(expr.display_name.empty() ? expr.col.col_name : expr.display_name);
+                throw ColumnNotFoundError(!item.order_name.empty()
+                                              ? item.order_name
+                                              : (expr.display_name.empty() ? expr.col.col_name : expr.display_name));
             }
             add_sort_key(*resolved, item.is_desc);
         }
     }
 
 public:
-    SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc, int limit = -1) {
         prev_ = std::move(prev);
         cols_ = prev_->cols();
         len_ = prev_->tupleLen();
+        limit_ = limit;
         add_sort_key(resolve_col(sel_cols), is_desc);
     }
 
     template <typename OrderByItemT, typename = std::enable_if_t<!std::is_same_v<OrderByItemT, TabCol>>>
-    SortExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<OrderByItemT>& order_by_items) {
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<OrderByItemT>& order_by_items,
+                 int limit = -1) {
         prev_ = std::move(prev);
         cols_ = prev_->cols();
         len_ = prev_->tupleLen();
+        limit_ = limit;
         build_from_order_by_items(order_by_items);
     }
 

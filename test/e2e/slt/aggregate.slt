@@ -149,6 +149,17 @@ SELECT course, id, score FROM grade ORDER BY course ASC, score DESC LIMIT 4;
 +------------------+------------------+------------------+
 Total record(s): 4
 
+query
+SELECT id, SUM(score) AS total_score FROM grade GROUP BY id HAVING COUNT(*) >= 3 ORDER BY total_score DESC LIMIT 2;
+----
++------------------+------------------+
+|               id |      total_score |
++------------------+------------------+
+|                1 |       386.000000 |
+|                3 |       276.500000 |
++------------------+------------------+
+Total record(s): 2
+
 statement error
 SELECT id, score FROM grade GROUP BY course;
 
