@@ -17,3 +17,6 @@ CLAUDE.md
 #忽略测试数据库
 test_e2e_db
 testdb
+#忽略flex和bison生成的文件
+src/parser/lex.yy.*
+src/parser/yacc.tab.*
