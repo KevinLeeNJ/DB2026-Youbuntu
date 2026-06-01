@@ -136,6 +136,7 @@ struct Condition {
     bool is_rhs_val; // true if right-hand side is a value (not a column)
     TabCol rhs_col;  // right-hand side column
     Value rhs_val;   // right-hand side value
+    std::string rhs_display;
 };
 
 struct SetClause {

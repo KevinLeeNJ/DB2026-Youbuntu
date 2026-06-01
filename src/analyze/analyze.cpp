@@ -318,6 +318,7 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv
         if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs); rhs_val != nullptr) {
             cond.is_rhs_val = true;
             cond.rhs_val = convert_sv_value(rhs_val);
+            cond.rhs_display = rhs_val->display_text;
         } else if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs); rhs_col != nullptr) {
             cond.is_rhs_val = false;
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};

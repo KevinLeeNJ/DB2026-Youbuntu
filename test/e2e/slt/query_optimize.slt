@@ -43,6 +43,9 @@ statement ok
 CREATE TABLE orders (order_id int, customer_id int, order_date char(40), total_amount float);
 
 statement ok
+CREATE TABLE payments (payment_id int, order_id int, amount float);
+
+statement ok
 INSERT INTO customers VALUES (1, 'Alice', 'alice@example.com', 'A Street');
 
 statement ok
@@ -65,6 +68,21 @@ INSERT INTO orders VALUES (104, 2, '2025-01-04', 1500.0);
 
 statement ok
 INSERT INTO orders VALUES (105, 3, '2025-01-05', 700.0);
+
+statement ok
+INSERT INTO payments VALUES (201, 101, 500.0);
+
+statement ok
+INSERT INTO payments VALUES (202, 102, 1200.0);
+
+statement ok
+INSERT INTO payments VALUES (203, 103, 900.0);
+
+statement ok
+INSERT INTO payments VALUES (204, 104, 1500.0);
+
+statement ok
+INSERT INTO payments VALUES (205, 105, 700.0);
 
 query
 SELECT c.name, o.order_id FROM customers c JOIN orders o ON c.customer_id = o.customer_id;
@@ -99,6 +117,17 @@ Project(columns=[c.name, o.order_id], rows=2)
 			Scan(table=customers, type=SeqScan, rows=3)
 		Project(columns=[o.customer_id, o.order_id], rows=6)
 			Filter(condition=[o.total_amount>1000.0], rows=6)
+				Scan(table=orders, type=SeqScan, rows=15)
+
+query
+EXPLAIN ANALYZE SELECT c.name, o.order_id FROM customers c JOIN orders o ON c.customer_id = o.customer_id WHERE o.total_amount > 1000.00;
+----
+Project(columns=[c.name, o.order_id], rows=2)
+	Join(tables=[customers, orders], condition=[c.customer_id=o.customer_id], rows=2)
+		Project(columns=[c.customer_id, c.name], rows=3)
+			Scan(table=customers, type=SeqScan, rows=3)
+		Project(columns=[o.customer_id, o.order_id], rows=6)
+			Filter(condition=[o.total_amount>1000.00], rows=6)
 				Scan(table=orders, type=SeqScan, rows=15)
 
 query
@@ -140,3 +169,18 @@ Project(columns=[*], rows=2)
 		Scan(table=customers, type=SeqScan, rows=3)
 		Filter(condition=[o.total_amount>1000], rows=6)
 			Scan(table=orders, type=SeqScan, rows=15)
+
+query
+EXPLAIN ANALYZE SELECT c.name, o.order_id, p.payment_id FROM orders o JOIN payments p ON o.order_id = p.order_id JOIN customers c ON o.customer_id = c.customer_id WHERE o.total_amount > 1000.00 AND p.amount >= 1200.00;
+----
+Project(columns=[c.name, o.order_id, p.payment_id], rows=2)
+	Join(tables=[customers, orders, payments], condition=[o.customer_id=c.customer_id], rows=2)
+		Join(tables=[orders, payments], condition=[o.order_id=p.order_id], rows=2)
+			Project(columns=[o.customer_id, o.order_id], rows=2)
+				Filter(condition=[o.total_amount>1000.00], rows=2)
+					Scan(table=orders, type=SeqScan, rows=5)
+			Project(columns=[p.order_id, p.payment_id], rows=4)
+				Filter(condition=[p.amount>=1200.00], rows=4)
+					Scan(table=payments, type=SeqScan, rows=10)
+		Project(columns=[c.customer_id, c.name], rows=6)
+			Scan(table=customers, type=SeqScan, rows=6)

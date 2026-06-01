@@ -386,7 +386,11 @@ private:
 
     static std::string condition_to_string(const Plan& plan, const Condition& cond) {
         std::string result = display_col(plan, cond.lhs_col) + comp_op_to_string(cond.op);
-        result += cond.is_rhs_val ? value_to_string(cond.rhs_val) : display_col(plan, cond.rhs_col);
+        if (cond.is_rhs_val) {
+            result += cond.rhs_display.empty() ? value_to_string(cond.rhs_val) : cond.rhs_display;
+        } else {
+            result += display_col(plan, cond.rhs_col);
+        }
         return result;
     }
 

@@ -28,10 +28,8 @@ EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SOR
 %token LEQ NEQ GEQ T_EOF
 
 // type-specific tokens
-%token <sv_str> IDENTIFIER VALUE_STRING
-%token <sv_int> VALUE_INT
-%token <sv_float> VALUE_FLOAT
-%token <sv_bool> VALUE_BOOL
+%token <sv_str> IDENTIFIER
+%token <sv_val> VALUE_STRING VALUE_INT VALUE_FLOAT VALUE_BOOL
 
 // specify types for non-terminal symbol
 %type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
@@ -128,7 +126,7 @@ dbStmt:
 setStmt:
         SET set_knob_type '=' VALUE_BOOL
     {
-        $$ = std::make_shared<SetStmt>($2, $4);
+        $$ = std::make_shared<SetStmt>($2, std::static_pointer_cast<BoolLit>($4)->val);
     }
     ;
 
@@ -254,7 +252,7 @@ type:
     }
     |   CHAR '(' VALUE_INT ')'
     {
-        $$ = std::make_shared<TypeLen>(SV_TYPE_STRING, $3);
+        $$ = std::make_shared<TypeLen>(SV_TYPE_STRING, std::static_pointer_cast<IntLit>($3)->val);
     }
     |   FLOAT
     {
@@ -276,19 +274,19 @@ valueList:
 value:
         VALUE_INT
     {
-        $$ = std::make_shared<IntLit>($1);
+        $$ = $1;
     }
     |   VALUE_FLOAT
     {
-        $$ = std::make_shared<FloatLit>($1);
+        $$ = $1;
     }
     |   VALUE_STRING
     {
-        $$ = std::make_shared<StringLit>($1);
+        $$ = $1;
     }
     |   VALUE_BOOL
     {
-        $$ = std::make_shared<BoolLit>($1);
+        $$ = $1;
     }
     ;
 
@@ -613,7 +611,7 @@ opt_limit_clause:
     }
     |   LIMIT VALUE_INT
     {
-        $$ = std::make_shared<IntLit>($2);
+        $$ = $2;
     }
     ;
 

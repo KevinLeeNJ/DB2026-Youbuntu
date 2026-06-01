@@ -77,16 +77,20 @@ std::string condition_sort_key(const Condition& cond) {
         break;
     }
     if (cond.is_rhs_val) {
-        switch (cond.rhs_val.type) {
-        case TYPE_INT:
-            key += std::to_string(cond.rhs_val.int_val);
-            break;
-        case TYPE_FLOAT:
-            key += std::to_string(cond.rhs_val.float_val);
-            break;
-        case TYPE_STRING:
-            key += cond.rhs_val.str_val;
-            break;
+        if (!cond.rhs_display.empty()) {
+            key += cond.rhs_display;
+        } else {
+            switch (cond.rhs_val.type) {
+            case TYPE_INT:
+                key += std::to_string(cond.rhs_val.int_val);
+                break;
+            case TYPE_FLOAT:
+                key += std::to_string(cond.rhs_val.float_val);
+                break;
+            case TYPE_STRING:
+                key += cond.rhs_val.str_val;
+                break;
+            }
         }
     } else {
         key += col_key(cond.rhs_col);
@@ -408,7 +412,7 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     }
 
     auto plan_tables = query->tables;
-    if (query->is_explain_analyze) {
+    if (query->is_explain_analyze && plan_tables.size() == 2) {
         std::stable_sort(plan_tables.begin(), plan_tables.end());
     }
 
