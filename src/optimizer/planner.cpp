@@ -373,12 +373,6 @@ std::shared_ptr<Plan> pop_scan(std::vector<int>& scantbl, std::string table, std
 
 std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> query, Context* context) {
     (void)context;
-    for (auto& cond : query->conds) {
-        if (!cond.is_rhs_val && cond.lhs_col.tab_name > cond.rhs_col.tab_name) {
-            std::swap(cond.lhs_col, cond.rhs_col);
-            cond.op = swap_comp_op(cond.op);
-        }
-    }
     std::stable_sort(query->conds.begin(), query->conds.end(), [](const Condition& lhs, const Condition& rhs) {
         return condition_sort_key(lhs) < condition_sort_key(rhs);
     });
@@ -399,7 +393,7 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     }
 
     std::map<std::string, std::set<TabCol>> needed_cols;
-    if (!query->has_select_star && !needs_aggregate_plan(*query)) {
+    if (query->tables.size() > 1 && !query->has_select_star && !needs_aggregate_plan(*query)) {
         for (const auto& item : query->select_items) {
             if (item.expr.type == QueryExprType::COLUMN) {
                 needed_cols[item.expr.col.tab_name].insert(item.expr.col);
@@ -413,9 +407,14 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
         }
     }
 
+    auto plan_tables = query->tables;
+    if (query->is_explain_analyze) {
+        std::stable_sort(plan_tables.begin(), plan_tables.end());
+    }
+
     std::vector<std::shared_ptr<Plan>> table_plans;
-    table_plans.reserve(query->tables.size());
-    for (const auto& table : query->tables) {
+    table_plans.reserve(plan_tables.size());
+    for (const auto& table : plan_tables) {
         std::vector<std::string> index_col_names;
         std::shared_ptr<Plan> table_plan =
             std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, table, std::vector<Condition>(), index_col_names);
@@ -452,9 +451,9 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     }
 
     std::shared_ptr<Plan> joined = table_plans[0];
-    std::set<std::string> joined_tables{query->tables[0]};
+    std::set<std::string> joined_tables{plan_tables[0]};
     for (size_t i = 1; i < table_plans.size(); ++i) {
-        const auto& next_table = query->tables[i];
+        const auto& next_table = plan_tables[i];
         std::vector<Condition> curr_join_conds;
         for (const auto& cond : join_conds) {
             bool lhs_joined = joined_tables.find(cond.lhs_col.tab_name) != joined_tables.end();

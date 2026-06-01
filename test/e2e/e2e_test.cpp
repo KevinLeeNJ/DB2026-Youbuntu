@@ -453,35 +453,6 @@ TEST_F(SltFileTest, Union) {
     run_slt_file("union.slt");
 }
 
-TEST_F(E2ETest, ExplainAnalyzeJoinPushdownWithAliases) {
-    db_->exec_sql("CREATE TABLE customers (customer_id int, name char(50), email char(100), address char(200));");
-    db_->exec_sql("CREATE TABLE orders (order_id int, customer_id int, order_date char(40), total_amount float);");
-    db_->exec_sql("INSERT INTO customers VALUES (1, 'Alice', 'alice@example.com', 'A Street');");
-    db_->exec_sql("INSERT INTO customers VALUES (2, 'Bob', 'bob@example.com', 'B Street');");
-    db_->exec_sql("INSERT INTO customers VALUES (3, 'Carol', 'carol@example.com', 'C Street');");
-    db_->exec_sql("INSERT INTO orders VALUES (101, 1, '2025-01-01', 500.0);");
-    db_->exec_sql("INSERT INTO orders VALUES (102, 1, '2025-01-02', 1200.0);");
-    db_->exec_sql("INSERT INTO orders VALUES (103, 2, '2025-01-03', 900.0);");
-    db_->exec_sql("INSERT INTO orders VALUES (104, 2, '2025-01-04', 1500.0);");
-    db_->exec_sql("INSERT INTO orders VALUES (105, 3, '2025-01-05', 700.0);");
-    db_->clean_output_txt();
-
-    const std::string output = db_->exec_sql("EXPLAIN ANALYZE SELECT c.name, o.order_id "
-                                             "FROM customers c JOIN orders o ON c.customer_id = o.customer_id "
-                                             "WHERE o.total_amount > 1000.0;");
-
-    const std::string expected = "Project(columns=[c.name, o.order_id], rows=2)\n"
-                                 "\tJoin(tables=[customers, orders], condition=[c.customer_id=o.customer_id], rows=2)\n"
-                                 "\t\tProject(columns=[c.customer_id, c.name], rows=3)\n"
-                                 "\t\t\tScan(table=customers, type=SeqScan, rows=3)\n"
-                                 "\t\tProject(columns=[o.customer_id, o.order_id], rows=6)\n"
-                                 "\t\t\tFilter(condition=[o.total_amount>1000.0], rows=6)\n"
-                                 "\t\t\t\tScan(table=orders, type=SeqScan, rows=15)\n";
-    EXPECT_EQ(output, expected);
-
-    std::ifstream outfile("output.txt");
-    ASSERT_TRUE(outfile.is_open());
-    std::stringstream contents;
-    contents << outfile.rdbuf();
-    EXPECT_EQ(contents.str(), expected);
+TEST_F(SltFileTest, QueryOptimize) {
+    run_slt_file("query_optimize.slt");
 }
