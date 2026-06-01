@@ -412,9 +412,6 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     }
 
     auto plan_tables = query->tables;
-    if (query->is_explain_analyze && plan_tables.size() == 2) {
-        std::stable_sort(plan_tables.begin(), plan_tables.end());
-    }
 
     std::vector<std::shared_ptr<Plan>> table_plans;
     table_plans.reserve(plan_tables.size());

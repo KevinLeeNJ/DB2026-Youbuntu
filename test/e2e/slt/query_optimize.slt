@@ -166,9 +166,9 @@ EXPLAIN ANALYZE SELECT * FROM orders o JOIN customers c ON o.customer_id = c.cus
 ----
 Project(columns=[*], rows=2)
 	Join(tables=[customers, orders], condition=[o.customer_id=c.customer_id], rows=2)
-		Scan(table=customers, type=SeqScan, rows=3)
-		Filter(condition=[o.total_amount>1000], rows=6)
-			Scan(table=orders, type=SeqScan, rows=15)
+		Filter(condition=[o.total_amount>1000], rows=2)
+			Scan(table=orders, type=SeqScan, rows=5)
+		Scan(table=customers, type=SeqScan, rows=6)
 
 query
 EXPLAIN ANALYZE SELECT c.name, o.order_id, p.payment_id FROM orders o JOIN payments p ON o.order_id = p.order_id JOIN customers c ON o.customer_id = c.customer_id WHERE o.total_amount > 1000.00 AND p.amount >= 1200.00;
