@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "parser/ast.h"
 
@@ -40,19 +41,23 @@ typedef enum PlanTag {
     T_Transaction_rollback,
     T_SeqScan,
     T_IndexScan,
+    T_Filter,
     T_NestLoop,
     T_SortMerge, // sort merge join
     T_Sort,
     T_Projection,
     T_Aggregate,
     T_Limit,
-    T_Union
+    T_Union,
+    T_ExplainAnalyze
 } PlanTag;
 
 // 查询执行计划
 class Plan {
 public:
     PlanTag tag;
+    size_t runtime_rows_ = 0;
+    std::unordered_map<std::string, std::string> table_name_to_display_;
     virtual ~Plan() = default;
 };
 
@@ -99,19 +104,36 @@ public:
     JoinType type;
 };
 
+class FilterPlan : public Plan {
+public:
+    FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<Condition> conds) {
+        Plan::tag = tag;
+        subplan_ = std::move(subplan);
+        conds_ = std::move(conds);
+    }
+    ~FilterPlan() {}
+    std::shared_ptr<Plan> subplan_;
+    std::vector<Condition> conds_;
+};
+
 class ProjectionPlan : public Plan {
 public:
     ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<SelectItem> select_items,
-                   std::vector<std::string> output_names) {
+                   std::vector<std::string> output_names, bool preserve_col_names = false,
+                   bool is_select_star = false) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         select_items_ = std::move(select_items);
         output_names_ = std::move(output_names);
+        preserve_col_names_ = preserve_col_names;
+        is_select_star_ = is_select_star;
     }
     ~ProjectionPlan() {}
     std::shared_ptr<Plan> subplan_;
     std::vector<SelectItem> select_items_;
     std::vector<std::string> output_names_;
+    bool preserve_col_names_ = false;
+    bool is_select_star_ = false;
 };
 
 class AggregatePlan : public Plan {

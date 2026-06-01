@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "parser/parser.h"
@@ -45,6 +46,10 @@ public:
     std::string union_alias;
     // 表名
     std::vector<std::string> tables;
+    std::vector<std::string> table_display_names;
+    std::unordered_map<std::string, std::string> table_alias_to_name;
+    std::unordered_map<std::string, std::string> table_name_to_display;
+    bool is_explain_analyze = false;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     // insert 的values值

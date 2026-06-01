@@ -452,3 +452,7 @@ TEST_F(SltFileTest, Aggregate) {
 TEST_F(SltFileTest, Union) {
     run_slt_file("union.slt");
 }
+
+TEST_F(SltFileTest, QueryOptimize) {
+    run_slt_file("query_optimize.slt");
+}

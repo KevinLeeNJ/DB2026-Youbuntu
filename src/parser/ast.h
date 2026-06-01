@@ -60,6 +60,7 @@ enum class AstType {
     SelectStmt,
     UnionStmt,
     SelectFromUnionStmt,
+    ExplainAnalyze,
     SetStmt
 };
 
@@ -163,32 +164,37 @@ protected:
 };
 
 struct Value : public Expr {
+    std::string display_text;
+
 protected:
-    explicit Value(AstType type_) : Expr(type_) {}
+    explicit Value(AstType type_, std::string display_text_ = "")
+        : Expr(type_), display_text(std::move(display_text_)) {}
 };
 
 struct IntLit : public Value {
     int val;
 
-    IntLit(int val_) : Value(AstType::IntLit), val(val_) {}
+    IntLit(int val_, std::string display_text_ = "") : Value(AstType::IntLit, std::move(display_text_)), val(val_) {}
 };
 
 struct FloatLit : public Value {
     float val;
 
-    FloatLit(float val_) : Value(AstType::FloatLit), val(val_) {}
+    FloatLit(float val_, std::string display_text_ = "")
+        : Value(AstType::FloatLit, std::move(display_text_)), val(val_) {}
 };
 
 struct StringLit : public Value {
     std::string val;
 
-    StringLit(std::string val_) : Value(AstType::StringLit), val(std::move(val_)) {}
+    StringLit(std::string val_, std::string display_text_ = "")
+        : Value(AstType::StringLit, std::move(display_text_)), val(std::move(val_)) {}
 };
 
 struct BoolLit : public Value {
     bool val;
 
-    BoolLit(bool val_) : Value(AstType::BoolLit), val(val_) {}
+    BoolLit(bool val_, std::string display_text_ = "") : Value(AstType::BoolLit, std::move(display_text_)), val(val_) {}
 };
 
 struct Col : public Expr {
@@ -371,6 +377,13 @@ struct SelectFromUnionStmt : public TreeNode {
           order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {}
 };
 
+struct ExplainAnalyze : public TreeNode {
+    std::shared_ptr<SelectStmt> select;
+
+    explicit ExplainAnalyze(std::shared_ptr<SelectStmt> select_)
+        : TreeNode(AstType::ExplainAnalyze), select(std::move(select_)) {}
+};
+
 // set enable_nestloop
 struct SetStmt : public TreeNode {
     SetKnobType set_knob_type_;
@@ -380,10 +393,13 @@ struct SetStmt : public TreeNode {
         : TreeNode(AstType::SetStmt), set_knob_type_(type), bool_val_(bool_value) {}
 };
 
+struct FromClause {
+    std::vector<std::string> tables;
+    std::vector<std::shared_ptr<BinaryExpr>> conds;
+};
+
 // Semantic value
 struct SemValue {
-    int sv_int;
-    float sv_float;
     std::string sv_str;
     bool sv_bool;
     AggFuncType sv_agg_func;
@@ -411,6 +427,7 @@ struct SemValue {
     std::vector<std::shared_ptr<SelectItem>> sv_select_items;
     std::shared_ptr<SelectStmt> sv_select_stmt;
     std::shared_ptr<UnionStmt> sv_union_stmt;
+    std::shared_ptr<FromClause> sv_from_clause;
     std::vector<std::shared_ptr<SelectStmt>> sv_select_stmts;
 
     std::shared_ptr<SetClause> sv_set_clause;

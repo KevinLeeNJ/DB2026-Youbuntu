@@ -52,6 +52,10 @@ public:
         return ColMeta();
     };
 
+    virtual void set_counting_enabled(bool enabled) {
+        (void)enabled;
+    }
+
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;

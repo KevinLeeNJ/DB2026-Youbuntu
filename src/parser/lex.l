@@ -74,6 +74,8 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "UPDATE" { return UPDATE; }
 "SET" { return SET; }
 "SELECT" { return SELECT; }
+"EXPLAIN" { return EXPLAIN; }
+"ANALYZE" { return ANALYZE; }
 "AS" { return AS; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
@@ -81,6 +83,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "INDEX" { return INDEX; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
+"ON" { return ON; }
 "COUNT" { return COUNT; }
 "MAX" { return MAX; }
 "MIN" { return MIN; }
@@ -97,12 +100,12 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "UNION" { return UNION; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
-"TRUE" { 
-    yylval->sv_bool = true;
-    return VALUE_BOOL; 
+"TRUE" {
+    yylval->sv_val = std::make_shared<ast::BoolLit>(true, yytext);
+    return VALUE_BOOL;
 }
 "FALSE" {
-    yylval->sv_bool = false;
+    yylval->sv_val = std::make_shared<ast::BoolLit>(false, yytext);
     return VALUE_BOOL;
 }
     /* operators */
@@ -117,15 +120,15 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 }
     /* literals */
 {value_int} {
-    yylval->sv_int = atoi(yytext);
+    yylval->sv_val = std::make_shared<ast::IntLit>(atoi(yytext), yytext);
     return VALUE_INT;
 }
 {value_float} {
-    yylval->sv_float = atof(yytext);
+    yylval->sv_val = std::make_shared<ast::FloatLit>(atof(yytext), yytext);
     return VALUE_FLOAT;
 }
 {value_string} {
-    yylval->sv_str = std::string(yytext + 1, strlen(yytext) - 2);
+    yylval->sv_val = std::make_shared<ast::StringLit>(std::string(yytext + 1, strlen(yytext) - 2), yytext);
     return VALUE_STRING;
 }
     /* EOF */
