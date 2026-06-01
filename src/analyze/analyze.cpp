@@ -13,8 +13,84 @@ See the Mulan PSL v2 for more details. */
 #include "analyze_select_internal.h"
 
 #include <algorithm>
+#include <utility>
 
 using namespace analyze_internal;
+
+namespace {
+
+constexpr char TABLE_ALIAS_SEPARATOR = '\001';
+
+std::pair<std::string, std::string> decode_table_ref(const std::string& table_ref) {
+    auto sep = table_ref.find(TABLE_ALIAS_SEPARATOR);
+    if (sep == std::string::npos) {
+        return {table_ref, table_ref};
+    }
+    return {table_ref.substr(0, sep), table_ref.substr(sep + 1)};
+}
+
+void resolve_alias(TabCol& col, const Query& query) {
+    if (col.tab_name.empty()) {
+        return;
+    }
+    auto alias_pos = query.table_alias_to_name.find(col.tab_name);
+    if (alias_pos != query.table_alias_to_name.end()) {
+        col.tab_name = alias_pos->second;
+    }
+}
+
+void resolve_alias(QueryExpr& expr, const Query& query) {
+    if (expr.type == QueryExprType::COLUMN) {
+        resolve_alias(expr.col, query);
+    } else if (expr.type == QueryExprType::AGGREGATE && !expr.agg.is_star) {
+        resolve_alias(expr.agg.col, query);
+    }
+}
+
+void resolve_aliases(Query& query) {
+    for (auto& item : query.select_items) {
+        resolve_alias(item.expr, query);
+    }
+    for (auto& col : query.group_by_cols) {
+        resolve_alias(col, query);
+    }
+    for (auto& cond : query.having_conds) {
+        resolve_alias(cond.lhs, query);
+        if (!cond.is_rhs_val) {
+            resolve_alias(cond.rhs_expr, query);
+        }
+    }
+    for (auto& item : query.order_by_items) {
+        resolve_alias(item.expr, query);
+    }
+    for (auto& cond : query.conds) {
+        resolve_alias(cond.lhs_col, query);
+        if (!cond.is_rhs_val) {
+            resolve_alias(cond.rhs_col, query);
+        }
+    }
+}
+
+void populate_table_refs(Query& query, const std::vector<std::string>& table_refs) {
+    query.tables.clear();
+    query.table_display_names.clear();
+    query.table_alias_to_name.clear();
+    query.table_name_to_display.clear();
+    query.tables.reserve(table_refs.size());
+    query.table_display_names.reserve(table_refs.size());
+
+    for (const auto& table_ref : table_refs) {
+        auto [table_name, display_name] = decode_table_ref(table_ref);
+        query.tables.push_back(table_name);
+        query.table_display_names.push_back(display_name);
+        query.table_name_to_display[table_name] = display_name;
+        if (display_name != table_name) {
+            query.table_alias_to_name[display_name] = table_name;
+        }
+    }
+}
+
+} // namespace
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
@@ -24,6 +100,13 @@ using namespace analyze_internal;
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse) {
     if (parse->type == ast::AstType::SelectStmt) {
         return analyze_select_stmt(std::static_pointer_cast<ast::SelectStmt>(parse));
+    }
+    if (parse->type == ast::AstType::ExplainAnalyze) {
+        auto explain = std::static_pointer_cast<ast::ExplainAnalyze>(parse);
+        auto query = analyze_select_stmt(explain->select);
+        query->is_explain_analyze = true;
+        query->parse = std::move(parse);
+        return query;
     }
     if (parse->type == ast::AstType::SelectFromUnionStmt) {
         return analyze_select_from_union_stmt(std::static_pointer_cast<ast::SelectFromUnionStmt>(parse));
@@ -67,7 +150,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 
 std::shared_ptr<Query> Analyze::analyze_select_stmt(const std::shared_ptr<ast::SelectStmt>& x) {
     std::shared_ptr<Query> query = std::make_shared<Query>();
-    query->tables = x->tabs;
+    populate_table_refs(*query, x->tabs);
 
     for (const auto& tab_name : query->tables) {
         if (!sm_manager_->db_.is_table(tab_name)) {
@@ -85,6 +168,7 @@ std::shared_ptr<Query> Analyze::analyze_select_stmt(const std::shared_ptr<ast::S
     populate_limit_from_ast(*query, *x);
 
     get_clause(x->conds, query->conds);
+    resolve_aliases(*query);
     check_clause(query->tables, query->conds);
     validate_select_query(*query, all_cols);
     query->parse = x;

@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY GROUP HAVING LIMIT AS UNION
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN COUNT MAX MIN SUM AVG
+WHERE UPDATE SET SELECT EXPLAIN ANALYZE INT CHAR FLOAT INDEX AND JOIN ON COUNT MAX MIN SUM AVG
 EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SORTMERGE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -42,8 +42,9 @@ EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SOR
 %type <sv_expr> expr aggregate_expr having_expr having_rhs
 %type <sv_val> value opt_limit_clause
 %type <sv_vals> valueList
-%type <sv_str> tbName colName opt_alias
-%type <sv_strs> tableList colNameList
+%type <sv_str> tbName colName opt_alias table_ref opt_table_alias
+%type <sv_strs> colNameList
+%type <sv_from_clause> from_clause
 %type <sv_col> col
 %type <sv_cols> colList opt_group_clause
 %type <sv_select_item> select_item
@@ -54,7 +55,7 @@ EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ENABLE_NESTLOOP ENABLE_SOR
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
-%type <sv_conds> whereClause optWhereClause
+%type <sv_conds> whereClause optWhereClause opt_join_on_clause
 %type <sv_having_cond> having_condition
 %type <sv_having_conds> having_clause opt_having_clause
 %type <sv_orderby_item> order_item
@@ -171,6 +172,10 @@ dml:
     {
         $$ = $1;
     }
+    |   EXPLAIN ANALYZE select_stmt
+    {
+        $$ = std::make_shared<ExplainAnalyze>($3);
+    }
     |   SELECT '*' FROM '(' union_query ')' AS tbName opt_order_clause
     {
         $$ = std::make_shared<SelectFromUnionStmt>($5, $8, $9);
@@ -178,15 +183,19 @@ dml:
     ;
 
 select_stmt:
-        SELECT '*' FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+        SELECT '*' FROM from_clause optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
-        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<SelectItem>>{}, $4, $5, $6, $7, $8,
+        auto conds = $4->conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<SelectItem>>{}, $4->tables, conds, $6, $7, $8,
                                           $9 != nullptr,
                                           $9 != nullptr ? std::static_pointer_cast<IntLit>($9)->val : 0, true);
     }
-    |   SELECT select_item_list FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    |   SELECT select_item_list FROM from_clause optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6, $7, $8, $9 != nullptr,
+        auto conds = $4->conds;
+        conds.insert(conds.end(), $5.begin(), $5.end());
+        $$ = std::make_shared<SelectStmt>($2, $4->tables, conds, $6, $7, $8, $9 != nullptr,
                                           $9 != nullptr ? std::static_pointer_cast<IntLit>($9)->val : 0, false);
     }
     ;
@@ -510,18 +519,55 @@ having_rhs:
     |   aggregate_expr
     ;
 
-tableList:
-        tbName
+from_clause:
+        table_ref
     {
-        $$ = std::vector<std::string>{$1};
+        $$ = std::make_shared<FromClause>();
+        $$->tables.push_back($1);
     }
-    |   tableList ',' tbName
+    |   from_clause ',' table_ref
     {
-        $$.push_back($3);
+        $$ = $1;
+        $$->tables.push_back($3);
     }
-    |   tableList JOIN tbName
+    |   from_clause JOIN table_ref opt_join_on_clause
     {
-        $$.push_back($3);
+        $$ = $1;
+        $$->tables.push_back($3);
+        $$->conds.insert($$->conds.end(), $4.begin(), $4.end());
+    }
+    ;
+
+table_ref:
+        tbName opt_table_alias
+    {
+        $$ = $2.empty() ? $1 : $1 + "\001" + $2;
+    }
+    ;
+
+opt_table_alias:
+        AS IDENTIFIER
+    {
+        $$ = $2;
+    }
+    |   IDENTIFIER
+    {
+        $$ = $1;
+    }
+    |   /* epsilon */
+    {
+        $$ = "";
+    }
+    ;
+
+opt_join_on_clause:
+        ON whereClause
+    {
+        $$ = $2;
+    }
+    |   /* epsilon */
+    {
+        $$ = {};
     }
     ;
 

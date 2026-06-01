@@ -60,6 +60,7 @@ enum class AstType {
     SelectStmt,
     UnionStmt,
     SelectFromUnionStmt,
+    ExplainAnalyze,
     SetStmt
 };
 
@@ -371,6 +372,13 @@ struct SelectFromUnionStmt : public TreeNode {
           order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {}
 };
 
+struct ExplainAnalyze : public TreeNode {
+    std::shared_ptr<SelectStmt> select;
+
+    explicit ExplainAnalyze(std::shared_ptr<SelectStmt> select_)
+        : TreeNode(AstType::ExplainAnalyze), select(std::move(select_)) {}
+};
+
 // set enable_nestloop
 struct SetStmt : public TreeNode {
     SetKnobType set_knob_type_;
@@ -378,6 +386,11 @@ struct SetStmt : public TreeNode {
 
     SetStmt(SetKnobType& type, bool bool_value)
         : TreeNode(AstType::SetStmt), set_knob_type_(type), bool_val_(bool_value) {}
+};
+
+struct FromClause {
+    std::vector<std::string> tables;
+    std::vector<std::shared_ptr<BinaryExpr>> conds;
 };
 
 // Semantic value
@@ -411,6 +424,7 @@ struct SemValue {
     std::vector<std::shared_ptr<SelectItem>> sv_select_items;
     std::shared_ptr<SelectStmt> sv_select_stmt;
     std::shared_ptr<UnionStmt> sv_union_stmt;
+    std::shared_ptr<FromClause> sv_from_clause;
     std::vector<std::shared_ptr<SelectStmt>> sv_select_stmts;
 
     std::shared_ptr<SetClause> sv_set_clause;

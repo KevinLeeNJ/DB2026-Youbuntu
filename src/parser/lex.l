@@ -74,6 +74,8 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "UPDATE" { return UPDATE; }
 "SET" { return SET; }
 "SELECT" { return SELECT; }
+"EXPLAIN" { return EXPLAIN; }
+"ANALYZE" { return ANALYZE; }
 "AS" { return AS; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
@@ -81,6 +83,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "INDEX" { return INDEX; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
+"ON" { return ON; }
 "COUNT" { return COUNT; }
 "MAX" { return MAX; }
 "MIN" { return MIN; }

@@ -287,6 +287,12 @@ private:
             print_node_list(x->order_by_items, offset);
             break;
         }
+        case AstType::ExplainAnalyze: {
+            auto x = std::static_pointer_cast<ExplainAnalyze>(node);
+            std::cout << "EXPLAIN_ANALYZE\n";
+            print_node(x->select, offset);
+            break;
+        }
         case AstType::TxnBegin:
             std::cout << "BEGIN\n";
             break;

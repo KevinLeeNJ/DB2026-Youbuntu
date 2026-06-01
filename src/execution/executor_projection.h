@@ -166,4 +166,8 @@ public:
         }
         return *pos;
     }
+
+    void set_counting_enabled(bool enabled) override {
+        prev_->set_counting_enabled(enabled);
+    }
 };

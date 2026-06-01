@@ -238,7 +238,9 @@ public:
 
     void beginTuple() override {
         left_->beginTuple();
+        right_->set_counting_enabled(false);
         right_->beginTuple();
+        right_->set_counting_enabled(true);
         isend = false;
         current_left_rec_ = nullptr; // 获取左表的第一条记录
         reset_buffered_record();
