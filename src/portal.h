@@ -493,8 +493,8 @@ private:
         }
         case T_IndexScan: {
             auto scan = std::static_pointer_cast<ScanPlan>(plan);
-            out << "Scan(table=" << scan->tab_name_ << ", type=IndexScan, using_index=("
-                << scan->index_col_names_[0] << "), rows=" << plan->runtime_rows_ << ")\n";
+            out << "Scan(table=" << scan->tab_name_ << ", type=IndexScan, using_index=(" << scan->index_col_names_[0]
+                << "), rows=" << plan->runtime_rows_ << ")\n";
             break;
         }
         case T_Filter: {
@@ -733,10 +733,9 @@ public:
             auto x = std::static_pointer_cast<JoinPlan>(plan);
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context, count_rows);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context, count_rows);
-            std::unique_ptr<AbstractExecutor> join =
-                std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), x->conds_,
-                                                          x->inlj_left_col_, x->inlj_right_col_,
-                                                          x->inlj_index_col_name_);
+            std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
+                std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
+                x->inlj_index_col_name_);
             return maybe_count(std::move(join), plan, count_rows);
         }
         case T_Sort: {

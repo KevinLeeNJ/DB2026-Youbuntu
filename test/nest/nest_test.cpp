@@ -45,8 +45,8 @@ protected:
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
-        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(),
-                                                   rm_manager_.get(), ix_manager_.get());
+        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
+                                                  ix_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
@@ -98,10 +98,10 @@ protected:
 
         std::vector<std::vector<std::string>> rows;
         if (portal_stmt->tag == PORTAL_ONE_SELECT) {
-            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end();
-                 portal_stmt->root->nextTuple()) {
+            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
                 auto rec = portal_stmt->root->Next();
-                if (rec == nullptr) break;
+                if (rec == nullptr)
+                    break;
                 std::vector<std::string> row;
                 const auto& cols = portal_stmt->root->cols();
                 for (const auto& col : cols) {
@@ -136,8 +136,7 @@ protected:
         auto portal_stmt = portal_->start(plan, nullptr);
 
         if (portal_stmt->tag == PORTAL_EXPLAIN_ANALYZE) {
-            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end();
-                 portal_stmt->root->nextTuple()) {
+            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
                 (void)portal_stmt->root->Next();
             }
             auto dml = std::static_pointer_cast<DMLPlan>(portal_stmt->plan);
@@ -169,23 +168,27 @@ TEST_F(NestTest, LargeDataPartialMatch) {
 
     // NLJ phase — SELECT
     auto t1_start = std::chrono::high_resolution_clock::now();
-    auto rows = select("SELECT large_left.id, large_right.id FROM large_left JOIN large_right ON large_left.id = large_right.ref");
+    auto rows = select(
+        "SELECT large_left.id, large_right.id FROM large_left JOIN large_right ON large_left.id = large_right.ref");
     auto t1_end = std::chrono::high_resolution_clock::now();
     double t_nl = std::chrono::duration<double>(t1_end - t1_start).count();
     EXPECT_EQ(rows.size(), expected_matches);
 
     // NLJ phase — EXPLAIN ANALYZE (right SeqScan rows = N*N)
-    std::string nlj_explain = explain_analyze("EXPLAIN ANALYZE SELECT large_left.id, large_right.id FROM large_left JOIN large_right ON large_left.id = large_right.ref");
+    std::string nlj_explain = explain_analyze("EXPLAIN ANALYZE SELECT large_left.id, large_right.id FROM large_left "
+                                              "JOIN large_right ON large_left.id = large_right.ref");
     EXPECT_NE(nlj_explain.find("SeqScan"), std::string::npos);
     EXPECT_NE(nlj_explain.find("rows=" + std::to_string(N * N)), std::string::npos)
-        << "Right SeqScan rows should be " << N * N << ", got:\n" << nlj_explain;
+        << "Right SeqScan rows should be " << N * N << ", got:\n"
+        << nlj_explain;
 
     // INLJ phase — create index on inner table join column (unique)
     execute("CREATE INDEX large_right(ref)");
 
     // INLJ phase — SELECT
     auto t2_start = std::chrono::high_resolution_clock::now();
-    rows = select("SELECT large_left.id, large_right.id FROM large_left JOIN large_right ON large_left.id = large_right.ref");
+    rows = select(
+        "SELECT large_left.id, large_right.id FROM large_left JOIN large_right ON large_left.id = large_right.ref");
     auto t2_end = std::chrono::high_resolution_clock::now();
     double t_inl = std::chrono::duration<double>(t2_end - t2_start).count();
     EXPECT_EQ(rows.size(), expected_matches);
@@ -195,11 +198,13 @@ TEST_F(NestTest, LargeDataPartialMatch) {
     EXPECT_LT(ratio, 0.5) << "INLJ/NLJ ratio = " << ratio << ", expected < 0.5";
 
     // INLJ phase — EXPLAIN ANALYZE
-    std::string inlj_explain = explain_analyze("EXPLAIN ANALYZE SELECT large_left.id, large_right.id FROM large_left JOIN large_right ON large_left.id = large_right.ref");
+    std::string inlj_explain = explain_analyze("EXPLAIN ANALYZE SELECT large_left.id, large_right.id FROM large_left "
+                                               "JOIN large_right ON large_left.id = large_right.ref");
     EXPECT_NE(inlj_explain.find("IndexScan"), std::string::npos);
     EXPECT_NE(inlj_explain.find("using_index=(ref)"), std::string::npos);
     EXPECT_NE(inlj_explain.find("rows=" + std::to_string(expected_matches)), std::string::npos)
-        << "IndexScan rows should be " << expected_matches << ", got:\n" << inlj_explain;
+        << "IndexScan rows should be " << expected_matches << ", got:\n"
+        << inlj_explain;
 }
 
 } // namespace

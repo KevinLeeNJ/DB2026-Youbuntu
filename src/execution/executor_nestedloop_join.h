@@ -54,10 +54,10 @@ private:
 
     // INLJ support
     bool inlj_mode_ = false;
-    TabCol inlj_left_col_;     // left-side column providing lookup key
-    TabCol inlj_right_col_;    // right-table indexed column
-    int left_key_offset_ = 0;  // pre-compiled offset of left key in left tuple
-    int left_key_len_ = 0;     // pre-compiled length of left key
+    TabCol inlj_left_col_;             // left-side column providing lookup key
+    TabCol inlj_right_col_;            // right-table indexed column
+    int left_key_offset_ = 0;          // pre-compiled offset of left key in left tuple
+    int left_key_len_ = 0;             // pre-compiled length of left key
     ColType left_key_type_ = TYPE_INT; // pre-compiled type of left key
 
     static bool compare_numeric(const int& op, const double& lhs, const double& rhs) {
@@ -246,9 +246,7 @@ private:
 
 public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
-                           std::vector<Condition> conds,
-                           TabCol inlj_left_col = {},
-                           TabCol inlj_right_col = {},
+                           std::vector<Condition> conds, TabCol inlj_left_col = {}, TabCol inlj_right_col = {},
                            const std::string& inlj_index_col_name = "") {
         left_ = std::move(left);
         right_ = std::move(right);

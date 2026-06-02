@@ -102,9 +102,9 @@ public:
     std::vector<Condition> conds_;
     // future TODO: 后续可以支持的连接类型
     // INLJ binding: set by planner when right table join column has an index
-    TabCol inlj_left_col_;              // left-side column providing lookup key (empty tab_name = NLJ mode)
-    TabCol inlj_right_col_;             // right (inner) table's indexed column
-    std::string inlj_index_col_name_;   // convenience: index column name for ScanPlan::index_col_names_
+    TabCol inlj_left_col_;            // left-side column providing lookup key (empty tab_name = NLJ mode)
+    TabCol inlj_right_col_;           // right (inner) table's indexed column
+    std::string inlj_index_col_name_; // convenience: index column name for ScanPlan::index_col_names_
     JoinType type;
 };
 

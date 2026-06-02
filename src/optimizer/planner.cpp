@@ -181,7 +181,7 @@ std::string get_select_item_output_name(const SelectItem& item) {
 // Rebuild the right plan tree, replacing the SeqScan leaf with new_scan (IndexScan).
 // The tree structure is: [Projection -> [Filter ->]] ScanPlan
 std::shared_ptr<Plan> rebuild_right_plan_with_index(const std::shared_ptr<Plan>& plan,
-                                                     const std::shared_ptr<Plan>& new_scan) {
+                                                    const std::shared_ptr<Plan>& new_scan) {
     if (plan->tag == T_SeqScan) {
         return new_scan;
     }
@@ -194,8 +194,7 @@ std::shared_ptr<Plan> rebuild_right_plan_with_index(const std::shared_ptr<Plan>&
         auto proj = std::static_pointer_cast<ProjectionPlan>(plan);
         auto rebuilt_sub = rebuild_right_plan_with_index(proj->subplan_, new_scan);
         return std::make_shared<ProjectionPlan>(T_Projection, std::move(rebuilt_sub), proj->select_items_,
-                                                 proj->output_names_, proj->preserve_col_names_,
-                                                 proj->is_select_star_);
+                                                proj->output_names_, proj->preserve_col_names_, proj->is_select_star_);
     }
     return plan;
 }
@@ -529,9 +528,9 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
         std::shared_ptr<Plan> right_plan = table_plans[i];
         if (!inlj_index_col_name.empty()) {
             // Replace right plan's SeqScan with IndexScan
-            std::shared_ptr<Plan> new_scan = std::make_shared<ScanPlan>(
-                T_IndexScan, sm_manager_, next_table, std::vector<Condition>(),
-                std::vector<std::string>{inlj_index_col_name});
+            std::shared_ptr<Plan> new_scan =
+                std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, next_table, std::vector<Condition>(),
+                                           std::vector<std::string>{inlj_index_col_name});
             right_plan = rebuild_right_plan_with_index(right_plan, new_scan);
         }
 
