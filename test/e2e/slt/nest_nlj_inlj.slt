@@ -1,0 +1,724 @@
+# nest_nlj_inlj.slt — NLJ → INLJ optimization E2E tests
+# Covers: TwoTableFullMatch, ThreeTableJoin, TwoTableNoMatch,
+#         TwoTablePartialMatch, SelectStarJoin, JoinMultipleConditions,
+#         CharColumnJoin, FiveTableJoin
+
+# ============================================================
+# Test 1: TwoTableFullMatch (Nest.md §3.1.2 + §3.1.3)
+# ============================================================
+
+statement ok
+CREATE TABLE departments (dept_id int, dept_name char(20));
+
+statement ok
+CREATE TABLE employees (emp_id int, dept_id int, emp_name char(20), salary int);
+
+statement ok
+INSERT INTO departments VALUES (10, 'Finance');
+
+statement ok
+INSERT INTO departments VALUES (20, 'HR');
+
+statement ok
+INSERT INTO departments VALUES (30, 'Sales');
+
+statement ok
+INSERT INTO departments VALUES (40, 'Engineering');
+
+statement ok
+INSERT INTO departments VALUES (50, 'Marketing');
+
+statement ok
+INSERT INTO employees VALUES (1, 10, 'Alice', 65000);
+
+statement ok
+INSERT INTO employees VALUES (2, 20, 'Bob', 48000);
+
+statement ok
+INSERT INTO employees VALUES (3, 30, 'Charlie', 52000);
+
+statement ok
+INSERT INTO employees VALUES (4, 40, 'Diana', 70000);
+
+statement ok
+INSERT INTO employees VALUES (5, 50, 'Eve', 55000);
+
+# NLJ phase — SELECT
+
+query
+SELECT departments.dept_name, employees.emp_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id;
+----
++------------------+------------------+
+|        dept_name |         emp_name |
++------------------+------------------+
+|          Finance |            Alice |
+|               HR |              Bob |
+|            Sales |          Charlie |
+|      Engineering |            Diana |
+|        Marketing |              Eve |
++------------------+------------------+
+Total record(s): 5
+
+# NLJ phase — EXPLAIN ANALYZE
+
+query
+EXPLAIN ANALYZE SELECT departments.dept_name, employees.emp_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id;
+----
+Project(columns=[departments.dept_name, employees.emp_name], rows=5)
+	Join(tables=[departments, employees], condition=[departments.dept_id=employees.dept_id], rows=5)
+		Project(columns=[departments.dept_id, departments.dept_name], rows=5)
+			Scan(table=departments, type=SeqScan, rows=5)
+		Project(columns=[employees.dept_id, employees.emp_name], rows=25)
+			Scan(table=employees, type=SeqScan, rows=25)
+
+# INLJ phase — create index on inner table
+
+statement ok
+CREATE INDEX employees(dept_id);
+
+# INLJ phase — SELECT
+
+query
+SELECT departments.dept_name, employees.emp_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id;
+----
++------------------+------------------+
+|        dept_name |         emp_name |
++------------------+------------------+
+|          Finance |            Alice |
+|               HR |              Bob |
+|            Sales |          Charlie |
+|      Engineering |            Diana |
+|        Marketing |              Eve |
++------------------+------------------+
+Total record(s): 5
+
+# INLJ phase — EXPLAIN ANALYZE
+
+query
+EXPLAIN ANALYZE SELECT departments.dept_name, employees.emp_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id;
+----
+Project(columns=[departments.dept_name, employees.emp_name], rows=5)
+	Join(tables=[departments, employees], condition=[departments.dept_id=employees.dept_id], rows=5)
+		Project(columns=[departments.dept_id, departments.dept_name], rows=5)
+			Scan(table=departments, type=SeqScan, rows=5)
+		Project(columns=[employees.dept_id, employees.emp_name], rows=5)
+			Scan(table=employees, type=IndexScan, using_index=(dept_id), rows=5)
+
+# ============================================================
+# Test 2: ThreeTableJoin (Nest.md §3.2.2 + §3.2.3)
+# ============================================================
+
+statement ok
+DROP TABLE employees;
+
+statement ok
+DROP TABLE departments;
+
+statement ok
+CREATE TABLE departments (dept_id int, dept_name char(20));
+
+statement ok
+CREATE TABLE employees (emp_id int, dept_id int, emp_name char(20));
+
+statement ok
+CREATE TABLE offices (office_id int, dept_id int, office_name char(20));
+
+statement ok
+INSERT INTO departments VALUES (10, 'Finance');
+
+statement ok
+INSERT INTO departments VALUES (20, 'HR');
+
+statement ok
+INSERT INTO departments VALUES (30, 'Sales');
+
+statement ok
+INSERT INTO employees VALUES (1, 10, 'Alice');
+
+statement ok
+INSERT INTO employees VALUES (2, 20, 'Bob');
+
+statement ok
+INSERT INTO employees VALUES (3, 30, 'Charlie');
+
+statement ok
+INSERT INTO offices VALUES (101, 10, 'HQ');
+
+statement ok
+INSERT INTO offices VALUES (102, 20, 'Remote');
+
+statement ok
+INSERT INTO offices VALUES (103, 30, 'Field');
+
+# NLJ phase — SELECT
+
+query
+SELECT departments.dept_name, employees.emp_name, offices.office_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id JOIN offices ON departments.dept_id = offices.dept_id;
+----
++------------------+------------------+------------------+
+|        dept_name |         emp_name |      office_name |
++------------------+------------------+------------------+
+|          Finance |            Alice |               HQ |
+|               HR |              Bob |           Remote |
+|            Sales |          Charlie |            Field |
++------------------+------------------+------------------+
+Total record(s): 3
+
+# NLJ phase — EXPLAIN ANALYZE
+
+query
+EXPLAIN ANALYZE SELECT departments.dept_name, employees.emp_name, offices.office_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id JOIN offices ON departments.dept_id = offices.dept_id;
+----
+Project(columns=[departments.dept_name, employees.emp_name, offices.office_name], rows=3)
+	Join(tables=[departments, employees, offices], condition=[departments.dept_id=offices.dept_id], rows=3)
+		Join(tables=[departments, employees], condition=[departments.dept_id=employees.dept_id], rows=3)
+			Project(columns=[departments.dept_id, departments.dept_name], rows=3)
+				Scan(table=departments, type=SeqScan, rows=3)
+			Project(columns=[employees.dept_id, employees.emp_name], rows=9)
+				Scan(table=employees, type=SeqScan, rows=9)
+		Project(columns=[offices.dept_id, offices.office_name], rows=9)
+			Scan(table=offices, type=SeqScan, rows=9)
+
+# INLJ phase — create indexes
+
+statement ok
+CREATE INDEX employees(dept_id);
+
+statement ok
+CREATE INDEX offices(dept_id);
+
+# INLJ phase — SELECT
+
+query
+SELECT departments.dept_name, employees.emp_name, offices.office_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id JOIN offices ON departments.dept_id = offices.dept_id;
+----
++------------------+------------------+------------------+
+|        dept_name |         emp_name |      office_name |
++------------------+------------------+------------------+
+|          Finance |            Alice |               HQ |
+|               HR |              Bob |           Remote |
+|            Sales |          Charlie |            Field |
++------------------+------------------+------------------+
+Total record(s): 3
+
+# INLJ phase — EXPLAIN ANALYZE
+
+query
+EXPLAIN ANALYZE SELECT departments.dept_name, employees.emp_name, offices.office_name FROM departments JOIN employees ON departments.dept_id = employees.dept_id JOIN offices ON departments.dept_id = offices.dept_id;
+----
+Project(columns=[departments.dept_name, employees.emp_name, offices.office_name], rows=3)
+	Join(tables=[departments, employees, offices], condition=[departments.dept_id=offices.dept_id], rows=3)
+		Join(tables=[departments, employees], condition=[departments.dept_id=employees.dept_id], rows=3)
+			Project(columns=[departments.dept_id, departments.dept_name], rows=3)
+				Scan(table=departments, type=SeqScan, rows=3)
+			Project(columns=[employees.dept_id, employees.emp_name], rows=3)
+				Scan(table=employees, type=IndexScan, using_index=(dept_id), rows=3)
+		Project(columns=[offices.dept_id, offices.office_name], rows=3)
+			Scan(table=offices, type=IndexScan, using_index=(dept_id), rows=3)
+
+# ============================================================
+# Test 3: TwoTableNoMatch
+# ============================================================
+
+statement ok
+DROP TABLE departments;
+
+statement ok
+DROP TABLE employees;
+
+statement ok
+DROP TABLE offices;
+
+statement ok
+CREATE TABLE left_t (id int, val char(10));
+
+statement ok
+CREATE TABLE right_t (id int, ref int, val char(10));
+
+statement ok
+INSERT INTO left_t VALUES (1, 'L1');
+
+statement ok
+INSERT INTO left_t VALUES (2, 'L2');
+
+statement ok
+INSERT INTO left_t VALUES (3, 'L3');
+
+statement ok
+INSERT INTO right_t VALUES (10, 100, 'R1');
+
+statement ok
+INSERT INTO right_t VALUES (20, 200, 'R2');
+
+# NLJ phase — SELECT (0 result rows)
+
+query
+SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+# NLJ phase — EXPLAIN ANALYZE (right SeqScan rows = 3*2 = 6)
+
+query
+EXPLAIN ANALYZE SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
+Project(columns=[left_t.id, right_t.id], rows=0)
+	Join(tables=[left_t, right_t], condition=[left_t.id=right_t.ref], rows=0)
+		Project(columns=[left_t.id], rows=3)
+			Scan(table=left_t, type=SeqScan, rows=3)
+		Project(columns=[right_t.id, right_t.ref], rows=6)
+			Scan(table=right_t, type=SeqScan, rows=6)
+
+# INLJ phase — create index
+
+statement ok
+CREATE INDEX right_t(ref);
+
+# INLJ phase — SELECT (0 result rows)
+
+query
+SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+# INLJ phase — EXPLAIN ANALYZE (IndexScan rows=0)
+
+query
+EXPLAIN ANALYZE SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
+Project(columns=[left_t.id, right_t.id], rows=0)
+	Join(tables=[left_t, right_t], condition=[left_t.id=right_t.ref], rows=0)
+		Project(columns=[left_t.id], rows=3)
+			Scan(table=left_t, type=SeqScan, rows=3)
+		Project(columns=[right_t.id, right_t.ref], rows=0)
+			Scan(table=right_t, type=IndexScan, using_index=(ref), rows=0)
+
+# ============================================================
+# Test 4: TwoTablePartialMatch
+# ============================================================
+
+statement ok
+DROP TABLE left_t;
+
+statement ok
+DROP TABLE right_t;
+
+statement ok
+CREATE TABLE left_t (id int, val char(10));
+
+statement ok
+CREATE TABLE right_t (id int, ref int, val char(10));
+
+statement ok
+INSERT INTO left_t VALUES (1, 'L1');
+
+statement ok
+INSERT INTO left_t VALUES (2, 'L2');
+
+statement ok
+INSERT INTO right_t VALUES (10, 1, 'R1');
+
+statement ok
+INSERT INTO right_t VALUES (20, 99, 'R2');
+
+statement ok
+INSERT INTO right_t VALUES (30, 2, 'R3');
+
+statement ok
+INSERT INTO right_t VALUES (40, 98, 'R4');
+
+# NLJ phase — SELECT (2 matching rows)
+
+query
+SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
+|                1 |               10 |
+|                2 |               30 |
++------------------+------------------+
+Total record(s): 2
+
+# NLJ phase — EXPLAIN ANALYZE (right SeqScan rows = 2*4 = 8)
+
+query
+EXPLAIN ANALYZE SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
+Project(columns=[left_t.id, right_t.id], rows=2)
+	Join(tables=[left_t, right_t], condition=[left_t.id=right_t.ref], rows=2)
+		Project(columns=[left_t.id], rows=2)
+			Scan(table=left_t, type=SeqScan, rows=2)
+		Project(columns=[right_t.id, right_t.ref], rows=8)
+			Scan(table=right_t, type=SeqScan, rows=8)
+
+# INLJ phase — create index (unique values: 1, 99, 2, 98)
+
+statement ok
+CREATE INDEX right_t(ref);
+
+# INLJ phase — SELECT (2 matching rows)
+
+query
+SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
+|                1 |               10 |
+|                2 |               30 |
++------------------+------------------+
+Total record(s): 2
+
+# INLJ phase — EXPLAIN ANALYZE (IndexScan rows=2)
+
+query
+EXPLAIN ANALYZE SELECT left_t.id, right_t.id FROM left_t JOIN right_t ON left_t.id = right_t.ref;
+----
+Project(columns=[left_t.id, right_t.id], rows=2)
+	Join(tables=[left_t, right_t], condition=[left_t.id=right_t.ref], rows=2)
+		Project(columns=[left_t.id], rows=2)
+			Scan(table=left_t, type=SeqScan, rows=2)
+		Project(columns=[right_t.id, right_t.ref], rows=2)
+			Scan(table=right_t, type=IndexScan, using_index=(ref), rows=2)
+
+# ============================================================
+# Test 5: SelectStarJoin
+# ============================================================
+
+statement ok
+DROP TABLE left_t;
+
+statement ok
+DROP TABLE right_t;
+
+statement ok
+CREATE TABLE a (id int, val int);
+
+statement ok
+CREATE TABLE b (id int, a_id int);
+
+statement ok
+INSERT INTO a VALUES (1, 100);
+
+statement ok
+INSERT INTO a VALUES (2, 200);
+
+statement ok
+INSERT INTO b VALUES (10, 1);
+
+statement ok
+INSERT INTO b VALUES (20, 2);
+
+# NLJ phase — EXPLAIN ANALYZE (SELECT * shows Project(columns=[*]))
+
+query
+EXPLAIN ANALYZE SELECT * FROM a JOIN b ON a.id = b.a_id;
+----
+Project(columns=[*], rows=2)
+	Join(tables=[a, b], condition=[a.id=b.a_id], rows=2)
+		Scan(table=a, type=SeqScan, rows=2)
+		Scan(table=b, type=SeqScan, rows=4)
+
+# INLJ phase — create index
+
+statement ok
+CREATE INDEX b(a_id);
+
+# INLJ phase — EXPLAIN ANALYZE
+
+query
+EXPLAIN ANALYZE SELECT * FROM a JOIN b ON a.id = b.a_id;
+----
+Project(columns=[*], rows=2)
+	Join(tables=[a, b], condition=[a.id=b.a_id], rows=2)
+		Scan(table=a, type=SeqScan, rows=2)
+		Scan(table=b, type=IndexScan, using_index=(a_id), rows=2)
+
+# ============================================================
+# Test 6: JoinMultipleConditions
+# ============================================================
+
+statement ok
+DROP TABLE a;
+
+statement ok
+DROP TABLE b;
+
+statement ok
+CREATE TABLE a (id int, x int);
+
+statement ok
+CREATE TABLE b (id int, a_id int, x int);
+
+statement ok
+INSERT INTO a VALUES (1, 10);
+
+statement ok
+INSERT INTO a VALUES (2, 20);
+
+statement ok
+INSERT INTO b VALUES (100, 1, 10);
+
+statement ok
+INSERT INTO b VALUES (200, 2, 99);
+
+# Create index only on a_id (INLJ on a_id, residual filter on x)
+
+statement ok
+CREATE INDEX b(a_id);
+
+# SELECT with multi-condition join (1 matching row: a.id=1,b.id=100)
+
+query
+SELECT a.id, b.id FROM a JOIN b ON a.id = b.a_id AND a.x = b.x;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
+|                1 |              100 |
++------------------+------------------+
+Total record(s): 1
+
+# EXPLAIN ANALYZE (IndexScan on a_id, both conditions preserved)
+
+query
+EXPLAIN ANALYZE SELECT a.id, b.id FROM a JOIN b ON a.id = b.a_id AND a.x = b.x;
+----
+Project(columns=[a.id, b.id], rows=1)
+	Join(tables=[a, b], condition=[a.id=b.a_id, a.x=b.x], rows=1)
+		Project(columns=[a.id, a.x], rows=2)
+			Scan(table=a, type=SeqScan, rows=2)
+		Project(columns=[b.a_id, b.id, b.x], rows=2)
+			Scan(table=b, type=IndexScan, using_index=(a_id), rows=2)
+
+# ============================================================
+# Test 7: CharColumnJoin
+# ============================================================
+
+statement ok
+DROP TABLE a;
+
+statement ok
+DROP TABLE b;
+
+statement ok
+CREATE TABLE a (code char(10), val int);
+
+statement ok
+CREATE TABLE b (id int, code char(10));
+
+statement ok
+INSERT INTO a VALUES ('ABC', 1);
+
+statement ok
+INSERT INTO a VALUES ('DEF', 2);
+
+statement ok
+INSERT INTO b VALUES (10, 'ABC');
+
+statement ok
+INSERT INTO b VALUES (20, 'XYZ');
+
+# NLJ phase — SELECT (1 matching row: code='ABC')
+
+query
+SELECT a.val, b.id FROM a JOIN b ON a.code = b.code;
+----
++------------------+------------------+
+|              val |               id |
++------------------+------------------+
+|                1 |               10 |
++------------------+------------------+
+Total record(s): 1
+
+# INLJ phase — create index on code
+
+statement ok
+CREATE INDEX b(code);
+
+# INLJ phase — SELECT (1 matching row)
+
+query
+SELECT a.val, b.id FROM a JOIN b ON a.code = b.code;
+----
++------------------+------------------+
+|              val |               id |
++------------------+------------------+
+|                1 |               10 |
++------------------+------------------+
+Total record(s): 1
+
+# INLJ phase — EXPLAIN ANALYZE (IndexScan on code)
+
+query
+EXPLAIN ANALYZE SELECT a.val, b.id FROM a JOIN b ON a.code = b.code;
+----
+Project(columns=[a.val, b.id], rows=1)
+	Join(tables=[a, b], condition=[a.code=b.code], rows=1)
+		Project(columns=[a.code, a.val], rows=2)
+			Scan(table=a, type=SeqScan, rows=2)
+		Project(columns=[b.code, b.id], rows=1)
+			Scan(table=b, type=IndexScan, using_index=(code), rows=1)
+
+# ============================================================
+# Test 8: FiveTableJoin
+# ============================================================
+
+statement ok
+DROP TABLE a;
+
+statement ok
+DROP TABLE b;
+
+statement ok
+CREATE TABLE t1 (id int);
+
+statement ok
+CREATE TABLE t2 (id int, t1_id int);
+
+statement ok
+CREATE TABLE t3 (id int, t1_id int);
+
+statement ok
+CREATE TABLE t4 (id int, t1_id int);
+
+statement ok
+CREATE TABLE t5 (id int, t1_id int);
+
+statement ok
+INSERT INTO t1 VALUES (1);
+
+statement ok
+INSERT INTO t1 VALUES (2);
+
+statement ok
+INSERT INTO t1 VALUES (3);
+
+statement ok
+INSERT INTO t2 VALUES (10, 1);
+
+statement ok
+INSERT INTO t2 VALUES (20, 2);
+
+statement ok
+INSERT INTO t2 VALUES (30, 3);
+
+statement ok
+INSERT INTO t3 VALUES (100, 1);
+
+statement ok
+INSERT INTO t3 VALUES (200, 2);
+
+statement ok
+INSERT INTO t3 VALUES (300, 3);
+
+statement ok
+INSERT INTO t4 VALUES (1000, 1);
+
+statement ok
+INSERT INTO t4 VALUES (2000, 2);
+
+statement ok
+INSERT INTO t4 VALUES (3000, 3);
+
+statement ok
+INSERT INTO t5 VALUES (10000, 1);
+
+statement ok
+INSERT INTO t5 VALUES (20000, 2);
+
+statement ok
+INSERT INTO t5 VALUES (30000, 3);
+
+# NLJ phase — SELECT (3 result rows)
+
+query
+SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t1.id = t3.t1_id JOIN t4 ON t1.id = t4.t1_id JOIN t5 ON t1.id = t5.t1_id;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
+|                3 |
++------------------+
+Total record(s): 3
+
+# NLJ phase — EXPLAIN ANALYZE (4 Join nodes for 5-table join)
+
+query
+EXPLAIN ANALYZE SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t1.id = t3.t1_id JOIN t4 ON t1.id = t4.t1_id JOIN t5 ON t1.id = t5.t1_id;
+----
+Project(columns=[t1.id], rows=3)
+	Join(tables=[t1, t2, t3, t4, t5], condition=[t1.id=t5.t1_id], rows=3)
+		Join(tables=[t1, t2, t3, t4], condition=[t1.id=t4.t1_id], rows=3)
+			Join(tables=[t1, t2, t3], condition=[t1.id=t3.t1_id], rows=3)
+				Join(tables=[t1, t2], condition=[t1.id=t2.t1_id], rows=3)
+					Project(columns=[t1.id], rows=3)
+						Scan(table=t1, type=SeqScan, rows=3)
+					Project(columns=[t2.t1_id], rows=9)
+						Scan(table=t2, type=SeqScan, rows=9)
+				Project(columns=[t3.t1_id], rows=9)
+					Scan(table=t3, type=SeqScan, rows=9)
+			Project(columns=[t4.t1_id], rows=9)
+				Scan(table=t4, type=SeqScan, rows=9)
+		Project(columns=[t5.t1_id], rows=9)
+			Scan(table=t5, type=SeqScan, rows=9)
+
+# INLJ phase — create indexes
+
+statement ok
+CREATE INDEX t2(t1_id);
+
+statement ok
+CREATE INDEX t3(t1_id);
+
+statement ok
+CREATE INDEX t4(t1_id);
+
+statement ok
+CREATE INDEX t5(t1_id);
+
+# INLJ phase — SELECT (3 result rows)
+
+query
+SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t1.id = t3.t1_id JOIN t4 ON t1.id = t4.t1_id JOIN t5 ON t1.id = t5.t1_id;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
+|                3 |
++------------------+
+Total record(s): 3
+
+# INLJ phase — EXPLAIN ANALYZE (4 IndexScan nodes)
+
+query
+EXPLAIN ANALYZE SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t1.id = t3.t1_id JOIN t4 ON t1.id = t4.t1_id JOIN t5 ON t1.id = t5.t1_id;
+----
+Project(columns=[t1.id], rows=3)
+	Join(tables=[t1, t2, t3, t4, t5], condition=[t1.id=t5.t1_id], rows=3)
+		Join(tables=[t1, t2, t3, t4], condition=[t1.id=t4.t1_id], rows=3)
+			Join(tables=[t1, t2, t3], condition=[t1.id=t3.t1_id], rows=3)
+				Join(tables=[t1, t2], condition=[t1.id=t2.t1_id], rows=3)
+					Project(columns=[t1.id], rows=3)
+						Scan(table=t1, type=SeqScan, rows=3)
+					Project(columns=[t2.t1_id], rows=3)
+						Scan(table=t2, type=IndexScan, using_index=(t1_id), rows=3)
+				Project(columns=[t3.t1_id], rows=3)
+					Scan(table=t3, type=IndexScan, using_index=(t1_id), rows=3)
+			Project(columns=[t4.t1_id], rows=3)
+				Scan(table=t4, type=IndexScan, using_index=(t1_id), rows=3)
+		Project(columns=[t5.t1_id], rows=3)
+			Scan(table=t5, type=IndexScan, using_index=(t1_id), rows=3)
