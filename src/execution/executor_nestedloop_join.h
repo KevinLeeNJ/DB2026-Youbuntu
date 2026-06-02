@@ -52,6 +52,14 @@ private:
     std::unique_ptr<RmRecord> _buffered_record;  // 复用的输出缓冲
     bool buffered_record_available_ = false;
 
+    // INLJ support
+    bool inlj_mode_ = false;
+    TabCol inlj_left_col_;     // left-side column providing lookup key
+    TabCol inlj_right_col_;    // right-table indexed column
+    int left_key_offset_ = 0;  // pre-compiled offset of left key in left tuple
+    int left_key_len_ = 0;     // pre-compiled length of left key
+    ColType left_key_type_ = TYPE_INT; // pre-compiled type of left key
+
     static bool compare_numeric(const int& op, const double& lhs, const double& rhs) {
         switch (op) {
         case OP_EQ:
@@ -209,9 +217,39 @@ private:
         }
     }
 
+    Value extract_key_from_left(const RmRecord& left_rec) const {
+        Value val;
+        const char* data = left_rec.data + left_key_offset_;
+        switch (left_key_type_) {
+        case TYPE_INT:
+            val.set_int(*reinterpret_cast<const int*>(data));
+            break;
+        case TYPE_FLOAT:
+            val.set_float(*reinterpret_cast<const float*>(data));
+            break;
+        case TYPE_STRING:
+            val.set_str(std::string(data, strnlen(data, left_key_len_)));
+            break;
+        }
+        return val;
+    }
+
+    std::vector<Condition> build_key_conditions(const RmRecord& left_rec) const {
+        Condition key_cond;
+        key_cond.lhs_col = inlj_right_col_;
+        key_cond.op = OP_EQ;
+        key_cond.is_rhs_val = true;
+        key_cond.rhs_val = extract_key_from_left(left_rec);
+        key_cond.rhs_val.init_raw(left_key_len_);
+        return {key_cond};
+    }
+
 public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
-                           std::vector<Condition> conds) {
+                           std::vector<Condition> conds,
+                           TabCol inlj_left_col = {},
+                           TabCol inlj_right_col = {},
+                           const std::string& inlj_index_col_name = "") {
         left_ = std::move(left);
         right_ = std::move(right);
         left_tuple_len_ = left_->tupleLen();
@@ -232,6 +270,23 @@ public:
         isend = false;
         fed_conds_ = std::move(conds);
         compile_conditions();
+
+        // INLJ initialization
+        if (!inlj_right_col.tab_name.empty()) {
+            inlj_mode_ = true;
+            inlj_left_col_ = inlj_left_col;
+            inlj_right_col_ = inlj_right_col;
+            // Pre-compile left key offset/type/len from cols_map
+            auto key = make_col_key(inlj_left_col_);
+            auto col_iter = cols_map.find(key);
+            if (col_iter != cols_map.end()) {
+                const auto& meta = *(col_iter->second);
+                left_key_offset_ = meta.offset;
+                left_key_len_ = meta.len;
+                left_key_type_ = meta.type;
+            }
+        }
+
         current_left_rec_ = nullptr; // 初始化 current_left_rec_
         reset_buffered_record();
     }
@@ -269,6 +324,10 @@ public:
                     return;
                 }
                 left_->nextTuple();
+                // INLJ: inject join key before resetting inner scan
+                if (inlj_mode_) {
+                    right_->set_key_conditions(build_key_conditions(*current_left_rec_));
+                }
                 right_->beginTuple();
             }
 

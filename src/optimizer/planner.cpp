@@ -178,6 +178,28 @@ std::string get_select_item_output_name(const SelectItem& item) {
     return item.expr.col.col_name;
 }
 
+// Rebuild the right plan tree, replacing the SeqScan leaf with new_scan (IndexScan).
+// The tree structure is: [Projection -> [Filter ->]] ScanPlan
+std::shared_ptr<Plan> rebuild_right_plan_with_index(const std::shared_ptr<Plan>& plan,
+                                                     const std::shared_ptr<Plan>& new_scan) {
+    if (plan->tag == T_SeqScan) {
+        return new_scan;
+    }
+    if (plan->tag == T_Filter) {
+        auto filter = std::static_pointer_cast<FilterPlan>(plan);
+        auto rebuilt_sub = rebuild_right_plan_with_index(filter->subplan_, new_scan);
+        return std::make_shared<FilterPlan>(T_Filter, std::move(rebuilt_sub), filter->conds_);
+    }
+    if (plan->tag == T_Projection) {
+        auto proj = std::static_pointer_cast<ProjectionPlan>(plan);
+        auto rebuilt_sub = rebuild_right_plan_with_index(proj->subplan_, new_scan);
+        return std::make_shared<ProjectionPlan>(T_Projection, std::move(rebuilt_sub), proj->select_items_,
+                                                 proj->output_names_, proj->preserve_col_names_,
+                                                 proj->is_select_star_);
+    }
+    return plan;
+}
+
 std::vector<OrderByItem> bind_order_by_output_names(const Query& query) {
     auto order_by_items = query.order_by_items;
     for (auto& item : order_by_items) {
@@ -468,10 +490,61 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
                          [](const Condition& lhs, const Condition& rhs) {
                              return condition_sort_key(lhs) < condition_sort_key(rhs);
                          });
+
+        // INLJ detection: find if right table has index on a join column
+        TabCol inlj_left_col;
+        TabCol inlj_right_col;
+        std::string inlj_index_col_name;
+        if (!curr_join_conds.empty()) {
+            TabMeta& next_tab = sm_manager_->db_.get_table(next_table);
+            for (const auto& cond : curr_join_conds) {
+                if (cond.op != OP_EQ || cond.is_rhs_val) {
+                    continue;
+                }
+                // Identify which side is right table, which is left side
+                TabCol right_col, left_col;
+                if (cond.rhs_col.tab_name == next_table) {
+                    right_col = cond.rhs_col;
+                    left_col = cond.lhs_col;
+                } else if (cond.lhs_col.tab_name == next_table) {
+                    right_col = cond.lhs_col;
+                    left_col = cond.rhs_col;
+                } else {
+                    continue;
+                }
+                // Check if left_col belongs to already-joined tables
+                if (joined_tables.find(left_col.tab_name) == joined_tables.end()) {
+                    continue;
+                }
+                // Check if right_col has an index on the right table
+                if (next_tab.is_index({right_col.col_name})) {
+                    inlj_right_col = right_col;
+                    inlj_left_col = left_col;
+                    inlj_index_col_name = right_col.col_name;
+                    break; // only use the first matching index
+                }
+            }
+        }
+
+        std::shared_ptr<Plan> right_plan = table_plans[i];
+        if (!inlj_index_col_name.empty()) {
+            // Replace right plan's SeqScan with IndexScan
+            std::shared_ptr<Plan> new_scan = std::make_shared<ScanPlan>(
+                T_IndexScan, sm_manager_, next_table, std::vector<Condition>(),
+                std::vector<std::string>{inlj_index_col_name});
+            right_plan = rebuild_right_plan_with_index(right_plan, new_scan);
+        }
+
         if (!query->is_explain_analyze && curr_join_conds.empty()) {
-            joined = std::make_shared<JoinPlan>(T_NestLoop, table_plans[i], std::move(joined), curr_join_conds);
+            joined = std::make_shared<JoinPlan>(T_NestLoop, right_plan, std::move(joined), curr_join_conds);
         } else {
-            joined = std::make_shared<JoinPlan>(T_NestLoop, std::move(joined), table_plans[i], curr_join_conds);
+            auto join_plan = std::make_shared<JoinPlan>(T_NestLoop, std::move(joined), right_plan, curr_join_conds);
+            if (!inlj_index_col_name.empty()) {
+                join_plan->inlj_left_col_ = inlj_left_col;
+                join_plan->inlj_right_col_ = inlj_right_col;
+                join_plan->inlj_index_col_name_ = inlj_index_col_name;
+            }
+            joined = join_plan;
         }
         joined_tables.insert(next_table);
     }
