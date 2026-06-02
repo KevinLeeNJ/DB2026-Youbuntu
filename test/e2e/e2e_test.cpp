@@ -456,3 +456,7 @@ TEST_F(SltFileTest, Union) {
 TEST_F(SltFileTest, QueryOptimize) {
     run_slt_file("query_optimize.slt");
 }
+
+TEST_F(SltFileTest, NestNljInlj) {
+    run_slt_file("nest_nlj_inlj.slt");
+}

@@ -100,4 +100,8 @@ public:
     void set_counting_enabled(bool enabled) override {
         prev_->set_counting_enabled(enabled);
     }
+
+    void set_key_conditions(std::vector<Condition> key_conds) override {
+        prev_->set_key_conditions(std::move(key_conds));
+    }
 };

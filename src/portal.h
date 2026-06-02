@@ -152,6 +152,10 @@ private:
             counting_enabled_ = enabled;
             inner_->set_counting_enabled(enabled);
         }
+
+        void set_key_conditions(std::vector<Condition> key_conds) override {
+            inner_->set_key_conditions(std::move(key_conds));
+        }
     };
 
     static ExecutorQueryExpr to_executor_query_expr(const QueryExpr& expr) {
@@ -482,10 +486,15 @@ private:
     static void render_explain_plan(const std::shared_ptr<Plan>& plan, int depth, std::ostringstream& out) {
         out << std::string(static_cast<size_t>(depth), '\t');
         switch (plan->tag) {
-        case T_SeqScan:
-        case T_IndexScan: {
+        case T_SeqScan: {
             auto scan = std::static_pointer_cast<ScanPlan>(plan);
             out << "Scan(table=" << scan->tab_name_ << ", type=SeqScan, rows=" << plan->runtime_rows_ << ")\n";
+            break;
+        }
+        case T_IndexScan: {
+            auto scan = std::static_pointer_cast<ScanPlan>(plan);
+            out << "Scan(table=" << scan->tab_name_ << ", type=IndexScan, using_index=(" << scan->index_col_names_[0]
+                << "), rows=" << plan->runtime_rows_ << ")\n";
             break;
         }
         case T_Filter: {
@@ -724,8 +733,9 @@ public:
             auto x = std::static_pointer_cast<JoinPlan>(plan);
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context, count_rows);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context, count_rows);
-            std::unique_ptr<AbstractExecutor> join =
-                std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), x->conds_);
+            std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
+                std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
+                x->inlj_index_col_name_);
             return maybe_count(std::move(join), plan, count_rows);
         }
         case T_Sort: {
