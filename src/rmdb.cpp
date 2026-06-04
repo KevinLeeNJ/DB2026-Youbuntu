@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 
 #include "errors.h"
+#include "minilog.h"
 #include "optimizer/optimizer.h"
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
@@ -52,7 +53,7 @@ static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
     should_exit = true;
     log_manager->flush_log_to_disk();
-    std::cout << "The Server receive Crtl+C, will been closed\n";
+    LOG_INFO("the server received Ctrl+C and will close");
     longjmp(jmpbuf, 1);
 }
 
@@ -81,36 +82,34 @@ void* client_handler(void* sock_fd) {
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
 
-    std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
-    std::cout << output;
+    LOG_INFO("establish client connection, sockfd: %d", fd);
 
     while (true) {
-        std::cout << "Waiting for request..." << std::endl;
+        LOG_DEBUG("waiting for request on sockfd: %d", fd);
         memset(data_recv, 0, BUFFER_LENGTH);
 
         i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
 
         if (i_recvBytes == 0) {
-            std::cout << "Maybe the client has closed" << std::endl;
+            LOG_WARN("client may have closed, sockfd: %d", fd);
             break;
         }
         if (i_recvBytes == -1) {
-            std::cout << "Client read error!" << std::endl;
+            LOG_ERROR("client read error on sockfd %d: %s", fd, strerror(errno));
             break;
         }
 
-        printf("i_recvBytes: %d \n ", i_recvBytes);
+        LOG_DEBUG("received %d bytes from sockfd: %d", i_recvBytes, fd);
 
         if (strcmp(data_recv, "exit") == 0) {
-            std::cout << "Client exit." << std::endl;
+            LOG_INFO("client exit, sockfd: %d", fd);
             break;
         }
         if (strcmp(data_recv, "crash") == 0) {
-            std::cout << "Server crash" << std::endl;
+            LOG_ERROR("server crash command received from sockfd: %d", fd);
+            minilog::Logger::get().flush();
             exit(1);
         }
-
-        std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
@@ -154,7 +153,7 @@ void* client_handler(void* sock_fd) {
                         context->txn_->get_state() != TransactionState::COMMITTED) {
                         txn_manager->abort(context->txn_, log_manager.get());
                     }
-                    std::cout << e.GetInfo() << std::endl;
+                    LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
@@ -162,7 +161,7 @@ void* client_handler(void* sock_fd) {
                     outfile.close();
                 } catch (RMDBError& e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
-                    std::cerr << e.what() << std::endl;
+                    LOG_ERROR("%s", e.what());
 
                     memcpy(data_send, e.what(), e.get_msg_len());
                     data_send[e.get_msg_len()] = '\n';
@@ -185,7 +184,7 @@ void* client_handler(void* sock_fd) {
         } else {
             // 解析失败，将 failure 信息写入 output.txt 并返回给客户端
             // where 中含有聚合函数时，会出现解析失败的情况，此处需要打印一个 failure
-            std::cerr << "Parse error" << std::endl;
+            LOG_ERROR("parse error");
 
             if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                 context->txn_->get_state() != TransactionState::COMMITTED &&
@@ -215,7 +214,7 @@ void* client_handler(void* sock_fd) {
     }
 
     // Clear
-    std::cout << "Terminating current client_connection..." << std::endl;
+    LOG_INFO("terminating client connection, sockfd: %d", fd);
     close(fd);          // close a file descriptor.
     pthread_exit(NULL); // terminate calling thread!
 }
@@ -244,24 +243,26 @@ void start_server() {
     s_addr_in.sin_port = htons(SOCK_PORT);
     fd_temp = bind(sockfd_server, (struct sockaddr*)(&s_addr_in), sizeof(s_addr_in));
     if (fd_temp == -1) {
-        std::cout << "Bind error!" << std::endl;
+        LOG_ERROR("bind failed: %s", strerror(errno));
+        minilog::Logger::get().stop();
         exit(1);
     }
 
     fd_temp = listen(sockfd_server, MAX_CONN_LIMIT);
     if (fd_temp == -1) {
-        std::cout << "Listen error!" << std::endl;
+        LOG_ERROR("listen failed: %s", strerror(errno));
+        minilog::Logger::get().stop();
         exit(1);
     }
 
     while (!should_exit) {
-        std::cout << "Waiting for new connection..." << std::endl;
+        LOG_DEBUG("waiting for new connection");
         pthread_t thread_id;
         struct sockaddr_in s_addr_client {};
         int client_length = sizeof(s_addr_client);
 
         if (setjmp(jmpbuf)) {
-            std::cout << "Break from Server Listen Loop\n";
+            LOG_INFO("break from server listen loop");
             break;
         }
 
@@ -269,33 +270,37 @@ void start_server() {
         pthread_mutex_lock(sockfd_mutex);
         int sockfd = accept(sockfd_server, (struct sockaddr*)(&s_addr_client), (socklen_t*)(&client_length));
         if (sockfd == -1) {
-            std::cout << "Accept error!" << std::endl;
+            LOG_WARN("accept failed: %s", strerror(errno));
             continue; // ignore current socket ,continue while loop.
         }
 
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
         if (pthread_create(&thread_id, nullptr, &client_handler, (void*)(&sockfd)) != 0) {
-            std::cout << "Create thread fail!" << std::endl;
+            LOG_ERROR("create client handler thread failed");
             break; // break while loop
         }
     }
 
     // Clear
-    std::cout << " Try to close all client-connection.\n";
+    LOG_INFO("try to close all client connections");
     int ret = shutdown(sockfd_server, SHUT_WR); // shut down the all or part of a full-duplex connection.
     if (ret == -1) {
-        printf("%s\n", strerror(errno));
+        LOG_ERROR("shutdown server socket failed: %s", strerror(errno));
     }
     //    assert(ret != -1);
     sm_manager->close_db();
-    std::cout << " DB has been closed.\n";
-    std::cout << "Server shuts down." << std::endl;
+    LOG_INFO("database has been closed");
+    LOG_INFO("server shuts down");
 }
 
 int main(int argc, char** argv) {
+    minilog::Logger::get().init("rmdb.log");
+    minilog::Logger::get().set_level(minilog::LogLevel::INFO);
+
     if (argc != 2) {
         // 需要指定数据库名称
-        std::cerr << "Usage: " << argv[0] << " <database>" << std::endl;
+        LOG_ERROR("usage: %s <database>", argv[0]);
+        minilog::Logger::get().stop();
         exit(1);
     }
 
@@ -314,23 +319,29 @@ int main(int argc, char** argv) {
                      "\n";
         // Database name is passed by args
         std::string db_name = argv[1];
+        LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
         if (!sm_manager->is_dir(db_name)) {
             // Database not found, create a new one
             sm_manager->create_db(db_name);
+            LOG_INFO("database created: %s", db_name.c_str());
         }
         // Open database
         sm_manager->open_db(db_name);
+        LOG_INFO("database opened: %s", db_name.c_str());
 
         // recovery database
         recovery->analyze();
         recovery->redo();
         recovery->undo();
+        LOG_INFO("database recovery finished");
 
         // 开启服务端，开始接受客户端连接
         start_server();
     } catch (RMDBError& e) {
-        std::cerr << e.what() << std::endl;
+        LOG_ERROR("RMDB error: %s", e.what());
+        minilog::Logger::get().stop();
         exit(1);
     }
+    minilog::Logger::get().stop();
     return 0;
 }
