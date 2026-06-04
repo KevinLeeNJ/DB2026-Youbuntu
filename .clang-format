@@ -7,6 +7,7 @@ BreakBeforeBraces: Attach
 ColumnLimit: 120
 PointerAlignment: Left
 AccessModifierOffset: -4
+AlignEscapedNewlines: DontAlign
 AlignTrailingComments: true
 AllowShortFunctionsOnASingleLine: Empty
 AllowShortIfStatementsOnASingleLine: Never
