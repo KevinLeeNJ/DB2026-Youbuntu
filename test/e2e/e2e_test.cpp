@@ -105,7 +105,7 @@ public:
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
-        Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset);
+        Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
         set_transaction(&context);
 
         // Parse

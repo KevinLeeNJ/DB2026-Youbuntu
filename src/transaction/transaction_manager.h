@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <functional>
 #include <shared_mutex>
@@ -87,11 +88,13 @@ public:
             return nullptr;
 
         std::unique_lock<std::mutex> lock(latch_);
-        assert(TransactionManager::txn_map.find(txn_id) != TransactionManager::txn_map.end());
-        auto* res = TransactionManager::txn_map[txn_id];
+        auto it = TransactionManager::txn_map.find(txn_id);
+        if (it == TransactionManager::txn_map.end())
+            return nullptr;
+        auto* res = it->second;
         lock.unlock();
         assert(res != nullptr);
-        assert(res->get_thread_id() == std::this_thread::get_id());
+        // Note: MVCC undo chain traversal may access other threads' transactions
 
         return res;
     }
@@ -131,6 +134,62 @@ public:
     /** @brief 获取系统中的最低读时间戳。 */
     timestamp_t GetWatermark();
 
+    /** @brief Traverse the undo chain to find a visible version of a tuple. */
+    std::optional<std::pair<TupleMeta, std::vector<char>>>
+    FindVisibleVersion(const TupleMeta& start_meta, timestamp_t read_ts, txn_id_t self_txn_id);
+
+    // ---- SSI Dependency Tracking (SER only) ----
+
+    /** @brief Add a rw dependency edge FROM ->rw TO. Returns true if a danger structure is formed. */
+    bool AddRwEdge(txn_id_t from, txn_id_t to);
+
+    /** @brief Check and record rw-dependency when the current reader (executing SELECT) sees
+     *  a page version written by another SER transaction that is invisible to the reader.
+     *  Creates reader ->rw writer edge. Returns true if danger structure formed. */
+    bool CheckInvisibleWriteEdge(txn_id_t reader, txn_id_t page_writer);
+
+    /** @brief Check if a write to RID on a table conflicts with any active SER transaction's read/predicate set.
+     *  Also stores the write info in ssi_writes_ for future predicate reads.
+     *  Thread-safe. Returns true if danger structure formed. */
+    bool CheckWriteAgainstReaders(txn_id_t writer, Rid rid, const std::string& tab_name);
+
+    /** @brief Consolidated check: checks both old_rec and new_rec atomically and stores
+     *  a single ssi_writes_ entry only if no danger is found.
+     *  For INSERT: old_rec=nullopt. For DELETE: new_rec=nullopt.
+     *  For UPDATE: both old_rec and new_rec are provided.
+     *  Thread-safe. Returns true if danger structure formed. */
+    bool CheckWriteAgainstReaders(txn_id_t writer, Rid rid, const std::string& tab_name,
+                                  const std::optional<RmRecord>& old_rec, const std::optional<RmRecord>& new_rec,
+                                  const std::vector<ColMeta>& cols);
+
+    /** @brief Check if any active SER transaction has an invisible write that would change
+     *  the current reader's SELECT result for the given RID. Creates current_reader ->rw writer edges.
+     *  Thread-safe. Returns true if danger structure formed. */
+    bool CheckInvisibleWrites(txn_id_t reader, Rid rid, const std::string& tab_name);
+
+    bool CheckPredicateInvisibleWrites(txn_id_t reader, const std::string& tab_name,
+                                       const std::vector<Condition>& conds, RmFileHandle* fh,
+                                       const std::vector<ColMeta>& cols);
+
+    /** @brief Record that a transaction read a record (for SSI read-set tracking).
+     *  Also stores the read in the centralized record-read list for write-side checking. */
+    void RecordRead(txn_id_t reader, const std::string& tab_name, const Rid& rid);
+
+    /** @brief Record a predicate read for a transaction and check invisible writes.
+     *  Checks ssi_writes_ for invisible writes that match the predicate, creating
+     *  reader ->rw writer edges. Returns true if SSI danger structure formed. */
+    bool RecordPredicateRead(Transaction* txn, const std::string& tab_name, const std::vector<Condition>& conds);
+
+    /** @brief Check for SSI danger: two consecutive rw-edges (Tin->rw->Tpivot, Tpivot->rw->Tout)
+     *  where intervals overlap and Tin==Tout or Tout committed before Tin. */
+    bool HasDangerousStructure(txn_id_t current_txn);
+
+    /** @brief Prune SSI state for transactions that are no longer relevant. */
+    void PruneSsiState();
+
+    /** @brief Clean up SSI state for an aborted/rolled-back transaction. */
+    void CleanupSsiState(txn_id_t txn_id);
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
@@ -157,4 +216,35 @@ private:
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+
+    // ---- SSI State (centralized) — protected by latch_ ----
+    struct SsiWriteEntry {
+        txn_id_t txn_id_;
+        std::string tab_name_;
+        std::optional<Rid> rid_;
+        std::optional<RmRecord> old_rec_;
+        std::optional<RmRecord> new_rec_;
+    };
+    std::vector<SsiWriteEntry> ssi_writes_;
+
+    struct SsiRecordReadEntry {
+        txn_id_t txn_id_;
+        std::string tab_name_;
+        Rid rid_;
+    };
+    std::vector<SsiRecordReadEntry> ssi_record_reads_;
+
+    // reader -> {writers} (rw anti-dependency edges)
+    std::unordered_map<txn_id_t, std::unordered_set<txn_id_t>> rw_edges_;
+
+    bool TransactionsOverlap(Transaction* lhs, Transaction* rhs);
+
+    bool CommittedBefore(txn_id_t lhs, txn_id_t rhs);
+    bool CommittedBeforeUnlocked(txn_id_t lhs, txn_id_t rhs);
+
+    bool HasDangerousStructureUnlocked(txn_id_t current_txn);
+
+    bool TupleMatches(const std::string& tab_name, const std::vector<Condition>& conds, const RmRecord& rec);
+
+    bool AddRwEdgeInternal(txn_id_t reader, txn_id_t writer, txn_id_t current_txn);
 };

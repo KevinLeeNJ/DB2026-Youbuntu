@@ -65,6 +65,7 @@ void SetTransaction(txn_id_t* txn_id, Context* context) {
         context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
+        context->txn_->set_isolation_level(context->isolation_level_);
     }
 }
 
@@ -81,6 +82,8 @@ void* client_handler(void* sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
+    // 记录客户端当前配置的隔离级别（默认 SERIALIZABLE）
+    IsolationLevel session_isolation_level = IsolationLevel::SERIALIZABLE;
 
     LOG_INFO("establish client connection, sockfd: %d", fd);
 
@@ -115,7 +118,9 @@ void* client_handler(void* sock_fd) {
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        Context* context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+        Context* context =
+            new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset, txn_manager.get());
+        context->isolation_level_ = session_isolation_level;
         SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
@@ -135,6 +140,8 @@ void* client_handler(void* sock_fd) {
                     // portal
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context);
+                    // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
+                    session_isolation_level = context->isolation_level_;
                     portal->drop();
                     if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                         context->txn_->get_state() != TransactionState::COMMITTED &&

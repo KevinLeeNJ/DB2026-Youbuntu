@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include "execution_defs.h"
+#include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
@@ -42,7 +43,10 @@ public:
         }
         // 删除记录
         for (Rid rid : rids_) {
-            auto rec = fh_->get_record(rid, context_);
+            auto rec = GetVisibleRecord(fh_, rid, context_);
+            if (rec == nullptr) {
+                continue;
+            }
             char* rec_data = rec->data;
             bool match = true;
             for (const auto& cond : conds_) {
@@ -53,6 +57,31 @@ public:
             }
             if (!match) {
                 continue; // 如果记录不匹配条件，则跳过删除
+            }
+            // MVCC Write-Write conflict detection
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                auto txn = context_->txn_;
+                if (context_->lock_mgr_ != nullptr &&
+                    !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                }
+                TupleMeta meta = fh_->get_tuple_meta(rid);
+                if (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id()) {
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                }
+                if (meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
+                    meta.writer_txn_id_ != txn->get_transaction_id()) {
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                }
+
+                // SSI: Check if this delete conflicts with other SER transactions' reads
+                if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr) {
+                    auto* txn_mgr = context_->txn_mgr_;
+                    if (txn_mgr->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, tab_name_,
+                                                          std::optional<RmRecord>(*rec), std::nullopt, tab_.cols)) {
+                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
+                    }
+                }
             }
             auto* undo_record = context_ != nullptr && context_->txn_ != nullptr
                                     ? new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec)
@@ -86,10 +115,26 @@ public:
                 throw;
             }
             if (undo_record != nullptr) {
+                UndoLog undo;
+                undo.is_deleted_ = true;
+                undo.old_meta_ = fh_->get_tuple_meta(rid);
+                undo.old_tuple_data_.assign(rec->data, rec->data + rec->size);
+                undo.prev_version_ = undo.old_meta_.version_chain_head_;
+                UndoLink undo_link = context_->txn_->AppendUndoLog(undo);
+
                 context_->txn_->append_write_record(undo_record);
                 undo_record = nullptr;
+                context_->txn_->append_modified_slot(tab_name_, rid);
+
+                TupleMeta tombstone;
+                tombstone.writer_txn_id_ = context_->txn_->get_transaction_id();
+                tombstone.is_committed_ = false;
+                tombstone.is_deleted_ = true;
+                tombstone.version_chain_head_ = undo_link;
+                fh_->set_tuple_meta(rid, tombstone);
+            } else {
+                fh_->delete_record(rid, context_);
             }
-            fh_->delete_record(rid, context_);
         }
         return nullptr;
     }

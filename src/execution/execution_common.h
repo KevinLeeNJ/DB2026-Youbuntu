@@ -10,14 +10,68 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstring>
+#include <memory>
 #include <vector>
 #include <optional>
 
 #include "transaction/transaction.h"
 #include "transaction/transaction_manager.h"
 #include "common/common.h"
+#include "record/rm_file_handle.h"
 
 auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const TupleMeta& base_meta,
                       const std::vector<UndoLog>& undo_logs) -> std::optional<RmRecord>;
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction* txn) -> bool;
+
+inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid, Context* context) {
+    if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
+        return fh->get_record(rid, context);
+    }
+
+    auto* txn = context->txn_;
+    auto* txn_mgr = context->txn_mgr_;
+    const timestamp_t read_ts = txn->get_start_ts();
+    const txn_id_t self_id = txn->get_transaction_id();
+
+    TupleMeta meta = fh->get_tuple_meta(rid);
+    std::vector<UndoLog> undo_stack;
+    constexpr int MAX_DEPTH = 100;
+
+    for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+        if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
+            return meta.is_deleted_ ? nullptr : fh->get_record(rid, context);
+        }
+
+        if (!meta.is_committed_) {
+            if (!meta.version_chain_head_.IsValid()) {
+                return nullptr;
+            }
+            undo_stack.push_back(txn_mgr->GetUndoLog(meta.version_chain_head_));
+            meta = undo_stack.back().old_meta_;
+            continue;
+        }
+
+        if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+            return nullptr;
+        }
+
+        if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+            if (undo_stack.empty()) {
+                return fh->get_record(rid, context);
+            }
+            const auto& log = undo_stack.back();
+            auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));
+            memcpy(rec->data, log.old_tuple_data_.data(), log.old_tuple_data_.size());
+            return rec;
+        }
+
+        if (!meta.version_chain_head_.IsValid()) {
+            return nullptr;
+        }
+        undo_stack.push_back(txn_mgr->GetUndoLog(meta.version_chain_head_));
+        meta = undo_stack.back().old_meta_;
+    }
+    return nullptr;
+}

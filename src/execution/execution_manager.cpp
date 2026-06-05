@@ -107,6 +107,8 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
                 *txn_id = context->txn_->get_transaction_id();
             }
             context->txn_->set_txn_mode(true);
+            // Propagate isolation level from Context to Transaction
+            context->txn_->set_isolation_level(context->isolation_level_);
             break;
         }
         case T_Transaction_commit: {
@@ -133,6 +135,20 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
         default:
             throw InternalError("Unexpected field type");
             break;
+        }
+        break;
+    }
+    case T_SetTransaction: {
+        auto x = std::static_pointer_cast<SetTransactionPlan>(plan);
+        switch (x->isolation_level_) {
+        case ast::IsolationLevelType::SNAPSHOT_ISOLATION: {
+            context->isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
+            break;
+        }
+        case ast::IsolationLevelType::SERIALIZABLE: {
+            context->isolation_level_ = IsolationLevel::SERIALIZABLE;
+            break;
+        }
         }
         break;
     }
@@ -173,22 +189,39 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     }
 
-    // Print header into buffer
-    RecordPrinter rec_printer(captions.size());
-    rec_printer.print_separator(context);
-    rec_printer.print_record(captions, context);
-    rec_printer.print_separator(context);
-    // print header into file
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for (size_t i = 0; i < captions.size(); ++i) {
-        outfile << " " << captions[i] << " |";
-    }
-    outfile << "\n";
-
     // Print records
     size_t num_rec = 0;
+    std::vector<char> local_send(BUFFER_LENGTH, 0);
+    int local_offset = 0;
+    Context print_context(context->lock_mgr_, context->log_mgr_, context->txn_, local_send.data(), &local_offset,
+                          context->txn_mgr_);
+    print_context.isolation_level_ = context->isolation_level_;
+
+    struct SsiReadTrackingGuard {
+        Context* context_;
+        bool old_value_;
+
+        explicit SsiReadTrackingGuard(Context* context) : context_(context), old_value_(false) {
+            if (context_ != nullptr) {
+                old_value_ = context_->enable_ssi_read_tracking_;
+                context_->enable_ssi_read_tracking_ = true;
+            }
+        }
+
+        ~SsiReadTrackingGuard() {
+            if (context_ != nullptr) {
+                context_->enable_ssi_read_tracking_ = old_value_;
+            }
+        }
+    } ssi_read_tracking_guard(context);
+
+    // Print header into a statement-local buffer. It is copied to the client
+    // and output.txt only after the SELECT completes without aborting.
+    RecordPrinter rec_printer(captions.size());
+    rec_printer.print_separator(&print_context);
+    rec_printer.print_record(captions, &print_context);
+    rec_printer.print_separator(&print_context);
+
     // 执行query_plan
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
@@ -208,20 +241,24 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             columns.push_back(col_str);
         }
         // print record into buffer
-        rec_printer.print_record(columns, context);
+        rec_printer.print_record(columns, &print_context);
         // print record into file
-        outfile << "|";
-        for (size_t i = 0; i < columns.size(); ++i) {
-            outfile << " " << columns[i] << " |";
-        }
-        outfile << "\n";
         num_rec++;
     }
-    outfile.close();
     // Print footer into buffer
-    rec_printer.print_separator(context);
+    rec_printer.print_separator(&print_context);
     // Print record count into buffer
-    RecordPrinter::print_record_count(num_rec, context);
+    RecordPrinter::print_record_count(num_rec, &print_context);
+
+    if (local_offset > 0) {
+        memcpy(context->data_send_ + *(context->offset_), local_send.data(), local_offset);
+        *(context->offset_) += local_offset;
+
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile.write(local_send.data(), local_offset);
+        outfile.close();
+    }
 }
 
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,

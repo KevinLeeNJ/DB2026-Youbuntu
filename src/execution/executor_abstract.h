@@ -60,6 +60,16 @@ public:
         // no-op default; only IndexScanExecutor overrides
     }
 
+    virtual std::string scan_table_name() const {
+        return "";
+    }
+
+    virtual std::vector<Condition> scan_conditions() const {
+        return {};
+    }
+
+    virtual void record_current_read_for_ssi() {}
+
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;

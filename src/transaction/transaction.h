@@ -22,26 +22,8 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/txn_defs.h"
 #include "record/rm_defs.h"
 
-/** 表示此tuple的前一个版本的链接 */
-struct UndoLink {
-    /* 之前的版本可以在其中的事务中找到 */
-    txn_id_t prev_txn_{INVALID_TXN_ID};
-    /* 在 `prev_txn_` 中前一个版本的日志索引 */
-    int prev_log_idx_{0};
-
-    friend auto operator==(const UndoLink& a, const UndoLink& b) {
-        return a.prev_txn_ == b.prev_txn_ && a.prev_log_idx_ == b.prev_log_idx_;
-    }
-
-    friend auto operator!=(const UndoLink& a, const UndoLink& b) {
-        return !(a == b);
-    }
-
-    /* Checks if the undo link points to something. */
-    bool IsValid() {
-        return prev_txn_ != INVALID_TXN_ID;
-    }
-};
+// UndoLink is now defined in record/rm_defs.h (physical undo pointer)
+// UndoLog is superseded by UndoLogRecord in undo/undo_defs.h
 
 struct UndoLog {
     /* 此日志是否为删除标记 */
@@ -55,6 +37,10 @@ struct UndoLog {
     timestamp_t ts_{INVALID_TS};
     /* 撤销日志的前一个版本 */
     UndoLink prev_version_{};
+
+    // MVCC old version fields
+    TupleMeta old_meta_;               // TupleMeta before the modification
+    std::vector<char> old_tuple_data_; // old record data (for version chain traversal)
 };
 
 class Transaction {
@@ -95,6 +81,9 @@ public:
 
     inline IsolationLevel get_isolation_level() {
         return isolation_level_;
+    }
+    inline void set_isolation_level(IsolationLevel level) {
+        isolation_level_ = level;
     }
 
     inline TransactionState get_state() {
@@ -142,6 +131,17 @@ public:
     inline timestamp_t get_commit_ts() const {
         return commit_ts_;
     }
+    inline void set_commit_ts(timestamp_t ts) {
+        commit_ts_ = ts;
+    }
+
+    // Modified slots tracking (for MVCC commit: mark slots as committed)
+    inline auto& get_modified_slots() {
+        return modified_slots_;
+    }
+    inline void append_modified_slot(const std::string& tab_name, const Rid& rid) {
+        modified_slots_.emplace_back(tab_name, rid);
+    }
 
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
@@ -149,11 +149,13 @@ public:
         undo_logs_[log_idx] = std::move(new_log);
     }
 
-    /** @return 此事务中撤销日志的索引 */
+    /** @return an UndoLink pointing to the appended undo log.
+     *  Uses the undo log index as the slot offset for in-memory undo storage. */
     inline auto AppendUndoLog(UndoLog log) -> UndoLink {
         std::scoped_lock<std::mutex> lck(latch_);
+        int idx = static_cast<int>(undo_logs_.size());
         undo_logs_.emplace_back(std::move(log));
-        return {txn_id_, static_cast<int>(undo_logs_.size() - 1)};
+        return UndoLink{0, idx, txn_id_}; // in-memory: page=0, slot=idx, txn=self
     }
     inline auto GetUndoLog(size_t log_id) -> UndoLog {
         std::scoped_lock<std::mutex> lck(latch_);
@@ -165,6 +167,23 @@ public:
         std::scoped_lock<std::mutex> lck(latch_);
         return undo_logs_.size();
     }
+
+    // MVCC: slots modified by this txn (tab_name, rid) — for commit-time TupleMeta update
+    std::vector<std::pair<std::string, Rid>> modified_slots_;
+
+    // SSI dependency tracking (SER only)
+    struct PredicateRead {
+        std::string tab_name_;
+        std::vector<Condition> conds_;
+    };
+
+    std::unordered_set<txn_id_t> in_rw_;        // transactions that ->rw this txn
+    std::unordered_set<txn_id_t> out_rw_;       // transactions this txn ->rw
+    std::unordered_set<std::string> read_rids_; // RIDs read by this txn (keyed as "page_no:slot_no")
+    std::vector<PredicateRead> predicate_reads_;
+
+    /** 提交时间戳 (public for TransactionManager access) */
+    std::atomic<timestamp_t> commit_ts_{INVALID_TS};
 
 private:
     bool txn_mode_;                  // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
@@ -181,8 +200,6 @@ private:
     std::shared_ptr<std::deque<Page*>> index_deleted_page_set_; // 维护事务执行过程中删除的索引页面
 
     std::atomic<timestamp_t> read_ts_{0};
-    /** 提交时间戳 */
-    std::atomic<timestamp_t> commit_ts_{INVALID_TS};
     /**
      * @brief 存储撤销日志。
      * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。

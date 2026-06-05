@@ -174,4 +174,12 @@ public:
     void set_key_conditions(std::vector<Condition> key_conds) override {
         prev_->set_key_conditions(std::move(key_conds));
     }
+
+    std::string scan_table_name() const override {
+        return prev_->scan_table_name();
+    }
+
+    std::vector<Condition> scan_conditions() const override {
+        return prev_->scan_conditions();
+    }
 };

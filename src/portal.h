@@ -106,6 +106,7 @@ private:
         CountingExecutor(std::unique_ptr<AbstractExecutor> inner, std::shared_ptr<Plan> plan) {
             inner_ = std::move(inner);
             plan_ = std::move(plan);
+            context_ = inner_->context_;
         }
 
         size_t tupleLen() const override {
@@ -155,6 +156,18 @@ private:
 
         void set_key_conditions(std::vector<Condition> key_conds) override {
             inner_->set_key_conditions(std::move(key_conds));
+        }
+
+        std::string scan_table_name() const override {
+            return inner_->scan_table_name();
+        }
+
+        std::vector<Condition> scan_conditions() const override {
+            return inner_->scan_conditions();
+        }
+
+        void record_current_read_for_ssi() override {
+            inner_->record_current_read_for_ssi();
         }
     };
 
@@ -571,6 +584,7 @@ public:
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
         case T_SetKnob:
+        case T_SetTransaction:
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
         case T_CreateTable:

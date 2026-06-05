@@ -50,6 +50,8 @@ public:
     std::unordered_map<std::string, std::string> table_alias_to_name;
     std::unordered_map<std::string, std::string> table_name_to_display;
     bool is_explain_analyze = false;
+    bool is_set_transaction = false;
+    ast::IsolationLevelType set_isolation_level;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     // insert 的values值

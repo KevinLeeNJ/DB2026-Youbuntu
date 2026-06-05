@@ -18,18 +18,48 @@ constexpr int RM_FILE_HDR_PAGE = 0;
 constexpr int RM_FIRST_RECORD_PAGE = 1;
 constexpr int RM_MAX_RECORD_SIZE = 512;
 
+// UndoLink — points to a physical undo storage location.
+// For in-memory undo (transitional): undo_page_id_ = 0, undo_slot_offset_ = log_index
+// For physical undo: undo_page_id_ = undo page id, undo_slot_offset_ = byte offset
+struct UndoLink {
+    page_id_t undo_page_id_{INVALID_PAGE_ID};
+    int undo_slot_offset_{0};
+    txn_id_t undo_txn_id_{INVALID_TXN_ID}; // owner txn for in-memory undo lookup
+
+    bool IsValid() const {
+        return undo_txn_id_ != INVALID_TXN_ID;
+    }
+
+    friend auto operator==(const UndoLink& a, const UndoLink& b) {
+        return a.undo_page_id_ == b.undo_page_id_ && a.undo_slot_offset_ == b.undo_slot_offset_ &&
+               a.undo_txn_id_ == b.undo_txn_id_;
+    }
+
+    friend auto operator!=(const UndoLink& a, const UndoLink& b) {
+        return !(a == b);
+    }
+};
+
 struct TupleMeta {
-    timestamp_t ts_;
-    bool is_deleted_;
+    timestamp_t commit_ts_{INVALID_TS};      // commit timestamp (valid when is_committed_)
+    txn_id_t writer_txn_id_{INVALID_TXN_ID}; // transaction that wrote this version
+    bool is_committed_{false};               // true if the writer has committed
+    bool is_deleted_{false};                 // true if this tuple is logically deleted
+    UndoLink version_chain_head_;            // pointer to undo storage chain
 
     friend auto operator==(const TupleMeta& a, const TupleMeta& b) {
-        return a.ts_ == b.ts_ && a.is_deleted_ == b.is_deleted_;
+        return a.commit_ts_ == b.commit_ts_ && a.writer_txn_id_ == b.writer_txn_id_ &&
+               a.is_committed_ == b.is_committed_ && a.is_deleted_ == b.is_deleted_ &&
+               a.version_chain_head_ == b.version_chain_head_;
     }
 
     friend auto operator!=(const TupleMeta& a, const TupleMeta& b) {
         return !(a == b);
     }
 };
+
+// Size of TupleMeta in bytes (used for page layout calculations)
+constexpr int TUPLE_META_SIZE = sizeof(TupleMeta);
 
 /* 文件头，记录表数据文件的元信息，写入磁盘中文件的第0号页面 */
 struct RmFileHdr {

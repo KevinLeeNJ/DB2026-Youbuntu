@@ -331,7 +331,7 @@ private:
 
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec) const {
         CellValue current_value;
-        if (!spec.is_star) {
+        if (!spec.is_star && spec.type != LocalAggType::COUNT) {
             current_value = read_cell(rec, spec.input_col);
         }
 

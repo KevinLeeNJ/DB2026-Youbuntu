@@ -49,7 +49,8 @@ typedef enum PlanTag {
     T_Aggregate,
     T_Limit,
     T_Union,
-    T_ExplainAnalyze
+    T_ExplainAnalyze,
+    T_SetTransaction
 } PlanTag;
 
 // 查询执行计划
@@ -254,6 +255,16 @@ public:
     }
     ast::SetKnobType set_knob_type_;
     bool bool_value_;
+};
+
+// Set Transaction Isolation Level Plan
+class SetTransactionPlan : public Plan {
+public:
+    explicit SetTransactionPlan(ast::IsolationLevelType level) {
+        Plan::tag = T_SetTransaction;
+        isolation_level_ = level;
+    }
+    ast::IsolationLevelType isolation_level_;
 };
 
 class plannerInfo {
