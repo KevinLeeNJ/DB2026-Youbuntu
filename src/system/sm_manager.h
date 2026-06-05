@@ -85,4 +85,18 @@ public:
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+
+    // MVCC: mark all slots modified by txn as committed with the given commit_ts
+    void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
+        for (const auto& [tab_name, rid] : txn.get_modified_slots()) {
+            auto it = fhs_.find(tab_name);
+            if (it == fhs_.end())
+                continue;
+            auto page_handle = it->second->fetch_page_handle(rid.page_no);
+            page_handle.get_meta(rid.slot_no).is_committed_ = true;
+            page_handle.get_meta(rid.slot_no).commit_ts_ = commit_ts;
+            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        }
+        txn.get_modified_slots().clear();
+    }
 };

@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "executor_abstract.h"
+#include "transaction/transaction_manager.h"
 
 class FilterExecutor : public AbstractExecutor {
 private:
@@ -20,6 +21,23 @@ private:
     size_t len_;
     std::unique_ptr<RmRecord> buffered_record_;
     bool isend_ = true;
+    bool predicate_recorded_ = false;
+
+    bool should_track_ssi_reads() const {
+        return context_ != nullptr && context_->enable_ssi_read_tracking_ && context_->txn_ != nullptr &&
+               context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr &&
+               !scan_table_name().empty();
+    }
+
+    void record_predicate_read() {
+        if (predicate_recorded_ || !should_track_ssi_reads()) {
+            return;
+        }
+        predicate_recorded_ = true;
+        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, scan_table_name(), scan_conditions())) {
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+        }
+    }
 
     bool matches(const RmRecord& rec) {
         for (const auto& cond : conds_) {
@@ -37,6 +55,7 @@ private:
             if (rec != nullptr && matches(*rec)) {
                 buffered_record_ = std::move(rec);
                 _abstract_rid = prev_->rid();
+                prev_->record_current_read_for_ssi();
                 isend_ = false;
                 return;
             }
@@ -48,19 +67,37 @@ private:
 public:
     FilterExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<Condition> conds) {
         prev_ = std::move(prev);
+        context_ = prev_->context_;
         conds_ = std::move(conds);
         cols_ = prev_->cols();
         len_ = prev_->tupleLen();
     }
 
     void beginTuple() override {
+        record_predicate_read();
+        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking_ : false;
+        bool suppress_child_tracking = should_track_ssi_reads();
+        if (context_ != nullptr && suppress_child_tracking) {
+            context_->enable_ssi_read_tracking_ = false;
+        }
         prev_->beginTuple();
+        if (context_ != nullptr && suppress_child_tracking) {
+            context_->enable_ssi_read_tracking_ = old_tracking;
+        }
         advance_to_match();
     }
 
     void nextTuple() override {
+        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking_ : false;
+        bool suppress_child_tracking = should_track_ssi_reads();
+        if (context_ != nullptr && suppress_child_tracking) {
+            context_->enable_ssi_read_tracking_ = false;
+        }
         if (!prev_->is_end()) {
             prev_->nextTuple();
+        }
+        if (context_ != nullptr && suppress_child_tracking) {
+            context_->enable_ssi_read_tracking_ = old_tracking;
         }
         advance_to_match();
     }
@@ -103,5 +140,15 @@ public:
 
     void set_key_conditions(std::vector<Condition> key_conds) override {
         prev_->set_key_conditions(std::move(key_conds));
+    }
+
+    std::string scan_table_name() const override {
+        return prev_->scan_table_name();
+    }
+
+    std::vector<Condition> scan_conditions() const override {
+        auto conds = prev_->scan_conditions();
+        conds.insert(conds.end(), conds_.begin(), conds_.end());
+        return conds;
     }
 };

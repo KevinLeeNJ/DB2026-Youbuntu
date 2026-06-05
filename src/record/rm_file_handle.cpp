@@ -46,14 +46,37 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     int slot_no = Bitmap::first_bit(false, insertpage_handle.bitmap, file_hdr_.num_records_per_page);
     if (slot_no != file_hdr_.num_records_per_page) {
         memcpy(insertpage_handle.get_slot(slot_no), buf, file_hdr_.record_size);
+        // Initialize TupleMeta to safe defaults (committed, no specific writer)
+        TupleMeta& meta = insertpage_handle.get_meta(slot_no);
+        meta.commit_ts_ = 0;
+        meta.writer_txn_id_ = INVALID_TXN_ID;
+        meta.is_committed_ = true;
+        meta.is_deleted_ = false;
+        meta.version_chain_head_ = UndoLink{};
         Bitmap::set(insertpage_handle.bitmap, slot_no);
         insertpage_handle.page_hdr->num_records++;
         if (insertpage_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
             file_hdr_.first_free_page_no = insertpage_handle.page_hdr->next_free_page_no;
         }
+        buffer_pool_manager_->unpin_page(insertpage_handle.page->get_page_id(), true);
+        return Rid{insertpage_handle.page->get_page_id().page_no, slot_no};
     }
+    // Defensive: page should have free space, but if not, create new page and retry
     buffer_pool_manager_->unpin_page(insertpage_handle.page->get_page_id(), true);
-    return Rid{insertpage_handle.page->get_page_id().page_no, slot_no};
+    auto new_page = create_new_page_handle();
+    slot_no = Bitmap::first_bit(false, new_page.bitmap, file_hdr_.num_records_per_page);
+    assert(slot_no != file_hdr_.num_records_per_page);
+    memcpy(new_page.get_slot(slot_no), buf, file_hdr_.record_size);
+    TupleMeta& meta = new_page.get_meta(slot_no);
+    meta.commit_ts_ = 0;
+    meta.writer_txn_id_ = INVALID_TXN_ID;
+    meta.is_committed_ = true;
+    meta.is_deleted_ = false;
+    meta.version_chain_head_ = UndoLink{};
+    Bitmap::set(new_page.bitmap, slot_no);
+    new_page.page_hdr->num_records++;
+    buffer_pool_manager_->unpin_page(new_page.page->get_page_id(), true);
+    return Rid{new_page.page->get_page_id().page_no, slot_no};
 }
 
 /**
@@ -78,6 +101,13 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
 
     char* slot = pageHandle.get_slot(rid.slot_no);
     memcpy(slot, buf, file_hdr_.record_size);
+    // Initialize TupleMeta to safe defaults
+    TupleMeta& meta = pageHandle.get_meta(rid.slot_no);
+    meta.commit_ts_ = 0;
+    meta.writer_txn_id_ = INVALID_TXN_ID;
+    meta.is_committed_ = true;
+    meta.is_deleted_ = false;
+    meta.version_chain_head_ = UndoLink{};
 
     buffer_pool_manager_->unpin_page(pageHandle.page->get_page_id(), true);
 }
@@ -186,6 +216,19 @@ RmPageHandle RmFileHandle::create_page_handle() {
 /**
  * @description: 当一个页面从没有空闲空间的状态变为有空闲空间状态时，更新文件头和页头中空闲页面相关的元数据
  */
+void RmFileHandle::set_tuple_meta(const Rid& rid, const TupleMeta& meta) {
+    auto page_handle = fetch_page_handle(rid.page_no);
+    page_handle.get_meta(rid.slot_no) = meta;
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+}
+
+TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
+    auto page_handle = fetch_page_handle(rid.page_no);
+    TupleMeta meta = page_handle.get_meta(rid.slot_no);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    return meta;
+}
+
 void RmFileHandle::release_page_handle(RmPageHandle& page_handle) {
     // Todo:
     // 当page从已满变成未满，考虑如何更新：

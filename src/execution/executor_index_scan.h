@@ -16,9 +16,11 @@ See the Mulan PSL v2 for more details. */
 #include <set>
 
 #include "execution_defs.h"
+#include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "record/rm_scan.h"
 #include "system/sm.h"
 
 class IndexScanExecutor : public AbstractExecutor {
@@ -37,8 +39,45 @@ private:
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
+    bool use_heap_scan_for_mvcc_ = false;
+    bool predicate_recorded_{false};
 
     SmManager* sm_manager_;
+
+    void record_predicate_read() {
+        if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
+            context_->txn_ == nullptr || context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE ||
+            context_->txn_mgr_ == nullptr) {
+            return;
+        }
+        predicate_recorded_ = true;
+        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, fed_conds_)) {
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+        }
+        if (context_->txn_mgr_->CheckPredicateInvisibleWrites(context_->txn_->get_transaction_id(), tab_name_,
+                                                              fed_conds_, fh_, cols_)) {
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+        }
+    }
+
+    void record_tuple_read(const Rid& rid, bool force = false) {
+        if (context_ == nullptr || (!force && !context_->enable_ssi_read_tracking_) || context_->txn_ == nullptr ||
+            context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE || context_->txn_mgr_ == nullptr) {
+            return;
+        }
+        auto* txn_mgr = context_->txn_mgr_;
+        txn_id_t reader_id = context_->txn_->get_transaction_id();
+        txn_mgr->RecordRead(reader_id, tab_name_, rid);
+
+        TupleMeta meta = fh_->get_tuple_meta(rid);
+        if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
+            return;
+        }
+        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_start_ts();
+        if (invisible && txn_mgr->CheckInvisibleWriteEdge(reader_id, meta.writer_txn_id_)) {
+            throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER);
+        }
+    }
 
     struct BoundValue {
         std::vector<char> data;
@@ -187,6 +226,14 @@ public:
     }
 
     void beginTuple() override {
+        record_predicate_read();
+        use_heap_scan_for_mvcc_ = context_ != nullptr && context_->txn_ != nullptr;
+        if (use_heap_scan_for_mvcc_) {
+            scan_ = std::make_unique<RmScan>(fh_);
+            advance_to_match();
+            return;
+        }
+
         auto ih =
             sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
         auto constraints = build_constraints();
@@ -259,7 +306,11 @@ public:
     void advance_to_match() {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = fh_->get_record(rid_, context_);
+            auto rec = GetVisibleRecord(fh_, rid_, context_);
+            if (rec == nullptr) {
+                scan_->next();
+                continue;
+            }
             bool match = true;
             for (const auto& cond : fed_conds_) {
                 if (!compare(cond, *rec)) {
@@ -268,6 +319,7 @@ public:
                 }
             }
             if (match) {
+                record_tuple_read(rid_);
                 break;
             }
             scan_->next();
@@ -278,7 +330,7 @@ public:
         if (is_end()) {
             return nullptr;
         }
-        return fh_->get_record(rid_, context_);
+        return GetVisibleRecord(fh_, rid_, context_);
     }
 
     Rid& rid() override {
@@ -317,5 +369,18 @@ public:
             conds_.push_back(std::move(kc));
         }
         fed_conds_ = conds_;
+    }
+
+    std::string scan_table_name() const override {
+        return tab_name_;
+    }
+
+    std::vector<Condition> scan_conditions() const override {
+        return fed_conds_;
+    }
+    void record_current_read_for_ssi() override {
+        if (!is_end()) {
+            record_tuple_read(rid_, true);
+        }
     }
 };

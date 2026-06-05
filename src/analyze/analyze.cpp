@@ -112,6 +112,15 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         return analyze_select_from_union_stmt(std::static_pointer_cast<ast::SelectFromUnionStmt>(parse));
     }
 
+    if (parse->type == ast::AstType::SetTransaction) {
+        auto x = std::static_pointer_cast<ast::SetTransaction>(parse);
+        auto query = std::make_shared<Query>();
+        query->is_set_transaction = true;
+        query->set_isolation_level = x->isolation_level_;
+        query->parse = std::move(parse);
+        return query;
+    }
+
     std::shared_ptr<Query> query = std::make_shared<Query>();
     switch (parse->type) {
     case ast::AstType::UpdateStmt: {

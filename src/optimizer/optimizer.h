@@ -64,6 +64,10 @@ public:
             // Set Knob Plan
             return std::make_shared<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
         }
+        case ast::AstType::SetTransaction: {
+            auto x = std::static_pointer_cast<ast::SetTransaction>(query->parse);
+            return std::make_shared<SetTransactionPlan>(x->isolation_level_);
+        }
         default:
             return planner_->do_planner(query, context);
         }

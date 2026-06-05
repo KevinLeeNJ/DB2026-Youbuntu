@@ -24,19 +24,26 @@ class RmManager;
 struct RmPageHandle {
     const RmFileHdr* file_hdr; // 当前页面所在文件的文件头指针
     Page* page;                // 页面的实际数据，包括页面存储的数据、元信息等
-    RmPageHdr* page_hdr; // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
-    char* bitmap; // page->data的第二部分，存储页面的bitmap，指针指向首地址，长度为file_hdr->bitmap_size
-    char* slots; // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
+    RmPageHdr* page_hdr;       // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
+    TupleMeta* meta_array;     // TupleMeta 数组，在 RmPageHdr 之后
+    char* bitmap; // page->data中TupleMeta之后的部分，存储页面的bitmap，指针指向首地址，长度为file_hdr->bitmap_size
+    char* slots;  // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
 
     RmPageHandle(const RmFileHdr* fhdr_, Page* page_) : file_hdr(fhdr_), page(page_) {
         page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + page->OFFSET_PAGE_HDR);
-        bitmap = page->get_data() + sizeof(RmPageHdr) + page->OFFSET_PAGE_HDR;
+        meta_array = reinterpret_cast<TupleMeta*>(page->get_data() + sizeof(RmPageHdr) + page->OFFSET_PAGE_HDR);
+        bitmap = reinterpret_cast<char*>(meta_array + file_hdr->num_records_per_page);
         slots = bitmap + file_hdr->bitmap_size;
     }
 
     // 返回指定slot_no的slot存储收地址
     char* get_slot(int slot_no) const {
         return slots + slot_no * file_hdr->record_size; // slots的首地址 + slot个数 * 每个slot的大小(每个record的大小)
+    }
+
+    // 返回指定slot_no的TupleMeta引用
+    TupleMeta& get_meta(int slot_no) const {
+        return meta_array[slot_no];
     }
 };
 
@@ -90,6 +97,17 @@ public:
     RmPageHandle create_new_page_handle();
 
     RmPageHandle fetch_page_handle(int page_no) const;
+
+    // MVCC: update TupleMeta for a slot (pins and unpins the page)
+    void set_tuple_meta(const Rid& rid, const TupleMeta& meta);
+
+    // MVCC: get TupleMeta for a slot
+    TupleMeta get_tuple_meta(const Rid& rid) const;
+
+    // Access buffer pool manager (for TupleMeta modifications that need explicit pin control)
+    BufferPoolManager* get_bpm() {
+        return buffer_pool_manager_;
+    }
 
 private:
     RmPageHandle create_page_handle();

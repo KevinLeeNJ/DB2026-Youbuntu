@@ -100,6 +100,11 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "UNION" { return UNION; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
+"TRANSACTION" { return TRANSACTION; }
+"ISOLATION" { return ISOLATION; }
+"LEVEL" { return LEVEL; }
+"SNAPSHOT" { return SNAPSHOT; }
+"SERIALIZABLE" { return SERIALIZABLE; }
 "TRUE" {
     yylval->sv_val = std::make_shared<ast::BoolLit>(true, yytext);
     return VALUE_BOOL;

@@ -307,6 +307,14 @@ private:
             break;
         case AstType::SetStmt:
             assert(0);
+        case AstType::SetTransaction: {
+            auto x = std::static_pointer_cast<SetTransaction>(node);
+            std::cout << "SET_TRANSACTION ISOLATION LEVEL "
+                      << (x->isolation_level_ == IsolationLevelType::SNAPSHOT_ISOLATION ? "SNAPSHOT ISOLATION"
+                                                                                        : "SERIALIZABLE")
+                      << "\n";
+            break;
+        }
         }
     }
 };

@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include "execution_defs.h"
+#include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
@@ -50,7 +51,10 @@ public:
     }
     std::unique_ptr<RmRecord> Next() override {
         for (Rid& rid : rids_) {
-            std::unique_ptr<RmRecord> rec = fh_->get_record(rid, context_);
+            std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
+            if (rec == nullptr) {
+                continue;
+            }
             bool match = true;
             for (auto cond : conds_) // 判断是否匹配
             {
@@ -60,8 +64,42 @@ public:
                 }
             }
             if (match) {
+                // MVCC Write-Write conflict detection
+                if (context_ != nullptr && context_->txn_ != nullptr) {
+                    auto txn = context_->txn_;
+                    if (context_->lock_mgr_ != nullptr &&
+                        !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
+                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                    }
+                    TupleMeta meta = fh_->get_tuple_meta(rid);
+                    if (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id()) {
+                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                    }
+                    if (meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
+                        meta.writer_txn_id_ != txn->get_transaction_id()) {
+                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                    }
+                }
+
                 auto new_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
                 update_record(new_rec.get());                    // 对记录更新
+
+                // SSI: Consolidated atomic check for both old and new records.
+                // Per spec: UPDATE must check both old (pre-update) and new (post-update) records.
+                // Both are checked atomically under a single lock; the write is stored
+                // as one ssi_writes_ entry only if no danger is found.
+                if (context_ != nullptr && context_->txn_ != nullptr &&
+                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE &&
+                    context_->txn_mgr_ != nullptr) {
+                    auto* txn_mgr = context_->txn_mgr_;
+                    txn_id_t writer_id = context_->txn_->get_transaction_id();
+                    bool danger =
+                        txn_mgr->CheckWriteAgainstReaders(writer_id, rid, tab_name_, std::optional<RmRecord>(*rec),
+                                                          std::optional<RmRecord>(*new_rec), tab_.cols);
+                    if (danger) {
+                        throw TransactionAbortException(writer_id, AbortReason::SSI_DANGER);
+                    }
+                }
 
                 struct IndexUpdate {
                     const IndexMeta* index;
@@ -88,6 +126,24 @@ public:
                 }
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
+
+                    // Save old version as undo log for MVCC version chain
+                    UndoLog undo;
+                    undo.is_deleted_ = false;
+                    undo.old_meta_ = fh_->get_tuple_meta(rid);
+                    undo.old_tuple_data_.assign(rec->data, rec->data + rec->size);
+                    undo.prev_version_ = undo.old_meta_.version_chain_head_;
+                    UndoLink undo_link = context_->txn_->AppendUndoLog(undo);
+
+                    // Track modified slot for MVCC commit
+                    context_->txn_->append_modified_slot(tab_name_, rid);
+                    // Update TupleMeta: mark as uncommitted, owned by this txn, chain to old version
+                    TupleMeta meta;
+                    meta.writer_txn_id_ = context_->txn_->get_transaction_id();
+                    meta.is_committed_ = false;
+                    meta.is_deleted_ = false;
+                    meta.version_chain_head_ = undo_link;
+                    fh_->set_tuple_meta(rid, meta);
                 }
 
                 std::vector<size_t> deleted_indexes;

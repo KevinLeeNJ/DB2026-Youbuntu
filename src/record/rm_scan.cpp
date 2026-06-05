@@ -34,22 +34,22 @@ void RmScan::next() {
     {
         RmPageHandle page_handle = file_handle_->fetch_page_handle(rid_.page_no);
         int next_slot = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
-                                         rid_.slot_no);                // 找到下一个存放了记录的slot
+                                         rid_.slot_no); // 找到下一个存放了记录的slot
+        PageId page_id = page_handle.page->get_page_id();
         if (next_slot != file_handle_->file_hdr_.num_records_per_page) // 成功找到
         {
             flag = true;
             rid_.slot_no = next_slot;
+            file_handle_->buffer_pool_manager_->unpin_page(page_id, false);
             break;
         }
+        file_handle_->buffer_pool_manager_->unpin_page(page_id, false);
         // 移动到下一页
         rid_.page_no++;
         rid_.slot_no = -1;
     }
     if (!flag)             // 没有找到下一个有效的记录
         rid_.page_no = -1; // 没有更多记录
-    else
-        file_handle_->buffer_pool_manager_->unpin_page(
-            file_handle_->fetch_page_handle(rid_.page_no).page->get_page_id(), false);
     return;
 }
 
