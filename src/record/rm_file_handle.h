@@ -24,10 +24,10 @@ class RmManager;
 struct RmPageHandle {
     const RmFileHdr* file_hdr; // 当前页面所在文件的文件头指针
     Page* page;                // 页面的实际数据，包括页面存储的数据、元信息等
-    RmPageHdr* page_hdr;       // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
-    TupleMeta* meta_array;     // TupleMeta 数组，在 RmPageHdr 之后
+    RmPageHdr* page_hdr; // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
+    TupleMeta* meta_array; // TupleMeta 数组，在 RmPageHdr 之后
     char* bitmap; // page->data中TupleMeta之后的部分，存储页面的bitmap，指针指向首地址，长度为file_hdr->bitmap_size
-    char* slots;  // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
+    char* slots; // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
 
     RmPageHandle(const RmFileHdr* fhdr_, Page* page_) : file_hdr(fhdr_), page(page_) {
         page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + page->OFFSET_PAGE_HDR);

@@ -215,7 +215,7 @@ private:
     LockManager* lock_manager_;
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
-    Watermark running_txns_{0};                  // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+    Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
 
     // ---- SSI State (centralized) — protected by latch_ ----
     struct SsiWriteEntry {
