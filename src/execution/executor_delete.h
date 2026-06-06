@@ -107,6 +107,8 @@ public:
                         std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
                         offset += index.cols[i].len;
                     }
+                    sm_manager_->remember_historical_index_key(
+                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid);
                     ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }

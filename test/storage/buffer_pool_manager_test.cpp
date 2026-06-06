@@ -148,6 +148,30 @@ TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
     EXPECT_GT(disk_manager->get_file_size(LOG_FILE_NAME), 0);
 }
 
+TEST_F(BufferPoolManagerTest, FlushAllPagesSkipsCleanPages) {
+    auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager);
+
+    PageId page_id{BufferPoolManagerTest::fd_, INVALID_PAGE_ID};
+    auto* page = bpm->new_page(&page_id);
+    ASSERT_NE(nullptr, page);
+    std::strcpy(page->get_data(), "persisted");
+    ASSERT_TRUE(bpm->unpin_page(page_id, true));
+    bpm->flush_all_pages(BufferPoolManagerTest::fd_);
+
+    page = bpm->fetch_page(page_id);
+    ASSERT_NE(nullptr, page);
+    std::strcpy(page->get_data(), "clean-only-memory");
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    bpm->flush_all_pages(BufferPoolManagerTest::fd_);
+
+    BufferPoolManager reopened_bpm(2, disk_manager);
+    auto* reopened_page = reopened_bpm.fetch_page(page_id);
+    ASSERT_NE(nullptr, reopened_page);
+    EXPECT_STREQ("persisted", reopened_page->get_data());
+    ASSERT_TRUE(reopened_bpm.unpin_page(page_id, false));
+}
+
 class BufferPoolManagerConcurrencyTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;

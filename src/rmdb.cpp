@@ -137,6 +137,7 @@ void* client_handler(void* sock_fd) {
                     std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
                     yy_delete_buffer(buf);
                     finish_analyze = true;
+                    LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(ast::parse_tree->type));
                     pthread_mutex_unlock(buffer_mutex);
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);

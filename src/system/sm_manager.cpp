@@ -125,6 +125,10 @@ void SmManager::open_db(const std::string& db_name) {
     if (!db_.name_.empty()) {
         throw DatabaseExistsError(db_name);
     }
+    {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        historical_index_keys_.clear();
+    }
     if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
         throw UnixError();
     }
@@ -173,6 +177,10 @@ void SmManager::close_db() {
     ihs_.clear();
     db_.name_.clear();
     db_.tabs_.clear();
+    {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        historical_index_keys_.clear();
+    }
     if (chdir("..") < 0) { // 回到根目录
         throw UnixError();
     }

@@ -115,12 +115,22 @@ public:
                     if (old_key == new_key) {
                         continue;
                     }
+                    sm_manager_->remember_historical_index_key(
+                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), old_key, rid);
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
                                   .get();
                     std::vector<Rid> result;
                     if (ih->get_value(new_key.data(), &result, txn) &&
                         std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
                         throw IndexEntryExistsError();
+                    }
+                    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+                    auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, new_key);
+                    for (const auto& candidate_rid : candidate_rids) {
+                        if (candidate_rid != rid &&
+                            HistoricalIndexKeyConflictsWithTxn(fh_, candidate_rid, index, new_key, context_)) {
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                        }
                     }
                     index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
                 }

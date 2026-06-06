@@ -199,6 +199,11 @@ public:
     /** @brief Clean up SSI state for an aborted/rolled-back transaction. */
     void CleanupSsiState(txn_id_t txn_id);
 
+    size_t DebugSsiWriteCount();
+    size_t DebugActiveRecordReaderKeyCount();
+    size_t DebugActivePredicateTableCount();
+    size_t DebugTxnMapSize();
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
@@ -233,6 +238,25 @@ private:
     std::unordered_set<txn_id_t> active_txn_ids_;
 
     // ---- SSI State (centralized) — protected by latch_ ----
+    struct SsiRecordKey {
+        std::string tab_name_;
+        int page_no_;
+        int slot_no_;
+
+        bool operator==(const SsiRecordKey& other) const {
+            return tab_name_ == other.tab_name_ && page_no_ == other.page_no_ && slot_no_ == other.slot_no_;
+        }
+    };
+
+    struct SsiRecordKeyHash {
+        size_t operator()(const SsiRecordKey& key) const {
+            size_t h = std::hash<std::string>{}(key.tab_name_);
+            h ^= std::hash<int>{}(key.page_no_) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>{}(key.slot_no_) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
     struct SsiWriteEntry {
         txn_id_t txn_id_;
         std::string tab_name_;
@@ -249,8 +273,38 @@ private:
     };
     std::vector<SsiRecordReadEntry> ssi_record_reads_;
 
+    std::unordered_set<txn_id_t> active_serializable_txns_;
+    std::unordered_map<SsiRecordKey, std::unordered_set<txn_id_t>, SsiRecordKeyHash> active_record_readers_;
+    std::unordered_map<txn_id_t, std::vector<SsiRecordKey>> txn_record_read_keys_;
+    std::unordered_map<std::string, std::unordered_set<txn_id_t>> active_predicate_readers_by_table_;
+    std::unordered_map<txn_id_t, std::vector<std::string>> txn_predicate_read_tables_;
+    std::unordered_map<std::string, std::vector<SsiWriteEntry>> recent_writes_by_table_;
+    uint64_t commits_since_full_ssi_prune_{0};
+
     // reader -> {writers} (rw anti-dependency edges)
     std::unordered_map<txn_id_t, std::unordered_set<txn_id_t>> rw_edges_;
+
+    SsiRecordKey MakeSsiRecordKey(const std::string& tab_name, const Rid& rid) const;
+
+    bool HasActiveSsiReadersForWriteUnlocked(const std::string& tab_name, const SsiRecordKey& key) const;
+    bool HasOtherActivePredicateReadersUnlocked(const std::string& tab_name, txn_id_t writer) const;
+    bool HasOtherActiveSerializableTxnUnlocked(txn_id_t writer) const;
+    bool HasActiveSerializableOverlapUnlocked(Transaction* txn);
+
+    size_t RecentWriteCountUnlocked() const;
+    size_t RwEdgeCountUnlocked() const;
+
+    void CleanupTxnReadIndexesUnlocked(txn_id_t txn_id);
+    void CleanupTxnRwEdgesUnlocked(txn_id_t txn_id);
+    void CleanupTxnRecentWritesUnlocked(txn_id_t txn_id);
+    void CleanupTxnSsiState(txn_id_t txn_id);
+    bool ShouldRunFullSsiPruneUnlocked() const;
+
+    bool TransactionHasSsiStateUnlocked(txn_id_t txn_id) const;
+    bool TransactionHasRetainedSsiStateUnlocked(txn_id_t txn_id) const;
+    bool TransactionHasUndoNeededByVersionChain(Transaction* txn) const;
+    bool CanRetireTransactionUnlocked(Transaction* txn) const;
+    void RetireTransactionIfSafe(Transaction* txn);
 
     bool TransactionsOverlap(Transaction* lhs, Transaction* rhs);
 

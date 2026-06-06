@@ -479,6 +479,37 @@ TEST_F(SltFileTest, Checkpoint) {
     run_slt_file("checkpoint.slt");
 }
 
+TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {
+    ASSERT_NO_THROW(db_->exec_sql("create table dup_heap (id int, val int);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select * from dup_heap;"); });
+    while (!output.empty() && output.back() == '\n') {
+        output.pop_back();
+    }
+
+    const std::string expected = "+------------------+------------------+\n"
+                                 "|               id |              val |\n"
+                                 "+------------------+------------------+\n"
+                                 "|                1 |               10 |\n"
+                                 "|                1 |               10 |\n"
+                                 "+------------------+------------------+\n"
+                                 "Total record(s): 2";
+    EXPECT_EQ(output, expected);
+}
+
+TEST_F(E2ETest, IndexedTableRejectsDuplicateKey) {
+    ASSERT_NO_THROW(db_->exec_sql("create table dup_idx (id int, val int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index dup_idx (id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into dup_idx values(1, 10);"));
+
+    std::string err;
+    ASSERT_NO_THROW({ err = db_->exec_sql_expect_error("insert into dup_idx values(1, 20);"); });
+    EXPECT_NE(err.find("Index"), std::string::npos);
+}
+
 TEST(CheckpointRecoveryTest, CheckpointRestartOffsetSurvivesRestartAndUndoRuns) {
     const std::string db_name = "e2e_checkpoint_recovery";
     const std::string select_expected = "+------------------+------------------+\n"
