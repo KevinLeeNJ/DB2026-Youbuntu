@@ -133,6 +133,10 @@ private:
                 print_val(col_name, offset);
             break;
         }
+        case AstType::StaticCheckpoint: {
+            std::cout << "STATIC_CHECKPOINT\n";
+            break;
+        }
         case AstType::ColDef: {
             auto x = std::static_pointer_cast<ColDef>(node);
             std::cout << "COL_DEF\n";

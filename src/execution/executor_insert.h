@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <mutex>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -189,8 +191,27 @@ public:
             index_keys.push_back(std::move(key));
         }
 
-        // Insert into record file
-        rid_ = fh_->insert_record(rec.data, context_);
+        std::unique_lock<std::mutex> physical_lock(fh_->get_physical_latch());
+        auto prepared_insert = fh_->prepare_insert_record();
+        bool insert_finished = false;
+        try {
+            rid_ = prepared_insert.rid;
+            if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
+                InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+                log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
+                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                context_->txn_->set_prev_lsn(lsn);
+                prepared_insert.page_handle.page->set_page_lsn(lsn);
+            }
+            fh_->finish_insert_record(prepared_insert, rec.data);
+            insert_finished = true;
+        } catch (...) {
+            if (!insert_finished) {
+                fh_->abort_prepared_insert(prepared_insert);
+            }
+            throw;
+        }
+        physical_lock.unlock();
 
         std::vector<size_t> inserted_indexes;
         try {

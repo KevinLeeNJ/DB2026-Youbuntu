@@ -121,7 +121,6 @@ void* client_handler(void* sock_fd) {
         Context* context =
             new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset, txn_manager.get());
         context->isolation_level_ = session_isolation_level;
-        SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
@@ -130,6 +129,10 @@ void* client_handler(void* sock_fd) {
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
+                    bool is_checkpoint = ast::parse_tree->type == ast::AstType::StaticCheckpoint;
+                    if (!is_checkpoint) {
+                        SetTransaction(&txn_id, context);
+                    }
                     // analyze and rewrite
                     std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
                     yy_delete_buffer(buf);
@@ -335,6 +338,9 @@ int main(int argc, char** argv) {
         // Open database
         sm_manager->open_db(db_name);
         LOG_INFO("database opened: %s", db_name.c_str());
+
+        log_manager->initialize_from_existing_log();
+        buffer_pool_manager->set_log_manager(log_manager.get());
 
         // recovery database
         recovery->analyze();

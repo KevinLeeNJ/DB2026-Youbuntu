@@ -182,6 +182,37 @@ bool SsiTxnCanConflictWithWriter(Transaction* reader_txn, Transaction* writer_tx
     return reader_commit_ts != INVALID_TS && reader_commit_ts > writer_txn->get_start_ts();
 }
 
+void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
+    if (txn == nullptr || log_manager == nullptr) {
+        return;
+    }
+    BeginLogRecord record(txn->get_transaction_id());
+    lsn_t lsn = log_manager->add_log_to_buffer(&record);
+    txn->set_prev_lsn(lsn);
+}
+
+void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
+    if (txn == nullptr || log_manager == nullptr) {
+        return;
+    }
+    CommitLogRecord record(txn->get_transaction_id());
+    record.prev_lsn_ = txn->get_prev_lsn();
+    lsn_t lsn = log_manager->add_log_to_buffer(&record);
+    txn->set_prev_lsn(lsn);
+    log_manager->flush_log_to_disk();
+}
+
+void WriteAbortLog(Transaction* txn, LogManager* log_manager) {
+    if (txn == nullptr || log_manager == nullptr) {
+        return;
+    }
+    AbortLogRecord record(txn->get_transaction_id());
+    record.prev_lsn_ = txn->get_prev_lsn();
+    lsn_t lsn = log_manager->add_log_to_buffer(&record);
+    txn->set_prev_lsn(lsn);
+    log_manager->flush_log_to_disk();
+}
+
 std::optional<UndoLog> GetCurrentUndoLog(RmFileHandle* fh, const Rid& rid) {
     TupleMeta meta = fh->get_tuple_meta(rid);
     if (!meta.version_chain_head_.IsValid()) {
@@ -255,10 +286,16 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
  * @param {LogManager*} log_manager 日志管理器指针
  */
 Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
-    (void)log_manager;
     if (txn == nullptr) {
         txn_id_t txn_id = next_txn_id_.fetch_add(1);
         txn = new Transaction(txn_id);
+    }
+
+    {
+        std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
+        checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
+        active_txn_ids_.insert(txn->get_transaction_id());
+        active_txn_count_ = static_cast<int>(active_txn_ids_.size());
     }
 
     txn->set_state(TransactionState::GROWING);
@@ -266,6 +303,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     txn->set_start_ts(next_timestamp_.fetch_add(1));
     // running_txns_ tracks active read timestamps for GC watermark
     running_txns_.AddTxn(txn->get_start_ts());
+    WriteBeginLog(txn, log_manager);
 
     std::unique_lock<std::mutex> lock(latch_);
     txn_map[txn->get_transaction_id()] = txn;
@@ -278,12 +316,20 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
  * @param {LogManager*} log_manager 日志管理器指针
  */
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
-    if (txn == nullptr || txn->get_state() == TransactionState::COMMITTED) {
+    if (txn == nullptr) {
         return;
     }
-    if (txn->get_state() == TransactionState::ABORTED) {
+    if (txn->get_state() == TransactionState::COMMITTED || txn->get_state() == TransactionState::ABORTED) {
+        {
+            std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+            active_txn_ids_.erase(txn->get_transaction_id());
+            active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+        }
+        checkpoint_cv_.notify_all();
         return;
     }
+
+    WriteCommitLog(txn, log_manager);
 
     // Allocate commit_ts (monotonic)
     timestamp_t commit_ts = next_timestamp_.fetch_add(1);
@@ -300,9 +346,12 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::COMMITTED);
     PruneSsiState();
-    if (log_manager != nullptr) {
-        log_manager->flush_log_to_disk();
+    {
+        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        active_txn_ids_.erase(txn->get_transaction_id());
+        active_txn_count_ = static_cast<int>(active_txn_ids_.size());
     }
+    checkpoint_cv_.notify_all();
 }
 
 /**
@@ -311,10 +360,16 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
  * @param {LogManager} *log_manager 日志管理器指针
  */
 void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
-    if (txn == nullptr || txn->get_state() == TransactionState::ABORTED) {
+    if (txn == nullptr) {
         return;
     }
-    if (txn->get_state() == TransactionState::COMMITTED) {
+    if (txn->get_state() == TransactionState::ABORTED || txn->get_state() == TransactionState::COMMITTED) {
+        {
+            std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+            active_txn_ids_.erase(txn->get_transaction_id());
+            active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+        }
+        checkpoint_cv_.notify_all();
         return;
     }
 
@@ -322,6 +377,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
         UndoWriteRecord(sm_manager_, *it, txn);
     }
+    WriteAbortLog(txn, log_manager);
     running_txns_.RemoveTxn(txn->get_start_ts());
     CleanupSsiState(txn->get_transaction_id());
     txn->read_rids_.clear();
@@ -330,9 +386,49 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::ABORTED);
     PruneSsiState();
-    if (log_manager != nullptr) {
-        log_manager->flush_log_to_disk();
+    {
+        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        active_txn_ids_.erase(txn->get_transaction_id());
+        active_txn_count_ = static_cast<int>(active_txn_ids_.size());
     }
+    checkpoint_cv_.notify_all();
+}
+
+void TransactionManager::block_new_transactions_for_checkpoint() {
+    std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+    checkpoint_blocking_new_txns_ = true;
+}
+
+void TransactionManager::unblock_new_transactions_after_checkpoint() {
+    {
+        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        checkpoint_blocking_new_txns_ = false;
+    }
+    checkpoint_cv_.notify_all();
+}
+
+std::unordered_map<txn_id_t, lsn_t> TransactionManager::wait_active_transactions_drained_for_checkpoint() {
+    std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
+    checkpoint_cv_.wait(checkpoint_lock, [&] { return active_txn_count_ == 0; });
+    return {};
+}
+
+std::unordered_map<txn_id_t, lsn_t> TransactionManager::get_active_txn_lsn_snapshot() {
+    std::vector<txn_id_t> active_ids;
+    {
+        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        active_ids.assign(active_txn_ids_.begin(), active_txn_ids_.end());
+    }
+
+    std::unordered_map<txn_id_t, lsn_t> snapshot;
+    std::unique_lock<std::mutex> lock(latch_);
+    for (txn_id_t txn_id : active_ids) {
+        auto it = txn_map.find(txn_id);
+        if (it != txn_map.end() && it->second != nullptr) {
+            snapshot.emplace(txn_id, it->second->get_prev_lsn());
+        }
+    }
+    return snapshot;
 }
 
 UndoLog TransactionManager::GetUndoLog(UndoLink link) {

@@ -86,6 +86,17 @@ public:
 
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
 
+    void insert_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& rec);
+
+    void delete_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec);
+
+    void update_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec,
+                                    const RmRecord& new_rec);
+
+    void flush_all_table_and_index_pages();
+
+    void reset_all_tuple_meta_after_recovery();
+
     // MVCC: mark all slots modified by txn as committed with the given commit_ts
     void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
         for (const auto& [tab_name, rid] : txn.get_modified_slots()) {

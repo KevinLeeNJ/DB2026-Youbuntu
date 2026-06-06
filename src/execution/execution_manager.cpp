@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "index/ix.h"
+#include "recovery/log_manager.h"
 #include "record_printer.h"
 
 const char* help_info = "Supported SQL syntax:\n"
@@ -167,6 +168,44 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             throw RMDBError("Not implemented!\n");
             break;
         }
+        }
+        break;
+    }
+    case T_StaticCheckpoint: {
+        if (txn_id != nullptr) {
+            Transaction* current_txn = txn_mgr_->get_transaction(*txn_id);
+            if (current_txn != nullptr && current_txn->get_state() != TransactionState::COMMITTED &&
+                current_txn->get_state() != TransactionState::ABORTED) {
+                throw RMDBError("static checkpoint cannot run inside an active transaction");
+            }
+        }
+
+        struct CheckpointBlockGuard {
+            TransactionManager* txn_mgr_;
+            bool armed_{false};
+
+            explicit CheckpointBlockGuard(TransactionManager* txn_mgr) : txn_mgr_(txn_mgr) {
+                txn_mgr_->block_new_transactions_for_checkpoint();
+                armed_ = true;
+            }
+
+            ~CheckpointBlockGuard() {
+                if (armed_) {
+                    txn_mgr_->unblock_new_transactions_after_checkpoint();
+                }
+            }
+        } checkpoint_guard(txn_mgr_);
+
+        auto active_txns = txn_mgr_->wait_active_transactions_drained_for_checkpoint();
+        if (context != nullptr && context->log_mgr_ != nullptr) {
+            context->log_mgr_->flush_log_to_disk();
+            CheckpointLogRecord checkpoint(active_txns);
+            int checkpoint_offset = context->log_mgr_->current_log_offset();
+            context->log_mgr_->add_log_to_buffer(&checkpoint);
+            context->log_mgr_->flush_log_to_disk();
+            sm_manager_->flush_all_table_and_index_pages();
+            sm_manager_->flush_meta();
+            context->log_mgr_->write_restart_offset(checkpoint_offset);
         }
         break;
     }

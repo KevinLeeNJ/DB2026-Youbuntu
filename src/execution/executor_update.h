@@ -124,6 +124,12 @@ public:
                     }
                     index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
                 }
+                if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
+                    UpdateLogRecord log_record(context_->txn_->get_transaction_id(), *rec, *new_rec, rid, tab_name_);
+                    log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
+                    lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                    context_->txn_->set_prev_lsn(lsn);
+                }
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
 

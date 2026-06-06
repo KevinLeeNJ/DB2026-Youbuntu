@@ -79,6 +79,40 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     return Rid{new_page.page->get_page_id().page_no, slot_no};
 }
 
+RmPinnedInsert RmFileHandle::prepare_insert_record() {
+    RmPageHandle page_handle = create_page_handle();
+    int slot_no = Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page);
+    if (slot_no == file_hdr_.num_records_per_page) {
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        page_handle = create_new_page_handle();
+        slot_no = Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page);
+        assert(slot_no != file_hdr_.num_records_per_page);
+    }
+    return RmPinnedInsert{page_handle, Rid{page_handle.page->get_page_id().page_no, slot_no}};
+}
+
+void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf) {
+    auto& page_handle = insert.page_handle;
+    const int slot_no = insert.rid.slot_no;
+    memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
+    TupleMeta& meta = page_handle.get_meta(slot_no);
+    meta.commit_ts_ = 0;
+    meta.writer_txn_id_ = INVALID_TXN_ID;
+    meta.is_committed_ = true;
+    meta.is_deleted_ = false;
+    meta.version_chain_head_ = UndoLink{};
+    Bitmap::set(page_handle.bitmap, slot_no);
+    page_handle.page_hdr->num_records++;
+    if (page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
+        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+}
+
+void RmFileHandle::abort_prepared_insert(RmPinnedInsert& insert) {
+    buffer_pool_manager_->unpin_page(insert.page_handle.page->get_page_id(), false);
+}
+
 /**
  * @description: 在当前表中的指定位置插入一条记录
  * @param {Rid&} rid 要插入记录的位置

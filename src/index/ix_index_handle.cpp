@@ -340,13 +340,8 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
     if (leaf->get_size() > 0) {
         maintain_parent(leaf);
     }
-    bool need_delete = coalesce_or_redistribute(leaf, transaction, &root_is_latched);
-    PageId leaf_page_id = leaf->get_page_id();
-    buffer_pool_manager_->unpin_page(leaf_page_id, true);
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
     delete leaf;
-    if (need_delete) {
-        buffer_pool_manager_->delete_page(leaf_page_id);
-    }
     return true;
 }
 

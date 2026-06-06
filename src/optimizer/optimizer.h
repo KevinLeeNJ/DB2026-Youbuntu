@@ -68,6 +68,8 @@ public:
             auto x = std::static_pointer_cast<ast::SetTransaction>(query->parse);
             return std::make_shared<SetTransactionPlan>(x->isolation_level_);
         }
+        case ast::AstType::StaticCheckpoint:
+            return std::make_shared<OtherPlan>(T_StaticCheckpoint, std::string());
         default:
             return planner_->do_planner(query, context);
         }

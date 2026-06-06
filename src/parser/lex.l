@@ -62,6 +62,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ROLLBACK" { return TXN_ROLLBACK; }
 "TABLES" { return TABLES; }
 "CREATE" { return CREATE; }
+"STATIC_CHECKPOINT" { return STATIC_CHECKPOINT; }
 "TABLE" { return TABLE; }
 "DROP" { return DROP; }
 "DESC" { return DESC; }

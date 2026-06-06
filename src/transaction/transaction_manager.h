@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
@@ -65,6 +66,14 @@ public:
     void commit(Transaction* txn, LogManager* log_manager);
 
     void abort(Transaction* txn, LogManager* log_manager);
+
+    void block_new_transactions_for_checkpoint();
+
+    void unblock_new_transactions_after_checkpoint();
+
+    std::unordered_map<txn_id_t, lsn_t> wait_active_transactions_drained_for_checkpoint();
+
+    std::unordered_map<txn_id_t, lsn_t> get_active_txn_lsn_snapshot();
 
     ConcurrencyMode get_concurrency_mode() {
         return concurrency_mode_;
@@ -216,6 +225,12 @@ private:
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+
+    std::mutex checkpoint_latch_;
+    std::condition_variable checkpoint_cv_;
+    bool checkpoint_blocking_new_txns_{false};
+    int active_txn_count_{0};
+    std::unordered_set<txn_id_t> active_txn_ids_;
 
     // ---- SSI State (centralized) — protected by latch_ ----
     struct SsiWriteEntry {

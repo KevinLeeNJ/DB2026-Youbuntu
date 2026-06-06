@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <assert.h>
 
 #include <memory>
+#include <mutex>
 
 #include "bitmap.h"
 #include "common/context.h"
@@ -47,6 +48,11 @@ struct RmPageHandle {
     }
 };
 
+struct RmPinnedInsert {
+    RmPageHandle page_handle;
+    Rid rid;
+};
+
 /* 每个RmFileHandle对应一个表的数据文件，里面有多个page，每个page的数据封装在RmPageHandle中 */
 class RmFileHandle {
     friend class RmScan;
@@ -57,6 +63,7 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     int fd_;             // 打开文件后产生的文件句柄
     RmFileHdr file_hdr_; // 文件头，维护当前表文件的元数据
+    std::mutex physical_latch_;
 
 public:
     RmFileHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd)
@@ -90,6 +97,12 @@ public:
 
     void insert_record(const Rid& rid, char* buf);
 
+    RmPinnedInsert prepare_insert_record();
+
+    void finish_insert_record(RmPinnedInsert& insert, char* buf);
+
+    void abort_prepared_insert(RmPinnedInsert& insert);
+
     void delete_record(const Rid& rid, Context* context);
 
     void update_record(const Rid& rid, char* buf, Context* context);
@@ -107,6 +120,10 @@ public:
     // Access buffer pool manager (for TupleMeta modifications that need explicit pin control)
     BufferPoolManager* get_bpm() {
         return buffer_pool_manager_;
+    }
+
+    std::mutex& get_physical_latch() {
+        return physical_latch_;
     }
 
 private:

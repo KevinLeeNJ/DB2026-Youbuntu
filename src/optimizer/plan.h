@@ -50,7 +50,8 @@ typedef enum PlanTag {
     T_Limit,
     T_Union,
     T_ExplainAnalyze,
-    T_SetTransaction
+    T_SetTransaction,
+    T_StaticCheckpoint
 } PlanTag;
 
 // 查询执行计划

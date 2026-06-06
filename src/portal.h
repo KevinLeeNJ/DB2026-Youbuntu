@@ -581,6 +581,7 @@ public:
         case T_Transaction_commit:
         case T_Transaction_abort:
         case T_Transaction_rollback:
+        case T_StaticCheckpoint:
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
         case T_SetKnob:

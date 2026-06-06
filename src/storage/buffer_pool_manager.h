@@ -24,6 +24,8 @@ See the Mulan PSL v2 for more details. */
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
 
+class LogManager;
+
 class BufferPoolManager {
 private:
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
@@ -33,6 +35,7 @@ private:
         page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
     std::list<frame_id_t> free_list_; // 空闲帧编号的链表
     DiskManager* disk_manager_;
+    LogManager* log_manager_{nullptr};
     std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
     std::mutex latch_;                   // 用于共享数据结构的并发控制
 
@@ -80,8 +83,14 @@ public:
 
     void delete_all_pages(int fd);
 
+    void set_log_manager(LogManager* log_manager) {
+        log_manager_ = log_manager;
+    }
+
 private:
     bool find_victim_page(frame_id_t* frame_id);
 
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
+
+    void flush_log_before_page_write();
 };

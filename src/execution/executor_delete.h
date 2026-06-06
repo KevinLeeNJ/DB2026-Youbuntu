@@ -83,6 +83,12 @@ public:
                     }
                 }
             }
+            if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
+                DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *rec, rid, tab_name_);
+                log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
+                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                context_->txn_->set_prev_lsn(lsn);
+            }
             auto* undo_record = context_ != nullptr && context_->txn_ != nullptr
                                     ? new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec)
                                     : nullptr;

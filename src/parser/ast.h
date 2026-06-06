@@ -64,7 +64,8 @@ enum class AstType {
     SelectFromUnionStmt,
     ExplainAnalyze,
     SetStmt,
-    SetTransaction
+    SetTransaction,
+    StaticCheckpoint
 };
 
 // Base class for tree nodes
@@ -159,6 +160,10 @@ struct DropIndex : public TreeNode {
 
     DropIndex(std::string tab_name_, std::vector<std::string> col_names_)
         : TreeNode(AstType::DropIndex), tab_name(std::move(tab_name_)), col_names(std::move(col_names_)) {}
+};
+
+struct StaticCheckpoint : public TreeNode {
+    StaticCheckpoint() : TreeNode(AstType::StaticCheckpoint) {}
 };
 
 struct Expr : public TreeNode {
