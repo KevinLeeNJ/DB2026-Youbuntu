@@ -31,21 +31,25 @@ int main() {
         "select * from tb where x <> 2 and y >= 3. and z <= '123' and b < tb.a;",
         "select x.a, y.b from x, y where x.a = y.b and c = d;",
         "select x.a, y.b from x join y where x.a = y.b and c = d;",
+        "select count(*), sum(a) as total from tb group by b having count(*) > 1 order by total desc limit 10;",
+        "select * from (select a from t1 union select a from t2) as u order by a;",
+        "set enable_nestloop = true;",
+        "set transaction isolation level snapshot isolation;",
+        "set transaction isolation level serializable;",
+        "create static_checkpoint;",
         "exit;",
         "help;",
         "",
     };
     for (auto& sql : sqls) {
         std::cout << sql << std::endl;
-        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-        assert(yyparse() == 0);
+        ast::parse_tree = ast::parse_sql(sql);
         if (ast::parse_tree != nullptr) {
             ast::TreePrinter::print(ast::parse_tree);
             std::cout << std::endl;
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
-        yy_delete_buffer(buf);
     }
     ast::parse_tree.reset();
     return 0;

@@ -309,8 +309,13 @@ private:
         case AstType::TxnRollback:
             std::cout << "ROLLBACK\n";
             break;
-        case AstType::SetStmt:
-            assert(0);
+        case AstType::SetStmt: {
+            auto x = std::static_pointer_cast<SetStmt>(node);
+            std::cout << "SET\n";
+            print_val(x->set_knob_type_ == EnableNestLoop ? "ENABLE_NESTLOOP" : "ENABLE_SORTMERGE", offset);
+            print_val(x->bool_val_, offset);
+            break;
+        }
         case AstType::SetTransaction: {
             auto x = std::static_pointer_cast<SetTransaction>(node);
             std::cout << "SET_TRANSACTION ISOLATION LEVEL "

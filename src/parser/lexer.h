@@ -1,0 +1,156 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+namespace parser {
+
+enum class TokenType {
+    // Keywords (50个)
+    SHOW,
+    TABLES,
+    CREATE,
+    TABLE,
+    DROP,
+    DESC,
+    INSERT,
+    INTO,
+    VALUES,
+    DELETE,
+    FROM,
+    ASC,
+    ORDER,
+    BY,
+    GROUP,
+    HAVING,
+    LIMIT,
+    AS,
+    UNION,
+    BEGIN_KW,
+    COMMIT,
+    ABORT,
+    ROLLBACK,
+    ENABLE_NESTLOOP,
+    ENABLE_SORTMERGE,
+    TRANSACTION,
+    ISOLATION,
+    LEVEL,
+    SNAPSHOT,
+    SERIALIZABLE,
+    STATIC_CHECKPOINT,
+    WHERE,
+    UPDATE,
+    SET,
+    SELECT,
+    EXPLAIN,
+    ANALYZE,
+    INT,
+    CHAR,
+    FLOAT,
+    INDEX,
+    AND,
+    JOIN,
+    ON,
+    COUNT,
+    MAX,
+    MIN,
+    SUM,
+    AVG,
+    EXIT,
+    HELP,
+
+    // Operators
+    LEQ,
+    NEQ,
+    GEQ,
+    EQ,
+    LT,
+    GT,
+
+    // Punctuation
+    LPAREN,
+    RPAREN,
+    COMMA,
+    SEMICOLON,
+    DOT,
+    STAR,
+
+    // Literals
+    IDENTIFIER,
+    VALUE_INT,
+    VALUE_FLOAT,
+    VALUE_STRING,
+    VALUE_BOOL,
+
+    // Special
+    T_EOF,
+    T_ERROR
+};
+
+struct Token {
+    TokenType type;
+    std::string_view text; // 零拷贝：指向输入缓冲区
+    int line;
+    int column;
+
+    // 对于数值类型，直接存储解析后的值
+    union {
+        int64_t int_value;
+        double float_value;
+        bool bool_value;
+    };
+
+    Token() : type(TokenType::T_ERROR), line(0), column(0), int_value(0) {}
+
+    Token(TokenType t, std::string_view txt, int l, int c) : type(t), text(txt), line(l), column(c), int_value(0) {}
+};
+
+class Lexer {
+public:
+    explicit Lexer(std::string_view input);
+
+    Token next_token();
+    Token peek_token();
+
+    int current_line() const {
+        return line_;
+    }
+    int current_column() const {
+        return column_;
+    }
+
+private:
+    std::string_view input_;
+    size_t pos_;
+    int line_;
+    int column_;
+
+    Token peeked_;
+    bool has_peeked_;
+
+    // 关键字查找表
+    static const std::unordered_map<std::string_view, TokenType> keywords_;
+
+    // 辅助函数
+    char current_char() const;
+    char peek_char(int offset = 1) const;
+    void advance(int count = 1);
+    void skip_whitespace_and_comments();
+    void skip_line_comment();
+    void skip_block_comment();
+
+    Token scan_identifier_or_keyword();
+    Token scan_number();
+    Token scan_string();
+    Token scan_operator();
+
+    // 数字解析
+    int64_t parse_integer(std::string_view text);
+    double parse_float(std::string_view text);
+};
+
+} // namespace parser

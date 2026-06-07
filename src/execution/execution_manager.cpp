@@ -198,11 +198,11 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
 
         auto active_txns = txn_mgr_->wait_active_transactions_drained_for_checkpoint();
         if (context != nullptr && context->log_mgr_ != nullptr) {
-            context->log_mgr_->flush_log_to_disk();
+            context->log_mgr_->flush_log_to_disk_with_sync();
             CheckpointLogRecord checkpoint(active_txns);
             int checkpoint_offset = context->log_mgr_->current_log_offset();
             context->log_mgr_->add_log_to_buffer(&checkpoint);
-            context->log_mgr_->flush_log_to_disk();
+            context->log_mgr_->flush_log_to_disk_with_sync();
             sm_manager_->flush_all_table_and_index_pages();
             sm_manager_->flush_meta();
             context->log_mgr_->write_restart_offset(checkpoint_offset);

@@ -24,7 +24,6 @@ namespace {
 constexpr uint64_t SSI_FULL_PRUNE_COMMIT_INTERVAL = 4096;
 constexpr size_t SSI_RECENT_WRITE_PRUNE_THRESHOLD = 8192;
 constexpr size_t SSI_EDGE_PRUNE_THRESHOLD = 8192;
-constexpr size_t SSI_TXN_MAP_PRUNE_THRESHOLD = 8192;
 
 void ClearWriteSet(Transaction* txn) {
     if (txn == nullptr) {

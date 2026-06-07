@@ -92,6 +92,12 @@ void LogManager::flush_log_to_disk() {
     flush_log_to_disk_unlocked();
 }
 
+void LogManager::flush_log_to_disk_with_sync() {
+    std::lock_guard<std::mutex> lock(latch_);
+    flush_log_to_disk_unlocked();
+    disk_manager_->fsync_log();
+}
+
 void LogManager::flush_log_to_disk_unlocked() {
     if (log_buffer_.offset_ == 0) {
         return;
@@ -99,7 +105,6 @@ void LogManager::flush_log_to_disk_unlocked() {
     disk_manager_->write_log(log_buffer_.buffer_, log_buffer_.offset_);
     log_file_offset_ += log_buffer_.offset_;
     persist_lsn_ = global_lsn_.load() - 1;
-    memset(log_buffer_.buffer_, 0, sizeof(log_buffer_.buffer_));
     log_buffer_.offset_ = 0;
 }
 
@@ -141,6 +146,7 @@ void LogManager::initialize_from_existing_log() {
     if (offset < file_size) {
         truncate(LOG_FILE_NAME.c_str(), offset);
     }
+    disk_manager_->SetLogOffset(offset);
 }
 
 void LogManager::write_restart_offset(int checkpoint_offset) {

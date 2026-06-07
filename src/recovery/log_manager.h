@@ -424,10 +424,7 @@ std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size);
 
 class LogBuffer {
 public:
-    LogBuffer() {
-        offset_ = 0;
-        memset(buffer_, 0, sizeof(buffer_));
-    }
+    LogBuffer() : offset_(0) {}
 
     bool is_full(int append_size) {
         if (offset_ + append_size > LOG_BUFFER_SIZE)
@@ -451,6 +448,7 @@ public:
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
     void flush_log_to_disk();
+    void flush_log_to_disk_with_sync();
     void initialize_from_existing_log();
 
     lsn_t get_persist_lsn() const {

@@ -13,3 +13,9 @@ See the Mulan PSL v2 for more details. */
 #include "ast_printer.h"
 #include "ast.h"
 #include "parser_defs.h"
+
+namespace ast {
+
+std::shared_ptr<TreeNode> parse_sql(const std::string& sql);
+
+} // namespace ast

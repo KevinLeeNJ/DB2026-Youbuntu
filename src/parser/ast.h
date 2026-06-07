@@ -413,58 +413,6 @@ struct FromClause {
     std::vector<std::shared_ptr<BinaryExpr>> conds;
 };
 
-// Semantic value
-struct SemValue {
-    std::string sv_str;
-    bool sv_bool;
-    AggFuncType sv_agg_func;
-    OrderByDir sv_orderby_dir;
-    std::vector<std::string> sv_strs;
-
-    std::shared_ptr<TreeNode> sv_node;
-
-    SvCompOp sv_comp_op;
-
-    std::shared_ptr<TypeLen> sv_type_len;
-
-    std::shared_ptr<Field> sv_field;
-    std::vector<std::shared_ptr<Field>> sv_fields;
-
-    std::shared_ptr<Expr> sv_expr;
-
-    std::shared_ptr<Value> sv_val;
-    std::vector<std::shared_ptr<Value>> sv_vals;
-
-    std::shared_ptr<Col> sv_col;
-    std::vector<std::shared_ptr<Col>> sv_cols;
-
-    std::shared_ptr<SelectItem> sv_select_item;
-    std::vector<std::shared_ptr<SelectItem>> sv_select_items;
-    std::shared_ptr<SelectStmt> sv_select_stmt;
-    std::shared_ptr<UnionStmt> sv_union_stmt;
-    std::shared_ptr<FromClause> sv_from_clause;
-    std::vector<std::shared_ptr<SelectStmt>> sv_select_stmts;
-
-    std::shared_ptr<SetClause> sv_set_clause;
-    std::vector<std::shared_ptr<SetClause>> sv_set_clauses;
-
-    std::shared_ptr<BinaryExpr> sv_cond;
-    std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
-
-    std::shared_ptr<HavingExpr> sv_having_cond;
-    std::vector<std::shared_ptr<HavingExpr>> sv_having_conds;
-
-    std::shared_ptr<OrderBy> sv_orderby;
-    std::shared_ptr<OrderByItem> sv_orderby_item;
-    std::vector<std::shared_ptr<OrderByItem>> sv_orderby_items;
-
-    SetKnobType sv_setKnobType;
-
-    IsolationLevelType sv_isolation_level;
-};
-
 extern std::shared_ptr<ast::TreeNode> parse_tree;
 
 } // namespace ast
-
-#define YYSTYPE ast::SemValue

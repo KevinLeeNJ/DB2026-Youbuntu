@@ -52,7 +52,7 @@ pthread_mutex_t* sockfd_mutex;
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
     should_exit = true;
-    log_manager->flush_log_to_disk();
+    log_manager->flush_log_to_disk_with_sync();
     LOG_INFO("the server received Ctrl+C and will close");
     longjmp(jmpbuf, 1);
 }
