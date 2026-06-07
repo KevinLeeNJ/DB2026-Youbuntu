@@ -9,9 +9,10 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 #pragma once
 
-#include <vector>
-#include <string>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 enum JoinType { INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN };
 namespace ast {
@@ -166,6 +167,14 @@ struct StaticCheckpoint : public TreeNode {
     StaticCheckpoint() : TreeNode(AstType::StaticCheckpoint) {}
 };
 
+struct TableRef {
+    std::string table_name;
+    std::string alias;
+
+    TableRef(std::string table_name_, std::string alias_ = "")
+        : table_name(std::move(table_name_)), alias(std::move(alias_)) {}
+};
+
 struct Expr : public TreeNode {
 protected:
     explicit Expr(AstType type_) : TreeNode(type_) {}
@@ -316,7 +325,7 @@ struct JoinExpr : public TreeNode {
 struct SelectStmt : public TreeNode {
     std::vector<std::unique_ptr<Col>> cols;
     std::vector<std::unique_ptr<SelectItem>> select_items;
-    std::vector<std::string> tabs;
+    std::vector<TableRef> tabs;
     std::vector<std::unique_ptr<BinaryExpr>> conds;
     std::vector<std::unique_ptr<JoinExpr>> jointree;
 
@@ -329,7 +338,7 @@ struct SelectStmt : public TreeNode {
     bool has_limit;
     int limit;
 
-    SelectStmt(std::vector<std::unique_ptr<Col>> cols_, std::vector<std::string> tabs_,
+    SelectStmt(std::vector<std::unique_ptr<Col>> cols_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::unique_ptr<OrderBy> order_)
         : TreeNode(AstType::SelectStmt), cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
           has_select_star(cols.empty()), order(std::move(order_)), has_limit(false), limit(0) {
@@ -342,7 +351,25 @@ struct SelectStmt : public TreeNode {
         has_sort = !order_by_items.empty();
     }
 
-    SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<std::string> tabs_,
+    // Backward compatibility: accepts vector<string> and converts to vector<TableRef>
+    SelectStmt(std::vector<std::unique_ptr<Col>> cols_, std::vector<std::string> tab_names_,
+               std::vector<std::unique_ptr<BinaryExpr>> conds_, std::unique_ptr<OrderBy> order_)
+        : TreeNode(AstType::SelectStmt), cols(std::move(cols_)), conds(std::move(conds_)),
+          has_select_star(cols.empty()), order(std::move(order_)), has_limit(false), limit(0) {
+        tabs.reserve(tab_names_.size());
+        for (auto& name : tab_names_) {
+            tabs.emplace_back(std::move(name));
+        }
+        for (const auto& col : cols) {
+            select_items.push_back(std::make_unique<SelectItem>(clone_col(*col), ""));
+        }
+        if (order != nullptr) {
+            order_by_items.push_back(std::make_unique<OrderByItem>(clone_col(*order->cols), order->orderby_dir));
+        }
+        has_sort = !order_by_items.empty();
+    }
+
+    SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
                std::vector<std::unique_ptr<HavingExpr>> having_conds_,
                std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
@@ -412,7 +439,7 @@ struct SetTransaction : public TreeNode {
 };
 
 struct FromClause {
-    std::vector<std::string> tables;
+    std::vector<TableRef> tables;
     std::vector<std::unique_ptr<BinaryExpr>> conds;
 };
 

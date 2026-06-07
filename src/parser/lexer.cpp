@@ -5,7 +5,7 @@
 
 namespace parser {
 
-const std::unordered_map<std::string_view, TokenType> Lexer::keywords_ = {
+const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::keywords_ = {
     {"SHOW", TokenType::SHOW},
     {"TABLES", TokenType::TABLES},
     {"CREATE", TokenType::CREATE},
@@ -137,7 +137,7 @@ Token Lexer::next_token() {
     }
 
     // Number
-    if (std::isdigit(c) || ((c == '+' || c == '-') && std::isdigit(peek_char()))) {
+    if (std::isdigit(c)) {
         return scan_number();
     }
 
@@ -174,18 +174,11 @@ Token Lexer::scan_identifier_or_keyword() {
 
     std::string_view text = input_.substr(start_pos, pos_ - start_pos);
 
-    // 转换为大写进行关键字查找
-    std::string upper;
-    upper.reserve(text.size());
-    for (char c : text) {
-        upper.push_back(std::toupper(c));
-    }
-
-    auto it = keywords_.find(upper);
+    auto it = keywords_.find(text);
     if (it != keywords_.end()) {
         Token tok(it->second, text, start_line, start_col);
         if (it->second == TokenType::VALUE_BOOL) {
-            tok.bool_value = upper == "TRUE";
+            tok.bool_value = CIEqual{}(text, "TRUE");
         }
         return tok;
     }
@@ -198,10 +191,6 @@ Token Lexer::scan_number() {
     int start_col = column_;
     size_t start_pos = pos_;
     bool has_dot = false;
-
-    if (current_char() == '+' || current_char() == '-') {
-        advance();
-    }
 
     while (pos_ < input_.size()) {
         char c = current_char();
@@ -281,6 +270,10 @@ Token Lexer::scan_operator() {
         return Token(TokenType::LT, "<", start_line, start_col);
     case '>':
         return Token(TokenType::GT, ">", start_line, start_col);
+    case '+':
+        return Token(TokenType::PLUS, "+", start_line, start_col);
+    case '-':
+        return Token(TokenType::MINUS, "-", start_line, start_col);
     case '(':
         return Token(TokenType::LPAREN, "(", start_line, start_col);
     case ')':

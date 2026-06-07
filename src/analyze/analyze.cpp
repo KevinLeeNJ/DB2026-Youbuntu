@@ -19,16 +19,6 @@ using namespace analyze_internal;
 
 namespace {
 
-constexpr char TABLE_ALIAS_SEPARATOR = '\001';
-
-std::pair<std::string, std::string> decode_table_ref(const std::string& table_ref) {
-    auto sep = table_ref.find(TABLE_ALIAS_SEPARATOR);
-    if (sep == std::string::npos) {
-        return {table_ref, table_ref};
-    }
-    return {table_ref.substr(0, sep), table_ref.substr(sep + 1)};
-}
-
 void resolve_alias(TabCol& col, const Query& query) {
     if (col.tab_name.empty()) {
         return;
@@ -71,7 +61,7 @@ void resolve_aliases(Query& query) {
     }
 }
 
-void populate_table_refs(Query& query, const std::vector<std::string>& table_refs) {
+void populate_table_refs(Query& query, const std::vector<ast::TableRef>& table_refs) {
     query.tables.clear();
     query.table_display_names.clear();
     query.table_alias_to_name.clear();
@@ -79,8 +69,9 @@ void populate_table_refs(Query& query, const std::vector<std::string>& table_ref
     query.tables.reserve(table_refs.size());
     query.table_display_names.reserve(table_refs.size());
 
-    for (const auto& table_ref : table_refs) {
-        auto [table_name, display_name] = decode_table_ref(table_ref);
+    for (const auto& ref : table_refs) {
+        const std::string& table_name = ref.table_name;
+        const std::string& display_name = ref.alias.empty() ? ref.table_name : ref.alias;
         query.tables.push_back(table_name);
         query.table_display_names.push_back(display_name);
         query.table_name_to_display[table_name] = display_name;

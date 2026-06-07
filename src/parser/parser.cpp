@@ -2,6 +2,8 @@
 
 #include "lexer.h"
 
+#include <climits>
+#include <limits>
 #include <iterator>
 #include <stdexcept>
 #include <utility>
@@ -102,9 +104,11 @@ private:
         if (check(TokenType::CREATE) || check(TokenType::DROP) || check(TokenType::DESC)) {
             return parse_ddl();
         }
-        if (check(TokenType::INSERT) || check(TokenType::DELETE) || check(TokenType::UPDATE) ||
-            check(TokenType::SELECT) || check(TokenType::EXPLAIN)) {
+        if (check(TokenType::INSERT) || check(TokenType::DELETE) || check(TokenType::UPDATE)) {
             return parse_dml();
+        }
+        if (check(TokenType::SELECT) || check(TokenType::EXPLAIN)) {
+            return parse_dql();
         }
         if (check(TokenType::BEGIN_KW) || check(TokenType::COMMIT) || check(TokenType::ABORT) ||
             check(TokenType::ROLLBACK)) {
@@ -162,12 +166,11 @@ private:
             error("expected set knob name");
         }
         expect(TokenType::EQ, "expected '=' after set knob");
-        auto value = parse_value();
-        auto bool_value = dynamic_cast<BoolLit*>(value.get());
-        if (bool_value == nullptr) {
+        if (!check(TokenType::VALUE_BOOL)) {
             error("expected boolean value");
         }
-        return std::make_unique<SetStmt>(knob, bool_value->val);
+        auto bool_lit = parse_bool_literal();
+        return std::make_unique<SetStmt>(knob, bool_lit->val);
     }
 
     std::unique_ptr<TreeNode> parse_ddl() {
@@ -221,12 +224,15 @@ private:
             std::string table = parse_identifier();
             return std::make_unique<DeleteStmt>(std::move(table), parse_opt_where_clause());
         }
-        if (match(TokenType::UPDATE)) {
-            std::string table = parse_identifier();
-            expect(TokenType::SET, "expected SET after table name");
-            auto clauses = parse_set_clause_list();
-            return std::make_unique<UpdateStmt>(std::move(table), std::move(clauses), parse_opt_where_clause());
-        }
+        // UPDATE
+        expect(TokenType::UPDATE, "expected DML statement");
+        std::string table = parse_identifier();
+        expect(TokenType::SET, "expected SET after table name");
+        auto clauses = parse_set_clause_list();
+        return std::make_unique<UpdateStmt>(std::move(table), std::move(clauses), parse_opt_where_clause());
+    }
+
+    std::unique_ptr<TreeNode> parse_dql() {
         if (match(TokenType::EXPLAIN)) {
             expect(TokenType::ANALYZE, "expected ANALYZE after EXPLAIN");
             return std::make_unique<ExplainAnalyze>(parse_select_stmt());
@@ -345,31 +351,59 @@ private:
     }
 
     std::unique_ptr<Value> parse_value() {
+        bool is_negative = match(TokenType::MINUS);
+
         if (check(TokenType::VALUE_INT)) {
-            return parse_int_literal();
+            return parse_int_literal(is_negative);
         }
         if (check(TokenType::VALUE_FLOAT)) {
-            Token token = current_;
-            advance();
-            return std::make_unique<FloatLit>(static_cast<float>(token.float_value), token_text(token));
+            return parse_float_literal(is_negative);
+        }
+        if (is_negative) {
+            error("expected numeric value after '-'");
         }
         if (check(TokenType::VALUE_STRING)) {
-            Token token = current_;
-            advance();
-            std::string value = token_text(token);
-            return std::make_unique<StringLit>(value, "'" + value + "'");
+            return parse_string_literal();
         }
         if (check(TokenType::VALUE_BOOL)) {
-            Token token = current_;
-            advance();
-            return std::make_unique<BoolLit>(token.bool_value, token_text(token));
+            return parse_bool_literal();
         }
         error("expected value");
     }
 
-    std::unique_ptr<IntLit> parse_int_literal() {
+    std::unique_ptr<IntLit> parse_int_literal(bool is_negative = false) {
         Token token = expect(TokenType::VALUE_INT, "expected integer");
-        return std::make_unique<IntLit>(static_cast<int>(token.int_value), token_text(token));
+        if (token.int_value < std::numeric_limits<int>::min() || token.int_value > std::numeric_limits<int>::max()) {
+            error("integer literal out of range");
+        }
+        int val = static_cast<int>(token.int_value);
+        std::string display = token_text(token);
+        if (is_negative) {
+            val = -val;
+            display = "-" + display;
+        }
+        return std::make_unique<IntLit>(val, std::move(display));
+    }
+
+    std::unique_ptr<FloatLit> parse_float_literal(bool is_negative = false) {
+        Token token = expect(TokenType::VALUE_FLOAT, "expected float");
+        float val = static_cast<float>(token.float_value);
+        std::string display = token_text(token);
+        if (is_negative) {
+            val = -val;
+            display = "-" + display;
+        }
+        return std::make_unique<FloatLit>(val, std::move(display));
+    }
+
+    std::unique_ptr<StringLit> parse_string_literal() {
+        Token token = expect(TokenType::VALUE_STRING, "expected string");
+        return std::make_unique<StringLit>(token_text(token), "'" + token_text(token) + "'");
+    }
+
+    std::unique_ptr<BoolLit> parse_bool_literal() {
+        Token token = expect(TokenType::VALUE_BOOL, "expected boolean");
+        return std::make_unique<BoolLit>(token.bool_value, token_text(token));
     }
 
     std::vector<std::unique_ptr<BinaryExpr>> parse_opt_where_clause() {
@@ -468,8 +502,10 @@ private:
         std::unique_ptr<Expr> expr;
         if (is_aggregate_start(current_.type)) {
             expr = parse_aggregate_expr();
-        } else {
+        } else if (check(TokenType::IDENTIFIER)) {
             expr = parse_col();
+        } else {
+            expr = parse_value();
         }
         std::string alias;
         if (match(TokenType::AS)) {
@@ -484,7 +520,7 @@ private:
     }
 
     std::unique_ptr<Expr> parse_aggregate_expr() {
-        AggFuncType func = AGG_COUNT;
+        AggFuncType func;
         if (match(TokenType::COUNT)) {
             func = AGG_COUNT;
         } else if (match(TokenType::MAX)) {
@@ -528,20 +564,13 @@ private:
     }
 
     std::unique_ptr<HavingExpr> parse_having_condition() {
-        auto lhs = parse_having_expr();
+        auto lhs = parse_general_expr();
         auto op = parse_op();
-        auto rhs = parse_having_rhs();
+        auto rhs = parse_general_expr();
         return std::make_unique<HavingExpr>(std::move(lhs), op, std::move(rhs));
     }
 
-    std::unique_ptr<Expr> parse_having_expr() {
-        if (is_aggregate_start(current_.type)) {
-            return parse_aggregate_expr();
-        }
-        return parse_col();
-    }
-
-    std::unique_ptr<Expr> parse_having_rhs() {
+    std::unique_ptr<Expr> parse_general_expr() {
         if (is_aggregate_start(current_.type)) {
             return parse_aggregate_expr();
         }
@@ -571,7 +600,7 @@ private:
         return from;
     }
 
-    std::string parse_table_ref() {
+    TableRef parse_table_ref() {
         std::string table = parse_identifier();
         std::string alias;
         if (match(TokenType::AS)) {
@@ -579,7 +608,7 @@ private:
         } else if (check(TokenType::IDENTIFIER)) {
             alias = parse_identifier();
         }
-        return alias.empty() ? table : table + "\001" + alias;
+        return TableRef(std::move(table), std::move(alias));
     }
 
     std::vector<std::unique_ptr<BinaryExpr>> parse_opt_join_on_clause() {
@@ -603,7 +632,7 @@ private:
     }
 
     std::unique_ptr<OrderByItem> parse_order_item() {
-        auto expr = parse_having_expr();
+        auto expr = parse_general_expr();
         OrderByDir dir = OrderBy_DEFAULT;
         if (match(TokenType::ASC)) {
             dir = OrderBy_ASC;
@@ -617,7 +646,8 @@ private:
         if (!match(TokenType::LIMIT)) {
             return nullptr;
         }
-        return parse_int_literal();
+        auto lit = parse_int_literal();
+        return std::unique_ptr<Value>(std::move(lit));
     }
 
     std::string parse_identifier() {

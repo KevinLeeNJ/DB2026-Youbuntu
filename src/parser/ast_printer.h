@@ -43,6 +43,18 @@ private:
         }
     }
 
+    static void print_table_refs(const std::vector<TableRef>& table_refs, int offset) {
+        std::cout << offset2string(offset) << "TABLE_REFS\n";
+        offset += 2;
+        for (auto& ref : table_refs) {
+            if (ref.alias.empty()) {
+                std::cout << offset2string(offset) << ref.table_name << '\n';
+            } else {
+                std::cout << offset2string(offset) << ref.table_name << " AS " << ref.alias << '\n';
+            }
+        }
+    }
+
     static std::string type2str(SvType type) {
         static std::map<SvType, std::string> m{
             {SV_TYPE_INT, "INT"},
@@ -274,7 +286,7 @@ private:
             std::cout << "SELECT\n";
             print_val(x->has_select_star, offset);
             print_node_list(x->select_items, offset);
-            print_val_list(x->tabs, offset);
+            print_table_refs(x->tabs, offset);
             print_node_list(x->conds, offset);
             print_node_list(x->group_by_cols, offset);
             print_node_list(x->having_conds, offset);

@@ -188,7 +188,7 @@ void* client_handler(void* sock_fd) {
             }
         } catch (const std::exception& e) {
             // 解析失败或其他未捕获异常，将 failure 信息写入 output.txt 并返回给客户端
-            LOG_ERROR("Parse error: %s", e.what());
+            LOG_ERROR("%s", e.what());
 
             if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                 context->txn_->get_state() != TransactionState::COMMITTED &&

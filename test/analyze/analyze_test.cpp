@@ -194,10 +194,10 @@ template <typename... Conds> std::vector<std::unique_ptr<ast::HavingExpr>> havin
 std::unique_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::unique_ptr<ast::SelectItem>> select_items,
                                                   std::vector<std::unique_ptr<ast::Col>> group_by_cols = {},
                                                   std::vector<std::unique_ptr<ast::HavingExpr>> having_conds = {}) {
-    return std::make_unique<ast::SelectStmt>(std::move(select_items), std::vector<std::string>{"grade"},
-                                             std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols),
-                                             std::move(having_conds), std::vector<std::unique_ptr<ast::OrderByItem>>{},
-                                             false, 0, false);
+    return std::make_unique<ast::SelectStmt>(
+        std::move(select_items), std::vector<ast::TableRef>{ast::TableRef("grade", "")},
+        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols), std::move(having_conds),
+        std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0, false);
 }
 
 } // namespace

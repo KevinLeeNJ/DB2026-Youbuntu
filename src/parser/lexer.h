@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -8,6 +9,28 @@
 #include <unordered_map>
 
 namespace parser {
+
+struct CIHash {
+    size_t operator()(std::string_view s) const {
+        size_t h = 0;
+        for (char c : s) {
+            h = h * 31 + std::toupper(static_cast<unsigned char>(c));
+        }
+        return h;
+    }
+};
+
+struct CIEqual {
+    bool operator()(std::string_view a, std::string_view b) const {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); i++) {
+            if (std::toupper(static_cast<unsigned char>(a[i])) != std::toupper(static_cast<unsigned char>(b[i])))
+                return false;
+        }
+        return true;
+    }
+};
 
 enum class TokenType {
     // Keywords (50个)
@@ -70,6 +93,8 @@ enum class TokenType {
     EQ,
     LT,
     GT,
+    PLUS,
+    MINUS,
 
     // Punctuation
     LPAREN,
@@ -132,8 +157,8 @@ private:
     Token peeked_;
     bool has_peeked_;
 
-    // 关键字查找表
-    static const std::unordered_map<std::string_view, TokenType> keywords_;
+    // 关键字查找表（大小写不敏感）
+    static const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> keywords_;
 
     // 辅助函数
     char current_char() const;
