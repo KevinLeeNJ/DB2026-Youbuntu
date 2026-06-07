@@ -553,7 +553,6 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
 }
 
 std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query) {
-    auto x = std::static_pointer_cast<ast::SelectStmt>(query->parse);
     std::vector<std::string> tables = query->tables;
     // // Scan table , 生成表算子列表tab_nodes
     std::vector<std::shared_ptr<Plan>> table_scan_executors(tables.size());
@@ -741,15 +740,19 @@ std::shared_ptr<Plan> Planner::generate_union_plan(std::shared_ptr<Query> query,
 // 生成DDL语句和DML语句的查询执行计划
 std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context* context) {
     std::shared_ptr<Plan> plannerRoot;
-    switch (query->parse->type) {
+    auto* parse = query->parse.get();
+    if (parse == nullptr) {
+        throw InternalError("Unexpected null AST root");
+    }
+    switch (parse->type) {
     case ast::AstType::CreateTable: {
-        auto x = std::static_pointer_cast<ast::CreateTable>(query->parse);
+        auto x = static_cast<const ast::CreateTable*>(parse);
         // create table;
         std::vector<ColDef> col_defs;
         col_defs.reserve(x->fields.size());
         for (auto& field : x->fields) {
             if (field->type == ast::AstType::ColDef) {
-                auto sv_col_def = std::static_pointer_cast<ast::ColDef>(field);
+                auto sv_col_def = static_cast<const ast::ColDef*>(field.get());
                 ColDef col_def = {.name = sv_col_def->col_name,
                                   .type = interp_sv_type(sv_col_def->type_len->type),
                                   .len = sv_col_def->type_len->len};
@@ -762,33 +765,33 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context*
         break;
     }
     case ast::AstType::DropTable: {
-        auto x = std::static_pointer_cast<ast::DropTable>(query->parse);
+        auto x = static_cast<const ast::DropTable*>(parse);
         // drop table;
         plannerRoot =
             std::make_shared<DDLPlan>(T_DropTable, x->tab_name, std::vector<std::string>(), std::vector<ColDef>());
         break;
     }
     case ast::AstType::CreateIndex: {
-        auto x = std::static_pointer_cast<ast::CreateIndex>(query->parse);
+        auto x = static_cast<const ast::CreateIndex*>(parse);
         // create index;
         plannerRoot = std::make_shared<DDLPlan>(T_CreateIndex, x->tab_name, x->col_names, std::vector<ColDef>());
         break;
     }
     case ast::AstType::DropIndex: {
-        auto x = std::static_pointer_cast<ast::DropIndex>(query->parse);
+        auto x = static_cast<const ast::DropIndex*>(parse);
         // drop index
         plannerRoot = std::make_shared<DDLPlan>(T_DropIndex, x->tab_name, x->col_names, std::vector<ColDef>());
         break;
     }
     case ast::AstType::InsertStmt: {
-        auto x = std::static_pointer_cast<ast::InsertStmt>(query->parse);
+        auto x = static_cast<const ast::InsertStmt*>(parse);
         // insert;
         plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(), x->tab_name, query->values,
                                                 std::vector<Condition>(), std::vector<SetClause>());
         break;
     }
     case ast::AstType::DeleteStmt: {
-        auto x = std::static_pointer_cast<ast::DeleteStmt>(query->parse);
+        auto x = static_cast<const ast::DeleteStmt*>(parse);
         // delete;
         // 生成表扫描方式
         std::shared_ptr<Plan> table_scan_executors;
@@ -811,7 +814,7 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context*
         break;
     }
     case ast::AstType::UpdateStmt: {
-        auto x = std::static_pointer_cast<ast::UpdateStmt>(query->parse);
+        auto x = static_cast<const ast::UpdateStmt*>(parse);
         // update;
         // 生成表扫描方式
         std::shared_ptr<Plan> table_scan_executors;

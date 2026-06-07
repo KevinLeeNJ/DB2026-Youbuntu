@@ -30,7 +30,11 @@ public:
     Optimizer(SmManager* sm_manager, Planner* planner) : sm_manager_(sm_manager), planner_(planner) {}
 
     std::shared_ptr<Plan> plan_query(std::shared_ptr<Query> query, Context* context) {
-        switch (query->parse->type) {
+        auto* parse = query->parse.get();
+        if (parse == nullptr) {
+            throw InternalError("Unexpected null AST root");
+        }
+        switch (parse->type) {
         case ast::AstType::Help:
             // help;
             return std::make_shared<OtherPlan>(T_Help, std::string());
@@ -38,12 +42,12 @@ public:
             // show tables;
             return std::make_shared<OtherPlan>(T_ShowTable, std::string());
         case ast::AstType::ShowIndex: {
-            auto x = std::static_pointer_cast<ast::ShowIndex>(query->parse);
+            auto x = static_cast<const ast::ShowIndex*>(parse);
             // show index from table;
             return std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
         }
         case ast::AstType::DescTable: {
-            auto x = std::static_pointer_cast<ast::DescTable>(query->parse);
+            auto x = static_cast<const ast::DescTable*>(parse);
             // desc table;
             return std::make_shared<OtherPlan>(T_DescTable, x->tab_name);
         }
@@ -60,12 +64,12 @@ public:
             // rollback;
             return std::make_shared<OtherPlan>(T_Transaction_rollback, std::string());
         case ast::AstType::SetStmt: {
-            auto x = std::static_pointer_cast<ast::SetStmt>(query->parse);
+            auto x = static_cast<const ast::SetStmt*>(parse);
             // Set Knob Plan
             return std::make_shared<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
         }
         case ast::AstType::SetTransaction: {
-            auto x = std::static_pointer_cast<ast::SetTransaction>(query->parse);
+            auto x = static_cast<const ast::SetTransaction*>(parse);
             return std::make_shared<SetTransactionPlan>(x->isolation_level_);
         }
         case ast::AstType::StaticCheckpoint:

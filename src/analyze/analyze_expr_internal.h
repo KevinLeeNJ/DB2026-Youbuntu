@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 namespace analyze_internal {
 
 // --- AST value/node conversion ---
-Value convert_ast_value_node(const std::shared_ptr<ast::Value>& sv_val);
+Value convert_ast_value_node(const ast::Value* sv_val);
 
 // --- Column resolution ---
 const ColMeta* resolve_column_meta(const std::vector<ColMeta>& all_cols, TabCol& target);

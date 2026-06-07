@@ -237,6 +237,11 @@ Token Lexer::scan_string() {
         advance();
     }
 
+    if (pos_ >= input_.size()) {
+        throw std::runtime_error("Lexer Error at line " + std::to_string(start_line) + " column " +
+                                 std::to_string(start_col) + ": unterminated string literal");
+    }
+
     std::string_view text = input_.substr(start_pos, pos_ - start_pos);
     advance(); // skip closing quote
 

@@ -43,14 +43,13 @@ int main() {
     };
     for (auto& sql : sqls) {
         std::cout << sql << std::endl;
-        ast::parse_tree = ast::parse_sql(sql);
-        if (ast::parse_tree != nullptr) {
-            ast::TreePrinter::print(ast::parse_tree);
+        auto parse_tree = ast::parse_sql(sql);
+        if (parse_tree != nullptr) {
+            ast::TreePrinter::print(parse_tree);
             std::cout << std::endl;
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
     }
-    ast::parse_tree.reset();
     return 0;
 }

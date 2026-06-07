@@ -24,7 +24,7 @@ See the Mulan PSL v2 for more details. */
 
 class Query {
 public:
-    std::shared_ptr<ast::TreeNode> parse;
+    std::unique_ptr<ast::TreeNode> parse;
     // TODO jointree
     // where条件
     std::vector<Condition> conds;
@@ -68,14 +68,14 @@ public:
     Analyze(SmManager* sm_manager) : sm_manager_(sm_manager) {}
     ~Analyze() {}
 
-    std::shared_ptr<Query> do_analyze(std::shared_ptr<ast::TreeNode> root);
+    std::shared_ptr<Query> do_analyze(std::unique_ptr<ast::TreeNode> root);
 
 private:
     TabCol check_column(const std::vector<ColMeta>& all_cols, TabCol target);
     void get_all_cols(const std::vector<std::string>& tab_names, std::vector<ColMeta>& all_cols);
-    void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds);
+    void get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds);
     void check_clause(const std::vector<std::string>& tab_names, std::vector<Condition>& conds);
-    Value convert_sv_value(const std::shared_ptr<ast::Value>& sv_val);
+    Value convert_sv_value(const ast::Value* sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
 
     bool can_cast(ColType lhs_type, ColType rhs_type) {
@@ -88,8 +88,10 @@ private:
         return false;
     }
 
-    std::shared_ptr<Query> analyze_select_stmt(const std::shared_ptr<ast::SelectStmt>& select);
-    std::shared_ptr<Query> analyze_select_from_union_stmt(const std::shared_ptr<ast::SelectFromUnionStmt>& select);
+    std::shared_ptr<Query> analyze_select_stmt(const ast::SelectStmt* select,
+                                               std::unique_ptr<ast::TreeNode> owner = nullptr);
+    std::shared_ptr<Query> analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select,
+                                                          std::unique_ptr<ast::TreeNode> owner);
     std::vector<ColMeta> get_query_output_metas(const Query& query);
     ColMeta make_union_col_meta(const ColMeta& current, const ColMeta& next);
     void validate_union_order_by(Query& query);

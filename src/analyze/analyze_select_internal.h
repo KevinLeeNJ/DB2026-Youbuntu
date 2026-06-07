@@ -78,7 +78,7 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols);
 // =============================================================================
 
 template <typename ExprPtrT> TabCol extract_ast_column(const ExprPtrT& expr_node, const std::string& clause_name) {
-    auto col = std::dynamic_pointer_cast<ast::Col>(expr_node);
+    auto col = dynamic_cast<const ast::Col*>(expr_node.get());
     if (col == nullptr) {
         throw RMDBError(clause_name + " clause does not allow aggregate expressions");
     }
@@ -90,16 +90,16 @@ QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& 
     if (expr_node == nullptr) {
         throw InternalError("Unexpected null expression node");
     }
-    if (auto col = std::dynamic_pointer_cast<ast::Col>(expr_node); col != nullptr) {
+    if (auto col = dynamic_cast<const ast::Col*>(expr_node.get()); col != nullptr) {
         return make_column_expr({.tab_name = col->tab_name, .col_name = col->col_name});
     }
-    if (auto val = std::dynamic_pointer_cast<ast::Value>(expr_node); val != nullptr) {
+    if (auto val = dynamic_cast<const ast::Value*>(expr_node.get()); val != nullptr) {
         QueryExpr expr;
         expr.type = QueryExprType::VALUE;
         expr.value = convert_ast_value_node(val);
         return expr;
     }
-    if (auto agg = std::dynamic_pointer_cast<ast::AggExpr>(expr_node); agg != nullptr) {
+    if (auto agg = dynamic_cast<const ast::AggExpr*>(expr_node.get()); agg != nullptr) {
         QueryExpr expr;
         expr.type = QueryExprType::AGGREGATE;
         expr.agg.type = convert_ast_agg_type(agg->func);
@@ -203,7 +203,7 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
                 cond.op = OP_GE;
                 break;
             }
-            if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(raw_cond->rhs); rhs_val != nullptr) {
+            if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
                 cond.is_rhs_val = true;
                 cond.rhs_val = convert_ast_value_node(rhs_val);
             } else {

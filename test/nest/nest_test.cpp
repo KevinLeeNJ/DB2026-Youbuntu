@@ -19,8 +19,7 @@
 #include "analyze/analyze.h"
 #include "transaction/transaction_manager.h"
 #include "transaction/concurrency/lock_manager.h"
-#include "parser/parser_defs.h"
-#include "parser/ast.h"
+#include "parser/parser.h"
 
 namespace {
 
@@ -71,18 +70,14 @@ protected:
         }
     }
 
-    std::shared_ptr<ast::TreeNode> parse_sql(const std::string& sql) {
+    std::unique_ptr<ast::TreeNode> parse_sql(const std::string& sql) {
         std::string sql_with_semi = sql.back() == ';' ? sql : sql + ";";
-        YY_BUFFER_STATE buf = yy_scan_string(sql_with_semi.c_str());
-        yyparse();
-        auto tree = ast::parse_tree;
-        yy_delete_buffer(buf);
-        return tree;
+        return ast::parse_sql(sql_with_semi);
     }
 
     void execute(const std::string& sql) {
         auto parse = parse_sql(sql);
-        auto query = analyze_->do_analyze(parse);
+        auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(query, nullptr);
         auto portal_stmt = portal_->start(plan, nullptr);
         QlManager ql_mgr(sm_manager_.get(), txn_manager_.get(), planner_.get());
@@ -92,7 +87,7 @@ protected:
 
     std::vector<std::vector<std::string>> select(const std::string& sql) {
         auto parse = parse_sql(sql);
-        auto query = analyze_->do_analyze(parse);
+        auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(query, nullptr);
         auto portal_stmt = portal_->start(plan, nullptr);
 
@@ -131,7 +126,7 @@ protected:
 
     std::string explain_analyze(const std::string& sql) {
         auto parse = parse_sql(sql);
-        auto query = analyze_->do_analyze(parse);
+        auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(query, nullptr);
         auto portal_stmt = portal_->start(plan, nullptr);
 

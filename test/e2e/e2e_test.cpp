@@ -118,26 +118,25 @@ public:
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
 
         // Parse
-        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-        if (yyparse() != 0) {
-            yy_delete_buffer(buf);
+        std::unique_ptr<ast::TreeNode> parse_tree;
+        try {
+            parse_tree = ast::parse_sql(sql);
+        } catch (...) {
             abort_implicit_statement(&context);
             throw RMDBError("Parse error for: " + sql);
         }
-        if (ast::parse_tree == nullptr) {
-            yy_delete_buffer(buf);
+        if (parse_tree == nullptr) {
             finish_statement(&context);
             return ""; // EXIT or EOF
         }
-        bool is_checkpoint = ast::parse_tree->type == ast::AstType::StaticCheckpoint;
+        bool is_checkpoint = parse_tree->type == ast::AstType::StaticCheckpoint;
         if (!is_checkpoint) {
             set_transaction(&context);
         }
-        yy_delete_buffer(buf);
 
         // Analyze → Optimize → Portal → Execute
         try {
-            std::shared_ptr<Query> query = analyze_->do_analyze(ast::parse_tree);
+            std::shared_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
             std::shared_ptr<Plan> plan = optimizer_->plan_query(query, &context);
             std::shared_ptr<PortalStmt> portal_stmt = portal_->start(plan, &context);
             portal_->run(portal_stmt, ql_manager_.get(), &txn_id_, &context);

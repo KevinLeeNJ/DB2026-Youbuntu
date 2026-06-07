@@ -1,4 +1,4 @@
-.PHONY: all build test clean run debug release format help client client-debug clean-client parser
+.PHONY: all build test clean run debug release format help client client-debug clean-client
 
 BUILD_DIR := build
 BINARY := $(BUILD_DIR)/bin/rmdb
@@ -6,7 +6,6 @@ CMAKE := cmake
 CTEST := ctest
 JOBS := 8
 CLIENT_JOBS := 4
-PARSER_DIR := src/parser
 
 all: build
 
@@ -21,7 +20,6 @@ help:
 	@echo "  make format        - Format code with clang-format"
 	@echo "  make client        - Build rmdb_client (Release, 4 threads)"
 	@echo "  make client-debug  - Build rmdb_client (Debug, 4 threads)"
-	@echo "  make parser        - Regenerate parser from flex/bison sources"
 
 build:
 	@if [ ! -d "$(BUILD_DIR)" ]; then \
@@ -71,8 +69,3 @@ clean-client:
 
 run-client: client
 	@./rmdb_client/build/rmdb_client
-
-parser:
-	@cd $(PARSER_DIR) && flex -o lex.yy.cpp lex.l
-	@cd $(PARSER_DIR) && bison --defines=yacc.tab.h -o yacc.tab.cpp yacc.y
-	@echo "Parser regenerated."

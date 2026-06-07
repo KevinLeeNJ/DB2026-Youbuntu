@@ -170,9 +170,6 @@ public:
         return analyze_.get();
     }
 
-    // ---- Mutex for shared parser state (yyparse is not reentrant) ----
-    std::mutex parser_mutex_;
-
 private:
     std::string db_name_;
     std::string original_cwd_;
@@ -212,24 +209,14 @@ public:
         context.isolation_level_ = session_isolation_;
         setup_transaction(&context);
 
-        {
-            std::lock_guard<std::mutex> lock(db_->parser_mutex_);
-            YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-            if (yyparse() != 0) {
-                yy_delete_buffer(buf);
-                abort_statement(&context);
-                throw RMDBError("Parse error: " + sql);
-            }
-            if (ast::parse_tree == nullptr) {
-                yy_delete_buffer(buf);
-                finish_statement(&context);
-                return "";
-            }
-            yy_delete_buffer(buf);
+        auto parse_tree = ast::parse_sql(sql);
+        if (parse_tree == nullptr) {
+            finish_statement(&context);
+            return "";
         }
 
         try {
-            std::shared_ptr<Query> query = db_->analyze()->do_analyze(ast::parse_tree);
+            std::shared_ptr<Query> query = db_->analyze()->do_analyze(std::move(parse_tree));
             std::shared_ptr<Plan> plan = db_->optimizer()->plan_query(query, &context);
             std::shared_ptr<PortalStmt> portal_stmt = db_->portal()->start(plan, &context);
             db_->portal()->run(portal_stmt, db_->ql(), &txn_id_, &context);

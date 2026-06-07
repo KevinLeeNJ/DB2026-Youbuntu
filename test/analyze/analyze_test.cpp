@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/common.h"
@@ -24,24 +25,24 @@
 
 TEST(AnalyzeConvertTest, convert_int_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_shared<ast::IntLit>(42);
-    Value val = analyze.convert_sv_value(sv_val);
+    auto sv_val = std::make_unique<ast::IntLit>(42);
+    Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_INT);
     EXPECT_EQ(val.int_val, 42);
 }
 
 TEST(AnalyzeConvertTest, convert_float_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_shared<ast::FloatLit>(3.14f);
-    Value val = analyze.convert_sv_value(sv_val);
+    auto sv_val = std::make_unique<ast::FloatLit>(3.14f);
+    Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_FLOAT);
     EXPECT_EQ(val.float_val, 3.14f);
 }
 
 TEST(AnalyzeConvertTest, convert_string_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_shared<ast::StringLit>("hello");
-    Value val = analyze.convert_sv_value(sv_val);
+    auto sv_val = std::make_unique<ast::StringLit>("hello");
+    Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_STRING);
     EXPECT_EQ(val.str_val, "hello");
 }
@@ -118,10 +119,9 @@ TEST_F(AnalyzeCheckColumnTest, explicit_tab_but_column_not_found) {
 
 TEST(AnalyzeGetClauseTest, single_cond_with_value) {
     Analyze analyze(nullptr);
-    auto lhs = std::make_shared<ast::Col>("t", "x");
-    auto rhs = std::make_shared<ast::IntLit>(10);
-    auto expr = std::make_shared<ast::BinaryExpr>(lhs, ast::SV_OP_EQ, rhs);
-    std::vector<std::shared_ptr<ast::BinaryExpr>> sv_conds = {expr};
+    std::vector<std::unique_ptr<ast::BinaryExpr>> sv_conds;
+    sv_conds.push_back(std::make_unique<ast::BinaryExpr>(std::make_unique<ast::Col>("t", "x"), ast::SV_OP_EQ,
+                                                         std::make_unique<ast::IntLit>(10)));
 
     std::vector<Condition> conds;
     analyze.get_clause(sv_conds, conds);
@@ -137,10 +137,9 @@ TEST(AnalyzeGetClauseTest, single_cond_with_value) {
 
 TEST(AnalyzeGetClauseTest, single_cond_with_col) {
     Analyze analyze(nullptr);
-    auto lhs = std::make_shared<ast::Col>("t1", "x");
-    auto rhs = std::make_shared<ast::Col>("t2", "y");
-    auto expr = std::make_shared<ast::BinaryExpr>(lhs, ast::SV_OP_GT, rhs);
-    std::vector<std::shared_ptr<ast::BinaryExpr>> sv_conds = {expr};
+    std::vector<std::unique_ptr<ast::BinaryExpr>> sv_conds;
+    sv_conds.push_back(std::make_unique<ast::BinaryExpr>(std::make_unique<ast::Col>("t1", "x"), ast::SV_OP_GT,
+                                                         std::make_unique<ast::Col>("t2", "y")));
 
     std::vector<Condition> conds;
     analyze.get_clause(sv_conds, conds);
@@ -166,20 +165,38 @@ TabMeta make_grade_tab() {
     return tab;
 }
 
-std::shared_ptr<ast::AggExpr> make_ast_agg(ast::AggFuncType func, const std::string& col_name) {
-    return std::make_shared<ast::AggExpr>(func, false, std::make_shared<ast::Col>("", col_name));
+std::unique_ptr<ast::AggExpr> make_ast_agg(ast::AggFuncType func, const std::string& col_name) {
+    return std::make_unique<ast::AggExpr>(func, false, std::make_unique<ast::Col>("", col_name));
 }
 
-std::shared_ptr<ast::AggExpr> make_ast_count_star() {
-    return std::make_shared<ast::AggExpr>(ast::AGG_COUNT, true, nullptr);
+std::unique_ptr<ast::AggExpr> make_ast_count_star() {
+    return std::make_unique<ast::AggExpr>(ast::AGG_COUNT, true, nullptr);
 }
 
-std::shared_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::shared_ptr<ast::SelectItem>> select_items,
-                                                  std::vector<std::shared_ptr<ast::Col>> group_by_cols = {},
-                                                  std::vector<std::shared_ptr<ast::HavingExpr>> having_conds = {}) {
-    return std::make_shared<ast::SelectStmt>(std::move(select_items), std::vector<std::string>{"grade"},
-                                             std::vector<std::shared_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols),
-                                             std::move(having_conds), std::vector<std::shared_ptr<ast::OrderByItem>>{},
+template <typename... Items> std::vector<std::unique_ptr<ast::SelectItem>> select_items(Items&&... items) {
+    std::vector<std::unique_ptr<ast::SelectItem>> result;
+    (result.push_back(std::forward<Items>(items)), ...);
+    return result;
+}
+
+template <typename... Cols> std::vector<std::unique_ptr<ast::Col>> group_cols(Cols&&... cols) {
+    std::vector<std::unique_ptr<ast::Col>> result;
+    (result.push_back(std::forward<Cols>(cols)), ...);
+    return result;
+}
+
+template <typename... Conds> std::vector<std::unique_ptr<ast::HavingExpr>> having_conds(Conds&&... conds) {
+    std::vector<std::unique_ptr<ast::HavingExpr>> result;
+    (result.push_back(std::forward<Conds>(conds)), ...);
+    return result;
+}
+
+std::unique_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::unique_ptr<ast::SelectItem>> select_items,
+                                                  std::vector<std::unique_ptr<ast::Col>> group_by_cols = {},
+                                                  std::vector<std::unique_ptr<ast::HavingExpr>> having_conds = {}) {
+    return std::make_unique<ast::SelectStmt>(std::move(select_items), std::vector<std::string>{"grade"},
+                                             std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols),
+                                             std::move(having_conds), std::vector<std::unique_ptr<ast::OrderByItem>>{},
                                              false, 0, false);
 }
 
@@ -197,14 +214,13 @@ protected:
 
 TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
     auto stmt = make_select_stmt(
-        {
-            std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "id"), ""),
-            std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "max_score"),
-        },
-        {std::make_shared<ast::Col>("", "id")},
-        {std::make_shared<ast::HavingExpr>(make_ast_count_star(), ast::SV_OP_GT, std::make_shared<ast::IntLit>(1))});
+        select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), ""),
+                     std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "max_score")),
+        group_cols(std::make_unique<ast::Col>("", "id")),
+        having_conds(
+            std::make_unique<ast::HavingExpr>(make_ast_count_star(), ast::SV_OP_GT, std::make_unique<ast::IntLit>(1))));
 
-    auto query = analyze_.do_analyze(stmt);
+    auto query = analyze_.do_analyze(std::move(stmt));
 
     ASSERT_EQ(query->select_items.size(), 2);
     EXPECT_TRUE(query->has_aggregate);
@@ -221,15 +237,13 @@ TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_select_column_not_in_group_by) {
-    auto stmt = make_select_stmt(
-        {
-            std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "course"), ""),
-            std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), ""),
-        },
-        {std::make_shared<ast::Col>("", "id")});
+    auto stmt =
+        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "course"), ""),
+                                      std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "")),
+                         group_cols(std::make_unique<ast::Col>("", "id")));
 
     try {
-        (void)analyze_.do_analyze(stmt);
+        (void)analyze_.do_analyze(std::move(stmt));
         FAIL() << "expected group-by validation failure";
     } catch (const RMDBError& err) {
         EXPECT_NE(std::string(err.what()).find("SELECT list contains a non-aggregated column that is not in GROUP BY"),
@@ -239,16 +253,14 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_select_column_not_in_group_by) {
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_having_column_not_in_group_by) {
     auto stmt = make_select_stmt(
-        {
-            std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "id"), ""),
-            std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), ""),
-        },
-        {std::make_shared<ast::Col>("", "id")},
-        {std::make_shared<ast::HavingExpr>(std::make_shared<ast::Col>("", "score"), ast::SV_OP_GT,
-                                           std::make_shared<ast::IntLit>(90))});
+        select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), ""),
+                     std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "")),
+        group_cols(std::make_unique<ast::Col>("", "id")),
+        having_conds(std::make_unique<ast::HavingExpr>(std::make_unique<ast::Col>("", "score"), ast::SV_OP_GT,
+                                                       std::make_unique<ast::IntLit>(90))));
 
     try {
-        (void)analyze_.do_analyze(stmt);
+        (void)analyze_.do_analyze(std::move(stmt));
         FAIL() << "expected having validation failure";
     } catch (const RMDBError& err) {
         EXPECT_NE(std::string(err.what()).find("HAVING contains a non-aggregated column that is not in GROUP BY"),
@@ -257,13 +269,12 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_having_column_not_in_group_by) {
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_mixed_aggregate_without_group_by) {
-    auto stmt = make_select_stmt({
-        std::make_shared<ast::SelectItem>(std::make_shared<ast::Col>("", "id"), ""),
-        std::make_shared<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), ""),
-    });
+    auto stmt =
+        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), ""),
+                                      std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "")));
 
     try {
-        (void)analyze_.do_analyze(stmt);
+        (void)analyze_.do_analyze(std::move(stmt));
         FAIL() << "expected aggregate mixing validation failure";
     } catch (const RMDBError& err) {
         EXPECT_NE(std::string(err.what())

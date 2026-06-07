@@ -12,21 +12,21 @@ See the Mulan PSL v2 for more details. */
 
 namespace analyze_internal {
 
-Value convert_ast_value_node(const std::shared_ptr<ast::Value>& sv_val) {
+Value convert_ast_value_node(const ast::Value* sv_val) {
     Value val;
     switch (sv_val->type) {
     case ast::AstType::IntLit: {
-        auto int_lit = std::static_pointer_cast<ast::IntLit>(sv_val);
+        auto int_lit = static_cast<const ast::IntLit*>(sv_val);
         val.set_int(int_lit->val);
         break;
     }
     case ast::AstType::FloatLit: {
-        auto float_lit = std::static_pointer_cast<ast::FloatLit>(sv_val);
+        auto float_lit = static_cast<const ast::FloatLit*>(sv_val);
         val.set_float(float_lit->val);
         break;
     }
     case ast::AstType::StringLit: {
-        auto str_lit = std::static_pointer_cast<ast::StringLit>(sv_val);
+        auto str_lit = static_cast<const ast::StringLit*>(sv_val);
         val.set_str(str_lit->val);
         break;
     }

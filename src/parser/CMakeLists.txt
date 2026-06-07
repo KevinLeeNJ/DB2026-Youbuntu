@@ -1,4 +1,4 @@
-set(SOURCES parser.cpp lexer.cpp ast.cpp)
+set(SOURCES parser.cpp lexer.cpp)
 add_library(parser STATIC ${SOURCES})
 
 add_executable(test_parser test_parser.cpp)

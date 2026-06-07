@@ -270,11 +270,11 @@ public:
 
 class plannerInfo {
 public:
-    std::shared_ptr<ast::SelectStmt> parse;
+    const ast::SelectStmt* parse;
     std::vector<Condition> where_conds;
     std::vector<TabCol> sel_cols;
     std::shared_ptr<Plan> plan;
     std::vector<std::shared_ptr<Plan>> table_scan_executors;
     std::vector<SetClause> set_clauses;
-    plannerInfo(std::shared_ptr<ast::SelectStmt> parse_) : parse(std::move(parse_)) {}
+    plannerInfo(const ast::SelectStmt* parse_) : parse(parse_) {}
 };

@@ -46,7 +46,6 @@ auto log_manager = std::make_unique<LogManager>(disk_manager.get());
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get());
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
-pthread_mutex_t* buffer_mutex;
 pthread_mutex_t* sockfd_mutex;
 
 static jmp_buf jmpbuf;
@@ -122,23 +121,18 @@ void* client_handler(void* sock_fd) {
             new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset, txn_manager.get());
         context->isolation_level_ = session_isolation_level;
 
-        // 用于判断是否已经调用了yy_delete_buffer来删除buf
-        bool finish_analyze = false;
-        pthread_mutex_lock(buffer_mutex);
-        YY_BUFFER_STATE buf = yy_scan_string(data_recv);
-        if (yyparse() == 0) {
-            if (ast::parse_tree != nullptr) {
+        try {
+            auto parse_tree = ast::parse_sql(data_recv);
+            if (parse_tree != nullptr) {
                 try {
-                    bool is_checkpoint = ast::parse_tree->type == ast::AstType::StaticCheckpoint;
+                    auto parsed_type = parse_tree->type;
+                    bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
                     if (!is_checkpoint) {
                         SetTransaction(&txn_id, context);
                     }
                     // analyze and rewrite
-                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
-                    yy_delete_buffer(buf);
-                    finish_analyze = true;
-                    LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(ast::parse_tree->type));
-                    pthread_mutex_unlock(buffer_mutex);
+                    std::shared_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
+                    LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
                     // portal
@@ -172,7 +166,7 @@ void* client_handler(void* sock_fd) {
                     outfile.close();
                 } catch (RMDBError& e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
-                    LOG_ERROR("%s", e.what());
+                    LOG_ERROR("RMDBError: %s", e.what());
 
                     memcpy(data_send, e.what(), e.get_msg_len());
                     data_send[e.get_msg_len()] = '\n';
@@ -192,10 +186,9 @@ void* client_handler(void* sock_fd) {
                     outfile.close();
                 }
             }
-        } else {
-            // 解析失败，将 failure 信息写入 output.txt 并返回给客户端
-            // where 中含有聚合函数时，会出现解析失败的情况，此处需要打印一个 failure
-            LOG_ERROR("parse error");
+        } catch (const std::exception& e) {
+            // 解析失败或其他未捕获异常，将 failure 信息写入 output.txt 并返回给客户端
+            LOG_ERROR("Parse error: %s", e.what());
 
             if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                 context->txn_->get_state() != TransactionState::COMMITTED &&
@@ -203,19 +196,17 @@ void* client_handler(void* sock_fd) {
                 txn_manager->abort(context->txn_, context->log_mgr_);
             }
 
-            std::string str = "Parse error\n";
-            memcpy(data_send, str.c_str(), str.length());
-            data_send[str.length()] = '\0';
-            offset = str.length();
+            const char* msg = e.what();
+            int msg_len = strlen(msg);
+            memcpy(data_send, msg, msg_len);
+            data_send[msg_len] = '\n';
+            data_send[msg_len + 1] = '\0';
+            offset = msg_len + 1;
 
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << "failure\n";
             outfile.close();
-        }
-        if (finish_analyze == false) {
-            yy_delete_buffer(buf);
-            pthread_mutex_unlock(buffer_mutex);
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
@@ -232,9 +223,7 @@ void* client_handler(void* sock_fd) {
 
 void start_server() {
     // init mutex
-    buffer_mutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
     sockfd_mutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init(buffer_mutex, nullptr);
     pthread_mutex_init(sockfd_mutex, nullptr);
 
     int sockfd_server;
