@@ -10,7 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include "ast_printer.h"
 #include "ast.h"
 
 namespace ast {

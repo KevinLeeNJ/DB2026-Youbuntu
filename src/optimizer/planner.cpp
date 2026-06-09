@@ -579,7 +579,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query) {
     std::shared_ptr<Plan> table_join_executors;
 
     std::vector<int> scantbl(tables.size(), -1);
-    // 假设在ast中已经添加了jointree，这里需要修改的逻辑是，先处理jointree，然后再考虑剩下的部分
+    // 当前 AST 将 JOIN 条件统一放入 query->conds，这里按条件生成连接计划。
     if (conds.size() >= 1) {
         // 有连接条件
 

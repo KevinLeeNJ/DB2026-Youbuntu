@@ -53,9 +53,11 @@ QueryExpr make_count_star_expr() {
 
 std::shared_ptr<Query> make_aggregate_query(bool with_sort, bool with_limit) {
     auto query = std::make_shared<Query>();
-    query->parse =
-        std::make_unique<ast::SelectStmt>(std::vector<std::unique_ptr<ast::Col>>{}, std::vector<std::string>{"grade"},
-                                          std::vector<std::unique_ptr<ast::BinaryExpr>>{}, nullptr);
+    query->parse = std::make_unique<ast::SelectStmt>(
+        std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("grade", "")},
+        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
+        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
+        true);
     query->tables = {"grade"};
     query->has_aggregate = true;
     query->group_by_cols = {{.tab_name = "grade", .col_name = "id"}};

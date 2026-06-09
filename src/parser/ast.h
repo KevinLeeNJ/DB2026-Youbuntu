@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -252,13 +253,19 @@ struct SetClause : public TreeNode {
 };
 
 struct BinaryExpr : public TreeNode {
-    std::unique_ptr<Col> lhs;
+    std::unique_ptr<Expr> lhs;
     SvCompOp op;
     std::unique_ptr<Expr> rhs;
 
-    BinaryExpr(std::unique_ptr<Col> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_)
+    BinaryExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_)
         : TreeNode(AstType::BinaryExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
 };
+
+inline std::unique_ptr<Expr> clone_expr(const Expr& expr);
+
+inline std::unique_ptr<BinaryExpr> clone_binary_expr(const BinaryExpr& expr) {
+    return std::make_unique<BinaryExpr>(clone_expr(*expr.lhs), expr.op, clone_expr(*expr.rhs));
+}
 
 struct HavingExpr : public TreeNode {
     std::unique_ptr<Expr> lhs;
@@ -269,13 +276,6 @@ struct HavingExpr : public TreeNode {
         : TreeNode(AstType::HavingExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
 };
 
-struct OrderBy : public TreeNode {
-    std::unique_ptr<Col> cols;
-    OrderByDir orderby_dir;
-    OrderBy(std::unique_ptr<Col> cols_, OrderByDir orderby_dir_)
-        : TreeNode(AstType::OrderBy), cols(std::move(cols_)), orderby_dir(orderby_dir_) {}
-};
-
 struct OrderByItem : public TreeNode {
     std::unique_ptr<Expr> expr;
     OrderByDir orderby_dir;
@@ -283,6 +283,48 @@ struct OrderByItem : public TreeNode {
     OrderByItem(std::unique_ptr<Expr> expr_, OrderByDir orderby_dir_)
         : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_) {}
 };
+
+inline std::unique_ptr<OrderByItem> clone_order_by_item(const OrderByItem& item) {
+    return std::make_unique<OrderByItem>(clone_expr(*item.expr), item.orderby_dir);
+}
+
+struct OrderBy : public TreeNode {
+    std::vector<std::unique_ptr<OrderByItem>> items;
+
+    explicit OrderBy(std::vector<std::unique_ptr<OrderByItem>> items_)
+        : TreeNode(AstType::OrderBy), items(std::move(items_)) {}
+};
+
+inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
+    switch (expr.type) {
+    case AstType::Col: {
+        auto& col = static_cast<const Col&>(expr);
+        return clone_col(col);
+    }
+    case AstType::AggExpr: {
+        auto& agg = static_cast<const AggExpr&>(expr);
+        return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.col == nullptr ? nullptr : clone_col(*agg.col));
+    }
+    case AstType::IntLit: {
+        auto& lit = static_cast<const IntLit&>(expr);
+        return std::make_unique<IntLit>(lit.val, lit.display_text);
+    }
+    case AstType::FloatLit: {
+        auto& lit = static_cast<const FloatLit&>(expr);
+        return std::make_unique<FloatLit>(lit.val, lit.display_text);
+    }
+    case AstType::StringLit: {
+        auto& lit = static_cast<const StringLit&>(expr);
+        return std::make_unique<StringLit>(lit.val, lit.display_text);
+    }
+    case AstType::BoolLit: {
+        auto& lit = static_cast<const BoolLit&>(expr);
+        return std::make_unique<BoolLit>(lit.val, lit.display_text);
+    }
+    default:
+        throw std::logic_error("unsupported expression type for AST clone");
+    }
+}
 
 struct InsertStmt : public TreeNode {
     std::string tab_name;
@@ -312,18 +354,17 @@ struct UpdateStmt : public TreeNode {
 };
 
 struct JoinExpr : public TreeNode {
-    std::string left;
-    std::string right;
+    TableRef left;
+    TableRef right;
     std::vector<std::unique_ptr<BinaryExpr>> conds;
-    JoinType type;
+    JoinType join_type;
 
-    JoinExpr(std::string left_, std::string right_, std::vector<std::unique_ptr<BinaryExpr>> conds_, JoinType type_)
+    JoinExpr(TableRef left_, TableRef right_, std::vector<std::unique_ptr<BinaryExpr>> conds_, JoinType type_)
         : TreeNode(AstType::JoinExpr), left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)),
-          type(type_) {}
+          join_type(type_) {}
 };
 
 struct SelectStmt : public TreeNode {
-    std::vector<std::unique_ptr<Col>> cols;
     std::vector<std::unique_ptr<SelectItem>> select_items;
     std::vector<TableRef> tabs;
     std::vector<std::unique_ptr<BinaryExpr>> conds;
@@ -338,60 +379,23 @@ struct SelectStmt : public TreeNode {
     bool has_limit;
     int limit;
 
-    SelectStmt(std::vector<std::unique_ptr<Col>> cols_, std::vector<TableRef> tabs_,
-               std::vector<std::unique_ptr<BinaryExpr>> conds_, std::unique_ptr<OrderBy> order_)
-        : TreeNode(AstType::SelectStmt), cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
-          has_select_star(cols.empty()), order(std::move(order_)), has_limit(false), limit(0) {
-        for (const auto& col : cols) {
-            select_items.push_back(std::make_unique<SelectItem>(clone_col(*col), ""));
-        }
-        if (order != nullptr) {
-            order_by_items.push_back(std::make_unique<OrderByItem>(clone_col(*order->cols), order->orderby_dir));
-        }
-        has_sort = !order_by_items.empty();
-    }
-
-    // Backward compatibility: accepts vector<string> and converts to vector<TableRef>
-    SelectStmt(std::vector<std::unique_ptr<Col>> cols_, std::vector<std::string> tab_names_,
-               std::vector<std::unique_ptr<BinaryExpr>> conds_, std::unique_ptr<OrderBy> order_)
-        : TreeNode(AstType::SelectStmt), cols(std::move(cols_)), conds(std::move(conds_)),
-          has_select_star(cols.empty()), order(std::move(order_)), has_limit(false), limit(0) {
-        tabs.reserve(tab_names_.size());
-        for (auto& name : tab_names_) {
-            tabs.emplace_back(std::move(name));
-        }
-        for (const auto& col : cols) {
-            select_items.push_back(std::make_unique<SelectItem>(clone_col(*col), ""));
-        }
-        if (order != nullptr) {
-            order_by_items.push_back(std::make_unique<OrderByItem>(clone_col(*order->cols), order->orderby_dir));
-        }
-        has_sort = !order_by_items.empty();
-    }
-
     SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
                std::vector<std::unique_ptr<HavingExpr>> having_conds_,
                std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
-               bool has_select_star_)
+               bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {})
         : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
-          conds(std::move(conds_)), has_select_star(has_select_star_), group_by_cols(std::move(group_by_cols_)),
-          having_conds(std::move(having_conds_)), has_sort(!order_by_items_.empty()),
-          order_by_items(std::move(order_by_items_)), has_limit(has_limit_), limit(limit_) {
-        for (const auto& item : select_items) {
-            if (item == nullptr) {
-                continue;
+          conds(std::move(conds_)), jointree(std::move(jointree_)), has_select_star(has_select_star_),
+          group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
+          has_sort(!order_by_items_.empty()), order_by_items(std::move(order_by_items_)), has_limit(has_limit_),
+          limit(limit_) {
+        if (!order_by_items.empty()) {
+            std::vector<std::unique_ptr<OrderByItem>> order_items;
+            order_items.reserve(order_by_items.size());
+            for (const auto& item : order_by_items) {
+                order_items.push_back(clone_order_by_item(*item));
             }
-            auto col = dynamic_cast<Col*>(item->expr.get());
-            if (col != nullptr) {
-                cols.push_back(clone_col(*col));
-            }
-        }
-        if (order_by_items.size() == 1) {
-            auto order_col = dynamic_cast<Col*>(order_by_items.front()->expr.get());
-            if (order_col != nullptr) {
-                order = std::make_unique<OrderBy>(clone_col(*order_col), order_by_items.front()->orderby_dir);
-            }
+            order = std::make_unique<OrderBy>(std::move(order_items));
         }
     }
 };
@@ -406,13 +410,23 @@ struct UnionStmt : public TreeNode {
 struct SelectFromUnionStmt : public TreeNode {
     std::unique_ptr<UnionStmt> union_stmt;
     std::string alias;
+    std::unique_ptr<OrderBy> order;
     std::vector<std::unique_ptr<OrderByItem>> order_by_items;
     bool has_sort;
 
     SelectFromUnionStmt(std::unique_ptr<UnionStmt> union_stmt_, std::string alias_,
                         std::vector<std::unique_ptr<OrderByItem>> order_by_items_)
         : TreeNode(AstType::SelectFromUnionStmt), union_stmt(std::move(union_stmt_)), alias(std::move(alias_)),
-          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {}
+          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {
+        if (!order_by_items.empty()) {
+            std::vector<std::unique_ptr<OrderByItem>> order_items;
+            order_items.reserve(order_by_items.size());
+            for (const auto& item : order_by_items) {
+                order_items.push_back(clone_order_by_item(*item));
+            }
+            order = std::make_unique<OrderBy>(std::move(order_items));
+        }
+    }
 };
 
 struct ExplainAnalyze : public TreeNode {
@@ -436,11 +450,6 @@ struct SetTransaction : public TreeNode {
     IsolationLevelType isolation_level_;
 
     explicit SetTransaction(IsolationLevelType level) : TreeNode(AstType::SetTransaction), isolation_level_(level) {}
-};
-
-struct FromClause {
-    std::vector<TableRef> tables;
-    std::vector<std::unique_ptr<BinaryExpr>> conds;
 };
 
 } // namespace ast

@@ -3,8 +3,8 @@
 #include "lexer.h"
 
 #include <climits>
-#include <limits>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -17,6 +17,12 @@ using parser::TokenType;
 
 struct ParseError : public std::runtime_error {
     explicit ParseError(const std::string& message) : std::runtime_error(message) {}
+};
+
+struct FromClause {
+    std::vector<TableRef> tables;
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
+    std::vector<std::unique_ptr<JoinExpr>> jointree;
 };
 
 class SqlParser {
@@ -222,14 +228,14 @@ private:
         if (match(TokenType::DELETE)) {
             expect(TokenType::FROM, "expected FROM after DELETE");
             std::string table = parse_identifier();
-            return std::make_unique<DeleteStmt>(std::move(table), parse_opt_where_clause());
+            return std::make_unique<DeleteStmt>(std::move(table), parse_where_clause());
         }
         // UPDATE
         expect(TokenType::UPDATE, "expected DML statement");
         std::string table = parse_identifier();
         expect(TokenType::SET, "expected SET after table name");
         auto clauses = parse_set_clause_list();
-        return std::make_unique<UpdateStmt>(std::move(table), std::move(clauses), parse_opt_where_clause());
+        return std::make_unique<UpdateStmt>(std::move(table), std::move(clauses), parse_where_clause());
     }
 
     std::unique_ptr<TreeNode> parse_dql() {
@@ -237,37 +243,53 @@ private:
             expect(TokenType::ANALYZE, "expected ANALYZE after EXPLAIN");
             return std::make_unique<ExplainAnalyze>(parse_select_stmt());
         }
-        return parse_select_or_union_wrapper();
+        if (is_select_from_union_wrapper()) {
+            return parse_select_from_union();
+        }
+        return parse_select_stmt();
     }
 
-    std::unique_ptr<TreeNode> parse_select_or_union_wrapper() {
-        expect(TokenType::SELECT, "expected SELECT");
-        if (match(TokenType::STAR)) {
-            expect(TokenType::FROM, "expected FROM in SELECT");
-            if (match(TokenType::LPAREN)) {
-                auto union_stmt = parse_union_query();
-                expect(TokenType::RPAREN, "expected ')' after union query");
-                expect(TokenType::AS, "expected AS after union query");
-                std::string alias = parse_identifier();
-                auto order = parse_opt_order_clause();
-                return std::make_unique<SelectFromUnionStmt>(std::move(union_stmt), std::move(alias), std::move(order));
-            }
-            return parse_select_tail(true, {});
+    bool is_select_from_union_wrapper() {
+        if (!check(TokenType::SELECT)) {
+            return false;
         }
-        return parse_select_stmt_after_select(false);
+        auto state = lexer_.save_state();
+        Token saved_current = current_;
+
+        advance();
+        bool result = check(TokenType::STAR);
+        if (result) {
+            advance();
+            result = check(TokenType::FROM);
+        }
+        if (result) {
+            advance();
+            result = check(TokenType::LPAREN);
+        }
+
+        lexer_.restore_state(state);
+        current_ = saved_current;
+        return result;
+    }
+
+    std::unique_ptr<TreeNode> parse_select_from_union() {
+        expect(TokenType::SELECT, "expected SELECT");
+        expect(TokenType::STAR, "expected '*' before union wrapper");
+        expect(TokenType::FROM, "expected FROM before union wrapper");
+        expect(TokenType::LPAREN, "expected '(' before union query");
+        auto union_stmt = parse_union_query();
+        expect(TokenType::RPAREN, "expected ')' after union query");
+        expect(TokenType::AS, "expected AS after union query");
+        std::string alias = parse_identifier();
+        auto order = parse_opt_order_clause();
+        return std::make_unique<SelectFromUnionStmt>(std::move(union_stmt), std::move(alias), std::move(order));
     }
 
     std::unique_ptr<SelectStmt> parse_select_stmt() {
         expect(TokenType::SELECT, "expected SELECT");
-        return parse_select_stmt_after_select(false);
-    }
-
-    std::unique_ptr<SelectStmt> parse_select_stmt_after_select(bool already_consumed_star) {
-        bool has_star = already_consumed_star;
+        bool has_star = match(TokenType::STAR);
         std::vector<std::unique_ptr<SelectItem>> items;
-        if (has_star || match(TokenType::STAR)) {
-            has_star = true;
-        } else {
+        if (!has_star) {
             items = parse_select_item_list();
         }
         expect(TokenType::FROM, "expected FROM in SELECT");
@@ -277,19 +299,15 @@ private:
     std::unique_ptr<SelectStmt> parse_select_tail(bool has_star, std::vector<std::unique_ptr<SelectItem>> items) {
         auto from = parse_from_clause();
         auto conds = std::move(from->conds);
-        auto where = parse_opt_where_clause();
+        auto where = parse_where_clause();
         conds.insert(conds.end(), std::make_move_iterator(where.begin()), std::make_move_iterator(where.end()));
         auto group_by = parse_opt_group_clause();
         auto having = parse_opt_having_clause();
         auto order = parse_opt_order_clause();
-        auto limit = parse_opt_limit_clause();
-        int limit_value = 0;
-        if (limit != nullptr) {
-            limit_value = static_cast<IntLit*>(limit.get())->val;
-        }
+        auto [has_limit, limit_value] = parse_opt_limit_clause();
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
-                                            std::move(having), std::move(order), limit != nullptr, limit_value,
-                                            has_star);
+                                            std::move(having), std::move(order), has_limit, limit_value, has_star,
+                                            std::move(from->jointree));
     }
 
     std::unique_ptr<UnionStmt> parse_union_query() {
@@ -373,13 +391,26 @@ private:
 
     std::unique_ptr<IntLit> parse_int_literal(bool is_negative = false) {
         Token token = expect(TokenType::VALUE_INT, "expected integer");
-        if (token.int_value < std::numeric_limits<int>::min() || token.int_value > std::numeric_limits<int>::max()) {
+        const int64_t lower =
+            is_negative ? static_cast<int64_t>(std::numeric_limits<int>::max()) + 1 : std::numeric_limits<int>::min();
+        const int64_t upper = std::numeric_limits<int>::max();
+        if ((!is_negative && (token.int_value < lower || token.int_value > upper)) ||
+            (is_negative && (token.int_value < 0 || token.int_value > lower))) {
             error("integer literal out of range");
         }
-        int val = static_cast<int>(token.int_value);
+
+        int val = 0;
+        if (is_negative && token.int_value == lower) {
+            val = std::numeric_limits<int>::min();
+        } else {
+            val = static_cast<int>(token.int_value);
+            if (is_negative) {
+                val = -val;
+            }
+        }
+
         std::string display = token_text(token);
         if (is_negative) {
-            val = -val;
             display = "-" + display;
         }
         return std::make_unique<IntLit>(val, std::move(display));
@@ -406,14 +437,10 @@ private:
         return std::make_unique<BoolLit>(token.bool_value, token_text(token));
     }
 
-    std::vector<std::unique_ptr<BinaryExpr>> parse_opt_where_clause() {
+    std::vector<std::unique_ptr<BinaryExpr>> parse_where_clause() {
         if (!match(TokenType::WHERE)) {
             return {};
         }
-        return parse_where_clause();
-    }
-
-    std::vector<std::unique_ptr<BinaryExpr>> parse_where_clause() {
         std::vector<std::unique_ptr<BinaryExpr>> conds;
         conds.push_back(parse_condition());
         while (match(TokenType::AND)) {
@@ -425,15 +452,15 @@ private:
     std::unique_ptr<BinaryExpr> parse_condition() {
         auto lhs = parse_col();
         auto op = parse_op();
-        auto rhs = parse_expr();
+        auto rhs = parse_general_expr();
         return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
     }
 
-    std::unique_ptr<Expr> parse_expr() {
-        if (check(TokenType::IDENTIFIER)) {
-            return parse_col();
-        }
-        return parse_value();
+    std::unique_ptr<BinaryExpr> parse_general_condition() {
+        auto lhs = parse_general_expr();
+        auto op = parse_op();
+        auto rhs = parse_general_expr();
+        return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
     }
 
     SvCompOp parse_op() {
@@ -564,10 +591,8 @@ private:
     }
 
     std::unique_ptr<HavingExpr> parse_having_condition() {
-        auto lhs = parse_general_expr();
-        auto op = parse_op();
-        auto rhs = parse_general_expr();
-        return std::make_unique<HavingExpr>(std::move(lhs), op, std::move(rhs));
+        auto cond = parse_general_condition();
+        return std::make_unique<HavingExpr>(std::move(cond->lhs), cond->op, std::move(cond->rhs));
     }
 
     std::unique_ptr<Expr> parse_general_expr() {
@@ -589,8 +614,17 @@ private:
                 continue;
             }
             if (match(TokenType::JOIN)) {
-                from->tables.push_back(parse_table_ref());
+                TableRef left = from->tables.back();
+                TableRef right = parse_table_ref();
+                from->tables.push_back(right);
                 auto join_conds = parse_opt_join_on_clause();
+                std::vector<std::unique_ptr<BinaryExpr>> join_tree_conds;
+                join_tree_conds.reserve(join_conds.size());
+                for (const auto& cond : join_conds) {
+                    join_tree_conds.push_back(clone_binary_expr(*cond));
+                }
+                from->jointree.push_back(std::make_unique<JoinExpr>(std::move(left), std::move(right),
+                                                                    std::move(join_tree_conds), INNER_JOIN));
                 from->conds.insert(from->conds.end(), std::make_move_iterator(join_conds.begin()),
                                    std::make_move_iterator(join_conds.end()));
                 continue;
@@ -615,7 +649,12 @@ private:
         if (!match(TokenType::ON)) {
             return {};
         }
-        return parse_where_clause();
+        std::vector<std::unique_ptr<BinaryExpr>> conds;
+        conds.push_back(parse_condition());
+        while (match(TokenType::AND)) {
+            conds.push_back(parse_condition());
+        }
+        return conds;
     }
 
     std::vector<std::unique_ptr<OrderByItem>> parse_opt_order_clause() {
@@ -642,12 +681,12 @@ private:
         return std::make_unique<OrderByItem>(std::move(expr), dir);
     }
 
-    std::unique_ptr<Value> parse_opt_limit_clause() {
+    std::pair<bool, int> parse_opt_limit_clause() {
         if (!match(TokenType::LIMIT)) {
-            return nullptr;
+            return {false, 0};
         }
         auto lit = parse_int_literal();
-        return std::unique_ptr<Value>(std::move(lit));
+        return {true, lit->val};
     }
 
     std::string parse_identifier() {

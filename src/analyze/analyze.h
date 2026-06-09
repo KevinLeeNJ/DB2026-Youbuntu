@@ -25,7 +25,6 @@ See the Mulan PSL v2 for more details. */
 class Query {
 public:
     std::unique_ptr<ast::TreeNode> parse;
-    // TODO jointree
     // where条件
     std::vector<Condition> conds;
     // 投影列

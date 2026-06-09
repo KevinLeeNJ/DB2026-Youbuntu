@@ -1,7 +1,9 @@
 #include "lexer.h"
-#include <cstdlib>
+
+#include <cerrno>
 #include <cctype>
-#include <stdexcept>
+#include <cstdlib>
+#include <limits>
 
 namespace parser {
 
@@ -88,7 +90,7 @@ void Lexer::skip_whitespace_and_comments() {
     while (pos_ < input_.size()) {
         char c = current_char();
 
-        if (std::isspace(c)) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
             advance();
         } else if (c == '-' && peek_char() == '-') {
             skip_line_comment();
@@ -107,6 +109,8 @@ void Lexer::skip_line_comment() {
 }
 
 void Lexer::skip_block_comment() {
+    int start_line = line_;
+    int start_col = column_;
     advance(2); // skip /*
     while (pos_ < input_.size()) {
         if (current_char() == '*' && peek_char() == '/') {
@@ -115,6 +119,8 @@ void Lexer::skip_block_comment() {
         }
         advance();
     }
+    throw LexerError("Lexer Error at line " + std::to_string(start_line) + " column " + std::to_string(start_col) +
+                     ": unterminated block comment");
 }
 
 Token Lexer::next_token() {
@@ -132,12 +138,12 @@ Token Lexer::next_token() {
     char c = current_char();
 
     // Identifier or keyword
-    if (std::isalpha(c) || c == '_') {
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
         return scan_identifier_or_keyword();
     }
 
     // Number
-    if (std::isdigit(c)) {
+    if (std::isdigit(static_cast<unsigned char>(c))) {
         return scan_number();
     }
 
@@ -158,6 +164,18 @@ Token Lexer::peek_token() {
     return peeked_;
 }
 
+Lexer::LexerState Lexer::save_state() const {
+    return LexerState{pos_, line_, column_, peeked_, has_peeked_};
+}
+
+void Lexer::restore_state(const LexerState& state) {
+    pos_ = state.pos;
+    line_ = state.line;
+    column_ = state.column;
+    peeked_ = state.peeked;
+    has_peeked_ = state.has_peeked;
+}
+
 Token Lexer::scan_identifier_or_keyword() {
     int start_line = line_;
     int start_col = column_;
@@ -165,7 +183,7 @@ Token Lexer::scan_identifier_or_keyword() {
 
     while (pos_ < input_.size()) {
         char c = current_char();
-        if (std::isalnum(c) || c == '_') {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
             advance();
         } else {
             break;
@@ -194,7 +212,7 @@ Token Lexer::scan_number() {
 
     while (pos_ < input_.size()) {
         char c = current_char();
-        if (std::isdigit(c)) {
+        if (std::isdigit(static_cast<unsigned char>(c))) {
             advance();
         } else if (c == '.' && !has_dot) {
             has_dot = true;
@@ -227,8 +245,8 @@ Token Lexer::scan_string() {
     }
 
     if (pos_ >= input_.size()) {
-        throw std::runtime_error("Lexer Error at line " + std::to_string(start_line) + " column " +
-                                 std::to_string(start_col) + ": unterminated string literal");
+        throw LexerError("Lexer Error at line " + std::to_string(start_line) + " column " + std::to_string(start_col) +
+                         ": unterminated string literal");
     }
 
     std::string_view text = input_.substr(start_pos, pos_ - start_pos);
@@ -292,11 +310,29 @@ Token Lexer::scan_operator() {
 }
 
 int64_t Lexer::parse_integer(std::string_view text) {
-    return std::strtoll(std::string(text).c_str(), nullptr, 10);
+    int64_t value = 0;
+    for (char c : text) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            throw LexerError("Lexer Error: integer literal malformed");
+        }
+        int digit = c - '0';
+        if (value > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+            throw LexerError("Lexer Error: integer literal out of range");
+        }
+        value = value * 10 + digit;
+    }
+    return value;
 }
 
 double Lexer::parse_float(std::string_view text) {
-    return std::strtod(std::string(text).c_str(), nullptr);
+    std::string owned(text);
+    char* end = nullptr;
+    errno = 0;
+    double value = std::strtod(owned.c_str(), &end);
+    if (errno == ERANGE || end != owned.c_str() + owned.size()) {
+        throw LexerError("Lexer Error: float literal out of range or malformed");
+    }
+    return value;
 }
 
 } // namespace parser

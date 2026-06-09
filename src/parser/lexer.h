@@ -4,11 +4,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 
 namespace parser {
+
+struct LexerError : public std::runtime_error {
+    explicit LexerError(const std::string& message) : std::runtime_error(message) {}
+};
 
 struct CIHash {
     size_t operator()(std::string_view s) const {
@@ -138,8 +143,18 @@ class Lexer {
 public:
     explicit Lexer(std::string_view input);
 
+    struct LexerState {
+        size_t pos;
+        int line;
+        int column;
+        Token peeked;
+        bool has_peeked;
+    };
+
     Token next_token();
     Token peek_token();
+    LexerState save_state() const;
+    void restore_state(const LexerState& state);
 
     int current_line() const {
         return line_;
