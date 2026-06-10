@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <signal.h>
 #include <unistd.h>
 #include <atomic>
+#include <thread>
 
 #include "errors.h"
 #include "minilog.h"
@@ -41,12 +42,11 @@ auto lock_manager = std::make_unique<LockManager>();
 auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
-auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), nullptr);
+auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
 auto log_manager = std::make_unique<LogManager>(disk_manager.get());
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get());
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
-pthread_mutex_t* sockfd_mutex;
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -68,15 +68,12 @@ void SetTransaction(txn_id_t* txn_id, Context* context) {
     }
 }
 
-void* client_handler(void* sock_fd) {
-    int fd = *((int*)sock_fd);
-    pthread_mutex_unlock(sockfd_mutex);
-
+void client_handler(int fd) {
     int i_recvBytes;
     // 接收客户端发送的请求
     char data_recv[BUFFER_LENGTH];
     // 需要返回给客户端的结果
-    char* data_send = new char[BUFFER_LENGTH];
+    char data_send[BUFFER_LENGTH];
     // 需要返回给客户端的结果的长度
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
@@ -110,6 +107,7 @@ void* client_handler(void* sock_fd) {
         if (strcmp(data_recv, "crash") == 0) {
             LOG_ERROR("server crash command received from sockfd: %d", fd);
             minilog::Logger::get().flush();
+            log_manager->flush_log_to_disk_with_sync();
             exit(1);
         }
 
@@ -117,8 +115,9 @@ void* client_handler(void* sock_fd) {
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        Context* context =
-            new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset, txn_manager.get());
+        auto _context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset,
+                                                  txn_manager.get());
+        Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
 
         try {
@@ -146,6 +145,7 @@ void* client_handler(void* sock_fd) {
                         context->txn_->get_state() != TransactionState::ABORTED) {
                         txn_manager->commit(context->txn_, context->log_mgr_);
                     }
+                    context->txn_ = nullptr;
                 } catch (TransactionAbortException& e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     std::string str = "abort\n";
@@ -158,6 +158,7 @@ void* client_handler(void* sock_fd) {
                         context->txn_->get_state() != TransactionState::COMMITTED) {
                         txn_manager->abort(context->txn_, log_manager.get());
                     }
+                    context->txn_ = nullptr;
                     LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
                     std::fstream outfile;
@@ -178,6 +179,7 @@ void* client_handler(void* sock_fd) {
                         context->txn_->get_state() != TransactionState::ABORTED) {
                         txn_manager->abort(context->txn_, context->log_mgr_);
                     }
+                    context->txn_ = nullptr;
 
                     // 将报错信息写入output.txt
                     std::fstream outfile;
@@ -195,6 +197,7 @@ void* client_handler(void* sock_fd) {
                 context->txn_->get_state() != TransactionState::ABORTED) {
                 txn_manager->abort(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
 
             const char* msg = e.what();
             int msg_len = strlen(msg);
@@ -217,15 +220,11 @@ void* client_handler(void* sock_fd) {
 
     // Clear
     LOG_INFO("terminating client connection, sockfd: %d", fd);
-    close(fd);          // close a file descriptor.
-    pthread_exit(NULL); // terminate calling thread!
+    close(fd); // close a file descriptor.
+    return;    // terminate calling thread!
 }
 
 void start_server() {
-    // init mutex
-    sockfd_mutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init(sockfd_mutex, nullptr);
-
     int sockfd_server;
     int fd_temp;
     struct sockaddr_in s_addr_in {};
@@ -257,7 +256,6 @@ void start_server() {
 
     while (!should_exit) {
         LOG_DEBUG("waiting for new connection");
-        pthread_t thread_id;
         struct sockaddr_in s_addr_client {};
         int client_length = sizeof(s_addr_client);
 
@@ -267,7 +265,6 @@ void start_server() {
         }
 
         // Block here. Until server accepts a new connection.
-        pthread_mutex_lock(sockfd_mutex);
         int sockfd = accept(sockfd_server, (struct sockaddr*)(&s_addr_client), (socklen_t*)(&client_length));
         if (sockfd == -1) {
             LOG_WARN("accept failed: %s", strerror(errno));
@@ -275,10 +272,7 @@ void start_server() {
         }
 
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        if (pthread_create(&thread_id, nullptr, &client_handler, (void*)(&sockfd)) != 0) {
-            LOG_ERROR("create client handler thread failed");
-            break; // break while loop
-        }
+        std::thread(client_handler, sockfd).detach();
     }
 
     // Clear

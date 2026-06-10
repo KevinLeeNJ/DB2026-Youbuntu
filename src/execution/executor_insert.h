@@ -141,7 +141,7 @@ public:
             throw;
         }
         if (context_ != nullptr && context_->txn_ != nullptr) {
-            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
+            context_->txn_->append_write_record(std::make_unique<WriteRecord>(WType::INSERT_TUPLE, tab_name_, rid_));
             // Initialize TupleMeta for MVCC
             TupleMeta meta;
             meta.writer_txn_id_ = context_->txn_->get_transaction_id();

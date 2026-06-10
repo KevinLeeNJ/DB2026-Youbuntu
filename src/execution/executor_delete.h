@@ -89,9 +89,9 @@ public:
                 lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
                 context_->txn_->set_prev_lsn(lsn);
             }
-            auto* undo_record = context_ != nullptr && context_->txn_ != nullptr
-                                    ? new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec)
-                                    : nullptr;
+            auto undo_record = context_ != nullptr && context_->txn_ != nullptr
+                                   ? std::make_unique<WriteRecord>(WType::DELETE_TUPLE, tab_name_, rid, *rec)
+                                   : nullptr;
             struct DeletedIndex {
                 const IndexMeta* index;
                 std::vector<char> key;
@@ -119,7 +119,7 @@ public:
                             .get();
                     ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                 }
-                delete undo_record;
+                // undo_record is automatically cleaned up by unique_ptr
                 throw;
             }
             if (undo_record != nullptr) {
@@ -130,8 +130,7 @@ public:
                 undo.prev_version_ = undo.old_meta_.version_chain_head_;
                 UndoLink undo_link = context_->txn_->AppendUndoLog(undo);
 
-                context_->txn_->append_write_record(undo_record);
-                undo_record = nullptr;
+                context_->txn_->append_write_record(std::move(undo_record));
                 context_->txn_->append_modified_slot(tab_name_, rid);
 
                 TupleMeta tombstone;

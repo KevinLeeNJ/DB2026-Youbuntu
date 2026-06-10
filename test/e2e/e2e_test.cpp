@@ -188,6 +188,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager_->commit(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     void abort_implicit_statement(Context* context) {
@@ -196,6 +197,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager_->abort(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     std::string db_name_;

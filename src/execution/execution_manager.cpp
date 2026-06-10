@@ -117,6 +117,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             if (context->txn_ != nullptr) {
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
             break;
         }
         case T_Transaction_rollback: {
@@ -124,6 +125,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             if (context->txn_ != nullptr) {
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
             break;
         }
         case T_Transaction_abort: {
@@ -131,6 +133,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             if (context->txn_ != nullptr) {
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
             break;
         }
         default:

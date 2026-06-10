@@ -141,7 +141,8 @@ public:
                     context_->txn_->set_prev_lsn(lsn);
                 }
                 if (context_ != nullptr && context_->txn_ != nullptr) {
-                    context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
+                    context_->txn_->append_write_record(
+                        std::make_unique<WriteRecord>(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
 
                     // Save old version as undo log for MVCC version chain
                     UndoLog undo;

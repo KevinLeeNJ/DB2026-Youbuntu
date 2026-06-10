@@ -284,6 +284,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             db_->txn()->commit(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     void abort_statement(Context* context) {
@@ -292,6 +293,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             db_->txn()->abort(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     void handle_abort(Context* context) {
@@ -299,6 +301,7 @@ private:
             context->txn_->get_state() != TransactionState::COMMITTED) {
             db_->txn()->abort(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     SharedTestDB* db_;
