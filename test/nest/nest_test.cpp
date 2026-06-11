@@ -78,18 +78,18 @@ protected:
     void execute(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
-        auto plan = planner_->do_planner(query, nullptr);
-        auto portal_stmt = portal_->start(plan, nullptr);
+        auto plan = planner_->do_planner(std::move(query), nullptr);
+        auto portal_stmt = portal_->start(std::move(plan), nullptr);
         QlManager ql_mgr(sm_manager_.get(), txn_manager_.get(), planner_.get());
         txn_id_t txn = 0;
-        portal_->run(portal_stmt, &ql_mgr, &txn, nullptr);
+        portal_->run(std::move(portal_stmt), &ql_mgr, &txn, nullptr);
     }
 
     std::vector<std::vector<std::string>> select(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
-        auto plan = planner_->do_planner(query, nullptr);
-        auto portal_stmt = portal_->start(plan, nullptr);
+        auto plan = planner_->do_planner(std::move(query), nullptr);
+        auto portal_stmt = portal_->start(std::move(plan), nullptr);
 
         std::vector<std::vector<std::string>> rows;
         if (portal_stmt->tag == PORTAL_ONE_SELECT) {
@@ -127,16 +127,16 @@ protected:
     std::string explain_analyze(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
-        auto plan = planner_->do_planner(query, nullptr);
-        auto portal_stmt = portal_->start(plan, nullptr);
+        auto plan = planner_->do_planner(std::move(query), nullptr);
+        auto portal_stmt = portal_->start(std::move(plan), nullptr);
 
         if (portal_stmt->tag == PORTAL_EXPLAIN_ANALYZE) {
             for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
                 (void)portal_stmt->root->Next();
             }
-            auto dml = std::static_pointer_cast<DMLPlan>(portal_stmt->plan);
+            auto* dml = static_cast<DMLPlan*>(portal_stmt->plan.get());
             std::ostringstream out;
-            Portal::render_explain_plan(dml->subplan_, 0, out);
+            Portal::render_explain_plan(dml->subplan_.get(), 0, out);
             return out.str();
         }
         return "";

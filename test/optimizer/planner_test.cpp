@@ -51,8 +51,8 @@ QueryExpr make_count_star_expr() {
     return expr;
 }
 
-std::shared_ptr<Query> make_aggregate_query(bool with_sort, bool with_limit) {
-    auto query = std::make_shared<Query>();
+std::unique_ptr<Query> make_aggregate_query(bool with_sort, bool with_limit) {
+    auto query = std::make_unique<Query>();
     query->parse = std::make_unique<ast::SelectStmt>(
         std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("grade", "")},
         std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
@@ -115,14 +115,14 @@ protected:
 TEST_F(PlannerAggregateTest, generate_select_plan_builds_aggregate_projection_shape) {
     auto query = make_aggregate_query(false, false);
 
-    auto plan = planner_.generate_select_plan(query, nullptr);
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
 
     ASSERT_NE(plan, nullptr);
     EXPECT_EQ(plan->tag, T_Projection);
-    auto projection = std::static_pointer_cast<ProjectionPlan>(plan);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
     ASSERT_NE(projection->subplan_, nullptr);
     EXPECT_EQ(projection->subplan_->tag, T_Aggregate);
-    auto aggregate = std::static_pointer_cast<AggregatePlan>(projection->subplan_);
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
     ASSERT_NE(aggregate->subplan_, nullptr);
     EXPECT_EQ(aggregate->subplan_->tag, T_SeqScan);
     ASSERT_EQ(aggregate->group_by_cols_.size(), 1);
@@ -135,17 +135,17 @@ TEST_F(PlannerAggregateTest, generate_select_plan_builds_aggregate_projection_sh
 TEST_F(PlannerAggregateTest, generate_select_plan_pushes_limit_into_sort_over_projection_and_aggregate) {
     auto query = make_aggregate_query(true, true);
 
-    auto plan = planner_.generate_select_plan(query, nullptr);
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
 
     ASSERT_NE(plan, nullptr);
     EXPECT_EQ(plan->tag, T_Sort);
-    auto sort = std::static_pointer_cast<SortPlan>(plan);
+    auto* sort = static_cast<SortPlan*>(plan.get());
     EXPECT_EQ(sort->limit_, 5);
     ASSERT_NE(sort->subplan_, nullptr);
     EXPECT_EQ(sort->subplan_->tag, T_Projection);
-    auto projection = std::static_pointer_cast<ProjectionPlan>(sort->subplan_);
+    auto* projection = static_cast<ProjectionPlan*>(sort->subplan_.get());
     ASSERT_NE(projection->subplan_, nullptr);
     EXPECT_EQ(projection->subplan_->tag, T_Aggregate);
-    auto aggregate = std::static_pointer_cast<AggregatePlan>(projection->subplan_);
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
     EXPECT_EQ(aggregate->subplan_->tag, T_SeqScan);
 }

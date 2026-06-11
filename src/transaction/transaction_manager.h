@@ -219,7 +219,7 @@ public:
     /** 保护版本信息 */
     std::shared_mutex version_info_mutex_;
     /** 存储表堆中每个元组的先前版本。 */
-    std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
+    std::unordered_map<page_id_t, std::unique_ptr<PageVersionInfo>> version_info_;
 
 private:
     ConcurrencyMode concurrency_mode_;           // 事务使用的并发控制算法，目前只需要考虑2PL

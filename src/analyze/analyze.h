@@ -40,7 +40,7 @@ public:
     bool has_select_star = false;
     std::vector<std::string> output_names;
     bool is_union = false;
-    std::vector<std::shared_ptr<Query>> union_branches;
+    std::vector<std::unique_ptr<Query>> union_branches;
     std::vector<ColMeta> union_cols;
     std::string union_alias;
     // 表名
@@ -67,7 +67,7 @@ public:
     Analyze(SmManager* sm_manager) : sm_manager_(sm_manager) {}
     ~Analyze() {}
 
-    std::shared_ptr<Query> do_analyze(std::unique_ptr<ast::TreeNode> root);
+    std::unique_ptr<Query> do_analyze(std::unique_ptr<ast::TreeNode> root);
 
 private:
     TabCol check_column(const std::vector<ColMeta>& all_cols, TabCol target);
@@ -87,9 +87,9 @@ private:
         return false;
     }
 
-    std::shared_ptr<Query> analyze_select_stmt(const ast::SelectStmt* select,
+    std::unique_ptr<Query> analyze_select_stmt(const ast::SelectStmt* select,
                                                std::unique_ptr<ast::TreeNode> owner = nullptr);
-    std::shared_ptr<Query> analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select,
+    std::unique_ptr<Query> analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select,
                                                           std::unique_ptr<ast::TreeNode> owner);
     std::vector<ColMeta> get_query_output_metas(const Query& query);
     ColMeta make_union_col_meta(const ColMeta& current, const ColMeta& next);

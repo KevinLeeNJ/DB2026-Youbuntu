@@ -86,9 +86,9 @@ void populate_table_refs(Query& query, const std::vector<ast::TableRef>& table_r
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
  * @param {unique_ptr<ast::TreeNode>} parse parser生成的结果集
- * @return {shared_ptr<Query>} Query
+ * @return {unique_ptr<Query>} Query
  */
-std::shared_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse) {
+std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse) {
     auto* root = parse.get();
     if (root == nullptr) {
         throw InternalError("Unexpected null AST root");
@@ -109,14 +109,14 @@ std::shared_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
 
     if (root->type == ast::AstType::SetTransaction) {
         auto x = static_cast<const ast::SetTransaction*>(root);
-        auto query = std::make_shared<Query>();
+        auto query = std::make_unique<Query>();
         query->is_set_transaction = true;
         query->set_isolation_level = x->isolation_level_;
         query->parse = std::move(parse);
         return query;
     }
 
-    std::shared_ptr<Query> query = std::make_shared<Query>();
+    auto query = std::make_unique<Query>();
     switch (root->type) {
     case ast::AstType::UpdateStmt: {
         auto x = static_cast<const ast::UpdateStmt*>(root);
@@ -152,8 +152,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     return query;
 }
 
-std::shared_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner) {
-    std::shared_ptr<Query> query = std::make_shared<Query>();
+std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner) {
+    auto query = std::make_unique<Query>();
     populate_table_refs(*query, x->tabs);
 
     for (const auto& tab_name : query->tables) {
@@ -255,13 +255,13 @@ void Analyze::validate_union_order_by(Query& query) {
     }
 }
 
-std::shared_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* x,
+std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* x,
                                                                std::unique_ptr<ast::TreeNode> owner) {
     if (x->union_stmt == nullptr || x->union_stmt->branches.size() < 2) {
         throw RMDBError("UNION requires at least two SELECT branches");
     }
 
-    auto query = std::make_shared<Query>();
+    auto query = std::make_unique<Query>();
     query->is_union = true;
     query->parse = std::move(owner);
     query->union_alias = x->alias;

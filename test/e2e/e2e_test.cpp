@@ -136,10 +136,10 @@ public:
 
         // Analyze → Optimize → Portal → Execute
         try {
-            std::shared_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
-            std::shared_ptr<Plan> plan = optimizer_->plan_query(query, &context);
-            std::shared_ptr<PortalStmt> portal_stmt = portal_->start(plan, &context);
-            portal_->run(portal_stmt, ql_manager_.get(), &txn_id_, &context);
+            std::unique_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
+            std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query), &context);
+            std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
+            portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
             portal_->drop();
             finish_statement(&context);
         } catch (...) {

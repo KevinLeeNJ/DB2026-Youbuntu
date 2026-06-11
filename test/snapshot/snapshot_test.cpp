@@ -216,10 +216,10 @@ public:
         }
 
         try {
-            std::shared_ptr<Query> query = db_->analyze()->do_analyze(std::move(parse_tree));
-            std::shared_ptr<Plan> plan = db_->optimizer()->plan_query(query, &context);
-            std::shared_ptr<PortalStmt> portal_stmt = db_->portal()->start(plan, &context);
-            db_->portal()->run(portal_stmt, db_->ql(), &txn_id_, &context);
+            std::unique_ptr<Query> query = db_->analyze()->do_analyze(std::move(parse_tree));
+            std::unique_ptr<Plan> plan = db_->optimizer()->plan_query(std::move(query), &context);
+            std::unique_ptr<PortalStmt> portal_stmt = db_->portal()->start(std::move(plan), &context);
+            db_->portal()->run(std::move(portal_stmt), db_->ql(), &txn_id_, &context);
             db_->portal()->drop();
             // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
             session_isolation_ = context.isolation_level_;

@@ -130,13 +130,13 @@ void client_handler(int fd) {
                         SetTransaction(&txn_id, context);
                     }
                     // analyze and rewrite
-                    std::shared_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
+                    std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
                     LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                     // 优化器
-                    std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+                    std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), context);
                     // portal
-                    std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
-                    portal->run(portalStmt, ql_manager.get(), &txn_id, context);
+                    std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
+                    portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
                     // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
                     session_isolation_level = context->isolation_level_;
                     portal->drop();
