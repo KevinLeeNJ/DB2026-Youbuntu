@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
@@ -66,6 +67,14 @@ public:
 
     void abort(Transaction* txn, LogManager* log_manager);
 
+    void block_new_transactions_for_checkpoint();
+
+    void unblock_new_transactions_after_checkpoint();
+
+    std::unordered_map<txn_id_t, lsn_t> wait_active_transactions_drained_for_checkpoint();
+
+    std::unordered_map<txn_id_t, lsn_t> get_active_txn_lsn_snapshot();
+
     ConcurrencyMode get_concurrency_mode() {
         return concurrency_mode_;
     }
@@ -91,7 +100,7 @@ public:
         auto it = TransactionManager::txn_map.find(txn_id);
         if (it == TransactionManager::txn_map.end())
             return nullptr;
-        auto* res = it->second;
+        auto* res = it->second.get();
         lock.unlock();
         assert(res != nullptr);
         // Note: MVCC undo chain traversal may access other threads' transactions
@@ -99,7 +108,8 @@ public:
         return res;
     }
 
-    static std::unordered_map<txn_id_t, Transaction*> txn_map; // 全局事务表，存放事务ID与事务对象的映射关系
+    static std::unordered_map<txn_id_t, std::unique_ptr<Transaction>>
+        txn_map; // 全局事务表，存放事务ID与事务对象的映射关系
     std::shared_mutex txn_map_mutex_;
     /** ------------------------以下函数仅可能在MVCC当中使用------------------------------------------*/
 
@@ -190,6 +200,11 @@ public:
     /** @brief Clean up SSI state for an aborted/rolled-back transaction. */
     void CleanupSsiState(txn_id_t txn_id);
 
+    size_t DebugSsiWriteCount();
+    size_t DebugActiveRecordReaderKeyCount();
+    size_t DebugActivePredicateTableCount();
+    size_t DebugTxnMapSize();
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
@@ -204,7 +219,7 @@ public:
     /** 保护版本信息 */
     std::shared_mutex version_info_mutex_;
     /** 存储表堆中每个元组的先前版本。 */
-    std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
+    std::unordered_map<page_id_t, std::unique_ptr<PageVersionInfo>> version_info_;
 
 private:
     ConcurrencyMode concurrency_mode_;           // 事务使用的并发控制算法，目前只需要考虑2PL
@@ -217,7 +232,32 @@ private:
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
 
+    std::mutex checkpoint_latch_;
+    std::condition_variable checkpoint_cv_;
+    bool checkpoint_blocking_new_txns_{false};
+    int active_txn_count_{0};
+    std::unordered_set<txn_id_t> active_txn_ids_;
+
     // ---- SSI State (centralized) — protected by latch_ ----
+    struct SsiRecordKey {
+        std::string tab_name_;
+        int page_no_;
+        int slot_no_;
+
+        bool operator==(const SsiRecordKey& other) const {
+            return tab_name_ == other.tab_name_ && page_no_ == other.page_no_ && slot_no_ == other.slot_no_;
+        }
+    };
+
+    struct SsiRecordKeyHash {
+        size_t operator()(const SsiRecordKey& key) const {
+            size_t h = std::hash<std::string>{}(key.tab_name_);
+            h ^= std::hash<int>{}(key.page_no_) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>{}(key.slot_no_) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
     struct SsiWriteEntry {
         txn_id_t txn_id_;
         std::string tab_name_;
@@ -234,8 +274,38 @@ private:
     };
     std::vector<SsiRecordReadEntry> ssi_record_reads_;
 
+    std::unordered_set<txn_id_t> active_serializable_txns_;
+    std::unordered_map<SsiRecordKey, std::unordered_set<txn_id_t>, SsiRecordKeyHash> active_record_readers_;
+    std::unordered_map<txn_id_t, std::vector<SsiRecordKey>> txn_record_read_keys_;
+    std::unordered_map<std::string, std::unordered_set<txn_id_t>> active_predicate_readers_by_table_;
+    std::unordered_map<txn_id_t, std::vector<std::string>> txn_predicate_read_tables_;
+    std::unordered_map<std::string, std::vector<SsiWriteEntry>> recent_writes_by_table_;
+    uint64_t commits_since_full_ssi_prune_{0};
+
     // reader -> {writers} (rw anti-dependency edges)
     std::unordered_map<txn_id_t, std::unordered_set<txn_id_t>> rw_edges_;
+
+    SsiRecordKey MakeSsiRecordKey(const std::string& tab_name, const Rid& rid) const;
+
+    bool HasActiveSsiReadersForWriteUnlocked(const std::string& tab_name, const SsiRecordKey& key) const;
+    bool HasOtherActivePredicateReadersUnlocked(const std::string& tab_name, txn_id_t writer) const;
+    bool HasOtherActiveSerializableTxnUnlocked(txn_id_t writer) const;
+    bool HasActiveSerializableOverlapUnlocked(Transaction* txn);
+
+    size_t RecentWriteCountUnlocked() const;
+    size_t RwEdgeCountUnlocked() const;
+
+    void CleanupTxnReadIndexesUnlocked(txn_id_t txn_id);
+    void CleanupTxnRwEdgesUnlocked(txn_id_t txn_id);
+    void CleanupTxnRecentWritesUnlocked(txn_id_t txn_id);
+    void CleanupTxnSsiState(txn_id_t txn_id);
+    bool ShouldRunFullSsiPruneUnlocked() const;
+
+    bool TransactionHasSsiStateUnlocked(txn_id_t txn_id) const;
+    bool TransactionHasRetainedSsiStateUnlocked(txn_id_t txn_id) const;
+    bool TransactionHasUndoNeededByVersionChain(Transaction* txn) const;
+    bool CanRetireTransactionUnlocked(Transaction* txn) const;
+    void RetireTransactionIfSafe(Transaction* txn);
 
     bool TransactionsOverlap(Transaction* lhs, Transaction* rhs);
 

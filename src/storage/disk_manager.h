@@ -69,6 +69,12 @@ public:
 
     void write_log(char* log_data, int size);
 
+    void fsync_log();
+
+    void SetLogOffset(int log_offset) {
+        log_offset_ = log_offset;
+    }
+
     void SetLogFd(int log_fd) {
         log_fd_ = log_fd;
     }
@@ -102,6 +108,7 @@ private:
     std::unordered_map<std::string, int> path2fd_; //<Page文件磁盘路径,Page fd>哈希表
     std::unordered_map<int, std::string> fd2path_; //<Page fd,Page文件磁盘路径>哈希表
 
-    int log_fd_ = -1; // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    int log_fd_ = -1;    // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    int log_offset_ = 0; // 日志文件追加偏移
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0
 };

@@ -1,0 +1,27 @@
+statement ok
+create table ckpt_t (id int, v int);
+
+statement ok
+insert into ckpt_t values (1, 10);
+
+statement ok
+create static_checkpoint;
+
+statement ok
+begin;
+
+statement error
+create static_checkpoint;
+
+statement ok
+rollback;
+
+query II
+select * from ckpt_t;
+----
++------------------+------------------+
+|               id |                v |
++------------------+------------------+
+|                1 |               10 |
++------------------+------------------+
+Total record(s): 1

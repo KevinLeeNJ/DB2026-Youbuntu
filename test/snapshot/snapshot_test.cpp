@@ -170,9 +170,6 @@ public:
         return analyze_.get();
     }
 
-    // ---- Mutex for shared parser state (yyparse is not reentrant) ----
-    std::mutex parser_mutex_;
-
 private:
     std::string db_name_;
     std::string original_cwd_;
@@ -212,27 +209,17 @@ public:
         context.isolation_level_ = session_isolation_;
         setup_transaction(&context);
 
-        {
-            std::lock_guard<std::mutex> lock(db_->parser_mutex_);
-            YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-            if (yyparse() != 0) {
-                yy_delete_buffer(buf);
-                abort_statement(&context);
-                throw RMDBError("Parse error: " + sql);
-            }
-            if (ast::parse_tree == nullptr) {
-                yy_delete_buffer(buf);
-                finish_statement(&context);
-                return "";
-            }
-            yy_delete_buffer(buf);
+        auto parse_tree = ast::parse_sql(sql);
+        if (parse_tree == nullptr) {
+            finish_statement(&context);
+            return "";
         }
 
         try {
-            std::shared_ptr<Query> query = db_->analyze()->do_analyze(ast::parse_tree);
-            std::shared_ptr<Plan> plan = db_->optimizer()->plan_query(query, &context);
-            std::shared_ptr<PortalStmt> portal_stmt = db_->portal()->start(plan, &context);
-            db_->portal()->run(portal_stmt, db_->ql(), &txn_id_, &context);
+            std::unique_ptr<Query> query = db_->analyze()->do_analyze(std::move(parse_tree));
+            std::unique_ptr<Plan> plan = db_->optimizer()->plan_query(std::move(query), &context);
+            std::unique_ptr<PortalStmt> portal_stmt = db_->portal()->start(std::move(plan), &context);
+            db_->portal()->run(std::move(portal_stmt), db_->ql(), &txn_id_, &context);
             db_->portal()->drop();
             // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
             session_isolation_ = context.isolation_level_;
@@ -297,6 +284,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             db_->txn()->commit(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     void abort_statement(Context* context) {
@@ -305,6 +293,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             db_->txn()->abort(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     void handle_abort(Context* context) {
@@ -312,6 +301,7 @@ private:
             context->txn_->get_state() != TransactionState::COMMITTED) {
             db_->txn()->abort(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     SharedTestDB* db_;
@@ -342,6 +332,43 @@ protected:
     std::unique_ptr<SharedTestDB> db_;
 };
 
+TEST_F(SnapshotTest, SER_PureAutoCommitInsertsDoNotRetainSsiHistory) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table lifecycle_insert (id int, val int);"));
+
+    constexpr int kInsertCount = 2000;
+    for (int i = 0; i < kInsertCount; ++i) {
+        ASSERT_TRUE(s->exec_sql_ok("insert into lifecycle_insert values (" + std::to_string(i) + ", " +
+                                   std::to_string(i * 10) + ");"));
+    }
+
+    EXPECT_EQ(db_->txn()->DebugSsiWriteCount(), 0);
+    EXPECT_LE(db_->txn()->DebugTxnMapSize(), 2);
+}
+
+TEST_F(SnapshotTest, SER_LatePredicateReadSeesOverlappingCommittedInsert) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table late_predicate (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into late_predicate values (1, 100);"));
+
+    auto t1 = create_session();
+    auto t2 = create_session();
+
+    ASSERT_TRUE(t1->exec_sql_ok("set transaction isolation level serializable;"));
+    ASSERT_TRUE(t1->exec_sql_ok("begin;"));
+
+    ASSERT_TRUE(t2->exec_sql_ok("set transaction isolation level serializable;"));
+    ASSERT_TRUE(t2->exec_sql_ok("begin;"));
+    ASSERT_TRUE(t2->exec_sql_ok("select * from late_predicate where id = 1;"));
+    ASSERT_TRUE(t2->exec_sql_ok("insert into late_predicate values (2, 200);"));
+    ASSERT_TRUE(t2->exec_sql_ok("commit;"));
+
+    ASSERT_TRUE(t1->exec_sql_ok("select * from late_predicate where id = 2;"));
+    std::string abort = t1->exec_sql_expect_abort("update late_predicate set val = 101 where id = 1;");
+    EXPECT_EQ(TestSession::trim_output(abort), "abort")
+        << "T1 must see T2's overlapping committed insert as an invisible predicate write";
+}
+
 // =============================================================================
 // Example 1: Write-Write Conflict (SI and SER — same result)
 // From: .doc/Snapshot.md 示例一, docs/测试说明文档2026.pdf pp.22-24
@@ -362,7 +389,7 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
     SimpleThreadBarrier barrier(2);
 
     std::string t1_output, t2_output, t3_output;
-    bool t1_ok = true, t2_ok = true, t3_ok = true;
+    bool t1_ok = true, t2_ok = true;
 
     // ---- Thread T1 ----
     std::thread th1([&]() {
@@ -1897,6 +1924,76 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_UncommittedUniqueKeyUpdateThenInsertO
                            "+------------------+------------------+\n"
                            "Total record(s): 1";
     EXPECT_EQ(TestSession::trim_output(final_state), expected);
+}
+
+TEST_F(SnapshotTest, SI_StaleSnapshotUpdateToPostSnapshotDeletedUniqueKeyAborts) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (2, 200);"));
+
+    auto stale_txn = create_session();
+    auto deleter = create_session();
+
+    ASSERT_TRUE(stale_txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(stale_txn->exec_sql_ok("begin;"));
+    std::string stale_read = stale_txn->exec_sql("select * from t where id = 1;");
+
+    ASSERT_TRUE(deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("delete from t where id = 1;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("commit;"));
+
+    std::string update_abort = stale_txn->exec_sql_expect_abort("update t set id = 1 where id = 2;");
+    EXPECT_EQ(TestSession::trim_output(update_abort), "abort")
+        << "A stale snapshot still sees key 1, so updating another indexed row to key 1 must conflict";
+    ASSERT_TRUE(stale_txn->exec_sql_ok("commit;"));
+
+    std::string expected_stale_read = "+------------------+------------------+\n"
+                                      "|               id |              val |\n"
+                                      "+------------------+------------------+\n"
+                                      "|                1 |              100 |\n"
+                                      "+------------------+------------------+\n"
+                                      "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(stale_read), expected_stale_read);
+}
+
+TEST_F(SnapshotTest, SI_InsertHistoricalKeyOlderThanVisibleVersionIsAllowed) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+    ASSERT_TRUE(s->exec_sql_ok("update t set id = 2 where id = 1;"));
+
+    auto reader = create_session();
+    auto writer = create_session();
+    auto verifier = create_session();
+
+    ASSERT_TRUE(reader->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+    std::string reader_visible = reader->exec_sql("select * from t where id = 2;");
+
+    ASSERT_TRUE(writer->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update t set id = 3 where id = 2;"));
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+
+    ASSERT_TRUE(reader->exec_sql_ok("insert into t values (1, 999);"))
+        << "Key 1 is older than reader's visible version key 2, so it should be reusable";
+    ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+
+    std::string expected_reader_visible = "+------------------+------------------+\n"
+                                          "|               id |              val |\n"
+                                          "+------------------+------------------+\n"
+                                          "|                2 |              100 |\n"
+                                          "+------------------+------------------+\n"
+                                          "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(reader_visible), expected_reader_visible);
+
+    std::string final_state = verifier->exec_sql("select * from t;");
+    EXPECT_NE(final_state.find("|                1 |              999 |"), std::string::npos);
+    EXPECT_NE(final_state.find("|                3 |              100 |"), std::string::npos);
 }
 
 // =============================================================================

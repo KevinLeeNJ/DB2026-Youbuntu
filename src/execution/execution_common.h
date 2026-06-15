@@ -75,3 +75,64 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
     }
     return nullptr;
 }
+
+inline bool IndexKeyEquals(const IndexMeta& index, const char* rec_data, const std::vector<char>& key) {
+    int offset = 0;
+    for (int i = 0; i < index.col_num; ++i) {
+        if (std::memcmp(rec_data + index.cols[i].offset, key.data() + offset, index.cols[i].len) != 0) {
+            return false;
+        }
+        offset += index.cols[i].len;
+    }
+    return true;
+}
+
+inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid, const IndexMeta& index,
+                                               const std::vector<char>& key, Context* context) {
+    if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr || !fh->is_record(rid)) {
+        return false;
+    }
+
+    auto* txn = context->txn_;
+    TupleMeta meta = fh->get_tuple_meta(rid);
+    if (meta.writer_txn_id_ == txn->get_transaction_id()) {
+        return false;
+    }
+
+    auto current_rec = fh->get_record(rid, context);
+    bool current_key_matches = current_rec != nullptr && IndexKeyEquals(index, current_rec->data, key);
+
+    if (!meta.is_committed_) {
+        if (current_key_matches) {
+            return true;
+        }
+    } else if (meta.commit_ts_ <= txn->get_start_ts()) {
+        return !meta.is_deleted_ && current_key_matches;
+    } else if (current_key_matches) {
+        return true;
+    }
+
+    UndoLink link = meta.version_chain_head_;
+    constexpr int MAX_DEPTH = 100;
+    for (int depth = 0; depth < MAX_DEPTH && link.IsValid(); ++depth) {
+        UndoLog undo = context->txn_mgr_->GetUndoLog(link);
+        const TupleMeta& old_meta = undo.old_meta_;
+        bool old_key_matches = !old_meta.is_deleted_ && !undo.old_tuple_data_.empty() &&
+                               IndexKeyEquals(index, undo.old_tuple_data_.data(), key);
+
+        if (!old_meta.is_committed_) {
+            if (old_meta.writer_txn_id_ == txn->get_transaction_id()) {
+                return old_key_matches;
+            }
+            link = undo.prev_version_;
+            continue;
+        }
+
+        if (old_meta.commit_ts_ <= txn->get_start_ts()) {
+            return old_key_matches;
+        }
+
+        link = undo.prev_version_;
+    }
+    return false;
+}

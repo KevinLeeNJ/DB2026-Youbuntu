@@ -50,7 +50,8 @@ typedef enum PlanTag {
     T_Limit,
     T_Union,
     T_ExplainAnalyze,
-    T_SetTransaction
+    T_SetTransaction,
+    T_StaticCheckpoint
 } PlanTag;
 
 // 查询执行计划
@@ -87,7 +88,7 @@ public:
 
 class JoinPlan : public Plan {
 public:
-    JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds) {
+    JoinPlan(PlanTag tag, std::unique_ptr<Plan> left, std::unique_ptr<Plan> right, std::vector<Condition> conds) {
         Plan::tag = tag;
         left_ = std::move(left);
         right_ = std::move(right);
@@ -96,9 +97,9 @@ public:
     }
     ~JoinPlan() {}
     // 左节点
-    std::shared_ptr<Plan> left_;
+    std::unique_ptr<Plan> left_;
     // 右节点
-    std::shared_ptr<Plan> right_;
+    std::unique_ptr<Plan> right_;
     // 连接条件
     std::vector<Condition> conds_;
     // future TODO: 后续可以支持的连接类型
@@ -111,19 +112,19 @@ public:
 
 class FilterPlan : public Plan {
 public:
-    FilterPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<Condition> conds) {
+    FilterPlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::vector<Condition> conds) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         conds_ = std::move(conds);
     }
     ~FilterPlan() {}
-    std::shared_ptr<Plan> subplan_;
+    std::unique_ptr<Plan> subplan_;
     std::vector<Condition> conds_;
 };
 
 class ProjectionPlan : public Plan {
 public:
-    ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<SelectItem> select_items,
+    ProjectionPlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::vector<SelectItem> select_items,
                    std::vector<std::string> output_names, bool preserve_col_names = false,
                    bool is_select_star = false) {
         Plan::tag = tag;
@@ -134,7 +135,7 @@ public:
         is_select_star_ = is_select_star;
     }
     ~ProjectionPlan() {}
-    std::shared_ptr<Plan> subplan_;
+    std::unique_ptr<Plan> subplan_;
     std::vector<SelectItem> select_items_;
     std::vector<std::string> output_names_;
     bool preserve_col_names_ = false;
@@ -143,7 +144,7 @@ public:
 
 class AggregatePlan : public Plan {
 public:
-    AggregatePlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> group_by_cols,
+    AggregatePlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::vector<TabCol> group_by_cols,
                   std::vector<AggExpr> agg_exprs, std::vector<HavingCondition> having_conds) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
@@ -152,7 +153,7 @@ public:
         having_conds_ = std::move(having_conds);
     }
     ~AggregatePlan() {}
-    std::shared_ptr<Plan> subplan_;
+    std::unique_ptr<Plan> subplan_;
     std::vector<TabCol> group_by_cols_;
     std::vector<AggExpr> agg_exprs_;
     std::vector<HavingCondition> having_conds_;
@@ -160,33 +161,33 @@ public:
 
 class SortPlan : public Plan {
 public:
-    SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<OrderByItem> order_by_items, int limit = -1) {
+    SortPlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::vector<OrderByItem> order_by_items, int limit = -1) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         order_by_items_ = std::move(order_by_items);
         limit_ = limit;
     }
     ~SortPlan() {}
-    std::shared_ptr<Plan> subplan_;
+    std::unique_ptr<Plan> subplan_;
     std::vector<OrderByItem> order_by_items_;
     int limit_ = -1;
 };
 
 class LimitPlan : public Plan {
 public:
-    LimitPlan(PlanTag tag, std::shared_ptr<Plan> subplan, int limit) {
+    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         limit_ = limit;
     }
     ~LimitPlan() {}
-    std::shared_ptr<Plan> subplan_;
+    std::unique_ptr<Plan> subplan_;
     int limit_;
 };
 
 class UnionPlan : public Plan {
 public:
-    UnionPlan(PlanTag tag, std::vector<std::shared_ptr<Plan>> branches, std::vector<ColMeta> cols,
+    UnionPlan(PlanTag tag, std::vector<std::unique_ptr<Plan>> branches, std::vector<ColMeta> cols,
               std::vector<std::string> output_names) {
         Plan::tag = tag;
         branches_ = std::move(branches);
@@ -194,7 +195,7 @@ public:
         output_names_ = std::move(output_names);
     }
     ~UnionPlan() {}
-    std::vector<std::shared_ptr<Plan>> branches_;
+    std::vector<std::unique_ptr<Plan>> branches_;
     std::vector<ColMeta> cols_;
     std::vector<std::string> output_names_;
 };
@@ -202,7 +203,7 @@ public:
 // dml语句，包括insert; delete; update; select语句　
 class DMLPlan : public Plan {
 public:
-    DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::string tab_name, std::vector<Value> values,
+    DMLPlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::string tab_name, std::vector<Value> values,
             std::vector<Condition> conds, std::vector<SetClause> set_clauses) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
@@ -212,7 +213,7 @@ public:
         set_clauses_ = std::move(set_clauses);
     }
     ~DMLPlan() {}
-    std::shared_ptr<Plan> subplan_;
+    std::unique_ptr<Plan> subplan_;
     std::string tab_name_;
     std::vector<Value> values_;
     std::vector<Condition> conds_;
@@ -269,11 +270,11 @@ public:
 
 class plannerInfo {
 public:
-    std::shared_ptr<ast::SelectStmt> parse;
+    const ast::SelectStmt* parse;
     std::vector<Condition> where_conds;
     std::vector<TabCol> sel_cols;
-    std::shared_ptr<Plan> plan;
-    std::vector<std::shared_ptr<Plan>> table_scan_executors;
+    std::unique_ptr<Plan> plan;
+    std::vector<std::unique_ptr<Plan>> table_scan_executors;
     std::vector<SetClause> set_clauses;
-    plannerInfo(std::shared_ptr<ast::SelectStmt> parse_) : parse(std::move(parse_)) {}
+    plannerInfo(const ast::SelectStmt* parse_) : parse(parse_) {}
 };

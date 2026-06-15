@@ -19,15 +19,6 @@ See the Mulan PSL v2 for more details. */
 
 namespace analyze_internal {
 
-// =============================================================================
-// Template traits for AST node type detection at compile time
-// =============================================================================
-
-template <typename T, typename = void> struct has_select_items_member : std::false_type {};
-
-template <typename T>
-struct has_select_items_member<T, std::void_t<decltype(std::declval<T>().select_items)>> : std::true_type {};
-
 template <typename T, typename = void> struct has_group_by_cols_member : std::false_type {};
 
 template <typename T>
@@ -57,10 +48,6 @@ template <typename T, typename = void> struct has_has_select_star_member : std::
 template <typename T>
 struct has_has_select_star_member<T, std::void_t<decltype(std::declval<T>().has_select_star)>> : std::true_type {};
 
-template <typename T, typename = void> struct has_order_member : std::false_type {};
-
-template <typename T> struct has_order_member<T, std::void_t<decltype(std::declval<T>().order)>> : std::true_type {};
-
 // =============================================================================
 // Non-template function declarations (forward declarations needed by templates)
 // =============================================================================
@@ -78,7 +65,7 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols);
 // =============================================================================
 
 template <typename ExprPtrT> TabCol extract_ast_column(const ExprPtrT& expr_node, const std::string& clause_name) {
-    auto col = std::dynamic_pointer_cast<ast::Col>(expr_node);
+    auto col = dynamic_cast<const ast::Col*>(expr_node.get());
     if (col == nullptr) {
         throw RMDBError(clause_name + " clause does not allow aggregate expressions");
     }
@@ -90,16 +77,16 @@ QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& 
     if (expr_node == nullptr) {
         throw InternalError("Unexpected null expression node");
     }
-    if (auto col = std::dynamic_pointer_cast<ast::Col>(expr_node); col != nullptr) {
+    if (auto col = dynamic_cast<const ast::Col*>(expr_node.get()); col != nullptr) {
         return make_column_expr({.tab_name = col->tab_name, .col_name = col->col_name});
     }
-    if (auto val = std::dynamic_pointer_cast<ast::Value>(expr_node); val != nullptr) {
+    if (auto val = dynamic_cast<const ast::Value*>(expr_node.get()); val != nullptr) {
         QueryExpr expr;
         expr.type = QueryExprType::VALUE;
         expr.value = convert_ast_value_node(val);
         return expr;
     }
-    if (auto agg = std::dynamic_pointer_cast<ast::AggExpr>(expr_node); agg != nullptr) {
+    if (auto agg = dynamic_cast<const ast::AggExpr*>(expr_node.get()); agg != nullptr) {
         QueryExpr expr;
         expr.type = QueryExprType::AGGREGATE;
         expr.agg.type = convert_ast_agg_type(agg->func);
@@ -121,40 +108,20 @@ QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& 
 template <typename SelectStmtT>
 void populate_select_items_from_ast(Query& query, const SelectStmtT& stmt, const std::vector<ColMeta>& all_cols) {
     query.select_items.clear();
-    query.has_select_star = false;
+    query.has_select_star = stmt.has_select_star;
 
-    if constexpr (has_select_items_member<SelectStmtT>::value) {
-        if constexpr (has_has_select_star_member<SelectStmtT>::value) {
-            query.has_select_star = stmt.has_select_star;
-        }
-        if (stmt.select_items.empty()) {
-            query.has_select_star = true;
-            append_star_projection(query, all_cols);
-            return;
-        }
-        for (const auto& raw_item : stmt.select_items) {
-            if (raw_item == nullptr) {
-                throw InternalError("Unexpected null select item");
-            }
-            SelectItem item;
-            item.expr = convert_simple_ast_expr(raw_item->expr, "SELECT");
-            item.alias = raw_item->alias;
-            query.select_items.push_back(std::move(item));
-        }
-        return;
-    }
-
-    query.has_select_star = stmt.cols.empty();
-    if (query.has_select_star) {
+    if (stmt.has_select_star) {
         append_star_projection(query, all_cols);
         return;
     }
-    for (const auto& raw_col : stmt.cols) {
-        if (raw_col == nullptr) {
-            throw InternalError("Unexpected null select column");
+
+    for (const auto& raw_item : stmt.select_items) {
+        if (raw_item == nullptr) {
+            throw InternalError("Unexpected null select item");
         }
         SelectItem item;
-        item.expr = make_column_expr({.tab_name = raw_col->tab_name, .col_name = raw_col->col_name});
+        item.expr = convert_simple_ast_expr(raw_item->expr, "SELECT");
+        item.alias = raw_item->alias;
         query.select_items.push_back(std::move(item));
     }
 }
@@ -203,7 +170,7 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
                 cond.op = OP_GE;
                 break;
             }
-            if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(raw_cond->rhs); rhs_val != nullptr) {
+            if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
                 cond.is_rhs_val = true;
                 cond.rhs_val = convert_ast_value_node(rhs_val);
             } else {
@@ -232,19 +199,6 @@ template <typename SelectStmtT> void populate_order_by_from_ast(Query& query, co
             query.order_by_items.push_back(std::move(item));
         }
         return;
-    }
-
-    if constexpr (has_order_member<SelectStmtT>::value) {
-        if (stmt.order != nullptr) {
-            OrderByItem item;
-            item.expr =
-                make_column_expr({.tab_name = stmt.order->cols->tab_name, .col_name = stmt.order->cols->col_name});
-            item.is_desc = stmt.order->orderby_dir == ast::OrderBy_DESC;
-            if (item.expr.col.tab_name.empty()) {
-                item.order_name = item.expr.col.col_name;
-            }
-            query.order_by_items.push_back(std::move(item));
-        }
     }
 }
 

@@ -77,8 +77,8 @@ protected:
         }
     }
 
-    std::shared_ptr<Plan> make_select_subplan(bool with_limit) {
-        auto scan = std::make_shared<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade", std::vector<Condition>{},
+    std::unique_ptr<Plan> make_select_subplan(bool with_limit) {
+        auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade", std::vector<Condition>{},
                                                std::vector<std::string>{});
 
         std::vector<AggExpr> agg_exprs = {
@@ -95,8 +95,8 @@ protected:
         };
         having_conds[0].rhs_val.set_int(90);
 
-        auto aggregate =
-            std::make_shared<AggregatePlan>(T_Aggregate, scan, std::move(group_by_cols), agg_exprs, having_conds);
+        auto aggregate = std::make_unique<AggregatePlan>(T_Aggregate, std::move(scan), std::move(group_by_cols),
+                                                         agg_exprs, having_conds);
 
         SelectItem group_item;
         group_item.expr = make_col_expr("id");
@@ -107,29 +107,29 @@ protected:
         agg_item.alias = "max_score";
         agg_item.output_name = "max_score";
 
-        auto projection =
-            std::make_shared<ProjectionPlan>(T_Projection, aggregate, std::vector<SelectItem>{group_item, agg_item},
-                                             std::vector<std::string>{"id", "max_score"});
+        auto projection = std::make_unique<ProjectionPlan>(T_Projection, std::move(aggregate),
+                                                           std::vector<SelectItem>{group_item, agg_item},
+                                                           std::vector<std::string>{"id", "max_score"});
 
         OrderByItem order_by;
         order_by.expr = make_agg_expr(AggType::MAX, "score", "MAX(score)");
         order_by.is_desc = true;
-        auto sort = std::make_shared<SortPlan>(T_Sort, projection, std::vector<OrderByItem>{order_by});
+        auto sort = std::make_unique<SortPlan>(T_Sort, std::move(projection), std::vector<OrderByItem>{order_by});
 
         if (!with_limit) {
             return sort;
         }
-        return std::make_shared<LimitPlan>(T_Limit, sort, 3);
+        return std::make_unique<LimitPlan>(T_Limit, std::move(sort), 3);
     }
 };
 
 TEST_F(PortalAggregateTest, get_plan_output_names_handles_aggregate_and_projection_aliases) {
     auto plan = make_select_subplan(false);
-    auto sort = std::static_pointer_cast<SortPlan>(plan);
+    auto* sort = static_cast<SortPlan*>(plan.get());
 
-    auto projection_output_names = portal_->get_plan_output_names(sort->subplan_);
+    auto projection_output_names = portal_->get_plan_output_names(sort->subplan_.get());
     auto aggregate_output_names = portal_->build_aggregate_output_names(
-        *std::static_pointer_cast<AggregatePlan>(std::static_pointer_cast<ProjectionPlan>(sort->subplan_)->subplan_));
+        *static_cast<AggregatePlan*>(static_cast<ProjectionPlan*>(sort->subplan_.get())->subplan_.get()));
 
     EXPECT_EQ(projection_output_names, (std::vector<std::string>{"id", "max_score"}));
     EXPECT_EQ(aggregate_output_names, (std::vector<std::string>{"id", "MAX(score)"}));
@@ -141,10 +141,10 @@ TEST_F(PortalAggregateTest, start_builds_limit_sort_projection_aggregate_executo
     Context context(nullptr, nullptr, nullptr, buffer, &offset);
 
     auto subplan = make_select_subplan(true);
-    auto full_plan = std::make_shared<DMLPlan>(T_select, subplan, std::string(), std::vector<Value>{},
+    auto full_plan = std::make_unique<DMLPlan>(T_select, std::move(subplan), std::string(), std::vector<Value>{},
                                                std::vector<Condition>{}, std::vector<SetClause>{});
 
-    auto stmt = portal_->start(full_plan, &context);
+    auto stmt = portal_->start(std::move(full_plan), &context);
 
     ASSERT_NE(stmt, nullptr);
     EXPECT_EQ(stmt->tag, PORTAL_ONE_SELECT);

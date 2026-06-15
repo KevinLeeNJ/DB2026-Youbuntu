@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "index/ix.h"
+#include "recovery/log_manager.h"
 #include "record_printer.h"
 
 const char* help_info = "Supported SQL syntax:\n"
@@ -45,8 +46,8 @@ const char* help_info = "Supported SQL syntax:\n"
                         "  {* | column [, column ...]}\n";
 
 // 主要负责执行DDL语句
-void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context* context) {
-    auto x = std::static_pointer_cast<DDLPlan>(plan);
+void QlManager::run_mutli_query(Plan* plan, Context* context) {
+    auto* x = static_cast<DDLPlan*>(plan);
     switch (plan->tag) {
     case T_CreateTable: {
         sm_manager_->create_table(x->tab_name_, x->cols_, context);
@@ -71,7 +72,7 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context* context) {
 }
 
 // 执行help; show tables; desc table; begin; commit; abort;语句
-void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Context* context) {
+void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) {
     switch (plan->tag) {
     case T_Help:
     case T_ShowTable:
@@ -81,7 +82,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
     case T_Transaction_commit:
     case T_Transaction_abort:
     case T_Transaction_rollback: {
-        auto x = std::static_pointer_cast<OtherPlan>(plan);
+        auto* x = static_cast<OtherPlan*>(plan);
         switch (plan->tag) {
         case T_Help: {
             memcpy(context->data_send_ + *(context->offset_), help_info, strlen(help_info));
@@ -116,6 +117,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             if (context->txn_ != nullptr) {
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
             break;
         }
         case T_Transaction_rollback: {
@@ -123,6 +125,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             if (context->txn_ != nullptr) {
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
             break;
         }
         case T_Transaction_abort: {
@@ -130,6 +133,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             if (context->txn_ != nullptr) {
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
+            context->txn_ = nullptr;
             break;
         }
         default:
@@ -139,7 +143,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
         break;
     }
     case T_SetTransaction: {
-        auto x = std::static_pointer_cast<SetTransactionPlan>(plan);
+        auto* x = static_cast<SetTransactionPlan*>(plan);
         switch (x->isolation_level_) {
         case ast::IsolationLevelType::SNAPSHOT_ISOLATION: {
             context->isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
@@ -153,7 +157,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
         break;
     }
     case T_SetKnob: {
-        auto x = std::static_pointer_cast<SetKnobPlan>(plan);
+        auto* x = static_cast<SetKnobPlan*>(plan);
         switch (x->set_knob_type_) {
         case ast::SetKnobType::EnableNestLoop: {
             planner_->set_enable_nestedloop_join(x->bool_value_);
@@ -167,6 +171,44 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t* txn_id, Co
             throw RMDBError("Not implemented!\n");
             break;
         }
+        }
+        break;
+    }
+    case T_StaticCheckpoint: {
+        if (txn_id != nullptr) {
+            Transaction* current_txn = txn_mgr_->get_transaction(*txn_id);
+            if (current_txn != nullptr && current_txn->get_state() != TransactionState::COMMITTED &&
+                current_txn->get_state() != TransactionState::ABORTED) {
+                throw RMDBError("static checkpoint cannot run inside an active transaction");
+            }
+        }
+
+        struct CheckpointBlockGuard {
+            TransactionManager* txn_mgr_;
+            bool armed_{false};
+
+            explicit CheckpointBlockGuard(TransactionManager* txn_mgr) : txn_mgr_(txn_mgr) {
+                txn_mgr_->block_new_transactions_for_checkpoint();
+                armed_ = true;
+            }
+
+            ~CheckpointBlockGuard() {
+                if (armed_) {
+                    txn_mgr_->unblock_new_transactions_after_checkpoint();
+                }
+            }
+        } checkpoint_guard(txn_mgr_);
+
+        auto active_txns = txn_mgr_->wait_active_transactions_drained_for_checkpoint();
+        if (context != nullptr && context->log_mgr_ != nullptr) {
+            context->log_mgr_->flush_log_to_disk_with_sync();
+            CheckpointLogRecord checkpoint(active_txns);
+            int checkpoint_offset = context->log_mgr_->current_log_offset();
+            context->log_mgr_->add_log_to_buffer(&checkpoint);
+            context->log_mgr_->flush_log_to_disk_with_sync();
+            sm_manager_->flush_all_table_and_index_pages();
+            sm_manager_->flush_meta();
+            context->log_mgr_->write_restart_offset(checkpoint_offset);
         }
         break;
     }

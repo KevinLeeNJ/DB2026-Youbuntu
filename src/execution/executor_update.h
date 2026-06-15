@@ -115,6 +115,8 @@ public:
                     if (old_key == new_key) {
                         continue;
                     }
+                    sm_manager_->remember_historical_index_key(
+                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), old_key, rid);
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
                                   .get();
                     std::vector<Rid> result;
@@ -122,10 +124,25 @@ public:
                         std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
                         throw IndexEntryExistsError();
                     }
+                    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+                    auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, new_key);
+                    for (const auto& candidate_rid : candidate_rids) {
+                        if (candidate_rid != rid &&
+                            HistoricalIndexKeyConflictsWithTxn(fh_, candidate_rid, index, new_key, context_)) {
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                        }
+                    }
                     index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
                 }
+                if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
+                    UpdateLogRecord log_record(context_->txn_->get_transaction_id(), *rec, *new_rec, rid, tab_name_);
+                    log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
+                    lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                    context_->txn_->set_prev_lsn(lsn);
+                }
                 if (context_ != nullptr && context_->txn_ != nullptr) {
-                    context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
+                    context_->txn_->append_write_record(
+                        std::make_unique<WriteRecord>(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
 
                     // Save old version as undo log for MVCC version chain
                     UndoLog undo;

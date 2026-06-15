@@ -10,11 +10,15 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+
+#include "common/context.h"
 #include "index/ix.h"
 #include "record/rm_file_handle.h"
 #include "sm_defs.h"
 #include "sm_meta.h"
-#include "common/context.h"
 
 class Context;
 
@@ -37,6 +41,20 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
+    static std::string make_historical_index_key(const std::string& tab_name, const std::string& index_name,
+                                                 const std::vector<char>& key) {
+        std::string combined;
+        combined.reserve(tab_name.size() + index_name.size() + key.size() + 2);
+        combined.append(tab_name);
+        combined.push_back('\0');
+        combined.append(index_name);
+        combined.push_back('\0');
+        combined.append(key.data(), key.size());
+        return combined;
+    }
+
+    mutable std::mutex historical_index_keys_latch_;
+    std::unordered_map<std::string, std::vector<Rid>> historical_index_keys_;
 
 public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
@@ -85,6 +103,36 @@ public:
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+
+    void insert_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& rec);
+
+    void delete_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec);
+
+    void update_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec,
+                                    const RmRecord& new_rec);
+
+    void remember_historical_index_key(const std::string& tab_name, const std::string& index_name,
+                                       const std::vector<char>& key, const Rid& rid) {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        auto& rids = historical_index_keys_[make_historical_index_key(tab_name, index_name, key)];
+        if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
+            rids.push_back(rid);
+        }
+    }
+
+    std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
+                                                   const std::vector<char>& key) const {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, key));
+        if (it == historical_index_keys_.end()) {
+            return {};
+        }
+        return it->second;
+    }
+
+    void flush_all_table_and_index_pages();
+
+    void reset_all_tuple_meta_after_recovery();
 
     // MVCC: mark all slots modified by txn as committed with the given commit_ts
     void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {

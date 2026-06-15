@@ -10,6 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include "ast_printer.h"
 #include "ast.h"
-#include "parser_defs.h"
+
+namespace ast {
+
+std::unique_ptr<TreeNode> parse_sql(const std::string& sql);
+
+} // namespace ast

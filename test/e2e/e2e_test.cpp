@@ -45,15 +45,18 @@ See the Mulan PSL v2 for more details. */
 
 class EmbeddedDB {
 public:
-    EmbeddedDB(const std::string& db_name) : db_name_(db_name) {
+    explicit EmbeddedDB(const std::string& db_name, bool reset_database = true, bool cleanup_on_destroy = true)
+        : db_name_(db_name), cleanup_on_destroy_(cleanup_on_destroy) {
         // Save original CWD for teardown
         char cwd_buf[1024];
         getcwd(cwd_buf, sizeof(cwd_buf));
         original_cwd_ = cwd_buf;
 
-        // Clean up any leftover from previous runs (use absolute path)
-        std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
-        system(cmd.c_str());
+        if (reset_database) {
+            // Clean up any leftover from previous runs (use absolute path)
+            std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
+            system(cmd.c_str());
+        }
 
         // 构建全局所需的管理器对象（同 src/rmdb.cpp）
         disk_manager_ = std::make_unique<DiskManager>();
@@ -75,8 +78,13 @@ public:
         analyze_ = std::make_unique<Analyze>(sm_manager_.get());
 
         // Create and open the database
-        sm_manager_->create_db(db_name_);
+        if (!sm_manager_->is_dir(db_name_)) {
+            sm_manager_->create_db(db_name_);
+        }
         sm_manager_->open_db(db_name_);
+
+        log_manager_->initialize_from_existing_log();
+        buffer_pool_manager_->set_log_manager(log_manager_.get());
 
         // ARIES recovery
         recovery_->analyze();
@@ -94,8 +102,10 @@ public:
             chdir(original_cwd_.c_str());
         }
         // Now CWD is back at original_cwd_ (one level above the db dir)
-        std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
-        system(cmd.c_str());
+        if (cleanup_on_destroy_) {
+            std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
+            system(cmd.c_str());
+        }
     }
 
     /// Execute a single SQL statement (must include trailing ';').
@@ -106,28 +116,30 @@ public:
         int offset = 0;
 
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
-        set_transaction(&context);
 
         // Parse
-        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-        if (yyparse() != 0) {
-            yy_delete_buffer(buf);
+        std::unique_ptr<ast::TreeNode> parse_tree;
+        try {
+            parse_tree = ast::parse_sql(sql);
+        } catch (...) {
             abort_implicit_statement(&context);
             throw RMDBError("Parse error for: " + sql);
         }
-        if (ast::parse_tree == nullptr) {
-            yy_delete_buffer(buf);
+        if (parse_tree == nullptr) {
             finish_statement(&context);
             return ""; // EXIT or EOF
         }
-        yy_delete_buffer(buf);
+        bool is_checkpoint = parse_tree->type == ast::AstType::StaticCheckpoint;
+        if (!is_checkpoint) {
+            set_transaction(&context);
+        }
 
         // Analyze → Optimize → Portal → Execute
         try {
-            std::shared_ptr<Query> query = analyze_->do_analyze(ast::parse_tree);
-            std::shared_ptr<Plan> plan = optimizer_->plan_query(query, &context);
-            std::shared_ptr<PortalStmt> portal_stmt = portal_->start(plan, &context);
-            portal_->run(portal_stmt, ql_manager_.get(), &txn_id_, &context);
+            std::unique_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
+            std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query), &context);
+            std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
+            portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
             portal_->drop();
             finish_statement(&context);
         } catch (...) {
@@ -176,6 +188,7 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager_->commit(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     void abort_implicit_statement(Context* context) {
@@ -184,10 +197,12 @@ private:
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager_->abort(context->txn_, context->log_mgr_);
         }
+        context->txn_ = nullptr;
     }
 
     std::string db_name_;
     std::string original_cwd_;
+    bool cleanup_on_destroy_{true};
     txn_id_t txn_id_{INVALID_TXN_ID};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
@@ -459,4 +474,111 @@ TEST_F(SltFileTest, QueryOptimize) {
 
 TEST_F(SltFileTest, NestNljInlj) {
     run_slt_file("nest_nlj_inlj.slt");
+}
+
+TEST_F(SltFileTest, Checkpoint) {
+    run_slt_file("checkpoint.slt");
+}
+
+TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {
+    ASSERT_NO_THROW(db_->exec_sql("create table dup_heap (id int, val int);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select * from dup_heap;"); });
+    while (!output.empty() && output.back() == '\n') {
+        output.pop_back();
+    }
+
+    const std::string expected = "+------------------+------------------+\n"
+                                 "|               id |              val |\n"
+                                 "+------------------+------------------+\n"
+                                 "|                1 |               10 |\n"
+                                 "|                1 |               10 |\n"
+                                 "+------------------+------------------+\n"
+                                 "Total record(s): 2";
+    EXPECT_EQ(output, expected);
+}
+
+TEST_F(E2ETest, IndexedTableRejectsDuplicateKey) {
+    ASSERT_NO_THROW(db_->exec_sql("create table dup_idx (id int, val int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index dup_idx (id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into dup_idx values(1, 10);"));
+
+    std::string err;
+    ASSERT_NO_THROW({ err = db_->exec_sql_expect_error("insert into dup_idx values(1, 20);"); });
+    EXPECT_NE(err.find("Index"), std::string::npos);
+}
+
+TEST(CheckpointRecoveryTest, CheckpointRestartOffsetSurvivesRestartAndUndoRuns) {
+    const std::string db_name = "e2e_checkpoint_recovery";
+    const std::string select_expected = "+------------------+------------------+\n"
+                                        "|               id |              num |\n"
+                                        "+------------------+------------------+\n"
+                                        "|                1 |                1 |\n"
+                                        "+------------------+------------------+\n"
+                                        "Total record(s): 1";
+
+    {
+        EmbeddedDB db(db_name, true, false);
+        ASSERT_NO_THROW(db.exec_sql("create table t1 (id int, num int);"));
+        ASSERT_NO_THROW(db.exec_sql("begin;"));
+        ASSERT_NO_THROW(db.exec_sql("insert into t1 values(1, 1);"));
+        ASSERT_NO_THROW(db.exec_sql("commit;"));
+        ASSERT_NO_THROW(db.exec_sql("create static_checkpoint;"));
+        ASSERT_NO_THROW(db.exec_sql("begin;"));
+        ASSERT_NO_THROW(db.exec_sql("insert into t1 values(2, 2);"));
+    }
+
+    std::ifstream restart_file(db_name + "/" + LogManager::RESTART_FILE_NAME);
+    ASSERT_TRUE(restart_file.is_open());
+    int restart_offset = 0;
+    restart_file >> restart_offset;
+    EXPECT_GT(restart_offset, 0);
+
+    TransactionManager::txn_map.clear();
+
+    {
+        EmbeddedDB recovered(db_name, false, true);
+        std::string output;
+        ASSERT_NO_THROW({ output = recovered.exec_sql("select * from t1;"); });
+        while (!output.empty() && output.back() == '\n') {
+            output.pop_back();
+        }
+        EXPECT_EQ(output, select_expected);
+    }
+}
+
+TEST(CheckpointRecoveryTest, CommittedDeleteBeforeCheckpointDoesNotReappearAfterRestart) {
+    const std::string db_name = "e2e_checkpoint_delete_recovery";
+    const std::string select_expected = "+------------------+------------------+\n"
+                                        "|               id |              num |\n"
+                                        "+------------------+------------------+\n"
+                                        "+------------------+------------------+\n"
+                                        "Total record(s): 0";
+
+    {
+        EmbeddedDB db(db_name, true, false);
+        ASSERT_NO_THROW(db.exec_sql("create table t1 (id int, num int);"));
+        ASSERT_NO_THROW(db.exec_sql("begin;"));
+        ASSERT_NO_THROW(db.exec_sql("insert into t1 values(1, 1);"));
+        ASSERT_NO_THROW(db.exec_sql("commit;"));
+        ASSERT_NO_THROW(db.exec_sql("begin;"));
+        ASSERT_NO_THROW(db.exec_sql("delete from t1 where id = 1;"));
+        ASSERT_NO_THROW(db.exec_sql("commit;"));
+        ASSERT_NO_THROW(db.exec_sql("create static_checkpoint;"));
+    }
+
+    TransactionManager::txn_map.clear();
+
+    {
+        EmbeddedDB recovered(db_name, false, true);
+        std::string output;
+        ASSERT_NO_THROW({ output = recovered.exec_sql("select * from t1;"); });
+        while (!output.empty() && output.back() == '\n') {
+            output.pop_back();
+        }
+        EXPECT_EQ(output, select_expected);
+    }
 }

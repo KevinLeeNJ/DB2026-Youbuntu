@@ -13,11 +13,47 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <fstream>
+#include <vector>
 
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
+
+namespace {
+
+std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
+    std::vector<char> key(index.col_tot_len);
+    int offset = 0;
+    for (int i = 0; i < index.col_num; ++i) {
+        std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
+        offset += index.cols[i].len;
+    }
+    return key;
+}
+
+void InsertIndexEntryIdempotent(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
+                                const RmRecord& rec, const Rid& rid) {
+    auto key = MakeIndexKey(index, rec.data);
+    auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+    std::vector<Rid> existing;
+    if (ih->get_value(key.data(), &existing, nullptr)) {
+        if (existing.size() == 1 && existing[0] == rid) {
+            return;
+        }
+    }
+    ih->insert_entry(key.data(), rid, nullptr);
+}
+
+void DeleteIndexEntryIfExists(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
+                              const RmRecord& rec) {
+    auto key = MakeIndexKey(index, rec.data);
+    auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+    ih->delete_entry(key.data(), nullptr);
+}
+
+} // namespace
 
 /**
  * @description: 判断是否为一个文件夹
@@ -89,6 +125,10 @@ void SmManager::open_db(const std::string& db_name) {
     if (!db_.name_.empty()) {
         throw DatabaseExistsError(db_name);
     }
+    {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        historical_index_keys_.clear();
+    }
     if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
         throw UnixError();
     }
@@ -137,6 +177,10 @@ void SmManager::close_db() {
     ihs_.clear();
     db_.name_.clear();
     db_.tabs_.clear();
+    {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        historical_index_keys_.clear();
+    }
     if (chdir("..") < 0) { // 回到根目录
         throw UnixError();
     }
@@ -372,4 +416,85 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
     ix_manager_->destroy_index(tab_name, col_names);
     ihs_.erase(index_name);
     flush_meta();
+}
+
+void SmManager::insert_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& rec) {
+    auto& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+    fh->insert_record(rid, rec.data);
+    for (const auto& index : tab.indexes) {
+        InsertIndexEntryIdempotent(this, tab_name, index, rec, rid);
+    }
+}
+
+void SmManager::delete_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec) {
+    auto& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+    for (const auto& index : tab.indexes) {
+        DeleteIndexEntryIfExists(this, tab_name, index, old_rec);
+    }
+    fh->delete_record(rid, nullptr);
+}
+
+void SmManager::update_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec,
+                                           const RmRecord& new_rec) {
+    auto& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+    for (const auto& index : tab.indexes) {
+        auto old_key = MakeIndexKey(index, old_rec.data);
+        auto new_key = MakeIndexKey(index, new_rec.data);
+        if (old_key != new_key) {
+            DeleteIndexEntryIfExists(this, tab_name, index, old_rec);
+        }
+    }
+    fh->update_record(rid, new_rec.data, nullptr);
+    for (const auto& index : tab.indexes) {
+        auto old_key = MakeIndexKey(index, old_rec.data);
+        auto new_key = MakeIndexKey(index, new_rec.data);
+        if (old_key != new_key) {
+            InsertIndexEntryIdempotent(this, tab_name, index, new_rec, rid);
+        }
+    }
+}
+
+void SmManager::flush_all_table_and_index_pages() {
+    for (const auto& [_, fh] : fhs_) {
+        rm_manager_->flush_file_header(fh.get());
+        buffer_pool_manager_->flush_all_pages(fh->GetFd());
+    }
+    for (const auto& [_, ih] : ihs_) {
+        ix_manager_->flush_index_header(ih.get());
+        buffer_pool_manager_->flush_all_pages(ih->GetFd());
+    }
+}
+
+void SmManager::reset_all_tuple_meta_after_recovery() {
+    TupleMeta clean_meta;
+    clean_meta.commit_ts_ = 0;
+    clean_meta.writer_txn_id_ = INVALID_TXN_ID;
+    clean_meta.is_committed_ = true;
+    clean_meta.is_deleted_ = false;
+    clean_meta.version_chain_head_ = UndoLink{};
+
+    for (const auto& [_, fh] : fhs_) {
+        std::vector<Rid> tombstones;
+        std::vector<Rid> live_records;
+        for (RmScan scan(fh.get()); !scan.is_end(); scan.next()) {
+            Rid rid = scan.rid();
+            TupleMeta meta = fh->get_tuple_meta(rid);
+            if (meta.is_deleted_) {
+                tombstones.push_back(rid);
+            } else {
+                live_records.push_back(rid);
+            }
+        }
+        for (const auto& rid : tombstones) {
+            fh->delete_record(rid, nullptr);
+        }
+        for (const auto& rid : live_records) {
+            if (fh->is_record(rid)) {
+                fh->set_tuple_meta(rid, clean_meta);
+            }
+        }
+    }
 }

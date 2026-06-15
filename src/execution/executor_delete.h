@@ -83,9 +83,15 @@ public:
                     }
                 }
             }
-            auto* undo_record = context_ != nullptr && context_->txn_ != nullptr
-                                    ? new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec)
-                                    : nullptr;
+            if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
+                DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *rec, rid, tab_name_);
+                log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
+                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                context_->txn_->set_prev_lsn(lsn);
+            }
+            auto undo_record = context_ != nullptr && context_->txn_ != nullptr
+                                   ? std::make_unique<WriteRecord>(WType::DELETE_TUPLE, tab_name_, rid, *rec)
+                                   : nullptr;
             struct DeletedIndex {
                 const IndexMeta* index;
                 std::vector<char> key;
@@ -101,6 +107,8 @@ public:
                         std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
                         offset += index.cols[i].len;
                     }
+                    sm_manager_->remember_historical_index_key(
+                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid);
                     ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }
@@ -111,7 +119,7 @@ public:
                             .get();
                     ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                 }
-                delete undo_record;
+                // undo_record is automatically cleaned up by unique_ptr
                 throw;
             }
             if (undo_record != nullptr) {
@@ -122,8 +130,7 @@ public:
                 undo.prev_version_ = undo.old_meta_.version_chain_head_;
                 UndoLink undo_link = context_->txn_->AppendUndoLog(undo);
 
-                context_->txn_->append_write_record(undo_record);
-                undo_record = nullptr;
+                context_->txn_->append_write_record(std::move(undo_record));
                 context_->txn_->append_modified_slot(tab_name_, rid);
 
                 TupleMeta tombstone;

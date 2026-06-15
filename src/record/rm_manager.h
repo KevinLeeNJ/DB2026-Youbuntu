@@ -86,4 +86,9 @@ public:
         buffer_pool_manager_->delete_all_pages(file_handle->fd_);
         disk_manager_->close_file(file_handle->fd_);
     }
+
+    void flush_file_header(const RmFileHandle* file_handle) {
+        disk_manager_->write_page(file_handle->fd_, RM_FILE_HDR_PAGE, (char*)&file_handle->file_hdr_,
+                                  sizeof(file_handle->file_hdr_));
+    }
 };

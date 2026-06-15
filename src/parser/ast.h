@@ -9,9 +9,11 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 #pragma once
 
-#include <vector>
-#include <string>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 enum JoinType { INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN };
 namespace ast {
@@ -64,7 +66,8 @@ enum class AstType {
     SelectFromUnionStmt,
     ExplainAnalyze,
     SetStmt,
-    SetTransaction
+    SetTransaction,
+    StaticCheckpoint
 };
 
 // Base class for tree nodes
@@ -119,17 +122,17 @@ protected:
 
 struct ColDef : public Field {
     std::string col_name;
-    std::shared_ptr<TypeLen> type_len;
+    std::unique_ptr<TypeLen> type_len;
 
-    ColDef(std::string col_name_, std::shared_ptr<TypeLen> type_len_)
+    ColDef(std::string col_name_, std::unique_ptr<TypeLen> type_len_)
         : Field(AstType::ColDef), col_name(std::move(col_name_)), type_len(std::move(type_len_)) {}
 };
 
 struct CreateTable : public TreeNode {
     std::string tab_name;
-    std::vector<std::shared_ptr<Field>> fields;
+    std::vector<std::unique_ptr<Field>> fields;
 
-    CreateTable(std::string tab_name_, std::vector<std::shared_ptr<Field>> fields_)
+    CreateTable(std::string tab_name_, std::vector<std::unique_ptr<Field>> fields_)
         : TreeNode(AstType::CreateTable), tab_name(std::move(tab_name_)), fields(std::move(fields_)) {}
 };
 
@@ -159,6 +162,18 @@ struct DropIndex : public TreeNode {
 
     DropIndex(std::string tab_name_, std::vector<std::string> col_names_)
         : TreeNode(AstType::DropIndex), tab_name(std::move(tab_name_)), col_names(std::move(col_names_)) {}
+};
+
+struct StaticCheckpoint : public TreeNode {
+    StaticCheckpoint() : TreeNode(AstType::StaticCheckpoint) {}
+};
+
+struct TableRef {
+    std::string table_name;
+    std::string alias;
+
+    TableRef(std::string table_name_, std::string alias_ = "")
+        : table_name(std::move(table_name_)), alias(std::move(alias_)) {}
 };
 
 struct Expr : public TreeNode {
@@ -208,182 +223,216 @@ struct Col : public Expr {
         : Expr(AstType::Col), tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+inline std::unique_ptr<Col> clone_col(const Col& col) {
+    return std::make_unique<Col>(col.tab_name, col.col_name);
+}
+
 struct AggExpr : public Expr {
     AggFuncType func;
     bool is_star;
-    std::shared_ptr<Col> col;
+    std::unique_ptr<Col> col;
 
-    AggExpr(AggFuncType func_, bool is_star_, std::shared_ptr<Col> col_)
+    AggExpr(AggFuncType func_, bool is_star_, std::unique_ptr<Col> col_)
         : Expr(AstType::AggExpr), func(func_), is_star(is_star_), col(std::move(col_)) {}
 };
 
 struct SelectItem : public TreeNode {
-    std::shared_ptr<Expr> expr;
+    std::unique_ptr<Expr> expr;
     std::string alias;
 
-    SelectItem(std::shared_ptr<Expr> expr_, std::string alias_)
+    SelectItem(std::unique_ptr<Expr> expr_, std::string alias_)
         : TreeNode(AstType::SelectItem), expr(std::move(expr_)), alias(std::move(alias_)) {}
 };
 
 struct SetClause : public TreeNode {
     std::string col_name;
-    std::shared_ptr<Value> val;
+    std::unique_ptr<Value> val;
 
-    SetClause(std::string col_name_, std::shared_ptr<Value> val_)
+    SetClause(std::string col_name_, std::unique_ptr<Value> val_)
         : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)) {}
 };
 
 struct BinaryExpr : public TreeNode {
-    std::shared_ptr<Col> lhs;
+    std::unique_ptr<Expr> lhs;
     SvCompOp op;
-    std::shared_ptr<Expr> rhs;
+    std::unique_ptr<Expr> rhs;
 
-    BinaryExpr(std::shared_ptr<Col> lhs_, SvCompOp op_, std::shared_ptr<Expr> rhs_)
+    BinaryExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_)
         : TreeNode(AstType::BinaryExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
 };
 
-struct HavingExpr : public TreeNode {
-    std::shared_ptr<Expr> lhs;
-    SvCompOp op;
-    std::shared_ptr<Expr> rhs;
+inline std::unique_ptr<Expr> clone_expr(const Expr& expr);
 
-    HavingExpr(std::shared_ptr<Expr> lhs_, SvCompOp op_, std::shared_ptr<Expr> rhs_)
+inline std::unique_ptr<BinaryExpr> clone_binary_expr(const BinaryExpr& expr) {
+    return std::make_unique<BinaryExpr>(clone_expr(*expr.lhs), expr.op, clone_expr(*expr.rhs));
+}
+
+struct HavingExpr : public TreeNode {
+    std::unique_ptr<Expr> lhs;
+    SvCompOp op;
+    std::unique_ptr<Expr> rhs;
+
+    HavingExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_)
         : TreeNode(AstType::HavingExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
 };
 
-struct OrderBy : public TreeNode {
-    std::shared_ptr<Col> cols;
-    OrderByDir orderby_dir;
-    OrderBy(std::shared_ptr<Col> cols_, OrderByDir orderby_dir_)
-        : TreeNode(AstType::OrderBy), cols(std::move(cols_)), orderby_dir(orderby_dir_) {}
-};
-
 struct OrderByItem : public TreeNode {
-    std::shared_ptr<Expr> expr;
+    std::unique_ptr<Expr> expr;
     OrderByDir orderby_dir;
 
-    OrderByItem(std::shared_ptr<Expr> expr_, OrderByDir orderby_dir_)
+    OrderByItem(std::unique_ptr<Expr> expr_, OrderByDir orderby_dir_)
         : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_) {}
 };
 
+inline std::unique_ptr<OrderByItem> clone_order_by_item(const OrderByItem& item) {
+    return std::make_unique<OrderByItem>(clone_expr(*item.expr), item.orderby_dir);
+}
+
+struct OrderBy : public TreeNode {
+    std::vector<std::unique_ptr<OrderByItem>> items;
+
+    explicit OrderBy(std::vector<std::unique_ptr<OrderByItem>> items_)
+        : TreeNode(AstType::OrderBy), items(std::move(items_)) {}
+};
+
+inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
+    switch (expr.type) {
+    case AstType::Col: {
+        auto& col = static_cast<const Col&>(expr);
+        return clone_col(col);
+    }
+    case AstType::AggExpr: {
+        auto& agg = static_cast<const AggExpr&>(expr);
+        return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.col == nullptr ? nullptr : clone_col(*agg.col));
+    }
+    case AstType::IntLit: {
+        auto& lit = static_cast<const IntLit&>(expr);
+        return std::make_unique<IntLit>(lit.val, lit.display_text);
+    }
+    case AstType::FloatLit: {
+        auto& lit = static_cast<const FloatLit&>(expr);
+        return std::make_unique<FloatLit>(lit.val, lit.display_text);
+    }
+    case AstType::StringLit: {
+        auto& lit = static_cast<const StringLit&>(expr);
+        return std::make_unique<StringLit>(lit.val, lit.display_text);
+    }
+    case AstType::BoolLit: {
+        auto& lit = static_cast<const BoolLit&>(expr);
+        return std::make_unique<BoolLit>(lit.val, lit.display_text);
+    }
+    default:
+        throw std::logic_error("unsupported expression type for AST clone");
+    }
+}
+
 struct InsertStmt : public TreeNode {
     std::string tab_name;
-    std::vector<std::shared_ptr<Value>> vals;
+    std::vector<std::unique_ptr<Value>> vals;
 
-    InsertStmt(std::string tab_name_, std::vector<std::shared_ptr<Value>> vals_)
+    InsertStmt(std::string tab_name_, std::vector<std::unique_ptr<Value>> vals_)
         : TreeNode(AstType::InsertStmt), tab_name(std::move(tab_name_)), vals(std::move(vals_)) {}
 };
 
 struct DeleteStmt : public TreeNode {
     std::string tab_name;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
 
-    DeleteStmt(std::string tab_name_, std::vector<std::shared_ptr<BinaryExpr>> conds_)
+    DeleteStmt(std::string tab_name_, std::vector<std::unique_ptr<BinaryExpr>> conds_)
         : TreeNode(AstType::DeleteStmt), tab_name(std::move(tab_name_)), conds(std::move(conds_)) {}
 };
 
 struct UpdateStmt : public TreeNode {
     std::string tab_name;
-    std::vector<std::shared_ptr<SetClause>> set_clauses;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
+    std::vector<std::unique_ptr<SetClause>> set_clauses;
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
 
-    UpdateStmt(std::string tab_name_, std::vector<std::shared_ptr<SetClause>> set_clauses_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_)
+    UpdateStmt(std::string tab_name_, std::vector<std::unique_ptr<SetClause>> set_clauses_,
+               std::vector<std::unique_ptr<BinaryExpr>> conds_)
         : TreeNode(AstType::UpdateStmt), tab_name(std::move(tab_name_)), set_clauses(std::move(set_clauses_)),
           conds(std::move(conds_)) {}
 };
 
 struct JoinExpr : public TreeNode {
-    std::string left;
-    std::string right;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
-    JoinType type;
+    TableRef left;
+    TableRef right;
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
+    JoinType join_type;
 
-    JoinExpr(std::string left_, std::string right_, std::vector<std::shared_ptr<BinaryExpr>> conds_, JoinType type_)
+    JoinExpr(TableRef left_, TableRef right_, std::vector<std::unique_ptr<BinaryExpr>> conds_, JoinType type_)
         : TreeNode(AstType::JoinExpr), left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)),
-          type(type_) {}
+          join_type(type_) {}
 };
 
 struct SelectStmt : public TreeNode {
-    std::vector<std::shared_ptr<Col>> cols;
-    std::vector<std::shared_ptr<SelectItem>> select_items;
-    std::vector<std::string> tabs;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
-    std::vector<std::shared_ptr<JoinExpr>> jointree;
+    std::vector<std::unique_ptr<SelectItem>> select_items;
+    std::vector<TableRef> tabs;
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
+    std::vector<std::unique_ptr<JoinExpr>> jointree;
 
     bool has_select_star;
-    std::vector<std::shared_ptr<Col>> group_by_cols;
-    std::vector<std::shared_ptr<HavingExpr>> having_conds;
+    std::vector<std::unique_ptr<Col>> group_by_cols;
+    std::vector<std::unique_ptr<HavingExpr>> having_conds;
     bool has_sort;
-    std::shared_ptr<OrderBy> order;
-    std::vector<std::shared_ptr<OrderByItem>> order_by_items;
+    std::unique_ptr<OrderBy> order;
+    std::vector<std::unique_ptr<OrderByItem>> order_by_items;
     bool has_limit;
     int limit;
 
-    SelectStmt(std::vector<std::shared_ptr<Col>> cols_, std::vector<std::string> tabs_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_, std::shared_ptr<OrderBy> order_)
-        : TreeNode(AstType::SelectStmt), cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
-          has_select_star(cols.empty()), order(std::move(order_)), has_limit(false), limit(0) {
-        for (const auto& col : cols) {
-            select_items.push_back(std::make_shared<SelectItem>(std::static_pointer_cast<Expr>(col), ""));
-        }
-        if (order != nullptr) {
-            order_by_items.push_back(
-                std::make_shared<OrderByItem>(std::static_pointer_cast<Expr>(order->cols), order->orderby_dir));
-        }
-        has_sort = !order_by_items.empty();
-    }
-
-    SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_, std::vector<std::string> tabs_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_, std::vector<std::shared_ptr<Col>> group_by_cols_,
-               std::vector<std::shared_ptr<HavingExpr>> having_conds_,
-               std::vector<std::shared_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
-               bool has_select_star_)
+    SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
+               std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
+               std::vector<std::unique_ptr<HavingExpr>> having_conds_,
+               std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
+               bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {})
         : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
-          conds(std::move(conds_)), has_select_star(has_select_star_), group_by_cols(std::move(group_by_cols_)),
-          having_conds(std::move(having_conds_)), has_sort(!order_by_items_.empty()),
-          order_by_items(std::move(order_by_items_)), has_limit(has_limit_), limit(limit_) {
-        for (const auto& item : select_items) {
-            if (item == nullptr) {
-                continue;
+          conds(std::move(conds_)), jointree(std::move(jointree_)), has_select_star(has_select_star_),
+          group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
+          has_sort(!order_by_items_.empty()), order_by_items(std::move(order_by_items_)), has_limit(has_limit_),
+          limit(limit_) {
+        if (!order_by_items.empty()) {
+            std::vector<std::unique_ptr<OrderByItem>> order_items;
+            order_items.reserve(order_by_items.size());
+            for (const auto& item : order_by_items) {
+                order_items.push_back(clone_order_by_item(*item));
             }
-            auto col = std::dynamic_pointer_cast<Col>(item->expr);
-            if (col != nullptr) {
-                cols.push_back(col);
-            }
-        }
-        if (order_by_items.size() == 1) {
-            auto order_col = std::dynamic_pointer_cast<Col>(order_by_items.front()->expr);
-            if (order_col != nullptr) {
-                order = std::make_shared<OrderBy>(order_col, order_by_items.front()->orderby_dir);
-            }
+            order = std::make_unique<OrderBy>(std::move(order_items));
         }
     }
 };
 
 struct UnionStmt : public TreeNode {
-    std::vector<std::shared_ptr<SelectStmt>> branches;
+    std::vector<std::unique_ptr<SelectStmt>> branches;
 
-    explicit UnionStmt(std::vector<std::shared_ptr<SelectStmt>> branches_)
+    explicit UnionStmt(std::vector<std::unique_ptr<SelectStmt>> branches_)
         : TreeNode(AstType::UnionStmt), branches(std::move(branches_)) {}
 };
 
 struct SelectFromUnionStmt : public TreeNode {
-    std::shared_ptr<UnionStmt> union_stmt;
+    std::unique_ptr<UnionStmt> union_stmt;
     std::string alias;
-    std::vector<std::shared_ptr<OrderByItem>> order_by_items;
+    std::unique_ptr<OrderBy> order;
+    std::vector<std::unique_ptr<OrderByItem>> order_by_items;
     bool has_sort;
 
-    SelectFromUnionStmt(std::shared_ptr<UnionStmt> union_stmt_, std::string alias_,
-                        std::vector<std::shared_ptr<OrderByItem>> order_by_items_)
+    SelectFromUnionStmt(std::unique_ptr<UnionStmt> union_stmt_, std::string alias_,
+                        std::vector<std::unique_ptr<OrderByItem>> order_by_items_)
         : TreeNode(AstType::SelectFromUnionStmt), union_stmt(std::move(union_stmt_)), alias(std::move(alias_)),
-          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {}
+          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {
+        if (!order_by_items.empty()) {
+            std::vector<std::unique_ptr<OrderByItem>> order_items;
+            order_items.reserve(order_by_items.size());
+            for (const auto& item : order_by_items) {
+                order_items.push_back(clone_order_by_item(*item));
+            }
+            order = std::make_unique<OrderBy>(std::move(order_items));
+        }
+    }
 };
 
 struct ExplainAnalyze : public TreeNode {
-    std::shared_ptr<SelectStmt> select;
+    std::unique_ptr<SelectStmt> select;
 
-    explicit ExplainAnalyze(std::shared_ptr<SelectStmt> select_)
+    explicit ExplainAnalyze(std::unique_ptr<SelectStmt> select_)
         : TreeNode(AstType::ExplainAnalyze), select(std::move(select_)) {}
 };
 
@@ -403,63 +452,4 @@ struct SetTransaction : public TreeNode {
     explicit SetTransaction(IsolationLevelType level) : TreeNode(AstType::SetTransaction), isolation_level_(level) {}
 };
 
-struct FromClause {
-    std::vector<std::string> tables;
-    std::vector<std::shared_ptr<BinaryExpr>> conds;
-};
-
-// Semantic value
-struct SemValue {
-    std::string sv_str;
-    bool sv_bool;
-    AggFuncType sv_agg_func;
-    OrderByDir sv_orderby_dir;
-    std::vector<std::string> sv_strs;
-
-    std::shared_ptr<TreeNode> sv_node;
-
-    SvCompOp sv_comp_op;
-
-    std::shared_ptr<TypeLen> sv_type_len;
-
-    std::shared_ptr<Field> sv_field;
-    std::vector<std::shared_ptr<Field>> sv_fields;
-
-    std::shared_ptr<Expr> sv_expr;
-
-    std::shared_ptr<Value> sv_val;
-    std::vector<std::shared_ptr<Value>> sv_vals;
-
-    std::shared_ptr<Col> sv_col;
-    std::vector<std::shared_ptr<Col>> sv_cols;
-
-    std::shared_ptr<SelectItem> sv_select_item;
-    std::vector<std::shared_ptr<SelectItem>> sv_select_items;
-    std::shared_ptr<SelectStmt> sv_select_stmt;
-    std::shared_ptr<UnionStmt> sv_union_stmt;
-    std::shared_ptr<FromClause> sv_from_clause;
-    std::vector<std::shared_ptr<SelectStmt>> sv_select_stmts;
-
-    std::shared_ptr<SetClause> sv_set_clause;
-    std::vector<std::shared_ptr<SetClause>> sv_set_clauses;
-
-    std::shared_ptr<BinaryExpr> sv_cond;
-    std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
-
-    std::shared_ptr<HavingExpr> sv_having_cond;
-    std::vector<std::shared_ptr<HavingExpr>> sv_having_conds;
-
-    std::shared_ptr<OrderBy> sv_orderby;
-    std::shared_ptr<OrderByItem> sv_orderby_item;
-    std::vector<std::shared_ptr<OrderByItem>> sv_orderby_items;
-
-    SetKnobType sv_setKnobType;
-
-    IsolationLevelType sv_isolation_level;
-};
-
-extern std::shared_ptr<ast::TreeNode> parse_tree;
-
 } // namespace ast
-
-#define YYSTYPE ast::SemValue

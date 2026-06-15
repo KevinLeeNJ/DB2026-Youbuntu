@@ -10,9 +10,14 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <atomic>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "log_defs.h"
@@ -20,8 +25,33 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm_defs.h"
 
 /* 日志记录对应操作的类型 */
-enum LogType : int { UPDATE = 0, INSERT, DELETE, begin, commit, ABORT };
-static std::string LogTypeStr[] = {"UPDATE", "INSERT", "DELETE", "BEGIN", "COMMIT", "ABORT"};
+enum LogType : int { UPDATE = 0, INSERT, DELETE, BEGIN, COMMIT, ABORT, CHECKPOINT };
+static std::string LogTypeStr[] = {"UPDATE", "INSERT", "DELETE", "BEGIN", "COMMIT", "ABORT", "CHECKPOINT"};
+
+static bool LogPayloadReadable(uint32_t total_len, int offset, size_t bytes) {
+    return offset >= 0 && static_cast<uint32_t>(offset) <= total_len &&
+           bytes <= total_len - static_cast<uint32_t>(offset);
+}
+
+static bool ReadRecordPayload(const char* src, uint32_t total_len, int* offset, RmRecord* record) {
+    if (!LogPayloadReadable(total_len, *offset, sizeof(int))) {
+        return false;
+    }
+    int record_size = *reinterpret_cast<const int*>(src + *offset);
+    *offset += sizeof(int);
+    if (record_size < 0 || !LogPayloadReadable(total_len, *offset, static_cast<size_t>(record_size))) {
+        return false;
+    }
+    if (record->allocated_) {
+        delete[] record->data;
+    }
+    record->size = record_size;
+    record->data = new char[record_size];
+    memcpy(record->data, src + *offset, record_size);
+    record->allocated_ = true;
+    *offset += record_size;
+    return true;
+}
 
 class LogRecord {
 public:
@@ -30,6 +60,8 @@ public:
     uint32_t log_tot_len_; /* 整个日志记录的长度 */
     txn_id_t log_tid_;     /* 创建当前日志的事务ID */
     lsn_t prev_lsn_;       /* 事务创建的前一条日志记录的lsn，用于undo */
+
+    virtual ~LogRecord() = default;
 
     // 把日志记录序列化到dest中
     virtual void serialize(char* dest) const {
@@ -62,7 +94,7 @@ public:
 class BeginLogRecord : public LogRecord {
 public:
     BeginLogRecord() {
-        log_type_ = LogType::begin;
+        log_type_ = LogType::BEGIN;
         lsn_ = INVALID_LSN;
         log_tot_len_ = LOG_HEADER_SIZE;
         log_tid_ = INVALID_TXN_ID;
@@ -86,14 +118,52 @@ public:
 };
 
 /**
- * TODO: commit操作的日志记录
+ * commit操作的日志记录
  */
-class CommitLogRecord : public LogRecord {};
+class CommitLogRecord : public LogRecord {
+public:
+    CommitLogRecord() {
+        log_type_ = LogType::COMMIT;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        prev_lsn_ = INVALID_LSN;
+    }
+    explicit CommitLogRecord(txn_id_t txn_id) : CommitLogRecord() {
+        log_tid_ = txn_id;
+    }
+
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+    }
+};
 
 /**
- * TODO: abort操作的日志记录
+ * abort操作的日志记录
  */
-class AbortLogRecord : public LogRecord {};
+class AbortLogRecord : public LogRecord {
+public:
+    AbortLogRecord() {
+        log_type_ = LogType::ABORT;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        prev_lsn_ = INVALID_LSN;
+    }
+    explicit AbortLogRecord(txn_id_t txn_id) : AbortLogRecord() {
+        log_tid_ = txn_id;
+    }
+
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+    }
+};
 
 class InsertLogRecord : public LogRecord {
 public:
@@ -133,12 +203,22 @@ public:
     // 从src中反序列化出一条Insert日志记录
     void deserialize(const char* src) override {
         LogRecord::deserialize(src);
-        insert_value_.Deserialize(src + OFFSET_LOG_DATA);
-        int offset = OFFSET_LOG_DATA + insert_value_.size + sizeof(int);
+        int offset = OFFSET_LOG_DATA;
+        if (!ReadRecordPayload(src, log_tot_len_, &offset, &insert_value_) ||
+            !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
+            return;
+        }
         rid_ = *reinterpret_cast<const Rid*>(src + offset);
         offset += sizeof(Rid);
+        if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
+            return;
+        }
         table_name_size_ = *reinterpret_cast<const size_t*>(src + offset);
         offset += sizeof(size_t);
+        if (!LogPayloadReadable(log_tot_len_, offset, table_name_size_)) {
+            table_name_size_ = 0;
+            return;
+        }
         table_name_.assign(src + offset, table_name_size_);
     }
     void format_print() override {
@@ -156,23 +236,195 @@ public:
 };
 
 /**
- * TODO: delete操作的日志记录
+ * delete操作的日志记录
  */
-class DeleteLogRecord : public LogRecord {};
+class DeleteLogRecord : public LogRecord {
+public:
+    DeleteLogRecord() {
+        log_type_ = LogType::DELETE;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        prev_lsn_ = INVALID_LSN;
+    }
+    DeleteLogRecord(txn_id_t txn_id, RmRecord& delete_value, Rid& rid, std::string table_name) : DeleteLogRecord() {
+        log_tid_ = txn_id;
+        delete_value_ = delete_value;
+        rid_ = rid;
+        table_name_ = std::move(table_name);
+        table_name_size_ = table_name_.size();
+        log_tot_len_ += sizeof(int) + delete_value_.size + sizeof(Rid) + sizeof(size_t) + table_name_size_;
+    }
+
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        memcpy(dest + offset, &delete_value_.size, sizeof(int));
+        offset += sizeof(int);
+        memcpy(dest + offset, delete_value_.data, delete_value_.size);
+        offset += delete_value_.size;
+        memcpy(dest + offset, &rid_, sizeof(Rid));
+        offset += sizeof(Rid);
+        memcpy(dest + offset, &table_name_size_, sizeof(size_t));
+        offset += sizeof(size_t);
+        memcpy(dest + offset, table_name_.data(), table_name_size_);
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        if (!ReadRecordPayload(src, log_tot_len_, &offset, &delete_value_) ||
+            !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
+            return;
+        }
+        rid_ = *reinterpret_cast<const Rid*>(src + offset);
+        offset += sizeof(Rid);
+        if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
+            return;
+        }
+        table_name_size_ = *reinterpret_cast<const size_t*>(src + offset);
+        offset += sizeof(size_t);
+        if (!LogPayloadReadable(log_tot_len_, offset, table_name_size_)) {
+            table_name_size_ = 0;
+            return;
+        }
+        table_name_.assign(src + offset, table_name_size_);
+    }
+
+    RmRecord delete_value_;
+    Rid rid_;
+    std::string table_name_;
+    size_t table_name_size_{0};
+};
 
 /**
- * TODO: update操作的日志记录
+ * update操作的日志记录
  */
-class UpdateLogRecord : public LogRecord {};
+class UpdateLogRecord : public LogRecord {
+public:
+    UpdateLogRecord() {
+        log_type_ = LogType::UPDATE;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        prev_lsn_ = INVALID_LSN;
+    }
+    UpdateLogRecord(txn_id_t txn_id, RmRecord& old_value, RmRecord& new_value, Rid& rid, std::string table_name)
+        : UpdateLogRecord() {
+        log_tid_ = txn_id;
+        old_value_ = old_value;
+        new_value_ = new_value;
+        rid_ = rid;
+        table_name_ = std::move(table_name);
+        table_name_size_ = table_name_.size();
+        log_tot_len_ += sizeof(int) + old_value_.size;
+        log_tot_len_ += sizeof(int) + new_value_.size;
+        log_tot_len_ += sizeof(Rid) + sizeof(size_t) + table_name_size_;
+    }
+
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        memcpy(dest + offset, &old_value_.size, sizeof(int));
+        offset += sizeof(int);
+        memcpy(dest + offset, old_value_.data, old_value_.size);
+        offset += old_value_.size;
+        memcpy(dest + offset, &new_value_.size, sizeof(int));
+        offset += sizeof(int);
+        memcpy(dest + offset, new_value_.data, new_value_.size);
+        offset += new_value_.size;
+        memcpy(dest + offset, &rid_, sizeof(Rid));
+        offset += sizeof(Rid);
+        memcpy(dest + offset, &table_name_size_, sizeof(size_t));
+        offset += sizeof(size_t);
+        memcpy(dest + offset, table_name_.data(), table_name_size_);
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        if (!ReadRecordPayload(src, log_tot_len_, &offset, &old_value_) ||
+            !ReadRecordPayload(src, log_tot_len_, &offset, &new_value_) ||
+            !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
+            return;
+        }
+        rid_ = *reinterpret_cast<const Rid*>(src + offset);
+        offset += sizeof(Rid);
+        if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
+            return;
+        }
+        table_name_size_ = *reinterpret_cast<const size_t*>(src + offset);
+        offset += sizeof(size_t);
+        if (!LogPayloadReadable(log_tot_len_, offset, table_name_size_)) {
+            table_name_size_ = 0;
+            return;
+        }
+        table_name_.assign(src + offset, table_name_size_);
+    }
+
+    RmRecord old_value_;
+    RmRecord new_value_;
+    Rid rid_;
+    std::string table_name_;
+    size_t table_name_size_{0};
+};
+
+class CheckpointLogRecord : public LogRecord {
+public:
+    CheckpointLogRecord() {
+        log_type_ = LogType::CHECKPOINT;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE + sizeof(size_t);
+        log_tid_ = INVALID_TXN_ID;
+        prev_lsn_ = INVALID_LSN;
+    }
+    explicit CheckpointLogRecord(std::unordered_map<txn_id_t, lsn_t> active_txns) : CheckpointLogRecord() {
+        active_txns_ = std::move(active_txns);
+        log_tot_len_ += active_txns_.size() * (sizeof(txn_id_t) + sizeof(lsn_t));
+    }
+
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        size_t active_count = active_txns_.size();
+        memcpy(dest + offset, &active_count, sizeof(size_t));
+        offset += sizeof(size_t);
+        for (const auto& [txn_id, last_lsn] : active_txns_) {
+            memcpy(dest + offset, &txn_id, sizeof(txn_id_t));
+            offset += sizeof(txn_id_t);
+            memcpy(dest + offset, &last_lsn, sizeof(lsn_t));
+            offset += sizeof(lsn_t);
+        }
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
+            return;
+        }
+        size_t active_count = *reinterpret_cast<const size_t*>(src + offset);
+        offset += sizeof(size_t);
+        if (active_count > (log_tot_len_ - offset) / (sizeof(txn_id_t) + sizeof(lsn_t))) {
+            return;
+        }
+        active_txns_.clear();
+        for (size_t i = 0; i < active_count; ++i) {
+            txn_id_t txn_id = *reinterpret_cast<const txn_id_t*>(src + offset);
+            offset += sizeof(txn_id_t);
+            lsn_t last_lsn = *reinterpret_cast<const lsn_t*>(src + offset);
+            offset += sizeof(lsn_t);
+            active_txns_.emplace(txn_id, last_lsn);
+        }
+    }
+
+    std::unordered_map<txn_id_t, lsn_t> active_txns_;
+};
+
+std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size);
 
 /* 日志缓冲区，只有一个buffer，因此需要阻塞地去把日志写入缓冲区中 */
 
 class LogBuffer {
 public:
-    LogBuffer() {
-        offset_ = 0;
-        memset(buffer_, 0, sizeof(buffer_));
-    }
+    LogBuffer() : offset_(0) {}
 
     bool is_full(int append_size) {
         if (offset_ + append_size > LOG_BUFFER_SIZE)
@@ -187,21 +439,40 @@ public:
 /* 日志管理器，负责把日志写入日志缓冲区，以及把日志缓冲区中的内容写入磁盘中 */
 class LogManager {
 public:
+    static constexpr const char* RESTART_FILE_NAME = "db.restart";
+
     LogManager(DiskManager* disk_manager) {
         disk_manager_ = disk_manager;
+        persist_lsn_ = INVALID_LSN;
     }
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
     void flush_log_to_disk();
+    void flush_log_to_disk_with_sync();
+    void initialize_from_existing_log();
+
+    lsn_t get_persist_lsn() const {
+        return persist_lsn_;
+    }
+
+    int current_log_offset() const {
+        return log_file_offset_;
+    }
+
+    void write_restart_offset(int checkpoint_offset);
+    int read_restart_offset() const;
 
     LogBuffer* get_log_buffer() {
         return &log_buffer_;
     }
 
 private:
+    void flush_log_to_disk_unlocked();
+
     std::atomic<lsn_t> global_lsn_{0}; // 全局lsn，递增，用于为每条记录分发lsn
     std::mutex latch_;                 // 用于对log_buffer_的互斥访问
     LogBuffer log_buffer_;             // 日志缓冲区
-    lsn_t persist_lsn_;                // 记录已经持久化到磁盘中的最后一条日志的日志号
+    lsn_t persist_lsn_{INVALID_LSN};   // 记录已经持久化到磁盘中的最后一条日志的日志号
+    int log_file_offset_{0};           // 日志文件当前追加偏移
     DiskManager* disk_manager_;
 };

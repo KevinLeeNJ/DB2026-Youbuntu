@@ -19,16 +19,6 @@ using namespace analyze_internal;
 
 namespace {
 
-constexpr char TABLE_ALIAS_SEPARATOR = '\001';
-
-std::pair<std::string, std::string> decode_table_ref(const std::string& table_ref) {
-    auto sep = table_ref.find(TABLE_ALIAS_SEPARATOR);
-    if (sep == std::string::npos) {
-        return {table_ref, table_ref};
-    }
-    return {table_ref.substr(0, sep), table_ref.substr(sep + 1)};
-}
-
 void resolve_alias(TabCol& col, const Query& query) {
     if (col.tab_name.empty()) {
         return;
@@ -71,7 +61,7 @@ void resolve_aliases(Query& query) {
     }
 }
 
-void populate_table_refs(Query& query, const std::vector<std::string>& table_refs) {
+void populate_table_refs(Query& query, const std::vector<ast::TableRef>& table_refs) {
     query.tables.clear();
     query.table_display_names.clear();
     query.table_alias_to_name.clear();
@@ -79,8 +69,9 @@ void populate_table_refs(Query& query, const std::vector<std::string>& table_ref
     query.tables.reserve(table_refs.size());
     query.table_display_names.reserve(table_refs.size());
 
-    for (const auto& table_ref : table_refs) {
-        auto [table_name, display_name] = decode_table_ref(table_ref);
+    for (const auto& ref : table_refs) {
+        const std::string& table_name = ref.table_name;
+        const std::string& display_name = ref.alias.empty() ? ref.table_name : ref.alias;
         query.tables.push_back(table_name);
         query.table_display_names.push_back(display_name);
         query.table_name_to_display[table_name] = display_name;
@@ -94,42 +85,46 @@ void populate_table_refs(Query& query, const std::vector<std::string>& table_ref
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
- * @param {shared_ptr<ast::TreeNode>} parse parser生成的结果集
- * @return {shared_ptr<Query>} Query
+ * @param {unique_ptr<ast::TreeNode>} parse parser生成的结果集
+ * @return {unique_ptr<Query>} Query
  */
-std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse) {
-    if (parse->type == ast::AstType::SelectStmt) {
-        return analyze_select_stmt(std::static_pointer_cast<ast::SelectStmt>(parse));
+std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse) {
+    auto* root = parse.get();
+    if (root == nullptr) {
+        throw InternalError("Unexpected null AST root");
     }
-    if (parse->type == ast::AstType::ExplainAnalyze) {
-        auto explain = std::static_pointer_cast<ast::ExplainAnalyze>(parse);
-        auto query = analyze_select_stmt(explain->select);
+    if (root->type == ast::AstType::SelectStmt) {
+        return analyze_select_stmt(static_cast<const ast::SelectStmt*>(root), std::move(parse));
+    }
+    if (root->type == ast::AstType::ExplainAnalyze) {
+        auto explain = static_cast<const ast::ExplainAnalyze*>(root);
+        auto query = analyze_select_stmt(explain->select.get());
         query->is_explain_analyze = true;
         query->parse = std::move(parse);
         return query;
     }
-    if (parse->type == ast::AstType::SelectFromUnionStmt) {
-        return analyze_select_from_union_stmt(std::static_pointer_cast<ast::SelectFromUnionStmt>(parse));
+    if (root->type == ast::AstType::SelectFromUnionStmt) {
+        return analyze_select_from_union_stmt(static_cast<const ast::SelectFromUnionStmt*>(root), std::move(parse));
     }
 
-    if (parse->type == ast::AstType::SetTransaction) {
-        auto x = std::static_pointer_cast<ast::SetTransaction>(parse);
-        auto query = std::make_shared<Query>();
+    if (root->type == ast::AstType::SetTransaction) {
+        auto x = static_cast<const ast::SetTransaction*>(root);
+        auto query = std::make_unique<Query>();
         query->is_set_transaction = true;
         query->set_isolation_level = x->isolation_level_;
         query->parse = std::move(parse);
         return query;
     }
 
-    std::shared_ptr<Query> query = std::make_shared<Query>();
-    switch (parse->type) {
+    auto query = std::make_unique<Query>();
+    switch (root->type) {
     case ast::AstType::UpdateStmt: {
-        auto x = std::static_pointer_cast<ast::UpdateStmt>(parse);
+        auto x = static_cast<const ast::UpdateStmt*>(root);
         query->set_clauses.reserve(x->set_clauses.size());
-        for (auto set_clause : x->set_clauses) {
+        for (const auto& set_clause : x->set_clauses) {
             SetClause clause;
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
-            clause.rhs = convert_sv_value(set_clause->val);
+            clause.rhs = convert_sv_value(set_clause->val.get());
             query->set_clauses.push_back(clause);
         }
         get_clause(x->conds, query->conds);
@@ -137,16 +132,16 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         break;
     }
     case ast::AstType::DeleteStmt: {
-        auto x = std::static_pointer_cast<ast::DeleteStmt>(parse);
+        auto x = static_cast<const ast::DeleteStmt*>(root);
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
         break;
     }
     case ast::AstType::InsertStmt: {
-        auto x = std::static_pointer_cast<ast::InsertStmt>(parse);
+        auto x = static_cast<const ast::InsertStmt*>(root);
         query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
-            query->values.push_back(convert_sv_value(sv_val));
+            query->values.push_back(convert_sv_value(sv_val.get()));
         }
         break;
     }
@@ -157,8 +152,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     return query;
 }
 
-std::shared_ptr<Query> Analyze::analyze_select_stmt(const std::shared_ptr<ast::SelectStmt>& x) {
-    std::shared_ptr<Query> query = std::make_shared<Query>();
+std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner) {
+    auto query = std::make_unique<Query>();
     populate_table_refs(*query, x->tabs);
 
     for (const auto& tab_name : query->tables) {
@@ -180,7 +175,7 @@ std::shared_ptr<Query> Analyze::analyze_select_stmt(const std::shared_ptr<ast::S
     resolve_aliases(*query);
     check_clause(query->tables, query->conds);
     validate_select_query(*query, all_cols);
-    query->parse = x;
+    query->parse = std::move(owner);
     return query;
 }
 
@@ -260,20 +255,21 @@ void Analyze::validate_union_order_by(Query& query) {
     }
 }
 
-std::shared_ptr<Query> Analyze::analyze_select_from_union_stmt(const std::shared_ptr<ast::SelectFromUnionStmt>& x) {
+std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* x,
+                                                               std::unique_ptr<ast::TreeNode> owner) {
     if (x->union_stmt == nullptr || x->union_stmt->branches.size() < 2) {
         throw RMDBError("UNION requires at least two SELECT branches");
     }
 
-    auto query = std::make_shared<Query>();
+    auto query = std::make_unique<Query>();
     query->is_union = true;
-    query->parse = x;
+    query->parse = std::move(owner);
     query->union_alias = x->alias;
     populate_order_by_from_ast(*query, *x);
 
     query->union_branches.reserve(x->union_stmt->branches.size());
     for (const auto& branch : x->union_stmt->branches) {
-        auto branch_query = analyze_select_stmt(branch);
+        auto branch_query = analyze_select_stmt(branch.get());
         if (!branch_query->order_by_items.empty() || branch_query->has_limit) {
             throw RMDBError("UNION branches do not support ORDER BY or LIMIT");
         }
@@ -316,7 +312,7 @@ void Analyze::get_all_cols(const std::vector<std::string>& tab_names, std::vecto
     }
 }
 
-void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds) {
+void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds) {
     conds.clear();
     conds.reserve(sv_conds.size());
     for (const auto& expr : sv_conds) {
@@ -324,11 +320,11 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>>& sv
         cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
         cond.op = convert_sv_comp_op(expr->op);
 
-        if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(expr->rhs); rhs_val != nullptr) {
+        if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
             cond.is_rhs_val = true;
             cond.rhs_val = convert_sv_value(rhs_val);
             cond.rhs_display = rhs_val->display_text;
-        } else if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs); rhs_col != nullptr) {
+        } else if (auto rhs_col = dynamic_cast<const ast::Col*>(expr->rhs.get()); rhs_col != nullptr) {
             cond.is_rhs_val = false;
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
         } else {
@@ -363,7 +359,7 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
     }
 }
 
-Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value>& sv_val) {
+Value Analyze::convert_sv_value(const ast::Value* sv_val) {
     return convert_ast_value_node(sv_val);
 }
 

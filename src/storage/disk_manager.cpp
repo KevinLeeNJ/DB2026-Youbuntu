@@ -242,6 +242,7 @@ int DiskManager::read_log(char* log_data, int size, int offset) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
     int file_size = get_file_size(LOG_FILE_NAME);
+    log_offset_ = file_size;
     if (offset > file_size) {
         return -1;
     }
@@ -263,12 +264,21 @@ int DiskManager::read_log(char* log_data, int size, int offset) {
 void DiskManager::write_log(char* log_data, int size) {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
+        log_offset_ = get_file_size(LOG_FILE_NAME);
+        if (log_offset_ < 0)
+            log_offset_ = 0;
     }
 
     // write from the file_end
-    lseek(log_fd_, 0, SEEK_END);
-    ssize_t bytes_write = write(log_fd_, log_data, size);
+    ssize_t bytes_write = pwrite(log_fd_, log_data, size, log_offset_);
     if (bytes_write != size) {
+        throw UnixError();
+    }
+    log_offset_ += size;
+}
+
+void DiskManager::fsync_log() {
+    if (log_fd_ != -1 && fdatasync(log_fd_) != 0) {
         throw UnixError();
     }
 }

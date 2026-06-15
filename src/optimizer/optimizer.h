@@ -29,47 +29,53 @@ private:
 public:
     Optimizer(SmManager* sm_manager, Planner* planner) : sm_manager_(sm_manager), planner_(planner) {}
 
-    std::shared_ptr<Plan> plan_query(std::shared_ptr<Query> query, Context* context) {
-        switch (query->parse->type) {
+    std::unique_ptr<Plan> plan_query(std::unique_ptr<Query> query, Context* context) {
+        auto* parse = query->parse.get();
+        if (parse == nullptr) {
+            throw InternalError("Unexpected null AST root");
+        }
+        switch (parse->type) {
         case ast::AstType::Help:
             // help;
-            return std::make_shared<OtherPlan>(T_Help, std::string());
+            return std::make_unique<OtherPlan>(T_Help, std::string());
         case ast::AstType::ShowTables:
             // show tables;
-            return std::make_shared<OtherPlan>(T_ShowTable, std::string());
+            return std::make_unique<OtherPlan>(T_ShowTable, std::string());
         case ast::AstType::ShowIndex: {
-            auto x = std::static_pointer_cast<ast::ShowIndex>(query->parse);
+            auto x = static_cast<const ast::ShowIndex*>(parse);
             // show index from table;
-            return std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
+            return std::make_unique<OtherPlan>(T_ShowIndex, x->tab_name);
         }
         case ast::AstType::DescTable: {
-            auto x = std::static_pointer_cast<ast::DescTable>(query->parse);
+            auto x = static_cast<const ast::DescTable*>(parse);
             // desc table;
-            return std::make_shared<OtherPlan>(T_DescTable, x->tab_name);
+            return std::make_unique<OtherPlan>(T_DescTable, x->tab_name);
         }
         case ast::AstType::TxnBegin:
             // begin;
-            return std::make_shared<OtherPlan>(T_Transaction_begin, std::string());
+            return std::make_unique<OtherPlan>(T_Transaction_begin, std::string());
         case ast::AstType::TxnAbort:
             // abort;
-            return std::make_shared<OtherPlan>(T_Transaction_abort, std::string());
+            return std::make_unique<OtherPlan>(T_Transaction_abort, std::string());
         case ast::AstType::TxnCommit:
             // commit;
-            return std::make_shared<OtherPlan>(T_Transaction_commit, std::string());
+            return std::make_unique<OtherPlan>(T_Transaction_commit, std::string());
         case ast::AstType::TxnRollback:
             // rollback;
-            return std::make_shared<OtherPlan>(T_Transaction_rollback, std::string());
+            return std::make_unique<OtherPlan>(T_Transaction_rollback, std::string());
         case ast::AstType::SetStmt: {
-            auto x = std::static_pointer_cast<ast::SetStmt>(query->parse);
+            auto x = static_cast<const ast::SetStmt*>(parse);
             // Set Knob Plan
-            return std::make_shared<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
+            return std::make_unique<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
         }
         case ast::AstType::SetTransaction: {
-            auto x = std::static_pointer_cast<ast::SetTransaction>(query->parse);
-            return std::make_shared<SetTransactionPlan>(x->isolation_level_);
+            auto x = static_cast<const ast::SetTransaction*>(parse);
+            return std::make_unique<SetTransactionPlan>(x->isolation_level_);
         }
+        case ast::AstType::StaticCheckpoint:
+            return std::make_unique<OtherPlan>(T_StaticCheckpoint, std::string());
         default:
-            return planner_->do_planner(query, context);
+            return planner_->do_planner(std::move(query), context);
         }
     }
 };

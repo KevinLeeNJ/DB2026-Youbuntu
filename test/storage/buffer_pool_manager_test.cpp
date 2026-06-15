@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "gtest/gtest.h"
+#include "recovery/log_manager.h"
 #include "storage/disk_manager.h"
 #include "errors.h"
 
@@ -120,6 +121,55 @@ TEST_F(BufferPoolManagerTest, ReplacerCreatedCorrectly) {
     ASSERT_NE(nullptr, bpm->replacer_);
     // 验证 replacer 可正常使用（非空且功能正确）
     EXPECT_EQ(0, bpm->replacer_->Size());
+}
+
+TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
+    auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
+    if (disk_manager->is_file(LOG_FILE_NAME)) {
+        disk_manager->destroy_file(LOG_FILE_NAME);
+    }
+    disk_manager->create_file(LOG_FILE_NAME);
+
+    LogManager log_manager(disk_manager);
+    auto bpm = std::make_unique<BufferPoolManager>(10, disk_manager);
+    bpm->set_log_manager(&log_manager);
+
+    PageId page_id{BufferPoolManagerTest::fd_, INVALID_PAGE_ID};
+    auto* page = bpm->new_page(&page_id);
+    ASSERT_NE(nullptr, page);
+    strcpy(page->get_data(), "wal-before-page");
+    ASSERT_TRUE(bpm->unpin_page(page_id, true));
+
+    BeginLogRecord begin_log(1);
+    log_manager.add_log_to_buffer(&begin_log);
+    ASSERT_EQ(0, disk_manager->get_file_size(LOG_FILE_NAME));
+
+    ASSERT_TRUE(bpm->flush_page(page_id));
+    EXPECT_GT(disk_manager->get_file_size(LOG_FILE_NAME), 0);
+}
+
+TEST_F(BufferPoolManagerTest, FlushAllPagesSkipsCleanPages) {
+    auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager);
+
+    PageId page_id{BufferPoolManagerTest::fd_, INVALID_PAGE_ID};
+    auto* page = bpm->new_page(&page_id);
+    ASSERT_NE(nullptr, page);
+    std::strcpy(page->get_data(), "persisted");
+    ASSERT_TRUE(bpm->unpin_page(page_id, true));
+    bpm->flush_all_pages(BufferPoolManagerTest::fd_);
+
+    page = bpm->fetch_page(page_id);
+    ASSERT_NE(nullptr, page);
+    std::strcpy(page->get_data(), "clean-only-memory");
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    bpm->flush_all_pages(BufferPoolManagerTest::fd_);
+
+    BufferPoolManager reopened_bpm(2, disk_manager);
+    auto* reopened_page = reopened_bpm.fetch_page(page_id);
+    ASSERT_NE(nullptr, reopened_page);
+    EXPECT_STREQ("persisted", reopened_page->get_data());
+    ASSERT_TRUE(reopened_bpm.unpin_page(page_id, false));
 }
 
 class BufferPoolManagerConcurrencyTest : public ::testing::Test {
