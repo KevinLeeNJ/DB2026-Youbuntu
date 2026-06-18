@@ -86,6 +86,10 @@ public:
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
+        if (DeletedTupleConflictsWithInsert(fh_, rec, context_)) {
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+        }
+
         std::vector<std::vector<char>> index_keys;
         index_keys.reserve(tab_.indexes.size());
         for (const auto& index : tab_.indexes) {
