@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/transaction_manager.h"
 #include "common/common.h"
 #include "record/rm_file_handle.h"
+#include "record/rm_scan.h"
 
 auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const TupleMeta& base_meta,
                       const std::vector<UndoLog>& undo_logs) -> std::optional<RmRecord>;
@@ -85,6 +86,36 @@ inline bool IndexKeyEquals(const IndexMeta& index, const char* rec_data, const s
         offset += index.cols[i].len;
     }
     return true;
+}
+
+inline bool RecordDataEquals(const RmRecord& lhs, const RmRecord& rhs) {
+    return lhs.size == rhs.size && std::memcmp(lhs.data, rhs.data, lhs.size) == 0;
+}
+
+inline bool DeletedTupleConflictsWithInsert(RmFileHandle* fh, const RmRecord& inserted_rec, Context* context) {
+    if (fh == nullptr || context == nullptr || context->txn_ == nullptr) {
+        return false;
+    }
+
+    auto* txn = context->txn_;
+    for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+        Rid rid = scan.rid();
+        TupleMeta meta = fh->get_tuple_meta(rid);
+        if (!meta.is_deleted_ || meta.writer_txn_id_ == txn->get_transaction_id()) {
+            continue;
+        }
+
+        bool concurrent_delete = !meta.is_committed_ || meta.commit_ts_ > txn->get_start_ts();
+        if (!concurrent_delete) {
+            continue;
+        }
+
+        auto deleted_rec = fh->get_record(rid, context);
+        if (deleted_rec != nullptr && RecordDataEquals(*deleted_rec, inserted_rec)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid, const IndexMeta& index,

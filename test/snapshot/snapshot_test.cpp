@@ -1745,6 +1745,62 @@ TEST_F(SnapshotTest, SI_UpdateTest_PostCommitVisibility) {
 }
 
 // =============================================================================
+// si/UpdateTest — self-referential UPDATE uses the original visible row
+// =============================================================================
+
+TEST_F(SnapshotTest, SI_UpdateTest_SelfReferentialUpdate) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table self_update_test (id int, score int, bonus float);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_test values (1, 10, 1.5);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_test values (2, 20, 2.5);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_test values (3, 30, 3.5);"));
+
+    auto txn = create_session();
+    ASSERT_TRUE(txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(txn->exec_sql_ok("begin;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update self_update_test set score = score + 5 where id < 3;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update self_update_test set bonus = bonus - 0.5 where id = 1;"));
+
+    std::string in_txn = txn->exec_sql("select * from self_update_test;");
+    ASSERT_TRUE(txn->exec_sql_ok("commit;"));
+
+    std::string expected = "+------------------+------------------+------------------+\n"
+                           "|               id |            score |            bonus |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "|                1 |               15 |         1.000000 |\n"
+                           "|                2 |               25 |         2.500000 |\n"
+                           "|                3 |               30 |         3.500000 |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "Total record(s): 3";
+    EXPECT_EQ(TestSession::trim_output(in_txn), expected);
+
+    auto check = create_session();
+    std::string after_commit = check->exec_sql("select * from self_update_test;");
+    EXPECT_EQ(TestSession::trim_output(after_commit), expected);
+}
+
+TEST_F(SnapshotTest, SI_UpdateTest_SelfReferentialUpdateReadsOriginalRowForEachClause) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table self_update_order_test (id int, a int, b int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_order_test values (1, 10, 0);"));
+
+    auto txn = create_session();
+    ASSERT_TRUE(txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(txn->exec_sql_ok("begin;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update self_update_order_test set a = a + 1, b = a + 2 where id = 1;"));
+    std::string in_txn = txn->exec_sql("select * from self_update_order_test where id = 1;");
+    ASSERT_TRUE(txn->exec_sql_ok("commit;"));
+
+    std::string expected = "+------------------+------------------+------------------+\n"
+                           "|               id |                a |                b |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "|                1 |               11 |               12 |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(in_txn), expected);
+}
+
+// =============================================================================
 // si/WriteWriteConflictDeleteInsertTest — WW conflict on concurrent DELETE
 // =============================================================================
 
@@ -1817,6 +1873,107 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_DeleteThenInsertDifferentTxn) {
     std::string final_state = t3->exec_sql("select * from t;");
     bool has_200 = final_state.find("200") != std::string::npos;
     EXPECT_TRUE(has_200) << "T2's insert should be visible after T1's delete";
+}
+
+TEST_F(SnapshotTest, SI_WriteWriteConflict_UncommittedDeleteThenInsertSameTupleNoIndex) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto deleter = create_session();
+    auto inserter = create_session();
+    auto verifier = create_session();
+
+    ASSERT_TRUE(deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("delete from t where id = 1 and val = 100;"));
+
+    ASSERT_TRUE(inserter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(inserter->exec_sql_ok("begin;"));
+    std::string insert_abort = inserter->exec_sql_expect_abort("insert into t values (1, 100);");
+    EXPECT_EQ(TestSession::trim_output(insert_abort), "abort")
+        << "A concurrent insert of the exact tuple deleted by another txn must abort even without indexes";
+    ASSERT_TRUE(inserter->exec_sql_ok("commit;"));
+
+    ASSERT_TRUE(deleter->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select * from t;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 0";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected);
+}
+
+TEST_F(SnapshotTest, SI_WriteWriteConflict_UncommittedDeleteThenInsertDifferentTupleNoIndexAllowed) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto deleter = create_session();
+    auto inserter = create_session();
+    auto verifier = create_session();
+
+    ASSERT_TRUE(deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("delete from t where id = 1 and val = 100;"));
+
+    ASSERT_TRUE(inserter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(inserter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(inserter->exec_sql_ok("insert into t values (1, 200);"));
+    ASSERT_TRUE(inserter->exec_sql_ok("commit;"));
+
+    ASSERT_TRUE(deleter->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select * from t;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              200 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected);
+}
+
+TEST_F(SnapshotTest, SI_WriteWriteConflict_PostSnapshotDeleteThenInsertSameTupleNoIndex) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto stale_txn = create_session();
+    auto deleter = create_session();
+    auto verifier = create_session();
+
+    ASSERT_TRUE(stale_txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(stale_txn->exec_sql_ok("begin;"));
+    std::string stale_read = stale_txn->exec_sql("select * from t where id = 1 and val = 100;");
+
+    ASSERT_TRUE(deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("delete from t where id = 1 and val = 100;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("commit;"));
+
+    std::string insert_abort = stale_txn->exec_sql_expect_abort("insert into t values (1, 100);");
+    EXPECT_EQ(TestSession::trim_output(insert_abort), "abort")
+        << "A stale snapshot cannot reinsert the exact tuple deleted by a concurrent transaction";
+    ASSERT_TRUE(stale_txn->exec_sql_ok("commit;"));
+
+    std::string expected_stale_read = "+------------------+------------------+\n"
+                                      "|               id |              val |\n"
+                                      "+------------------+------------------+\n"
+                                      "|                1 |              100 |\n"
+                                      "+------------------+------------------+\n"
+                                      "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(stale_read), expected_stale_read);
+
+    std::string final_state = verifier->exec_sql("select * from t;");
+    std::string expected_final = "+------------------+------------------+\n"
+                                 "|               id |              val |\n"
+                                 "+------------------+------------------+\n"
+                                 "+------------------+------------------+\n"
+                                 "Total record(s): 0";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
 }
 
 TEST_F(SnapshotTest, SI_WriteWriteConflict_UncommittedDeleteThenInsertSameUniqueKey) {

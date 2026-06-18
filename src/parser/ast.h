@@ -247,9 +247,15 @@ struct SelectItem : public TreeNode {
 struct SetClause : public TreeNode {
     std::string col_name;
     std::unique_ptr<Value> val;
+    std::unique_ptr<Col> rhs_col;
+    bool is_self_ref;
 
     SetClause(std::string col_name_, std::unique_ptr<Value> val_)
-        : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)) {}
+        : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)), is_self_ref(false) {}
+
+    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_)
+        : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)),
+          rhs_col(std::move(rhs_col_)), is_self_ref(true) {}
 };
 
 struct BinaryExpr : public TreeNode {
