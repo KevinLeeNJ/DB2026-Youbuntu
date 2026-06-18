@@ -82,7 +82,7 @@ public:
                 }
 
                 auto new_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
-                update_record(new_rec.get());                    // 对记录更新
+                update_record(new_rec.get(), *rec);              // 对记录更新
 
                 // SSI: Consolidated atomic check for both old and new records.
                 // Per spec: UPDATE must check both old (pre-update) and new (post-update) records.
@@ -210,10 +210,36 @@ public:
      * @brief 更新记录
      * @param rec 需要更新的记录
      */
-    void update_record(RmRecord* rec) {
+    void update_record(RmRecord* rec, const RmRecord& old_rec) {
         for (const auto& set_clause : set_clauses_) {
             auto col_meta = get_col_offset(set_clause.lhs);
             char* data = rec->data + col_meta.offset;
+            if (set_clause.is_self_ref) {
+                auto rhs_col_meta = get_col_offset(set_clause.rhs_col);
+                if ((rhs_col_meta.type != TYPE_INT && rhs_col_meta.type != TYPE_FLOAT) ||
+                    (set_clause.rhs.type != TYPE_INT && set_clause.rhs.type != TYPE_FLOAT)) {
+                    throw IncompatibleTypeError(coltype2str(rhs_col_meta.type), coltype2str(set_clause.rhs.type));
+                }
+
+                float base = rhs_col_meta.type == TYPE_INT
+                                 ? static_cast<float>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset))
+                                 : *reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset);
+                float delta = set_clause.rhs.type == TYPE_INT ? static_cast<float>(set_clause.rhs.int_val)
+                                                              : set_clause.rhs.float_val;
+                float result = base + delta;
+
+                switch (col_meta.type) {
+                case TYPE_INT:
+                    *reinterpret_cast<int*>(data) = static_cast<int>(result);
+                    break;
+                case TYPE_FLOAT:
+                    *reinterpret_cast<float*>(data) = result;
+                    break;
+                case TYPE_STRING:
+                    throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
+                }
+                continue;
+            }
             if (can_cast(col_meta.type, set_clause.rhs.type) == false) {
                 throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(set_clause.rhs.type));
             }

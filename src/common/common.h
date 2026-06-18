@@ -142,4 +142,6 @@ struct Condition {
 struct SetClause {
     TabCol lhs;
     Value rhs;
+    bool is_self_ref = false;
+    TabCol rhs_col;
 };

@@ -389,6 +389,28 @@ private:
         error("expected value");
     }
 
+    std::unique_ptr<Value> parse_numeric_delta_after(TokenType op) {
+        auto delta = parse_value();
+        if (op == TokenType::PLUS) {
+            if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit) {
+                error("expected numeric value after '+'");
+            }
+            return delta;
+        }
+
+        if (auto* int_delta = dynamic_cast<IntLit*>(delta.get())) {
+            int_delta->val = -int_delta->val;
+            int_delta->display_text = "-" + int_delta->display_text;
+            return delta;
+        }
+        if (auto* float_delta = dynamic_cast<FloatLit*>(delta.get())) {
+            float_delta->val = -float_delta->val;
+            float_delta->display_text = "-" + float_delta->display_text;
+            return delta;
+        }
+        error("expected numeric value after '-'");
+    }
+
     std::unique_ptr<IntLit> parse_int_literal(bool is_negative = false) {
         Token token = expect(TokenType::VALUE_INT, "expected integer");
         const int64_t lower =
@@ -513,6 +535,23 @@ private:
     std::unique_ptr<SetClause> parse_set_clause() {
         std::string column = parse_identifier();
         expect(TokenType::EQ, "expected '=' in SET clause");
+        if (check(TokenType::IDENTIFIER)) {
+            auto state = lexer_.save_state();
+            Token saved_current = current_;
+            auto rhs_col = parse_col();
+
+            if (match(TokenType::PLUS)) {
+                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                                   parse_numeric_delta_after(TokenType::PLUS));
+            }
+            if (match(TokenType::MINUS)) {
+                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                                   parse_numeric_delta_after(TokenType::MINUS));
+            }
+
+            lexer_.restore_state(state);
+            current_ = saved_current;
+        }
         return std::make_unique<SetClause>(std::move(column), parse_value());
     }
 

@@ -1745,6 +1745,62 @@ TEST_F(SnapshotTest, SI_UpdateTest_PostCommitVisibility) {
 }
 
 // =============================================================================
+// si/UpdateTest — self-referential UPDATE uses the original visible row
+// =============================================================================
+
+TEST_F(SnapshotTest, SI_UpdateTest_SelfReferentialUpdate) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table self_update_test (id int, score int, bonus float);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_test values (1, 10, 1.5);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_test values (2, 20, 2.5);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_test values (3, 30, 3.5);"));
+
+    auto txn = create_session();
+    ASSERT_TRUE(txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(txn->exec_sql_ok("begin;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update self_update_test set score = score + 5 where id < 3;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update self_update_test set bonus = bonus - 0.5 where id = 1;"));
+
+    std::string in_txn = txn->exec_sql("select * from self_update_test;");
+    ASSERT_TRUE(txn->exec_sql_ok("commit;"));
+
+    std::string expected = "+------------------+------------------+------------------+\n"
+                           "|               id |            score |            bonus |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "|                1 |               15 |         1.000000 |\n"
+                           "|                2 |               25 |         2.500000 |\n"
+                           "|                3 |               30 |         3.500000 |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "Total record(s): 3";
+    EXPECT_EQ(TestSession::trim_output(in_txn), expected);
+
+    auto check = create_session();
+    std::string after_commit = check->exec_sql("select * from self_update_test;");
+    EXPECT_EQ(TestSession::trim_output(after_commit), expected);
+}
+
+TEST_F(SnapshotTest, SI_UpdateTest_SelfReferentialUpdateReadsOriginalRowForEachClause) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table self_update_order_test (id int, a int, b int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into self_update_order_test values (1, 10, 0);"));
+
+    auto txn = create_session();
+    ASSERT_TRUE(txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(txn->exec_sql_ok("begin;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update self_update_order_test set a = a + 1, b = a + 2 where id = 1;"));
+    std::string in_txn = txn->exec_sql("select * from self_update_order_test where id = 1;");
+    ASSERT_TRUE(txn->exec_sql_ok("commit;"));
+
+    std::string expected = "+------------------+------------------+------------------+\n"
+                           "|               id |                a |                b |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "|                1 |               11 |               12 |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(in_txn), expected);
+}
+
+// =============================================================================
 // si/WriteWriteConflictDeleteInsertTest — WW conflict on concurrent DELETE
 // =============================================================================
 

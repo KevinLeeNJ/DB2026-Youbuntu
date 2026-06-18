@@ -125,6 +125,15 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
             SetClause clause;
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
             clause.rhs = convert_sv_value(set_clause->val.get());
+            clause.is_self_ref = set_clause->is_self_ref;
+            if (set_clause->is_self_ref) {
+                clause.rhs_col = {.tab_name = set_clause->rhs_col->tab_name.empty() ? x->tab_name
+                                                                                    : set_clause->rhs_col->tab_name,
+                                  .col_name = set_clause->rhs_col->col_name};
+                std::vector<ColMeta> all_cols;
+                get_all_cols({x->tab_name}, all_cols);
+                clause.rhs_col = check_column(all_cols, clause.rhs_col);
+            }
             query->set_clauses.push_back(clause);
         }
         get_clause(x->conds, query->conds);
