@@ -176,6 +176,27 @@ TEST_F(ExecutorTest, seq_scan_empty_table) {
     EXPECT_TRUE(exec.is_end());
 }
 
+TEST_F(ExecutorTest, tombstone_candidates_are_deduplicated_and_removable) {
+    Rid first{1, 3};
+    Rid second{2, 5};
+
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("t").empty());
+
+    sm_manager_->remember_deleted_tuple_candidate("t", first);
+    sm_manager_->remember_deleted_tuple_candidate("t", first);
+    sm_manager_->remember_deleted_tuple_candidate("t", second);
+
+    auto candidates = sm_manager_->get_deleted_tuple_candidates("t");
+    ASSERT_EQ(candidates.size(), 2);
+    EXPECT_NE(std::find(candidates.begin(), candidates.end(), first), candidates.end());
+    EXPECT_NE(std::find(candidates.begin(), candidates.end(), second), candidates.end());
+
+    sm_manager_->remove_deleted_tuple_candidate("t", first);
+    candidates = sm_manager_->get_deleted_tuple_candidates("t");
+    ASSERT_EQ(candidates.size(), 1);
+    EXPECT_EQ(candidates[0], second);
+}
+
 TEST_F(ExecutorTest, seq_scan_all_records) {
     setup_db();
     auto cols = make_int_cols({"id"});

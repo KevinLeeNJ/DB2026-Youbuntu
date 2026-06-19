@@ -55,6 +55,8 @@ private:
 
     mutable std::mutex historical_index_keys_latch_;
     std::unordered_map<std::string, std::vector<Rid>> historical_index_keys_;
+    mutable std::mutex deleted_tuple_candidates_latch_;
+    std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
 
 public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
@@ -128,6 +130,36 @@ public:
             return {};
         }
         return it->second;
+    }
+
+    void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        auto& rids = deleted_tuple_candidates_[tab_name];
+        if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
+            rids.push_back(rid);
+        }
+    }
+
+    std::vector<Rid> get_deleted_tuple_candidates(const std::string& tab_name) const {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        auto it = deleted_tuple_candidates_.find(tab_name);
+        if (it == deleted_tuple_candidates_.end()) {
+            return {};
+        }
+        return it->second;
+    }
+
+    void remove_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        auto it = deleted_tuple_candidates_.find(tab_name);
+        if (it == deleted_tuple_candidates_.end()) {
+            return;
+        }
+        auto& rids = it->second;
+        rids.erase(std::remove(rids.begin(), rids.end(), rid), rids.end());
+        if (rids.empty()) {
+            deleted_tuple_candidates_.erase(it);
+        }
     }
 
     void flush_all_table_and_index_pages();

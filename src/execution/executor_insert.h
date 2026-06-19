@@ -86,7 +86,7 @@ public:
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
-        if (DeletedTupleConflictsWithInsert(fh_, rec, context_)) {
+        if (DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, tab_name_, rec, context_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
         }
 
