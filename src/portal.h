@@ -551,10 +551,12 @@ private:
 
     static void write_explain_output(const std::string& text, Context* context) {
         append_to_context(text, context);
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << text;
-        outfile.close();
+        if (context->output_file_enabled_) {
+            std::fstream outfile;
+            outfile.open("output.txt", std::ios::out | std::ios::app);
+            outfile << text;
+            outfile.close();
+        }
     }
 
     static std::unique_ptr<AbstractExecutor> maybe_count(std::unique_ptr<AbstractExecutor> executor, Plan* plan,
@@ -586,6 +588,8 @@ public:
                                                 std::unique_ptr<AbstractExecutor>(), std::move(plan));
         case T_SetKnob:
         case T_SetTransaction:
+        case T_SetOutputFile:
+        case T_LoadData:
             return std::make_unique<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), std::move(plan));
         case T_CreateTable:

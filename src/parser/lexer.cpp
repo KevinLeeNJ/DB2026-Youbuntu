@@ -57,6 +57,9 @@ const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::ke
     {"ENABLE_NESTLOOP", TokenType::ENABLE_NESTLOOP},
     {"ENABLE_SORTMERGE", TokenType::ENABLE_SORTMERGE},
     {"STATIC_CHECKPOINT", TokenType::STATIC_CHECKPOINT},
+    {"OUTPUT_FILE", TokenType::OUTPUT_FILE},
+    {"OFF", TokenType::OFF},
+    {"LOAD", TokenType::LOAD},
     {"EXIT", TokenType::EXIT},
     {"HELP", TokenType::HELP},
     {"TRUE", TokenType::VALUE_BOOL},
@@ -136,6 +139,11 @@ Token Lexer::next_token() {
     }
 
     char c = current_char();
+
+    // File path (for LOAD): starts with '/', "./" or "../"
+    if (c == '/' || (c == '.' && (peek_char(1) == '/' || (peek_char(1) == '.' && peek_char(2) == '/')))) {
+        return scan_path();
+    }
 
     // Identifier or keyword
     if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
@@ -253,6 +261,19 @@ Token Lexer::scan_string() {
     advance(); // skip closing quote
 
     return Token(TokenType::VALUE_STRING, text, start_line, start_col);
+}
+
+Token Lexer::scan_path() {
+    int start_line = line_;
+    int start_col = column_;
+    size_t start_pos = pos_;
+    // Scan until whitespace or ';' (file paths contain no such characters).
+    while (pos_ < input_.size() && current_char() != ' ' && current_char() != '\t' && current_char() != '\n' &&
+           current_char() != '\r' && current_char() != ';') {
+        advance();
+    }
+    std::string_view text = input_.substr(start_pos, pos_ - start_pos);
+    return Token(TokenType::VALUE_PATH, text, start_line, start_col);
 }
 
 Token Lexer::scan_operator() {

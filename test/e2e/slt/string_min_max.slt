@@ -1,0 +1,59 @@
+# string_min_max.slt — MIN/MAX over string columns
+
+statement ok
+CREATE TABLE t_str (name CHAR(20), grp INT);
+
+statement ok
+INSERT INTO t_str VALUES ('banana', 1);
+
+statement ok
+INSERT INTO t_str VALUES ('apple', 1);
+
+statement ok
+INSERT INTO t_str VALUES ('cherry', 1);
+
+statement ok
+INSERT INTO t_str VALUES ('avocado', 2);
+
+statement ok
+INSERT INTO t_str VALUES ('apricot', 2);
+
+query
+SELECT MIN(name) AS mn, MAX(name) AS mx FROM t_str;
+----
++------------------+------------------+
+|               mn |               mx |
++------------------+------------------+
+|            apple |           cherry |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT grp, MIN(name) AS mn, MAX(name) AS mx FROM t_str GROUP BY grp ORDER BY grp;
+----
++------------------+------------------+------------------+
+|              grp |               mn |               mx |
++------------------+------------------+------------------+
+|                1 |            apple |           cherry |
+|                2 |          apricot |          avocado |
++------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT MIN(name) AS mn FROM t_str WHERE grp = 99;
+----
++------------------+
+|               mn |
++------------------+
+|                  |
++------------------+
+Total record(s): 1
+
+statement error
+SELECT SUM(name) FROM t_str;
+
+statement error
+SELECT AVG(name) FROM t_str;
+
+statement ok
+DROP TABLE t_str;

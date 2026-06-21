@@ -179,4 +179,9 @@ public:
         }
         txn.get_modified_slots().clear();
     }
+
+    // Bulk-load a CSV file into an existing table. The path is relative to the
+    // server's working directory. Reuses the insert path (WAL + index + MVCC
+    // meta) in self-managed batched transactions, skipping conflict checks.
+    void load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context);
 };

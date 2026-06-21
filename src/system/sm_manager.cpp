@@ -13,13 +13,16 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <vector>
 
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
+#include "transaction/transaction_manager.h"
 
 namespace {
 
@@ -192,8 +195,10 @@ void SmManager::close_db() {
  */
 void SmManager::show_tables(Context* context) {
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "| Tables |\n";
+    if (context->output_file_enabled_) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "| Tables |\n";
+    }
     RecordPrinter printer(1);
     printer.print_separator(context);
     printer.print_record({"Tables"}, context);
@@ -201,10 +206,14 @@ void SmManager::show_tables(Context* context) {
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
         printer.print_record({tab.name}, context);
-        outfile << "| " << tab.name << " |\n";
+        if (context->output_file_enabled_) {
+            outfile << "| " << tab.name << " |\n";
+        }
     }
     printer.print_separator(context);
-    outfile.close();
+    if (context->output_file_enabled_) {
+        outfile.close();
+    }
 }
 
 void SmManager::show_index(const std::string& tab_name, Context* context) {
@@ -217,24 +226,36 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
     printer.print_separator(context);
 
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
+    if (context->output_file_enabled_) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+    }
     for (const auto& index : tab.indexes) {
         std::string cols = "(";
-        outfile << "| " << tab_name << " | unique | (";
+        if (context->output_file_enabled_) {
+            outfile << "| " << tab_name << " | unique | (";
+        }
         for (int i = 0; i < index.col_num; ++i) {
             if (i != 0) {
                 cols += ",";
-                outfile << ",";
+                if (context->output_file_enabled_) {
+                    outfile << ",";
+                }
             }
             cols += index.cols[i].name;
-            outfile << index.cols[i].name;
+            if (context->output_file_enabled_) {
+                outfile << index.cols[i].name;
+            }
         }
         cols += ")";
-        outfile << ") |\n";
+        if (context->output_file_enabled_) {
+            outfile << ") |\n";
+        }
 
         printer.print_record({tab_name, "unique", cols}, context);
     }
-    outfile.close();
+    if (context->output_file_enabled_) {
+        outfile.close();
+    }
 
     printer.print_separator(context);
 }
@@ -496,5 +517,228 @@ void SmManager::reset_all_tuple_meta_after_recovery() {
                 fh->set_tuple_meta(rid, clean_meta);
             }
         }
+    }
+}
+
+void SmManager::load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context) {
+    std::ifstream infile(file_path);
+    if (!infile.is_open()) {
+        throw RMDBError("cannot open load file: " + file_path);
+    }
+
+    auto& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+    const int record_size = fh->get_file_hdr().record_size;
+    const auto& cols = tab.cols;
+
+    // CSV files may use CRLF line endings; strip a trailing '\r' from each line.
+    auto strip_cr = [](std::string& s) {
+        if (!s.empty() && s.back() == '\r') {
+            s.pop_back();
+        }
+    };
+
+    // Build column-name -> CSV-field-index map from the header row.
+    std::string header_line;
+    if (!std::getline(infile, header_line)) {
+        throw RMDBError("load file is empty: " + file_path);
+    }
+    strip_cr(header_line);
+    std::vector<std::string> header_fields;
+    {
+        std::stringstream ss(header_line);
+        std::string field;
+        while (std::getline(ss, field, ',')) {
+            header_fields.push_back(field);
+        }
+    }
+    std::unordered_map<std::string, size_t> col_index;
+    for (size_t i = 0; i < header_fields.size(); ++i) {
+        col_index[header_fields[i]] = i;
+    }
+    for (const auto& col : cols) {
+        if (col_index.find(col.name) == col_index.end()) {
+            throw RMDBError("load file missing column: " + col.name);
+        }
+    }
+
+    // Per table column: its CSV field index and storage metadata.
+    struct ColSrc {
+        size_t csv_idx;
+        ColType type;
+        int len;
+        int offset;
+    };
+    std::vector<ColSrc> col_src;
+    col_src.reserve(cols.size());
+    for (const auto& col : cols) {
+        col_src.push_back({col_index[col.name], col.type, col.len, col.offset});
+    }
+
+    const size_t BATCH = 65536;
+    Transaction* batch_txn = nullptr;
+    size_t in_batch = 0;
+    std::vector<char> record(record_size, 0);
+
+    auto begin_batch = [&]() {
+        batch_txn = context->txn_mgr_->begin(nullptr, context->log_mgr_);
+        in_batch = 0;
+    };
+    auto commit_batch = [&]() {
+        context->txn_mgr_->commit(batch_txn, context->log_mgr_);
+        batch_txn = nullptr;
+        in_batch = 0;
+    };
+    auto abort_batch = [&]() {
+        if (batch_txn != nullptr) {
+            context->txn_mgr_->abort(batch_txn, context->log_mgr_);
+            batch_txn = nullptr;
+            in_batch = 0;
+        }
+    };
+
+    begin_batch();
+
+    std::string line;
+    size_t line_no = 1; // header was line 1
+    try {
+        while (std::getline(infile, line)) {
+            ++line_no;
+            strip_cr(line);
+            if (line.empty()) {
+                continue; // skip trailing blank lines
+            }
+            std::vector<std::string> fields;
+            {
+                std::stringstream ss(line);
+                std::string field;
+                while (std::getline(ss, field, ',')) {
+                    fields.push_back(field);
+                }
+            }
+
+            std::memset(record.data(), 0, record_size);
+            for (const auto& cs : col_src) {
+                if (cs.csv_idx >= fields.size()) {
+                    throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected");
+                }
+                const std::string& raw = fields[cs.csv_idx];
+                if (raw.find('"') != std::string::npos) {
+                    throw RMDBError("load file row " + std::to_string(line_no) +
+                                    " contains an unexpected quote character");
+                }
+                if (cs.type == TYPE_INT) {
+                    errno = 0;
+                    char* end = nullptr;
+                    long v = std::strtol(raw.c_str(), &end, 10);
+                    if (errno != 0 || end == raw.c_str() || *end != '\0') {
+                        throw RMDBError("load file row " + std::to_string(line_no) + " invalid int for column");
+                    }
+                    int iv = static_cast<int>(v);
+                    std::memcpy(record.data() + cs.offset, &iv, cs.len);
+                } else if (cs.type == TYPE_FLOAT) {
+                    errno = 0;
+                    char* end = nullptr;
+                    float v = std::strtof(raw.c_str(), &end);
+                    if (errno != 0 || end == raw.c_str() || *end != '\0') {
+                        throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
+                    }
+                    std::memcpy(record.data() + cs.offset, &v, cs.len);
+                } else if (cs.type == TYPE_STRING) {
+                    if (static_cast<int>(raw.size()) > cs.len) {
+                        throw RMDBError("load file row " + std::to_string(line_no) + " string too long for column");
+                    }
+                    std::memcpy(record.data() + cs.offset, raw.c_str(), raw.size());
+                }
+            }
+
+            // Physical insert + WAL + MVCC meta (reuse InsertExecutor primitives, skip conflict checks).
+            std::unique_lock<std::mutex> physical_lock(fh->get_physical_latch());
+            auto prepared = fh->prepare_insert_record();
+            Rid rid = prepared.rid;
+            RmRecord rec(record_size);
+            std::memcpy(rec.data, record.data(), record_size);
+            try {
+                if (context->log_mgr_ != nullptr && batch_txn != nullptr) {
+                    InsertLogRecord log_record(batch_txn->get_transaction_id(), rec, rid, tab_name);
+                    log_record.prev_lsn_ = batch_txn->get_prev_lsn();
+                    lsn_t lsn = context->log_mgr_->add_log_to_buffer(&log_record);
+                    batch_txn->set_prev_lsn(lsn);
+                    prepared.page_handle.page->set_page_lsn(lsn);
+                }
+                fh->finish_insert_record(prepared, record.data());
+            } catch (...) {
+                fh->abort_prepared_insert(prepared);
+                throw;
+            }
+            physical_lock.unlock();
+
+            // MVCC meta + write set bookkeeping (record the insert BEFORE index
+            // maintenance so that a later index failure can be rolled back).
+            TupleMeta meta;
+            meta.writer_txn_id_ = batch_txn->get_transaction_id();
+            meta.is_committed_ = false;
+            meta.is_deleted_ = false;
+            meta.version_chain_head_ = UndoLink{};
+            fh->set_tuple_meta(rid, meta);
+            batch_txn->append_write_record(std::make_unique<WriteRecord>(WType::INSERT_TUPLE, tab_name, rid));
+            batch_txn->append_modified_slot(tab_name, rid);
+
+            // Index maintenance (skip unique-conflict probe: loading into a table).
+            // On failure, roll back already-inserted index entries and the record,
+            // then rethrow so the batch is aborted.
+            std::vector<std::vector<char>> index_keys;
+            index_keys.reserve(tab.indexes.size());
+            for (const auto& index : tab.indexes) {
+                std::vector<char> key(index.col_tot_len);
+                int off = 0;
+                for (int i = 0; i < index.col_num; ++i) {
+                    std::memcpy(key.data() + off, record.data() + index.cols[i].offset, index.cols[i].len);
+                    off += index.cols[i].len;
+                }
+                index_keys.push_back(std::move(key));
+            }
+            try {
+                size_t inserted = 0;
+                for (size_t i = 0; i < tab.indexes.size(); ++i) {
+                    const auto& index = tab.indexes[i];
+                    auto ih = ihs_.at(get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                    ih->insert_entry(index_keys[i].data(), rid, batch_txn);
+                    ++inserted;
+                }
+            } catch (...) {
+                // Undo the index entries inserted so far this row (reverse order),
+                // then remove the record so no orphan remains.
+                for (size_t i = 0; i < tab.indexes.size(); ++i) {
+                    const auto& index = tab.indexes[i];
+                    auto ih = ihs_.at(get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                    try {
+                        ih->delete_entry(index_keys[i].data(), batch_txn);
+                    } catch (...) {
+                        // index entry was never inserted for this one; ignore
+                    }
+                }
+                fh->delete_record(rid, context);
+                throw;
+            }
+
+            if (++in_batch == BATCH) {
+                commit_batch();
+                begin_batch();
+            }
+        }
+    } catch (...) {
+        // A mid-batch failure leaves the in-flight batch uncommitted; abort it so
+        // its inserted rows/index entries are rolled back before propagating.
+        abort_batch();
+        throw;
+    }
+
+    if (in_batch > 0) {
+        commit_batch();
+    } else if (batch_txn != nullptr) {
+        // No rows were added in the trailing batch; abort the empty txn.
+        context->txn_mgr_->abort(batch_txn, context->log_mgr_);
+        batch_txn = nullptr;
     }
 }

@@ -46,6 +46,30 @@ public:
             return nullptr;
         }
 
+        // "set output_file off" has no semicolon; handle before the semicolon-enforcing path.
+        if (check(TokenType::SET)) {
+            auto state = lexer_.save_state();
+            Token saved_current = current_;
+            advance(); // consume SET
+            if (check(TokenType::OUTPUT_FILE)) {
+                advance(); // consume OUTPUT_FILE
+                bool enable;
+                if (match(TokenType::ON)) {
+                    enable = true;
+                } else if (match(TokenType::OFF)) {
+                    enable = false;
+                } else {
+                    error("expected ON or OFF after OUTPUT_FILE");
+                }
+                consume_optional_semicolon();
+                expect_end();
+                return std::make_unique<SetOutputFile>(enable);
+            }
+            lexer_.restore_state(state);
+            current_ = saved_current;
+            // fall through to parse_stmt() for SET TRANSACTION / SET knob (which require ';')
+        }
+
         auto result = parse_stmt();
         expect(TokenType::SEMICOLON, "expected ';' after statement");
         expect_end();
@@ -123,7 +147,18 @@ private:
         if (check(TokenType::SET)) {
             return parse_set_stmt();
         }
+        if (check(TokenType::LOAD)) {
+            return parse_load_stmt();
+        }
         error("unexpected start of statement");
+    }
+
+    std::unique_ptr<TreeNode> parse_load_stmt() {
+        expect(TokenType::LOAD, "expected LOAD");
+        Token path = expect(TokenType::VALUE_PATH, "expected file path after LOAD");
+        expect(TokenType::INTO, "expected INTO after file path");
+        std::string table = parse_identifier();
+        return std::make_unique<LoadStmt>(std::string(path.text), std::move(table));
     }
 
     std::unique_ptr<TreeNode> parse_db_stmt() {

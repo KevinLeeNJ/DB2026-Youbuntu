@@ -174,6 +174,16 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         }
         break;
     }
+    case T_SetOutputFile: {
+        auto* x = static_cast<SetOutputFilePlan*>(plan);
+        context->output_file_enabled_ = x->enable_;
+        break;
+    }
+    case T_LoadData: {
+        auto* x = static_cast<LoadDataPlan*>(plan);
+        sm_manager_->load_csv_data(x->file_name_, x->tab_name_, context);
+        break;
+    }
     case T_StaticCheckpoint: {
         if (txn_id != nullptr) {
             Transaction* current_txn = txn_mgr_->get_transaction(*txn_id);
@@ -308,10 +318,12 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         memcpy(context->data_send_ + *(context->offset_), local_send.data(), local_offset);
         *(context->offset_) += local_offset;
 
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << out_file_stream.str();
-        outfile.close();
+        if (context->output_file_enabled_) {
+            std::fstream outfile;
+            outfile.open("output.txt", std::ios::out | std::ios::app);
+            outfile << out_file_stream.str();
+            outfile.close();
+        }
     }
 }
 

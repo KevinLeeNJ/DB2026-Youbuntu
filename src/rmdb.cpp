@@ -81,6 +81,8 @@ void client_handler(int fd) {
     txn_id_t txn_id = INVALID_TXN_ID;
     // 记录客户端当前配置的隔离级别（默认 SERIALIZABLE）
     IsolationLevel session_isolation_level = IsolationLevel::SERIALIZABLE;
+    // 记录客户端是否开启向 output.txt 写入结果（默认开启）
+    bool session_output_enabled = true;
 
     LOG_INFO("establish client connection, sockfd: %d", fd);
 
@@ -120,6 +122,7 @@ void client_handler(int fd) {
                                                   txn_manager.get());
         Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
+        context->output_file_enabled_ = session_output_enabled;
 
         try {
             auto parse_tree = ast::parse_sql(data_recv);
@@ -127,7 +130,8 @@ void client_handler(int fd) {
                 try {
                     auto parsed_type = parse_tree->type;
                     bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
-                    if (!is_checkpoint) {
+                    bool is_load = parsed_type == ast::AstType::LoadStmt;
+                    if (!is_checkpoint && !is_load) {
                         SetTransaction(&txn_id, context);
                     }
                     // analyze and rewrite
@@ -140,6 +144,8 @@ void client_handler(int fd) {
                     portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
                     // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
                     session_isolation_level = context->isolation_level_;
+                    // Persist output_file toggle change (SET OUTPUT_FILE ON|OFF)
+                    session_output_enabled = context->output_file_enabled_;
                     portal->drop();
                     if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                         context->txn_->get_state() != TransactionState::COMMITTED &&
@@ -162,10 +168,12 @@ void client_handler(int fd) {
                     context->txn_ = nullptr;
                     LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << str;
-                    outfile.close();
+                    if (session_output_enabled) {
+                        std::fstream outfile;
+                        outfile.open("output.txt", std::ios::out | std::ios::app);
+                        outfile << str;
+                        outfile.close();
+                    }
                 } catch (RMDBError& e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     LOG_ERROR("RMDBError: %s", e.what());
@@ -183,10 +191,12 @@ void client_handler(int fd) {
                     context->txn_ = nullptr;
 
                     // 将报错信息写入output.txt
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    if (session_output_enabled) {
+                        std::fstream outfile;
+                        outfile.open("output.txt", std::ios::out | std::ios::app);
+                        outfile << "failure\n";
+                        outfile.close();
+                    }
                 }
             }
         } catch (const std::exception& e) {
@@ -207,10 +217,12 @@ void client_handler(int fd) {
             data_send[msg_len + 1] = '\0';
             offset = msg_len + 1;
 
-            std::fstream outfile;
-            outfile.open("output.txt", std::ios::out | std::ios::app);
-            outfile << "failure\n";
-            outfile.close();
+            if (session_output_enabled) {
+                std::fstream outfile;
+                outfile.open("output.txt", std::ios::out | std::ios::app);
+                outfile << "failure\n";
+                outfile.close();
+            }
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
