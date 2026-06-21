@@ -22,6 +22,7 @@ void RecoveryManager::analyze() {
     committed_txns_.clear();
     log_records_.clear();
     log_order_.clear();
+    max_lsn_ = INVALID_LSN;
     checkpoint_offset_ = 0;
 
     const int file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
@@ -108,6 +109,9 @@ void RecoveryManager::analyze() {
 
         log_order_.push_back(lsn);
         log_records_[lsn] = std::move(record);
+        if (lsn != INVALID_LSN && (max_lsn_ == INVALID_LSN || lsn > max_lsn_)) {
+            max_lsn_ = lsn;
+        }
         offset += static_cast<int>(header.log_tot_len_);
     }
 }
@@ -173,6 +177,13 @@ void RecoveryManager::undo() {
     }
     sm_manager_->reset_all_tuple_meta_after_recovery();
     sm_manager_->flush_all_table_and_index_pages();
+    // 表页与索引页已落盘后，截断日志文件并推进 global_lsn。
+    // 这样已 undo 完毕的 loser 日志不再残留，避免下一次重启跨轮重复 undo
+    // 同 RID 上的数据（尤其是 RID 复用且内容相同时，仅靠 undo 内容守卫无法区分）。
+    if (log_manager_ != nullptr) {
+        lsn_t next_lsn = (max_lsn_ == INVALID_LSN) ? 0 : max_lsn_ + 1;
+        log_manager_->reset_log(next_lsn);
+    }
 }
 
 bool RecoveryManager::record_exists(const std::string& table_name, const Rid& rid) const {
@@ -199,6 +210,14 @@ std::unique_ptr<RmRecord> RecoveryManager::get_record_if_exists(const std::strin
     } catch (const std::exception&) {
         return nullptr;
     }
+}
+
+bool RecoveryManager::record_equals(const std::string& table_name, const Rid& rid, const RmRecord& expected) const {
+    auto current = get_record_if_exists(table_name, rid);
+    if (current == nullptr) {
+        return false;
+    }
+    return current->size == expected.size && memcmp(current->data, expected.data, expected.size) == 0;
 }
 
 void RecoveryManager::reset_tuple_meta(const std::string& table_name, const Rid& rid) {
@@ -245,29 +264,30 @@ void RecoveryManager::redo_update(const UpdateLogRecord& log) {
 }
 
 void RecoveryManager::undo_insert(const InsertLogRecord& log) {
-    auto current = get_record_if_exists(log.table_name_, log.rid_);
-    if (current == nullptr) {
+    // 幂等守卫：仅当该 rid 仍持有本 loser 事务插入的值时才删除。
+    // 若 rid 已被后续 committed 事务复用并写入不同内容，跳过，避免误删 committed 数据。
+    if (!record_equals(log.table_name_, log.rid_, log.insert_value_)) {
         return;
     }
-    sm_manager_->delete_record_with_indexes(log.table_name_, log.rid_, *current);
+    sm_manager_->delete_record_with_indexes(log.table_name_, log.rid_, log.insert_value_);
 }
 
 void RecoveryManager::undo_delete(const DeleteLogRecord& log) {
-    auto current = get_record_if_exists(log.table_name_, log.rid_);
-    if (current != nullptr && (current->size != log.delete_value_.size ||
-                               memcmp(current->data, log.delete_value_.data, log.delete_value_.size) != 0)) {
-        sm_manager_->update_record_with_indexes(log.table_name_, log.rid_, *current, log.delete_value_);
+    // 幂等守卫：仅当该 slot 当前为空（即本 loser 的 delete 仍生效）时才恢复。
+    // 若 slot 已被后续 committed 事务重新写入，跳过，避免覆盖 committed 数据。
+    if (record_exists(log.table_name_, log.rid_)) {
+        return;
     }
     sm_manager_->insert_record_with_indexes(log.table_name_, log.rid_, log.delete_value_);
     reset_tuple_meta(log.table_name_, log.rid_);
 }
 
 void RecoveryManager::undo_update(const UpdateLogRecord& log) {
-    auto current = get_record_if_exists(log.table_name_, log.rid_);
-    if (current == nullptr) {
-        sm_manager_->insert_record_with_indexes(log.table_name_, log.rid_, log.old_value_);
-    } else {
-        sm_manager_->update_record_with_indexes(log.table_name_, log.rid_, *current, log.old_value_);
+    // 幂等守卫：仅当该 rid 仍持有本 loser 事务写入的 new_value 时才回滚到 old_value。
+    // 若 rid 已被后续 committed 事务覆盖为其他值，跳过，避免覆盖 committed 数据。
+    if (!record_equals(log.table_name_, log.rid_, log.new_value_)) {
+        return;
     }
+    sm_manager_->update_record_with_indexes(log.table_name_, log.rid_, log.new_value_, log.old_value_);
     reset_tuple_meta(log.table_name_, log.rid_);
 }

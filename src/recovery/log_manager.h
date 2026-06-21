@@ -451,8 +451,18 @@ public:
     void flush_log_to_disk_with_sync();
     void initialize_from_existing_log();
 
+    // recovery/checkpoint 成功落盘表页与元数据后调用：先把缓冲区残留日志刷盘，
+    // 再把日志文件截断为空，并把 global_lsn/persist_lsn/追加偏移重置为 next_lsn 起点。
+    // 这样下一次重启只从干净日志开始扫描，已 undo 完毕的旧 loser 日志不再残留，
+    // 避免跨轮 recovery 在同 RID 上重复 undo 覆盖后续 committed 数据。
+    void reset_log(lsn_t next_lsn);
+
     lsn_t get_persist_lsn() const {
         return persist_lsn_;
+    }
+
+    lsn_t get_global_lsn() const {
+        return global_lsn_.load();
     }
 
     int current_log_offset() const {

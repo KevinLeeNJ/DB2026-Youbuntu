@@ -149,6 +149,18 @@ void LogManager::initialize_from_existing_log() {
     disk_manager_->SetLogOffset(offset);
 }
 
+void LogManager::reset_log(lsn_t next_lsn) {
+    std::lock_guard<std::mutex> lock(latch_);
+    // 先把日志缓冲区残留内容落盘，避免截断丢失未刷盘的日志。
+    flush_log_to_disk_unlocked();
+    // 截断日志文件为空并重置追加偏移。
+    disk_manager_->truncate_log();
+    log_file_offset_ = 0;
+    log_buffer_.offset_ = 0;
+    global_lsn_.store(next_lsn);
+    persist_lsn_ = INVALID_LSN;
+}
+
 void LogManager::write_restart_offset(int checkpoint_offset) {
     std::ofstream restart_file(RESTART_FILE_NAME, std::ios::trunc);
     if (!restart_file.is_open()) {

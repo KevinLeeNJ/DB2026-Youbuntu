@@ -30,10 +30,12 @@ public:
 
 class RecoveryManager {
 public:
-    RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager) {
+    RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager,
+                    LogManager* log_manager = nullptr) {
         disk_manager_ = disk_manager;
         buffer_pool_manager_ = buffer_pool_manager;
         sm_manager_ = sm_manager;
+        log_manager_ = log_manager;
     }
 
     void analyze();
@@ -42,6 +44,10 @@ public:
 
 private:
     bool record_exists(const std::string& table_name, const Rid& rid) const;
+    // 当前 rid 处的记录是否与 expected 内容一致（rid 不存在视为不等）。
+    // 用于 undo 幂等守卫：仅当页面仍反映该 loser 事务自身的效果时才回滚，
+    // 避免跨轮 recovery 重复 undo 覆盖同 RID 上的后续 committed 数据。
+    bool record_equals(const std::string& table_name, const Rid& rid, const RmRecord& expected) const;
     std::unique_ptr<RmRecord> get_record_if_exists(const std::string& table_name, const Rid& rid) const;
     void reset_tuple_meta(const std::string& table_name, const Rid& rid);
 
@@ -56,10 +62,12 @@ private:
     std::unordered_set<txn_id_t> committed_txns_;
     std::unordered_map<lsn_t, std::unique_ptr<LogRecord>> log_records_;
     std::vector<lsn_t> log_order_;
+    lsn_t max_lsn_{INVALID_LSN}; // analyze 扫描到的最大 lsn，用于 recovery 后推进 global_lsn
     int checkpoint_offset_{0};
 
     LogBuffer buffer_;                       // 读入日志
     DiskManager* disk_manager_;              // 用来读写文件
     BufferPoolManager* buffer_pool_manager_; // 对页面进行读写
     SmManager* sm_manager_;                  // 访问数据库元数据
+    LogManager* log_manager_;                // recovery 完成后截断日志
 };

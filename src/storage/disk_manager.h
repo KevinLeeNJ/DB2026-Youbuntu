@@ -71,6 +71,10 @@ public:
 
     void fsync_log();
 
+    // 将日志文件截断为空，并把追加偏移归零。recovery/checkpoint 完成后调用，
+    // 消除已处理完毕的 loser 日志，避免跨轮 recovery 重复 undo 同 RID 上的数据。
+    void truncate_log();
+
     void SetLogOffset(int log_offset) {
         log_offset_ = log_offset;
     }
