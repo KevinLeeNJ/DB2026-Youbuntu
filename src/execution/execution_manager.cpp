@@ -264,6 +264,13 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_record(captions, &print_context);
     rec_printer.print_separator(&print_context);
 
+    std::ostringstream out_file_stream;
+    out_file_stream << "|";
+    for (const auto& cap : captions) {
+        out_file_stream << " " << cap << " |";
+    }
+    out_file_stream << "\n";
+
     // 执行query_plan
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
@@ -282,14 +289,19 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             }
             columns.push_back(col_str);
         }
-        // print record into buffer
+        // print record into client buffer
         rec_printer.print_record(columns, &print_context);
-        // print record into file
+        // print record into output.txt (compact borderless)
+        out_file_stream << "|";
+        for (const auto& col_str : columns) {
+            out_file_stream << " " << col_str << " |";
+        }
+        out_file_stream << "\n";
         num_rec++;
     }
-    // Print footer into buffer
+    // Print footer into client buffer
     rec_printer.print_separator(&print_context);
-    // Print record count into buffer
+    // Print record count into client buffer
     RecordPrinter::print_record_count(num_rec, &print_context);
 
     if (local_offset > 0) {
@@ -298,7 +310,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
         std::fstream outfile;
         outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile.write(local_send.data(), local_offset);
+        outfile << out_file_stream.str();
         outfile.close();
     }
 }

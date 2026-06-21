@@ -139,6 +139,7 @@ public:
                 tombstone.is_deleted_ = true;
                 tombstone.version_chain_head_ = undo_link;
                 fh_->set_tuple_meta(rid, tombstone);
+                sm_manager_->remember_deleted_tuple_candidate(tab_name_, rid);
             } else {
                 fh_->delete_record(rid, context_);
             }

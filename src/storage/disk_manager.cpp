@@ -282,3 +282,17 @@ void DiskManager::fsync_log() {
         throw UnixError();
     }
 }
+
+void DiskManager::truncate_log() {
+    if (log_fd_ == -1) {
+        log_fd_ = open_file(LOG_FILE_NAME);
+    }
+    if (log_fd_ != -1) {
+        if (ftruncate(log_fd_, 0) != 0) {
+            throw UnixError();
+        }
+        fdatasync(log_fd_);
+        lseek(log_fd_, 0, SEEK_SET);
+    }
+    log_offset_ = 0;
+}
