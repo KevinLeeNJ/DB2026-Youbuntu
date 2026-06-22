@@ -200,7 +200,7 @@ void client_handler(int fd) {
                 }
             }
         } catch (const std::exception& e) {
-            // 解析失败或其他未捕获异常，将 failure 信息写入 output.txt 并返回给客户端
+            // 解析失败或其他未捕获异常只返回给客户端；baseline 不向 output.txt 追加 failure。
             LOG_ERROR("%s", e.what());
 
             if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
@@ -216,13 +216,6 @@ void client_handler(int fd) {
             data_send[msg_len] = '\n';
             data_send[msg_len + 1] = '\0';
             offset = msg_len + 1;
-
-            if (session_output_enabled) {
-                std::fstream outfile;
-                outfile.open("output.txt", std::ios::out | std::ios::app);
-                outfile << "failure\n";
-                outfile.close();
-            }
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future

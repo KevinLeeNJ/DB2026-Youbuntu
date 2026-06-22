@@ -57,6 +57,7 @@ private:
     void undo_insert(const InsertLogRecord& log);
     void undo_delete(const DeleteLogRecord& log);
     void undo_update(const UpdateLogRecord& log);
+    void rebuild_indexes();
 
     std::unordered_map<txn_id_t, lsn_t> active_txn_last_lsn_;
     std::unordered_set<txn_id_t> committed_txns_;

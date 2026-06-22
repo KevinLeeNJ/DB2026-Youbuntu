@@ -119,6 +119,12 @@ void AppendCommit(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn) {
     log_mgr.add_log_to_buffer(&commit);
 }
 
+void AppendAbort(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn) {
+    AbortLogRecord abort(txn_id);
+    abort.prev_lsn_ = prev_lsn;
+    log_mgr.add_log_to_buffer(&abort);
+}
+
 void FlushLogs(LogManager& log_mgr) {
     log_mgr.flush_log_to_disk();
 }
@@ -350,4 +356,61 @@ TEST(RecoveryManagerTest, UncommittedDeleteIsUndone) {
     ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryManagerTest, UncommittedMvccDeleteTombstoneIsUndone) {
+    ScopedTestDir test_dir("recovery_uncommitted_mvcc_delete_root");
+    const std::string db_name = "recovery_uncommitted_mvcc_delete_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        AppendDelete(*db.log_mgr_, 100, begin_lsn, rid, rec);
+        FlushLogs(*db.log_mgr_);
+
+        TupleMeta tombstone;
+        tombstone.writer_txn_id_ = 100;
+        tombstone.is_committed_ = false;
+        tombstone.is_deleted_ = true;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, tombstone);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
+    ScopedTestDir test_dir("recovery_aborted_insert_root");
+    const std::string db_name = "recovery_aborted_insert_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto insert_lsn = AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);
+        AppendAbort(*db.log_mgr_, 100, insert_lsn);
+        FlushLogs(*db.log_mgr_);
+
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }

@@ -489,6 +489,28 @@ void SmManager::flush_all_table_and_index_pages() {
     }
 }
 
+void SmManager::rebuild_all_indexes() {
+    std::vector<std::pair<std::string, std::vector<IndexMeta>>> indexes_by_table;
+    indexes_by_table.reserve(db_.tabs_.size());
+    for (const auto& [tab_name, tab] : db_.tabs_) {
+        if (!tab.indexes.empty()) {
+            indexes_by_table.emplace_back(tab_name, tab.indexes);
+        }
+    }
+
+    for (const auto& [tab_name, indexes] : indexes_by_table) {
+        for (const auto& index : indexes) {
+            std::vector<std::string> col_names;
+            col_names.reserve(index.cols.size());
+            for (const auto& col : index.cols) {
+                col_names.emplace_back(col.name);
+            }
+            drop_index(tab_name, index.cols, nullptr);
+            create_index(tab_name, col_names, nullptr);
+        }
+    }
+}
+
 void SmManager::reset_all_tuple_meta_after_recovery() {
     TupleMeta clean_meta;
     clean_meta.commit_ts_ = 0;
