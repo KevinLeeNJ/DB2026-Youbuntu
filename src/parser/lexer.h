@@ -114,6 +114,8 @@ enum class TokenType {
     GT,
     PLUS,
     MINUS,
+    PLUS_ASSIGN,
+    MINUS_ASSIGN,
 
     // Punctuation
     LPAREN,

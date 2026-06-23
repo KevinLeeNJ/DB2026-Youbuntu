@@ -575,6 +575,19 @@ private:
 
     std::unique_ptr<SetClause> parse_set_clause() {
         std::string column = parse_identifier();
+
+        // 复合赋值: col += num / col -= num,脱糖为 col = col ± num
+        if (match(TokenType::PLUS_ASSIGN)) {
+            auto rhs_col = std::make_unique<Col>("", column);
+            return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                               parse_numeric_delta_after(TokenType::PLUS));
+        }
+        if (match(TokenType::MINUS_ASSIGN)) {
+            auto rhs_col = std::make_unique<Col>("", column);
+            return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                               parse_numeric_delta_after(TokenType::MINUS));
+        }
+
         expect(TokenType::EQ, "expected '=' in SET clause");
         if (check(TokenType::IDENTIFIER)) {
             auto state = lexer_.save_state();

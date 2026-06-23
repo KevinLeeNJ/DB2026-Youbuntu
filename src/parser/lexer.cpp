@@ -309,6 +309,14 @@ Token Lexer::scan_operator() {
         advance(2);
         return Token(TokenType::NEQ, "!=", start_line, start_col);
     }
+    if (c == '+' && next == '=') {
+        advance(2);
+        return Token(TokenType::PLUS_ASSIGN, "+=", start_line, start_col);
+    }
+    if (c == '-' && next == '=') {
+        advance(2);
+        return Token(TokenType::MINUS_ASSIGN, "-=", start_line, start_col);
+    }
 
     // Single-character operators
     advance();

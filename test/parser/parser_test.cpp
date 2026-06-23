@@ -98,6 +98,36 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     EXPECT_FLOAT_EQ(bonus_delta->val, -0.5F);
 }
 
+TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
+    // col += num / col -= num 在解析期脱糖为 col = col ± num 的自引用节点
+    auto parsed = parse_ok("update score_tab set score += 5, bonus -= 0.5 where id < 3;");
+    auto update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 2);
+
+    // score += 5  脱糖为 score = score + 5
+    const auto* score_clause = update->set_clauses[0].get();
+    EXPECT_TRUE(score_clause->is_self_ref);
+    EXPECT_EQ(score_clause->col_name, "score");
+    ASSERT_NE(score_clause->rhs_col, nullptr);
+    EXPECT_EQ(score_clause->rhs_col->tab_name, "");
+    EXPECT_EQ(score_clause->rhs_col->col_name, "score");
+    auto score_delta = dynamic_cast<const ast::IntLit*>(score_clause->val.get());
+    ASSERT_NE(score_delta, nullptr);
+    EXPECT_EQ(score_delta->val, 5);
+
+    // bonus -= 0.5  脱糖为 bonus = bonus - 0.5(delta 取反为 -0.5)
+    const auto* bonus_clause = update->set_clauses[1].get();
+    EXPECT_TRUE(bonus_clause->is_self_ref);
+    EXPECT_EQ(bonus_clause->col_name, "bonus");
+    ASSERT_NE(bonus_clause->rhs_col, nullptr);
+    EXPECT_EQ(bonus_clause->rhs_col->tab_name, "");
+    EXPECT_EQ(bonus_clause->rhs_col->col_name, "bonus");
+    auto bonus_delta = dynamic_cast<const ast::FloatLit*>(bonus_clause->val.get());
+    ASSERT_NE(bonus_delta, nullptr);
+    EXPECT_FLOAT_EQ(bonus_delta->val, -0.5F);
+}
+
 TEST(ParserTest, ParsesSelectFeaturesUsedByCompetition) {
     auto select_star = parse_ok("select * from tb;");
     auto select_star_node = as_node<ast::SelectStmt>(select_star);
