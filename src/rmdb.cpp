@@ -135,13 +135,6 @@ void client_handler(int fd) {
             data_send[msg_len] = '\n';
             data_send[msg_len + 1] = '\0';
             offset = msg_len + 1;
-
-            if (session_output_enabled) {
-                std::fstream outfile;
-                outfile.open("output.txt", std::ios::out | std::ios::app);
-                outfile << "failure\n";
-                outfile.close();
-            }
         }
 
         if (parse_tree != nullptr) {
