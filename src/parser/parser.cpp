@@ -15,10 +15,6 @@ using parser::Lexer;
 using parser::Token;
 using parser::TokenType;
 
-struct ParseError : public std::runtime_error {
-    explicit ParseError(const std::string& message) : std::runtime_error(message) {}
-};
-
 struct FromClause {
     std::vector<TableRef> tables;
     std::vector<std::unique_ptr<BinaryExpr>> conds;
@@ -771,8 +767,12 @@ private:
 } // namespace
 
 std::unique_ptr<TreeNode> parse_sql(const std::string& sql) {
-    SqlParser parser(sql);
-    return parser.parse();
+    try {
+        SqlParser parser(sql);
+        return parser.parse();
+    } catch (const parser::LexerError& e) {
+        throw ParseError(e.what());
+    }
 }
 
 } // namespace ast

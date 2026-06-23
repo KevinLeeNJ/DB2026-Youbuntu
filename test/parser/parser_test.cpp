@@ -28,6 +28,11 @@ void expect_parse_error(const std::string& sql) {
 
 } // namespace
 
+TEST(ParserTest, ParserAndLexerErrorsUsePublicType) {
+    EXPECT_THROW((void)ast::parse_sql("select from;"), ast::ParseError);
+    EXPECT_THROW((void)ast::parse_sql("select @;"), ast::ParseError);
+}
+
 TEST(ParserTest, ParsesUtilityStatements) {
     EXPECT_EQ(ast::parse_sql("").get(), nullptr);
     EXPECT_EQ(ast::parse_sql("exit;").get(), nullptr);
