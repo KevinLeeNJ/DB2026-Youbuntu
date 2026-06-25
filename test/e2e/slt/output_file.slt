@@ -1,0 +1,52 @@
+# output_file.slt — set output_file off/on toggles output.txt writes
+
+statement ok
+CREATE TABLE t_of (a INT);
+
+statement ok
+INSERT INTO t_of VALUES (1);
+
+statement ok
+INSERT INTO t_of VALUES (2);
+
+query
+SELECT a FROM t_of ORDER BY a;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+statement ok
+set output_file off
+
+query
+SELECT a FROM t_of ORDER BY a;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+statement ok
+set output_file on
+
+query
+SELECT a FROM t_of ORDER BY a;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+statement ok
+DROP TABLE t_of;

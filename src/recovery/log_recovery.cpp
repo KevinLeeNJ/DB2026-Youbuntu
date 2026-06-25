@@ -101,7 +101,9 @@ void RecoveryManager::analyze() {
             active_txn_last_lsn_.erase(txn_id);
             break;
         case LogType::ABORT:
-            active_txn_last_lsn_.erase(txn_id);
+            // ABORT only records that rollback was requested. This system does not write CLRs,
+            // so recovery must still idempotently undo the transaction's original DML records.
+            active_txn_last_lsn_[txn_id] = lsn;
             break;
         case LogType::CHECKPOINT:
             break;
@@ -176,6 +178,7 @@ void RecoveryManager::undo() {
         }
     }
     sm_manager_->reset_all_tuple_meta_after_recovery();
+    rebuild_indexes();
     sm_manager_->flush_all_table_and_index_pages();
     // 表页与索引页已落盘后，截断日志文件并推进 global_lsn。
     // 这样已 undo 完毕的 loser 日志不再残留，避免下一次重启跨轮重复 undo
@@ -236,12 +239,7 @@ void RecoveryManager::reset_tuple_meta(const std::string& table_name, const Rid&
 }
 
 void RecoveryManager::redo_insert(const InsertLogRecord& log) {
-    auto current = get_record_if_exists(log.table_name_, log.rid_);
-    if (current != nullptr && (current->size != log.insert_value_.size ||
-                               memcmp(current->data, log.insert_value_.data, log.insert_value_.size) != 0)) {
-        sm_manager_->update_record_with_indexes(log.table_name_, log.rid_, *current, log.insert_value_);
-    }
-    sm_manager_->insert_record_with_indexes(log.table_name_, log.rid_, log.insert_value_);
+    sm_manager_->fhs_.at(log.table_name_)->insert_record(log.rid_, log.insert_value_.data);
     reset_tuple_meta(log.table_name_, log.rid_);
 }
 
@@ -250,15 +248,15 @@ void RecoveryManager::redo_delete(const DeleteLogRecord& log) {
     if (current == nullptr) {
         return;
     }
-    sm_manager_->delete_record_with_indexes(log.table_name_, log.rid_, *current);
+    sm_manager_->fhs_.at(log.table_name_)->delete_record(log.rid_, nullptr);
 }
 
 void RecoveryManager::redo_update(const UpdateLogRecord& log) {
     auto current = get_record_if_exists(log.table_name_, log.rid_);
     if (current == nullptr) {
-        sm_manager_->insert_record_with_indexes(log.table_name_, log.rid_, log.new_value_);
+        sm_manager_->fhs_.at(log.table_name_)->insert_record(log.rid_, log.new_value_.data);
     } else {
-        sm_manager_->update_record_with_indexes(log.table_name_, log.rid_, *current, log.new_value_);
+        sm_manager_->fhs_.at(log.table_name_)->update_record(log.rid_, log.new_value_.data, nullptr);
     }
     reset_tuple_meta(log.table_name_, log.rid_);
 }
@@ -269,16 +267,25 @@ void RecoveryManager::undo_insert(const InsertLogRecord& log) {
     if (!record_equals(log.table_name_, log.rid_, log.insert_value_)) {
         return;
     }
-    sm_manager_->delete_record_with_indexes(log.table_name_, log.rid_, log.insert_value_);
+    sm_manager_->fhs_.at(log.table_name_)->delete_record(log.rid_, nullptr);
 }
 
 void RecoveryManager::undo_delete(const DeleteLogRecord& log) {
-    // 幂等守卫：仅当该 slot 当前为空（即本 loser 的 delete 仍生效）时才恢复。
-    // 若 slot 已被后续 committed 事务重新写入，跳过，避免覆盖 committed 数据。
-    if (record_exists(log.table_name_, log.rid_)) {
+    // 幂等守卫：仅当该 slot 当前为空，或仍是本 loser 写下的 MVCC tombstone 时才恢复。
+    // 若 slot 已被后续 committed 事务重新写入为 live tuple，跳过，避免覆盖 committed 数据。
+    auto table_it = sm_manager_->fhs_.find(log.table_name_);
+    if (table_it == sm_manager_->fhs_.end()) {
         return;
     }
-    sm_manager_->insert_record_with_indexes(log.table_name_, log.rid_, log.delete_value_);
+    if (record_exists(log.table_name_, log.rid_)) {
+        TupleMeta meta = table_it->second->get_tuple_meta(log.rid_);
+        if (meta.is_deleted_ && meta.writer_txn_id_ == log.log_tid_) {
+            table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr);
+            reset_tuple_meta(log.table_name_, log.rid_);
+        }
+        return;
+    }
+    table_it->second->insert_record(log.rid_, log.delete_value_.data);
     reset_tuple_meta(log.table_name_, log.rid_);
 }
 
@@ -288,6 +295,10 @@ void RecoveryManager::undo_update(const UpdateLogRecord& log) {
     if (!record_equals(log.table_name_, log.rid_, log.new_value_)) {
         return;
     }
-    sm_manager_->update_record_with_indexes(log.table_name_, log.rid_, log.new_value_, log.old_value_);
+    sm_manager_->fhs_.at(log.table_name_)->update_record(log.rid_, log.old_value_.data, nullptr);
     reset_tuple_meta(log.table_name_, log.rid_);
+}
+
+void RecoveryManager::rebuild_indexes() {
+    sm_manager_->rebuild_all_indexes();
 }

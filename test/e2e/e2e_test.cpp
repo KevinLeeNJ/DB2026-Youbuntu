@@ -116,6 +116,7 @@ public:
         int offset = 0;
 
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
+        context.output_file_enabled_ = session_output_enabled_;
 
         // Parse
         std::unique_ptr<ast::TreeNode> parse_tree;
@@ -130,7 +131,8 @@ public:
             return ""; // EXIT or EOF
         }
         bool is_checkpoint = parse_tree->type == ast::AstType::StaticCheckpoint;
-        if (!is_checkpoint) {
+        bool is_load = parse_tree->type == ast::AstType::LoadStmt;
+        if (!is_checkpoint && !is_load) {
             set_transaction(&context);
         }
 
@@ -141,6 +143,7 @@ public:
             std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
             portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
             portal_->drop();
+            session_output_enabled_ = context.output_file_enabled_;
             finish_statement(&context);
         } catch (...) {
             abort_implicit_statement(&context);
@@ -204,6 +207,7 @@ private:
     std::string original_cwd_;
     bool cleanup_on_destroy_{true};
     txn_id_t txn_id_{INVALID_TXN_ID};
+    bool session_output_enabled_{true};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<RmManager> rm_manager_;
@@ -464,6 +468,14 @@ TEST_F(SltFileTest, Aggregate) {
     run_slt_file("aggregate.slt");
 }
 
+TEST_F(SltFileTest, StringMinMax) {
+    run_slt_file("string_min_max.slt");
+}
+
+TEST_F(SltFileTest, OutputFile) {
+    run_slt_file("output_file.slt");
+}
+
 TEST_F(SltFileTest, Union) {
     run_slt_file("union.slt");
 }
@@ -581,4 +593,143 @@ TEST(CheckpointRecoveryTest, CommittedDeleteBeforeCheckpointDoesNotReappearAfter
         }
         EXPECT_EQ(output, select_expected);
     }
+}
+
+// =============================================================================
+// LoadCsv: bulk-load a CSV via the "load <path> into <table>;" statement.
+// The CSV is copied next to the DB (cwd after open_db) so the relative path
+// is just the filename, regardless of the test process's original CWD.
+// =============================================================================
+
+TEST_F(E2ETest, LoadCsvMatchesFileContents) {
+    // Locate the shipped sample CSV via the compile-time source dir.
+    std::string src_csv;
+#ifdef RMDB_SRC_DIR
+    src_csv = std::string(RMDB_SRC_DIR) + "/src/test/performance_test/table_data/warehouse.csv";
+#else
+    src_csv = "src/test/performance_test/table_data/warehouse.csv";
+#endif
+    std::ifstream check(src_csv);
+    ASSERT_TRUE(check.good()) << "missing sample CSV: " << src_csv;
+    check.close();
+
+    // Copy the CSV into the current (db) directory so the load path is just the filename.
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/warehouse_load_test.csv";
+    {
+        std::ifstream in(src_csv, std::ios::binary);
+        std::ofstream out(dest_csv, std::ios::binary);
+        out << in.rdbuf();
+    }
+
+    // warehouse.csv columns: w_id,w_name,w_street_1,w_street_2,w_city,w_state,w_zip,w_tax,w_ytd
+    ASSERT_NO_THROW(
+        db_->exec_sql("create table warehouse (w_id int, w_name char(20), w_street_1 char(40), w_street_2 char(40), "
+                      "w_city char(20), w_state char(2), w_zip char(9), w_tax float, w_ytd float);"));
+    // Load via "./<name>" — the "./" prefix is recognized as VALUE_PATH by the lexer,
+    // and since cwd is the db directory, the copied CSV is found by relative path.
+    ASSERT_NO_THROW(db_->exec_sql("load ./warehouse_load_test.csv into warehouse;"));
+
+    // warehouse.csv has 1 data row.
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from warehouse;"); });
+    EXPECT_NE(output.find("1"), std::string::npos) << output;
+
+    // Verify content: w_id=1, w_state=JY, w_tax=0.125 (from the sample row).
+    ASSERT_NO_THROW({ output = db_->exec_sql("select w_id, w_state, w_tax from warehouse;"); });
+    EXPECT_NE(output.find("1"), std::string::npos);
+    EXPECT_NE(output.find("JY"), std::string::npos);
+    EXPECT_NE(output.find("0.125"), std::string::npos) << output;
+
+    // Cleanup the copied CSV.
+    std::remove(dest_csv.c_str());
+}
+
+// =============================================================================
+// LoadCrashRecovery: loaded data must survive a crash (recovery redo replays
+// committed batched inserts). Mirrors the CheckpointRecoveryTest pattern.
+// =============================================================================
+
+TEST(LoadCrashRecoveryTest, LoadedDataSurvivesRestart) {
+    const std::string db_name = "e2e_load_crash_recovery";
+
+    // Locate and copy the shipped item.csv (10 data rows) next to the DB.
+    std::string src_csv;
+#ifdef RMDB_SRC_DIR
+    src_csv = std::string(RMDB_SRC_DIR) + "/src/test/performance_test/table_data/item.csv";
+#else
+    src_csv = "src/test/performance_test/table_data/item.csv";
+#endif
+    std::ifstream check(src_csv);
+    ASSERT_TRUE(check.good()) << "missing sample CSV: " << src_csv;
+    check.close();
+
+    {
+        EmbeddedDB db(db_name, true, false);
+        char cwd_buf[1024];
+        getcwd(cwd_buf, sizeof(cwd_buf));
+        std::string dest_csv = std::string(cwd_buf) + "/item_crash_test.csv";
+        {
+            std::ifstream in(src_csv, std::ios::binary);
+            std::ofstream out(dest_csv, std::ios::binary);
+            out << in.rdbuf();
+        }
+
+        // item.csv columns: i_id,i_im_id,i_name,i_price,i_data
+        ASSERT_NO_THROW(
+            db.exec_sql("create table item (i_id int, i_im_id int, i_name char(40), i_price float, i_data char(50));"));
+        ASSERT_NO_THROW(db.exec_sql("load ./item_crash_test.csv into item;"));
+
+        // Verify the load worked before the "crash".
+        std::string output;
+        ASSERT_NO_THROW({ output = db.exec_sql("select count(*) from item;"); });
+        EXPECT_NE(output.find("10"), std::string::npos) << output;
+        // Destructor closes the DB (simulating a clean-ish exit); the batched
+        // commits already flushed WAL, so recovery can redo them.
+    }
+
+    // Simulate restart: clear in-memory txn state so recovery runs fresh.
+    TransactionManager::txn_map.clear();
+
+    {
+        EmbeddedDB recovered(db_name, false, true);
+        std::string output;
+        ASSERT_NO_THROW({ output = recovered.exec_sql("select count(*) from item;"); });
+        // All 10 loaded rows must survive the restart.
+        EXPECT_NE(output.find("10"), std::string::npos) << "loaded data lost after restart; output: " << output;
+
+        // Spot-check content: the first item row has i_id=1.
+        ASSERT_NO_THROW({ output = recovered.exec_sql("select i_id, i_name from item order by i_id limit 1;"); });
+        EXPECT_NE(output.find("1"), std::string::npos) << output;
+    }
+}
+
+// Verify show tables/index respect the output_file toggle: after "set output_file off",
+// these commands must NOT append to output.txt.
+
+TEST_F(E2ETest, ShowCommandsRespectOutputFileOff) {
+    ASSERT_NO_THROW(db_->exec_sql("create table t_show (a int, b char(4));"));
+    ASSERT_NO_THROW(db_->exec_sql("create index t_show(a);"));
+    db_->clean_output_txt();
+
+    // With output OFF, show commands should produce client output but no file output.
+    ASSERT_NO_THROW(db_->exec_sql("set output_file off"));
+    ASSERT_NO_THROW(db_->exec_sql("show tables;"));
+    ASSERT_NO_THROW(db_->exec_sql("show index from t_show;"));
+
+    // output.txt should not exist (or be empty) after show commands with output off.
+    std::ifstream f("output.txt");
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+    EXPECT_EQ(content, "") << "show commands wrote to output.txt despite output_file off";
+
+    // With output ON, show commands should write to output.txt.
+    ASSERT_NO_THROW(db_->exec_sql("set output_file on"));
+    ASSERT_NO_THROW(db_->exec_sql("show tables;"));
+    std::ifstream f2("output.txt");
+    std::string content2((std::istreambuf_iterator<char>(f2)), std::istreambuf_iterator<char>());
+    f2.close();
+    EXPECT_NE(content2, "") << "show tables did not write to output.txt with output_file on";
+    EXPECT_NE(content2.find("t_show"), std::string::npos);
 }

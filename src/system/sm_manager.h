@@ -164,6 +164,8 @@ public:
 
     void flush_all_table_and_index_pages();
 
+    void rebuild_all_indexes();
+
     void reset_all_tuple_meta_after_recovery();
 
     // MVCC: mark all slots modified by txn as committed with the given commit_ts
@@ -179,4 +181,9 @@ public:
         }
         txn.get_modified_slots().clear();
     }
+
+    // Bulk-load a CSV file into an existing table. The path is relative to the
+    // server's working directory. Reuses the insert path (WAL + index + MVCC
+    // meta) in self-managed batched transactions, skipping conflict checks.
+    void load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context);
 };

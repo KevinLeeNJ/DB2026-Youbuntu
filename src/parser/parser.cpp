@@ -15,10 +15,6 @@ using parser::Lexer;
 using parser::Token;
 using parser::TokenType;
 
-struct ParseError : public std::runtime_error {
-    explicit ParseError(const std::string& message) : std::runtime_error(message) {}
-};
-
 struct FromClause {
     std::vector<TableRef> tables;
     std::vector<std::unique_ptr<BinaryExpr>> conds;
@@ -44,6 +40,30 @@ public:
             consume_optional_semicolon();
             expect_end();
             return nullptr;
+        }
+
+        // "set output_file off" has no semicolon; handle before the semicolon-enforcing path.
+        if (check(TokenType::SET)) {
+            auto state = lexer_.save_state();
+            Token saved_current = current_;
+            advance(); // consume SET
+            if (check(TokenType::OUTPUT_FILE)) {
+                advance(); // consume OUTPUT_FILE
+                bool enable;
+                if (match(TokenType::ON)) {
+                    enable = true;
+                } else if (match(TokenType::OFF)) {
+                    enable = false;
+                } else {
+                    error("expected ON or OFF after OUTPUT_FILE");
+                }
+                consume_optional_semicolon();
+                expect_end();
+                return std::make_unique<SetOutputFile>(enable);
+            }
+            lexer_.restore_state(state);
+            current_ = saved_current;
+            // fall through to parse_stmt() for SET TRANSACTION / SET knob (which require ';')
         }
 
         auto result = parse_stmt();
@@ -123,7 +143,18 @@ private:
         if (check(TokenType::SET)) {
             return parse_set_stmt();
         }
+        if (check(TokenType::LOAD)) {
+            return parse_load_stmt();
+        }
         error("unexpected start of statement");
+    }
+
+    std::unique_ptr<TreeNode> parse_load_stmt() {
+        expect(TokenType::LOAD, "expected LOAD");
+        Token path = expect(TokenType::VALUE_PATH, "expected file path after LOAD");
+        expect(TokenType::INTO, "expected INTO after file path");
+        std::string table = parse_identifier();
+        return std::make_unique<LoadStmt>(std::string(path.text), std::move(table));
     }
 
     std::unique_ptr<TreeNode> parse_db_stmt() {
@@ -736,8 +767,12 @@ private:
 } // namespace
 
 std::unique_ptr<TreeNode> parse_sql(const std::string& sql) {
-    SqlParser parser(sql);
-    return parser.parse();
+    try {
+        SqlParser parser(sql);
+        return parser.parse();
+    } catch (const parser::LexerError& e) {
+        throw ParseError(e.what());
+    }
 }
 
 } // namespace ast

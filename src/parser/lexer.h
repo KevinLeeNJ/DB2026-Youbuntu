@@ -70,6 +70,10 @@ enum class TokenType {
     SNAPSHOT,
     SERIALIZABLE,
     STATIC_CHECKPOINT,
+    OUTPUT_FILE,
+    OFF,
+    LOAD,
+    VALUE_PATH,
     WHERE,
     UPDATE,
     SET,
@@ -186,6 +190,7 @@ private:
     Token scan_identifier_or_keyword();
     Token scan_number();
     Token scan_string();
+    Token scan_path();
     Token scan_operator();
 
     // 数字解析

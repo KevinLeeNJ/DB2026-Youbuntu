@@ -28,6 +28,11 @@ void expect_parse_error(const std::string& sql) {
 
 } // namespace
 
+TEST(ParserTest, ParserAndLexerErrorsUsePublicType) {
+    EXPECT_THROW((void)ast::parse_sql("select from;"), ast::ParseError);
+    EXPECT_THROW((void)ast::parse_sql("select @;"), ast::ParseError);
+}
+
 TEST(ParserTest, ParsesUtilityStatements) {
     EXPECT_EQ(ast::parse_sql("").get(), nullptr);
     EXPECT_EQ(ast::parse_sql("exit;").get(), nullptr);
@@ -227,4 +232,38 @@ TEST(ParserTest, ParsesIntMinBoundary) {
 TEST(ParserTest, RejectsIntegerOverflow) {
     expect_parse_error("insert into tb values (2147483648);");
     expect_parse_error("insert into tb values (-2147483649);");
+}
+
+TEST(ParserTest, ParsesSetOutputFile) {
+    auto off = parse_ok("set output_file off");
+    auto off_node = as_node<ast::SetOutputFile>(off);
+    ASSERT_NE(off_node, nullptr);
+    EXPECT_FALSE(off_node->enable_);
+
+    auto on = parse_ok("set output_file on");
+    auto on_node = as_node<ast::SetOutputFile>(on);
+    ASSERT_NE(on_node, nullptr);
+    EXPECT_TRUE(on_node->enable_);
+
+    // trailing semicolon is tolerated (optional)
+    auto on_semi = parse_ok("set output_file on;");
+    EXPECT_EQ(on_semi->type, ast::AstType::SetOutputFile);
+
+    // normal SET statements still require a semicolon
+    EXPECT_NO_THROW((void)parse_ok("set enable_nestloop = true;"));
+    EXPECT_NO_THROW((void)parse_ok("set transaction isolation level serializable;"));
+}
+
+TEST(ParserTest, ParsesLoadStmt) {
+    auto node = parse_ok("load ../../src/test/performance_test/table_data/warehouse.csv into warehouse;");
+    auto load = as_node<ast::LoadStmt>(node);
+    ASSERT_NE(load, nullptr);
+    EXPECT_EQ(load->file_name_, "../../src/test/performance_test/table_data/warehouse.csv");
+    EXPECT_EQ(load->tab_name_, "warehouse");
+
+    auto node2 = parse_ok("load ./x.csv into t;");
+    auto load2 = as_node<ast::LoadStmt>(node2);
+    ASSERT_NE(load2, nullptr);
+    EXPECT_EQ(load2->file_name_, "./x.csv");
+    EXPECT_EQ(load2->tab_name_, "t");
 }

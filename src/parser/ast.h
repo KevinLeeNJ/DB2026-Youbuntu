@@ -67,7 +67,9 @@ enum class AstType {
     ExplainAnalyze,
     SetStmt,
     SetTransaction,
-    StaticCheckpoint
+    StaticCheckpoint,
+    SetOutputFile,
+    LoadStmt
 };
 
 // Base class for tree nodes
@@ -456,6 +458,22 @@ struct SetTransaction : public TreeNode {
     IsolationLevelType isolation_level_;
 
     explicit SetTransaction(IsolationLevelType level) : TreeNode(AstType::SetTransaction), isolation_level_(level) {}
+};
+
+// set output_file on|off
+struct SetOutputFile : public TreeNode {
+    bool enable_;
+
+    explicit SetOutputFile(bool enable) : TreeNode(AstType::SetOutputFile), enable_(enable) {}
+};
+
+// load file_name into table_name
+struct LoadStmt : public TreeNode {
+    std::string file_name_;
+    std::string tab_name_;
+
+    LoadStmt(std::string file_name, std::string tab_name)
+        : TreeNode(AstType::LoadStmt), file_name_(std::move(file_name)), tab_name_(std::move(tab_name)) {}
 };
 
 } // namespace ast

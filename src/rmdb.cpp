@@ -81,6 +81,8 @@ void client_handler(int fd) {
     txn_id_t txn_id = INVALID_TXN_ID;
     // 记录客户端当前配置的隔离级别（默认 SERIALIZABLE）
     IsolationLevel session_isolation_level = IsolationLevel::SERIALIZABLE;
+    // 记录客户端是否开启向 output.txt 写入结果（默认开启）
+    bool session_output_enabled = true;
 
     LOG_INFO("establish client connection, sockfd: %d", fd);
 
@@ -120,97 +122,109 @@ void client_handler(int fd) {
                                                   txn_manager.get());
         Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
+        context->output_file_enabled_ = session_output_enabled;
 
+        std::unique_ptr<ast::TreeNode> parse_tree;
         try {
-            auto parse_tree = ast::parse_sql(data_recv);
-            if (parse_tree != nullptr) {
-                try {
-                    auto parsed_type = parse_tree->type;
-                    bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
-                    if (!is_checkpoint) {
-                        SetTransaction(&txn_id, context);
-                    }
-                    // analyze and rewrite
-                    std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
-                    LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
-                    // 优化器
-                    std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), context);
-                    // portal
-                    std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
-                    portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
-                    // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
-                    session_isolation_level = context->isolation_level_;
-                    portal->drop();
-                    if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                        context->txn_->get_state() != TransactionState::COMMITTED &&
-                        context->txn_->get_state() != TransactionState::ABORTED) {
-                        txn_manager->commit(context->txn_, context->log_mgr_);
-                    }
-                    context->txn_ = nullptr;
-                } catch (TransactionAbortException& e) {
-                    // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
-                    std::string str = "abort\n";
-                    memcpy(data_send, str.c_str(), str.length());
-                    data_send[str.length()] = '\0';
-                    offset = str.length();
-
-                    // 回滚事务
-                    if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
-                        context->txn_->get_state() != TransactionState::COMMITTED) {
-                        txn_manager->abort(context->txn_, log_manager.get());
-                    }
-                    context->txn_ = nullptr;
-                    LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
-
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << str;
-                    outfile.close();
-                } catch (RMDBError& e) {
-                    // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
-                    LOG_ERROR("RMDBError: %s", e.what());
-
-                    memcpy(data_send, e.what(), e.get_msg_len());
-                    data_send[e.get_msg_len()] = '\n';
-                    data_send[e.get_msg_len() + 1] = '\0';
-                    offset = e.get_msg_len() + 1;
-
-                    if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                        context->txn_->get_state() != TransactionState::COMMITTED &&
-                        context->txn_->get_state() != TransactionState::ABORTED) {
-                        txn_manager->abort(context->txn_, context->log_mgr_);
-                    }
-                    context->txn_ = nullptr;
-
-                    // 将报错信息写入output.txt
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
-                }
-            }
-        } catch (const std::exception& e) {
-            // 解析失败或其他未捕获异常，将 failure 信息写入 output.txt 并返回给客户端
-            LOG_ERROR("%s", e.what());
-
-            if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                context->txn_->get_state() != TransactionState::COMMITTED &&
-                context->txn_->get_state() != TransactionState::ABORTED) {
-                txn_manager->abort(context->txn_, context->log_mgr_);
-            }
-            context->txn_ = nullptr;
-
+            parse_tree = ast::parse_sql(data_recv);
+        } catch (const ast::ParseError& e) {
+            LOG_ERROR("parse failed for SQL [%s]: %s", data_recv, e.what());
             const char* msg = e.what();
             int msg_len = strlen(msg);
             memcpy(data_send, msg, msg_len);
             data_send[msg_len] = '\n';
             data_send[msg_len + 1] = '\0';
             offset = msg_len + 1;
+        }
 
-            std::fstream outfile;
-            outfile.open("output.txt", std::ios::out | std::ios::app);
-            outfile << "failure\n";
-            outfile.close();
+        if (parse_tree != nullptr) {
+            try {
+                auto parsed_type = parse_tree->type;
+                bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
+                bool is_load = parsed_type == ast::AstType::LoadStmt;
+                if (!is_checkpoint && !is_load) {
+                    SetTransaction(&txn_id, context);
+                }
+                // analyze and rewrite
+                std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
+                LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
+                // 优化器
+                std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), context);
+                // portal
+                std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
+                portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
+                // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
+                session_isolation_level = context->isolation_level_;
+                // Persist output_file toggle change (SET OUTPUT_FILE ON|OFF)
+                session_output_enabled = context->output_file_enabled_;
+                portal->drop();
+                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+                    context->txn_->get_state() != TransactionState::COMMITTED &&
+                    context->txn_->get_state() != TransactionState::ABORTED) {
+                    txn_manager->commit(context->txn_, context->log_mgr_);
+                }
+                context->txn_ = nullptr;
+            } catch (TransactionAbortException& e) {
+                // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
+                std::string str = "abort\n";
+                memcpy(data_send, str.c_str(), str.length());
+                data_send[str.length()] = '\0';
+                offset = str.length();
+
+                // 回滚事务
+                if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
+                    context->txn_->get_state() != TransactionState::COMMITTED) {
+                    txn_manager->abort(context->txn_, log_manager.get());
+                }
+                context->txn_ = nullptr;
+                LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
+
+                if (session_output_enabled) {
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << str;
+                    outfile.close();
+                }
+            } catch (RMDBError& e) {
+                // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
+                LOG_ERROR("RMDBError: %s", e.what());
+
+                memcpy(data_send, e.what(), e.get_msg_len());
+                data_send[e.get_msg_len()] = '\n';
+                data_send[e.get_msg_len() + 1] = '\0';
+                offset = e.get_msg_len() + 1;
+
+                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+                    context->txn_->get_state() != TransactionState::COMMITTED &&
+                    context->txn_->get_state() != TransactionState::ABORTED) {
+                    txn_manager->abort(context->txn_, context->log_mgr_);
+                }
+                context->txn_ = nullptr;
+
+                // 将报错信息写入output.txt
+                if (session_output_enabled) {
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR("%s", e.what());
+
+                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
+                    context->txn_->get_state() != TransactionState::COMMITTED &&
+                    context->txn_->get_state() != TransactionState::ABORTED) {
+                    txn_manager->abort(context->txn_, context->log_mgr_);
+                }
+                context->txn_ = nullptr;
+
+                const char* msg = e.what();
+                int msg_len = strlen(msg);
+                memcpy(data_send, msg, msg_len);
+                data_send[msg_len] = '\n';
+                data_send[msg_len + 1] = '\0';
+                offset = msg_len + 1;
+            }
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future

@@ -51,7 +51,9 @@ typedef enum PlanTag {
     T_Union,
     T_ExplainAnalyze,
     T_SetTransaction,
-    T_StaticCheckpoint
+    T_StaticCheckpoint,
+    T_SetOutputFile,
+    T_LoadData
 } PlanTag;
 
 // 查询执行计划
@@ -266,6 +268,28 @@ public:
         isolation_level_ = level;
     }
     ast::IsolationLevelType isolation_level_;
+};
+
+// Set Output File Plan
+class SetOutputFilePlan : public Plan {
+public:
+    explicit SetOutputFilePlan(bool enable) {
+        Plan::tag = T_SetOutputFile;
+        enable_ = enable;
+    }
+    bool enable_;
+};
+
+// Load Data Plan
+class LoadDataPlan : public Plan {
+public:
+    LoadDataPlan(std::string file_name, std::string tab_name) {
+        Plan::tag = T_LoadData;
+        file_name_ = std::move(file_name);
+        tab_name_ = std::move(tab_name);
+    }
+    std::string file_name_;
+    std::string tab_name_;
 };
 
 class plannerInfo {

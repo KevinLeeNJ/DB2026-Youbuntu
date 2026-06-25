@@ -12,7 +12,14 @@ See the Mulan PSL v2 for more details. */
 
 #include "ast.h"
 
+#include <stdexcept>
+#include <string>
+
 namespace ast {
+
+struct ParseError : public std::runtime_error {
+    explicit ParseError(const std::string& message) : std::runtime_error(message) {}
+};
 
 std::unique_ptr<TreeNode> parse_sql(const std::string& sql);
 

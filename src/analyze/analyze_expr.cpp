@@ -167,6 +167,10 @@ void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols) {
         break;
     case AggType::MAX:
     case AggType::MIN:
+        if (col_meta->type != TYPE_INT && col_meta->type != TYPE_FLOAT && col_meta->type != TYPE_STRING) {
+            throw RMDBError(agg_type_to_string(agg.type) + " only supports int, float, and string columns");
+        }
+        break;
     case AggType::SUM:
     case AggType::AVG:
         if (!is_numeric_type(col_meta->type)) {

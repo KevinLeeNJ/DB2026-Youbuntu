@@ -38,4 +38,5 @@ public:
     bool ellipsis_;
     IsolationLevel isolation_level_;
     bool enable_ssi_read_tracking_{false};
+    bool output_file_enabled_{true};
 };

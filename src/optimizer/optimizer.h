@@ -72,6 +72,14 @@ public:
             auto x = static_cast<const ast::SetTransaction*>(parse);
             return std::make_unique<SetTransactionPlan>(x->isolation_level_);
         }
+        case ast::AstType::SetOutputFile: {
+            auto x = static_cast<const ast::SetOutputFile*>(parse);
+            return std::make_unique<SetOutputFilePlan>(x->enable_);
+        }
+        case ast::AstType::LoadStmt: {
+            auto x = static_cast<const ast::LoadStmt*>(parse);
+            return std::make_unique<LoadDataPlan>(x->file_name_, x->tab_name_);
+        }
         case ast::AstType::StaticCheckpoint:
             return std::make_unique<OtherPlan>(T_StaticCheckpoint, std::string());
         default:
