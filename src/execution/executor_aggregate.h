@@ -146,6 +146,7 @@ private:
             value.float_val = *reinterpret_cast<const float*>(data);
             break;
         case TYPE_STRING:
+        case TYPE_DATETIME:
             value.str_val = trim_string(data, col.len);
             break;
         }
@@ -198,6 +199,7 @@ private:
             *reinterpret_cast<float*>(dest + col.offset) = value.float_val;
             break;
         case TYPE_STRING:
+        case TYPE_DATETIME:
             std::memset(dest + col.offset, 0, col.len);
             std::memcpy(dest + col.offset, value.str_val.data(), std::min<int>(col.len, value.str_val.size()));
             break;

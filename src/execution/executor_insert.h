@@ -81,6 +81,9 @@ public:
                     val.set_float(static_cast<float>(val.int_val));
                 } else if (col.type == TYPE_INT && val.type == TYPE_FLOAT) {
                     val.set_int(static_cast<int>(val.float_val));
+                } else if ((col.type == TYPE_STRING || col.type == TYPE_DATETIME) &&
+                           (val.type == TYPE_STRING || val.type == TYPE_DATETIME)) {
+                    val.type = col.type;
                 }
             }
             val.init_raw(col.len);

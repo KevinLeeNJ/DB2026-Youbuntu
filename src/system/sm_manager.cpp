@@ -667,7 +667,7 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
                         throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
                     }
                     std::memcpy(record.data() + cs.offset, &v, cs.len);
-                } else if (cs.type == TYPE_STRING) {
+                } else if (cs.type == TYPE_STRING || cs.type == TYPE_DATETIME) {
                     if (static_cast<int>(raw.size()) > cs.len) {
                         throw RMDBError("load file row " + std::to_string(line_no) + " string too long for column");
                     }

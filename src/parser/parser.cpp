@@ -383,6 +383,9 @@ private:
         if (match(TokenType::FLOAT)) {
             return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
         }
+        if (match(TokenType::DATETIME)) {
+            return std::make_unique<TypeLen>(SV_TYPE_DATETIME, 19);
+        }
         expect(TokenType::CHAR, "expected type");
         expect(TokenType::LPAREN, "expected '(' after CHAR");
         auto length = parse_int_literal();
@@ -430,24 +433,13 @@ private:
 
     std::unique_ptr<Value> parse_numeric_delta_after(TokenType op) {
         auto delta = parse_value();
-        if (op == TokenType::PLUS) {
+        if (op == TokenType::PLUS || op == TokenType::MINUS || op == TokenType::STAR || op == TokenType::SLASH) {
             if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit) {
-                error("expected numeric value after '+'");
+                error("expected numeric value after arithmetic operator");
             }
             return delta;
         }
-
-        if (auto* int_delta = dynamic_cast<IntLit*>(delta.get())) {
-            int_delta->val = -int_delta->val;
-            int_delta->display_text = "-" + int_delta->display_text;
-            return delta;
-        }
-        if (auto* float_delta = dynamic_cast<FloatLit*>(delta.get())) {
-            float_delta->val = -float_delta->val;
-            float_delta->display_text = "-" + float_delta->display_text;
-            return delta;
-        }
-        error("expected numeric value after '-'");
+        error("expected numeric value after arithmetic operator");
     }
 
     std::unique_ptr<IntLit> parse_int_literal(bool is_negative = false) {
@@ -578,12 +570,12 @@ private:
         if (match(TokenType::PLUS_ASSIGN)) {
             auto rhs_col = std::make_unique<Col>("", column);
             return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                               parse_numeric_delta_after(TokenType::PLUS));
+                                               parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
         }
         if (match(TokenType::MINUS_ASSIGN)) {
             auto rhs_col = std::make_unique<Col>("", column);
             return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                               parse_numeric_delta_after(TokenType::MINUS));
+                                               parse_numeric_delta_after(TokenType::MINUS), SetOp::SELF_SUB);
         }
 
         expect(TokenType::EQ, "expected '=' in SET clause");
@@ -594,13 +586,24 @@ private:
             auto rhs_col = parse_col();
             if (match(TokenType::PLUS)) {
                 return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::PLUS));
+                                                   parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
             }
             if (match(TokenType::MINUS)) {
                 return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::MINUS));
+                                                   parse_numeric_delta_after(TokenType::MINUS), SetOp::SELF_SUB);
             }
-            error("expected '+' or '-' after column reference in SET clause");
+            if (match(TokenType::STAR)) {
+                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                                   parse_numeric_delta_after(TokenType::STAR), SetOp::SELF_MUL);
+            }
+            if (match(TokenType::SLASH)) {
+                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                                   parse_numeric_delta_after(TokenType::SLASH), SetOp::SELF_DIV);
+            }
+            if (rhs_col->col_name != column) {
+                error("expected arithmetic operator after different column reference in SET clause");
+            }
+            return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), nullptr, SetOp::ASSIGNMENT);
         }
         return std::make_unique<SetClause>(std::move(column), parse_value());
     }

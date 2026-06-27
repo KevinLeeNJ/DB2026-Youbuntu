@@ -147,6 +147,7 @@ RmRecord make_record(const std::vector<ColMeta>& cols, const std::vector<Value>&
             *reinterpret_cast<float*>(dest) = value.float_val;
             break;
         case TYPE_STRING:
+        case TYPE_DATETIME:
             std::memcpy(dest, value.str_val.data(), std::min<int>(col.len, value.str_val.size()));
             break;
         }

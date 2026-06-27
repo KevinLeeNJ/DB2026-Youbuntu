@@ -99,7 +99,9 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
     }
 
     bool can_cast = lhs_type == rhs_type || (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-                    (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT);
+                    (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
+                    ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
+                     (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME));
     if (!can_cast) {
         throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
     }
@@ -131,7 +133,8 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
             return lhs_val >= rhs_val;
         }
     }
-    case TYPE_STRING: {
+    case TYPE_STRING:
+    case TYPE_DATETIME: {
         std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
         std::string rhs_val =
             cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta->len));
@@ -531,11 +534,13 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
             rhs_data = rec.data + rhs_col.offset;
         }
         if (!((lhs_col.type == rhs_type) || (lhs_col.type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-              (lhs_col.type == TYPE_FLOAT && rhs_type == TYPE_INT))) {
+              (lhs_col.type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
+              ((lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) &&
+               (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)))) {
             throw IncompatibleTypeError(coltype2str(lhs_col.type), coltype2str(rhs_type));
         }
         int cmp = 0;
-        if (lhs_col.type == TYPE_STRING) {
+        if (lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) {
             std::string lhs(lhs_data, strnlen(lhs_data, lhs_col.len));
             std::string rhs =
                 cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col.len));

@@ -93,6 +93,7 @@ enum class TokenType {
     INT,
     CHAR,
     FLOAT,
+    DATETIME,
     INDEX,
     AND,
     JOIN,
@@ -114,6 +115,8 @@ enum class TokenType {
     GT,
     PLUS,
     MINUS,
+    STAR,
+    SLASH,
     PLUS_ASSIGN,
     MINUS_ASSIGN,
 
@@ -123,7 +126,6 @@ enum class TokenType {
     COMMA,
     SEMICOLON,
     DOT,
-    STAR,
 
     // Literals
     IDENTIFIER,

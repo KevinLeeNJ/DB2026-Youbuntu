@@ -63,7 +63,7 @@ struct Value {
         } else if (type == TYPE_FLOAT) {
             assert(len == sizeof(float));
             *(float*)(raw->data) = float_val;
-        } else if (type == TYPE_STRING) {
+        } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
             if (len < (int)str_val.size()) {
                 throw StringOverflowError();
             }
@@ -140,9 +140,12 @@ struct Condition {
     std::string rhs_display;
 };
 
+enum class UpdateOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
+
 struct SetClause {
     TabCol lhs;
     Value rhs;
     bool is_self_ref = false;
     TabCol rhs_col;
+    UpdateOp op = UpdateOp::ASSIGNMENT;
 };

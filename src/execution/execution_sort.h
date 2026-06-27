@@ -95,6 +95,7 @@ private:
         case TYPE_FLOAT:
             return &compare_float_cell;
         case TYPE_STRING:
+        case TYPE_DATETIME:
             return &compare_string_cell;
         }
         throw InternalError("Unexpected column type in SortExecutor");

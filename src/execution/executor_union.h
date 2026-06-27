@@ -45,7 +45,8 @@ private:
             return;
         }
 
-        if (dst_col.type == TYPE_STRING && src_col.type == TYPE_STRING) {
+        if ((dst_col.type == TYPE_STRING || dst_col.type == TYPE_DATETIME) &&
+            (src_col.type == TYPE_STRING || src_col.type == TYPE_DATETIME)) {
             std::memset(dst, 0, static_cast<size_t>(dst_col.len));
             std::string value = read_string_cell(src, src_col.len);
             std::memcpy(dst, value.data(), std::min(value.size(), static_cast<size_t>(dst_col.len)));

@@ -77,12 +77,17 @@ private:
     void check_clause(const std::vector<std::string>& tab_names, std::vector<Condition>& conds);
     Value convert_sv_value(const ast::Value* sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
+    void cast_value(Value& val, ColType to);
 
     bool can_cast(ColType lhs_type, ColType rhs_type) {
         if (lhs_type == rhs_type) {
             return true;
         }
         if ((lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) || (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT)) {
+            return true;
+        }
+        if ((lhs_type == TYPE_STRING && rhs_type == TYPE_DATETIME) ||
+            (lhs_type == TYPE_DATETIME && rhs_type == TYPE_STRING)) {
             return true;
         }
         return false;

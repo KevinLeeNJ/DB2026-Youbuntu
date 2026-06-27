@@ -39,6 +39,7 @@ const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::ke
     {"INT", TokenType::INT},
     {"CHAR", TokenType::CHAR},
     {"FLOAT", TokenType::FLOAT},
+    {"DATETIME", TokenType::DATETIME},
     {"INDEX", TokenType::INDEX},
     {"AND", TokenType::AND},
     {"ORDER", TokenType::ORDER},
@@ -151,7 +152,10 @@ Token Lexer::next_token() {
     char c = current_char();
 
     // File path (for LOAD): starts with '/', "./" or "../"
-    if (c == '/' || (c == '.' && (peek_char(1) == '/' || (peek_char(1) == '.' && peek_char(2) == '/')))) {
+    if ((c == '/' &&
+         !(std::isspace(static_cast<unsigned char>(peek_char(1))) ||
+           std::isdigit(static_cast<unsigned char>(peek_char(1))) || peek_char(1) == '-' || peek_char(1) == '\'')) ||
+        (c == '.' && (peek_char(1) == '/' || (peek_char(1) == '.' && peek_char(2) == '/')))) {
         return scan_path();
     }
 
@@ -331,6 +335,8 @@ Token Lexer::scan_operator() {
         return Token(TokenType::DOT, ".", start_line, start_col);
     case '*':
         return Token(TokenType::STAR, "*", start_line, start_col);
+    case '/':
+        return Token(TokenType::SLASH, "/", start_line, start_col);
     default:
         return Token(TokenType::T_ERROR, std::string_view(&input_[pos_ - 1], 1), start_line, start_col);
     }

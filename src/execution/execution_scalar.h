@@ -72,7 +72,7 @@ inline int compare_cells(const CellValue& lhs, const CellValue& rhs) {
     if (lhs.type != rhs.type) {
         throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
     }
-    if (lhs.type == TYPE_STRING) {
+    if (lhs.type == TYPE_STRING || lhs.type == TYPE_DATETIME) {
         if (lhs.str_val < rhs.str_val) {
             return -1;
         }
@@ -131,7 +131,7 @@ inline CellValue zero_value(ColType type) {
     value.type = type;
     if (type == TYPE_FLOAT) {
         value.float_val = 0.0f;
-    } else if (type == TYPE_STRING) {
+    } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
         value.str_val.clear();
     } else {
         value.int_val = 0;

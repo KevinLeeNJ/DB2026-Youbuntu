@@ -71,6 +71,10 @@ bool can_cast_types(ColType lhs_type, ColType rhs_type) {
     if ((lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) || (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT)) {
         return true;
     }
+    if ((lhs_type == TYPE_STRING && rhs_type == TYPE_DATETIME) ||
+        (lhs_type == TYPE_DATETIME && rhs_type == TYPE_STRING)) {
+        return true;
+    }
     return false;
 }
 
@@ -79,7 +83,7 @@ bool is_numeric_type(ColType type) {
 }
 
 bool is_groupable_type(ColType type) {
-    return type == TYPE_INT || type == TYPE_FLOAT || type == TYPE_STRING;
+    return type == TYPE_INT || type == TYPE_FLOAT || type == TYPE_STRING || type == TYPE_DATETIME;
 }
 
 std::string agg_type_to_string(AggType type) {
@@ -161,13 +165,15 @@ void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols) {
 
     switch (agg.type) {
     case AggType::COUNT:
-        if (col_meta->type != TYPE_INT && col_meta->type != TYPE_FLOAT && col_meta->type != TYPE_STRING) {
+        if (col_meta->type != TYPE_INT && col_meta->type != TYPE_FLOAT && col_meta->type != TYPE_STRING &&
+            col_meta->type != TYPE_DATETIME) {
             throw RMDBError("COUNT(col) only supports int, float, and string columns");
         }
         break;
     case AggType::MAX:
     case AggType::MIN:
-        if (col_meta->type != TYPE_INT && col_meta->type != TYPE_FLOAT && col_meta->type != TYPE_STRING) {
+        if (col_meta->type != TYPE_INT && col_meta->type != TYPE_FLOAT && col_meta->type != TYPE_STRING &&
+            col_meta->type != TYPE_DATETIME) {
             throw RMDBError(agg_type_to_string(agg.type) + " only supports int, float, and string columns");
         }
         break;

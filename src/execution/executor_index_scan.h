@@ -104,6 +104,7 @@ private:
             break;
         }
         case TYPE_STRING:
+        case TYPE_DATETIME:
             memset(dest, 0, col.len);
             break;
         }
@@ -122,6 +123,7 @@ private:
             break;
         }
         case TYPE_STRING:
+        case TYPE_DATETIME:
             memset(dest, 0xFF, col.len);
             break;
         }
@@ -141,6 +143,7 @@ private:
             break;
         }
         case TYPE_STRING:
+        case TYPE_DATETIME:
             memcpy(data.data(), value.str_val.c_str(), std::min(static_cast<int>(value.str_val.size()), col.len));
             break;
         }

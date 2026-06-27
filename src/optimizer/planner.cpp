@@ -89,6 +89,7 @@ std::string condition_sort_key(const Condition& cond) {
                 key += std::to_string(cond.rhs_val.float_val);
                 break;
             case TYPE_STRING:
+            case TYPE_DATETIME:
                 key += cond.rhs_val.str_val;
                 break;
             }

@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 enum JoinType { INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN };
 namespace ast {
 
-enum SvType { SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL };
+enum SvType { SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL, SV_TYPE_DATETIME };
 
 enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE };
 
@@ -28,6 +28,8 @@ enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 enum AggFuncType { AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
 
 enum SetKnobType { EnableNestLoop, EnableSortMerge };
+
+enum class SetOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
 
 enum class IsolationLevelType { SNAPSHOT_ISOLATION, SERIALIZABLE };
 
@@ -252,13 +254,15 @@ struct SetClause : public TreeNode {
     std::unique_ptr<Value> val;
     std::unique_ptr<Col> rhs_col;
     bool is_self_ref;
+    SetOp op;
 
     SetClause(std::string col_name_, std::unique_ptr<Value> val_)
-        : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)), is_self_ref(false) {}
+        : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)), is_self_ref(false),
+          op(SetOp::ASSIGNMENT) {}
 
-    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_)
+    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_, SetOp op_)
         : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)),
-          rhs_col(std::move(rhs_col_)), is_self_ref(true) {}
+          rhs_col(std::move(rhs_col_)), is_self_ref(true), op(op_) {}
 };
 
 struct BinaryExpr : public TreeNode {
