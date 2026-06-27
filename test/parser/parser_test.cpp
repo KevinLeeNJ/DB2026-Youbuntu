@@ -194,6 +194,9 @@ TEST(ParserTest, RejectsMalformedStatements) {
     expect_parse_error("select from tb;");
     expect_parse_error("insert into tb values (1, );");
     expect_parse_error("set enable_nestloop = maybe;");
+    // rhs column reference must be followed by +/- (self-referential form); a bare
+    // column-to-column copy is not supported.
+    expect_parse_error("update tb set a = b where x = 1;");
 }
 
 TEST(ParserTest, SelectStmtUsesSelectItemsAsSingleProjectionContract) {

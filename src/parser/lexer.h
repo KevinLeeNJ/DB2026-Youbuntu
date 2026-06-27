@@ -159,18 +159,8 @@ class Lexer {
 public:
     explicit Lexer(std::string_view input);
 
-    struct LexerState {
-        size_t pos;
-        int line;
-        int column;
-        Token peeked;
-        bool has_peeked;
-    };
-
     Token next_token();
     Token peek_token();
-    LexerState save_state() const;
-    void restore_state(const LexerState& state);
 
     int current_line() const {
         return line_;

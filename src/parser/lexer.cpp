@@ -182,18 +182,6 @@ Token Lexer::peek_token() {
     return peeked_;
 }
 
-Lexer::LexerState Lexer::save_state() const {
-    return LexerState{pos_, line_, column_, peeked_, has_peeked_};
-}
-
-void Lexer::restore_state(const LexerState& state) {
-    pos_ = state.pos;
-    line_ = state.line;
-    column_ = state.column;
-    peeked_ = state.peeked;
-    has_peeked_ = state.has_peeked;
-}
-
 Token Lexer::scan_identifier_or_keyword() {
     int start_line = line_;
     int start_col = column_;
