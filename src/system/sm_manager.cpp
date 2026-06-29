@@ -43,18 +43,20 @@ void InsertIndexEntryIdempotent(SmManager* sm_manager, const std::string& tab_na
     auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
     std::vector<Rid> existing;
     if (ih->get_value(key.data(), &existing, nullptr)) {
-        if (existing.size() == 1 && existing[0] == rid) {
-            return;
+        for (const auto& existing_rid : existing) {
+            if (existing_rid == rid) {
+                return;
+            }
         }
     }
-    ih->insert_entry(key.data(), rid, nullptr);
+    ih->insert_entry(key.data(), rid, nullptr, true);
 }
 
 void DeleteIndexEntryIfExists(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
-                              const RmRecord& rec) {
+                              const RmRecord& rec, const Rid& rid) {
     auto key = MakeIndexKey(index, rec.data);
     auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-    ih->delete_entry(key.data(), nullptr);
+    ih->delete_entry(key.data(), rid, nullptr);
 }
 
 } // namespace
@@ -130,25 +132,48 @@ void SmManager::open_db(const std::string& db_name) {
         throw DatabaseExistsError(db_name);
     }
     {
+        std::ifstream meta_check(db_name + "/" + DB_META_NAME);
+        if (!meta_check || meta_check.peek() == std::ifstream::traits_type::eof()) {
+            throw UnixError();
+        }
+    }
+    char cwd_buf[4096];
+    if (getcwd(cwd_buf, sizeof(cwd_buf)) == nullptr) {
+        throw UnixError();
+    }
+    std::string original_cwd = cwd_buf;
+    {
         std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
     }
-    if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
-        throw UnixError();
-    }
-    // 读取数据库元数据
-    std::ifstream ifs(DB_META_NAME);
-    ifs >> db_;
-    // ifs.close();
-    //  打开所有表的记录文件
-    for (auto& entry : db_.tabs_) {
-        auto& tab_meta = entry.second;
-        fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
-        for (auto& index : tab_meta.indexes) {
-            // 打开索引文件
-            ihs_.emplace(ix_manager_->get_index_name(tab_meta.name, index.cols),
-                         ix_manager_->open_index(index.tab_name, index.cols));
+    try {
+        if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
+            throw UnixError();
         }
+        // 读取数据库元数据
+        std::ifstream ifs(DB_META_NAME);
+        DbMeta loaded_db;
+        if (!(ifs >> loaded_db) || loaded_db.name_.empty()) {
+            throw UnixError();
+        }
+        db_ = std::move(loaded_db);
+        // ifs.close();
+        //  打开所有表的记录文件
+        for (auto& entry : db_.tabs_) {
+            auto& tab_meta = entry.second;
+            fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
+            for (auto& index : tab_meta.indexes) {
+                // 打开索引文件
+                ihs_.emplace(ix_manager_->get_index_name(tab_meta.name, index.cols),
+                             ix_manager_->open_index(index.tab_name, index.cols));
+            }
+        }
+    } catch (...) {
+        fhs_.clear();
+        ihs_.clear();
+        db_ = DbMeta();
+        chdir(original_cwd.c_str());
+        throw;
     }
 }
 
@@ -453,7 +478,7 @@ void SmManager::delete_record_with_indexes(const std::string& tab_name, const Ri
     auto& tab = db_.get_table(tab_name);
     auto* fh = fhs_.at(tab_name).get();
     for (const auto& index : tab.indexes) {
-        DeleteIndexEntryIfExists(this, tab_name, index, old_rec);
+        DeleteIndexEntryIfExists(this, tab_name, index, old_rec, rid);
     }
     fh->delete_record(rid, nullptr);
 }
@@ -466,7 +491,7 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
         auto old_key = MakeIndexKey(index, old_rec.data);
         auto new_key = MakeIndexKey(index, new_rec.data);
         if (old_key != new_key) {
-            DeleteIndexEntryIfExists(this, tab_name, index, old_rec);
+            DeleteIndexEntryIfExists(this, tab_name, index, old_rec, rid);
         }
     }
     fh->update_record(rid, new_rec.data, nullptr);
@@ -682,7 +707,7 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
                             target.meta->cols[i].len);
                 off += target.meta->cols[i].len;
             }
-            target.inserter->insert(target.key.data(), rid, nullptr);
+            target.inserter->insert(target.key.data(), rid, nullptr, true);
         }
     }
 }

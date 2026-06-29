@@ -506,6 +506,10 @@ TEST_F(SltFileTest, ArithConstant) {
     run_slt_file("arith_constant.slt");
 }
 
+TEST_F(SltFileTest, PerformanceLoadQuery) {
+    run_slt_file("performance_load_query.slt");
+}
+
 TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {
     ASSERT_NO_THROW(db_->exec_sql("create table dup_heap (id int, val int);"));
     ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
@@ -685,6 +689,138 @@ TEST_F(E2ETest, LoadCsvStoresRowsAsCommittedBaseData) {
     EXPECT_EQ(INVALID_TXN_ID, meta.writer_txn_id_);
     EXPECT_FALSE(meta.is_deleted_);
     EXPECT_FALSE(meta.version_chain_head_.IsValid());
+
+    std::remove(dest_csv.c_str());
+}
+
+TEST_F(E2ETest, LoadCsvAllowsDuplicateSecondaryIndexKeys) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/load_duplicate_index_test.csv";
+    {
+        std::ofstream out(dest_csv);
+        out << "id,a\n";
+        out << "1,10\n";
+        out << "2,10\n";
+        out << "3,20\n";
+    }
+
+    ASSERT_NO_THROW(db_->exec_sql("create table load_dup_idx (id int, a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index load_dup_idx(a);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./load_duplicate_index_test.csv into load_dup_idx;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from load_dup_idx where a = 10;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+
+    std::remove(dest_csv.c_str());
+}
+
+TEST_F(E2ETest, DeleteLoadedDuplicateSecondaryIndexKeyRemovesMatchingRidOnly) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/load_duplicate_index_delete_test.csv";
+    {
+        std::ofstream out(dest_csv);
+        out << "id,a\n";
+        out << "1,10\n";
+        out << "2,10\n";
+    }
+
+    ASSERT_NO_THROW(db_->exec_sql("create table load_dup_idx_delete (id int, a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index load_dup_idx_delete(a);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./load_duplicate_index_delete_test.csv into load_dup_idx_delete;"));
+    ASSERT_NO_THROW(db_->exec_sql("delete from load_dup_idx_delete where id = 2;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from load_dup_idx_delete where a = 10;"); });
+    EXPECT_NE(output.find("|                1 |"), std::string::npos) << output;
+    EXPECT_EQ(output.find("|                2 |"), std::string::npos) << output;
+
+    std::remove(dest_csv.c_str());
+}
+
+TEST_F(E2ETest, UpdateLoadedDuplicateSecondaryIndexKeyRemovesMatchingRidOnly) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/load_duplicate_index_update_test.csv";
+    {
+        std::ofstream out(dest_csv);
+        out << "id,a\n";
+        out << "1,10\n";
+        out << "2,10\n";
+    }
+
+    ASSERT_NO_THROW(db_->exec_sql("create table load_dup_idx_update (id int, a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index load_dup_idx_update(a);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./load_duplicate_index_update_test.csv into load_dup_idx_update;"));
+    ASSERT_NO_THROW(db_->exec_sql("update load_dup_idx_update set a = 20 where id = 2;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from load_dup_idx_update where a = 10;"); });
+    EXPECT_NE(output.find("|                1 |"), std::string::npos) << output;
+    EXPECT_EQ(output.find("|                2 |"), std::string::npos) << output;
+
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from load_dup_idx_update where a = 20;"); });
+    EXPECT_NE(output.find("|                2 |"), std::string::npos) << output;
+
+    std::remove(dest_csv.c_str());
+}
+
+TEST_F(E2ETest, AbortDeleteLoadedDuplicateSecondaryIndexKeyRestoresMatchingRid) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/load_duplicate_index_abort_delete_test.csv";
+    {
+        std::ofstream out(dest_csv);
+        out << "id,a\n";
+        out << "1,10\n";
+        out << "2,10\n";
+    }
+
+    ASSERT_NO_THROW(db_->exec_sql("create table load_dup_idx_abort_delete (id int, a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index load_dup_idx_abort_delete(a);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./load_duplicate_index_abort_delete_test.csv into load_dup_idx_abort_delete;"));
+    ASSERT_NO_THROW(db_->exec_sql("begin;"));
+    ASSERT_NO_THROW(db_->exec_sql("delete from load_dup_idx_abort_delete where id = 2;"));
+    ASSERT_NO_THROW(db_->exec_sql("abort;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from load_dup_idx_abort_delete where a = 10;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from load_dup_idx_abort_delete where a = 10;"); });
+    EXPECT_NE(output.find("|                1 |"), std::string::npos) << output;
+    EXPECT_NE(output.find("|                2 |"), std::string::npos) << output;
+
+    std::remove(dest_csv.c_str());
+}
+
+TEST_F(E2ETest, LoadCsvBuildsUsableIndexForUnsortedKeys) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/load_unsorted_index_test.csv";
+    int expected_id = -1;
+    {
+        std::ofstream out(dest_csv);
+        out << "id,a\n";
+        for (int id = 0; id < 1000; ++id) {
+            int a = (id * 919) % 1000;
+            if (a == 777) {
+                expected_id = id;
+            }
+            out << id << "," << a << "\n";
+        }
+    }
+    ASSERT_GE(expected_id, 0);
+
+    ASSERT_NO_THROW(db_->exec_sql("create table load_unsorted_idx (id int, a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index load_unsorted_idx(a);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./load_unsorted_index_test.csv into load_unsorted_idx;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from load_unsorted_idx where a = 777;"); });
+    EXPECT_NE(output.find(std::to_string(expected_id)), std::string::npos) << output;
 
     std::remove(dest_csv.c_str());
 }

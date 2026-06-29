@@ -40,8 +40,8 @@ private:
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
-    bool use_heap_scan_for_mvcc_ = false;
     bool predicate_recorded_{false};
+    bool use_heap_scan_for_mvcc_{false};
 
     SmManager* sm_manager_;
 
@@ -201,6 +201,15 @@ private:
         return constraints;
     }
 
+    bool needs_historical_heap_scan() const {
+        if (context_ == nullptr || context_->txn_ == nullptr) {
+            return false;
+        }
+        IsolationLevel level = context_->txn_->get_isolation_level();
+        return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::REPEATABLE_READ ||
+               (level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode());
+    }
+
 public:
     IndexScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
                       std::vector<std::string> index_col_names, Context* context) {
@@ -231,7 +240,8 @@ public:
 
     void beginTuple() override {
         record_predicate_read();
-        use_heap_scan_for_mvcc_ = context_ != nullptr && context_->txn_ != nullptr;
+
+        use_heap_scan_for_mvcc_ = needs_historical_heap_scan();
         if (use_heap_scan_for_mvcc_) {
             scan_ = std::make_unique<RmScan>(fh_);
             advance_to_match();

@@ -172,7 +172,7 @@ public:
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->delete_entry(update.old_key.data(), txn); // 删除旧索引
+                        ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
                         ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
                         inserted_indexes.push_back(i);
@@ -184,14 +184,14 @@ public:
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->delete_entry(update.new_key.data(), txn); // 删除新索引
+                        ih->delete_entry(update.new_key.data(), rid, txn); // 删除新索引
                     }
                     for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
                         const auto& update = index_updates[*it];
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->insert_entry(update.old_key.data(), rid, txn); // 恢复旧索引
+                        ih->insert_entry(update.old_key.data(), rid, txn, true); // 恢复旧索引
                     }
                     throw; // 仍然抛出错误
                 }

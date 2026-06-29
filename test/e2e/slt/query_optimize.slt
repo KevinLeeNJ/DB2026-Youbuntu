@@ -33,8 +33,7 @@ query
 EXPLAIN ANALYZE SELECT a, b FROM t WHERE a > 1 AND b < 10;
 ----
 Project(columns=[t.a, t.b], rows=2)
-	Filter(condition=[t.a>1, t.b<10], rows=2)
-		Scan(table=t, type=SeqScan, rows=5)
+	Scan(table=t, type=SeqScan, rows=2)
 
 statement ok
 CREATE TABLE customers (customer_id int, name char(50), email char(100), address char(200));
@@ -116,8 +115,7 @@ Project(columns=[c.name, o.order_id], rows=2)
 		Project(columns=[c.customer_id, c.name], rows=3)
 			Scan(table=customers, type=SeqScan, rows=3)
 		Project(columns=[o.customer_id, o.order_id], rows=6)
-			Filter(condition=[o.total_amount>1000.0], rows=6)
-				Scan(table=orders, type=SeqScan, rows=15)
+			Scan(table=orders, type=SeqScan, rows=6)
 
 query
 EXPLAIN ANALYZE SELECT c.name, o.order_id FROM customers c JOIN orders o ON c.customer_id = o.customer_id WHERE o.total_amount > 1000.00;
@@ -127,8 +125,7 @@ Project(columns=[c.name, o.order_id], rows=2)
 		Project(columns=[c.customer_id, c.name], rows=3)
 			Scan(table=customers, type=SeqScan, rows=3)
 		Project(columns=[o.customer_id, o.order_id], rows=6)
-			Filter(condition=[o.total_amount>1000.00], rows=6)
-				Scan(table=orders, type=SeqScan, rows=15)
+			Scan(table=orders, type=SeqScan, rows=6)
 
 query
 SELECT * FROM customers c JOIN orders o ON c.customer_id = o.customer_id WHERE o.total_amount > 1000;
@@ -147,8 +144,7 @@ EXPLAIN ANALYZE SELECT * FROM customers c JOIN orders o ON c.customer_id = o.cus
 Project(columns=[*], rows=2)
 	Join(tables=[customers, orders], condition=[c.customer_id=o.customer_id], rows=2)
 		Scan(table=customers, type=SeqScan, rows=3)
-		Filter(condition=[o.total_amount>1000], rows=6)
-			Scan(table=orders, type=SeqScan, rows=15)
+		Scan(table=orders, type=SeqScan, rows=6)
 
 query
 SELECT * FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE o.total_amount > 1000;
@@ -166,8 +162,7 @@ EXPLAIN ANALYZE SELECT * FROM orders o JOIN customers c ON o.customer_id = c.cus
 ----
 Project(columns=[*], rows=2)
 	Join(tables=[customers, orders], condition=[o.customer_id=c.customer_id], rows=2)
-		Filter(condition=[o.total_amount>1000], rows=2)
-			Scan(table=orders, type=SeqScan, rows=5)
+		Scan(table=orders, type=SeqScan, rows=2)
 		Scan(table=customers, type=SeqScan, rows=6)
 
 query
@@ -177,10 +172,8 @@ Project(columns=[c.name, o.order_id, p.payment_id], rows=2)
 	Join(tables=[customers, orders, payments], condition=[o.customer_id=c.customer_id], rows=2)
 		Join(tables=[orders, payments], condition=[o.order_id=p.order_id], rows=2)
 			Project(columns=[o.customer_id, o.order_id], rows=2)
-				Filter(condition=[o.total_amount>1000.00], rows=2)
-					Scan(table=orders, type=SeqScan, rows=5)
+				Scan(table=orders, type=SeqScan, rows=2)
 			Project(columns=[p.order_id, p.payment_id], rows=4)
-				Filter(condition=[p.amount>=1200.00], rows=4)
-					Scan(table=payments, type=SeqScan, rows=10)
+				Scan(table=payments, type=SeqScan, rows=4)
 		Project(columns=[c.customer_id, c.name], rows=6)
 			Scan(table=customers, type=SeqScan, rows=6)

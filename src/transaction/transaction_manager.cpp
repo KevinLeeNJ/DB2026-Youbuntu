@@ -56,11 +56,11 @@ std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
 }
 
 void DeleteIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
-                        Transaction* txn) {
+                        const Rid& rid, Transaction* txn) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->delete_entry(key.data(), txn);
+        ih->delete_entry(key.data(), rid, txn);
     }
 }
 
@@ -69,7 +69,7 @@ void InsertIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::st
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->insert_entry(key.data(), rid, txn);
+        ih->insert_entry(key.data(), rid, txn, true);
     }
 }
 
@@ -249,7 +249,7 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
     case WType::INSERT_TUPLE: {
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, txn);
+            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
             fh->delete_record(rid, nullptr);
         }
         break;
@@ -269,7 +269,7 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
     case WType::UPDATE_TUPLE: {
         if (fh->is_record(rid)) {
             auto current_rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *current_rec, txn);
+            DeleteIndexEntries(sm_manager, tab, tab_name, *current_rec, rid, txn);
         }
         RmRecord old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(fh, rid);

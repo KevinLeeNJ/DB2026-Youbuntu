@@ -105,6 +105,53 @@ private:
     Rid rid_{};
 };
 
+class CursorOnlyScanExecutor : public AbstractExecutor {
+public:
+    explicit CursorOnlyScanExecutor(size_t row_count) : row_count_(row_count) {}
+
+    void beginTuple() override {
+        cursor_ = 0;
+    }
+
+    void nextTuple() override {
+        if (!is_end()) {
+            ++cursor_;
+        }
+    }
+
+    bool is_end() const override {
+        return cursor_ >= row_count_;
+    }
+
+    std::unique_ptr<RmRecord> Next() override {
+        ADD_FAILURE() << "COUNT(*) should not materialize scan records";
+        return nullptr;
+    }
+
+    Rid& rid() override {
+        return rid_;
+    }
+
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+
+    ColMeta get_col_offset(const TabCol& target) override {
+        (void)target;
+        return cols_.front();
+    }
+
+    std::string scan_table_name() const override {
+        return "t";
+    }
+
+private:
+    size_t row_count_ = 0;
+    size_t cursor_ = 0;
+    Rid rid_{};
+    std::vector<ColMeta> cols_{ColMeta{"t", "id", TYPE_INT, 4, 0, false}};
+};
+
 ColMeta make_col(std::string tab_name, std::string col_name, ColType type, int len, int offset) {
     return ColMeta{std::move(tab_name), std::move(col_name), type, len, offset, false};
 }
@@ -351,6 +398,20 @@ TEST(AggregateExecutorTest, CountStarCountsRowsWithoutReadingADataColumn) {
     auto row = exec.Next();
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_int(*row, 0), 3);
+}
+
+TEST(AggregateExecutorTest, GlobalCountStarOverScanDoesNotMaterializeRows) {
+    std::vector<TabCol> group_by;
+    std::vector<AggExpr> aggs = {make_count_star("cnt")};
+    std::vector<TestExecutorHavingCondition> having;
+
+    AggregateExecutor exec(std::make_unique<CursorOnlyScanExecutor>(5), group_by, aggs, having);
+
+    exec.beginTuple();
+    ASSERT_FALSE(exec.is_end());
+    auto row = exec.Next();
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(read_int(*row, 0), 5);
 }
 
 TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {

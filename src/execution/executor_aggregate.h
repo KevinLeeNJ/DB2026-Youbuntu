@@ -439,6 +439,12 @@ private:
         return passes_having(group_state.group_values, aggregate_values);
     }
 
+    bool can_count_star_by_cursor_only() const {
+        return !has_group_by_ && having_conds_.empty() && aggregates_.size() == 1 &&
+               aggregates_[0].type == LocalAggType::COUNT && aggregates_[0].is_star &&
+               !prev_->scan_table_name().empty();
+    }
+
     std::unique_ptr<RmRecord> materialize_group_result(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
         RmRecord rec(static_cast<int>(len_));
@@ -502,6 +508,14 @@ private:
         }
 
         GroupState global_state = make_group_state({});
+        if (can_count_star_by_cursor_only()) {
+            for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+                ++global_state.aggregate_states[0].count;
+            }
+            groups_.push_back(std::move(global_state));
+            return;
+        }
+
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = prev_->Next();
             if (rec == nullptr) {

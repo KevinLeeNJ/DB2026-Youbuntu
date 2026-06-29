@@ -200,11 +200,15 @@ public:
     }
 
     friend std::istream& operator>>(std::istream& is, DbMeta& db_meta) {
-        size_t n;
-        is >> db_meta.name_ >> n;
+        size_t n = 0;
+        if (!(is >> db_meta.name_ >> n)) {
+            return is;
+        }
         for (size_t i = 0; i < n; i++) {
             TabMeta tab;
-            is >> tab;
+            if (!(is >> tab)) {
+                return is;
+            }
             db_meta.tabs_[tab.name] = tab;
         }
         return is;

@@ -1379,6 +1379,36 @@ TEST_F(SnapshotTest, SI_IndexScanFindsHistoricalIndexedKeyVersion) {
     ASSERT_TRUE(reader->exec_sql_ok("commit;"));
 }
 
+TEST_F(SnapshotTest, SER_IndexScanFindsHistoricalIndexedKeyVersion) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto reader = create_session();
+    auto writer = create_session();
+
+    ASSERT_TRUE(reader->exec_sql_ok("set transaction isolation level serializable;"));
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+
+    ASSERT_TRUE(writer->exec_sql_ok("set transaction isolation level serializable;"));
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update t set id = 2 where id = 1;"));
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+
+    std::string out = reader->exec_sql("select * from t where id = 1;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "Serializable index scans in an explicit transaction must not miss the visible old key";
+
+    ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+}
+
 TEST_F(SnapshotTest, SER_EmptySelectDetectsInvisibleInsertAndDoesNotWriteOutput) {
     auto s = create_session();
     ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));

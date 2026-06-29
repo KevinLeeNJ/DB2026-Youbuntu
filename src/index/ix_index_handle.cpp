@@ -40,7 +40,7 @@ int IxNodeHandle::lower_bound(const char* target) const {
  * @note 注意此处的范围从1开始
  */
 int IxNodeHandle::upper_bound(const char* target) const {
-    int left = 1;
+    int left = 0;
     int right = page_hdr->num_key;
     while (left < right) {
         int mid = left + (right - left) / 2;
@@ -76,7 +76,11 @@ bool IxNodeHandle::leaf_lookup(const char* key, Rid** value) {
  * @return page_id_t 目标key所在的孩子节点（子树）的存储页面编号
  */
 page_id_t IxNodeHandle::internal_lookup(const char* key) {
-    return value_at(upper_bound(key) - 1);
+    int child_idx = upper_bound(key) - 1;
+    if (child_idx < 0) {
+        child_idx = 0;
+    }
+    return value_at(child_idx);
 }
 
 /**
@@ -195,15 +199,15 @@ std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Op
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transaction* transaction) {
-    auto [leaf, root_is_latched] = find_leaf_page(key, Operation::FIND, transaction);
-    Rid* rid = nullptr;
-    bool found = leaf->leaf_lookup(key, &rid);
-    if (found) {
-        result->push_back(*rid);
+    (void)transaction;
+    Iid lower = lower_bound(key);
+    Iid upper = upper_bound(key);
+    IxScan scan(this, lower, upper, buffer_pool_manager_);
+    while (!scan.is_end()) {
+        result->push_back(scan.rid());
+        scan.next();
     }
-    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
-    delete leaf;
-    return found;
+    return !result->empty();
 }
 
 /**
@@ -296,7 +300,8 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
  * @param transaction 事务指针
  * @return page_id_t 插入到的叶结点的page_no
  */
-page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction) {
+page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
+                                      bool allow_duplicate) {
     IxNodeHandle leaf;
     fetch_node_into(file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
@@ -306,9 +311,17 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
     }
 
     int pos = leaf.lower_bound(key);
-    if (pos < leaf.get_size() && ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+    bool duplicate_key =
+        pos < leaf.get_size() && ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
+    if (duplicate_key && !allow_duplicate) {
         buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
         throw IndexEntryExistsError();
+    }
+    if (allow_duplicate) {
+        while (pos < leaf.get_size() &&
+               ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+            ++pos;
+        }
     }
 
     leaf.insert_pair(pos, key, value);
@@ -346,11 +359,15 @@ IxIndexHandle::PinnedInserter::~PinnedInserter() {
     }
 }
 
-void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Transaction* txn) {
+void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate) {
     // Skip root→leaf walk if key belongs in the pinned leaf (ascending bulk load).
     if (leaf.get_size() > 0) {
-        int cmp = ix_compare(key, leaf.get_key(0), ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_);
-        if (cmp < 0) {
+        int cmp_first = ix_compare(key, leaf.get_key(0), ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_);
+        int cmp_last =
+            ix_compare(key, leaf.get_key(leaf.get_size() - 1), ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_);
+        bool before_leaf = cmp_first < 0;
+        bool after_leaf = cmp_last > 0 && leaf.get_page_no() != ih->file_hdr_->last_leaf_;
+        if (before_leaf || after_leaf) {
             // Key out of range — rewalk.
             ih->buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
             ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
@@ -363,9 +380,16 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
     }
 
     int pos = leaf.lower_bound(key);
-    if (pos < leaf.get_size() &&
-        ix_compare(leaf.get_key(pos), key, ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_) == 0) {
+    bool duplicate_key = pos < leaf.get_size() &&
+                         ix_compare(leaf.get_key(pos), key, ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_) == 0;
+    if (duplicate_key && !allow_duplicate) {
         throw IndexEntryExistsError();
+    }
+    if (allow_duplicate) {
+        while (pos < leaf.get_size() &&
+               ix_compare(leaf.get_key(pos), key, ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_) == 0) {
+            ++pos;
+        }
     }
 
     leaf.insert_pair(pos, key, value);
@@ -412,6 +436,28 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
     delete leaf;
     return true;
+}
+
+bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
+    (void)transaction;
+    Iid lower = lower_bound(key);
+    Iid upper = upper_bound(key);
+    IxScan scan(this, lower, upper, buffer_pool_manager_);
+    while (!scan.is_end()) {
+        Iid iid = scan.iid();
+        if (scan.rid() == value) {
+            IxNodeHandle* leaf = fetch_node(iid.page_no);
+            leaf->erase_pair(iid.slot_no);
+            if (leaf->get_size() > 0) {
+                maintain_parent(leaf);
+            }
+            buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+            delete leaf;
+            return true;
+        }
+        scan.next();
+    }
+    return false;
 }
 
 /**
@@ -575,14 +621,26 @@ Rid IxIndexHandle::get_rid(const Iid& iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char* key) {
-    auto [leaf, root_is_latched] = find_leaf_page(key, Operation::FIND, nullptr);
-    int slot_no = leaf->lower_bound(key);
-    Iid iid{leaf->get_page_no(), slot_no};
-    if (slot_no == leaf->get_size() && leaf->get_page_no() != file_hdr_->last_leaf_) {
-        iid = Iid{leaf->get_next_leaf(), 0};
+    IxNodeHandle leaf;
+    fetch_node_into(file_hdr_->root_page_, leaf);
+    while (!leaf.is_leaf_page()) {
+        int child_idx = leaf.lower_bound(key);
+        if (child_idx >= leaf.get_size()) {
+            child_idx = leaf.get_size() - 1;
+        } else if (child_idx > 0 &&
+                   ix_compare(leaf.get_key(child_idx), key, file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
+            child_idx--;
+        }
+        page_id_t child_page_no = leaf.value_at(child_idx);
+        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+        fetch_node_into(child_page_no, leaf);
     }
-    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
-    delete leaf;
+    int slot_no = leaf.lower_bound(key);
+    Iid iid{leaf.get_page_no(), slot_no};
+    if (slot_no == leaf.get_size() && leaf.get_page_no() != file_hdr_->last_leaf_) {
+        iid = Iid{leaf.get_next_leaf(), 0};
+    }
+    buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
     return iid;
 }
 

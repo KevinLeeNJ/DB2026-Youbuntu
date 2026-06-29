@@ -437,18 +437,20 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     std::vector<std::unique_ptr<Plan>> table_plans;
     table_plans.reserve(plan_tables.size());
     for (const auto& table : plan_tables) {
-        std::vector<std::string> index_col_names;
-        std::unique_ptr<Plan> table_plan =
-            std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, table, std::vector<Condition>(), index_col_names);
-
         auto filter_pos = table_filters.find(table);
-        if (filter_pos != table_filters.end() && !filter_pos->second.empty()) {
-            std::stable_sort(filter_pos->second.begin(), filter_pos->second.end(),
-                             [](const Condition& lhs, const Condition& rhs) {
-                                 return condition_sort_key(lhs) < condition_sort_key(rhs);
-                             });
-            table_plan = std::make_unique<FilterPlan>(T_Filter, std::move(table_plan), filter_pos->second);
+        std::vector<Condition> scan_conds;
+        if (filter_pos != table_filters.end()) {
+            scan_conds = filter_pos->second;
         }
+        if (!scan_conds.empty()) {
+            std::stable_sort(scan_conds.begin(), scan_conds.end(), [](const Condition& lhs, const Condition& rhs) {
+                return condition_sort_key(lhs) < condition_sort_key(rhs);
+            });
+        }
+        std::vector<std::string> index_col_names;
+        bool index_exist = get_index_cols(table, scan_conds, index_col_names);
+        std::unique_ptr<Plan> table_plan = std::make_unique<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan,
+                                                                      sm_manager_, table, scan_conds, index_col_names);
 
         auto needed_pos = needed_cols.find(table);
         if (needed_pos != needed_cols.end() && !needed_pos->second.empty()) {

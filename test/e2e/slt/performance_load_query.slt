@@ -1,0 +1,61 @@
+# performance_load_query.slt — load-phase validation query performance regressions
+
+statement ok
+CREATE TABLE t_idx_plan (id INT, v INT);
+
+statement ok
+CREATE INDEX t_idx_plan(id);
+
+statement ok
+INSERT INTO t_idx_plan VALUES (1, 10);
+
+statement ok
+INSERT INTO t_idx_plan VALUES (2, 20);
+
+query
+EXPLAIN ANALYZE SELECT v FROM t_idx_plan WHERE id = 2;
+----
+Project(columns=[t_idx_plan.v], rows=1)
+	Scan(table=t_idx_plan, type=IndexScan, using_index=(id), rows=1)
+
+query
+SELECT COUNT(*) FROM t_idx_plan;
+----
++------------------+
+|         COUNT(*) |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) FROM t_idx_plan WHERE id = 2;
+----
++------------------+
+|         COUNT(*) |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE t_count_visible (id INT, v INT);
+
+statement ok
+INSERT INTO t_count_visible VALUES (1, 10);
+
+statement ok
+INSERT INTO t_count_visible VALUES (2, 20);
+
+statement ok
+DELETE FROM t_count_visible WHERE id = 1;
+
+query
+SELECT COUNT(*) FROM t_count_visible;
+----
++------------------+
+|         COUNT(*) |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1

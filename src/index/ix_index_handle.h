@@ -235,7 +235,7 @@ public:
                                                   bool find_first = false);
 
     // for insert
-    page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction);
+    page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction, bool allow_duplicate = false);
 
     // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
     struct PinnedInserter {
@@ -248,7 +248,7 @@ public:
         PinnedInserter(const PinnedInserter&) = delete;
         PinnedInserter& operator=(const PinnedInserter&) = delete;
 
-        void insert(const char* key, const Rid& value, Transaction* txn);
+        void insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate = false);
     };
 
     IxNodeHandle* split(IxNodeHandle* node);
@@ -257,6 +257,7 @@ public:
 
     // for delete
     bool delete_entry(const char* key, Transaction* transaction);
+    bool delete_entry(const char* key, const Rid& value, Transaction* transaction);
 
     bool coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction = nullptr,
                                   bool* root_is_latched = nullptr);

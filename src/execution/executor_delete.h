@@ -110,7 +110,7 @@ public:
                     }
                     sm_manager_->remember_historical_index_key(
                         tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid);
-                    ih->delete_entry(key.data(), context_ == nullptr ? nullptr : context_->txn_);
+                    ih->delete_entry(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }
             } catch (...) {
@@ -118,7 +118,7 @@ public:
                     auto ih =
                         sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, it->index->cols))
                             .get();
-                    ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
+                    ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_, true);
                 }
                 // undo_record is automatically cleaned up by unique_ptr
                 throw;
