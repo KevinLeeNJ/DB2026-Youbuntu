@@ -2,7 +2,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from benchmark.tpcc.phases.datagen import customer_header, district_rows, ensure_empty_or_allowed, warehouse_header, warehouse_rows
+from benchmark.tpcc.phases.datagen import (
+    complete_csv_set,
+    customer_header,
+    district_rows,
+    ensure_empty_or_allowed,
+    warehouse_header,
+    warehouse_rows,
+)
 
 
 class DataGenTest(unittest.TestCase):
@@ -29,6 +36,14 @@ class DataGenTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 ensure_empty_or_allowed(path, overwrite=False)
             ensure_empty_or_allowed(path, overwrite=True)
+
+    def test_complete_csv_set_requires_every_table_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            for table in ["warehouse", "district"]:
+                (path / f"{table}.csv").write_text("header\n")
+            self.assertTrue(complete_csv_set(path, ["warehouse", "district"]))
+            self.assertFalse(complete_csv_set(path, ["warehouse", "district", "customer"]))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from benchmark.tpcc.core.sqlite_backend import SqliteBackend
 from benchmark.tpcc.phases.benchmark import run_benchmark
 from benchmark.tpcc.core.parsing import scalar_int
 from benchmark.tpcc.phases.consistency import run_consistency, run_district_diagnostics
-from benchmark.tpcc.phases.datagen import ensure_empty_or_allowed, generate_all
+from benchmark.tpcc.phases.datagen import complete_csv_set, ensure_empty_or_allowed, generate_all
 from benchmark.tpcc.phases.load import TABLES, execute_sql_file, load_all
 
 
@@ -55,6 +55,10 @@ def count_districts(backend) -> int:
     return scalar_int(backend.execute("select count(*) from district;"), 0)
 
 
+def phase(message: str) -> None:
+    print(f"[tpcc] {message}", flush=True)
+
+
 def max_district_id(backend) -> int:
     return scalar_int(backend.execute("select max(d_id) from district;"), 0)
 
@@ -81,15 +85,22 @@ def main() -> None:
     parser.add_argument("--sqlite-path", type=Path, default=Path("benchmark/tpcc/tpcc.sqlite"))
     parser.add_argument("--rmdb-db-dir", type=Path)
     parser.add_argument("--overwrite-data-dir", action="store_true")
+    parser.add_argument("--reuse-data-dir", action="store_true")
     args = parser.parse_args()
 
     schema_dir = Path(__file__).parent / "schema"
 
     if args.command in ("datagen", "all"):
-        ensure_empty_or_allowed(args.data_dir, overwrite=args.overwrite_data_dir)
-        generate_all(args.warehouses, args.data_dir, args.seed, overwrite=args.overwrite_data_dir)
+        if args.reuse_data_dir and complete_csv_set(args.data_dir, TABLES):
+            phase(f"datagen skipped, reusing CSV files in {args.data_dir}")
+        else:
+            phase(f"datagen start: warehouses={args.warehouses}, seed={args.seed}, dir={args.data_dir}")
+            ensure_empty_or_allowed(args.data_dir, overwrite=args.overwrite_data_dir)
+            generate_all(args.warehouses, args.data_dir, args.seed, overwrite=args.overwrite_data_dir)
+            phase("datagen complete")
 
     if args.command in ("load", "all"):
+        phase(f"load start: backend={args.backend}, data_dir={args.data_dir}")
         if args.backend == "sqlite":
             import_csv_to_sqlite(args.sqlite_path, args.data_dir)
         else:
@@ -98,6 +109,7 @@ def main() -> None:
                 load_all(backend, args.data_dir, schema_dir, "rmdb", args.rmdb_db_dir)
             finally:
                 backend.close()
+        phase("load complete")
 
     rounds = []
     baseline_orders_total = args.baseline_orders_total
@@ -114,6 +126,10 @@ def main() -> None:
             districts_per_warehouse = max_district_id(baseline_backend)
         finally:
             baseline_backend.close()
+        phase(
+            f"run start: rounds={args.rounds}, workers={args.workers}, "
+            f"warmup={args.warmup}s, measure={args.measure}s"
+        )
         rounds = run_benchmark(
             factory,
             warehouses=args.warehouses,
@@ -147,8 +163,10 @@ def main() -> None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(summary, indent=2))
         print(json.dumps(summary, indent=2))
+        phase(f"run complete: result={args.json_out}")
 
     if args.command in ("consistency", "all"):
+        phase("consistency start")
         committed = sum(round_result.total_committed_new_order() for round_result in rounds) if rounds else args.committed_new_order
         backend = sqlite_backend_factory(args)() if args.backend == "sqlite" else rmdb_backend_factory(args)()
         try:
@@ -174,6 +192,7 @@ def main() -> None:
         if failures:
             raise SystemExit("\n".join(failures))
         print("consistency ok")
+        phase("consistency complete")
 
 
 if __name__ == "__main__":

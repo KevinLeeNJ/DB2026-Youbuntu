@@ -38,6 +38,10 @@ def ensure_empty_or_allowed(data_dir: Path, overwrite: bool) -> None:
         raise FileExistsError(f"refusing to overwrite existing CSV files in {data_dir}")
 
 
+def complete_csv_set(data_dir: Path, table_names: Iterable[str]) -> bool:
+    return all((data_dir / f"{table}.csv").is_file() for table in table_names)
+
+
 def warehouse_header() -> list[str]:
     return ["w_id", "w_name", "w_street_1", "w_street_2", "w_city", "w_state", "w_zip", "w_tax", "w_ytd"]
 
