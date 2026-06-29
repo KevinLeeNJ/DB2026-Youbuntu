@@ -64,8 +64,10 @@ private:
                         std::vector<std::string>& index_col_names);
 
     ColType interp_sv_type(ast::SvType sv_type) {
-        std::map<ast::SvType, ColType> m = {
-            {ast::SV_TYPE_INT, TYPE_INT}, {ast::SV_TYPE_FLOAT, TYPE_FLOAT}, {ast::SV_TYPE_STRING, TYPE_STRING}};
+        std::map<ast::SvType, ColType> m = {{ast::SV_TYPE_INT, TYPE_INT},
+                                            {ast::SV_TYPE_FLOAT, TYPE_FLOAT},
+                                            {ast::SV_TYPE_STRING, TYPE_STRING},
+                                            {ast::SV_TYPE_DATETIME, TYPE_DATETIME}};
         return m.at(sv_type);
     }
 };

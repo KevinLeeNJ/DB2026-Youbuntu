@@ -43,18 +43,20 @@ void InsertIndexEntryIdempotent(SmManager* sm_manager, const std::string& tab_na
     auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
     std::vector<Rid> existing;
     if (ih->get_value(key.data(), &existing, nullptr)) {
-        if (existing.size() == 1 && existing[0] == rid) {
-            return;
+        for (const auto& existing_rid : existing) {
+            if (existing_rid == rid) {
+                return;
+            }
         }
     }
-    ih->insert_entry(key.data(), rid, nullptr);
+    ih->insert_entry(key.data(), rid, nullptr, true);
 }
 
 void DeleteIndexEntryIfExists(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
-                              const RmRecord& rec) {
+                              const RmRecord& rec, const Rid& rid) {
     auto key = MakeIndexKey(index, rec.data);
     auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-    ih->delete_entry(key.data(), nullptr);
+    ih->delete_entry(key.data(), rid, nullptr);
 }
 
 } // namespace
@@ -130,25 +132,48 @@ void SmManager::open_db(const std::string& db_name) {
         throw DatabaseExistsError(db_name);
     }
     {
+        std::ifstream meta_check(db_name + "/" + DB_META_NAME);
+        if (!meta_check || meta_check.peek() == std::ifstream::traits_type::eof()) {
+            throw UnixError();
+        }
+    }
+    char cwd_buf[4096];
+    if (getcwd(cwd_buf, sizeof(cwd_buf)) == nullptr) {
+        throw UnixError();
+    }
+    std::string original_cwd = cwd_buf;
+    {
         std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
     }
-    if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
-        throw UnixError();
-    }
-    // 读取数据库元数据
-    std::ifstream ifs(DB_META_NAME);
-    ifs >> db_;
-    // ifs.close();
-    //  打开所有表的记录文件
-    for (auto& entry : db_.tabs_) {
-        auto& tab_meta = entry.second;
-        fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
-        for (auto& index : tab_meta.indexes) {
-            // 打开索引文件
-            ihs_.emplace(ix_manager_->get_index_name(tab_meta.name, index.cols),
-                         ix_manager_->open_index(index.tab_name, index.cols));
+    try {
+        if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
+            throw UnixError();
         }
+        // 读取数据库元数据
+        std::ifstream ifs(DB_META_NAME);
+        DbMeta loaded_db;
+        if (!(ifs >> loaded_db) || loaded_db.name_.empty()) {
+            throw UnixError();
+        }
+        db_ = std::move(loaded_db);
+        // ifs.close();
+        //  打开所有表的记录文件
+        for (auto& entry : db_.tabs_) {
+            auto& tab_meta = entry.second;
+            fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
+            for (auto& index : tab_meta.indexes) {
+                // 打开索引文件
+                ihs_.emplace(ix_manager_->get_index_name(tab_meta.name, index.cols),
+                             ix_manager_->open_index(index.tab_name, index.cols));
+            }
+        }
+    } catch (...) {
+        fhs_.clear();
+        ihs_.clear();
+        db_ = DbMeta();
+        chdir(original_cwd.c_str());
+        throw;
     }
 }
 
@@ -453,7 +478,7 @@ void SmManager::delete_record_with_indexes(const std::string& tab_name, const Ri
     auto& tab = db_.get_table(tab_name);
     auto* fh = fhs_.at(tab_name).get();
     for (const auto& index : tab.indexes) {
-        DeleteIndexEntryIfExists(this, tab_name, index, old_rec);
+        DeleteIndexEntryIfExists(this, tab_name, index, old_rec, rid);
     }
     fh->delete_record(rid, nullptr);
 }
@@ -466,7 +491,7 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
         auto old_key = MakeIndexKey(index, old_rec.data);
         auto new_key = MakeIndexKey(index, new_rec.data);
         if (old_key != new_key) {
-            DeleteIndexEntryIfExists(this, tab_name, index, old_rec);
+            DeleteIndexEntryIfExists(this, tab_name, index, old_rec, rid);
         }
     }
     fh->update_record(rid, new_rec.data, nullptr);
@@ -598,170 +623,97 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
         col_src.push_back({col_index[col.name], col.type, col.len, col.offset});
     }
 
-    const size_t BATCH = 65536;
-    Transaction* batch_txn = nullptr;
-    size_t in_batch = 0;
+    struct LoadIndexTarget {
+        const IndexMeta* meta;
+        std::vector<char> key;
+        std::unique_ptr<IxIndexHandle::PinnedInserter> inserter;
+    };
+    std::vector<LoadIndexTarget> idx_inserters;
+    idx_inserters.reserve(tab.indexes.size());
+    for (const auto& index : tab.indexes) {
+        auto ih = ihs_.at(get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        idx_inserters.push_back(
+            {&index, std::vector<char>(index.col_tot_len), std::make_unique<IxIndexHandle::PinnedInserter>(ih)});
+    }
+
+    RmFileHandle::PinnedInserter rm_inserter(fh);
     std::vector<char> record(record_size, 0);
-
-    auto begin_batch = [&]() {
-        batch_txn = context->txn_mgr_->begin(nullptr, context->log_mgr_);
-        in_batch = 0;
-    };
-    auto commit_batch = [&]() {
-        context->txn_mgr_->commit(batch_txn, context->log_mgr_);
-        batch_txn = nullptr;
-        in_batch = 0;
-    };
-    auto abort_batch = [&]() {
-        if (batch_txn != nullptr) {
-            context->txn_mgr_->abort(batch_txn, context->log_mgr_);
-            batch_txn = nullptr;
-            in_batch = 0;
-        }
-    };
-
-    begin_batch();
 
     std::string line;
     size_t line_no = 1; // header was line 1
-    try {
-        while (std::getline(infile, line)) {
-            ++line_no;
-            strip_cr(line);
-            if (line.empty()) {
-                continue; // skip trailing blank lines
-            }
-            std::vector<std::string> fields;
-            {
-                std::stringstream ss(line);
-                std::string field;
-                while (std::getline(ss, field, ',')) {
-                    fields.push_back(field);
-                }
-            }
+    while (std::getline(infile, line)) {
+        ++line_no;
+        strip_cr(line);
+        if (line.empty()) {
+            continue; // skip trailing blank lines
+        }
 
-            std::memset(record.data(), 0, record_size);
-            for (const auto& cs : col_src) {
-                if (cs.csv_idx >= fields.size()) {
-                    throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected");
-                }
-                const std::string& raw = fields[cs.csv_idx];
-                if (raw.find('"') != std::string::npos) {
-                    throw RMDBError("load file row " + std::to_string(line_no) +
-                                    " contains an unexpected quote character");
-                }
-                if (cs.type == TYPE_INT) {
-                    errno = 0;
-                    char* end = nullptr;
-                    long v = std::strtol(raw.c_str(), &end, 10);
-                    if (errno != 0 || end == raw.c_str() || *end != '\0') {
-                        throw RMDBError("load file row " + std::to_string(line_no) + " invalid int for column");
-                    }
-                    int iv = static_cast<int>(v);
-                    std::memcpy(record.data() + cs.offset, &iv, cs.len);
-                } else if (cs.type == TYPE_FLOAT) {
-                    errno = 0;
-                    char* end = nullptr;
-                    float v = std::strtof(raw.c_str(), &end);
-                    if (errno != 0 || end == raw.c_str() || *end != '\0') {
-                        throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
-                    }
-                    std::memcpy(record.data() + cs.offset, &v, cs.len);
-                } else if (cs.type == TYPE_STRING) {
-                    if (static_cast<int>(raw.size()) > cs.len) {
-                        throw RMDBError("load file row " + std::to_string(line_no) + " string too long for column");
-                    }
-                    std::memcpy(record.data() + cs.offset, raw.c_str(), raw.size());
+        std::vector<const char*> fields;
+        fields.reserve(col_src.size() * 2);
+        {
+            const char* field_start = line.data();
+            for (char* p = line.data(); *p != '\0'; ++p) {
+                if (*p == ',') {
+                    *p = '\0';
+                    fields.push_back(field_start);
+                    field_start = p + 1;
                 }
             }
+            fields.push_back(field_start);
+        }
 
-            // Physical insert + WAL + MVCC meta (reuse InsertExecutor primitives, skip conflict checks).
-            std::unique_lock<std::mutex> physical_lock(fh->get_physical_latch());
-            auto prepared = fh->prepare_insert_record();
-            Rid rid = prepared.rid;
-            RmRecord rec(record_size);
-            std::memcpy(rec.data, record.data(), record_size);
-            try {
-                if (context->log_mgr_ != nullptr && batch_txn != nullptr) {
-                    InsertLogRecord log_record(batch_txn->get_transaction_id(), rec, rid, tab_name);
-                    log_record.prev_lsn_ = batch_txn->get_prev_lsn();
-                    lsn_t lsn = context->log_mgr_->add_log_to_buffer(&log_record);
-                    batch_txn->set_prev_lsn(lsn);
-                    prepared.page_handle.page->set_page_lsn(lsn);
-                }
-                fh->finish_insert_record(prepared, record.data());
-            } catch (...) {
-                fh->abort_prepared_insert(prepared);
-                throw;
+        std::memset(record.data(), 0, record_size);
+        for (const auto& cs : col_src) {
+            if (cs.csv_idx >= fields.size()) {
+                throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected");
             }
-            physical_lock.unlock();
-
-            // MVCC meta + write set bookkeeping (record the insert BEFORE index
-            // maintenance so that a later index failure can be rolled back).
-            TupleMeta meta;
-            meta.writer_txn_id_ = batch_txn->get_transaction_id();
-            meta.is_committed_ = false;
-            meta.is_deleted_ = false;
-            meta.version_chain_head_ = UndoLink{};
-            fh->set_tuple_meta(rid, meta);
-            batch_txn->append_write_record(std::make_unique<WriteRecord>(WType::INSERT_TUPLE, tab_name, rid));
-            batch_txn->append_modified_slot(tab_name, rid);
-
-            // Index maintenance (skip unique-conflict probe: loading into a table).
-            // On failure, roll back already-inserted index entries and the record,
-            // then rethrow so the batch is aborted.
-            std::vector<std::vector<char>> index_keys;
-            index_keys.reserve(tab.indexes.size());
-            for (const auto& index : tab.indexes) {
-                std::vector<char> key(index.col_tot_len);
-                int off = 0;
-                for (int i = 0; i < index.col_num; ++i) {
-                    std::memcpy(key.data() + off, record.data() + index.cols[i].offset, index.cols[i].len);
-                    off += index.cols[i].len;
-                }
-                index_keys.push_back(std::move(key));
+            const char* raw = fields[cs.csv_idx];
+            if (std::strchr(raw, '"') != nullptr) {
+                throw RMDBError("load file row " + std::to_string(line_no) + " contains an unexpected quote character");
             }
-            try {
-                size_t inserted = 0;
-                for (size_t i = 0; i < tab.indexes.size(); ++i) {
-                    const auto& index = tab.indexes[i];
-                    auto ih = ihs_.at(get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-                    ih->insert_entry(index_keys[i].data(), rid, batch_txn);
-                    ++inserted;
+            if (cs.type == TYPE_INT) {
+                errno = 0;
+                char* end = nullptr;
+                long v = std::strtol(raw, &end, 10);
+                if (errno != 0 || end == raw || *end != '\0') {
+                    throw RMDBError("load file row " + std::to_string(line_no) + " invalid int for column");
                 }
-            } catch (...) {
-                // Undo the index entries inserted so far this row (reverse order),
-                // then remove the record so no orphan remains.
-                for (size_t i = 0; i < tab.indexes.size(); ++i) {
-                    const auto& index = tab.indexes[i];
-                    auto ih = ihs_.at(get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-                    try {
-                        ih->delete_entry(index_keys[i].data(), batch_txn);
-                    } catch (...) {
-                        // index entry was never inserted for this one; ignore
-                    }
+                int iv = static_cast<int>(v);
+                std::memcpy(record.data() + cs.offset, &iv, cs.len);
+            } else if (cs.type == TYPE_FLOAT) {
+                errno = 0;
+                char* end = nullptr;
+                float v = std::strtof(raw, &end);
+                if (errno != 0 || end == raw || *end != '\0') {
+                    throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
                 }
-                fh->delete_record(rid, context);
-                throw;
-            }
-
-            if (++in_batch == BATCH) {
-                commit_batch();
-                begin_batch();
+                std::memcpy(record.data() + cs.offset, &v, cs.len);
+            } else if (cs.type == TYPE_STRING || cs.type == TYPE_DATETIME) {
+                size_t raw_len = std::strlen(raw);
+                if (static_cast<int>(raw_len) > cs.len) {
+                    throw RMDBError("load file row " + std::to_string(line_no) + " string too long for column");
+                }
+                std::memcpy(record.data() + cs.offset, raw, raw_len);
             }
         }
-    } catch (...) {
-        // A mid-batch failure leaves the in-flight batch uncommitted; abort it so
-        // its inserted rows/index entries are rolled back before propagating.
-        abort_batch();
-        throw;
+
+        Rid rid = rm_inserter.insert(record.data());
+
+        // Build index keys and insert via pinned-leaf batch path.
+        for (auto& target : idx_inserters) {
+            int off = 0;
+            for (int i = 0; i < target.meta->col_num; ++i) {
+                std::memcpy(target.key.data() + off, record.data() + target.meta->cols[i].offset,
+                            target.meta->cols[i].len);
+                off += target.meta->cols[i].len;
+            }
+            target.inserter->insert(target.key.data(), rid, nullptr, true);
+        }
     }
 
-    if (in_batch > 0) {
-        commit_batch();
-    } else if (batch_txn != nullptr) {
-        // No rows were added in the trailing batch; abort the empty txn.
-        context->txn_mgr_->abort(batch_txn, context->log_mgr_);
-        batch_txn = nullptr;
-    }
+    idx_inserters.clear();
+    { RmFileHandle::PinnedInserter tmp(std::move(rm_inserter)); }
+
+    flush_all_table_and_index_pages();
+    flush_meta();
 }

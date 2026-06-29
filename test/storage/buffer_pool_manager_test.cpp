@@ -133,6 +133,20 @@ TEST_F(BufferPoolManagerTest, ReplacerCreatedCorrectly) {
     EXPECT_EQ(0, bpm->replacer_->Size());
 }
 
+TEST_F(BufferPoolManagerTest, NewPageFromFreshFrameHasOnlyValidPageTableEntry) {
+    auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager);
+
+    PageId page_id{BufferPoolManagerTest::fd_, INVALID_PAGE_ID};
+    auto* page = bpm->new_page(&page_id);
+
+    ASSERT_NE(nullptr, page);
+    EXPECT_EQ((PageId{BufferPoolManagerTest::fd_, 0}), page->get_page_id());
+    ASSERT_EQ(1, bpm->page_table_.size());
+    EXPECT_EQ(1, bpm->page_table_.count(page_id));
+    EXPECT_EQ(0, bpm->page_table_.count(PageId{0, INVALID_PAGE_ID}));
+}
+
 TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
     auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
     if (disk_manager->is_file(LOG_FILE_NAME)) {

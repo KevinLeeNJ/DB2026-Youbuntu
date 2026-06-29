@@ -603,7 +603,8 @@ TEST(RecordManagerTest, SimpleTest) {
         assert(file_handle->file_hdr_.num_pages == 1);
 
         int max_bytes = file_handle->file_hdr_.record_size * file_handle->file_hdr_.num_records_per_page +
-                        file_handle->file_hdr_.bitmap_size + (int)sizeof(RmPageHdr);
+                        file_handle->file_hdr_.bitmap_size +
+                        file_handle->file_hdr_.num_records_per_page * TUPLE_META_SIZE + RM_PAGE_META_OFFSET;
         assert(max_bytes <= PAGE_SIZE);
         int rand_val = rand();
         file_handle->file_hdr_.num_pages = rand_val;

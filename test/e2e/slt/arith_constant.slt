@@ -1,0 +1,81 @@
+# arith_constant.slt — constant folding of parenthesized/arithmetic expressions in WHERE
+
+statement ok
+CREATE TABLE nums (id INT, v INT);
+
+statement ok
+INSERT INTO nums VALUES (1, 10);
+
+statement ok
+INSERT INTO nums VALUES (2, 20);
+
+statement ok
+INSERT INTO nums VALUES (3, 30);
+
+statement ok
+INSERT INTO nums VALUES (4, 40);
+
+statement ok
+INSERT INTO nums VALUES (5, 50);
+
+# Parenthesized constant arithmetic on the RHS of WHERE (the StockLevel pattern).
+query
+SELECT id FROM nums WHERE id >= (3-1) ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
+|                3 |
+|                4 |
+|                5 |
++------------------+
+Total record(s): 4
+
+# Nested parentheses.
+query
+SELECT id FROM nums WHERE id >= ((1+1)*2) ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                4 |
+|                5 |
++------------------+
+Total record(s): 2
+
+# Arithmetic without parentheses.
+query
+SELECT id FROM nums WHERE id < 5 - 1 ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
+|                3 |
++------------------+
+Total record(s): 3
+
+# Equality against a folded constant (single row, no ORDER BY needed).
+query
+SELECT v FROM nums WHERE id = (2+1);
+----
++------------------+
+|                v |
++------------------+
+|               30 |
++------------------+
+Total record(s): 1
+
+# Division folds to an integer constant (8/2 == 4, so id >= 4).
+query
+SELECT id FROM nums WHERE id >= (8/2) ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                4 |
+|                5 |
++------------------+
+Total record(s): 2

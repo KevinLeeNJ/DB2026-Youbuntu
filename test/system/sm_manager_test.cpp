@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <fstream>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 #include <unistd.h>
 
@@ -130,6 +131,33 @@ TEST_F(SmManagerTest, open_db_success) {
 
 TEST_F(SmManagerTest, open_db_not_found_throws) {
     EXPECT_THROW(sm_manager_->open_db(TEST_DB_NAME), DatabaseNotFoundError);
+}
+
+TEST_F(SmManagerTest, open_db_empty_directory_throws_without_changing_cwd) {
+    std::string empty_db_name = TEST_DB_NAME + "_empty";
+    if (sm_manager_->is_dir(empty_db_name)) {
+        sm_manager_->drop_db(empty_db_name);
+    }
+    ASSERT_EQ(mkdir(empty_db_name.c_str(), 0755), 0);
+
+    char before_buf[1024];
+    ASSERT_NE(getcwd(before_buf, sizeof(before_buf)), nullptr);
+    std::string before = before_buf;
+
+    EXPECT_THROW(sm_manager_->open_db(empty_db_name), RMDBError);
+
+    char after_buf[1024];
+    ASSERT_NE(getcwd(after_buf, sizeof(after_buf)), nullptr);
+    std::string after = after_buf;
+    if (after != before) {
+        ASSERT_EQ(chdir(before.c_str()), 0);
+    }
+    EXPECT_EQ(after, before);
+    EXPECT_TRUE(sm_manager_->db_.name_.empty());
+
+    if (sm_manager_->is_dir(empty_db_name)) {
+        sm_manager_->drop_db(empty_db_name);
+    }
 }
 
 TEST_F(SmManagerTest, close_db_success) {

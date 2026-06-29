@@ -69,3 +69,57 @@ DESC t1;
 # Drop non-existent table should error
 statement error
 DROP TABLE nonexistent;
+
+statement ok
+CREATE TABLE events (id INT, created_at DATETIME);
+
+query
+DESC events;
+----
++------------------+------------------+------------------+
+|            Field |             Type |            Index |
++------------------+------------------+------------------+
+|               id |              INT |               NO |
+|       created_at |         DATETIME |               NO |
++------------------+------------------+------------------+
+
+statement ok
+INSERT INTO events VALUES (1, '2026-06-27 12:34:56');
+
+statement ok
+INSERT INTO events VALUES (2, '2026-06-26 01:02:03');
+
+query
+SELECT id, created_at FROM events;
+----
++------------------+------------------+
+|               id |       created_at |
++------------------+------------------+
+|                1 | 2026-06-27 12... |
+|                2 | 2026-06-26 01... |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, created_at FROM events ORDER BY created_at;
+----
++------------------+------------------+
+|               id |       created_at |
++------------------+------------------+
+|                2 | 2026-06-26 01... |
+|                1 | 2026-06-27 12... |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE INDEX events(created_at);
+
+query
+SELECT id FROM events WHERE created_at = '2026-06-27 12:34:56';
+----
++------------------+
+|               id |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1

@@ -397,6 +397,7 @@ private:
             return str;
         }
         case TYPE_STRING:
+        case TYPE_DATETIME:
             return "'" + val.str_val + "'";
         }
         throw InternalError("Unexpected value type");

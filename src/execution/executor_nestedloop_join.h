@@ -193,7 +193,8 @@ private:
             if ((lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT) && (rhs_type == TYPE_INT || rhs_type == TYPE_FLOAT)) {
                 condition_result = compare_numeric(cond.op, read_numeric_operand(cond.lhs, left_rec, right_rec),
                                                    read_numeric_operand(cond.rhs, left_rec, right_rec));
-            } else if (lhs_type == TYPE_STRING && rhs_type == TYPE_STRING) {
+            } else if ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
+                       (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)) {
                 condition_result = compare_string(cond.op, read_string_operand(cond.lhs, left_rec, right_rec),
                                                   read_string_operand(cond.rhs, left_rec, right_rec));
             } else {
@@ -229,7 +230,9 @@ private:
             val.set_float(*reinterpret_cast<const float*>(data));
             break;
         case TYPE_STRING:
+        case TYPE_DATETIME:
             val.set_str(std::string(data, strnlen(data, left_key_len_)));
+            val.type = left_key_type_;
             break;
         }
         return val;

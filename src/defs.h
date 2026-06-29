@@ -44,7 +44,7 @@ struct Rid {
     }
 };
 
-enum ColType { TYPE_INT, TYPE_FLOAT, TYPE_STRING };
+enum ColType { TYPE_INT, TYPE_FLOAT, TYPE_STRING, TYPE_DATETIME };
 
 inline std::string coltype2str(ColType type) {
     switch (type) {
@@ -54,6 +54,8 @@ inline std::string coltype2str(ColType type) {
         return "FLOAT";
     case TYPE_STRING:
         return "STRING";
+    case TYPE_DATETIME:
+        return "DATETIME";
     }
     throw std::out_of_range("map::at");
 }

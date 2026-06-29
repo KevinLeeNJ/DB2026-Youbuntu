@@ -56,11 +56,11 @@ std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
 }
 
 void DeleteIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
-                        Transaction* txn) {
+                        const Rid& rid, Transaction* txn) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->delete_entry(key.data(), txn);
+        ih->delete_entry(key.data(), rid, txn);
     }
 }
 
@@ -69,7 +69,7 @@ void InsertIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::st
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->insert_entry(key.data(), rid, txn);
+        ih->insert_entry(key.data(), rid, txn, true);
     }
 }
 
@@ -99,7 +99,9 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
     }
 
     bool can_cast = lhs_type == rhs_type || (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-                    (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT);
+                    (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
+                    ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
+                     (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME));
     if (!can_cast) {
         throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
     }
@@ -131,7 +133,8 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
             return lhs_val >= rhs_val;
         }
     }
-    case TYPE_STRING: {
+    case TYPE_STRING:
+    case TYPE_DATETIME: {
         std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
         std::string rhs_val =
             cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta->len));
@@ -246,7 +249,7 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
     case WType::INSERT_TUPLE: {
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, txn);
+            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
             fh->delete_record(rid, nullptr);
         }
         break;
@@ -266,7 +269,7 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
     case WType::UPDATE_TUPLE: {
         if (fh->is_record(rid)) {
             auto current_rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *current_rec, txn);
+            DeleteIndexEntries(sm_manager, tab, tab_name, *current_rec, rid, txn);
         }
         RmRecord old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(fh, rid);
@@ -531,11 +534,13 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
             rhs_data = rec.data + rhs_col.offset;
         }
         if (!((lhs_col.type == rhs_type) || (lhs_col.type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-              (lhs_col.type == TYPE_FLOAT && rhs_type == TYPE_INT))) {
+              (lhs_col.type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
+              ((lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) &&
+               (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)))) {
             throw IncompatibleTypeError(coltype2str(lhs_col.type), coltype2str(rhs_type));
         }
         int cmp = 0;
-        if (lhs_col.type == TYPE_STRING) {
+        if (lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) {
             std::string lhs(lhs_data, strnlen(lhs_data, lhs_col.len));
             std::string rhs =
                 cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col.len));

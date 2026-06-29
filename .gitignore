@@ -11,12 +11,10 @@ diff-coverage.html
 .DS_Store
 **/.DS_Store
 testdb
-#忽略AGENT的init文档
-AGENTS.md
+
 CLAUDE.md
 #忽略测试数据库
 test_e2e_db
 testdb
-#忽略flex和bison生成的文件
-src/parser/lex.yy.*
-src/parser/yacc.tab.*
+#忽略.codegraph
+.codegraph

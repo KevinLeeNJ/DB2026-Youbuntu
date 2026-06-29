@@ -20,6 +20,22 @@ using namespace analyze_internal;
 
 namespace {
 
+UpdateOp convert_update_op(ast::SetOp op) {
+    switch (op) {
+    case ast::SetOp::SELF_ADD:
+        return UpdateOp::SELF_ADD;
+    case ast::SetOp::SELF_SUB:
+        return UpdateOp::SELF_SUB;
+    case ast::SetOp::SELF_MUL:
+        return UpdateOp::SELF_MUL;
+    case ast::SetOp::SELF_DIV:
+        return UpdateOp::SELF_DIV;
+    case ast::SetOp::ASSIGNMENT:
+        return UpdateOp::ASSIGNMENT;
+    }
+    throw InternalError("Unexpected UPDATE operator");
+}
+
 void resolve_alias(TabCol& col, const Query& query) {
     if (col.tab_name.empty()) {
         return;
@@ -125,7 +141,10 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
         for (const auto& set_clause : x->set_clauses) {
             SetClause clause;
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
-            clause.rhs = convert_sv_value(set_clause->val.get());
+            clause.op = convert_update_op(set_clause->op);
+            if (set_clause->val != nullptr) {
+                clause.rhs = convert_sv_value(set_clause->val.get());
+            }
             clause.is_self_ref = set_clause->is_self_ref;
             if (set_clause->is_self_ref) {
                 clause.rhs_col = {.tab_name = set_clause->rhs_col->tab_name.empty() ? x->tab_name
@@ -202,7 +221,7 @@ std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query) {
         int len = sizeof(int);
         if (type == TYPE_FLOAT) {
             len = sizeof(float);
-        } else if (type == TYPE_STRING) {
+        } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
             if (item.expr.type != QueryExprType::COLUMN) {
                 throw RMDBError("UNION only supports string output from columns");
             }
@@ -228,7 +247,7 @@ ColMeta Analyze::make_union_col_meta(const ColMeta& current, const ColMeta& next
     result.tab_name.clear();
 
     if (current.type == next.type) {
-        if (current.type == TYPE_STRING) {
+        if (current.type == TYPE_STRING || current.type == TYPE_DATETIME) {
             result.len = std::max(current.len, next.len);
         }
         return result;
@@ -355,8 +374,13 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            cond.rhs_val.init_raw(lhs_col->len);
             rhs_type = cond.rhs_val.type;
+            if (!can_cast(lhs_type, rhs_type)) {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            }
+            cast_value(cond.rhs_val, lhs_type);
+            cond.rhs_val.init_raw(lhs_col->len);
+            continue;
         } else {
             cond.rhs_col = check_column(all_cols, cond.rhs_col);
             auto rhs_col = sm_manager_->db_.get_table(cond.rhs_col.tab_name).get_col(cond.rhs_col.col_name);
@@ -371,6 +395,25 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
 Value Analyze::convert_sv_value(const ast::Value* sv_val) {
     return convert_ast_value_node(sv_val);
+}
+
+void Analyze::cast_value(Value& val, ColType to) {
+    if (to == TYPE_FLOAT && val.type == TYPE_INT) {
+        val.set_float(static_cast<float>(val.int_val));
+        return;
+    }
+    if (to == TYPE_INT && val.type == TYPE_FLOAT) {
+        val.set_int(static_cast<int>(val.float_val));
+        return;
+    }
+    if (to == TYPE_DATETIME && val.type == TYPE_STRING) {
+        val.type = TYPE_DATETIME;
+        return;
+    }
+    if (to == TYPE_STRING && val.type == TYPE_DATETIME) {
+        val.type = TYPE_STRING;
+        return;
+    }
 }
 
 CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {

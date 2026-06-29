@@ -79,6 +79,7 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
 
     const auto* score_clause = update->set_clauses[0].get();
     EXPECT_TRUE(score_clause->is_self_ref);
+    EXPECT_EQ(score_clause->op, ast::SetOp::SELF_ADD);
     EXPECT_EQ(score_clause->col_name, "score");
     ASSERT_NE(score_clause->rhs_col, nullptr);
     EXPECT_EQ(score_clause->rhs_col->tab_name, "");
@@ -89,13 +90,162 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
 
     const auto* bonus_clause = update->set_clauses[1].get();
     EXPECT_TRUE(bonus_clause->is_self_ref);
+    EXPECT_EQ(bonus_clause->op, ast::SetOp::SELF_SUB);
     EXPECT_EQ(bonus_clause->col_name, "bonus");
     ASSERT_NE(bonus_clause->rhs_col, nullptr);
     EXPECT_EQ(bonus_clause->rhs_col->tab_name, "score_tab");
     EXPECT_EQ(bonus_clause->rhs_col->col_name, "bonus");
     auto bonus_delta = dynamic_cast<const ast::FloatLit*>(bonus_clause->val.get());
     ASSERT_NE(bonus_delta, nullptr);
-    EXPECT_FLOAT_EQ(bonus_delta->val, -0.5F);
+    EXPECT_FLOAT_EQ(bonus_delta->val, 0.5F);
+}
+
+TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
+    // col += num / col -= num 在解析期脱糖为 col = col ± num 的自引用节点
+    auto parsed = parse_ok("update score_tab set score += 5, bonus -= 0.5 where id < 3;");
+    auto update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 2);
+
+    // score += 5  脱糖为 score = score + 5
+    const auto* score_clause = update->set_clauses[0].get();
+    EXPECT_TRUE(score_clause->is_self_ref);
+    EXPECT_EQ(score_clause->op, ast::SetOp::SELF_ADD);
+    EXPECT_EQ(score_clause->col_name, "score");
+    ASSERT_NE(score_clause->rhs_col, nullptr);
+    EXPECT_EQ(score_clause->rhs_col->tab_name, "");
+    EXPECT_EQ(score_clause->rhs_col->col_name, "score");
+    auto score_delta = dynamic_cast<const ast::IntLit*>(score_clause->val.get());
+    ASSERT_NE(score_delta, nullptr);
+    EXPECT_EQ(score_delta->val, 5);
+
+    // bonus -= 0.5  脱糖为 bonus = bonus - 0.5
+    const auto* bonus_clause = update->set_clauses[1].get();
+    EXPECT_TRUE(bonus_clause->is_self_ref);
+    EXPECT_EQ(bonus_clause->op, ast::SetOp::SELF_SUB);
+    EXPECT_EQ(bonus_clause->col_name, "bonus");
+    ASSERT_NE(bonus_clause->rhs_col, nullptr);
+    EXPECT_EQ(bonus_clause->rhs_col->tab_name, "");
+    EXPECT_EQ(bonus_clause->rhs_col->col_name, "bonus");
+    auto bonus_delta = dynamic_cast<const ast::FloatLit*>(bonus_clause->val.get());
+    ASSERT_NE(bonus_delta, nullptr);
+    EXPECT_FLOAT_EQ(bonus_delta->val, 0.5F);
+}
+
+TEST(ParserTest, FoldsConstantArithmeticExpressions) {
+    // 括号常量算术:折叠成 IntLit,display_text 保留原始表达式文本
+    {
+        auto parsed = parse_ok("select * from t where id >= (100-20);");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        ASSERT_FALSE(sel->conds.empty());
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 80);
+        EXPECT_EQ(lit->display_text, "(100-20)");
+    }
+    // 嵌套括号
+    {
+        auto parsed = parse_ok("select * from t where id >= ((10+5)*2);");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 30);
+        EXPECT_EQ(lit->display_text, "((10+5)*2)");
+    }
+    // 无括号算术(保留运算符两侧空格)
+    {
+        auto parsed = parse_ok("select * from t where id >= 100 - 20;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 80);
+        EXPECT_EQ(lit->display_text, "100 - 20");
+    }
+    // int 与 float 混合提升为 float
+    {
+        auto parsed = parse_ok("select * from t where x > 5.0 + 3;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::FloatLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_FLOAT_EQ(lit->val, 8.0F);
+    }
+    // 括号外接算术
+    {
+        auto parsed = parse_ok("select * from t where id >= (3-1)*2;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 4);
+        EXPECT_EQ(lit->display_text, "(3-1)*2");
+    }
+    // 纯常量、字符串不受影响(回归)
+    {
+        auto parsed = parse_ok("select * from t where id >= 5;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 5);
+    }
+    {
+        auto parsed = parse_ok("select * from t where x = 'abc';");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        EXPECT_EQ(sel->conds.front()->rhs->type, ast::AstType::StringLit);
+    }
+    // 除零、溢出、非数值、列参与算术 均应解析失败
+    expect_parse_error("select * from t where id >= (100/0);");
+    expect_parse_error("select * from t where id >= (2000000000+2000000000);");
+    expect_parse_error("select * from t where id >= ('a'-1);");
+    expect_parse_error("select * from t where id >= (col-20);");
+}
+
+TEST(ParserTest, ParsesRushdbCompatibleUpdateSetOperators) {
+    auto parsed =
+        parse_ok("update score_tab set score = score * 2, ratio = score_tab.ratio / 4, untouched = untouched where "
+                 "id < 3;");
+    auto update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 3);
+
+    const auto* mul_clause = update->set_clauses[0].get();
+    EXPECT_TRUE(mul_clause->is_self_ref);
+    EXPECT_EQ(mul_clause->op, ast::SetOp::SELF_MUL);
+    EXPECT_EQ(mul_clause->col_name, "score");
+    ASSERT_NE(mul_clause->rhs_col, nullptr);
+    EXPECT_EQ(mul_clause->rhs_col->col_name, "score");
+    auto mul_value = dynamic_cast<const ast::IntLit*>(mul_clause->val.get());
+    ASSERT_NE(mul_value, nullptr);
+    EXPECT_EQ(mul_value->val, 2);
+
+    const auto* div_clause = update->set_clauses[1].get();
+    EXPECT_TRUE(div_clause->is_self_ref);
+    EXPECT_EQ(div_clause->op, ast::SetOp::SELF_DIV);
+    EXPECT_EQ(div_clause->col_name, "ratio");
+    ASSERT_NE(div_clause->rhs_col, nullptr);
+    EXPECT_EQ(div_clause->rhs_col->tab_name, "score_tab");
+    EXPECT_EQ(div_clause->rhs_col->col_name, "ratio");
+    auto div_value = dynamic_cast<const ast::IntLit*>(div_clause->val.get());
+    ASSERT_NE(div_value, nullptr);
+    EXPECT_EQ(div_value->val, 4);
+
+    const auto* bare_clause = update->set_clauses[2].get();
+    EXPECT_TRUE(bare_clause->is_self_ref);
+    EXPECT_EQ(bare_clause->op, ast::SetOp::ASSIGNMENT);
+    EXPECT_EQ(bare_clause->col_name, "untouched");
+    ASSERT_NE(bare_clause->rhs_col, nullptr);
+    EXPECT_EQ(bare_clause->rhs_col->col_name, "untouched");
+    EXPECT_EQ(bare_clause->val, nullptr);
+}
+
+TEST(ParserTest, ParsesDatetimeTypeAsFixedLengthColumn) {
+    auto parsed = parse_ok("create table orders (id int, created_at datetime);");
+    auto create = as_node<ast::CreateTable>(parsed);
+    ASSERT_NE(create, nullptr);
+    ASSERT_EQ(create->fields.size(), 2);
+    auto col = dynamic_cast<const ast::ColDef*>(create->fields[1].get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->col_name, "created_at");
+    EXPECT_EQ(col->type_len->type, ast::SV_TYPE_DATETIME);
+    EXPECT_EQ(col->type_len->len, 19);
 }
 
 TEST(ParserTest, ParsesSelectFeaturesUsedByCompetition) {
@@ -164,6 +314,9 @@ TEST(ParserTest, RejectsMalformedStatements) {
     expect_parse_error("select from tb;");
     expect_parse_error("insert into tb values (1, );");
     expect_parse_error("set enable_nestloop = maybe;");
+    expect_parse_error("update tb set a = b where x = 1;");
+    EXPECT_EQ(parse_ok("update tb set a = a where x = 1;")->type, ast::AstType::UpdateStmt);
+    expect_parse_error("update tb set a = b * 'bad' where x = 1;");
 }
 
 TEST(ParserTest, SelectStmtUsesSelectItemsAsSingleProjectionContract) {

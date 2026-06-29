@@ -21,16 +21,21 @@ static const bool binary_search = false;
 inline int ix_compare(const char* a, const char* b, ColType type, int col_len) {
     switch (type) {
     case TYPE_INT: {
-        int ia = *(int*)a;
-        int ib = *(int*)b;
+        int ia;
+        int ib;
+        memcpy(&ia, a, sizeof(ia));
+        memcpy(&ib, b, sizeof(ib));
         return (ia < ib) ? -1 : ((ia > ib) ? 1 : 0);
     }
     case TYPE_FLOAT: {
-        float fa = *(float*)a;
-        float fb = *(float*)b;
+        float fa;
+        float fb;
+        memcpy(&fa, a, sizeof(fa));
+        memcpy(&fb, b, sizeof(fb));
         return (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);
     }
     case TYPE_STRING:
+    case TYPE_DATETIME:
         return memcmp(a, b, col_len);
     default:
         throw InternalError("Unexpected data type");
@@ -230,7 +235,21 @@ public:
                                                   bool find_first = false);
 
     // for insert
-    page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction);
+    page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction, bool allow_duplicate = false);
+
+    // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
+    struct PinnedInserter {
+        IxIndexHandle* ih;
+        IxNodeHandle leaf;
+        bool active = false;
+
+        explicit PinnedInserter(IxIndexHandle* h);
+        ~PinnedInserter();
+        PinnedInserter(const PinnedInserter&) = delete;
+        PinnedInserter& operator=(const PinnedInserter&) = delete;
+
+        void insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate = false);
+    };
 
     IxNodeHandle* split(IxNodeHandle* node);
 
@@ -238,6 +257,7 @@ public:
 
     // for delete
     bool delete_entry(const char* key, Transaction* transaction);
+    bool delete_entry(const char* key, const Rid& value, Transaction* transaction);
 
     bool coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction = nullptr,
                                   bool* root_is_latched = nullptr);
@@ -268,6 +288,8 @@ private:
 
     // for get/create node
     IxNodeHandle* fetch_node(int page_no) const;
+
+    void fetch_node_into(int page_no, IxNodeHandle& out) const;
 
     IxNodeHandle* create_node();
 

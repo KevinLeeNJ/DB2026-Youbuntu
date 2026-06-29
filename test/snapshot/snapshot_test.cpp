@@ -1379,6 +1379,36 @@ TEST_F(SnapshotTest, SI_IndexScanFindsHistoricalIndexedKeyVersion) {
     ASSERT_TRUE(reader->exec_sql_ok("commit;"));
 }
 
+TEST_F(SnapshotTest, SER_IndexScanFindsHistoricalIndexedKeyVersion) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto reader = create_session();
+    auto writer = create_session();
+
+    ASSERT_TRUE(reader->exec_sql_ok("set transaction isolation level serializable;"));
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+
+    ASSERT_TRUE(writer->exec_sql_ok("set transaction isolation level serializable;"));
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update t set id = 2 where id = 1;"));
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+
+    std::string out = reader->exec_sql("select * from t where id = 1;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "Serializable index scans in an explicit transaction must not miss the visible old key";
+
+    ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+}
+
 TEST_F(SnapshotTest, SER_EmptySelectDetectsInvisibleInsertAndDoesNotWriteOutput) {
     auto s = create_session();
     ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
@@ -1798,6 +1828,38 @@ TEST_F(SnapshotTest, SI_UpdateTest_SelfReferentialUpdateReadsOriginalRowForEachC
                            "+------------------+------------------+------------------+\n"
                            "Total record(s): 1";
     EXPECT_EQ(TestSession::trim_output(in_txn), expected);
+}
+
+TEST_F(SnapshotTest, SI_UpdateTest_CompoundAssignment) {
+    // col += num / col -= num 与 col = col ± num 语义一致
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table compound_update_test (id int, score int, bonus float);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into compound_update_test values (1, 10, 1.5);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into compound_update_test values (2, 20, 2.5);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into compound_update_test values (3, 30, 3.5);"));
+
+    auto txn = create_session();
+    ASSERT_TRUE(txn->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(txn->exec_sql_ok("begin;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update compound_update_test set score += 5 where id < 3;"));
+    ASSERT_TRUE(txn->exec_sql_ok("update compound_update_test set bonus -= 0.5 where id = 1;"));
+
+    std::string in_txn = txn->exec_sql("select * from compound_update_test;");
+    ASSERT_TRUE(txn->exec_sql_ok("commit;"));
+
+    std::string expected = "+------------------+------------------+------------------+\n"
+                           "|               id |            score |            bonus |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "|                1 |               15 |         1.000000 |\n"
+                           "|                2 |               25 |         2.500000 |\n"
+                           "|                3 |               30 |         3.500000 |\n"
+                           "+------------------+------------------+------------------+\n"
+                           "Total record(s): 3";
+    EXPECT_EQ(TestSession::trim_output(in_txn), expected);
+
+    auto check = create_session();
+    std::string after_commit = check->exec_sql("select * from compound_update_test;");
+    EXPECT_EQ(TestSession::trim_output(after_commit), expected);
 }
 
 // =============================================================================

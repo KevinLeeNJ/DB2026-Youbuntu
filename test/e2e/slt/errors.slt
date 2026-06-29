@@ -43,6 +43,10 @@ SELECT nonexistent FROM t;
 statement error
 SELECT * FROM t WHERE ghost = 1;
 
+# SELECT with incompatible WHERE literal type
+statement error
+SELECT * FROM t WHERE a = 'one';
+
 # --- Index errors ---
 
 # CREATE INDEX on non-existent table

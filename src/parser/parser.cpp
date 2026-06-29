@@ -53,27 +53,20 @@ public:
         }
 
         // "set output_file off" has no semicolon; handle before the semicolon-enforcing path.
-        if (check(TokenType::SET)) {
-            auto state = lexer_.save_state();
-            Token saved_current = current_;
+        if (check(TokenType::SET) && peek(1).type == TokenType::OUTPUT_FILE) {
             advance(); // consume SET
-            if (check(TokenType::OUTPUT_FILE)) {
-                advance(); // consume OUTPUT_FILE
-                bool enable;
-                if (match(TokenType::ON)) {
-                    enable = true;
-                } else if (match(TokenType::OFF)) {
-                    enable = false;
-                } else {
-                    error("expected ON or OFF after OUTPUT_FILE");
-                }
-                consume_optional_semicolon();
-                expect_end();
-                return std::make_unique<SetOutputFile>(enable);
+            advance(); // consume OUTPUT_FILE
+            bool enable;
+            if (match(TokenType::ON)) {
+                enable = true;
+            } else if (match(TokenType::OFF)) {
+                enable = false;
+            } else {
+                error("expected ON or OFF after OUTPUT_FILE");
             }
-            lexer_.restore_state(state);
-            current_ = saved_current;
-            // fall through to parse_stmt() for SET TRANSACTION / SET knob (which require ';')
+            consume_optional_semicolon();
+            expect_end();
+            return std::make_unique<SetOutputFile>(enable);
         }
 
         auto result = parse_stmt();
@@ -85,12 +78,38 @@ public:
 private:
     Lexer lexer_;
     Token current_;
+    // The most recently consumed token. Token.text is a zero-copy string_view into
+    // the lexer input buffer, so prev_token_.text.data() + size() marks where that
+    // token ended in the original source. Used to capture raw expression text for
+    // constant-folded literals (e.g. display_text of "(100-20)").
+    Token prev_token_;
+    // Tokens scanned ahead of current_ but not yet consumed; filled by peek() and
+    // drained by advance(). Lets the parser look ahead without re-lexing on backtrack.
+    std::vector<Token> lookahead_;
 
     void advance() {
-        current_ = lexer_.next_token();
+        prev_token_ = current_;
+        if (!lookahead_.empty()) {
+            current_ = lookahead_.front();
+            lookahead_.erase(lookahead_.begin());
+        } else {
+            current_ = lexer_.next_token();
+        }
         if (current_.type == TokenType::T_ERROR) {
             error("unexpected token");
         }
+    }
+
+    // Return the k-th token ahead of current_ (k >= 1) without consuming it.
+    Token peek(size_t k) {
+        while (lookahead_.size() < k) {
+            Token tok = lexer_.next_token();
+            if (tok.type == TokenType::T_ERROR) {
+                error("unexpected token");
+            }
+            lookahead_.push_back(tok);
+        }
+        return lookahead_[k - 1];
     }
 
     bool check(TokenType type) const {
@@ -291,26 +310,11 @@ private:
     }
 
     bool is_select_from_union_wrapper() {
-        if (!check(TokenType::SELECT)) {
-            return false;
-        }
-        auto state = lexer_.save_state();
-        Token saved_current = current_;
-
-        advance();
-        bool result = check(TokenType::STAR);
-        if (result) {
-            advance();
-            result = check(TokenType::FROM);
-        }
-        if (result) {
-            advance();
-            result = check(TokenType::LPAREN);
-        }
-
-        lexer_.restore_state(state);
-        current_ = saved_current;
-        return result;
+        // "SELECT * FROM (" distinguishes the union wrapper from a plain SELECT.
+        // peek() buffers the scanned tokens so the subsequent parse consumes them
+        // without re-lexing (the previous save/restore re-scanned them).
+        return check(TokenType::SELECT) && peek(1).type == TokenType::STAR && peek(2).type == TokenType::FROM &&
+               peek(3).type == TokenType::LPAREN;
     }
 
     std::unique_ptr<TreeNode> parse_select_from_union() {
@@ -385,6 +389,9 @@ private:
         if (match(TokenType::FLOAT)) {
             return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
         }
+        if (match(TokenType::DATETIME)) {
+            return std::make_unique<TypeLen>(SV_TYPE_DATETIME, 19);
+        }
         expect(TokenType::CHAR, "expected type");
         expect(TokenType::LPAREN, "expected '(' after CHAR");
         auto length = parse_int_literal();
@@ -432,24 +439,13 @@ private:
 
     std::unique_ptr<Value> parse_numeric_delta_after(TokenType op) {
         auto delta = parse_value();
-        if (op == TokenType::PLUS) {
+        if (op == TokenType::PLUS || op == TokenType::MINUS || op == TokenType::STAR || op == TokenType::SLASH) {
             if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit) {
-                error("expected numeric value after '+'");
+                error("expected numeric value after arithmetic operator");
             }
             return delta;
         }
-
-        if (auto* int_delta = dynamic_cast<IntLit*>(delta.get())) {
-            int_delta->val = -int_delta->val;
-            int_delta->display_text = "-" + int_delta->display_text;
-            return delta;
-        }
-        if (auto* float_delta = dynamic_cast<FloatLit*>(delta.get())) {
-            float_delta->val = -float_delta->val;
-            float_delta->display_text = "-" + float_delta->display_text;
-            return delta;
-        }
-        error("expected numeric value after '-'");
+        error("expected numeric value after arithmetic operator");
     }
 
     std::unique_ptr<IntLit> parse_int_literal(bool is_negative = false) {
@@ -575,23 +571,45 @@ private:
 
     std::unique_ptr<SetClause> parse_set_clause() {
         std::string column = parse_identifier();
-        expect(TokenType::EQ, "expected '=' in SET clause");
-        if (check(TokenType::IDENTIFIER)) {
-            auto state = lexer_.save_state();
-            Token saved_current = current_;
-            auto rhs_col = parse_col();
 
+        // 复合赋值: col += num / col -= num,脱糖为 col = col ± num
+        if (match(TokenType::PLUS_ASSIGN)) {
+            auto rhs_col = std::make_unique<Col>("", column);
+            return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                               parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
+        }
+        if (match(TokenType::MINUS_ASSIGN)) {
+            auto rhs_col = std::make_unique<Col>("", column);
+            return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                               parse_numeric_delta_after(TokenType::MINUS), SetOp::SELF_SUB);
+        }
+
+        expect(TokenType::EQ, "expected '=' in SET clause");
+        // A column reference on the rhs starts the self-referential form
+        // (col = col +/- value); any other rhs is a plain value. The two forms have
+        // disjoint FIRST sets, so a single token decides -- no speculative parse needed.
+        if (check(TokenType::IDENTIFIER)) {
+            auto rhs_col = parse_col();
             if (match(TokenType::PLUS)) {
                 return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::PLUS));
+                                                   parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
             }
             if (match(TokenType::MINUS)) {
                 return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::MINUS));
+                                                   parse_numeric_delta_after(TokenType::MINUS), SetOp::SELF_SUB);
             }
-
-            lexer_.restore_state(state);
-            current_ = saved_current;
+            if (match(TokenType::STAR)) {
+                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                                   parse_numeric_delta_after(TokenType::STAR), SetOp::SELF_MUL);
+            }
+            if (match(TokenType::SLASH)) {
+                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
+                                                   parse_numeric_delta_after(TokenType::SLASH), SetOp::SELF_DIV);
+            }
+            if (rhs_col->col_name != column) {
+                error("expected arithmetic operator after different column reference in SET clause");
+            }
+            return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), nullptr, SetOp::ASSIGNMENT);
         }
         return std::make_unique<SetClause>(std::move(column), parse_value());
     }
@@ -682,7 +700,118 @@ private:
         if (check(TokenType::IDENTIFIER)) {
             return parse_col();
         }
+        // Constant path: parentheses / arithmetic / nesting are supported and folded
+        // into a single IntLit/FloatLit at parse time (constant folding). Columns and
+        // other non-constant operands fall through to parse_value, which rejects them.
+        return parse_constant_arith_expr();
+    }
+
+    // Constant arithmetic expression entry: handles + - (left associative), folding
+    // the whole expression into a single IntLit/FloatLit. display_text preserves the
+    // raw source text of the expression (e.g. "(100 - 20)").
+    std::unique_ptr<Value> parse_constant_arith_expr() {
+        const char* start = current_.text.data();
+        auto result = parse_arith_term();
+        while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
+            TokenType op = current_.type;
+            advance();
+            auto rhs = parse_arith_term();
+            result = fold_binary(op, std::move(result), std::move(rhs));
+        }
+        const char* end = prev_token_.text.data() + prev_token_.text.size();
+        result->display_text = std::string(start, static_cast<size_t>(end - start));
+        return result;
+    }
+
+    // Term: handles * / (left associative).
+    std::unique_ptr<Value> parse_arith_term() {
+        auto result = parse_arith_factor();
+        while (check(TokenType::STAR) || check(TokenType::SLASH)) {
+            TokenType op = current_.type;
+            advance();
+            auto rhs = parse_arith_factor();
+            result = fold_binary(op, std::move(result), std::move(rhs));
+        }
+        return result;
+    }
+
+    // Factor: a parenthesized sub-expression (supports nesting) or a plain literal via
+    // parse_value (int/float/string/bool, with a leading unary '-').
+    std::unique_ptr<Value> parse_arith_factor() {
+        if (match(TokenType::LPAREN)) {
+            auto inner = parse_constant_arith_expr();
+            expect(TokenType::RPAREN, "expected ')' in constant expression");
+            return inner;
+        }
         return parse_value();
+    }
+
+    // Fold a binary arithmetic op of two constant literals into a single literal.
+    // Only IntLit/FloatLit participate; other value types raise a ParseError. Overflow
+    // and division-by-zero are detected here so they surface as parse-time errors.
+    std::unique_ptr<Value> fold_binary(TokenType op, std::unique_ptr<Value> lhs, std::unique_ptr<Value> rhs) {
+        auto is_int = [](const Value* v) { return v->type == AstType::IntLit; };
+        auto is_float = [](const Value* v) { return v->type == AstType::FloatLit; };
+        if (!is_int(lhs.get()) && !is_float(lhs.get())) {
+            error("arithmetic on non-numeric constant");
+        }
+        if (!is_int(rhs.get()) && !is_float(rhs.get())) {
+            error("arithmetic on non-numeric constant");
+        }
+        bool both_int = is_int(lhs.get()) && is_int(rhs.get());
+        if (both_int) {
+            int64_t l = static_cast<const IntLit*>(lhs.get())->val;
+            int64_t r = static_cast<const IntLit*>(rhs.get())->val;
+            int64_t res = 0;
+            switch (op) {
+            case TokenType::PLUS:
+                res = l + r;
+                break;
+            case TokenType::MINUS:
+                res = l - r;
+                break;
+            case TokenType::STAR:
+                res = l * r;
+                break;
+            case TokenType::SLASH:
+                if (r == 0) {
+                    error("division by zero in constant expression");
+                }
+                res = l / r;
+                break;
+            default:
+                error("invalid arithmetic operator");
+            }
+            if (res < std::numeric_limits<int>::min() || res > std::numeric_limits<int>::max()) {
+                error("constant arithmetic overflow");
+            }
+            return std::make_unique<IntLit>(static_cast<int>(res), "");
+        }
+        double l = is_float(lhs.get()) ? static_cast<const FloatLit*>(lhs.get())->val
+                                       : static_cast<const IntLit*>(lhs.get())->val;
+        double r = is_float(rhs.get()) ? static_cast<const FloatLit*>(rhs.get())->val
+                                       : static_cast<const IntLit*>(rhs.get())->val;
+        double res = 0;
+        switch (op) {
+        case TokenType::PLUS:
+            res = l + r;
+            break;
+        case TokenType::MINUS:
+            res = l - r;
+            break;
+        case TokenType::STAR:
+            res = l * r;
+            break;
+        case TokenType::SLASH:
+            if (r == 0.0) {
+                error("division by zero in constant expression");
+            }
+            res = l / r;
+            break;
+        default:
+            error("invalid arithmetic operator");
+        }
+        return std::make_unique<FloatLit>(static_cast<float>(res), "");
     }
 
     std::unique_ptr<FromClause> parse_from_clause() {

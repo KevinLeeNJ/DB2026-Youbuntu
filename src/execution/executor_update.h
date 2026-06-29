@@ -172,7 +172,7 @@ public:
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->delete_entry(update.old_key.data(), txn); // 删除旧索引
+                        ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
                         ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
                         inserted_indexes.push_back(i);
@@ -184,14 +184,14 @@ public:
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->delete_entry(update.new_key.data(), txn); // 删除新索引
+                        ih->delete_entry(update.new_key.data(), rid, txn); // 删除新索引
                     }
                     for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
                         const auto& update = index_updates[*it];
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->insert_entry(update.old_key.data(), rid, txn); // 恢复旧索引
+                        ih->insert_entry(update.old_key.data(), rid, txn, true); // 恢复旧索引
                     }
                     throw; // 仍然抛出错误
                 }
@@ -217,6 +217,33 @@ public:
             char* data = rec->data + col_meta.offset;
             if (set_clause.is_self_ref) {
                 auto rhs_col_meta = get_col_offset(set_clause.rhs_col);
+                if (set_clause.op == UpdateOp::ASSIGNMENT) {
+                    if (col_meta.type == TYPE_INT && rhs_col_meta.type == TYPE_FLOAT) {
+                        *reinterpret_cast<int*>(data) =
+                            static_cast<int>(*reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset));
+                    } else if (col_meta.type == TYPE_FLOAT && rhs_col_meta.type == TYPE_INT) {
+                        *reinterpret_cast<float*>(data) =
+                            static_cast<float>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset));
+                    } else if (col_meta.type == TYPE_STRING || col_meta.type == TYPE_DATETIME) {
+                        if (rhs_col_meta.type != TYPE_STRING && rhs_col_meta.type != TYPE_DATETIME) {
+                            throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
+                        }
+                        std::memset(data, 0, col_meta.len);
+                        std::memcpy(data, old_rec.data + rhs_col_meta.offset, std::min(col_meta.len, rhs_col_meta.len));
+                    } else if (col_meta.type == TYPE_INT) {
+                        if (rhs_col_meta.type != TYPE_INT) {
+                            throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
+                        }
+                        *reinterpret_cast<int*>(data) = *reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset);
+                    } else if (col_meta.type == TYPE_FLOAT) {
+                        if (rhs_col_meta.type != TYPE_FLOAT) {
+                            throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
+                        }
+                        *reinterpret_cast<float*>(data) = *reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset);
+                    }
+                    continue;
+                }
+
                 if ((rhs_col_meta.type != TYPE_INT && rhs_col_meta.type != TYPE_FLOAT) ||
                     (set_clause.rhs.type != TYPE_INT && set_clause.rhs.type != TYPE_FLOAT)) {
                     throw IncompatibleTypeError(coltype2str(rhs_col_meta.type), coltype2str(set_clause.rhs.type));
@@ -227,7 +254,27 @@ public:
                                  : *reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset);
                 float delta = set_clause.rhs.type == TYPE_INT ? static_cast<float>(set_clause.rhs.int_val)
                                                               : set_clause.rhs.float_val;
-                float result = base + delta;
+                float result = base;
+                switch (set_clause.op) {
+                case UpdateOp::SELF_ADD:
+                    result = base + delta;
+                    break;
+                case UpdateOp::SELF_SUB:
+                    result = base - delta;
+                    break;
+                case UpdateOp::SELF_MUL:
+                    result = base * delta;
+                    break;
+                case UpdateOp::SELF_DIV:
+                    if (delta == 0.0F) {
+                        throw InternalError("division by zero in UPDATE");
+                    }
+                    result = base / delta;
+                    break;
+                case UpdateOp::ASSIGNMENT:
+                    result = base;
+                    break;
+                }
 
                 switch (col_meta.type) {
                 case TYPE_INT:
@@ -237,6 +284,7 @@ public:
                     *reinterpret_cast<float*>(data) = result;
                     break;
                 case TYPE_STRING:
+                case TYPE_DATETIME:
                     throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
                 }
                 continue;
@@ -261,7 +309,8 @@ public:
                 }
                 break;
             }
-            case TYPE_STRING: {
+            case TYPE_STRING:
+            case TYPE_DATETIME: {
                 int len = get_col_offset(set_clause.lhs).len;
                 std::memset(data, 0, len);
                 std::memcpy(data, set_clause.rhs.str_val.c_str(), std::min(len, (int)set_clause.rhs.str_val.size()));

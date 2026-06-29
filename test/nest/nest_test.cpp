@@ -123,6 +123,7 @@ protected:
                         break;
                     }
                     case TYPE_STRING:
+                    case TYPE_DATETIME:
                         val = std::string(data, strnlen(data, col.len));
                         break;
                     }
