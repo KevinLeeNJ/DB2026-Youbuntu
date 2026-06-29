@@ -132,6 +132,72 @@ TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
     EXPECT_FLOAT_EQ(bonus_delta->val, 0.5F);
 }
 
+TEST(ParserTest, FoldsConstantArithmeticExpressions) {
+    // 括号常量算术:折叠成 IntLit,display_text 保留原始表达式文本
+    {
+        auto parsed = parse_ok("select * from t where id >= (100-20);");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        ASSERT_FALSE(sel->conds.empty());
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 80);
+        EXPECT_EQ(lit->display_text, "(100-20)");
+    }
+    // 嵌套括号
+    {
+        auto parsed = parse_ok("select * from t where id >= ((10+5)*2);");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 30);
+        EXPECT_EQ(lit->display_text, "((10+5)*2)");
+    }
+    // 无括号算术(保留运算符两侧空格)
+    {
+        auto parsed = parse_ok("select * from t where id >= 100 - 20;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 80);
+        EXPECT_EQ(lit->display_text, "100 - 20");
+    }
+    // int 与 float 混合提升为 float
+    {
+        auto parsed = parse_ok("select * from t where x > 5.0 + 3;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::FloatLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_FLOAT_EQ(lit->val, 8.0F);
+    }
+    // 括号外接算术
+    {
+        auto parsed = parse_ok("select * from t where id >= (3-1)*2;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 4);
+        EXPECT_EQ(lit->display_text, "(3-1)*2");
+    }
+    // 纯常量、字符串不受影响(回归)
+    {
+        auto parsed = parse_ok("select * from t where id >= 5;");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto lit = dynamic_cast<const ast::IntLit*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(lit->val, 5);
+    }
+    {
+        auto parsed = parse_ok("select * from t where x = 'abc';");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        EXPECT_EQ(sel->conds.front()->rhs->type, ast::AstType::StringLit);
+    }
+    // 除零、溢出、非数值、列参与算术 均应解析失败
+    expect_parse_error("select * from t where id >= (100/0);");
+    expect_parse_error("select * from t where id >= (2000000000+2000000000);");
+    expect_parse_error("select * from t where id >= ('a'-1);");
+    expect_parse_error("select * from t where id >= (col-20);");
+}
+
 TEST(ParserTest, ParsesRushdbCompatibleUpdateSetOperators) {
     auto parsed =
         parse_ok("update score_tab set score = score * 2, ratio = score_tab.ratio / 4, untouched = untouched where "

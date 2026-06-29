@@ -281,64 +281,65 @@ Token Lexer::scan_path() {
 Token Lexer::scan_operator() {
     int start_line = line_;
     int start_col = column_;
+    size_t start_pos = pos_;
     char c = current_char();
     char next = peek_char();
 
     // Two-character operators
     if (c == '<' && next == '=') {
         advance(2);
-        return Token(TokenType::LEQ, "<=", start_line, start_col);
+        return Token(TokenType::LEQ, input_.substr(start_pos, 2), start_line, start_col);
     }
     if (c == '>' && next == '=') {
         advance(2);
-        return Token(TokenType::GEQ, ">=", start_line, start_col);
+        return Token(TokenType::GEQ, input_.substr(start_pos, 2), start_line, start_col);
     }
     if (c == '<' && next == '>') {
         advance(2);
-        return Token(TokenType::NEQ, "<>", start_line, start_col);
+        return Token(TokenType::NEQ, input_.substr(start_pos, 2), start_line, start_col);
     }
     if (c == '!' && next == '=') {
         advance(2);
-        return Token(TokenType::NEQ, "!=", start_line, start_col);
+        return Token(TokenType::NEQ, input_.substr(start_pos, 2), start_line, start_col);
     }
     if (c == '+' && next == '=') {
         advance(2);
-        return Token(TokenType::PLUS_ASSIGN, "+=", start_line, start_col);
+        return Token(TokenType::PLUS_ASSIGN, input_.substr(start_pos, 2), start_line, start_col);
     }
     if (c == '-' && next == '=') {
         advance(2);
-        return Token(TokenType::MINUS_ASSIGN, "-=", start_line, start_col);
+        return Token(TokenType::MINUS_ASSIGN, input_.substr(start_pos, 2), start_line, start_col);
     }
 
     // Single-character operators
     advance();
     switch (c) {
     case '=':
-        return Token(TokenType::EQ, "=", start_line, start_col);
+        return Token(TokenType::EQ, input_.substr(start_pos, 1), start_line, start_col);
     case '<':
-        return Token(TokenType::LT, "<", start_line, start_col);
+        return Token(TokenType::LT, input_.substr(start_pos, 1), start_line, start_col);
     case '>':
-        return Token(TokenType::GT, ">", start_line, start_col);
+        return Token(TokenType::GT, input_.substr(start_pos, 1), start_line, start_col);
     case '+':
-        return Token(TokenType::PLUS, "+", start_line, start_col);
+        return Token(TokenType::PLUS, input_.substr(start_pos, 1), start_line, start_col);
     case '-':
-        return Token(TokenType::MINUS, "-", start_line, start_col);
+        return Token(TokenType::MINUS, input_.substr(start_pos, 1), start_line, start_col);
     case '(':
-        return Token(TokenType::LPAREN, "(", start_line, start_col);
+        return Token(TokenType::LPAREN, input_.substr(start_pos, 1), start_line, start_col);
     case ')':
-        return Token(TokenType::RPAREN, ")", start_line, start_col);
+        return Token(TokenType::RPAREN, input_.substr(start_pos, 1), start_line, start_col);
     case ',':
-        return Token(TokenType::COMMA, ",", start_line, start_col);
+        return Token(TokenType::COMMA, input_.substr(start_pos, 1), start_line, start_col);
     case ';':
-        return Token(TokenType::SEMICOLON, ";", start_line, start_col);
+        return Token(TokenType::SEMICOLON, input_.substr(start_pos, 1), start_line, start_col);
     case '.':
-        return Token(TokenType::DOT, ".", start_line, start_col);
+        return Token(TokenType::DOT, input_.substr(start_pos, 1), start_line, start_col);
     case '*':
-        return Token(TokenType::STAR, "*", start_line, start_col);
+        return Token(TokenType::STAR, input_.substr(start_pos, 1), start_line, start_col);
     case '/':
-        return Token(TokenType::SLASH, "/", start_line, start_col);
+        return Token(TokenType::SLASH, input_.substr(start_pos, 1), start_line, start_col);
     default:
-        return Token(TokenType::T_ERROR, std::string_view(&input_[pos_ - 1], 1), start_line, start_col);
+        return Token(TokenType::T_ERROR, input_.substr(start_pos, 1), start_line, start_col);
     }
 }
 

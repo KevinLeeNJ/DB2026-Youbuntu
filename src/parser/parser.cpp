@@ -78,11 +78,17 @@ public:
 private:
     Lexer lexer_;
     Token current_;
+    // The most recently consumed token. Token.text is a zero-copy string_view into
+    // the lexer input buffer, so prev_token_.text.data() + size() marks where that
+    // token ended in the original source. Used to capture raw expression text for
+    // constant-folded literals (e.g. display_text of "(100-20)").
+    Token prev_token_;
     // Tokens scanned ahead of current_ but not yet consumed; filled by peek() and
     // drained by advance(). Lets the parser look ahead without re-lexing on backtrack.
     std::vector<Token> lookahead_;
 
     void advance() {
+        prev_token_ = current_;
         if (!lookahead_.empty()) {
             current_ = lookahead_.front();
             lookahead_.erase(lookahead_.begin());
@@ -694,7 +700,119 @@ private:
         if (check(TokenType::IDENTIFIER)) {
             return parse_col();
         }
+        // Constant path: parentheses / arithmetic / nesting are supported and folded
+        // into a single IntLit/FloatLit at parse time (constant folding). Columns and
+        // other non-constant operands fall through to parse_value, which rejects them.
+        return parse_constant_arith_expr();
+    }
+
+    // Constant arithmetic expression entry: handles + - (left associative), folding
+    // the whole expression into a single IntLit/FloatLit. display_text preserves the
+    // raw source text of the expression (e.g. "(100 - 20)").
+    std::unique_ptr<Value> parse_constant_arith_expr() {
+        const char* start = current_.text.data();
+        auto result = parse_arith_term();
+        while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
+            TokenType op = current_.type;
+            advance();
+            auto rhs = parse_arith_term();
+            result = fold_binary(op, std::move(result), std::move(rhs));
+        }
+        const char* end = prev_token_.text.data() + prev_token_.text.size();
+        result->display_text = std::string(start, static_cast<size_t>(end - start));
+        return result;
+    }
+
+    // Term: handles * / (left associative).
+    std::unique_ptr<Value> parse_arith_term() {
+        auto result = parse_arith_factor();
+        while (check(TokenType::STAR) || check(TokenType::SLASH)) {
+            TokenType op = current_.type;
+            advance();
+            auto rhs = parse_arith_factor();
+            result = fold_binary(op, std::move(result), std::move(rhs));
+        }
+        return result;
+    }
+
+    // Factor: a parenthesized sub-expression (supports nesting) or a plain literal via
+    // parse_value (int/float/string/bool, with a leading unary '-').
+    std::unique_ptr<Value> parse_arith_factor() {
+        if (match(TokenType::LPAREN)) {
+            auto inner = parse_constant_arith_expr();
+            expect(TokenType::RPAREN, "expected ')' in constant expression");
+            return inner;
+        }
         return parse_value();
+    }
+
+    // Fold a binary arithmetic op of two constant literals into a single literal.
+    // Only IntLit/FloatLit participate; other value types raise a ParseError. Overflow
+    // and division-by-zero are detected here so they surface as parse-time errors.
+    std::unique_ptr<Value> fold_binary(TokenType op, std::unique_ptr<Value> lhs,
+                                        std::unique_ptr<Value> rhs) {
+        auto is_int = [](const Value* v) { return v->type == AstType::IntLit; };
+        auto is_float = [](const Value* v) { return v->type == AstType::FloatLit; };
+        if (!is_int(lhs.get()) && !is_float(lhs.get())) {
+            error("arithmetic on non-numeric constant");
+        }
+        if (!is_int(rhs.get()) && !is_float(rhs.get())) {
+            error("arithmetic on non-numeric constant");
+        }
+        bool both_int = is_int(lhs.get()) && is_int(rhs.get());
+        if (both_int) {
+            int64_t l = static_cast<const IntLit*>(lhs.get())->val;
+            int64_t r = static_cast<const IntLit*>(rhs.get())->val;
+            int64_t res = 0;
+            switch (op) {
+            case TokenType::PLUS:
+                res = l + r;
+                break;
+            case TokenType::MINUS:
+                res = l - r;
+                break;
+            case TokenType::STAR:
+                res = l * r;
+                break;
+            case TokenType::SLASH:
+                if (r == 0) {
+                    error("division by zero in constant expression");
+                }
+                res = l / r;
+                break;
+            default:
+                error("invalid arithmetic operator");
+            }
+            if (res < std::numeric_limits<int>::min() || res > std::numeric_limits<int>::max()) {
+                error("constant arithmetic overflow");
+            }
+            return std::make_unique<IntLit>(static_cast<int>(res), "");
+        }
+        double l = is_float(lhs.get()) ? static_cast<const FloatLit*>(lhs.get())->val
+                                       : static_cast<const IntLit*>(lhs.get())->val;
+        double r = is_float(rhs.get()) ? static_cast<const FloatLit*>(rhs.get())->val
+                                       : static_cast<const IntLit*>(rhs.get())->val;
+        double res = 0;
+        switch (op) {
+        case TokenType::PLUS:
+            res = l + r;
+            break;
+        case TokenType::MINUS:
+            res = l - r;
+            break;
+        case TokenType::STAR:
+            res = l * r;
+            break;
+        case TokenType::SLASH:
+            if (r == 0.0) {
+                error("division by zero in constant expression");
+            }
+            res = l / r;
+            break;
+        default:
+            error("invalid arithmetic operator");
+        }
+        return std::make_unique<FloatLit>(static_cast<float>(res), "");
     }
 
     std::unique_ptr<FromClause> parse_from_clause() {

@@ -492,6 +492,10 @@ TEST_F(SltFileTest, Checkpoint) {
     run_slt_file("checkpoint.slt");
 }
 
+TEST_F(SltFileTest, ArithConstant) {
+    run_slt_file("arith_constant.slt");
+}
+
 TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {
     ASSERT_NO_THROW(db_->exec_sql("create table dup_heap (id int, val int);"));
     ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
