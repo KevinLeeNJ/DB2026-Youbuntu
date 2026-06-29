@@ -74,14 +74,18 @@ public:
         if (col_tot_len > IX_MAX_COL_LEN) {
             throw InvalidColLengthError(col_tot_len);
         }
-        // 根据 |page_hdr| + (|attr| + |rid|) * (n + 1) <= PAGE_SIZE 求得n的最大值btree_order
+        // 根据对齐后的 |page_hdr| + |attr| * (n + 1) + |rid| * (n + 1) <= PAGE_SIZE 求得n的最大值btree_order
         // 即 n <= btree_order，那么btree_order就是每个结点最多可插入的键值对数量（实际还多留了一个空位，但其不可插入）
         int btree_order = static_cast<int>((PAGE_SIZE - sizeof(IxPageHdr)) / (col_tot_len + sizeof(Rid)) - 1);
+        while (btree_order > 2 && IxNodeUsedBytes(btree_order + 1, col_tot_len) > PAGE_SIZE) {
+            --btree_order;
+        }
         assert(btree_order > 2);
+        int keys_size = IxKeysSize(btree_order + 1, col_tot_len);
 
         // Create file header and write to file
         IxFileHdr fhdr = IxFileHdr(IX_NO_PAGE, IX_INIT_NUM_PAGES, IX_INIT_ROOT_PAGE, col_num, col_tot_len, btree_order,
-                                   (btree_order + 1) * col_tot_len, IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
+                                   keys_size, IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
         for (int i = 0; i < col_num; ++i) {
             fhdr.col_types_.push_back(index_cols[i].type);
             fhdr.col_lens_.push_back(index_cols[i].len);

@@ -77,6 +77,13 @@ struct RmPageHdr {
     int num_records;       // 当前页面中当前已经存储的记录个数（初始化为0）
 };
 
+constexpr int AlignUp(int value, int alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+constexpr int RM_PAGE_META_OFFSET =
+    AlignUp(static_cast<int>(Page::OFFSET_PAGE_HDR) + static_cast<int>(sizeof(RmPageHdr)), alignof(TupleMeta));
+
 /* 表中的记录 */
 struct RmRecord {
     char* data;              // 记录的数据

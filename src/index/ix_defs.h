@@ -138,6 +138,20 @@ public:
     page_id_t next_leaf; // next leaf node's page_no, effective only when is_leaf is true
 };
 
+constexpr int IxAlignUp(int value, int alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+inline int IxKeysSize(int key_count, int col_tot_len) {
+    return IxAlignUp(static_cast<int>(sizeof(IxPageHdr)) + key_count * col_tot_len, alignof(Rid)) -
+           static_cast<int>(sizeof(IxPageHdr));
+}
+
+inline int IxNodeUsedBytes(int key_count, int col_tot_len) {
+    return static_cast<int>(sizeof(IxPageHdr)) + IxKeysSize(key_count, col_tot_len) +
+           key_count * static_cast<int>(sizeof(Rid));
+}
+
 class Iid {
 public:
     int page_no;

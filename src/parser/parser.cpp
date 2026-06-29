@@ -749,8 +749,7 @@ private:
     // Fold a binary arithmetic op of two constant literals into a single literal.
     // Only IntLit/FloatLit participate; other value types raise a ParseError. Overflow
     // and division-by-zero are detected here so they surface as parse-time errors.
-    std::unique_ptr<Value> fold_binary(TokenType op, std::unique_ptr<Value> lhs,
-                                        std::unique_ptr<Value> rhs) {
+    std::unique_ptr<Value> fold_binary(TokenType op, std::unique_ptr<Value> lhs, std::unique_ptr<Value> rhs) {
         auto is_int = [](const Value* v) { return v->type == AstType::IntLit; };
         auto is_float = [](const Value* v) { return v->type == AstType::FloatLit; };
         if (!is_int(lhs.get()) && !is_float(lhs.get())) {

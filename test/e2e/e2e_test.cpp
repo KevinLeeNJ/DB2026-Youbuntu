@@ -31,6 +31,7 @@ See the Mulan PSL v2 for more details. */
 #include "parser/parser.h"
 #include "portal.h"
 #include "record/rm_manager.h"
+#include "record/rm_scan.h"
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
 #include "storage/buffer_pool_manager.h"
@@ -172,6 +173,15 @@ public:
     void clean_output_txt() {
         // output.txt is written in the db directory (cwd after open_db)
         std::remove("output.txt");
+    }
+
+    TupleMeta first_tuple_meta(const std::string& table_name) {
+        auto* fh = sm_manager_->fhs_.at(table_name).get();
+        RmScan scan(fh);
+        if (scan.is_end()) {
+            throw InternalError("table has no tuple: " + table_name);
+        }
+        return fh->get_tuple_meta(scan.rid());
     }
 
 private:
@@ -647,6 +657,35 @@ TEST_F(E2ETest, LoadCsvMatchesFileContents) {
     EXPECT_NE(output.find("0.125"), std::string::npos) << output;
 
     // Cleanup the copied CSV.
+    std::remove(dest_csv.c_str());
+}
+
+TEST_F(E2ETest, LoadCsvStoresRowsAsCommittedBaseData) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/load_base_meta_test.csv";
+    {
+        std::ofstream out(dest_csv);
+        out << "id,val,name\n";
+        out << "1,10,alpha\n";
+        out << "2,20,beta\n";
+    }
+
+    ASSERT_NO_THROW(db_->exec_sql("create table load_base_meta (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("create index load_base_meta(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./load_base_meta_test.csv into load_base_meta;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select val from load_base_meta where id = 2;"); });
+    EXPECT_NE(output.find("20"), std::string::npos) << output;
+
+    TupleMeta meta = db_->first_tuple_meta("load_base_meta");
+    EXPECT_TRUE(meta.is_committed_);
+    EXPECT_EQ(0, meta.commit_ts_);
+    EXPECT_EQ(INVALID_TXN_ID, meta.writer_txn_id_);
+    EXPECT_FALSE(meta.is_deleted_);
+    EXPECT_FALSE(meta.version_chain_head_.IsValid());
+
     std::remove(dest_csv.c_str());
 }
 

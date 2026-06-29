@@ -18,6 +18,3 @@ test_e2e_db
 testdb
 #忽略.codegraph
 .codegraph
-#忽略flex和bison生成的文件
-src/parser/lex.yy.*
-src/parser/yacc.tab.*

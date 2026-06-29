@@ -24,16 +24,19 @@ class RmManager;
 
 /* 对表数据文件中的页面进行封装 */
 struct RmPageHandle {
-    const RmFileHdr* file_hdr; // 当前页面所在文件的文件头指针
-    Page* page;                // 页面的实际数据，包括页面存储的数据、元信息等
-    RmPageHdr* page_hdr; // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
-    TupleMeta* meta_array; // TupleMeta 数组，在 RmPageHdr 之后
-    char* bitmap; // page->data中TupleMeta之后的部分，存储页面的bitmap，指针指向首地址，长度为file_hdr->bitmap_size
-    char* slots; // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
+    const RmFileHdr* file_hdr = nullptr; // 当前页面所在文件的文件头指针
+    Page* page = nullptr;                // 页面的实际数据，包括页面存储的数据、元信息等
+    RmPageHdr* page_hdr = nullptr; // page->data的第一部分，存储页面元信息，指针指向首地址，长度为sizeof(RmPageHdr)
+    TupleMeta* meta_array = nullptr; // TupleMeta 数组，在 RmPageHdr 之后
+    char* bitmap =
+        nullptr; // page->data中TupleMeta之后的部分，存储页面的bitmap，指针指向首地址，长度为file_hdr->bitmap_size
+    char* slots = nullptr; // page->data的第三部分，存储表的记录，指针指向首地址，每个slot的长度为file_hdr->record_size
+
+    RmPageHandle() = default;
 
     RmPageHandle(const RmFileHdr* fhdr_, Page* page_) : file_hdr(fhdr_), page(page_) {
         page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + page->OFFSET_PAGE_HDR);
-        meta_array = reinterpret_cast<TupleMeta*>(page->get_data() + sizeof(RmPageHdr) + page->OFFSET_PAGE_HDR);
+        meta_array = reinterpret_cast<TupleMeta*>(page->get_data() + RM_PAGE_META_OFFSET);
         bitmap = reinterpret_cast<char*>(meta_array + file_hdr->num_records_per_page);
         slots = bitmap + file_hdr->bitmap_size;
     }
@@ -126,6 +129,57 @@ public:
     std::mutex& get_physical_latch() {
         return physical_latch_;
     }
+
+    // Bulk-load: pins data page across rows to skip per-record fetch/unpin.
+    struct PinnedInserter {
+        RmFileHandle* fh;
+        RmPageHandle page;
+        bool active = false;
+
+        explicit PinnedInserter(RmFileHandle* f) : fh(f) {
+            page = fh->create_page_handle();
+            active = true;
+        }
+        ~PinnedInserter() {
+            if (active) {
+                fh->buffer_pool_manager_->unpin_page(page.page->get_page_id(), true);
+            }
+        }
+        PinnedInserter(const PinnedInserter&) = delete;
+        PinnedInserter& operator=(const PinnedInserter&) = delete;
+        PinnedInserter(PinnedInserter&& o) noexcept : fh(o.fh), page(o.page), active(o.active) {
+            o.active = false;
+        }
+
+        // Insert one record into the pinned page; returns its Rid. Caller must
+        // ensure `buf` points to `record_size` bytes.
+        Rid insert(const char* buf) {
+            int slot_no = Bitmap::first_bit(false, page.bitmap, fh->file_hdr_.num_records_per_page);
+            if (slot_no == fh->file_hdr_.num_records_per_page) {
+                // Page full → advance to next free page
+                fh->buffer_pool_manager_->unpin_page(page.page->get_page_id(), true);
+                if (fh->file_hdr_.first_free_page_no == -1) {
+                    page = fh->create_new_page_handle();
+                } else {
+                    page = fh->fetch_page_handle(fh->file_hdr_.first_free_page_no);
+                }
+                slot_no = Bitmap::first_bit(false, page.bitmap, fh->file_hdr_.num_records_per_page);
+            }
+            memcpy(page.get_slot(slot_no), buf, fh->file_hdr_.record_size);
+            TupleMeta& meta = page.get_meta(slot_no);
+            meta.commit_ts_ = 0;
+            meta.writer_txn_id_ = INVALID_TXN_ID;
+            meta.is_committed_ = true;
+            meta.is_deleted_ = false;
+            meta.version_chain_head_ = UndoLink{};
+            Bitmap::set(page.bitmap, slot_no);
+            page.page_hdr->num_records++;
+            if (page.page_hdr->num_records >= fh->file_hdr_.num_records_per_page) {
+                fh->file_hdr_.first_free_page_no = page.page_hdr->next_free_page_no;
+            }
+            return Rid{page.page->get_page_id().page_no, slot_no};
+        }
+    };
 
 private:
     RmPageHandle create_page_handle();

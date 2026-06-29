@@ -21,13 +21,17 @@ static const bool binary_search = false;
 inline int ix_compare(const char* a, const char* b, ColType type, int col_len) {
     switch (type) {
     case TYPE_INT: {
-        int ia = *(int*)a;
-        int ib = *(int*)b;
+        int ia;
+        int ib;
+        memcpy(&ia, a, sizeof(ia));
+        memcpy(&ib, b, sizeof(ib));
         return (ia < ib) ? -1 : ((ia > ib) ? 1 : 0);
     }
     case TYPE_FLOAT: {
-        float fa = *(float*)a;
-        float fb = *(float*)b;
+        float fa;
+        float fb;
+        memcpy(&fa, a, sizeof(fa));
+        memcpy(&fb, b, sizeof(fb));
         return (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);
     }
     case TYPE_STRING:
@@ -233,6 +237,20 @@ public:
     // for insert
     page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction);
 
+    // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
+    struct PinnedInserter {
+        IxIndexHandle* ih;
+        IxNodeHandle leaf;
+        bool active = false;
+
+        explicit PinnedInserter(IxIndexHandle* h);
+        ~PinnedInserter();
+        PinnedInserter(const PinnedInserter&) = delete;
+        PinnedInserter& operator=(const PinnedInserter&) = delete;
+
+        void insert(const char* key, const Rid& value, Transaction* txn);
+    };
+
     IxNodeHandle* split(IxNodeHandle* node);
 
     void insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node, Transaction* transaction);
@@ -269,6 +287,8 @@ private:
 
     // for get/create node
     IxNodeHandle* fetch_node(int page_no) const;
+
+    void fetch_node_into(int page_no, IxNodeHandle& out) const;
 
     IxNodeHandle* create_node();
 

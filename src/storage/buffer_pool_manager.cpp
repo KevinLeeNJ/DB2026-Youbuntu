@@ -13,6 +13,14 @@ See the Mulan PSL v2 for more details. */
 
 #include "recovery/log_manager.h"
 
+namespace {
+
+bool IsValidPageId(const PageId& page_id) {
+    return page_id.fd >= 0 && page_id.page_no != INVALID_PAGE_ID;
+}
+
+} // namespace
+
 void BufferPoolManager::flush_log_before_page_write() {
     if (log_manager_ != nullptr) {
         log_manager_->flush_log_to_disk();
@@ -62,9 +70,11 @@ void BufferPoolManager::update_page(Page* page, PageId new_page_id, frame_id_t n
         page->is_dirty_ = false;
     }
     // 更新page table
-    auto it = page_table_.find(page->id_);
-    if (it != page_table_.end()) {
-        page_table_.erase(it);
+    if (IsValidPageId(page->id_)) {
+        auto it = page_table_.find(page->id_);
+        if (it != page_table_.end()) {
+            page_table_.erase(it);
+        }
     }
     page_table_[new_page_id] = new_frame_id;
 
@@ -134,14 +144,16 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
             // 为了解决此问题，将flush_page()函数展开
             PageId old_page_id = targetPage->get_page_id();
-            if (page_table_.count(old_page_id) > 0) {
+            if (IsValidPageId(old_page_id) && page_table_.count(old_page_id) > 0) {
                 flush_log_before_page_write();
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, targetPage->data_, PAGE_SIZE);
             }
             targetPage->is_dirty_ = false;
         }
         // 2.2 更新page table
-        page_table_.erase(targetPage->get_page_id());
+        if (IsValidPageId(targetPage->get_page_id())) {
+            page_table_.erase(targetPage->get_page_id());
+        }
         page_table_.insert(std::make_pair(page_id, fid));
         // 2.3 重置page的data，更新page id
         targetPage->reset_memory();
@@ -280,7 +292,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
         // 为了解决此问题，将flush_page()函数剥离出来
         PageId old_page_id = page->id_;
-        if (page_table_.count(old_page_id) > 0) {
+        if (IsValidPageId(old_page_id) && page_table_.count(old_page_id) > 0) {
             frame_id_t fid = page_table_[old_page_id];
             Page* page = &(pages_[fid]);
             flush_log_before_page_write();
@@ -290,7 +302,9 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     }
 
     // 4.   更新page_table_
-    page_table_.erase(page->id_);
+    if (IsValidPageId(page->id_)) {
+        page_table_.erase(page->id_);
+    }
     page_table_.insert(std::make_pair(*page_id, fid));
 
     // 5.   固定frame，更新pin_count_
@@ -337,7 +351,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
     // 为了解决此问题，将flush_page()函数剥离出来
     PageId old_page_id = page_id;
-    if (page_table_.count(old_page_id) > 0) {
+    if (IsValidPageId(old_page_id) && page_table_.count(old_page_id) > 0) {
         frame_id_t fid = page_table_[old_page_id];
         Page* page = &(pages_[fid]);
         flush_log_before_page_write();
