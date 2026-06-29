@@ -710,4 +710,10 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
             target.inserter->insert(target.key.data(), rid, nullptr, true);
         }
     }
+
+    idx_inserters.clear();
+    { RmFileHandle::PinnedInserter tmp(std::move(rm_inserter)); }
+
+    flush_all_table_and_index_pages();
+    flush_meta();
 }
