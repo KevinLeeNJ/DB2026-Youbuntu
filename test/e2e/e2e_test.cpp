@@ -189,7 +189,7 @@ private:
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
         if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
             context->txn_->get_state() == TransactionState::ABORTED) {
-            context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_);
+            context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_, context->isolation_level_);
             txn_id_ = context->txn_->get_transaction_id();
             context->txn_->set_txn_mode(false);
         }

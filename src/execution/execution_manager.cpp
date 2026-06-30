@@ -105,7 +105,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         case T_Transaction_begin: {
             // 显示开启一个事务
             if (context->txn_ == nullptr) {
-                context->txn_ = txn_mgr_->begin(nullptr, context->log_mgr_);
+                context->txn_ = txn_mgr_->begin(nullptr, context->log_mgr_, context->isolation_level_);
                 *txn_id = context->txn_->get_transaction_id();
             }
             context->txn_->set_txn_mode(true);

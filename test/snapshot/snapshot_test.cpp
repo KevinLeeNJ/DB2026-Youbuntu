@@ -271,7 +271,7 @@ private:
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : db_->txn()->get_transaction(txn_id_);
         if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
             context->txn_->get_state() == TransactionState::ABORTED) {
-            context->txn_ = db_->txn()->begin(nullptr, context->log_mgr_);
+            context->txn_ = db_->txn()->begin(nullptr, context->log_mgr_, context->isolation_level_);
             txn_id_ = context->txn_->get_transaction_id();
             context->txn_->set_txn_mode(false);
             context->txn_->set_isolation_level(context->isolation_level_);
@@ -306,7 +306,7 @@ private:
 
     SharedTestDB* db_;
     txn_id_t txn_id_{INVALID_TXN_ID};
-    IsolationLevel session_isolation_{IsolationLevel::SERIALIZABLE};
+    IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
 
 // =============================================================================
@@ -367,6 +367,69 @@ TEST_F(SnapshotTest, SER_LatePredicateReadSeesOverlappingCommittedInsert) {
     std::string abort = t1->exec_sql_expect_abort("update late_predicate set val = 101 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(abort), "abort")
         << "T1 must see T2's overlapping committed insert as an invisible predicate write";
+}
+
+TEST_F(SnapshotTest, DefaultIsolationIsSnapshotIsolation) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table duty_default_iso (doctor_id int, on_call int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into duty_default_iso values (1, 1);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into duty_default_iso values (2, 1);"));
+
+    auto t1 = create_session();
+    auto t2 = create_session();
+    auto verifier = create_session();
+
+    SimpleThreadBarrier both_read(2), t1_updated(2), updates_done(2);
+    bool t1_update_ok = false;
+    bool t2_update_ok = false;
+    bool t1_commit_ok = false;
+    bool t2_commit_ok = false;
+
+    std::thread th1([&]() {
+        ASSERT_TRUE(t1->exec_sql_ok("begin;"));
+        ASSERT_TRUE(t1->exec_sql_ok("select * from duty_default_iso where doctor_id = 2;"));
+
+        both_read.arrive_and_wait();
+
+        t1_update_ok = t1->exec_sql_ok("update duty_default_iso set on_call = 0 where doctor_id = 1;");
+
+        t1_updated.arrive_and_wait();
+        updates_done.arrive_and_wait();
+
+        t1_commit_ok = t1->exec_sql_ok("commit;");
+    });
+
+    std::thread th2([&]() {
+        ASSERT_TRUE(t2->exec_sql_ok("begin;"));
+        ASSERT_TRUE(t2->exec_sql_ok("select * from duty_default_iso where doctor_id = 1;"));
+
+        both_read.arrive_and_wait();
+        t1_updated.arrive_and_wait();
+
+        t2_update_ok = t2->exec_sql_ok("update duty_default_iso set on_call = 0 where doctor_id = 2;");
+
+        updates_done.arrive_and_wait();
+
+        t2_commit_ok = t2->exec_sql_ok("commit;");
+    });
+
+    th1.join();
+    th2.join();
+
+    EXPECT_TRUE(t1_update_ok);
+    EXPECT_TRUE(t2_update_ok);
+    EXPECT_TRUE(t1_commit_ok);
+    EXPECT_TRUE(t2_commit_ok);
+
+    std::string result = verifier->exec_sql("select * from duty_default_iso;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|        doctor_id |          on_call |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |                0 |\n"
+                           "|                2 |                0 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 2";
+    EXPECT_EQ(TestSession::trim_output(result), expected);
 }
 
 // =============================================================================

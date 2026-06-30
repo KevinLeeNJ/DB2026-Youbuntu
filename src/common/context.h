@@ -25,7 +25,7 @@ public:
     Context(LockManager* lock_mgr, LogManager* log_mgr, Transaction* txn, char* data_send = nullptr,
             int* offset = &const_offset, TransactionManager* txn_mgr = nullptr)
         : lock_mgr_(lock_mgr), log_mgr_(log_mgr), txn_(txn), txn_mgr_(txn_mgr), data_send_(data_send), offset_(offset),
-          isolation_level_(IsolationLevel::SERIALIZABLE) {
+          isolation_level_(DEFAULT_ISOLATION_LEVEL) {
         ellipsis_ = false;
     }
 

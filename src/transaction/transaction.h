@@ -46,7 +46,7 @@ struct UndoLog {
 
 class Transaction {
 public:
-    explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE)
+    explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {
         lock_set_ = std::make_unique<std::unordered_set<LockDataId>>();
         index_latch_page_set_ = std::make_unique<std::deque<Page*>>();
@@ -188,7 +188,7 @@ public:
 private:
     bool txn_mode_;                  // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     TransactionState state_;         // 事务状态
-    IsolationLevel isolation_level_; // 事务的隔离级别，默认隔离级别为可串行化
+    IsolationLevel isolation_level_; // 事务的隔离级别
     std::thread::id thread_id_;      // 当前事务对应的线程id
     lsn_t prev_lsn_;                 // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
     txn_id_t txn_id_;                // 事务的ID，唯一标识符

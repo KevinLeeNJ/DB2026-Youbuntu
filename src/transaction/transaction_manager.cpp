@@ -289,11 +289,11 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
  * @param {Transaction*} txn 事务指针，空指针代表需要创建新事务，否则开始已有事务
  * @param {LogManager*} log_manager 日志管理器指针
  */
-Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
+Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager, IsolationLevel isolation_level) {
     std::unique_ptr<Transaction> created;
     if (txn == nullptr) {
         txn_id_t txn_id = next_txn_id_.fetch_add(1);
-        created = std::make_unique<Transaction>(txn_id);
+        created = std::make_unique<Transaction>(txn_id, isolation_level);
         txn = created.get();
     }
 

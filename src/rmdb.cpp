@@ -63,7 +63,7 @@ void SetTransaction(txn_id_t* txn_id, Context* context) {
     context->txn_ = txn_manager->get_transaction(*txn_id);
     if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
+        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
         context->txn_->set_isolation_level(context->isolation_level_);
@@ -80,8 +80,8 @@ void client_handler(int fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
-    // 记录客户端当前配置的隔离级别（默认 SERIALIZABLE）
-    IsolationLevel session_isolation_level = IsolationLevel::SERIALIZABLE;
+    // 记录客户端当前配置的隔离级别
+    IsolationLevel session_isolation_level = DEFAULT_ISOLATION_LEVEL;
     // 记录客户端是否开启向 output.txt 写入结果（默认开启）
     bool session_output_enabled = true;
 

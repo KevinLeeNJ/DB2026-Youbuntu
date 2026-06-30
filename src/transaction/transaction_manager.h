@@ -62,7 +62,8 @@ public:
 
     ~TransactionManager() = default;
 
-    Transaction* begin(Transaction* txn, LogManager* log_manager);
+    Transaction* begin(Transaction* txn, LogManager* log_manager,
+                       IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL);
 
     void commit(Transaction* txn, LogManager* log_manager);
 
