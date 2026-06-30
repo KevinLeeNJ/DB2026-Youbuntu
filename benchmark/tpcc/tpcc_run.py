@@ -12,6 +12,7 @@ from benchmark.tpcc.phases.benchmark import run_benchmark
 from benchmark.tpcc.core.parsing import scalar_int
 from benchmark.tpcc.phases.consistency import run_consistency, run_district_diagnostics
 from benchmark.tpcc.phases.datagen import complete_csv_set, ensure_empty_or_allowed, generate_all
+from benchmark.tpcc.phases.datagen import complete_csv_set, ensure_empty_or_allowed, generate_all
 from benchmark.tpcc.phases.load import TABLES, execute_sql_file, load_all
 
 
@@ -59,6 +60,10 @@ def phase(message: str) -> None:
     print(f"[tpcc] {message}", flush=True)
 
 
+def phase(message: str) -> None:
+    print(f"[tpcc] {message}", flush=True)
+
+
 def max_district_id(backend) -> int:
     return scalar_int(backend.execute("select max(d_id) from district;"), 0)
 
@@ -86,6 +91,8 @@ def main() -> None:
     parser.add_argument("--rmdb-db-dir", type=Path)
     parser.add_argument("--overwrite-data-dir", action="store_true")
     parser.add_argument("--reuse-data-dir", action="store_true")
+    parser.add_argument("--skip-consistency", action="store_true",
+                        help="skip the consistency check phase (useful for profiling)")
     args = parser.parse_args()
 
     schema_dir = Path(__file__).parent / "schema"
@@ -164,35 +171,39 @@ def main() -> None:
         args.json_out.write_text(json.dumps(summary, indent=2))
         print(json.dumps(summary, indent=2))
         phase(f"run complete: result={args.json_out}")
+        phase(f"run complete: result={args.json_out}")
 
     if args.command in ("consistency", "all"):
-        phase("consistency start")
-        committed = sum(round_result.total_committed_new_order() for round_result in rounds) if rounds else args.committed_new_order
-        backend = sqlite_backend_factory(args)() if args.backend == "sqlite" else rmdb_backend_factory(args)()
-        try:
-            if baseline_orders_total < 0:
-                current_orders = count_orders(backend)
-                baseline_orders_total = current_orders - committed
-            if baseline_warehouse_total < 0:
-                baseline_warehouse_total = count_warehouses(backend)
-            if baseline_district_total < 0:
-                baseline_district_total = count_districts(backend)
-            if districts_per_warehouse <= 0:
-                districts_per_warehouse = max_district_id(backend)
-            failures = run_consistency(
-                backend,
-                baseline_warehouse_total,
-                baseline_district_total,
-                baseline_orders_total,
-                committed,
-            )
-            failures.extend(run_district_diagnostics(backend, baseline_warehouse_total, districts_per_warehouse))
-        finally:
-            backend.close()
-        if failures:
-            raise SystemExit("\n".join(failures))
-        print("consistency ok")
-        phase("consistency complete")
+        if args.command == "all" and args.skip_consistency:
+            phase("consistency skipped (--skip-consistency)")
+        else:
+            phase("consistency start")
+            committed = sum(round_result.total_committed_new_order() for round_result in rounds) if rounds else args.committed_new_order
+            backend = sqlite_backend_factory(args)() if args.backend == "sqlite" else rmdb_backend_factory(args)()
+            try:
+                if baseline_orders_total < 0:
+                    current_orders = count_orders(backend)
+                    baseline_orders_total = current_orders - committed
+                if baseline_warehouse_total < 0:
+                    baseline_warehouse_total = count_warehouses(backend)
+                if baseline_district_total < 0:
+                    baseline_district_total = count_districts(backend)
+                if districts_per_warehouse <= 0:
+                    districts_per_warehouse = max_district_id(backend)
+                failures = run_consistency(
+                    backend,
+                    baseline_warehouse_total,
+                    baseline_district_total,
+                    baseline_orders_total,
+                    committed,
+                )
+                failures.extend(run_district_diagnostics(backend, baseline_warehouse_total, districts_per_warehouse))
+            finally:
+                backend.close()
+            if failures:
+                raise SystemExit("\n".join(failures))
+            print("consistency ok")
+            phase("consistency complete")
 
 
 if __name__ == "__main__":

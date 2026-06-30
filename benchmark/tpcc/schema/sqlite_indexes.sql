@@ -1,7 +1,6 @@
 create index idx_warehouse_pk on warehouse(w_id);
 create index idx_district_pk on district(d_w_id, d_id);
 create index idx_customer_pk on customer(c_w_id, c_d_id, c_id);
-create index idx_history_pk on history(h_w_id, h_d_id, h_c_w_id, h_c_d_id, h_c_id);
 create index idx_new_orders_pk on new_orders(no_w_id, no_d_id, no_o_id);
 create index idx_orders_pk on orders(o_w_id, o_d_id, o_id);
 create index idx_order_line_pk on order_line(ol_w_id, ol_d_id, ol_o_id, ol_number);

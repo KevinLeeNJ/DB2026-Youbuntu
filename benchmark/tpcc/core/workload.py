@@ -90,28 +90,33 @@ def worker_loop(
             try:
                 TXN_FUNCS[txn_type](backend, choose_context(profile, worker_id, policy))
                 outcome = "commit"
+                error_detail = None
             except InvalidItemRollback:
                 outcome = "invalid-item-rollback"
-            except BackendAbort:
+                error_detail = "invalid item rollback"
+            except BackendAbort as exc:
                 try:
                     backend.rollback()
                 except Exception:
                     pass
                 outcome = "server-abort"
-            except BackendError:
+                error_detail = str(exc)
+            except BackendError as exc:
                 try:
                     backend.rollback()
                 except Exception:
                     pass
                 outcome = "backend-error"
-            except Exception:
+                error_detail = str(exc)
+            except Exception as exc:
                 try:
                     backend.rollback()
                 except Exception:
                     pass
                 outcome = "backend-error"
+                error_detail = f"{type(exc).__name__}: {exc}"
             latency_ms = (time.monotonic() - start) * 1000.0
             with _RESULT_LOCK:
-                result.record(phase, txn_type, outcome, latency_ms)
+                result.record(phase, txn_type, outcome, latency_ms, error_detail)
     finally:
         backend.close()
