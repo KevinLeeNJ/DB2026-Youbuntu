@@ -10,11 +10,14 @@ diff-coverage.html
 *.pdf
 .DS_Store
 **/.DS_Store
-testdb
-
+__pycache__/
 CLAUDE.md
+
 #忽略测试数据库
 test_e2e_db
 testdb
+tpcc_benchmark_db
+benchmark/tpcc/data
+
 #忽略.codegraph
 .codegraph
