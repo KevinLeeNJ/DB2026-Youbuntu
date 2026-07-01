@@ -17,18 +17,15 @@ See the Mulan PSL v2 for more details. */
  */
 void IxScan::next() {
     assert(!is_end());
+    normalize_position();
+    if (is_end()) {
+        return;
+    }
     assert(pinned_leaf_page_ != nullptr);
     assert(leaf_.is_leaf_page());
     assert(iid_.slot_no < leaf_.get_size());
 
     // increment slot no
     iid_.slot_no++;
-    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == leaf_.get_size()) {
-        // go to next leaf
-        page_id_t next_leaf = leaf_.get_next_leaf();
-        unpin_current_leaf();
-        iid_.slot_no = 0;
-        iid_.page_no = next_leaf;
-        pin_current_leaf();
-    }
+    normalize_position();
 }

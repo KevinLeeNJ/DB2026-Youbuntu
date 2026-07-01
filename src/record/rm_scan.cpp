@@ -19,7 +19,9 @@ void RmScan::release_page() {
     }
 }
 
-RmScan::~RmScan() { release_page(); }
+RmScan::~RmScan() {
+    release_page();
+}
 
 /**
  * @brief 初始化file_handle和rid
@@ -44,12 +46,11 @@ void RmScan::next() {
     while (rid_.page_no < file_handle_->file_hdr_.num_pages) // 没到最后一页
     {
         if (pinned_page_ == nullptr) {
-            pinned_page_ = file_handle_->buffer_pool_manager_->fetch_page(
-                PageId{file_handle_->fd_, rid_.page_no});
+            pinned_page_ = file_handle_->buffer_pool_manager_->fetch_page(PageId{file_handle_->fd_, rid_.page_no});
         }
         RmPageHandle page_handle(&file_handle_->file_hdr_, pinned_page_);
         int next_slot = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
-                                         rid_.slot_no); // 找到下一个存放了记录的slot
+                                         rid_.slot_no);                // 找到下一个存放了记录的slot
         if (next_slot != file_handle_->file_hdr_.num_records_per_page) // 成功找到
         {
             flag = true;
@@ -61,7 +62,7 @@ void RmScan::next() {
         rid_.page_no++;
         rid_.slot_no = -1;
     }
-    if (!flag)             // 没有找到下一个有效的记录
+    if (!flag) // 没有找到下一个有效的记录
     {
         rid_.page_no = -1; // 没有更多记录
         release_page();

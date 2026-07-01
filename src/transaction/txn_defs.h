@@ -152,28 +152,28 @@ public:
         switch (abort_reason_) {
         case AbortReason::LOCK_ON_SHIRINKING: {
             return "Transaction " + std::to_string(txn_id_) +
-                   " aborted because it cannot request locks on SHRINKING phase\n";
+                   " aborted because it cannot request locks on SHRINKING phase";
         } break;
 
         case AbortReason::UPGRADE_CONFLICT: {
             return "Transaction " + std::to_string(txn_id_) +
-                   " aborted because another transaction is waiting for upgrading\n";
+                   " aborted because another transaction is waiting for upgrading";
         } break;
 
         case AbortReason::DEADLOCK_PREVENTION: {
-            return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention\n";
+            return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention";
         } break;
 
         case AbortReason::WW_CONFLICT: {
-            return "Transaction " + std::to_string(txn_id_) + " aborted because of write-write conflict\n";
+            return "Transaction " + std::to_string(txn_id_) + " aborted because of write-write conflict";
         } break;
 
         case AbortReason::SSI_DANGER: {
-            return "Transaction " + std::to_string(txn_id_) + " aborted because of SSI danger structure\n";
+            return "Transaction " + std::to_string(txn_id_) + " aborted because of SSI danger structure";
         } break;
 
         default: {
-            return "Transaction aborted\n";
+            return "Transaction aborted";
         } break;
         }
     }

@@ -180,8 +180,7 @@ std::string get_select_item_output_name(const SelectItem& item) {
     return item.expr.col.col_name;
 }
 
-bool has_value_equality(const std::vector<Condition>& conds, const std::string& tab_name,
-                        const std::string& col_name) {
+bool has_value_equality(const std::vector<Condition>& conds, const std::string& tab_name, const std::string& col_name) {
     return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
         return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name == tab_name &&
                cond.lhs_col.col_name == col_name;
@@ -530,9 +529,8 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
 
     std::vector<size_t> table_order(table_plans.size());
     std::iota(table_order.begin(), table_order.end(), 0);
-    std::stable_sort(table_order.begin(), table_order.end(), [&](size_t lhs, size_t rhs) {
-        return table_access_scores[lhs] > table_access_scores[rhs];
-    });
+    std::stable_sort(table_order.begin(), table_order.end(),
+                     [&](size_t lhs, size_t rhs) { return table_access_scores[lhs] > table_access_scores[rhs]; });
     std::vector<std::string> ordered_plan_tables;
     std::vector<std::unique_ptr<Plan>> ordered_table_plans;
     std::vector<std::vector<Condition>> ordered_table_scan_conds;

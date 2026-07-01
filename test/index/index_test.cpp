@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 #undef private
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -85,6 +86,31 @@ public:
         std::vector<char> buf(sizeof(int));
         std::memcpy(buf.data(), &value, sizeof(int));
         return buf;
+    }
+
+    struct LeafSnapshot {
+        page_id_t page_no;
+        std::vector<int> keys;
+    };
+
+    std::vector<LeafSnapshot> leaf_snapshots(IxIndexHandle* ih) {
+        std::vector<LeafSnapshot> leaves;
+        page_id_t page_no = ih->file_hdr_->first_leaf_;
+        while (page_no != IX_LEAF_HEADER_PAGE) {
+            IxNodeHandle* leaf = ih->fetch_node(page_no);
+            LeafSnapshot snapshot{page_no, {}};
+            for (int i = 0; i < leaf->get_size(); ++i) {
+                int value = 0;
+                std::memcpy(&value, leaf->get_key(i), sizeof(int));
+                snapshot.keys.push_back(value);
+            }
+            page_id_t next_leaf = leaf->get_next_leaf();
+            buffer_pool_manager->unpin_page(leaf->get_page_id(), false);
+            delete leaf;
+            leaves.push_back(std::move(snapshot));
+            page_no = next_leaf;
+        }
+        return leaves;
     }
 };
 
@@ -168,6 +194,49 @@ TEST_F(IndexHandleTest, DeletesKeysAndKeepsRemainingEntriesSearchable) {
             EXPECT_EQ(result[0].slot_no, value);
         }
     }
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
+    auto ih = open_index();
+    for (int value = 0; value < 2500; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+    }
+
+    auto leaves = leaf_snapshots(ih.get());
+    ASSERT_GE(leaves.size(), 3);
+    ASSERT_FALSE(leaves[0].keys.empty());
+    ASSERT_FALSE(leaves[1].keys.empty());
+    ASSERT_FALSE(leaves[2].keys.empty());
+
+    int before_empty = leaves[0].keys.back();
+    int after_empty = leaves[2].keys.front();
+    page_id_t emptied_page = leaves[1].page_no;
+    for (int value : leaves[1].keys) {
+        auto k = key(value);
+        EXPECT_TRUE(ih->delete_entry(k.data(), nullptr)) << value;
+    }
+
+    leaves = leaf_snapshots(ih.get());
+    auto emptied_leaf = std::find_if(leaves.begin(), leaves.end(),
+                                     [&](const LeafSnapshot& leaf) { return leaf.page_no == emptied_page; });
+    ASSERT_NE(emptied_leaf, leaves.end());
+    ASSERT_TRUE(emptied_leaf->keys.empty());
+
+    auto lower_key = key(before_empty);
+    auto upper_key = key(after_empty);
+    IxScan scan(ih.get(), ih->lower_bound(lower_key.data()), ih->upper_bound(upper_key.data()),
+                buffer_pool_manager.get());
+
+    std::vector<int> slots;
+    while (!scan.is_end()) {
+        slots.push_back(scan.rid().slot_no);
+        scan.next();
+    }
+
+    EXPECT_EQ(slots, std::vector<int>({before_empty, after_empty}));
 
     close_index(ih);
 }

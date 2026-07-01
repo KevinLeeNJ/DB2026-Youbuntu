@@ -93,10 +93,8 @@ TabMeta make_order_line_tab() {
     TabMeta tab;
     tab.name = "order_line";
     tab.cols = {
-        make_int_col("order_line", "ol_w_id", 0),
-        make_int_col("order_line", "ol_d_id", 4),
-        make_int_col("order_line", "ol_o_id", 8),
-        make_int_col("order_line", "ol_number", 12),
+        make_int_col("order_line", "ol_w_id", 0),  make_int_col("order_line", "ol_d_id", 4),
+        make_int_col("order_line", "ol_o_id", 8),  make_int_col("order_line", "ol_number", 12),
         make_int_col("order_line", "ol_i_id", 16),
     };
     tab.indexes.push_back(make_index("order_line", {tab.cols[0], tab.cols[1], tab.cols[2], tab.cols[3]}));
@@ -174,8 +172,8 @@ std::unique_ptr<Query> make_aggregate_query(bool with_sort, bool with_limit) {
 std::unique_ptr<Query> make_stock_level_query() {
     auto query = std::make_unique<Query>();
     query->parse = std::make_unique<ast::SelectStmt>(
-        std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("stock", ""),
-                                                                                    ast::TableRef("order_line", "")},
+        std::vector<std::unique_ptr<ast::SelectItem>>{},
+        std::vector<ast::TableRef>{ast::TableRef("stock", ""), ast::TableRef("order_line", "")},
         std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
         std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
         true);
@@ -184,12 +182,9 @@ std::unique_ptr<Query> make_stock_level_query() {
     query->select_items.push_back({.expr = make_count_star_expr(), .output_name = "COUNT(*)"});
     query->output_names = {"COUNT(*)"};
     query->conds = {
-        value_cond("stock", "s_w_id", OP_EQ, 1),
-        join_cond("stock", "s_i_id", "order_line", "ol_i_id"),
-        value_cond("order_line", "ol_w_id", OP_EQ, 1),
-        value_cond("order_line", "ol_d_id", OP_EQ, 1),
-        value_cond("order_line", "ol_o_id", OP_GE, 2981),
-        value_cond("order_line", "ol_o_id", OP_LT, 3001),
+        value_cond("stock", "s_w_id", OP_EQ, 1),          join_cond("stock", "s_i_id", "order_line", "ol_i_id"),
+        value_cond("order_line", "ol_w_id", OP_EQ, 1),    value_cond("order_line", "ol_d_id", OP_EQ, 1),
+        value_cond("order_line", "ol_o_id", OP_GE, 2981), value_cond("order_line", "ol_o_id", OP_LT, 3001),
         value_cond("stock", "s_quantity", OP_LT, 15),
     };
     return query;

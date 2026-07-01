@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -36,9 +37,9 @@ class IxScan : public RecScan {
         if (iid_ == end_) {
             return;
         }
-        Page* page = bpm_->fetch_page(PageId{ih_->fd_, iid_.page_no});
-        pinned_leaf_page_ = page;
-        ih_->fetch_node_into(iid_.page_no, leaf_);
+        pinned_leaf_page_ = bpm_->fetch_page(PageId{ih_->fd_, iid_.page_no});
+        assert(pinned_leaf_page_ != nullptr);
+        leaf_ = IxNodeHandle(ih_->file_hdr_.get(), pinned_leaf_page_);
     }
 
     void unpin_current_leaf() {
@@ -48,13 +49,44 @@ class IxScan : public RecScan {
         }
     }
 
+    void move_to_end() {
+        unpin_current_leaf();
+        iid_ = end_;
+    }
+
+    void normalize_position() {
+        while (iid_ != end_) {
+            pin_current_leaf();
+            assert(leaf_.is_leaf_page());
+
+            if (iid_.page_no == end_.page_no && iid_.slot_no >= end_.slot_no) {
+                move_to_end();
+                return;
+            }
+            if (iid_.slot_no < leaf_.get_size()) {
+                return;
+            }
+
+            page_id_t next_leaf = leaf_.get_next_leaf();
+            if (iid_.page_no == ih_->file_hdr_->last_leaf_ || next_leaf == IX_LEAF_HEADER_PAGE) {
+                move_to_end();
+                return;
+            }
+            unpin_current_leaf();
+            iid_.page_no = next_leaf;
+            iid_.slot_no = 0;
+        }
+    }
+
 public:
     IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm)
         : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {
-        pin_current_leaf();
+        normalize_position();
     }
 
-    ~IxScan() override { unpin_current_leaf(); }
+    ~IxScan() override {
+        unpin_current_leaf();
+    }
 
     IxScan(const IxScan&) = delete;
     IxScan& operator=(const IxScan&) = delete;
