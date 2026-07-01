@@ -34,7 +34,8 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
 
     auto* txn = context->txn_;
     auto* txn_mgr = context->txn_mgr_;
-    const timestamp_t read_ts = txn->get_start_ts();
+    const timestamp_t read_ts =
+        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
     const txn_id_t self_id = txn->get_transaction_id();
 
     TupleMeta meta = fh->get_tuple_meta(rid);

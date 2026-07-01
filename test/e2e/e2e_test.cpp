@@ -193,6 +193,7 @@ private:
             txn_id_ = context->txn_->get_transaction_id();
             context->txn_->set_txn_mode(false);
         }
+        txn_manager_->BeginStatement(context->txn_);
     }
 
     void finish_statement(Context* context) {

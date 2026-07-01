@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <sstream>
 
@@ -177,6 +178,61 @@ std::string get_select_item_output_name(const SelectItem& item) {
         return item.expr.agg.display_name;
     }
     return item.expr.col.col_name;
+}
+
+bool has_value_equality(const std::vector<Condition>& conds, const std::string& tab_name,
+                        const std::string& col_name) {
+    return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
+        return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name == tab_name &&
+               cond.lhs_col.col_name == col_name;
+    });
+}
+
+bool has_value_range(const std::vector<Condition>& conds, const std::string& tab_name, const std::string& col_name) {
+    return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
+        return cond.is_rhs_val && cond.op != OP_EQ && cond.op != OP_NE && cond.lhs_col.tab_name == tab_name &&
+               cond.lhs_col.col_name == col_name;
+    });
+}
+
+int index_access_score(const std::string& tab_name, const std::vector<std::string>& index_col_names,
+                       const std::vector<Condition>& scan_conds) {
+    if (index_col_names.empty()) {
+        return 0;
+    }
+
+    int score = 0;
+    for (const auto& col_name : index_col_names) {
+        if (has_value_equality(scan_conds, tab_name, col_name)) {
+            score += 10;
+            continue;
+        }
+        if (has_value_range(scan_conds, tab_name, col_name)) {
+            score += 5;
+        }
+        break;
+    }
+    return score;
+}
+
+std::vector<std::string> index_cols_for_inlj(const TabMeta& right_tab, const TabCol& right_col,
+                                             const std::vector<Condition>& right_scan_conds) {
+    for (const auto& index : right_tab.indexes) {
+        std::vector<std::string> index_col_names;
+        index_col_names.reserve(index.cols.size());
+        for (const auto& col : index.cols) {
+            index_col_names.push_back(col.name);
+        }
+        for (const auto& col : index.cols) {
+            if (col.name == right_col.col_name) {
+                return index_col_names;
+            }
+            if (!has_value_equality(right_scan_conds, right_tab.name, col.name)) {
+                break;
+            }
+        }
+    }
+    return {};
 }
 
 // Rebuild the right plan tree, replacing the SeqScan leaf with new_scan (IndexScan).
@@ -435,7 +491,11 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     auto plan_tables = query->tables;
 
     std::vector<std::unique_ptr<Plan>> table_plans;
+    std::vector<std::vector<Condition>> table_scan_conds;
+    std::vector<int> table_access_scores;
     table_plans.reserve(plan_tables.size());
+    table_scan_conds.reserve(plan_tables.size());
+    table_access_scores.reserve(plan_tables.size());
     for (const auto& table : plan_tables) {
         auto filter_pos = table_filters.find(table);
         std::vector<Condition> scan_conds;
@@ -449,6 +509,8 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         }
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(table, scan_conds, index_col_names);
+        table_access_scores.push_back(index_access_score(table, index_col_names, scan_conds));
+        table_scan_conds.push_back(scan_conds);
         std::unique_ptr<Plan> table_plan = std::make_unique<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan,
                                                                       sm_manager_, table, scan_conds, index_col_names);
 
@@ -465,6 +527,26 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
 
         table_plans.push_back(std::move(table_plan));
     }
+
+    std::vector<size_t> table_order(table_plans.size());
+    std::iota(table_order.begin(), table_order.end(), 0);
+    std::stable_sort(table_order.begin(), table_order.end(), [&](size_t lhs, size_t rhs) {
+        return table_access_scores[lhs] > table_access_scores[rhs];
+    });
+    std::vector<std::string> ordered_plan_tables;
+    std::vector<std::unique_ptr<Plan>> ordered_table_plans;
+    std::vector<std::vector<Condition>> ordered_table_scan_conds;
+    ordered_plan_tables.reserve(plan_tables.size());
+    ordered_table_plans.reserve(table_plans.size());
+    ordered_table_scan_conds.reserve(table_scan_conds.size());
+    for (size_t old_pos : table_order) {
+        ordered_plan_tables.push_back(std::move(plan_tables[old_pos]));
+        ordered_table_plans.push_back(std::move(table_plans[old_pos]));
+        ordered_table_scan_conds.push_back(std::move(table_scan_conds[old_pos]));
+    }
+    plan_tables = std::move(ordered_plan_tables);
+    table_plans = std::move(ordered_table_plans);
+    table_scan_conds = std::move(ordered_table_scan_conds);
 
     if (table_plans.empty()) {
         throw InternalError("SELECT has no table plan");
@@ -495,7 +577,7 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         // INLJ detection: find if right table has index on a join column
         TabCol inlj_left_col;
         TabCol inlj_right_col;
-        std::string inlj_index_col_name;
+        std::vector<std::string> inlj_index_col_names;
         if (!curr_join_conds.empty()) {
             TabMeta& next_tab = sm_manager_->db_.get_table(next_table);
             for (const auto& cond : curr_join_conds) {
@@ -517,22 +599,22 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
                 if (joined_tables.find(left_col.tab_name) == joined_tables.end()) {
                     continue;
                 }
-                // Check if right_col has an index on the right table
-                if (next_tab.is_index({right_col.col_name})) {
+                // Check if right_col can complete an indexed prefix on the right table.
+                auto candidate_index_cols = index_cols_for_inlj(next_tab, right_col, table_scan_conds[i]);
+                if (!candidate_index_cols.empty()) {
                     inlj_right_col = right_col;
                     inlj_left_col = left_col;
-                    inlj_index_col_name = right_col.col_name;
+                    inlj_index_col_names = std::move(candidate_index_cols);
                     break; // only use the first matching index
                 }
             }
         }
 
         std::unique_ptr<Plan> right_plan = std::move(table_plans[i]);
-        if (!inlj_index_col_name.empty()) {
+        if (!inlj_index_col_names.empty()) {
             // Replace right plan's SeqScan with IndexScan
-            std::unique_ptr<Plan> new_scan =
-                std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, next_table, std::vector<Condition>(),
-                                           std::vector<std::string>{inlj_index_col_name});
+            std::unique_ptr<Plan> new_scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, next_table,
+                                                                        table_scan_conds[i], inlj_index_col_names);
             right_plan = rebuild_right_plan_with_index(std::move(right_plan), std::move(new_scan));
         }
 
@@ -541,10 +623,10 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         } else {
             auto join_plan =
                 std::make_unique<JoinPlan>(T_NestLoop, std::move(joined), std::move(right_plan), curr_join_conds);
-            if (!inlj_index_col_name.empty()) {
+            if (!inlj_index_col_names.empty()) {
                 join_plan->inlj_left_col_ = inlj_left_col;
                 join_plan->inlj_right_col_ = inlj_right_col;
-                join_plan->inlj_index_col_name_ = inlj_index_col_name;
+                join_plan->inlj_index_col_name_ = inlj_right_col.col_name;
             }
             joined = std::move(join_plan);
         }

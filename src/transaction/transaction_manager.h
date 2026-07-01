@@ -65,6 +65,8 @@ public:
     Transaction* begin(Transaction* txn, LogManager* log_manager,
                        IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL);
 
+    void BeginStatement(Transaction* txn);
+
     void commit(Transaction* txn, LogManager* log_manager);
 
     void abort(Transaction* txn, LogManager* log_manager);

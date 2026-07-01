@@ -306,6 +306,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
 
     txn->set_state(TransactionState::GROWING);
     txn->set_start_ts(next_timestamp_.fetch_add(1));
+    txn->set_read_ts(last_commit_ts_.load());
     running_txns_.AddTxn(txn->get_start_ts());
     WriteBeginLog(txn, log_manager);
 
@@ -317,6 +318,15 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         active_serializable_txns_.insert(txn->get_transaction_id());
     }
     return txn;
+}
+
+void TransactionManager::BeginStatement(Transaction* txn) {
+    if (txn == nullptr) {
+        return;
+    }
+    if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+        txn->set_read_ts(last_commit_ts_.load());
+    }
 }
 
 /**

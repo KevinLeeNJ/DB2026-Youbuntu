@@ -68,6 +68,7 @@ void SetTransaction(txn_id_t* txn_id, Context* context) {
         context->txn_->set_txn_mode(false);
         context->txn_->set_isolation_level(context->isolation_level_);
     }
+    txn_manager->BeginStatement(context->txn_);
 }
 
 void client_handler(int fd) {
@@ -315,6 +316,7 @@ int main(int argc, char** argv) {
     }
 
     signal(SIGINT, sigint_handler);
+    signal(SIGPIPE, SIG_IGN);
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
