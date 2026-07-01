@@ -32,7 +32,11 @@ def rmdb_load_path(path: Path, relative_to: Path | None = None) -> str:
         # database directory when launched as `rmdb <db_dir>` from the parent of db_dir.
         path_to_emit = Path(os.path.relpath(path_to_emit, relative_to))
         text = path_to_emit.as_posix()
-        if path_to_emit.is_absolute() or text.startswith("./") or text.startswith("../"):
+        if (
+            path_to_emit.is_absolute()
+            or text.startswith("./")
+            or text.startswith("../")
+        ):
             return text
         return f"./{text}"
     # No db_dir context: emit an absolute path so the file is found regardless of cwd.
@@ -40,7 +44,11 @@ def rmdb_load_path(path: Path, relative_to: Path | None = None) -> str:
 
 
 def load_all(
-    backend: Backend, data_dir: Path, schema_dir: Path, backend_name: str, rmdb_db_dir: Path | None = None
+    backend: Backend,
+    data_dir: Path,
+    schema_dir: Path,
+    backend_name: str,
+    rmdb_db_dir: Path | None = None,
 ) -> None:
     if backend_name == "sqlite":
         execute_sql_file(backend, schema_dir / "sqlite_schema.sql")

@@ -17,7 +17,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT_DIR = Path(__file__).resolve().parents[2]
 SERVER_BIN = ROOT_DIR / "build" / "bin" / "rmdb"
 PORT = 8765
@@ -72,7 +71,9 @@ class LiveServer:
         start = time.monotonic()
         out = open(self.work_dir / f"{log_name}.out", "wb")
         err = open(self.work_dir / f"{log_name}.err", "wb")
-        self.proc = subprocess.Popen([str(SERVER_BIN), self.db_name], cwd=self.work_dir, stdout=out, stderr=err)
+        self.proc = subprocess.Popen(
+            [str(SERVER_BIN), self.db_name], cwd=self.work_dir, stdout=out, stderr=err
+        )
         wait_for_server()
         return time.monotonic() - start
 
@@ -137,14 +138,18 @@ def assert_count(client: SqlClient, expected: int) -> None:
     output = client.sql("select count(*) from kv;")
     actual = parse_first_int(output)
     if actual != expected:
-        raise AssertionError(f"行数不符合预期: expected={expected}, actual={actual}\n{output}")
+        raise AssertionError(
+            f"行数不符合预期: expected={expected}, actual={actual}\n{output}"
+        )
 
 
 def assert_value(client: SqlClient, row_id: int, expected_v: int) -> None:
     output = client.sql(f"select v from kv where id = {row_id};")
     actual = parse_first_int(output)
     if actual != expected_v:
-        raise AssertionError(f"id={row_id} 的 v 不符合预期: expected={expected_v}, actual={actual}\n{output}")
+        raise AssertionError(
+            f"id={row_id} 的 v 不符合预期: expected={expected_v}, actual={actual}\n{output}"
+        )
 
 
 def setup_schema(with_index: bool) -> None:
@@ -249,7 +254,9 @@ def run_case(
             assert_value(client, rows, rows * 10)
         finally:
             client.close()
-        return TestResult(name, True, f"功能通过，恢复耗时 {recovery_seconds:.4f}s", recovery_seconds)
+        return TestResult(
+            name, True, f"功能通过，恢复耗时 {recovery_seconds:.4f}s", recovery_seconds
+        )
     except BaseException as exc:  # noqa: BLE001 - 汇总测试结果
         return TestResult(name, False, str(exc), recovery_seconds)
     finally:
@@ -257,20 +264,26 @@ def run_case(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="运行真实 server crash recovery 近似测试矩阵")
+    parser = argparse.ArgumentParser(
+        description="运行真实 server crash recovery 近似测试矩阵"
+    )
     parser.add_argument("--skip-build", action="store_true", help="跳过 make build")
     parser.add_argument("--small-rows", type=int, default=30)
     parser.add_argument("--large-rows", type=int, default=2000)
     parser.add_argument("--huge-rows", type=int, default=10000)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--only", choices=[
-        "single",
-        "multi",
-        "index",
-        "large",
-        "without_checkpoint",
-        "with_checkpoint",
-    ], help="只运行一个测试点，便于定位")
+    parser.add_argument(
+        "--only",
+        choices=[
+            "single",
+            "multi",
+            "index",
+            "large",
+            "without_checkpoint",
+            "with_checkpoint",
+        ],
+        help="只运行一个测试点，便于定位",
+    )
     args = parser.parse_args()
 
     if not args.skip_build:
@@ -288,7 +301,11 @@ def main() -> int:
         with_checkpoint: TestResult | None = None
 
         if args.only in (None, "single"):
-            results.append(run_case("crash_recovery_single_thread_test", work_root, args.small_rows))
+            results.append(
+                run_case(
+                    "crash_recovery_single_thread_test", work_root, args.small_rows
+                )
+            )
         if args.only in (None, "multi"):
             results.append(
                 run_case(
@@ -300,7 +317,14 @@ def main() -> int:
                 )
             )
         if args.only in (None, "index"):
-            results.append(run_case("crash_recovery_index_test", work_root, args.large_rows, with_index=True))
+            results.append(
+                run_case(
+                    "crash_recovery_index_test",
+                    work_root,
+                    args.large_rows,
+                    with_index=True,
+                )
+            )
         if args.only in (None, "large"):
             results.append(
                 run_case(
@@ -312,7 +336,9 @@ def main() -> int:
                 )
             )
         if args.only in (None, "without_checkpoint"):
-            without_checkpoint = run_case("crash_recovery_without_checkpoint", work_root, args.huge_rows)
+            without_checkpoint = run_case(
+                "crash_recovery_without_checkpoint", work_root, args.huge_rows
+            )
             results.append(without_checkpoint)
         if args.only in (None, "with_checkpoint"):
             checkpoint_every = max(1, args.huge_rows // 8)
@@ -330,12 +356,19 @@ def main() -> int:
             status = "PASS" if result.ok else "FAIL"
             print(f"- {status} {result.name}: {result.detail}")
 
-        if without_checkpoint is not None and with_checkpoint is not None and without_checkpoint.ok and with_checkpoint.ok:
+        if (
+            without_checkpoint is not None
+            and with_checkpoint is not None
+            and without_checkpoint.ok
+            and with_checkpoint.ok
+        ):
             t1 = without_checkpoint.recovery_seconds or 0.0
             t2 = with_checkpoint.recovery_seconds or 0.0
             ratio = (t2 / t1) if t1 > 0 else float("inf")
             perf_status = "PASS" if ratio <= 0.70 else "WARN"
-            print(f"- {perf_status} checkpoint 恢复耗时比例: t2/t1 = {ratio:.3f} ({t2:.4f}s / {t1:.4f}s)")
+            print(
+                f"- {perf_status} checkpoint 恢复耗时比例: t2/t1 = {ratio:.3f} ({t2:.4f}s / {t1:.4f}s)"
+            )
 
         return 0 if all(result.ok for result in results) else 1
     finally:

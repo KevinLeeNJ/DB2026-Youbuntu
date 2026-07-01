@@ -4,7 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 
-from benchmark.tpcc.core.backend import Backend
+from benchmark.tpcc.core.backend import Backend, BackendError
 from benchmark.tpcc.core.constants import DISTRICTS_PER_WAREHOUSE
 from benchmark.tpcc.core.parsing import scalar_float, scalar_int, scalar_text
 
@@ -33,20 +33,33 @@ def new_order(backend: Backend, ctx: TxnContext) -> None:
     backend.begin()
     try:
         d_next = scalar_int(
-            backend.execute(f"select d_next_o_id from district where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};")
+            backend.execute(
+                f"select d_next_o_id from district where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
+            ),
+            -1,
         )
+        if d_next <= 0:
+            raise BackendError("district next order id not found")
         backend.execute(
             f"update district set d_next_o_id = {d_next + 1} where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
         )
         backend.execute(
             f"insert into orders values ({d_next}, {ctx.d_id}, {ctx.w_id}, {c_id}, '{now_text()}', 0, {ol_cnt}, 1);"
         )
-        backend.execute(f"insert into new_orders values ({d_next}, {ctx.d_id}, {ctx.w_id});")
+        backend.execute(
+            f"insert into new_orders values ({d_next}, {ctx.d_id}, {ctx.w_id});"
+        )
         invalid = random.randint(1, 100) == 1
         for number in range(1, ol_cnt + 1):
-            item_id = ctx.item_count + 1 if invalid and number == ol_cnt else random.randint(1, ctx.item_count)
-            item_price_text = backend.execute(f"select i_price from item where i_id = {item_id};")
-            if not item_price_text.strip():
+            item_id = (
+                ctx.item_count + 1
+                if invalid and number == ol_cnt
+                else random.randint(1, ctx.item_count)
+            )
+            item_price_text = backend.execute(
+                f"select i_price from item where i_id = {item_id};"
+            )
+            if scalar_text(item_price_text, "") == "":
                 raise InvalidItemRollback()
             price = scalar_float(item_price_text, 1.0)
             qty = random.randint(1, 10)
@@ -75,7 +88,9 @@ def payment(backend: Backend, ctx: TxnContext) -> None:
     c_id = random.randint(1, ctx.customers_per_district)
     amount = round(random.uniform(1.0, 5000.0), 2)
     backend.begin()
-    backend.execute(f"update warehouse set w_ytd = w_ytd + {amount} where w_id = {ctx.w_id};")
+    backend.execute(
+        f"update warehouse set w_ytd = w_ytd + {amount} where w_id = {ctx.w_id};"
+    )
     backend.execute(
         f"update district set d_ytd = d_ytd + {amount} where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
     )
@@ -115,7 +130,9 @@ def delivery(backend: Backend, ctx: TxnContext) -> None:
     backend.begin()
     for d_id in range(1, ctx.districts_per_warehouse + 1):
         o_id = scalar_int(
-            backend.execute(f"select min(no_o_id) from new_orders where no_w_id = {ctx.w_id} and no_d_id = {d_id};"),
+            backend.execute(
+                f"select min(no_o_id) from new_orders where no_w_id = {ctx.w_id} and no_d_id = {d_id};"
+            ),
             0,
         )
         if o_id == 0:
@@ -154,7 +171,9 @@ def stock_level(backend: Backend, ctx: TxnContext) -> None:
     threshold = random.randint(10, 20)
     backend.begin()
     d_next = scalar_int(
-        backend.execute(f"select d_next_o_id from district where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"),
+        backend.execute(
+            f"select d_next_o_id from district where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
+        ),
         0,
     )
     backend.execute(

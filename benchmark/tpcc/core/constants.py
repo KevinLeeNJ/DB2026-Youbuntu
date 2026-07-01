@@ -43,4 +43,3 @@ def surname(number: int) -> str:
     tens = (number // 10) % 10
     ones = number % 10
     return C_LAST_SYLLABLES[hundreds] + C_LAST_SYLLABLES[tens] + C_LAST_SYLLABLES[ones]
-

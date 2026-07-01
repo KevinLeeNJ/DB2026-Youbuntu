@@ -34,7 +34,10 @@ def progress_monitor(
             break
         if phase != last_phase:
             last_phase = phase
-        print(format_progress_line(result, round_no, total_rounds, phase, elapsed, total), flush=True)
+        print(
+            format_progress_line(result, round_no, total_rounds, phase, elapsed, total),
+            flush=True,
+        )
 
 
 def run_round(
@@ -52,7 +55,12 @@ def run_round(
     profile = inspect_dataset(backend_factory)
     warmup_end = time.monotonic() + warmup_seconds
     measure_end = warmup_end + measure_seconds
-    print(format_progress_line(result, round_no, total_rounds, "warmup", 0, warmup_seconds), flush=True)
+    print(
+        format_progress_line(
+            result, round_no, total_rounds, "warmup", 0, warmup_seconds
+        ),
+        flush=True,
+    )
     stop_event = threading.Event()
     monitor = None
     if progress_interval > 0:
@@ -75,7 +83,15 @@ def run_round(
     threads = [
         threading.Thread(
             target=worker_loop,
-            args=(backend_factory, result, worker_id, profile, warehouse_policy, warmup_end, measure_end),
+            args=(
+                backend_factory,
+                result,
+                worker_id,
+                profile,
+                warehouse_policy,
+                warmup_end,
+                measure_end,
+            ),
         )
         for worker_id in range(workers)
     ]
@@ -86,7 +102,12 @@ def run_round(
     stop_event.set()
     if monitor is not None:
         monitor.join()
-    print(format_progress_line(result, round_no, total_rounds, "measure", measure_seconds, measure_seconds), flush=True)
+    print(
+        format_progress_line(
+            result, round_no, total_rounds, "measure", measure_seconds, measure_seconds
+        ),
+        flush=True,
+    )
     return result
 
 

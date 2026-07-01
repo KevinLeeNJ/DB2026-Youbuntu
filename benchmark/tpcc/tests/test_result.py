@@ -41,11 +41,25 @@ class ResultTest(unittest.TestCase):
 
     def test_error_details_are_counted_in_json_result(self) -> None:
         result = RoundResult(measure_seconds=60)
-        result.record("measure", "payment", "backend-error", 1.0, "Error: Index entry already exists")
-        result.record("measure", "payment", "backend-error", 1.0, "Error: Index entry already exists")
+        result.record(
+            "measure",
+            "payment",
+            "backend-error",
+            1.0,
+            "Error: Index entry already exists",
+        )
+        result.record(
+            "measure",
+            "payment",
+            "backend-error",
+            1.0,
+            "Error: Index entry already exists",
+        )
 
         self.assertEqual(
-            result.to_dict()["errors"]["measure"]["payment"]["Error: Index entry already exists"],
+            result.to_dict()["errors"]["measure"]["payment"][
+                "Error: Index entry already exists"
+            ],
             2,
         )
 
