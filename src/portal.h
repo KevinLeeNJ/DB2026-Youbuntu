@@ -734,7 +734,7 @@ public:
             auto having_conds = to_executor_having_conds(x->having_conds_);
             std::unique_ptr<AbstractExecutor> executor =
                 std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
-                                                    x->group_by_cols_, x->agg_exprs_, having_conds);
+                                                    x->group_by_cols_, x->agg_exprs_, having_conds, context);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_SeqScan:

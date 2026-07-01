@@ -103,6 +103,7 @@ private:
     struct has_member_agg<T, std::void_t<decltype(std::declval<const T&>().agg)>> : std::true_type {};
 
     std::unique_ptr<AbstractExecutor> prev_;
+    Context* context_ = nullptr;
     std::vector<ColMeta> cols_;
     size_t len_ = 0;
     std::vector<ColMeta> group_cols_;
@@ -445,6 +446,19 @@ private:
                !prev_->scan_table_name().empty();
     }
 
+    // min(col) can stop at the first row if the child provides ascending order
+    // on col. Only applies to a single min() with no GROUP BY / HAVING.
+    bool can_use_min_index_shortcut() const {
+        if (has_group_by_ || !having_conds_.empty() || aggregates_.size() != 1) {
+            return false;
+        }
+        const auto& agg = aggregates_[0];
+        if (agg.type != LocalAggType::MIN || agg.is_star) {
+            return false;
+        }
+        return prev_->provides_min_order(agg.col);
+    }
+
     std::unique_ptr<RmRecord> materialize_group_result(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
         RmRecord rec(static_cast<int>(len_));
@@ -513,6 +527,27 @@ private:
                 ++global_state.aggregate_states[0].count;
             }
             groups_.push_back(std::move(global_state));
+            return;
+        }
+
+        // min(col) index-order shortcut: when the child yields rows in ascending
+        // order of the aggregated column (e.g. an index range scan whose leading
+        // column is col), the first visible matching row is the minimum, so we can
+        // stop after consuming it instead of scanning the whole range.
+        if (can_use_min_index_shortcut()) {
+            for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+                auto rec = prev_->Next();
+                if (rec == nullptr) {
+                    continue;
+                }
+                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], *rec);
+                groups_.push_back(std::move(global_state));
+                return;
+            }
+            // No visible rows: result is the zero/empty value.
+            if (passes_having(global_state)) {
+                groups_.push_back(std::move(global_state));
+            }
             return;
         }
 
@@ -590,8 +625,9 @@ private:
 public:
     template <typename GroupByT, typename AggExprT, typename HavingCondT>
     AggregateExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<GroupByT>& group_by_cols,
-                      const std::vector<AggExprT>& aggregate_exprs, const std::vector<HavingCondT>& having_conds)
-        : prev_(std::move(prev)) {
+                      const std::vector<AggExprT>& aggregate_exprs, const std::vector<HavingCondT>& having_conds,
+                      Context* context = nullptr)
+        : prev_(std::move(prev)), context_(context) {
         init_group_cols(group_by_cols);
         init_aggregate_cols(aggregate_exprs);
         init_having_conds(having_conds);

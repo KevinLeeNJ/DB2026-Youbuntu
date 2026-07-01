@@ -18,8 +18,19 @@ class RmScan : public RecScan {
     const RmFileHandle* file_handle_;
     Rid rid_;
 
+    // Pinned current data page. Stays pinned while walking slots on the same
+    // page; released on move to next page / destruction / reaching end.
+    Page* pinned_page_ = nullptr;
+
+    void release_page();
+
 public:
     RmScan(const RmFileHandle* file_handle);
+
+    ~RmScan() override;
+
+    RmScan(const RmScan&) = delete;
+    RmScan& operator=(const RmScan&) = delete;
 
     void next() override;
 

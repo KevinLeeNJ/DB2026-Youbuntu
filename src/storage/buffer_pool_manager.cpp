@@ -106,8 +106,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     // Todo:
     //  1.     从page_table_中搜寻目标页
     //  1.1    若目标页有被page_table_记录，则将其所在frame固定(pin)，并返回目标页。
-    if (page_table_.count(page_id) > 0) {
-        frame_id_t fid = page_table_[page_id];
+    auto hit = page_table_.find(page_id);
+    if (hit != page_table_.end()) {
+        frame_id_t fid = hit->second;
         replacer_->pin(fid);
 
         // 返回目标页
@@ -142,9 +143,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         // 2.1 如果是脏页，写回磁盘，并且把dirty置为false
         if (targetPage->is_dirty()) {
             // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
-            // 为了解决此问题，将flush_page()函数展开
+            // 为了解决此问题，将flush_page()函数剥离出来
             PageId old_page_id = targetPage->get_page_id();
-            if (IsValidPageId(old_page_id) && page_table_.count(old_page_id) > 0) {
+            if (IsValidPageId(old_page_id) && page_table_.find(old_page_id) != page_table_.end()) {
                 flush_log_before_page_write();
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, targetPage->data_, PAGE_SIZE);
             }
@@ -191,11 +192,12 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     std::scoped_lock lock{latch_};
     // 1. 尝试在page_table_中搜寻page_id对应的页P
     // 1.1 P在页表中不存在 return false
-    if (page_table_.count(page_id) == 0)
+    auto hit = page_table_.find(page_id);
+    if (hit == page_table_.end())
         return false;
 
     // 1.2 P在页表中存在,获取其pin_count_
-    frame_id_t fid = page_table_[page_id];
+    frame_id_t fid = hit->second;
     Page* targetPage = &(pages_[fid]);
 
     // 2.1 若pin_count_已经等于0,则返回false
@@ -234,13 +236,14 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     // 1.1 目标页P没有被page_table_记录 ，返回false
     std::scoped_lock lock{latch_};
 
-    if (page_table_.count(page_id) == 0) {
+    auto hit = page_table_.find(page_id);
+    if (hit == page_table_.end()) {
         return false;
     }
     // if(page_id.page_no == -1){
     //     std::cout<<"问题发生,page_id.pag_no=-1"<<std::endl;
     // }
-    frame_id_t fid = page_table_[page_id];
+    frame_id_t fid = hit->second;
     Page* page = &(pages_[fid]);
     // 2. 无论P是否为脏都将其写回磁盘。
     flush_log_before_page_write();
@@ -292,8 +295,9 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
         // 为了解决此问题，将flush_page()函数剥离出来
         PageId old_page_id = page->id_;
-        if (IsValidPageId(old_page_id) && page_table_.count(old_page_id) > 0) {
-            frame_id_t fid = page_table_[old_page_id];
+        auto old_hit = page_table_.find(old_page_id);
+        if (IsValidPageId(old_page_id) && old_hit != page_table_.end()) {
+            frame_id_t fid = old_hit->second;
             Page* page = &(pages_[fid]);
             flush_log_before_page_write();
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
@@ -335,10 +339,11 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     std::scoped_lock lock{latch_};
 
     // 1.   在page_table_中查找目标页，若不存在返回true
-    if (page_table_.count(page_id) == 0) {
+    auto hit = page_table_.find(page_id);
+    if (hit == page_table_.end()) {
         return true;
     }
-    frame_id_t fid = page_table_[page_id];
+    frame_id_t fid = hit->second;
     // 将目标页从replacer的队列中删除，防止被其他进程引用
     replacer_->pin(fid);
     // 2.   若目标页的pin_count不为0，则返回false
@@ -350,14 +355,9 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 3.   将目标页数据写回磁盘
     // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
     // 为了解决此问题，将flush_page()函数剥离出来
-    PageId old_page_id = page_id;
-    if (IsValidPageId(old_page_id) && page_table_.count(old_page_id) > 0) {
-        frame_id_t fid = page_table_[old_page_id];
-        Page* page = &(pages_[fid]);
-        flush_log_before_page_write();
-        disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
-        page->is_dirty_ = false;
-    }
+    flush_log_before_page_write();
+    disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    page->is_dirty_ = false;
 
     // 4. 从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
     page_table_.erase(page_id);

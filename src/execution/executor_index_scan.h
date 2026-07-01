@@ -397,4 +397,46 @@ public:
             record_tuple_read(rid_, true);
         }
     }
+
+    // An ascending index range scan yields rows ordered by the index columns.
+    // A min(col) aggregate on `col` can be answered from the first visible
+    // matching row when `col` is an index column and every index column before
+    // it is constrained to a single equality value (so the remaining order is
+    // monotonic in `col`).
+    bool provides_min_order(const TabCol& col) const override {
+        if (use_heap_scan_for_mvcc_) {
+            return false;
+        }
+        if (!col.tab_name.empty() && col.tab_name != tab_name_) {
+            return false;
+        }
+        // Locate col within the index column sequence.
+        size_t col_pos = index_meta_.cols.size();
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            if (index_meta_.cols[i].name == col.col_name) {
+                col_pos = i;
+                break;
+            }
+        }
+        if (col_pos == index_meta_.cols.size()) {
+            return false; // col not part of this index
+        }
+        // Every index column preceding col must have an equality predicate on
+        // this table, otherwise the scan is not monotonic in col alone.
+        for (size_t i = 0; i < col_pos; ++i) {
+            const std::string& before_name = index_meta_.cols[i].name;
+            bool has_eq = false;
+            for (const auto& cond : fed_conds_) {
+                if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == before_name &&
+                    (cond.lhs_col.tab_name.empty() || cond.lhs_col.tab_name == tab_name_)) {
+                    has_eq = true;
+                    break;
+                }
+            }
+            if (!has_eq) {
+                return false;
+            }
+        }
+        return true;
+    }
 };

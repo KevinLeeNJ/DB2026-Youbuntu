@@ -71,6 +71,14 @@ public:
 
     virtual void record_current_read_for_ssi() {}
 
+    // Returns true if this executor yields rows in ascending order of `col`
+    // (i.e. an index-ordered scan whose range is monotonic on `col`), so that
+    // a min(col) aggregate can be answered from the first matching row alone.
+    // Default: not supported.
+    virtual bool provides_min_order(const TabCol& /*col*/) const {
+        return false;
+    }
+
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;
