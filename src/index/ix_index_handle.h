@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
+#include <mutex>
+
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
 
 static const bool binary_search = false;
@@ -240,6 +242,7 @@ public:
     // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
     struct PinnedInserter {
         IxIndexHandle* ih;
+        std::unique_lock<std::mutex> latch;
         IxNodeHandle leaf;
         bool active = false;
 
@@ -271,6 +274,8 @@ public:
     Iid lower_bound(const char* key);
 
     Iid upper_bound(const char* key);
+
+    std::pair<Iid, Iid> equal_range(const char* key);
 
     Iid leaf_end() const;
 

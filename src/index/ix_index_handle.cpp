@@ -200,6 +200,7 @@ std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Op
  */
 bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transaction* transaction) {
     (void)transaction;
+    std::lock_guard<std::mutex> guard(root_latch_);
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
     IxScan scan(this, lower, upper, buffer_pool_manager_);
@@ -302,6 +303,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
  */
 page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
                                       bool allow_duplicate) {
+    std::lock_guard<std::mutex> guard(root_latch_);
     IxNodeHandle leaf;
     fetch_node_into(file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
@@ -343,7 +345,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
     return inserted_page_no;
 }
 
-IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h) {
+IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h), latch(h->root_latch_) {
     ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
         page_id_t child_page_no = leaf.value_at(0);
@@ -420,6 +422,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
+    std::lock_guard<std::mutex> guard(root_latch_);
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
@@ -440,6 +443,7 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 
 bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
     (void)transaction;
+    std::lock_guard<std::mutex> guard(root_latch_);
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
     IxScan scan(this, lower, upper, buffer_pool_manager_);
@@ -660,6 +664,39 @@ Iid IxIndexHandle::upper_bound(const char* key) {
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
     delete leaf;
     return iid;
+}
+
+/**
+ * @brief Single root-to-leaf descent returning both lower and upper Iid for an
+ * equality lookup. Avoids the double tree walk of lower_bound + upper_bound.
+ */
+std::pair<Iid, Iid> IxIndexHandle::equal_range(const char* key) {
+    IxNodeHandle leaf;
+    fetch_node_into(file_hdr_->root_page_, leaf);
+    while (!leaf.is_leaf_page()) {
+        int child_idx = leaf.lower_bound(key);
+        if (child_idx >= leaf.get_size()) {
+            child_idx = leaf.get_size() - 1;
+        } else if (child_idx > 0 &&
+                   ix_compare(leaf.get_key(child_idx), key, file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
+            child_idx--;
+        }
+        page_id_t child_page_no = leaf.value_at(child_idx);
+        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+        fetch_node_into(child_page_no, leaf);
+    }
+    int lower_slot = leaf.lower_bound(key);
+    int upper_slot = leaf.upper_bound(key);
+    Iid lower{leaf.get_page_no(), lower_slot};
+    if (lower_slot == leaf.get_size() && leaf.get_page_no() != file_hdr_->last_leaf_) {
+        lower = Iid{leaf.get_next_leaf(), 0};
+    }
+    Iid upper{leaf.get_page_no(), upper_slot};
+    if (upper_slot == leaf.get_size() && leaf.get_page_no() != file_hdr_->last_leaf_) {
+        upper = Iid{leaf.get_next_leaf(), 0};
+    }
+    buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+    return {lower, upper};
 }
 
 /**

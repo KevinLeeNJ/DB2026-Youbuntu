@@ -16,9 +16,11 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/config.h"
@@ -166,6 +168,144 @@ TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
     }
 
     EXPECT_EQ(slots, std::vector<int>({123, 124, 125, 126, 127, 128, 129, 130}));
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, EqualRangeMatchesLowerBoundPlusUpperBound) {
+    auto ih = open_index();
+    // Insert enough keys to cause several leaf splits (btree_order is small).
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    // For every key (including non-existent ones at boundaries), verify that
+    // equal_range produces the same IxScan result as lower_bound + upper_bound.
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+
+        Iid lo1 = ih->lower_bound(k.data());
+        Iid hi1 = ih->upper_bound(k.data());
+
+        auto [lo2, hi2] = ih->equal_range(k.data());
+
+        // Collect rids via the two-visit approach.
+        std::vector<int> rids1;
+        IxScan scan1(ih.get(), lo1, hi1, buffer_pool_manager.get());
+        while (!scan1.is_end()) {
+            rids1.push_back(scan1.rid().slot_no);
+            scan1.next();
+        }
+
+        // Collect rids via equal_range.
+        std::vector<int> rids2;
+        IxScan scan2(ih.get(), lo2, hi2, buffer_pool_manager.get());
+        while (!scan2.is_end()) {
+            rids2.push_back(scan2.rid().slot_no);
+            scan2.next();
+        }
+
+        EXPECT_EQ(rids1, rids2) << "Mismatch at key=" << value;
+        ASSERT_EQ(rids1.size(), 1u) << "Expected exactly one entry for key=" << value;
+        EXPECT_EQ(rids1[0], value);
+    }
+
+    // Also test non-existent keys (gaps after deletion would be ideal, but
+    // with all keys present, test boundary values).
+    for (int value : {-1, 2000, 2001}) {
+        auto k = key(value);
+        Iid lo1 = ih->lower_bound(k.data());
+        Iid hi1 = ih->upper_bound(k.data());
+        auto [lo2, hi2] = ih->equal_range(k.data());
+
+        std::vector<int> rids1;
+        IxScan scan1(ih.get(), lo1, hi1, buffer_pool_manager.get());
+        while (!scan1.is_end()) {
+            rids1.push_back(scan1.rid().slot_no);
+            scan1.next();
+        }
+
+        std::vector<int> rids2;
+        IxScan scan2(ih.get(), lo2, hi2, buffer_pool_manager.get());
+        while (!scan2.is_end()) {
+            rids2.push_back(scan2.rid().slot_no);
+            scan2.next();
+        }
+
+        EXPECT_EQ(rids1, rids2) << "Mismatch at non-existent key=" << value;
+        EXPECT_TRUE(rids1.empty()) << "Expected empty result for non-existent key=" << value;
+    }
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
+    auto ih = open_index();
+    auto duplicate_key = key(777);
+
+    std::vector<Rid> inserted;
+    for (int i = 0; i < 1000; ++i) {
+        Rid rid{i + 1, i};
+        inserted.push_back(rid);
+        ih->insert_entry(duplicate_key.data(), rid, nullptr, true);
+    }
+
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), inserted.size());
+
+    Rid target = inserted[inserted.size() / 2];
+    EXPECT_TRUE(ih->delete_entry(duplicate_key.data(), target, nullptr));
+
+    result.clear();
+    ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
+    EXPECT_EQ(result.size(), inserted.size() - 1);
+    EXPECT_TRUE(std::none_of(result.begin(), result.end(), [&](const Rid& rid) { return rid == target; }));
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ConcurrentInsertDeleteByRidDoesNotCorruptTree) {
+    auto ih = open_index();
+    auto duplicate_key = key(888);
+
+    constexpr int thread_count = 8;
+    constexpr int iterations = 3000;
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    for (int thread_id = 0; thread_id < thread_count; ++thread_id) {
+        threads.emplace_back([&, thread_id] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            for (int i = 0; i < iterations; ++i) {
+                Rid rid{thread_id + 1, i};
+                try {
+                    ih->insert_entry(duplicate_key.data(), rid, nullptr, true);
+                    if (!ih->delete_entry(duplicate_key.data(), rid, nullptr)) {
+                        failures.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } catch (...) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+
+    std::vector<Rid> result;
+    bool found = ih->get_value(duplicate_key.data(), &result, nullptr);
+    EXPECT_FALSE(found);
+    EXPECT_TRUE(result.empty());
 
     close_index(ih);
 }

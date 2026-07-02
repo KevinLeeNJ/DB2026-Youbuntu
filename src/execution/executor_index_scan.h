@@ -307,8 +307,15 @@ public:
             break;
         }
 
-        Iid lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
-        Iid upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
+        Iid lower, upper;
+        if (!lower_exclusive && upper_inclusive && lower_key == upper_key) {
+            auto [lo, hi] = ih->equal_range(lower_key.data());
+            lower = lo;
+            upper = hi;
+        } else {
+            lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
+            upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
+        }
         scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
         advance_to_match();
     }

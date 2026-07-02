@@ -203,7 +203,6 @@ def main() -> None:
         args.json_out.write_text(json.dumps(summary, indent=2))
         print(json.dumps(summary, indent=2))
         phase(f"run complete: result={args.json_out}")
-        phase(f"run complete: result={args.json_out}")
 
     if args.command in ("consistency", "all"):
         if args.command == "all" and args.skip_consistency:
