@@ -51,6 +51,8 @@ public:
         context_ = context;
     }
     std::unique_ptr<RmRecord> Next() override {
+        bool has_non_self_ref_set = std::any_of(set_clauses_.begin(), set_clauses_.end(),
+                                                [](const SetClause& clause) { return !clause.is_self_ref; });
         for (Rid& rid : rids_) {
             std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
@@ -68,6 +70,7 @@ public:
                 // MVCC Write-Write conflict detection
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     auto txn = context_->txn_;
+                    timestamp_t statement_read_ts = txn->get_read_ts();
                     if (context_->lock_mgr_ != nullptr &&
                         !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
                         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
@@ -87,6 +90,12 @@ public:
                         }
                         if (!latest_match) {
                             continue;
+                        }
+                        TupleMeta latest_meta = fh_->get_tuple_meta(rid);
+                        if (has_non_self_ref_set && latest_meta.is_committed_ &&
+                            latest_meta.writer_txn_id_ != txn->get_transaction_id() &&
+                            latest_meta.commit_ts_ > statement_read_ts) {
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
                     }
                     TupleMeta meta = fh_->get_tuple_meta(rid);

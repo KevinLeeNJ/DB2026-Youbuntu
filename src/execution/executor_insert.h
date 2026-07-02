@@ -90,7 +90,9 @@ public:
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
-        if (DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, tab_name_, rec, context_)) {
+        if (context_ != nullptr && context_->txn_ != nullptr &&
+            context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
+            DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, tab_name_, rec, context_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
         }
 

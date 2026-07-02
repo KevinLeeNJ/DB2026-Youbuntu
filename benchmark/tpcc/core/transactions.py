@@ -32,17 +32,18 @@ def new_order(backend: Backend, ctx: TxnContext) -> None:
     ol_cnt = random.randint(5, 15)
     backend.begin()
     try:
-        d_next = scalar_int(
+        backend.execute(
+            f"update district set d_next_o_id = d_next_o_id + 1 where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
+        )
+        d_next_after = scalar_int(
             backend.execute(
                 f"select d_next_o_id from district where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
             ),
             -1,
         )
+        d_next = d_next_after - 1
         if d_next <= 0:
             raise BackendError("district next order id not found")
-        backend.execute(
-            f"update district set d_next_o_id = {d_next + 1} where d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
-        )
         backend.execute(
             f"insert into orders values ({d_next}, {ctx.d_id}, {ctx.w_id}, {c_id}, '{now_text()}', 0, {ol_cnt}, 1);"
         )

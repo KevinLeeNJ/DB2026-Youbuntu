@@ -30,6 +30,17 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     return record_ptr;
 }
 
+RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* context) const {
+    (void)context;
+    RmPageHandle tmp_page_handle = fetch_page_handle(rid.page_no);
+    TupleMeta meta = tmp_page_handle.get_meta(rid.slot_no);
+    int size_ = tmp_page_handle.file_hdr->record_size;
+    char* data_ = tmp_page_handle.get_slot(rid.slot_no);
+    std::unique_ptr<RmRecord> record_ptr(new RmRecord(size_, data_));
+    buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
+    return RmRecordWithMeta{meta, std::move(record_ptr)};
+}
+
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据

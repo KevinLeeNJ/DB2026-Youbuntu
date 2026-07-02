@@ -29,6 +29,8 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm.h"
 #include "index/ix.h"
 #include "common/config.h"
+#include "transaction/concurrency/lock_manager.h"
+#include "transaction/transaction_manager.h"
 
 const std::string TEST_DB_NAME = "executor_test_db";
 
@@ -651,6 +653,80 @@ TEST_F(ExecutorTest, update_single_field) {
     for (int val : results) {
         EXPECT_EQ(val, 110);
     }
+}
+
+TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_commit) {
+    setup_db();
+    auto cols = make_int_cols({"id", "next_id"});
+    sm_manager_->create_table("rc_lost_update", cols, nullptr);
+
+    {
+        std::vector<Value> vals;
+        Value id;
+        id.set_int(1);
+        Value next_id;
+        next_id.set_int(3020);
+        vals.push_back(id);
+        vals.push_back(next_id);
+
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        InsertExecutor exec(sm_manager_.get(), "rc_lost_update", vals, &ctx);
+        exec.Next();
+    }
+
+    Rid rid;
+    {
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        SeqScanExecutor scan(sm_manager_.get(), "rc_lost_update", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    auto* txn1 = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+    auto* txn2 = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+
+    char buf1[4096];
+    int offset1 = 0;
+    Context ctx1(&lock_manager, nullptr, txn1, buf1, &offset1, &txn_manager);
+    char buf2[4096];
+    int offset2 = 0;
+    Context ctx2(&lock_manager, nullptr, txn2, buf2, &offset2, &txn_manager);
+
+    auto* fh = sm_manager_->fhs_.at("rc_lost_update").get();
+    auto txn2_old_rec = GetVisibleRecord(fh, rid, &ctx2);
+    ASSERT_NE(txn2_old_rec, nullptr);
+    ASSERT_EQ(*reinterpret_cast<int*>(txn2_old_rec->data + 4), 3020);
+
+    SetClause set_next_to_3021;
+    set_next_to_3021.lhs = {"rc_lost_update", "next_id"};
+    Value next_3021;
+    next_3021.set_int(3021);
+    set_next_to_3021.rhs = next_3021;
+
+    UpdateExecutor txn1_update(sm_manager_.get(), "rc_lost_update", {set_next_to_3021}, {}, {rid}, &ctx1);
+    ASSERT_NO_THROW(txn1_update.Next());
+    txn_manager.commit(txn1, nullptr);
+
+    bool txn2_aborted = false;
+    try {
+        UpdateExecutor txn2_update(sm_manager_.get(), "rc_lost_update", {set_next_to_3021}, {}, {rid}, &ctx2);
+        txn2_update.Next();
+    } catch (const TransactionAbortException&) {
+        txn2_aborted = true;
+    }
+    txn_manager.abort(txn2, nullptr);
+
+    EXPECT_TRUE(txn2_aborted) << "RC constant UPDATE must not overwrite a row committed after the statement read_ts";
+    auto final_rec = fh->get_record(rid, nullptr);
+    ASSERT_NE(final_rec, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(final_rec->data + 4), 3021);
 }
 
 TEST_F(ExecutorTest, update_multiple_fields) {

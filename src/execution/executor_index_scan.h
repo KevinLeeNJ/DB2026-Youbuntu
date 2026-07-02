@@ -42,6 +42,7 @@ private:
     std::unique_ptr<RecScan> scan_;
     bool predicate_recorded_{false};
     bool use_heap_scan_for_mvcc_{false};
+    std::unique_ptr<RmRecord> buffered_record_;
 
     SmManager* sm_manager_;
 
@@ -318,6 +319,7 @@ public:
     }
 
     void advance_to_match() {
+        buffered_record_.reset();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = GetVisibleRecord(fh_, rid_, context_);
@@ -334,6 +336,7 @@ public:
             }
             if (match) {
                 record_tuple_read(rid_);
+                buffered_record_ = std::move(rec);
                 break;
             }
             scan_->next();
@@ -341,10 +344,10 @@ public:
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end()) {
+        if (is_end() || buffered_record_ == nullptr) {
             return nullptr;
         }
-        return GetVisibleRecord(fh_, rid_, context_);
+        return std::make_unique<RmRecord>(*buffered_record_);
     }
 
     Rid& rid() override {

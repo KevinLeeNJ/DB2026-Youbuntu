@@ -38,13 +38,18 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
         txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
     const txn_id_t self_id = txn->get_transaction_id();
 
-    TupleMeta meta = fh->get_tuple_meta(rid);
+    auto record_with_meta = fh->get_record_with_meta(rid, context);
+    TupleMeta meta = record_with_meta.meta;
+    auto base_record = std::move(record_with_meta.record);
     std::vector<UndoLog> undo_stack;
     constexpr int MAX_DEPTH = 100;
 
     for (int depth = 0; depth < MAX_DEPTH; ++depth) {
         if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
-            return meta.is_deleted_ ? nullptr : fh->get_record(rid, context);
+            if (meta.is_deleted_) {
+                return nullptr;
+            }
+            return base_record;
         }
 
         if (!meta.is_committed_) {
@@ -62,7 +67,7 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
 
         if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
             if (undo_stack.empty()) {
-                return fh->get_record(rid, context);
+                return base_record;
             }
             const auto& log = undo_stack.back();
             auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));

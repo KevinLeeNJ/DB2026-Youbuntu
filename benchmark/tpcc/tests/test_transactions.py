@@ -44,13 +44,59 @@ def deterministic_randint(low: int, high: int) -> int:
     return low
 
 
+def deterministic_valid_randint(low: int, high: int) -> int:
+    if (low, high) == (5, 15):
+        return 5
+    if (low, high) == (1, 100):
+        return 2
+    return low
+
+
 class TransactionsTest(unittest.TestCase):
+    def test_new_order_reserves_order_id_with_atomic_district_increment(self) -> None:
+        backend = FakeBackend(
+            {
+                "select d_next_o_id from district where d_w_id = 1 and d_id = 1;": "3002",
+            }
+        )
+        ctx = TxnContext(
+            w_id=1, d_id=1, warehouses=1, item_count=1, customers_per_district=1
+        )
+
+        with mock.patch(
+            "benchmark.tpcc.core.transactions.random.randint",
+            side_effect=deterministic_valid_randint,
+        ):
+            new_order(backend, ctx)
+
+        district_update = (
+            "update district set d_next_o_id = d_next_o_id + 1 "
+            "where d_w_id = 1 and d_id = 1;"
+        )
+        district_select = (
+            "select d_next_o_id from district where d_w_id = 1 and d_id = 1;"
+        )
+        self.assertIn(district_update, backend.statements)
+        self.assertIn(district_select, backend.statements)
+        self.assertLess(
+            backend.statements.index(district_update),
+            backend.statements.index(district_select),
+        )
+        self.assertTrue(
+            any(
+                statement.startswith("insert into orders values (3001, 1, 1")
+                for statement in backend.statements
+            )
+        )
+        self.assertIn("insert into new_orders values (3001, 1, 1);", backend.statements)
+        self.assertTrue(backend.committed)
+
     def test_new_order_rolls_back_when_rmdb_empty_item_result_has_table_header(
         self,
     ) -> None:
         backend = FakeBackend(
             {
-                "select d_next_o_id from district where d_w_id = 1 and d_id = 1;": "3001",
+                "select d_next_o_id from district where d_w_id = 1 and d_id = 1;": "3002",
                 "select i_price from item where i_id = 2;": EMPTY_PRICE_RESULT,
             }
         )
