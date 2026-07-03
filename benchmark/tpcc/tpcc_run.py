@@ -76,10 +76,45 @@ def max_district_id(backend) -> int:
     return scalar_int(backend.execute("select max(d_id) from district;"), 0)
 
 
+def load_baseline_and_committed_from_result(
+    result_path: Path,
+) -> tuple[int, int, int, int]:
+    """Read baseline counts and total committed new_order from a result.json.
+
+    Used by the standalone consistency subcommand after a crash/restart so it
+    does not have to re-derive these values from an in-memory `rounds` list or
+    by re-querying the (now recovered) server. Returns
+    (baseline_warehouse_total, baseline_district_total, baseline_orders_total,
+     total_committed_new_order). Raises SystemExit if the file is missing or
+    lacks the required fields.
+    """
+    if not result_path.exists():
+        raise SystemExit(f"--result-json 指向的文件不存在: {result_path}")
+    data = json.loads(result_path.read_text())
+    config = data.get("config", {})
+    try:
+        baseline_warehouse = int(config["baseline_warehouse_total"])
+        baseline_district = int(config["baseline_district_total"])
+        baseline_orders = int(config["baseline_orders_total"])
+    except KeyError as exc:
+        raise SystemExit(f"{result_path} 缺少 baseline 字段: {exc}") from exc
+    committed = 0
+    for round_result in data.get("rounds", []):
+        counts = round_result.get("counts", {})
+        for phase in ("warmup", "measure", "drain"):
+            committed += int(
+                counts.get(phase, {}).get("new_order", {}).get("commit", 0)
+            )
+    return baseline_warehouse, baseline_district, baseline_orders, committed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", choices=["datagen", "load", "run", "consistency", "all"]
+        "command",
+        nargs="+",
+        choices=["datagen", "load", "run", "consistency", "all"],
+        help="one or more phases to run in order: datagen, load, run, consistency, all",
     )
     parser.add_argument("--backend", choices=["rmdb", "sqlite"], default="rmdb")
     parser.add_argument("--warehouses", type=int, default=1)
@@ -107,6 +142,14 @@ def main() -> None:
         "--sqlite-path", type=Path, default=Path("benchmark/tpcc/tpcc.sqlite")
     )
     parser.add_argument("--rmdb-db-dir", type=Path)
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        default=None,
+        help="read baseline counts and committed new_order total from a result.json "
+        "(written by the run phase); used by the standalone consistency subcommand "
+        "after a crash/restart so it does not have to re-derive them in memory",
+    )
     parser.add_argument("--overwrite-data-dir", action="store_true")
     parser.add_argument("--reuse-data-dir", action="store_true")
     parser.add_argument(
@@ -118,7 +161,7 @@ def main() -> None:
 
     schema_dir = Path(__file__).parent / "schema"
 
-    if args.command in ("datagen", "all"):
+    if set(args.command) & {"datagen", "all"}:
         if args.reuse_data_dir and complete_csv_set(args.data_dir, TABLES):
             phase(f"datagen skipped, reusing CSV files in {args.data_dir}")
         else:
@@ -134,7 +177,7 @@ def main() -> None:
             )
             phase("datagen complete")
 
-    if args.command in ("load", "all"):
+    if set(args.command) & {"load", "all"}:
         phase(f"load start: backend={args.backend}, data_dir={args.data_dir}")
         if args.backend == "sqlite":
             import_csv_to_sqlite(args.sqlite_path, args.data_dir)
@@ -151,7 +194,7 @@ def main() -> None:
     baseline_warehouse_total = -1
     baseline_district_total = -1
     districts_per_warehouse = 0
-    if args.command in ("run", "all"):
+    if set(args.command) & {"run", "all"}:
         factory = (
             sqlite_backend_factory(args)
             if args.backend == "sqlite"
@@ -204,16 +247,32 @@ def main() -> None:
         print(json.dumps(summary, indent=2))
         phase(f"run complete: result={args.json_out}")
 
-    if args.command in ("consistency", "all"):
-        if args.command == "all" and args.skip_consistency:
+    if set(args.command) & {"consistency", "all"}:
+        if "all" in args.command and args.skip_consistency:
             phase("consistency skipped (--skip-consistency)")
         else:
             phase("consistency start")
-            committed = (
-                sum(round_result.total_committed_new_order() for round_result in rounds)
-                if rounds
-                else args.committed_new_order
-            )
+            if "consistency" in args.command and args.result_json is not None:
+                (
+                    baseline_warehouse_total,
+                    baseline_district_total,
+                    baseline_orders_total,
+                    committed,
+                ) = load_baseline_and_committed_from_result(args.result_json)
+                phase(
+                    f"loaded from {args.result_json}: "
+                    f"baseline orders={baseline_orders_total}, "
+                    f"committed new_order={committed}"
+                )
+            else:
+                committed = (
+                    sum(
+                        round_result.total_committed_new_order()
+                        for round_result in rounds
+                    )
+                    if rounds
+                    else args.committed_new_order
+                )
             backend = (
                 sqlite_backend_factory(args)()
                 if args.backend == "sqlite"

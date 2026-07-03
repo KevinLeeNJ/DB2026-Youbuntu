@@ -12,11 +12,13 @@ TPCC_RESULT ?= benchmark/tpcc/result.json
 TPCC_SQLITE_PATH ?= benchmark/tpcc/tpcc.sqlite
 TPCC_WAREHOUSES ?= 8
 TPCC_WORKERS ?= 16
-TPCC_WARMUP ?= 30
-TPCC_MEASURE ?= 360
+TPCC_WARMUP ?= 10
+TPCC_MEASURE ?= 60
 TPCC_ROUNDS ?= 1
 TPCC_PROGRESS_INTERVAL ?= 5
 TPCC_REGENERATE_DATA ?= 0
+TPCC_PORT ?= 8765
+TPCC_RESTART_TIMEOUT ?= 120
 
 TPCC_DATA_ARGS := --reuse-data-dir
 ifeq ($(TPCC_REGENERATE_DATA),1)
@@ -27,17 +29,16 @@ all: build
 
 help:
 	@echo "Available targets:"
-	@echo "  make build         - Configure and build the project with cmake (8 threads)"
-	@echo "  make test          - Run unit tests only"
-	@echo "  make run           - Build and run the rmdb binary"
-	@echo "  make clean         - Remove build directory"
-	@echo "  make debug         - Build with debug flags (default)"
-	@echo "  make release       - Build with release/optimized flags"
-	@echo "  make format        - Format code with clang-format"
-	@echo "  make client        - Build rmdb_client (Release, 4 threads)"
-	@echo "  make client-debug  - Build rmdb_client (Debug, 4 threads)"
-	@echo "  make benchmark     - Run rmdb TPC-C benchmark with live progress"
-	@echo "                       Set TPCC_REGENERATE_DATA=1 to rebuild CSV data"
+	@echo "  make build           - Configure and build the project with cmake"
+	@echo "  make test            - Run unit tests only"
+	@echo "  make run             - Build and run the rmdb binary"
+	@echo "  make clean           - Remove build directory"
+	@echo "  make debug           - Build with debug flags (default)"
+	@echo "  make release         - Build with release/optimized flags"
+	@echo "  make format          - Format code with clang-format"
+	@echo "  make client          - Build rmdb_client"
+	@echo "  make client-debug    - Build rmdb_client with debug flags"
+	@echo "  make benchmark       - Run rmdb TPC-C benchmark"
 	@echo "  make benchmark-clean - Remove benchmark runtime data, keep CSV files"
 
 build:
@@ -91,14 +92,10 @@ run-client: client
 	@./rmdb_client/build/rmdb_client
 
 benchmark: build
-	@if [ "$(TPCC_REGENERATE_DATA)" = "1" ]; then rm -rf $(TPCC_DATA_DIR); fi
-	@rm -rf $(TPCC_DB) $(TPCC_RESULT)
-	@$(BINARY) $(TPCC_DB) > benchmark/tpcc/rmdb-server.log 2>&1 & \
-	server_pid=$$!; \
-	trap 'kill $$server_pid 2>/dev/null || true' EXIT INT TERM; \
-	sleep 1; \
-	python3 -m benchmark.tpcc.tpcc_run all \
-		--backend rmdb \
+	@scripts/benchmark_tpcc.sh \
+		--binary $(BINARY) \
+		--db-dir $(TPCC_DB) \
+		--port $(TPCC_PORT) \
 		--warehouses $(TPCC_WAREHOUSES) \
 		--workers $(TPCC_WORKERS) \
 		--warmup $(TPCC_WARMUP) \
@@ -108,10 +105,9 @@ benchmark: build
 		--data-dir $(TPCC_DATA_DIR) \
 		--json-out $(TPCC_RESULT) \
 		--rmdb-db-dir $(TPCC_DB) \
-		$(TPCC_DATA_ARGS); \
-	status=$$?; \
-	kill $$server_pid 2>/dev/null || true; \
-	exit $$status
+		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
+		$(TPCC_DATA_ARGS) \
+		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 
 benchmark-clean:
 	@rm -rf $(TPCC_DB) $(TPCC_RESULT) benchmark/tpcc/rmdb-server.log
