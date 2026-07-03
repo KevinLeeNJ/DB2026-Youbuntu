@@ -256,6 +256,12 @@ TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {
         AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);
         FlushLogs(*db.log_mgr_);
         db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        // 模拟 executor_insert 写下的 MVCC meta：未提交、归属本事务。
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
@@ -309,6 +315,12 @@ TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
         AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
         FlushLogs(*db.log_mgr_);
         db.sm_mgr_.update_record_with_indexes("t", rid, old_rec, new_rec);
+        // 模拟 executor_update 写下的 MVCC meta：未提交、归属本事务。
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
@@ -319,6 +331,37 @@ TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+TEST(RecoveryManagerTest, AbortedUpdateDoesNotUndoLaterCommittedSameValueUpdate) {
+    ScopedTestDir test_dir("recovery_aborted_update_same_value_root");
+    const std::string db_name = "recovery_aborted_update_same_value_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(1, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto loser_begin = AppendBegin(*db.log_mgr_, 100);
+        auto loser_update = AppendUpdate(*db.log_mgr_, 100, loser_begin, rid, old_rec, new_rec);
+        AppendAbort(*db.log_mgr_, 100, loser_update);
+
+        auto committed_begin = AppendBegin(*db.log_mgr_, 200);
+        auto committed_update = AppendUpdate(*db.log_mgr_, 200, committed_begin, rid, old_rec, new_rec);
+        AppendCommit(*db.log_mgr_, 200, committed_update);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, CommittedDeleteSurvivesRecovery) {
@@ -371,6 +414,35 @@ TEST(RecoveryManagerTest, UncommittedDeleteIsUndone) {
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }
 
+TEST(RecoveryManagerTest, AbortedDeleteDoesNotRestoreLaterCommittedSameRowDelete) {
+    ScopedTestDir test_dir("recovery_aborted_delete_same_row_root");
+    const std::string db_name = "recovery_aborted_delete_same_row_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto loser_begin = AppendBegin(*db.log_mgr_, 100);
+        auto loser_delete = AppendDelete(*db.log_mgr_, 100, loser_begin, rid, rec);
+        AppendAbort(*db.log_mgr_, 100, loser_delete);
+
+        auto committed_begin = AppendBegin(*db.log_mgr_, 200);
+        auto committed_delete = AppendDelete(*db.log_mgr_, 200, committed_begin, rid, rec);
+        AppendCommit(*db.log_mgr_, 200, committed_delete);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
 TEST(RecoveryManagerTest, UncommittedMvccDeleteTombstoneIsUndone) {
     ScopedTestDir test_dir("recovery_uncommitted_mvcc_delete_root");
     const std::string db_name = "recovery_uncommitted_mvcc_delete_db";
@@ -418,6 +490,12 @@ TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
         FlushLogs(*db.log_mgr_);
 
         db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        // 模拟 executor_insert 写下的 MVCC meta：未提交、归属本事务。
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 

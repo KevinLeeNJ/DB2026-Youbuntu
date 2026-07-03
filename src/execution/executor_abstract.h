@@ -20,7 +20,7 @@ class AbstractExecutor {
 public:
     Rid _abstract_rid;
 
-    Context* context_;
+    Context* context_ = nullptr;
 
     virtual ~AbstractExecutor() = default;
 

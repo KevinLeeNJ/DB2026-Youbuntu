@@ -59,6 +59,8 @@ public:
             std::string exception_message = "Message :: " + message + "\n";
             std::cerr << exception_message;
         }
+#else
+        (void)print;
 #endif
     }
 
@@ -75,6 +77,8 @@ public:
                 "\nException Type :: " + ExceptionTypeToString(type_) + ", Message :: " + message + "\n\n";
             std::cerr << exception_message;
         }
+#else
+        (void)print;
 #endif
     }
 
