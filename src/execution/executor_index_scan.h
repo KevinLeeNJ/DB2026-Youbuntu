@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 
 #include "execution_defs.h"
 #include "execution_common.h"
@@ -251,6 +252,7 @@ public:
 
         auto ih =
             sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
+        auto index_latch_guard = ih->lock_shared();
         auto constraints = build_constraints();
 
         std::vector<char> lower_key(index_meta_.col_tot_len);
@@ -316,7 +318,7 @@ public:
             lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
             upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
         }
-        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
+        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
         advance_to_match();
     }
 

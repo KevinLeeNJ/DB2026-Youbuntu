@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -59,14 +60,14 @@ public:
 
     void close_file(int fd);
 
-    int get_file_size(const std::string& file_name);
+    int64_t get_file_size(const std::string& file_name);
 
     std::string get_file_name(int fd);
 
     int get_file_fd(const std::string& file_name);
 
     /*日志操作*/
-    int read_log(char* log_data, int size, int offset);
+    int read_log(char* log_data, int size, int64_t offset);
 
     void write_log(char* log_data, int size);
 
@@ -76,7 +77,7 @@ public:
     // 消除已处理完毕的 loser 日志，避免跨轮 recovery 重复 undo 同 RID 上的数据。
     void truncate_log();
 
-    void SetLogOffset(int log_offset) {
+    void SetLogOffset(int64_t log_offset) {
         log_offset_ = log_offset;
     }
 
@@ -113,7 +114,7 @@ private:
     std::unordered_map<std::string, int> path2fd_; //<Page文件磁盘路径,Page fd>哈希表
     std::unordered_map<int, std::string> fd2path_; //<Page fd,Page文件磁盘路径>哈希表
 
-    int log_fd_ = -1;    // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
-    int log_offset_ = 0; // 日志文件追加偏移
+    int log_fd_ = -1;        // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    int64_t log_offset_ = 0; // 日志文件追加偏移
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0
 };

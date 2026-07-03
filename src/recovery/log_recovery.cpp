@@ -26,15 +26,15 @@ void RecoveryManager::analyze() {
     max_lsn_ = INVALID_LSN;
     checkpoint_offset_ = 0;
 
-    const int file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
+    const int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
         return;
     }
 
-    int scan_offset = 0;
+    int64_t scan_offset = 0;
     {
         std::ifstream restart_file(LogManager::RESTART_FILE_NAME);
-        int restart_offset = 0;
+        int64_t restart_offset = 0;
         if (restart_file >> restart_offset) {
             if (restart_offset >= 0 && restart_offset + LOG_HEADER_SIZE <= file_size) {
                 std::vector<char> header_buf(LOG_HEADER_SIZE);
@@ -42,7 +42,7 @@ void RecoveryManager::analyze() {
                     LogRecord header;
                     header.deserialize(header_buf.data());
                     if (header.log_type_ == LogType::CHECKPOINT && header.log_tot_len_ >= LOG_HEADER_SIZE &&
-                        restart_offset + static_cast<int>(header.log_tot_len_) <= file_size) {
+                        restart_offset + static_cast<int64_t>(header.log_tot_len_) <= file_size) {
                         std::vector<char> record_buf(header.log_tot_len_);
                         if (disk_manager_->read_log(record_buf.data(), static_cast<int>(record_buf.size()),
                                                     restart_offset) == static_cast<int>(record_buf.size())) {
@@ -61,7 +61,7 @@ void RecoveryManager::analyze() {
         }
     }
 
-    int offset = scan_offset;
+    int64_t offset = scan_offset;
     while (offset + LOG_HEADER_SIZE <= file_size) {
         std::vector<char> header_buf(LOG_HEADER_SIZE);
         int header_bytes = disk_manager_->read_log(header_buf.data(), LOG_HEADER_SIZE, offset);
@@ -71,7 +71,7 @@ void RecoveryManager::analyze() {
 
         LogRecord header;
         header.deserialize(header_buf.data());
-        if (header.log_tot_len_ < LOG_HEADER_SIZE || offset + static_cast<int>(header.log_tot_len_) > file_size) {
+        if (header.log_tot_len_ < LOG_HEADER_SIZE || offset + static_cast<int64_t>(header.log_tot_len_) > file_size) {
             break;
         }
 
@@ -115,7 +115,7 @@ void RecoveryManager::analyze() {
         if (lsn != INVALID_LSN && (max_lsn_ == INVALID_LSN || lsn > max_lsn_)) {
             max_lsn_ = lsn;
         }
-        offset += static_cast<int>(header.log_tot_len_);
+        offset += static_cast<int64_t>(header.log_tot_len_);
     }
 }
 

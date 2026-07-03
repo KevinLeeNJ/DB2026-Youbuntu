@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/transaction.h"
 
 #include <mutex>
+#include <shared_mutex>
 
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
 
@@ -220,14 +221,25 @@ private:
     int fd_; // 存储B+树的文件
     std::unique_ptr<IxFileHdr>
         file_hdr_; // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
-    std::mutex root_latch_;
+    mutable std::shared_mutex index_latch_;
 
 public:
+    using SharedIndexLatch = std::shared_lock<std::shared_mutex>;
+    using UniqueIndexLatch = std::unique_lock<std::shared_mutex>;
+
     IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd);
     ~IxIndexHandle() = default;
 
     int GetFd() const {
         return fd_;
+    }
+
+    SharedIndexLatch lock_shared() const {
+        return SharedIndexLatch(index_latch_);
+    }
+
+    UniqueIndexLatch lock_exclusive() {
+        return UniqueIndexLatch(index_latch_);
     }
 
     // for search
@@ -242,7 +254,7 @@ public:
     // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
     struct PinnedInserter {
         IxIndexHandle* ih;
-        std::unique_lock<std::mutex> latch;
+        UniqueIndexLatch latch;
         IxNodeHandle leaf;
         bool active = false;
 

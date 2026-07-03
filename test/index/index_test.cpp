@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -306,6 +307,88 @@ TEST_F(IndexHandleTest, ConcurrentInsertDeleteByRidDoesNotCorruptTree) {
     bool found = ih->get_value(duplicate_key.data(), &result, nullptr);
     EXPECT_FALSE(found);
     EXPECT_TRUE(result.empty());
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+    }
+
+    auto inserted_key = key(5000);
+    auto deleted_key = key(1000);
+    std::atomic<bool> scan_ready{false};
+    std::atomic<bool> release_scan{false};
+    std::atomic<bool> insert_done{false};
+    std::atomic<bool> delete_done{false};
+    std::atomic<bool> delete_result{false};
+
+    std::thread reader([&] {
+        IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
+        scan_ready.store(true, std::memory_order_release);
+        while (!release_scan.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    std::thread inserter([&] {
+        while (!scan_ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        ih->insert_entry(inserted_key.data(), Rid{5001, 5000}, nullptr);
+        insert_done.store(true, std::memory_order_release);
+    });
+
+    std::thread deleter([&] {
+        while (!scan_ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        delete_result.store(ih->delete_entry(deleted_key.data(), nullptr), std::memory_order_release);
+        delete_done.store(true, std::memory_order_release);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (!scan_ready.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(scan_ready.load(std::memory_order_acquire));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(insert_done.load(std::memory_order_acquire));
+    EXPECT_FALSE(delete_done.load(std::memory_order_acquire));
+
+    release_scan.store(true, std::memory_order_release);
+    reader.join();
+    inserter.join();
+    deleter.join();
+
+    EXPECT_TRUE(insert_done.load(std::memory_order_acquire));
+    EXPECT_TRUE(delete_done.load(std::memory_order_acquire));
+    EXPECT_TRUE(delete_result.load(std::memory_order_acquire));
+
+    std::vector<Rid> result;
+    EXPECT_TRUE(ih->get_value(inserted_key.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1);
+    EXPECT_EQ(result[0], (Rid{5001, 5000}));
+
+    result.clear();
+    EXPECT_FALSE(ih->get_value(deleted_key.data(), &result, nullptr));
+    EXPECT_TRUE(result.empty());
+
+    IxScan final_scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
+    std::vector<int> slots;
+    while (!final_scan.is_end()) {
+        slots.push_back(final_scan.rid().slot_no);
+        final_scan.next();
+    }
+
+    ASSERT_EQ(slots.size(), 2000u);
+    EXPECT_TRUE(std::is_sorted(slots.begin(), slots.end()));
+    EXPECT_EQ(std::count(slots.begin(), slots.end(), 1000), 0);
+    EXPECT_EQ(std::count(slots.begin(), slots.end(), 5000), 1);
 
     close_index(ih);
 }

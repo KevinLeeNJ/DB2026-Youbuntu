@@ -101,7 +101,11 @@ protected:
             {.tab_name = "grade", .col_name = "id"},
         };
         std::vector<HavingCondition> having_conds = {
-            {.lhs = make_agg_expr(AggType::MAX, "score", "MAX(score)"), .op = OP_GT, .is_rhs_val = true},
+            {.lhs = make_agg_expr(AggType::MAX, "score", "MAX(score)"),
+             .op = OP_GT,
+             .is_rhs_val = true,
+             .rhs_expr = {},
+             .rhs_val = {}},
         };
         having_conds[0].rhs_val.set_int(90);
 

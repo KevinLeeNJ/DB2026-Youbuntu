@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -466,12 +467,12 @@ public:
         return global_lsn_.load();
     }
 
-    int current_log_offset() const {
+    int64_t current_log_offset() const {
         return log_file_offset_;
     }
 
-    void write_restart_offset(int checkpoint_offset);
-    int read_restart_offset() const;
+    void write_restart_offset(int64_t checkpoint_offset);
+    int64_t read_restart_offset() const;
 
     LogBuffer* get_log_buffer() {
         return &log_buffer_;
@@ -484,6 +485,6 @@ private:
     std::mutex latch_;                 // 用于对log_buffer_的互斥访问
     LogBuffer log_buffer_;             // 日志缓冲区
     lsn_t persist_lsn_{INVALID_LSN};   // 记录已经持久化到磁盘中的最后一条日志的日志号
-    int log_file_offset_{0};           // 日志文件当前追加偏移
+    int64_t log_file_offset_{0};       // 日志文件当前追加偏移
     DiskManager* disk_manager_;
 };

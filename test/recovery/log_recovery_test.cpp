@@ -10,10 +10,13 @@ See the Mulan PSL v2 for more details. */
 
 #include "index/ix.h"
 #include "record/rm.h"
+#include "recovery/checkpoint_manager.h"
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
 #include "storage/buffer_pool_manager.h"
 #include "system/sm.h"
+#include "transaction/concurrency/lock_manager.h"
+#include "transaction/transaction_manager.h"
 
 #include <gtest/gtest.h>
 
@@ -423,4 +426,38 @@ TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
     OpenRecoveryDb db(db_name);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
+    ScopedTestDir test_dir("recovery_clean_checkpoint_root");
+    const std::string db_name = "recovery_clean_checkpoint_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        LockManager lock_mgr;
+        TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+        CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, db.log_mgr_.get());
+
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto insert_lsn = AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);
+        AppendCommit(*db.log_mgr_, 100, insert_lsn);
+        FlushLogs(*db.log_mgr_);
+        db.log_mgr_->write_restart_offset(64);
+
+        ASSERT_GT(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+        ASSERT_TRUE(checkpoint_mgr.RunCleanCheckpoint());
+
+        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+        EXPECT_EQ(db.log_mgr_->read_restart_offset(), 0);
+    }
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }

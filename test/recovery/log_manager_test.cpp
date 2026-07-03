@@ -42,8 +42,8 @@ void ExpectRecordEq(const RmRecord& actual, const RmRecord& expected) {
 
 std::vector<std::unique_ptr<LogRecord>> ReadAllLogs(DiskManager& disk) {
     std::vector<std::unique_ptr<LogRecord>> logs;
-    int offset = 0;
-    const int file_size = disk.get_file_size(LOG_FILE_NAME);
+    int64_t offset = 0;
+    const int64_t file_size = disk.get_file_size(LOG_FILE_NAME);
     while (offset + LOG_HEADER_SIZE <= file_size) {
         std::vector<char> header(LOG_HEADER_SIZE);
         if (disk.read_log(header.data(), LOG_HEADER_SIZE, offset) != LOG_HEADER_SIZE) {
@@ -52,7 +52,7 @@ std::vector<std::unique_ptr<LogRecord>> ReadAllLogs(DiskManager& disk) {
         LogRecord log_header;
         log_header.deserialize(header.data());
         if (log_header.log_tot_len_ < LOG_HEADER_SIZE ||
-            offset + static_cast<int>(log_header.log_tot_len_) > file_size) {
+            offset + static_cast<int64_t>(log_header.log_tot_len_) > file_size) {
             break;
         }
         std::vector<char> buf(log_header.log_tot_len_);
@@ -66,7 +66,7 @@ std::vector<std::unique_ptr<LogRecord>> ReadAllLogs(DiskManager& disk) {
             return logs;
         }
         logs.emplace_back(std::move(decoded));
-        offset += static_cast<int>(log_header.log_tot_len_);
+        offset += static_cast<int64_t>(log_header.log_tot_len_);
     }
     return logs;
 }
@@ -234,6 +234,42 @@ TEST(LogManagerTest, RestartOffsetRoundTrip) {
     EXPECT_EQ(log_mgr.read_restart_offset(), 128);
 }
 
+TEST(LogManagerTest, DiskManagerReportsFileSizePastTwoGb) {
+    ScopedTestDir test_dir("log_manager_large_file_size_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+
+    constexpr int64_t kLargeOffset = 2LL * 1024 * 1024 * 1024 + 4096;
+    ASSERT_EQ(truncate(LOG_FILE_NAME.c_str(), static_cast<off_t>(kLargeOffset)), 0);
+
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), kLargeOffset);
+}
+
+TEST(LogManagerTest, DiskManagerWritesLogPastTwoGb) {
+    ScopedTestDir test_dir("log_manager_large_log_write_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    int fd = disk.open_file(LOG_FILE_NAME);
+
+    constexpr int64_t kLargeOffset = 2LL * 1024 * 1024 * 1024 + 4096;
+    disk.SetLogFd(fd);
+    disk.SetLogOffset(kLargeOffset);
+
+    char record[] = {'x', 'y', 'z'};
+    ASSERT_NO_THROW(disk.write_log(record, static_cast<int>(sizeof(record))));
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), kLargeOffset + static_cast<int64_t>(sizeof(record)));
+}
+
+TEST(LogManagerTest, RestartOffsetRoundTripPastTwoGb) {
+    ScopedTestDir test_dir("log_manager_large_restart_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    constexpr int64_t kLargeOffset = 2LL * 1024 * 1024 * 1024 + 4096;
+    log_mgr.write_restart_offset(kLargeOffset);
+    EXPECT_EQ(log_mgr.read_restart_offset(), kLargeOffset);
+}
+
 TEST(LogManagerTest, InvalidRestartOffsetReturnsZero) {
     ScopedTestDir test_dir("log_manager_invalid_restart_test_db");
     DiskManager disk;
@@ -304,7 +340,7 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
 
     Value new_v;
     new_v.set_int(20);
-    SetClause set_clause{{"t", "v"}, new_v};
+    SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT};
     UpdateExecutor update_executor(&sm_mgr, "t", {set_clause}, {}, {rid}, &context);
     update_executor.Next();
 

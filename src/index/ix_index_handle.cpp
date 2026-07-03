@@ -178,6 +178,8 @@ IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffe
  */
 std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Operation operation,
                                                              Transaction* transaction, bool find_first) {
+    (void)operation;
+    (void)transaction;
     IxNodeHandle node;
     fetch_node_into(file_hdr_->root_page_, node);
     while (!node.is_leaf_page()) {
@@ -200,10 +202,10 @@ std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Op
  */
 bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transaction* transaction) {
     (void)transaction;
-    std::lock_guard<std::mutex> guard(root_latch_);
+    auto guard = lock_shared();
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_);
+    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
     while (!scan.is_end()) {
         result->push_back(scan.rid());
         scan.next();
@@ -303,7 +305,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
  */
 page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
                                       bool allow_duplicate) {
-    std::lock_guard<std::mutex> guard(root_latch_);
+    auto guard = lock_exclusive();
     IxNodeHandle leaf;
     fetch_node_into(file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
@@ -345,7 +347,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
     return inserted_page_no;
 }
 
-IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h), latch(h->root_latch_) {
+IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h), latch(h->lock_exclusive()) {
     ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
         page_id_t child_page_no = leaf.value_at(0);
@@ -422,7 +424,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
-    std::lock_guard<std::mutex> guard(root_latch_);
+    auto guard = lock_exclusive();
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
@@ -443,10 +445,10 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 
 bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
     (void)transaction;
-    std::lock_guard<std::mutex> guard(root_latch_);
+    auto guard = lock_exclusive();
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_);
+    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
     while (!scan.is_end()) {
         Iid iid = scan.iid();
         if (scan.rid() == value) {
@@ -539,6 +541,7 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
  * 注意更新parent结点的相关kv对
  */
 void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node, IxNodeHandle* parent, int index) {
+    (void)parent;
     if (index == 0) {
         node->insert_pair(node->get_size(), neighbor_node->get_key(0), *neighbor_node->get_rid(0));
         neighbor_node->erase_pair(0);
@@ -824,6 +827,7 @@ void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
  * @param node
  */
 void IxIndexHandle::release_node_handle(IxNodeHandle& node) {
+    (void)node;
     file_hdr_->num_pages_--;
 }
 

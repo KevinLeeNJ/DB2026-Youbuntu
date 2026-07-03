@@ -179,7 +179,7 @@ std::unique_ptr<Query> make_stock_level_query() {
         true);
     query->tables = {"stock", "order_line"};
     query->has_aggregate = true;
-    query->select_items.push_back({.expr = make_count_star_expr(), .output_name = "COUNT(*)"});
+    query->select_items.push_back({.expr = make_count_star_expr(), .alias = "", .output_name = "COUNT(*)"});
     query->output_names = {"COUNT(*)"};
     query->conds = {
         value_cond("stock", "s_w_id", OP_EQ, 1),          join_cond("stock", "s_i_id", "order_line", "ol_i_id"),

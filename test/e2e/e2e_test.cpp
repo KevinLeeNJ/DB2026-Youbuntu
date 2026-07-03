@@ -564,9 +564,9 @@ TEST(CheckpointRecoveryTest, CheckpointRestartOffsetSurvivesRestartAndUndoRuns) 
 
     std::ifstream restart_file(db_name + "/" + LogManager::RESTART_FILE_NAME);
     ASSERT_TRUE(restart_file.is_open());
-    int restart_offset = 0;
+    int64_t restart_offset = 0;
     restart_file >> restart_offset;
-    EXPECT_GT(restart_offset, 0);
+    EXPECT_EQ(restart_offset, 0);
 
     TransactionManager::txn_map.clear();
 

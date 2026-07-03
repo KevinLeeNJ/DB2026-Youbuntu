@@ -17,6 +17,17 @@ class ResultTest(unittest.TestCase):
         self.assertEqual(result.tpmc(), 2.0 / 6.0)
         self.assertEqual(result.total_committed_new_order(), 4)
 
+    def test_total_committed_new_order_includes_warmup_measure_and_drain(
+        self,
+    ) -> None:
+        result = RoundResult(measure_seconds=10)
+        result.record("warmup", "new_order", "commit", 1.0)
+        result.record("measure", "new_order", "commit", 1.0)
+        result.record("drain", "new_order", "commit", 1.0)
+
+        assert result.total_committed_new_order() == 3
+        assert result.measured_committed_new_order() == 1
+
     def test_format_progress_line_shows_live_counts(self) -> None:
         result = RoundResult(measure_seconds=360)
         result.record("measure", "new_order", "commit", 10.0)

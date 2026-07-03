@@ -132,6 +132,7 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         case OP_GE:
             return lhs_val >= rhs_val;
         }
+        break;
     }
     case TYPE_STRING:
     case TYPE_DATETIME: {

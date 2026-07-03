@@ -50,6 +50,7 @@ public:
     virtual std::unique_ptr<RmRecord> Next() = 0;
 
     virtual ColMeta get_col_offset(const TabCol& target) {
+        (void)target;
         return ColMeta();
     };
 
@@ -137,6 +138,7 @@ protected:
             case OP_GE:
                 return lhs_val >= rhs_val;
             }
+            break;
         }
         case TYPE_STRING:
         case TYPE_DATETIME: {

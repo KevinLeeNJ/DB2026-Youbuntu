@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <unordered_set>
@@ -65,7 +66,7 @@ private:
     std::unordered_map<lsn_t, std::unique_ptr<LogRecord>> log_records_;
     std::vector<lsn_t> log_order_;
     lsn_t max_lsn_{INVALID_LSN}; // analyze 扫描到的最大 lsn，用于 recovery 后推进 global_lsn
-    int checkpoint_offset_{0};
+    int64_t checkpoint_offset_{0};
 
     LogBuffer buffer_;                       // 读入日志
     DiskManager* disk_manager_;              // 用来读写文件

@@ -14,13 +14,16 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "ix_index_handle.h"
 
+#include <utility>
+
 // class IxIndexHandle;
 
 // 用于遍历叶子结点
-// 用于直接遍历叶子结点，而不用findleafpage来得到叶子结点
-// TODO：对page遍历时，要加上读锁
+// 用于直接遍历叶子结点，而不用findleafpage来得到叶子结点。
+// 默认在整个扫描生命周期内持有索引共享锁，避免叶链遍历与并发结构修改交错。
 class IxScan : public RecScan {
     const IxIndexHandle* ih_;
+    IxIndexHandle::SharedIndexLatch index_latch_guard_;
     Iid iid_; // 初始为lower（用于遍历的指针）
     Iid end_; // 初始为upper
     BufferPoolManager* bpm_;
@@ -49,9 +52,16 @@ class IxScan : public RecScan {
         }
     }
 
+    void release_index_latch_if_held() {
+        if (index_latch_guard_.owns_lock()) {
+            index_latch_guard_.unlock();
+        }
+    }
+
     void move_to_end() {
         unpin_current_leaf();
         iid_ = end_;
+        release_index_latch_if_held();
     }
 
     void normalize_position() {
@@ -76,12 +86,21 @@ class IxScan : public RecScan {
             iid_.page_no = next_leaf;
             iid_.slot_no = 0;
         }
+        move_to_end();
     }
 
 public:
-    IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm)
-        : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {
+    IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm,
+           bool acquire_index_latch = true)
+        : IxScan(ih, lower, upper, bpm, acquire_index_latch ? ih->lock_shared() : IxIndexHandle::SharedIndexLatch{}) {}
+
+    IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm,
+           IxIndexHandle::SharedIndexLatch index_latch_guard)
+        : ih_(ih), index_latch_guard_(std::move(index_latch_guard)), iid_(lower), end_(upper), bpm_(bpm) {
         normalize_position();
+        if (is_end()) {
+            release_index_latch_if_held();
+        }
     }
 
     ~IxScan() override {
