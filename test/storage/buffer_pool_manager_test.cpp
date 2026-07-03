@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "gtest/gtest.h"
 #include "recovery/log_manager.h"
+#include "replacer/clock_replacer.h"
 #include "storage/disk_manager.h"
 #include "errors.h"
 
@@ -129,6 +130,7 @@ TEST_F(BufferPoolManagerTest, ReplacerCreatedCorrectly) {
     auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
     auto bpm = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager);
     ASSERT_NE(nullptr, bpm->replacer_);
+    EXPECT_NE(nullptr, dynamic_cast<ClockReplacer*>(bpm->replacer_.get()));
     // 验证 replacer 可正常使用（非空且功能正确）
     EXPECT_EQ(0, bpm->replacer_->Size());
 }

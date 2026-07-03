@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "disk_manager.h"
 #include "errors.h"
 #include "page.h"
+#include "replacer/clock_replacer.h"
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
 
@@ -45,12 +46,9 @@ public:
         : pool_size_(pool_size), disk_manager_(disk_manager) {
         // 为buffer pool分配一块连续的内存空间
         pages_ = std::make_unique<Page[]>(pool_size_);
-        // 可以被Replacer改变
-        if (REPLACER_TYPE.compare("LRU"))
-            replacer_ = std::make_unique<LRUReplacer>(pool_size_);
-        else if (REPLACER_TYPE.compare("CLOCK"))
-            replacer_ = std::make_unique<LRUReplacer>(pool_size_);
-        else {
+        if (REPLACER_TYPE == "CLOCK") {
+            replacer_ = std::make_unique<ClockReplacer>(pool_size_);
+        } else {
             replacer_ = std::make_unique<LRUReplacer>(pool_size_);
         }
         // 初始化时，所有的page都在free_list_中
