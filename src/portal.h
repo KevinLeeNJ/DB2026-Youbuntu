@@ -71,7 +71,7 @@ struct PortalStmt {
 
 class Portal {
 private:
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
 
     struct ExecutorQueryExpr {
         QueryExprType type = QueryExprType::COLUMN;
@@ -562,7 +562,7 @@ private:
 
     void write_explain_output(const std::string& text, Context* context) {
         append_to_context(text, context);
-        if (sm_manager_->output_file_enabled_) {
+        if (schema_manager_->output_file_enabled()) {
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << text;
@@ -579,7 +579,7 @@ private:
     }
 
 public:
-    Portal(SmManager* sm_manager) : sm_manager_(sm_manager) {}
+    Portal(SchemaManager* schema_manager) : schema_manager_(schema_manager) {}
     ~Portal() {}
 
     // 将查询执行计划转换成对应的算子树
@@ -636,7 +636,7 @@ public:
                     rids.push_back(scan->rid());
                 }
                 std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
-                    sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
+                    schema_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
@@ -648,7 +648,7 @@ public:
                 }
 
                 std::unique_ptr<AbstractExecutor> root =
-                    std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
+                    std::make_unique<DeleteExecutor>(schema_manager_, x->tab_name_, x->conds_, rids, context);
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
@@ -656,7 +656,7 @@ public:
 
             case T_Insert: {
                 std::unique_ptr<AbstractExecutor> root =
-                    std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
+                    std::make_unique<InsertExecutor>(schema_manager_, x->tab_name_, x->values_, context);
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
@@ -752,12 +752,12 @@ public:
             auto x = static_cast<ScanPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor;
             if (x->tag == T_SeqScan) {
-                executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
+                executor = std::make_unique<SeqScanExecutor>(schema_manager_, x->tab_name_, x->conds_, context);
             } else if (x->tag == T_IndexSkipScan) {
-                executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
+                executor = std::make_unique<IndexSkipScanExecutor>(schema_manager_, x->tab_name_, x->conds_,
                                                                    x->index_col_names_, context);
             } else {
-                executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
+                executor = std::make_unique<IndexScanExecutor>(schema_manager_, x->tab_name_, x->conds_,
                                                                x->index_col_names_, context);
             }
             return maybe_count(std::move(executor), plan, count_rows);

@@ -11,8 +11,6 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <algorithm>
-#include <mutex>
 #include <unordered_map>
 
 #include "common/context.h"
@@ -31,33 +29,18 @@ struct ColDef {
 
 /* 系统管理器，负责元数据管理和DDL语句的执行 */
 class SmManager {
-public:
+    friend class SchemaManager;
+
+private:
     DbMeta db_; // 当前打开的数据库的元数据
     std::unordered_map<std::string, std::unique_ptr<RmFileHandle>>
         fhs_; // file name -> record file handle, 当前数据库中每张表的数据文件
     std::unordered_map<std::string, std::unique_ptr<IxIndexHandle>>
         ihs_; // file name -> index file handle, 当前数据库中每个索引的文件
-private:
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
-    static std::string make_historical_index_key(const std::string& tab_name, const std::string& index_name,
-                                                 const std::vector<char>& key) {
-        std::string combined;
-        combined.reserve(tab_name.size() + index_name.size() + key.size() + 2);
-        combined.append(tab_name);
-        combined.push_back('\0');
-        combined.append(index_name);
-        combined.push_back('\0');
-        combined.append(key.data(), key.size());
-        return combined;
-    }
-
-    mutable std::mutex historical_index_keys_latch_;
-    std::unordered_map<std::string, std::vector<Rid>> historical_index_keys_;
-    mutable std::mutex deleted_tuple_candidates_latch_;
-    std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
 
 public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
@@ -82,6 +65,11 @@ public:
 
     IxManager* get_ix_manager() {
         return ix_manager_;
+    }
+
+    // 索引句柄访问（供同文件 DDL/load helper 使用，外部经 SchemaManager 访问）。
+    IxIndexHandle* get_ih(const std::string& tab_name, const std::vector<ColMeta>& cols) {
+        return ihs_.at(ix_manager_->get_index_name(tab_name, cols)).get();
     }
 
     bool is_dir(const std::string& db_name);
@@ -118,55 +106,6 @@ public:
 
     void update_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec,
                                     const RmRecord& new_rec);
-
-    void remember_historical_index_key(const std::string& tab_name, const std::string& index_name,
-                                       const std::vector<char>& key, const Rid& rid) {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
-        auto& rids = historical_index_keys_[make_historical_index_key(tab_name, index_name, key)];
-        if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
-            rids.push_back(rid);
-        }
-    }
-
-    std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
-                                                   const std::vector<char>& key) const {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, key));
-        if (it == historical_index_keys_.end()) {
-            return {};
-        }
-        return it->second;
-    }
-
-    void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto& rids = deleted_tuple_candidates_[tab_name];
-        if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
-            rids.push_back(rid);
-        }
-    }
-
-    std::vector<Rid> get_deleted_tuple_candidates(const std::string& tab_name) const {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto it = deleted_tuple_candidates_.find(tab_name);
-        if (it == deleted_tuple_candidates_.end()) {
-            return {};
-        }
-        return it->second;
-    }
-
-    void remove_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto it = deleted_tuple_candidates_.find(tab_name);
-        if (it == deleted_tuple_candidates_.end()) {
-            return;
-        }
-        auto& rids = it->second;
-        rids.erase(std::remove(rids.begin(), rids.end(), rid), rids.end());
-        if (rids.empty()) {
-            deleted_tuple_candidates_.erase(it);
-        }
-    }
 
     void flush_all_table_and_index_pages();
 

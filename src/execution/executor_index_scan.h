@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record/rm_scan.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 
 class IndexScanExecutor : public AbstractExecutor {
 protected:
@@ -45,7 +46,7 @@ protected:
     bool use_heap_scan_for_mvcc_{false};
     std::unique_ptr<RmRecord> buffered_record_;
 
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
 
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -213,17 +214,17 @@ protected:
     }
 
 public:
-    IndexScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
+    IndexScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
                       std::vector<std::string> index_col_names, Context* context) {
-        sm_manager_ = sm_manager;
+        schema_manager_ = schema_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
-        tab_ = sm_manager_->db_.get_table(tab_name_);
+        tab_ = schema_manager_->catalog().get_table(tab_name_);
         conds_ = std::move(conds);
         // index_no_ = index_no;
         index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
-        fh_ = sm_manager_->fhs_.at(tab_name_).get();
+        fh_ = schema_manager_->get_table_handle(tab_name_);
         cols_ = tab_.cols;
         len_ = cols_.back().offset + cols_.back().len;
 
@@ -250,8 +251,7 @@ public:
             return;
         }
 
-        auto ih =
-            sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
+        auto ih = schema_manager_->get_index_handle(tab_name_, index_meta_.cols);
         auto index_latch_guard = ih->lock_shared();
         auto constraints = build_constraints();
 
@@ -318,7 +318,7 @@ public:
             lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
             upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
         }
-        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+        scan_ = std::make_unique<IxScan>(ih, lower, upper, schema_manager_->get_bpm(), std::move(index_latch_guard));
         advance_to_match();
     }
 

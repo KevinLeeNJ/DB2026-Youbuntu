@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 
 class SeqScanExecutor : public AbstractExecutor {
 private:
@@ -31,7 +32,7 @@ private:
     Rid rid_;
     std::unique_ptr<RecScan> scan_; // table_iterator
 
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
     bool predicate_recorded_{false};
 
     void record_predicate_read() {
@@ -70,12 +71,13 @@ private:
     }
 
 public:
-    SeqScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds, Context* context) {
-        sm_manager_ = sm_manager;
+    SeqScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
+                    Context* context) {
+        schema_manager_ = schema_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
-        TabMeta& tab = sm_manager_->db_.get_table(tab_name_);
-        fh_ = sm_manager_->fhs_.at(tab_name_).get();
+        TabMeta& tab = schema_manager_->catalog().get_table(tab_name_);
+        fh_ = schema_manager_->get_table_handle(tab_name_);
         cols_ = tab.cols;
         len_ = cols_.back().offset + cols_.back().len;
 

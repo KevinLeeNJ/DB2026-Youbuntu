@@ -301,7 +301,7 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_
     if (curr_conds.empty()) {
         return false;
     }
-    TabMeta& tab = sm_manager_->db_.get_table(tab_name);
+    TabMeta& tab = catalog_->get_table(tab_name);
     if (tab.indexes.empty()) {
         return false;
     }
@@ -395,7 +395,7 @@ bool Planner::get_skip_scan_index_cols(std::string tab_name, std::vector<Conditi
     if (curr_conds.empty()) {
         return false;
     }
-    TabMeta& tab = sm_manager_->db_.get_table(tab_name);
+    TabMeta& tab = catalog_->get_table(tab_name);
     if (tab.indexes.empty()) {
         return false;
     }
@@ -647,7 +647,7 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
                                           : index_access_score(table, index_col_names, scan_conds));
         table_scan_conds.push_back(scan_conds);
         std::unique_ptr<Plan> table_plan =
-            std::make_unique<ScanPlan>(scan_tag, sm_manager_, table, scan_conds, index_col_names);
+            std::make_unique<ScanPlan>(scan_tag, schema_manager_, table, scan_conds, index_col_names);
 
         auto needed_pos = needed_cols.find(table);
         if (needed_pos != needed_cols.end() && !needed_pos->second.empty()) {
@@ -713,7 +713,7 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         TabCol inlj_right_col;
         std::vector<std::string> inlj_index_col_names;
         if (!curr_join_conds.empty()) {
-            TabMeta& next_tab = sm_manager_->db_.get_table(next_table);
+            TabMeta& next_tab = catalog_->get_table(next_table);
             for (const auto& cond : curr_join_conds) {
                 if (cond.op != OP_EQ || cond.is_rhs_val) {
                     continue;
@@ -747,7 +747,7 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         std::unique_ptr<Plan> right_plan = std::move(table_plans[i]);
         if (!inlj_index_col_names.empty()) {
             // Replace right plan's SeqScan with IndexScan
-            std::unique_ptr<Plan> new_scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, next_table,
+            std::unique_ptr<Plan> new_scan = std::make_unique<ScanPlan>(T_IndexScan, schema_manager_, next_table,
                                                                         table_scan_conds[i], inlj_index_col_names);
             right_plan = rebuild_right_plan_with_index(std::move(right_plan), std::move(new_scan));
         }
@@ -783,10 +783,10 @@ std::unique_ptr<Plan> Planner::make_one_rel(Query* query) {
         if (scan_tag == T_SeqScan) { // 该表没有可用索引
             index_col_names.clear();
             table_scan_executors[i] =
-                std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
+                std::make_unique<ScanPlan>(T_SeqScan, schema_manager_, tables[i], curr_conds, index_col_names);
         } else { // 存在索引
             table_scan_executors[i] =
-                std::make_unique<ScanPlan>(scan_tag, sm_manager_, tables[i], curr_conds, index_col_names);
+                std::make_unique<ScanPlan>(scan_tag, schema_manager_, tables[i], curr_conds, index_col_names);
         }
     }
     // 只有一个表，不需要join。
@@ -1022,10 +1022,10 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         if (scan_tag == T_SeqScan) { // 该表没有可用索引
             index_col_names.clear();
             table_scan_executors =
-                std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_unique<ScanPlan>(T_SeqScan, schema_manager_, x->tab_name, query->conds, index_col_names);
         } else { // 存在索引
             table_scan_executors =
-                std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_unique<ScanPlan>(scan_tag, schema_manager_, x->tab_name, query->conds, index_col_names);
         }
 
         plannerRoot = std::make_unique<DMLPlan>(T_Delete, std::move(table_scan_executors), x->tab_name,
@@ -1045,10 +1045,10 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         if (scan_tag == T_SeqScan) { // 该表没有可用索引
             index_col_names.clear();
             table_scan_executors =
-                std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_unique<ScanPlan>(T_SeqScan, schema_manager_, x->tab_name, query->conds, index_col_names);
         } else { // 存在索引
             table_scan_executors =
-                std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_unique<ScanPlan>(scan_tag, schema_manager_, x->tab_name, query->conds, index_col_names);
         }
         plannerRoot = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
                                                 std::vector<Value>(), query->conds, query->set_clauses);

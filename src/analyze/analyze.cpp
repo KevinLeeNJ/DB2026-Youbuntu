@@ -186,7 +186,7 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, st
     populate_table_refs(*query, x->tabs);
 
     for (const auto& tab_name : query->tables) {
-        if (!sm_manager_->db_.is_table(tab_name)) {
+        if (!catalog_->is_table(tab_name)) {
             throw TableNotFoundError(tab_name);
         }
     }
@@ -336,7 +336,7 @@ TabCol Analyze::check_column(const std::vector<ColMeta>& all_cols, TabCol target
 
 void Analyze::get_all_cols(const std::vector<std::string>& tab_names, std::vector<ColMeta>& all_cols) {
     for (const auto& sel_tab_name : tab_names) {
-        const auto& sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
+        const auto& sel_tab_cols = catalog_->get_table(sel_tab_name).cols;
         all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
     }
 }
@@ -369,7 +369,7 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
     for (auto& cond : conds) {
         cond.lhs_col = check_column(all_cols, cond.lhs_col);
-        auto lhs_col = sm_manager_->db_.get_table(cond.lhs_col.tab_name).get_col(cond.lhs_col.col_name);
+        auto lhs_col = catalog_->get_table(cond.lhs_col.tab_name).get_col(cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
 
         ColType rhs_type;
@@ -383,7 +383,7 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
             continue;
         } else {
             cond.rhs_col = check_column(all_cols, cond.rhs_col);
-            auto rhs_col = sm_manager_->db_.get_table(cond.rhs_col.tab_name).get_col(cond.rhs_col.col_name);
+            auto rhs_col = catalog_->get_table(cond.rhs_col.tab_name).get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }
 

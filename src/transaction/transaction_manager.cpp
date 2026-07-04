@@ -55,20 +55,20 @@ std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
     return key;
 }
 
-void DeleteIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
-                        const Rid& rid, Transaction* txn) {
+void DeleteIndexEntries(SchemaManager* schema_manager, const TabMeta& tab, const std::string& tab_name,
+                        const RmRecord& rec, const Rid& rid, Transaction* txn) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
-        auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        auto ih = schema_manager->get_index_handle(tab_name, index.cols);
         ih->delete_entry(key.data(), rid, txn);
     }
 }
 
-void InsertIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
-                        const Rid& rid, Transaction* txn) {
+void InsertIndexEntries(SchemaManager* schema_manager, const TabMeta& tab, const std::string& tab_name,
+                        const RmRecord& rec, const Rid& rid, Transaction* txn) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
-        auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        auto ih = schema_manager->get_index_handle(tab_name, index.cols);
         ih->insert_entry(key.data(), rid, txn, true);
     }
 }
@@ -240,17 +240,17 @@ TupleMeta FallbackCommittedMeta() {
     return meta;
 }
 
-void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transaction* txn) {
+void UndoWriteRecord(SchemaManager* schema_manager, WriteRecord* write_record, Transaction* txn) {
     const std::string tab_name = write_record->GetTableName();
-    auto& tab = sm_manager->db_.get_table(tab_name);
-    auto* fh = sm_manager->fhs_.at(tab_name).get();
+    auto& tab = schema_manager->catalog().get_table(tab_name);
+    auto* fh = schema_manager->get_table_handle(tab_name);
     Rid rid = write_record->GetRid();
 
     switch (write_record->GetWriteType()) {
     case WType::INSERT_TUPLE: {
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
+            DeleteIndexEntries(schema_manager, tab, tab_name, *rec, rid, txn);
             fh->delete_record(rid, nullptr);
         }
         break;
@@ -264,19 +264,19 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
             fh->insert_record(rid, old_rec.data);
         }
         fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
-        InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
+        InsertIndexEntries(schema_manager, tab, tab_name, old_rec, rid, txn);
         break;
     }
     case WType::UPDATE_TUPLE: {
         if (fh->is_record(rid)) {
             auto current_rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *current_rec, rid, txn);
+            DeleteIndexEntries(schema_manager, tab, tab_name, *current_rec, rid, txn);
         }
         RmRecord old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(fh, rid);
         fh->update_record(rid, old_rec.data, nullptr);
         fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
-        InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
+        InsertIndexEntries(schema_manager, tab, tab_name, old_rec, rid, txn);
         break;
     }
     }
@@ -361,7 +361,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     running_txns_.RemoveTxn(txn->get_start_ts());
 
     // Mark all modified slots as committed
-    sm_manager_->mark_slots_committed(*txn, commit_ts);
+    schema_manager_->mark_slots_committed(*txn, commit_ts);
 
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
@@ -407,7 +407,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
 
     auto& write_set = txn->get_write_set();
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(sm_manager_, it->get(), txn);
+        UndoWriteRecord(schema_manager_, it->get(), txn);
     }
     WriteAbortLog(txn, log_manager);
     running_txns_.RemoveTxn(txn->get_start_ts());
@@ -521,7 +521,7 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
     if (conds.empty()) {
         return true;
     }
-    const auto& tab = sm_manager_->db_.get_table(tab_name);
+    const auto& tab = schema_manager_->catalog().get_table(tab_name);
     auto get_col_meta = [&](const TabCol& target) -> const ColMeta& {
         auto iter = std::find_if(tab.cols.begin(), tab.cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;

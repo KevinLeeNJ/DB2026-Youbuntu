@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "parser/parser.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 #include "common/common.h"
 
 class Query {
@@ -62,10 +63,12 @@ public:
 
 class Analyze {
 private:
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
+    Catalog* catalog_;
 
 public:
-    Analyze(SmManager* sm_manager) : sm_manager_(sm_manager) {}
+    Analyze(SchemaManager* schema_manager)
+        : schema_manager_(schema_manager), catalog_(schema_manager ? &schema_manager->catalog() : nullptr) {}
     ~Analyze() {}
 
     std::unique_ptr<Query> do_analyze(std::unique_ptr<ast::TreeNode> root);

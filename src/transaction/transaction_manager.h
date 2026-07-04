@@ -24,7 +24,9 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_manager.h"
 #include "concurrency/lock_manager.h"
 #include "system/sm_manager.h"
+#include "system/schema_manager.h"
 #include "common/exception.h"
+#include "transaction/ssi_registry.h"
 
 /* 系统采用的并发控制算法，当前题目中要求两阶段封锁并发控制算法 */
 enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
@@ -53,14 +55,20 @@ struct VersionUndoLink {
 
 class TransactionManager {
 public:
-    explicit TransactionManager(LockManager* lock_manager, SmManager* sm_manager,
+    explicit TransactionManager(LockManager* lock_manager, SchemaManager* schema_manager,
                                 ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING) {
-        sm_manager_ = sm_manager;
+        schema_manager_ = schema_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
     }
 
     ~TransactionManager() = default;
+
+    // SSI 辅助数据（历史索引键 + 已删除元组候选），Phase 2 从 SmManager 迁入。
+    // executor 通过 context_->txn_mgr_->ssi_registry() 访问。
+    SSIRegistry& ssi_registry() {
+        return ssi_registry_;
+    }
 
     Transaction* begin(Transaction* txn, LogManager* log_manager,
                        IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL);
@@ -230,8 +238,9 @@ private:
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
     std::mutex latch_;                           // 用于txn_map的并发
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
     LockManager* lock_manager_;
+    SSIRegistry ssi_registry_; // SSI 辅助数据，Phase 2 迁入
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC

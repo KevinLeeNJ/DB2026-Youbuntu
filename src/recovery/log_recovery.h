@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "log_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
+#include "system/schema_manager.h"
 
 class RedoLogsInPage {
 public:
@@ -32,11 +33,11 @@ public:
 
 class RecoveryManager {
 public:
-    RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager,
+    RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SchemaManager* schema_manager,
                     LogManager* log_manager = nullptr) {
         disk_manager_ = disk_manager;
         buffer_pool_manager_ = buffer_pool_manager;
-        sm_manager_ = sm_manager;
+        schema_manager_ = schema_manager;
         log_manager_ = log_manager;
     }
 
@@ -71,6 +72,6 @@ private:
     LogBuffer buffer_;                       // 读入日志
     DiskManager* disk_manager_;              // 用来读写文件
     BufferPoolManager* buffer_pool_manager_; // 对页面进行读写
-    SmManager* sm_manager_;                  // 访问数据库元数据
+    SchemaManager* schema_manager_;          // 访问数据库元数据
     LogManager* log_manager_;                // recovery 完成后截断日志
 };

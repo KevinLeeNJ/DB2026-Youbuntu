@@ -69,6 +69,7 @@ void client_handler(int fd, instance::DBInstance& instance) {
     auto& log_manager = instance.log_manager();
     auto& txn_manager = instance.transaction_manager();
     auto& sm_manager = instance.sm_manager();
+    auto& schema_manager = instance.schema_manager();
     auto& analyze = instance.analyze();
     auto& optimizer = instance.optimizer();
     auto& ql_manager = instance.ql_manager();
@@ -170,7 +171,7 @@ void client_handler(int fd, instance::DBInstance& instance) {
                 context->txn_ = nullptr;
                 LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
-                if (sm_manager.output_file_enabled_) {
+                if (schema_manager.output_file_enabled()) {
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << str;
@@ -193,7 +194,7 @@ void client_handler(int fd, instance::DBInstance& instance) {
                 context->txn_ = nullptr;
 
                 // 将报错信息写入output.txt
-                if (sm_manager.output_file_enabled_) {
+                if (schema_manager.output_file_enabled()) {
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << "failure\n";

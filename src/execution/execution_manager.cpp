@@ -52,19 +52,19 @@ void QlManager::run_mutli_query(Plan* plan, Context* context) {
     auto* x = static_cast<DDLPlan*>(plan);
     switch (plan->tag) {
     case T_CreateTable: {
-        sm_manager_->create_table(x->tab_name_, x->cols_, context);
+        schema_manager_->create_table(x->tab_name_, x->cols_, context);
         break;
     }
     case T_DropTable: {
-        sm_manager_->drop_table(x->tab_name_, context);
+        schema_manager_->drop_table(x->tab_name_, context);
         break;
     }
     case T_CreateIndex: {
-        sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
+        schema_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
         break;
     }
     case T_DropIndex: {
-        sm_manager_->drop_index(x->tab_name_, x->tab_col_names_, context);
+        schema_manager_->drop_index(x->tab_name_, x->tab_col_names_, context);
         break;
     }
     default:
@@ -92,15 +92,15 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
             break;
         }
         case T_ShowTable: {
-            sm_manager_->show_tables(context);
+            schema_manager_->show_tables(context);
             break;
         }
         case T_ShowIndex: {
-            sm_manager_->show_index(x->tab_name_, context);
+            schema_manager_->show_index(x->tab_name_, context);
             break;
         }
         case T_DescTable: {
-            sm_manager_->desc_table(x->tab_name_, context);
+            schema_manager_->desc_table(x->tab_name_, context);
             break;
         }
         case T_Transaction_begin: {
@@ -180,12 +180,12 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         auto* x = static_cast<SetOutputFilePlan*>(plan);
         // output_file is a database-global toggle shared across all connections;
         // store it on SmManager so it persists across connection lifetimes.
-        sm_manager_->output_file_enabled_ = x->enable_;
+        schema_manager_->set_output_file(x->enable_);
         break;
     }
     case T_LoadData: {
         auto* x = static_cast<LoadDataPlan*>(plan);
-        sm_manager_->load_csv_data(x->file_name_, x->tab_name_, context);
+        schema_manager_->load_csv_data(x->file_name_, x->tab_name_, context);
         break;
     }
     case T_StaticCheckpoint: {
@@ -196,7 +196,8 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 throw RMDBError("static checkpoint cannot run inside an active transaction");
             }
         }
-        CheckpointManager checkpoint_mgr(txn_mgr_, sm_manager_, context == nullptr ? nullptr : context->log_mgr_);
+        CheckpointManager checkpoint_mgr(txn_mgr_, schema_manager_->sm_manager(),
+                                         context == nullptr ? nullptr : context->log_mgr_);
         checkpoint_mgr.RunCleanCheckpoint();
         break;
     }
@@ -296,7 +297,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         memcpy(context->data_send_ + *(context->offset_), local_send.data(), local_offset);
         *(context->offset_) += local_offset;
 
-        if (sm_manager_->output_file_enabled_) {
+        if (schema_manager_->output_file_enabled()) {
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << out_file_stream.str();

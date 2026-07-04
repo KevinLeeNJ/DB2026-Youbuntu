@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "parser/ast.h"
 
 #include "parser/parser.h"
+#include "system/schema_manager.h"
 
 typedef enum PlanTag {
     T_Invalid = 1,
@@ -69,12 +70,12 @@ public:
 
 class ScanPlan : public Plan {
 public:
-    ScanPlan(PlanTag tag, SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
+    ScanPlan(PlanTag tag, SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
              std::vector<std::string> index_col_names) {
         Plan::tag = tag;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
-        TabMeta& tab = sm_manager->db_.get_table(tab_name_);
+        TabMeta& tab = schema_manager->catalog().get_table(tab_name_);
         cols_ = tab.cols;
         len_ = cols_.back().offset + cols_.back().len;
         fed_conds_ = conds_;

@@ -42,6 +42,7 @@ protected:
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
+    std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
@@ -56,11 +57,12 @@ protected:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
-        txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
-        planner_ = std::make_unique<Planner>(sm_manager_.get());
-        analyze_ = std::make_unique<Analyze>(sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
+        txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
+        planner_ = std::make_unique<Planner>(schema_manager_.get());
+        analyze_ = std::make_unique<Analyze>(schema_manager_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get());
 
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
@@ -90,7 +92,7 @@ protected:
         auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(std::move(query), nullptr);
         auto portal_stmt = portal_->start(std::move(plan), nullptr);
-        QlManager ql_mgr(sm_manager_.get(), txn_manager_.get(), planner_.get());
+        QlManager ql_mgr(schema_manager_.get(), txn_manager_.get(), planner_.get());
         txn_id_t txn = 0;
         portal_->run(std::move(portal_stmt), &ql_mgr, &txn, nullptr);
     }

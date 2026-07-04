@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 
 class DeleteExecutor : public AbstractExecutor {
 private:
@@ -24,15 +25,15 @@ private:
     RmFileHandle* fh_;             // 表的数据文件句柄
     std::vector<Rid> rids_;        // 需要删除的记录的位置
     std::string tab_name_;         // 表名称
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
 
 public:
-    DeleteExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Condition> conds,
+    DeleteExecutor(SchemaManager* schema_manager, const std::string& tab_name, std::vector<Condition> conds,
                    std::vector<Rid> rids, Context* context) {
-        sm_manager_ = sm_manager;
+        schema_manager_ = schema_manager;
         tab_name_ = tab_name;
-        tab_ = sm_manager_->db_.get_table(tab_name);
-        fh_ = sm_manager_->fhs_.at(tab_name).get();
+        tab_ = schema_manager_->catalog().get_table(tab_name);
+        fh_ = schema_manager_->get_table_handle(tab_name);
         conds_ = conds;
         rids_ = rids;
         context_ = context;
@@ -122,24 +123,24 @@ public:
             std::vector<DeletedIndex> deleted_indexes;
             try {
                 for (auto& index : tab_.indexes) {
-                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                  .get();
+                    auto ih = schema_manager_->get_index_handle(tab_name_, index.cols);
                     std::vector<char> key(index.col_tot_len);
                     int offset = 0;
                     for (int i = 0; i < index.col_num; ++i) {
                         std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
                         offset += index.cols[i].len;
                     }
-                    sm_manager_->remember_historical_index_key(
-                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid);
+                    if (context_->txn_mgr_ != nullptr) {
+                        context_->txn_mgr_->ssi_registry().remember_historical_index_key(
+                            tab_name_, schema_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key,
+                            rid);
+                    }
                     ih->delete_entry(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }
             } catch (...) {
                 for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
-                    auto ih =
-                        sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, it->index->cols))
-                            .get();
+                    auto ih = schema_manager_->get_index_handle(tab_name_, it->index->cols);
                     ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_, true);
                 }
                 // undo_record is automatically cleaned up by unique_ptr
@@ -162,7 +163,9 @@ public:
                 tombstone.is_deleted_ = true;
                 tombstone.version_chain_head_ = undo_link;
                 fh_->set_tuple_meta(rid, tombstone);
-                sm_manager_->remember_deleted_tuple_candidate(tab_name_, rid);
+                if (context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->ssi_registry().remember_deleted_tuple_candidate(tab_name_, rid);
+                }
             } else {
                 fh_->delete_record(rid, context_);
             }

@@ -99,24 +99,24 @@ inline bool RecordDataEquals(const RmRecord& lhs, const RmRecord& rhs) {
     return lhs.size == rhs.size && std::memcmp(lhs.data, rhs.data, lhs.size) == 0;
 }
 
-inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager* sm_manager,
-                                                     const std::string& tab_name, const RmRecord& inserted_rec,
-                                                     Context* context) {
-    if (fh == nullptr || sm_manager == nullptr || context == nullptr || context->txn_ == nullptr) {
+inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, const std::string& tab_name,
+                                                     const RmRecord& inserted_rec, Context* context) {
+    if (fh == nullptr || context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
         return false;
     }
 
+    auto& ssi = context->txn_mgr_->ssi_registry();
     auto* txn = context->txn_;
-    auto candidate_rids = sm_manager->get_deleted_tuple_candidates(tab_name);
+    auto candidate_rids = ssi.get_deleted_tuple_candidates(tab_name);
     for (const auto& rid : candidate_rids) {
         if (!fh->is_record(rid)) {
-            sm_manager->remove_deleted_tuple_candidate(tab_name, rid);
+            ssi.remove_deleted_tuple_candidate(tab_name, rid);
             continue;
         }
 
         TupleMeta meta = fh->get_tuple_meta(rid);
         if (!meta.is_deleted_) {
-            sm_manager->remove_deleted_tuple_candidate(tab_name, rid);
+            ssi.remove_deleted_tuple_candidate(tab_name, rid);
             continue;
         }
         if (meta.writer_txn_id_ == txn->get_transaction_id()) {

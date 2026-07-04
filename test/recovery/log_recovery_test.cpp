@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_recovery.h"
 #include "storage/buffer_pool_manager.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
@@ -80,7 +81,7 @@ class OpenRecoveryDb {
 public:
     explicit OpenRecoveryDb(const std::string& db_name)
         : bpm_(64, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_), sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_),
-          log_mgr_(std::make_unique<LogManager>(&disk_)) {
+          schema_mgr_(&sm_mgr_), log_mgr_(std::make_unique<LogManager>(&disk_)) {
         sm_mgr_.open_db(db_name);
     }
 
@@ -95,6 +96,7 @@ public:
     RmManager rm_mgr_;
     IxManager ix_mgr_;
     SmManager sm_mgr_;
+    SchemaManager schema_mgr_;
     std::unique_ptr<LogManager> log_mgr_;
     bool opened_{true};
 };
@@ -144,15 +146,15 @@ void FlushLogs(LogManager& log_mgr) {
 
 void RunRecovery(const std::string& db_name) {
     OpenRecoveryDb db(db_name);
-    auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.sm_mgr_);
+    auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.schema_mgr_);
     recovery->analyze();
     recovery->redo();
     recovery->undo();
 }
 
-bool RecordExists(SmManager& sm_mgr, const Rid& rid) {
+bool RecordExists(SchemaManager& schema_mgr, const Rid& rid) {
     try {
-        auto* fh = sm_mgr.fhs_.at("t").get();
+        auto* fh = schema_mgr.get_table_handle("t");
         if (rid.page_no < 0 || rid.page_no >= fh->get_file_hdr().num_pages) {
             return false;
         }
@@ -162,15 +164,15 @@ bool RecordExists(SmManager& sm_mgr, const Rid& rid) {
     }
 }
 
-int RecordValue(SmManager& sm_mgr, const Rid& rid) {
-    auto record = sm_mgr.fhs_.at("t")->get_record(rid, nullptr);
+int RecordValue(SchemaManager& schema_mgr, const Rid& rid) {
+    auto record = schema_mgr.get_table_handle("t")->get_record(rid, nullptr);
     int value = 0;
     memcpy(&value, record->data + sizeof(int), sizeof(int));
     return value;
 }
 
-bool IndexPointsTo(SmManager& sm_mgr, int key, const Rid& rid) {
-    auto* index = sm_mgr.ihs_.at(sm_mgr.get_ix_manager()->get_index_name("t", {"id"})).get();
+bool IndexPointsTo(SchemaManager& schema_mgr, int key, const Rid& rid) {
+    auto* index = schema_mgr.get_index_handle("t", std::vector<std::string>{"id"});
     std::vector<Rid> result;
     if (!index->get_value(MakeIntKey(key).data(), &result, nullptr)) {
         return false;
@@ -187,6 +189,7 @@ TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     RmManager rm_mgr(&disk, &bpm);
     IxManager ix_mgr(&disk, &bpm);
     SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    SchemaManager schema_mgr(&sm_mgr);
 
     sm_mgr.create_db("recovery_apply_test_db");
     sm_mgr.open_db("recovery_apply_test_db");
@@ -196,7 +199,7 @@ TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     Rid rid{1, 0};
     auto rec1 = MakeTuple(1, 10);
     auto rec2 = MakeTuple(2, 20);
-    auto* index = sm_mgr.ihs_.at(sm_mgr.get_ix_manager()->get_index_name("t", {"id"})).get();
+    auto* index = schema_mgr.get_index_handle("t", std::vector<std::string>{"id"});
 
     sm_mgr.insert_record_with_indexes("t", rid, rec1);
     std::vector<Rid> result;
@@ -215,7 +218,7 @@ TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     sm_mgr.delete_record_with_indexes("t", rid, rec2);
     result.clear();
     EXPECT_FALSE(index->get_value(MakeIntKey(2).data(), &result, nullptr));
-    EXPECT_FALSE(sm_mgr.fhs_.at("t")->is_record(rid));
+    EXPECT_FALSE(schema_mgr.get_table_handle("t")->is_record(rid));
 
     sm_mgr.close_db();
 }
@@ -238,9 +241,9 @@ TEST(RecoveryManagerTest, CommittedInsertSurvivesRecovery) {
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {
@@ -261,15 +264,15 @@ TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {
         meta.writer_txn_id_ = 100;
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
-        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+        db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, meta);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, CommittedUpdateSurvivesRecovery) {
@@ -293,10 +296,10 @@ TEST(RecoveryManagerTest, CommittedUpdateSurvivesRecovery) {
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 20);
+    EXPECT_FALSE(IndexPointsTo(db.schema_mgr_, 1, rid));
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 2, rid));
 }
 
 TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
@@ -320,17 +323,17 @@ TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
         meta.writer_txn_id_ = 100;
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
-        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+        db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, meta);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 1, rid));
+    EXPECT_FALSE(IndexPointsTo(db.schema_mgr_, 2, rid));
 }
 
 TEST(RecoveryManagerTest, AbortedUpdateDoesNotUndoLaterCommittedSameValueUpdate) {
@@ -359,9 +362,9 @@ TEST(RecoveryManagerTest, AbortedUpdateDoesNotUndoLaterCommittedSameValueUpdate)
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 20);
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, CommittedDeleteSurvivesRecovery) {
@@ -384,8 +387,8 @@ TEST(RecoveryManagerTest, CommittedDeleteSurvivesRecovery) {
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, UncommittedDeleteIsUndone) {
@@ -409,9 +412,9 @@ TEST(RecoveryManagerTest, UncommittedDeleteIsUndone) {
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, AbortedDeleteDoesNotRestoreLaterCommittedSameRowDelete) {
@@ -439,8 +442,8 @@ TEST(RecoveryManagerTest, AbortedDeleteDoesNotRestoreLaterCommittedSameRowDelete
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, UncommittedMvccDeleteTombstoneIsUndone) {
@@ -463,16 +466,16 @@ TEST(RecoveryManagerTest, UncommittedMvccDeleteTombstoneIsUndone) {
         tombstone.writer_txn_id_ = 100;
         tombstone.is_committed_ = false;
         tombstone.is_deleted_ = true;
-        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, tombstone);
+        db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, tombstone);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
@@ -495,15 +498,15 @@ TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
         meta.writer_txn_id_ = 100;
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
-        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+        db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, meta);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
-    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
@@ -516,7 +519,7 @@ TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
     {
         OpenRecoveryDb db(db_name);
         LockManager lock_mgr;
-        TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+        TransactionManager txn_mgr(&lock_mgr, &db.schema_mgr_);
         CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, db.log_mgr_.get());
 
         db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
@@ -535,7 +538,7 @@ TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
     }
 
     OpenRecoveryDb db(db_name);
-    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
-    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
-    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    ASSERT_TRUE(RecordExists(db.schema_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.schema_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.schema_mgr_, 1, rid));
 }

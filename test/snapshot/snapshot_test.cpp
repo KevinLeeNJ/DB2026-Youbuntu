@@ -113,17 +113,18 @@ public:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
-        txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
-        planner_ = std::make_unique<Planner>(sm_manager_.get());
-        optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
+        txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
+        planner_ = std::make_unique<Planner>(schema_manager_.get());
+        optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
         ql_manager_ =
-            std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
+            std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         recovery_ =
-            std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
-        analyze_ = std::make_unique<Analyze>(sm_manager_.get());
+            std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get());
+        analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
         sm_manager_->create_db(db_name_);
         sm_manager_->open_db(db_name_);
@@ -180,6 +181,7 @@ private:
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
+    std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;

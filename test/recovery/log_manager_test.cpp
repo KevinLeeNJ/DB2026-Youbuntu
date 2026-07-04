@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 #include "transaction/transaction_manager.h"
 
 #include <gtest/gtest.h>
@@ -297,7 +298,8 @@ TEST(LogManagerTest, TransactionBeginCommitLogPrevLsn) {
     IxManager ix_mgr(&disk, &bpm);
     SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
     LockManager lock_mgr;
-    TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
+    SchemaManager schema_mgr(&sm_mgr);
+    TransactionManager txn_mgr(&lock_mgr, &schema_mgr);
     LogManager log_mgr(&disk);
 
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr);
@@ -318,7 +320,8 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     IxManager ix_mgr(&disk, &bpm);
     SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
     LockManager lock_mgr;
-    TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
+    SchemaManager schema_mgr(&sm_mgr);
+    TransactionManager txn_mgr(&lock_mgr, &schema_mgr);
 
     sm_mgr.create_db("executor_dml_log_test_db");
     sm_mgr.open_db("executor_dml_log_test_db");
@@ -334,17 +337,17 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     id.set_int(1);
     Value v;
     v.set_int(10);
-    InsertExecutor insert_executor(&sm_mgr, "t", {id, v}, &context);
+    InsertExecutor insert_executor(&schema_mgr, "t", {id, v}, &context);
     insert_executor.Next();
     Rid rid = insert_executor.rid();
 
     Value new_v;
     new_v.set_int(20);
     SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT};
-    UpdateExecutor update_executor(&sm_mgr, "t", {set_clause}, {}, {rid}, &context);
+    UpdateExecutor update_executor(&schema_mgr, "t", {set_clause}, {}, {rid}, &context);
     update_executor.Next();
 
-    DeleteExecutor delete_executor(&sm_mgr, "t", {}, {rid}, &context);
+    DeleteExecutor delete_executor(&schema_mgr, "t", {}, {rid}, &context);
     delete_executor.Next();
 
     txn_mgr.commit(txn, &log_mgr);

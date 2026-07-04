@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution.h"
 #include "parser/parser.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 #include "common/context.h"
 #include "transaction/transaction_manager.h"
 #include "planner.h"
@@ -24,11 +25,11 @@ See the Mulan PSL v2 for more details. */
 
 class Optimizer {
 private:
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
     Planner* planner_;
 
 public:
-    Optimizer(SmManager* sm_manager, Planner* planner) : sm_manager_(sm_manager), planner_(planner) {}
+    Optimizer(SchemaManager* schema_manager, Planner* planner) : schema_manager_(schema_manager), planner_(planner) {}
 
     std::unique_ptr<Plan> plan_query(std::unique_ptr<Query> query, Context* context) {
         auto* parse = query->parse.get();

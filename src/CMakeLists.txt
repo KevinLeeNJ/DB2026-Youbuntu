@@ -15,6 +15,7 @@ add_subdirectory(recovery)
 add_subdirectory(diagnostics)
 add_subdirectory(statement)
 add_subdirectory(server)
+add_subdirectory(catalog)
 add_subdirectory(instance)
 add_subdirectory(test)
 

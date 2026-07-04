@@ -37,6 +37,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
+#include "system/schema_manager.h"
 #include "system/sm_meta.h"
 
 namespace {
@@ -476,6 +477,7 @@ public:
     std::unique_ptr<RmManager> rm_manager;
     std::unique_ptr<IxManager> ix_manager;
     std::unique_ptr<SmManager> sm_manager;
+    std::unique_ptr<SchemaManager> schema_manager;
     std::string db_name = "index_scan_feature_test_db";
     bool opened = false;
 
@@ -486,6 +488,7 @@ public:
         ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
         sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
                                                  ix_manager.get());
+        schema_manager = std::make_unique<SchemaManager>(sm_manager.get());
         if (sm_manager->is_dir(db_name)) {
             sm_manager->drop_db(db_name);
         }
@@ -536,7 +539,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), "warehouse", {id, name_val}, &context);
+        InsertExecutor executor(schema_manager.get(), "warehouse", {id, name_val}, &context);
         executor.Next();
     }
 
@@ -548,7 +551,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), tab_name, {av, bv}, &context);
+        InsertExecutor executor(schema_manager.get(), tab_name, {av, bv}, &context);
         executor.Next();
     }
 
@@ -562,7 +565,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), tab_name, {av, bv, cv}, &context);
+        InsertExecutor executor(schema_manager.get(), tab_name, {av, bv, cv}, &context);
         executor.Next();
     }
 
@@ -576,7 +579,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), "scores", {sid_val, cid_val, score_val}, &context);
+        InsertExecutor executor(schema_manager.get(), "scores", {sid_val, cid_val, score_val}, &context);
         executor.Next();
     }
 
@@ -626,7 +629,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexScanExecutor executor(sm_manager.get(), "warehouse", conds, index_cols, &context);
+        IndexScanExecutor executor(schema_manager.get(), "warehouse", conds, index_cols, &context);
         std::vector<int> ids;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -640,7 +643,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexScanExecutor executor(sm_manager.get(), tab_name, conds, index_cols, &context);
+        IndexScanExecutor executor(schema_manager.get(), tab_name, conds, index_cols, &context);
         std::vector<int> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -654,7 +657,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexScanExecutor executor(sm_manager.get(), "scores", conds, index_cols, &context);
+        IndexScanExecutor executor(schema_manager.get(), "scores", conds, index_cols, &context);
         std::vector<std::pair<int, int>> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -668,7 +671,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexSkipScanExecutor executor(sm_manager.get(), "triples", conds, index_cols, &context);
+        IndexSkipScanExecutor executor(schema_manager.get(), "triples", conds, index_cols, &context);
         std::vector<int> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -749,7 +752,7 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
 TEST_F(IndexScanFeatureTest, PlannerSelectsBestLeftmostPrefixIndexAndReordersConditions) {
     create_warehouse();
     sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
-    Planner planner(sm_manager.get());
+    Planner planner(schema_manager.get());
     std::vector<Condition> conds = {string_cond(OP_EQ, "qwerghjk"), int_cond(OP_EQ, 100)};
     std::vector<std::string> index_cols;
 
@@ -771,20 +774,20 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     int offset = 0;
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
     std::vector<Rid> delete_rids;
-    IndexScanExecutor delete_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &context);
+    IndexScanExecutor delete_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &context);
     for (delete_scan.beginTuple(); !delete_scan.is_end(); delete_scan.nextTuple()) {
         delete_rids.push_back(delete_scan.rid());
     }
-    DeleteExecutor delete_exec(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, delete_rids, &context);
+    DeleteExecutor delete_exec(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, delete_rids, &context);
     delete_exec.Next();
     EXPECT_TRUE(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}).empty());
 
     std::vector<Rid> update_rids;
-    IndexScanExecutor update_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &context);
+    IndexScanExecutor update_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &context);
     for (update_scan.beginTuple(); !update_scan.is_end(); update_scan.nextTuple()) {
         update_rids.push_back(update_scan.rid());
     }
-    UpdateExecutor update_exec(sm_manager.get(), "warehouse", {set_int_clause("warehouse", "w_id", 507)},
+    UpdateExecutor update_exec(schema_manager.get(), "warehouse", {set_int_clause("warehouse", "w_id", 507)},
                                {int_cond(OP_EQ, 534)}, update_rids, &context);
     update_exec.Next();
     EXPECT_EQ(scan_ids({int_cond(OP_GT, 100), int_cond(OP_LT, 534)}, {"w_id"}), std::vector<int>({500, 507}));
@@ -810,12 +813,12 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
     int offset = 0;
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
     std::vector<Rid> rids;
-    IndexScanExecutor scan(sm_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &context);
+    IndexScanExecutor scan(schema_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &context);
     for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
         rids.push_back(scan.rid());
     }
 
-    UpdateExecutor update_exec(sm_manager.get(), "warehouse", {set_string_clause("warehouse", "name", "qweruiop")},
+    UpdateExecutor update_exec(schema_manager.get(), "warehouse", {set_string_clause("warehouse", "name", "qweruiop")},
                                {string_cond(OP_EQ, "asdfhjkl")}, rids, &context);
     EXPECT_THROW(update_exec.Next(), IndexEntryExistsError);
 

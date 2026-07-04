@@ -40,7 +40,7 @@ std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
 void InsertIndexEntryIdempotent(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
                                 const RmRecord& rec, const Rid& rid) {
     auto key = MakeIndexKey(index, rec.data);
-    auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+    auto ih = sm_manager->get_ih(tab_name, index.cols);
     std::vector<Rid> existing;
     if (ih->get_value(key.data(), &existing, nullptr)) {
         for (const auto& existing_rid : existing) {
@@ -55,7 +55,7 @@ void InsertIndexEntryIdempotent(SmManager* sm_manager, const std::string& tab_na
 void DeleteIndexEntryIfExists(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
                               const RmRecord& rec, const Rid& rid) {
     auto key = MakeIndexKey(index, rec.data);
-    auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+    auto ih = sm_manager->get_ih(tab_name, index.cols);
     ih->delete_entry(key.data(), rid, nullptr);
 }
 
@@ -142,10 +142,6 @@ void SmManager::open_db(const std::string& db_name) {
         throw UnixError();
     }
     std::string original_cwd = cwd_buf;
-    {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
-        historical_index_keys_.clear();
-    }
     try {
         if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
             throw UnixError();
@@ -209,10 +205,6 @@ void SmManager::close_db() {
     ihs_.clear();
     db_.name_.clear();
     db_.tabs_.clear();
-    {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
-        historical_index_keys_.clear();
-    }
     if (chdir("..") < 0) { // 回到根目录
         throw UnixError();
     }

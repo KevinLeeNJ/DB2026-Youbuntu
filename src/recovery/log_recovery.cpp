@@ -178,9 +178,9 @@ void RecoveryManager::undo() {
             current_lsn = record->prev_lsn_;
         }
     }
-    sm_manager_->reset_all_tuple_meta_after_recovery();
+    schema_manager_->reset_all_tuple_meta_after_recovery();
     rebuild_indexes();
-    sm_manager_->flush_all_table_and_index_pages();
+    schema_manager_->flush_all_table_and_index_pages();
     // 表页与索引页已落盘后，截断日志文件并推进 global_lsn。
     // 这样已 undo 完毕的 loser 日志不再残留，避免下一次重启跨轮重复 undo
     // 同 RID 上的数据（尤其是 RID 复用且内容相同时，仅靠 undo 内容守卫无法区分）。
@@ -191,15 +191,15 @@ void RecoveryManager::undo() {
 }
 
 bool RecoveryManager::record_exists(const std::string& table_name, const Rid& rid) const {
-    auto it = sm_manager_->fhs_.find(table_name);
-    if (it == sm_manager_->fhs_.end()) {
+    auto* fh = schema_manager_->find_table_handle(table_name);
+    if (fh == nullptr) {
         return false;
     }
-    if (rid.page_no < 0 || rid.page_no >= it->second->get_file_hdr().num_pages) {
+    if (rid.page_no < 0 || rid.page_no >= fh->get_file_hdr().num_pages) {
         return false;
     }
     try {
-        return it->second->is_record(rid);
+        return fh->is_record(rid);
     } catch (const std::exception&) {
         return false;
     }
@@ -210,7 +210,7 @@ std::unique_ptr<RmRecord> RecoveryManager::get_record_if_exists(const std::strin
         return nullptr;
     }
     try {
-        return sm_manager_->fhs_.at(table_name)->get_record(rid, nullptr);
+        return schema_manager_->get_table_handle(table_name)->get_record(rid, nullptr);
     } catch (const std::exception&) {
         return nullptr;
     }
@@ -225,8 +225,8 @@ bool RecoveryManager::record_equals(const std::string& table_name, const Rid& ri
 }
 
 void RecoveryManager::reset_tuple_meta(const std::string& table_name, const Rid& rid) {
-    auto it = sm_manager_->fhs_.find(table_name);
-    if (it == sm_manager_->fhs_.end() || !record_exists(table_name, rid)) {
+    auto* it = schema_manager_->find_table_handle(table_name);
+    if (it == nullptr || !record_exists(table_name, rid)) {
         return;
     }
 
@@ -236,34 +236,34 @@ void RecoveryManager::reset_tuple_meta(const std::string& table_name, const Rid&
     meta.is_committed_ = true;
     meta.is_deleted_ = false;
     meta.version_chain_head_ = UndoLink{};
-    it->second->set_tuple_meta(rid, meta);
+    it->set_tuple_meta(rid, meta);
 }
 
 void RecoveryManager::redo_insert(const InsertLogRecord& log) {
-    sm_manager_->fhs_.at(log.table_name_)->insert_record(log.rid_, log.insert_value_.data);
+    schema_manager_->get_table_handle(log.table_name_)->insert_record(log.rid_, log.insert_value_.data);
     // 标记该 slot 由本 committed 事务重做写入，以便 undo_insert 能据此区分所有权：
     // 若某 loser 事务曾在同一 RID 插入过相同内容，内容比较无法区分，必须用 writer_txn_id 判断。
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it != sm_manager_->fhs_.end() && table_it->second->is_record(log.rid_)) {
+    auto* table_it = schema_manager_->find_table_handle(log.table_name_);
+    if (table_it != nullptr && table_it->is_record(log.rid_)) {
         TupleMeta meta;
         meta.commit_ts_ = 0;
         meta.writer_txn_id_ = log.log_tid_;
         meta.is_committed_ = true;
         meta.is_deleted_ = false;
         meta.version_chain_head_ = UndoLink{};
-        table_it->second->set_tuple_meta(log.rid_, meta);
+        table_it->set_tuple_meta(log.rid_, meta);
     }
 }
 
 void RecoveryManager::redo_delete(const DeleteLogRecord& log) {
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it == sm_manager_->fhs_.end()) {
+    auto* table_it = schema_manager_->find_table_handle(log.table_name_);
+    if (table_it == nullptr) {
         return;
     }
     if (record_exists(log.table_name_, log.rid_)) {
-        table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr);
+        table_it->update_record(log.rid_, log.delete_value_.data, nullptr);
     } else {
-        table_it->second->insert_record(log.rid_, log.delete_value_.data);
+        table_it->insert_record(log.rid_, log.delete_value_.data);
     }
     TupleMeta meta;
     meta.commit_ts_ = 0;
@@ -271,25 +271,25 @@ void RecoveryManager::redo_delete(const DeleteLogRecord& log) {
     meta.is_committed_ = true;
     meta.is_deleted_ = true;
     meta.version_chain_head_ = UndoLink{};
-    table_it->second->set_tuple_meta(log.rid_, meta);
+    table_it->set_tuple_meta(log.rid_, meta);
 }
 
 void RecoveryManager::redo_update(const UpdateLogRecord& log) {
     auto current = get_record_if_exists(log.table_name_, log.rid_);
     if (current == nullptr) {
-        sm_manager_->fhs_.at(log.table_name_)->insert_record(log.rid_, log.new_value_.data);
+        schema_manager_->get_table_handle(log.table_name_)->insert_record(log.rid_, log.new_value_.data);
     } else {
-        sm_manager_->fhs_.at(log.table_name_)->update_record(log.rid_, log.new_value_.data, nullptr);
+        schema_manager_->get_table_handle(log.table_name_)->update_record(log.rid_, log.new_value_.data, nullptr);
     }
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it != sm_manager_->fhs_.end() && table_it->second->is_record(log.rid_)) {
+    auto* table_it = schema_manager_->find_table_handle(log.table_name_);
+    if (table_it != nullptr && table_it->is_record(log.rid_)) {
         TupleMeta meta;
         meta.commit_ts_ = 0;
         meta.writer_txn_id_ = log.log_tid_;
         meta.is_committed_ = true;
         meta.is_deleted_ = false;
         meta.version_chain_head_ = UndoLink{};
-        table_it->second->set_tuple_meta(log.rid_, meta);
+        table_it->set_tuple_meta(log.rid_, meta);
     }
 }
 
@@ -298,72 +298,72 @@ void RecoveryManager::undo_insert(const InsertLogRecord& log) {
     // 内容比较无法区分「loser 未刷盘的 insert」与「committed 事务在同一 RID 复用并写入
     // 相同内容」（RID 复用 + d_next_o_id 回退后复位会导致两者完全相同），故必须用
     // TupleMeta.writer_txn_id_ 判断所有权：仅当 slot 仍归属本 loser 事务时才删除。
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it == sm_manager_->fhs_.end() || !table_it->second->is_record(log.rid_)) {
+    auto* table_it = schema_manager_->find_table_handle(log.table_name_);
+    if (table_it == nullptr || !table_it->is_record(log.rid_)) {
         return;
     }
-    TupleMeta meta = table_it->second->get_tuple_meta(log.rid_);
+    TupleMeta meta = table_it->get_tuple_meta(log.rid_);
     if (meta.writer_txn_id_ != log.log_tid_) {
         return;
     }
-    table_it->second->delete_record(log.rid_, nullptr);
+    table_it->delete_record(log.rid_, nullptr);
 }
 
 void RecoveryManager::undo_delete(const DeleteLogRecord& log) {
     // 幂等守卫：仅当该 slot 当前为空，或仍是本 loser 写下的 MVCC tombstone 时才恢复。
     // 若 slot 已被后续 committed 事务重新写入为 live tuple，跳过，避免覆盖 committed 数据。
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it == sm_manager_->fhs_.end()) {
+    auto* table_it = schema_manager_->find_table_handle(log.table_name_);
+    if (table_it == nullptr) {
         return;
     }
     if (record_exists(log.table_name_, log.rid_)) {
-        TupleMeta meta = table_it->second->get_tuple_meta(log.rid_);
+        TupleMeta meta = table_it->get_tuple_meta(log.rid_);
         if (meta.is_deleted_ && meta.writer_txn_id_ == log.log_tid_) {
-            table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr);
+            table_it->update_record(log.rid_, log.delete_value_.data, nullptr);
             TupleMeta restored_meta;
             restored_meta.commit_ts_ = 0;
             restored_meta.writer_txn_id_ = log.log_tid_;
             restored_meta.is_committed_ = false;
             restored_meta.is_deleted_ = false;
             restored_meta.version_chain_head_ = UndoLink{};
-            table_it->second->set_tuple_meta(log.rid_, restored_meta);
+            table_it->set_tuple_meta(log.rid_, restored_meta);
         }
         return;
     }
-    table_it->second->insert_record(log.rid_, log.delete_value_.data);
+    table_it->insert_record(log.rid_, log.delete_value_.data);
     TupleMeta restored_meta;
     restored_meta.commit_ts_ = 0;
     restored_meta.writer_txn_id_ = log.log_tid_;
     restored_meta.is_committed_ = false;
     restored_meta.is_deleted_ = false;
     restored_meta.version_chain_head_ = UndoLink{};
-    table_it->second->set_tuple_meta(log.rid_, restored_meta);
+    table_it->set_tuple_meta(log.rid_, restored_meta);
 }
 
 void RecoveryManager::undo_update(const UpdateLogRecord& log) {
     // 幂等守卫：仅当该 rid 仍持有本 loser 事务写入的 new_value 时才回滚到 old_value。
     // 若 rid 已被后续 committed 事务覆盖为其他值，跳过，避免覆盖 committed 数据。
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it == sm_manager_->fhs_.end() || !table_it->second->is_record(log.rid_)) {
+    auto* table_it = schema_manager_->find_table_handle(log.table_name_);
+    if (table_it == nullptr || !table_it->is_record(log.rid_)) {
         return;
     }
-    TupleMeta meta = table_it->second->get_tuple_meta(log.rid_);
+    TupleMeta meta = table_it->get_tuple_meta(log.rid_);
     if (meta.writer_txn_id_ != log.log_tid_) {
         return;
     }
     if (!record_equals(log.table_name_, log.rid_, log.new_value_)) {
         return;
     }
-    table_it->second->update_record(log.rid_, log.old_value_.data, nullptr);
+    table_it->update_record(log.rid_, log.old_value_.data, nullptr);
     TupleMeta restored_meta;
     restored_meta.commit_ts_ = 0;
     restored_meta.writer_txn_id_ = log.log_tid_;
     restored_meta.is_committed_ = false;
     restored_meta.is_deleted_ = false;
     restored_meta.version_chain_head_ = UndoLink{};
-    table_it->second->set_tuple_meta(log.rid_, restored_meta);
+    table_it->set_tuple_meta(log.rid_, restored_meta);
 }
 
 void RecoveryManager::rebuild_indexes() {
-    sm_manager_->rebuild_all_indexes();
+    schema_manager_->rebuild_all_indexes();
 }

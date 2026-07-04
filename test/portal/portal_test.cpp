@@ -57,6 +57,7 @@ protected:
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
+    std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<Portal> portal_;
     bool db_opened_ = false;
 
@@ -67,7 +68,8 @@ protected:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get());
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
         }
@@ -88,7 +90,7 @@ protected:
     }
 
     std::unique_ptr<Plan> make_select_subplan(bool with_limit) {
-        auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade", std::vector<Condition>{},
+        auto scan = std::make_unique<ScanPlan>(T_SeqScan, schema_manager_.get(), "grade", std::vector<Condition>{},
                                                std::vector<std::string>{});
 
         std::vector<AggExpr> agg_exprs = {

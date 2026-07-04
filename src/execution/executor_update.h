@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 #include <algorithm>
 
 class UpdateExecutor : public AbstractExecutor {
@@ -26,7 +27,7 @@ private:
     std::vector<Rid> rids_;
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
 
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
         std::vector<char> key(index.col_tot_len);
@@ -39,13 +40,13 @@ private:
     }
 
 public:
-    UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
+    UpdateExecutor(SchemaManager* schema_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
                    std::vector<Condition> conds, std::vector<Rid> rids, Context* context) {
-        sm_manager_ = sm_manager;
+        schema_manager_ = schema_manager;
         tab_name_ = tab_name;
         set_clauses_ = set_clauses;
-        tab_ = sm_manager_->db_.get_table(tab_name);
-        fh_ = sm_manager_->fhs_.at(tab_name).get();
+        tab_ = schema_manager_->catalog().get_table(tab_name);
+        fh_ = schema_manager_->get_table_handle(tab_name);
         conds_ = conds;
         rids_ = rids;
         context_ = context;
@@ -146,17 +147,23 @@ public:
                     if (old_key == new_key) {
                         continue;
                     }
-                    sm_manager_->remember_historical_index_key(
-                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), old_key, rid);
-                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                  .get();
+                    if (context_->txn_mgr_ != nullptr) {
+                        context_->txn_mgr_->ssi_registry().remember_historical_index_key(
+                            tab_name_, schema_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols),
+                            old_key, rid);
+                    }
+                    auto ih = schema_manager_->get_index_handle(tab_name_, index.cols);
                     std::vector<Rid> result;
                     if (ih->get_value(new_key.data(), &result, txn) &&
                         std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
                         throw IndexEntryExistsError();
                     }
-                    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-                    auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, new_key);
+                    const std::string index_name =
+                        schema_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+                    auto candidate_rids = context_->txn_mgr_ != nullptr
+                                              ? context_->txn_mgr_->ssi_registry().get_historical_index_key_rids(
+                                                    tab_name_, index_name, new_key)
+                                              : std::vector<Rid>{};
                     for (const auto& candidate_rid : candidate_rids) {
                         if (candidate_rid != rid &&
                             HistoricalIndexKeyConflictsWithTxn(fh_, candidate_rid, index, new_key, context_)) {
@@ -199,9 +206,7 @@ public:
                 try {
                     for (size_t i = 0; i < index_updates.size(); ++i) {
                         const auto& update = index_updates[i];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
+                        auto ih = schema_manager_->get_index_handle(tab_name_, update.index->cols);
                         ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
                         ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
@@ -211,16 +216,12 @@ public:
                 {
                     for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
                         const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
+                        auto ih = schema_manager_->get_index_handle(tab_name_, update.index->cols);
                         ih->delete_entry(update.new_key.data(), rid, txn); // 删除新索引
                     }
                     for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
                         const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
+                        auto ih = schema_manager_->get_index_handle(tab_name_, update.index->cols);
                         ih->insert_entry(update.old_key.data(), rid, txn, true); // 恢复旧索引
                     }
                     throw; // 仍然抛出错误

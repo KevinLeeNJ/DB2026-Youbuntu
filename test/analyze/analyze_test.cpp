@@ -215,10 +215,11 @@ std::unique_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::unique_ptr<as
 class AnalyzeAggregateTest : public ::testing::Test {
 protected:
     SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr};
-    Analyze analyze_{&sm_manager_};
+    SchemaManager schema_manager_{&sm_manager_};
+    Analyze analyze_{&schema_manager_};
 
     void SetUp() override {
-        sm_manager_.db_.SetTabMeta("grade", make_grade_tab());
+        schema_manager_.db().SetTabMeta("grade", make_grade_tab());
     }
 };
 

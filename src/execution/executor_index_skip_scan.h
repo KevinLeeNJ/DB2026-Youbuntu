@@ -97,7 +97,7 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         while (cursor != end) {
             std::vector<char> prefix_key;
             {
-                IxScan probe(ih_, cursor, end, sm_manager_->get_bpm(), false);
+                IxScan probe(ih_, cursor, end, schema_manager_->get_bpm(), false);
                 if (probe.is_end()) {
                     break;
                 }
@@ -130,7 +130,7 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         scan_.reset();
         while (next_range_pos_ < ranges_.size()) {
             const auto range = ranges_[next_range_pos_++];
-            scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, sm_manager_->get_bpm(), false);
+            scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, schema_manager_->get_bpm(), false);
             if (!scan_->is_end()) {
                 return;
             }
@@ -153,9 +153,10 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
     }
 
 public:
-    IndexSkipScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
+    IndexSkipScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
                           std::vector<std::string> index_col_names, Context* context)
-        : IndexScanExecutor(sm_manager, std::move(tab_name), std::move(conds), std::move(index_col_names), context) {}
+        : IndexScanExecutor(schema_manager, std::move(tab_name), std::move(conds), std::move(index_col_names),
+                            context) {}
 
     void beginTuple() override {
         record_predicate_read();
@@ -167,7 +168,7 @@ public:
             return;
         }
 
-        ih_ = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
+        ih_ = schema_manager_->get_index_handle(tab_name_, index_meta_.cols);
         index_latch_guard_ = ih_->lock_shared();
         auto constraints = build_constraints();
         auto suffix_pos = first_suffix_equality_pos(constraints);

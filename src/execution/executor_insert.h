@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 
 class InsertExecutor : public AbstractExecutor {
 private:
@@ -26,7 +27,7 @@ private:
     RmFileHandle* fh_;          // 表的数据文件句柄
     std::string tab_name_;      // 表名称
     Rid rid_; // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
 
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
         std::vector<char> key(index.col_tot_len);
@@ -43,8 +44,9 @@ private:
             return;
         }
 
-        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-        auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, key);
+        const std::string index_name = schema_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+        auto candidate_rids =
+            context_->txn_mgr_->ssi_registry().get_historical_index_key_rids(tab_name_, index_name, key);
 
         for (const auto& existing_rid : candidate_rids) {
             if (HistoricalIndexKeyConflictsWithTxn(fh_, existing_rid, index, key, context_)) {
@@ -54,15 +56,16 @@ private:
     }
 
 public:
-    InsertExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Value> values, Context* context) {
-        sm_manager_ = sm_manager;
-        tab_ = sm_manager_->db_.get_table(tab_name);
+    InsertExecutor(SchemaManager* schema_manager, const std::string& tab_name, std::vector<Value> values,
+                   Context* context) {
+        schema_manager_ = schema_manager;
+        tab_ = schema_manager_->catalog().get_table(tab_name);
         values_ = values;
         tab_name_ = tab_name;
         if (values.size() != tab_.cols.size()) {
             throw InvalidValueCountError();
         }
-        fh_ = sm_manager_->fhs_.at(tab_name).get();
+        fh_ = schema_manager_->get_table_handle(tab_name);
         context_ = context;
     };
 
@@ -92,7 +95,7 @@ public:
 
         if (context_ != nullptr && context_->txn_ != nullptr &&
             context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
-            DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, tab_name_, rec, context_)) {
+            DeletedTupleCandidatesConflictWithInsert(fh_, tab_name_, rec, context_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
         }
 
@@ -101,7 +104,7 @@ public:
         for (const auto& index : tab_.indexes) {
             auto key = make_index_key(index, rec.data);
             check_mvcc_unique_key_conflict(index, key);
-            auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+            auto ih = schema_manager_->get_index_handle(tab_name_, index.cols);
             std::vector<Rid> result;
             if (ih->get_value(key.data(), &result, context_ == nullptr ? nullptr : context_->txn_)) {
                 throw IndexEntryExistsError();
@@ -135,16 +138,14 @@ public:
         try {
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
-                auto ih =
-                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                auto ih = schema_manager_->get_index_handle(tab_name_, index.cols);
                 ih->insert_entry(index_keys[i].data(), rid_, context_ == nullptr ? nullptr : context_->txn_);
                 inserted_indexes.push_back(i);
             }
         } catch (...) {
             for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
                 auto& index = tab_.indexes[*it];
-                auto ih =
-                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                auto ih = schema_manager_->get_index_handle(tab_name_, index.cols);
                 ih->delete_entry(index_keys[*it].data(), context_ == nullptr ? nullptr : context_->txn_);
             }
             fh_->delete_record(rid_, context_);

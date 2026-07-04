@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "record/rm.h"
 #include "system/sm.h"
+#include "system/schema_manager.h"
 #include "common/context.h"
 #include "common/common.h"
 #include "optimizer/plan.h"
@@ -31,13 +32,13 @@ class Planner;
 
 class QlManager {
 private:
-    SmManager* sm_manager_;
+    SchemaManager* schema_manager_;
     TransactionManager* txn_mgr_;
     Planner* planner_;
 
 public:
-    QlManager(SmManager* sm_manager, TransactionManager* txn_mgr, Planner* planner)
-        : sm_manager_(sm_manager), txn_mgr_(txn_mgr), planner_(planner) {}
+    QlManager(SchemaManager* schema_manager, TransactionManager* txn_mgr, Planner* planner)
+        : schema_manager_(schema_manager), txn_mgr_(txn_mgr), planner_(planner) {}
 
     void run_mutli_query(Plan* plan, Context* context);
     void run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context);

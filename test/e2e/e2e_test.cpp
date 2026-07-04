@@ -37,6 +37,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
+#include "system/schema_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
@@ -66,17 +67,18 @@ public:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
-        txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
-        planner_ = std::make_unique<Planner>(sm_manager_.get());
-        optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
+        txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
+        planner_ = std::make_unique<Planner>(schema_manager_.get());
+        optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
         ql_manager_ =
-            std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
+            std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         recovery_ =
-            std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
-        analyze_ = std::make_unique<Analyze>(sm_manager_.get());
+            std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get());
+        analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
         // Create and open the database
         if (!sm_manager_->is_dir(db_name_)) {
@@ -176,7 +178,7 @@ public:
     }
 
     TupleMeta first_tuple_meta(const std::string& table_name) {
-        auto* fh = sm_manager_->fhs_.at(table_name).get();
+        auto* fh = schema_manager_->get_table_handle(table_name);
         RmScan scan(fh);
         if (scan.is_end()) {
             throw InternalError("table has no tuple: " + table_name);
@@ -223,6 +225,7 @@ private:
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
+    std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
