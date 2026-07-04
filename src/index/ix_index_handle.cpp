@@ -178,6 +178,8 @@ IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffe
  */
 std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Operation operation,
                                                              Transaction* transaction, bool find_first) {
+    (void)operation;
+    (void)transaction;
     IxNodeHandle node;
     fetch_node_into(file_hdr_->root_page_, node);
     while (!node.is_leaf_page()) {
@@ -200,9 +202,10 @@ std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Op
  */
 bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transaction* transaction) {
     (void)transaction;
+    auto guard = lock_shared();
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_);
+    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
     while (!scan.is_end()) {
         result->push_back(scan.rid());
         scan.next();
@@ -302,6 +305,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
  */
 page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
                                       bool allow_duplicate) {
+    auto guard = lock_exclusive();
     IxNodeHandle leaf;
     fetch_node_into(file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
@@ -343,7 +347,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
     return inserted_page_no;
 }
 
-IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h) {
+IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h), latch(h->lock_exclusive()) {
     ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
         page_id_t child_page_no = leaf.value_at(0);
@@ -420,6 +424,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
+    auto guard = lock_exclusive();
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
@@ -440,9 +445,10 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 
 bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
     (void)transaction;
+    auto guard = lock_exclusive();
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_);
+    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
     while (!scan.is_end()) {
         Iid iid = scan.iid();
         if (scan.rid() == value) {
@@ -535,6 +541,7 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
  * 注意更新parent结点的相关kv对
  */
 void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node, IxNodeHandle* parent, int index) {
+    (void)parent;
     if (index == 0) {
         node->insert_pair(node->get_size(), neighbor_node->get_key(0), *neighbor_node->get_rid(0));
         neighbor_node->erase_pair(0);
@@ -663,6 +670,39 @@ Iid IxIndexHandle::upper_bound(const char* key) {
 }
 
 /**
+ * @brief Single root-to-leaf descent returning both lower and upper Iid for an
+ * equality lookup. Avoids the double tree walk of lower_bound + upper_bound.
+ */
+std::pair<Iid, Iid> IxIndexHandle::equal_range(const char* key) {
+    IxNodeHandle leaf;
+    fetch_node_into(file_hdr_->root_page_, leaf);
+    while (!leaf.is_leaf_page()) {
+        int child_idx = leaf.lower_bound(key);
+        if (child_idx >= leaf.get_size()) {
+            child_idx = leaf.get_size() - 1;
+        } else if (child_idx > 0 &&
+                   ix_compare(leaf.get_key(child_idx), key, file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
+            child_idx--;
+        }
+        page_id_t child_page_no = leaf.value_at(child_idx);
+        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+        fetch_node_into(child_page_no, leaf);
+    }
+    int lower_slot = leaf.lower_bound(key);
+    int upper_slot = leaf.upper_bound(key);
+    Iid lower{leaf.get_page_no(), lower_slot};
+    if (lower_slot == leaf.get_size() && leaf.get_page_no() != file_hdr_->last_leaf_) {
+        lower = Iid{leaf.get_next_leaf(), 0};
+    }
+    Iid upper{leaf.get_page_no(), upper_slot};
+    if (upper_slot == leaf.get_size() && leaf.get_page_no() != file_hdr_->last_leaf_) {
+        upper = Iid{leaf.get_next_leaf(), 0};
+    }
+    buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+    return {lower, upper};
+}
+
+/**
  * @brief 指向最后一个叶子的最后一个结点的后一个
  * 用处在于可以作为IxScan的最后一个
  *
@@ -787,6 +827,7 @@ void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
  * @param node
  */
 void IxIndexHandle::release_node_handle(IxNodeHandle& node) {
+    (void)node;
     file_hdr_->num_pages_--;
 }
 

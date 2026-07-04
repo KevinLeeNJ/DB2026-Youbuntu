@@ -13,11 +13,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 endif()
 
-add_compile_options(-Wall)
+add_compile_options(-Wall -Wextra)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -ggdb3")
+set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g -ggdb3")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
-set(CMAKE_C_FLAGS_DEBUG "-O0 -g -ggdb3")
+set(CMAKE_C_FLAGS_DEBUG "-O2 -g -ggdb3")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
 
 enable_testing()

@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 
 #include "execution_defs.h"
 #include "execution_common.h"
@@ -25,7 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 
 class IndexScanExecutor : public AbstractExecutor {
-private:
+protected:
     std::string tab_name_;              // 表名称
     TabMeta tab_;                       // 表的元数据
     std::vector<Condition> conds_;      // 扫描条件
@@ -42,6 +43,7 @@ private:
     std::unique_ptr<RecScan> scan_;
     bool predicate_recorded_{false};
     bool use_heap_scan_for_mvcc_{false};
+    std::unique_ptr<RmRecord> buffered_record_;
 
     SmManager* sm_manager_;
 
@@ -250,6 +252,7 @@ public:
 
         auto ih =
             sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
+        auto index_latch_guard = ih->lock_shared();
         auto constraints = build_constraints();
 
         std::vector<char> lower_key(index_meta_.col_tot_len);
@@ -306,9 +309,16 @@ public:
             break;
         }
 
-        Iid lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
-        Iid upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
-        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
+        Iid lower, upper;
+        if (!lower_exclusive && upper_inclusive && lower_key == upper_key) {
+            auto [lo, hi] = ih->equal_range(lower_key.data());
+            lower = lo;
+            upper = hi;
+        } else {
+            lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
+            upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
+        }
+        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
         advance_to_match();
     }
 
@@ -318,6 +328,7 @@ public:
     }
 
     void advance_to_match() {
+        buffered_record_.reset();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = GetVisibleRecord(fh_, rid_, context_);
@@ -334,6 +345,7 @@ public:
             }
             if (match) {
                 record_tuple_read(rid_);
+                buffered_record_ = std::move(rec);
                 break;
             }
             scan_->next();
@@ -341,10 +353,10 @@ public:
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end()) {
+        if (is_end() || buffered_record_ == nullptr) {
             return nullptr;
         }
-        return GetVisibleRecord(fh_, rid_, context_);
+        return std::make_unique<RmRecord>(*buffered_record_);
     }
 
     Rid& rid() override {
@@ -396,5 +408,47 @@ public:
         if (!is_end()) {
             record_tuple_read(rid_, true);
         }
+    }
+
+    // An ascending index range scan yields rows ordered by the index columns.
+    // A min(col) aggregate on `col` can be answered from the first visible
+    // matching row when `col` is an index column and every index column before
+    // it is constrained to a single equality value (so the remaining order is
+    // monotonic in `col`).
+    bool provides_min_order(const TabCol& col) const override {
+        if (use_heap_scan_for_mvcc_) {
+            return false;
+        }
+        if (!col.tab_name.empty() && col.tab_name != tab_name_) {
+            return false;
+        }
+        // Locate col within the index column sequence.
+        size_t col_pos = index_meta_.cols.size();
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            if (index_meta_.cols[i].name == col.col_name) {
+                col_pos = i;
+                break;
+            }
+        }
+        if (col_pos == index_meta_.cols.size()) {
+            return false; // col not part of this index
+        }
+        // Every index column preceding col must have an equality predicate on
+        // this table, otherwise the scan is not monotonic in col alone.
+        for (size_t i = 0; i < col_pos; ++i) {
+            const std::string& before_name = index_meta_.cols[i].name;
+            bool has_eq = false;
+            for (const auto& cond : fed_conds_) {
+                if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == before_name &&
+                    (cond.lhs_col.tab_name.empty() || cond.lhs_col.tab_name == tab_name_)) {
+                    has_eq = true;
+                    break;
+                }
+            }
+            if (!has_eq) {
+                return false;
+            }
+        }
+        return true;
     }
 };

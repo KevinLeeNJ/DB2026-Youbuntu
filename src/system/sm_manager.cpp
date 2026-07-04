@@ -316,6 +316,7 @@ void SmManager::desc_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
+    (void)context;
     if (db_.is_table(tab_name)) {
         throw TableExistsError(tab_name);
     }
@@ -428,6 +429,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    (void)context;
     TabMeta& tab = db_.get_table(tab_name);
     if (!tab.is_index(col_names)) {
         throw IndexNotFoundError(tab_name, col_names);
@@ -449,6 +451,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
+    (void)context;
     TabMeta& tab = db_.get_table(tab_name);
     std::vector<std::string> col_names;
     col_names.reserve(cols.size());
@@ -569,6 +572,7 @@ void SmManager::reset_all_tuple_meta_after_recovery() {
 }
 
 void SmManager::load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context) {
+    (void)context;
     std::ifstream infile(file_path);
     if (!infile.is_open()) {
         throw RMDBError("cannot open load file: " + file_path);

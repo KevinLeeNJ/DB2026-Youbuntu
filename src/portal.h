@@ -36,6 +36,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_delete.h"
 #include "execution/executor_filter.h"
 #include "execution/executor_index_scan.h"
+#include "execution/executor_index_skip_scan.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_limit.h"
 #include "execution/executor_nestedloop_join.h"
@@ -331,6 +332,7 @@ private:
             return output_names;
         }
         case T_SeqScan:
+        case T_IndexSkipScan:
         case T_IndexScan: {
             std::vector<std::string> output_names;
             const auto& cols = static_cast<ScanPlan*>(plan)->cols_;
@@ -438,6 +440,7 @@ private:
     static void collect_tables(Plan* plan, std::set<std::string>& tables) {
         switch (plan->tag) {
         case T_SeqScan:
+        case T_IndexSkipScan:
         case T_IndexScan:
             tables.insert(static_cast<ScanPlan*>(plan)->tab_name_);
             break;
@@ -510,6 +513,12 @@ private:
             auto scan = static_cast<ScanPlan*>(plan);
             out << "Scan(table=" << scan->tab_name_ << ", type=IndexScan, using_index=(" << scan->index_col_names_[0]
                 << "), rows=" << plan->runtime_rows_ << ")\n";
+            break;
+        }
+        case T_IndexSkipScan: {
+            auto scan = static_cast<ScanPlan*>(plan);
+            out << "Scan(table=" << scan->tab_name_ << ", type=IndexSkipScan, using_index=("
+                << scan->index_col_names_[0] << "), rows=" << plan->runtime_rows_ << ")\n";
             break;
         }
         case T_Filter: {
@@ -734,15 +743,19 @@ public:
             auto having_conds = to_executor_having_conds(x->having_conds_);
             std::unique_ptr<AbstractExecutor> executor =
                 std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
-                                                    x->group_by_cols_, x->agg_exprs_, having_conds);
+                                                    x->group_by_cols_, x->agg_exprs_, having_conds, context);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_SeqScan:
+        case T_IndexSkipScan:
         case T_IndexScan: {
             auto x = static_cast<ScanPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor;
             if (x->tag == T_SeqScan) {
                 executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
+            } else if (x->tag == T_IndexSkipScan) {
+                executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
+                                                                   x->index_col_names_, context);
             } else {
                 executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
                                                                x->index_col_names_, context);

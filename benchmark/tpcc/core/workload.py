@@ -9,7 +9,15 @@ from typing import Callable
 from benchmark.tpcc.core.backend import BackendAbort, BackendError
 from benchmark.tpcc.core.parsing import scalar_int
 from benchmark.tpcc.core.result import RoundResult
-from benchmark.tpcc.core.transactions import InvalidItemRollback, TxnContext, delivery, new_order, order_status, payment, stock_level
+from benchmark.tpcc.core.transactions import (
+    InvalidItemRollback,
+    TxnContext,
+    delivery,
+    new_order,
+    order_status,
+    payment,
+    stock_level,
+)
 
 TXN_FUNCS = {
     "new_order": new_order,
@@ -34,10 +42,18 @@ def inspect_dataset(backend_factory: Callable[[], object]) -> DatasetProfile:
     backend = backend_factory()
     try:
         return DatasetProfile(
-            warehouses=max(1, scalar_int(backend.execute("select count(*) from warehouse;"), 1)),
-            districts_per_warehouse=max(1, scalar_int(backend.execute("select max(d_id) from district;"), 1)),
-            customers_per_district=max(1, scalar_int(backend.execute("select max(c_id) from customer;"), 1)),
-            item_count=max(1, scalar_int(backend.execute("select max(i_id) from item;"), 1)),
+            warehouses=max(
+                1, scalar_int(backend.execute("select count(*) from warehouse;"), 1)
+            ),
+            districts_per_warehouse=max(
+                1, scalar_int(backend.execute("select max(d_id) from district;"), 1)
+            ),
+            customers_per_district=max(
+                1, scalar_int(backend.execute("select max(c_id) from customer;"), 1)
+            ),
+            item_count=max(
+                1, scalar_int(backend.execute("select max(i_id) from item;"), 1)
+            ),
         )
     finally:
         backend.close()
@@ -76,6 +92,15 @@ def worker_loop(
     measure_end: float,
 ) -> None:
     backend = backend_factory()
+
+    def reconnect_backend() -> None:
+        nonlocal backend
+        try:
+            backend.close()
+        except Exception:
+            pass
+        backend = backend_factory()
+
     try:
         while True:
             now = time.monotonic()
@@ -90,28 +115,34 @@ def worker_loop(
             try:
                 TXN_FUNCS[txn_type](backend, choose_context(profile, worker_id, policy))
                 outcome = "commit"
+                error_detail = None
             except InvalidItemRollback:
                 outcome = "invalid-item-rollback"
-            except BackendAbort:
+                error_detail = "invalid item rollback"
+            except BackendAbort as exc:
                 try:
                     backend.rollback()
                 except Exception:
                     pass
                 outcome = "server-abort"
-            except BackendError:
+                error_detail = str(exc)
+            except BackendError as exc:
+                try:
+                    backend.rollback()
+                except Exception:
+                    pass
+                reconnect_backend()
+                outcome = "backend-error"
+                error_detail = str(exc)
+            except Exception as exc:
                 try:
                     backend.rollback()
                 except Exception:
                     pass
                 outcome = "backend-error"
-            except Exception:
-                try:
-                    backend.rollback()
-                except Exception:
-                    pass
-                outcome = "backend-error"
+                error_detail = f"{type(exc).__name__}: {exc}"
             latency_ms = (time.monotonic() - start) * 1000.0
             with _RESULT_LOCK:
-                result.record(phase, txn_type, outcome, latency_ms)
+                result.record(phase, txn_type, outcome, latency_ms, error_detail)
     finally:
         backend.close()

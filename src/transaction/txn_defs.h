@@ -20,8 +20,10 @@ See the Mulan PSL v2 for more details. */
 /* 标识事务状态 */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
-/* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
+/* 系统的隔离级别 */
 enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };
+
+constexpr IsolationLevel DEFAULT_ISOLATION_LEVEL = IsolationLevel::READ_COMMITTED;
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
 enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE };
@@ -150,28 +152,28 @@ public:
         switch (abort_reason_) {
         case AbortReason::LOCK_ON_SHIRINKING: {
             return "Transaction " + std::to_string(txn_id_) +
-                   " aborted because it cannot request locks on SHRINKING phase\n";
+                   " aborted because it cannot request locks on SHRINKING phase";
         } break;
 
         case AbortReason::UPGRADE_CONFLICT: {
             return "Transaction " + std::to_string(txn_id_) +
-                   " aborted because another transaction is waiting for upgrading\n";
+                   " aborted because another transaction is waiting for upgrading";
         } break;
 
         case AbortReason::DEADLOCK_PREVENTION: {
-            return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention\n";
+            return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention";
         } break;
 
         case AbortReason::WW_CONFLICT: {
-            return "Transaction " + std::to_string(txn_id_) + " aborted because of write-write conflict\n";
+            return "Transaction " + std::to_string(txn_id_) + " aborted because of write-write conflict";
         } break;
 
         case AbortReason::SSI_DANGER: {
-            return "Transaction " + std::to_string(txn_id_) + " aborted because of SSI danger structure\n";
+            return "Transaction " + std::to_string(txn_id_) + " aborted because of SSI danger structure";
         } break;
 
         default: {
-            return "Transaction aborted\n";
+            return "Transaction aborted";
         } break;
         }
     }

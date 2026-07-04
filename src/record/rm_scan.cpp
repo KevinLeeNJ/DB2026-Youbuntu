@@ -12,6 +12,17 @@ See the Mulan PSL v2 for more details. */
 #include "rm_scan.h"
 #include "rm_file_handle.h"
 
+void RmScan::release_page() {
+    if (pinned_page_ != nullptr) {
+        file_handle_->buffer_pool_manager_->unpin_page(pinned_page_->get_page_id(), false);
+        pinned_page_ = nullptr;
+    }
+}
+
+RmScan::~RmScan() {
+    release_page();
+}
+
 /**
  * @brief 初始化file_handle和rid
  * @param file_handle
@@ -26,6 +37,7 @@ RmScan::RmScan(const RmFileHandle* file_handle) : file_handle_(file_handle) {
 
 /**
  * @brief 找到文件中下一个存放了记录的位置
+ *        当前页保持 pinned，在同一页内连续扫描 bitmap；仅在换页或结束时 unpin。
  */
 void RmScan::next() {
     // Todo:
@@ -33,24 +45,28 @@ void RmScan::next() {
     bool flag = false;                                       // 用于标记是否找到下一个有效的记录
     while (rid_.page_no < file_handle_->file_hdr_.num_pages) // 没到最后一页
     {
-        RmPageHandle page_handle = file_handle_->fetch_page_handle(rid_.page_no);
+        if (pinned_page_ == nullptr) {
+            pinned_page_ = file_handle_->buffer_pool_manager_->fetch_page(PageId{file_handle_->fd_, rid_.page_no});
+        }
+        RmPageHandle page_handle(&file_handle_->file_hdr_, pinned_page_);
         int next_slot = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
-                                         rid_.slot_no); // 找到下一个存放了记录的slot
-        PageId page_id = page_handle.page->get_page_id();
+                                         rid_.slot_no);                // 找到下一个存放了记录的slot
         if (next_slot != file_handle_->file_hdr_.num_records_per_page) // 成功找到
         {
             flag = true;
             rid_.slot_no = next_slot;
-            file_handle_->buffer_pool_manager_->unpin_page(page_id, false);
             break;
         }
-        file_handle_->buffer_pool_manager_->unpin_page(page_id, false);
-        // 移动到下一页
+        // 当前页扫描完毕，unpin 并移动到下一页
+        release_page();
         rid_.page_no++;
         rid_.slot_no = -1;
     }
-    if (!flag)             // 没有找到下一个有效的记录
+    if (!flag) // 没有找到下一个有效的记录
+    {
         rid_.page_no = -1; // 没有更多记录
+        release_page();
+    }
     return;
 }
 

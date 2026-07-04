@@ -132,6 +132,7 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         case OP_GE:
             return lhs_val >= rhs_val;
         }
+        break;
     }
     case TYPE_STRING:
     case TYPE_DATETIME: {
@@ -289,11 +290,11 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
  * @param {Transaction*} txn 事务指针，空指针代表需要创建新事务，否则开始已有事务
  * @param {LogManager*} log_manager 日志管理器指针
  */
-Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
+Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager, IsolationLevel isolation_level) {
     std::unique_ptr<Transaction> created;
     if (txn == nullptr) {
         txn_id_t txn_id = next_txn_id_.fetch_add(1);
-        created = std::make_unique<Transaction>(txn_id);
+        created = std::make_unique<Transaction>(txn_id, isolation_level);
         txn = created.get();
     }
 
@@ -306,6 +307,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
 
     txn->set_state(TransactionState::GROWING);
     txn->set_start_ts(next_timestamp_.fetch_add(1));
+    txn->set_read_ts(last_commit_ts_.load());
     running_txns_.AddTxn(txn->get_start_ts());
     WriteBeginLog(txn, log_manager);
 
@@ -317,6 +319,15 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         active_serializable_txns_.insert(txn->get_transaction_id());
     }
     return txn;
+}
+
+void TransactionManager::BeginStatement(Transaction* txn) {
+    if (txn == nullptr) {
+        return;
+    }
+    if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+        txn->set_read_ts(last_commit_ts_.load());
+    }
 }
 
 /**

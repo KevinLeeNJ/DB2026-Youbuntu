@@ -11,16 +11,26 @@ class RmdbBackend(Backend):
         self.sock.settimeout(timeout)
 
     def execute(self, sql: str) -> str:
+        if self.sock is None:
+            raise BackendError("rmdb connection is closed")
         payload = sql.encode("utf-8") + b"\0"
-        self.sock.sendall(payload)
-        chunks: list[bytes] = []
-        while True:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise BackendError("connection closed by rmdb server")
-            chunks.append(chunk)
-            if b"\0" in chunk:
-                break
+        try:
+            self.sock.sendall(payload)
+            chunks: list[bytes] = []
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    self.close()
+                    raise BackendError("connection closed by rmdb server")
+                chunks.append(chunk)
+                if b"\0" in chunk:
+                    break
+        except socket.timeout as exc:
+            self.close()
+            raise BackendError("rmdb response timed out") from exc
+        except OSError as exc:
+            self.close()
+            raise BackendError(f"rmdb connection error: {exc}") from exc
         raw = b"".join(chunks).split(b"\0", 1)[0].decode("utf-8", errors="replace")
         text = raw.rstrip("\n")
         if text == "abort":
@@ -30,5 +40,6 @@ class RmdbBackend(Backend):
         return text
 
     def close(self) -> None:
-        self.sock.close()
-
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None

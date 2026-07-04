@@ -43,11 +43,33 @@ def complete_csv_set(data_dir: Path, table_names: Iterable[str]) -> bool:
 
 
 def warehouse_header() -> list[str]:
-    return ["w_id", "w_name", "w_street_1", "w_street_2", "w_city", "w_state", "w_zip", "w_tax", "w_ytd"]
+    return [
+        "w_id",
+        "w_name",
+        "w_street_1",
+        "w_street_2",
+        "w_city",
+        "w_state",
+        "w_zip",
+        "w_tax",
+        "w_ytd",
+    ]
 
 
 def district_header() -> list[str]:
-    return ["d_id", "d_w_id", "d_name", "d_street_1", "d_street_2", "d_city", "d_state", "d_zip", "d_tax", "d_ytd", "d_next_o_id"]
+    return [
+        "d_id",
+        "d_w_id",
+        "d_name",
+        "d_street_1",
+        "d_street_2",
+        "d_city",
+        "d_state",
+        "d_zip",
+        "d_tax",
+        "d_ytd",
+        "d_next_o_id",
+    ]
 
 
 def customer_header() -> list[str]:
@@ -77,7 +99,16 @@ def customer_header() -> list[str]:
 
 
 def history_header() -> list[str]:
-    return ["h_c_id", "h_c_d_id", "h_c_w_id", "h_d_id", "h_w_id", "h_date", "h_amount", "h_data"]
+    return [
+        "h_c_id",
+        "h_c_d_id",
+        "h_c_w_id",
+        "h_d_id",
+        "h_w_id",
+        "h_date",
+        "h_amount",
+        "h_data",
+    ]
 
 
 def new_orders_header() -> list[str]:
@@ -85,11 +116,35 @@ def new_orders_header() -> list[str]:
 
 
 def orders_header() -> list[str]:
-    return ["o_id", "o_d_id", "o_w_id", "o_c_id", "o_entry_d", "o_carrier_id", "o_ol_cnt", "o_all_local"]
+    return [
+        "o_id",
+        "o_d_id",
+        "o_w_id",
+        "o_c_id",
+        "o_entry_d",
+        "o_carrier_id",
+        "o_ol_cnt",
+        "o_all_local",
+    ]
 
 
 def order_line_header() -> list[str]:
-    return ["ol_o_id", "ol_d_id", "ol_w_id", "ol_number", "ol_i_id", "ol_supply_w_id", "ol_delivery_d", "ol_quantity", "ol_amount", "ol_dist_info"]
+    return [
+        "ol_o_id",
+        "ol_d_id",
+        "ol_w_id",
+        "ol_number",
+        "ol_i_id",
+        "ol_supply_w_id",
+        "ol_delivery_d",
+        "ol_quantity",
+        "ol_amount",
+        "ol_dist_info",
+    ]
+
+
+def initial_order_line_count(w_id: int, d_id: int, o_id: int) -> int:
+    return 5 + ((o_id + d_id + w_id) % 11)
 
 
 def item_header() -> list[str]:
@@ -121,7 +176,19 @@ def stock_header() -> list[str]:
 def warehouse_rows(warehouses: int) -> list[list[object]]:
     rows: list[list[object]] = [warehouse_header()]
     for w_id in range(1, warehouses + 1):
-        rows.append([w_id, rand_str(10), rand_str(20), rand_str(20), rand_str(20), rand_str(2), rand_str(9), round(random.uniform(0, 0.2), 4), 300000.0])
+        rows.append(
+            [
+                w_id,
+                rand_str(10),
+                rand_str(20),
+                rand_str(20),
+                rand_str(20),
+                rand_str(2),
+                rand_str(9),
+                round(random.uniform(0, 0.2), 4),
+                300000.0,
+            ]
+        )
     return rows
 
 
@@ -129,7 +196,21 @@ def district_rows(warehouses: int) -> list[list[object]]:
     rows: list[list[object]] = [district_header()]
     for w_id in range(1, warehouses + 1):
         for d_id in range(1, DISTRICTS_PER_WAREHOUSE + 1):
-            rows.append([d_id, w_id, rand_str(10), rand_str(20), rand_str(20), rand_str(20), rand_str(2), rand_str(9), round(random.uniform(0, 0.2), 4), 30000.0, INITIAL_ORDERS_PER_DISTRICT + 1])
+            rows.append(
+                [
+                    d_id,
+                    w_id,
+                    rand_str(10),
+                    rand_str(20),
+                    rand_str(20),
+                    rand_str(20),
+                    rand_str(2),
+                    rand_str(9),
+                    round(random.uniform(0, 0.2), 4),
+                    30000.0,
+                    INITIAL_ORDERS_PER_DISTRICT + 1,
+                ]
+            )
     return rows
 
 
@@ -138,7 +219,11 @@ def iter_customer_rows(warehouses: int) -> Iterator[list[object]]:
     for w_id in range(1, warehouses + 1):
         for d_id in range(1, DISTRICTS_PER_WAREHOUSE + 1):
             for c_id in range(1, CUSTOMERS_PER_DISTRICT + 1):
-                last = surname(c_id - 1) if c_id <= 1000 else surname(random.randint(0, 999))
+                last = (
+                    surname(c_id - 1)
+                    if c_id <= 1000
+                    else surname(random.randint(0, 999))
+                )
                 yield [
                     c_id,
                     d_id,
@@ -178,7 +263,13 @@ def iter_item_rows() -> Iterator[list[object]]:
         data = rand_str(44)
         if i_id % 10 == 0:
             data = "ORIGINAL" + data[:36]
-        yield [i_id, random.randint(1, 10000), rand_str(24), round(random.uniform(1, 100), 2), data]
+        yield [
+            i_id,
+            random.randint(1, 10000),
+            rand_str(24),
+            round(random.uniform(1, 100), 2),
+            data,
+        ]
 
 
 def iter_stock_rows(warehouses: int) -> Iterator[list[object]]:
@@ -216,7 +307,16 @@ def iter_orders_rows(warehouses: int) -> Iterator[list[object]]:
             customer_ids = list(range(1, CUSTOMERS_PER_DISTRICT + 1))
             random.shuffle(customer_ids)
             for o_id, c_id in enumerate(customer_ids, start=1):
-                yield [o_id, d_id, w_id, c_id, ts_text(), random.randint(1, 10) if o_id <= 2100 else 0, random.randint(5, 15), 1]
+                yield [
+                    o_id,
+                    d_id,
+                    w_id,
+                    c_id,
+                    ts_text(),
+                    random.randint(1, 10) if o_id <= 2100 else 0,
+                    initial_order_line_count(w_id, d_id, o_id),
+                    1,
+                ]
 
 
 def iter_new_orders_rows(warehouses: int) -> Iterator[list[object]]:
@@ -233,7 +333,7 @@ def iter_order_line_rows(warehouses: int) -> Iterator[list[object]]:
     for w_id in range(1, warehouses + 1):
         for d_id in range(1, DISTRICTS_PER_WAREHOUSE + 1):
             for o_id in range(1, INITIAL_ORDERS_PER_DISTRICT + 1):
-                ol_cnt = 5 + ((o_id + d_id + w_id) % 11)
+                ol_cnt = initial_order_line_count(w_id, d_id, o_id)
                 for number in range(1, ol_cnt + 1):
                     yield [
                         o_id,
@@ -249,7 +349,9 @@ def iter_order_line_rows(warehouses: int) -> Iterator[list[object]]:
                     ]
 
 
-def generate_all(warehouses: int, data_dir: Path, seed: int = 1, overwrite: bool = False) -> None:
+def generate_all(
+    warehouses: int, data_dir: Path, seed: int = 1, overwrite: bool = False
+) -> None:
     random.seed(seed)
     ensure_empty_or_allowed(data_dir, overwrite=overwrite)
     data_dir.mkdir(parents=True, exist_ok=True)

@@ -252,6 +252,7 @@ public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
                            std::vector<Condition> conds, TabCol inlj_left_col = {}, TabCol inlj_right_col = {},
                            const std::string& inlj_index_col_name = "") {
+        (void)inlj_index_col_name;
         left_ = std::move(left);
         right_ = std::move(right);
         left_tuple_len_ = left_->tupleLen();

@@ -1,5 +1,6 @@
 import socket
 import threading
+import time
 import unittest
 
 from benchmark.tpcc.core.backend import BackendAbort, BackendError
@@ -17,6 +18,29 @@ def run_fake_server(response: bytes, captured: list[bytes]) -> int:
         with conn:
             captured.append(conn.recv(4096))
             conn.sendall(response)
+        server.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+
+def run_slow_server(
+    response: bytes, delay_seconds: float, captured: list[bytes]
+) -> int:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def serve() -> None:
+        conn, _ = server.accept()
+        with conn:
+            captured.append(conn.recv(4096))
+            time.sleep(delay_seconds)
+            try:
+                conn.sendall(response)
+            except OSError:
+                pass
         server.close()
 
     threading.Thread(target=serve, daemon=True).start()
@@ -48,7 +72,19 @@ class BackendProtocolTest(unittest.TestCase):
             backend.execute("bad sql;")
         backend.close()
 
+    def test_timeout_closes_connection_before_late_response_can_desync_protocol(
+        self,
+    ) -> None:
+        captured: list[bytes] = []
+        port = run_slow_server(b"LATE\0", 0.2, captured)
+        backend = RmdbBackend("127.0.0.1", port, timeout=0.05)
+        with self.assertRaises(BackendError):
+            backend.execute("slow sql;")
+        with self.assertRaises(BackendError):
+            backend.execute("select 1;")
+        backend.close()
+        self.assertEqual(captured, [b"slow sql;\0"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

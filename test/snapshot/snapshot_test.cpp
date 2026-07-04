@@ -17,6 +17,8 @@ See the Mulan PSL v2 for more details. */
 // ALL TESTS CURRENTLY FAIL — the feature is not yet implemented (TDD RED phase).
 // =============================================================================
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -271,11 +273,12 @@ private:
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : db_->txn()->get_transaction(txn_id_);
         if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
             context->txn_->get_state() == TransactionState::ABORTED) {
-            context->txn_ = db_->txn()->begin(nullptr, context->log_mgr_);
+            context->txn_ = db_->txn()->begin(nullptr, context->log_mgr_, context->isolation_level_);
             txn_id_ = context->txn_->get_transaction_id();
             context->txn_->set_txn_mode(false);
             context->txn_->set_isolation_level(context->isolation_level_);
         }
+        db_->txn()->BeginStatement(context->txn_);
     }
 
     void finish_statement(Context* context) {
@@ -306,7 +309,7 @@ private:
 
     SharedTestDB* db_;
     txn_id_t txn_id_{INVALID_TXN_ID};
-    IsolationLevel session_isolation_{IsolationLevel::SERIALIZABLE};
+    IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
 
 // =============================================================================
@@ -331,6 +334,115 @@ protected:
 
     std::unique_ptr<SharedTestDB> db_;
 };
+
+TEST_F(SnapshotTest, DefaultIsolationIsReadCommitted) {
+    EXPECT_EQ(DEFAULT_ISOLATION_LEVEL, IsolationLevel::READ_COMMITTED);
+}
+
+TEST_F(SnapshotTest, RC_DefaultStatementSeesNewCommittedVersion) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table rc_counter (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into rc_counter values (1, 100);"));
+
+    auto t1 = create_session();
+    auto t2 = create_session();
+
+    ASSERT_TRUE(t1->exec_sql_ok("begin;"));
+    std::string first_read = t1->exec_sql("select * from rc_counter where id = 1;");
+
+    ASSERT_TRUE(t2->exec_sql_ok("begin;"));
+    ASSERT_TRUE(t2->exec_sql_ok("update rc_counter set val = 200 where id = 1;"));
+    ASSERT_TRUE(t2->exec_sql_ok("commit;"));
+
+    std::string second_read = t1->exec_sql("select * from rc_counter where id = 1;");
+    ASSERT_TRUE(t1->exec_sql_ok("commit;"));
+
+    std::string expected_first = "+------------------+------------------+\n"
+                                 "|               id |              val |\n"
+                                 "+------------------+------------------+\n"
+                                 "|                1 |              100 |\n"
+                                 "+------------------+------------------+\n"
+                                 "Total record(s): 1";
+    std::string expected_second = "+------------------+------------------+\n"
+                                  "|               id |              val |\n"
+                                  "+------------------+------------------+\n"
+                                  "|                1 |              200 |\n"
+                                  "+------------------+------------------+\n"
+                                  "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(first_read), expected_first);
+    EXPECT_EQ(TestSession::trim_output(second_read), expected_second);
+}
+
+TEST_F(SnapshotTest, RC_DefaultUpdateUsesLatestCommittedVersion) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table rc_update_latest (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_latest values (1, 100);"));
+
+    auto t1 = create_session();
+    auto t2 = create_session();
+    auto verifier = create_session();
+
+    ASSERT_TRUE(t1->exec_sql_ok("begin;"));
+    ASSERT_TRUE(t1->exec_sql_ok("select * from rc_update_latest where id = 1;"));
+
+    ASSERT_TRUE(t2->exec_sql_ok("begin;"));
+    ASSERT_TRUE(t2->exec_sql_ok("update rc_update_latest set val = 200 where id = 1;"));
+    ASSERT_TRUE(t2->exec_sql_ok("commit;"));
+
+    ASSERT_TRUE(t1->exec_sql_ok("update rc_update_latest set val = 300 where id = 1;"));
+    ASSERT_TRUE(t1->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select * from rc_update_latest where id = 1;");
+    std::string expected_final = "+------------------+------------------+\n"
+                                 "|               id |              val |\n"
+                                 "+------------------+------------------+\n"
+                                 "|                1 |              300 |\n"
+                                 "+------------------+------------------+\n"
+                                 "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
+
+TEST_F(SnapshotTest, RC_UpdateRechecksLatestVersionAfterWaitingForLock) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table rc_update_recheck (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_recheck values (1, 100);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_recheck values (2, 100);"));
+
+    auto older = create_session();
+    auto writer = create_session();
+    auto verifier = create_session();
+
+    ASSERT_TRUE(older->exec_sql_ok("begin;"));
+    ASSERT_TRUE(older->exec_sql_ok("update rc_update_recheck set val = val + 1 where id = 2;"));
+
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update rc_update_recheck set val = val + 1 where id = 1;"));
+
+    std::atomic<bool> older_update_started{false};
+    std::atomic<bool> older_update_ok{false};
+    std::thread waiting_update([&]() {
+        older_update_started = true;
+        older_update_ok = older->exec_sql_ok("update rc_update_recheck set val = val + 1 where id = 1;");
+    });
+
+    while (!older_update_started) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+    waiting_update.join();
+    ASSERT_TRUE(older_update_ok);
+    ASSERT_TRUE(older->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select * from rc_update_recheck where id = 1;");
+    std::string expected_final = "+------------------+------------------+\n"
+                                 "|               id |              val |\n"
+                                 "+------------------+------------------+\n"
+                                 "|                1 |              102 |\n"
+                                 "+------------------+------------------+\n"
+                                 "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
 
 TEST_F(SnapshotTest, SER_PureAutoCommitInsertsDoNotRetainSsiHistory) {
     auto s = create_session();
@@ -367,6 +479,69 @@ TEST_F(SnapshotTest, SER_LatePredicateReadSeesOverlappingCommittedInsert) {
     std::string abort = t1->exec_sql_expect_abort("update late_predicate set val = 101 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(abort), "abort")
         << "T1 must see T2's overlapping committed insert as an invisible predicate write";
+}
+
+TEST_F(SnapshotTest, DefaultIsolationAllowsWriteSkew) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table duty_default_iso (doctor_id int, on_call int);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into duty_default_iso values (1, 1);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into duty_default_iso values (2, 1);"));
+
+    auto t1 = create_session();
+    auto t2 = create_session();
+    auto verifier = create_session();
+
+    SimpleThreadBarrier both_read(2), t1_updated(2), updates_done(2);
+    bool t1_update_ok = false;
+    bool t2_update_ok = false;
+    bool t1_commit_ok = false;
+    bool t2_commit_ok = false;
+
+    std::thread th1([&]() {
+        ASSERT_TRUE(t1->exec_sql_ok("begin;"));
+        ASSERT_TRUE(t1->exec_sql_ok("select * from duty_default_iso where doctor_id = 2;"));
+
+        both_read.arrive_and_wait();
+
+        t1_update_ok = t1->exec_sql_ok("update duty_default_iso set on_call = 0 where doctor_id = 1;");
+
+        t1_updated.arrive_and_wait();
+        updates_done.arrive_and_wait();
+
+        t1_commit_ok = t1->exec_sql_ok("commit;");
+    });
+
+    std::thread th2([&]() {
+        ASSERT_TRUE(t2->exec_sql_ok("begin;"));
+        ASSERT_TRUE(t2->exec_sql_ok("select * from duty_default_iso where doctor_id = 1;"));
+
+        both_read.arrive_and_wait();
+        t1_updated.arrive_and_wait();
+
+        t2_update_ok = t2->exec_sql_ok("update duty_default_iso set on_call = 0 where doctor_id = 2;");
+
+        updates_done.arrive_and_wait();
+
+        t2_commit_ok = t2->exec_sql_ok("commit;");
+    });
+
+    th1.join();
+    th2.join();
+
+    EXPECT_TRUE(t1_update_ok);
+    EXPECT_TRUE(t2_update_ok);
+    EXPECT_TRUE(t1_commit_ok);
+    EXPECT_TRUE(t2_commit_ok);
+
+    std::string result = verifier->exec_sql("select * from duty_default_iso;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|        doctor_id |          on_call |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |                0 |\n"
+                           "|                2 |                0 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 2";
+    EXPECT_EQ(TestSession::trim_output(result), expected);
 }
 
 // =============================================================================

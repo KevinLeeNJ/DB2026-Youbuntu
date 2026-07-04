@@ -20,7 +20,7 @@ class AbstractExecutor {
 public:
     Rid _abstract_rid;
 
-    Context* context_;
+    Context* context_ = nullptr;
 
     virtual ~AbstractExecutor() = default;
 
@@ -50,6 +50,7 @@ public:
     virtual std::unique_ptr<RmRecord> Next() = 0;
 
     virtual ColMeta get_col_offset(const TabCol& target) {
+        (void)target;
         return ColMeta();
     };
 
@@ -70,6 +71,14 @@ public:
     }
 
     virtual void record_current_read_for_ssi() {}
+
+    // Returns true if this executor yields rows in ascending order of `col`
+    // (i.e. an index-ordered scan whose range is monotonic on `col`), so that
+    // a min(col) aggregate can be answered from the first matching row alone.
+    // Default: not supported.
+    virtual bool provides_min_order(const TabCol& /*col*/) const {
+        return false;
+    }
 
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
@@ -129,6 +138,7 @@ protected:
             case OP_GE:
                 return lhs_val >= rhs_val;
             }
+            break;
         }
         case TYPE_STRING:
         case TYPE_DATETIME: {

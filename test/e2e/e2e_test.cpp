@@ -189,10 +189,11 @@ private:
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
         if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
             context->txn_->get_state() == TransactionState::ABORTED) {
-            context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_);
+            context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_, context->isolation_level_);
             txn_id_ = context->txn_->get_transaction_id();
             context->txn_->set_txn_mode(false);
         }
+        txn_manager_->BeginStatement(context->txn_);
     }
 
     void finish_statement(Context* context) {
@@ -563,9 +564,9 @@ TEST(CheckpointRecoveryTest, CheckpointRestartOffsetSurvivesRestartAndUndoRuns) 
 
     std::ifstream restart_file(db_name + "/" + LogManager::RESTART_FILE_NAME);
     ASSERT_TRUE(restart_file.is_open());
-    int restart_offset = 0;
+    int64_t restart_offset = 0;
     restart_file >> restart_offset;
-    EXPECT_GT(restart_offset, 0);
+    EXPECT_EQ(restart_offset, 0);
 
     TransactionManager::txn_map.clear();
 

@@ -197,13 +197,13 @@ void DiskManager::close_file(int fd) {
 
 /**
  * @description: 获得文件的大小
- * @return {int} 文件的大小
+ * @return {int64_t} 文件的大小
  * @param {string} &file_name 文件名
  */
-int DiskManager::get_file_size(const std::string& file_name) {
+int64_t DiskManager::get_file_size(const std::string& file_name) {
     struct stat stat_buf;
     int rc = stat(file_name.c_str(), &stat_buf);
-    return rc == 0 ? stat_buf.st_size : -1;
+    return rc == 0 ? static_cast<int64_t>(stat_buf.st_size) : -1;
 }
 
 /**
@@ -235,26 +235,27 @@ int DiskManager::get_file_fd(const std::string& file_name) {
  * @return {int} 返回读取的数据量，若为-1说明读取数据的起始位置超过了文件大小
  * @param {char} *log_data 读取内容到log_data中
  * @param {int} size 读取的数据量大小
- * @param {int} offset 读取的内容在文件中的位置
+ * @param {int64_t} offset 读取的内容在文件中的位置
  */
-int DiskManager::read_log(char* log_data, int size, int offset) {
+int DiskManager::read_log(char* log_data, int size, int64_t offset) {
     // read log file from the previous end
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
-    int file_size = get_file_size(LOG_FILE_NAME);
+    int64_t file_size = get_file_size(LOG_FILE_NAME);
     log_offset_ = file_size;
     if (offset > file_size) {
         return -1;
     }
 
-    size = std::min(size, file_size - offset);
-    if (size == 0)
+    int64_t readable = file_size - offset;
+    size = static_cast<int>(std::min<int64_t>(size, readable));
+    if (size == 0) {
         return 0;
-    lseek(log_fd_, offset, SEEK_SET);
-    ssize_t bytes_read = read(log_fd_, log_data, size);
+    }
+    ssize_t bytes_read = pread(log_fd_, log_data, size, static_cast<off_t>(offset));
     assert(bytes_read == size);
-    return bytes_read;
+    return static_cast<int>(bytes_read);
 }
 
 /**
@@ -271,7 +272,7 @@ void DiskManager::write_log(char* log_data, int size) {
     }
 
     // write from the file_end
-    ssize_t bytes_write = pwrite(log_fd_, log_data, size, log_offset_);
+    ssize_t bytes_write = pwrite(log_fd_, log_data, size, static_cast<off_t>(log_offset_));
     if (bytes_write != size) {
         throw UnixError();
     }

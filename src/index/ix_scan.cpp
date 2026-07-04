@@ -12,25 +12,20 @@ See the Mulan PSL v2 for more details. */
 #include "ix_scan.h"
 
 /**
- * @brief
- * @todo 加上读锁（需要使用缓冲池得到page）
+ * @brief 前进到下一个索引项。当前叶子保持 pinned，跨叶时换页。
+ *        leaf_ 与 pinned_leaf_page_ 始终与 iid_.page_no 同步（非 end 时）。
  */
 void IxScan::next() {
     assert(!is_end());
-    IxNodeHandle* node = ih_->fetch_node(iid_.page_no);
-    assert(node->is_leaf_page());
-    assert(iid_.slot_no < node->get_size());
+    normalize_position();
+    if (is_end()) {
+        return;
+    }
+    assert(pinned_leaf_page_ != nullptr);
+    assert(leaf_.is_leaf_page());
+    assert(iid_.slot_no < leaf_.get_size());
+
     // increment slot no
     iid_.slot_no++;
-    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == node->get_size()) {
-        // go to next leaf
-        iid_.slot_no = 0;
-        iid_.page_no = node->get_next_leaf();
-    }
-    ih_->buffer_pool_manager_->unpin_page(node->get_page_id(), false);
-    delete node;
-}
-
-Rid IxScan::rid() const {
-    return ih_->get_rid(iid_);
+    normalize_position();
 }

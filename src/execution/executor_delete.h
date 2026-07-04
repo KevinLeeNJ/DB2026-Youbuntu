@@ -66,11 +66,33 @@ public:
                     !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
                     throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }
+                if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->BeginStatement(txn);
+                    rec = GetVisibleRecord(fh_, rid, context_);
+                    if (rec == nullptr) {
+                        continue;
+                    }
+                    rec_data = rec->data;
+                    bool latest_match = true;
+                    for (const auto& cond : conds_) {
+                        if (!compare(cond, *rec)) {
+                            latest_match = false;
+                            break;
+                        }
+                    }
+                    if (!latest_match) {
+                        continue;
+                    }
+                }
                 TupleMeta meta = fh_->get_tuple_meta(rid);
                 if (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id()) {
                     throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }
-                if (meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
+                IsolationLevel level = txn->get_isolation_level();
+                bool snapshot_conflict_check = level == IsolationLevel::SNAPSHOT_ISOLATION ||
+                                               level == IsolationLevel::REPEATABLE_READ ||
+                                               level == IsolationLevel::SERIALIZABLE;
+                if (snapshot_conflict_check && meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
                     meta.writer_txn_id_ != txn->get_transaction_id()) {
                     throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }

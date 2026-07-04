@@ -16,11 +16,13 @@ See the Mulan PSL v2 for more details. */
 #include <signal.h>
 #include <unistd.h>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "errors.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
+#include "recovery/checkpoint_manager.h"
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
 #include "optimizer/planner.h"
@@ -52,6 +54,7 @@ auto analyze = std::make_unique<Analyze>(sm_manager.get());
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
+    (void)signo;
     should_exit = true;
     log_manager->flush_log_to_disk_with_sync();
     LOG_INFO("the server received Ctrl+C and will close");
@@ -63,11 +66,12 @@ void SetTransaction(txn_id_t* txn_id, Context* context) {
     context->txn_ = txn_manager->get_transaction(*txn_id);
     if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
+        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
         context->txn_->set_isolation_level(context->isolation_level_);
     }
+    txn_manager->BeginStatement(context->txn_);
 }
 
 void client_handler(int fd) {
@@ -80,8 +84,8 @@ void client_handler(int fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
-    // 记录客户端当前配置的隔离级别（默认 SERIALIZABLE）
-    IsolationLevel session_isolation_level = IsolationLevel::SERIALIZABLE;
+    // 记录客户端当前配置的隔离级别
+    IsolationLevel session_isolation_level = DEFAULT_ISOLATION_LEVEL;
     // 记录客户端是否开启向 output.txt 写入结果（默认开启）
     bool session_output_enabled = true;
 
@@ -298,8 +302,6 @@ void start_server() {
         LOG_ERROR("shutdown server socket failed: %s", strerror(errno));
     }
     //    assert(ret != -1);
-    sm_manager->close_db();
-    LOG_INFO("database has been closed");
     LOG_INFO("server shuts down");
 }
 
@@ -315,6 +317,7 @@ int main(int argc, char** argv) {
     }
 
     signal(SIGINT, sigint_handler);
+    signal(SIGPIPE, SIG_IGN);
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
@@ -348,8 +351,30 @@ int main(int argc, char** argv) {
         recovery->undo();
         LOG_INFO("database recovery finished");
 
-        // 开启服务端，开始接受客户端连接
-        start_server();
+        {
+            std::atomic<bool> checkpoint_thread_stop{false};
+            std::thread checkpoint_thread([&checkpoint_thread_stop] {
+                CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
+                while (!checkpoint_thread_stop.load()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    if (checkpoint_thread_stop.load()) {
+                        break;
+                    }
+                    checkpoint_mgr.RunIfNeeded();
+                }
+            });
+
+            // 开启服务端，开始接受客户端连接
+            start_server();
+
+            checkpoint_thread_stop.store(true);
+            if (checkpoint_thread.joinable()) {
+                checkpoint_thread.join();
+            }
+        }
+
+        sm_manager->close_db();
+        LOG_INFO("database has been closed");
     } catch (RMDBError& e) {
         LOG_ERROR("RMDB error: %s", e.what());
         minilog::Logger::get().stop();

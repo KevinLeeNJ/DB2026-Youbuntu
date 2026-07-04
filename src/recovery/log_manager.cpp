@@ -114,7 +114,7 @@ void LogManager::initialize_from_existing_log() {
     log_buffer_.offset_ = 0;
     memset(log_buffer_.buffer_, 0, sizeof(log_buffer_.buffer_));
 
-    int file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
+    int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
         log_file_offset_ = 0;
         persist_lsn_ = INVALID_LSN;
@@ -122,7 +122,7 @@ void LogManager::initialize_from_existing_log() {
         return;
     }
 
-    int offset = 0;
+    int64_t offset = 0;
     lsn_t max_lsn = INVALID_LSN;
     std::vector<char> header_buf(LOG_HEADER_SIZE);
     while (offset + LOG_HEADER_SIZE <= file_size) {
@@ -133,19 +133,19 @@ void LogManager::initialize_from_existing_log() {
 
         LogRecord header;
         header.deserialize(header_buf.data());
-        if (header.log_tot_len_ < LOG_HEADER_SIZE || offset + static_cast<int>(header.log_tot_len_) > file_size) {
+        if (header.log_tot_len_ < LOG_HEADER_SIZE || offset + static_cast<int64_t>(header.log_tot_len_) > file_size) {
             break;
         }
 
         max_lsn = std::max(max_lsn, header.lsn_);
-        offset += static_cast<int>(header.log_tot_len_);
+        offset += static_cast<int64_t>(header.log_tot_len_);
     }
 
     log_file_offset_ = offset;
     persist_lsn_ = max_lsn;
     global_lsn_.store(max_lsn == INVALID_LSN ? 0 : max_lsn + 1);
     if (offset < file_size) {
-        truncate(LOG_FILE_NAME.c_str(), offset);
+        truncate(LOG_FILE_NAME.c_str(), static_cast<off_t>(offset));
     }
     disk_manager_->SetLogOffset(offset);
 }
@@ -162,7 +162,7 @@ void LogManager::reset_log(lsn_t next_lsn) {
     persist_lsn_ = INVALID_LSN;
 }
 
-void LogManager::write_restart_offset(int checkpoint_offset) {
+void LogManager::write_restart_offset(int64_t checkpoint_offset) {
     std::ofstream restart_file(RESTART_FILE_NAME, std::ios::trunc);
     if (!restart_file.is_open()) {
         return;
@@ -170,13 +170,13 @@ void LogManager::write_restart_offset(int checkpoint_offset) {
     restart_file << checkpoint_offset;
 }
 
-int LogManager::read_restart_offset() const {
+int64_t LogManager::read_restart_offset() const {
     std::ifstream restart_file(RESTART_FILE_NAME);
     if (!restart_file.is_open()) {
         return 0;
     }
 
-    int checkpoint_offset = 0;
+    int64_t checkpoint_offset = 0;
     restart_file >> checkpoint_offset;
     if (!restart_file || checkpoint_offset < 0) {
         return 0;

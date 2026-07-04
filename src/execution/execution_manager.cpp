@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "index/ix.h"
+#include "recovery/checkpoint_manager.h"
 #include "recovery/log_manager.h"
 #include "record_printer.h"
 
@@ -105,7 +106,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         case T_Transaction_begin: {
             // 显示开启一个事务
             if (context->txn_ == nullptr) {
-                context->txn_ = txn_mgr_->begin(nullptr, context->log_mgr_);
+                context->txn_ = txn_mgr_->begin(nullptr, context->log_mgr_, context->isolation_level_);
                 *txn_id = context->txn_->get_transaction_id();
             }
             context->txn_->set_txn_mode(true);
@@ -193,34 +194,8 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 throw RMDBError("static checkpoint cannot run inside an active transaction");
             }
         }
-
-        struct CheckpointBlockGuard {
-            TransactionManager* txn_mgr_;
-            bool armed_{false};
-
-            explicit CheckpointBlockGuard(TransactionManager* txn_mgr) : txn_mgr_(txn_mgr) {
-                txn_mgr_->block_new_transactions_for_checkpoint();
-                armed_ = true;
-            }
-
-            ~CheckpointBlockGuard() {
-                if (armed_) {
-                    txn_mgr_->unblock_new_transactions_after_checkpoint();
-                }
-            }
-        } checkpoint_guard(txn_mgr_);
-
-        auto active_txns = txn_mgr_->wait_active_transactions_drained_for_checkpoint();
-        if (context != nullptr && context->log_mgr_ != nullptr) {
-            context->log_mgr_->flush_log_to_disk_with_sync();
-            CheckpointLogRecord checkpoint(active_txns);
-            int checkpoint_offset = context->log_mgr_->current_log_offset();
-            context->log_mgr_->add_log_to_buffer(&checkpoint);
-            context->log_mgr_->flush_log_to_disk_with_sync();
-            sm_manager_->flush_all_table_and_index_pages();
-            sm_manager_->flush_meta();
-            context->log_mgr_->write_restart_offset(checkpoint_offset);
-        }
+        CheckpointManager checkpoint_mgr(txn_mgr_, sm_manager_, context == nullptr ? nullptr : context->log_mgr_);
+        checkpoint_mgr.RunCleanCheckpoint();
         break;
     }
     default:

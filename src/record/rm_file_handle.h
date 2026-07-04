@@ -57,6 +57,12 @@ struct RmPinnedInsert {
     Rid rid;
 };
 
+/* A record paired with its TupleMeta, fetched in a single buffer-pool pin. */
+struct RmRecordWithMeta {
+    TupleMeta meta;
+    std::unique_ptr<RmRecord> record;
+};
+
 /* 每个RmFileHandle对应一个表的数据文件，里面有多个page，每个page的数据封装在RmPageHandle中 */
 class RmFileHandle {
     friend class RmScan;
@@ -96,6 +102,10 @@ public:
     }
 
     std::unique_ptr<RmRecord> get_record(const Rid& rid, Context* context) const;
+
+    /* Fetch both TupleMeta and record data in a single page pin, halving the
+       buffer-pool latch acquisitions compared to get_tuple_meta + get_record. */
+    RmRecordWithMeta get_record_with_meta(const Rid& rid, Context* context) const;
 
     Rid insert_record(char* buf, Context* context);
 

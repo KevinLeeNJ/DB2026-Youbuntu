@@ -19,7 +19,10 @@ class SqliteBackend(Backend):
         rows = cursor.fetchall()
         if not rows:
             return ""
-        return "\n".join("|".join("" if value is None else str(value) for value in row) for row in rows)
+        return "\n".join(
+            "|".join("" if value is None else str(value) for value in row)
+            for row in rows
+        )
 
     def begin(self) -> None:
         self.conn.execute("begin;")

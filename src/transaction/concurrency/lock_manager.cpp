@@ -21,6 +21,9 @@ See the Mulan PSL v2 for more details. */
  * @param {int} tab_fd
  */
 bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
+    (void)txn;
+    (void)rid;
+    (void)tab_fd;
 
     return true;
 }
@@ -83,6 +86,8 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
+    (void)txn;
+    (void)tab_fd;
 
     return true;
 }
@@ -94,6 +99,8 @@ bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
+    (void)txn;
+    (void)tab_fd;
 
     return true;
 }
@@ -105,6 +112,8 @@ bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
+    (void)txn;
+    (void)tab_fd;
 
     return true;
 }
@@ -116,6 +125,8 @@ bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_IX_on_table(Transaction* txn, int tab_fd) {
+    (void)txn;
+    (void)tab_fd;
 
     return true;
 }
