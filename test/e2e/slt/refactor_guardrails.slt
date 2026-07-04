@@ -1,0 +1,121 @@
+# refactor_guardrails.slt — 重构护栏 golden 输出基线
+#
+# 覆盖 Phase 0 要求的护栏场景：show tables、desc table、select、失败输出、
+# 事务 abort、set output_file off。本文件在重构期间必须保持逐字节通过，作为
+# output.txt 格式兼容性的早期预警。任何对该文件 expected 输出的改动都需要
+# 用户明确批准。
+
+# === show tables ===
+
+statement ok
+CREATE TABLE guard_t1 (a INT, b CHAR(4));
+
+query
+SHOW TABLES;
+----
++------------------+
+|           Tables |
++------------------+
+|         guard_t1 |
++------------------+
+
+# === desc table ===
+
+query
+DESC guard_t1;
+----
++------------------+------------------+------------------+
+|            Field |             Type |            Index |
++------------------+------------------+------------------+
+|                a |              INT |               NO |
+|                b |           STRING |               NO |
++------------------+------------------+------------------+
+
+# === select（含中文相邻不涉及，仅基本类型）===
+
+statement ok
+INSERT INTO guard_t1 VALUES (1, 'ab');
+
+statement ok
+INSERT INTO guard_t1 VALUES (2, 'cd');
+
+query
+SELECT * FROM guard_t1 ORDER BY a;
+----
++------------------+------------------+
+|                a |                b |
++------------------+------------------+
+|                1 |               ab |
+|                2 |               cd |
++------------------+------------------+
+Total record(s): 2
+
+# === 失败输出：重复表名抛 RMDBError ===
+
+statement error
+CREATE TABLE guard_t1 (x INT);
+
+# === 失败输出：select 不存在的列 ===
+
+statement error
+SELECT nonexistent FROM guard_t1;
+
+# === 事务 abort：abort 后修改不持久化 ===
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE guard_t1 SET b = 'zz' WHERE a = 1;
+
+statement ok
+DELETE FROM guard_t1 WHERE a = 2;
+
+statement ok
+ABORT;
+
+query
+SELECT * FROM guard_t1 ORDER BY a;
+----
++------------------+------------------+
+|                a |                b |
++------------------+------------------+
+|                1 |               ab |
+|                2 |               cd |
++------------------+------------------+
+Total record(s): 2
+
+# === set output_file off：后续 query 仍返回客户端输出 ===
+
+statement ok
+SET output_file off
+
+query
+SELECT a FROM guard_t1 WHERE a = 1;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+statement ok
+SET output_file on
+
+# === show index ===
+
+statement ok
+CREATE INDEX guard_t1(a);
+
+query
+SHOW INDEX FROM guard_t1;
+----
++------------------+------------------+------------------+
+|           Tables |             Type |           Column |
++------------------+------------------+------------------+
+|         guard_t1 |           unique |              (a) |
++------------------+------------------+------------------+
+
+statement ok
+DROP TABLE guard_t1;

@@ -510,6 +510,14 @@ TEST_F(SltFileTest, PerformanceLoadQuery) {
     run_slt_file("performance_load_query.slt");
 }
 
+TEST_F(SltFileTest, RefactorGuardrails) {
+    run_slt_file("refactor_guardrails.slt");
+}
+
+TEST_F(SltFileTest, WriteProtocolDifferential) {
+    run_slt_file("write_protocol_differential.slt");
+}
+
 TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {
     ASSERT_NO_THROW(db_->exec_sql("create table dup_heap (id int, val int);"));
     ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));
