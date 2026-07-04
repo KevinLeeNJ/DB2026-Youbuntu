@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "planner.h"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -214,6 +215,27 @@ int index_access_score(const std::string& tab_name, const std::vector<std::strin
     return score;
 }
 
+int skip_scan_access_score(const std::string& tab_name, const std::vector<std::string>& index_col_names,
+                           const std::vector<Condition>& scan_conds) {
+    if (index_col_names.empty()) {
+        return 0;
+    }
+
+    int score = 0;
+    bool missing_prefix = false;
+    for (const auto& col_name : index_col_names) {
+        if (has_value_equality(scan_conds, tab_name, col_name)) {
+            score += missing_prefix ? 8 : 10;
+            continue;
+        }
+        missing_prefix = true;
+        if (score > 0) {
+            break;
+        }
+    }
+    return score;
+}
+
 std::vector<std::string> index_cols_for_inlj(const TabMeta& right_tab, const TabCol& right_col,
                                              const std::vector<Condition>& right_scan_conds) {
     for (const auto& index : right_tab.indexes) {
@@ -234,10 +256,10 @@ std::vector<std::string> index_cols_for_inlj(const TabMeta& right_tab, const Tab
     return {};
 }
 
-// Rebuild the right plan tree, replacing the SeqScan leaf with new_scan (IndexScan).
+// Rebuild the right plan tree, replacing the scan leaf with new_scan (IndexScan).
 // The tree structure is: [Projection -> [Filter ->]] ScanPlan
 std::unique_ptr<Plan> rebuild_right_plan_with_index(std::unique_ptr<Plan> plan, std::unique_ptr<Plan> new_scan) {
-    if (plan->tag == T_SeqScan) {
+    if (plan->tag == T_SeqScan || plan->tag == T_IndexScan || plan->tag == T_IndexSkipScan) {
         return new_scan;
     }
     if (plan->tag == T_Filter) {
@@ -367,6 +389,117 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_
     return true;
 }
 
+bool Planner::get_skip_scan_index_cols(std::string tab_name, std::vector<Condition>& curr_conds,
+                                       std::vector<std::string>& index_col_names) {
+    index_col_names.clear();
+    if (curr_conds.empty()) {
+        return false;
+    }
+    TabMeta& tab = sm_manager_->db_.get_table(tab_name);
+    if (tab.indexes.empty()) {
+        return false;
+    }
+
+    for (auto& cond : curr_conds) {
+        if (cond.lhs_col.tab_name != tab_name && !cond.is_rhs_val && cond.rhs_col.tab_name == tab_name) {
+            std::swap(cond.lhs_col, cond.rhs_col);
+            cond.op = swap_comp_op(cond.op);
+        }
+    }
+
+    int best_index = -1;
+    int best_suffix_eq_count = 0;
+    int best_missing_prefix = std::numeric_limits<int>::max();
+    std::vector<int> best_condition_order;
+
+    for (size_t index_no = 0; index_no < tab.indexes.size(); ++index_no) {
+        const auto& index = tab.indexes[index_no];
+        std::vector<int> condition_order;
+        bool saw_missing_prefix = false;
+        bool collecting_suffix = false;
+        int missing_prefix = 0;
+        int suffix_eq_count = 0;
+
+        for (const auto& index_col : index.cols) {
+            std::vector<int> eq_conds;
+            for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
+                const auto& cond = curr_conds[cond_no];
+                if (!cond.is_rhs_val || cond.op != OP_EQ || cond.lhs_col.tab_name != tab_name ||
+                    cond.lhs_col.col_name != index_col.name) {
+                    continue;
+                }
+                eq_conds.push_back(static_cast<int>(cond_no));
+            }
+
+            if (eq_conds.empty()) {
+                if (collecting_suffix) {
+                    break;
+                }
+                saw_missing_prefix = true;
+                ++missing_prefix;
+                continue;
+            }
+
+            if (!saw_missing_prefix) {
+                continue;
+            }
+
+            collecting_suffix = true;
+            ++suffix_eq_count;
+            condition_order.insert(condition_order.end(), eq_conds.begin(), eq_conds.end());
+        }
+
+        if (suffix_eq_count == 0 || missing_prefix == 0) {
+            continue;
+        }
+        if (suffix_eq_count > best_suffix_eq_count ||
+            (suffix_eq_count == best_suffix_eq_count && missing_prefix < best_missing_prefix)) {
+            best_index = static_cast<int>(index_no);
+            best_suffix_eq_count = suffix_eq_count;
+            best_missing_prefix = missing_prefix;
+            best_condition_order = std::move(condition_order);
+        }
+    }
+
+    if (best_index < 0) {
+        return false;
+    }
+
+    const auto& best_meta = tab.indexes[best_index];
+    for (const auto& col : best_meta.cols) {
+        index_col_names.push_back(col.name);
+    }
+
+    std::vector<bool> used(curr_conds.size(), false);
+    std::vector<Condition> reordered;
+    reordered.reserve(curr_conds.size());
+    for (int cond_no : best_condition_order) {
+        if (!used[cond_no]) {
+            reordered.push_back(curr_conds[cond_no]);
+            used[cond_no] = true;
+        }
+    }
+    for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
+        if (!used[cond_no]) {
+            reordered.push_back(curr_conds[cond_no]);
+        }
+    }
+    curr_conds = std::move(reordered);
+    return true;
+}
+
+PlanTag Planner::choose_scan_plan_tag(std::string tab_name, std::vector<Condition>& curr_conds,
+                                      std::vector<std::string>& index_col_names) {
+    if (get_index_cols(tab_name, curr_conds, index_col_names)) {
+        return T_IndexScan;
+    }
+    if (get_skip_scan_index_cols(tab_name, curr_conds, index_col_names)) {
+        return T_IndexSkipScan;
+    }
+    index_col_names.clear();
+    return T_SeqScan;
+}
+
 /**
  * @brief 表算子条件谓词生成
  *
@@ -396,6 +529,7 @@ std::vector<Condition> pop_conds(std::vector<Condition>& conds, std::string tab_
 int push_conds(Condition* cond, Plan* plan) {
     switch (plan->tag) {
     case T_SeqScan:
+    case T_IndexSkipScan:
     case T_IndexScan: {
         auto* x = static_cast<ScanPlan*>(plan);
         if (x->tab_name_.compare(cond->lhs_col.tab_name) == 0) {
@@ -507,11 +641,13 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
             });
         }
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(table, scan_conds, index_col_names);
-        table_access_scores.push_back(index_access_score(table, index_col_names, scan_conds));
+        PlanTag scan_tag = choose_scan_plan_tag(table, scan_conds, index_col_names);
+        table_access_scores.push_back(scan_tag == T_IndexSkipScan
+                                          ? skip_scan_access_score(table, index_col_names, scan_conds)
+                                          : index_access_score(table, index_col_names, scan_conds));
         table_scan_conds.push_back(scan_conds);
-        std::unique_ptr<Plan> table_plan = std::make_unique<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan,
-                                                                      sm_manager_, table, scan_conds, index_col_names);
+        std::unique_ptr<Plan> table_plan =
+            std::make_unique<ScanPlan>(scan_tag, sm_manager_, table, scan_conds, index_col_names);
 
         auto needed_pos = needed_cols.find(table);
         if (needed_pos != needed_cols.end() && !needed_pos->second.empty()) {
@@ -643,14 +779,14 @@ std::unique_ptr<Plan> Planner::make_one_rel(Query* query) {
         auto curr_conds = pop_conds(query->conds, tables[i]);
         // int index_no = get_indexNo(tables[i], curr_conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
-        if (index_exist == false) { // 该表没有索引
+        PlanTag scan_tag = choose_scan_plan_tag(tables[i], curr_conds, index_col_names);
+        if (scan_tag == T_SeqScan) { // 该表没有可用索引
             index_col_names.clear();
             table_scan_executors[i] =
                 std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
         } else { // 存在索引
             table_scan_executors[i] =
-                std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, tables[i], curr_conds, index_col_names);
+                std::make_unique<ScanPlan>(scan_tag, sm_manager_, tables[i], curr_conds, index_col_names);
         }
     }
     // 只有一个表，不需要join。
@@ -881,15 +1017,15 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
+        PlanTag scan_tag = choose_scan_plan_tag(x->tab_name, query->conds, index_col_names);
 
-        if (index_exist == false) { // 该表没有索引
+        if (scan_tag == T_SeqScan) { // 该表没有可用索引
             index_col_names.clear();
             table_scan_executors =
                 std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
         } else { // 存在索引
             table_scan_executors =
-                std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
 
         plannerRoot = std::make_unique<DMLPlan>(T_Delete, std::move(table_scan_executors), x->tab_name,
@@ -904,15 +1040,15 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
-        bool index_exist = get_index_cols(x->tab_name, query->conds, index_col_names);
+        PlanTag scan_tag = choose_scan_plan_tag(x->tab_name, query->conds, index_col_names);
 
-        if (index_exist == false) { // 该表没有索引
+        if (scan_tag == T_SeqScan) { // 该表没有可用索引
             index_col_names.clear();
             table_scan_executors =
                 std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
         } else { // 存在索引
             table_scan_executors =
-                std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name, query->conds, index_col_names);
+                std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
         plannerRoot = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
                                                 std::vector<Value>(), query->conds, query->set_clauses);

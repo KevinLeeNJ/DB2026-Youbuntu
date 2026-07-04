@@ -121,6 +121,11 @@ public:
         return *leaf_.get_rid(iid_.slot_no);
     }
 
+    const char* key() const {
+        // Caller must ensure !is_end(). Leaf is pinned, so read directly.
+        return leaf_.get_key(iid_.slot_no);
+    }
+
     const Iid& iid() const {
         return iid_;
     }

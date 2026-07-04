@@ -26,7 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 
 class IndexScanExecutor : public AbstractExecutor {
-private:
+protected:
     std::string tab_name_;              // 表名称
     TabMeta tab_;                       // 表的元数据
     std::vector<Condition> conds_;      // 扫描条件

@@ -190,6 +190,24 @@ std::unique_ptr<Query> make_stock_level_query() {
     return query;
 }
 
+std::unique_ptr<Query> make_order_line_suffix_lookup_query() {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::SelectStmt>(
+        std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("order_line", "")},
+        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
+        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
+        true);
+    query->tables = {"order_line"};
+    query->has_aggregate = true;
+    query->select_items.push_back({.expr = make_count_star_expr(), .alias = "", .output_name = "COUNT(*)"});
+    query->output_names = {"COUNT(*)"};
+    query->conds = {
+        value_cond("order_line", "ol_d_id", OP_EQ, 1),
+        value_cond("order_line", "ol_o_id", OP_EQ, 3001),
+    };
+    return query;
+}
+
 } // namespace
 
 class PlannerAggregateTest : public ::testing::Test {
@@ -265,4 +283,20 @@ TEST_F(PlannerAggregateTest, stock_level_join_starts_from_order_line_and_uses_st
     EXPECT_EQ(join->inlj_left_col_.col_name, "ol_i_id");
     EXPECT_EQ(join->inlj_right_col_.tab_name, "stock");
     EXPECT_EQ(join->inlj_right_col_.col_name, "s_i_id");
+}
+
+TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) {
+    sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
+    auto query = make_order_line_suffix_lookup_query();
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->tag, T_Projection);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    ASSERT_EQ(projection->subplan_->tag, T_Aggregate);
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
+    ASSERT_EQ(aggregate->subplan_->tag, T_IndexSkipScan);
+    auto* scan = static_cast<ScanPlan*>(aggregate->subplan_.get());
+    EXPECT_EQ(scan->index_col_names_, (std::vector<std::string>{"ol_w_id", "ol_d_id", "ol_o_id", "ol_number"}));
 }

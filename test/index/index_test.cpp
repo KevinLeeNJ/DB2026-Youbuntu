@@ -28,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 #include "errors.h"
 #include "execution/executor_index_scan.h"
+#include "execution/executor_index_skip_scan.h"
 #include "execution/executor_delete.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_update.h"
@@ -517,6 +518,11 @@ public:
         sm_manager->create_table(tab_name, cols, nullptr);
     }
 
+    void create_three_int_table(const std::string& tab_name) {
+        std::vector<ColDef> cols = {{"a", TYPE_INT, 4}, {"b", TYPE_INT, 4}, {"c", TYPE_INT, 4}};
+        sm_manager->create_table(tab_name, cols, nullptr);
+    }
+
     void create_scores() {
         std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4}};
         sm_manager->create_table("scores", cols, nullptr);
@@ -543,6 +549,20 @@ public:
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
         InsertExecutor executor(sm_manager.get(), tab_name, {av, bv}, &context);
+        executor.Next();
+    }
+
+    void insert_three_ints(const std::string& tab_name, int a, int b, int c) {
+        Value av;
+        av.set_int(a);
+        Value bv;
+        bv.set_int(b);
+        Value cv;
+        cv.set_int(c);
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        InsertExecutor executor(sm_manager.get(), tab_name, {av, bv, cv}, &context);
         executor.Next();
     }
 
@@ -642,6 +662,20 @@ public:
         }
         return values;
     }
+
+    std::vector<int> skip_scan_three_int_a_values(const std::vector<Condition>& conds,
+                                                  const std::vector<std::string>& index_cols) {
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        IndexSkipScanExecutor executor(sm_manager.get(), "triples", conds, index_cols, &context);
+        std::vector<int> values;
+        for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+            auto rec = executor.Next();
+            values.push_back(*reinterpret_cast<int*>(rec->data));
+        }
+        return values;
+    }
 };
 
 TEST_F(IndexScanFeatureTest, UsesSingleColumnIndexForPointAndRangeScans) {
@@ -660,6 +694,21 @@ TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRan
               std::vector<int>({100}));
     EXPECT_EQ(scan_ids({int_cond(OP_LT, 600), string_cond(OP_GT, "bztyhnmj")}, {"w_id", "name"}),
               std::vector<int>({10, 100}));
+}
+
+TEST_F(IndexScanFeatureTest, SkipScanUsesSuffixEqualityAcrossDistinctPrefixes) {
+    create_three_int_table("triples");
+    insert_three_ints("triples", 1, 2, 3);
+    insert_three_ints("triples", 1, 2, 4);
+    insert_three_ints("triples", 2, 2, 3);
+    insert_three_ints("triples", 2, 1, 3);
+    insert_three_ints("triples", 3, 2, 3);
+    sm_manager->create_index("triples", {"a", "b", "c"}, nullptr);
+
+    auto result = skip_scan_three_int_a_values(
+        {table_int_cond("triples", "b", OP_EQ, 2), table_int_cond("triples", "c", OP_EQ, 3)}, {"a", "b", "c"});
+
+    EXPECT_EQ(result, std::vector<int>({1, 2, 3}));
 }
 
 TEST_F(IndexScanFeatureTest, DroppedIndexPagesDoNotPolluteRecreatedIndexes) {
