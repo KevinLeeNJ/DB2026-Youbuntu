@@ -80,6 +80,29 @@ if [[ "$REGENERATE_DATA" -eq 1 ]]; then
     DATA_ARGS="--overwrite-data-dir"
 fi
 
+# Auto-detect whether the CSV test data set is present in $DATA_DIR; if it is
+# missing or incomplete, run the datagen phase before load/run so `make
+# benchmark` works on a fresh checkout without a manual datagen step.
+DATA_COMPLETE=0
+if (cd "$ROOT_DIR" && python3 - "$DATA_DIR" <<'PY'
+import sys
+from pathlib import Path
+from benchmark.tpcc.phases.load import TABLES
+from benchmark.tpcc.phases.datagen import complete_csv_set
+sys.exit(0 if complete_csv_set(Path(sys.argv[1]), TABLES) else 1)
+PY
+); then
+    DATA_COMPLETE=1
+fi
+
+PHASES="load run"
+if [[ "$DATA_COMPLETE" -eq 0 ]]; then
+    echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
+    PHASES="datagen load run"
+    # Force overwrite so datagen proceeds even if some partial CSVs exist.
+    DATA_ARGS="--overwrite-data-dir"
+fi
+
 if [[ ! -x "$BINARY" ]]; then
     echo "missing server binary: $BINARY" >&2
     echo "run: make build" >&2
@@ -137,8 +160,8 @@ echo "[benchmark] 启动 rmdb server (db=$DB_DIR)"
 SERVER_PID=$!
 wait_port 30
 
-echo "[benchmark] load + run: warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s rounds=$ROUNDS"
-python3 -m benchmark.tpcc.tpcc_run load run \
+echo "[benchmark] $PHASES: warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s rounds=$ROUNDS"
+python3 -m benchmark.tpcc.tpcc_run $PHASES \
     --backend rmdb \
     --port "$PORT" \
     --warehouses "$WAREHOUSES" \

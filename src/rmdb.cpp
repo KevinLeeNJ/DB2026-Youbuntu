@@ -86,8 +86,6 @@ void client_handler(int fd) {
     txn_id_t txn_id = INVALID_TXN_ID;
     // 记录客户端当前配置的隔离级别
     IsolationLevel session_isolation_level = DEFAULT_ISOLATION_LEVEL;
-    // 记录客户端是否开启向 output.txt 写入结果（默认开启）
-    bool session_output_enabled = true;
 
     LOG_INFO("establish client connection, sockfd: %d", fd);
 
@@ -127,7 +125,6 @@ void client_handler(int fd) {
                                                   txn_manager.get());
         Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
-        context->output_file_enabled_ = session_output_enabled;
 
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
@@ -160,8 +157,9 @@ void client_handler(int fd) {
                 portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
                 // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
                 session_isolation_level = context->isolation_level_;
-                // Persist output_file toggle change (SET OUTPUT_FILE ON|OFF)
-                session_output_enabled = context->output_file_enabled_;
+                // Note: "set output_file on|off" is a database-global toggle stored
+                // on SmManager (see execution_manager.cpp T_SetOutputFile), so it
+                // persists across connections without per-session mirroring here.
                 portal->drop();
                 if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                     context->txn_->get_state() != TransactionState::COMMITTED &&
@@ -184,7 +182,7 @@ void client_handler(int fd) {
                 context->txn_ = nullptr;
                 LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
-                if (session_output_enabled) {
+                if (sm_manager->output_file_enabled_) {
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << str;
@@ -207,7 +205,7 @@ void client_handler(int fd) {
                 context->txn_ = nullptr;
 
                 // 将报错信息写入output.txt
-                if (session_output_enabled) {
+                if (sm_manager->output_file_enabled_) {
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << "failure\n";

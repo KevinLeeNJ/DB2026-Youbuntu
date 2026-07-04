@@ -52,6 +52,20 @@ def run_round(
     progress_interval: int,
 ) -> RoundResult:
     result = RoundResult(measure_seconds=measure_seconds)
+    # Ensure the database-global output_file toggle is OFF for the duration of
+    # this round. "set output_file off" is a server-wide toggle (stored on the
+    # shared SmManager), so setting it once here covers every connection opened
+    # during measurement: the inspect_dataset probe, all worker connections,
+    # and any reconnects. This keeps the throughput phase from appending query
+    # results to output.txt (avoids per-SELECT fstream open/close overhead and
+    # keeps the benchmark from contaminating output.txt).
+    probe_backend = backend_factory()
+    try:
+        probe_backend.execute("set output_file off")
+    except Exception:
+        pass
+    finally:
+        probe_backend.close()
     profile = inspect_dataset(backend_factory)
     warmup_end = time.monotonic() + warmup_seconds
     measure_end = warmup_end + measure_seconds

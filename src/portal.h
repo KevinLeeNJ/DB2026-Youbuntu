@@ -560,9 +560,9 @@ private:
         *(context->offset_) += static_cast<int>(text.size());
     }
 
-    static void write_explain_output(const std::string& text, Context* context) {
+    void write_explain_output(const std::string& text, Context* context) {
         append_to_context(text, context);
-        if (context->output_file_enabled_) {
+        if (sm_manager_->output_file_enabled_) {
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << text;
