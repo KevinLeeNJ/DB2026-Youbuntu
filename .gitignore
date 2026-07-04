@@ -21,3 +21,9 @@ benchmark/tpcc/data
 
 #忽略.codegraph
 .codegraph
+
+#忽略perf数据
+perf_out
+
+#忽略文档
+docs
