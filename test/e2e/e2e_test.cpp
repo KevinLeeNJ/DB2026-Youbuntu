@@ -117,7 +117,8 @@ public:
         int offset = 0;
 
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
-        context.output_file_enabled_ = session_output_enabled_;
+        // output_file toggle is now a database-global on SmManager; no per-session
+        // mirror needed here.
 
         // Parse
         std::unique_ptr<ast::TreeNode> parse_tree;
@@ -144,7 +145,6 @@ public:
             std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
             portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
             portal_->drop();
-            session_output_enabled_ = context.output_file_enabled_;
             finish_statement(&context);
         } catch (...) {
             abort_implicit_statement(&context);
@@ -218,7 +218,6 @@ private:
     std::string original_cwd_;
     bool cleanup_on_destroy_{true};
     txn_id_t txn_id_{INVALID_TXN_ID};
-    bool session_output_enabled_{true};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<RmManager> rm_manager_;

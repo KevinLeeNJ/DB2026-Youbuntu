@@ -15,9 +15,9 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g -ggdb3")
+set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
-set(CMAKE_C_FLAGS_DEBUG "-O2 -g -ggdb3")
+set(CMAKE_C_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
 
 enable_testing()

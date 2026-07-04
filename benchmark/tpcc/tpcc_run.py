@@ -202,6 +202,16 @@ def main() -> None:
         )
         baseline_backend = factory()
         try:
+            # Disable output.txt writes for the entirety of the run phase (counting
+            # probe + benchmark rounds + consistency). "set output_file off" is a
+            # server-wide toggle on SmManager, so one call here covers every
+            # subsequent connection in this process. This keeps throughput
+            # measurement from appending query results to output.txt.
+            if args.backend == "rmdb":
+                try:
+                    baseline_backend.execute("set output_file off")
+                except Exception:
+                    pass
             baseline_orders_total = count_orders(baseline_backend)
             baseline_warehouse_total = count_warehouses(baseline_backend)
             baseline_district_total = count_districts(baseline_backend)

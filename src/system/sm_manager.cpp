@@ -168,6 +168,9 @@ void SmManager::open_db(const std::string& db_name) {
                              ix_manager_->open_index(index.tab_name, index.cols));
             }
         }
+        // Reset the database-global output_file toggle: opening a (possibly
+        // different) database should not inherit the previous database's toggle.
+        output_file_enabled_ = true;
     } catch (...) {
         fhs_.clear();
         ihs_.clear();
@@ -221,7 +224,7 @@ void SmManager::close_db() {
  */
 void SmManager::show_tables(Context* context) {
     std::fstream outfile;
-    if (context->output_file_enabled_) {
+    if (output_file_enabled_) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
         outfile << "| Tables |\n";
     }
@@ -232,12 +235,12 @@ void SmManager::show_tables(Context* context) {
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
         printer.print_record({tab.name}, context);
-        if (context->output_file_enabled_) {
+        if (output_file_enabled_) {
             outfile << "| " << tab.name << " |\n";
         }
     }
     printer.print_separator(context);
-    if (context->output_file_enabled_) {
+    if (output_file_enabled_) {
         outfile.close();
     }
 }
@@ -252,34 +255,34 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
     printer.print_separator(context);
 
     std::fstream outfile;
-    if (context->output_file_enabled_) {
+    if (output_file_enabled_) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
     }
     for (const auto& index : tab.indexes) {
         std::string cols = "(";
-        if (context->output_file_enabled_) {
+        if (output_file_enabled_) {
             outfile << "| " << tab_name << " | unique | (";
         }
         for (int i = 0; i < index.col_num; ++i) {
             if (i != 0) {
                 cols += ",";
-                if (context->output_file_enabled_) {
+                if (output_file_enabled_) {
                     outfile << ",";
                 }
             }
             cols += index.cols[i].name;
-            if (context->output_file_enabled_) {
+            if (output_file_enabled_) {
                 outfile << index.cols[i].name;
             }
         }
         cols += ")";
-        if (context->output_file_enabled_) {
+        if (output_file_enabled_) {
             outfile << ") |\n";
         }
 
         printer.print_record({tab_name, "unique", cols}, context);
     }
-    if (context->output_file_enabled_) {
+    if (output_file_enabled_) {
         outfile.close();
     }
 

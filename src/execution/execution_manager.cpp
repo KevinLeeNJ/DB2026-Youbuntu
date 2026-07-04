@@ -178,7 +178,9 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     }
     case T_SetOutputFile: {
         auto* x = static_cast<SetOutputFilePlan*>(plan);
-        context->output_file_enabled_ = x->enable_;
+        // output_file is a database-global toggle shared across all connections;
+        // store it on SmManager so it persists across connection lifetimes.
+        sm_manager_->output_file_enabled_ = x->enable_;
         break;
     }
     case T_LoadData: {
@@ -294,7 +296,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         memcpy(context->data_send_ + *(context->offset_), local_send.data(), local_offset);
         *(context->offset_) += local_offset;
 
-        if (context->output_file_enabled_) {
+        if (sm_manager_->output_file_enabled_) {
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << out_file_stream.str();

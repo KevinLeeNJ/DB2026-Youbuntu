@@ -67,6 +67,11 @@ public:
 
     ~SmManager() {}
 
+    // Database-global toggle controlling whether query results are appended to
+    // output.txt. Shared across all client connections on this server process.
+    // Reset to true on every open_db. Toggled by "set output_file on|off".
+    bool output_file_enabled_{true};
+
     BufferPoolManager* get_bpm() {
         return buffer_pool_manager_;
     }
