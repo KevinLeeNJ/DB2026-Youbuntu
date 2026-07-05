@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "index/ix.h"
+#include "pager/pager.h"
 #include "record/rm.h"
 #include "recovery/checkpoint_manager.h"
 #include "recovery/log_manager.h"
@@ -67,9 +68,12 @@ std::vector<char> MakeIntKey(int value) {
 void CreateRecoveryTestDb(const std::string& db_name) {
     DiskManager disk;
     BufferPoolManager bpm(64, &disk);
-    RmManager rm_mgr(&disk, &bpm);
-    IxManager ix_mgr(&disk, &bpm);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    LogManager log_mgr(&disk);
+    rmdb::pager::Pager pager(&bpm, &log_mgr);
+    bpm.set_wal_guard(&pager);
+    RmManager rm_mgr(&disk, &bpm, &pager);
+    IxManager ix_mgr(&disk, &bpm, &pager);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
 
     sm_mgr.create_db(db_name);
     sm_mgr.open_db(db_name);
@@ -81,8 +85,10 @@ void CreateRecoveryTestDb(const std::string& db_name) {
 class OpenRecoveryDb {
 public:
     explicit OpenRecoveryDb(const std::string& db_name)
-        : bpm_(64, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_), sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_),
-          schema_mgr_(&sm_mgr_), log_mgr_(std::make_unique<LogManager>(&disk_)) {
+        : bpm_(64, &disk_), log_mgr_(std::make_unique<LogManager>(&disk_)), pager_(&bpm_, log_mgr_.get()),
+          rm_mgr_(&disk_, &bpm_, &pager_), ix_mgr_(&disk_, &bpm_, &pager_),
+          sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_, &pager_), schema_mgr_(&sm_mgr_) {
+        bpm_.set_wal_guard(&pager_);
         sm_mgr_.open_db(db_name);
     }
 
@@ -94,11 +100,12 @@ public:
 
     DiskManager disk_;
     BufferPoolManager bpm_;
+    std::unique_ptr<LogManager> log_mgr_;
+    rmdb::pager::Pager pager_;
     RmManager rm_mgr_;
     IxManager ix_mgr_;
     SmManager sm_mgr_;
     SchemaManager schema_mgr_;
-    std::unique_ptr<LogManager> log_mgr_;
     bool opened_{true};
 };
 
@@ -187,9 +194,12 @@ TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     ScopedTestDir test_dir("recovery_apply_test_root");
     DiskManager disk;
     BufferPoolManager bpm(64, &disk);
-    RmManager rm_mgr(&disk, &bpm);
-    IxManager ix_mgr(&disk, &bpm);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    LogManager log_mgr(&disk);
+    rmdb::pager::Pager pager(&bpm, &log_mgr);
+    bpm.set_wal_guard(&pager);
+    RmManager rm_mgr(&disk, &bpm, &pager);
+    IxManager ix_mgr(&disk, &bpm, &pager);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
     SchemaManager schema_mgr(&sm_mgr);
 
     sm_mgr.create_db("recovery_apply_test_db");

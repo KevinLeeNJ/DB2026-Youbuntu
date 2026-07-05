@@ -31,6 +31,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix_manager.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
+#include "pager/pager.h"
 #include "parser/parser.h"
 #include "portal.h"
 #include "record/rm_manager.h"
@@ -67,16 +68,17 @@ public:
         // 构建全局所需的管理器对象（同 src/rmdb.cpp）
         disk_manager_ = std::make_unique<DiskManager>();
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
-        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
-        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+        log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
+        pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), log_manager_.get());
+        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
+        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get());
+                                                  ix_manager_.get(), pager_.get());
         schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
-        log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager_.get());
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get(),
@@ -97,7 +99,8 @@ public:
         sm_manager_->open_db(db_name_);
 
         log_manager_->initialize_from_existing_log();
-        buffer_pool_manager_->set_log_manager(log_manager_.get());
+        // Phase 5: 通过 Pager 注入 WAL guard，替代 set_log_manager
+        buffer_pool_manager_->set_wal_guard(pager_.get());
 
         // ARIES recovery
         recovery_->analyze();
@@ -232,6 +235,8 @@ private:
     txn_id_t txn_id_{INVALID_TXN_ID};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<LogManager> log_manager_;
+    std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
@@ -240,7 +245,6 @@ private:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Optimizer> optimizer_;
-    std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<rmdb::access::RecoveryAccess> recovery_access_;
     std::unique_ptr<RecoveryManager> recovery_;
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;

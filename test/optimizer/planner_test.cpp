@@ -219,7 +219,7 @@ std::unique_ptr<Query> make_order_line_suffix_lookup_query() {
 
 class PlannerAggregateTest : public ::testing::Test {
 protected:
-    SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr};
+    SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr, nullptr};
     SchemaManager schema_manager_{&sm_manager_};
     Planner planner_{&schema_manager_};
 

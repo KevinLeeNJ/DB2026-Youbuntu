@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <assert.h>
 
 #include "bitmap.h"
+#include "pager/pager.h"
 #include "rm_defs.h"
 #include "rm_file_handle.h"
 
@@ -23,10 +24,11 @@ class RmManager {
 private:
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
+    rmdb::pager::Pager* pager_; // Phase 5: flush 路径经由 Pager，保证 WAL-before-page-write
 
 public:
-    RmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager)
-        : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager) {}
+    RmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, rmdb::pager::Pager* pager)
+        : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), pager_(pager) {}
 
     /**
      * @description: 创建表的数据文件并初始化相关信息
@@ -83,8 +85,8 @@ public:
     void close_file(const RmFileHandle* file_handle) {
         disk_manager_->write_page(file_handle->fd_, RM_FILE_HDR_PAGE, (char*)&file_handle->file_hdr_,
                                   sizeof(file_handle->file_hdr_));
-        // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
-        buffer_pool_manager_->flush_all_pages(file_handle->fd_);
+        // 先 flush WAL 再将缓冲区脏页写盘，保证 WAL-before-page-write 不变量
+        pager_->flush_all_pages(file_handle->fd_);
         buffer_pool_manager_->delete_all_pages(file_handle->fd_);
         disk_manager_->close_file(file_handle->fd_);
     }

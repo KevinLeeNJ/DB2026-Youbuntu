@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_insert.h"
 #include "execution/executor_update.h"
 #include "index/ix.h"
+#include "pager/pager.h"
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
 #include "system/sm.h"
@@ -295,9 +296,9 @@ TEST(LogManagerTest, TransactionBeginCommitLogPrevLsn) {
     DiskManager disk;
     disk.create_file(LOG_FILE_NAME);
     BufferPoolManager bpm(32, &disk);
-    RmManager rm_mgr(&disk, &bpm);
-    IxManager ix_mgr(&disk, &bpm);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    RmManager rm_mgr(&disk, &bpm, nullptr);
+    IxManager ix_mgr(&disk, &bpm, nullptr);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, nullptr);
     LockManager lock_mgr;
     SchemaManager schema_mgr(&sm_mgr);
     TransactionManager txn_mgr(&lock_mgr, &schema_mgr);
@@ -317,16 +318,18 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     ScopedTestDir test_dir("executor_dml_log_test_root");
     DiskManager disk;
     BufferPoolManager bpm(64, &disk);
-    RmManager rm_mgr(&disk, &bpm);
-    IxManager ix_mgr(&disk, &bpm);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    LogManager log_mgr(&disk);
+    rmdb::pager::Pager pager(&bpm, &log_mgr);
+    bpm.set_wal_guard(&pager);
+    RmManager rm_mgr(&disk, &bpm, &pager);
+    IxManager ix_mgr(&disk, &bpm, &pager);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
     LockManager lock_mgr;
     SchemaManager schema_mgr(&sm_mgr);
     TransactionManager txn_mgr(&lock_mgr, &schema_mgr);
 
     sm_mgr.create_db("executor_dml_log_test_db");
     sm_mgr.open_db("executor_dml_log_test_db");
-    LogManager log_mgr(&disk);
     rmdb::access::TableWriteService write_svc(&schema_mgr, &lock_mgr, &log_mgr, &txn_mgr);
 
     sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);

@@ -22,17 +22,10 @@ See the Mulan PSL v2 for more details. */
 #include "disk_manager.h"
 #include "errors.h"
 #include "page.h"
+#include "pager/wal_guard.h"
 #include "replacer/clock_replacer.h"
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
-
-namespace rmdb::recovery {
-class LogManager;
-}
-
-namespace rmdb {
-using recovery::LogManager;
-}
 
 namespace rmdb::storage {
 
@@ -45,9 +38,9 @@ private:
         page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
     std::list<frame_id_t> free_list_; // 空闲帧编号的链表
     DiskManager* disk_manager_;
-    LogManager* log_manager_{nullptr};
-    std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
-    std::mutex latch_;                   // 用于共享数据结构的并发控制
+    rmdb::pager::IWalGuard* wal_guard_{nullptr}; // Phase 5: 由 Pager 注入，替代 LogManager*
+    std::unique_ptr<Replacer> replacer_;         // buffer_pool的置换策略，当前赛题中为LRU置换策略
+    std::mutex latch_;                           // 用于共享数据结构的并发控制
 
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
@@ -90,8 +83,9 @@ public:
 
     void delete_all_pages(int fd);
 
-    void set_log_manager(LogManager* log_manager) {
-        log_manager_ = log_manager;
+    /// 注入 WAL guard（由 Pager 实现）；数据库打开后调用，关闭前有效。
+    void set_wal_guard(rmdb::pager::IWalGuard* guard) {
+        wal_guard_ = guard;
     }
 
 private:
@@ -99,7 +93,8 @@ private:
 
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
 
-    void flush_log_before_page_write();
+    /// 写盘前触发 WAL flush（若 wal_guard_ 为 nullptr 则跳过）。
+    void flush_wal_before_write();
 };
 
 } // namespace rmdb::storage

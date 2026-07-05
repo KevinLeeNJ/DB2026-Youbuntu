@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix_manager.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
+#include "pager/pager.h"
 #include "portal.h"
 #include "record/rm_manager.h"
 #include "recovery/log_manager.h"
@@ -45,8 +46,7 @@ public:
     DBInstance(const DBInstance&) = delete;
     DBInstance& operator=(const DBInstance&) = delete;
 
-    /// 打开（必要时创建）数据库目录，初始化 log，注入 BPM。
-    /// 保留 BPM::set_log_manager 调用，Phase 5 由 Pager 接管后删除。
+    /// 打开（必要时创建）数据库目录，初始化 log，向 BPM 注入 Pager。
     void open_database(const std::string& db_name);
 
     /// 运行 ARIES 三阶段恢复。须在 open_database 之后调用。
@@ -113,11 +113,17 @@ public:
     rmdb::access::LoadDataService& load_data_service() {
         return *load_data_service_;
     }
+    rmdb::pager::Pager& pager() {
+        return *pager_;
+    }
 
 private:
     // 声明顺序即构造顺序，逆序析构。切勿随意调整顺序。
+    // Phase 5: log_manager_ 和 pager_ 提前，rm_manager_/ix_manager_/sm_manager_ 依赖 pager_。
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<LogManager> log_manager_;
+    std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
@@ -126,7 +132,6 @@ private:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Optimizer> optimizer_;
-    std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<rmdb::access::RecoveryAccess> recovery_access_;
     std::unique_ptr<RecoveryManager> recovery_;
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;

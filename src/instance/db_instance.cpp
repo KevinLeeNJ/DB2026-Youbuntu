@@ -14,18 +14,20 @@ namespace rmdb::instance {
 
 DBInstance::DBInstance() {
     // 构造顺序与成员声明一致：底层存储先行，上层 manager 依赖前者
+    // Phase 5: log_manager_ 和 pager_ 提前，rm/ix/sm_manager_ 依赖 pager_
     disk_manager_ = std::make_unique<DiskManager>();
     buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
-    rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
-    ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+    log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
+    pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), log_manager_.get());
+    rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
+    ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
     sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                              ix_manager_.get());
+                                              ix_manager_.get(), pager_.get());
     schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
     lock_manager_ = std::make_unique<LockManager>();
     txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
     planner_ = std::make_unique<Planner>(schema_manager_.get());
     optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
-    log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
     recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager_.get());
     recovery_ = std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(),
                                                   schema_manager_.get(), log_manager_.get(), recovery_access_.get());
@@ -47,8 +49,8 @@ void DBInstance::open_database(const std::string& db_name) {
     }
     sm_manager_->open_db(db_name);
     log_manager_->initialize_from_existing_log();
-    // WAL 注入 BPM：Phase 5 由 Pager 接管后删除此调用
-    buffer_pool_manager_->set_log_manager(log_manager_.get());
+    // Phase 5: 向 BPM 注入 Pager 作为 WAL guard，eviction 路径写盘前触发 log flush
+    buffer_pool_manager_->set_wal_guard(pager_.get());
 }
 
 void DBInstance::run_recovery() {

@@ -23,6 +23,7 @@ using namespace rmdb;
 #include "gtest/gtest.h"
 #include "common/config.h"
 #include "index/ix.h"
+#include "pager/pager.h"
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
@@ -40,6 +41,7 @@ class NestTest : public ::testing::Test {
 protected:
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
@@ -55,10 +57,12 @@ protected:
     void SetUp() override {
         disk_manager_ = std::make_unique<DiskManager>();
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
-        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
-        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+        pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), nullptr);
+        buffer_pool_manager_->set_wal_guard(pager_.get());
+        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
+        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get());
+                                                  ix_manager_.get(), pager_.get());
         schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());

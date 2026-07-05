@@ -28,6 +28,7 @@ using namespace rmdb;
 #include "storage/disk_manager.h"
 #include "record/rm_manager.h"
 #include "index/ix_manager.h"
+#include "pager/pager.h"
 #include "common/config.h"
 
 namespace {
@@ -38,6 +39,7 @@ class DdlFaultTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
@@ -46,10 +48,12 @@ public:
     void SetUp() override {
         disk_manager_ = std::make_unique<DiskManager>();
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
-        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
-        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+        pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), nullptr);
+        buffer_pool_manager_->set_wal_guard(pager_.get());
+        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
+        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get());
+                                                  ix_manager_.get(), pager_.get());
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
         }

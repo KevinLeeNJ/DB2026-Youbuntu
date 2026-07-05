@@ -43,6 +43,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
+#include "pager/pager.h"
 #include "portal.h"
 #include "record/rm_manager.h"
 #include "recovery/log_manager.h"
@@ -110,10 +111,12 @@ public:
 
         disk_manager_ = std::make_unique<DiskManager>();
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
-        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
-        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+        pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), nullptr);
+        buffer_pool_manager_->set_wal_guard(pager_.get());
+        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
+        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get());
+                                                  ix_manager_.get(), pager_.get());
         schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
@@ -181,6 +184,7 @@ private:
     std::string original_cwd_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;

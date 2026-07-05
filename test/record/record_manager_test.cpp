@@ -31,6 +31,7 @@ using namespace rmdb;
 
 #include "gtest/gtest.h"
 #include "errors.h"
+#include "pager/pager.h"
 #include "test_util.h"
 
 const std::string TEST_DB_NAME = "record_manager_test_db";
@@ -115,7 +116,9 @@ TEST_F(RecordManagerTest, SimpleTest) {
     // 创建RmManager类的对象rm_manager
     auto disk_manager = std::make_unique<DiskManager>();
     auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
-    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
+    rmdb::pager::Pager pager(buffer_pool_manager.get(), nullptr);
+    buffer_pool_manager->set_wal_guard(&pager);
+    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get(), &pager);
 
     std::unordered_map<Rid, std::string, rid_hash_t, rid_equal_t> mock;
 
@@ -207,7 +210,9 @@ TEST(RecordManagerIsRecordTest, is_record_unpins_page) {
     auto disk_manager = std::make_unique<DiskManager>();
     const size_t bpm_size = 10;
     auto bpm = std::make_unique<BufferPoolManager>(bpm_size, disk_manager.get());
-    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), bpm.get());
+    rmdb::pager::Pager pager(bpm.get(), nullptr);
+    bpm->set_wal_guard(&pager);
+    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), bpm.get(), &pager);
 
     std::string filename = "is_record_test.txt";
     if (disk_manager->is_file(filename))

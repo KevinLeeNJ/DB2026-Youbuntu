@@ -24,6 +24,7 @@ using namespace rmdb;
 #include <cstring>
 #include <memory>
 #include "gtest/gtest.h"
+#include "pager/pager.h"
 #include "system/sm_manager.h"
 #include "system/schema_manager.h"
 #include "storage/buffer_pool_manager.h"
@@ -121,6 +122,7 @@ class ExecutorTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
@@ -131,10 +133,12 @@ public:
     void SetUp() override {
         disk_manager_ = std::make_unique<DiskManager>();
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
-        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get());
-        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+        pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), nullptr);
+        buffer_pool_manager_->set_wal_guard(pager_.get());
+        rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
+        ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get());
+                                                  ix_manager_.get(), pager_.get());
         schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
         write_service_ =
             std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), nullptr, nullptr, nullptr);

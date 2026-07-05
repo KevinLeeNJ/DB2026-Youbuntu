@@ -11,8 +11,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "buffer_pool_manager.h"
 
-#include "recovery/log_manager.h"
-
 namespace rmdb::storage {
 namespace {
 
@@ -22,9 +20,9 @@ bool IsValidPageId(const PageId& page_id) {
 
 } // namespace
 
-void BufferPoolManager::flush_log_before_page_write() {
-    if (log_manager_ != nullptr) {
-        log_manager_->flush_log_to_disk();
+void BufferPoolManager::flush_wal_before_write() {
+    if (wal_guard_ != nullptr) {
+        wal_guard_->flush_before_write();
     }
 }
 
@@ -66,7 +64,7 @@ void BufferPoolManager::update_page(Page* page, PageId new_page_id, frame_id_t n
 
     // 如果page是脏页，写回磁盘
     if (page->is_dirty_) {
-        flush_log_before_page_write();
+        flush_wal_before_write();
         disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
         page->is_dirty_ = false;
     }
@@ -147,7 +145,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             // 为了解决此问题，将flush_page()函数剥离出来
             PageId old_page_id = targetPage->get_page_id();
             if (IsValidPageId(old_page_id) && page_table_.find(old_page_id) != page_table_.end()) {
-                flush_log_before_page_write();
+                flush_wal_before_write();
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, targetPage->data_, PAGE_SIZE);
             }
             targetPage->is_dirty_ = false;
@@ -247,7 +245,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     frame_id_t fid = hit->second;
     Page* page = &(pages_[fid]);
     // 2. 无论P是否为脏都将其写回磁盘。
-    flush_log_before_page_write();
+    flush_wal_before_write();
     disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
 
     // 3. 更新P的is_dirty_
@@ -300,7 +298,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         if (IsValidPageId(old_page_id) && old_hit != page_table_.end()) {
             frame_id_t fid = old_hit->second;
             Page* page = &(pages_[fid]);
-            flush_log_before_page_write();
+            flush_wal_before_write();
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
             page->is_dirty_ = false;
         }
@@ -356,7 +354,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 3.   将目标页数据写回磁盘
     // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
     // 为了解决此问题，将flush_page()函数剥离出来
-    flush_log_before_page_write();
+    flush_wal_before_write();
     disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
     page->is_dirty_ = false;
 
@@ -379,7 +377,7 @@ void BufferPoolManager::flush_all_pages(int fd) {
     for (size_t i = 0; i < pool_size_; i++) {
         Page* page = &pages_[i];
         if (page->id_.fd == fd && page->id_.page_no != INVALID_PAGE_ID && page->is_dirty_) {
-            flush_log_before_page_write();
+            flush_wal_before_write();
             disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
             page->is_dirty_ = false;
         }

@@ -23,6 +23,7 @@ using namespace rmdb;
 #include <unistd.h>
 
 #include "gtest/gtest.h"
+#include "pager/pager.h"
 #include "recovery/log_manager.h"
 #include "replacer/clock_replacer.h"
 #include "storage/disk_manager.h"
@@ -159,7 +160,9 @@ TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
 
     LogManager log_manager(disk_manager);
     auto bpm = std::make_unique<BufferPoolManager>(10, disk_manager);
-    bpm->set_log_manager(&log_manager);
+    // Phase 5: 通过 Pager 注入 WAL guard，替代原来的 set_log_manager
+    rmdb::pager::Pager pager(bpm.get(), &log_manager);
+    bpm->set_wal_guard(&pager);
 
     PageId page_id{BufferPoolManagerTest::fd_, INVALID_PAGE_ID};
     auto* page = bpm->new_page(&page_id);

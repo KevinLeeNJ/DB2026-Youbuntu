@@ -222,7 +222,7 @@ make_select_stmt(std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>> sel
 
 class AnalyzeAggregateTest : public ::testing::Test {
 protected:
-    SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr};
+    SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr, nullptr};
     SchemaManager schema_manager_{&sm_manager_};
     Analyze analyze_{&schema_manager_};
 

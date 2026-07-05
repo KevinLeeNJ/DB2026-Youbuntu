@@ -34,6 +34,7 @@ using namespace rmdb;
 #include "execution/executor_insert.h"
 #include "execution/executor_update.h"
 #include "gtest/gtest.h"
+#include "pager/pager.h"
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
@@ -47,6 +48,7 @@ class IndexHandleTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager;
+    std::unique_ptr<rmdb::pager::Pager> pager;
     std::unique_ptr<IxManager> ix_manager;
     std::string table_name;
     std::vector<ColMeta> cols;
@@ -55,7 +57,9 @@ public:
         table_name = "index_handle_test_" + std::to_string(reinterpret_cast<uintptr_t>(this));
         disk_manager = std::make_unique<DiskManager>();
         buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
-        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+        pager = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager.get(), nullptr);
+        buffer_pool_manager->set_wal_guard(pager.get());
+        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
         cols = {ColMeta{.tab_name = table_name,
                         .name = "id",
                         .type = TYPE_INT,
@@ -475,6 +479,7 @@ class IndexScanFeatureTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager;
+    std::unique_ptr<rmdb::pager::Pager> pager;
     std::unique_ptr<RmManager> rm_manager;
     std::unique_ptr<IxManager> ix_manager;
     std::unique_ptr<SmManager> sm_manager;
@@ -486,10 +491,12 @@ public:
     void SetUp() override {
         disk_manager = std::make_unique<DiskManager>();
         buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
-        rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
-        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+        pager = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager.get(), nullptr);
+        buffer_pool_manager->set_wal_guard(pager.get());
+        rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
+        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
         sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
-                                                 ix_manager.get());
+                                                 ix_manager.get(), pager.get());
         schema_manager = std::make_unique<SchemaManager>(sm_manager.get());
         write_service =
             std::make_unique<rmdb::access::TableWriteService>(schema_manager.get(), nullptr, nullptr, nullptr);
@@ -853,6 +860,7 @@ class ShowIndexTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager;
+    std::unique_ptr<rmdb::pager::Pager> pager;
     std::unique_ptr<RmManager> rm_manager;
     std::unique_ptr<IxManager> ix_manager;
     std::unique_ptr<SmManager> sm_manager;
@@ -862,10 +870,12 @@ public:
     void SetUp() override {
         disk_manager = std::make_unique<DiskManager>();
         buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
-        rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
-        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+        pager = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager.get(), nullptr);
+        buffer_pool_manager->set_wal_guard(pager.get());
+        rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
+        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
         sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
-                                                 ix_manager.get());
+                                                 ix_manager.get(), pager.get());
         if (sm_manager->is_dir(db_name)) {
             sm_manager->drop_db(db_name);
         }

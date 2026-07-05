@@ -14,19 +14,21 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 
-#include "system/sm_meta.h"
 #include "ix_defs.h"
 #include "ix_index_handle.h"
+#include "pager/pager.h"
+#include "system/sm_meta.h"
 
 namespace rmdb::index {
 class IxManager {
 private:
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
+    rmdb::pager::Pager* pager_; // Phase 5: flush 路径经由 Pager，保证 WAL-before-page-write
 
 public:
-    IxManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager)
-        : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager) {}
+    IxManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, rmdb::pager::Pager* pager)
+        : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), pager_(pager) {}
 
     std::string get_index_name(const std::string& filename, const std::vector<std::string>& index_cols) {
         std::string index_name = filename;
@@ -165,8 +167,8 @@ public:
         std::vector<char> data(ih->file_hdr_->tot_len_);
         ih->file_hdr_->serialize(data.data());
         disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data.data(), ih->file_hdr_->tot_len_);
-        // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
-        buffer_pool_manager_->flush_all_pages(ih->fd_);
+        // 先 flush WAL 再将缓冲区脏页写盘，保证 WAL-before-page-write 不变量
+        pager_->flush_all_pages(ih->fd_);
         buffer_pool_manager_->delete_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
     }

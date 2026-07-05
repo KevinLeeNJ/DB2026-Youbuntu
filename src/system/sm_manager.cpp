@@ -506,11 +506,11 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
 void SmManager::flush_all_table_and_index_pages() {
     for (const auto& [_, fh] : fhs_) {
         rm_manager_->flush_file_header(fh.get());
-        buffer_pool_manager_->flush_all_pages(fh->GetFd());
+        pager_->flush_all_pages(fh->GetFd());
     }
     for (const auto& [_, ih] : ihs_) {
         ix_manager_->flush_index_header(ih.get());
-        buffer_pool_manager_->flush_all_pages(ih->GetFd());
+        pager_->flush_all_pages(ih->GetFd());
     }
 }
 

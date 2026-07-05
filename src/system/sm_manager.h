@@ -27,6 +27,10 @@ namespace rmdb {
 using record::RmManager;
 }
 
+namespace rmdb::pager {
+class Pager;
+}
+
 namespace rmdb::system {
 
 struct ColDef {
@@ -49,12 +53,13 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
+    rmdb::pager::Pager* pager_; // Phase 5: flush_all_table_and_index_pages 经由 Pager
 
 public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
-              IxManager* ix_manager)
+              IxManager* ix_manager, rmdb::pager::Pager* pager)
         : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), rm_manager_(rm_manager),
-          ix_manager_(ix_manager) {}
+          ix_manager_(ix_manager), pager_(pager) {}
 
     ~SmManager() {}
 
