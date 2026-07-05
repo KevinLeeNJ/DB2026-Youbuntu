@@ -11,29 +11,56 @@ The main module responsibilities are as follows:
 - `src/parser`: handwritten lexer and recursive descent parser, AST definitions, and conversion from SQL text to
   syntax trees; the current `parser` target only compiles `parser.cpp` and `lexer.cpp`.
 - `src/analyze`: semantic analysis, responsible for validation of table names, column names, types, expressions,
-  aggregation, grouping, ordering, LIMIT, UNION, and generation of the `Query` structure.
+  aggregation, grouping, ordering, LIMIT, UNION, and generation of the `Query` structure. Depends only on the
+  read-only `Catalog` interface; does not hold storage handles directly.
 - `src/optimizer`: query plan generation and basic optimization, constructing `Plan` nodes for scan, filter, join,
-  projection, aggregation, sort, LIMIT, UNION, DML, DDL, transaction control, and so on.
-- `src/execution`: executor framework and concrete executors, covering sequential scan, index scan, filter,
-  projection, nested loop join, aggregation, sort, LIMIT, UNION, insert, delete, update, and execution management.
-- `src/system`: system management and metadata management, responsible for creating, dropping, opening, and closing
-  databases/tables/indexes, metadata persistence, DDL execution, and management of table files and index handles.
-- `src/storage`: disk management, page abstraction, and buffer pool management, responsible for page allocation,
-  reading, writeback, flushing, and WAL write-before constraints.
-- `src/record`: record file management, in-page slot/bitmap/TupleMeta layout, record insert/delete/update/scan, and
-  MVCC metadata access.
-- `src/index`: B+ tree index management, composite key comparison, index node operations, insert/delete/search, and
-  range scan.
+  projection, aggregation, sort, LIMIT, UNION, DML, DDL, transaction control, and so on. Like `analyze`, depends
+  only on `Catalog`.
+- `src/execution`: executor framework and concrete executors (all header-only), covering sequential scan, index
+  scan, filter, projection, nested loop join, aggregation, sort, LIMIT, UNION, insert, delete, and update.
+  Executors access table data exclusively through `access/cursor/`; they do not instantiate `RmScan` or `IxScan`
+  directly. Also contains `expression_evaluator.h` for standalone expression evaluation.
+- `src/access`: unified data-access layer introduced by the v2 refactor.
+  - `cursor/`: cursor abstractions — `ScanCursor` (abstract base), `TableCursor` (wraps `RmScan`),
+    `IndexCursor` (wraps `IxScan`), and `TableAccess` (façade that selects the appropriate cursor).
+  - `table_write_service.h/.cpp`: single write path for insert/delete/update, handling locking, WAL, undo-log,
+    and MVCC visibility in one place.
+  - `mvcc_access.h`: MVCC visibility interface.
+  - `tuple_meta_writer.h/.cpp`: TupleMeta commit/rollback bridge.
+  - `recovery_access.h/.cpp`: bridge used by the recovery module to apply redo/undo without going through the
+    normal write service.
+  - `load_data_service.h/.cpp`: LOAD DATA fast path (approved bulk-insert; deliberately bypasses locks, WAL,
+    undo, and MVCC).
+- `src/catalog`: read-only schema view (`catalog.h`) consumed by `analyze` and `optimizer`; does not expose
+  storage handles.
+- `src/instance`: `DBInstance` — owns the canonical set of subsystem objects (buffer pool, log manager, lock
+  manager, transaction manager, schema manager, etc.) that previously lived as global variables in `rmdb.cpp`.
+- `src/server`: per-connection state (`session.h`) and output routing (`output_sink.h`).
+- `src/statement`: statement-level plumbing — `statement_context.h` (resource references valid for one
+  statement's lifetime) and `statement_runner.h/.cpp` (top-level command dispatch).
+- `src/system`: schema management split into a public boundary and an internal implementation.
+  `schema_manager.h/.cpp` is the externally visible API (DDL execution, handle ownership); `sm_manager.h/.cpp`
+  is an internal implementation detail visible only within `src/system/`.
+- `src/pager`: `pager.h/.cpp` is the single legitimate call site for `flush_page` / `flush_all_pages`, enforcing
+  the WAL-before-page-write invariant. `wal_guard.h` provides RAII helpers.
+- `src/storage`: pure physical layer — disk management, page abstraction, and buffer pool management. Has no
+  knowledge of `LogManager` or WAL; all WAL ordering is enforced by `pager/`.
+- `src/record`: record file management, in-page slot/bitmap/TupleMeta layout, record insert/delete/update/scan,
+  and MVCC metadata access.
+- `src/index`: B+ tree index management, composite key comparison, index node operations, insert/delete/search,
+  and range scan.
 - `src/transaction`: transaction lifecycle, commit/rollback, concurrency control modes, MVCC undo/version chains,
-  watermark, and SSI dependency tracking.
-- `src/transaction/concurrency`: lock manager, responsible for table-level and record-level shared locks, exclusive
-  locks, intention locks, SIX locks, and unlocking.
-- `src/recovery`: WAL logging, log management, checkpoint, crash recovery analyze/redo/undo, and post-recovery log
-  truncation.
+  watermark (`watermark.h/.cpp`), and SSI dependency tracking (`ssi_registry.h`).
+- `src/transaction/concurrency`: lock manager, responsible for table-level and record-level shared locks,
+  exclusive locks, intention locks, SIX locks, and unlocking.
+- `src/recovery`: WAL logging, log management, checkpoint, crash recovery analyze/redo/undo, and post-recovery
+  log truncation. Interacts with the storage layer through `access/recovery_access.h`.
 - `src/replacer`: buffer pool page replacement strategy, currently implementing the LRU replacer.
-- `src/common`: cross-module common configuration, context, exceptions, and basic definitions.
-- `src/test` and `src/test/performance_test`: test/performance-test helper targets inside the source tree, not part of
-  the main server execution path.
+- `src/common`: cross-module common configuration, context, exceptions, and basic definitions. `type_utils.h` is
+  the single authoritative source for type-compatibility and cast-legality checks.
+- `src/diagnostics`: minimal `TraceHook` interface (`trace.h`) for observability without coupling subsystems.
+- `src/test` and `src/test/performance_test`: test/performance-test helper targets inside the source tree, not
+  part of the main server execution path.
 
 Tests are organized by subsystem under `test/`, including directories such as `analyze`, `execution`, `index`, `nest`,
 `optimizer`, `parser`, `portal`, `record`, `recovery`, `replacer`, `snapshot`, `storage`, and `system`. End-to-end
