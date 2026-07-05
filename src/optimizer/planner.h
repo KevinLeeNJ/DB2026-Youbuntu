@@ -28,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/common.h"
 #include "analyze/analyze.h"
 
+namespace rmdb::optimizer {
 class Planner {
 private:
     SchemaManager* schema_manager_;
@@ -69,11 +70,17 @@ private:
     PlanTag choose_scan_plan_tag(std::string tab_name, std::vector<Condition>& curr_conds,
                                  std::vector<std::string>& index_col_names);
 
-    ColType interp_sv_type(ast::SvType sv_type) {
-        std::map<ast::SvType, ColType> m = {{ast::SV_TYPE_INT, TYPE_INT},
-                                            {ast::SV_TYPE_FLOAT, TYPE_FLOAT},
-                                            {ast::SV_TYPE_STRING, TYPE_STRING},
-                                            {ast::SV_TYPE_DATETIME, TYPE_DATETIME}};
+    ColType interp_sv_type(rmdb::parser::ast::SvType sv_type) {
+        std::map<rmdb::parser::ast::SvType, ColType> m = {{rmdb::parser::ast::SV_TYPE_INT, TYPE_INT},
+                                                          {rmdb::parser::ast::SV_TYPE_FLOAT, TYPE_FLOAT},
+                                                          {rmdb::parser::ast::SV_TYPE_STRING, TYPE_STRING},
+                                                          {rmdb::parser::ast::SV_TYPE_DATETIME, TYPE_DATETIME}};
         return m.at(sv_type);
     }
 };
+
+} // namespace rmdb::optimizer
+
+namespace rmdb {
+using optimizer::Planner;
+} // namespace rmdb

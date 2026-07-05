@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "parser/parser.h"
 #include "system/schema_manager.h"
 
+namespace rmdb::optimizer {
 typedef enum PlanTag {
     T_Invalid = 1,
     T_Help,
@@ -254,23 +255,23 @@ public:
 // Set Knob Plan
 class SetKnobPlan : public Plan {
 public:
-    SetKnobPlan(ast::SetKnobType knob_type, bool bool_value) {
+    SetKnobPlan(rmdb::parser::ast::SetKnobType knob_type, bool bool_value) {
         Plan::tag = T_SetKnob;
         set_knob_type_ = knob_type;
         bool_value_ = bool_value;
     }
-    ast::SetKnobType set_knob_type_;
+    rmdb::parser::ast::SetKnobType set_knob_type_;
     bool bool_value_;
 };
 
 // Set Transaction Isolation Level Plan
 class SetTransactionPlan : public Plan {
 public:
-    explicit SetTransactionPlan(ast::IsolationLevelType level) {
+    explicit SetTransactionPlan(rmdb::parser::ast::IsolationLevelType level) {
         Plan::tag = T_SetTransaction;
         isolation_level_ = level;
     }
-    ast::IsolationLevelType isolation_level_;
+    rmdb::parser::ast::IsolationLevelType isolation_level_;
 };
 
 // Set Output File Plan
@@ -297,11 +298,68 @@ public:
 
 class plannerInfo {
 public:
-    const ast::SelectStmt* parse;
+    const rmdb::parser::ast::SelectStmt* parse;
     std::vector<Condition> where_conds;
     std::vector<TabCol> sel_cols;
     std::unique_ptr<Plan> plan;
     std::vector<std::unique_ptr<Plan>> table_scan_executors;
     std::vector<SetClause> set_clauses;
-    plannerInfo(const ast::SelectStmt* parse_) : parse(parse_) {}
+    plannerInfo(const rmdb::parser::ast::SelectStmt* parse_) : parse(parse_) {}
 };
+
+} // namespace rmdb::optimizer
+
+namespace rmdb {
+using optimizer::AggregatePlan;
+using optimizer::DDLPlan;
+using optimizer::DMLPlan;
+using optimizer::FilterPlan;
+using optimizer::JoinPlan;
+using optimizer::LimitPlan;
+using optimizer::LoadDataPlan;
+using optimizer::OtherPlan;
+using optimizer::Plan;
+using optimizer::plannerInfo;
+using optimizer::PlanTag;
+using optimizer::ProjectionPlan;
+using optimizer::ScanPlan;
+using optimizer::SetKnobPlan;
+using optimizer::SetOutputFilePlan;
+using optimizer::SetTransactionPlan;
+using optimizer::SortPlan;
+using optimizer::T_Aggregate;
+using optimizer::T_CreateIndex;
+using optimizer::T_CreateTable;
+using optimizer::T_Delete;
+using optimizer::T_DescTable;
+using optimizer::T_DropIndex;
+using optimizer::T_DropTable;
+using optimizer::T_ExplainAnalyze;
+using optimizer::T_Filter;
+using optimizer::T_Help;
+using optimizer::T_IndexScan;
+using optimizer::T_IndexSkipScan;
+using optimizer::T_Insert;
+using optimizer::T_Invalid;
+using optimizer::T_Limit;
+using optimizer::T_LoadData;
+using optimizer::T_NestLoop;
+using optimizer::T_Projection;
+using optimizer::T_select;
+using optimizer::T_SeqScan;
+using optimizer::T_SetKnob;
+using optimizer::T_SetOutputFile;
+using optimizer::T_SetTransaction;
+using optimizer::T_ShowIndex;
+using optimizer::T_ShowTable;
+using optimizer::T_Sort;
+using optimizer::T_SortMerge;
+using optimizer::T_StaticCheckpoint;
+using optimizer::T_Transaction_abort;
+using optimizer::T_Transaction_begin;
+using optimizer::T_Transaction_commit;
+using optimizer::T_Transaction_rollback;
+using optimizer::T_Union;
+using optimizer::T_Update;
+using optimizer::UnionPlan;
+} // namespace rmdb

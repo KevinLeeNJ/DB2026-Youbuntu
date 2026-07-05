@@ -17,7 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 enum JoinType { INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN };
-namespace ast {
+namespace rmdb::parser::ast {
 
 enum SvType { SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL, SV_TYPE_DATETIME };
 
@@ -481,4 +481,4 @@ struct LoadStmt : public TreeNode {
         : TreeNode(AstType::LoadStmt), file_name_(std::move(file_name)), tab_name_(std::move(tab_name)) {}
 };
 
-} // namespace ast
+} // namespace rmdb::parser::ast

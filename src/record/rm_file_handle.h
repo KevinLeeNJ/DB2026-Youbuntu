@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 #include "rm_defs.h"
 
+namespace rmdb::record {
 class RmManager;
 
 /* 对表数据文件中的页面进行封装 */
@@ -196,3 +197,12 @@ private:
 
     void release_page_handle(RmPageHandle& page_handle);
 };
+
+} // namespace rmdb::record
+
+namespace rmdb {
+using record::RmFileHandle;
+using record::RmPageHandle;
+using record::RmPinnedInsert;
+using record::RmRecordWithMeta;
+} // namespace rmdb

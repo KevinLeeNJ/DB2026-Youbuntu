@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdlib>
 #include <limits>
 
-namespace parser {
+namespace rmdb::parser {
 
 const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::keywords_ = {
     {"SHOW", TokenType::SHOW},
@@ -369,4 +369,4 @@ double Lexer::parse_float(std::string_view text) {
     return value;
 }
 
-} // namespace parser
+} // namespace rmdb::parser

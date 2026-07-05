@@ -15,7 +15,15 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/concurrency/lock_manager.h"
 #include "recovery/log_manager.h"
 
+namespace rmdb::txn {
 class TransactionManager;
+}
+
+namespace rmdb {
+using txn::TransactionManager;
+}
+
+namespace rmdb::common {
 
 // used for data_send
 static int const_offset = -1;
@@ -40,3 +48,10 @@ public:
     IsolationLevel isolation_level_;
     bool enable_ssi_read_tracking_{false};
 };
+
+} // namespace rmdb::common
+
+namespace rmdb {
+using common::const_offset;
+using common::Context;
+} // namespace rmdb

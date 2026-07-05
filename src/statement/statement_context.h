@@ -16,12 +16,18 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/transaction.h"
 #include "transaction/txn_defs.h"
 
+namespace rmdb::txn {
 class TransactionManager;
+}
 
-namespace statement {
+namespace rmdb {
+using txn::TransactionManager;
+}
+
+namespace rmdb::statement {
 
 /// 一条 SQL 语句执行期间的内核资源引用集合。
-/// 不拥有任何对象，生命周期短于 server::Session。
+/// 不拥有任何对象，生命周期短于 rmdb::server::Session。
 /// Phase 1 仅定义，被执行器采用自 Phase 4 起（见 migration-ledger）。
 struct StatementContext {
     Transaction* txn{nullptr};
@@ -30,7 +36,7 @@ struct StatementContext {
     TransactionManager* txn_mgr{nullptr};
     IsolationLevel isolation_level{DEFAULT_ISOLATION_LEVEL};
     bool enable_ssi_read_tracking{false};
-    diagnostics::TraceHook trace_hook{nullptr};
+    rmdb::diagnostics::TraceHook trace_hook{nullptr};
 };
 
-} // namespace statement
+} // namespace rmdb::statement

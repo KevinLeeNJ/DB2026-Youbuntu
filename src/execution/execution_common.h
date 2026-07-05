@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm_file_handle.h"
 #include "record/rm_scan.h"
 
+namespace rmdb::exec {
 auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const TupleMeta& base_meta,
                       const std::vector<UndoLog>& undo_logs) -> std::optional<RmRecord>;
 
@@ -185,3 +186,13 @@ inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid,
     }
     return false;
 }
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::DeletedTupleCandidatesConflictWithInsert;
+using exec::GetVisibleRecord;
+using exec::HistoricalIndexKeyConflictsWithTxn;
+using exec::ReconstructTuple;
+using exec::RecordDataEquals;
+} // namespace rmdb

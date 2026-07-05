@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/config.h"
 #include "record/rm_defs.h"
 
+namespace rmdb::recovery {
 /* 日志记录对应操作的类型 */
 enum LogType : int { UPDATE = 0, INSERT, DELETE, BEGIN, COMMIT, ABORT, CHECKPOINT };
 static std::string LogTypeStr[] = {"UPDATE", "INSERT", "DELETE", "BEGIN", "COMMIT", "ABORT", "CHECKPOINT"};
@@ -488,3 +489,20 @@ private:
     int64_t log_file_offset_{0};       // 日志文件当前追加偏移
     DiskManager* disk_manager_;
 };
+
+} // namespace rmdb::recovery
+
+namespace rmdb {
+using recovery::AbortLogRecord;
+using recovery::BeginLogRecord;
+using recovery::CheckpointLogRecord;
+using recovery::CommitLogRecord;
+using recovery::DeleteLogRecord;
+using recovery::DeserializeLogRecord;
+using recovery::InsertLogRecord;
+using recovery::LogBuffer;
+using recovery::LogManager;
+using recovery::LogRecord;
+using recovery::LogType;
+using recovery::UpdateLogRecord;
+} // namespace rmdb

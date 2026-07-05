@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "rm_scan.h"
 #include "rm_file_handle.h"
 
+namespace rmdb::record {
 void RmScan::release_page() {
     if (pinned_page_ != nullptr) {
         file_handle_->buffer_pool_manager_->unpin_page(pinned_page_->get_page_id(), false);
@@ -83,3 +84,5 @@ bool RmScan::is_end() const {
 Rid RmScan::rid() const {
     return rid_;
 }
+
+} // namespace rmdb::record

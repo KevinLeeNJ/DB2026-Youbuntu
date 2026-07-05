@@ -22,10 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/transaction.h"
 #include "transaction/transaction_manager.h"
 
-class Context;
-class Transaction;
-
-namespace dbaccess {
+namespace rmdb::access {
 
 /// 统一写路径服务。insert / delete / update / load 的写协议集中在此实现。
 /// 执行器只调用本服务的接口，不再直接调 add_log_to_buffer / set_tuple_meta /
@@ -81,4 +78,4 @@ private:
     inline TransactionManager* resolve_txn_mgr(Context* ctx) const;
 };
 
-} // namespace dbaccess
+} // namespace rmdb::access

@@ -16,21 +16,22 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <utility>
 
+namespace rmdb::analyze {
 using namespace analyze_internal;
 
 namespace {
 
-UpdateOp convert_update_op(ast::SetOp op) {
+UpdateOp convert_update_op(rmdb::parser::ast::SetOp op) {
     switch (op) {
-    case ast::SetOp::SELF_ADD:
+    case rmdb::parser::ast::SetOp::SELF_ADD:
         return UpdateOp::SELF_ADD;
-    case ast::SetOp::SELF_SUB:
+    case rmdb::parser::ast::SetOp::SELF_SUB:
         return UpdateOp::SELF_SUB;
-    case ast::SetOp::SELF_MUL:
+    case rmdb::parser::ast::SetOp::SELF_MUL:
         return UpdateOp::SELF_MUL;
-    case ast::SetOp::SELF_DIV:
+    case rmdb::parser::ast::SetOp::SELF_DIV:
         return UpdateOp::SELF_DIV;
-    case ast::SetOp::ASSIGNMENT:
+    case rmdb::parser::ast::SetOp::ASSIGNMENT:
         return UpdateOp::ASSIGNMENT;
     }
     throw InternalError("Unexpected UPDATE operator");
@@ -78,7 +79,7 @@ void resolve_aliases(Query& query) {
     }
 }
 
-void populate_table_refs(Query& query, const std::vector<ast::TableRef>& table_refs) {
+void populate_table_refs(Query& query, const std::vector<rmdb::parser::ast::TableRef>& table_refs) {
     query.tables.clear();
     query.table_display_names.clear();
     query.table_alias_to_name.clear();
@@ -102,30 +103,31 @@ void populate_table_refs(Query& query, const std::vector<ast::TableRef>& table_r
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
- * @param {unique_ptr<ast::TreeNode>} parse parser生成的结果集
+ * @param {unique_ptr<rmdb::parser::ast::TreeNode>} parse parser生成的结果集
  * @return {unique_ptr<Query>} Query
  */
-std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse) {
+std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<rmdb::parser::ast::TreeNode> parse) {
     auto* root = parse.get();
     if (root == nullptr) {
         throw InternalError("Unexpected null AST root");
     }
-    if (root->type == ast::AstType::SelectStmt) {
-        return analyze_select_stmt(static_cast<const ast::SelectStmt*>(root), std::move(parse));
+    if (root->type == rmdb::parser::ast::AstType::SelectStmt) {
+        return analyze_select_stmt(static_cast<const rmdb::parser::ast::SelectStmt*>(root), std::move(parse));
     }
-    if (root->type == ast::AstType::ExplainAnalyze) {
-        auto explain = static_cast<const ast::ExplainAnalyze*>(root);
+    if (root->type == rmdb::parser::ast::AstType::ExplainAnalyze) {
+        auto explain = static_cast<const rmdb::parser::ast::ExplainAnalyze*>(root);
         auto query = analyze_select_stmt(explain->select.get());
         query->is_explain_analyze = true;
         query->parse = std::move(parse);
         return query;
     }
-    if (root->type == ast::AstType::SelectFromUnionStmt) {
-        return analyze_select_from_union_stmt(static_cast<const ast::SelectFromUnionStmt*>(root), std::move(parse));
+    if (root->type == rmdb::parser::ast::AstType::SelectFromUnionStmt) {
+        return analyze_select_from_union_stmt(static_cast<const rmdb::parser::ast::SelectFromUnionStmt*>(root),
+                                              std::move(parse));
     }
 
-    if (root->type == ast::AstType::SetTransaction) {
-        auto x = static_cast<const ast::SetTransaction*>(root);
+    if (root->type == rmdb::parser::ast::AstType::SetTransaction) {
+        auto x = static_cast<const rmdb::parser::ast::SetTransaction*>(root);
         auto query = std::make_unique<Query>();
         query->is_set_transaction = true;
         query->set_isolation_level = x->isolation_level_;
@@ -135,8 +137,8 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
 
     auto query = std::make_unique<Query>();
     switch (root->type) {
-    case ast::AstType::UpdateStmt: {
-        auto x = static_cast<const ast::UpdateStmt*>(root);
+    case rmdb::parser::ast::AstType::UpdateStmt: {
+        auto x = static_cast<const rmdb::parser::ast::UpdateStmt*>(root);
         query->set_clauses.reserve(x->set_clauses.size());
         for (const auto& set_clause : x->set_clauses) {
             SetClause clause;
@@ -160,14 +162,14 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
         check_clause({x->tab_name}, query->conds);
         break;
     }
-    case ast::AstType::DeleteStmt: {
-        auto x = static_cast<const ast::DeleteStmt*>(root);
+    case rmdb::parser::ast::AstType::DeleteStmt: {
+        auto x = static_cast<const rmdb::parser::ast::DeleteStmt*>(root);
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);
         break;
     }
-    case ast::AstType::InsertStmt: {
-        auto x = static_cast<const ast::InsertStmt*>(root);
+    case rmdb::parser::ast::AstType::InsertStmt: {
+        auto x = static_cast<const rmdb::parser::ast::InsertStmt*>(root);
         query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val.get()));
@@ -181,7 +183,8 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     return query;
 }
 
-std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner) {
+std::unique_ptr<Query> Analyze::analyze_select_stmt(const rmdb::parser::ast::SelectStmt* x,
+                                                    std::unique_ptr<rmdb::parser::ast::TreeNode> owner) {
     auto query = std::make_unique<Query>();
     populate_table_refs(*query, x->tabs);
 
@@ -284,8 +287,8 @@ void Analyze::validate_union_order_by(Query& query) {
     }
 }
 
-std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* x,
-                                                               std::unique_ptr<ast::TreeNode> owner) {
+std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const rmdb::parser::ast::SelectFromUnionStmt* x,
+                                                               std::unique_ptr<rmdb::parser::ast::TreeNode> owner) {
     if (x->union_stmt == nullptr || x->union_stmt->branches.size() < 2) {
         throw RMDBError("UNION requires at least two SELECT branches");
     }
@@ -341,7 +344,8 @@ void Analyze::get_all_cols(const std::vector<std::string>& tab_names, std::vecto
     }
 }
 
-void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds) {
+void Analyze::get_clause(const std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>>& sv_conds,
+                         std::vector<Condition>& conds) {
     conds.clear();
     conds.reserve(sv_conds.size());
     for (const auto& expr : sv_conds) {
@@ -349,11 +353,11 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
         cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
         cond.op = convert_sv_comp_op(expr->op);
 
-        if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
+        if (auto rhs_val = dynamic_cast<const rmdb::parser::ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
             cond.is_rhs_val = true;
             cond.rhs_val = convert_sv_value(rhs_val);
             cond.rhs_display = rhs_val->display_text;
-        } else if (auto rhs_col = dynamic_cast<const ast::Col*>(expr->rhs.get()); rhs_col != nullptr) {
+        } else if (auto rhs_col = dynamic_cast<const rmdb::parser::ast::Col*>(expr->rhs.get()); rhs_col != nullptr) {
             cond.is_rhs_val = false;
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
         } else {
@@ -393,7 +397,7 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
     }
 }
 
-Value Analyze::convert_sv_value(const ast::Value* sv_val) {
+Value Analyze::convert_sv_value(const rmdb::parser::ast::Value* sv_val) {
     return convert_ast_value_node(sv_val);
 }
 
@@ -416,20 +420,22 @@ void Analyze::cast_value(Value& val, ColType to) {
     }
 }
 
-CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
+CompOp Analyze::convert_sv_comp_op(rmdb::parser::ast::SvCompOp op) {
     switch (op) {
-    case ast::SV_OP_EQ:
+    case rmdb::parser::ast::SV_OP_EQ:
         return OP_EQ;
-    case ast::SV_OP_NE:
+    case rmdb::parser::ast::SV_OP_NE:
         return OP_NE;
-    case ast::SV_OP_LT:
+    case rmdb::parser::ast::SV_OP_LT:
         return OP_LT;
-    case ast::SV_OP_GT:
+    case rmdb::parser::ast::SV_OP_GT:
         return OP_GT;
-    case ast::SV_OP_LE:
+    case rmdb::parser::ast::SV_OP_LE:
         return OP_LE;
-    case ast::SV_OP_GE:
+    case rmdb::parser::ast::SV_OP_GE:
         return OP_GE;
     }
     throw InternalError("Unexpected comparison operator");
 }
+
+} // namespace rmdb::analyze

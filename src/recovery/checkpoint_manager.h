@@ -13,9 +13,21 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <cstdint>
 
-class LogManager;
+namespace rmdb::system {
 class SmManager;
+}
+
+namespace rmdb::txn {
 class TransactionManager;
+}
+
+namespace rmdb {
+using system::SmManager;
+using txn::TransactionManager;
+} // namespace rmdb
+
+namespace rmdb::recovery {
+class LogManager;
 
 struct CheckpointOptions {
     int64_t auto_checkpoint_bytes = 256LL * 1024 * 1024;
@@ -36,3 +48,10 @@ private:
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};
 };
+
+} // namespace rmdb::recovery
+
+namespace rmdb {
+using recovery::CheckpointManager;
+using recovery::CheckpointOptions;
+} // namespace rmdb

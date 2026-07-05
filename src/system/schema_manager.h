@@ -20,7 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "sm_meta.h"
 #include "system/sm_manager.h"
 
-class Context;
+namespace rmdb::system {
 struct ColDef;
 
 /// DDL 编排 + 句柄所有权。Phase 2 委托 SmManager 实现，
@@ -164,3 +164,9 @@ private:
     SmManager* sm_manager_;
     Catalog catalog_;
 };
+
+} // namespace rmdb::system
+
+namespace rmdb {
+using system::SchemaManager;
+} // namespace rmdb

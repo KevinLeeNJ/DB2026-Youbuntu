@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "system/schema_manager.h"
 
+namespace rmdb::recovery {
 class RedoLogsInPage {
 public:
     RedoLogsInPage() {
@@ -35,7 +36,7 @@ public:
 class RecoveryManager {
 public:
     RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SchemaManager* schema_manager,
-                    LogManager* log_manager = nullptr, dbaccess::RecoveryAccess* recovery_access = nullptr) {
+                    LogManager* log_manager = nullptr, rmdb::access::RecoveryAccess* recovery_access = nullptr) {
         disk_manager_ = disk_manager;
         buffer_pool_manager_ = buffer_pool_manager;
         schema_manager_ = schema_manager;
@@ -44,7 +45,7 @@ public:
         if (recovery_access != nullptr) {
             recovery_access_ = recovery_access;
         } else {
-            owned_recovery_access_ = std::make_unique<dbaccess::RecoveryAccess>(schema_manager);
+            owned_recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager);
             recovery_access_ = owned_recovery_access_.get();
         }
     }
@@ -68,11 +69,18 @@ private:
     lsn_t max_lsn_{INVALID_LSN}; // analyze 扫描到的最大 lsn，用于 recovery 后推进 global_lsn
     int64_t checkpoint_offset_{0};
 
-    LogBuffer buffer_;                                                // 读入日志
-    DiskManager* disk_manager_;                                       // 用来读写文件
-    BufferPoolManager* buffer_pool_manager_;                          // 对页面进行读写
-    SchemaManager* schema_manager_;                                   // 访问数据库元数据
-    LogManager* log_manager_;                                         // recovery 完成后截断日志
-    std::unique_ptr<dbaccess::RecoveryAccess> owned_recovery_access_; // 默认持有的桥接
-    dbaccess::RecoveryAccess* recovery_access_;                       // 存储访问桥接
+    LogBuffer buffer_;                                                    // 读入日志
+    DiskManager* disk_manager_;                                           // 用来读写文件
+    BufferPoolManager* buffer_pool_manager_;                              // 对页面进行读写
+    SchemaManager* schema_manager_;                                       // 访问数据库元数据
+    LogManager* log_manager_;                                             // recovery 完成后截断日志
+    std::unique_ptr<rmdb::access::RecoveryAccess> owned_recovery_access_; // 默认持有的桥接
+    rmdb::access::RecoveryAccess* recovery_access_;                       // 存储访问桥接
 };
+
+} // namespace rmdb::recovery
+
+namespace rmdb {
+using recovery::RecoveryManager;
+using recovery::RedoLogsInPage;
+} // namespace rmdb

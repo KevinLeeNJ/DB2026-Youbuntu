@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "executor_index_scan.h"
 
+namespace rmdb::exec {
 class IndexSkipScanExecutor : public IndexScanExecutor {
     struct IndexRange {
         Iid lower;
@@ -199,3 +200,9 @@ public:
         return "IndexSkipScanExecutor";
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::IndexSkipScanExecutor;
+} // namespace rmdb

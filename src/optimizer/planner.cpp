@@ -29,6 +29,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
+namespace rmdb::optimizer {
 namespace {
 
 bool same_tab_col(const TabCol& lhs, const TabCol& rhs) {
@@ -964,14 +965,14 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         throw InternalError("Unexpected null AST root");
     }
     switch (parse->type) {
-    case ast::AstType::CreateTable: {
-        auto x = static_cast<const ast::CreateTable*>(parse);
+    case rmdb::parser::ast::AstType::CreateTable: {
+        auto x = static_cast<const rmdb::parser::ast::CreateTable*>(parse);
         // create table;
         std::vector<ColDef> col_defs;
         col_defs.reserve(x->fields.size());
         for (auto& field : x->fields) {
-            if (field->type == ast::AstType::ColDef) {
-                auto sv_col_def = static_cast<const ast::ColDef*>(field.get());
+            if (field->type == rmdb::parser::ast::AstType::ColDef) {
+                auto sv_col_def = static_cast<const rmdb::parser::ast::ColDef*>(field.get());
                 ColDef col_def = {.name = sv_col_def->col_name,
                                   .type = interp_sv_type(sv_col_def->type_len->type),
                                   .len = sv_col_def->type_len->len};
@@ -983,34 +984,34 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         plannerRoot = std::make_unique<DDLPlan>(T_CreateTable, x->tab_name, std::vector<std::string>(), col_defs);
         break;
     }
-    case ast::AstType::DropTable: {
-        auto x = static_cast<const ast::DropTable*>(parse);
+    case rmdb::parser::ast::AstType::DropTable: {
+        auto x = static_cast<const rmdb::parser::ast::DropTable*>(parse);
         // drop table;
         plannerRoot =
             std::make_unique<DDLPlan>(T_DropTable, x->tab_name, std::vector<std::string>(), std::vector<ColDef>());
         break;
     }
-    case ast::AstType::CreateIndex: {
-        auto x = static_cast<const ast::CreateIndex*>(parse);
+    case rmdb::parser::ast::AstType::CreateIndex: {
+        auto x = static_cast<const rmdb::parser::ast::CreateIndex*>(parse);
         // create index;
         plannerRoot = std::make_unique<DDLPlan>(T_CreateIndex, x->tab_name, x->col_names, std::vector<ColDef>());
         break;
     }
-    case ast::AstType::DropIndex: {
-        auto x = static_cast<const ast::DropIndex*>(parse);
+    case rmdb::parser::ast::AstType::DropIndex: {
+        auto x = static_cast<const rmdb::parser::ast::DropIndex*>(parse);
         // drop index
         plannerRoot = std::make_unique<DDLPlan>(T_DropIndex, x->tab_name, x->col_names, std::vector<ColDef>());
         break;
     }
-    case ast::AstType::InsertStmt: {
-        auto x = static_cast<const ast::InsertStmt*>(parse);
+    case rmdb::parser::ast::AstType::InsertStmt: {
+        auto x = static_cast<const rmdb::parser::ast::InsertStmt*>(parse);
         // insert;
         plannerRoot = std::make_unique<DMLPlan>(T_Insert, std::unique_ptr<Plan>(), x->tab_name, query->values,
                                                 std::vector<Condition>(), std::vector<SetClause>());
         break;
     }
-    case ast::AstType::DeleteStmt: {
-        auto x = static_cast<const ast::DeleteStmt*>(parse);
+    case rmdb::parser::ast::AstType::DeleteStmt: {
+        auto x = static_cast<const rmdb::parser::ast::DeleteStmt*>(parse);
         // delete;
         // 生成表扫描方式
         std::unique_ptr<Plan> table_scan_executors;
@@ -1032,8 +1033,8 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
                                                 std::vector<Value>(), query->conds, std::vector<SetClause>());
         break;
     }
-    case ast::AstType::UpdateStmt: {
-        auto x = static_cast<const ast::UpdateStmt*>(parse);
+    case rmdb::parser::ast::AstType::UpdateStmt: {
+        auto x = static_cast<const rmdb::parser::ast::UpdateStmt*>(parse);
         // update;
         // 生成表扫描方式
         std::unique_ptr<Plan> table_scan_executors;
@@ -1054,21 +1055,21 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
                                                 std::vector<Value>(), query->conds, query->set_clauses);
         break;
     }
-    case ast::AstType::SelectStmt: {
+    case rmdb::parser::ast::AstType::SelectStmt: {
         // 生成select语句的查询执行计划
         std::unique_ptr<Plan> projection = generate_select_plan(std::move(query), context);
         plannerRoot = std::make_unique<DMLPlan>(T_select, std::move(projection), std::string(), std::vector<Value>(),
                                                 std::vector<Condition>(), std::vector<SetClause>());
         break;
     }
-    case ast::AstType::ExplainAnalyze: {
+    case rmdb::parser::ast::AstType::ExplainAnalyze: {
         std::unique_ptr<Plan> projection = generate_select_plan(std::move(query), context);
         plannerRoot =
             std::make_unique<DMLPlan>(T_ExplainAnalyze, std::move(projection), std::string(), std::vector<Value>(),
                                       std::vector<Condition>(), std::vector<SetClause>());
         break;
     }
-    case ast::AstType::SelectFromUnionStmt: {
+    case rmdb::parser::ast::AstType::SelectFromUnionStmt: {
         std::unique_ptr<Plan> union_plan = generate_union_plan(std::move(query), context);
         plannerRoot = std::make_unique<DMLPlan>(T_select, std::move(union_plan), std::string(), std::vector<Value>(),
                                                 std::vector<Condition>(), std::vector<SetClause>());
@@ -1079,3 +1080,5 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     }
     return plannerRoot;
 }
+
+} // namespace rmdb::optimizer

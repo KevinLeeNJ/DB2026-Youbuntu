@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_scalar.h"
 #include "executor_abstract.h"
 
+namespace rmdb::exec {
 class AggregateExecutor : public AbstractExecutor {
 private:
     enum class LocalAggType { COUNT = 0, MAX = 1, MIN = 2, SUM = 3, AVG = 4 };
@@ -687,3 +688,9 @@ public:
         return *pos;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::AggregateExecutor;
+} // namespace rmdb

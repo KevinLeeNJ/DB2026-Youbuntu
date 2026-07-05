@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 
+namespace rmdb::txn::concurrency {
 /**
  * @description: 申请行级共享锁
  * @return {bool} 加锁是否成功
@@ -167,3 +168,5 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
     }
     return true;
 }
+
+} // namespace rmdb::txn::concurrency

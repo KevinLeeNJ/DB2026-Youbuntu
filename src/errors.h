@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+namespace rmdb::common {
 class RMDBError : public std::exception {
 public:
     RMDBError() : _msg("Error: ") {}
@@ -171,3 +172,32 @@ public:
     PageNotExistError(const std::string& table_name, int page_no)
         : RMDBError("Page " + std::to_string(page_no) + " in table " + table_name + "not exits") {}
 };
+
+} // namespace rmdb::common
+
+namespace rmdb {
+using common::AmbiguousColumnError;
+using common::ColumnNotFoundError;
+using common::DatabaseExistsError;
+using common::DatabaseNotFoundError;
+using common::FileExistsError;
+using common::FileNotClosedError;
+using common::FileNotFoundError;
+using common::FileNotOpenError;
+using common::IncompatibleTypeError;
+using common::IndexEntryExistsError;
+using common::IndexEntryNotFoundError;
+using common::IndexExistsError;
+using common::IndexNotFoundError;
+using common::InternalError;
+using common::InvalidColLengthError;
+using common::InvalidRecordSizeError;
+using common::InvalidValueCountError;
+using common::PageNotExistError;
+using common::RecordNotFoundError;
+using common::RMDBError;
+using common::StringOverflowError;
+using common::TableExistsError;
+using common::TableNotFoundError;
+using common::UnixError;
+} // namespace rmdb

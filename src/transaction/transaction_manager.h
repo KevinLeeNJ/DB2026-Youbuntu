@@ -28,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/exception.h"
 #include "transaction/ssi_registry.h"
 
+namespace rmdb::txn {
 /* 系统采用的并发控制算法，当前题目中要求两阶段封锁并发控制算法 */
 enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
 
@@ -331,3 +332,10 @@ private:
 
     bool AddRwEdgeInternal(txn_id_t reader, txn_id_t writer, txn_id_t current_txn);
 };
+
+} // namespace rmdb::txn
+
+namespace rmdb {
+using txn::TransactionManager;
+using txn::VersionUndoLink;
+} // namespace rmdb

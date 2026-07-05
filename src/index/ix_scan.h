@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <utility>
 
+namespace rmdb::index {
 // class IxIndexHandle;
 
 // 用于遍历叶子结点
@@ -130,3 +131,9 @@ public:
         return iid_;
     }
 };
+
+} // namespace rmdb::index
+
+namespace rmdb {
+using index::IxScan;
+} // namespace rmdb

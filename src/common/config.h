@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <cstdint>
 
+namespace rmdb::common {
 #define BUFFER_LENGTH 8192
 
 /** Cycle detection is performed every CYCLE_DETECTION_INTERVAL milliseconds. */
@@ -56,3 +57,33 @@ static const std::string LOG_FILE_NAME = "db.log";
 static const std::string REPLACER_TYPE = "CLOCK";
 
 static const std::string DB_META_NAME = "db.meta";
+
+} // namespace rmdb::common
+
+namespace rmdb {
+using common::BUCKET_SIZE;
+using common::BUFFER_POOL_SIZE;
+using common::cycle_detection_interval;
+using common::DB_META_NAME;
+using common::enable_logging;
+using common::frame_id_t;
+using common::HEADER_PAGE_ID;
+using common::INVALID_FRAME_ID;
+using common::INVALID_LSN;
+using common::INVALID_PAGE_ID;
+using common::INVALID_TIMESTAMP;
+using common::INVALID_TS;
+using common::INVALID_TXN_ID;
+using common::LOG_BUFFER_SIZE;
+using common::LOG_FILE_NAME;
+using common::log_timeout;
+using common::lsn_t;
+using common::oid_t;
+using common::page_id_t;
+using common::PAGE_SIZE;
+using common::REPLACER_TYPE;
+using common::slot_offset_t;
+using common::timestamp_t;
+using common::txn_id_t;
+using common::TXN_START_ID;
+} // namespace rmdb

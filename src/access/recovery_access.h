@@ -17,7 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_manager.h"
 #include "system/schema_manager.h"
 
-namespace dbaccess {
+namespace rmdb::access {
 
 /// Recovery 路径的存储访问桥接。RecoveryManager 不再直接调 fh->insert_record /
 /// set_tuple_meta，统一经此桥接。详见 write-protocol-contract.md 第 7 节：
@@ -52,4 +52,4 @@ private:
     SchemaManager* schema_mgr_;
 };
 
-} // namespace dbaccess
+} // namespace rmdb::access

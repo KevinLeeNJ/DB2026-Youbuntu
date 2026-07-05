@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
 
+namespace rmdb::record {
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
@@ -285,3 +286,5 @@ void RmFileHandle::release_page_handle(RmPageHandle& page_handle) {
     page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
     file_hdr_.first_free_page_no = page_handle.page->get_page_id().page_no;
 }
+
+} // namespace rmdb::record

@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/txn_defs.h"
 #include "record/rm_defs.h"
 
+namespace rmdb::txn {
 // UndoLink is now defined in record/rm_defs.h (physical undo pointer)
 // UndoLog is superseded by UndoLogRecord in undo/undo_defs.h
 
@@ -211,3 +212,10 @@ private:
     /** 用于访问事务级撤销日志的锁。 */
     std::mutex latch_;
 };
+
+} // namespace rmdb::txn
+
+namespace rmdb {
+using txn::Transaction;
+using txn::UndoLog;
+} // namespace rmdb

@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #define private public
 #include "portal.h"
+using namespace rmdb;
 #undef private
 
 #include <chrono>
@@ -47,7 +48,7 @@ protected:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Analyze> analyze_;
-    std::unique_ptr<dbaccess::TableWriteService> write_service_;
+    std::unique_ptr<rmdb::access::TableWriteService> write_service_;
     std::unique_ptr<Portal> portal_;
     bool db_opened_ = false;
 
@@ -63,8 +64,8 @@ protected:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
-        write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
-                                                                       nullptr, txn_manager_.get());
+        write_service_ = std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                           nullptr, txn_manager_.get());
         portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
 
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
@@ -85,9 +86,9 @@ protected:
         }
     }
 
-    std::unique_ptr<ast::TreeNode> parse_sql(const std::string& sql) {
+    std::unique_ptr<rmdb::parser::ast::TreeNode> parse_sql(const std::string& sql) {
         std::string sql_with_semi = sql.back() == ';' ? sql : sql + ";";
-        return ast::parse_sql(sql_with_semi);
+        return rmdb::parser::ast::parse_sql(sql_with_semi);
     }
 
     void execute(const std::string& sql) {

@@ -16,10 +16,11 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+namespace rmdb::analyze {
 namespace analyze_internal {
 
 // --- AST value/node conversion ---
-Value convert_ast_value_node(const ast::Value* sv_val);
+Value convert_ast_value_node(const rmdb::parser::ast::Value* sv_val);
 
 // --- Column resolution ---
 const ColMeta* resolve_column_meta(const std::vector<ColMeta>& all_cols, TabCol& target);
@@ -31,7 +32,7 @@ bool is_groupable_type(ColType type);
 
 // --- Aggregate utilities ---
 std::string agg_type_to_string(AggType type);
-AggType convert_ast_agg_type(ast::AggFuncType type);
+AggType convert_ast_agg_type(rmdb::parser::ast::AggFuncType type);
 std::string build_agg_display_name(const AggExpr& agg);
 void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols);
 
@@ -51,3 +52,5 @@ const SelectItem* find_output_item_by_name(const Query& query, const std::string
 bool having_uses_plain_column(const HavingCondition& cond);
 
 } // namespace analyze_internal
+
+} // namespace rmdb::analyze

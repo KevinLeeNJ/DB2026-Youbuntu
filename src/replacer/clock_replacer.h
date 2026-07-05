@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "replacer/replacer.h"
 
+namespace rmdb::storage {
 class ClockReplacer : public Replacer {
 public:
     explicit ClockReplacer(size_t num_pages) : capacity_(num_pages) {
@@ -118,3 +119,9 @@ private:
     size_t hand_{0};
     std::mutex hand_latch_;
 };
+
+} // namespace rmdb::storage
+
+namespace rmdb {
+using storage::ClockReplacer;
+} // namespace rmdb

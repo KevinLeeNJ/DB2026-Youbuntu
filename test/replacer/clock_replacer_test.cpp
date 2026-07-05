@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "gtest/gtest.h"
 #include "replacer/clock_replacer.h"
 
+using namespace rmdb;
 TEST(ClockReplacerTest, FrequentlyUsedFrameGetsMoreSecondChances) {
     ClockReplacer replacer(3);
 

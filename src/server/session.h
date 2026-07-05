@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/config.h"
 #include "transaction/txn_defs.h"
 
-namespace server {
+namespace rmdb::server {
 
 /// 单个客户端连接的 per-session 状态。
 /// 持有当前事务 id、隔离级别、输出缓冲区；不拥有任何内核对象。
@@ -68,4 +68,4 @@ private:
     IsolationLevel isolation_level_;
 };
 
-} // namespace server
+} // namespace rmdb::server

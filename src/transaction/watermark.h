@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -15,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction/transaction.h"
 
+namespace rmdb::txn {
 /**
  * @brief 追踪所有的读时间戳
  *
@@ -38,3 +40,9 @@ public:
 
     std::map<timestamp_t, int> current_reads_;
 };
+
+} // namespace rmdb::txn
+
+namespace rmdb {
+using txn::Watermark;
+} // namespace rmdb

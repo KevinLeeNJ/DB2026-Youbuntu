@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "record/rm_scan.h"
 
-namespace dbaccess {
+namespace rmdb::access {
 
 RecoveryAccess::RecoveryAccess(SchemaManager* schema_mgr) : schema_mgr_(schema_mgr) {}
 
@@ -198,4 +198,4 @@ void RecoveryAccess::flush_all_table_and_index_pages() {
     schema_mgr_->flush_all_table_and_index_pages();
 }
 
-} // namespace dbaccess
+} // namespace rmdb::access

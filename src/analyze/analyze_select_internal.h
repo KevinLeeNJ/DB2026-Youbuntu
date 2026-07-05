@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <utility>
 #include <vector>
 
+namespace rmdb::analyze {
 namespace analyze_internal {
 
 template <typename T, typename = void> struct has_group_by_cols_member : std::false_type {};
@@ -65,7 +66,7 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols);
 // =============================================================================
 
 template <typename ExprPtrT> TabCol extract_ast_column(const ExprPtrT& expr_node, const std::string& clause_name) {
-    auto col = dynamic_cast<const ast::Col*>(expr_node.get());
+    auto col = dynamic_cast<const rmdb::parser::ast::Col*>(expr_node.get());
     if (col == nullptr) {
         throw RMDBError(clause_name + " clause does not allow aggregate expressions");
     }
@@ -77,16 +78,16 @@ QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& 
     if (expr_node == nullptr) {
         throw InternalError("Unexpected null expression node");
     }
-    if (auto col = dynamic_cast<const ast::Col*>(expr_node.get()); col != nullptr) {
+    if (auto col = dynamic_cast<const rmdb::parser::ast::Col*>(expr_node.get()); col != nullptr) {
         return make_column_expr({.tab_name = col->tab_name, .col_name = col->col_name});
     }
-    if (auto val = dynamic_cast<const ast::Value*>(expr_node.get()); val != nullptr) {
+    if (auto val = dynamic_cast<const rmdb::parser::ast::Value*>(expr_node.get()); val != nullptr) {
         QueryExpr expr;
         expr.type = QueryExprType::VALUE;
         expr.value = convert_ast_value_node(val);
         return expr;
     }
-    if (auto agg = dynamic_cast<const ast::AggExpr*>(expr_node.get()); agg != nullptr) {
+    if (auto agg = dynamic_cast<const rmdb::parser::ast::AggExpr*>(expr_node.get()); agg != nullptr) {
         QueryExpr expr;
         expr.type = QueryExprType::AGGREGATE;
         expr.agg.type = convert_ast_agg_type(agg->func);
@@ -151,26 +152,26 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
             cond.lhs = convert_simple_ast_expr(raw_cond->lhs, "HAVING");
             cond.op = static_cast<CompOp>(0); // overwritten below
             switch (raw_cond->op) {
-            case ast::SV_OP_EQ:
+            case rmdb::parser::ast::SV_OP_EQ:
                 cond.op = OP_EQ;
                 break;
-            case ast::SV_OP_NE:
+            case rmdb::parser::ast::SV_OP_NE:
                 cond.op = OP_NE;
                 break;
-            case ast::SV_OP_LT:
+            case rmdb::parser::ast::SV_OP_LT:
                 cond.op = OP_LT;
                 break;
-            case ast::SV_OP_GT:
+            case rmdb::parser::ast::SV_OP_GT:
                 cond.op = OP_GT;
                 break;
-            case ast::SV_OP_LE:
+            case rmdb::parser::ast::SV_OP_LE:
                 cond.op = OP_LE;
                 break;
-            case ast::SV_OP_GE:
+            case rmdb::parser::ast::SV_OP_GE:
                 cond.op = OP_GE;
                 break;
             }
-            if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
+            if (auto rhs_val = dynamic_cast<const rmdb::parser::ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
                 cond.is_rhs_val = true;
                 cond.rhs_val = convert_ast_value_node(rhs_val);
             } else {
@@ -192,7 +193,7 @@ template <typename SelectStmtT> void populate_order_by_from_ast(Query& query, co
             }
             OrderByItem item;
             item.expr = convert_simple_ast_expr(raw_item->expr, "ORDER BY");
-            item.is_desc = raw_item->orderby_dir == ast::OrderBy_DESC;
+            item.is_desc = raw_item->orderby_dir == rmdb::parser::ast::OrderBy_DESC;
             if (item.expr.type == QueryExprType::COLUMN && item.expr.col.tab_name.empty()) {
                 item.order_name = item.expr.col.col_name;
             }
@@ -212,3 +213,5 @@ template <typename SelectStmtT> void populate_limit_from_ast(Query& query, const
 }
 
 } // namespace analyze_internal
+
+} // namespace rmdb::analyze

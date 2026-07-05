@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "executor_abstract.h"
 
+namespace rmdb::exec {
 class LimitExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
@@ -69,3 +70,9 @@ public:
         return prev_->get_col_offset(target);
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::LimitExecutor;
+} // namespace rmdb

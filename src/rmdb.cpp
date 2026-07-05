@@ -28,10 +28,12 @@ See the Mulan PSL v2 for more details. */
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 8
 
+using namespace rmdb;
+
 static bool should_exit = false;
 
 // 信号处理函数需要全局访问点；Phase 7 StatementRunner 重构后移除（见 migration-ledger）。
-static instance::DBInstance* g_instance = nullptr;
+static rmdb::instance::DBInstance* g_instance = nullptr;
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -45,7 +47,7 @@ void sigint_handler(int signo) {
 }
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(server::Session& session, Context* context, instance::DBInstance& instance) {
+void SetTransaction(rmdb::server::Session& session, Context* context, rmdb::instance::DBInstance& instance) {
     auto& txn_manager = instance.transaction_manager();
     context->txn_ = txn_manager.get_transaction(session.txn_id());
     if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
@@ -58,12 +60,12 @@ void SetTransaction(server::Session& session, Context* context, instance::DBInst
     txn_manager.BeginStatement(context->txn_);
 }
 
-void client_handler(int fd, instance::DBInstance& instance) {
+void client_handler(int fd, rmdb::instance::DBInstance& instance) {
     int i_recvBytes;
     // 接收客户端发送的请求
     char data_recv[BUFFER_LENGTH];
     // per-client 状态：事务 id、隔离级别、输出缓冲区
-    server::Session session;
+    rmdb::server::Session session;
 
     auto& lock_manager = instance.lock_manager();
     auto& log_manager = instance.log_manager();
@@ -115,10 +117,10 @@ void client_handler(int fd, instance::DBInstance& instance) {
         Context* context = _context.get();
         context->isolation_level_ = session.isolation_level();
 
-        std::unique_ptr<ast::TreeNode> parse_tree;
+        std::unique_ptr<rmdb::parser::ast::TreeNode> parse_tree;
         try {
-            parse_tree = ast::parse_sql(data_recv);
-        } catch (const ast::ParseError& e) {
+            parse_tree = rmdb::parser::ast::parse_sql(data_recv);
+        } catch (const rmdb::parser::ast::ParseError& e) {
             LOG_ERROR("parse failed for SQL [%s]: %s", data_recv, e.what());
             const char* msg = e.what();
             int msg_len = strlen(msg);
@@ -131,8 +133,8 @@ void client_handler(int fd, instance::DBInstance& instance) {
         if (parse_tree != nullptr) {
             try {
                 auto parsed_type = parse_tree->type;
-                bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
-                bool is_load = parsed_type == ast::AstType::LoadStmt;
+                bool is_checkpoint = parsed_type == rmdb::parser::ast::AstType::StaticCheckpoint;
+                bool is_load = parsed_type == rmdb::parser::ast::AstType::LoadStmt;
                 if (!is_checkpoint && !is_load) {
                     SetTransaction(session, context, instance);
                 }
@@ -231,7 +233,7 @@ void client_handler(int fd, instance::DBInstance& instance) {
     return;    // terminate calling thread!
 }
 
-void start_server(instance::DBInstance& instance) {
+void start_server(rmdb::instance::DBInstance& instance) {
     int sockfd_server;
     int fd_temp;
     struct sockaddr_in s_addr_in {};
@@ -321,7 +323,7 @@ int main(int argc, char** argv) {
         std::string db_name = argv[1];
         LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
 
-        instance::DBInstance instance;
+        rmdb::instance::DBInstance instance;
         g_instance = &instance;
         instance.open_database(db_name);
         LOG_INFO("database opened: %s", db_name.c_str());

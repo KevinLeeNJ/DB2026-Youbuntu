@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "recovery/log_manager.h"
 
+namespace rmdb::storage {
 namespace {
 
 bool IsValidPageId(const PageId& page_id) {
@@ -402,3 +403,5 @@ void BufferPoolManager::delete_all_pages(int fd) {
         }
     }
 }
+
+} // namespace rmdb::storage

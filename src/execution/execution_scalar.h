@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include "defs.h"
 #include "errors.h"
 
+namespace rmdb::exec {
 namespace execution_scalar {
 
 inline bool is_numeric_type(ColType type) {
@@ -140,3 +141,11 @@ inline CellValue zero_value(ColType type) {
 }
 
 } // namespace execution_scalar
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+namespace execution_scalar = exec::execution_scalar;
+using exec::execution_scalar::CellValue;
+using exec::execution_scalar::CellValueHash;
+} // namespace rmdb

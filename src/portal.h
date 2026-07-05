@@ -49,6 +49,8 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/plan.h"
 #include "access/table_write_service.h"
 
+namespace rmdb::exec {
+
 typedef enum portalTag {
     PORTAL_Invalid_Query = 0,
     PORTAL_ONE_SELECT,
@@ -73,7 +75,7 @@ struct PortalStmt {
 class Portal {
 private:
     SchemaManager* schema_manager_;
-    dbaccess::TableWriteService* write_service_;
+    rmdb::access::TableWriteService* write_service_;
 
     struct ExecutorQueryExpr {
         QueryExprType type = QueryExprType::COLUMN;
@@ -581,7 +583,7 @@ private:
     }
 
 public:
-    Portal(SchemaManager* schema_manager, dbaccess::TableWriteService* write_service)
+    Portal(SchemaManager* schema_manager, rmdb::access::TableWriteService* write_service)
         : schema_manager_(schema_manager), write_service_(write_service) {}
     ~Portal() {}
 
@@ -802,3 +804,17 @@ public:
         return nullptr;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::Portal;
+using exec::PORTAL_CMD_UTILITY;
+using exec::PORTAL_DML_WITHOUT_SELECT;
+using exec::PORTAL_EXPLAIN_ANALYZE;
+using exec::PORTAL_Invalid_Query;
+using exec::PORTAL_MULTI_QUERY;
+using exec::PORTAL_ONE_SELECT;
+using exec::PortalStmt;
+using exec::portalTag;
+} // namespace rmdb

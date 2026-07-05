@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "system/schema_manager.h"
 
+namespace rmdb::exec {
 class IndexScanExecutor : public AbstractExecutor {
 protected:
     std::string tab_name_;              // 表名称
@@ -452,3 +453,9 @@ public:
         return true;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::IndexScanExecutor;
+} // namespace rmdb

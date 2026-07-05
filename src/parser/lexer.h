@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 #include <unordered_map>
 
-namespace parser {
+namespace rmdb::parser {
 
 struct LexerError : public std::runtime_error {
     explicit LexerError(const std::string& message) : std::runtime_error(message) {}
@@ -202,4 +202,4 @@ private:
     double parse_float(std::string_view text);
 };
 
-} // namespace parser
+} // namespace rmdb::parser

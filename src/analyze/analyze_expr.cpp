@@ -10,27 +10,28 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze_expr_internal.h"
 
+namespace rmdb::analyze {
 namespace analyze_internal {
 
-Value convert_ast_value_node(const ast::Value* sv_val) {
+Value convert_ast_value_node(const rmdb::parser::ast::Value* sv_val) {
     Value val;
     switch (sv_val->type) {
-    case ast::AstType::IntLit: {
-        auto int_lit = static_cast<const ast::IntLit*>(sv_val);
+    case rmdb::parser::ast::AstType::IntLit: {
+        auto int_lit = static_cast<const rmdb::parser::ast::IntLit*>(sv_val);
         val.set_int(int_lit->val);
         break;
     }
-    case ast::AstType::FloatLit: {
-        auto float_lit = static_cast<const ast::FloatLit*>(sv_val);
+    case rmdb::parser::ast::AstType::FloatLit: {
+        auto float_lit = static_cast<const rmdb::parser::ast::FloatLit*>(sv_val);
         val.set_float(float_lit->val);
         break;
     }
-    case ast::AstType::StringLit: {
-        auto str_lit = static_cast<const ast::StringLit*>(sv_val);
+    case rmdb::parser::ast::AstType::StringLit: {
+        auto str_lit = static_cast<const rmdb::parser::ast::StringLit*>(sv_val);
         val.set_str(str_lit->val);
         break;
     }
-    case ast::AstType::BoolLit:
+    case rmdb::parser::ast::AstType::BoolLit:
     default:
         throw InternalError("Unexpected sv value type");
     }
@@ -102,17 +103,17 @@ std::string agg_type_to_string(AggType type) {
     throw InternalError("Unexpected aggregate type");
 }
 
-AggType convert_ast_agg_type(ast::AggFuncType type) {
+AggType convert_ast_agg_type(rmdb::parser::ast::AggFuncType type) {
     switch (type) {
-    case ast::AGG_COUNT:
+    case rmdb::parser::ast::AGG_COUNT:
         return AggType::COUNT;
-    case ast::AGG_MAX:
+    case rmdb::parser::ast::AGG_MAX:
         return AggType::MAX;
-    case ast::AGG_MIN:
+    case rmdb::parser::ast::AGG_MIN:
         return AggType::MIN;
-    case ast::AGG_SUM:
+    case rmdb::parser::ast::AGG_SUM:
         return AggType::SUM;
-    case ast::AGG_AVG:
+    case rmdb::parser::ast::AGG_AVG:
         return AggType::AVG;
     }
     throw InternalError("Unexpected aggregate function type");
@@ -284,3 +285,5 @@ bool having_uses_plain_column(const HavingCondition& cond) {
 }
 
 } // namespace analyze_internal
+
+} // namespace rmdb::analyze

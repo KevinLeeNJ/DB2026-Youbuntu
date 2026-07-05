@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #define private public
 #include "system/sm_manager.h"
+using namespace rmdb;
 #undef private
 
 #include <memory>

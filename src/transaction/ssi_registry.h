@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 
+namespace rmdb::txn {
 /// SSI 辅助数据：历史索引键 + 已删除元组候选。
 /// Phase 2 从 SmManager 迁入，由 TransactionManager 持有。
 /// executor 通过 TransactionManager::ssi_registry() 访问。
@@ -104,3 +105,9 @@ private:
     mutable std::mutex deleted_tuple_candidates_latch_;
     std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
 };
+
+} // namespace rmdb::txn
+
+namespace rmdb {
+using txn::SSIRegistry;
+} // namespace rmdb

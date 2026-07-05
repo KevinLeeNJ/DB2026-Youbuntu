@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #define private public
 #include "optimizer/planner.h"
+using namespace rmdb;
 #undef private
 
 #include <memory>
@@ -122,11 +123,13 @@ Condition join_cond(const std::string& lhs_tab, const std::string& lhs_col, cons
 
 std::unique_ptr<Query> make_aggregate_query(bool with_sort, bool with_limit) {
     auto query = std::make_unique<Query>();
-    query->parse = std::make_unique<ast::SelectStmt>(
-        std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("grade", "")},
-        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
-        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
-        true);
+    query->parse = std::make_unique<rmdb::parser::ast::SelectStmt>(
+        std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>>{},
+        std::vector<rmdb::parser::ast::TableRef>{rmdb::parser::ast::TableRef("grade", "")},
+        std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::Col>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::HavingExpr>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::OrderByItem>>{}, false, 0, true);
     query->tables = {"grade"};
     query->has_aggregate = true;
     query->group_by_cols = {{.tab_name = "grade", .col_name = "id"}};
@@ -171,12 +174,14 @@ std::unique_ptr<Query> make_aggregate_query(bool with_sort, bool with_limit) {
 
 std::unique_ptr<Query> make_stock_level_query() {
     auto query = std::make_unique<Query>();
-    query->parse = std::make_unique<ast::SelectStmt>(
-        std::vector<std::unique_ptr<ast::SelectItem>>{},
-        std::vector<ast::TableRef>{ast::TableRef("stock", ""), ast::TableRef("order_line", "")},
-        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
-        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
-        true);
+    query->parse = std::make_unique<rmdb::parser::ast::SelectStmt>(
+        std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>>{},
+        std::vector<rmdb::parser::ast::TableRef>{rmdb::parser::ast::TableRef("stock", ""),
+                                                 rmdb::parser::ast::TableRef("order_line", "")},
+        std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::Col>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::HavingExpr>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::OrderByItem>>{}, false, 0, true);
     query->tables = {"stock", "order_line"};
     query->has_aggregate = true;
     query->select_items.push_back({.expr = make_count_star_expr(), .alias = "", .output_name = "COUNT(*)"});
@@ -192,11 +197,13 @@ std::unique_ptr<Query> make_stock_level_query() {
 
 std::unique_ptr<Query> make_order_line_suffix_lookup_query() {
     auto query = std::make_unique<Query>();
-    query->parse = std::make_unique<ast::SelectStmt>(
-        std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("order_line", "")},
-        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
-        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
-        true);
+    query->parse = std::make_unique<rmdb::parser::ast::SelectStmt>(
+        std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>>{},
+        std::vector<rmdb::parser::ast::TableRef>{rmdb::parser::ast::TableRef("order_line", "")},
+        std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::Col>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::HavingExpr>>{},
+        std::vector<std::unique_ptr<rmdb::parser::ast::OrderByItem>>{}, false, 0, true);
     query->tables = {"order_line"};
     query->has_aggregate = true;
     query->select_items.push_back({.expr = make_count_star_expr(), .alias = "", .output_name = "COUNT(*)"});

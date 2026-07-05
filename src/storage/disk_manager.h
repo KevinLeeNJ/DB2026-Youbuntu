@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/config.h"
 #include "errors.h"
 
+namespace rmdb::storage {
 /**
  * @description: DiskManager的作用主要是根据上层的需要对磁盘文件进行操作
  */
@@ -118,3 +119,9 @@ private:
     int64_t log_offset_ = 0; // 日志文件追加偏移
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0
 };
+
+} // namespace rmdb::storage
+
+namespace rmdb {
+using storage::DiskManager;
+} // namespace rmdb

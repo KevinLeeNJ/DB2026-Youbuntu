@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze_select_internal.h"
 
+namespace rmdb::analyze {
 namespace analyze_internal {
 
 void append_star_projection(Query& query, const std::vector<ColMeta>& all_cols) {
@@ -160,3 +161,5 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols) {
 }
 
 } // namespace analyze_internal
+
+} // namespace rmdb::analyze

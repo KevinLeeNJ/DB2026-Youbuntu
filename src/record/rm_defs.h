@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "defs.h"
 #include "storage/buffer_pool_manager.h"
 
+namespace rmdb::record {
 constexpr int RM_NO_PAGE = -1;
 constexpr int RM_FILE_HDR_PAGE = 0;
 constexpr int RM_FIRST_RECORD_PAGE = 1;
@@ -144,3 +145,20 @@ struct RmRecord {
         data = nullptr;
     }
 };
+
+} // namespace rmdb::record
+
+namespace rmdb {
+using record::AlignUp;
+using record::RM_FILE_HDR_PAGE;
+using record::RM_FIRST_RECORD_PAGE;
+using record::RM_MAX_RECORD_SIZE;
+using record::RM_NO_PAGE;
+using record::RM_PAGE_META_OFFSET;
+using record::RmFileHdr;
+using record::RmPageHdr;
+using record::RmRecord;
+using record::TUPLE_META_SIZE;
+using record::TupleMeta;
+using record::UndoLink;
+} // namespace rmdb

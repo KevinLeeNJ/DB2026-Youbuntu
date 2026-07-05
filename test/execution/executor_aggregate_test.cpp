@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #define private public
 #include "execution/executor_aggregate.h"
+using namespace rmdb;
 #undef private
 
 #include <algorithm>

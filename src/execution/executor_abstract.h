@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+namespace rmdb::exec {
 class AbstractExecutor {
 public:
     Rid _abstract_rid;
@@ -181,3 +182,9 @@ protected:
         return false;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::AbstractExecutor;
+} // namespace rmdb

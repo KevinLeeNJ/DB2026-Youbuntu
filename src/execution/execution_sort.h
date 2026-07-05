@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+namespace rmdb::exec {
 class SortExecutor : public AbstractExecutor {
 private:
     using CompareFn = int (*)(const RmRecord&, const RmRecord&, const ColMeta&);
@@ -334,3 +335,9 @@ public:
         return resolve_col(target);
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::SortExecutor;
+} // namespace rmdb

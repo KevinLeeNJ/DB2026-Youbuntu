@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+using namespace rmdb;
 namespace {
 
 std::filesystem::path CurrentPath() {

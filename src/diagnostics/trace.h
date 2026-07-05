@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <string_view>
 
-namespace diagnostics {
+namespace rmdb::diagnostics {
 
 /// 事件类型，仅枚举重构期间有实际消费者的类别。
 enum class TraceEventType {
@@ -33,4 +33,4 @@ struct TraceEvent {
 /// 不建框架：无 sink、无 scope、无 SQL 命令。
 using TraceHook = std::function<void(const TraceEvent&)>;
 
-} // namespace diagnostics
+} // namespace rmdb::diagnostics

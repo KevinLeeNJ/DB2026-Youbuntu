@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 
+namespace rmdb::storage {
 DiskManager::DiskManager() = default;
 
 /**
@@ -84,14 +85,14 @@ bool DiskManager::is_dir(const std::string& path) {
 void DiskManager::create_dir(const std::string& path) {
     // Create a subdirectory
     std::string cmd = "mkdir " + path;
-    if (system(cmd.c_str()) < 0) { // 创建一个名为path的目录
+    if (::system(cmd.c_str()) < 0) { // 创建一个名为path的目录
         throw UnixError();
     }
 }
 
 void DiskManager::destroy_dir(const std::string& path) {
     std::string cmd = "rm -r " + path;
-    if (system(cmd.c_str()) < 0) {
+    if (::system(cmd.c_str()) < 0) {
         throw UnixError();
     }
 }
@@ -298,3 +299,5 @@ void DiskManager::truncate_log() {
     }
     log_offset_ = 0;
 }
+
+} // namespace rmdb::storage

@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "system/schema_manager.h"
 
+namespace rmdb::exec {
 class InsertExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;               // 表的元数据
@@ -29,10 +30,10 @@ private:
     std::string tab_name_;      // 表名称
     Rid rid_; // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
     SchemaManager* schema_manager_;
-    dbaccess::TableWriteService* write_service_;
+    rmdb::access::TableWriteService* write_service_;
 
 public:
-    InsertExecutor(SchemaManager* schema_manager, dbaccess::TableWriteService* write_service,
+    InsertExecutor(SchemaManager* schema_manager, rmdb::access::TableWriteService* write_service,
                    const std::string& tab_name, std::vector<Value> values, Context* context)
         : write_service_(write_service) {
         schema_manager_ = schema_manager;
@@ -77,3 +78,9 @@ public:
         return rid_;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::InsertExecutor;
+} // namespace rmdb

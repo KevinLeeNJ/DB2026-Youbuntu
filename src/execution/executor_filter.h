@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "transaction/transaction_manager.h"
 
+namespace rmdb::exec {
 class FilterExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
@@ -152,3 +153,9 @@ public:
         return conds;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::FilterExecutor;
+} // namespace rmdb

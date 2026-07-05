@@ -13,6 +13,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/config.h"
 
+namespace rmdb::storage {
+
 /**
  * @description: 存储层每个Page的id的声明
  */
@@ -47,15 +49,10 @@ struct PageIdHash {
     }
 };
 
-template <> struct std::hash<PageId> {
-    size_t operator()(const PageId& obj) const {
-        return std::hash<int64_t>()(obj.Get());
-    }
-};
-
 /**
  * @description: Page类声明, Page是RMDB数据块的单位、是负责数据操作Record模块的操作对象，
- * Page对象在磁盘上有文件存储, 若在Buffer中则有帧偏移, 并非特指Buffer或Disk上的数据
+
+ * * Page对象在磁盘上有文件存储, 若在Buffer中则有帧偏移, 并非特指Buffer或Disk上的数据
  */
 class Page {
     friend class BufferPoolManager;
@@ -110,3 +107,17 @@ private:
     /** The pin count of this page. */
     int pin_count_ = 0;
 };
+
+} // namespace rmdb::storage
+
+template <> struct std::hash<rmdb::storage::PageId> {
+    size_t operator()(const rmdb::storage::PageId& obj) const {
+        return std::hash<int64_t>()(obj.Get());
+    }
+};
+
+namespace rmdb {
+using storage::Page;
+using storage::PageId;
+using storage::PageIdHash;
+} // namespace rmdb

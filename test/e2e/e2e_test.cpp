@@ -44,6 +44,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
+using namespace rmdb;
 // =============================================================================
 // EmbeddedDB: in-process database engine that bypasses the network layer
 // =============================================================================
@@ -60,7 +61,7 @@ public:
         if (reset_database) {
             // Clean up any leftover from previous runs (use absolute path)
             std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
-            system(cmd.c_str());
+            ::system(cmd.c_str());
         }
 
         // 构建全局所需的管理器对象（同 src/rmdb.cpp）
@@ -76,13 +77,14 @@ public:
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
-        recovery_access_ = std::make_unique<dbaccess::RecoveryAccess>(schema_manager_.get());
+        recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager_.get());
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get(),
                                               log_manager_.get(), recovery_access_.get());
-        write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
-                                                                       log_manager_.get(), txn_manager_.get());
-        load_data_service_ = std::make_unique<dbaccess::LoadDataService>(schema_manager_.get(), write_service_.get());
+        write_service_ = std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                           log_manager_.get(), txn_manager_.get());
+        load_data_service_ =
+            std::make_unique<rmdb::access::LoadDataService>(schema_manager_.get(), write_service_.get());
         ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(),
                                                   static_cast<Planner*>(nullptr), load_data_service_.get());
         portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
@@ -115,7 +117,7 @@ public:
         // Now CWD is back at original_cwd_ (one level above the db dir)
         if (cleanup_on_destroy_) {
             std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
-            system(cmd.c_str());
+            ::system(cmd.c_str());
         }
     }
 
@@ -131,9 +133,9 @@ public:
         // mirror needed here.
 
         // Parse
-        std::unique_ptr<ast::TreeNode> parse_tree;
+        std::unique_ptr<rmdb::parser::ast::TreeNode> parse_tree;
         try {
-            parse_tree = ast::parse_sql(sql);
+            parse_tree = rmdb::parser::ast::parse_sql(sql);
         } catch (...) {
             abort_implicit_statement(&context);
             throw RMDBError("Parse error for: " + sql);
@@ -142,8 +144,8 @@ public:
             finish_statement(&context);
             return ""; // EXIT or EOF
         }
-        bool is_checkpoint = parse_tree->type == ast::AstType::StaticCheckpoint;
-        bool is_load = parse_tree->type == ast::AstType::LoadStmt;
+        bool is_checkpoint = parse_tree->type == rmdb::parser::ast::AstType::StaticCheckpoint;
+        bool is_load = parse_tree->type == rmdb::parser::ast::AstType::LoadStmt;
         if (!is_checkpoint && !is_load) {
             set_transaction(&context);
         }
@@ -239,10 +241,10 @@ private:
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Optimizer> optimizer_;
     std::unique_ptr<LogManager> log_manager_;
-    std::unique_ptr<dbaccess::RecoveryAccess> recovery_access_;
+    std::unique_ptr<rmdb::access::RecoveryAccess> recovery_access_;
     std::unique_ptr<RecoveryManager> recovery_;
-    std::unique_ptr<dbaccess::TableWriteService> write_service_;
-    std::unique_ptr<dbaccess::LoadDataService> load_data_service_;
+    std::unique_ptr<rmdb::access::TableWriteService> write_service_;
+    std::unique_ptr<rmdb::access::LoadDataService> load_data_service_;
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;

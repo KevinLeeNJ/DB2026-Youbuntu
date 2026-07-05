@@ -18,12 +18,12 @@ See the Mulan PSL v2 for more details. */
 #include <stdexcept>
 #include <utility>
 
-namespace ast {
+namespace rmdb::parser::ast {
 namespace {
 
-using parser::Lexer;
-using parser::Token;
-using parser::TokenType;
+using rmdb::parser::Lexer;
+using rmdb::parser::Token;
+using rmdb::parser::TokenType;
 
 struct FromClause {
     std::vector<TableRef> tables;
@@ -914,4 +914,4 @@ std::unique_ptr<TreeNode> parse_sql(const std::string& sql) {
     }
 }
 
-} // namespace ast
+} // namespace rmdb::parser::ast

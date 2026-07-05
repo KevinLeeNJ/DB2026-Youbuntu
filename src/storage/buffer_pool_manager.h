@@ -26,7 +26,15 @@ See the Mulan PSL v2 for more details. */
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
 
+namespace rmdb::recovery {
 class LogManager;
+}
+
+namespace rmdb {
+using recovery::LogManager;
+}
+
+namespace rmdb::storage {
 
 class BufferPoolManager {
 private:
@@ -93,3 +101,9 @@ private:
 
     void flush_log_before_page_write();
 };
+
+} // namespace rmdb::storage
+
+namespace rmdb {
+using storage::BufferPoolManager;
+} // namespace rmdb

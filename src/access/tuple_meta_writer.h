@@ -16,7 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/schema_manager.h"
 #include "transaction/transaction.h"
 
-namespace dbaccess {
+namespace rmdb::access {
 
 /// TupleMeta 写入桥接。事务 commit/abort 路径更新 TupleMeta 时使用，
 /// 通过 SchemaManager::get_table_handle 访问句柄，不散装访问 fhs_。
@@ -36,4 +36,4 @@ private:
     SchemaManager* schema_mgr_;
 };
 
-} // namespace dbaccess
+} // namespace rmdb::access

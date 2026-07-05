@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction/watermark.h"
 
+namespace rmdb::txn {
 auto Watermark::AddTxn(timestamp_t read_ts) -> void {
     (void)read_ts;
 }
@@ -18,3 +19,5 @@ auto Watermark::AddTxn(timestamp_t read_ts) -> void {
 auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {
     (void)read_ts;
 }
+
+} // namespace rmdb::txn

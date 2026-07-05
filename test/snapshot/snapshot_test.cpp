@@ -53,6 +53,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
+using namespace rmdb;
 // =============================================================================
 // SimpleThreadBarrier — reusable thread barrier (C++17 compatible)
 // Avoids std::barrier (C++20) and naming conflict with ::sync() from unistd.h.
@@ -105,7 +106,7 @@ public:
         original_cwd_ = cwd_buf;
 
         std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
-        system(cmd.c_str());
+        ::system(cmd.c_str());
 
         disk_manager_ = std::make_unique<DiskManager>();
         buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
@@ -119,8 +120,8 @@ public:
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
-        write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
-                                                                       log_manager_.get(), txn_manager_.get());
+        write_service_ = std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                           log_manager_.get(), txn_manager_.get());
         ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(),
                                                   static_cast<Planner*>(nullptr), nullptr);
         recovery_ =
@@ -143,7 +144,7 @@ public:
             chdir(original_cwd_.c_str());
         }
         std::string cmd = "rm -rf " + original_cwd_ + "/" + db_name_;
-        system(cmd.c_str());
+        ::system(cmd.c_str());
     }
 
     // Managers accessible to sessions
@@ -190,7 +191,7 @@ private:
     std::unique_ptr<Optimizer> optimizer_;
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
-    std::unique_ptr<dbaccess::TableWriteService> write_service_;
+    std::unique_ptr<rmdb::access::TableWriteService> write_service_;
     std::unique_ptr<RecoveryManager> recovery_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
@@ -216,7 +217,7 @@ public:
         context.isolation_level_ = session_isolation_;
         setup_transaction(&context);
 
-        auto parse_tree = ast::parse_sql(sql);
+        auto parse_tree = rmdb::parser::ast::parse_sql(sql);
         if (parse_tree == nullptr) {
             finish_statement(&context);
             return "";

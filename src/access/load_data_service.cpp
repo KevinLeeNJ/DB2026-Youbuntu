@@ -22,7 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm_file_handle.h"
 #include "system/sm.h"
 
-namespace dbaccess {
+namespace rmdb::access {
 
 void LoadDataService::load_csv(const std::string& file_path, const std::string& tab_name, Context* ctx) {
     (void)ctx;
@@ -149,4 +149,4 @@ void LoadDataService::load_csv(const std::string& file_path, const std::string& 
     schema_mgr_->flush_meta();
 }
 
-} // namespace dbaccess
+} // namespace rmdb::access

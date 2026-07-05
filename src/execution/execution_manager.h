@@ -26,21 +26,28 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/plan.h"
 #include "executor_abstract.h"
 #include "transaction/transaction_manager.h"
-#include "optimizer/planner.h"
 #include "access/load_data_service.h"
 
+namespace rmdb::optimizer {
 class Planner;
+}
+
+namespace rmdb {
+using optimizer::Planner;
+}
+
+namespace rmdb::exec {
 
 class QlManager {
 private:
     SchemaManager* schema_manager_;
     TransactionManager* txn_mgr_;
     Planner* planner_;
-    dbaccess::LoadDataService* load_data_service_;
+    rmdb::access::LoadDataService* load_data_service_;
 
 public:
     QlManager(SchemaManager* schema_manager, TransactionManager* txn_mgr, Planner* planner,
-              dbaccess::LoadDataService* load_data_service)
+              rmdb::access::LoadDataService* load_data_service)
         : schema_manager_(schema_manager), txn_mgr_(txn_mgr), planner_(planner), load_data_service_(load_data_service) {
     }
 
@@ -53,3 +60,9 @@ public:
 
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::QlManager;
+} // namespace rmdb

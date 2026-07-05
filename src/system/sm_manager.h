@@ -19,7 +19,15 @@ See the Mulan PSL v2 for more details. */
 #include "sm_defs.h"
 #include "sm_meta.h"
 
-class Context;
+namespace rmdb::record {
+class RmManager;
+}
+
+namespace rmdb {
+using record::RmManager;
+}
+
+namespace rmdb::system {
 
 struct ColDef {
     std::string name; // Column name
@@ -132,3 +140,10 @@ public:
     // meta) in self-managed batched transactions, skipping conflict checks.
     void load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context);
 };
+
+} // namespace rmdb::system
+
+namespace rmdb {
+using system::ColDef;
+using system::SmManager;
+} // namespace rmdb

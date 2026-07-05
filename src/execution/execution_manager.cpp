@@ -19,10 +19,12 @@ See the Mulan PSL v2 for more details. */
 #include "executor_seq_scan.h"
 #include "executor_update.h"
 #include "index/ix.h"
+#include "optimizer/planner.h"
 #include "recovery/checkpoint_manager.h"
 #include "recovery/log_manager.h"
 #include "record_printer.h"
 
+namespace rmdb::exec {
 const char* help_info = "Supported SQL syntax:\n"
                         "  command ;\n"
                         "command:\n"
@@ -147,11 +149,11 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     case T_SetTransaction: {
         auto* x = static_cast<SetTransactionPlan*>(plan);
         switch (x->isolation_level_) {
-        case ast::IsolationLevelType::SNAPSHOT_ISOLATION: {
+        case rmdb::parser::ast::IsolationLevelType::SNAPSHOT_ISOLATION: {
             context->isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
             break;
         }
-        case ast::IsolationLevelType::SERIALIZABLE: {
+        case rmdb::parser::ast::IsolationLevelType::SERIALIZABLE: {
             context->isolation_level_ = IsolationLevel::SERIALIZABLE;
             break;
         }
@@ -161,11 +163,11 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     case T_SetKnob: {
         auto* x = static_cast<SetKnobPlan*>(plan);
         switch (x->set_knob_type_) {
-        case ast::SetKnobType::EnableNestLoop: {
+        case rmdb::parser::ast::SetKnobType::EnableNestLoop: {
             planner_->set_enable_nestedloop_join(x->bool_value_);
             break;
         }
-        case ast::SetKnobType::EnableSortMerge: {
+        case rmdb::parser::ast::SetKnobType::EnableSortMerge: {
             planner_->set_enable_sortmerge_join(x->bool_value_);
             break;
         }
@@ -320,3 +322,5 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 void QlManager::run_dml(std::unique_ptr<AbstractExecutor> exec) {
     exec->Next();
 }
+
+} // namespace rmdb::exec

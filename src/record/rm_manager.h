@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "rm_defs.h"
 #include "rm_file_handle.h"
 
+namespace rmdb::record {
 /* 记录管理器，用于管理表的数据文件，进行文件的创建、打开、删除、关闭 */
 class RmManager {
 private:
@@ -93,3 +94,9 @@ public:
                                   sizeof(file_handle->file_hdr_));
     }
 };
+
+} // namespace rmdb::record
+
+namespace rmdb {
+using record::RmManager;
+} // namespace rmdb

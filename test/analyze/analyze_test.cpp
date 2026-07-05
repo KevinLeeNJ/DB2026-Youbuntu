@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #define private public
 #include "analyze/analyze.h"
+using namespace rmdb;
 #undef private
 
 #include <memory>
@@ -35,7 +36,7 @@ See the Mulan PSL v2 for more details. */
 
 TEST(AnalyzeConvertTest, convert_int_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_unique<ast::IntLit>(42);
+    auto sv_val = std::make_unique<rmdb::parser::ast::IntLit>(42);
     Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_INT);
     EXPECT_EQ(val.int_val, 42);
@@ -43,7 +44,7 @@ TEST(AnalyzeConvertTest, convert_int_lit) {
 
 TEST(AnalyzeConvertTest, convert_float_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_unique<ast::FloatLit>(3.14f);
+    auto sv_val = std::make_unique<rmdb::parser::ast::FloatLit>(3.14f);
     Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_FLOAT);
     EXPECT_EQ(val.float_val, 3.14f);
@@ -51,7 +52,7 @@ TEST(AnalyzeConvertTest, convert_float_lit) {
 
 TEST(AnalyzeConvertTest, convert_string_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_unique<ast::StringLit>("hello");
+    auto sv_val = std::make_unique<rmdb::parser::ast::StringLit>("hello");
     Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_STRING);
     EXPECT_EQ(val.str_val, "hello");
@@ -63,12 +64,12 @@ TEST(AnalyzeConvertTest, convert_string_lit) {
 
 TEST(AnalyzeConvertTest, convert_all_comp_ops) {
     Analyze analyze(nullptr);
-    EXPECT_EQ(analyze.convert_sv_comp_op(ast::SV_OP_EQ), OP_EQ);
-    EXPECT_EQ(analyze.convert_sv_comp_op(ast::SV_OP_NE), OP_NE);
-    EXPECT_EQ(analyze.convert_sv_comp_op(ast::SV_OP_LT), OP_LT);
-    EXPECT_EQ(analyze.convert_sv_comp_op(ast::SV_OP_GT), OP_GT);
-    EXPECT_EQ(analyze.convert_sv_comp_op(ast::SV_OP_LE), OP_LE);
-    EXPECT_EQ(analyze.convert_sv_comp_op(ast::SV_OP_GE), OP_GE);
+    EXPECT_EQ(analyze.convert_sv_comp_op(rmdb::parser::ast::SV_OP_EQ), OP_EQ);
+    EXPECT_EQ(analyze.convert_sv_comp_op(rmdb::parser::ast::SV_OP_NE), OP_NE);
+    EXPECT_EQ(analyze.convert_sv_comp_op(rmdb::parser::ast::SV_OP_LT), OP_LT);
+    EXPECT_EQ(analyze.convert_sv_comp_op(rmdb::parser::ast::SV_OP_GT), OP_GT);
+    EXPECT_EQ(analyze.convert_sv_comp_op(rmdb::parser::ast::SV_OP_LE), OP_LE);
+    EXPECT_EQ(analyze.convert_sv_comp_op(rmdb::parser::ast::SV_OP_GE), OP_GE);
 }
 
 // =============================================================================
@@ -129,9 +130,10 @@ TEST_F(AnalyzeCheckColumnTest, explicit_tab_but_column_not_found) {
 
 TEST(AnalyzeGetClauseTest, single_cond_with_value) {
     Analyze analyze(nullptr);
-    std::vector<std::unique_ptr<ast::BinaryExpr>> sv_conds;
-    sv_conds.push_back(std::make_unique<ast::BinaryExpr>(std::make_unique<ast::Col>("t", "x"), ast::SV_OP_EQ,
-                                                         std::make_unique<ast::IntLit>(10)));
+    std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>> sv_conds;
+    sv_conds.push_back(std::make_unique<rmdb::parser::ast::BinaryExpr>(
+        std::make_unique<rmdb::parser::ast::Col>("t", "x"), rmdb::parser::ast::SV_OP_EQ,
+        std::make_unique<rmdb::parser::ast::IntLit>(10)));
 
     std::vector<Condition> conds;
     analyze.get_clause(sv_conds, conds);
@@ -147,9 +149,10 @@ TEST(AnalyzeGetClauseTest, single_cond_with_value) {
 
 TEST(AnalyzeGetClauseTest, single_cond_with_col) {
     Analyze analyze(nullptr);
-    std::vector<std::unique_ptr<ast::BinaryExpr>> sv_conds;
-    sv_conds.push_back(std::make_unique<ast::BinaryExpr>(std::make_unique<ast::Col>("t1", "x"), ast::SV_OP_GT,
-                                                         std::make_unique<ast::Col>("t2", "y")));
+    std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>> sv_conds;
+    sv_conds.push_back(std::make_unique<rmdb::parser::ast::BinaryExpr>(
+        std::make_unique<rmdb::parser::ast::Col>("t1", "x"), rmdb::parser::ast::SV_OP_GT,
+        std::make_unique<rmdb::parser::ast::Col>("t2", "y")));
 
     std::vector<Condition> conds;
     analyze.get_clause(sv_conds, conds);
@@ -175,39 +178,44 @@ TabMeta make_grade_tab() {
     return tab;
 }
 
-std::unique_ptr<ast::AggExpr> make_ast_agg(ast::AggFuncType func, const std::string& col_name) {
-    return std::make_unique<ast::AggExpr>(func, false, std::make_unique<ast::Col>("", col_name));
+std::unique_ptr<rmdb::parser::ast::AggExpr> make_ast_agg(rmdb::parser::ast::AggFuncType func,
+                                                         const std::string& col_name) {
+    return std::make_unique<rmdb::parser::ast::AggExpr>(func, false,
+                                                        std::make_unique<rmdb::parser::ast::Col>("", col_name));
 }
 
-std::unique_ptr<ast::AggExpr> make_ast_count_star() {
-    return std::make_unique<ast::AggExpr>(ast::AGG_COUNT, true, nullptr);
+std::unique_ptr<rmdb::parser::ast::AggExpr> make_ast_count_star() {
+    return std::make_unique<rmdb::parser::ast::AggExpr>(rmdb::parser::ast::AGG_COUNT, true, nullptr);
 }
 
-template <typename... Items> std::vector<std::unique_ptr<ast::SelectItem>> select_items(Items&&... items) {
-    std::vector<std::unique_ptr<ast::SelectItem>> result;
+template <typename... Items>
+std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>> select_items(Items&&... items) {
+    std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>> result;
     (result.push_back(std::forward<Items>(items)), ...);
     return result;
 }
 
-template <typename... Cols> std::vector<std::unique_ptr<ast::Col>> group_cols(Cols&&... cols) {
-    std::vector<std::unique_ptr<ast::Col>> result;
+template <typename... Cols> std::vector<std::unique_ptr<rmdb::parser::ast::Col>> group_cols(Cols&&... cols) {
+    std::vector<std::unique_ptr<rmdb::parser::ast::Col>> result;
     (result.push_back(std::forward<Cols>(cols)), ...);
     return result;
 }
 
-template <typename... Conds> std::vector<std::unique_ptr<ast::HavingExpr>> having_conds(Conds&&... conds) {
-    std::vector<std::unique_ptr<ast::HavingExpr>> result;
+template <typename... Conds>
+std::vector<std::unique_ptr<rmdb::parser::ast::HavingExpr>> having_conds(Conds&&... conds) {
+    std::vector<std::unique_ptr<rmdb::parser::ast::HavingExpr>> result;
     (result.push_back(std::forward<Conds>(conds)), ...);
     return result;
 }
 
-std::unique_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::unique_ptr<ast::SelectItem>> select_items,
-                                                  std::vector<std::unique_ptr<ast::Col>> group_by_cols = {},
-                                                  std::vector<std::unique_ptr<ast::HavingExpr>> having_conds = {}) {
-    return std::make_unique<ast::SelectStmt>(
-        std::move(select_items), std::vector<ast::TableRef>{ast::TableRef("grade", "")},
-        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols), std::move(having_conds),
-        std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0, false);
+std::unique_ptr<rmdb::parser::ast::SelectStmt>
+make_select_stmt(std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>> select_items,
+                 std::vector<std::unique_ptr<rmdb::parser::ast::Col>> group_by_cols = {},
+                 std::vector<std::unique_ptr<rmdb::parser::ast::HavingExpr>> having_conds = {}) {
+    return std::make_unique<rmdb::parser::ast::SelectStmt>(
+        std::move(select_items), std::vector<rmdb::parser::ast::TableRef>{rmdb::parser::ast::TableRef("grade", "")},
+        std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>>{}, std::move(group_by_cols),
+        std::move(having_conds), std::vector<std::unique_ptr<rmdb::parser::ast::OrderByItem>>{}, false, 0, false);
 }
 
 } // namespace
@@ -225,11 +233,13 @@ protected:
 
 TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
     auto stmt = make_select_stmt(
-        select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), ""),
-                     std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "max_score")),
-        group_cols(std::make_unique<ast::Col>("", "id")),
-        having_conds(
-            std::make_unique<ast::HavingExpr>(make_ast_count_star(), ast::SV_OP_GT, std::make_unique<ast::IntLit>(1))));
+        select_items(
+            std::make_unique<rmdb::parser::ast::SelectItem>(std::make_unique<rmdb::parser::ast::Col>("", "id"), ""),
+            std::make_unique<rmdb::parser::ast::SelectItem>(make_ast_agg(rmdb::parser::ast::AGG_MAX, "score"),
+                                                            "max_score")),
+        group_cols(std::make_unique<rmdb::parser::ast::Col>("", "id")),
+        having_conds(std::make_unique<rmdb::parser::ast::HavingExpr>(make_ast_count_star(), rmdb::parser::ast::SV_OP_GT,
+                                                                     std::make_unique<rmdb::parser::ast::IntLit>(1))));
 
     auto query = analyze_.do_analyze(std::move(stmt));
 
@@ -248,10 +258,11 @@ TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_select_column_not_in_group_by) {
-    auto stmt =
-        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "course"), ""),
-                                      std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "")),
-                         group_cols(std::make_unique<ast::Col>("", "id")));
+    auto stmt = make_select_stmt(
+        select_items(
+            std::make_unique<rmdb::parser::ast::SelectItem>(std::make_unique<rmdb::parser::ast::Col>("", "course"), ""),
+            std::make_unique<rmdb::parser::ast::SelectItem>(make_ast_agg(rmdb::parser::ast::AGG_MAX, "score"), "")),
+        group_cols(std::make_unique<rmdb::parser::ast::Col>("", "id")));
 
     try {
         (void)analyze_.do_analyze(std::move(stmt));
@@ -264,11 +275,13 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_select_column_not_in_group_by) {
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_having_column_not_in_group_by) {
     auto stmt = make_select_stmt(
-        select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), ""),
-                     std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "")),
-        group_cols(std::make_unique<ast::Col>("", "id")),
-        having_conds(std::make_unique<ast::HavingExpr>(std::make_unique<ast::Col>("", "score"), ast::SV_OP_GT,
-                                                       std::make_unique<ast::IntLit>(90))));
+        select_items(
+            std::make_unique<rmdb::parser::ast::SelectItem>(std::make_unique<rmdb::parser::ast::Col>("", "id"), ""),
+            std::make_unique<rmdb::parser::ast::SelectItem>(make_ast_agg(rmdb::parser::ast::AGG_MAX, "score"), "")),
+        group_cols(std::make_unique<rmdb::parser::ast::Col>("", "id")),
+        having_conds(std::make_unique<rmdb::parser::ast::HavingExpr>(
+            std::make_unique<rmdb::parser::ast::Col>("", "score"), rmdb::parser::ast::SV_OP_GT,
+            std::make_unique<rmdb::parser::ast::IntLit>(90))));
 
     try {
         (void)analyze_.do_analyze(std::move(stmt));
@@ -280,9 +293,9 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_having_column_not_in_group_by) {
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_mixed_aggregate_without_group_by) {
-    auto stmt =
-        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), ""),
-                                      std::make_unique<ast::SelectItem>(make_ast_agg(ast::AGG_MAX, "score"), "")));
+    auto stmt = make_select_stmt(select_items(
+        std::make_unique<rmdb::parser::ast::SelectItem>(std::make_unique<rmdb::parser::ast::Col>("", "id"), ""),
+        std::make_unique<rmdb::parser::ast::SelectItem>(make_ast_agg(rmdb::parser::ast::AGG_MAX, "score"), "")));
 
     try {
         (void)analyze_.do_analyze(std::move(stmt));

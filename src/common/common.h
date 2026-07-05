@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "record/rm_defs.h"
 
+namespace rmdb::common {
 struct TabCol {
     std::string tab_name;
     std::string col_name;
@@ -149,3 +150,28 @@ struct SetClause {
     TabCol rhs_col;
     UpdateOp op = UpdateOp::ASSIGNMENT;
 };
+
+} // namespace rmdb::common
+
+namespace rmdb {
+using common::AggExpr;
+using common::AggType;
+using common::CompOp;
+using common::Condition;
+using common::HavingCondition;
+using common::OP_EQ;
+using common::OP_GE;
+using common::OP_GT;
+using common::OP_LE;
+using common::OP_LT;
+using common::OP_NE;
+using common::OrderByItem;
+using common::QueryExpr;
+using common::QueryExprType;
+using common::SelectItem;
+using common::SetClause;
+using common::swap_comp_op;
+using common::TabCol;
+using common::UpdateOp;
+using common::Value;
+} // namespace rmdb

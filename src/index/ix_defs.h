@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "defs.h"
 #include "storage/buffer_pool_manager.h"
 
+namespace rmdb::index {
 constexpr int IX_NO_PAGE = -1;
 constexpr int IX_FILE_HDR_PAGE = 0;
 constexpr int IX_LEAF_HEADER_PAGE = 1;
@@ -165,3 +166,20 @@ public:
         return !(x == y);
     }
 };
+
+} // namespace rmdb::index
+
+namespace rmdb {
+using index::Iid;
+using index::IX_FILE_HDR_PAGE;
+using index::IX_INIT_NUM_PAGES;
+using index::IX_INIT_ROOT_PAGE;
+using index::IX_LEAF_HEADER_PAGE;
+using index::IX_MAX_COL_LEN;
+using index::IX_NO_PAGE;
+using index::IxAlignUp;
+using index::IxFileHdr;
+using index::IxKeysSize;
+using index::IxNodeUsedBytes;
+using index::IxPageHdr;
+} // namespace rmdb

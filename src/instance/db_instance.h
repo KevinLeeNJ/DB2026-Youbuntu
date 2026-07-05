@@ -32,7 +32,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
-namespace instance {
+namespace rmdb::instance {
 
 /// 一个数据库实例的生命周期主人。持有所有 manager 的 unique_ptr，
 /// 构造顺序即依赖顺序，析构按成员声明逆序自动释放。
@@ -101,16 +101,16 @@ public:
     Analyze& analyze() {
         return *analyze_;
     }
-    dbaccess::TableWriteService& write_service() {
+    rmdb::access::TableWriteService& write_service() {
         return *write_service_;
     }
-    dbaccess::RecoveryAccess& recovery_access() {
+    rmdb::access::RecoveryAccess& recovery_access() {
         return *recovery_access_;
     }
-    dbaccess::TupleMetaWriter& tuple_meta_writer() {
+    rmdb::access::TupleMetaWriter& tuple_meta_writer() {
         return *tuple_meta_writer_;
     }
-    dbaccess::LoadDataService& load_data_service() {
+    rmdb::access::LoadDataService& load_data_service() {
         return *load_data_service_;
     }
 
@@ -127,14 +127,14 @@ private:
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Optimizer> optimizer_;
     std::unique_ptr<LogManager> log_manager_;
-    std::unique_ptr<dbaccess::RecoveryAccess> recovery_access_;
+    std::unique_ptr<rmdb::access::RecoveryAccess> recovery_access_;
     std::unique_ptr<RecoveryManager> recovery_;
-    std::unique_ptr<dbaccess::TableWriteService> write_service_;
-    std::unique_ptr<dbaccess::TupleMetaWriter> tuple_meta_writer_;
-    std::unique_ptr<dbaccess::LoadDataService> load_data_service_;
+    std::unique_ptr<rmdb::access::TableWriteService> write_service_;
+    std::unique_ptr<rmdb::access::TupleMetaWriter> tuple_meta_writer_;
+    std::unique_ptr<rmdb::access::LoadDataService> load_data_service_;
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };
 
-} // namespace instance
+} // namespace rmdb::instance

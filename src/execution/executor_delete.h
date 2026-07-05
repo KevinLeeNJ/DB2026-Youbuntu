@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/schema_manager.h"
 #include "access/table_write_service.h"
 
+namespace rmdb::exec {
 class DeleteExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;                  // 表的元数据
@@ -27,10 +28,10 @@ private:
     std::vector<Rid> rids_;        // 需要删除的记录的位置
     std::string tab_name_;         // 表名称
     SchemaManager* schema_manager_;
-    dbaccess::TableWriteService* write_service_;
+    rmdb::access::TableWriteService* write_service_;
 
 public:
-    DeleteExecutor(SchemaManager* schema_manager, dbaccess::TableWriteService* write_service,
+    DeleteExecutor(SchemaManager* schema_manager, rmdb::access::TableWriteService* write_service,
                    const std::string& tab_name, std::vector<Condition> conds, std::vector<Rid> rids, Context* context)
         : write_service_(write_service) {
         schema_manager_ = schema_manager;
@@ -68,3 +69,9 @@ public:
         throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::DeleteExecutor;
+} // namespace rmdb

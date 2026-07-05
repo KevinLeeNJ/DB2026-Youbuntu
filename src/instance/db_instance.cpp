@@ -10,7 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "instance/db_instance.h"
 
-namespace instance {
+namespace rmdb::instance {
 
 DBInstance::DBInstance() {
     // 构造顺序与成员声明一致：底层存储先行，上层 manager 依赖前者
@@ -26,13 +26,13 @@ DBInstance::DBInstance() {
     planner_ = std::make_unique<Planner>(schema_manager_.get());
     optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
     log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
-    recovery_access_ = std::make_unique<dbaccess::RecoveryAccess>(schema_manager_.get());
+    recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager_.get());
     recovery_ = std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(),
                                                   schema_manager_.get(), log_manager_.get(), recovery_access_.get());
-    write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
-                                                                   log_manager_.get(), txn_manager_.get());
-    tuple_meta_writer_ = std::make_unique<dbaccess::TupleMetaWriter>(schema_manager_.get());
-    load_data_service_ = std::make_unique<dbaccess::LoadDataService>(schema_manager_.get(), write_service_.get());
+    write_service_ = std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                       log_manager_.get(), txn_manager_.get());
+    tuple_meta_writer_ = std::make_unique<rmdb::access::TupleMetaWriter>(schema_manager_.get());
+    load_data_service_ = std::make_unique<rmdb::access::LoadDataService>(schema_manager_.get(), write_service_.get());
     ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), planner_.get(),
                                               load_data_service_.get());
     portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
@@ -61,4 +61,4 @@ void DBInstance::close_database() {
     sm_manager_->close_db();
 }
 
-} // namespace instance
+} // namespace rmdb::instance

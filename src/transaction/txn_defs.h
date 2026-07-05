@@ -17,6 +17,8 @@ See the Mulan PSL v2 for more details. */
 #include "defs.h"
 #include "record/rm_defs.h"
 
+namespace rmdb::txn {
+
 /* 标识事务状态 */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
@@ -124,12 +126,6 @@ public:
     LockDataType type_;
 };
 
-template <> struct std::hash<LockDataId> {
-    size_t operator()(const LockDataId& obj) const {
-        return std::hash<int64_t>()(obj.Get());
-    }
-};
-
 /* 事务回滚原因 */
 enum class AbortReason { LOCK_ON_SHIRINKING = 0, UPGRADE_CONFLICT, DEADLOCK_PREVENTION, WW_CONFLICT, SSI_DANGER };
 
@@ -178,3 +174,23 @@ public:
         }
     }
 };
+
+} // namespace rmdb::txn
+
+template <> struct std::hash<rmdb::txn::LockDataId> {
+    size_t operator()(const rmdb::txn::LockDataId& obj) const {
+        return std::hash<int64_t>()(obj.Get());
+    }
+};
+
+namespace rmdb {
+using txn::AbortReason;
+using txn::DEFAULT_ISOLATION_LEVEL;
+using txn::IsolationLevel;
+using txn::LockDataId;
+using txn::LockDataType;
+using txn::TransactionAbortException;
+using txn::TransactionState;
+using txn::WriteRecord;
+using txn::WType;
+} // namespace rmdb

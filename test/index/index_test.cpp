@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #define private public
 #include "index/ix.h"
 #include "optimizer/planner.h"
+using namespace rmdb;
 #undef private
 
 #include <algorithm>
@@ -478,7 +479,7 @@ public:
     std::unique_ptr<IxManager> ix_manager;
     std::unique_ptr<SmManager> sm_manager;
     std::unique_ptr<SchemaManager> schema_manager;
-    std::unique_ptr<dbaccess::TableWriteService> write_service;
+    std::unique_ptr<rmdb::access::TableWriteService> write_service;
     std::string db_name = "index_scan_feature_test_db";
     bool opened = false;
 
@@ -490,7 +491,8 @@ public:
         sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
                                                  ix_manager.get());
         schema_manager = std::make_unique<SchemaManager>(sm_manager.get());
-        write_service = std::make_unique<dbaccess::TableWriteService>(schema_manager.get(), nullptr, nullptr, nullptr);
+        write_service =
+            std::make_unique<rmdb::access::TableWriteService>(schema_manager.get(), nullptr, nullptr, nullptr);
         if (sm_manager->is_dir(db_name)) {
             sm_manager->drop_db(db_name);
         }

@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <thread>
 #include <vector>
 
+using namespace rmdb;
 TEST(LRUReplacerTest, SampleTest) {
     LRUReplacer lru_replacer(7);
 

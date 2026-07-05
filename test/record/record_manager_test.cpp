@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #define private public
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
+using namespace rmdb;
 #undef private
 
 #include <algorithm>

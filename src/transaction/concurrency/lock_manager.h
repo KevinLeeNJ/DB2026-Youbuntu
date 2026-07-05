@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include "transaction/transaction.h"
 
+namespace rmdb::txn::concurrency {
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
 
 class LockManager {
@@ -69,3 +70,10 @@ private:
     std::mutex latch_;                                                             // 用于锁表的并发
     std::unordered_map<LockDataId, std::shared_ptr<LockRequestQueue>> lock_table_; // 全局锁表
 };
+
+} // namespace rmdb::txn::concurrency
+
+namespace rmdb {
+using txn::concurrency::GroupLockModeStr;
+using txn::concurrency::LockManager;
+} // namespace rmdb

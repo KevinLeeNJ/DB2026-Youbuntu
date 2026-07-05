@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "lru_replacer.h"
 
+namespace rmdb::storage {
 LRUReplacer::LRUReplacer(size_t num_pages) {
     max_size_ = num_pages;
 }
@@ -80,3 +81,5 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
 size_t LRUReplacer::Size() {
     return LRUlist_.size();
 }
+
+} // namespace rmdb::storage

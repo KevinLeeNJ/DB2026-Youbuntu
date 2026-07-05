@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 #include "log_manager.h"
 
+namespace rmdb::recovery {
 std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size) {
     if (src == nullptr || size < LOG_HEADER_SIZE) {
         return nullptr;
@@ -183,3 +184,5 @@ int64_t LogManager::read_restart_offset() const {
     }
     return checkpoint_offset;
 }
+
+} // namespace rmdb::recovery

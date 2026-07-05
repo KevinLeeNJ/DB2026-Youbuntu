@@ -24,9 +24,10 @@ See the Mulan PSL v2 for more details. */
 #include "system/schema_manager.h"
 #include "common/common.h"
 
+namespace rmdb::analyze {
 class Query {
 public:
-    std::unique_ptr<ast::TreeNode> parse;
+    std::unique_ptr<rmdb::parser::ast::TreeNode> parse;
     // where条件
     std::vector<Condition> conds;
     // 投影列
@@ -52,7 +53,7 @@ public:
     std::unordered_map<std::string, std::string> table_name_to_display;
     bool is_explain_analyze = false;
     bool is_set_transaction = false;
-    ast::IsolationLevelType set_isolation_level;
+    rmdb::parser::ast::IsolationLevelType set_isolation_level;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     // insert 的values值
@@ -71,15 +72,16 @@ public:
         : schema_manager_(schema_manager), catalog_(schema_manager ? &schema_manager->catalog() : nullptr) {}
     ~Analyze() {}
 
-    std::unique_ptr<Query> do_analyze(std::unique_ptr<ast::TreeNode> root);
+    std::unique_ptr<Query> do_analyze(std::unique_ptr<rmdb::parser::ast::TreeNode> root);
 
 private:
     TabCol check_column(const std::vector<ColMeta>& all_cols, TabCol target);
     void get_all_cols(const std::vector<std::string>& tab_names, std::vector<ColMeta>& all_cols);
-    void get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds);
+    void get_clause(const std::vector<std::unique_ptr<rmdb::parser::ast::BinaryExpr>>& sv_conds,
+                    std::vector<Condition>& conds);
     void check_clause(const std::vector<std::string>& tab_names, std::vector<Condition>& conds);
-    Value convert_sv_value(const ast::Value* sv_val);
-    CompOp convert_sv_comp_op(ast::SvCompOp op);
+    Value convert_sv_value(const rmdb::parser::ast::Value* sv_val);
+    CompOp convert_sv_comp_op(rmdb::parser::ast::SvCompOp op);
     void cast_value(Value& val, ColType to);
 
     bool can_cast(ColType lhs_type, ColType rhs_type) {
@@ -96,11 +98,18 @@ private:
         return false;
     }
 
-    std::unique_ptr<Query> analyze_select_stmt(const ast::SelectStmt* select,
-                                               std::unique_ptr<ast::TreeNode> owner = nullptr);
-    std::unique_ptr<Query> analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select,
-                                                          std::unique_ptr<ast::TreeNode> owner);
+    std::unique_ptr<Query> analyze_select_stmt(const rmdb::parser::ast::SelectStmt* select,
+                                               std::unique_ptr<rmdb::parser::ast::TreeNode> owner = nullptr);
+    std::unique_ptr<Query> analyze_select_from_union_stmt(const rmdb::parser::ast::SelectFromUnionStmt* select,
+                                                          std::unique_ptr<rmdb::parser::ast::TreeNode> owner);
     std::vector<ColMeta> get_query_output_metas(const Query& query);
     ColMeta make_union_col_meta(const ColMeta& current, const ColMeta& next);
     void validate_union_order_by(Query& query);
 };
+
+} // namespace rmdb::analyze
+
+namespace rmdb {
+using analyze::Analyze;
+using analyze::Query;
+} // namespace rmdb

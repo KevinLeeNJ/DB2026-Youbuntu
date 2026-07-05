@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "access/recovery_access.h"
 
+namespace rmdb::recovery {
 /**
  * @description: analyze阶段，需要获得脏页表（DPT）和未完成的事务列表（ATT）
  */
@@ -215,3 +216,5 @@ void RecoveryManager::undo_delete(const DeleteLogRecord& log) {
 void RecoveryManager::undo_update(const UpdateLogRecord& log) {
     recovery_access_->undo_update(log);
 }
+
+} // namespace rmdb::recovery

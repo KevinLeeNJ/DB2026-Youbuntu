@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -12,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/config.h"
 
+namespace rmdb::storage {
 /**
  * Replacer is an abstract class that tracks page usage.
  */
@@ -42,3 +44,9 @@ public:
     /** @return the number of elements in the replacer that can be victimized */
     virtual size_t Size() = 0;
 };
+
+} // namespace rmdb::storage
+
+namespace rmdb {
+using storage::Replacer;
+} // namespace rmdb

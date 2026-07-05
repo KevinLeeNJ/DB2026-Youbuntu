@@ -28,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <vector>
 
+using namespace rmdb;
 namespace {
 
 RmRecord MakeRecord(const std::string& text) {
@@ -326,7 +327,7 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     sm_mgr.create_db("executor_dml_log_test_db");
     sm_mgr.open_db("executor_dml_log_test_db");
     LogManager log_mgr(&disk);
-    dbaccess::TableWriteService write_svc(&schema_mgr, &lock_mgr, &log_mgr, &txn_mgr);
+    rmdb::access::TableWriteService write_svc(&schema_mgr, &lock_mgr, &log_mgr, &txn_mgr);
 
     sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
     sm_mgr.create_index("t", {"id"}, nullptr);

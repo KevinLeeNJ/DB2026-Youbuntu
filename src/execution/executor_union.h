@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "executor_abstract.h"
 
+namespace rmdb::exec {
 class UnionExecutor : public AbstractExecutor {
 private:
     std::vector<std::unique_ptr<AbstractExecutor>> branches_;
@@ -147,3 +148,9 @@ public:
         return *pos;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::UnionExecutor;
+} // namespace rmdb

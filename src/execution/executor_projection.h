@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+namespace rmdb::exec {
 class ProjectionExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_; // 投影节点的儿子节点
@@ -184,3 +185,9 @@ public:
         return prev_->scan_conditions();
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::ProjectionExecutor;
+} // namespace rmdb

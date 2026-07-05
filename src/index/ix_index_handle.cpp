@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
+namespace rmdb::index {
 /**
  * @brief 在当前node中查找第一个>=target的key_idx
  *
@@ -844,3 +845,5 @@ void IxIndexHandle::maintain_child(IxNodeHandle* node, int child_idx) {
         delete child;
     }
 }
+
+} // namespace rmdb::index

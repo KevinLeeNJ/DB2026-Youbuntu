@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+namespace rmdb::exec {
 class NestedLoopJoinExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> left_;  // 左儿子节点（需要join的表）
@@ -388,3 +389,9 @@ public:
         return len_;
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::NestedLoopJoinExecutor;
+} // namespace rmdb

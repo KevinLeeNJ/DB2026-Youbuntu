@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "transaction/transaction_manager.h"
 
+namespace rmdb::recovery {
 namespace {
 
 std::atomic<bool> g_checkpoint_running{false};
@@ -76,3 +77,5 @@ bool CheckpointManager::RunIfNeeded() {
     }
     return RunCleanCheckpoint();
 }
+
+} // namespace rmdb::recovery

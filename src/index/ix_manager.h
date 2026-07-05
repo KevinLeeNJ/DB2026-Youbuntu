@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "ix_index_handle.h"
 
+namespace rmdb::index {
 class IxManager {
 private:
     DiskManager* disk_manager_;
@@ -176,3 +177,9 @@ public:
         disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data.data(), ih->file_hdr_->tot_len_);
     }
 };
+
+} // namespace rmdb::index
+
+namespace rmdb {
+using index::IxManager;
+} // namespace rmdb

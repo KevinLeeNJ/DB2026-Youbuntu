@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_manager.h"
 #include "system/sm.h"
 
-namespace dbaccess {
+namespace rmdb::access {
 
 namespace {
 
@@ -726,4 +726,4 @@ void TableWriteService::bulk_insert(const std::string& tab_name, const std::vect
     (void)ctx;
 }
 
-} // namespace dbaccess
+} // namespace rmdb::access

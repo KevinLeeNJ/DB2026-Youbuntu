@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
+namespace rmdb::index {
 /**
  * @brief 前进到下一个索引项。当前叶子保持 pinned，跨叶时换页。
  *        leaf_ 与 pinned_leaf_page_ 始终与 iid_.page_no 同步（非 end 时）。
@@ -29,3 +30,5 @@ void IxScan::next() {
     iid_.slot_no++;
     normalize_position();
 }
+
+} // namespace rmdb::index

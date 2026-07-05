@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "sm_defs.h"
 
+namespace rmdb::system {
 /* 字段元数据 */
 struct ColMeta {
     std::string tab_name; // 字段所属表名称
@@ -210,3 +211,12 @@ public:
         return is;
     }
 };
+
+} // namespace rmdb::system
+
+namespace rmdb {
+using system::ColMeta;
+using system::DbMeta;
+using system::IndexMeta;
+using system::TabMeta;
+} // namespace rmdb

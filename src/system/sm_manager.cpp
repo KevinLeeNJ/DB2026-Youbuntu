@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include "record_printer.h"
 #include "transaction/transaction_manager.h"
 
+namespace rmdb::system {
 namespace {
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
@@ -81,7 +82,7 @@ void SmManager::create_db(const std::string& db_name) {
     }
     // 为数据库创建一个子目录
     std::string cmd = "mkdir " + db_name;
-    if (system(cmd.c_str()) < 0) { // 创建一个名为db_name的目录
+    if (::system(cmd.c_str()) < 0) { // 创建一个名为db_name的目录
         throw UnixError();
     }
     if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
@@ -115,7 +116,7 @@ void SmManager::drop_db(const std::string& db_name) {
         throw DatabaseNotFoundError(db_name);
     }
     std::string cmd = "rm -r " + db_name;
-    if (system(cmd.c_str()) < 0) {
+    if (::system(cmd.c_str()) < 0) {
         throw UnixError();
     }
 }
@@ -716,3 +717,5 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     flush_all_table_and_index_pages();
     flush_meta();
 }
+
+} // namespace rmdb::system

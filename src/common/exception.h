@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -18,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <stdexcept>
 #include <string>
 
+namespace rmdb::common {
 /** ExceptionType 是我们系统中可能抛出的所有异常类型。 */
 enum class ExceptionType {
     /** 无效的异常类型。*/
@@ -132,3 +134,13 @@ public:
     ExecutionException() = delete;
     explicit ExecutionException(const std::string& msg) : Exception(ExceptionType::EXECUTION, msg, true) {}
 };
+
+} // namespace rmdb::common
+
+namespace rmdb {
+using common::Exception;
+using common::ExceptionType;
+using common::ExecutionException;
+using common::global_disable_execution_exception_print;
+using common::NotImplementedException;
+} // namespace rmdb

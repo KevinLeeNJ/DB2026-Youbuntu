@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "system/schema_manager.h"
 
+namespace rmdb::exec {
 class SeqScanExecutor : public AbstractExecutor {
 private:
     std::string tab_name_;             // 表的名称
@@ -189,3 +190,9 @@ public:
         }
     }
 };
+
+} // namespace rmdb::exec
+
+namespace rmdb {
+using exec::SeqScanExecutor;
+} // namespace rmdb

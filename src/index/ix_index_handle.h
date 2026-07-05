@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <shared_mutex>
 
+namespace rmdb::index {
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
 
 static const bool binary_search = false;
@@ -322,3 +323,13 @@ private:
     // for index test
     Rid get_rid(const Iid& iid) const;
 };
+
+} // namespace rmdb::index
+
+namespace rmdb {
+using index::binary_search;
+using index::ix_compare;
+using index::IxIndexHandle;
+using index::IxNodeHandle;
+using index::Operation;
+} // namespace rmdb

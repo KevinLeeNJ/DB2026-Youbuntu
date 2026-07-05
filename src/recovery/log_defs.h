@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -17,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <chrono>
 
+namespace rmdb::recovery {
 static constexpr std::chrono::duration<int64_t> FLUSH_TIMEOUT = std::chrono::seconds(3);
 // the offset of log_type_ in log header
 static constexpr int OFFSET_LOG_TYPE = 0;
@@ -32,3 +34,16 @@ static constexpr int OFFSET_PREV_LSN = OFFSET_LOG_TID + sizeof(txn_id_t);
 static constexpr int OFFSET_LOG_DATA = OFFSET_PREV_LSN + sizeof(lsn_t);
 // sizeof log_header
 static constexpr int LOG_HEADER_SIZE = OFFSET_LOG_DATA;
+
+} // namespace rmdb::recovery
+
+namespace rmdb {
+using recovery::FLUSH_TIMEOUT;
+using recovery::LOG_HEADER_SIZE;
+using recovery::OFFSET_LOG_DATA;
+using recovery::OFFSET_LOG_TID;
+using recovery::OFFSET_LOG_TOT_LEN;
+using recovery::OFFSET_LOG_TYPE;
+using recovery::OFFSET_LSN;
+using recovery::OFFSET_PREV_LSN;
+} // namespace rmdb

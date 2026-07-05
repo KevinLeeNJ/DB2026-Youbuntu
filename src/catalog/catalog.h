@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "system/sm_meta.h"
 
+namespace rmdb::catalog {
 /// 只读 schema 视图。analyze/optimizer 通过它读取表/列/索引元数据，
 /// 不接触存储句柄。唯一写入方是 SchemaManager（migration-ledger 登记）。
 /// Phase 2：持有 DbMeta*（非 const，因 DbMeta::get_table 返回非 const），
@@ -47,3 +48,9 @@ private:
     DbMeta* db_{nullptr};
     uint64_t version_{0};
 };
+
+} // namespace rmdb::catalog
+
+namespace rmdb {
+using catalog::Catalog;
+} // namespace rmdb

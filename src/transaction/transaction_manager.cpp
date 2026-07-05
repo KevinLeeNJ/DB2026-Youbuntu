@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <vector>
 
+namespace rmdb::txn {
 std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> TransactionManager::txn_map = {};
 
 namespace {
@@ -1439,3 +1440,5 @@ void TransactionManager::PruneSsiState() {
 
     commits_since_full_ssi_prune_ = 0;
 }
+
+} // namespace rmdb::txn
