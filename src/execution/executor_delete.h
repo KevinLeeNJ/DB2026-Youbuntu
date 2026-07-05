@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 #include "access/table_write_service.h"
 
@@ -24,7 +24,6 @@ class DeleteExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;                  // 表的元数据
     std::vector<Condition> conds_; // delete的条件
-    RmFileHandle* fh_;             // 表的数据文件句柄
     std::vector<Rid> rids_;        // 需要删除的记录的位置
     std::string tab_name_;         // 表名称
     SchemaManager* schema_manager_;
@@ -37,7 +36,6 @@ public:
         schema_manager_ = schema_manager;
         tab_name_ = tab_name;
         tab_ = schema_manager_->catalog().get_table(tab_name);
-        fh_ = schema_manager_->get_table_handle(tab_name);
         conds_ = conds;
         rids_ = rids;
         context_ = context;

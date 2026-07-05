@@ -33,12 +33,6 @@ class Pager;
 
 namespace rmdb::system {
 
-struct ColDef {
-    std::string name; // Column name
-    ColType type;     // Type of column
-    int len;          // Length of column
-};
-
 /* 系统管理器，负责元数据管理和DDL语句的执行 */
 class SmManager {
     friend class SchemaManager;
@@ -149,6 +143,5 @@ public:
 } // namespace rmdb::system
 
 namespace rmdb {
-using system::ColDef;
 using system::SmManager;
 } // namespace rmdb

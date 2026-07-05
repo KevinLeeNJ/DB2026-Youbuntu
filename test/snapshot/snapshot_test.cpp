@@ -50,7 +50,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_recovery.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
-#include "system/sm_manager.h"
+#include "system/schema_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
@@ -115,9 +115,8 @@ public:
         buffer_pool_manager_->set_wal_guard(pager_.get());
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get(), pager_.get());
-        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
+                                                          rm_manager_.get(), ix_manager_.get(), pager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
@@ -132,8 +131,8 @@ public:
         portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
-        sm_manager_->create_db(db_name_);
-        sm_manager_->open_db(db_name_);
+        schema_manager_->create_db(db_name_);
+        schema_manager_->open_db(db_name_);
 
         recovery_->analyze();
         recovery_->redo();
@@ -142,7 +141,7 @@ public:
 
     ~SharedTestDB() {
         try {
-            sm_manager_->close_db();
+            schema_manager_->close_db();
         } catch (...) {
             chdir(original_cwd_.c_str());
         }
@@ -151,9 +150,6 @@ public:
     }
 
     // Managers accessible to sessions
-    SmManager* sm() {
-        return sm_manager_.get();
-    }
     LockManager* lock() {
         return lock_manager_.get();
     }
@@ -187,7 +183,6 @@ private:
     std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
-    std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;

@@ -16,7 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 
 namespace rmdb::exec {
 class ProjectionExecutor : public AbstractExecutor {

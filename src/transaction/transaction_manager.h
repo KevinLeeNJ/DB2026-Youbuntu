@@ -23,7 +23,6 @@ See the Mulan PSL v2 for more details. */
 #include "watermark.h"
 #include "recovery/log_manager.h"
 #include "concurrency/lock_manager.h"
-#include "system/sm_manager.h"
 #include "system/schema_manager.h"
 #include "common/exception.h"
 #include "transaction/ssi_registry.h"

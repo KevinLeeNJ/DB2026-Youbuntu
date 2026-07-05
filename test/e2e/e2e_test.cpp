@@ -40,7 +40,6 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_recovery.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
-#include "system/sm_manager.h"
 #include "system/schema_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
@@ -72,9 +71,8 @@ public:
         pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), log_manager_.get());
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get(), pager_.get());
-        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
+                                                          rm_manager_.get(), ix_manager_.get(), pager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
@@ -93,10 +91,10 @@ public:
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
         // Create and open the database
-        if (!sm_manager_->is_dir(db_name_)) {
-            sm_manager_->create_db(db_name_);
+        if (!schema_manager_->is_dir(db_name_)) {
+            schema_manager_->create_db(db_name_);
         }
-        sm_manager_->open_db(db_name_);
+        schema_manager_->open_db(db_name_);
 
         log_manager_->initialize_from_existing_log();
         // Phase 5: 通过 Pager 注入 WAL guard，替代 set_log_manager
@@ -111,7 +109,7 @@ public:
     ~EmbeddedDB() {
         // close_db() does chdir("..") internally — do NOT chdir before it.
         try {
-            sm_manager_->close_db();
+            schema_manager_->close_db();
         } catch (...) {
             // If close_db() throws, we may be stuck inside the db dir.
             // Force-restore CWD so cleanup works.
@@ -239,7 +237,6 @@ private:
     std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
-    std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;

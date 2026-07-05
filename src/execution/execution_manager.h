@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_defs.h"
 #include "record/rm.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 #include "common/context.h"
 #include "common/common.h"

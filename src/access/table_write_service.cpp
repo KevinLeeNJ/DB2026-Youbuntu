@@ -16,8 +16,10 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution/execution_common.h"
 #include "index/ix_index_handle.h"
+#include "index/ix_manager.h"
 #include "recovery/log_manager.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
+#include "common/type_utils.h"
 
 namespace rmdb::access {
 
@@ -44,18 +46,6 @@ ColMeta find_col(const TabMeta& tab, const TabCol& target) {
     throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
 }
 
-bool can_cast_types(ColType lhs, ColType rhs) {
-    if (lhs == rhs)
-        return true;
-    if (lhs == TYPE_INT && rhs == TYPE_FLOAT)
-        return true;
-    if (lhs == TYPE_FLOAT && rhs == TYPE_INT)
-        return true;
-    if ((lhs == TYPE_STRING && rhs == TYPE_DATETIME) || (lhs == TYPE_DATETIME && rhs == TYPE_STRING))
-        return true;
-    return false;
-}
-
 } // namespace
 
 bool TableWriteService::record_matches_conds(const TabMeta& tab, const std::vector<Condition>& conds,
@@ -74,7 +64,7 @@ bool TableWriteService::record_matches_conds(const TabMeta& tab, const std::vect
         } else {
             rhs_type = cond.rhs_val.type;
         }
-        if (!can_cast_types(lhs_type, rhs_type)) {
+        if (!can_cast(lhs_type, rhs_type)) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
         bool ok = false;
@@ -655,7 +645,7 @@ void TableWriteService::apply_set_clauses(const TabMeta& tab, const std::vector<
             }
             continue;
         }
-        if (!can_cast_types(col_meta.type, set_clause.rhs.type)) {
+        if (!can_cast(col_meta.type, set_clause.rhs.type)) {
             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(set_clause.rhs.type));
         }
         switch (col_meta.type) {

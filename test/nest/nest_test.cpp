@@ -44,7 +44,6 @@ protected:
     std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
-    std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;
@@ -61,9 +60,8 @@ protected:
         buffer_pool_manager_->set_wal_guard(pager_.get());
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get(), pager_.get());
-        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
+                                                          rm_manager_.get(), ix_manager_.get(), pager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
@@ -72,21 +70,21 @@ protected:
                                                                            nullptr, txn_manager_.get());
         portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
 
-        if (sm_manager_->is_dir(TEST_DB_NAME)) {
-            sm_manager_->drop_db(TEST_DB_NAME);
+        if (schema_manager_->is_dir(TEST_DB_NAME)) {
+            schema_manager_->drop_db(TEST_DB_NAME);
         }
-        sm_manager_->create_db(TEST_DB_NAME);
-        sm_manager_->open_db(TEST_DB_NAME);
+        schema_manager_->create_db(TEST_DB_NAME);
+        schema_manager_->open_db(TEST_DB_NAME);
         db_opened_ = true;
     }
 
     void TearDown() override {
         if (db_opened_) {
-            sm_manager_->close_db();
+            schema_manager_->close_db();
             db_opened_ = false;
         }
-        if (sm_manager_->is_dir(TEST_DB_NAME)) {
-            sm_manager_->drop_db(TEST_DB_NAME);
+        if (schema_manager_->is_dir(TEST_DB_NAME)) {
+            schema_manager_->drop_db(TEST_DB_NAME);
         }
     }
 
@@ -170,8 +168,8 @@ protected:
 // (other NLJ/INLJ correctness tests moved to test/e2e/slt/nest_nlj_inlj.slt)
 // ============================================================
 TEST_F(NestTest, LargeDataPartialMatch) {
-    sm_manager_->create_table("large_left", {{"id", TYPE_INT, 4}, {"val", TYPE_INT, 4}}, nullptr);
-    sm_manager_->create_table("large_right", {{"id", TYPE_INT, 4}, {"ref", TYPE_INT, 4}}, nullptr);
+    schema_manager_->create_table("large_left", {{"id", TYPE_INT, 4}, {"val", TYPE_INT, 4}}, nullptr);
+    schema_manager_->create_table("large_right", {{"id", TYPE_INT, 4}, {"ref", TYPE_INT, 4}}, nullptr);
 
     // Partial match: left id=0..999, right ref=0,2,4,...,1998 (unique)
     // Only even left ids match → 500 out of 1000 rows

@@ -16,7 +16,6 @@ See the Mulan PSL v2 for more details. */
 #include "pager/pager.h"
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
-#include "system/sm.h"
 #include "system/schema_manager.h"
 #include "transaction/transaction_manager.h"
 
@@ -298,9 +297,8 @@ TEST(LogManagerTest, TransactionBeginCommitLogPrevLsn) {
     BufferPoolManager bpm(32, &disk);
     RmManager rm_mgr(&disk, &bpm, nullptr);
     IxManager ix_mgr(&disk, &bpm, nullptr);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, nullptr);
+    SchemaManager schema_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, nullptr);
     LockManager lock_mgr;
-    SchemaManager schema_mgr(&sm_mgr);
     TransactionManager txn_mgr(&lock_mgr, &schema_mgr);
     LogManager log_mgr(&disk);
 
@@ -323,17 +321,16 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     bpm.set_wal_guard(&pager);
     RmManager rm_mgr(&disk, &bpm, &pager);
     IxManager ix_mgr(&disk, &bpm, &pager);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
+    SchemaManager schema_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
     LockManager lock_mgr;
-    SchemaManager schema_mgr(&sm_mgr);
     TransactionManager txn_mgr(&lock_mgr, &schema_mgr);
 
-    sm_mgr.create_db("executor_dml_log_test_db");
-    sm_mgr.open_db("executor_dml_log_test_db");
+    schema_mgr.create_db("executor_dml_log_test_db");
+    schema_mgr.open_db("executor_dml_log_test_db");
     rmdb::access::TableWriteService write_svc(&schema_mgr, &lock_mgr, &log_mgr, &txn_mgr);
 
-    sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
-    sm_mgr.create_index("t", {"id"}, nullptr);
+    schema_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
+    schema_mgr.create_index("t", {"id"}, nullptr);
 
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr);
     Context context(&lock_mgr, &log_mgr, txn, nullptr, &const_offset, &txn_mgr);
@@ -375,5 +372,5 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     ASSERT_EQ(delete_log->delete_value_.size, update_log->new_value_.size);
     EXPECT_EQ(memcmp(delete_log->delete_value_.data, update_log->new_value_.data, delete_log->delete_value_.size), 0);
 
-    sm_mgr.close_db();
+    schema_mgr.close_db();
 }

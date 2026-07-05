@@ -13,7 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 
 #include "recovery/log_manager.h"
-#include "system/sm_manager.h"
+#include "system/schema_manager.h"
 #include "transaction/transaction_manager.h"
 
 namespace rmdb::recovery {
@@ -23,8 +23,8 @@ std::atomic<bool> g_checkpoint_running{false};
 
 } // namespace
 
-CheckpointManager::CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr)
-    : txn_mgr_(txn_mgr), sm_mgr_(sm_mgr), log_mgr_(log_mgr) {}
+CheckpointManager::CheckpointManager(TransactionManager* txn_mgr, SchemaManager* schema_mgr, LogManager* log_mgr)
+    : txn_mgr_(txn_mgr), schema_mgr_(schema_mgr), log_mgr_(log_mgr) {}
 
 void CheckpointManager::SetOptions(CheckpointOptions options) {
     options_ = options;
@@ -46,7 +46,7 @@ bool CheckpointManager::RunCleanCheckpoint() {
         }
     } running_guard{&running_};
 
-    if (txn_mgr_ == nullptr || sm_mgr_ == nullptr || log_mgr_ == nullptr) {
+    if (txn_mgr_ == nullptr || schema_mgr_ == nullptr || log_mgr_ == nullptr) {
         return false;
     }
 
@@ -64,8 +64,8 @@ bool CheckpointManager::RunCleanCheckpoint() {
 
     txn_mgr_->wait_active_transactions_drained_for_checkpoint();
     log_mgr_->flush_log_to_disk_with_sync();
-    sm_mgr_->flush_all_table_and_index_pages();
-    sm_mgr_->flush_meta();
+    schema_mgr_->flush_all_table_and_index_pages();
+    schema_mgr_->flush_meta();
     log_mgr_->reset_log(log_mgr_->get_global_lsn());
     log_mgr_->write_restart_offset(0);
     return true;

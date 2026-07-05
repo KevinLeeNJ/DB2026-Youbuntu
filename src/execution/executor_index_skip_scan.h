@@ -19,8 +19,7 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         Iid upper;
     };
 
-    IxIndexHandle* ih_ = nullptr;
-    IxIndexHandle::SharedIndexLatch index_latch_guard_;
+    std::unique_ptr<rmdb::access::IndexCursor> index_cursor_; // 持有索引锁 + 提供范围查询 + 当前子范围扫描
     std::vector<IndexRange> ranges_;
     size_t next_range_pos_ = 0;
 
@@ -92,18 +91,15 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
 
         auto min_key = make_min_key();
         auto max_key = make_max_key();
-        Iid cursor = ih_->lower_bound(min_key.data());
-        Iid end = ih_->upper_bound(max_key.data());
+        Iid cursor = index_cursor_->lower_bound(min_key.data());
+        Iid end = index_cursor_->upper_bound(max_key.data());
 
         while (cursor != end) {
-            std::vector<char> prefix_key;
-            {
-                IxScan probe(ih_, cursor, end, schema_manager_->get_bpm(), false);
-                if (probe.is_end()) {
-                    break;
-                }
-                prefix_key.assign(probe.key(), probe.key() + index_meta_.col_tot_len);
+            auto probe = index_cursor_->probe_first_key(cursor, end, index_meta_.col_tot_len);
+            if (!probe.has_value()) {
+                break;
             }
+            const auto& prefix_key = *probe;
 
             auto lower_key = min_key;
             auto upper_key = max_key;
@@ -113,13 +109,13 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
             copy_prefix_from_key(next_prefix_key, prefix_key.data(), suffix_pos);
             apply_suffix_equalities(lower_key, upper_key, constraints, suffix_pos);
 
-            Iid lower = ih_->lower_bound(lower_key.data());
-            Iid upper = ih_->upper_bound(upper_key.data());
+            Iid lower = index_cursor_->lower_bound(lower_key.data());
+            Iid upper = index_cursor_->upper_bound(upper_key.data());
             if (lower != upper) {
                 ranges_.push_back(IndexRange{lower, upper});
             }
 
-            Iid next_cursor = ih_->upper_bound(next_prefix_key.data());
+            Iid next_cursor = index_cursor_->upper_bound(next_prefix_key.data());
             if (next_cursor == cursor) {
                 break;
             }
@@ -127,29 +123,46 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         }
     }
 
-    void open_next_range() {
-        scan_.reset();
+    /// 打开下一个子范围；返回 true 表示成功打开一个非空范围。
+    bool open_next_range() {
         while (next_range_pos_ < ranges_.size()) {
             const auto range = ranges_[next_range_pos_++];
-            scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, schema_manager_->get_bpm(), false);
-            if (!scan_->is_end()) {
-                return;
+            index_cursor_->open_range_no_lock(range.lower, range.upper);
+            if (!index_cursor_->is_end()) {
+                return true;
             }
         }
-        scan_.reset();
-        if (index_latch_guard_.owns_lock()) {
-            index_latch_guard_.unlock();
-        }
+        return false;
     }
 
-    void advance_to_match() {
+    /// skip scan 专用 advance：直接用 index_cursor_ 迭代，不走基类 scan_。
+    void advance_to_match_skip() {
         buffered_record_.reset();
-        while (scan_ != nullptr) {
-            IndexScanExecutor::advance_to_match();
-            if (buffered_record_ != nullptr) {
+        while (index_cursor_ != nullptr && !index_cursor_->is_end()) {
+            rid_ = index_cursor_->rid();
+            auto rec = index_cursor_->get_visible_record(context_);
+            if (rec == nullptr) {
+                index_cursor_->next();
+                continue;
+            }
+            bool match = true;
+            for (const auto& cond : fed_conds_) {
+                if (!compare(cond, *rec)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                record_tuple_read(rid_);
+                buffered_record_ = std::move(rec);
                 return;
             }
-            open_next_range();
+            index_cursor_->next();
+        }
+        // 当前子范围耗尽，尝试打开下一个
+        while (index_cursor_ != nullptr && open_next_range()) {
+            advance_to_match_skip();
+            return;
         }
     }
 
@@ -164,36 +177,48 @@ public:
 
         use_heap_scan_for_mvcc_ = needs_historical_heap_scan();
         if (use_heap_scan_for_mvcc_) {
-            scan_ = std::make_unique<RmScan>(fh_);
+            auto table_cursor = table_access_.open_table_scan(tab_name_);
+            table_cursor->open();
+            scan_ = std::move(table_cursor);
             IndexScanExecutor::advance_to_match();
             return;
         }
 
-        ih_ = schema_manager_->get_index_handle(tab_name_, index_meta_.cols);
-        index_latch_guard_ = ih_->lock_shared();
+        index_cursor_ = table_access_.open_index_scan(tab_name_, index_meta_.cols);
+        index_cursor_->acquire_shared_lock();
         auto constraints = build_constraints();
         auto suffix_pos = first_suffix_equality_pos(constraints);
         if (!suffix_pos.has_value()) {
-            scan_.reset();
-            index_latch_guard_.unlock();
+            index_cursor_.reset();
             return;
         }
 
         build_ranges(constraints, *suffix_pos);
-        open_next_range();
-        advance_to_match();
+        if (open_next_range()) {
+            advance_to_match_skip();
+        } else {
+            index_cursor_.reset();
+        }
     }
 
     void nextTuple() override {
-        if (scan_ == nullptr) {
+        if (use_heap_scan_for_mvcc_) {
+            scan_->next();
+            IndexScanExecutor::advance_to_match();
             return;
         }
-        scan_->next();
-        advance_to_match();
+        if (index_cursor_ == nullptr) {
+            return;
+        }
+        index_cursor_->next();
+        advance_to_match_skip();
     }
 
     bool is_end() const override {
-        return scan_ == nullptr || scan_->is_end();
+        if (use_heap_scan_for_mvcc_) {
+            return scan_ == nullptr || scan_->is_end();
+        }
+        return index_cursor_ == nullptr || index_cursor_->is_end();
     }
 
     std::string getType() override {

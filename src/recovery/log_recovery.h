@@ -20,7 +20,6 @@ See the Mulan PSL v2 for more details. */
 #include "access/recovery_access.h"
 #include "log_manager.h"
 #include "storage/disk_manager.h"
-#include "system/sm_manager.h"
 #include "system/schema_manager.h"
 
 namespace rmdb::recovery {

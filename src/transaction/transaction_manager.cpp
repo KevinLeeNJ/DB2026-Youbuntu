@@ -10,8 +10,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
+#include "index/ix.h"
 #include "record/rm_file_handle.h"
-#include "system/sm_manager.h"
+#include "common/type_utils.h"
 
 #include <algorithm>
 #include <cstring>
@@ -99,11 +100,7 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         rhs_type = rhs_col_meta->type;
     }
 
-    bool can_cast = lhs_type == rhs_type || (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-                    (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
-                    ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
-                     (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME));
-    if (!can_cast) {
+    if (!rmdb::common::can_cast(lhs_type, rhs_type)) {
         throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
     }
 

@@ -20,9 +20,10 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "parser/parser.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 #include "common/common.h"
+#include "common/type_utils.h"
 
 namespace rmdb::analyze {
 class Query {
@@ -83,20 +84,6 @@ private:
     Value convert_sv_value(const rmdb::parser::ast::Value* sv_val);
     CompOp convert_sv_comp_op(rmdb::parser::ast::SvCompOp op);
     void cast_value(Value& val, ColType to);
-
-    bool can_cast(ColType lhs_type, ColType rhs_type) {
-        if (lhs_type == rhs_type) {
-            return true;
-        }
-        if ((lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) || (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT)) {
-            return true;
-        }
-        if ((lhs_type == TYPE_STRING && rhs_type == TYPE_DATETIME) ||
-            (lhs_type == TYPE_DATETIME && rhs_type == TYPE_STRING)) {
-            return true;
-        }
-        return false;
-    }
 
     std::unique_ptr<Query> analyze_select_stmt(const rmdb::parser::ast::SelectStmt* select,
                                                std::unique_ptr<rmdb::parser::ast::TreeNode> owner = nullptr);

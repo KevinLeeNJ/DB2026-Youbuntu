@@ -21,9 +21,9 @@ DBInstance::DBInstance() {
     pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), log_manager_.get());
     rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
     ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-    sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                              ix_manager_.get(), pager_.get());
-    schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+    // Phase 6: SchemaManager 拥有 SmManager（内部实现细节），外部不再访问 SmManager。
+    schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
+                                                      rm_manager_.get(), ix_manager_.get(), pager_.get());
     lock_manager_ = std::make_unique<LockManager>();
     txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
     planner_ = std::make_unique<Planner>(schema_manager_.get());
@@ -44,10 +44,10 @@ DBInstance::DBInstance() {
 DBInstance::~DBInstance() = default;
 
 void DBInstance::open_database(const std::string& db_name) {
-    if (!sm_manager_->is_dir(db_name)) {
-        sm_manager_->create_db(db_name);
+    if (!schema_manager_->is_dir(db_name)) {
+        schema_manager_->create_db(db_name);
     }
-    sm_manager_->open_db(db_name);
+    schema_manager_->open_db(db_name);
     log_manager_->initialize_from_existing_log();
     // Phase 5: 向 BPM 注入 Pager 作为 WAL guard，eviction 路径写盘前触发 log flush
     buffer_pool_manager_->set_wal_guard(pager_.get());
@@ -60,7 +60,7 @@ void DBInstance::run_recovery() {
 }
 
 void DBInstance::close_database() {
-    sm_manager_->close_db();
+    schema_manager_->close_db();
 }
 
 } // namespace rmdb::instance

@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze_expr_internal.h"
 
+#include "common/type_utils.h"
+
 namespace rmdb::analyze {
 namespace analyze_internal {
 
@@ -63,28 +65,6 @@ const ColMeta* resolve_column_meta(const std::vector<ColMeta>& all_cols, TabCol&
         }
     }
     throw ColumnNotFoundError(target.col_name);
-}
-
-bool can_cast_types(ColType lhs_type, ColType rhs_type) {
-    if (lhs_type == rhs_type) {
-        return true;
-    }
-    if ((lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) || (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT)) {
-        return true;
-    }
-    if ((lhs_type == TYPE_STRING && rhs_type == TYPE_DATETIME) ||
-        (lhs_type == TYPE_DATETIME && rhs_type == TYPE_STRING)) {
-        return true;
-    }
-    return false;
-}
-
-bool is_numeric_type(ColType type) {
-    return type == TYPE_INT || type == TYPE_FLOAT;
-}
-
-bool is_groupable_type(ColType type) {
-    return type == TYPE_INT || type == TYPE_FLOAT || type == TYPE_STRING || type == TYPE_DATETIME;
 }
 
 std::string agg_type_to_string(AggType type) {

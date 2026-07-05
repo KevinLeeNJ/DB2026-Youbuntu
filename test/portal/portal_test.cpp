@@ -59,7 +59,6 @@ protected:
     std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
-    std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;
     std::unique_ptr<Portal> portal_;
@@ -72,28 +71,27 @@ protected:
         buffer_pool_manager_->set_wal_guard(pager_.get());
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get(), pager_.get());
-        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
+                                                          rm_manager_.get(), ix_manager_.get(), pager_.get());
         write_service_ =
             std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), nullptr, nullptr, nullptr);
         portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
-        if (sm_manager_->is_dir(TEST_DB_NAME)) {
-            sm_manager_->drop_db(TEST_DB_NAME);
+        if (schema_manager_->is_dir(TEST_DB_NAME)) {
+            schema_manager_->drop_db(TEST_DB_NAME);
         }
-        sm_manager_->create_db(TEST_DB_NAME);
-        sm_manager_->open_db(TEST_DB_NAME);
+        schema_manager_->create_db(TEST_DB_NAME);
+        schema_manager_->open_db(TEST_DB_NAME);
         db_opened_ = true;
-        sm_manager_->create_table("grade", {{"id", TYPE_INT, 4}, {"score", TYPE_INT, 4}}, nullptr);
+        schema_manager_->create_table("grade", {{"id", TYPE_INT, 4}, {"score", TYPE_INT, 4}}, nullptr);
     }
 
     void TearDown() override {
         if (db_opened_) {
-            sm_manager_->close_db();
+            schema_manager_->close_db();
             db_opened_ = false;
         }
-        if (sm_manager_->is_dir(TEST_DB_NAME)) {
-            sm_manager_->drop_db(TEST_DB_NAME);
+        if (schema_manager_->is_dir(TEST_DB_NAME)) {
+            schema_manager_->drop_db(TEST_DB_NAME);
         }
     }
 

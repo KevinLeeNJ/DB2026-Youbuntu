@@ -29,7 +29,6 @@ See the Mulan PSL v2 for more details. */
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
 #include "system/schema_manager.h"
-#include "system/sm_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 
@@ -67,9 +66,6 @@ public:
     }
     IxManager& ix_manager() {
         return *ix_manager_;
-    }
-    SmManager& sm_manager() {
-        return *sm_manager_;
     }
     SchemaManager& schema_manager() {
         return *schema_manager_;
@@ -126,7 +122,6 @@ private:
     std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
-    std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<TransactionManager> txn_manager_;

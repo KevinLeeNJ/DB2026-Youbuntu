@@ -20,7 +20,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/exception.h"
 #include "record/rm_file_handle.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 
 namespace rmdb::access {
 

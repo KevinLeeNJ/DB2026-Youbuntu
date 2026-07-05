@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdint>
 
 namespace rmdb::system {
-class SmManager;
+class SchemaManager;
 }
 
 namespace rmdb::txn {
@@ -22,7 +22,7 @@ class TransactionManager;
 }
 
 namespace rmdb {
-using system::SmManager;
+using system::SchemaManager;
 using txn::TransactionManager;
 } // namespace rmdb
 
@@ -35,7 +35,7 @@ struct CheckpointOptions {
 
 class CheckpointManager {
 public:
-    CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr);
+    CheckpointManager(TransactionManager* txn_mgr, SchemaManager* schema_mgr, LogManager* log_mgr);
 
     bool RunCleanCheckpoint();
     bool RunIfNeeded();
@@ -43,7 +43,7 @@ public:
 
 private:
     TransactionManager* txn_mgr_;
-    SmManager* sm_mgr_;
+    SchemaManager* schema_mgr_;
     LogManager* log_mgr_;
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};

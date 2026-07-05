@@ -20,7 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_scalar.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 
 namespace rmdb::exec {
 class SortExecutor : public AbstractExecutor {

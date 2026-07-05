@@ -56,7 +56,7 @@ void validate_having(Query& query, const std::vector<ColMeta>& all_cols) {
             rhs_type = infer_expr_type(cond.rhs_expr, all_cols);
         }
 
-        if (!can_cast_types(lhs_type, rhs_type)) {
+        if (!can_cast(lhs_type, rhs_type)) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
     }

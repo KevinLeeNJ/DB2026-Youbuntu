@@ -38,7 +38,6 @@ using namespace rmdb;
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
-#include "system/sm_manager.h"
 #include "system/schema_manager.h"
 #include "system/sm_meta.h"
 
@@ -482,7 +481,6 @@ public:
     std::unique_ptr<rmdb::pager::Pager> pager;
     std::unique_ptr<RmManager> rm_manager;
     std::unique_ptr<IxManager> ix_manager;
-    std::unique_ptr<SmManager> sm_manager;
     std::unique_ptr<SchemaManager> schema_manager;
     std::unique_ptr<rmdb::access::TableWriteService> write_service;
     std::string db_name = "index_scan_feature_test_db";
@@ -495,32 +493,31 @@ public:
         buffer_pool_manager->set_wal_guard(pager.get());
         rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
         ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
-        sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
-                                                 ix_manager.get(), pager.get());
-        schema_manager = std::make_unique<SchemaManager>(sm_manager.get());
+        schema_manager = std::make_unique<SchemaManager>(disk_manager.get(), buffer_pool_manager.get(),
+                                                         rm_manager.get(), ix_manager.get(), pager.get());
         write_service =
             std::make_unique<rmdb::access::TableWriteService>(schema_manager.get(), nullptr, nullptr, nullptr);
-        if (sm_manager->is_dir(db_name)) {
-            sm_manager->drop_db(db_name);
+        if (schema_manager->is_dir(db_name)) {
+            schema_manager->drop_db(db_name);
         }
-        sm_manager->create_db(db_name);
-        sm_manager->open_db(db_name);
+        schema_manager->create_db(db_name);
+        schema_manager->open_db(db_name);
         opened = true;
     }
 
     void TearDown() override {
         if (opened) {
-            sm_manager->close_db();
+            schema_manager->close_db();
             opened = false;
         }
-        if (sm_manager->is_dir(db_name)) {
-            sm_manager->drop_db(db_name);
+        if (schema_manager->is_dir(db_name)) {
+            schema_manager->drop_db(db_name);
         }
     }
 
     void create_warehouse() {
         std::vector<ColDef> cols = {{"w_id", TYPE_INT, 4}, {"name", TYPE_STRING, 8}};
-        sm_manager->create_table("warehouse", cols, nullptr);
+        schema_manager->create_table("warehouse", cols, nullptr);
         insert_row(10, "qweruiop");
         insert_row(534, "asdfhjkl");
         insert_row(100, "qwerghjk");
@@ -529,17 +526,17 @@ public:
 
     void create_two_int_table(const std::string& tab_name) {
         std::vector<ColDef> cols = {{"a", TYPE_INT, 4}, {"b", TYPE_INT, 4}};
-        sm_manager->create_table(tab_name, cols, nullptr);
+        schema_manager->create_table(tab_name, cols, nullptr);
     }
 
     void create_three_int_table(const std::string& tab_name) {
         std::vector<ColDef> cols = {{"a", TYPE_INT, 4}, {"b", TYPE_INT, 4}, {"c", TYPE_INT, 4}};
-        sm_manager->create_table(tab_name, cols, nullptr);
+        schema_manager->create_table(tab_name, cols, nullptr);
     }
 
     void create_scores() {
         std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4}};
-        sm_manager->create_table("scores", cols, nullptr);
+        schema_manager->create_table("scores", cols, nullptr);
     }
 
     void insert_row(int w_id, const std::string& name) {
@@ -695,7 +692,7 @@ public:
 
 TEST_F(IndexScanFeatureTest, UsesSingleColumnIndexForPointAndRangeScans) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+    schema_manager->create_index("warehouse", {"w_id"}, nullptr);
 
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 10)}, {"w_id"}), std::vector<int>({10}));
     EXPECT_EQ(scan_ids({int_cond(OP_LT, 534), int_cond(OP_GT, 100)}, {"w_id"}), std::vector<int>({500}));
@@ -703,7 +700,7 @@ TEST_F(IndexScanFeatureTest, UsesSingleColumnIndexForPointAndRangeScans) {
 
 TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRange) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
+    schema_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
 
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "qwerghjk"), int_cond(OP_EQ, 100)}, {"w_id", "name"}),
               std::vector<int>({100}));
@@ -718,7 +715,7 @@ TEST_F(IndexScanFeatureTest, SkipScanUsesSuffixEqualityAcrossDistinctPrefixes) {
     insert_three_ints("triples", 2, 2, 3);
     insert_three_ints("triples", 2, 1, 3);
     insert_three_ints("triples", 3, 2, 3);
-    sm_manager->create_index("triples", {"a", "b", "c"}, nullptr);
+    schema_manager->create_index("triples", {"a", "b", "c"}, nullptr);
 
     auto result = skip_scan_three_int_a_values(
         {table_int_cond("triples", "b", OP_EQ, 2), table_int_cond("triples", "c", OP_EQ, 3)}, {"a", "b", "c"});
@@ -728,19 +725,19 @@ TEST_F(IndexScanFeatureTest, SkipScanUsesSuffixEqualityAcrossDistinctPrefixes) {
 
 TEST_F(IndexScanFeatureTest, DroppedIndexPagesDoNotPolluteRecreatedIndexes) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+    schema_manager->create_index("warehouse", {"w_id"}, nullptr);
     EXPECT_EQ(scan_ids({int_cond(OP_GE, 100)}, {"w_id"}), std::vector<int>({100, 500, 534}));
 
-    sm_manager->drop_index("warehouse", {"w_id"}, nullptr);
-    sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
+    schema_manager->drop_index("warehouse", {"w_id"}, nullptr);
+    schema_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
 
     EXPECT_EQ(scan_ids({int_cond(OP_LT, 500)}, {"w_id", "name"}), std::vector<int>({10, 100}));
 }
 
 TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
-    sm_manager->drop_table("warehouse", nullptr);
+    schema_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
+    schema_manager->drop_table("warehouse", nullptr);
 
     create_scores();
     for (int sid = 10; sid <= 15; ++sid) {
@@ -748,7 +745,7 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
         insert_score(sid, 102, static_cast<float>(sid) + 0.5F);
         insert_score(sid, 103, static_cast<float>(sid) + 1.0F);
     }
-    sm_manager->create_index("scores", {"sid", "cid"}, nullptr);
+    schema_manager->create_index("scores", {"sid", "cid"}, nullptr);
 
     auto result = scan_score_keys(
         {table_int_cond("scores", "sid", OP_GE, 10), table_int_cond("scores", "sid", OP_LE, 15)}, {"sid", "cid"});
@@ -763,7 +760,7 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
 
 TEST_F(IndexScanFeatureTest, PlannerSelectsBestLeftmostPrefixIndexAndReordersConditions) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
+    schema_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
     Planner planner(schema_manager.get());
     std::vector<Condition> conds = {string_cond(OP_EQ, "qwerghjk"), int_cond(OP_EQ, 100)};
     std::vector<std::string> index_cols;
@@ -777,7 +774,7 @@ TEST_F(IndexScanFeatureTest, PlannerSelectsBestLeftmostPrefixIndexAndReordersCon
 
 TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+    schema_manager->create_index("warehouse", {"w_id"}, nullptr);
 
     insert_row(700, "newdance");
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}), std::vector<int>({700}));
@@ -811,8 +808,8 @@ TEST_F(IndexScanFeatureTest, InsertConflictRollsBackAllPreviouslyInsertedIndexEn
     create_two_int_table("pairs");
     insert_two_ints("pairs", 1, 1);
     insert_two_ints("pairs", 2, 2);
-    sm_manager->create_index("pairs", {"a"}, nullptr);
-    sm_manager->create_index("pairs", {"b"}, nullptr);
+    schema_manager->create_index("pairs", {"a"}, nullptr);
+    schema_manager->create_index("pairs", {"b"}, nullptr);
 
     EXPECT_THROW(insert_two_ints("pairs", 3, 2), IndexEntryExistsError);
     EXPECT_NO_THROW(insert_two_ints("pairs", 3, 3));
@@ -821,7 +818,7 @@ TEST_F(IndexScanFeatureTest, InsertConflictRollsBackAllPreviouslyInsertedIndexEn
 
 TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorruptIndexesOrRecord) {
     create_warehouse();
-    sm_manager->create_index("warehouse", {"name"}, nullptr);
+    schema_manager->create_index("warehouse", {"name"}, nullptr);
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
@@ -846,10 +843,9 @@ TEST_F(IndexScanFeatureTest, CreateIndexRejectsDuplicateExistingKeysAndDoesNotLe
     insert_two_ints("dups", 1, 10);
     insert_two_ints("dups", 1, 20);
 
-    EXPECT_THROW(sm_manager->create_index("dups", {"a"}, nullptr), IndexEntryExistsError);
-    EXPECT_FALSE(sm_manager->db_.get_table("dups").is_index({"a"}));
-    EXPECT_TRUE(sm_manager->ihs_.find(sm_manager->get_ix_manager()->get_index_name(
-                    "dups", std::vector<std::string>{"a"})) == sm_manager->ihs_.end());
+    EXPECT_THROW(schema_manager->create_index("dups", {"a"}, nullptr), IndexEntryExistsError);
+    EXPECT_FALSE(schema_manager->db().get_table("dups").is_index({"a"}));
+    EXPECT_TRUE(schema_manager->find_index_handle("dups", std::vector<std::string>{"a"}) == nullptr);
 }
 
 } // namespace
@@ -863,7 +859,7 @@ public:
     std::unique_ptr<rmdb::pager::Pager> pager;
     std::unique_ptr<RmManager> rm_manager;
     std::unique_ptr<IxManager> ix_manager;
-    std::unique_ptr<SmManager> sm_manager;
+    std::unique_ptr<SchemaManager> schema_manager;
     std::string db_name = "show_index_test_db";
     bool opened = false;
 
@@ -874,38 +870,38 @@ public:
         buffer_pool_manager->set_wal_guard(pager.get());
         rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
         ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get(), pager.get());
-        sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
-                                                 ix_manager.get(), pager.get());
-        if (sm_manager->is_dir(db_name)) {
-            sm_manager->drop_db(db_name);
+        schema_manager = std::make_unique<SchemaManager>(disk_manager.get(), buffer_pool_manager.get(),
+                                                         rm_manager.get(), ix_manager.get(), pager.get());
+        if (schema_manager->is_dir(db_name)) {
+            schema_manager->drop_db(db_name);
         }
-        sm_manager->create_db(db_name);
-        sm_manager->open_db(db_name);
+        schema_manager->create_db(db_name);
+        schema_manager->open_db(db_name);
         opened = true;
     }
 
     void TearDown() override {
         if (opened) {
-            sm_manager->close_db();
+            schema_manager->close_db();
             opened = false;
         }
-        if (sm_manager->is_dir(db_name)) {
-            sm_manager->drop_db(db_name);
+        if (schema_manager->is_dir(db_name)) {
+            schema_manager->drop_db(db_name);
         }
     }
 };
 
 TEST_F(ShowIndexTest, PrintsFormattedIndexMetadataTable) {
     std::vector<ColDef> cols = {{"id", TYPE_INT, 4}, {"name", TYPE_STRING, 8}};
-    sm_manager->create_table("warehouse", cols, nullptr);
-    sm_manager->create_index("warehouse", {"id"}, nullptr);
-    sm_manager->create_index("warehouse", {"id", "name"}, nullptr);
+    schema_manager->create_table("warehouse", cols, nullptr);
+    schema_manager->create_index("warehouse", {"id"}, nullptr);
+    schema_manager->create_index("warehouse", {"id", "name"}, nullptr);
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
 
-    sm_manager->show_index("warehouse", &context);
+    schema_manager->show_index("warehouse", &context);
 
     std::string output(data_send, offset);
     EXPECT_NE(output.find("+------------------+------------------+------------------+"), std::string::npos);

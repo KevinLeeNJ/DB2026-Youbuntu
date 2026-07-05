@@ -16,8 +16,10 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "errors.h"
+#include "access/cursor/table_access.h"
+#include "access/cursor/table_cursor.h"
 #include "index/ix.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 
 namespace rmdb::exec {
@@ -25,15 +27,15 @@ class SeqScanExecutor : public AbstractExecutor {
 private:
     std::string tab_name_;             // 表的名称
     std::vector<Condition> conds_;     // scan的条件
-    RmFileHandle* fh_;                 // 表的数据文件句柄
     std::vector<ColMeta> cols_;        // scan后生成的记录的字段
     size_t len_;                       // scan后生成的每条记录的长度
     std::vector<Condition> fed_conds_; // 同conds_，两个字段相同
 
     Rid rid_;
-    std::unique_ptr<RecScan> scan_; // table_iterator
+    std::unique_ptr<rmdb::access::TableCursor> scan_; // table_iterator
 
     SchemaManager* schema_manager_;
+    rmdb::access::TableAccess table_access_;
     bool predicate_recorded_{false};
 
     void record_predicate_read() {
@@ -46,8 +48,8 @@ private:
         if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, fed_conds_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
-        if (context_->txn_mgr_->CheckPredicateInvisibleWrites(context_->txn_->get_transaction_id(), tab_name_,
-                                                              fed_conds_, fh_, cols_)) {
+        if (table_access_.check_predicate_invisible_writes(context_, context_->txn_->get_transaction_id(), tab_name_,
+                                                           fed_conds_, cols_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
@@ -61,7 +63,7 @@ private:
         txn_id_t reader_id = context_->txn_->get_transaction_id();
         txn_mgr->RecordRead(reader_id, tab_name_, rid);
 
-        TupleMeta meta = fh_->get_tuple_meta(rid);
+        TupleMeta meta = scan_->get_tuple_meta(rid);
         if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
             return;
         }
@@ -72,13 +74,12 @@ private:
     }
 
 public:
-    SeqScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
-                    Context* context) {
+    SeqScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds, Context* context)
+        : table_access_(schema_manager) {
         schema_manager_ = schema_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
         TabMeta& tab = schema_manager_->catalog().get_table(tab_name_);
-        fh_ = schema_manager_->get_table_handle(tab_name_);
         cols_ = tab.cols;
         len_ = cols_.back().offset + cols_.back().len;
 
@@ -86,19 +87,17 @@ public:
 
         fed_conds_ = conds_;
     }
-    std::unique_ptr<RmRecord> visible_record(const Rid& rid) {
-        return GetVisibleRecord(fh_, rid, context_);
-    }
 
     /**
      * @brief 构建表迭代器scan_,并开始迭代扫描,直到扫描到第一个满足谓词条件和MVCC可见性的元组停止,并赋值给rid_
      */
     void beginTuple() override {
         record_predicate_read();
-        scan_ = std::make_unique<RmScan>(fh_);
+        scan_ = table_access_.open_table_scan(tab_name_);
+        scan_->open();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = visible_record(rid_);
+            auto rec = scan_->get_visible_record(context_);
             if (rec == nullptr) {
                 scan_->next();
                 continue;
@@ -124,7 +123,7 @@ public:
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = visible_record(rid_);
+            auto rec = scan_->get_visible_record(context_);
             if (rec == nullptr) {
                 scan_->next();
                 continue;
@@ -151,7 +150,7 @@ public:
     std::unique_ptr<RmRecord> Next() override {
         if (is_end())
             return nullptr;
-        return visible_record(rid_);
+        return scan_->get_visible_record(context_);
     }
 
     Rid& rid() override {

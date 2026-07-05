@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 #include "access/table_write_service.h"
 
@@ -24,7 +24,6 @@ class UpdateExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;
     std::vector<Condition> conds_;
-    RmFileHandle* fh_;
     std::vector<Rid> rids_;
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
@@ -40,7 +39,6 @@ public:
         tab_name_ = tab_name;
         set_clauses_ = set_clauses;
         tab_ = schema_manager_->catalog().get_table(tab_name);
-        fh_ = schema_manager_->get_table_handle(tab_name);
         conds_ = conds;
         rids_ = rids;
         context_ = context;

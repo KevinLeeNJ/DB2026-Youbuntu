@@ -70,7 +70,6 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
     auto& lock_manager = instance.lock_manager();
     auto& log_manager = instance.log_manager();
     auto& txn_manager = instance.transaction_manager();
-    auto& sm_manager = instance.sm_manager();
     auto& schema_manager = instance.schema_manager();
     auto& analyze = instance.analyze();
     auto& optimizer = instance.optimizer();
@@ -335,7 +334,7 @@ int main(int argc, char** argv) {
         {
             std::atomic<bool> checkpoint_thread_stop{false};
             std::thread checkpoint_thread([&instance, &checkpoint_thread_stop] {
-                CheckpointManager checkpoint_mgr(&instance.transaction_manager(), &instance.sm_manager(),
+                CheckpointManager checkpoint_mgr(&instance.transaction_manager(), &instance.schema_manager(),
                                                  &instance.log_manager());
                 while (!checkpoint_thread_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));

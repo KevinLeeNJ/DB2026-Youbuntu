@@ -16,7 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "execution/execution.h"
 #include "parser/parser.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 #include "common/context.h"
 #include "transaction/transaction_manager.h"

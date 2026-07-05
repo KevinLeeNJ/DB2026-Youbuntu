@@ -25,11 +25,6 @@ Value convert_ast_value_node(const rmdb::parser::ast::Value* sv_val);
 // --- Column resolution ---
 const ColMeta* resolve_column_meta(const std::vector<ColMeta>& all_cols, TabCol& target);
 
-// --- Type checks ---
-bool can_cast_types(ColType lhs_type, ColType rhs_type);
-bool is_numeric_type(ColType type);
-bool is_groupable_type(ColType type);
-
 // --- Aggregate utilities ---
 std::string agg_type_to_string(AggType type);
 AggType convert_ast_agg_type(rmdb::parser::ast::AggFuncType type);

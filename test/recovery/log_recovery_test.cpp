@@ -15,7 +15,6 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
 #include "storage/buffer_pool_manager.h"
-#include "system/sm.h"
 #include "system/schema_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
@@ -73,13 +72,13 @@ void CreateRecoveryTestDb(const std::string& db_name) {
     bpm.set_wal_guard(&pager);
     RmManager rm_mgr(&disk, &bpm, &pager);
     IxManager ix_mgr(&disk, &bpm, &pager);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
+    SchemaManager schema_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
 
-    sm_mgr.create_db(db_name);
-    sm_mgr.open_db(db_name);
-    sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
-    sm_mgr.create_index("t", {"id"}, nullptr);
-    sm_mgr.close_db();
+    schema_mgr.create_db(db_name);
+    schema_mgr.open_db(db_name);
+    schema_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
+    schema_mgr.create_index("t", {"id"}, nullptr);
+    schema_mgr.close_db();
 }
 
 class OpenRecoveryDb {
@@ -87,14 +86,14 @@ public:
     explicit OpenRecoveryDb(const std::string& db_name)
         : bpm_(64, &disk_), log_mgr_(std::make_unique<LogManager>(&disk_)), pager_(&bpm_, log_mgr_.get()),
           rm_mgr_(&disk_, &bpm_, &pager_), ix_mgr_(&disk_, &bpm_, &pager_),
-          sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_, &pager_), schema_mgr_(&sm_mgr_) {
+          schema_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_, &pager_) {
         bpm_.set_wal_guard(&pager_);
-        sm_mgr_.open_db(db_name);
+        schema_mgr_.open_db(db_name);
     }
 
     ~OpenRecoveryDb() {
         if (opened_) {
-            sm_mgr_.close_db();
+            schema_mgr_.close_db();
         }
     }
 
@@ -104,7 +103,6 @@ public:
     rmdb::pager::Pager pager_;
     RmManager rm_mgr_;
     IxManager ix_mgr_;
-    SmManager sm_mgr_;
     SchemaManager schema_mgr_;
     bool opened_{true};
 };
@@ -199,26 +197,25 @@ TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     bpm.set_wal_guard(&pager);
     RmManager rm_mgr(&disk, &bpm, &pager);
     IxManager ix_mgr(&disk, &bpm, &pager);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
-    SchemaManager schema_mgr(&sm_mgr);
+    SchemaManager schema_mgr(&disk, &bpm, &rm_mgr, &ix_mgr, &pager);
 
-    sm_mgr.create_db("recovery_apply_test_db");
-    sm_mgr.open_db("recovery_apply_test_db");
-    sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
-    sm_mgr.create_index("t", {"id"}, nullptr);
+    schema_mgr.create_db("recovery_apply_test_db");
+    schema_mgr.open_db("recovery_apply_test_db");
+    schema_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
+    schema_mgr.create_index("t", {"id"}, nullptr);
 
     Rid rid{1, 0};
     auto rec1 = MakeTuple(1, 10);
     auto rec2 = MakeTuple(2, 20);
     auto* index = schema_mgr.get_index_handle("t", std::vector<std::string>{"id"});
 
-    sm_mgr.insert_record_with_indexes("t", rid, rec1);
+    schema_mgr.insert_record_with_indexes("t", rid, rec1);
     std::vector<Rid> result;
     EXPECT_TRUE(index->get_value(MakeIntKey(1).data(), &result, nullptr));
     ASSERT_EQ(result.size(), 1);
     EXPECT_EQ(result[0], rid);
 
-    sm_mgr.update_record_with_indexes("t", rid, rec1, rec2);
+    schema_mgr.update_record_with_indexes("t", rid, rec1, rec2);
     result.clear();
     EXPECT_FALSE(index->get_value(MakeIntKey(1).data(), &result, nullptr));
     result.clear();
@@ -226,12 +223,12 @@ TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     ASSERT_EQ(result.size(), 1);
     EXPECT_EQ(result[0], rid);
 
-    sm_mgr.delete_record_with_indexes("t", rid, rec2);
+    schema_mgr.delete_record_with_indexes("t", rid, rec2);
     result.clear();
     EXPECT_FALSE(index->get_value(MakeIntKey(2).data(), &result, nullptr));
     EXPECT_FALSE(schema_mgr.get_table_handle("t")->is_record(rid));
 
-    sm_mgr.close_db();
+    schema_mgr.close_db();
 }
 
 TEST(RecoveryManagerTest, CommittedInsertSurvivesRecovery) {
@@ -269,14 +266,14 @@ TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);
         FlushLogs(*db.log_mgr_);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
         // 模拟 executor_insert 写下的 MVCC meta：未提交、归属本事务。
         TupleMeta meta;
         meta.writer_txn_id_ = 100;
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
         db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, meta);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
@@ -296,8 +293,8 @@ TEST(RecoveryManagerTest, CommittedUpdateSurvivesRecovery) {
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
         AppendCommit(*db.log_mgr_, 100, update_lsn);
@@ -323,19 +320,19 @@ TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
         FlushLogs(*db.log_mgr_);
-        db.sm_mgr_.update_record_with_indexes("t", rid, old_rec, new_rec);
+        db.schema_mgr_.update_record_with_indexes("t", rid, old_rec, new_rec);
         // 模拟 executor_update 写下的 MVCC meta：未提交、归属本事务。
         TupleMeta meta;
         meta.writer_txn_id_ = 100;
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
         db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, meta);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
@@ -357,8 +354,8 @@ TEST(RecoveryManagerTest, AbortedUpdateDoesNotUndoLaterCommittedSameValueUpdate)
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
 
         auto loser_begin = AppendBegin(*db.log_mgr_, 100);
         auto loser_update = AppendUpdate(*db.log_mgr_, 100, loser_begin, rid, old_rec, new_rec);
@@ -387,8 +384,8 @@ TEST(RecoveryManagerTest, CommittedDeleteSurvivesRecovery) {
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         auto delete_lsn = AppendDelete(*db.log_mgr_, 100, begin_lsn, rid, rec);
         AppendCommit(*db.log_mgr_, 100, delete_lsn);
@@ -411,13 +408,13 @@ TEST(RecoveryManagerTest, UncommittedDeleteIsUndone) {
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         AppendDelete(*db.log_mgr_, 100, begin_lsn, rid, rec);
         FlushLogs(*db.log_mgr_);
-        db.sm_mgr_.delete_record_with_indexes("t", rid, rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.delete_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
@@ -437,8 +434,8 @@ TEST(RecoveryManagerTest, AbortedDeleteDoesNotRestoreLaterCommittedSameRowDelete
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
 
         auto loser_begin = AppendBegin(*db.log_mgr_, 100);
         auto loser_delete = AppendDelete(*db.log_mgr_, 100, loser_begin, rid, rec);
@@ -466,8 +463,8 @@ TEST(RecoveryManagerTest, UncommittedMvccDeleteTombstoneIsUndone) {
 
     {
         OpenRecoveryDb db(db_name);
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.flush_all_table_and_index_pages();
 
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         AppendDelete(*db.log_mgr_, 100, begin_lsn, rid, rec);
@@ -478,7 +475,7 @@ TEST(RecoveryManagerTest, UncommittedMvccDeleteTombstoneIsUndone) {
         tombstone.is_committed_ = false;
         tombstone.is_deleted_ = true;
         db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, tombstone);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
@@ -503,14 +500,14 @@ TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
         AppendAbort(*db.log_mgr_, 100, insert_lsn);
         FlushLogs(*db.log_mgr_);
 
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
         // 模拟 executor_insert 写下的 MVCC meta：未提交、归属本事务。
         TupleMeta meta;
         meta.writer_txn_id_ = 100;
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
         db.schema_mgr_.get_table_handle("t")->set_tuple_meta(rid, meta);
-        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.schema_mgr_.flush_all_table_and_index_pages();
     }
 
     RunRecovery(db_name);
@@ -531,9 +528,9 @@ TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
         OpenRecoveryDb db(db_name);
         LockManager lock_mgr;
         TransactionManager txn_mgr(&lock_mgr, &db.schema_mgr_);
-        CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, db.log_mgr_.get());
+        CheckpointManager checkpoint_mgr(&txn_mgr, &db.schema_mgr_, db.log_mgr_.get());
 
-        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        db.schema_mgr_.insert_record_with_indexes("t", rid, rec);
 
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
         auto insert_lsn = AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);

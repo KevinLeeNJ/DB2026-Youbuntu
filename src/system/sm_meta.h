@@ -21,6 +21,13 @@ See the Mulan PSL v2 for more details. */
 #include "sm_defs.h"
 
 namespace rmdb::system {
+/* DDL 列定义（Phase 6 从 sm_manager.h 迁入，供外部模块只依赖类型头） */
+struct ColDef {
+    std::string name; // Column name
+    ColType type;     // Type of column
+    int len;          // Length of column
+};
+
 /* 字段元数据 */
 struct ColMeta {
     std::string tab_name; // 字段所属表名称
@@ -215,6 +222,7 @@ public:
 } // namespace rmdb::system
 
 namespace rmdb {
+using system::ColDef;
 using system::ColMeta;
 using system::DbMeta;
 using system::IndexMeta;

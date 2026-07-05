@@ -18,7 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 
 namespace rmdb::exec {
@@ -26,7 +26,6 @@ class InsertExecutor : public AbstractExecutor {
 private:
     TabMeta tab_;               // 表的元数据
     std::vector<Value> values_; // 需要插入的数据
-    RmFileHandle* fh_;          // 表的数据文件句柄
     std::string tab_name_;      // 表名称
     Rid rid_; // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
     SchemaManager* schema_manager_;
@@ -43,13 +42,13 @@ public:
         if (values.size() != tab_.cols.size()) {
             throw InvalidValueCountError();
         }
-        fh_ = schema_manager_->get_table_handle(tab_name);
         context_ = context;
     };
 
     std::unique_ptr<RmRecord> Next() override {
         // 构造记录缓冲区，按列做类型转换。
-        RmRecord rec(fh_->get_file_hdr().record_size);
+        int record_size = tab_.cols.back().offset + tab_.cols.back().len;
+        RmRecord rec(record_size);
         for (size_t i = 0; i < values_.size(); i++) {
             auto& col = tab_.cols[i];
             auto& val = values_[i];

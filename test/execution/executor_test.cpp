@@ -25,7 +25,6 @@ using namespace rmdb;
 #include <memory>
 #include "gtest/gtest.h"
 #include "pager/pager.h"
-#include "system/sm_manager.h"
 #include "system/schema_manager.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
@@ -125,7 +124,6 @@ public:
     std::unique_ptr<rmdb::pager::Pager> pager_;
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
-    std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;
     bool db_opened_ = false;
@@ -137,29 +135,28 @@ public:
         buffer_pool_manager_->set_wal_guard(pager_.get());
         rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-        sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
-                                                  ix_manager_.get(), pager_.get());
-        schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
+                                                          rm_manager_.get(), ix_manager_.get(), pager_.get());
         write_service_ =
             std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), nullptr, nullptr, nullptr);
-        if (sm_manager_->is_dir(TEST_DB_NAME)) {
-            sm_manager_->drop_db(TEST_DB_NAME);
+        if (schema_manager_->is_dir(TEST_DB_NAME)) {
+            schema_manager_->drop_db(TEST_DB_NAME);
         }
     }
 
     void TearDown() override {
         if (db_opened_) {
-            sm_manager_->close_db();
+            schema_manager_->close_db();
             db_opened_ = false;
         }
-        if (sm_manager_->is_dir(TEST_DB_NAME)) {
-            sm_manager_->drop_db(TEST_DB_NAME);
+        if (schema_manager_->is_dir(TEST_DB_NAME)) {
+            schema_manager_->drop_db(TEST_DB_NAME);
         }
     }
 
     void setup_db() {
-        sm_manager_->create_db(TEST_DB_NAME);
-        sm_manager_->open_db(TEST_DB_NAME);
+        schema_manager_->create_db(TEST_DB_NAME);
+        schema_manager_->open_db(TEST_DB_NAME);
         db_opened_ = true;
     }
 
@@ -189,7 +186,7 @@ public:
 TEST_F(ExecutorTest, seq_scan_empty_table) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("empty_t", cols, nullptr);
+    schema_manager_->create_table("empty_t", cols, nullptr);
 
     char buf[4096];
     int offset = 0;
@@ -225,7 +222,7 @@ TEST_F(ExecutorTest, tombstone_candidates_are_deduplicated_and_removable) {
 TEST_F(ExecutorTest, seq_scan_all_records) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("t1", cols, nullptr);
+    schema_manager_->create_table("t1", cols, nullptr);
     insert_test_rows("t1", {10, 20, 30});
 
     char buf[4096];
@@ -247,7 +244,7 @@ TEST_F(ExecutorTest, seq_scan_all_records) {
 TEST_F(ExecutorTest, seq_scan_with_equality_condition) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("t2", cols, nullptr);
+    schema_manager_->create_table("t2", cols, nullptr);
     insert_test_rows("t2", {5, 10, 5, 15});
 
     char buf[4096];
@@ -276,7 +273,7 @@ TEST_F(ExecutorTest, seq_scan_with_equality_condition) {
 TEST_F(ExecutorTest, seq_scan_with_range_condition) {
     setup_db();
     auto cols = make_int_cols({"val"});
-    sm_manager_->create_table("t3", cols, nullptr);
+    schema_manager_->create_table("t3", cols, nullptr);
     insert_test_rows("t3", {1, 2, 3, 4, 5});
 
     char buf[4096];
@@ -305,7 +302,7 @@ TEST_F(ExecutorTest, seq_scan_with_range_condition) {
 TEST_F(ExecutorTest, seq_scan_no_matches) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("t4", cols, nullptr);
+    schema_manager_->create_table("t4", cols, nullptr);
     insert_test_rows("t4", {1, 2, 3});
 
     char buf[4096];
@@ -333,7 +330,7 @@ TEST_F(ExecutorTest, projection_subset_columns) {
         {"name", TYPE_STRING, 16},
         {"score", TYPE_INT, 4},
     };
-    sm_manager_->create_table("proj_t1", cols, nullptr);
+    schema_manager_->create_table("proj_t1", cols, nullptr);
 
     // Insert a row
     {
@@ -377,7 +374,7 @@ TEST_F(ExecutorTest, projection_subset_columns) {
 TEST_F(ExecutorTest, projection_all_columns) {
     setup_db();
     auto cols = make_int_cols({"a", "b"});
-    sm_manager_->create_table("proj_t2", cols, nullptr);
+    schema_manager_->create_table("proj_t2", cols, nullptr);
 
     {
         std::vector<Value> vals;
@@ -413,7 +410,7 @@ TEST_F(ExecutorTest, projection_all_columns) {
 TEST_F(ExecutorTest, projection_multiple_rows) {
     setup_db();
     auto cols = make_int_cols({"x"});
-    sm_manager_->create_table("proj_t3", cols, nullptr);
+    schema_manager_->create_table("proj_t3", cols, nullptr);
     insert_test_rows("proj_t3", {1, 2, 3});
 
     char buf[4096];
@@ -438,8 +435,8 @@ TEST_F(ExecutorTest, projection_multiple_rows) {
 TEST_F(ExecutorTest, nljoin_empty_left) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("join_left", cols, nullptr);
-    sm_manager_->create_table("join_right", cols, nullptr);
+    schema_manager_->create_table("join_left", cols, nullptr);
+    schema_manager_->create_table("join_right", cols, nullptr);
     // Left is empty, right has data
     insert_test_rows("join_right", {1, 2, 3});
 
@@ -458,8 +455,8 @@ TEST_F(ExecutorTest, nljoin_empty_left) {
 TEST_F(ExecutorTest, nljoin_empty_right) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("join_l2", cols, nullptr);
-    sm_manager_->create_table("join_r2", cols, nullptr);
+    schema_manager_->create_table("join_l2", cols, nullptr);
+    schema_manager_->create_table("join_r2", cols, nullptr);
     insert_test_rows("join_l2", {1, 2});
 
     char buf[4096];
@@ -477,8 +474,8 @@ TEST_F(ExecutorTest, nljoin_empty_right) {
 TEST_F(ExecutorTest, nljoin_cross_product) {
     setup_db();
     auto cols = make_int_cols({"x"});
-    sm_manager_->create_table("jl", cols, nullptr);
-    sm_manager_->create_table("jr", cols, nullptr);
+    schema_manager_->create_table("jl", cols, nullptr);
+    schema_manager_->create_table("jr", cols, nullptr);
     insert_test_rows("jl", {1, 2});
     insert_test_rows("jr", {10, 20, 30});
 
@@ -516,8 +513,8 @@ TEST_F(ExecutorTest, nljoin_cross_product) {
 TEST_F(ExecutorTest, nljoin_with_condition) {
     setup_db();
     auto cols = make_int_cols({"val"});
-    sm_manager_->create_table("jc_l", cols, nullptr);
-    sm_manager_->create_table("jc_r", cols, nullptr);
+    schema_manager_->create_table("jc_l", cols, nullptr);
+    schema_manager_->create_table("jc_r", cols, nullptr);
     insert_test_rows("jc_l", {1, 2, 3});
     insert_test_rows("jc_r", {1, 2, 4});
 
@@ -554,7 +551,7 @@ TEST_F(ExecutorTest, nljoin_with_condition) {
 TEST_F(ExecutorTest, delete_all_records) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("del_t1", cols, nullptr);
+    schema_manager_->create_table("del_t1", cols, nullptr);
     insert_test_rows("del_t1", {1, 2, 3});
 
     // Verify 3 records exist
@@ -603,7 +600,7 @@ TEST_F(ExecutorTest, delete_all_records) {
 TEST_F(ExecutorTest, seq_scan_rid_after_beginTuple) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("rid_t1", cols, nullptr);
+    schema_manager_->create_table("rid_t1", cols, nullptr);
     insert_test_rows("rid_t1", {10, 20, 30});
 
     char buf[4096];
@@ -626,7 +623,7 @@ TEST_F(ExecutorTest, seq_scan_rid_after_beginTuple) {
 TEST_F(ExecutorTest, update_single_field) {
     setup_db();
     auto cols = make_int_cols({"id"});
-    sm_manager_->create_table("upd_t1", cols, nullptr);
+    schema_manager_->create_table("upd_t1", cols, nullptr);
     insert_test_rows("upd_t1", {10, 20, 30});
 
     // Collect all Rids
@@ -671,7 +668,7 @@ TEST_F(ExecutorTest, update_single_field) {
 TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_commit) {
     setup_db();
     auto cols = make_int_cols({"id", "next_id"});
-    sm_manager_->create_table("rc_lost_update", cols, nullptr);
+    schema_manager_->create_table("rc_lost_update", cols, nullptr);
 
     {
         std::vector<Value> vals;
@@ -712,7 +709,7 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     int offset2 = 0;
     Context ctx2(&lock_manager, nullptr, txn2, buf2, &offset2, &txn_manager);
 
-    auto* fh = sm_manager_->fhs_.at("rc_lost_update").get();
+    auto* fh = schema_manager_->get_table_handle("rc_lost_update");
     auto txn2_old_rec = GetVisibleRecord(fh, rid, &ctx2);
     ASSERT_NE(txn2_old_rec, nullptr);
     ASSERT_EQ(*reinterpret_cast<int*>(txn2_old_rec->data + 4), 3020);
@@ -750,7 +747,7 @@ TEST_F(ExecutorTest, update_multiple_fields) {
         {"a", TYPE_INT, 4},
         {"b", TYPE_STRING, 16},
     };
-    sm_manager_->create_table("upd_t3", cols, nullptr);
+    schema_manager_->create_table("upd_t3", cols, nullptr);
 
     // Insert a row
     {
@@ -807,7 +804,7 @@ TEST_F(ExecutorTest, delete_with_condition_via_scan_rids) {
         {"id", TYPE_INT, 4},
         {"val", TYPE_INT, 4},
     };
-    sm_manager_->create_table("del_cond", cols, nullptr);
+    schema_manager_->create_table("del_cond", cols, nullptr);
     for (int i = 1; i <= 3; i++) {
         std::vector<Value> vals;
         Value v1;
@@ -865,7 +862,7 @@ TEST_F(ExecutorTest, update_with_condition_via_scan_rids) {
         {"id", TYPE_INT, 4},
         {"score", TYPE_INT, 4},
     };
-    sm_manager_->create_table("upd_cond", cols, nullptr);
+    schema_manager_->create_table("upd_cond", cols, nullptr);
     for (int i = 1; i <= 3; i++) {
         std::vector<Value> vals;
         Value v1;
@@ -933,7 +930,7 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
         {"id", TYPE_INT, 4},
         {"score", TYPE_FLOAT, 4},
     };
-    sm_manager_->create_table("upd_promo", cols, nullptr);
+    schema_manager_->create_table("upd_promo", cols, nullptr);
     {
         std::vector<Value> vals;
         Value v1;
@@ -985,7 +982,7 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
         {"id", TYPE_INT, 4},
         {"score", TYPE_FLOAT, 4},
     };
-    sm_manager_->create_table("upd_trunc", cols, nullptr);
+    schema_manager_->create_table("upd_trunc", cols, nullptr);
     {
         std::vector<Value> vals;
         Value v1;

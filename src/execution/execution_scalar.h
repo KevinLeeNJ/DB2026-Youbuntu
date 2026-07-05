@@ -20,13 +20,10 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 #include "errors.h"
+#include "common/type_utils.h"
 
 namespace rmdb::exec {
 namespace execution_scalar {
-
-inline bool is_numeric_type(ColType type) {
-    return type == TYPE_INT || type == TYPE_FLOAT;
-}
 
 inline std::size_t trimmed_string_length(const char* data, int len) {
     const void* terminator = std::memchr(data, '\0', static_cast<std::size_t>(len));

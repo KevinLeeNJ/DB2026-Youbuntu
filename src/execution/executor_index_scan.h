@@ -21,9 +21,12 @@ See the Mulan PSL v2 for more details. */
 #include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "access/cursor/index_cursor.h"
+#include "access/cursor/scan_cursor.h"
+#include "access/cursor/table_access.h"
+#include "access/cursor/table_cursor.h"
 #include "index/ix.h"
-#include "record/rm_scan.h"
-#include "system/sm.h"
+#include "system/sm_meta.h"
 #include "system/schema_manager.h"
 
 namespace rmdb::exec {
@@ -32,7 +35,6 @@ protected:
     std::string tab_name_;              // 表名称
     TabMeta tab_;                       // 表的元数据
     std::vector<Condition> conds_;      // 扫描条件
-    RmFileHandle* fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // 需要读取的字段
     size_t len_;                        // 选取出来的一条记录的长度
     std::vector<Condition> fed_conds_;  // 扫描条件，和conds_字段相同
@@ -42,12 +44,13 @@ protected:
     IndexMeta index_meta_;                     // index scan涉及到的索引元数据
 
     Rid rid_;
-    std::unique_ptr<RecScan> scan_;
+    std::unique_ptr<rmdb::access::ScanCursor> scan_; // table_iterator (IndexCursor 或 TableCursor)
     bool predicate_recorded_{false};
     bool use_heap_scan_for_mvcc_{false};
     std::unique_ptr<RmRecord> buffered_record_;
 
     SchemaManager* schema_manager_;
+    rmdb::access::TableAccess table_access_;
 
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -59,8 +62,8 @@ protected:
         if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, fed_conds_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
-        if (context_->txn_mgr_->CheckPredicateInvisibleWrites(context_->txn_->get_transaction_id(), tab_name_,
-                                                              fed_conds_, fh_, cols_)) {
+        if (table_access_.check_predicate_invisible_writes(context_, context_->txn_->get_transaction_id(), tab_name_,
+                                                           fed_conds_, cols_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
@@ -74,7 +77,7 @@ protected:
         txn_id_t reader_id = context_->txn_->get_transaction_id();
         txn_mgr->RecordRead(reader_id, tab_name_, rid);
 
-        TupleMeta meta = fh_->get_tuple_meta(rid);
+        TupleMeta meta = scan_->get_tuple_meta(rid);
         if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
             return;
         }
@@ -216,16 +219,15 @@ protected:
 
 public:
     IndexScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
-                      std::vector<std::string> index_col_names, Context* context) {
+                      std::vector<std::string> index_col_names, Context* context)
+        : table_access_(schema_manager) {
         schema_manager_ = schema_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
         tab_ = schema_manager_->catalog().get_table(tab_name_);
         conds_ = std::move(conds);
-        // index_no_ = index_no;
         index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
-        fh_ = schema_manager_->get_table_handle(tab_name_);
         cols_ = tab_.cols;
         len_ = cols_.back().offset + cols_.back().len;
 
@@ -247,13 +249,15 @@ public:
 
         use_heap_scan_for_mvcc_ = needs_historical_heap_scan();
         if (use_heap_scan_for_mvcc_) {
-            scan_ = std::make_unique<RmScan>(fh_);
+            auto table_cursor = table_access_.open_table_scan(tab_name_);
+            table_cursor->open();
+            scan_ = std::move(table_cursor);
             advance_to_match();
             return;
         }
 
-        auto ih = schema_manager_->get_index_handle(tab_name_, index_meta_.cols);
-        auto index_latch_guard = ih->lock_shared();
+        auto cursor = table_access_.open_index_scan(tab_name_, index_meta_.cols);
+        cursor->acquire_shared_lock();
         auto constraints = build_constraints();
 
         std::vector<char> lower_key(index_meta_.col_tot_len);
@@ -310,16 +314,8 @@ public:
             break;
         }
 
-        Iid lower, upper;
-        if (!lower_exclusive && upper_inclusive && lower_key == upper_key) {
-            auto [lo, hi] = ih->equal_range(lower_key.data());
-            lower = lo;
-            upper = hi;
-        } else {
-            lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
-            upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
-        }
-        scan_ = std::make_unique<IxScan>(ih, lower, upper, schema_manager_->get_bpm(), std::move(index_latch_guard));
+        cursor->open_range(lower_key, upper_key, lower_exclusive, upper_inclusive);
+        scan_ = std::move(cursor);
         advance_to_match();
     }
 
@@ -332,7 +328,7 @@ public:
         buffered_record_.reset();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = GetVisibleRecord(fh_, rid_, context_);
+            auto rec = scan_->get_visible_record(context_);
             if (rec == nullptr) {
                 scan_->next();
                 continue;
