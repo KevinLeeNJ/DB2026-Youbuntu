@@ -25,8 +25,8 @@ private:
     bool predicate_recorded_ = false;
 
     bool should_track_ssi_reads() const {
-        return context_ != nullptr && context_->enable_ssi_read_tracking_ && context_->txn_ != nullptr &&
-               context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr &&
+        return context_ != nullptr && context_->enable_ssi_read_tracking && context_->txn != nullptr &&
+               context_->txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr != nullptr &&
                !scan_table_name().empty();
     }
 
@@ -35,8 +35,8 @@ private:
             return;
         }
         predicate_recorded_ = true;
-        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, scan_table_name(), scan_conditions())) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+        if (context_->txn_mgr->RecordPredicateRead(context_->txn, scan_table_name(), scan_conditions())) {
+            throw TransactionAbortException(context_->txn->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
 
@@ -76,29 +76,29 @@ public:
 
     void beginTuple() override {
         record_predicate_read();
-        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking_ : false;
+        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking : false;
         bool suppress_child_tracking = should_track_ssi_reads();
         if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = false;
+            context_->enable_ssi_read_tracking = false;
         }
         prev_->beginTuple();
         if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = old_tracking;
+            context_->enable_ssi_read_tracking = old_tracking;
         }
         advance_to_match();
     }
 
     void nextTuple() override {
-        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking_ : false;
+        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking : false;
         bool suppress_child_tracking = should_track_ssi_reads();
         if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = false;
+            context_->enable_ssi_read_tracking = false;
         }
         if (!prev_->is_end()) {
             prev_->nextTuple();
         }
         if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = old_tracking;
+            context_->enable_ssi_read_tracking = old_tracking;
         }
         advance_to_match();
     }

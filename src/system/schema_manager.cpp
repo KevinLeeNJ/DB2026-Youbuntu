@@ -62,34 +62,36 @@ void SchemaManager::close_db() {
 void SchemaManager::flush_meta() {
     sm_manager_->flush_meta();
 }
-void SchemaManager::show_tables(Context* context) {
-    sm_manager_->show_tables(context);
+void SchemaManager::show_tables(OutputSink* sink) {
+    sm_manager_->show_tables(sink);
 }
-void SchemaManager::show_index(const std::string& tab_name, Context* context) {
-    sm_manager_->show_index(tab_name, context);
+void SchemaManager::show_index(const std::string& tab_name, OutputSink* sink) {
+    sm_manager_->show_index(tab_name, sink);
 }
-void SchemaManager::desc_table(const std::string& tab_name, Context* context) {
-    sm_manager_->desc_table(tab_name, context);
+void SchemaManager::desc_table(const std::string& tab_name, OutputSink* sink) {
+    sm_manager_->desc_table(tab_name, sink);
 }
-void SchemaManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
+void SchemaManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs,
+                                 StatementContext* context) {
     sm_manager_->create_table(tab_name, col_defs, context);
     catalog_.bump_schema_version();
 }
-void SchemaManager::drop_table(const std::string& tab_name, Context* context) {
+void SchemaManager::drop_table(const std::string& tab_name, StatementContext* context) {
     sm_manager_->drop_table(tab_name, context);
     catalog_.bump_schema_version();
 }
 void SchemaManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names,
-                                 Context* context) {
+                                 StatementContext* context) {
     sm_manager_->create_index(tab_name, col_names, context);
     catalog_.bump_schema_version();
 }
 void SchemaManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names,
-                               Context* context) {
+                               StatementContext* context) {
     sm_manager_->drop_index(tab_name, col_names, context);
     catalog_.bump_schema_version();
 }
-void SchemaManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context) {
+void SchemaManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names,
+                               StatementContext* context) {
     sm_manager_->drop_index(tab_name, col_names, context);
     catalog_.bump_schema_version();
 }
@@ -168,7 +170,8 @@ void SchemaManager::reset_all_tuple_meta_after_recovery() {
 void SchemaManager::mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
     sm_manager_->mark_slots_committed(txn, commit_ts);
 }
-void SchemaManager::load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context) {
+void SchemaManager::load_csv_data(const std::string& file_path, const std::string& tab_name,
+                                  StatementContext* context) {
     sm_manager_->load_csv_data(file_path, tab_name, context);
 }
 

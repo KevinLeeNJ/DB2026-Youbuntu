@@ -24,20 +24,20 @@ See the Mulan PSL v2 for more details. */
 #include "access/recovery_access.h"
 #include "access/table_write_service.h"
 #include "common/config.h"
-#include "common/context.h"
 #include "errors.h"
-#include "execution/execution_manager.h"
 #include "gtest/gtest.h"
 #include "index/ix_manager.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "pager/pager.h"
 #include "parser/parser.h"
-#include "portal.h"
 #include "record/rm_manager.h"
 #include "record/rm_scan.h"
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
+#include "server/output_sink.h"
+#include "statement/statement_context.h"
+#include "statement/statement_runner.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
 #include "system/schema_manager.h"
@@ -85,9 +85,8 @@ public:
                                                                            log_manager_.get(), txn_manager_.get());
         load_data_service_ =
             std::make_unique<rmdb::access::LoadDataService>(schema_manager_.get(), write_service_.get());
-        ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(),
-                                                  static_cast<Planner*>(nullptr), load_data_service_.get());
-        portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
+        statement_runner_ = std::make_unique<StatementRunner>(
+            schema_manager_.get(), write_service_.get(), planner_.get(), load_data_service_.get(), txn_manager_.get());
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
         // Create and open the database
@@ -129,7 +128,10 @@ public:
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
-        Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
+        StatementContext stmt_ctx;
+        stmt_ctx.lock_mgr = lock_manager_.get();
+        stmt_ctx.log_mgr = log_manager_.get();
+        stmt_ctx.txn_mgr = txn_manager_.get();
         // output_file toggle is now a database-global on SmManager; no per-session
         // mirror needed here.
 
@@ -138,29 +140,28 @@ public:
         try {
             parse_tree = rmdb::parser::ast::parse_sql(sql);
         } catch (...) {
-            abort_implicit_statement(&context);
+            abort_implicit_statement(&stmt_ctx);
             throw RMDBError("Parse error for: " + sql);
         }
         if (parse_tree == nullptr) {
-            finish_statement(&context);
+            finish_statement(&stmt_ctx);
             return ""; // EXIT or EOF
         }
         bool is_checkpoint = parse_tree->type == rmdb::parser::ast::AstType::StaticCheckpoint;
         bool is_load = parse_tree->type == rmdb::parser::ast::AstType::LoadStmt;
         if (!is_checkpoint && !is_load) {
-            set_transaction(&context);
+            set_transaction(&stmt_ctx);
         }
 
-        // Analyze → Optimize → Portal → Execute
+        // Analyze → Optimize → StatementRunner → Execute
         try {
             std::unique_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
-            std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query), &context);
-            std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
-            portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
-            portal_->drop();
-            finish_statement(&context);
+            std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query));
+            OutputSink sink{data_send, &offset, false};
+            statement_runner_->run(std::move(plan), &stmt_ctx, &sink, &txn_id_);
+            finish_statement(&stmt_ctx);
         } catch (...) {
-            abort_implicit_statement(&context);
+            abort_implicit_statement(&stmt_ctx);
             throw;
         }
 
@@ -198,33 +199,33 @@ public:
     }
 
 private:
-    void set_transaction(Context* context) {
-        context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
-        if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
-            context->txn_->get_state() == TransactionState::ABORTED) {
-            context->txn_ = txn_manager_->begin(nullptr, context->log_mgr_, context->isolation_level_);
-            txn_id_ = context->txn_->get_transaction_id();
-            context->txn_->set_txn_mode(false);
+    void set_transaction(StatementContext* stmt_ctx) {
+        stmt_ctx->txn = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
+        if (stmt_ctx->txn == nullptr || stmt_ctx->txn->get_state() == TransactionState::COMMITTED ||
+            stmt_ctx->txn->get_state() == TransactionState::ABORTED) {
+            stmt_ctx->txn = txn_manager_->begin(nullptr, stmt_ctx->log_mgr, stmt_ctx->isolation_level);
+            txn_id_ = stmt_ctx->txn->get_transaction_id();
+            stmt_ctx->txn->set_txn_mode(false);
         }
-        txn_manager_->BeginStatement(context->txn_);
+        txn_manager_->BeginStatement(stmt_ctx->txn);
     }
 
-    void finish_statement(Context* context) {
-        if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager_->commit(context->txn_, context->log_mgr_);
+    void finish_statement(StatementContext* stmt_ctx) {
+        if (stmt_ctx->txn != nullptr && !stmt_ctx->txn->get_txn_mode() &&
+            stmt_ctx->txn->get_state() != TransactionState::COMMITTED &&
+            stmt_ctx->txn->get_state() != TransactionState::ABORTED) {
+            txn_manager_->commit(stmt_ctx->txn, stmt_ctx->log_mgr);
         }
-        context->txn_ = nullptr;
+        stmt_ctx->txn = nullptr;
     }
 
-    void abort_implicit_statement(Context* context) {
-        if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager_->abort(context->txn_, context->log_mgr_);
+    void abort_implicit_statement(StatementContext* stmt_ctx) {
+        if (stmt_ctx->txn != nullptr && !stmt_ctx->txn->get_txn_mode() &&
+            stmt_ctx->txn->get_state() != TransactionState::COMMITTED &&
+            stmt_ctx->txn->get_state() != TransactionState::ABORTED) {
+            txn_manager_->abort(stmt_ctx->txn, stmt_ctx->log_mgr);
         }
-        context->txn_ = nullptr;
+        stmt_ctx->txn = nullptr;
     }
 
     std::string db_name_;
@@ -246,8 +247,7 @@ private:
     std::unique_ptr<RecoveryManager> recovery_;
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;
     std::unique_ptr<rmdb::access::LoadDataService> load_data_service_;
-    std::unique_ptr<QlManager> ql_manager_;
-    std::unique_ptr<Portal> portal_;
+    std::unique_ptr<StatementRunner> statement_runner_;
     std::unique_ptr<Analyze> analyze_;
 };
 

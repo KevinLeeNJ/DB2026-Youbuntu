@@ -15,10 +15,11 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "catalog/catalog.h"
-#include "common/context.h"
 #include "record/rm_file_handle.h"
+#include "server/output_sink.h"
 #include "sm_defs.h"
 #include "sm_meta.h"
+#include "statement/statement_context.h"
 
 namespace rmdb::index {
 class IxManager;
@@ -74,14 +75,15 @@ public:
     void open_db(const std::string& db_name);
     void close_db();
     void flush_meta();
-    void show_tables(Context* context);
-    void show_index(const std::string& tab_name, Context* context);
-    void desc_table(const std::string& tab_name, Context* context);
-    void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context);
-    void drop_table(const std::string& tab_name, Context* context);
-    void create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
-    void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
-    void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+    void show_tables(OutputSink* sink);
+    void show_index(const std::string& tab_name, OutputSink* sink);
+    void desc_table(const std::string& tab_name, OutputSink* sink);
+    void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, StatementContext* context);
+    void drop_table(const std::string& tab_name, StatementContext* context);
+    void create_index(const std::string& tab_name, const std::vector<std::string>& col_names,
+                      StatementContext* context);
+    void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, StatementContext* context);
+    void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, StatementContext* context);
 
     // ---- 窄句柄接口（不暴露容器）----
     /// 获取表数据文件句柄。表不存在则抛异常。
@@ -115,7 +117,7 @@ public:
     void rebuild_all_indexes();
     void reset_all_tuple_meta_after_recovery();
     void mark_slots_committed(Transaction& txn, timestamp_t commit_ts);
-    void load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context);
+    void load_csv_data(const std::string& file_path, const std::string& tab_name, StatementContext* context);
 
 private:
     std::unique_ptr<SmManager> sm_manager_;

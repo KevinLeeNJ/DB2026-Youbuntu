@@ -66,7 +66,7 @@ const char* IndexCursor::key() const {
     return scan_->key();
 }
 
-std::unique_ptr<RmRecord> IndexCursor::get_visible_record(rmdb::Context* context) {
+std::unique_ptr<RmRecord> IndexCursor::get_visible_record(rmdb::statement::StatementContext* context) {
     return GetVisibleRecord(fh_, scan_->rid(), context);
 }
 
@@ -78,7 +78,7 @@ bool IndexCursor::is_record(const Rid& rid) const {
     return fh_->is_record(rid);
 }
 
-std::unique_ptr<RmRecord> IndexCursor::get_record(const Rid& rid, rmdb::Context* context) const {
+std::unique_ptr<RmRecord> IndexCursor::get_record(const Rid& rid, rmdb::statement::StatementContext* context) const {
     return fh_->get_record(rid, context);
 }
 

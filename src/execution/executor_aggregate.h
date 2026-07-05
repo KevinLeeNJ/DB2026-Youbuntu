@@ -104,7 +104,7 @@ private:
     struct has_member_agg<T, std::void_t<decltype(std::declval<const T&>().agg)>> : std::true_type {};
 
     std::unique_ptr<AbstractExecutor> prev_;
-    Context* context_ = nullptr;
+    StatementContext* context_ = nullptr;
     std::vector<ColMeta> cols_;
     size_t len_ = 0;
     std::vector<ColMeta> group_cols_;
@@ -627,7 +627,7 @@ public:
     template <typename GroupByT, typename AggExprT, typename HavingCondT>
     AggregateExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<GroupByT>& group_by_cols,
                       const std::vector<AggExprT>& aggregate_exprs, const std::vector<HavingCondT>& having_conds,
-                      Context* context = nullptr)
+                      StatementContext* context = nullptr)
         : prev_(std::move(prev)), context_(context) {
         init_group_cols(group_by_cols);
         init_aggregate_cols(aggregate_exprs);

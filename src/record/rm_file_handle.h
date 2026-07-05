@@ -17,8 +17,8 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 
 #include "bitmap.h"
-#include "common/context.h"
 #include "rm_defs.h"
+#include "statement/statement_context.h"
 
 namespace rmdb::record {
 class RmManager;
@@ -102,13 +102,13 @@ public:
         return is_record;
     }
 
-    std::unique_ptr<RmRecord> get_record(const Rid& rid, Context* context) const;
+    std::unique_ptr<RmRecord> get_record(const Rid& rid, StatementContext* context) const;
 
     /* Fetch both TupleMeta and record data in a single page pin, halving the
        buffer-pool latch acquisitions compared to get_tuple_meta + get_record. */
-    RmRecordWithMeta get_record_with_meta(const Rid& rid, Context* context) const;
+    RmRecordWithMeta get_record_with_meta(const Rid& rid, StatementContext* context) const;
 
-    Rid insert_record(char* buf, Context* context);
+    Rid insert_record(char* buf, StatementContext* context);
 
     void insert_record(const Rid& rid, char* buf);
 
@@ -118,9 +118,9 @@ public:
 
     void abort_prepared_insert(RmPinnedInsert& insert);
 
-    void delete_record(const Rid& rid, Context* context);
+    void delete_record(const Rid& rid, StatementContext* context);
 
-    void update_record(const Rid& rid, char* buf, Context* context);
+    void update_record(const Rid& rid, char* buf, StatementContext* context);
 
     RmPageHandle create_new_page_handle();
 

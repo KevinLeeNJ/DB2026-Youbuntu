@@ -333,23 +333,27 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     schema_mgr.create_index("t", {"id"}, nullptr);
 
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr);
-    Context context(&lock_mgr, &log_mgr, txn, nullptr, &const_offset, &txn_mgr);
+    StatementContext scontext;
+    scontext.lock_mgr = &lock_mgr;
+    scontext.log_mgr = &log_mgr;
+    scontext.txn = txn;
+    scontext.txn_mgr = &txn_mgr;
 
     Value id;
     id.set_int(1);
     Value v;
     v.set_int(10);
-    InsertExecutor insert_executor(&schema_mgr, &write_svc, "t", {id, v}, &context);
+    InsertExecutor insert_executor(&schema_mgr, &write_svc, "t", {id, v}, &scontext);
     insert_executor.Next();
     Rid rid = insert_executor.rid();
 
     Value new_v;
     new_v.set_int(20);
     SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT};
-    UpdateExecutor update_executor(&schema_mgr, &write_svc, "t", {set_clause}, {}, {rid}, &context);
+    UpdateExecutor update_executor(&schema_mgr, &write_svc, "t", {set_clause}, {}, {rid}, &scontext);
     update_executor.Next();
 
-    DeleteExecutor delete_executor(&schema_mgr, &write_svc, "t", {}, {rid}, &context);
+    DeleteExecutor delete_executor(&schema_mgr, &write_svc, "t", {}, {rid}, &scontext);
     delete_executor.Next();
 
     txn_mgr.commit(txn, &log_mgr);

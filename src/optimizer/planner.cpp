@@ -19,15 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <set>
 #include <sstream>
 
-#include "execution/executor_delete.h"
-#include "execution/executor_index_scan.h"
-#include "execution/executor_insert.h"
-#include "execution/executor_nestedloop_join.h"
-#include "execution/executor_projection.h"
-#include "execution/executor_seq_scan.h"
-#include "execution/executor_update.h"
 #include "index/ix.h"
-#include "record_printer.h"
 
 namespace rmdb::optimizer {
 namespace {
@@ -586,8 +578,7 @@ std::unique_ptr<Plan> pop_scan(std::vector<int>& scantbl, std::string table, std
     return nullptr;
 }
 
-std::unique_ptr<Query> Planner::logical_optimization(std::unique_ptr<Query> query, Context* context) {
-    (void)context;
+std::unique_ptr<Query> Planner::logical_optimization(std::unique_ptr<Query> query) {
     std::stable_sort(query->conds.begin(), query->conds.end(), [](const Condition& lhs, const Condition& rhs) {
         return condition_sort_key(lhs) < condition_sort_key(rhs);
     });
@@ -595,8 +586,7 @@ std::unique_ptr<Query> Planner::logical_optimization(std::unique_ptr<Query> quer
     return query;
 }
 
-std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* context) {
-    (void)context;
+std::unique_ptr<Plan> Planner::physical_optimization(Query* query) {
     std::map<std::string, std::vector<Condition>> table_filters;
     std::vector<Condition> join_conds;
     for (const auto& cond : query->conds) {
@@ -914,12 +904,12 @@ std::unique_ptr<Plan> Planner::generate_limit_plan(const Query* query, std::uniq
  * @param tab_names select plan 目标的表
  * @param conds select plan 选取条件
  */
-std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query, Context* context) {
+std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query) {
     // 逻辑优化
-    query = logical_optimization(std::move(query), context);
+    query = logical_optimization(std::move(query));
 
     // scan / join
-    std::unique_ptr<Plan> plannerRoot = physical_optimization(query.get(), context);
+    std::unique_ptr<Plan> plannerRoot = physical_optimization(query.get());
 
     // aggregate / group by / having
     if (needs_aggregate_plan(*query)) {
@@ -941,11 +931,11 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
     return plannerRoot;
 }
 
-std::unique_ptr<Plan> Planner::generate_union_plan(std::unique_ptr<Query> query, Context* context) {
+std::unique_ptr<Plan> Planner::generate_union_plan(std::unique_ptr<Query> query) {
     std::vector<std::unique_ptr<Plan>> branch_plans;
     branch_plans.reserve(query->union_branches.size());
     for (auto& branch_query : query->union_branches) {
-        branch_plans.push_back(generate_select_plan(std::move(branch_query), context));
+        branch_plans.push_back(generate_select_plan(std::move(branch_query)));
     }
 
     std::unique_ptr<Plan> plannerRoot =
@@ -958,7 +948,7 @@ std::unique_ptr<Plan> Planner::generate_union_plan(std::unique_ptr<Query> query,
 }
 
 // 生成DDL语句和DML语句的查询执行计划
-std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context* context) {
+std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query) {
     std::unique_ptr<Plan> plannerRoot;
     auto* parse = query->parse.get();
     if (parse == nullptr) {
@@ -1057,20 +1047,20 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     }
     case rmdb::parser::ast::AstType::SelectStmt: {
         // 生成select语句的查询执行计划
-        std::unique_ptr<Plan> projection = generate_select_plan(std::move(query), context);
+        std::unique_ptr<Plan> projection = generate_select_plan(std::move(query));
         plannerRoot = std::make_unique<DMLPlan>(T_select, std::move(projection), std::string(), std::vector<Value>(),
                                                 std::vector<Condition>(), std::vector<SetClause>());
         break;
     }
     case rmdb::parser::ast::AstType::ExplainAnalyze: {
-        std::unique_ptr<Plan> projection = generate_select_plan(std::move(query), context);
+        std::unique_ptr<Plan> projection = generate_select_plan(std::move(query));
         plannerRoot =
             std::make_unique<DMLPlan>(T_ExplainAnalyze, std::move(projection), std::string(), std::vector<Value>(),
                                       std::vector<Condition>(), std::vector<SetClause>());
         break;
     }
     case rmdb::parser::ast::AstType::SelectFromUnionStmt: {
-        std::unique_ptr<Plan> union_plan = generate_union_plan(std::move(query), context);
+        std::unique_ptr<Plan> union_plan = generate_union_plan(std::move(query));
         plannerRoot = std::make_unique<DMLPlan>(T_select, std::move(union_plan), std::string(), std::vector<Value>(),
                                                 std::vector<Condition>(), std::vector<SetClause>());
         break;

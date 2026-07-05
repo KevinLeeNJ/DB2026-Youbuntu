@@ -14,9 +14,9 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "expression_evaluator.h"
 #include "common/common.h"
-#include "common/context.h"
 #include "common/type_utils.h"
 #include "index/ix.h"
+#include "statement/statement_context.h"
 #include "system/sm_meta.h"
 
 namespace rmdb::exec {
@@ -24,7 +24,7 @@ class AbstractExecutor {
 public:
     Rid _abstract_rid;
 
-    Context* context_ = nullptr;
+    StatementContext* context_ = nullptr;
 
     virtual ~AbstractExecutor() = default;
 

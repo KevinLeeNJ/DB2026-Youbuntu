@@ -13,7 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 
 #include "common/common.h"
-#include "common/context.h"
+#include "statement/statement_context.h"
 #include "record/rm_defs.h"
 #include "system/sm_meta.h"
 
@@ -31,7 +31,7 @@ public:
     virtual Rid rid() const = 0;
 
     /// 读取当前 rid 对应的 MVCC 可见记录（不可见返回 nullptr）。
-    virtual std::unique_ptr<RmRecord> get_visible_record(rmdb::Context* context) = 0;
+    virtual std::unique_ptr<RmRecord> get_visible_record(rmdb::statement::StatementContext* context) = 0;
 
     /// 读取指定 rid 的 TupleMeta（SSI 追踪用）。
     virtual TupleMeta get_tuple_meta(const Rid& rid) const = 0;
@@ -40,7 +40,7 @@ public:
     virtual bool is_record(const Rid& rid) const = 0;
 
     /// 读取指定 rid 的物理记录（不经 MVCC 过滤）。
-    virtual std::unique_ptr<RmRecord> get_record(const Rid& rid, rmdb::Context* context) const = 0;
+    virtual std::unique_ptr<RmRecord> get_record(const Rid& rid, rmdb::statement::StatementContext* context) const = 0;
 };
 
 } // namespace rmdb::access

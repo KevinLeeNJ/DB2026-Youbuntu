@@ -23,7 +23,10 @@ See the Mulan PSL v2 for more details. */
 #include "instance/db_instance.h"
 #include "minilog.h"
 #include "recovery/checkpoint_manager.h"
+#include "server/output_sink.h"
 #include "server/session.h"
+#include "statement/statement_context.h"
+#include "statement/statement_runner.h"
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 8
@@ -47,17 +50,17 @@ void sigint_handler(int signo) {
 }
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(rmdb::server::Session& session, Context* context, rmdb::instance::DBInstance& instance) {
+void SetTransaction(rmdb::server::Session& session, StatementContext* stmt_ctx, rmdb::instance::DBInstance& instance) {
     auto& txn_manager = instance.transaction_manager();
-    context->txn_ = txn_manager.get_transaction(session.txn_id());
-    if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
-        context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager.begin(nullptr, context->log_mgr_, context->isolation_level_);
-        session.set_txn_id(context->txn_->get_transaction_id());
-        context->txn_->set_txn_mode(false);
-        context->txn_->set_isolation_level(context->isolation_level_);
+    stmt_ctx->txn = txn_manager.get_transaction(session.txn_id());
+    if (stmt_ctx->txn == nullptr || stmt_ctx->txn->get_state() == TransactionState::COMMITTED ||
+        stmt_ctx->txn->get_state() == TransactionState::ABORTED) {
+        stmt_ctx->txn = txn_manager.begin(nullptr, stmt_ctx->log_mgr, stmt_ctx->isolation_level);
+        session.set_txn_id(stmt_ctx->txn->get_transaction_id());
+        stmt_ctx->txn->set_txn_mode(false);
+        stmt_ctx->txn->set_isolation_level(stmt_ctx->isolation_level);
     }
-    txn_manager.BeginStatement(context->txn_);
+    txn_manager.BeginStatement(stmt_ctx->txn);
 }
 
 void client_handler(int fd, rmdb::instance::DBInstance& instance) {
@@ -73,8 +76,7 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
     auto& schema_manager = instance.schema_manager();
     auto& analyze = instance.analyze();
     auto& optimizer = instance.optimizer();
-    auto& ql_manager = instance.ql_manager();
-    auto& portal = instance.portal();
+    auto& statement_runner = instance.statement_runner();
 
     LOG_INFO("establish client connection, sockfd: %d", fd);
 
@@ -110,11 +112,13 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
         char* data_send = session.data_send();
         int* offset_ptr = session.offset_ptr();
 
-        // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        auto _context =
-            std::make_unique<Context>(&lock_manager, &log_manager, nullptr, data_send, offset_ptr, &txn_manager);
-        Context* context = _context.get();
-        context->isolation_level_ = session.isolation_level();
+        // 语句级内核上下文：事务对象、锁/日志/事务管理器引用、隔离级别。
+        // 输出缓冲由 server::Session 拥有，经 OutputSink 传入 StatementRunner。
+        StatementContext stmt_ctx;
+        stmt_ctx.lock_mgr = &lock_manager;
+        stmt_ctx.log_mgr = &log_manager;
+        stmt_ctx.txn_mgr = &txn_manager;
+        stmt_ctx.isolation_level = session.isolation_level();
 
         std::unique_ptr<rmdb::parser::ast::TreeNode> parse_tree;
         try {
@@ -135,28 +139,27 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
                 bool is_checkpoint = parsed_type == rmdb::parser::ast::AstType::StaticCheckpoint;
                 bool is_load = parsed_type == rmdb::parser::ast::AstType::LoadStmt;
                 if (!is_checkpoint && !is_load) {
-                    SetTransaction(session, context, instance);
+                    SetTransaction(session, &stmt_ctx, instance);
                 }
                 // analyze and rewrite
                 std::unique_ptr<Query> query = analyze.do_analyze(std::move(parse_tree));
                 LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                 // 优化器
-                std::unique_ptr<Plan> plan = optimizer.plan_query(std::move(query), context);
-                // portal
-                std::unique_ptr<PortalStmt> portalStmt = portal.start(std::move(plan), context);
-                portal.run(std::move(portalStmt), &ql_manager, session.txn_id_ptr(), context);
+                std::unique_ptr<Plan> plan = optimizer.plan_query(std::move(query));
+                // StatementRunner 接管命令分发
+                OutputSink sink{data_send, offset_ptr, false};
+                statement_runner.run(std::move(plan), &stmt_ctx, &sink, session.txn_id_ptr());
                 // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
-                session.set_isolation_level(context->isolation_level_);
+                session.set_isolation_level(stmt_ctx.isolation_level);
                 // Note: "set output_file on|off" is a database-global toggle stored
-                // on SmManager (see execution_manager.cpp T_SetOutputFile), so it
+                // on SmManager (see statement_runner.cpp T_SetOutputFile), so it
                 // persists across connections without per-session mirroring here.
-                portal.drop();
-                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                    context->txn_->get_state() != TransactionState::COMMITTED &&
-                    context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager.commit(context->txn_, context->log_mgr_);
+                if (stmt_ctx.txn != nullptr && !stmt_ctx.txn->get_txn_mode() &&
+                    stmt_ctx.txn->get_state() != TransactionState::COMMITTED &&
+                    stmt_ctx.txn->get_state() != TransactionState::ABORTED) {
+                    txn_manager.commit(stmt_ctx.txn, stmt_ctx.log_mgr);
                 }
-                context->txn_ = nullptr;
+                stmt_ctx.txn = nullptr;
             } catch (TransactionAbortException& e) {
                 // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                 std::string str = "abort\n";
@@ -165,11 +168,11 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
                 *offset_ptr = str.length();
 
                 // 回滚事务
-                if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
-                    context->txn_->get_state() != TransactionState::COMMITTED) {
-                    txn_manager.abort(context->txn_, &log_manager);
+                if (stmt_ctx.txn != nullptr && stmt_ctx.txn->get_state() != TransactionState::ABORTED &&
+                    stmt_ctx.txn->get_state() != TransactionState::COMMITTED) {
+                    txn_manager.abort(stmt_ctx.txn, &log_manager);
                 }
-                context->txn_ = nullptr;
+                stmt_ctx.txn = nullptr;
                 LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
                 if (schema_manager.output_file_enabled()) {
@@ -187,12 +190,12 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
                 data_send[e.get_msg_len() + 1] = '\0';
                 *offset_ptr = e.get_msg_len() + 1;
 
-                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                    context->txn_->get_state() != TransactionState::COMMITTED &&
-                    context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager.abort(context->txn_, context->log_mgr_);
+                if (stmt_ctx.txn != nullptr && !stmt_ctx.txn->get_txn_mode() &&
+                    stmt_ctx.txn->get_state() != TransactionState::COMMITTED &&
+                    stmt_ctx.txn->get_state() != TransactionState::ABORTED) {
+                    txn_manager.abort(stmt_ctx.txn, stmt_ctx.log_mgr);
                 }
-                context->txn_ = nullptr;
+                stmt_ctx.txn = nullptr;
 
                 // 将报错信息写入output.txt
                 if (schema_manager.output_file_enabled()) {
@@ -204,12 +207,12 @@ void client_handler(int fd, rmdb::instance::DBInstance& instance) {
             } catch (const std::exception& e) {
                 LOG_ERROR("%s", e.what());
 
-                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                    context->txn_->get_state() != TransactionState::COMMITTED &&
-                    context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager.abort(context->txn_, context->log_mgr_);
+                if (stmt_ctx.txn != nullptr && !stmt_ctx.txn->get_txn_mode() &&
+                    stmt_ctx.txn->get_state() != TransactionState::COMMITTED &&
+                    stmt_ctx.txn->get_state() != TransactionState::ABORTED) {
+                    txn_manager.abort(stmt_ctx.txn, stmt_ctx.log_mgr);
                 }
-                context->txn_ = nullptr;
+                stmt_ctx.txn = nullptr;
 
                 const char* msg = e.what();
                 int msg_len = strlen(msg);

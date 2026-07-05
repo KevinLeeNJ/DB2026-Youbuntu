@@ -27,13 +27,14 @@ auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const T
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction* txn) -> bool;
 
-inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid, rmdb::Context* context) {
-    if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
+inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid,
+                                                  rmdb::statement::StatementContext* context) {
+    if (context == nullptr || context->txn == nullptr || context->txn_mgr == nullptr) {
         return fh->get_record(rid, context);
     }
 
-    auto* txn = context->txn_;
-    auto* txn_mgr = context->txn_mgr_;
+    auto* txn = context->txn;
+    auto* txn_mgr = context->txn_mgr;
     const timestamp_t read_ts =
         txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
     const txn_id_t self_id = txn->get_transaction_id();
@@ -100,13 +101,14 @@ inline bool RecordDataEquals(const RmRecord& lhs, const RmRecord& rhs) {
 }
 
 inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, const std::string& tab_name,
-                                                     const RmRecord& inserted_rec, rmdb::Context* context) {
-    if (fh == nullptr || context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
+                                                     const RmRecord& inserted_rec,
+                                                     rmdb::statement::StatementContext* context) {
+    if (fh == nullptr || context == nullptr || context->txn == nullptr || context->txn_mgr == nullptr) {
         return false;
     }
 
-    auto& ssi = context->txn_mgr_->ssi_registry();
-    auto* txn = context->txn_;
+    auto& ssi = context->txn_mgr->ssi_registry();
+    auto* txn = context->txn;
     auto candidate_rids = ssi.get_deleted_tuple_candidates(tab_name);
     for (const auto& rid : candidate_rids) {
         if (!fh->is_record(rid)) {
@@ -137,12 +139,13 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, const std
 }
 
 inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid, const IndexMeta& index,
-                                               const std::vector<char>& key, rmdb::Context* context) {
-    if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr || !fh->is_record(rid)) {
+                                               const std::vector<char>& key,
+                                               rmdb::statement::StatementContext* context) {
+    if (context == nullptr || context->txn == nullptr || context->txn_mgr == nullptr || !fh->is_record(rid)) {
         return false;
     }
 
-    auto* txn = context->txn_;
+    auto* txn = context->txn;
     TupleMeta meta = fh->get_tuple_meta(rid);
     if (meta.writer_txn_id_ == txn->get_transaction_id()) {
         return false;
@@ -164,7 +167,7 @@ inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid,
     UndoLink link = meta.version_chain_head_;
     constexpr int MAX_DEPTH = 100;
     for (int depth = 0; depth < MAX_DEPTH && link.IsValid(); ++depth) {
-        UndoLog undo = context->txn_mgr_->GetUndoLog(link);
+        UndoLog undo = context->txn_mgr->GetUndoLog(link);
         const TupleMeta& old_meta = undo.old_meta_;
         bool old_key_matches = !old_meta.is_deleted_ && !undo.old_tuple_data_.empty() &&
                                IndexKeyEquals(index, undo.old_tuple_data_.data(), key);

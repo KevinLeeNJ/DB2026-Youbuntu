@@ -52,10 +52,10 @@ public:
     const char* key() const;
 
     // --- heap 回表 ---
-    std::unique_ptr<RmRecord> get_visible_record(rmdb::Context* context) override;
+    std::unique_ptr<RmRecord> get_visible_record(rmdb::statement::StatementContext* context) override;
     TupleMeta get_tuple_meta(const Rid& rid) const override;
     bool is_record(const Rid& rid) const override;
-    std::unique_ptr<RmRecord> get_record(const Rid& rid, rmdb::Context* context) const override;
+    std::unique_ptr<RmRecord> get_record(const Rid& rid, rmdb::statement::StatementContext* context) const override;
 
     // --- 索引级查询（供 IndexSkipScan 构造子范围用）---
     /// 返回 lower_bound(key) 的 Iid（不移动当前 scan_）。

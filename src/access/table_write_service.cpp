@@ -141,26 +141,27 @@ TableWriteService::TableWriteService(SchemaManager* schema_mgr, LockManager* loc
                                      TransactionManager* txn_mgr)
     : schema_mgr_(schema_mgr), lock_mgr_(lock_mgr), log_mgr_(log_mgr), txn_mgr_(txn_mgr) {}
 
-// 管理器优先取自 Context（与原 executor 行为一致：context_->lock_mgr_ 等），
-// Context 不存在或字段为空时回退到服务构造时注入的成员。这保证既有从 DBInstance
-// 注入的运行时路径，也有测试中仅通过 Context 传管理器的路径。
-inline LockManager* TableWriteService::resolve_lock_mgr(Context* ctx) const {
-    if (ctx != nullptr && ctx->lock_mgr_ != nullptr)
-        return ctx->lock_mgr_;
+// 管理器优先取自 StatementContext（与原 executor 行为一致：ctx->lock_mgr 等），
+// StatementContext 不存在或字段为空时回退到服务构造时注入的成员。这保证既有从 DBInstance
+// 注入的运行时路径，也有测试中仅通过 StatementContext 传管理器的路径。
+inline LockManager* TableWriteService::resolve_lock_mgr(StatementContext* ctx) const {
+    if (ctx != nullptr && ctx->lock_mgr != nullptr)
+        return ctx->lock_mgr;
     return lock_mgr_;
 }
-inline LogManager* TableWriteService::resolve_log_mgr(Context* ctx) const {
-    if (ctx != nullptr && ctx->log_mgr_ != nullptr)
-        return ctx->log_mgr_;
+inline LogManager* TableWriteService::resolve_log_mgr(StatementContext* ctx) const {
+    if (ctx != nullptr && ctx->log_mgr != nullptr)
+        return ctx->log_mgr;
     return log_mgr_;
 }
-inline TransactionManager* TableWriteService::resolve_txn_mgr(Context* ctx) const {
-    if (ctx != nullptr && ctx->txn_mgr_ != nullptr)
-        return ctx->txn_mgr_;
+inline TransactionManager* TableWriteService::resolve_txn_mgr(StatementContext* ctx) const {
+    if (ctx != nullptr && ctx->txn_mgr != nullptr)
+        return ctx->txn_mgr;
     return txn_mgr_;
 }
 
-Rid TableWriteService::insert(const std::string& tab_name, const RmRecord& rec, Transaction* txn, Context* ctx) {
+Rid TableWriteService::insert(const std::string& tab_name, const RmRecord& rec, Transaction* txn,
+                              StatementContext* ctx) {
     auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     auto* txn_mgr = resolve_txn_mgr(ctx);
@@ -262,7 +263,7 @@ Rid TableWriteService::insert(const std::string& tab_name, const RmRecord& rec, 
 }
 
 bool TableWriteService::remove(const std::string& tab_name, const Rid& rid, const std::vector<Condition>& conds,
-                               Transaction* txn, Context* ctx) {
+                               Transaction* txn, StatementContext* ctx) {
     auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     auto* txn_mgr = resolve_txn_mgr(ctx);
@@ -391,7 +392,7 @@ bool TableWriteService::remove(const std::string& tab_name, const Rid& rid, cons
 }
 
 bool TableWriteService::update(const std::string& tab_name, const Rid& rid, const std::vector<SetClause>& set_clauses,
-                               const std::vector<Condition>& conds, Transaction* txn, Context* ctx) {
+                               const std::vector<Condition>& conds, Transaction* txn, StatementContext* ctx) {
     auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     auto* txn_mgr = resolve_txn_mgr(ctx);
@@ -677,7 +678,7 @@ void TableWriteService::apply_set_clauses(const TabMeta& tab, const std::vector<
 }
 
 void TableWriteService::bulk_insert(const std::string& tab_name, const std::vector<std::vector<char>>& rows,
-                                    Context* ctx) {
+                                    StatementContext* ctx) {
     // 无事务批量插入：跳过锁/WAL/Undo/MVCC，直接物理写 heap + index。
     auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);

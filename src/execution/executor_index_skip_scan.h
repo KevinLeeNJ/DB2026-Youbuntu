@@ -168,7 +168,7 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
 
 public:
     IndexSkipScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
-                          std::vector<std::string> index_col_names, Context* context)
+                          std::vector<std::string> index_col_names, StatementContext* context)
         : IndexScanExecutor(schema_manager, std::move(tab_name), std::move(conds), std::move(index_col_names),
                             context) {}
 

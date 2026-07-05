@@ -10,11 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #undef NDEBUG
 
-#define private public
-#include "portal.h"
-using namespace rmdb;
-#undef private
-
 #include <chrono>
 #include <memory>
 #include <string>
@@ -32,6 +27,18 @@ using namespace rmdb;
 #include "transaction/transaction_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "parser/parser.h"
+#include "server/output_sink.h"
+#include "statement/statement_context.h"
+#include "statement/statement_runner.h"
+#include "access/table_write_service.h"
+#include "execution/executor_abstract.h"
+#include "execution/executor_aggregate.h"
+#include "execution/executor_limit.h"
+#include "execution/executor_projection.h"
+#include "execution/executor_seq_scan.h"
+#include "execution/execution_sort.h"
+
+using namespace rmdb;
 
 namespace {
 
@@ -50,7 +57,7 @@ protected:
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Analyze> analyze_;
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;
-    std::unique_ptr<Portal> portal_;
+    std::unique_ptr<StatementRunner> statement_runner_;
     bool db_opened_ = false;
 
     void SetUp() override {
@@ -68,7 +75,8 @@ protected:
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
         write_service_ = std::make_unique<rmdb::access::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
                                                                            nullptr, txn_manager_.get());
-        portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
+        statement_runner_ = std::make_unique<StatementRunner>(schema_manager_.get(), write_service_.get(),
+                                                              planner_.get(), nullptr, txn_manager_.get());
 
         if (schema_manager_->is_dir(TEST_DB_NAME)) {
             schema_manager_->drop_db(TEST_DB_NAME);
@@ -96,27 +104,31 @@ protected:
     void execute(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
-        auto plan = planner_->do_planner(std::move(query), nullptr);
-        auto portal_stmt = portal_->start(std::move(plan), nullptr);
-        QlManager ql_mgr(schema_manager_.get(), txn_manager_.get(), planner_.get(), nullptr);
+        auto plan = planner_->do_planner(std::move(query));
+        StatementContext sctx;
+        char buf[BUFFER_LENGTH];
+        int offset = 0;
+        OutputSink sink{buf, &offset, false};
         txn_id_t txn = 0;
-        portal_->run(std::move(portal_stmt), &ql_mgr, &txn, nullptr);
+        statement_runner_->run(std::move(plan), &sctx, &sink, &txn);
     }
 
     std::vector<std::vector<std::string>> select(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
-        auto plan = planner_->do_planner(std::move(query), nullptr);
-        auto portal_stmt = portal_->start(std::move(plan), nullptr);
+        auto plan = planner_->do_planner(std::move(query));
+        auto* dml = static_cast<DMLPlan*>(plan.get());
+        StatementContext sctx;
+        auto root = statement_runner_->build_executor_tree(dml->subplan_.get(), &sctx);
 
         std::vector<std::vector<std::string>> rows;
-        if (portal_stmt->tag == PORTAL_ONE_SELECT) {
-            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
-                auto rec = portal_stmt->root->Next();
+        if (root != nullptr) {
+            for (root->beginTuple(); !root->is_end(); root->nextTuple()) {
+                auto rec = root->Next();
                 if (rec == nullptr)
                     break;
                 std::vector<std::string> row;
-                const auto& cols = portal_stmt->root->cols();
+                const auto& cols = root->cols();
                 for (const auto& col : cols) {
                     std::string val;
                     const char* data = rec->data + col.offset;
@@ -146,19 +158,19 @@ protected:
     std::string explain_analyze(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
-        auto plan = planner_->do_planner(std::move(query), nullptr);
-        auto portal_stmt = portal_->start(std::move(plan), nullptr);
-
-        if (portal_stmt->tag == PORTAL_EXPLAIN_ANALYZE) {
-            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
-                (void)portal_stmt->root->Next();
-            }
-            auto* dml = static_cast<DMLPlan*>(portal_stmt->plan.get());
-            std::ostringstream out;
-            Portal::render_explain_plan(dml->subplan_.get(), 0, out);
-            return out.str();
+        auto plan = planner_->do_planner(std::move(query));
+        auto* dml = static_cast<DMLPlan*>(plan.get());
+        if (dml->tag != T_ExplainAnalyze) {
+            return "";
         }
-        return "";
+        StatementContext sctx;
+        auto root = statement_runner_->build_executor_tree(dml->subplan_.get(), &sctx, true);
+        for (root->beginTuple(); !root->is_end(); root->nextTuple()) {
+            (void)root->Next();
+        }
+        std::ostringstream out;
+        StatementRunner::render_explain_plan(dml->subplan_.get(), 0, out);
+        return out.str();
     }
 };
 

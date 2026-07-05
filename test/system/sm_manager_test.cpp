@@ -300,8 +300,8 @@ TEST_F(SmManagerTest, show_tables_empty) {
     std::remove("output.txt");
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_NO_THROW(sm_manager_->show_tables(&ctx));
+    OutputSink sink{buf, &offset, false};
+    EXPECT_NO_THROW(sm_manager_->show_tables(&sink));
     EXPECT_GT(offset, 0);
 }
 
@@ -314,8 +314,8 @@ TEST_F(SmManagerTest, show_tables_with_data) {
 
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    sm_manager_->show_tables(&ctx);
+    OutputSink sink{buf, &offset, false};
+    sm_manager_->show_tables(&sink);
     EXPECT_GT(offset, 0);
 
     // 验证output.txt包含表名
@@ -335,8 +335,8 @@ TEST_F(SmManagerTest, desc_table_success) {
 
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_NO_THROW(sm_manager_->desc_table("desc_tab", &ctx));
+    OutputSink sink{buf, &offset, false};
+    EXPECT_NO_THROW(sm_manager_->desc_table("desc_tab", &sink));
     std::string output(buf);
     EXPECT_NE(output.find("id"), std::string::npos);
     EXPECT_NE(output.find("INT"), std::string::npos);
@@ -348,8 +348,8 @@ TEST_F(SmManagerTest, desc_table_not_found_throws) {
     setup_db();
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_THROW(sm_manager_->desc_table("no_such_table", &ctx), TableNotFoundError);
+    OutputSink sink{buf, &offset, false};
+    EXPECT_THROW(sm_manager_->desc_table("no_such_table", &sink), TableNotFoundError);
 }
 
 // =============================================================================
@@ -501,8 +501,8 @@ TEST_F(SmManagerTest, full_lifecycle) {
     // desc 验证
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_NO_THROW(sm_manager_->desc_table("full_tab", &ctx));
+    OutputSink sink{buf, &offset, false};
+    EXPECT_NO_THROW(sm_manager_->desc_table("full_tab", &sink));
 
     // 删一个索引
     sm_manager_->drop_index("full_tab", {"score"}, nullptr);

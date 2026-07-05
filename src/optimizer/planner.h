@@ -17,12 +17,9 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
-#include "execution/execution_defs.h"
-#include "execution/execution_manager.h"
 #include "record/rm.h"
 #include "system/sm_meta.h"
 #include "system/schema_manager.h"
-#include "common/context.h"
 #include "plan.h"
 #include "parser/parser.h"
 #include "common/common.h"
@@ -40,7 +37,7 @@ private:
 public:
     Planner(SchemaManager* schema_manager) : schema_manager_(schema_manager), catalog_(&schema_manager_->catalog()) {}
 
-    std::unique_ptr<Plan> do_planner(std::unique_ptr<Query> query, Context* context);
+    std::unique_ptr<Plan> do_planner(std::unique_ptr<Query> query);
 
     void set_enable_nestedloop_join(bool set_val) {
         enable_nestedloop_join = set_val;
@@ -51,16 +48,16 @@ public:
     }
 
 private:
-    std::unique_ptr<Query> logical_optimization(std::unique_ptr<Query> query, Context* context);
-    std::unique_ptr<Plan> physical_optimization(Query* query, Context* context);
+    std::unique_ptr<Query> logical_optimization(std::unique_ptr<Query> query);
+    std::unique_ptr<Plan> physical_optimization(Query* query);
 
     std::unique_ptr<Plan> make_one_rel(Query* query);
 
     std::unique_ptr<Plan> generate_sort_plan(const Query* query, std::unique_ptr<Plan> plan);
     std::unique_ptr<Plan> generate_limit_plan(const Query* query, std::unique_ptr<Plan> plan);
 
-    std::unique_ptr<Plan> generate_select_plan(std::unique_ptr<Query> query, Context* context);
-    std::unique_ptr<Plan> generate_union_plan(std::unique_ptr<Query> query, Context* context);
+    std::unique_ptr<Plan> generate_select_plan(std::unique_ptr<Query> query);
+    std::unique_ptr<Plan> generate_union_plan(std::unique_ptr<Query> query);
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     bool get_index_cols(std::string tab_name, std::vector<Condition>& curr_conds,

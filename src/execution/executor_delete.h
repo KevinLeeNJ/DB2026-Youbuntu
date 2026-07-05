@@ -31,7 +31,8 @@ private:
 
 public:
     DeleteExecutor(SchemaManager* schema_manager, rmdb::access::TableWriteService* write_service,
-                   const std::string& tab_name, std::vector<Condition> conds, std::vector<Rid> rids, Context* context)
+                   const std::string& tab_name, std::vector<Condition> conds, std::vector<Rid> rids,
+                   StatementContext* context)
         : write_service_(write_service) {
         schema_manager_ = schema_manager;
         tab_name_ = tab_name;
@@ -48,7 +49,7 @@ public:
         for (Rid rid : rids_) {
             // 写协议（可见性预检 / 加锁 / 重读 / WW / WAL / Undo / 索引 / TupleMeta / SSI）
             // 统一交由 TableWriteService::remove 执行。
-            write_service_->remove(tab_name_, rid, conds_, context_ == nullptr ? nullptr : context_->txn_, context_);
+            write_service_->remove(tab_name_, rid, conds_, context_ == nullptr ? nullptr : context_->txn, context_);
         }
         return nullptr;
     }

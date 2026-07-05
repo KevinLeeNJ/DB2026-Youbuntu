@@ -176,8 +176,8 @@ public:
             vals.push_back(v);
             char buf[4096];
             int offset = 0;
-            Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-            InsertExecutor exec(schema_manager_.get(), write_service_.get(), tab_name, vals, &ctx);
+            StatementContext sctx;
+            InsertExecutor exec(schema_manager_.get(), write_service_.get(), tab_name, vals, &sctx);
             exec.Next();
         }
     }
@@ -190,8 +190,8 @@ TEST_F(ExecutorTest, seq_scan_empty_table) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    SeqScanExecutor exec(schema_manager_.get(), "empty_t", {}, &ctx);
+    StatementContext sctx;
+    SeqScanExecutor exec(schema_manager_.get(), "empty_t", {}, &sctx);
 
     exec.beginTuple();
     EXPECT_TRUE(exec.is_end());
@@ -227,8 +227,8 @@ TEST_F(ExecutorTest, seq_scan_all_records) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    SeqScanExecutor exec(schema_manager_.get(), "t1", {}, &ctx);
+    StatementContext sctx;
+    SeqScanExecutor exec(schema_manager_.get(), "t1", {}, &sctx);
 
     std::vector<std::unique_ptr<RmRecord>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
@@ -249,7 +249,7 @@ TEST_F(ExecutorTest, seq_scan_with_equality_condition) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
     Condition cond;
     cond.lhs_col = {"t2", "id"};
@@ -259,7 +259,7 @@ TEST_F(ExecutorTest, seq_scan_with_equality_condition) {
     rhs.set_int(5);
     cond.rhs_val = rhs;
 
-    SeqScanExecutor exec(schema_manager_.get(), "t2", {cond}, &ctx);
+    SeqScanExecutor exec(schema_manager_.get(), "t2", {cond}, &sctx);
 
     std::vector<std::unique_ptr<RmRecord>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
@@ -278,7 +278,7 @@ TEST_F(ExecutorTest, seq_scan_with_range_condition) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
     Condition cond;
     cond.lhs_col = {"t3", "val"};
@@ -288,7 +288,7 @@ TEST_F(ExecutorTest, seq_scan_with_range_condition) {
     rhs.set_int(3);
     cond.rhs_val = rhs;
 
-    SeqScanExecutor exec(schema_manager_.get(), "t3", {cond}, &ctx);
+    SeqScanExecutor exec(schema_manager_.get(), "t3", {cond}, &sctx);
 
     std::vector<std::unique_ptr<RmRecord>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
@@ -307,7 +307,7 @@ TEST_F(ExecutorTest, seq_scan_no_matches) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
     Condition cond;
     cond.lhs_col = {"t4", "id"};
@@ -317,7 +317,7 @@ TEST_F(ExecutorTest, seq_scan_no_matches) {
     rhs.set_int(99);
     cond.rhs_val = rhs;
 
-    SeqScanExecutor exec(schema_manager_.get(), "t4", {cond}, &ctx);
+    SeqScanExecutor exec(schema_manager_.get(), "t4", {cond}, &sctx);
 
     exec.beginTuple();
     EXPECT_TRUE(exec.is_end());
@@ -346,17 +346,17 @@ TEST_F(ExecutorTest, projection_subset_columns) {
         vals.push_back(v3);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "proj_t1", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "proj_t1", vals, &sctx);
         exec.Next();
     }
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
     // Scan child: read all columns
-    auto scan = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "proj_t1", std::vector<Condition>{}, &ctx);
+    auto scan = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "proj_t1", std::vector<Condition>{}, &sctx);
 
     // Project only "id" and "score" (skip "name")
     std::vector<TabCol> sel_cols = {{"proj_t1", "id"}, {"proj_t1", "score"}};
@@ -386,16 +386,16 @@ TEST_F(ExecutorTest, projection_all_columns) {
         vals.push_back(v2);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "proj_t2", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "proj_t2", vals, &sctx);
         exec.Next();
     }
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
-    auto scan = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "proj_t2", std::vector<Condition>{}, &ctx);
+    auto scan = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "proj_t2", std::vector<Condition>{}, &sctx);
     std::vector<TabCol> sel_cols = {{"proj_t2", "a"}, {"proj_t2", "b"}};
     ProjectionExecutor exec(std::move(scan), sel_cols);
 
@@ -415,9 +415,9 @@ TEST_F(ExecutorTest, projection_multiple_rows) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
-    auto scan = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "proj_t3", std::vector<Condition>{}, &ctx);
+    auto scan = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "proj_t3", std::vector<Condition>{}, &sctx);
     std::vector<TabCol> sel_cols = {{"proj_t3", "x"}};
     ProjectionExecutor exec(std::move(scan), sel_cols);
 
@@ -442,10 +442,11 @@ TEST_F(ExecutorTest, nljoin_empty_left) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
-    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_left", std::vector<Condition>{}, &ctx);
-    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_right", std::vector<Condition>{}, &ctx);
+    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_left", std::vector<Condition>{}, &sctx);
+    auto right =
+        std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_right", std::vector<Condition>{}, &sctx);
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {});
 
     exec.beginTuple();
@@ -461,10 +462,10 @@ TEST_F(ExecutorTest, nljoin_empty_right) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
-    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_l2", std::vector<Condition>{}, &ctx);
-    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_r2", std::vector<Condition>{}, &ctx);
+    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_l2", std::vector<Condition>{}, &sctx);
+    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "join_r2", std::vector<Condition>{}, &sctx);
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {});
 
     exec.beginTuple();
@@ -481,10 +482,10 @@ TEST_F(ExecutorTest, nljoin_cross_product) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
-    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jl", std::vector<Condition>{}, &ctx);
-    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jr", std::vector<Condition>{}, &ctx);
+    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jl", std::vector<Condition>{}, &sctx);
+    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jr", std::vector<Condition>{}, &sctx);
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {});
 
     std::vector<std::pair<int, int>> results;
@@ -520,10 +521,10 @@ TEST_F(ExecutorTest, nljoin_with_condition) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    StatementContext sctx;
 
-    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jc_l", std::vector<Condition>{}, &ctx);
-    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jc_r", std::vector<Condition>{}, &ctx);
+    auto left = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jc_l", std::vector<Condition>{}, &sctx);
+    auto right = std::make_unique<SeqScanExecutor>(schema_manager_.get(), "jc_r", std::vector<Condition>{}, &sctx);
 
     // Join condition: left.val == right.val
     Condition cond;
@@ -558,8 +559,8 @@ TEST_F(ExecutorTest, delete_all_records) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "del_t1", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "del_t1", {}, &sctx);
         int count = 0;
         for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
             count++;
@@ -572,8 +573,8 @@ TEST_F(ExecutorTest, delete_all_records) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "del_t1", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "del_t1", {}, &sctx);
         for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
             scan.Next();
             rids.push_back(scan.rid());
@@ -582,16 +583,16 @@ TEST_F(ExecutorTest, delete_all_records) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    DeleteExecutor exec(schema_manager_.get(), write_service_.get(), "del_t1", {}, rids, &ctx);
+    StatementContext sctx;
+    DeleteExecutor exec(schema_manager_.get(), write_service_.get(), "del_t1", {}, rids, &sctx);
     exec.Next();
 
     // Verify all records are gone
     {
         char buf2[4096];
         int offset2 = 0;
-        Context ctx2(nullptr, nullptr, nullptr, buf2, &offset2);
-        SeqScanExecutor scan(schema_manager_.get(), "del_t1", {}, &ctx2);
+        StatementContext sctx2;
+        SeqScanExecutor scan(schema_manager_.get(), "del_t1", {}, &sctx2);
         scan.beginTuple();
         EXPECT_TRUE(scan.is_end());
     }
@@ -605,8 +606,8 @@ TEST_F(ExecutorTest, seq_scan_rid_after_beginTuple) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    SeqScanExecutor exec(schema_manager_.get(), "rid_t1", {}, &ctx);
+    StatementContext sctx;
+    SeqScanExecutor exec(schema_manager_.get(), "rid_t1", {}, &sctx);
 
     std::vector<Rid> rids;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
@@ -631,8 +632,8 @@ TEST_F(ExecutorTest, update_single_field) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "upd_t1", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "upd_t1", {}, &sctx);
         for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
             scan.Next();
             rids.push_back(scan.rid());
@@ -648,12 +649,12 @@ TEST_F(ExecutorTest, update_single_field) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t1", {sc}, {}, rids, &ctx);
+    StatementContext sctx;
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t1", {sc}, {}, rids, &sctx);
     exec.Next();
 
     // Verify all records now have id=110
-    SeqScanExecutor scan(schema_manager_.get(), "upd_t1", {}, &ctx);
+    SeqScanExecutor scan(schema_manager_.get(), "upd_t1", {}, &sctx);
     std::vector<int> results;
     for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
         auto rec = scan.Next();
@@ -681,8 +682,8 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
 
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "rc_lost_update", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "rc_lost_update", vals, &sctx);
         exec.Next();
     }
 
@@ -690,8 +691,8 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "rc_lost_update", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "rc_lost_update", {}, &sctx);
         scan.beginTuple();
         ASSERT_FALSE(scan.is_end());
         rid = scan.rid();
@@ -704,13 +705,19 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
 
     char buf1[4096];
     int offset1 = 0;
-    Context ctx1(&lock_manager, nullptr, txn1, buf1, &offset1, &txn_manager);
+    StatementContext sctx1;
+    sctx1.lock_mgr = &lock_manager;
+    sctx1.txn = txn1;
+    sctx1.txn_mgr = &txn_manager;
     char buf2[4096];
     int offset2 = 0;
-    Context ctx2(&lock_manager, nullptr, txn2, buf2, &offset2, &txn_manager);
+    StatementContext sctx2;
+    sctx2.lock_mgr = &lock_manager;
+    sctx2.txn = txn2;
+    sctx2.txn_mgr = &txn_manager;
 
     auto* fh = schema_manager_->get_table_handle("rc_lost_update");
-    auto txn2_old_rec = GetVisibleRecord(fh, rid, &ctx2);
+    auto txn2_old_rec = GetVisibleRecord(fh, rid, &sctx2);
     ASSERT_NE(txn2_old_rec, nullptr);
     ASSERT_EQ(*reinterpret_cast<int*>(txn2_old_rec->data + 4), 3020);
 
@@ -721,14 +728,14 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     set_next_to_3021.rhs = next_3021;
 
     UpdateExecutor txn1_update(schema_manager_.get(), write_service_.get(), "rc_lost_update", {set_next_to_3021}, {},
-                               {rid}, &ctx1);
+                               {rid}, &sctx1);
     ASSERT_NO_THROW(txn1_update.Next());
     txn_manager.commit(txn1, nullptr);
 
     bool txn2_aborted = false;
     try {
         UpdateExecutor txn2_update(schema_manager_.get(), write_service_.get(), "rc_lost_update", {set_next_to_3021},
-                                   {}, {rid}, &ctx2);
+                                   {}, {rid}, &sctx2);
         txn2_update.Next();
     } catch (const TransactionAbortException&) {
         txn2_aborted = true;
@@ -760,8 +767,8 @@ TEST_F(ExecutorTest, update_multiple_fields) {
         vals.push_back(v2);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t3", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t3", vals, &sctx);
         exec.Next();
     }
 
@@ -770,8 +777,8 @@ TEST_F(ExecutorTest, update_multiple_fields) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "upd_t3", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "upd_t3", {}, &sctx);
         scan.beginTuple();
         scan.Next();
         rids.push_back(scan.rid());
@@ -786,12 +793,12 @@ TEST_F(ExecutorTest, update_multiple_fields) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t3", {sc}, {}, rids, &ctx);
+    StatementContext sctx;
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t3", {sc}, {}, rids, &sctx);
     exec.Next();
 
     // Verify
-    SeqScanExecutor scan(schema_manager_.get(), "upd_t3", {}, &ctx);
+    SeqScanExecutor scan(schema_manager_.get(), "upd_t3", {}, &sctx);
     scan.beginTuple();
     auto rec = scan.Next();
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 5);
@@ -815,8 +822,8 @@ TEST_F(ExecutorTest, delete_with_condition_via_scan_rids) {
         vals.push_back(v2);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "del_cond", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "del_cond", vals, &sctx);
         exec.Next();
     }
 
@@ -832,8 +839,8 @@ TEST_F(ExecutorTest, delete_with_condition_via_scan_rids) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "del_cond", {cond}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "del_cond", {cond}, &sctx);
         for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
             rids.push_back(scan.rid());
         }
@@ -842,11 +849,11 @@ TEST_F(ExecutorTest, delete_with_condition_via_scan_rids) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    DeleteExecutor exec(schema_manager_.get(), write_service_.get(), "del_cond", {cond}, rids, &ctx);
+    StatementContext sctx;
+    DeleteExecutor exec(schema_manager_.get(), write_service_.get(), "del_cond", {cond}, rids, &sctx);
     exec.Next();
 
-    SeqScanExecutor scan(schema_manager_.get(), "del_cond", {}, &ctx);
+    SeqScanExecutor scan(schema_manager_.get(), "del_cond", {}, &sctx);
     std::vector<int> remaining;
     for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
         auto rec = scan.Next();
@@ -873,8 +880,8 @@ TEST_F(ExecutorTest, update_with_condition_via_scan_rids) {
         vals.push_back(v2);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_cond", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_cond", vals, &sctx);
         exec.Next();
     }
 
@@ -890,8 +897,8 @@ TEST_F(ExecutorTest, update_with_condition_via_scan_rids) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "upd_cond", {cond}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "upd_cond", {cond}, &sctx);
         for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
             rids.push_back(scan.rid());
         }
@@ -906,11 +913,11 @@ TEST_F(ExecutorTest, update_with_condition_via_scan_rids) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_cond", {sc}, {cond}, rids, &ctx);
+    StatementContext sctx;
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_cond", {sc}, {cond}, rids, &sctx);
     exec.Next();
 
-    SeqScanExecutor scan(schema_manager_.get(), "upd_cond", {}, &ctx);
+    SeqScanExecutor scan(schema_manager_.get(), "upd_cond", {}, &sctx);
     std::vector<std::pair<int, int>> results;
     for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
         auto rec = scan.Next();
@@ -941,8 +948,8 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
         vals.push_back(v2);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_promo", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_promo", vals, &sctx);
         exec.Next();
     }
 
@@ -950,8 +957,8 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "upd_promo", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "upd_promo", {}, &sctx);
         scan.beginTuple();
         scan.Next();
         rids.push_back(scan.rid());
@@ -965,11 +972,11 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_promo", {sc}, {}, rids, &ctx);
+    StatementContext sctx;
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_promo", {sc}, {}, rids, &sctx);
     exec.Next();
 
-    SeqScanExecutor scan(schema_manager_.get(), "upd_promo", {}, &ctx);
+    SeqScanExecutor scan(schema_manager_.get(), "upd_promo", {}, &sctx);
     scan.beginTuple();
     auto rec = scan.Next();
     float score = *reinterpret_cast<float*>(rec->data + 4);
@@ -993,8 +1000,8 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
         vals.push_back(v2);
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_trunc", vals, &ctx);
+        StatementContext sctx;
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_trunc", vals, &sctx);
         exec.Next();
     }
 
@@ -1002,8 +1009,8 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
     {
         char buf[4096];
         int offset = 0;
-        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        SeqScanExecutor scan(schema_manager_.get(), "upd_trunc", {}, &ctx);
+        StatementContext sctx;
+        SeqScanExecutor scan(schema_manager_.get(), "upd_trunc", {}, &sctx);
         scan.beginTuple();
         scan.Next();
         rids.push_back(scan.rid());
@@ -1017,11 +1024,11 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
 
     char buf[4096];
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_trunc", {sc}, {}, rids, &ctx);
+    StatementContext sctx;
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_trunc", {sc}, {}, rids, &sctx);
     exec.Next();
 
-    SeqScanExecutor scan(schema_manager_.get(), "upd_trunc", {}, &ctx);
+    SeqScanExecutor scan(schema_manager_.get(), "upd_trunc", {}, &sctx);
     scan.beginTuple();
     auto rec = scan.Next();
     int id = *reinterpret_cast<int*>(rec->data);

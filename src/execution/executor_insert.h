@@ -33,7 +33,7 @@ private:
 
 public:
     InsertExecutor(SchemaManager* schema_manager, rmdb::access::TableWriteService* write_service,
-                   const std::string& tab_name, std::vector<Value> values, Context* context)
+                   const std::string& tab_name, std::vector<Value> values, StatementContext* context)
         : write_service_(write_service) {
         schema_manager_ = schema_manager;
         tab_ = schema_manager_->catalog().get_table(tab_name);
@@ -70,7 +70,7 @@ public:
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
-        rid_ = write_service_->insert(tab_name_, rec, context_ == nullptr ? nullptr : context_->txn_, context_);
+        rid_ = write_service_->insert(tab_name_, rec, context_ == nullptr ? nullptr : context_->txn, context_);
         return nullptr;
     }
     Rid& rid() override {

@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "common/common.h"
-#include "common/context.h"
+#include "statement/statement_context.h"
 #include "record/rm_file_handle.h"
 #include "recovery/log_manager.h"
 #include "system/schema_manager.h"
@@ -41,23 +41,23 @@ public:
 
     /// 插入一条记录。返回新插入行的 rid。
     /// txn 可为 nullptr（无事务场景，跳过锁/WAL/Undo/MVCC）。
-    Rid insert(const std::string& tab_name, const RmRecord& rec, Transaction* txn, Context* ctx);
+    Rid insert(const std::string& tab_name, const RmRecord& rec, Transaction* txn, StatementContext* ctx);
 
     /// 删除 rid 指向的行。conds 用于加锁前谓词预检与 RC 重读后谓词复检。
     /// 返回是否实际删除（false=skip）。
     bool remove(const std::string& tab_name, const Rid& rid, const std::vector<Condition>& conds, Transaction* txn,
-                Context* ctx);
+                StatementContext* ctx);
 
     /// 更新 rid 指向的行。set_clauses 描述如何由旧值计算新值（与原 UpdateExecutor
     /// 的 update_record 语义一致），conds 用于加锁前谓词预检与 RC 重读后谓词复检。
     /// 返回是否实际更新（false=skip）。
     bool update(const std::string& tab_name, const Rid& rid, const std::vector<SetClause>& set_clauses,
-                const std::vector<Condition>& conds, Transaction* txn, Context* ctx);
+                const std::vector<Condition>& conds, Transaction* txn, StatementContext* ctx);
 
     // === 批量插入（LOAD DATA 用）===
     /// 无事务批量插入。内部用 PinnedInserter 走批量路径，跳过锁/WAL/Undo/MVCC。
     /// 失败时抛 RMDBError。调用方负责 flush（LoadDataService 在结束时 flush）。
-    void bulk_insert(const std::string& tab_name, const std::vector<std::vector<char>>& rows, Context* ctx);
+    void bulk_insert(const std::string& tab_name, const std::vector<std::vector<char>>& rows, StatementContext* ctx);
 
 private:
     SchemaManager* schema_mgr_;
@@ -72,10 +72,10 @@ private:
     // 谓词匹配（迁移自 AbstractExecutor::compare，独立实现避免依赖执行器）。
     static bool record_matches_conds(const TabMeta& tab, const std::vector<Condition>& conds, const RmRecord& rec);
 
-    // 管理器解析：优先取自 Context（与原 executor 一致），回退到服务成员。
-    inline LockManager* resolve_lock_mgr(Context* ctx) const;
-    inline LogManager* resolve_log_mgr(Context* ctx) const;
-    inline TransactionManager* resolve_txn_mgr(Context* ctx) const;
+    // 管理器解析：优先取自 StatementContext（与原 executor 一致），回退到服务成员。
+    inline LockManager* resolve_lock_mgr(StatementContext* ctx) const;
+    inline LogManager* resolve_log_mgr(StatementContext* ctx) const;
+    inline TransactionManager* resolve_txn_mgr(StatementContext* ctx) const;
 };
 
 } // namespace rmdb::access

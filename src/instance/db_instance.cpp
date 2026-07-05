@@ -35,9 +35,8 @@ DBInstance::DBInstance() {
                                                                        log_manager_.get(), txn_manager_.get());
     tuple_meta_writer_ = std::make_unique<rmdb::access::TupleMetaWriter>(schema_manager_.get());
     load_data_service_ = std::make_unique<rmdb::access::LoadDataService>(schema_manager_.get(), write_service_.get());
-    ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), planner_.get(),
-                                              load_data_service_.get());
-    portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
+    statement_runner_ = std::make_unique<StatementRunner>(schema_manager_.get(), write_service_.get(), planner_.get(),
+                                                          load_data_service_.get(), txn_manager_.get());
     analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 }
 

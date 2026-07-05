@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 
 #include "common/config.h"
+#include "output_sink.h"
 #include "transaction/txn_defs.h"
 
 namespace rmdb::server {
@@ -32,6 +33,7 @@ public:
     void reset_buffer() {
         memset(data_send_, '\0', BUFFER_LENGTH);
         offset_ = 0;
+        output_sink_.ellipsis = false;
     }
 
     txn_id_t txn_id() const {
@@ -61,11 +63,17 @@ public:
         return offset_;
     }
 
+    /// 输出缓冲视图，供 RecordPrinter / show / desc 等格式化路径使用。
+    OutputSink& output_sink() {
+        return output_sink_;
+    }
+
 private:
     char data_send_[BUFFER_LENGTH];
     int offset_;
     txn_id_t txn_id_;
     IsolationLevel isolation_level_;
+    OutputSink output_sink_{data_send_, &offset_, false};
 };
 
 } // namespace rmdb::server

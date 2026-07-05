@@ -213,39 +213,39 @@ void SmManager::close_db() {
 
 /**
  * @description: 显示所有的表,通过测试需要将其结果写入到output.txt,详情看题目文档
- * @param {Context*} context
+ * @param {OutputSink*} sink
  */
-void SmManager::show_tables(Context* context) {
+void SmManager::show_tables(OutputSink* sink) {
     std::fstream outfile;
     if (output_file_enabled_) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
         outfile << "| Tables |\n";
     }
     RecordPrinter printer(1);
-    printer.print_separator(context);
-    printer.print_record({"Tables"}, context);
-    printer.print_separator(context);
+    printer.print_separator(sink);
+    printer.print_record({"Tables"}, sink);
+    printer.print_separator(sink);
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
-        printer.print_record({tab.name}, context);
+        printer.print_record({tab.name}, sink);
         if (output_file_enabled_) {
             outfile << "| " << tab.name << " |\n";
         }
     }
-    printer.print_separator(context);
+    printer.print_separator(sink);
     if (output_file_enabled_) {
         outfile.close();
     }
 }
 
-void SmManager::show_index(const std::string& tab_name, Context* context) {
+void SmManager::show_index(const std::string& tab_name, OutputSink* sink) {
     TabMeta& tab = db_.get_table(tab_name);
     std::vector<std::string> captions = {"Tables", "Type", "Column"};
     RecordPrinter printer(captions.size());
 
-    printer.print_separator(context);
-    printer.print_record(captions, context);
-    printer.print_separator(context);
+    printer.print_separator(sink);
+    printer.print_record(captions, sink);
+    printer.print_separator(sink);
 
     std::fstream outfile;
     if (output_file_enabled_) {
@@ -273,45 +273,46 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
             outfile << ") |\n";
         }
 
-        printer.print_record({tab_name, "unique", cols}, context);
+        printer.print_record({tab_name, "unique", cols}, sink);
     }
     if (output_file_enabled_) {
         outfile.close();
     }
 
-    printer.print_separator(context);
+    printer.print_separator(sink);
 }
 
 /**
  * @description: 显示表的元数据
  * @param {string&} tab_name 表名称
- * @param {Context*} context
+ * @param {OutputSink*} sink
  */
-void SmManager::desc_table(const std::string& tab_name, Context* context) {
+void SmManager::desc_table(const std::string& tab_name, OutputSink* sink) {
     TabMeta& tab = db_.get_table(tab_name);
 
     std::vector<std::string> captions = {"Field", "Type", "Index"};
     RecordPrinter printer(captions.size());
     // Print header
-    printer.print_separator(context);
-    printer.print_record(captions, context);
-    printer.print_separator(context);
+    printer.print_separator(sink);
+    printer.print_record(captions, sink);
+    printer.print_separator(sink);
     // Print fields
     for (auto& col : tab.cols) {
         std::vector<std::string> field_info = {col.name, coltype2str(col.type), col.index ? "YES" : "NO"};
-        printer.print_record(field_info, context);
+        printer.print_record(field_info, sink);
     }
     // Print footer
-    printer.print_separator(context);
+    printer.print_separator(sink);
 }
 
 /**
  * @description: 创建表
  * @param {string&} tab_name 表的名称
  * @param {vector<ColDef>&} col_defs 表的字段
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
+void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs,
+                             StatementContext* context) {
     (void)context;
     if (db_.is_table(tab_name)) {
         throw TableExistsError(tab_name);
@@ -344,9 +345,9 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
 /**
  * @description: 删除表
  * @param {string&} tab_name 表的名称
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void SmManager::drop_table(const std::string& tab_name, Context* context) {
+void SmManager::drop_table(const std::string& tab_name, StatementContext* context) {
     if (!db_.is_table(tab_name))
         throw TableNotFoundError(tab_name);
     TabMeta& tab = db_.get_table(tab_name);
@@ -364,9 +365,10 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @description: 创建索引
  * @param {string&} tab_name 表的名称
  * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names,
+                             StatementContext* context) {
     if (!db_.is_table(tab_name))
         throw TableNotFoundError(tab_name);
     TabMeta& tab = db_.get_table(tab_name);
@@ -405,7 +407,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
                 offset += col.len;
             }
             // 插入索引
-            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_);
+            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn);
         }
     } catch (...) {
         ix_manager_->close_index(index_handle.get());
@@ -422,9 +424,10 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @description: 删除索引
  * @param {string&} tab_name 表名称
  * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names,
+                           StatementContext* context) {
     (void)context;
     TabMeta& tab = db_.get_table(tab_name);
     if (!tab.is_index(col_names)) {
@@ -444,9 +447,9 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @description: 删除索引
  * @param {string&} tab_name 表名称
  * @param {vector<ColMeta>&} 索引包含的字段元数据
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
+void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, StatementContext* context) {
     (void)context;
     TabMeta& tab = db_.get_table(tab_name);
     std::vector<std::string> col_names;
@@ -567,7 +570,7 @@ void SmManager::reset_all_tuple_meta_after_recovery() {
     }
 }
 
-void SmManager::load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context) {
+void SmManager::load_csv_data(const std::string& file_path, const std::string& tab_name, StatementContext* context) {
     (void)context;
     std::ifstream infile(file_path);
     if (!infile.is_open()) {

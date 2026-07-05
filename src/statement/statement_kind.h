@@ -8,5 +8,12 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
-// Phase 7: QlManager 已删除，命令分发由 statement::StatementRunner 接管。
-// execution 库保留为执行器头文件的聚合包含点，本身无独立翻译单元产物。
+#pragma once
+
+namespace rmdb::statement {
+
+/// 语句大类。StatementRunner 按 StatementKind 分派命令处理路径，
+/// 替代旧 Portal 的 portalTag 内部分发。
+enum class StatementKind { Select, Insert, Update, Delete, DDL, Transaction, Utility, Load, ExplainAnalyze };
+
+} // namespace rmdb::statement

@@ -16,8 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include <iomanip>
 #include <string>
 #include <sstream>
-#include "common/context.h"
 #include "common/config.h"
+#include "server/output_sink.h"
 
 namespace rmdb::common {
 #define RECORD_COUNT_LENGTH 40
@@ -31,27 +31,27 @@ public:
         assert(num_cols_ > 0);
     }
 
-    void print_separator(Context* context) const {
+    void print_separator(OutputSink* sink) const {
         for (size_t i = 0; i < num_cols; i++) {
             // std::cout << '+' << std::string(COL_WIDTH + 2, '-');
             std::string str = "+" + std::string(COL_WIDTH + 2, '-');
-            if (context->ellipsis_ == false && *context->offset_ + RECORD_COUNT_LENGTH + str.length() < BUFFER_LENGTH) {
-                memcpy(context->data_send_ + *(context->offset_), str.c_str(), str.length());
-                *(context->offset_) = *(context->offset_) + str.length();
+            if (sink->ellipsis == false && *sink->offset + RECORD_COUNT_LENGTH + str.length() < BUFFER_LENGTH) {
+                memcpy(sink->data_send + *sink->offset, str.c_str(), str.length());
+                *sink->offset = *sink->offset + str.length();
             } else {
-                context->ellipsis_ = true;
+                sink->ellipsis = true;
             }
         }
         std::string str = "+\n";
-        if (context->ellipsis_ == false && *context->offset_ + RECORD_COUNT_LENGTH + str.length() < BUFFER_LENGTH) {
-            memcpy(context->data_send_ + *(context->offset_), str.c_str(), str.length());
-            *(context->offset_) = *(context->offset_) + str.length();
+        if (sink->ellipsis == false && *sink->offset + RECORD_COUNT_LENGTH + str.length() < BUFFER_LENGTH) {
+            memcpy(sink->data_send + *sink->offset, str.c_str(), str.length());
+            *sink->offset = *sink->offset + str.length();
         } else {
-            context->ellipsis_ = true;
+            sink->ellipsis = true;
         }
     }
 
-    void print_record(const std::vector<std::string>& rec_str, Context* context) const {
+    void print_record(const std::vector<std::string>& rec_str, OutputSink* sink) const {
         assert(rec_str.size() == num_cols);
         for (auto col : rec_str) {
             if (col.size() > COL_WIDTH) {
@@ -60,31 +60,30 @@ public:
             // std::cout << "| " << std::setw(COL_WIDTH) << col << ' ';
             std::stringstream ss;
             ss << "| " << std::setw(COL_WIDTH) << col << " ";
-            if (context->ellipsis_ == false &&
-                *context->offset_ + RECORD_COUNT_LENGTH + ss.str().length() < BUFFER_LENGTH) {
-                memcpy(context->data_send_ + *(context->offset_), ss.str().c_str(), ss.str().length());
-                *(context->offset_) = *(context->offset_) + ss.str().length();
+            if (sink->ellipsis == false && *sink->offset + RECORD_COUNT_LENGTH + ss.str().length() < BUFFER_LENGTH) {
+                memcpy(sink->data_send + *sink->offset, ss.str().c_str(), ss.str().length());
+                *sink->offset = *sink->offset + ss.str().length();
             } else {
-                context->ellipsis_ = true;
+                sink->ellipsis = true;
             }
         }
         // std::cout << "|\n";
         std::string str = "|\n";
-        if (context->ellipsis_ == false && *context->offset_ + RECORD_COUNT_LENGTH + str.length() < BUFFER_LENGTH) {
-            memcpy(context->data_send_ + *(context->offset_), str.c_str(), str.length());
-            *(context->offset_) = *(context->offset_) + str.length();
+        if (sink->ellipsis == false && *sink->offset + RECORD_COUNT_LENGTH + str.length() < BUFFER_LENGTH) {
+            memcpy(sink->data_send + *sink->offset, str.c_str(), str.length());
+            *sink->offset = *sink->offset + str.length();
         }
     }
 
-    static void print_record_count(size_t num_rec, Context* context) {
+    static void print_record_count(size_t num_rec, OutputSink* sink) {
         // std::cout << "Total record(s): " << num_rec << '\n';
         std::string str = "";
-        if (context->ellipsis_ == true) {
+        if (sink->ellipsis == true) {
             str = "... ...\n";
         }
         str += "Total record(s): " + std::to_string(num_rec) + '\n';
-        memcpy(context->data_send_ + *(context->offset_), str.c_str(), str.length());
-        *(context->offset_) = *(context->offset_) + str.length();
+        memcpy(sink->data_send + *sink->offset, str.c_str(), str.length());
+        *sink->offset = *sink->offset + str.length();
     }
 };
 

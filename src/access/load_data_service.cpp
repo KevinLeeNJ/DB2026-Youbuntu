@@ -24,7 +24,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::access {
 
-void LoadDataService::load_csv(const std::string& file_path, const std::string& tab_name, Context* ctx) {
+void LoadDataService::load_csv(const std::string& file_path, const std::string& tab_name, StatementContext* ctx) {
     (void)ctx;
     std::ifstream infile(file_path);
     if (!infile.is_open()) {

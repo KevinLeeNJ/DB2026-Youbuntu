@@ -43,21 +43,25 @@ public:
     int record_size(const std::string& tab_name);
     bool is_record(const std::string& tab_name, const Rid& rid);
     TupleMeta get_tuple_meta(const std::string& tab_name, const Rid& rid);
-    std::unique_ptr<RmRecord> get_record(const std::string& tab_name, const Rid& rid, rmdb::Context* context);
-    std::unique_ptr<RmRecord> get_visible_record(const std::string& tab_name, const Rid& rid, rmdb::Context* context);
+    std::unique_ptr<RmRecord> get_record(const std::string& tab_name, const Rid& rid,
+                                         rmdb::statement::StatementContext* context);
+    std::unique_ptr<RmRecord> get_visible_record(const std::string& tab_name, const Rid& rid,
+                                                 rmdb::statement::StatementContext* context);
 
     // --- SSI 转发（替代执行器直接持有 fh_ 调用 TransactionManager）---
     /// 谓词读冲突检测（转发 TransactionManager::CheckPredicateInvisibleWrites）。
-    bool check_predicate_invisible_writes(rmdb::Context* context, txn_id_t reader, const std::string& tab_name,
-                                          const std::vector<Condition>& conds, const std::vector<ColMeta>& cols);
+    bool check_predicate_invisible_writes(rmdb::statement::StatementContext* context, txn_id_t reader,
+                                          const std::string& tab_name, const std::vector<Condition>& conds,
+                                          const std::vector<ColMeta>& cols);
 
     /// insert 的 SSI deleted-tuple-candidate 冲突检测。
     bool deleted_tuple_candidates_conflict_with_insert(const std::string& tab_name, const RmRecord& inserted_rec,
-                                                       rmdb::Context* context);
+                                                       rmdb::statement::StatementContext* context);
 
     /// 索引历史键冲突检测。
     bool historical_index_key_conflicts_with_txn(const std::string& tab_name, const Rid& rid, const IndexMeta& index,
-                                                 const std::vector<char>& key, rmdb::Context* context);
+                                                 const std::vector<char>& key,
+                                                 rmdb::statement::StatementContext* context);
 
 private:
     rmdb::system::SchemaManager* schema_manager_;

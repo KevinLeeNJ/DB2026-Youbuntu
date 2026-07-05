@@ -26,7 +26,7 @@ using namespace rmdb;
 #include <vector>
 
 #include "common/config.h"
-#include "common/context.h"
+#include "statement/statement_context.h"
 #include "errors.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_skip_scan.h"
@@ -546,8 +546,8 @@ public:
         name_val.set_str(name);
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), write_service.get(), "warehouse", {id, name_val}, &context);
+        StatementContext scontext;
+        InsertExecutor executor(schema_manager.get(), write_service.get(), "warehouse", {id, name_val}, &scontext);
         executor.Next();
     }
 
@@ -558,8 +558,8 @@ public:
         bv.set_int(b);
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv}, &context);
+        StatementContext scontext;
+        InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv}, &scontext);
         executor.Next();
     }
 
@@ -572,8 +572,8 @@ public:
         cv.set_int(c);
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv, cv}, &context);
+        StatementContext scontext;
+        InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv, cv}, &scontext);
         executor.Next();
     }
 
@@ -586,9 +586,9 @@ public:
         score_val.set_float(score);
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        StatementContext scontext;
         InsertExecutor executor(schema_manager.get(), write_service.get(), "scores", {sid_val, cid_val, score_val},
-                                &context);
+                                &scontext);
         executor.Next();
     }
 
@@ -637,8 +637,8 @@ public:
     std::vector<int> scan_ids(const std::vector<Condition>& conds, const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexScanExecutor executor(schema_manager.get(), "warehouse", conds, index_cols, &context);
+        StatementContext scontext;
+        IndexScanExecutor executor(schema_manager.get(), "warehouse", conds, index_cols, &scontext);
         std::vector<int> ids;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -651,8 +651,8 @@ public:
                                      const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexScanExecutor executor(schema_manager.get(), tab_name, conds, index_cols, &context);
+        StatementContext scontext;
+        IndexScanExecutor executor(schema_manager.get(), tab_name, conds, index_cols, &scontext);
         std::vector<int> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -665,8 +665,8 @@ public:
                                                      const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexScanExecutor executor(schema_manager.get(), "scores", conds, index_cols, &context);
+        StatementContext scontext;
+        IndexScanExecutor executor(schema_manager.get(), "scores", conds, index_cols, &scontext);
         std::vector<std::pair<int, int>> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -679,8 +679,8 @@ public:
                                                   const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        IndexSkipScanExecutor executor(schema_manager.get(), "triples", conds, index_cols, &context);
+        StatementContext scontext;
+        IndexSkipScanExecutor executor(schema_manager.get(), "triples", conds, index_cols, &scontext);
         std::vector<int> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
             auto rec = executor.Next();
@@ -781,25 +781,25 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    StatementContext scontext;
     std::vector<Rid> delete_rids;
-    IndexScanExecutor delete_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &context);
+    IndexScanExecutor delete_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &scontext);
     for (delete_scan.beginTuple(); !delete_scan.is_end(); delete_scan.nextTuple()) {
         delete_rids.push_back(delete_scan.rid());
     }
     DeleteExecutor delete_exec(schema_manager.get(), write_service.get(), "warehouse", {int_cond(OP_EQ, 700)},
-                               delete_rids, &context);
+                               delete_rids, &scontext);
     delete_exec.Next();
     EXPECT_TRUE(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}).empty());
 
     std::vector<Rid> update_rids;
-    IndexScanExecutor update_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &context);
+    IndexScanExecutor update_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &scontext);
     for (update_scan.beginTuple(); !update_scan.is_end(); update_scan.nextTuple()) {
         update_rids.push_back(update_scan.rid());
     }
     UpdateExecutor update_exec(schema_manager.get(), write_service.get(), "warehouse",
                                {set_int_clause("warehouse", "w_id", 507)}, {int_cond(OP_EQ, 534)}, update_rids,
-                               &context);
+                               &scontext);
     update_exec.Next();
     EXPECT_EQ(scan_ids({int_cond(OP_GT, 100), int_cond(OP_LT, 534)}, {"w_id"}), std::vector<int>({500, 507}));
 }
@@ -822,16 +822,16 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    StatementContext scontext;
     std::vector<Rid> rids;
-    IndexScanExecutor scan(schema_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &context);
+    IndexScanExecutor scan(schema_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &scontext);
     for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
         rids.push_back(scan.rid());
     }
 
     UpdateExecutor update_exec(schema_manager.get(), write_service.get(), "warehouse",
                                {set_string_clause("warehouse", "name", "qweruiop")}, {string_cond(OP_EQ, "asdfhjkl")},
-                               rids, &context);
+                               rids, &scontext);
     EXPECT_THROW(update_exec.Next(), IndexEntryExistsError);
 
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "asdfhjkl")}, {"name"}), std::vector<int>({534}));
@@ -899,9 +899,9 @@ TEST_F(ShowIndexTest, PrintsFormattedIndexMetadataTable) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    OutputSink sink{data_send, &offset, false};
 
-    schema_manager->show_index("warehouse", &context);
+    schema_manager->show_index("warehouse", &sink);
 
     std::string output(data_send, offset);
     EXPECT_NE(output.find("+------------------+------------------+------------------+"), std::string::npos);

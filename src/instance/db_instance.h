@@ -22,10 +22,10 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "pager/pager.h"
-#include "portal.h"
 #include "record/rm_manager.h"
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
+#include "statement/statement_runner.h"
 #include "storage/buffer_pool_manager.h"
 #include "storage/disk_manager.h"
 #include "system/schema_manager.h"
@@ -82,17 +82,14 @@ public:
     Optimizer& optimizer() {
         return *optimizer_;
     }
-    QlManager& ql_manager() {
-        return *ql_manager_;
-    }
     LogManager& log_manager() {
         return *log_manager_;
     }
     RecoveryManager& recovery() {
         return *recovery_;
     }
-    Portal& portal() {
-        return *portal_;
+    StatementRunner& statement_runner() {
+        return *statement_runner_;
     }
     Analyze& analyze() {
         return *analyze_;
@@ -132,8 +129,7 @@ private:
     std::unique_ptr<rmdb::access::TableWriteService> write_service_;
     std::unique_ptr<rmdb::access::TupleMetaWriter> tuple_meta_writer_;
     std::unique_ptr<rmdb::access::LoadDataService> load_data_service_;
-    std::unique_ptr<QlManager> ql_manager_;
-    std::unique_ptr<Portal> portal_;
+    std::unique_ptr<StatementRunner> statement_runner_;
     std::unique_ptr<Analyze> analyze_;
 };
 

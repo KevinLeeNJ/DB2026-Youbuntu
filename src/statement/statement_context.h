@@ -1,6 +1,6 @@
 /* Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
-You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
         http://license.coscl.org.cn/MulanPSL2
 THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
@@ -28,8 +28,9 @@ namespace rmdb::statement {
 
 /// 一条 SQL 语句执行期间的内核资源引用集合。
 /// 不拥有任何对象，生命周期短于 rmdb::server::Session。
-/// Phase 1 仅定义，被执行器采用自 Phase 4 起（见 migration-ledger）。
 struct StatementContext {
+    StatementContext() = default;
+
     Transaction* txn{nullptr};
     LockManager* lock_mgr{nullptr};
     LogManager* log_mgr{nullptr};
@@ -40,3 +41,7 @@ struct StatementContext {
 };
 
 } // namespace rmdb::statement
+
+namespace rmdb {
+using statement::StatementContext;
+} // namespace rmdb

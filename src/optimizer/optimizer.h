@@ -14,11 +14,9 @@ See the Mulan PSL v2 for more details. */
 #include <map>
 
 #include "errors.h"
-#include "execution/execution.h"
 #include "parser/parser.h"
 #include "system/sm_meta.h"
 #include "system/schema_manager.h"
-#include "common/context.h"
 #include "transaction/transaction_manager.h"
 #include "planner.h"
 #include "plan.h"
@@ -32,7 +30,7 @@ private:
 public:
     Optimizer(SchemaManager* schema_manager, Planner* planner) : schema_manager_(schema_manager), planner_(planner) {}
 
-    std::unique_ptr<Plan> plan_query(std::unique_ptr<Query> query, Context* context) {
+    std::unique_ptr<Plan> plan_query(std::unique_ptr<Query> query) {
         auto* parse = query->parse.get();
         if (parse == nullptr) {
             throw InternalError("Unexpected null AST root");
@@ -86,7 +84,7 @@ public:
         case rmdb::parser::ast::AstType::StaticCheckpoint:
             return std::make_unique<OtherPlan>(T_StaticCheckpoint, std::string());
         default:
-            return planner_->do_planner(std::move(query), context);
+            return planner_->do_planner(std::move(query));
         }
     }
 };

@@ -13,7 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 
 #include "access/table_write_service.h"
-#include "common/context.h"
+#include "statement/statement_context.h"
 #include "system/schema_manager.h"
 
 namespace rmdb::access {
@@ -25,7 +25,7 @@ public:
     LoadDataService(SchemaManager* schema_mgr, TableWriteService* write_svc)
         : schema_mgr_(schema_mgr), write_svc_(write_svc) {}
 
-    void load_csv(const std::string& file_path, const std::string& tab_name, Context* ctx);
+    void load_csv(const std::string& file_path, const std::string& tab_name, StatementContext* ctx);
 
 private:
     SchemaManager* schema_mgr_;

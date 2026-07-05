@@ -230,7 +230,7 @@ protected:
 TEST_F(PlannerAggregateTest, generate_select_plan_builds_aggregate_projection_shape) {
     auto query = make_aggregate_query(false, false);
 
-    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+    auto plan = planner_.generate_select_plan(std::move(query));
 
     ASSERT_NE(plan, nullptr);
     EXPECT_EQ(plan->tag, T_Projection);
@@ -250,7 +250,7 @@ TEST_F(PlannerAggregateTest, generate_select_plan_builds_aggregate_projection_sh
 TEST_F(PlannerAggregateTest, generate_select_plan_pushes_limit_into_sort_over_projection_and_aggregate) {
     auto query = make_aggregate_query(true, true);
 
-    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+    auto plan = planner_.generate_select_plan(std::move(query));
 
     ASSERT_NE(plan, nullptr);
     EXPECT_EQ(plan->tag, T_Sort);
@@ -270,7 +270,7 @@ TEST_F(PlannerAggregateTest, stock_level_join_starts_from_order_line_and_uses_st
     schema_manager_.db().SetTabMeta("order_line", make_order_line_tab());
     auto query = make_stock_level_query();
 
-    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+    auto plan = planner_.generate_select_plan(std::move(query));
 
     ASSERT_NE(plan, nullptr);
     ASSERT_EQ(plan->tag, T_Projection);
@@ -296,7 +296,7 @@ TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) 
     schema_manager_.db().SetTabMeta("order_line", make_order_line_tab());
     auto query = make_order_line_suffix_lookup_query();
 
-    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+    auto plan = planner_.generate_select_plan(std::move(query));
 
     ASSERT_NE(plan, nullptr);
     ASSERT_EQ(plan->tag, T_Projection);

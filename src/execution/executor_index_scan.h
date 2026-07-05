@@ -53,35 +53,35 @@ protected:
     rmdb::access::TableAccess table_access_;
 
     void record_predicate_read() {
-        if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
-            context_->txn_ == nullptr || context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE ||
-            context_->txn_mgr_ == nullptr) {
+        if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking ||
+            context_->txn == nullptr || context_->txn->get_isolation_level() != IsolationLevel::SERIALIZABLE ||
+            context_->txn_mgr == nullptr) {
             return;
         }
         predicate_recorded_ = true;
-        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, fed_conds_)) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+        if (context_->txn_mgr->RecordPredicateRead(context_->txn, tab_name_, fed_conds_)) {
+            throw TransactionAbortException(context_->txn->get_transaction_id(), AbortReason::SSI_DANGER);
         }
-        if (table_access_.check_predicate_invisible_writes(context_, context_->txn_->get_transaction_id(), tab_name_,
+        if (table_access_.check_predicate_invisible_writes(context_, context_->txn->get_transaction_id(), tab_name_,
                                                            fed_conds_, cols_)) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+            throw TransactionAbortException(context_->txn->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
 
     void record_tuple_read(const Rid& rid, bool force = false) {
-        if (context_ == nullptr || (!force && !context_->enable_ssi_read_tracking_) || context_->txn_ == nullptr ||
-            context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE || context_->txn_mgr_ == nullptr) {
+        if (context_ == nullptr || (!force && !context_->enable_ssi_read_tracking) || context_->txn == nullptr ||
+            context_->txn->get_isolation_level() != IsolationLevel::SERIALIZABLE || context_->txn_mgr == nullptr) {
             return;
         }
-        auto* txn_mgr = context_->txn_mgr_;
-        txn_id_t reader_id = context_->txn_->get_transaction_id();
+        auto* txn_mgr = context_->txn_mgr;
+        txn_id_t reader_id = context_->txn->get_transaction_id();
         txn_mgr->RecordRead(reader_id, tab_name_, rid);
 
         TupleMeta meta = scan_->get_tuple_meta(rid);
         if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
             return;
         }
-        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_start_ts();
+        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn->get_start_ts();
         if (invisible && txn_mgr->CheckInvisibleWriteEdge(reader_id, meta.writer_txn_id_)) {
             throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER);
         }
@@ -209,17 +209,17 @@ protected:
     }
 
     bool needs_historical_heap_scan() const {
-        if (context_ == nullptr || context_->txn_ == nullptr) {
+        if (context_ == nullptr || context_->txn == nullptr) {
             return false;
         }
-        IsolationLevel level = context_->txn_->get_isolation_level();
+        IsolationLevel level = context_->txn->get_isolation_level();
         return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::REPEATABLE_READ ||
-               (level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode());
+               (level == IsolationLevel::SERIALIZABLE && context_->txn->get_txn_mode());
     }
 
 public:
     IndexScanExecutor(SchemaManager* schema_manager, std::string tab_name, std::vector<Condition> conds,
-                      std::vector<std::string> index_col_names, Context* context)
+                      std::vector<std::string> index_col_names, StatementContext* context)
         : table_access_(schema_manager) {
         schema_manager_ = schema_manager;
         context_ = context;

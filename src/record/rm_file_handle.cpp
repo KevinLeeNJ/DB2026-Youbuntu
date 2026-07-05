@@ -15,10 +15,10 @@ namespace rmdb::record {
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
- * @param {Context*} context
+ * @param {StatementContext*} context
  * @return {unique_ptr<RmRecord>} rid对应的记录对象指针
  */
-std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
+std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, StatementContext* context) const {
     (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle
@@ -31,7 +31,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     return record_ptr;
 }
 
-RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* context) const {
+RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, StatementContext* context) const {
     (void)context;
     RmPageHandle tmp_page_handle = fetch_page_handle(rid.page_no);
     TupleMeta meta = tmp_page_handle.get_meta(rid.slot_no);
@@ -45,10 +45,10 @@ RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* con
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据
- * @param {Context*} context
+ * @param {StatementContext*} context
  * @return {Rid} 插入的记录的记录号（位置）
  */
-Rid RmFileHandle::insert_record(char* buf, Context* context) {
+Rid RmFileHandle::insert_record(char* buf, StatementContext* context) {
     (void)context;
     // Todo:
     // 1. 获取当前未满的page handle
@@ -163,9 +163,9 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
 /**
  * @description: 删除记录文件中记录号为rid的记录
  * @param {Rid&} rid 要删除的记录的记录号（位置）
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void RmFileHandle::delete_record(const Rid& rid, Context* context) {
+void RmFileHandle::delete_record(const Rid& rid, StatementContext* context) {
     (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle
@@ -188,9 +188,9 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @description: 更新记录文件中记录号为rid的记录
  * @param {Rid&} rid 要更新的记录的记录号（位置）
  * @param {char*} buf 新记录的数据
- * @param {Context*} context
+ * @param {StatementContext*} context
  */
-void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
+void RmFileHandle::update_record(const Rid& rid, char* buf, StatementContext* context) {
     (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle

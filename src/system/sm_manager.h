@@ -13,11 +13,12 @@ See the Mulan PSL v2 for more details. */
 
 #include <unordered_map>
 
-#include "common/context.h"
 #include "index/ix.h"
 #include "record/rm_file_handle.h"
+#include "server/output_sink.h"
 #include "sm_defs.h"
 #include "sm_meta.h"
+#include "statement/statement_context.h"
 
 namespace rmdb::record {
 class RmManager;
@@ -91,21 +92,22 @@ public:
 
     void flush_meta();
 
-    void show_tables(Context* context);
+    void show_tables(OutputSink* sink);
 
-    void show_index(const std::string& tab_name, Context* context);
+    void show_index(const std::string& tab_name, OutputSink* sink);
 
-    void desc_table(const std::string& tab_name, Context* context);
+    void desc_table(const std::string& tab_name, OutputSink* sink);
 
-    void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context);
+    void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, StatementContext* context);
 
-    void drop_table(const std::string& tab_name, Context* context);
+    void drop_table(const std::string& tab_name, StatementContext* context);
 
-    void create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
+    void create_index(const std::string& tab_name, const std::vector<std::string>& col_names,
+                      StatementContext* context);
 
-    void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
+    void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, StatementContext* context);
 
-    void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+    void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, StatementContext* context);
 
     void insert_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& rec);
 
@@ -137,7 +139,7 @@ public:
     // Bulk-load a CSV file into an existing table. The path is relative to the
     // server's working directory. Reuses the insert path (WAL + index + MVCC
     // meta) in self-managed batched transactions, skipping conflict checks.
-    void load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context);
+    void load_csv_data(const std::string& file_path, const std::string& tab_name, StatementContext* context);
 };
 
 } // namespace rmdb::system

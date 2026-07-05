@@ -45,34 +45,36 @@ TupleMeta TableAccess::get_tuple_meta(const std::string& tab_name, const Rid& ri
     return schema_manager_->get_table_handle(tab_name)->get_tuple_meta(rid);
 }
 
-std::unique_ptr<RmRecord> TableAccess::get_record(const std::string& tab_name, const Rid& rid, rmdb::Context* context) {
+std::unique_ptr<RmRecord> TableAccess::get_record(const std::string& tab_name, const Rid& rid,
+                                                  rmdb::statement::StatementContext* context) {
     return schema_manager_->get_table_handle(tab_name)->get_record(rid, context);
 }
 
 std::unique_ptr<RmRecord> TableAccess::get_visible_record(const std::string& tab_name, const Rid& rid,
-                                                          rmdb::Context* context) {
+                                                          rmdb::statement::StatementContext* context) {
     return GetVisibleRecord(schema_manager_->get_table_handle(tab_name), rid, context);
 }
 
-bool TableAccess::check_predicate_invisible_writes(rmdb::Context* context, txn_id_t reader, const std::string& tab_name,
-                                                   const std::vector<Condition>& conds,
+bool TableAccess::check_predicate_invisible_writes(rmdb::statement::StatementContext* context, txn_id_t reader,
+                                                   const std::string& tab_name, const std::vector<Condition>& conds,
                                                    const std::vector<ColMeta>& cols) {
-    if (context == nullptr || context->txn_mgr_ == nullptr) {
+    if (context == nullptr || context->txn_mgr == nullptr) {
         return false;
     }
-    return context->txn_mgr_->CheckPredicateInvisibleWrites(reader, tab_name, conds,
-                                                            schema_manager_->get_table_handle(tab_name), cols);
+    return context->txn_mgr->CheckPredicateInvisibleWrites(reader, tab_name, conds,
+                                                           schema_manager_->get_table_handle(tab_name), cols);
 }
 
 bool TableAccess::deleted_tuple_candidates_conflict_with_insert(const std::string& tab_name,
-                                                                const RmRecord& inserted_rec, rmdb::Context* context) {
+                                                                const RmRecord& inserted_rec,
+                                                                rmdb::statement::StatementContext* context) {
     return DeletedTupleCandidatesConflictWithInsert(schema_manager_->get_table_handle(tab_name), tab_name, inserted_rec,
                                                     context);
 }
 
 bool TableAccess::historical_index_key_conflicts_with_txn(const std::string& tab_name, const Rid& rid,
                                                           const IndexMeta& index, const std::vector<char>& key,
-                                                          rmdb::Context* context) {
+                                                          rmdb::statement::StatementContext* context) {
     return HistoricalIndexKeyConflictsWithTxn(schema_manager_->get_table_handle(tab_name), rid, index, key, context);
 }
 

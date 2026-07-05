@@ -34,7 +34,7 @@ Rid TableCursor::rid() const {
     return scan_->rid();
 }
 
-std::unique_ptr<RmRecord> TableCursor::get_visible_record(rmdb::Context* context) {
+std::unique_ptr<RmRecord> TableCursor::get_visible_record(rmdb::statement::StatementContext* context) {
     return GetVisibleRecord(fh_, scan_->rid(), context);
 }
 
@@ -46,11 +46,11 @@ bool TableCursor::is_record(const Rid& rid) const {
     return fh_->is_record(rid);
 }
 
-std::unique_ptr<RmRecord> TableCursor::get_record(const Rid& rid, rmdb::Context* context) const {
+std::unique_ptr<RmRecord> TableCursor::get_record(const Rid& rid, rmdb::statement::StatementContext* context) const {
     return fh_->get_record(rid, context);
 }
 
-RmRecordWithMeta TableCursor::get_record_with_meta(const Rid& rid, rmdb::Context* context) const {
+RmRecordWithMeta TableCursor::get_record_with_meta(const Rid& rid, rmdb::statement::StatementContext* context) const {
     return fh_->get_record_with_meta(rid, context);
 }
 
