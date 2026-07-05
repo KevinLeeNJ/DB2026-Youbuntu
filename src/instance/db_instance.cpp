@@ -25,11 +25,17 @@ DBInstance::DBInstance() {
     txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
     planner_ = std::make_unique<Planner>(schema_manager_.get());
     optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
-    ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), planner_.get());
     log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
+    recovery_access_ = std::make_unique<dbaccess::RecoveryAccess>(schema_manager_.get());
     recovery_ = std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(),
-                                                  schema_manager_.get(), log_manager_.get());
-    portal_ = std::make_unique<Portal>(schema_manager_.get());
+                                                  schema_manager_.get(), log_manager_.get(), recovery_access_.get());
+    write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                   log_manager_.get(), txn_manager_.get());
+    tuple_meta_writer_ = std::make_unique<dbaccess::TupleMetaWriter>(schema_manager_.get());
+    load_data_service_ = std::make_unique<dbaccess::LoadDataService>(schema_manager_.get(), write_service_.get());
+    ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), planner_.get(),
+                                              load_data_service_.get());
+    portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
     analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 }
 

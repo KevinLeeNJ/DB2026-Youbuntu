@@ -20,6 +20,9 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "analyze/analyze.h"
+#include "access/load_data_service.h"
+#include "access/recovery_access.h"
+#include "access/table_write_service.h"
 #include "common/config.h"
 #include "common/context.h"
 #include "errors.h"
@@ -72,12 +75,17 @@ public:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
-        ql_manager_ =
-            std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
+        recovery_access_ = std::make_unique<dbaccess::RecoveryAccess>(schema_manager_.get());
         recovery_ =
-            std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get());
-        portal_ = std::make_unique<Portal>(schema_manager_.get());
+            std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get(),
+                                              log_manager_.get(), recovery_access_.get());
+        write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                       log_manager_.get(), txn_manager_.get());
+        load_data_service_ = std::make_unique<dbaccess::LoadDataService>(schema_manager_.get(), write_service_.get());
+        ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(),
+                                                  static_cast<Planner*>(nullptr), load_data_service_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
         // Create and open the database
@@ -230,9 +238,12 @@ private:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Optimizer> optimizer_;
-    std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
+    std::unique_ptr<dbaccess::RecoveryAccess> recovery_access_;
     std::unique_ptr<RecoveryManager> recovery_;
+    std::unique_ptr<dbaccess::TableWriteService> write_service_;
+    std::unique_ptr<dbaccess::LoadDataService> load_data_service_;
+    std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };

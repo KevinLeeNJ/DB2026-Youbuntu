@@ -118,12 +118,14 @@ public:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
-        ql_manager_ =
-            std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
+        write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                       log_manager_.get(), txn_manager_.get());
+        ql_manager_ = std::make_unique<QlManager>(schema_manager_.get(), txn_manager_.get(),
+                                                  static_cast<Planner*>(nullptr), nullptr);
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get());
-        portal_ = std::make_unique<Portal>(schema_manager_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
 
         sm_manager_->create_db(db_name_);
@@ -188,6 +190,7 @@ private:
     std::unique_ptr<Optimizer> optimizer_;
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
+    std::unique_ptr<dbaccess::TableWriteService> write_service_;
     std::unique_ptr<RecoveryManager> recovery_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;

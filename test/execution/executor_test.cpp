@@ -124,6 +124,7 @@ public:
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
     std::unique_ptr<SchemaManager> schema_manager_;
+    std::unique_ptr<dbaccess::TableWriteService> write_service_;
     bool db_opened_ = false;
 
     void SetUp() override {
@@ -134,6 +135,8 @@ public:
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
         schema_manager_ = std::make_unique<SchemaManager>(sm_manager_.get());
+        write_service_ =
+            std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), nullptr, nullptr, nullptr);
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
         }
@@ -172,7 +175,7 @@ public:
             char buf[4096];
             int offset = 0;
             Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-            InsertExecutor exec(schema_manager_.get(), tab_name, vals, &ctx);
+            InsertExecutor exec(schema_manager_.get(), write_service_.get(), tab_name, vals, &ctx);
             exec.Next();
         }
     }
@@ -342,7 +345,7 @@ TEST_F(ExecutorTest, projection_subset_columns) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "proj_t1", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "proj_t1", vals, &ctx);
         exec.Next();
     }
 
@@ -382,7 +385,7 @@ TEST_F(ExecutorTest, projection_all_columns) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "proj_t2", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "proj_t2", vals, &ctx);
         exec.Next();
     }
 
@@ -578,7 +581,7 @@ TEST_F(ExecutorTest, delete_all_records) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    DeleteExecutor exec(schema_manager_.get(), "del_t1", {}, rids, &ctx);
+    DeleteExecutor exec(schema_manager_.get(), write_service_.get(), "del_t1", {}, rids, &ctx);
     exec.Next();
 
     // Verify all records are gone
@@ -644,7 +647,7 @@ TEST_F(ExecutorTest, update_single_field) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), "upd_t1", {sc}, {}, rids, &ctx);
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t1", {sc}, {}, rids, &ctx);
     exec.Next();
 
     // Verify all records now have id=110
@@ -677,7 +680,7 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "rc_lost_update", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "rc_lost_update", vals, &ctx);
         exec.Next();
     }
 
@@ -715,13 +718,15 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     next_3021.set_int(3021);
     set_next_to_3021.rhs = next_3021;
 
-    UpdateExecutor txn1_update(schema_manager_.get(), "rc_lost_update", {set_next_to_3021}, {}, {rid}, &ctx1);
+    UpdateExecutor txn1_update(schema_manager_.get(), write_service_.get(), "rc_lost_update", {set_next_to_3021}, {},
+                               {rid}, &ctx1);
     ASSERT_NO_THROW(txn1_update.Next());
     txn_manager.commit(txn1, nullptr);
 
     bool txn2_aborted = false;
     try {
-        UpdateExecutor txn2_update(schema_manager_.get(), "rc_lost_update", {set_next_to_3021}, {}, {rid}, &ctx2);
+        UpdateExecutor txn2_update(schema_manager_.get(), write_service_.get(), "rc_lost_update", {set_next_to_3021},
+                                   {}, {rid}, &ctx2);
         txn2_update.Next();
     } catch (const TransactionAbortException&) {
         txn2_aborted = true;
@@ -754,7 +759,7 @@ TEST_F(ExecutorTest, update_multiple_fields) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "upd_t3", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t3", vals, &ctx);
         exec.Next();
     }
 
@@ -780,7 +785,7 @@ TEST_F(ExecutorTest, update_multiple_fields) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), "upd_t3", {sc}, {}, rids, &ctx);
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_t3", {sc}, {}, rids, &ctx);
     exec.Next();
 
     // Verify
@@ -809,7 +814,7 @@ TEST_F(ExecutorTest, delete_with_condition_via_scan_rids) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "del_cond", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "del_cond", vals, &ctx);
         exec.Next();
     }
 
@@ -836,7 +841,7 @@ TEST_F(ExecutorTest, delete_with_condition_via_scan_rids) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    DeleteExecutor exec(schema_manager_.get(), "del_cond", {cond}, rids, &ctx);
+    DeleteExecutor exec(schema_manager_.get(), write_service_.get(), "del_cond", {cond}, rids, &ctx);
     exec.Next();
 
     SeqScanExecutor scan(schema_manager_.get(), "del_cond", {}, &ctx);
@@ -867,7 +872,7 @@ TEST_F(ExecutorTest, update_with_condition_via_scan_rids) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "upd_cond", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_cond", vals, &ctx);
         exec.Next();
     }
 
@@ -900,7 +905,7 @@ TEST_F(ExecutorTest, update_with_condition_via_scan_rids) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), "upd_cond", {sc}, {cond}, rids, &ctx);
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_cond", {sc}, {cond}, rids, &ctx);
     exec.Next();
 
     SeqScanExecutor scan(schema_manager_.get(), "upd_cond", {}, &ctx);
@@ -935,7 +940,7 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "upd_promo", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_promo", vals, &ctx);
         exec.Next();
     }
 
@@ -959,7 +964,7 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), "upd_promo", {sc}, {}, rids, &ctx);
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_promo", {sc}, {}, rids, &ctx);
     exec.Next();
 
     SeqScanExecutor scan(schema_manager_.get(), "upd_promo", {}, &ctx);
@@ -987,7 +992,7 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
         char buf[4096];
         int offset = 0;
         Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-        InsertExecutor exec(schema_manager_.get(), "upd_trunc", vals, &ctx);
+        InsertExecutor exec(schema_manager_.get(), write_service_.get(), "upd_trunc", vals, &ctx);
         exec.Next();
     }
 
@@ -1011,7 +1016,7 @@ TEST_F(ExecutorTest, update_float_to_int_truncation) {
     char buf[4096];
     int offset = 0;
     Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    UpdateExecutor exec(schema_manager_.get(), "upd_trunc", {sc}, {}, rids, &ctx);
+    UpdateExecutor exec(schema_manager_.get(), write_service_.get(), "upd_trunc", {sc}, {}, rids, &ctx);
     exec.Next();
 
     SeqScanExecutor scan(schema_manager_.get(), "upd_trunc", {}, &ctx);

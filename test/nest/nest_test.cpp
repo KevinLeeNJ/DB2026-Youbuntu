@@ -47,6 +47,7 @@ protected:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Analyze> analyze_;
+    std::unique_ptr<dbaccess::TableWriteService> write_service_;
     std::unique_ptr<Portal> portal_;
     bool db_opened_ = false;
 
@@ -62,7 +63,9 @@ protected:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
         planner_ = std::make_unique<Planner>(schema_manager_.get());
         analyze_ = std::make_unique<Analyze>(schema_manager_.get());
-        portal_ = std::make_unique<Portal>(schema_manager_.get());
+        write_service_ = std::make_unique<dbaccess::TableWriteService>(schema_manager_.get(), lock_manager_.get(),
+                                                                       nullptr, txn_manager_.get());
+        portal_ = std::make_unique<Portal>(schema_manager_.get(), write_service_.get());
 
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
@@ -92,7 +95,7 @@ protected:
         auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(std::move(query), nullptr);
         auto portal_stmt = portal_->start(std::move(plan), nullptr);
-        QlManager ql_mgr(schema_manager_.get(), txn_manager_.get(), planner_.get());
+        QlManager ql_mgr(schema_manager_.get(), txn_manager_.get(), planner_.get(), nullptr);
         txn_id_t txn = 0;
         portal_->run(std::move(portal_stmt), &ql_mgr, &txn, nullptr);
     }

@@ -47,6 +47,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution_sort.h"
 #include "common/common.h"
 #include "optimizer/plan.h"
+#include "access/table_write_service.h"
 
 typedef enum portalTag {
     PORTAL_Invalid_Query = 0,
@@ -72,6 +73,7 @@ struct PortalStmt {
 class Portal {
 private:
     SchemaManager* schema_manager_;
+    dbaccess::TableWriteService* write_service_;
 
     struct ExecutorQueryExpr {
         QueryExprType type = QueryExprType::COLUMN;
@@ -579,7 +581,8 @@ private:
     }
 
 public:
-    Portal(SchemaManager* schema_manager) : schema_manager_(schema_manager) {}
+    Portal(SchemaManager* schema_manager, dbaccess::TableWriteService* write_service)
+        : schema_manager_(schema_manager), write_service_(write_service) {}
     ~Portal() {}
 
     // 将查询执行计划转换成对应的算子树
@@ -636,7 +639,7 @@ public:
                     rids.push_back(scan->rid());
                 }
                 std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
-                    schema_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
+                    schema_manager_, write_service_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
@@ -647,16 +650,16 @@ public:
                     rids.push_back(scan->rid());
                 }
 
-                std::unique_ptr<AbstractExecutor> root =
-                    std::make_unique<DeleteExecutor>(schema_manager_, x->tab_name_, x->conds_, rids, context);
+                std::unique_ptr<AbstractExecutor> root = std::make_unique<DeleteExecutor>(
+                    schema_manager_, write_service_, x->tab_name_, x->conds_, rids, context);
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
 
             case T_Insert: {
-                std::unique_ptr<AbstractExecutor> root =
-                    std::make_unique<InsertExecutor>(schema_manager_, x->tab_name_, x->values_, context);
+                std::unique_ptr<AbstractExecutor> root = std::make_unique<InsertExecutor>(
+                    schema_manager_, write_service_, x->tab_name_, x->values_, context);
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));

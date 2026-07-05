@@ -326,6 +326,7 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     sm_mgr.create_db("executor_dml_log_test_db");
     sm_mgr.open_db("executor_dml_log_test_db");
     LogManager log_mgr(&disk);
+    dbaccess::TableWriteService write_svc(&schema_mgr, &lock_mgr, &log_mgr, &txn_mgr);
 
     sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
     sm_mgr.create_index("t", {"id"}, nullptr);
@@ -337,17 +338,17 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     id.set_int(1);
     Value v;
     v.set_int(10);
-    InsertExecutor insert_executor(&schema_mgr, "t", {id, v}, &context);
+    InsertExecutor insert_executor(&schema_mgr, &write_svc, "t", {id, v}, &context);
     insert_executor.Next();
     Rid rid = insert_executor.rid();
 
     Value new_v;
     new_v.set_int(20);
     SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT};
-    UpdateExecutor update_executor(&schema_mgr, "t", {set_clause}, {}, {rid}, &context);
+    UpdateExecutor update_executor(&schema_mgr, &write_svc, "t", {set_clause}, {}, {rid}, &context);
     update_executor.Next();
 
-    DeleteExecutor delete_executor(&schema_mgr, "t", {}, {rid}, &context);
+    DeleteExecutor delete_executor(&schema_mgr, &write_svc, "t", {}, {rid}, &context);
     delete_executor.Next();
 
     txn_mgr.commit(txn, &log_mgr);

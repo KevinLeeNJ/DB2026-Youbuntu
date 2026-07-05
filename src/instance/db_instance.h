@@ -13,6 +13,10 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 
+#include "access/load_data_service.h"
+#include "access/recovery_access.h"
+#include "access/table_write_service.h"
+#include "access/tuple_meta_writer.h"
 #include "analyze/analyze.h"
 #include "index/ix_manager.h"
 #include "optimizer/optimizer.h"
@@ -97,6 +101,18 @@ public:
     Analyze& analyze() {
         return *analyze_;
     }
+    dbaccess::TableWriteService& write_service() {
+        return *write_service_;
+    }
+    dbaccess::RecoveryAccess& recovery_access() {
+        return *recovery_access_;
+    }
+    dbaccess::TupleMetaWriter& tuple_meta_writer() {
+        return *tuple_meta_writer_;
+    }
+    dbaccess::LoadDataService& load_data_service() {
+        return *load_data_service_;
+    }
 
 private:
     // 声明顺序即构造顺序，逆序析构。切勿随意调整顺序。
@@ -110,9 +126,13 @@ private:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Optimizer> optimizer_;
-    std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
+    std::unique_ptr<dbaccess::RecoveryAccess> recovery_access_;
     std::unique_ptr<RecoveryManager> recovery_;
+    std::unique_ptr<dbaccess::TableWriteService> write_service_;
+    std::unique_ptr<dbaccess::TupleMetaWriter> tuple_meta_writer_;
+    std::unique_ptr<dbaccess::LoadDataService> load_data_service_;
+    std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };

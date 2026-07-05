@@ -478,6 +478,7 @@ public:
     std::unique_ptr<IxManager> ix_manager;
     std::unique_ptr<SmManager> sm_manager;
     std::unique_ptr<SchemaManager> schema_manager;
+    std::unique_ptr<dbaccess::TableWriteService> write_service;
     std::string db_name = "index_scan_feature_test_db";
     bool opened = false;
 
@@ -489,6 +490,7 @@ public:
         sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
                                                  ix_manager.get());
         schema_manager = std::make_unique<SchemaManager>(sm_manager.get());
+        write_service = std::make_unique<dbaccess::TableWriteService>(schema_manager.get(), nullptr, nullptr, nullptr);
         if (sm_manager->is_dir(db_name)) {
             sm_manager->drop_db(db_name);
         }
@@ -539,7 +541,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), "warehouse", {id, name_val}, &context);
+        InsertExecutor executor(schema_manager.get(), write_service.get(), "warehouse", {id, name_val}, &context);
         executor.Next();
     }
 
@@ -551,7 +553,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), tab_name, {av, bv}, &context);
+        InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv}, &context);
         executor.Next();
     }
 
@@ -565,7 +567,7 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), tab_name, {av, bv, cv}, &context);
+        InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv, cv}, &context);
         executor.Next();
     }
 
@@ -579,7 +581,8 @@ public:
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(schema_manager.get(), "scores", {sid_val, cid_val, score_val}, &context);
+        InsertExecutor executor(schema_manager.get(), write_service.get(), "scores", {sid_val, cid_val, score_val},
+                                &context);
         executor.Next();
     }
 
@@ -778,7 +781,8 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     for (delete_scan.beginTuple(); !delete_scan.is_end(); delete_scan.nextTuple()) {
         delete_rids.push_back(delete_scan.rid());
     }
-    DeleteExecutor delete_exec(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, delete_rids, &context);
+    DeleteExecutor delete_exec(schema_manager.get(), write_service.get(), "warehouse", {int_cond(OP_EQ, 700)},
+                               delete_rids, &context);
     delete_exec.Next();
     EXPECT_TRUE(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}).empty());
 
@@ -787,8 +791,9 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     for (update_scan.beginTuple(); !update_scan.is_end(); update_scan.nextTuple()) {
         update_rids.push_back(update_scan.rid());
     }
-    UpdateExecutor update_exec(schema_manager.get(), "warehouse", {set_int_clause("warehouse", "w_id", 507)},
-                               {int_cond(OP_EQ, 534)}, update_rids, &context);
+    UpdateExecutor update_exec(schema_manager.get(), write_service.get(), "warehouse",
+                               {set_int_clause("warehouse", "w_id", 507)}, {int_cond(OP_EQ, 534)}, update_rids,
+                               &context);
     update_exec.Next();
     EXPECT_EQ(scan_ids({int_cond(OP_GT, 100), int_cond(OP_LT, 534)}, {"w_id"}), std::vector<int>({500, 507}));
 }
@@ -818,8 +823,9 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
         rids.push_back(scan.rid());
     }
 
-    UpdateExecutor update_exec(schema_manager.get(), "warehouse", {set_string_clause("warehouse", "name", "qweruiop")},
-                               {string_cond(OP_EQ, "asdfhjkl")}, rids, &context);
+    UpdateExecutor update_exec(schema_manager.get(), write_service.get(), "warehouse",
+                               {set_string_clause("warehouse", "name", "qweruiop")}, {string_cond(OP_EQ, "asdfhjkl")},
+                               rids, &context);
     EXPECT_THROW(update_exec.Next(), IndexEntryExistsError);
 
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "asdfhjkl")}, {"name"}), std::vector<int>({534}));

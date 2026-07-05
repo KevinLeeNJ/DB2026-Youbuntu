@@ -27,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "transaction/transaction_manager.h"
 #include "optimizer/planner.h"
+#include "access/load_data_service.h"
 
 class Planner;
 
@@ -35,10 +36,13 @@ private:
     SchemaManager* schema_manager_;
     TransactionManager* txn_mgr_;
     Planner* planner_;
+    dbaccess::LoadDataService* load_data_service_;
 
 public:
-    QlManager(SchemaManager* schema_manager, TransactionManager* txn_mgr, Planner* planner)
-        : schema_manager_(schema_manager), txn_mgr_(txn_mgr), planner_(planner) {}
+    QlManager(SchemaManager* schema_manager, TransactionManager* txn_mgr, Planner* planner,
+              dbaccess::LoadDataService* load_data_service)
+        : schema_manager_(schema_manager), txn_mgr_(txn_mgr), planner_(planner), load_data_service_(load_data_service) {
+    }
 
     void run_mutli_query(Plan* plan, Context* context);
     void run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context);

@@ -185,7 +185,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     }
     case T_LoadData: {
         auto* x = static_cast<LoadDataPlan*>(plan);
-        schema_manager_->load_csv_data(x->file_name_, x->tab_name_, context);
+        load_data_service_->load_csv(x->file_name_, x->tab_name_, context);
         break;
     }
     case T_StaticCheckpoint: {

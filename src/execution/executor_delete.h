@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 #include "system/schema_manager.h"
+#include "access/table_write_service.h"
 
 class DeleteExecutor : public AbstractExecutor {
 private:
@@ -26,10 +27,12 @@ private:
     std::vector<Rid> rids_;        // 需要删除的记录的位置
     std::string tab_name_;         // 表名称
     SchemaManager* schema_manager_;
+    dbaccess::TableWriteService* write_service_;
 
 public:
-    DeleteExecutor(SchemaManager* schema_manager, const std::string& tab_name, std::vector<Condition> conds,
-                   std::vector<Rid> rids, Context* context) {
+    DeleteExecutor(SchemaManager* schema_manager, dbaccess::TableWriteService* write_service,
+                   const std::string& tab_name, std::vector<Condition> conds, std::vector<Rid> rids, Context* context)
+        : write_service_(write_service) {
         schema_manager_ = schema_manager;
         tab_name_ = tab_name;
         tab_ = schema_manager_->catalog().get_table(tab_name);
@@ -43,132 +46,10 @@ public:
         if (rids_.empty()) {
             return nullptr; // 没有更多记录可以删除
         }
-        // 删除记录
         for (Rid rid : rids_) {
-            auto rec = GetVisibleRecord(fh_, rid, context_);
-            if (rec == nullptr) {
-                continue;
-            }
-            char* rec_data = rec->data;
-            bool match = true;
-            for (const auto& cond : conds_) {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
-            if (!match) {
-                continue; // 如果记录不匹配条件，则跳过删除
-            }
-            // MVCC Write-Write conflict detection
-            if (context_ != nullptr && context_->txn_ != nullptr) {
-                auto txn = context_->txn_;
-                if (context_->lock_mgr_ != nullptr &&
-                    !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
-                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                }
-                if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
-                    context_->txn_mgr_->BeginStatement(txn);
-                    rec = GetVisibleRecord(fh_, rid, context_);
-                    if (rec == nullptr) {
-                        continue;
-                    }
-                    rec_data = rec->data;
-                    bool latest_match = true;
-                    for (const auto& cond : conds_) {
-                        if (!compare(cond, *rec)) {
-                            latest_match = false;
-                            break;
-                        }
-                    }
-                    if (!latest_match) {
-                        continue;
-                    }
-                }
-                TupleMeta meta = fh_->get_tuple_meta(rid);
-                if (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id()) {
-                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                }
-                IsolationLevel level = txn->get_isolation_level();
-                bool snapshot_conflict_check = level == IsolationLevel::SNAPSHOT_ISOLATION ||
-                                               level == IsolationLevel::REPEATABLE_READ ||
-                                               level == IsolationLevel::SERIALIZABLE;
-                if (snapshot_conflict_check && meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
-                    meta.writer_txn_id_ != txn->get_transaction_id()) {
-                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                }
-
-                // SSI: Check if this delete conflicts with other SER transactions' reads
-                if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr) {
-                    auto* txn_mgr = context_->txn_mgr_;
-                    if (txn_mgr->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, tab_name_,
-                                                          std::optional<RmRecord>(*rec), std::nullopt, tab_.cols)) {
-                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
-                    }
-                }
-            }
-            if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
-                DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *rec, rid, tab_name_);
-                log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
-                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
-                context_->txn_->set_prev_lsn(lsn);
-            }
-            auto undo_record = context_ != nullptr && context_->txn_ != nullptr
-                                   ? std::make_unique<WriteRecord>(WType::DELETE_TUPLE, tab_name_, rid, *rec)
-                                   : nullptr;
-            struct DeletedIndex {
-                const IndexMeta* index;
-                std::vector<char> key;
-            };
-            std::vector<DeletedIndex> deleted_indexes;
-            try {
-                for (auto& index : tab_.indexes) {
-                    auto ih = schema_manager_->get_index_handle(tab_name_, index.cols);
-                    std::vector<char> key(index.col_tot_len);
-                    int offset = 0;
-                    for (int i = 0; i < index.col_num; ++i) {
-                        std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
-                        offset += index.cols[i].len;
-                    }
-                    if (context_->txn_mgr_ != nullptr) {
-                        context_->txn_mgr_->ssi_registry().remember_historical_index_key(
-                            tab_name_, schema_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key,
-                            rid);
-                    }
-                    ih->delete_entry(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
-                    deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
-                }
-            } catch (...) {
-                for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
-                    auto ih = schema_manager_->get_index_handle(tab_name_, it->index->cols);
-                    ih->insert_entry(it->key.data(), rid, context_ == nullptr ? nullptr : context_->txn_, true);
-                }
-                // undo_record is automatically cleaned up by unique_ptr
-                throw;
-            }
-            if (undo_record != nullptr) {
-                UndoLog undo;
-                undo.is_deleted_ = true;
-                undo.old_meta_ = fh_->get_tuple_meta(rid);
-                undo.old_tuple_data_.assign(rec->data, rec->data + rec->size);
-                undo.prev_version_ = undo.old_meta_.version_chain_head_;
-                UndoLink undo_link = context_->txn_->AppendUndoLog(undo);
-
-                context_->txn_->append_write_record(std::move(undo_record));
-                context_->txn_->append_modified_slot(tab_name_, rid);
-
-                TupleMeta tombstone;
-                tombstone.writer_txn_id_ = context_->txn_->get_transaction_id();
-                tombstone.is_committed_ = false;
-                tombstone.is_deleted_ = true;
-                tombstone.version_chain_head_ = undo_link;
-                fh_->set_tuple_meta(rid, tombstone);
-                if (context_->txn_mgr_ != nullptr) {
-                    context_->txn_mgr_->ssi_registry().remember_deleted_tuple_candidate(tab_name_, rid);
-                }
-            } else {
-                fh_->delete_record(rid, context_);
-            }
+            // 写协议（可见性预检 / 加锁 / 重读 / WW / WAL / Undo / 索引 / TupleMeta / SSI）
+            // 统一交由 TableWriteService::remove 执行。
+            write_service_->remove(tab_name_, rid, conds_, context_ == nullptr ? nullptr : context_->txn_, context_);
         }
         return nullptr;
     }
