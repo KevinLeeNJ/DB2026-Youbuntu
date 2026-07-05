@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::access {
 
-/// 扫描游标抽象基类（Phase 6）。
+/// 扫描游标抽象基类。
 /// TableCursor / IndexCursor 共同继承，让执行器以统一接口持有 scan_。
 /// 不暴露 RmScan/IxScan/RmFileHandle/IxIndexHandle，execution/ 经此门面访问数据。
 class ScanCursor {

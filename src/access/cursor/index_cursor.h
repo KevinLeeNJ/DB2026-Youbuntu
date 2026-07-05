@@ -23,7 +23,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::access {
 
-/// 封装 IxScan + heap 回表 + 索引范围查询构造（Phase 6）。
+/// 封装 IxScan + heap 回表 + 索引范围查询构造。
 /// 持有 IxIndexHandle* 和 RmFileHandle*，对外不暴露这些存储细节。
 class IndexCursor : public ScanCursor {
 public:

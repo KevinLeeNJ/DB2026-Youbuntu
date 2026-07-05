@@ -22,7 +22,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::exec {
 
-/// 表达式求值器（Phase 6 子任务3）。
+/// 表达式求值器。
 /// 当前仅提取条件比较的 type dispatch / op-switch 逻辑，
 /// 消除 AbstractExecutor::compare 中的类型分支重复。
 /// get_col_offset 虚回调仍保留在 executor 中（ledger 登记后续收敛）。

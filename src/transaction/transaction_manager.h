@@ -64,7 +64,7 @@ public:
 
     ~TransactionManager() = default;
 
-    // SSI 辅助数据（历史索引键 + 已删除元组候选），Phase 2 从 SmManager 迁入。
+    // SSI 辅助数据（历史索引键 + 已删除元组候选）。
     // executor 通过 context_->txn_mgr_->ssi_registry() 访问。
     SSIRegistry& ssi_registry() {
         return ssi_registry_;
@@ -240,7 +240,7 @@ private:
     std::mutex latch_;                           // 用于txn_map的并发
     SchemaManager* schema_manager_;
     LockManager* lock_manager_;
-    SSIRegistry ssi_registry_; // SSI 辅助数据，Phase 2 迁入
+    SSIRegistry ssi_registry_; // SSI 辅助数据
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC

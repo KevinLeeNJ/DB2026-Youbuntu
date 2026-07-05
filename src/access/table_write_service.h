@@ -24,13 +24,14 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::access {
 
-/// 统一写路径服务。insert / delete / update / load 的写协议集中在此实现。
+/// 统一写路径服务。insert / delete / update 的事务写协议集中在此实现；
+/// LOAD DATA 通过无 WAL bulk_insert 走受控物理批量写快路径。
 /// 执行器只调用本服务的接口，不再直接调 add_log_to_buffer / set_tuple_meta /
 /// insert_entry / delete_entry。详见 docs/refactor/write-protocol-contract.md。
 ///
-/// Phase 4 保持行为不变：
-/// - 决策 G：不调用 set_page_lsn（独立 PR 修复）。
-/// - 决策 H 选项 A：保持当前锁语义，delete/update 行级 X 锁，insert 无事务锁。
+/// 当前行为约束：
+/// - 不调用 set_page_lsn（pageLSN 修复作为独立 PR）。
+/// - delete/update 行级 X 锁，insert 无事务锁。
 /// - txn=nullptr（recovery / load 无事务场景）：跳过锁 / WAL / Undo / MVCC。
 class TableWriteService {
 public:
@@ -55,8 +56,9 @@ public:
                 const std::vector<Condition>& conds, Transaction* txn, StatementContext* ctx);
 
     // === 批量插入（LOAD DATA 用）===
-    /// 无事务批量插入。内部用 PinnedInserter 走批量路径，跳过锁/WAL/Undo/MVCC。
-    /// 失败时抛 RMDBError。调用方负责 flush（LoadDataService 在结束时 flush）。
+
+    /// 无 WAL 批量插入。内部用 PinnedInserter 写 heap/index，跳过锁/WAL/Undo/MVCC。
+    /// 仅供 LOAD DATA fast path 使用；普通 INSERT/UPDATE/DELETE 不得调用。
     void bulk_insert(const std::string& tab_name, const std::vector<std::vector<char>>& rows, StatementContext* ctx);
 
 private:

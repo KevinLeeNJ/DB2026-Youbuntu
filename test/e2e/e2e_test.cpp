@@ -75,8 +75,8 @@ public:
                                                           rm_manager_.get(), ix_manager_.get(), pager_.get());
         lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
-        planner_ = std::make_unique<Planner>(schema_manager_.get());
-        optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
+        planner_ = std::make_unique<Planner>(&schema_manager_->catalog());
+        optimizer_ = std::make_unique<Optimizer>(planner_.get());
         recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager_.get());
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), schema_manager_.get(),
@@ -87,7 +87,7 @@ public:
             std::make_unique<rmdb::access::LoadDataService>(schema_manager_.get(), write_service_.get());
         statement_runner_ = std::make_unique<StatementRunner>(
             schema_manager_.get(), write_service_.get(), planner_.get(), load_data_service_.get(), txn_manager_.get());
-        analyze_ = std::make_unique<Analyze>(schema_manager_.get());
+        analyze_ = std::make_unique<Analyze>(&schema_manager_->catalog());
 
         // Create and open the database
         if (!schema_manager_->is_dir(db_name_)) {

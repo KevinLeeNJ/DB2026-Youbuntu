@@ -13,9 +13,8 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 
 #include "access/table_write_service.h"
-#include "execution_common.h"
+#include "access/mvcc_access.h"
 #include "execution_defs.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm_meta.h"

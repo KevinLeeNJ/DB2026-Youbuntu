@@ -25,13 +25,12 @@ See the Mulan PSL v2 for more details. */
 namespace rmdb::access {
 
 void LoadDataService::load_csv(const std::string& file_path, const std::string& tab_name, StatementContext* ctx) {
-    (void)ctx;
     std::ifstream infile(file_path);
     if (!infile.is_open()) {
         throw RMDBError("cannot open load file: " + file_path);
     }
 
-    auto& tab = schema_mgr_->catalog().get_table(tab_name);
+    const auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     const int record_size = fh->get_file_hdr().record_size;
     const auto& cols = tab.cols;

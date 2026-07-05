@@ -18,8 +18,8 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::access {
 
-/// LOAD DATA 服务。CSV 解析 + 批量插入，受写协议约束（无事务批量路径）。
-/// 取代 SmManager::load_csv_data 的法外写路径。
+/// LOAD DATA 服务。CSV 解析 + 无 WAL 物理批量插入。
+/// SmManager::load_csv_data 已删除，此为唯一 LOAD DATA 入口。
 class LoadDataService {
 public:
     LoadDataService(SchemaManager* schema_mgr, TableWriteService* write_svc)

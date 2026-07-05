@@ -35,7 +35,8 @@ using namespace rmdb;
 
 static bool should_exit = false;
 
-// 信号处理函数需要全局访问点；Phase 7 StatementRunner 重构后移除（见 migration-ledger）。
+// 信号处理函数需要进程全局访问点，SIGINT 时可调用 flush_log_to_disk_with_sync。
+// 单进程单实例，生命周期与 main() 绑定。
 static rmdb::instance::DBInstance* g_instance = nullptr;
 
 static jmp_buf jmpbuf;

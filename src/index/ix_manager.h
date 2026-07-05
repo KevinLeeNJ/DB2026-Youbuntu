@@ -24,7 +24,7 @@ class IxManager {
 private:
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
-    rmdb::pager::Pager* pager_; // Phase 5: flush 路径经由 Pager，保证 WAL-before-page-write
+    rmdb::pager::Pager* pager_; // flush 路径经由 Pager，保证 WAL-before-page-write
 
 public:
     IxManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, rmdb::pager::Pager* pager)

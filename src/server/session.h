@@ -20,7 +20,7 @@ namespace rmdb::server {
 
 /// 单个客户端连接的 per-session 状态。
 /// 持有当前事务 id、隔离级别、输出缓冲区；不拥有任何内核对象。
-/// 生命周期与连接线程绑定。Phase 1 从 rmdb.cpp 的 client_handler 局部变量迁入。
+/// 生命周期与连接线程绑定。
 class Session {
 public:
     Session() {

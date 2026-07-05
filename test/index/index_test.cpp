@@ -544,8 +544,6 @@ public:
         id.set_int(w_id);
         Value name_val;
         name_val.set_str(name);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         InsertExecutor executor(schema_manager.get(), write_service.get(), "warehouse", {id, name_val}, &scontext);
         executor.Next();
@@ -556,8 +554,6 @@ public:
         av.set_int(a);
         Value bv;
         bv.set_int(b);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv}, &scontext);
         executor.Next();
@@ -570,8 +566,6 @@ public:
         bv.set_int(b);
         Value cv;
         cv.set_int(c);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         InsertExecutor executor(schema_manager.get(), write_service.get(), tab_name, {av, bv, cv}, &scontext);
         executor.Next();
@@ -584,8 +578,6 @@ public:
         cid_val.set_int(cid);
         Value score_val;
         score_val.set_float(score);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         InsertExecutor executor(schema_manager.get(), write_service.get(), "scores", {sid_val, cid_val, score_val},
                                 &scontext);
@@ -635,8 +627,6 @@ public:
     }
 
     std::vector<int> scan_ids(const std::vector<Condition>& conds, const std::vector<std::string>& index_cols) {
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         IndexScanExecutor executor(schema_manager.get(), "warehouse", conds, index_cols, &scontext);
         std::vector<int> ids;
@@ -649,8 +639,6 @@ public:
 
     std::vector<int> scan_table_ints(const std::string& tab_name, const std::vector<Condition>& conds,
                                      const std::vector<std::string>& index_cols) {
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         IndexScanExecutor executor(schema_manager.get(), tab_name, conds, index_cols, &scontext);
         std::vector<int> values;
@@ -663,8 +651,6 @@ public:
 
     std::vector<std::pair<int, int>> scan_score_keys(const std::vector<Condition>& conds,
                                                      const std::vector<std::string>& index_cols) {
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         IndexScanExecutor executor(schema_manager.get(), "scores", conds, index_cols, &scontext);
         std::vector<std::pair<int, int>> values;
@@ -677,8 +663,6 @@ public:
 
     std::vector<int> skip_scan_three_int_a_values(const std::vector<Condition>& conds,
                                                   const std::vector<std::string>& index_cols) {
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
         StatementContext scontext;
         IndexSkipScanExecutor executor(schema_manager.get(), "triples", conds, index_cols, &scontext);
         std::vector<int> values;
@@ -761,7 +745,7 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
 TEST_F(IndexScanFeatureTest, PlannerSelectsBestLeftmostPrefixIndexAndReordersConditions) {
     create_warehouse();
     schema_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
-    Planner planner(schema_manager.get());
+    Planner planner(&schema_manager->catalog());
     std::vector<Condition> conds = {string_cond(OP_EQ, "qwerghjk"), int_cond(OP_EQ, 100)};
     std::vector<std::string> index_cols;
 
@@ -779,8 +763,6 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     insert_row(700, "newdance");
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}), std::vector<int>({700}));
 
-    char data_send[BUFFER_LENGTH] = {};
-    int offset = 0;
     StatementContext scontext;
     std::vector<Rid> delete_rids;
     IndexScanExecutor delete_scan(schema_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &scontext);
@@ -820,8 +802,6 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
     create_warehouse();
     schema_manager->create_index("warehouse", {"name"}, nullptr);
 
-    char data_send[BUFFER_LENGTH] = {};
-    int offset = 0;
     StatementContext scontext;
     std::vector<Rid> rids;
     IndexScanExecutor scan(schema_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &scontext);
@@ -844,7 +824,7 @@ TEST_F(IndexScanFeatureTest, CreateIndexRejectsDuplicateExistingKeysAndDoesNotLe
     insert_two_ints("dups", 1, 20);
 
     EXPECT_THROW(schema_manager->create_index("dups", {"a"}, nullptr), IndexEntryExistsError);
-    EXPECT_FALSE(schema_manager->db().get_table("dups").is_index({"a"}));
+    EXPECT_FALSE(schema_manager->catalog().get_table("dups").is_index({"a"}));
     EXPECT_TRUE(schema_manager->find_index_handle("dups", std::vector<std::string>{"a"}) == nullptr);
 }
 

@@ -240,7 +240,7 @@ TupleMeta FallbackCommittedMeta() {
 
 void UndoWriteRecord(SchemaManager* schema_manager, WriteRecord* write_record, Transaction* txn) {
     const std::string tab_name = write_record->GetTableName();
-    auto& tab = schema_manager->catalog().get_table(tab_name);
+    const auto& tab = schema_manager->catalog().get_table(tab_name);
     auto* fh = schema_manager->get_table_handle(tab_name);
     Rid rid = write_record->GetRid();
 
@@ -542,10 +542,7 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
             rhs_type = rhs_col.type;
             rhs_data = rec.data + rhs_col.offset;
         }
-        if (!((lhs_col.type == rhs_type) || (lhs_col.type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-              (lhs_col.type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
-              ((lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) &&
-               (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)))) {
+        if (!can_cast(lhs_col.type, rhs_type)) {
             throw IncompatibleTypeError(coltype2str(lhs_col.type), coltype2str(rhs_type));
         }
         int cmp = 0;

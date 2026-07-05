@@ -21,7 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include "sm_defs.h"
 
 namespace rmdb::system {
-/* DDL 列定义（Phase 6 从 sm_manager.h 迁入，供外部模块只依赖类型头） */
+/* DDL 列定义，供外部模块只依赖类型头 */
 struct ColDef {
     std::string name; // Column name
     ColType type;     // Type of column
@@ -123,9 +123,31 @@ struct TabMeta {
         }
         throw IndexNotFoundError(name, col_names);
     }
+    std::vector<IndexMeta>::const_iterator get_index_meta(const std::vector<std::string>& col_names) const {
+        for (auto index = indexes.begin(); index != indexes.end(); ++index) {
+            if (static_cast<size_t>((*index).col_num) != col_names.size())
+                continue;
+            const auto& index_cols = (*index).cols;
+            size_t i = 0;
+            for (; i < col_names.size(); ++i) {
+                if (index_cols[i].name.compare(col_names[i]) != 0)
+                    break;
+            }
+            if (i == col_names.size())
+                return index;
+        }
+        throw IndexNotFoundError(name, col_names);
+    }
 
     /* 根据字段名称获取字段元数据 */
     std::vector<ColMeta>::iterator get_col(const std::string& col_name) {
+        auto pos = std::find_if(cols.begin(), cols.end(), [&](const ColMeta& col) { return col.name == col_name; });
+        if (pos == cols.end()) {
+            throw ColumnNotFoundError(col_name);
+        }
+        return pos;
+    }
+    std::vector<ColMeta>::const_iterator get_col(const std::string& col_name) const {
         auto pos = std::find_if(cols.begin(), cols.end(), [&](const ColMeta& col) { return col.name == col_name; });
         if (pos == cols.end()) {
             throw ColumnNotFoundError(col_name);
@@ -186,6 +208,14 @@ public:
 
     /* 获取指定名称表的元数据 */
     TabMeta& get_table(const std::string& tab_name) {
+        auto pos = tabs_.find(tab_name);
+        if (pos == tabs_.end()) {
+            throw TableNotFoundError(tab_name);
+        }
+
+        return pos->second;
+    }
+    const TabMeta& get_table(const std::string& tab_name) const {
         auto pos = tabs_.find(tab_name);
         if (pos == tabs_.end()) {
             throw TableNotFoundError(tab_name);

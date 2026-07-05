@@ -14,20 +14,20 @@ namespace rmdb::instance {
 
 DBInstance::DBInstance() {
     // 构造顺序与成员声明一致：底层存储先行，上层 manager 依赖前者
-    // Phase 5: log_manager_ 和 pager_ 提前，rm/ix/sm_manager_ 依赖 pager_
+    // log_manager_ 和 pager_ 先于 rm/ix/sm_manager_（后者依赖 pager_）
     disk_manager_ = std::make_unique<DiskManager>();
     buffer_pool_manager_ = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
     log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
     pager_ = std::make_unique<rmdb::pager::Pager>(buffer_pool_manager_.get(), log_manager_.get());
     rm_manager_ = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
     ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get(), pager_.get());
-    // Phase 6: SchemaManager 拥有 SmManager（内部实现细节），外部不再访问 SmManager。
+    // 构造顺序：schema_manager 先于依赖它的 analyzer/planner。
     schema_manager_ = std::make_unique<SchemaManager>(disk_manager_.get(), buffer_pool_manager_.get(),
                                                       rm_manager_.get(), ix_manager_.get(), pager_.get());
     lock_manager_ = std::make_unique<LockManager>();
     txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), schema_manager_.get());
-    planner_ = std::make_unique<Planner>(schema_manager_.get());
-    optimizer_ = std::make_unique<Optimizer>(schema_manager_.get(), planner_.get());
+    planner_ = std::make_unique<Planner>(&schema_manager_->catalog());
+    optimizer_ = std::make_unique<Optimizer>(planner_.get());
     recovery_access_ = std::make_unique<rmdb::access::RecoveryAccess>(schema_manager_.get());
     recovery_ = std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(),
                                                   schema_manager_.get(), log_manager_.get(), recovery_access_.get());
@@ -37,7 +37,7 @@ DBInstance::DBInstance() {
     load_data_service_ = std::make_unique<rmdb::access::LoadDataService>(schema_manager_.get(), write_service_.get());
     statement_runner_ = std::make_unique<StatementRunner>(schema_manager_.get(), write_service_.get(), planner_.get(),
                                                           load_data_service_.get(), txn_manager_.get());
-    analyze_ = std::make_unique<Analyze>(schema_manager_.get());
+    analyze_ = std::make_unique<Analyze>(&schema_manager_->catalog());
 }
 
 DBInstance::~DBInstance() = default;
@@ -48,7 +48,7 @@ void DBInstance::open_database(const std::string& db_name) {
     }
     schema_manager_->open_db(db_name);
     log_manager_->initialize_from_existing_log();
-    // Phase 5: 向 BPM 注入 Pager 作为 WAL guard，eviction 路径写盘前触发 log flush
+    // 向 BPM 注入 Pager 作为 WAL guard：eviction 路径写盘前触发 log flush
     buffer_pool_manager_->set_wal_guard(pager_.get());
 }
 

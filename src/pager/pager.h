@@ -19,7 +19,7 @@ class LogManager;
 
 namespace rmdb::pager {
 
-/// WAL-before-page-write 规则的唯一执行者（Phase 5 目标）。
+/// WAL-before-page-write 规则的唯一执行者。
 ///
 /// 持有 BufferPoolManager* 和 LogManager*，对外提供 flush_page / flush_all_pages /
 /// discard_pages 接口。每次写盘前均先执行全量 log flush（Route A 保守策略）。

@@ -21,7 +21,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "parser/parser.h"
 #include "system/sm_meta.h"
-#include "system/schema_manager.h"
+#include "catalog/catalog.h"
 #include "common/common.h"
 #include "common/type_utils.h"
 
@@ -65,12 +65,10 @@ public:
 
 class Analyze {
 private:
-    SchemaManager* schema_manager_;
-    Catalog* catalog_;
+    const Catalog* catalog_;
 
 public:
-    Analyze(SchemaManager* schema_manager)
-        : schema_manager_(schema_manager), catalog_(schema_manager ? &schema_manager->catalog() : nullptr) {}
+    explicit Analyze(const Catalog* catalog) : catalog_(catalog) {}
     ~Analyze() {}
 
     std::unique_ptr<Query> do_analyze(std::unique_ptr<rmdb::parser::ast::TreeNode> root);

@@ -12,8 +12,6 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "execution_defs.h"
-#include "execution_common.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "errors.h"
 #include "access/cursor/table_access.h"
@@ -80,7 +78,7 @@ public:
         schema_manager_ = schema_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
-        TabMeta& tab = schema_manager_->catalog().get_table(tab_name_);
+        const TabMeta& tab = schema_manager_->catalog().get_table(tab_name_);
         cols_ = tab.cols;
         len_ = cols_.back().offset + cols_.back().len;
 

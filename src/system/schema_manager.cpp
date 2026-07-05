@@ -27,7 +27,7 @@ namespace rmdb::system {
 SchemaManager::SchemaManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
                              IxManager* ix_manager, rmdb::pager::Pager* pager)
     : sm_manager_(std::make_unique<SmManager>(disk_manager, buffer_pool_manager, rm_manager, ix_manager, pager)),
-      catalog_(&sm_manager_->db_) {}
+      catalog_(&sm_manager_->db_meta()) {}
 
 // 析构必须在 .cpp 定义（unique_ptr<不完全类型> 在头文件中前向声明）。
 SchemaManager::~SchemaManager() = default;
@@ -35,11 +35,6 @@ SchemaManager::~SchemaManager() = default;
 // ---- Catalog：只读 schema 视图 ----
 Catalog& SchemaManager::catalog() {
     return catalog_;
-}
-
-// 元数据写访问（DDL setup 用，SchemaManager 是唯一写入方）。
-DbMeta& SchemaManager::db() {
-    return sm_manager_->db_;
 }
 
 // ---- DDL 委托 ----
@@ -98,53 +93,40 @@ void SchemaManager::drop_index(const std::string& tab_name, const std::vector<Co
 
 // ---- 窄句柄接口（不暴露容器）----
 RmFileHandle* SchemaManager::get_table_handle(const std::string& tab_name) const {
-    return sm_manager_->fhs_.at(tab_name).get();
+    return sm_manager_->get_table_handle(tab_name);
 }
 RmFileHandle* SchemaManager::find_table_handle(const std::string& tab_name) const {
-    auto it = sm_manager_->fhs_.find(tab_name);
-    return it == sm_manager_->fhs_.end() ? nullptr : it->second.get();
+    return sm_manager_->find_table_handle(tab_name);
 }
 IxIndexHandle* SchemaManager::get_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols) const {
-    const std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, cols);
-    return sm_manager_->ihs_.at(ix_name).get();
+    return sm_manager_->get_index_handle(tab_name, cols);
 }
 IxIndexHandle* SchemaManager::get_index_handle(const std::string& tab_name,
                                                const std::vector<std::string>& cols) const {
-    const std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, cols);
-    return sm_manager_->ihs_.at(ix_name).get();
+    return sm_manager_->get_index_handle(tab_name, cols);
 }
 IxIndexHandle* SchemaManager::find_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols) const {
-    const std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, cols);
-    auto it = sm_manager_->ihs_.find(ix_name);
-    return it == sm_manager_->ihs_.end() ? nullptr : it->second.get();
+    return sm_manager_->find_index_handle(tab_name, cols);
 }
 IxIndexHandle* SchemaManager::find_index_handle(const std::string& tab_name,
                                                 const std::vector<std::string>& cols) const {
-    const std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, cols);
-    auto it = sm_manager_->ihs_.find(ix_name);
-    return it == sm_manager_->ihs_.end() ? nullptr : it->second.get();
+    return sm_manager_->find_index_handle(tab_name, cols);
 }
 
-// ---- 底层 manager 访问器（过渡期保留，Phase 6 收敛）----
+// ---- 底层 manager 访问器 ----
 BufferPoolManager* SchemaManager::get_bpm() {
     return sm_manager_->get_bpm();
-}
-RmManager* SchemaManager::get_rm_manager() {
-    return sm_manager_->get_rm_manager();
 }
 IxManager* SchemaManager::get_ix_manager() {
     return sm_manager_->get_ix_manager();
 }
-SmManager& SchemaManager::sm_manager() {
-    return *sm_manager_;
-}
 
 // ---- output_file 开关（db-global，保留在 SmManager）----
 bool SchemaManager::output_file_enabled() const {
-    return sm_manager_->output_file_enabled_;
+    return sm_manager_->output_file_enabled();
 }
 void SchemaManager::set_output_file(bool enabled) {
-    sm_manager_->output_file_enabled_ = enabled;
+    sm_manager_->set_output_file(enabled);
 }
 
 // ---- DML 辅助 / MVCC / 恢复 ----
@@ -169,10 +151,6 @@ void SchemaManager::reset_all_tuple_meta_after_recovery() {
 }
 void SchemaManager::mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
     sm_manager_->mark_slots_committed(txn, commit_ts);
-}
-void SchemaManager::load_csv_data(const std::string& file_path, const std::string& tab_name,
-                                  StatementContext* context) {
-    sm_manager_->load_csv_data(file_path, tab_name, context);
 }
 
 } // namespace rmdb::system

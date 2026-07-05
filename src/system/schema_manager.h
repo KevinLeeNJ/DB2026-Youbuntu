@@ -47,13 +47,10 @@ namespace rmdb::system {
 
 class SmManager;
 
-/// DDL 编排 + 句柄所有权。Phase 2 委托 SmManager 实现，
-/// Phase 6 末 SmManager 删除后直接实现逻辑。
-/// 提供 DDL 方法、窄句柄访问接口（不暴露容器）和只读 Catalog。
+/// DDL 编排 + 句柄所有权。提供 DDL 方法、窄句柄访问接口（不暴露容器）和只读 Catalog。
 ///
-/// Phase 6: SchemaManager 拥有 SmManager（std::unique_ptr<SmManager>）。
-/// sm_manager.h 仅在 src/system/ 内部可见（schema_manager.cpp include）。
-/// 外部模块只 include schema_manager.h，SmManager 成为内部实现细节。
+/// SchemaManager 是 system 模块的公开边界。SmManager 是 SchemaManager 内部
+/// 持有的实现细节，其头文件不对 src/system/ 外部暴露。
 class SchemaManager {
 public:
     SchemaManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
@@ -64,9 +61,6 @@ public:
 
     // ---- Catalog：只读 schema 视图 ----
     Catalog& catalog();
-
-    // 元数据写访问（DDL setup 用，SchemaManager 是唯一写入方）。
-    DbMeta& db();
 
     // ---- DDL 委托 ----
     bool is_dir(const std::string& db_name);
@@ -97,12 +91,9 @@ public:
     IxIndexHandle* find_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols) const;
     IxIndexHandle* find_index_handle(const std::string& tab_name, const std::vector<std::string>& cols) const;
 
-    // ---- 底层 manager 访问器（过渡期保留，Phase 6 收敛）----
+    // ---- 底层 manager 访问器 ----
     BufferPoolManager* get_bpm();
-    RmManager* get_rm_manager();
     IxManager* get_ix_manager();
-    /// 仅供 system/ 内部和 recovery/transaction 用。返回内部 SmManager 引用。
-    SmManager& sm_manager();
 
     // ---- output_file 开关（db-global，保留在 SmManager）----
     bool output_file_enabled() const;
@@ -117,7 +108,6 @@ public:
     void rebuild_all_indexes();
     void reset_all_tuple_meta_after_recovery();
     void mark_slots_committed(Transaction& txn, timestamp_t commit_ts);
-    void load_csv_data(const std::string& file_path, const std::string& tab_name, StatementContext* context);
 
 private:
     std::unique_ptr<SmManager> sm_manager_;

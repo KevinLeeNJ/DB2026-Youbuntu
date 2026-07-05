@@ -222,11 +222,12 @@ make_select_stmt(std::vector<std::unique_ptr<rmdb::parser::ast::SelectItem>> sel
 
 class AnalyzeAggregateTest : public ::testing::Test {
 protected:
-    SchemaManager schema_manager_{nullptr, nullptr, nullptr, nullptr, nullptr};
-    Analyze analyze_{&schema_manager_};
+    DbMeta db_;
+    Catalog catalog_{&db_};
+    Analyze analyze_{&catalog_};
 
     void SetUp() override {
-        schema_manager_.db().SetTabMeta("grade", make_grade_tab());
+        db_.SetTabMeta("grade", make_grade_tab());
     }
 };
 

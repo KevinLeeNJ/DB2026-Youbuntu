@@ -18,9 +18,8 @@ See the Mulan PSL v2 for more details. */
 #include <utility>
 
 #include "execution_defs.h"
-#include "execution_common.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
+#include "access/mvcc_access.h"
 #include "access/cursor/index_cursor.h"
 #include "access/cursor/scan_cursor.h"
 #include "access/cursor/table_access.h"

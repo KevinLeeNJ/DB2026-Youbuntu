@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <vector>
 
-#include "execution/execution_common.h"
+#include "access/mvcc_access.h"
 #include "index/ix_index_handle.h"
 #include "index/ix_manager.h"
 #include "recovery/log_manager.h"
@@ -162,7 +162,7 @@ inline TransactionManager* TableWriteService::resolve_txn_mgr(StatementContext* 
 
 Rid TableWriteService::insert(const std::string& tab_name, const RmRecord& rec, Transaction* txn,
                               StatementContext* ctx) {
-    auto& tab = schema_mgr_->catalog().get_table(tab_name);
+    const auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     auto* txn_mgr = resolve_txn_mgr(ctx);
     auto* log_mgr = resolve_log_mgr(ctx);
@@ -264,7 +264,7 @@ Rid TableWriteService::insert(const std::string& tab_name, const RmRecord& rec, 
 
 bool TableWriteService::remove(const std::string& tab_name, const Rid& rid, const std::vector<Condition>& conds,
                                Transaction* txn, StatementContext* ctx) {
-    auto& tab = schema_mgr_->catalog().get_table(tab_name);
+    const auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     auto* txn_mgr = resolve_txn_mgr(ctx);
     auto* lock_mgr = resolve_lock_mgr(ctx);
@@ -393,7 +393,7 @@ bool TableWriteService::remove(const std::string& tab_name, const Rid& rid, cons
 
 bool TableWriteService::update(const std::string& tab_name, const Rid& rid, const std::vector<SetClause>& set_clauses,
                                const std::vector<Condition>& conds, Transaction* txn, StatementContext* ctx) {
-    auto& tab = schema_mgr_->catalog().get_table(tab_name);
+    const auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
     auto* txn_mgr = resolve_txn_mgr(ctx);
     auto* lock_mgr = resolve_lock_mgr(ctx);
@@ -679,8 +679,11 @@ void TableWriteService::apply_set_clauses(const TabMeta& tab, const std::vector<
 
 void TableWriteService::bulk_insert(const std::string& tab_name, const std::vector<std::vector<char>>& rows,
                                     StatementContext* ctx) {
+    if (rows.empty())
+        return;
+
     // 无事务批量插入：跳过锁/WAL/Undo/MVCC，直接物理写 heap + index。
-    auto& tab = schema_mgr_->catalog().get_table(tab_name);
+    const auto& tab = schema_mgr_->catalog().get_table(tab_name);
     auto* fh = schema_mgr_->get_table_handle(tab_name);
 
     // 准备索引 PinnedInserter（批量插入走 pinned-leaf 路径以保持吞吐）。

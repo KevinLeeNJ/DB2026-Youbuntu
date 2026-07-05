@@ -107,8 +107,8 @@ protected:
     }
 
     std::unique_ptr<Plan> make_select_subplan(bool with_limit) {
-        auto scan = std::make_unique<ScanPlan>(T_SeqScan, schema_manager_.get(), "grade", std::vector<Condition>{},
-                                               std::vector<std::string>{});
+        auto scan = std::make_unique<ScanPlan>(T_SeqScan, schema_manager_->catalog().get_table("grade"), "grade",
+                                               std::vector<Condition>{}, std::vector<std::string>{});
 
         std::vector<AggExpr> agg_exprs = {
             {.type = AggType::MAX,
@@ -169,8 +169,6 @@ TEST_F(PortalAggregateTest, get_plan_output_names_handles_aggregate_and_projecti
 }
 
 TEST_F(PortalAggregateTest, start_builds_limit_sort_projection_aggregate_executor_chain) {
-    char buffer[256];
-    int offset = 0;
     StatementContext sctx;
 
     auto subplan = make_select_subplan(true);

@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::common {
 
-/// 类型转换矩阵的唯一来源（Phase 6 收口）。
+/// 类型兼容性判断的唯一来源。
 /// 规则：同类型可转；INT<->FLOAT 可转；STRING<->DATETIME 可转；其余不可转。
 inline bool can_cast(ColType lhs_type, ColType rhs_type) {
     if (lhs_type == rhs_type) {

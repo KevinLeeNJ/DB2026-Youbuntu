@@ -16,7 +16,6 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "parser/parser.h"
 #include "system/sm_meta.h"
-#include "system/schema_manager.h"
 #include "transaction/transaction_manager.h"
 #include "planner.h"
 #include "plan.h"
@@ -24,11 +23,10 @@ See the Mulan PSL v2 for more details. */
 namespace rmdb::optimizer {
 class Optimizer {
 private:
-    SchemaManager* schema_manager_;
     Planner* planner_;
 
 public:
-    Optimizer(SchemaManager* schema_manager, Planner* planner) : schema_manager_(schema_manager), planner_(planner) {}
+    explicit Optimizer(Planner* planner) : planner_(planner) {}
 
     std::unique_ptr<Plan> plan_query(std::unique_ptr<Query> query) {
         auto* parse = query->parse.get();

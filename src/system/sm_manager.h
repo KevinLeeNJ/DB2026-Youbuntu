@@ -36,8 +36,6 @@ namespace rmdb::system {
 
 /* 系统管理器，负责元数据管理和DDL语句的执行 */
 class SmManager {
-    friend class SchemaManager;
-
 private:
     DbMeta db_; // 当前打开的数据库的元数据
     std::unordered_map<std::string, std::unique_ptr<RmFileHandle>>
@@ -48,7 +46,7 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
-    rmdb::pager::Pager* pager_; // Phase 5: flush_all_table_and_index_pages 经由 Pager
+    rmdb::pager::Pager* pager_; // flush_all_table_and_index_pages 经由 Pager
 
 public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
@@ -67,12 +65,50 @@ public:
         return buffer_pool_manager_;
     }
 
-    RmManager* get_rm_manager() {
-        return rm_manager_;
-    }
-
     IxManager* get_ix_manager() {
         return ix_manager_;
+    }
+
+    // ---- 窄接口：替代 friend class SchemaManager 的直接字段访问 ----
+    DbMeta& db_meta() {
+        return db_;
+    }
+    const DbMeta& db_meta() const {
+        return db_;
+    }
+
+    RmFileHandle* get_table_handle(const std::string& tab_name) const {
+        return fhs_.at(tab_name).get();
+    }
+    RmFileHandle* find_table_handle(const std::string& tab_name) const {
+        auto it = fhs_.find(tab_name);
+        return it == fhs_.end() ? nullptr : it->second.get();
+    }
+
+    IxIndexHandle* get_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols) const {
+        const std::string ix_name = ix_manager_->get_index_name(tab_name, cols);
+        return ihs_.at(ix_name).get();
+    }
+    IxIndexHandle* get_index_handle(const std::string& tab_name, const std::vector<std::string>& col_names) const {
+        const std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
+        return ihs_.at(ix_name).get();
+    }
+    IxIndexHandle* find_index_handle(const std::string& tab_name, const std::vector<ColMeta>& cols) const {
+        const std::string ix_name = ix_manager_->get_index_name(tab_name, cols);
+        auto it = ihs_.find(ix_name);
+        return it == ihs_.end() ? nullptr : it->second.get();
+    }
+    IxIndexHandle* find_index_handle(const std::string& tab_name, const std::vector<std::string>& col_names) const {
+        const std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
+        auto it = ihs_.find(ix_name);
+        return it == ihs_.end() ? nullptr : it->second.get();
+    }
+
+    bool output_file_enabled() const {
+        return output_file_enabled_;
+    }
+    void set_output_file(bool enabled) {
+        output_file_enabled_ = enabled;
     }
 
     // 索引句柄访问（供同文件 DDL/load helper 使用，外部经 SchemaManager 访问）。
@@ -135,11 +171,6 @@ public:
         }
         txn.get_modified_slots().clear();
     }
-
-    // Bulk-load a CSV file into an existing table. The path is relative to the
-    // server's working directory. Reuses the insert path (WAL + index + MVCC
-    // meta) in self-managed batched transactions, skipping conflict checks.
-    void load_csv_data(const std::string& file_path, const std::string& tab_name, StatementContext* context);
 };
 
 } // namespace rmdb::system

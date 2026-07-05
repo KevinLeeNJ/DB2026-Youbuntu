@@ -20,7 +20,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace rmdb::access {
 
-/// 封装 RmScan + heap 访问（Phase 6）。
+/// 封装 RmScan + heap 访问。
 /// 持有 RmFileHandle* 和 RmScan，对外不暴露这些存储细节。
 class TableCursor : public ScanCursor {
 public:

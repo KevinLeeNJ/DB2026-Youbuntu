@@ -23,10 +23,10 @@ add_subdirectory(instance)
 add_subdirectory(test)
 
 
-target_link_libraries(parser execution pthread)
+target_link_libraries(parser pthread)
 
 add_executable(rmdb rmdb.cpp)
-target_link_libraries(rmdb instance server statement diagnostics parser execution readline pthread planner analyze)
+target_link_libraries(rmdb instance server statement diagnostics parser readline pthread planner analyze)
 
 # unit_test
 add_executable(unit_test unit_test.cpp)

@@ -14,7 +14,6 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 
 #include "execution_defs.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm_meta.h"

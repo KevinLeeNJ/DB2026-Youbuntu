@@ -219,11 +219,12 @@ std::unique_ptr<Query> make_order_line_suffix_lookup_query() {
 
 class PlannerAggregateTest : public ::testing::Test {
 protected:
-    SchemaManager schema_manager_{nullptr, nullptr, nullptr, nullptr, nullptr};
-    Planner planner_{&schema_manager_};
+    DbMeta db_;
+    Catalog catalog_{&db_};
+    Planner planner_{&catalog_};
 
     void SetUp() override {
-        schema_manager_.db().SetTabMeta("grade", make_grade_tab());
+        db_.SetTabMeta("grade", make_grade_tab());
     }
 };
 
@@ -266,8 +267,8 @@ TEST_F(PlannerAggregateTest, generate_select_plan_pushes_limit_into_sort_over_pr
 }
 
 TEST_F(PlannerAggregateTest, stock_level_join_starts_from_order_line_and_uses_stock_inlj) {
-    schema_manager_.db().SetTabMeta("stock", make_stock_tab());
-    schema_manager_.db().SetTabMeta("order_line", make_order_line_tab());
+    db_.SetTabMeta("stock", make_stock_tab());
+    db_.SetTabMeta("order_line", make_order_line_tab());
     auto query = make_stock_level_query();
 
     auto plan = planner_.generate_select_plan(std::move(query));
@@ -293,7 +294,7 @@ TEST_F(PlannerAggregateTest, stock_level_join_starts_from_order_line_and_uses_st
 }
 
 TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) {
-    schema_manager_.db().SetTabMeta("order_line", make_order_line_tab());
+    db_.SetTabMeta("order_line", make_order_line_tab());
     auto query = make_order_line_suffix_lookup_query();
 
     auto plan = planner_.generate_select_plan(std::move(query));

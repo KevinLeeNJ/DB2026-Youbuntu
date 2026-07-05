@@ -36,7 +36,6 @@ namespace rmdb::instance {
 
 /// 一个数据库实例的生命周期主人。持有所有 manager 的 unique_ptr，
 /// 构造顺序即依赖顺序，析构按成员声明逆序自动释放。
-/// 取代 rmdb.cpp 中文件级全局 unique_ptr（Phase 1 目标）。
 class DBInstance {
 public:
     DBInstance();
@@ -112,7 +111,7 @@ public:
 
 private:
     // 声明顺序即构造顺序，逆序析构。切勿随意调整顺序。
-    // Phase 5: log_manager_ 和 pager_ 提前，rm_manager_/ix_manager_/sm_manager_ 依赖 pager_。
+    // log_manager_/pager_ 在 rm/ix/sm_manager_ 之前（后者依赖 pager_）。
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<LogManager> log_manager_;

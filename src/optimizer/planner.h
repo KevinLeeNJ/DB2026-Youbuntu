@@ -19,7 +19,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "record/rm.h"
 #include "system/sm_meta.h"
-#include "system/schema_manager.h"
+#include "catalog/catalog.h"
 #include "plan.h"
 #include "parser/parser.h"
 #include "common/common.h"
@@ -28,14 +28,13 @@ See the Mulan PSL v2 for more details. */
 namespace rmdb::optimizer {
 class Planner {
 private:
-    SchemaManager* schema_manager_;
-    Catalog* catalog_;
+    const Catalog* catalog_;
 
     bool enable_nestedloop_join = true;
     bool enable_sortmerge_join = false;
 
 public:
-    Planner(SchemaManager* schema_manager) : schema_manager_(schema_manager), catalog_(&schema_manager_->catalog()) {}
+    explicit Planner(const Catalog* catalog) : catalog_(catalog) {}
 
     std::unique_ptr<Plan> do_planner(std::unique_ptr<Query> query);
 

@@ -26,7 +26,7 @@ class SchemaManager;
 
 namespace rmdb::access {
 
-/// 执行层访问数据的统一门面（Phase 6）。
+/// 执行层访问数据的统一门面。
 /// 持有 SchemaManager*，创建 TableCursor / IndexCursor，并提供 SSI 转发。
 /// execution/ 依赖 TableAccess，不再直接接触 RmScan/IxScan/RmFileHandle/IxIndexHandle。
 class TableAccess {

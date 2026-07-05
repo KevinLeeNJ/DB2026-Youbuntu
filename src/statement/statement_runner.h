@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/plan.h"
 #include "server/output_sink.h"
 #include "statement/statement_context.h"
+#include "system/schema_manager.h"
 
 namespace rmdb::access {
 class TableWriteService;
