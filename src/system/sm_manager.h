@@ -168,6 +168,13 @@ public:
         }
     }
 
+    /** @brief 按水位线回收版本链相关历史结构。
+     *  移除当前 tuple 版本已提交且 commit_ts 严格小于水位线的 RID：
+     *  此时任何活跃事务（read_ts >= 水位线）都不会再回溯该 RID 的版本链，
+     *  对应的历史索引键/删除候选不再被冲突检测访问，可安全删除。
+     *  由 TransactionManager::GarbageCollection 在 txn_map 回收后调用。 */
+    void prune_version_history(timestamp_t watermark);
+
     void flush_all_table_and_index_pages();
 
     void rebuild_all_indexes();

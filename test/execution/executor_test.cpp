@@ -20,8 +20,10 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include "gtest/gtest.h"
 #include "system/sm_manager.h"
 #include "storage/buffer_pool_manager.h"
@@ -1116,4 +1118,185 @@ TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
     EXPECT_EQ(right_ptr->begin_calls_, 3);
     EXPECT_EQ(right_ptr->next_record_calls_, 8);
     EXPECT_EQ(right_ptr->next_calls_, 6);
+}
+
+// 回归测试：TPC-C 场景下每个写事务都会追加 undo log，曾因 txn_map 永不回收导致
+// RSS 持续增长。这里反复执行「更新+提交」并断言 txn_map 不会无限膨胀，且 GC 后
+// 旧事务被安全回收。同时验证版本链遍历在 GC 后仍正确（无 InternalError/崩溃）。
+TEST_F(ExecutorTest, gc_reclaims_txn_map_after_committed_updates) {
+    setup_db();
+    auto cols = make_int_cols({"id", "val"});
+    sm_manager_->create_table("gc_tab", cols, nullptr);
+
+    // 插入一行初值
+    {
+        std::vector<Value> vals;
+        Value id;
+        id.set_int(1);
+        Value val;
+        val.set_int(0);
+        vals.push_back(id);
+        vals.push_back(val);
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        InsertExecutor exec(sm_manager_.get(), "gc_tab", vals, &ctx);
+        exec.Next();
+    }
+
+    Rid rid;
+    {
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        SeqScanExecutor scan(sm_manager_.get(), "gc_tab", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+
+    SetClause set_val;
+    set_val.lhs = {"gc_tab", "val"};
+    Value v;
+    v.set_int(0);
+    set_val.rhs = v;
+
+    // 反复提交大量更新事务，每个都会产生 undo log
+    constexpr int N = 3000;
+    for (int i = 0; i < N; ++i) {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buf[4096];
+        int offset = 0;
+        Context ctx(&lock_manager, nullptr, txn, buf, &offset, &txn_manager);
+        UpdateExecutor upd(sm_manager_.get(), "gc_tab", {set_val}, {}, {rid}, &ctx);
+        ASSERT_NO_THROW(upd.Next());
+        txn_manager.commit(txn, nullptr);
+    }
+
+    // 提交后触发 GC，txn_map 必须被回收，不得随事务数线性增长
+    txn_manager.GarbageCollection();
+    size_t map_size = txn_manager.txn_map.size();
+    EXPECT_LT(map_size, 100u) << "txn_map must be reclaimed by GC, got " << map_size << " entries after " << N
+                              << " commits";
+
+    // GC 后仍能正确读取（版本链遍历不应命中已回收事务导致 InternalError/崩溃）
+    auto* fh = sm_manager_->fhs_.at("gc_tab").get();
+    auto rec = fh->get_record(rid, nullptr);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(rec->data + 4), 0);
+
+    // 再做一次更新+读取，确认 GC 后系统状态正常
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buf[4096];
+        int offset = 0;
+        Context ctx(&lock_manager, nullptr, txn, buf, &offset, &txn_manager);
+        UpdateExecutor upd(sm_manager_.get(), "gc_tab", {set_val}, {}, {rid}, &ctx);
+        ASSERT_NO_THROW(upd.Next());
+        txn_manager.commit(txn, nullptr);
+    }
+}
+
+// 回归测试：并发场景下 GC 与版本链遍历的安全性。一个线程持续提交更新事务
+// （驱动 GC 回收旧事务），另一线程并发扫描读，验证不会因 GC 回收了仍在被遍历
+// 的事务而崩溃或抛 InternalError。
+TEST_F(ExecutorTest, gc_concurrent_with_version_chain_reads_is_safe) {
+    setup_db();
+    auto cols = make_int_cols({"id", "val"});
+    sm_manager_->create_table("gc_conc", cols, nullptr);
+
+    {
+        std::vector<Value> vals;
+        Value id;
+        id.set_int(1);
+        Value val;
+        val.set_int(0);
+        vals.push_back(id);
+        vals.push_back(val);
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        InsertExecutor exec(sm_manager_.get(), "gc_conc", vals, &ctx);
+        exec.Next();
+    }
+
+    Rid rid;
+    {
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        SeqScanExecutor scan(sm_manager_.get(), "gc_conc", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+
+    SetClause set_val;
+    set_val.lhs = {"gc_conc", "val"};
+    Value v;
+    v.set_int(0);
+    set_val.rhs = v;
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+
+    // 写线程：反复提交更新，驱动 GC
+    auto writer = [&]() {
+        for (int i = 0; i < 2000 && !stop.load(); ++i) {
+            auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+            char buf[4096];
+            int offset = 0;
+            Context ctx(&lock_manager, nullptr, txn, buf, &offset, &txn_manager);
+            UpdateExecutor upd(sm_manager_.get(), "gc_conc", {set_val}, {}, {rid}, &ctx);
+            try {
+                upd.Next();
+                txn_manager.commit(txn, nullptr);
+            } catch (...) {
+                ++errors;
+                txn_manager.abort(txn, nullptr);
+            }
+        }
+    };
+
+    // 读线程：并发扫描，触发版本链遍历
+    auto reader = [&]() {
+        for (int i = 0; i < 2000 && !stop.load(); ++i) {
+            auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+            char buf[4096];
+            int offset = 0;
+            Context ctx(&lock_manager, nullptr, txn, buf, &offset, &txn_manager);
+            try {
+                SeqScanExecutor scan(sm_manager_.get(), "gc_conc", {}, &ctx);
+                scan.beginTuple();
+                while (!scan.is_end()) {
+                    scan.Next();
+                    scan.nextTuple();
+                }
+                txn_manager.commit(txn, nullptr);
+            } catch (const TransactionAbortException&) {
+                txn_manager.abort(txn, nullptr);
+            } catch (...) {
+                // InternalError 等非预期异常视为失败
+                ++errors;
+                txn_manager.abort(txn, nullptr);
+            }
+        }
+    };
+
+    std::thread w1(writer);
+    std::thread r1(reader);
+    std::thread r2(reader);
+    w1.join();
+    r1.join();
+    r2.join();
+
+    EXPECT_EQ(errors.load(), 0) << "concurrent GC + version-chain reads must not crash or throw InternalError";
+    txn_manager.GarbageCollection();
+    EXPECT_LT(txn_manager.txn_map.size(), 100u) << "txn_map should be reclaimed after concurrent run";
 }
