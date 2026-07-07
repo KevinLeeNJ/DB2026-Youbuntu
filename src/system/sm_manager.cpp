@@ -146,6 +146,10 @@ void SmManager::open_db(const std::string& db_name) {
         std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        deleted_tuple_candidates_.clear();
+    }
     try {
         if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
             throw UnixError();
@@ -213,8 +217,99 @@ void SmManager::close_db() {
         std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        deleted_tuple_candidates_.clear();
+    }
     if (chdir("..") < 0) { // 回到根目录
         throw UnixError();
+    }
+}
+
+void SmManager::prune_version_history(timestamp_t watermark) {
+    // 回收 historical_index_keys_：键编码为 tab_name + '\0' + index_name + '\0' + key
+    // 对每个 RID，若其当前 tuple 版本已提交且 commit_ts < watermark，则任何活跃事务
+    // （read_ts >= watermark）都不会回溯其版本链，该历史键不再被冲突检测访问。
+    // 先在锁内快照待检查的 (key, RID) 列表，再在锁外读 meta，最后回锁内删除，避免
+    // 持锁访问缓冲池造成长时间持锁/死锁。
+    std::vector<std::pair<std::string, Rid>> hist_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        hist_snapshot.reserve(historical_index_keys_.size() * 2);
+        for (const auto& [combined_key, rids] : historical_index_keys_) {
+            for (const Rid& rid : rids) {
+                hist_snapshot.emplace_back(combined_key, rid);
+            }
+        }
+    }
+    std::vector<std::pair<std::string, Rid>> hist_to_remove;
+    for (auto& [combined_key, rid] : hist_snapshot) {
+        // 解析 tab_name（第一个 '\0' 之前的部分）
+        size_t nul = combined_key.find('\0');
+        std::string tab_name = (nul != std::string::npos) ? combined_key.substr(0, nul) : std::string{};
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it == fhs_.end()) {
+            // 表已不存在，整组历史键失效，直接标记删除
+            hist_to_remove.emplace_back(std::move(combined_key), rid);
+            continue;
+        }
+        RmFileHandle* fh = fh_it->second.get();
+        if (!fh->is_record(rid)) {
+            hist_to_remove.emplace_back(std::move(combined_key), rid);
+            continue;
+        }
+        TupleMeta meta = fh->get_tuple_meta(rid);
+        if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
+            hist_to_remove.emplace_back(std::move(combined_key), rid);
+        }
+    }
+    if (!hist_to_remove.empty()) {
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        for (auto& [combined_key, rid] : hist_to_remove) {
+            auto it = historical_index_keys_.find(combined_key);
+            if (it == historical_index_keys_.end()) {
+                continue;
+            }
+            auto& rids = it->second;
+            rids.erase(std::remove(rids.begin(), rids.end(), rid), rids.end());
+            if (rids.empty()) {
+                historical_index_keys_.erase(it);
+            }
+        }
+    }
+
+    // 回收 deleted_tuple_candidates_：同样的水位线条件
+    std::vector<std::pair<std::string, Rid>> del_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        del_snapshot.reserve(deleted_tuple_candidates_.size() * 2);
+        for (const auto& [tab_name, rids] : deleted_tuple_candidates_) {
+            for (const Rid& rid : rids) {
+                del_snapshot.emplace_back(tab_name, rid);
+            }
+        }
+    }
+    std::vector<std::pair<std::string, Rid>> del_to_remove;
+    for (auto& [tab_name, rid] : del_snapshot) {
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it == fhs_.end()) {
+            del_to_remove.emplace_back(std::move(tab_name), rid);
+            continue;
+        }
+        RmFileHandle* fh = fh_it->second.get();
+        if (!fh->is_record(rid)) {
+            del_to_remove.emplace_back(std::move(tab_name), rid);
+            continue;
+        }
+        TupleMeta meta = fh->get_tuple_meta(rid);
+        // 候选仅在 tombstone 仍可能被并发 INSERT 检测时需要保留；若当前版本已提交
+        // 且 commit_ts < watermark，则无活跃事务会再把它视为并发删除。
+        if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
+            del_to_remove.emplace_back(std::move(tab_name), rid);
+        }
+    }
+    for (auto& [tab_name, rid] : del_to_remove) {
+        remove_deleted_tuple_candidate(tab_name, rid);
     }
 }
 

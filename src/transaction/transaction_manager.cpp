@@ -26,6 +26,10 @@ constexpr uint64_t SSI_FULL_PRUNE_COMMIT_INTERVAL = 4096;
 constexpr size_t SSI_RECENT_WRITE_PRUNE_THRESHOLD = 8192;
 constexpr size_t SSI_EDGE_PRUNE_THRESHOLD = 8192;
 
+// 垃圾回收节流：避免每次 commit 都全表扫描 txn_map
+constexpr uint64_t GC_COMMIT_INTERVAL = 256;  // 每 N 次提交尝试一次 GC
+constexpr size_t GC_TXN_MAP_THRESHOLD = 1024; // 或 txn_map 超过该阈值立即 GC
+
 void ClearWriteSet(Transaction* txn) {
     if (txn == nullptr) {
         return;
@@ -308,7 +312,9 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     txn->set_state(TransactionState::GROWING);
     txn->set_start_ts(next_timestamp_.fetch_add(1));
     txn->set_read_ts(last_commit_ts_.load());
-    running_txns_.AddTxn(txn->get_start_ts());
+    // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
+    // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
+    running_txns_.AddTxn(txn->get_read_ts());
     WriteBeginLog(txn, log_manager);
 
     std::unique_lock<std::mutex> lock(latch_);
@@ -326,7 +332,14 @@ void TransactionManager::BeginStatement(Transaction* txn) {
         return;
     }
     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
-        txn->set_read_ts(last_commit_ts_.load());
+        // 刷新 read_ts 时同步更新水位线，确保水位线始终追踪当前真实读时间戳
+        timestamp_t old_read_ts = txn->get_read_ts();
+        timestamp_t new_read_ts = last_commit_ts_.load();
+        if (new_read_ts != old_read_ts) {
+            running_txns_.RemoveTxn(old_read_ts);
+            txn->set_read_ts(new_read_ts);
+            running_txns_.AddTxn(new_read_ts);
+        }
     }
 }
 
@@ -357,8 +370,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     txn->commit_ts_ = commit_ts;
     last_commit_ts_ = commit_ts;
 
-    // Remove from running txns (for watermark)
-    running_txns_.RemoveTxn(txn->get_start_ts());
+    // 先更新提交时间戳，再用读时间戳从水位线移除，保证水位线计算正确
+    running_txns_.UpdateCommitTs(commit_ts);
+    running_txns_.RemoveTxn(txn->get_read_ts());
 
     // Mark all modified slots as committed
     sm_manager_->mark_slots_committed(*txn, commit_ts);
@@ -383,6 +397,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
     checkpoint_cv_.notify_all();
     RetireTransactionIfSafe(txn);
+    MaybeRunGarbageCollection();
 }
 
 /**
@@ -410,7 +425,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         UndoWriteRecord(sm_manager_, it->get(), txn);
     }
     WriteAbortLog(txn, log_manager);
-    running_txns_.RemoveTxn(txn->get_start_ts());
+    running_txns_.RemoveTxn(txn->get_read_ts());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::ABORTED);
@@ -430,6 +445,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     }
     checkpoint_cv_.notify_all();
     RetireTransactionIfSafe(txn);
+    MaybeRunGarbageCollection();
 }
 
 void TransactionManager::block_new_transactions_for_checkpoint() {
@@ -911,6 +927,79 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
     auto it = txn_map.find(txn->get_transaction_id());
     if (it != txn_map.end() && it->second.get() == txn) {
         txn_map.erase(it);
+    }
+}
+
+timestamp_t TransactionManager::GetWatermark() {
+    return running_txns_.GetWatermark();
+}
+
+void TransactionManager::MaybeRunGarbageCollection() {
+    bool should_run = false;
+    {
+        std::unique_lock<std::mutex> lock(latch_);
+        ++commits_since_gc_;
+        if (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD) {
+            should_run = true;
+            commits_since_gc_ = 0;
+        }
+    }
+    if (should_run) {
+        GarbageCollection();
+    }
+}
+
+void TransactionManager::GarbageCollection() {
+    // 安全条件：水位线是所有活跃事务读时间戳的最小值。只有 commit_ts（已提交）
+    // 或 start_ts（已中止）严格小于水位线的事务，其 undo log 才不会被任何活跃
+    // 事务的版本链遍历访问到，因而可安全从 txn_map 回收。
+    // 与 GetUndoLog 互斥：二者都持 latch_。
+    timestamp_t watermark = running_txns_.GetWatermark();
+    std::vector<txn_id_t> to_erase;
+    {
+        std::unique_lock<std::mutex> lock(latch_);
+        for (auto it = txn_map.begin(); it != txn_map.end(); ++it) {
+            Transaction* txn = it->second.get();
+            if (txn == nullptr) {
+                to_erase.push_back(it->first);
+                continue;
+            }
+            TransactionState state = txn->get_state();
+            if (state != TransactionState::COMMITTED && state != TransactionState::ABORTED) {
+                continue;
+            }
+            if (active_txn_ids_.count(it->first) > 0) {
+                continue;
+            }
+            if (TransactionHasRetainedSsiStateUnlocked(it->first)) {
+                continue;
+            }
+            if (state == TransactionState::COMMITTED) {
+                if (txn->get_commit_ts() == INVALID_TS || txn->get_commit_ts() >= watermark) {
+                    continue;
+                }
+            } else {
+                // 已中止事务：commit_ts 无效，保守用 start_ts 判断。
+                // 任何 read_ts >= start_ts 的活跃事务都已无法看到该事务的版本。
+                if (txn->get_start_ts() >= watermark) {
+                    continue;
+                }
+            }
+            // 仅在无 SSI 活跃重叠时回收，避免误删仍被 SSI 依赖追踪的事务
+            auto* non_const_this = const_cast<TransactionManager*>(this);
+            if (non_const_this->HasActiveSerializableOverlapUnlocked(txn)) {
+                continue;
+            }
+            to_erase.push_back(it->first);
+        }
+        for (txn_id_t txn_id : to_erase) {
+            txn_map.erase(txn_id);
+        }
+    }
+    // 回收 SmManager 侧随写操作单调增长的历史索引键/删除候选（需访问 tuple meta，
+    // 不在 latch_ 下进行，避免与缓冲池操作死锁）
+    if (!to_erase.empty()) {
+        sm_manager_->prune_version_history(watermark);
     }
 }
 

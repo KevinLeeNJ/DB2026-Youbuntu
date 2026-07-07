@@ -236,6 +236,12 @@ private:
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
 
+    // 垃圾回收节流计数（在 latch_ 下维护）
+    uint64_t commits_since_gc_{0};
+
+    /** 节流式触发垃圾回收：按提交计数或 txn_map 规模决定是否真正执行。 */
+    void MaybeRunGarbageCollection();
+
     std::mutex checkpoint_latch_;
     std::condition_variable checkpoint_cv_;
     bool checkpoint_blocking_new_txns_{false};
