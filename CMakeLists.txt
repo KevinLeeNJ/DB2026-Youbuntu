@@ -13,12 +13,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 endif()
 
+option(RMDB_ENABLE_NATIVE_OPTIMIZATIONS "Build release binaries for the current host CPU" ON)
+
 add_compile_options(-Wall -Wextra)
 
 set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
 set(CMAKE_C_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
-set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
+
+set(RMDB_RELEASE_FLAGS "-O3 -DNDEBUG -funroll-loops")
+if(RMDB_ENABLE_NATIVE_OPTIMIZATIONS)
+    string(APPEND RMDB_RELEASE_FLAGS " -march=native")
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "${RMDB_RELEASE_FLAGS}")
+set(CMAKE_C_FLAGS_RELEASE "${RMDB_RELEASE_FLAGS}")
 
 enable_testing()
 add_subdirectory(src)
