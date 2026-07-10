@@ -180,7 +180,7 @@ void client_handler(int fd) {
                     txn_manager->abort(context->txn_, log_manager.get());
                 }
                 context->txn_ = nullptr;
-                LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
+                LOG_INFO("transaction aborted: %s", e.GetInfo().c_str());
 
                 if (sm_manager->output_file_enabled_) {
                     std::fstream outfile;
@@ -305,7 +305,7 @@ void start_server() {
 
 int main(int argc, char** argv) {
     minilog::Logger::get().init("rmdb.log");
-    minilog::Logger::get().set_level(minilog::LogLevel::INFO);
+    minilog::Logger::get().set_level(minilog::LogLevel::WARN);
 
     if (argc != 2) {
         // 需要指定数据库名称
