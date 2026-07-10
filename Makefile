@@ -1,4 +1,4 @@
-.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark benchmark-clean
+.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark benchmark-ci benchmark-clean
 
 BUILD_DIR := build
 BINARY := $(BUILD_DIR)/bin/rmdb
@@ -31,15 +31,8 @@ help:
 	@echo "Available targets:"
 	@echo "  make build           - Configure and build the project with cmake"
 	@echo "  make test            - Run unit tests only"
-	@echo "  make run             - Build and run the rmdb binary"
-	@echo "  make clean           - Remove build directory"
-	@echo "  make debug           - Build with debug flags (default)"
-	@echo "  make release         - Build with release/optimized flags"
-	@echo "  make format          - Format code with clang-format"
-	@echo "  make client          - Build rmdb_client"
-	@echo "  make client-debug    - Build rmdb_client with debug flags"
-	@echo "  make benchmark       - Run rmdb TPC-C benchmark"
-	@echo "  make benchmark-clean - Remove benchmark runtime data, keep CSV files"
+	@echo "  make benchmark       - Run full TPC-C benchmark"
+	@echo "  make benchmark-ci    - Run reduced CI TPC-C consistency benchmark"
 
 build:
 	@if [ ! -d "$(BUILD_DIR)" ]; then \
@@ -50,46 +43,6 @@ build:
 
 test: build
 	@cd $(BUILD_DIR) && $(CTEST) --output-on-failure
-
-run: build
-	@$(BINARY) testdb
-
-clean:
-	@rm -rf $(BUILD_DIR)
-	@echo "Build directory removed."
-
-debug: clean
-	@mkdir -p $(BUILD_DIR)
-	@$(CMAKE) -B $(BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Debug
-	@$(CMAKE) --build $(BUILD_DIR) --parallel $(JOBS)
-
-release: clean
-	@mkdir -p $(BUILD_DIR)
-	@$(CMAKE) -B $(BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Release
-	@$(CMAKE) --build $(BUILD_DIR) --parallel $(JOBS)
-
-format:
-	@bash scripts/add_license.sh workspace
-	@find src -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
-	@find test -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
-	@echo "Code formatted."
-
-client:
-	@mkdir -p rmdb_client/build
-	@cd rmdb_client/build && $(CMAKE) .. -DCMAKE_BUILD_TYPE=Release
-	@$(CMAKE) --build rmdb_client/build --target rmdb_client --parallel $(CLIENT_JOBS)
-
-client-debug: clean-client
-	@mkdir -p rmdb_client/build
-	@cd rmdb_client/build && $(CMAKE) .. -DCMAKE_BUILD_TYPE=Debug
-	@$(CMAKE) --build rmdb_client/build --target rmdb_client --parallel $(CLIENT_JOBS)
-
-clean-client:
-	@rm -rf rmdb_client/build
-	@echo "Client build directory removed."
-
-run-client: client
-	@./rmdb_client/build/rmdb_client
 
 benchmark: build
 	@scripts/benchmark_tpcc.sh \
@@ -106,11 +59,19 @@ benchmark: build
 		--json-out $(TPCC_RESULT) \
 		--rmdb-db-dir $(TPCC_DB) \
 		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
-		$(TPCC_DATA_ARGS) \
-		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
+		$(TPCC_DATA_ARGS)
 
-benchmark-clean:
-	@rm -rf $(TPCC_DB) $(TPCC_RESULT) benchmark/tpcc/rmdb-server.log
-	@rm -rf $(TPCC_SQLITE_PATH) $(TPCC_SQLITE_PATH)-shm $(TPCC_SQLITE_PATH)-wal
-	@find benchmark/tpcc -type d -name __pycache__ -prune -exec rm -rf {} +
-	@echo "Benchmark runtime data removed; CSV files in $(TPCC_DATA_DIR) were kept."
+benchmark-ci:
+	@$(MAKE) benchmark TPCC_DB=tpcc_ci_db TPCC_RESULT=benchmark/tpcc/ci_result.json TPCC_WAREHOUSES=1 TPCC_WORKERS=2 TPCC_WARMUP=2 TPCC_MEASURE=8 TPCC_ROUNDS=1 TPCC_PROGRESS_INTERVAL=2 TPCC_RESTART_TIMEOUT=30
+
+clean:
+	@rm -rf $(BUILD_DIR)
+
+release: clean
+	@mkdir -p $(BUILD_DIR)
+	@$(CMAKE) -B $(BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Release
+	@$(CMAKE) --build $(BUILD_DIR) --parallel $(JOBS)
+
+format:
+	@bash scripts/add_license.sh workspace
+	@find src -name '*.cpp' -o -name '*.h' | xargs clang-format-18 -i
