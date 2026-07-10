@@ -17,64 +17,56 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <thread>
 
 #include "errors.h"
+#include "instance/db_instance.h"
 #include "minilog.h"
-#include "optimizer/optimizer.h"
 #include "recovery/checkpoint_manager.h"
-#include "recovery/log_recovery.h"
-#include "optimizer/plan.h"
-#include "optimizer/planner.h"
-#include "portal.h"
-#include "analyze/analyze.h"
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 8
 
-static bool should_exit = false;
+using rmdb::instance::DBInstance;
 
-// 构建全局所需的管理器对象
-auto disk_manager = std::make_unique<DiskManager>();
-auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
-auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
-auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
-auto sm_manager =
-    std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
-auto lock_manager = std::make_unique<LockManager>();
-auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
-auto planner = std::make_unique<Planner>(sm_manager.get());
-auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
-auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
-auto log_manager = std::make_unique<LogManager>(disk_manager.get());
-auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get(),
-                                                  log_manager.get());
-auto portal = std::make_unique<Portal>(sm_manager.get());
-auto analyze = std::make_unique<Analyze>(sm_manager.get());
+static bool should_exit = false;
+static LogManager* signal_log_manager = nullptr;
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
     (void)signo;
     should_exit = true;
-    log_manager->flush_log_to_disk_with_sync();
+    if (signal_log_manager != nullptr) {
+        signal_log_manager->flush_log_to_disk_with_sync();
+    }
     LOG_INFO("the server received Ctrl+C and will close");
     longjmp(jmpbuf, 1);
 }
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(txn_id_t* txn_id, Context* context) {
-    context->txn_ = txn_manager->get_transaction(*txn_id);
+void SetTransaction(txn_id_t* txn_id, Context* context, TransactionManager& txn_manager) {
+    context->txn_ = txn_manager.get_transaction(*txn_id);
     if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
+        context->txn_ = txn_manager.begin(nullptr, context->log_mgr_, context->isolation_level_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
         context->txn_->set_isolation_level(context->isolation_level_);
     }
-    txn_manager->BeginStatement(context->txn_);
+    txn_manager.BeginStatement(context->txn_);
 }
 
-void client_handler(int fd) {
+void client_handler(int fd, DBInstance& instance) {
+    auto& sm_manager = instance.sm_manager();
+    auto& lock_manager = instance.lock_manager();
+    auto& txn_manager = instance.transaction_manager();
+    auto& optimizer = instance.optimizer();
+    auto& query_manager = instance.query_manager();
+    auto& log_manager = instance.log_manager();
+    auto& portal = instance.portal();
+    auto& analyzer = instance.analyzer();
+
     int i_recvBytes;
     // 接收客户端发送的请求
     char data_recv[BUFFER_LENGTH];
@@ -113,7 +105,7 @@ void client_handler(int fd) {
         if (strcmp(data_recv, "crash") == 0) {
             LOG_ERROR("server crash command received from sockfd: %d", fd);
             minilog::Logger::get().flush();
-            log_manager->flush_log_to_disk_with_sync();
+            log_manager.flush_log_to_disk_with_sync();
             exit(1);
         }
 
@@ -121,8 +113,8 @@ void client_handler(int fd) {
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        auto _context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset,
-                                                  txn_manager.get());
+        auto _context =
+            std::make_unique<Context>(&lock_manager, &log_manager, nullptr, data_send, &offset, &txn_manager);
         Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
 
@@ -145,26 +137,26 @@ void client_handler(int fd) {
                 bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
                 bool is_load = parsed_type == ast::AstType::LoadStmt;
                 if (!is_checkpoint && !is_load) {
-                    SetTransaction(&txn_id, context);
+                    SetTransaction(&txn_id, context, txn_manager);
                 }
                 // analyze and rewrite
-                std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
+                std::unique_ptr<Query> query = analyzer.do_analyze(std::move(parse_tree));
                 LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                 // 优化器
-                std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), context);
+                std::unique_ptr<Plan> plan = optimizer.plan_query(std::move(query), context);
                 // portal
-                std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
-                portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
+                std::unique_ptr<PortalStmt> portalStmt = portal.start(std::move(plan), context);
+                portal.run(std::move(portalStmt), &query_manager, &txn_id, context);
                 // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
                 session_isolation_level = context->isolation_level_;
                 // Note: "set output_file on|off" is a database-global toggle stored
                 // on SmManager (see execution_manager.cpp T_SetOutputFile), so it
                 // persists across connections without per-session mirroring here.
-                portal->drop();
+                portal.drop();
                 if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager->commit(context->txn_, context->log_mgr_);
+                    txn_manager.commit(context->txn_, context->log_mgr_);
                 }
                 context->txn_ = nullptr;
             } catch (TransactionAbortException& e) {
@@ -177,12 +169,12 @@ void client_handler(int fd) {
                 // 回滚事务
                 if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
                     context->txn_->get_state() != TransactionState::COMMITTED) {
-                    txn_manager->abort(context->txn_, log_manager.get());
+                    txn_manager.abort(context->txn_, &log_manager);
                 }
                 context->txn_ = nullptr;
                 LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
 
-                if (sm_manager->output_file_enabled_) {
+                if (sm_manager.output_file_enabled_) {
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << str;
@@ -200,12 +192,12 @@ void client_handler(int fd) {
                 if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager->abort(context->txn_, context->log_mgr_);
+                    txn_manager.abort(context->txn_, context->log_mgr_);
                 }
                 context->txn_ = nullptr;
 
                 // 将报错信息写入output.txt
-                if (sm_manager->output_file_enabled_) {
+                if (sm_manager.output_file_enabled_) {
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << "failure\n";
@@ -217,7 +209,7 @@ void client_handler(int fd) {
                 if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager->abort(context->txn_, context->log_mgr_);
+                    txn_manager.abort(context->txn_, context->log_mgr_);
                 }
                 context->txn_ = nullptr;
 
@@ -242,7 +234,7 @@ void client_handler(int fd) {
     return;    // terminate calling thread!
 }
 
-void start_server() {
+void start_server(DBInstance& instance) {
     int sockfd_server;
     int fd_temp;
     struct sockaddr_in s_addr_in {};
@@ -290,7 +282,7 @@ void start_server() {
         }
 
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        std::thread(client_handler, sockfd).detach();
+        std::thread(client_handler, sockfd, std::ref(instance)).detach();
     }
 
     // Clear
@@ -314,9 +306,17 @@ int main(int argc, char** argv) {
         exit(1);
     }
 
+    DBInstance instance;
+    signal_log_manager = &instance.log_manager();
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
     try {
+        auto& sm_manager = instance.sm_manager();
+        auto& buffer_pool_manager = instance.buffer_pool_manager();
+        auto& txn_manager = instance.transaction_manager();
+        auto& log_manager = instance.log_manager();
+        auto& recovery = instance.recovery_manager();
+
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
                      " |  __ \\|  \\/  |  __ \\|  _ \\ \n"
@@ -331,28 +331,28 @@ int main(int argc, char** argv) {
         // Database name is passed by args
         std::string db_name = argv[1];
         LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
-        if (!sm_manager->is_dir(db_name)) {
+        if (!sm_manager.is_dir(db_name)) {
             // Database not found, create a new one
-            sm_manager->create_db(db_name);
+            sm_manager.create_db(db_name);
             LOG_INFO("database created: %s", db_name.c_str());
         }
         // Open database
-        sm_manager->open_db(db_name);
+        sm_manager.open_db(db_name);
         LOG_INFO("database opened: %s", db_name.c_str());
 
-        log_manager->initialize_from_existing_log();
-        buffer_pool_manager->set_log_manager(log_manager.get());
+        log_manager.initialize_from_existing_log();
+        buffer_pool_manager.set_log_manager(&log_manager);
 
         // recovery database
-        recovery->analyze();
-        recovery->redo();
-        recovery->undo();
+        recovery.analyze();
+        recovery.redo();
+        recovery.undo();
         LOG_INFO("database recovery finished");
 
         {
             std::atomic<bool> checkpoint_thread_stop{false};
-            std::thread checkpoint_thread([&checkpoint_thread_stop] {
-                CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
+            std::thread checkpoint_thread([&checkpoint_thread_stop, &txn_manager, &sm_manager, &log_manager] {
+                CheckpointManager checkpoint_mgr(&txn_manager, &sm_manager, &log_manager);
                 while (!checkpoint_thread_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                     if (checkpoint_thread_stop.load()) {
@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
             });
 
             // 开启服务端，开始接受客户端连接
-            start_server();
+            start_server(instance);
 
             checkpoint_thread_stop.store(true);
             if (checkpoint_thread.joinable()) {
@@ -371,13 +371,14 @@ int main(int argc, char** argv) {
             }
         }
 
-        sm_manager->close_db();
+        sm_manager.close_db();
         LOG_INFO("database has been closed");
     } catch (RMDBError& e) {
         LOG_ERROR("RMDB error: %s", e.what());
         minilog::Logger::get().stop();
         exit(1);
     }
+    signal_log_manager = nullptr;
     minilog::Logger::get().stop();
     return 0;
 }
