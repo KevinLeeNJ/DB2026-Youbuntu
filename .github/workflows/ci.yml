@@ -8,137 +8,75 @@ permissions:
 
 env:
   RMDB_DIR: .
+  BUILD_DIR: build
 
 jobs:
   style:
     name: Style
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Install style tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format-18
-
-      - name: Check changed C/C++ files
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - name: Check format
         shell: bash
         run: |
           set -euo pipefail
-
-          base_sha="${{ github.event.pull_request.base.sha }}"
-          head_sha="${{ github.event.pull_request.head.sha }}"
-
-          mapfile -t files < <(
-            git diff --name-only --diff-filter=ACMRT "$base_sha" "$head_sha" -- \
-              "$RMDB_DIR/src" "$RMDB_DIR/rmdb_client" \
-              ':(exclude)src/parser/lex.yy.*' \
-              ':(exclude)src/parser/yacc.tab.*' |
-              grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true
-          )
-
-          existing_files=()
-          for file in "${files[@]}"; do
-            if [[ -f "$file" ]]; then
-              existing_files+=("$file")
-            else
-              echo "Skipping changed path not present in checkout: $file"
-            fi
-          done
-          files=("${existing_files[@]}")
-
-          if (( ${#files[@]} == 0 )); then
-            echo "No changed C/C++ files to format-check."
-            exit 0
+          files=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- src rmdb_client | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' || true)
+          if [ -n "$files" ]; then
+            clang-format-18 --dry-run --Werror $files
           fi
-
-          printf 'Style-checking changed files:\n'
-          printf '  %s\n' "${files[@]}"
-          clang-format-18 --dry-run --Werror "${files[@]}"
 
   lint:
     name: Lint
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Install RMDB dependencies and lint tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake flex bison libreadline-dev clang-tidy
-
-      - name: Configure CMake
-        working-directory: ${{ env.RMDB_DIR }}
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-
-      - name: Lint changed C/C++ source files
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake flex bison libreadline-dev clang-tidy
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Lint changed sources
         shell: bash
         run: |
           set -euo pipefail
-
-          base_sha="${{ github.event.pull_request.base.sha }}"
-          head_sha="${{ github.event.pull_request.head.sha }}"
-
-          mapfile -t files < <(
-            git diff --name-only --diff-filter=ACMRT "$base_sha" "$head_sha" -- \
-              "$RMDB_DIR/src" "$RMDB_DIR/rmdb_client" \
-              ':(exclude)src/parser/lex.yy.*' \
-              ':(exclude)src/parser/yacc.tab.*' |
-              grep -E '\.(c|cc|cpp|cxx)$' || true
-          )
-
-          existing_files=()
-          for file in "${files[@]}"; do
-            if [[ -f "$file" ]]; then
-              existing_files+=("$file")
-            else
-              echo "Skipping changed path not present in checkout: $file"
-            fi
-          done
-          files=("${existing_files[@]}")
-
-          if (( ${#files[@]} == 0 )); then
-            echo "No changed C/C++ source files to lint."
-            exit 0
+          files=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- src rmdb_client | grep -E '\.(c|cc|cpp|cxx)$' || true)
+          if [ -n "$files" ]; then
+            clang-tidy -p build $files
           fi
 
-          printf 'Linting changed source files:\n'
-          printf '  %s\n' "${files[@]}"
-          clang-tidy -p "$RMDB_DIR/build" "${files[@]}"
-
-  ut:
-    name: Unit Tests
+  build-test-e2e:
+    name: Build UnitTest E2E
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install RMDB dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake flex bison libreadline-dev
+          sudo apt-get install -y build-essential cmake flex bison libreadline-dev ccache python3
 
-      - name: Configure CMake
-        working-directory: ${{ env.RMDB_DIR }}
+      - name: Enable ccache
+        uses: hendrikmuhs/ccache-action@v1
+
+      - name: Configure Debug build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DRMDB_ENABLE_NATIVE_OPTIMIZATIONS=OFF
 
       - name: Build
-        working-directory: ${{ env.RMDB_DIR }}
-        run: |
-          cmake --build build --parallel
+        run: cmake --build build --parallel
 
-      - name: Run CTest
-        working-directory: ${{ env.RMDB_DIR }}/build
-        run: |
-          ctest --output-on-failure
+      - name: Unit tests
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Reduced TPC-C crash recovery E2E
+        run: make benchmark-ci
