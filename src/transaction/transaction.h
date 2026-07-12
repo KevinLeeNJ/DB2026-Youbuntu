@@ -189,7 +189,7 @@ public:
     std::atomic<timestamp_t> commit_ts_{INVALID_TS};
 
 private:
-    bool txn_mode_;                  // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
+    bool txn_mode_{false};           // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     TransactionState state_;         // 事务状态
     IsolationLevel isolation_level_; // 事务的隔离级别
     std::thread::id thread_id_;      // 当前事务对应的线程id

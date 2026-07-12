@@ -65,6 +65,18 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
             return true;
         }
 
+        // A transaction that does not hold any lock cannot participate in a
+        // wait-for cycle yet, so waiting for its first lock is safe.  Abort
+        // only when it already owns another lock and the wait-die ordering
+        // would otherwise allow a cycle.
+        if (txn->get_lock_set()->empty() && txn->get_txn_mode() &&
+            txn->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+            request_queue->waiting_count_++;
+            request_queue->cv_.wait(lock);
+            request_queue->waiting_count_--;
+            continue;
+        }
+
         if (txn->get_transaction_id() > owner_it->txn_id_) {
             return false;
         }
