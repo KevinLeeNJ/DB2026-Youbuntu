@@ -78,7 +78,7 @@ public:
                 }
                 // Convert value type for storage (e.g., INT literal into FLOAT column)
                 if (col.type == TYPE_FLOAT && val.type == TYPE_INT) {
-                    val.set_float(static_cast<float>(val.int_val));
+                    val.set_float(static_cast<double>(val.int_val));
                 } else if (col.type == TYPE_INT && val.type == TYPE_FLOAT) {
                     val.set_int(static_cast<int>(val.float_val));
                 } else if ((col.type == TYPE_STRING || col.type == TYPE_DATETIME) &&

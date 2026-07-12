@@ -185,11 +185,12 @@ echo "[benchmark] 重启 rmdb server，等待恢复就绪 (最长 ${RESTART_TIME
 SERVER_PID=$!
 wait_port "$RESTART_TIMEOUT"
 
-echo "[benchmark] 一致性检查 (基于 $JSON_OUT)"
+echo "[benchmark] 恢复后一致性检查 (基于 $JSON_OUT)"
 set +e
 python3 -m benchmark.tpcc.tpcc_run consistency \
     --backend rmdb \
     --port "$PORT" \
+    --consistency-stage post-recovery \
     --result-json "$JSON_OUT"
 consistency_status=$?
 set -e

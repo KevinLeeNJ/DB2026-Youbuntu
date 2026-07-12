@@ -63,8 +63,8 @@ private:
     static int compare_float_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
-        float lhs_val = *reinterpret_cast<const float*>(lhs_data);
-        float rhs_val = *reinterpret_cast<const float*>(rhs_data);
+        double lhs_val = *reinterpret_cast<const double*>(lhs_data);
+        double rhs_val = *reinterpret_cast<const double*>(rhs_data);
         if (lhs_val < rhs_val) {
             return -1;
         }

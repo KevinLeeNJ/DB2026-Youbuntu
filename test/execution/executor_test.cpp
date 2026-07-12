@@ -918,7 +918,7 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"score", TYPE_FLOAT, 4},
+        {"score", TYPE_FLOAT, 8},
     };
     sm_manager_->create_table("upd_promo", cols, nullptr);
     {
@@ -962,15 +962,15 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     SeqScanExecutor scan(sm_manager_.get(), "upd_promo", {}, &ctx);
     scan.beginTuple();
     auto rec = scan.Next();
-    float score = *reinterpret_cast<float*>(rec->data + 4);
-    EXPECT_FLOAT_EQ(score, 90.0f);
+    double score = *reinterpret_cast<double*>(rec->data + 4);
+    EXPECT_DOUBLE_EQ(score, 90.0);
 }
 
 TEST_F(ExecutorTest, update_float_to_int_truncation) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"score", TYPE_FLOAT, 4},
+        {"score", TYPE_FLOAT, 8},
     };
     sm_manager_->create_table("upd_trunc", cols, nullptr);
     {

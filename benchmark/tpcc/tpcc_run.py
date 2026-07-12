@@ -36,8 +36,11 @@ def import_csv_to_sqlite(sqlite_path: Path, data_dir: Path) -> None:
     backend = SqliteBackend(str(sqlite_path))
     try:
         schema_dir = Path(__file__).parent / "schema"
+        # Build tables first and defer indexes until all rows are loaded. The
+        # previous path created indexes before inserting and autocommitted each
+        # row through sqlite3's isolation_level=None connection.
         execute_sql_file(backend, schema_dir / "sqlite_schema.sql")
-        execute_sql_file(backend, schema_dir / "sqlite_indexes.sql")
+        backend.conn.execute("begin;")
         for table in TABLES:
             csv_path = data_dir / f"{table}.csv"
             with csv_path.open(newline="") as file:
@@ -45,9 +48,12 @@ def import_csv_to_sqlite(sqlite_path: Path, data_dir: Path) -> None:
                 header = next(reader)
                 placeholders = ",".join(["?"] * len(header))
                 insert_sql = f"insert into {table} values ({placeholders})"
-                for row in reader:
-                    backend.conn.execute(insert_sql, row)
+                backend.conn.executemany(insert_sql, reader)
         backend.conn.commit()
+        execute_sql_file(backend, schema_dir / "sqlite_indexes.sql")
+    except Exception:
+        backend.conn.rollback()
+        raise
     finally:
         backend.close()
 
@@ -157,9 +163,54 @@ def main() -> None:
         action="store_true",
         help="skip the consistency check phase (useful for profiling)",
     )
+    parser.add_argument(
+        "--consistency-stage",
+        default="standalone",
+        help="stage label used by the standalone consistency command",
+    )
     args = parser.parse_args()
 
     schema_dir = Path(__file__).parent / "schema"
+    rounds = []
+    baseline_orders_total = args.baseline_orders_total
+    baseline_warehouse_total = -1
+    baseline_district_total = -1
+    districts_per_warehouse = 0
+
+    def validate(
+        stage: str,
+        warehouse_total: int,
+        district_total: int,
+        orders_total: int,
+        committed: int,
+        district_count: int,
+    ) -> None:
+        phase(f"consistency start: stage={stage}")
+        backend = (
+            sqlite_backend_factory(args)()
+            if args.backend == "sqlite"
+            else rmdb_backend_factory(args)()
+        )
+        try:
+            failures = run_consistency(
+                backend,
+                warehouse_total,
+                district_total,
+                orders_total,
+                committed,
+            )
+            failures.extend(
+                run_district_diagnostics(backend, warehouse_total, district_count)
+            )
+        finally:
+            backend.close()
+        if failures:
+            details = "\n".join(f"[{stage}] {failure}" for failure in failures)
+            raise SystemExit(
+                f"[{stage}] consistency validation failed ({len(failures)} rule(s))\n{details}"
+            )
+        print(f"consistency ok: stage={stage}")
+        phase(f"consistency complete: stage={stage}")
 
     if set(args.command) & {"datagen", "all"}:
         if args.reuse_data_dir and complete_csv_set(args.data_dir, TABLES):
@@ -188,12 +239,30 @@ def main() -> None:
             finally:
                 backend.close()
         phase("load complete")
+        if args.skip_consistency:
+            phase("consistency skipped: stage=post-load (--skip-consistency)")
+        else:
+            load_backend = (
+                sqlite_backend_factory(args)()
+                if args.backend == "sqlite"
+                else rmdb_backend_factory(args)()
+            )
+            try:
+                baseline_orders_total = count_orders(load_backend)
+                baseline_warehouse_total = count_warehouses(load_backend)
+                baseline_district_total = count_districts(load_backend)
+                districts_per_warehouse = max_district_id(load_backend)
+            finally:
+                load_backend.close()
+            validate(
+                "post-load",
+                baseline_warehouse_total,
+                baseline_district_total,
+                baseline_orders_total,
+                0,
+                districts_per_warehouse,
+            )
 
-    rounds = []
-    baseline_orders_total = args.baseline_orders_total
-    baseline_warehouse_total = -1
-    baseline_district_total = -1
-    districts_per_warehouse = 0
     if set(args.command) & {"run", "all"}:
         factory = (
             sqlite_backend_factory(args)
@@ -256,13 +325,28 @@ def main() -> None:
         args.json_out.write_text(json.dumps(summary, indent=2))
         print(json.dumps(summary, indent=2))
         phase(f"run complete: result={args.json_out}")
-
-    if set(args.command) & {"consistency", "all"}:
-        if "all" in args.command and args.skip_consistency:
-            phase("consistency skipped (--skip-consistency)")
+        if args.skip_consistency:
+            phase("consistency skipped: stage=post-transaction (--skip-consistency)")
         else:
-            phase("consistency start")
-            if "consistency" in args.command and args.result_json is not None:
+            committed = sum(
+                round_result.total_committed_new_order() for round_result in rounds
+            )
+            validate(
+                "post-transaction",
+                baseline_warehouse_total,
+                baseline_district_total,
+                baseline_orders_total,
+                committed,
+                districts_per_warehouse,
+            )
+
+    if "consistency" in args.command:
+        if args.skip_consistency:
+            phase(
+                f"consistency skipped: stage={args.consistency_stage} (--skip-consistency)"
+            )
+        else:
+            if args.result_json is not None:
                 (
                     baseline_warehouse_total,
                     baseline_district_total,
@@ -298,24 +382,16 @@ def main() -> None:
                     baseline_district_total = count_districts(backend)
                 if districts_per_warehouse <= 0:
                     districts_per_warehouse = max_district_id(backend)
-                failures = run_consistency(
-                    backend,
-                    baseline_warehouse_total,
-                    baseline_district_total,
-                    baseline_orders_total,
-                    committed,
-                )
-                failures.extend(
-                    run_district_diagnostics(
-                        backend, baseline_warehouse_total, districts_per_warehouse
-                    )
-                )
             finally:
                 backend.close()
-            if failures:
-                raise SystemExit("\n".join(failures))
-            print("consistency ok")
-            phase("consistency complete")
+            validate(
+                args.consistency_stage,
+                baseline_warehouse_total,
+                baseline_district_total,
+                baseline_orders_total,
+                committed,
+                districts_per_warehouse,
+            )
 
 
 if __name__ == "__main__":

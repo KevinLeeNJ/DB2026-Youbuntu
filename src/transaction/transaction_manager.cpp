@@ -113,14 +113,14 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
     switch (lhs_type) {
     case TYPE_INT:
     case TYPE_FLOAT: {
-        float lhs_val = lhs_type == TYPE_INT ? static_cast<float>(*reinterpret_cast<int*>(lhs_data))
-                                             : *reinterpret_cast<float*>(lhs_data);
-        float rhs_val;
+        double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(lhs_data))
+                                              : *reinterpret_cast<double*>(lhs_data);
+        double rhs_val;
         if (cond.is_rhs_val) {
-            rhs_val = rhs_type == TYPE_INT ? static_cast<float>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
+            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
         } else {
-            rhs_val = rhs_type == TYPE_INT ? static_cast<float>(*reinterpret_cast<int*>(rhs_data))
-                                           : *reinterpret_cast<float*>(rhs_data);
+            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(rhs_data))
+                                           : *reinterpret_cast<double*>(rhs_data);
         }
         switch (cond.op) {
         case OP_EQ:
@@ -573,14 +573,14 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
                 cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col.len));
             cmp = lhs.compare(rhs);
         } else {
-            float lhs = lhs_col.type == TYPE_INT ? static_cast<float>(*reinterpret_cast<const int*>(lhs_data))
-                                                 : *reinterpret_cast<const float*>(lhs_data);
-            float rhs;
+            double lhs = lhs_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(lhs_data))
+                                                  : *reinterpret_cast<const double*>(lhs_data);
+            double rhs;
             if (cond.is_rhs_val) {
-                rhs = rhs_type == TYPE_INT ? static_cast<float>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
+                rhs = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
             } else {
-                rhs = rhs_type == TYPE_INT ? static_cast<float>(*reinterpret_cast<const int*>(rhs_data))
-                                           : *reinterpret_cast<const float*>(rhs_data);
+                rhs = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(rhs_data))
+                                           : *reinterpret_cast<const double*>(rhs_data);
             }
             cmp = lhs == rhs ? 0 : (lhs < rhs ? -1 : 1);
         }

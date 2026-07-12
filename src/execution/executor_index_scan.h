@@ -101,7 +101,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            float value = std::numeric_limits<float>::lowest();
+            double value = std::numeric_limits<double>::lowest();
             memcpy(dest, &value, col.len);
             break;
         }
@@ -120,7 +120,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            float value = std::numeric_limits<float>::max();
+            double value = std::numeric_limits<double>::max();
             memcpy(dest, &value, col.len);
             break;
         }
@@ -140,7 +140,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            float converted = value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+            double converted = value.type == TYPE_INT ? static_cast<double>(value.int_val) : value.float_val;
             memcpy(data.data(), &converted, col.len);
             break;
         }

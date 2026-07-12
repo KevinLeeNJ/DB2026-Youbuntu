@@ -785,7 +785,7 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
             } else if (cs.type == TYPE_FLOAT) {
                 errno = 0;
                 char* end = nullptr;
-                float v = std::strtof(raw, &end);
+                double v = std::strtod(raw, &end);
                 if (errno != 0 || end == raw || *end != '\0') {
                     throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
                 }

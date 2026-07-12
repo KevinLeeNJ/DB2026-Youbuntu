@@ -47,20 +47,20 @@ inline std::string trim_string(const char* data, int len) {
 struct CellValue {
     ColType type = TYPE_INT;
     int int_val = 0;
-    float float_val = 0.0f;
+    double float_val = 0.0;
     std::string str_val;
 
     bool operator==(const CellValue& other) const;
 };
 
-inline float promote_numeric_value(const CellValue& value) {
-    return value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+inline double promote_numeric_value(const CellValue& value) {
+    return value.type == TYPE_INT ? static_cast<double>(value.int_val) : value.float_val;
 }
 
 inline int compare_cells(const CellValue& lhs, const CellValue& rhs) {
     if (is_numeric_type(lhs.type) && is_numeric_type(rhs.type)) {
-        float lhs_val = promote_numeric_value(lhs);
-        float rhs_val = promote_numeric_value(rhs);
+        double lhs_val = promote_numeric_value(lhs);
+        double rhs_val = promote_numeric_value(rhs);
         if (lhs_val < rhs_val) {
             return -1;
         }
@@ -103,14 +103,14 @@ inline void hash_combine(std::size_t& seed, std::size_t value) {
 }
 
 inline std::size_t hash_numeric_value(const CellValue& value) {
-    float normalized = promote_numeric_value(value);
-    if (normalized == 0.0f) {
-        normalized = 0.0f;
+    double normalized = promote_numeric_value(value);
+    if (normalized == 0.0) {
+        normalized = 0.0;
     }
-    std::uint32_t bits = 0;
+    std::uint64_t bits = 0;
     std::memcpy(&bits, &normalized, sizeof(bits));
     std::size_t seed = std::hash<int>()(static_cast<int>(TYPE_FLOAT));
-    hash_combine(seed, std::hash<std::uint32_t>()(bits));
+    hash_combine(seed, std::hash<std::uint64_t>()(bits));
     return seed;
 }
 
@@ -130,7 +130,7 @@ inline CellValue zero_value(ColType type) {
     CellValue value;
     value.type = type;
     if (type == TYPE_FLOAT) {
-        value.float_val = 0.0f;
+        value.float_val = 0.0;
     } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
         value.str_val.clear();
     } else {

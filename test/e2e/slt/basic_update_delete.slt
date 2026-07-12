@@ -26,6 +26,25 @@ SELECT * FROM employees WHERE id = 1;
 +------------------+------------------+------------------+
 Total record(s): 1
 
+statement ok
+CREATE TABLE float64_update (id INT, amount FLOAT);
+
+statement ok
+INSERT INTO float64_update VALUES (1, 300000.0);
+
+statement ok
+UPDATE float64_update SET amount = amount + 0.01 WHERE id = 1;
+
+query
+SELECT amount FROM float64_update WHERE id = 1;
+----
++------------------+
+|           amount |
++------------------+
+|    300000.010000 |
++------------------+
+Total record(s): 1
+
 # UPDATE a single row
 statement ok
 UPDATE employees SET salary = 6500.0 WHERE id = 2;

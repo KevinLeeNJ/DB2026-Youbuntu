@@ -43,10 +43,10 @@ TEST(AnalyzeConvertTest, convert_int_lit) {
 
 TEST(AnalyzeConvertTest, convert_float_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_unique<ast::FloatLit>(3.14f);
+    auto sv_val = std::make_unique<ast::FloatLit>(3.14);
     Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_FLOAT);
-    EXPECT_EQ(val.float_val, 3.14f);
+    EXPECT_DOUBLE_EQ(val.float_val, 3.14);
 }
 
 TEST(AnalyzeConvertTest, convert_string_lit) {
