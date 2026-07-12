@@ -181,8 +181,6 @@ def main() -> None:
         stage: str,
         warehouse_total: int,
         district_total: int,
-        orders_total: int,
-        committed: int,
         district_count: int,
     ) -> None:
         phase(f"consistency start: stage={stage}")
@@ -196,8 +194,6 @@ def main() -> None:
                 backend,
                 warehouse_total,
                 district_total,
-                orders_total,
-                committed,
             )
             failures.extend(
                 run_district_diagnostics(backend, warehouse_total, district_count)
@@ -258,8 +254,6 @@ def main() -> None:
                 "post-load",
                 baseline_warehouse_total,
                 baseline_district_total,
-                baseline_orders_total,
-                0,
                 districts_per_warehouse,
             )
 
@@ -328,15 +322,10 @@ def main() -> None:
         if args.skip_consistency:
             phase("consistency skipped: stage=post-transaction (--skip-consistency)")
         else:
-            committed = sum(
-                round_result.total_committed_new_order() for round_result in rounds
-            )
             validate(
                 "post-transaction",
                 baseline_warehouse_total,
                 baseline_district_total,
-                baseline_orders_total,
-                committed,
                 districts_per_warehouse,
             )
 
@@ -350,22 +339,13 @@ def main() -> None:
                 (
                     baseline_warehouse_total,
                     baseline_district_total,
-                    baseline_orders_total,
-                    committed,
+                    _,
+                    _,
                 ) = load_baseline_and_committed_from_result(args.result_json)
                 phase(
                     f"loaded from {args.result_json}: "
-                    f"baseline orders={baseline_orders_total}, "
-                    f"committed new_order={committed}"
-                )
-            else:
-                committed = (
-                    sum(
-                        round_result.total_committed_new_order()
-                        for round_result in rounds
-                    )
-                    if rounds
-                    else args.committed_new_order
+                    f"baseline warehouses={baseline_warehouse_total}, "
+                    f"districts={baseline_district_total}"
                 )
             backend = (
                 sqlite_backend_factory(args)()
@@ -373,9 +353,6 @@ def main() -> None:
                 else rmdb_backend_factory(args)()
             )
             try:
-                if baseline_orders_total < 0:
-                    current_orders = count_orders(backend)
-                    baseline_orders_total = current_orders - committed
                 if baseline_warehouse_total < 0:
                     baseline_warehouse_total = count_warehouses(backend)
                 if baseline_district_total < 0:
@@ -388,8 +365,6 @@ def main() -> None:
                 args.consistency_stage,
                 baseline_warehouse_total,
                 baseline_district_total,
-                baseline_orders_total,
-                committed,
                 districts_per_warehouse,
             )
 

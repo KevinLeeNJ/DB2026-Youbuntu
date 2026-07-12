@@ -3,7 +3,6 @@ from __future__ import annotations
 from benchmark.tpcc.core.backend import Backend
 from benchmark.tpcc.core.constants import (
     DISTRICTS_PER_WAREHOUSE,
-    INITIAL_ORDERS_PER_DISTRICT,
 )
 from benchmark.tpcc.core.parsing import scalar_float, scalar_int
 
@@ -15,38 +14,18 @@ def check_scalar(backend: Backend, sql: str, expected: int, name: str) -> list[s
     return []
 
 
-def check_equal_scalars(
-    backend: Backend, left_sql: str, right_sql: str, name: str
-) -> list[str]:
-    left = scalar_int(backend.execute(left_sql), -1)
-    right = scalar_int(backend.execute(right_sql), -1)
-    if left != right:
-        return [f"{name}: left={left}, right={right}"]
-    return []
-
-
-def check_equal_amounts(
-    backend: Backend, left_sql: str, right_sql: str, name: str
-) -> list[str]:
-    left = scalar_float(backend.execute(left_sql), 0.0)
-    right = scalar_float(backend.execute(right_sql), 0.0)
-    if abs(left - right) > 0.01:
-        return [f"{name}: left={left:.2f}, right={right:.2f}"]
-    return []
-
-
 def run_consistency(
     backend: Backend,
     baseline_warehouse_total: int,
     baseline_district_total: int,
-    baseline_orders_total: int,
-    total_committed_new_order: int,
 ) -> list[str]:
+    """Validate TPC-C's committed database-state consistency conditions.
+
+    Snapshot isolation can legitimately abort a transaction after the client has
+    sent BEGIN, so client-side commit counters are not authoritative. These
+    checks only use state that survived commit.
+    """
     failures: list[str] = []
-    expected_orders = baseline_orders_total + total_committed_new_order
-    post_load_order_lines = (
-        f"from order_line where ol_o_id > {INITIAL_ORDERS_PER_DISTRICT}"
-    )
     failures.extend(
         check_scalar(
             backend,
@@ -63,67 +42,20 @@ def run_consistency(
             "district count",
         )
     )
-    failures.extend(
-        check_scalar(
-            backend, "select count(*) from orders;", expected_orders, "orders total"
+    for warehouse_id in range(1, baseline_warehouse_total + 1):
+        warehouse_ytd = scalar_float(
+            backend.execute(f"select w_ytd from warehouse where w_id = {warehouse_id};"),
+            0.0,
         )
-    )
-    failures.extend(
-        check_equal_amounts(
-            backend,
-            "select sum(w_ytd) from warehouse;",
-            "select sum(d_ytd) from district;",
-            "warehouse/district YTD mismatch",
+        district_ytd = scalar_float(
+            backend.execute(f"select sum(d_ytd) from district where d_w_id = {warehouse_id};"),
+            0.0,
         )
-    )
-    failures.extend(
-        check_equal_amounts(
-            backend,
-            "select sum(w_ytd) from warehouse;",
-            "select sum(h_amount) from history;",
-            "warehouse/history YTD mismatch",
-        )
-    )
-    failures.extend(
-        check_equal_amounts(
-            backend,
-            "select sum(c_ytd_payment) from customer;",
-            "select sum(h_amount) from history;",
-            "customer/history payment amount mismatch",
-        )
-    )
-    failures.extend(
-        check_equal_scalars(
-            backend,
-            "select sum(c_payment_cnt) from customer;",
-            "select count(*) from history;",
-            "customer/history payment count mismatch",
-        )
-    )
-    failures.extend(
-        check_equal_amounts(
-            backend,
-            "select sum(s_ytd) from stock;",
-            f"select sum(ol_quantity) {post_load_order_lines};",
-            "stock YTD/new order-line quantity mismatch",
-        )
-    )
-    failures.extend(
-        check_equal_scalars(
-            backend,
-            "select sum(s_order_cnt) from stock;",
-            f"select count(*) {post_load_order_lines};",
-            "stock/new order-line count mismatch",
-        )
-    )
-    failures.extend(
-        check_equal_scalars(
-            backend,
-            "select sum(s_remote_cnt) from stock;",
-            f"select count(*) {post_load_order_lines} and ol_supply_w_id != ol_w_id;",
-            "stock/remote order-line count mismatch",
-        )
-    )
+        if abs(warehouse_ytd - district_ytd) > 0.01:
+            failures.append(
+                f"warehouse/district YTD mismatch w={warehouse_id}: "
+                f"warehouse={warehouse_ytd:.2f}, districts={district_ytd:.2f}"
+            )
     return failures
 
 

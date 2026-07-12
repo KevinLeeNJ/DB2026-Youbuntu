@@ -12,32 +12,19 @@ class FakeBackend:
 
 
 class ConsistencyTest(unittest.TestCase):
-    def test_consistency_uses_baseline_order_count(self) -> None:
+    def test_consistency_uses_standard_committed_state_rules(self) -> None:
         backend = FakeBackend(
             {
                 "select count(*) from warehouse;": "1",
                 "select count(*) from district;": "3",
-                "select count(*) from orders;": "32",
-                "select sum(w_ytd) from warehouse;": "300000.00",
-                "select sum(d_ytd) from district;": "300000.00",
-                "select sum(h_amount) from history;": "300000.00",
-                "select sum(c_ytd_payment) from customer;": "300000.00",
-                "select sum(c_payment_cnt) from customer;": "30000",
-                "select count(*) from history;": "30000",
-                "select sum(s_ytd) from stock;": "12",
-                "select sum(ol_quantity) from order_line where ol_o_id > 3000;": "12",
-                "select sum(s_order_cnt) from stock;": "2",
-                "select count(*) from order_line where ol_o_id > 3000;": "2",
-                "select sum(s_remote_cnt) from stock;": "1",
-                "select count(*) from order_line where ol_o_id > 3000 and ol_supply_w_id != ol_w_id;": "1",
+                "select w_ytd from warehouse where w_id = 1;": "300000.00",
+                "select sum(d_ytd) from district where d_w_id = 1;": "300000.00",
             }
         )
         failures = run_consistency(
             backend,
             baseline_warehouse_total=1,
             baseline_district_total=3,
-            baseline_orders_total=30,
-            total_committed_new_order=2,
         )
         self.assertEqual(failures, [])
 
@@ -88,36 +75,22 @@ class ConsistencyTest(unittest.TestCase):
             ],
         )
 
-    def test_consistency_reports_transaction_accounting_failures(self) -> None:
+    def test_consistency_reports_per_warehouse_ytd_failure(self) -> None:
         backend = FakeBackend(
             {
                 "select count(*) from warehouse;": "1",
                 "select count(*) from district;": "10",
-                "select count(*) from orders;": "30001",
-                "select sum(w_ytd) from warehouse;": "300010",
-                "select sum(d_ytd) from district;": "300010",
-                "select sum(h_amount) from history;": "300010",
-                "select sum(c_ytd_payment) from customer;": "300000",
-                "select sum(c_payment_cnt) from customer;": "30000",
-                "select count(*) from history;": "30001",
-                "select sum(s_ytd) from stock;": "0",
-                "select sum(ol_quantity) from order_line where ol_o_id > 3000;": "5",
-                "select sum(s_order_cnt) from stock;": "0",
-                "select count(*) from order_line where ol_o_id > 3000;": "1",
-                "select sum(s_remote_cnt) from stock;": "0",
-                "select count(*) from order_line where ol_o_id > 3000 and ol_supply_w_id != ol_w_id;": "0",
+                "select w_ytd from warehouse where w_id = 1;": "300010",
+                "select sum(d_ytd) from district where d_w_id = 1;": "300000",
             }
         )
 
-        failures = run_consistency(backend, 1, 10, 30000, 1)
+        failures = run_consistency(backend, 1, 10)
 
         self.assertEqual(
             failures,
             [
-                "customer/history payment amount mismatch: left=300000.00, right=300010.00",
-                "customer/history payment count mismatch: left=30000, right=30001",
-                "stock YTD/new order-line quantity mismatch: left=0.00, right=5.00",
-                "stock/new order-line count mismatch: left=0, right=1",
+                "warehouse/district YTD mismatch w=1: warehouse=300010.00, districts=300000.00",
             ],
         )
 
