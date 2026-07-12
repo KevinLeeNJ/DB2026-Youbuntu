@@ -138,6 +138,19 @@ public:
         return it->second;
     }
 
+    bool has_historical_index_keys(const std::string& tab_name, const std::string& index_name) const {
+        std::string prefix;
+        prefix.reserve(tab_name.size() + index_name.size() + 2);
+        prefix.append(tab_name);
+        prefix.push_back('\0');
+        prefix.append(index_name);
+        prefix.push_back('\0');
+
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        return std::any_of(historical_index_keys_.begin(), historical_index_keys_.end(),
+                           [&](const auto& entry) { return entry.first.compare(0, prefix.size(), prefix) == 0; });
+    }
+
     void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
         auto& rids = deleted_tuple_candidates_[tab_name];

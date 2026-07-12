@@ -110,22 +110,15 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     }
 
     // A transaction that does not hold any lock cannot participate in a
-    // wait-for cycle yet, so waiting for its first lock is safe.  Abort
-    // only when it already owns another lock and the wait-die ordering
-    // would otherwise allow a cycle.
-    bool first_explicit_rc_lock = txn->get_lock_set()->empty() && txn->get_txn_mode() &&
-                                  txn->get_isolation_level() == IsolationLevel::READ_COMMITTED;
-    if (!first_explicit_rc_lock && txn->get_transaction_id() > (*owner_it)->txn_id_) {
+    // wait-for cycle yet, so waiting for its first lock is safe at every
+    // isolation level.  In particular, aborting SI transactions here turns
+    // TPCC's warehouse and district hot rows into an abort storm.
+    bool first_lock = txn->get_lock_set()->empty();
+    if (!first_lock && txn->get_transaction_id() > (*owner_it)->txn_id_) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         return false;
     }
-    if (!first_explicit_rc_lock && txn->get_lock_set()->empty()) {
-        lock.unlock();
-        release_queue_user(lock_data_id, request_queue);
-        return false;
-    }
-
     auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
     request_queue->request_queue_.push_back(request);
     request->cv_.wait(lock, [&request] { return request->granted_; });

@@ -208,8 +208,17 @@ protected:
             return false;
         }
         IsolationLevel level = context_->txn_->get_isolation_level();
-        return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::REPEATABLE_READ ||
-               (level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode());
+        if (level != IsolationLevel::SNAPSHOT_ISOLATION && level != IsolationLevel::REPEATABLE_READ &&
+            !(level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode())) {
+            return false;
+        }
+
+        // The current index can miss a tuple visible to an older snapshot only
+        // after its indexed key was changed or deleted. Those old keys are
+        // tracked by SmManager; non-index updates and post-snapshot inserts are
+        // handled by GetVisibleRecord without falling back to a heap scan.
+        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+        return sm_manager_->has_historical_index_keys(tab_name_, index_name);
     }
 
 public:

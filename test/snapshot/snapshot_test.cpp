@@ -425,8 +425,8 @@ protected:
     std::unique_ptr<SharedTestDB> db_;
 };
 
-TEST_F(SnapshotTest, DefaultIsolationIsReadCommitted) {
-    EXPECT_EQ(DEFAULT_ISOLATION_LEVEL, IsolationLevel::READ_COMMITTED);
+TEST_F(SnapshotTest, DefaultIsolationIsSnapshotIsolation) {
+    EXPECT_EQ(DEFAULT_ISOLATION_LEVEL, IsolationLevel::SNAPSHOT_ISOLATION);
 }
 
 TEST_F(SnapshotTest, RC_DefaultStatementSeesNewCommittedVersion) {
