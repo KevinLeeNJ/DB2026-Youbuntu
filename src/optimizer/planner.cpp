@@ -1019,11 +1019,11 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         std::vector<std::string> index_col_names;
         PlanTag scan_tag = choose_scan_plan_tag(x->tab_name, query->conds, index_col_names);
 
-        if (scan_tag == T_SeqScan) { // 该表没有可用索引
+        if (scan_tag == T_SeqScan) {
             index_col_names.clear();
             table_scan_executors =
                 std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
-        } else { // 存在索引
+        } else {
             table_scan_executors =
                 std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
@@ -1041,12 +1041,11 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
         PlanTag scan_tag = choose_scan_plan_tag(x->tab_name, query->conds, index_col_names);
-
-        if (scan_tag == T_SeqScan) { // 该表没有可用索引
+        if (scan_tag == T_SeqScan) {
             index_col_names.clear();
             table_scan_executors =
                 std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
-        } else { // 存在索引
+        } else {
             table_scan_executors =
                 std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }

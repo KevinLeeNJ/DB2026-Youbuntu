@@ -272,15 +272,36 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
         break;
     }
     case WType::UPDATE_TUPLE: {
-        if (fh->is_record(rid)) {
-            auto current_rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *current_rec, rid, txn);
-        }
         RmRecord old_rec = write_record->GetRecord();
+        std::unique_ptr<RmRecord> current_rec;
+        if (fh->is_record(rid)) {
+            current_rec = fh->get_record(rid, nullptr);
+            for (const auto& index : tab.indexes) {
+                auto current_key = MakeIndexKey(index, current_rec->data);
+                auto old_key = MakeIndexKey(index, old_rec.data);
+                if (current_key == old_key) {
+                    continue;
+                }
+                auto ih =
+                    sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                ih->delete_entry(current_key.data(), rid, txn);
+            }
+        }
         auto undo = GetCurrentUndoLog(fh, rid);
         fh->update_record(rid, old_rec.data, nullptr);
         fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
-        InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
+        if (current_rec != nullptr) {
+            for (const auto& index : tab.indexes) {
+                auto current_key = MakeIndexKey(index, current_rec->data);
+                auto old_key = MakeIndexKey(index, old_rec.data);
+                if (current_key == old_key) {
+                    continue;
+                }
+                auto ih =
+                    sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                ih->insert_entry(old_key.data(), rid, txn, true);
+            }
+        }
         break;
     }
     }

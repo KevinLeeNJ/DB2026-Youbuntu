@@ -56,6 +56,9 @@ public:
         for (Rid& rid : rids_) {
             std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
+                if (context_ != nullptr && context_->txn_ != nullptr) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+                }
                 continue;
             }
             bool match = true;
@@ -79,7 +82,7 @@ public:
                         context_->txn_mgr_->BeginStatement(txn);
                         rec = GetVisibleRecord(fh_, rid, context_);
                         if (rec == nullptr) {
-                            continue;
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
                         bool latest_match = true;
                         for (const auto& cond : conds_) {
@@ -89,7 +92,7 @@ public:
                             }
                         }
                         if (!latest_match) {
-                            continue;
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
                         TupleMeta latest_meta = fh_->get_tuple_meta(rid);
                         if (has_non_self_ref_set && latest_meta.is_committed_ &&
