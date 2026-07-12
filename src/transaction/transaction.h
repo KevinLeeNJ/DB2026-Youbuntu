@@ -143,6 +143,10 @@ public:
         return modified_slots_;
     }
     inline void append_modified_slot(const std::string& tab_name, const Rid& rid) {
+        if (!modified_slots_.empty() && modified_slots_.back().first == tab_name &&
+            modified_slots_.back().second == rid) {
+            return;
+        }
         modified_slots_.emplace_back(tab_name, rid);
     }
 
