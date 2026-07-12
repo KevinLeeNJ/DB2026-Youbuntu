@@ -401,15 +401,17 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::COMMITTED);
-    CleanupTxnSsiState(txn->get_transaction_id());
-    bool run_full_prune = false;
-    {
-        std::unique_lock<std::mutex> lock(latch_);
-        ++commits_since_full_ssi_prune_;
-        run_full_prune = ShouldRunFullSsiPruneUnlocked();
-    }
-    if (run_full_prune) {
-        PruneSsiState();
+    if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+        CleanupTxnSsiState(txn->get_transaction_id());
+        bool run_full_prune = false;
+        {
+            std::unique_lock<std::mutex> lock(latch_);
+            ++commits_since_full_ssi_prune_;
+            run_full_prune = ShouldRunFullSsiPruneUnlocked();
+        }
+        if (run_full_prune) {
+            PruneSsiState();
+        }
     }
     {
         std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
@@ -450,14 +452,16 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::ABORTED);
-    CleanupTxnSsiState(txn->get_transaction_id());
-    bool run_full_prune = false;
-    {
-        std::unique_lock<std::mutex> lock(latch_);
-        run_full_prune = ShouldRunFullSsiPruneUnlocked();
-    }
-    if (run_full_prune) {
-        PruneSsiState();
+    if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+        CleanupTxnSsiState(txn->get_transaction_id());
+        bool run_full_prune = false;
+        {
+            std::unique_lock<std::mutex> lock(latch_);
+            run_full_prune = ShouldRunFullSsiPruneUnlocked();
+        }
+        if (run_full_prune) {
+            PruneSsiState();
+        }
     }
     {
         std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
