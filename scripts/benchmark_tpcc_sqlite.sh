@@ -19,6 +19,7 @@ ROUNDS=1
 PROGRESS_INTERVAL=5
 REGENERATE_DATA=0
 SKIP_CONSISTENCY=0
+THINK_MS=0
 
 usage() {
     cat <<EOF
@@ -32,6 +33,7 @@ Usage: $0 [options]
   --measure N              measurement seconds (default: 60)
   --rounds N               (default: 1)
   --progress-interval N    (default: 5)
+  --think-ms N             pause N milliseconds between transactions (default: 0)
   --regenerate-data        regenerate CSV data before loading
   --skip-consistency       skip post-load and post-transaction checks
   -h, --help               show this help
@@ -49,12 +51,18 @@ while [[ $# -gt 0 ]]; do
         --measure) MEASURE="$2"; shift 2 ;;
         --rounds) ROUNDS="$2"; shift 2 ;;
         --progress-interval) PROGRESS_INTERVAL="$2"; shift 2 ;;
+        --think-ms) THINK_MS="$2"; shift 2 ;;
         --regenerate-data) REGENERATE_DATA=1; shift ;;
         --skip-consistency) SKIP_CONSISTENCY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ ! "$THINK_MS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "--think-ms must be a non-negative number" >&2
+    exit 2
+fi
 
 if [[ "$REGENERATE_DATA" -eq 1 ]]; then
     DATA_ARGS=(--overwrite-data-dir)
@@ -75,7 +83,8 @@ rm -f "$SQLITE_PATH" "$SQLITE_PATH-shm" "$SQLITE_PATH-wal"
 rm -f "$JSON_OUT"
 
 echo "[benchmark-sqlite] running: warehouses=$WAREHOUSES workers=$WORKERS " \
-     "warmup=${WARMUP}s measure=${MEASURE}s rounds=$ROUNDS"
+     "warmup=${WARMUP}s measure=${MEASURE}s rounds=$ROUNDS think_ms=$THINK_MS"
+RMDB_BENCH_THINK_MS="$THINK_MS" \
 python3 -m benchmark.tpcc.tpcc_run all \
     --backend sqlite \
     --warehouses "$WAREHOUSES" \

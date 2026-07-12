@@ -28,6 +28,8 @@ RMDB_DB_DIR=""
 RESTART_TIMEOUT=120
 REGENERATE_DATA=0
 DATA_ARGS="--reuse-data-dir"
+THINK_MS=0
+RECONNECT_EACH_TXN=0
 
 usage() {
     cat <<EOF
@@ -45,6 +47,8 @@ Usage: $0 [options]
   --json-out PATH          result.json path
   --rmdb-db-dir PATH       passed through to tpcc_run
   --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 120)
+  --think-ms N             pause N milliseconds between transactions (default: 0)
+  --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate (passed to tpcc_run)
   --reuse-data-dir         reuse CSV data (passed to tpcc_run, default)
@@ -67,6 +71,8 @@ while [[ $# -gt 0 ]]; do
         --json-out) JSON_OUT="$2"; shift 2 ;;
         --rmdb-db-dir) RMDB_DB_DIR="$2"; shift 2 ;;
         --restart-timeout) RESTART_TIMEOUT="$2"; shift 2 ;;
+        --think-ms) THINK_MS="$2"; shift 2 ;;
+        --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
         --regenerate-data) REGENERATE_DATA=1; shift ;;
         --overwrite-data-dir) DATA_ARGS="--overwrite-data-dir"; shift ;;
         --reuse-data-dir) DATA_ARGS="--reuse-data-dir"; shift ;;
@@ -74,6 +80,15 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ ! "$THINK_MS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "--think-ms must be a non-negative number" >&2
+    exit 2
+fi
+if [[ "$RECONNECT_EACH_TXN" != "0" && "$RECONNECT_EACH_TXN" != "1" ]]; then
+    echo "--reconnect-each-txn must be 0 or 1" >&2
+    exit 2
+fi
 
 if [[ "$REGENERATE_DATA" -eq 1 ]]; then
     rm -rf "$DATA_DIR"
@@ -161,6 +176,8 @@ SERVER_PID=$!
 wait_port 30
 
 echo "[benchmark] $PHASES: warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s rounds=$ROUNDS"
+RMDB_BENCH_THINK_MS="$THINK_MS" \
+RMDB_BENCH_RECONNECT_EACH_TXN="$RECONNECT_EACH_TXN" \
 python3 -m benchmark.tpcc.tpcc_run $PHASES \
     --backend rmdb \
     --port "$PORT" \

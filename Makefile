@@ -19,6 +19,8 @@ TPCC_PROGRESS_INTERVAL ?= 5
 TPCC_REGENERATE_DATA ?= 0
 TPCC_PORT ?= 8765
 TPCC_RESTART_TIMEOUT ?= 120
+TPCC_THINK_MS ?= 0
+TPCC_RECONNECT_EACH_TXN ?= 0
 
 TPCC_DATA_ARGS := --reuse-data-dir
 ifeq ($(TPCC_REGENERATE_DATA),1)
@@ -106,6 +108,8 @@ benchmark: build
 		--json-out $(TPCC_RESULT) \
 		--rmdb-db-dir $(TPCC_DB) \
 		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
+		--think-ms $(TPCC_THINK_MS) \
+		--reconnect-each-txn $(TPCC_RECONNECT_EACH_TXN) \
 		$(TPCC_DATA_ARGS) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 

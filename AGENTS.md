@@ -49,6 +49,8 @@ and related scenarios.
 - `make client`: build `rmdb_client` in Release mode.
 - `make client-debug`: rebuild `rmdb_client` in Debug mode.
 - `make run-client`: build and run the interactive client.
+- `make benchmark`: server runtime logs are written to the repository-root `rmdb.log`; use this file for benchmark
+  diagnostics instead of the former `benchmark/tpcc/rmdb-server.log` location.
 - `make parser`: historical Flex/Bison generation entry point; the current main parser is handwritten, so when changing
   parsing logic, prefer editing `src/parser/parser.cpp`, `src/parser/lexer.cpp`, and related headers.
 - `make format`: apply `clang-format-18` to C++ source code under `src/` and `test/`.
