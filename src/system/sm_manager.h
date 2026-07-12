@@ -138,6 +138,24 @@ public:
         return it->second;
     }
 
+    std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {
+        std::string prefix;
+        prefix.reserve(tab_name.size() + index_name.size() + 2);
+        prefix.append(tab_name);
+        prefix.push_back('\0');
+        prefix.append(index_name);
+        prefix.push_back('\0');
+
+        std::vector<Rid> result;
+        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        for (const auto& [key, rids] : historical_index_keys_) {
+            if (key.compare(0, prefix.size(), prefix) == 0) {
+                result.insert(result.end(), rids.begin(), rids.end());
+            }
+        }
+        return result;
+    }
+
     bool has_historical_index_keys(const std::string& tab_name, const std::string& index_name) const {
         std::string prefix;
         prefix.reserve(tab_name.size() + index_name.size() + 2);
