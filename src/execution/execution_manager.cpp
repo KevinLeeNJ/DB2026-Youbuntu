@@ -120,6 +120,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
             }
             context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
             break;
         }
         case T_Transaction_rollback: {
@@ -128,6 +129,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
             context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
             break;
         }
         case T_Transaction_abort: {
@@ -136,6 +138,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
             context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
             break;
         }
         default:

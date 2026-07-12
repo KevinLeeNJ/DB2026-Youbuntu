@@ -165,6 +165,7 @@ void client_handler(int fd) {
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
                     txn_manager->commit(context->txn_, context->log_mgr_);
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
             } catch (TransactionAbortException& e) {
@@ -178,6 +179,7 @@ void client_handler(int fd) {
                 if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
                     context->txn_->get_state() != TransactionState::COMMITTED) {
                     txn_manager->abort(context->txn_, log_manager.get());
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
                 LOG_INFO("transaction aborted: %s", e.GetInfo().c_str());
@@ -201,6 +203,7 @@ void client_handler(int fd) {
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
                     txn_manager->abort(context->txn_, context->log_mgr_);
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
 
@@ -218,6 +221,7 @@ void client_handler(int fd) {
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
                     txn_manager->abort(context->txn_, context->log_mgr_);
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
 

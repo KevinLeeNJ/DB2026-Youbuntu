@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_delete.h"
 #include "execution/executor_update.h"
+#include "execution/execution_manager.h"
 #undef private
 
 #include <algorithm>
@@ -729,6 +730,27 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     auto final_rec = fh->get_record(rid, nullptr);
     ASSERT_NE(final_rec, nullptr);
     EXPECT_EQ(*reinterpret_cast<int*>(final_rec->data + 4), 3021);
+}
+
+TEST_F(ExecutorTest, transaction_end_commands_clear_session_transaction_id) {
+    setup_db();
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    QlManager ql_manager(sm_manager_.get(), &txn_manager, nullptr);
+
+    for (PlanTag tag : {T_Transaction_commit, T_Transaction_rollback, T_Transaction_abort}) {
+        Transaction* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        txn_id_t txn_id = txn->get_transaction_id();
+        char buf[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buf, &offset, &txn_manager);
+        OtherPlan plan(tag, "");
+
+        ql_manager.run_cmd_utility(&plan, &txn_id, &context);
+
+        EXPECT_EQ(txn_id, INVALID_TXN_ID);
+        EXPECT_EQ(context.txn_, nullptr);
+    }
 }
 
 TEST_F(ExecutorTest, update_multiple_fields) {

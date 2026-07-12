@@ -222,16 +222,16 @@ void WriteAbortLog(Transaction* txn, LogManager* log_manager) {
     log_manager->flush_log_to_disk();
 }
 
-std::optional<UndoLog> GetCurrentUndoLog(RmFileHandle* fh, const Rid& rid) {
+std::optional<UndoLog> GetCurrentUndoLog(TransactionManager* txn_mgr, RmFileHandle* fh, const Rid& rid) {
     TupleMeta meta = fh->get_tuple_meta(rid);
     if (!meta.version_chain_head_.IsValid()) {
         return std::nullopt;
     }
-    auto it = TransactionManager::txn_map.find(meta.version_chain_head_.undo_txn_id_);
-    if (it == TransactionManager::txn_map.end()) {
+    try {
+        return txn_mgr->GetUndoLog(meta.version_chain_head_);
+    } catch (const InternalError&) {
         return std::nullopt;
     }
-    return it->second.get()->GetUndoLog(meta.version_chain_head_.undo_slot_offset_);
 }
 
 TupleMeta FallbackCommittedMeta() {
@@ -244,7 +244,7 @@ TupleMeta FallbackCommittedMeta() {
     return meta;
 }
 
-void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transaction* txn) {
+void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, Transaction* txn) {
     const std::string tab_name = write_record->GetTableName();
     auto& tab = sm_manager->db_.get_table(tab_name);
     auto* fh = sm_manager->fhs_.at(tab_name).get();
@@ -261,7 +261,7 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
     }
     case WType::DELETE_TUPLE: {
         RmRecord old_rec = write_record->GetRecord();
-        auto undo = GetCurrentUndoLog(fh, rid);
+        auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         if (fh->is_record(rid)) {
             fh->update_record(rid, old_rec.data, nullptr);
         } else {
@@ -287,7 +287,7 @@ void UndoWriteRecord(SmManager* sm_manager, WriteRecord* write_record, Transacti
                 ih->delete_entry(current_key.data(), rid, txn);
             }
         }
-        auto undo = GetCurrentUndoLog(fh, rid);
+        auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         fh->update_record(rid, old_rec.data, nullptr);
         fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
         if (current_rec != nullptr) {
@@ -443,7 +443,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
 
     auto& write_set = txn->get_write_set();
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(sm_manager_, it->get(), txn);
+        UndoWriteRecord(this, sm_manager_, it->get(), txn);
     }
     WriteAbortLog(txn, log_manager);
     running_txns_.RemoveTxn(txn->get_read_ts());
