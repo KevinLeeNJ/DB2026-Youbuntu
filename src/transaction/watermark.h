@@ -33,9 +33,11 @@ public:
 
     /** Atomically replace one active transaction's read timestamp.
      *
-     * READ COMMITTED advances its statement snapshot while remaining active.
+     * READ COMMITTED advances its statement
+     * snapshot while remaining active.
      * Removing and re-adding it in separate critical sections incorrectly
-     * exposes an empty reader set to concurrent garbage collection. */
+
+     * * exposes an empty reader set to concurrent garbage collection. */
     void UpdateTxnReadTs(timestamp_t old_read_ts, timestamp_t new_read_ts);
 
     /** 调用者应在从水印中移除事务之前更新提交时间戳，以便我们能够正确跟踪水印。 */

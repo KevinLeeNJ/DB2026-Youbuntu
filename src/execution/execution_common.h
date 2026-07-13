@@ -104,8 +104,8 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
 }
 
 /* The caller must already hold this transaction's record X lock. */
-inline std::optional<RmRecordWithMeta> GetCurrentRecordForRcWrite(RmFileHandle* fh, const Rid& rid,
-                                                                   Transaction* txn, Context* context) {
+inline std::optional<RmRecordWithMeta> GetCurrentRecordForRcWrite(RmFileHandle* fh, const Rid& rid, Transaction* txn,
+                                                                  Context* context) {
     auto record_with_meta = fh->get_record_with_meta(rid, context);
     const TupleMeta& meta = record_with_meta.meta;
     if (meta.is_deleted_ || (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id())) {
