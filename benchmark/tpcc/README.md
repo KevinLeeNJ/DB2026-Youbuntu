@@ -1,14 +1,18 @@
 # rmdb TPC-C Benchmark
 
-Local TPC-C benchmark tooling for rmdb, with an optional SQLite baseline for rough throughput comparison.
+Local Go-based TPC-C benchmark tooling for RMDB.
 
-Default rmdb flow:
+The RMDB benchmark defaults to `READ COMMITTED`. Use
+`TPCC_ISOLATION=snapshot-isolation` when invoking the script directly to run
+the same data set and worker count under snapshot isolation.
+
+The default `make benchmark` path uses the Go load generator for the run phase:
 
 ```bash
-python3 -m benchmark.tpcc.tpcc_run all --warehouses 1 --data-dir benchmark/tpcc/data --host 127.0.0.1 --port 8765
+make benchmark TPCC_WORKERS=16 TPCC_WARMUP=10 TPCC_MEASURE=60
 ```
 
-The RMDB benchmark defaults to the server's `READ COMMITTED` isolation level.
-Use `--isolation snapshot-isolation` to set snapshot isolation on every benchmark
-connection, so RC and SI runs use the same binary, data set, worker count, and
-duration. The selected level is recorded in the result JSON.
+It keeps one TCP connection per worker and uses goroutines with independent
+random generators. The same binary also generates CSV data, loads the RMDB
+schema/data, waits for recovery, merges round results, and runs consistency
+checks. `make benchmark` therefore has no Python runtime dependency.

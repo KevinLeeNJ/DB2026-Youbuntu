@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-DURATION=30
+DURATION=15
 PID_ARG=""
 WIDTH=2000
 MINWIDTH=0.5
