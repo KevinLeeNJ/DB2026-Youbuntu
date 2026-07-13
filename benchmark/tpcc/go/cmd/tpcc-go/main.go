@@ -799,8 +799,10 @@ type document struct {
 }
 
 func main() {
+	command := flag.String("command", "run", "run, data-ready, datagen, load, consistency, wait-port, or merge-results")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
 	port := flag.Int("port", 8765, "RMDB port")
+	warehouses := flag.Int("warehouses", 1, "warehouses for data generation")
 	workers := flag.Int("workers", 16, "concurrent workers")
 	warmup := flag.Int("warmup", 30, "warmup seconds")
 	measure := flag.Int("measure", 360, "measurement seconds")
@@ -812,7 +814,48 @@ func main() {
 	progress := flag.Int("progress-interval", 5, "seconds between live progress lines; 0 disables")
 	think := flag.Duration("think", 0, "delay between transactions")
 	reconnectEachTxn := flag.Bool("reconnect-each-txn", false, "reconnect after every transaction")
+	dataDir := flag.String("data-dir", "benchmark/tpcc/data", "TPC-C CSV directory")
+	schemaDir := flag.String("schema-dir", "benchmark/tpcc/schema", "RMDB schema directory")
+	rmdbDBDir := flag.String("rmdb-db-dir", "", "RMDB database directory, used to resolve load paths")
+	seed := flag.Int64("seed", 1, "data generation seed")
+	overwriteData := flag.Bool("overwrite-data-dir", false, "overwrite existing CSV files")
+	reuseData := flag.Bool("reuse-data-dir", false, "skip data generation when all CSV files exist")
+	resultJSON := flag.String("result-json", "", "existing result JSON used by consistency")
+	consistencyStage := flag.String("consistency-stage", "standalone", "consistency stage label")
+	waitTimeout := flag.Duration("wait-timeout", 30*time.Second, "wait-port timeout")
+	resultInputs := flag.String("result-inputs", "", "comma-separated per-round result JSON files for merge-results")
 	flag.Parse()
+	if *command == "data-ready" {
+		if completeCSVSet(*dataDir) {
+			return
+		}
+		os.Exit(1)
+	}
+	if *command == "datagen" {
+		if *reuseData && completeCSVSet(*dataDir) {
+			fmt.Printf("[tpcc] datagen skipped, reusing CSV files in %s\n", *dataDir)
+			return
+		}
+		if err := generateData(*warehouses, *dataDir, *seed, *overwriteData); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *command == "wait-port" {
+		if err := waitForPort(net.JoinHostPort(*host, strconv.Itoa(*port)), *waitTimeout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *command == "merge-results" {
+		if err := mergeResultFiles(*jsonOut, *resultInputs); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *workers < 1 || *warmup < 0 || *measure < 1 || *rounds < 1 {
 		fmt.Fprintln(os.Stderr, "workers must be positive, warmup non-negative, measure and rounds positive")
 		os.Exit(2)
@@ -822,6 +865,24 @@ func main() {
 		os.Exit(2)
 	}
 	address := net.JoinHostPort(*host, strconv.Itoa(*port))
+	if *command == "load" {
+		if err := loadData(address, *timeout, *isolation, *dataDir, *schemaDir, *rmdbDBDir); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *command == "consistency" {
+		if err := checkConsistency(address, *timeout, *isolation, *resultJSON, *consistencyStage); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *command != "run" {
+		fmt.Fprintf(os.Stderr, "unsupported command: %s\n", *command)
+		os.Exit(2)
+	}
 	probe, err := newClient(address, *timeout, *isolation)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

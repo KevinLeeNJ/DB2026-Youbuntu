@@ -2,6 +2,8 @@ package main
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -69,6 +71,15 @@ func TestParseRowsDropsTableHeader(t *testing.T) {
 	}
 }
 
+func TestSurnameAcceptsTPCCTokenRange(t *testing.T) {
+	if got := surname(0); got != "BARBARBAR" {
+		t.Fatalf("surname(0) = %q", got)
+	}
+	if got := surname(999); got != "EINGEINGEING" {
+		t.Fatalf("surname(999) = %q", got)
+	}
+}
+
 func TestResultMergePreservesCountsAndLatencies(t *testing.T) {
 	combined := newResult(60)
 	first := newResult(60)
@@ -87,5 +98,28 @@ func TestResultMergePreservesCountsAndLatencies(t *testing.T) {
 	}
 	if combined.LatencyMS["new_order"].P50 != 10 || combined.LatencyMS["new_order"].Max != 20 {
 		t.Fatalf("latency = %#v", combined.LatencyMS["new_order"])
+	}
+}
+
+func TestCSVSetAndLoadPath(t *testing.T) {
+	dir := t.TempDir()
+	if completeCSVSet(dir) {
+		t.Fatal("empty directory reported as complete")
+	}
+	for _, table := range tpccTables {
+		if err := os.WriteFile(filepath.Join(dir, table+".csv"), []byte("header\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !completeCSVSet(dir) {
+		t.Fatal("complete CSV set not detected")
+	}
+	t.Chdir(dir)
+	path, err := loadPath("data", "db", "warehouse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "../data/warehouse.csv" {
+		t.Fatalf("load path = %q", path)
 	}
 }

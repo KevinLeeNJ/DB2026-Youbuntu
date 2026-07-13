@@ -9,7 +9,6 @@ CLIENT_JOBS := 4
 TPCC_DB ?= tpcc_benchmark_db
 TPCC_DATA_DIR ?= benchmark/tpcc/data
 TPCC_RESULT ?= benchmark/tpcc/result.json
-TPCC_SQLITE_PATH ?= benchmark/tpcc/tpcc.sqlite
 TPCC_WAREHOUSES ?= 8
 TPCC_WORKERS ?= 16
 TPCC_WARMUP ?= 10
@@ -21,12 +20,8 @@ TPCC_PORT ?= 8765
 TPCC_RESTART_TIMEOUT ?= 120
 TPCC_THINK_MS ?= 0
 TPCC_RECONNECT_EACH_TXN ?= 0
+TPCC_ISOLATION ?= read-committed
 TPCC_GO_BINARY := $(BUILD_DIR)/bin/tpcc-go
-
-TPCC_DATA_ARGS := --reuse-data-dir
-ifeq ($(TPCC_REGENERATE_DATA),1)
-TPCC_DATA_ARGS := --overwrite-data-dir
-endif
 
 all: build
 
@@ -115,12 +110,10 @@ benchmark: build tpcc-go
 		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
 		--think-ms $(TPCC_THINK_MS) \
 		--reconnect-each-txn $(TPCC_RECONNECT_EACH_TXN) \
+		--isolation $(TPCC_ISOLATION) \
 		--go-binary $(TPCC_GO_BINARY) \
-		$(TPCC_DATA_ARGS) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 
 benchmark-clean:
 	@rm -rf $(TPCC_DB) $(TPCC_RESULT) benchmark/tpcc/rmdb-server.log
-	@rm -rf $(TPCC_SQLITE_PATH) $(TPCC_SQLITE_PATH)-shm $(TPCC_SQLITE_PATH)-wal
-	@find benchmark/tpcc -type d -name __pycache__ -prune -exec rm -rf {} +
 	@echo "Benchmark runtime data removed; CSV files in $(TPCC_DATA_DIR) were kept."
