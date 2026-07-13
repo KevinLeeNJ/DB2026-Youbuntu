@@ -42,6 +42,22 @@ auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {
     }
 }
 
+void Watermark::UpdateTxnReadTs(timestamp_t old_read_ts, timestamp_t new_read_ts) {
+    if (old_read_ts == new_read_ts) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(latch_);
+    auto old_it = current_reads_.find(old_read_ts);
+    if (old_it != current_reads_.end()) {
+        if (--old_it->second == 0) {
+            current_reads_.erase(old_it);
+        }
+    }
+    ++current_reads_[new_read_ts];
+    watermark_ = current_reads_.begin()->first;
+}
+
 void Watermark::UpdateCommitTs(timestamp_t commit_ts) {
     std::lock_guard<std::mutex> lock(latch_);
     if (commit_ts > commit_ts_) {

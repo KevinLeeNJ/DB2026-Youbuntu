@@ -351,13 +351,14 @@ void TransactionManager::BeginStatement(Transaction* txn) {
         return;
     }
     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
-        // 刷新 read_ts 时同步更新水位线，确保水位线始终追踪当前真实读时间戳
+        // Atomically refresh the statement snapshot in the watermark. A
+        // remove/add pair would briefly make an active RC transaction vanish
+        // and allow concurrent GC to reclaim its visible version chain.
         timestamp_t old_read_ts = txn->get_read_ts();
         timestamp_t new_read_ts = last_commit_ts_.load();
         if (new_read_ts != old_read_ts) {
-            running_txns_.RemoveTxn(old_read_ts);
+            running_txns_.UpdateTxnReadTs(old_read_ts, new_read_ts);
             txn->set_read_ts(new_read_ts);
-            running_txns_.AddTxn(new_read_ts);
         }
     }
 }
@@ -502,6 +503,15 @@ UndoLog TransactionManager::GetUndoLog(UndoLink link) {
     auto it = txn_map.find(link.undo_txn_id_);
     if (it == txn_map.end()) {
         throw InternalError("GetUndoLog: transaction not found");
+    }
+    return it->second->GetUndoLog(link.undo_slot_offset_);
+}
+
+std::optional<UndoLog> TransactionManager::GetUndoLogOptional(UndoLink link) {
+    std::unique_lock<std::mutex> lock(latch_);
+    auto it = txn_map.find(link.undo_txn_id_);
+    if (it == txn_map.end()) {
+        return std::nullopt;
     }
     return it->second->GetUndoLog(link.undo_slot_offset_);
 }

@@ -79,11 +79,11 @@ public:
                         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                     }
                     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
-                        context_->txn_mgr_->BeginStatement(txn);
-                        rec = GetVisibleRecord(fh_, rid, context_);
-                        if (rec == nullptr) {
+                        auto current_record = GetCurrentRecordForRcWrite(fh_, rid, txn, context_);
+                        if (!current_record.has_value()) {
                             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
+                        rec = std::move(current_record->record);
                         bool latest_match = true;
                         for (const auto& cond : conds_) {
                             if (!compare(cond, *rec)) {
@@ -94,7 +94,7 @@ public:
                         if (!latest_match) {
                             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
-                        TupleMeta latest_meta = fh_->get_tuple_meta(rid);
+                        const TupleMeta& latest_meta = current_record->meta;
                         if (has_non_self_ref_set && latest_meta.is_committed_ &&
                             latest_meta.writer_txn_id_ != txn->get_transaction_id() &&
                             latest_meta.commit_ts_ > statement_read_ts) {

@@ -67,11 +67,11 @@ public:
                     throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }
                 if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
-                    context_->txn_mgr_->BeginStatement(txn);
-                    rec = GetVisibleRecord(fh_, rid, context_);
-                    if (rec == nullptr) {
+                    auto current_record = GetCurrentRecordForRcWrite(fh_, rid, txn, context_);
+                    if (!current_record.has_value()) {
                         continue;
                     }
+                    rec = std::move(current_record->record);
                     rec_data = rec->data;
                     bool latest_match = true;
                     for (const auto& cond : conds_) {

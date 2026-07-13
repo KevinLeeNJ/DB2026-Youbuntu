@@ -104,16 +104,20 @@ RmPinnedInsert RmFileHandle::prepare_insert_record() {
     return RmPinnedInsert{page_handle, Rid{page_handle.page->get_page_id().page_no, slot_no}};
 }
 
-void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf) {
+void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta) {
     auto& page_handle = insert.page_handle;
     const int slot_no = insert.rid.slot_no;
     memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
     TupleMeta& meta = page_handle.get_meta(slot_no);
-    meta.commit_ts_ = 0;
-    meta.writer_txn_id_ = INVALID_TXN_ID;
-    meta.is_committed_ = true;
-    meta.is_deleted_ = false;
-    meta.version_chain_head_ = UndoLink{};
+    if (tuple_meta != nullptr) {
+        meta = *tuple_meta;
+    } else {
+        meta.commit_ts_ = 0;
+        meta.writer_txn_id_ = INVALID_TXN_ID;
+        meta.is_committed_ = true;
+        meta.is_deleted_ = false;
+        meta.version_chain_head_ = UndoLink{};
+    }
     Bitmap::set(page_handle.bitmap, slot_no);
     page_handle.page_hdr->num_records++;
     if (page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {

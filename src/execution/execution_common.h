@@ -38,50 +38,80 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
         txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
     const txn_id_t self_id = txn->get_transaction_id();
 
-    auto record_with_meta = fh->get_record_with_meta(rid, context);
-    TupleMeta meta = record_with_meta.meta;
-    auto base_record = std::move(record_with_meta.record);
-    std::optional<UndoLog> current_undo;
     constexpr int MAX_DEPTH = 100;
 
-    for (int depth = 0; depth < MAX_DEPTH; ++depth) {
-        if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
-            if (meta.is_deleted_) {
+    // A lock-free reader can observe an uncommitted tuple just as its writer
+    // rolls back and retires its undo buffer. Re-read the tuple in that narrow
+    // publication window instead of treating the transient link as corruption.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto record_with_meta = fh->get_record_with_meta(rid, context);
+        TupleMeta meta = record_with_meta.meta;
+        auto base_record = std::move(record_with_meta.record);
+        std::optional<UndoLog> current_undo;
+        bool retry = false;
+
+        for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+            if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
+                if (meta.is_deleted_) {
+                    return nullptr;
+                }
+                return base_record;
+            }
+
+            if (!meta.is_committed_) {
+                if (!meta.version_chain_head_.IsValid()) {
+                    return nullptr;
+                }
+                current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
+                if (!current_undo.has_value()) {
+                    retry = true;
+                    break;
+                }
+                meta = current_undo->old_meta_;
+                continue;
+            }
+
+            if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
                 return nullptr;
             }
-            return base_record;
-        }
 
-        if (!meta.is_committed_) {
+            if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+                if (!current_undo.has_value()) {
+                    return base_record;
+                }
+                const auto& log = *current_undo;
+                auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));
+                memcpy(rec->data, log.old_tuple_data_.data(), log.old_tuple_data_.size());
+                return rec;
+            }
+
             if (!meta.version_chain_head_.IsValid()) {
                 return nullptr;
             }
-            current_undo = txn_mgr->GetUndoLog(meta.version_chain_head_);
-            meta = current_undo->old_meta_;
-            continue;
-        }
-
-        if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-            return nullptr;
-        }
-
-        if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+            current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
             if (!current_undo.has_value()) {
-                return base_record;
+                retry = true;
+                break;
             }
-            const auto& log = *current_undo;
-            auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));
-            memcpy(rec->data, log.old_tuple_data_.data(), log.old_tuple_data_.size());
-            return rec;
+            meta = current_undo->old_meta_;
         }
 
-        if (!meta.version_chain_head_.IsValid()) {
+        if (!retry) {
             return nullptr;
         }
-        current_undo = txn_mgr->GetUndoLog(meta.version_chain_head_);
-        meta = current_undo->old_meta_;
     }
     return nullptr;
+}
+
+/* The caller must already hold this transaction's record X lock. */
+inline std::optional<RmRecordWithMeta> GetCurrentRecordForRcWrite(RmFileHandle* fh, const Rid& rid,
+                                                                   Transaction* txn, Context* context) {
+    auto record_with_meta = fh->get_record_with_meta(rid, context);
+    const TupleMeta& meta = record_with_meta.meta;
+    if (meta.is_deleted_ || (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id())) {
+        return std::nullopt;
+    }
+    return record_with_meta;
 }
 
 inline bool IndexKeyEquals(const IndexMeta& index, const char* rec_data, const std::vector<char>& key) {

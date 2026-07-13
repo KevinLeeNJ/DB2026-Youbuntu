@@ -113,7 +113,7 @@ public:
 
     RmPinnedInsert prepare_insert_record();
 
-    void finish_insert_record(RmPinnedInsert& insert, char* buf);
+    void finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta = nullptr);
 
     void abort_prepared_insert(RmPinnedInsert& insert);
 
