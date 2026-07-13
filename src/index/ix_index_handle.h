@@ -251,6 +251,12 @@ public:
     // for insert
     page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction, bool allow_duplicate = false);
 
+    // Variants for callers that already hold the index exclusive latch.  Keeping
+    // the mutation and its visibility bookkeeping under one latch closes the
+    // historical-key reader/writer window.
+    page_id_t insert_entry_unlocked(const char* key, const Rid& value, Transaction* transaction,
+                                    bool allow_duplicate = false);
+
     // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
     struct PinnedInserter {
         IxIndexHandle* ih;
@@ -273,6 +279,8 @@ public:
     // for delete
     bool delete_entry(const char* key, Transaction* transaction);
     bool delete_entry(const char* key, const Rid& value, Transaction* transaction);
+    bool delete_entry_unlocked(const char* key, Transaction* transaction);
+    bool delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction);
 
     bool coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction = nullptr,
                                   bool* root_is_latched = nullptr);

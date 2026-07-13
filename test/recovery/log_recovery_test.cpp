@@ -236,11 +236,34 @@ TEST(RecoveryManagerTest, CommittedInsertSurvivesRecovery) {
     }
 
     RunRecovery(db_name);
+    // A second recovery pass must be harmless after the first pass has
+    // rebuilt pages/indexes and reset the WAL.
+    RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
     ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    auto file_hdr = db.sm_mgr_.fhs_.at("t")->get_file_hdr();
+    EXPECT_EQ(file_hdr.num_pages, 2);
+    EXPECT_EQ(file_hdr.first_free_page_no, 1);
+}
+
+TEST(RecoveryManagerTest, InterruptedIndexSwapIsRepairedOnOpen) {
+    ScopedTestDir test_dir("recovery_index_swap_repair_root");
+    const std::string db_name = "recovery_index_swap_repair_db";
+    CreateRecoveryTestDb(db_name);
+
+    DiskManager disk;
+    const std::string index_name = "t_id.idx";
+    const std::string backup_name = index_name + ".rebuild.bak";
+    ASSERT_TRUE(disk.is_file(db_name + "/" + index_name));
+    std::filesystem::rename(db_name + "/" + index_name, db_name + "/" + backup_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_TRUE(disk.is_file(index_name));
+    EXPECT_FALSE(disk.is_file(backup_name));
+    EXPECT_NE(db.sm_mgr_.ihs_.find(index_name), db.sm_mgr_.ihs_.end());
 }
 
 TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {

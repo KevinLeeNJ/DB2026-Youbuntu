@@ -51,8 +51,6 @@ public:
         context_ = context;
     }
     std::unique_ptr<RmRecord> Next() override {
-        bool has_non_self_ref_set = std::any_of(set_clauses_.begin(), set_clauses_.end(),
-                                                [](const SetClause& clause) { return !clause.is_self_ref; });
         for (Rid& rid : rids_) {
             std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
@@ -70,10 +68,10 @@ public:
                 }
             }
             if (match) {
+                lsn_t log_lsn = INVALID_LSN;
                 // MVCC Write-Write conflict detection
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     auto txn = context_->txn_;
-                    timestamp_t statement_read_ts = txn->get_read_ts();
                     if (context_->lock_mgr_ != nullptr &&
                         !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
                         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
@@ -92,13 +90,11 @@ public:
                             }
                         }
                         if (!latest_match) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                        }
-                        const TupleMeta& latest_meta = current_record->meta;
-                        if (has_non_self_ref_set && latest_meta.is_committed_ &&
-                            latest_meta.writer_txn_id_ != txn->get_transaction_id() &&
-                            latest_meta.commit_ts_ > statement_read_ts) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                            // RC evaluates the predicate against the version
+                            // obtained after waiting. If that version no
+                            // longer matches, this row simply left the
+                            // statement's target set.
+                            continue;
                         }
                     }
                     TupleMeta meta = fh_->get_tuple_meta(rid);
@@ -149,8 +145,6 @@ public:
                     if (old_key == new_key) {
                         continue;
                     }
-                    sm_manager_->remember_historical_index_key(
-                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), old_key, rid);
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
                                   .get();
                     std::vector<Rid> result;
@@ -173,6 +167,7 @@ public:
                     log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
                     lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
                     context_->txn_->set_prev_lsn(lsn);
+                    log_lsn = lsn;
                 }
                 if (context_ != nullptr && context_->txn_ != nullptr) {
                     context_->txn_->append_write_record(
@@ -194,7 +189,7 @@ public:
                     meta.is_committed_ = false;
                     meta.is_deleted_ = false;
                     meta.version_chain_head_ = undo_link;
-                    fh_->set_tuple_meta(rid, meta);
+                    fh_->set_tuple_meta(rid, meta, log_lsn);
                 }
 
                 std::vector<size_t> deleted_indexes;
@@ -205,9 +200,13 @@ public:
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
+                        auto index_latch = ih->lock_exclusive();
+                        sm_manager_->remember_historical_index_key(
+                            tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols),
+                            update.old_key, rid);
+                        ih->delete_entry_unlocked(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
-                        ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
+                        ih->insert_entry_unlocked(update.new_key.data(), rid, txn); // 插入新索引
                         inserted_indexes.push_back(i);
                     }
                 } catch (...) // 失败时回滚已经修改过的索引
@@ -228,7 +227,7 @@ public:
                     }
                     throw; // 仍然抛出错误
                 }
-                fh_->update_record(rid, new_rec->data, context_);
+                fh_->update_record(rid, new_rec->data, context_, log_lsn);
             }
         }
         return nullptr;

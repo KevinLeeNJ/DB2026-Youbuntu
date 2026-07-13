@@ -10,10 +10,25 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "log_recovery.h"
+#include "common/fault_injection.h"
 
 #include <algorithm>
 #include <fstream>
 #include <vector>
+
+namespace {
+
+bool PageAlreadyContainsLog(const RmFileHandle* fh, const Rid& rid, lsn_t lsn) {
+    try {
+        return fh != nullptr && fh->get_page_lsn(rid) >= lsn;
+    } catch (const std::exception&) {
+        // The WAL may be the record that allocates this page. In that case
+        // there is no page to inspect yet and redo must proceed.
+        return false;
+    }
+}
+
+} // namespace
 
 /**
  * @description: analyze阶段，需要获得脏页表（DPT）和未完成的事务列表（ATT）
@@ -129,6 +144,8 @@ void RecoveryManager::redo() {
             continue;
         }
 
+        FaultInjector::Point("mid_recovery_redo");
+
         switch (it->second->log_type_) {
         case LogType::INSERT:
             redo_insert(*static_cast<InsertLogRecord*>(it->second.get()));
@@ -240,18 +257,21 @@ void RecoveryManager::reset_tuple_meta(const std::string& table_name, const Rid&
 }
 
 void RecoveryManager::redo_insert(const InsertLogRecord& log) {
-    sm_manager_->fhs_.at(log.table_name_)->insert_record(log.rid_, log.insert_value_.data);
+    auto table_it = sm_manager_->fhs_.find(log.table_name_);
+    if (table_it == sm_manager_->fhs_.end() || PageAlreadyContainsLog(table_it->second.get(), log.rid_, log.lsn_)) {
+        return;
+    }
+    table_it->second->insert_record(log.rid_, log.insert_value_.data, log.lsn_);
     // 标记该 slot 由本 committed 事务重做写入，以便 undo_insert 能据此区分所有权：
     // 若某 loser 事务曾在同一 RID 插入过相同内容，内容比较无法区分，必须用 writer_txn_id 判断。
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it != sm_manager_->fhs_.end() && table_it->second->is_record(log.rid_)) {
+    if (table_it->second->is_record(log.rid_)) {
         TupleMeta meta;
         meta.commit_ts_ = 0;
         meta.writer_txn_id_ = log.log_tid_;
         meta.is_committed_ = true;
         meta.is_deleted_ = false;
         meta.version_chain_head_ = UndoLink{};
-        table_it->second->set_tuple_meta(log.rid_, meta);
+        table_it->second->set_tuple_meta(log.rid_, meta, log.lsn_);
     }
 }
 
@@ -260,10 +280,13 @@ void RecoveryManager::redo_delete(const DeleteLogRecord& log) {
     if (table_it == sm_manager_->fhs_.end()) {
         return;
     }
+    if (PageAlreadyContainsLog(table_it->second.get(), log.rid_, log.lsn_)) {
+        return;
+    }
     if (record_exists(log.table_name_, log.rid_)) {
-        table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr);
+        table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr, log.lsn_);
     } else {
-        table_it->second->insert_record(log.rid_, log.delete_value_.data);
+        table_it->second->insert_record(log.rid_, log.delete_value_.data, log.lsn_);
     }
     TupleMeta meta;
     meta.commit_ts_ = 0;
@@ -271,25 +294,28 @@ void RecoveryManager::redo_delete(const DeleteLogRecord& log) {
     meta.is_committed_ = true;
     meta.is_deleted_ = true;
     meta.version_chain_head_ = UndoLink{};
-    table_it->second->set_tuple_meta(log.rid_, meta);
+    table_it->second->set_tuple_meta(log.rid_, meta, log.lsn_);
 }
 
 void RecoveryManager::redo_update(const UpdateLogRecord& log) {
+    auto table_it = sm_manager_->fhs_.find(log.table_name_);
+    if (table_it == sm_manager_->fhs_.end() || PageAlreadyContainsLog(table_it->second.get(), log.rid_, log.lsn_)) {
+        return;
+    }
     auto current = get_record_if_exists(log.table_name_, log.rid_);
     if (current == nullptr) {
-        sm_manager_->fhs_.at(log.table_name_)->insert_record(log.rid_, log.new_value_.data);
+        table_it->second->insert_record(log.rid_, log.new_value_.data, log.lsn_);
     } else {
-        sm_manager_->fhs_.at(log.table_name_)->update_record(log.rid_, log.new_value_.data, nullptr);
+        table_it->second->update_record(log.rid_, log.new_value_.data, nullptr, log.lsn_);
     }
-    auto table_it = sm_manager_->fhs_.find(log.table_name_);
-    if (table_it != sm_manager_->fhs_.end() && table_it->second->is_record(log.rid_)) {
+    if (table_it->second->is_record(log.rid_)) {
         TupleMeta meta;
         meta.commit_ts_ = 0;
         meta.writer_txn_id_ = log.log_tid_;
         meta.is_committed_ = true;
         meta.is_deleted_ = false;
         meta.version_chain_head_ = UndoLink{};
-        table_it->second->set_tuple_meta(log.rid_, meta);
+        table_it->second->set_tuple_meta(log.rid_, meta, log.lsn_);
     }
 }
 
@@ -306,7 +332,7 @@ void RecoveryManager::undo_insert(const InsertLogRecord& log) {
     if (meta.writer_txn_id_ != log.log_tid_) {
         return;
     }
-    table_it->second->delete_record(log.rid_, nullptr);
+    table_it->second->delete_record(log.rid_, nullptr, log.lsn_);
 }
 
 void RecoveryManager::undo_delete(const DeleteLogRecord& log) {
@@ -319,25 +345,25 @@ void RecoveryManager::undo_delete(const DeleteLogRecord& log) {
     if (record_exists(log.table_name_, log.rid_)) {
         TupleMeta meta = table_it->second->get_tuple_meta(log.rid_);
         if (meta.is_deleted_ && meta.writer_txn_id_ == log.log_tid_) {
-            table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr);
+            table_it->second->update_record(log.rid_, log.delete_value_.data, nullptr, log.lsn_);
             TupleMeta restored_meta;
             restored_meta.commit_ts_ = 0;
             restored_meta.writer_txn_id_ = log.log_tid_;
             restored_meta.is_committed_ = false;
             restored_meta.is_deleted_ = false;
             restored_meta.version_chain_head_ = UndoLink{};
-            table_it->second->set_tuple_meta(log.rid_, restored_meta);
+            table_it->second->set_tuple_meta(log.rid_, restored_meta, log.lsn_);
         }
         return;
     }
-    table_it->second->insert_record(log.rid_, log.delete_value_.data);
+    table_it->second->insert_record(log.rid_, log.delete_value_.data, log.lsn_);
     TupleMeta restored_meta;
     restored_meta.commit_ts_ = 0;
     restored_meta.writer_txn_id_ = log.log_tid_;
     restored_meta.is_committed_ = false;
     restored_meta.is_deleted_ = false;
     restored_meta.version_chain_head_ = UndoLink{};
-    table_it->second->set_tuple_meta(log.rid_, restored_meta);
+    table_it->second->set_tuple_meta(log.rid_, restored_meta, log.lsn_);
 }
 
 void RecoveryManager::undo_update(const UpdateLogRecord& log) {
@@ -354,14 +380,14 @@ void RecoveryManager::undo_update(const UpdateLogRecord& log) {
     if (!record_equals(log.table_name_, log.rid_, log.new_value_)) {
         return;
     }
-    table_it->second->update_record(log.rid_, log.old_value_.data, nullptr);
+    table_it->second->update_record(log.rid_, log.old_value_.data, nullptr, log.lsn_);
     TupleMeta restored_meta;
     restored_meta.commit_ts_ = 0;
     restored_meta.writer_txn_id_ = log.log_tid_;
     restored_meta.is_committed_ = false;
     restored_meta.is_deleted_ = false;
     restored_meta.version_chain_head_ = UndoLink{};
-    table_it->second->set_tuple_meta(log.rid_, restored_meta);
+    table_it->second->set_tuple_meta(log.rid_, restored_meta, log.lsn_);
 }
 
 void RecoveryManager::rebuild_indexes() {

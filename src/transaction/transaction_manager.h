@@ -230,6 +230,9 @@ private:
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
     std::mutex latch_;                           // 用于txn_map的并发
+    // Serializes commit publication. A statement snapshot may advance only
+    // after every tuple of the preceding commit has been published.
+    std::mutex commit_publish_latch_;
     SmManager* sm_manager_;
     LockManager* lock_manager_;
 

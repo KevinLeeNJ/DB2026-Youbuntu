@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
 
+#include <algorithm>
+
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
@@ -147,7 +149,7 @@ void RmFileHandle::abort_prepared_insert(RmPinnedInsert& insert) {
  * @param {Rid&} rid 要插入记录的位置
  * @param {char*} buf 要插入记录的数据
  */
-void RmFileHandle::insert_record(const Rid& rid, char* buf) {
+void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
     while (rid.page_no >= file_hdr_.num_pages) {
         auto new_page = create_new_page_handle();
         buffer_pool_manager_->unpin_page(new_page.page->get_page_id(), true);
@@ -171,6 +173,9 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
     meta.is_committed_ = true;
     meta.is_deleted_ = false;
     meta.version_chain_head_ = UndoLink{};
+    if (page_lsn != INVALID_LSN && pageHandle.page->get_page_lsn() < page_lsn) {
+        pageHandle.page->set_page_lsn(page_lsn);
+    }
 
     buffer_pool_manager_->unpin_page(pageHandle.page->get_page_id(), true);
 }
@@ -180,7 +185,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  * @param {Rid&} rid 要删除的记录的记录号（位置）
  * @param {Context*} context
  */
-void RmFileHandle::delete_record(const Rid& rid, Context* context) {
+void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_lsn) {
     (void)context;
     // InsertExecutor holds this latch while it chooses and publishes a free
     // slot. Rollback deletes must participate as well: deleting the last slot
@@ -201,6 +206,9 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
             if (deletepage_handle.page_hdr->num_records == (file_hdr_.num_records_per_page - 1)) {
                 release_page_handle(deletepage_handle);
             }
+            if (page_lsn != INVALID_LSN && deletepage_handle.page->get_page_lsn() < page_lsn) {
+                deletepage_handle.page->set_page_lsn(page_lsn);
+            }
             deleted = true;
         }
     }
@@ -213,7 +221,7 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @param {char*} buf 新记录的数据
  * @param {Context*} context
  */
-void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
+void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context, lsn_t page_lsn) {
     (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle
@@ -222,6 +230,9 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     {
         std::unique_lock<std::shared_mutex> page_lock(updatepage_handle.page->latch());
         memcpy(updatepage_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+        if (page_lsn != INVALID_LSN && updatepage_handle.page->get_page_lsn() < page_lsn) {
+            updatepage_handle.page->set_page_lsn(page_lsn);
+        }
     }
     buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), true);
 }
@@ -291,13 +302,109 @@ RmPageHandle RmFileHandle::create_page_handle() {
 /**
  * @description: 当一个页面从没有空闲空间的状态变为有空闲空间状态时，更新文件头和页头中空闲页面相关的元数据
  */
-void RmFileHandle::set_tuple_meta(const Rid& rid, const TupleMeta& meta) {
+void RmFileHandle::set_tuple_meta(const Rid& rid, const TupleMeta& meta, lsn_t page_lsn) {
     auto page_handle = fetch_page_handle(rid.page_no);
     {
         std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
         page_handle.get_meta(rid.slot_no) = meta;
+        if (page_lsn != INVALID_LSN && page_handle.page->get_page_lsn() < page_lsn) {
+            page_handle.page->set_page_lsn(page_lsn);
+        }
     }
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+}
+
+void RmFileHandle::set_page_lsn(const Rid& rid, lsn_t lsn) {
+    if (lsn == INVALID_LSN) {
+        return;
+    }
+    auto page_handle = fetch_page_handle(rid.page_no);
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        if (page_handle.page->get_page_lsn() < lsn) {
+            page_handle.page->set_page_lsn(lsn);
+        }
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+}
+
+lsn_t RmFileHandle::get_page_lsn(const Rid& rid) const {
+    auto page_handle = fetch_page_handle(rid.page_no);
+    lsn_t lsn;
+    {
+        std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        lsn = page_handle.page->get_page_lsn();
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    return lsn;
+}
+
+void RmFileHandle::rebuild_file_header_from_pages() {
+    const std::string& path = disk_manager_->get_file_name(fd_);
+    int64_t file_size = disk_manager_->get_file_size(path);
+    if (file_size < static_cast<int64_t>(sizeof(RmFileHdr))) {
+        throw InternalError("record file has an incomplete page during recovery");
+    }
+    if (file_size > PAGE_SIZE && file_size % PAGE_SIZE != 0) {
+        throw InternalError("record file has an incomplete page during recovery");
+    }
+
+    // The file header is intentionally a short write at page 0. Pages created
+    // by redo may still exist only in the buffer pool, so retain the current
+    // in-memory allocation count and use the disk size as a lower bound.
+    int disk_page_count = file_size <= PAGE_SIZE ? 1 : static_cast<int>(file_size / PAGE_SIZE);
+    int page_upper_bound = std::max(file_hdr_.num_pages, disk_page_count);
+    file_hdr_.num_pages = page_upper_bound;
+    file_hdr_.first_free_page_no = RM_NO_PAGE;
+
+    std::vector<int> free_pages;
+    free_pages.reserve(static_cast<size_t>(page_upper_bound));
+    int actual_page_count = RM_FIRST_RECORD_PAGE;
+    for (int page_no = RM_FIRST_RECORD_PAGE; page_no < page_upper_bound; ++page_no) {
+        PageId page_id{fd_, page_no};
+        if (page_no >= disk_page_count && !buffer_pool_manager_->is_page_resident(page_id)) {
+            // A stale header can mention a page that never reached disk. A
+            // redo-created page is still discoverable here through the BPM.
+            break;
+        }
+        auto page_handle = fetch_page_handle(page_no);
+        actual_page_count = page_no + 1;
+        int num_records = 0;
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            for (int slot_no = 0; slot_no < file_hdr_.num_records_per_page; ++slot_no) {
+                if (Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                    ++num_records;
+                }
+            }
+            if (page_handle.page_hdr->num_records != num_records) {
+                page_handle.page_hdr->num_records = num_records;
+            }
+            if (num_records == file_hdr_.num_records_per_page) {
+                page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
+            }
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        if (num_records < file_hdr_.num_records_per_page) {
+            free_pages.push_back(page_no);
+        }
+    }
+
+    for (size_t i = 0; i < free_pages.size(); ++i) {
+        int page_no = free_pages[i];
+        int next_page_no = i + 1 < free_pages.size() ? free_pages[i + 1] : RM_NO_PAGE;
+        auto page_handle = fetch_page_handle(page_no);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            page_handle.page_hdr->next_free_page_no = next_page_no;
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    }
+    if (!free_pages.empty()) {
+        file_hdr_.first_free_page_no = free_pages.front();
+    }
+    file_hdr_.num_pages = actual_page_count;
+    disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
 }
 
 TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {

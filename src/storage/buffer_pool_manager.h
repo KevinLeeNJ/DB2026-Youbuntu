@@ -70,6 +70,8 @@ public:
 public:
     Page* fetch_page(PageId page_id);
 
+    bool is_page_resident(PageId page_id);
+
     bool unpin_page(PageId page_id, bool is_dirty);
 
     bool flush_page(PageId page_id);
@@ -91,5 +93,5 @@ private:
 
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
 
-    void flush_log_before_page_write();
+    void flush_log_before_page_write(lsn_t page_lsn);
 };

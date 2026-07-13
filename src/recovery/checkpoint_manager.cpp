@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 
+#include "common/fault_injection.h"
 #include "recovery/log_manager.h"
 #include "system/sm_manager.h"
 #include "transaction/transaction_manager.h"
@@ -63,10 +64,15 @@ bool CheckpointManager::RunCleanCheckpoint() {
 
     txn_mgr_->wait_active_transactions_drained_for_checkpoint();
     log_mgr_->flush_log_to_disk_with_sync();
+    FaultInjector::Point("before_checkpoint_data_sync");
     sm_mgr_->flush_all_table_and_index_pages();
+    FaultInjector::Point("after_checkpoint_data_sync");
     sm_mgr_->flush_meta();
-    log_mgr_->reset_log(log_mgr_->get_global_lsn());
+    // Publish the restart manifest before truncating WAL. If anything after
+    // this point fails, the complete WAL is still available for recovery.
     log_mgr_->write_restart_offset(0);
+    FaultInjector::Point("before_wal_truncate");
+    log_mgr_->reset_log(log_mgr_->get_global_lsn());
     return true;
 }
 

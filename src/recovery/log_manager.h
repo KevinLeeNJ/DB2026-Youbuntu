@@ -446,11 +446,13 @@ public:
     LogManager(DiskManager* disk_manager) {
         disk_manager_ = disk_manager;
         persist_lsn_ = INVALID_LSN;
+        durable_lsn_ = INVALID_LSN;
     }
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
     void flush_log_to_disk();
     void flush_log_to_disk_with_sync();
+    void flush_log_to_disk_up_to(lsn_t target_lsn);
     void initialize_from_existing_log();
 
     // recovery/checkpoint 成功落盘表页与元数据后调用：先把缓冲区残留日志刷盘，
@@ -461,6 +463,10 @@ public:
 
     lsn_t get_persist_lsn() const {
         return persist_lsn_;
+    }
+
+    lsn_t get_durable_lsn() const {
+        return durable_lsn_.load(std::memory_order_acquire);
     }
 
     lsn_t get_global_lsn() const {
@@ -481,10 +487,11 @@ public:
 private:
     void flush_log_to_disk_unlocked();
 
-    std::atomic<lsn_t> global_lsn_{0}; // 全局lsn，递增，用于为每条记录分发lsn
-    std::mutex latch_;                 // 用于对log_buffer_的互斥访问
-    LogBuffer log_buffer_;             // 日志缓冲区
-    lsn_t persist_lsn_{INVALID_LSN};   // 记录已经持久化到磁盘中的最后一条日志的日志号
-    int64_t log_file_offset_{0};       // 日志文件当前追加偏移
+    std::atomic<lsn_t> global_lsn_{0};            // 全局lsn，递增，用于为每条记录分发lsn
+    std::mutex latch_;                            // 用于对log_buffer_的互斥访问
+    LogBuffer log_buffer_;                        // 日志缓冲区
+    lsn_t persist_lsn_{INVALID_LSN};              // 记录已经持久化到磁盘中的最后一条日志的日志号
+    std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
+    int64_t log_file_offset_{0};                  // 日志文件当前追加偏移
     DiskManager* disk_manager_;
 };

@@ -92,6 +92,9 @@ public:
     inline void set_state(TransactionState state) {
         state_.store(state, std::memory_order_release);
     }
+    inline bool compare_exchange_state(TransactionState& expected, TransactionState desired) {
+        return state_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
 
     inline lsn_t get_prev_lsn() {
         return prev_lsn_;

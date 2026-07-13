@@ -659,7 +659,7 @@ TEST_F(ExecutorTest, update_single_field) {
     }
 }
 
-TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_commit) {
+TEST_F(ExecutorTest, read_committed_update_rechecks_latest_version) {
     setup_db();
     auto cols = make_int_cols({"id", "next_id"});
     sm_manager_->create_table("rc_lost_update", cols, nullptr);
@@ -718,19 +718,22 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     ASSERT_NO_THROW(txn1_update.Next());
     txn_manager.commit(txn1, nullptr);
 
-    bool txn2_aborted = false;
-    try {
-        UpdateExecutor txn2_update(sm_manager_.get(), "rc_lost_update", {set_next_to_3021}, {}, {rid}, &ctx2);
+    SetClause set_next_to_3022;
+    set_next_to_3022.lhs = {"rc_lost_update", "next_id"};
+    Value next_3022;
+    next_3022.set_int(3022);
+    set_next_to_3022.rhs = next_3022;
+    ASSERT_NO_THROW({
+        UpdateExecutor txn2_update(sm_manager_.get(), "rc_lost_update", {set_next_to_3022}, {}, {rid}, &ctx2);
         txn2_update.Next();
-    } catch (const TransactionAbortException&) {
-        txn2_aborted = true;
-    }
-    txn_manager.abort(txn2, nullptr);
+    });
+    txn_manager.commit(txn2, nullptr);
 
-    EXPECT_TRUE(txn2_aborted) << "RC constant UPDATE must not overwrite a row committed after the statement read_ts";
+    EXPECT_FALSE(txn2->get_state() == TransactionState::ABORTED)
+        << "RC UPDATE should re-read the latest committed row after waiting for its writer";
     auto final_rec = fh->get_record(rid, nullptr);
     ASSERT_NE(final_rec, nullptr);
-    EXPECT_EQ(*reinterpret_cast<int*>(final_rec->data + 4), 3021);
+    EXPECT_EQ(*reinterpret_cast<int*>(final_rec->data + 4), 3022);
 }
 
 TEST_F(ExecutorTest, transaction_end_commands_clear_session_transaction_id) {

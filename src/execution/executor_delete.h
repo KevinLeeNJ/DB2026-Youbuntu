@@ -59,6 +59,7 @@ public:
             if (!match) {
                 continue; // 如果记录不匹配条件，则跳过删除
             }
+            lsn_t log_lsn = INVALID_LSN;
             // MVCC Write-Write conflict detection
             if (context_ != nullptr && context_->txn_ != nullptr) {
                 auto txn = context_->txn_;
@@ -111,6 +112,7 @@ public:
                 log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
                 lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
                 context_->txn_->set_prev_lsn(lsn);
+                log_lsn = lsn;
             }
             auto undo_record = context_ != nullptr && context_->txn_ != nullptr
                                    ? std::make_unique<WriteRecord>(WType::DELETE_TUPLE, tab_name_, rid, *rec)
@@ -130,9 +132,10 @@ public:
                         std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
                         offset += index.cols[i].len;
                     }
+                    auto index_latch = ih->lock_exclusive();
                     sm_manager_->remember_historical_index_key(
                         tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid);
-                    ih->delete_entry(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
+                    ih->delete_entry_unlocked(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }
             } catch (...) {
@@ -161,7 +164,7 @@ public:
                 tombstone.is_committed_ = false;
                 tombstone.is_deleted_ = true;
                 tombstone.version_chain_head_ = undo_link;
-                fh_->set_tuple_meta(rid, tombstone);
+                fh_->set_tuple_meta(rid, tombstone, log_lsn);
                 sm_manager_->remember_deleted_tuple_candidate(tab_name_, rid);
             } else {
                 fh_->delete_record(rid, context_);

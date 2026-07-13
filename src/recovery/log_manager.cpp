@@ -10,6 +10,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -97,6 +98,34 @@ void LogManager::flush_log_to_disk_with_sync() {
     std::lock_guard<std::mutex> lock(latch_);
     flush_log_to_disk_unlocked();
     disk_manager_->fsync_log();
+    durable_lsn_.store(persist_lsn_, std::memory_order_release);
+}
+
+void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
+    if (target_lsn == INVALID_LSN) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(latch_);
+    // A page can retain an LSN from a previous, already truncated WAL
+    // epoch. If no current WAL record exists at or below this target, there
+    // is nothing to flush for this page.
+    if (log_buffer_.offset_ == 0 && target_lsn >= global_lsn_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (durable_lsn_.load(std::memory_order_acquire) >= target_lsn) {
+        return;
+    }
+    flush_log_to_disk_unlocked();
+    disk_manager_->fsync_log();
+    durable_lsn_.store(persist_lsn_, std::memory_order_release);
+    if (durable_lsn_.load(std::memory_order_acquire) < target_lsn) {
+        // Pages created outside the WAL path (or legacy pages whose first
+        // four bytes predate page-LSN initialization) can contain a value
+        // larger than the current WAL tail. They have no WAL dependency to
+        // wait for; valid WAL-backed page LSNs are always <= the appended
+        // tail and are covered by the sync above.
+        return;
+    }
 }
 
 void LogManager::flush_log_to_disk_unlocked() {
@@ -118,6 +147,7 @@ void LogManager::initialize_from_existing_log() {
     if (file_size <= 0) {
         log_file_offset_ = 0;
         persist_lsn_ = INVALID_LSN;
+        durable_lsn_.store(INVALID_LSN, std::memory_order_release);
         global_lsn_.store(0);
         return;
     }
@@ -143,9 +173,10 @@ void LogManager::initialize_from_existing_log() {
 
     log_file_offset_ = offset;
     persist_lsn_ = max_lsn;
+    durable_lsn_.store(max_lsn, std::memory_order_release);
     global_lsn_.store(max_lsn == INVALID_LSN ? 0 : max_lsn + 1);
     if (offset < file_size) {
-        truncate(LOG_FILE_NAME.c_str(), static_cast<off_t>(offset));
+        disk_manager_->truncate_log_to(offset);
     }
     disk_manager_->SetLogOffset(offset);
 }
@@ -160,14 +191,32 @@ void LogManager::reset_log(lsn_t next_lsn) {
     log_buffer_.offset_ = 0;
     global_lsn_.store(next_lsn);
     persist_lsn_ = INVALID_LSN;
+    // Pages flushed before truncation may still carry their old page LSN.
+    // Treat the truncated prefix as durable so those stale LSNs do not cause
+    // a false WAL-missing failure after restart.
+    durable_lsn_.store(next_lsn == 0 ? INVALID_LSN : next_lsn - 1, std::memory_order_release);
 }
 
 void LogManager::write_restart_offset(int64_t checkpoint_offset) {
-    std::ofstream restart_file(RESTART_FILE_NAME, std::ios::trunc);
+    const std::string temp_name = std::string(RESTART_FILE_NAME) + ".tmp";
+    std::ofstream restart_file(temp_name, std::ios::trunc);
     if (!restart_file.is_open()) {
-        return;
+        throw UnixError();
     }
     restart_file << checkpoint_offset;
+    restart_file.flush();
+    if (!restart_file) {
+        throw UnixError();
+    }
+    restart_file.close();
+    if (!restart_file) {
+        throw UnixError();
+    }
+    disk_manager_->sync_path(temp_name);
+    if (rename(temp_name.c_str(), RESTART_FILE_NAME) != 0) {
+        throw UnixError();
+    }
+    disk_manager_->sync_directory(".");
 }
 
 int64_t LogManager::read_restart_offset() const {

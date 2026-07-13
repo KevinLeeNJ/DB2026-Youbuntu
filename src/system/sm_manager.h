@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 
 #include "common/context.h"
+#include "common/fault_injection.h"
 #include "index/ix.h"
 #include "record/rm_file_handle.h"
 #include "sm_defs.h"
@@ -213,8 +214,10 @@ public:
 
     void reset_all_tuple_meta_after_recovery();
 
-    // MVCC: mark all slots modified by txn as committed with the given commit_ts
-    void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
+    // Validate and freeze the publication set before a COMMIT record is made
+    // durable. Publication must not discover a missing table or invalid RID
+    // after durable COMMIT has already been written.
+    void prepare_commit_publication(Transaction& txn) {
         auto& modified_slots = txn.get_modified_slots();
         std::sort(modified_slots.begin(), modified_slots.end(), [](const auto& lhs, const auto& rhs) {
             if (lhs.first != rhs.first) {
@@ -227,6 +230,23 @@ public:
         });
         modified_slots.erase(std::unique(modified_slots.begin(), modified_slots.end()), modified_slots.end());
 
+        for (const auto& [tab_name, rid] : modified_slots) {
+            auto table_it = fhs_.find(tab_name);
+            if (table_it == fhs_.end()) {
+                throw InternalError("commit publication table is missing: " + tab_name);
+            }
+            const auto file_hdr = table_it->second->get_file_hdr();
+            if (rid.page_no < RM_FIRST_RECORD_PAGE || rid.page_no >= file_hdr.num_pages || rid.slot_no < 0 ||
+                rid.slot_no >= file_hdr.num_records_per_page) {
+                throw InternalError("commit publication RID is invalid");
+            }
+        }
+    }
+
+    // MVCC: mark all slots modified by txn as committed with the given commit_ts
+    void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
+        auto& modified_slots = txn.get_modified_slots();
+
         size_t offset = 0;
         while (offset < modified_slots.size()) {
             const auto& [tab_name, first_rid] = modified_slots[offset];
@@ -236,17 +256,34 @@ public:
                    modified_slots[next].second.page_no == first_rid.page_no) {
                 ++next;
             }
-            if (table_it != fhs_.end()) {
-                auto page_handle = table_it->second->fetch_page_handle(first_rid.page_no);
-                {
-                    std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
-                    for (size_t i = offset; i < next; ++i) {
-                        page_handle.get_meta(modified_slots[i].second.slot_no).is_committed_ = true;
-                        page_handle.get_meta(modified_slots[i].second.slot_no).commit_ts_ = commit_ts;
-                    }
-                }
-                buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+            if (table_it == fhs_.end()) {
+                // Defensive check: prepare_commit_publication() should have
+                // caught this before the COMMIT WAL became durable.
+                throw InternalError("commit publication table is missing: " + tab_name);
             }
+            const auto file_hdr = table_it->second->get_file_hdr();
+            if (first_rid.page_no < RM_FIRST_RECORD_PAGE || first_rid.page_no >= file_hdr.num_pages) {
+                throw InternalError("commit publication page is invalid");
+            }
+            for (size_t i = offset; i < next; ++i) {
+                const Rid& rid = modified_slots[i].second;
+                if (rid.slot_no < 0 || rid.slot_no >= file_hdr.num_records_per_page) {
+                    throw InternalError("commit publication slot is invalid");
+                }
+            }
+            auto page_handle = table_it->second->fetch_page_handle(first_rid.page_no);
+            {
+                std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+                for (size_t i = offset; i < next; ++i) {
+                    page_handle.get_meta(modified_slots[i].second.slot_no).is_committed_ = true;
+                    page_handle.get_meta(modified_slots[i].second.slot_no).commit_ts_ = commit_ts;
+                }
+                if (txn.get_prev_lsn() != INVALID_LSN && page_handle.page->get_page_lsn() < txn.get_prev_lsn()) {
+                    page_handle.page->set_page_lsn(txn.get_prev_lsn());
+                }
+                FaultInjector::Point("mid_tuple_publication");
+            }
+            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
             offset = next;
         }
         modified_slots.clear();

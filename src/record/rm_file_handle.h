@@ -113,7 +113,7 @@ public:
 
     Rid insert_record(char* buf, Context* context);
 
-    void insert_record(const Rid& rid, char* buf);
+    void insert_record(const Rid& rid, char* buf, lsn_t page_lsn = INVALID_LSN);
 
     RmPinnedInsert prepare_insert_record();
 
@@ -121,16 +121,27 @@ public:
 
     void abort_prepared_insert(RmPinnedInsert& insert);
 
-    void delete_record(const Rid& rid, Context* context);
+    void delete_record(const Rid& rid, Context* context, lsn_t page_lsn = INVALID_LSN);
 
-    void update_record(const Rid& rid, char* buf, Context* context);
+    void update_record(const Rid& rid, char* buf, Context* context, lsn_t page_lsn = INVALID_LSN);
 
     RmPageHandle create_new_page_handle();
 
     RmPageHandle fetch_page_handle(int page_no) const;
 
     // MVCC: update TupleMeta for a slot (pins and unpins the page)
-    void set_tuple_meta(const Rid& rid, const TupleMeta& meta);
+    void set_tuple_meta(const Rid& rid, const TupleMeta& meta, lsn_t page_lsn = INVALID_LSN);
+
+    // Advance the page LSN after a WAL record has been installed for a tuple
+    // update. The page LSN is monotonic because recovery uses it as its redo
+    // idempotence guard.
+    void set_page_lsn(const Rid& rid, lsn_t lsn);
+
+    lsn_t get_page_lsn(const Rid& rid) const;
+
+    // Recovery rebuilds allocation metadata from the on-disk page bitmaps;
+    // the file header itself may have been stale when the process crashed.
+    void rebuild_file_header_from_pages();
 
     // MVCC: get TupleMeta for a slot
     TupleMeta get_tuple_meta(const Rid& rid) const;

@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <map>
 #include <optional>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -66,6 +67,7 @@ protected:
     std::unique_ptr<RecScan> scan_;
     bool predicate_recorded_{false};
     bool use_historical_index_candidates_{false};
+    bool historical_candidates_merged_{false};
     std::unique_ptr<RmRecord> buffered_record_;
 
     SmManager* sm_manager_;
@@ -231,7 +233,8 @@ protected:
             return false;
         }
         IsolationLevel level = context_->txn_->get_isolation_level();
-        if (level != IsolationLevel::SNAPSHOT_ISOLATION && level != IsolationLevel::REPEATABLE_READ &&
+        if (level != IsolationLevel::READ_COMMITTED && level != IsolationLevel::SNAPSHOT_ISOLATION &&
+            level != IsolationLevel::REPEATABLE_READ &&
             !(level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode())) {
             return false;
         }
@@ -273,13 +276,14 @@ public:
     }
 
     void beginTuple() override {
+        historical_candidates_merged_ = false;
         record_predicate_read();
-
-        use_historical_index_candidates_ = needs_historical_index_candidates();
 
         auto ih =
             sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
         auto index_latch_guard = ih->lock_shared();
+        const bool historical_candidates_available = needs_historical_index_candidates();
+        use_historical_index_candidates_ = historical_candidates_available;
         auto constraints = build_constraints();
 
         std::vector<char> lower_key(index_meta_.col_tot_len);
@@ -352,15 +356,19 @@ public:
         // historical-index scan on the RC hot path.
         bool use_rc_exact_historical_key = false;
         std::vector<Rid> rc_exact_historical_rids;
-        if (!use_historical_index_candidates_ && context_ != nullptr && context_->txn_ != nullptr &&
+        if (historical_candidates_available && context_ != nullptr && context_->txn_ != nullptr &&
             context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && !lower_exclusive &&
             upper_inclusive && lower_key == upper_key) {
             const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
             rc_exact_historical_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, lower_key);
             use_rc_exact_historical_key = !rc_exact_historical_rids.empty();
+            // Exact RC probes only need history for the requested key. Range,
+            // prefix and skip-scan paths retain the broad candidate set.
+            use_historical_index_candidates_ = false;
         }
 
         if (use_historical_index_candidates_ || use_rc_exact_historical_key) {
+            historical_candidates_merged_ = true;
             std::vector<Rid> rids;
             for (IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
                  !index_scan.is_end(); index_scan.next()) {
@@ -373,8 +381,16 @@ public:
                     sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
                 historical_rids = sm_manager_->get_historical_index_rids(tab_name_, index_name);
             }
+            std::unordered_set<uint64_t> seen_rids;
+            seen_rids.reserve(rids.size() + historical_rids.size());
+            for (const Rid& rid : rids) {
+                seen_rids.insert((static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
+                                 static_cast<uint32_t>(rid.slot_no));
+            }
             for (const Rid& historical_rid : historical_rids) {
-                if (std::find(rids.begin(), rids.end(), historical_rid) == rids.end()) {
+                uint64_t rid_key = (static_cast<uint64_t>(static_cast<uint32_t>(historical_rid.page_no)) << 32) |
+                                   static_cast<uint32_t>(historical_rid.slot_no);
+                if (seen_rids.insert(rid_key).second) {
                     rids.push_back(historical_rid);
                 }
             }
@@ -479,7 +495,7 @@ public:
     // it is constrained to a single equality value (so the remaining order is
     // monotonic in `col`).
     bool provides_min_order(const TabCol& col) const override {
-        if (use_historical_index_candidates_) {
+        if (historical_candidates_merged_) {
             return false;
         }
         if (!col.tab_name.empty() && col.tab_name != tab_name_) {

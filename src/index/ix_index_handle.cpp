@@ -306,6 +306,11 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
 page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
                                       bool allow_duplicate) {
     auto guard = lock_exclusive();
+    return insert_entry_unlocked(key, value, transaction, allow_duplicate);
+}
+
+page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value, Transaction* transaction,
+                                               bool allow_duplicate) {
     IxNodeHandle leaf;
     fetch_node_into(file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
@@ -425,6 +430,10 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
  */
 bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
     auto guard = lock_exclusive();
+    return delete_entry_unlocked(key, transaction);
+}
+
+bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transaction) {
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
@@ -444,8 +453,12 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 }
 
 bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
-    (void)transaction;
     auto guard = lock_exclusive();
+    return delete_entry_unlocked(key, value, transaction);
+}
+
+bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction) {
+    (void)transaction;
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
     IxScan scan(this, lower, upper, buffer_pool_manager_, false);

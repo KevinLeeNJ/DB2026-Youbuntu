@@ -21,9 +21,9 @@ bool IsValidPageId(const PageId& page_id) {
 
 } // namespace
 
-void BufferPoolManager::flush_log_before_page_write() {
+void BufferPoolManager::flush_log_before_page_write(lsn_t page_lsn) {
     if (log_manager_ != nullptr) {
-        log_manager_->flush_log_to_disk();
+        log_manager_->flush_log_to_disk_up_to(page_lsn);
     }
 }
 
@@ -65,7 +65,7 @@ void BufferPoolManager::update_page(Page* page, PageId new_page_id, frame_id_t n
 
     // 如果page是脏页，写回磁盘
     if (page->is_dirty_) {
-        flush_log_before_page_write();
+        flush_log_before_page_write(page->get_page_lsn());
         disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
         page->is_dirty_ = false;
     }
@@ -146,7 +146,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             // 为了解决此问题，将flush_page()函数剥离出来
             PageId old_page_id = targetPage->get_page_id();
             if (IsValidPageId(old_page_id) && page_table_.find(old_page_id) != page_table_.end()) {
-                flush_log_before_page_write();
+                flush_log_before_page_write(targetPage->get_page_lsn());
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, targetPage->data_, PAGE_SIZE);
             }
             targetPage->is_dirty_ = false;
@@ -171,6 +171,11 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         return targetPage;
     }
     return nullptr;
+}
+
+bool BufferPoolManager::is_page_resident(PageId page_id) {
+    std::scoped_lock lock{latch_};
+    return page_table_.find(page_id) != page_table_.end();
 }
 
 /**
@@ -247,7 +252,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     Page* page = &(pages_[fid]);
     std::shared_lock<std::shared_mutex> page_lock(page->latch());
     // 2. 无论P是否为脏都将其写回磁盘。
-    flush_log_before_page_write();
+    flush_log_before_page_write(page->get_page_lsn());
     disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
 
     // 3. 更新P的is_dirty_
@@ -300,7 +305,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         if (IsValidPageId(old_page_id) && old_hit != page_table_.end()) {
             frame_id_t fid = old_hit->second;
             Page* page = &(pages_[fid]);
-            flush_log_before_page_write();
+            flush_log_before_page_write(page->get_page_lsn());
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
             page->is_dirty_ = false;
         }
@@ -356,7 +361,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 3.   将目标页数据写回磁盘
     // 原本此处调用flush_page()函数，但调用需要临时解锁操作，会带来并发冲突问题
     // 为了解决此问题，将flush_page()函数剥离出来
-    flush_log_before_page_write();
+    flush_log_before_page_write(page->get_page_lsn());
     disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
     page->is_dirty_ = false;
 
@@ -380,7 +385,7 @@ void BufferPoolManager::flush_all_pages(int fd) {
         Page* page = &pages_[i];
         if (page->id_.fd == fd && page->id_.page_no != INVALID_PAGE_ID && page->is_dirty_) {
             std::shared_lock<std::shared_mutex> page_lock(page->latch());
-            flush_log_before_page_write();
+            flush_log_before_page_write(page->get_page_lsn());
             disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
             page->is_dirty_ = false;
         }

@@ -158,9 +158,13 @@ public:
         : IndexScanExecutor(sm_manager, std::move(tab_name), std::move(conds), std::move(index_col_names), context) {}
 
     void beginTuple() override {
+        historical_candidates_merged_ = false;
         record_predicate_read();
 
         if (needs_historical_index_candidates()) {
+            // The historical fallback is a heap scan, not index order.  Do not
+            // let MIN/MAX planning use the ordered-index shortcut here.
+            historical_candidates_merged_ = true;
             scan_ = std::make_unique<RmScan>(fh_);
             IndexScanExecutor::advance_to_match();
             return;

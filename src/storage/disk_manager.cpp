@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>   // for lseek
 
 #include "defs.h"
+#include "common/fault_injection.h"
 
 DiskManager::DiskManager() = default;
 
@@ -280,7 +281,46 @@ void DiskManager::write_log(char* log_data, int size) {
 }
 
 void DiskManager::fsync_log() {
+    FaultInjector::Point("before_wal_fsync");
     if (log_fd_ != -1 && fdatasync(log_fd_) != 0) {
+        throw UnixError();
+    }
+}
+
+void DiskManager::sync_file(int fd) {
+    FaultInjector::Point("before_data_fsync");
+    if (fd < 0 || fdatasync(fd) != 0) {
+        throw UnixError();
+    }
+}
+
+void DiskManager::sync_path(const std::string& path) {
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+        throw UnixError();
+    }
+    try {
+        sync_file(fd);
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+    if (close(fd) != 0) {
+        throw UnixError();
+    }
+}
+
+void DiskManager::sync_directory(const std::string& path) {
+    FaultInjector::Point("before_directory_fsync");
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        throw UnixError();
+    }
+    if (fsync(fd) != 0) {
+        close(fd);
+        throw UnixError();
+    }
+    if (close(fd) != 0) {
         throw UnixError();
     }
 }
@@ -293,8 +333,31 @@ void DiskManager::truncate_log() {
         if (ftruncate(log_fd_, 0) != 0) {
             throw UnixError();
         }
-        fdatasync(log_fd_);
-        lseek(log_fd_, 0, SEEK_SET);
+        if (fdatasync(log_fd_) != 0) {
+            throw UnixError();
+        }
+        if (lseek(log_fd_, 0, SEEK_SET) < 0) {
+            throw UnixError();
+        }
     }
     log_offset_ = 0;
+}
+
+void DiskManager::truncate_log_to(int64_t offset) {
+    if (offset < 0) {
+        throw InternalError("negative WAL truncation offset");
+    }
+    if (log_fd_ == -1) {
+        log_fd_ = open_file(LOG_FILE_NAME);
+    }
+    if (ftruncate(log_fd_, static_cast<off_t>(offset)) != 0) {
+        throw UnixError();
+    }
+    if (fdatasync(log_fd_) != 0) {
+        throw UnixError();
+    }
+    if (lseek(log_fd_, static_cast<off_t>(offset), SEEK_SET) < 0) {
+        throw UnixError();
+    }
+    log_offset_ = offset;
 }

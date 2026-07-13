@@ -109,15 +109,20 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         return true;
     }
 
+    // A transaction that already owns locks uses wait-die: an older
+    // requester may wait for a younger owner, while a younger requester
+    // aborts. For RC, a transaction with no locks cannot participate in a
+    // wait cycle, so its first request is allowed to wait regardless of age.
+    // Preserve the established SI/RR/SER first-writer conflict behavior;
+    // this plan changes the RC path only.
     bool first_lock = txn->get_lock_set()->empty();
-    bool first_explicit_rc_lock =
-        first_lock && txn->get_txn_mode() && txn->get_isolation_level() == IsolationLevel::READ_COMMITTED;
-    if (!first_explicit_rc_lock && txn->get_transaction_id() > (*owner_it)->txn_id_) {
+    bool rc_first_lock = first_lock && txn->get_isolation_level() == IsolationLevel::READ_COMMITTED;
+    if (first_lock && !rc_first_lock) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         return false;
     }
-    if (!first_explicit_rc_lock && first_lock) {
+    if (!first_lock && txn->get_transaction_id() > (*owner_it)->txn_id_) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         return false;

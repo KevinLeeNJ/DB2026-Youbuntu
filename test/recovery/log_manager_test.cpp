@@ -215,6 +215,10 @@ TEST(LogManagerTest, AppendFlushAndReadBack) {
     EXPECT_EQ(commit_lsn, 1);
     EXPECT_EQ(log_mgr.get_persist_lsn(), commit_lsn);
     EXPECT_GE(disk.get_file_size(LOG_FILE_NAME), LOG_HEADER_SIZE * 2);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+
+    log_mgr.flush_log_to_disk_with_sync();
+    EXPECT_EQ(log_mgr.get_durable_lsn(), commit_lsn);
 
     std::vector<char> first(LOG_HEADER_SIZE);
     ASSERT_EQ(disk.read_log(first.data(), static_cast<int>(first.size()), 0), LOG_HEADER_SIZE);
@@ -222,6 +226,22 @@ TEST(LogManagerTest, AppendFlushAndReadBack) {
     ASSERT_NE(decoded, nullptr);
     EXPECT_EQ(decoded->log_type_, LogType::BEGIN);
     EXPECT_EQ(decoded->lsn_, begin_lsn);
+}
+
+TEST(LogManagerTest, FlushDurableUpToHonorsPageLsnTarget) {
+    ScopedTestDir test_dir("log_manager_flush_up_to_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    BeginLogRecord begin(101);
+    lsn_t begin_lsn = log_mgr.add_log_to_buffer(&begin);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+
+    log_mgr.flush_log_to_disk_up_to(begin_lsn);
+
+    EXPECT_EQ(log_mgr.get_durable_lsn(), begin_lsn);
+    EXPECT_GE(log_mgr.get_persist_lsn(), begin_lsn);
 }
 
 TEST(LogManagerTest, RestartOffsetRoundTrip) {

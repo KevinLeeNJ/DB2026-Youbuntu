@@ -82,15 +82,30 @@ private:
     int generation_ = 0;
 };
 
-TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockRejectsSecondWriter) {
+TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) {
     LockManager lock_manager;
     Transaction t1(1001);
     Transaction t2(1002);
     Rid rid{1, 0};
+    LockDataId lock_id(42, rid, LockDataType::RECORD);
 
     EXPECT_TRUE(lock_manager.lock_exclusive_on_record(&t1, rid, 42));
-    EXPECT_FALSE(lock_manager.lock_exclusive_on_record(&t2, rid, 42))
-        << "A second writer must not be able to concurrently own the same RID";
+    std::atomic<bool> started{false};
+    std::atomic<bool> acquired{false};
+    std::thread waiter([&] {
+        started.store(true);
+        acquired.store(lock_manager.lock_exclusive_on_record(&t2, rid, 42));
+    });
+    while (!started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(acquired.load());
+    ASSERT_TRUE(lock_manager.unlock(&t1, lock_id));
+    waiter.join();
+
+    EXPECT_TRUE(acquired.load());
+    EXPECT_TRUE(lock_manager.unlock(&t2, lock_id));
 }
 
 TEST(SnapshotIsolationConcurrencyTest, ExplicitReadCommittedWriterWaitsForRecordLock) {
@@ -1694,6 +1709,32 @@ TEST_F(SnapshotTest, RC_IndexScanSeesOldKeyDuringUncommittedUpdate) {
                            "Total record(s): 1";
     EXPECT_EQ(TestSession::trim_output(out), expected)
         << "RC index scans must retain an uncommitted writer's old indexed key";
+
+    ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
+}
+
+TEST_F(SnapshotTest, RC_IndexRangeScanSeesOldKeyDuringUncommittedUpdate) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (2, 200);"));
+
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto reader = create_session(IsolationLevel::READ_COMMITTED);
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update t set id = 20 where id = 2;"));
+
+    std::string out = reader->exec_sql("select * from t where id >= 1 and id <= 10;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "|                2 |              200 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 2";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "RC range scans must merge historical RIDs after an indexed key change";
 
     ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
 }

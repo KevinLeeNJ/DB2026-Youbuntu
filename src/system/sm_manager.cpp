@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -93,9 +94,19 @@ void SmManager::create_db(const std::string& db_name) {
 
     // 注意，此处ofstream会在当前目录创建(如果没有此文件先创建)和打开一个名为DB_META_NAME的文件
     std::ofstream ofs(DB_META_NAME);
+    if (!ofs.is_open()) {
+        throw UnixError();
+    }
 
     // 将new_db中的信息，按照定义好的operator<<操作符，写入到ofs打开的DB_META_NAME文件中
     ofs << new_db; // 注意：此处重载了操作符<<
+
+    ofs.flush();
+    if (!ofs) {
+        throw UnixError();
+    }
+    ofs.close();
+    disk_manager_->sync_path(DB_META_NAME);
 
     // 创建日志文件
     disk_manager_->create_file(LOG_FILE_NAME);
@@ -168,8 +179,30 @@ void SmManager::open_db(const std::string& db_name) {
             fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
             for (auto& index : tab_meta.indexes) {
                 // 打开索引文件
-                ihs_.emplace(ix_manager_->get_index_name(tab_meta.name, index.cols),
-                             ix_manager_->open_index(index.tab_name, index.cols));
+                const std::string index_name = ix_manager_->get_index_name(tab_meta.name, index.cols);
+                const std::string backup_name = index_name + ".rebuild.bak";
+                const std::string temp_base = index_name + ".rebuild.tmp";
+                const std::string temp_name = ix_manager_->get_index_name(temp_base, index.cols);
+                // A crash between the two rename operations must leave a
+                // complete old or new index that can be opened on restart.
+                if (!disk_manager_->is_file(index_name) && disk_manager_->is_file(backup_name)) {
+                    if (rename(backup_name.c_str(), index_name.c_str()) != 0) {
+                        throw UnixError();
+                    }
+                    disk_manager_->sync_directory(".");
+                }
+                if (disk_manager_->is_file(index_name) && disk_manager_->is_file(backup_name)) {
+                    if (std::remove(backup_name.c_str()) != 0) {
+                        throw UnixError();
+                    }
+                    disk_manager_->sync_directory(".");
+                }
+                if (disk_manager_->is_file(temp_name)) {
+                    if (std::remove(temp_name.c_str()) != 0) {
+                        throw UnixError();
+                    }
+                }
+                ihs_.emplace(index_name, ix_manager_->open_index(index.tab_name, index.cols));
             }
         }
         // Reset the database-global output_file toggle: opening a (possibly
@@ -188,9 +221,22 @@ void SmManager::open_db(const std::string& db_name) {
  * @description: 把数据库相关的元数据刷入磁盘中
  */
 void SmManager::flush_meta() {
-    // 默认清空文件
-    std::ofstream ofs(DB_META_NAME);
+    const std::string temp_meta = std::string(DB_META_NAME) + ".tmp";
+    std::ofstream ofs(temp_meta, std::ios::trunc);
+    if (!ofs.is_open()) {
+        throw UnixError();
+    }
     ofs << db_;
+    ofs.flush();
+    if (!ofs) {
+        throw UnixError();
+    }
+    ofs.close();
+    disk_manager_->sync_path(temp_meta);
+    if (rename(temp_meta.c_str(), DB_META_NAME.c_str()) != 0) {
+        throw UnixError();
+    }
+    disk_manager_->sync_directory(".");
 }
 
 /**
@@ -609,13 +655,14 @@ void SmManager::flush_all_table_and_index_pages() {
     for (const auto& [_, fh] : fhs_) {
         rm_manager_->flush_file_header(fh.get());
         buffer_pool_manager_->flush_all_pages(fh->GetFd());
+        disk_manager_->sync_file(fh->GetFd());
     }
     for (const auto& [_, ih] : ihs_) {
         ix_manager_->flush_index_header(ih.get());
         buffer_pool_manager_->flush_all_pages(ih->GetFd());
+        disk_manager_->sync_file(ih->GetFd());
     }
 }
-
 void SmManager::rebuild_all_indexes() {
     std::vector<std::pair<std::string, std::vector<IndexMeta>>> indexes_by_table;
     indexes_by_table.reserve(db_.tabs_.size());
@@ -632,8 +679,70 @@ void SmManager::rebuild_all_indexes() {
             for (const auto& col : index.cols) {
                 col_names.emplace_back(col.name);
             }
-            drop_index(tab_name, index.cols, nullptr);
-            create_index(tab_name, col_names, nullptr);
+            const std::string index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            const std::string backup_name = index_name + ".rebuild.bak";
+            const std::string temp_base = index_name + ".rebuild.tmp";
+            const std::string temp_name = ix_manager_->get_index_name(temp_base, index.cols);
+
+            ix_manager_->create_index(temp_base, index.cols);
+            auto temp_handle = ix_manager_->open_index(temp_base, index.cols);
+            try {
+                auto file_handle = fhs_.at(tab_name).get();
+                for (RmScan scan(file_handle); !scan.is_end(); scan.next()) {
+                    auto record = file_handle->get_record(scan.rid(), nullptr);
+                    auto key = MakeIndexKey(index, record->data);
+                    temp_handle->insert_entry(key.data(), scan.rid(), nullptr, true);
+                }
+                ix_manager_->close_index(temp_handle.get());
+                temp_handle.reset();
+                FaultInjector::Point("mid_index_rebuild");
+                disk_manager_->sync_path(temp_name);
+            } catch (...) {
+                if (temp_handle != nullptr) {
+                    ix_manager_->close_index(temp_handle.get());
+                }
+                if (disk_manager_->is_file(temp_name)) {
+                    ix_manager_->destroy_index(temp_base, index.cols);
+                }
+                throw;
+            }
+
+            auto old_it = ihs_.find(index_name);
+            if (old_it == ihs_.end()) {
+                throw InternalError("missing index handle during recovery rebuild");
+            }
+            ix_manager_->close_index(old_it->second.get());
+            old_it->second.reset();
+            ihs_.erase(old_it);
+
+            if (rename(index_name.c_str(), backup_name.c_str()) != 0) {
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+                throw UnixError();
+            }
+            if (rename(temp_name.c_str(), index_name.c_str()) != 0) {
+                if (rename(backup_name.c_str(), index_name.c_str()) != 0) {
+                    throw UnixError();
+                }
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+                throw UnixError();
+            }
+            disk_manager_->sync_directory(".");
+
+            try {
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+            } catch (...) {
+                std::remove(index_name.c_str());
+                if (rename(backup_name.c_str(), index_name.c_str()) != 0) {
+                    throw UnixError();
+                }
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+                disk_manager_->sync_directory(".");
+                throw;
+            }
+            if (std::remove(backup_name.c_str()) != 0) {
+                throw UnixError();
+            }
+            disk_manager_->sync_directory(".");
         }
     }
 }
@@ -666,6 +775,7 @@ void SmManager::reset_all_tuple_meta_after_recovery() {
                 fh->set_tuple_meta(rid, clean_meta);
             }
         }
+        fh->rebuild_file_header_from_pages();
     }
 }
 

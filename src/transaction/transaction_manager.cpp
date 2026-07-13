@@ -10,6 +10,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
+#include "common/fault_injection.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 
@@ -208,18 +209,23 @@ void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
+    // Returning from COMMIT means the commit record survived an OS crash,
+    // not merely that it reached the kernel page cache.
     log_manager->flush_log_to_disk();
+    FaultInjector::Point("after_commit_wal_write");
+    log_manager->flush_log_to_disk_with_sync();
 }
 
-void WriteAbortLog(Transaction* txn, LogManager* log_manager) {
+lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr || log_manager == nullptr) {
-        return;
+        return INVALID_LSN;
     }
     AbortLogRecord record(txn->get_transaction_id());
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
     log_manager->flush_log_to_disk();
+    return lsn;
 }
 
 std::optional<UndoLog> GetCurrentUndoLog(TransactionManager* txn_mgr, RmFileHandle* fh, const Rid& rid) {
@@ -244,7 +250,8 @@ TupleMeta FallbackCommittedMeta() {
     return meta;
 }
 
-void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, Transaction* txn) {
+void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, Transaction* txn,
+                     lsn_t page_lsn) {
     const std::string tab_name = write_record->GetTableName();
     auto& tab = sm_manager->db_.get_table(tab_name);
     auto* fh = sm_manager->fhs_.at(tab_name).get();
@@ -255,7 +262,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
             DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
-            fh->delete_record(rid, nullptr);
+            fh->delete_record(rid, nullptr, page_lsn);
         }
         break;
     }
@@ -263,11 +270,11 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         RmRecord old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         if (fh->is_record(rid)) {
-            fh->update_record(rid, old_rec.data, nullptr);
+            fh->update_record(rid, old_rec.data, nullptr, page_lsn);
         } else {
-            fh->insert_record(rid, old_rec.data);
+            fh->insert_record(rid, old_rec.data, page_lsn);
         }
-        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
+        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
         InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
         break;
     }
@@ -287,8 +294,8 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
             }
         }
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
-        fh->update_record(rid, old_rec.data, nullptr);
-        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
+        fh->update_record(rid, old_rec.data, nullptr, page_lsn);
+        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
         if (current_rec != nullptr) {
             for (const auto& index : tab.indexes) {
                 auto current_key = MakeIndexKey(index, current_rec->data);
@@ -377,33 +384,52 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         return;
     }
 
-    WriteCommitLog(txn, log_manager);
+    sm_manager_->prepare_commit_publication(*txn);
+    TransactionState expected_state = TransactionState::GROWING;
+    if (!txn->compare_exchange_state(expected_state, TransactionState::COMMITTING)) {
+        if (expected_state == TransactionState::COMMITTED || expected_state == TransactionState::ABORTED) {
+            RetireTransactionIfSafe(txn);
+            return;
+        }
+        throw InternalError("transaction is not ready to commit");
+    }
 
-    // Allocate commit_ts (monotonic)
+    FaultInjector::Point("before_commit_wal");
+    WriteCommitLog(txn, log_manager);
+    FaultInjector::Point("after_commit_wal_sync");
+
+    // WAL durability is intentionally outside the publication latch. The
+    // latch orders only the visibility phase, so a statement snapshot can
+    // never advance past a partially published transaction.
+    std::unique_lock<std::mutex> publish_lock(commit_publish_latch_);
+    if (txn->get_state() != TransactionState::COMMITTING) {
+        publish_lock.unlock();
+        throw InternalError("transaction left COMMITTING during publication");
+    }
+
+    // Allocate the timestamp while holding the publication latch. Therefore
+    // commit timestamp order is also publication order.
     timestamp_t commit_ts = next_timestamp_.fetch_add(1);
     txn->commit_ts_ = commit_ts;
 
-    // Update the watermark bookkeeping before publishing the commit timestamp.
-    // The latter is published below, after tuple metadata is committed.
+    // Publish every modified slot before making this commit timestamp visible
+    // to a new RC statement. A multi-page transaction is consequently atomic
+    // from the statement-snapshot point of view.
+    FaultInjector::Point("before_tuple_publication");
+    sm_manager_->mark_slots_committed(*txn, commit_ts);
+    FaultInjector::Point("after_tuple_publication");
+    txn->set_state(TransactionState::COMMITTED);
+    FaultInjector::Point("before_published_csn_store");
+    last_commit_ts_.store(commit_ts, std::memory_order_release);
+    publish_lock.unlock();
+
+    // Keep the committing transaction in the watermark until publication is
+    // complete; otherwise GC could reclaim its undo state in the publication
+    // window.
     running_txns_.UpdateCommitTs(commit_ts);
     running_txns_.RemoveTxn(txn->get_read_ts());
-
-    // Mark all modified slots as committed
-    sm_manager_->mark_slots_committed(*txn, commit_ts);
-
-    // Concurrent commits can finish out of commit-ts allocation order. Publish
-    // the largest committed timestamp only; a plain store would allow a later
-    // commit with a smaller timestamp to move last_commit_ts_ backwards and
-    // make READ COMMITTED transactions spuriously report WW_CONFLICT.
-    timestamp_t published_ts = last_commit_ts_.load(std::memory_order_relaxed);
-    while (published_ts < commit_ts &&
-           !last_commit_ts_.compare_exchange_weak(published_ts, commit_ts, std::memory_order_release,
-                                                  std::memory_order_relaxed)) {
-    }
-
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
-    txn->set_state(TransactionState::COMMITTED);
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
         CleanupTxnSsiState(txn->get_transaction_id());
         bool run_full_prune = false;
@@ -433,15 +459,23 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         RetireTransactionIfSafe(txn);
         return;
     }
+    if (txn->get_state() == TransactionState::COMMITTING) {
+        // The COMMIT WAL is already durable. Rolling this transaction back
+        // would create a state that recovery cannot distinguish from a lost
+        // committed transaction.
+        throw InternalError("cannot abort a transaction during commit publication");
+    }
 
     auto& write_set = txn->get_write_set();
     if (lock_manager_ != nullptr) {
         lock_manager_->cancel_transaction(txn);
     }
+    // The abort record must precede the physical undo. This gives every page
+    // modified by rollback a WAL record that can be used as its page LSN.
+    lsn_t abort_lsn = WriteAbortLog(txn, log_manager);
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(this, sm_manager_, it->get(), txn);
+        UndoWriteRecord(this, sm_manager_, it->get(), txn, abort_lsn);
     }
-    WriteAbortLog(txn, log_manager);
     running_txns_.RemoveTxn(txn->get_read_ts());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
