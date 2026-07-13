@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include "common/context.h"
@@ -54,7 +55,7 @@ private:
         return combined;
     }
 
-    mutable std::mutex historical_index_keys_latch_;
+    mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, std::vector<Rid>> historical_index_keys_;
     mutable std::mutex deleted_tuple_candidates_latch_;
     std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
@@ -121,7 +122,7 @@ public:
 
     void remember_historical_index_key(const std::string& tab_name, const std::string& index_name,
                                        const std::vector<char>& key, const Rid& rid) {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         auto& rids = historical_index_keys_[make_historical_index_key(tab_name, index_name, key)];
         if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
             rids.push_back(rid);
@@ -130,12 +131,43 @@ public:
 
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
                                                    const std::vector<char>& key) const {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, key));
         if (it == historical_index_keys_.end()) {
             return {};
         }
         return it->second;
+    }
+
+    std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {
+        std::string prefix;
+        prefix.reserve(tab_name.size() + index_name.size() + 2);
+        prefix.append(tab_name);
+        prefix.push_back('\0');
+        prefix.append(index_name);
+        prefix.push_back('\0');
+
+        std::vector<Rid> result;
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        for (const auto& [key, rids] : historical_index_keys_) {
+            if (key.compare(0, prefix.size(), prefix) == 0) {
+                result.insert(result.end(), rids.begin(), rids.end());
+            }
+        }
+        return result;
+    }
+
+    bool has_historical_index_keys(const std::string& tab_name, const std::string& index_name) const {
+        std::string prefix;
+        prefix.reserve(tab_name.size() + index_name.size() + 2);
+        prefix.append(tab_name);
+        prefix.push_back('\0');
+        prefix.append(index_name);
+        prefix.push_back('\0');
+
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        return std::any_of(historical_index_keys_.begin(), historical_index_keys_.end(),
+                           [&](const auto& entry) { return entry.first.compare(0, prefix.size(), prefix) == 0; });
     }
 
     void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
@@ -183,16 +215,41 @@ public:
 
     // MVCC: mark all slots modified by txn as committed with the given commit_ts
     void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
-        for (const auto& [tab_name, rid] : txn.get_modified_slots()) {
-            auto it = fhs_.find(tab_name);
-            if (it == fhs_.end())
-                continue;
-            auto page_handle = it->second->fetch_page_handle(rid.page_no);
-            page_handle.get_meta(rid.slot_no).is_committed_ = true;
-            page_handle.get_meta(rid.slot_no).commit_ts_ = commit_ts;
-            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        auto& modified_slots = txn.get_modified_slots();
+        std::sort(modified_slots.begin(), modified_slots.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            if (lhs.second.page_no != rhs.second.page_no) {
+                return lhs.second.page_no < rhs.second.page_no;
+            }
+            return lhs.second.slot_no < rhs.second.slot_no;
+        });
+        modified_slots.erase(std::unique(modified_slots.begin(), modified_slots.end()), modified_slots.end());
+
+        size_t offset = 0;
+        while (offset < modified_slots.size()) {
+            const auto& [tab_name, first_rid] = modified_slots[offset];
+            auto table_it = fhs_.find(tab_name);
+            size_t next = offset + 1;
+            while (next < modified_slots.size() && modified_slots[next].first == tab_name &&
+                   modified_slots[next].second.page_no == first_rid.page_no) {
+                ++next;
+            }
+            if (table_it != fhs_.end()) {
+                auto page_handle = table_it->second->fetch_page_handle(first_rid.page_no);
+                {
+                    std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+                    for (size_t i = offset; i < next; ++i) {
+                        page_handle.get_meta(modified_slots[i].second.slot_no).is_committed_ = true;
+                        page_handle.get_meta(modified_slots[i].second.slot_no).commit_ts_ = commit_ts;
+                    }
+                }
+                buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+            }
+            offset = next;
         }
-        txn.get_modified_slots().clear();
+        modified_slots.clear();
     }
 
     // Bulk-load a CSV file into an existing table. The path is relative to the

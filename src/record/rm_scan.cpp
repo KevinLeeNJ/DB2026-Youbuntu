@@ -49,8 +49,12 @@ void RmScan::next() {
             pinned_page_ = file_handle_->buffer_pool_manager_->fetch_page(PageId{file_handle_->fd_, rid_.page_no});
         }
         RmPageHandle page_handle(&file_handle_->file_hdr_, pinned_page_);
-        int next_slot = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
-                                         rid_.slot_no);                // 找到下一个存放了记录的slot
+        int next_slot;
+        {
+            std::shared_lock<std::shared_mutex> page_lock(pinned_page_->latch());
+            next_slot = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
+                                         rid_.slot_no); // 找到下一个存放了记录的slot
+        }
         if (next_slot != file_handle_->file_hdr_.num_records_per_page) // 成功找到
         {
             flag = true;

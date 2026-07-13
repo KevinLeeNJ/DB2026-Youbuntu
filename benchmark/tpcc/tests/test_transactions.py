@@ -1,7 +1,9 @@
+from pathlib import Path
 import unittest
 from unittest import mock
 
 from benchmark.tpcc.core.backend import BackendError
+from benchmark.tpcc.core.sqlite_backend import SqliteBackend
 from benchmark.tpcc.core.transactions import (
     InvalidItemRollback,
     TxnContext,
@@ -11,6 +13,7 @@ from benchmark.tpcc.core.transactions import (
     payment,
     stock_level,
 )
+from benchmark.tpcc.phases.load import execute_sql_file
 
 EMPTY_PRICE_RESULT = (
     "+------------------+\n"
@@ -61,10 +64,105 @@ def deterministic_valid_randint(low: int, high: int) -> int:
 
 
 class TransactionsTest(unittest.TestCase):
+    def test_sqlite_payment_and_new_order_maintain_accounting_fields(self) -> None:
+        backend = SqliteBackend(":memory:")
+        schema = Path(__file__).parents[1] / "schema" / "sqlite_schema.sql"
+        execute_sql_file(backend, schema)
+        backend.execute(
+            "insert into warehouse values (1, 'w', 's1', 's2', 'city', 'ST', 'zip', 0.1, 300000);"
+        )
+        backend.execute(
+            "insert into district values (1, 1, 'd', 's1', 's2', 'city', 'ST', 'zip', 0.1, 30000, 3001);"
+        )
+        backend.execute(
+            "insert into customer values (1, 1, 1, 'first', 'OE', 'last', 's1', 's2', 'city', 'ST', "
+            "'zip', 'phone', '2026-01-01 00:00:00', 'GC', 50000, 0.1, -10, 10, 1, 0, 'data');"
+        )
+        backend.execute(
+            "insert into history values (1, 1, 1, 1, 1, '2026-01-01 00:00:00', 10, 'initial');"
+        )
+        backend.execute("insert into item values (1, 1, 'item', 2.5, 'data');")
+        backend.execute(
+            "insert into stock values (1, 1, 50, '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', "
+            "0, 0, 0, 'data');"
+        )
+        ctx = TxnContext(
+            w_id=1, d_id=1, warehouses=1, item_count=1, customers_per_district=1
+        )
+
+        with mock.patch(
+            "benchmark.tpcc.core.transactions.random.randint", return_value=1
+        ):
+            with mock.patch(
+                "benchmark.tpcc.core.transactions.random.uniform", return_value=10.0
+            ):
+                payment(backend, ctx)
+        with mock.patch(
+            "benchmark.tpcc.core.transactions.random.randint",
+            side_effect=deterministic_valid_randint,
+        ):
+            new_order(backend, ctx)
+
+        self.assertEqual(
+            backend.execute(
+                "select c_balance, c_ytd_payment, c_payment_cnt from customer;"
+            ),
+            "-20.0|20.0|2",
+        )
+        self.assertEqual(
+            backend.execute(
+                "select s_quantity, s_ytd, s_order_cnt, s_remote_cnt from stock;"
+            ),
+            "45|5.0|5|0",
+        )
+        self.assertEqual(backend.execute("select d_next_o_id from district;"), "3002")
+        self.assertEqual(backend.execute("select count(*) from orders;"), "1")
+        self.assertEqual(backend.execute("select count(*) from order_line;"), "5")
+        backend.close()
+
+    def test_new_order_marks_remote_order_not_all_local(self) -> None:
+        backend = FakeBackend(
+            {
+                "select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;": "3002",
+                "select i_price, i_name, i_data from item where i_id = 1;": "2.50",
+            }
+        )
+        ctx = TxnContext(
+            w_id=1, d_id=1, warehouses=2, item_count=1, customers_per_district=1
+        )
+        percent_calls = 0
+
+        def remote_once_randint(low: int, high: int) -> int:
+            nonlocal percent_calls
+            if (low, high) == (5, 15):
+                return 5
+            if (low, high) == (1, 100):
+                percent_calls += 1
+                return 1 if percent_calls == 2 else 2
+            if (low, high) == (1, 2):
+                return 2
+            return low
+
+        with mock.patch(
+            "benchmark.tpcc.core.transactions.random.randint",
+            side_effect=remote_once_randint,
+        ):
+            new_order(backend, ctx)
+
+        self.assertIn(
+            "update stock set s_ytd = s_ytd + 1, s_order_cnt = s_order_cnt + 1, "
+            "s_remote_cnt = s_remote_cnt + 1 where s_i_id = 1 and s_w_id = 2;",
+            backend.statements,
+        )
+        self.assertIn(
+            "update orders set o_all_local = 0 where o_id = 3001 and o_d_id = 1 and o_w_id = 1;",
+            backend.statements,
+        )
+
     def test_new_order_uses_final_sql_shape_for_order_id_and_stock(self) -> None:
         backend = FakeBackend(
             {
-                "select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;": "3001",
+                "select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;": "3002",
                 "select i_price, i_name, i_data from item where i_id = 1;": "2.50",
                 "select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, "
                 "s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = 1 "
@@ -82,7 +180,7 @@ class TransactionsTest(unittest.TestCase):
             new_order(backend, ctx)
 
         district_update = (
-            "update district set d_next_o_id = 3002 where d_id = 1 and d_w_id = 1;"
+            "update district set d_next_o_id = d_next_o_id + 1 where d_id = 1 and d_w_id = 1;"
         )
         district_select = (
             "select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;"
@@ -90,8 +188,8 @@ class TransactionsTest(unittest.TestCase):
         self.assertIn(district_update, backend.statements)
         self.assertIn(district_select, backend.statements)
         self.assertLess(
-            backend.statements.index(district_select),
             backend.statements.index(district_update),
+            backend.statements.index(district_select),
         )
         self.assertTrue(
             any(
@@ -111,8 +209,26 @@ class TransactionsTest(unittest.TestCase):
             backend.statements,
         )
         self.assertIn(
-            "update stock set s_quantity = 49 where s_i_id = 1 and s_w_id = 1;",
+            "update stock set s_ytd = s_ytd + 1, s_order_cnt = s_order_cnt + 1, "
+            "s_remote_cnt = s_remote_cnt + 0 where s_i_id = 1 and s_w_id = 1;",
             backend.statements,
+        )
+        self.assertIn(
+            "update stock set s_quantity = s_quantity - 1 where s_i_id = 1 and s_w_id = 1;",
+            backend.statements,
+        )
+        stock_lock = next(
+            statement
+            for statement in backend.statements
+            if statement.startswith("update stock set s_ytd")
+        )
+        stock_select = next(
+            statement
+            for statement in backend.statements
+            if statement.startswith("select s_quantity")
+        )
+        self.assertLess(
+            backend.statements.index(stock_lock), backend.statements.index(stock_select)
         )
         self.assertTrue(backend.committed)
 
@@ -169,7 +285,7 @@ class TransactionsTest(unittest.TestCase):
             )
         )
 
-    def test_payment_reads_customer_before_constant_balance_update(self) -> None:
+    def test_payment_uses_atomic_customer_accounting_update(self) -> None:
         customer_select = (
             "select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, "
             "c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where "
@@ -202,9 +318,15 @@ class TransactionsTest(unittest.TestCase):
             backend.statements,
         )
         self.assertIn(customer_select, backend.statements)
-        self.assertIn(
-            "update customer set c_balance = 90.0 where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
-            backend.statements,
+        customer_update = (
+            "update customer set c_balance = c_balance - 10.0, "
+            "c_ytd_payment = c_ytd_payment + 10.0, c_payment_cnt = c_payment_cnt + 1 "
+            "where c_w_id = 1 and c_d_id = 1 and c_id = 1;"
+        )
+        self.assertIn(customer_update, backend.statements)
+        self.assertLess(
+            backend.statements.index(customer_update),
+            backend.statements.index(customer_select),
         )
 
     def test_order_status_uses_final_last_name_sql_shape(self) -> None:
@@ -268,8 +390,7 @@ class TransactionsTest(unittest.TestCase):
             {
                 "select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;": "3001",
                 "select o_c_id from orders where o_id = 3001 and o_d_id = 1 and o_w_id = 1;": "7",
-                "select sum(ol_amount) from order_line where ol_o_id = 3001 and ol_d_id = 1;": "42.5",
-                "select c_balance from customer where c_id = 7 and c_d_id = 1 and c_w_id = 1;": "100.0",
+                "select sum(ol_amount) from order_line where ol_o_id = 3001 and ol_d_id = 1 and ol_w_id = 1;": "42.5",
             }
         )
         ctx = TxnContext(
@@ -291,11 +412,25 @@ class TransactionsTest(unittest.TestCase):
             backend.statements,
         )
         self.assertIn(
-            "select sum(ol_amount) from order_line where ol_o_id = 3001 and ol_d_id = 1;",
+            "select sum(ol_amount) from order_line where ol_o_id = 3001 and ol_d_id = 1 and ol_w_id = 1;",
             backend.statements,
         )
         self.assertIn(
-            "update customer set c_balance = 142.5, c_delivery_cnt = c_delivery_cnt + 1 "
+            "update district set d_next_o_id = d_next_o_id + 0 where d_w_id = 1 and d_id = 1;",
+            backend.statements,
+        )
+        district_lock = (
+            "update district set d_next_o_id = d_next_o_id + 0 where d_w_id = 1 and d_id = 1;"
+        )
+        pending_select = (
+            "select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;"
+        )
+        self.assertLess(
+            backend.statements.index(district_lock),
+            backend.statements.index(pending_select),
+        )
+        self.assertIn(
+            "update customer set c_balance = c_balance + 42.5, c_delivery_cnt = c_delivery_cnt + 1 "
             "where c_id = 7 and c_d_id = 1 and c_w_id = 1;",
             backend.statements,
         )

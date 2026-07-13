@@ -144,7 +144,7 @@ private:
             value.int_val = *reinterpret_cast<const int*>(data);
             break;
         case TYPE_FLOAT:
-            value.float_val = *reinterpret_cast<const float*>(data);
+            value.float_val = *reinterpret_cast<const double*>(data);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -197,7 +197,7 @@ private:
             *reinterpret_cast<int*>(dest + col.offset) = value.int_val;
             break;
         case TYPE_FLOAT:
-            *reinterpret_cast<float*>(dest + col.offset) = value.float_val;
+            *reinterpret_cast<double*>(dest + col.offset) = value.float_val;
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -389,15 +389,14 @@ private:
             if (spec.input_type == TYPE_INT) {
                 value.int_val = static_cast<int>(state.sum);
             } else {
-                value.float_val = static_cast<float>(state.sum);
+                value.float_val = state.sum;
             }
             return value;
         }
         case LocalAggType::AVG: {
             CellValue value;
             value.type = TYPE_FLOAT;
-            value.float_val =
-                state.count == 0 ? 0.0f : static_cast<float>(state.sum / static_cast<double>(state.count));
+            value.float_val = state.count == 0 ? 0.0 : state.sum / static_cast<double>(state.count);
             return value;
         }
         case LocalAggType::MAX:
@@ -603,7 +602,7 @@ private:
                 break;
             case LocalAggType::AVG:
                 output_col.type = TYPE_FLOAT;
-                output_col.len = static_cast<int>(sizeof(float));
+                output_col.len = static_cast<int>(sizeof(double));
                 break;
             case LocalAggType::MAX:
             case LocalAggType::MIN:

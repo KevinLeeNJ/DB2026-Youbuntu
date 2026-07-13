@@ -524,7 +524,7 @@ public:
     }
 
     void create_scores() {
-        std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4}};
+        std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 8}};
         sm_manager->create_table("scores", cols, nullptr);
     }
 
@@ -566,7 +566,7 @@ public:
         executor.Next();
     }
 
-    void insert_score(int sid, int cid, float score) {
+    void insert_score(int sid, int cid, double score) {
         Value sid_val;
         sid_val.set_int(sid);
         Value cid_val;
@@ -729,9 +729,9 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
 
     create_scores();
     for (int sid = 10; sid <= 15; ++sid) {
-        insert_score(sid, 101, static_cast<float>(sid));
-        insert_score(sid, 102, static_cast<float>(sid) + 0.5F);
-        insert_score(sid, 103, static_cast<float>(sid) + 1.0F);
+        insert_score(sid, 101, static_cast<double>(sid));
+        insert_score(sid, 102, static_cast<double>(sid) + 0.5);
+        insert_score(sid, 103, static_cast<double>(sid) + 1.0);
     }
     sm_manager->create_index("scores", {"sid", "cid"}, nullptr);
 

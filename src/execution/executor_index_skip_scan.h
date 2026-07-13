@@ -160,8 +160,7 @@ public:
     void beginTuple() override {
         record_predicate_read();
 
-        use_heap_scan_for_mvcc_ = needs_historical_heap_scan();
-        if (use_heap_scan_for_mvcc_) {
+        if (needs_historical_index_candidates()) {
             scan_ = std::make_unique<RmScan>(fh_);
             IndexScanExecutor::advance_to_match();
             return;

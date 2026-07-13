@@ -48,6 +48,41 @@ def run_slow_server(
 
 
 class BackendProtocolTest(unittest.TestCase):
+    def test_snapshot_isolation_is_set_before_workload_commands(self) -> None:
+        captured: list[bytes] = []
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def serve() -> None:
+            conn, _ = server.accept()
+            with conn:
+                commands = []
+                pending = b""
+                while len(commands) < 2:
+                    pending += conn.recv(4096)
+                    while b"\0" in pending:
+                        command, pending = pending.split(b"\0", 1)
+                        commands.append(command)
+                        conn.sendall(b"OK\0")
+                        if len(commands) == 2:
+                            break
+                captured.extend(commands)
+            server.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        backend = RmdbBackend("127.0.0.1", port, isolation="snapshot-isolation")
+        self.assertEqual(backend.execute("select * from warehouse;"), "OK")
+        backend.close()
+        self.assertEqual(
+            captured,
+            [
+                b"set transaction isolation level snapshot isolation;",
+                b"select * from warehouse;",
+            ],
+        )
+
     def test_execute_sends_nul_terminated_single_command(self) -> None:
         captured: list[bytes] = []
         port = run_fake_server(b"OK\0", captured)

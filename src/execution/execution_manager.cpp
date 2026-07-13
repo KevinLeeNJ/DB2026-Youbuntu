@@ -120,6 +120,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
             }
             context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
             break;
         }
         case T_Transaction_rollback: {
@@ -128,6 +129,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
             context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
             break;
         }
         case T_Transaction_abort: {
@@ -136,6 +138,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
             }
             context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
             break;
         }
         default:
@@ -270,7 +273,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             if (col.type == TYPE_INT) {
                 col_str = std::to_string(*(int*)rec_buf);
             } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(*(float*)rec_buf);
+                col_str = std::to_string(*(double*)rec_buf);
             } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
                 col_str = std::string((char*)rec_buf, col.len);
                 col_str.resize(strlen(col_str.c_str()));

@@ -6,9 +6,20 @@ from benchmark.tpcc.core.backend import Backend, BackendAbort, BackendError
 
 
 class RmdbBackend(Backend):
-    def __init__(self, host: str, port: int, timeout: float = 30.0):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 30.0,
+        isolation: str = "read-committed",
+    ):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
+        if isolation == "snapshot-isolation":
+            self.execute("set transaction isolation level snapshot isolation;")
+        elif isolation != "read-committed":
+            self.close()
+            raise ValueError(f"unsupported rmdb isolation level: {isolation}")
 
     def execute(self, sql: str) -> str:
         if self.sock is None:

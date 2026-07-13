@@ -165,6 +165,7 @@ void client_handler(int fd) {
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
                     txn_manager->commit(context->txn_, context->log_mgr_);
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
             } catch (TransactionAbortException& e) {
@@ -178,9 +179,10 @@ void client_handler(int fd) {
                 if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
                     context->txn_->get_state() != TransactionState::COMMITTED) {
                     txn_manager->abort(context->txn_, log_manager.get());
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
-                LOG_WARN("transaction aborted: %s", e.GetInfo().c_str());
+                LOG_INFO("transaction aborted: %s", e.GetInfo().c_str());
 
                 if (sm_manager->output_file_enabled_) {
                     std::fstream outfile;
@@ -201,6 +203,7 @@ void client_handler(int fd) {
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
                     txn_manager->abort(context->txn_, context->log_mgr_);
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
 
@@ -218,6 +221,7 @@ void client_handler(int fd) {
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
                     txn_manager->abort(context->txn_, context->log_mgr_);
+                    txn_id = INVALID_TXN_ID;
                 }
                 context->txn_ = nullptr;
 
@@ -233,6 +237,15 @@ void client_handler(int fd) {
         // send result with fixed format, use protobuf in the future
         if (write(fd, data_send, offset + 1) == -1) {
             break;
+        }
+    }
+
+    // An abruptly closed session may still own an explicit transaction and its locks.
+    if (txn_id != INVALID_TXN_ID) {
+        Transaction* txn = txn_manager->get_transaction(txn_id);
+        if (txn != nullptr && txn->get_state() != TransactionState::COMMITTED &&
+            txn->get_state() != TransactionState::ABORTED) {
+            txn_manager->abort(txn, log_manager.get());
         }
     }
 
@@ -305,7 +318,7 @@ void start_server() {
 
 int main(int argc, char** argv) {
     minilog::Logger::get().init("rmdb.log");
-    minilog::Logger::get().set_level(minilog::LogLevel::INFO);
+    minilog::Logger::get().set_level(minilog::LogLevel::WARN);
 
     if (argc != 2) {
         // 需要指定数据库名称

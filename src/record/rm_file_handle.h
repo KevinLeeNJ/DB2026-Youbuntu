@@ -96,7 +96,11 @@ public:
     /* 判断指定位置上是否已经存在一条记录，通过Bitmap来判断 */
     bool is_record(const Rid& rid) const {
         RmPageHandle page_handle = fetch_page_handle(rid.page_no);
-        bool is_record = Bitmap::is_set(page_handle.bitmap, rid.slot_no); // page的slot_no位置上是否有record
+        bool is_record;
+        {
+            std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            is_record = Bitmap::is_set(page_handle.bitmap, rid.slot_no); // page的slot_no位置上是否有record
+        }
         buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
         return is_record;
     }
@@ -113,7 +117,7 @@ public:
 
     RmPinnedInsert prepare_insert_record();
 
-    void finish_insert_record(RmPinnedInsert& insert, char* buf);
+    void finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta = nullptr);
 
     void abort_prepared_insert(RmPinnedInsert& insert);
 

@@ -117,12 +117,12 @@ protected:
         switch (lhs_type) {
         case TYPE_INT:
         case TYPE_FLOAT: {
-            float lhs_val = lhs_type == TYPE_INT ? (float)*(int*)lhs_data : *(float*)lhs_data;
-            float rhs_val;
+            double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*(int*)lhs_data) : *(double*)lhs_data;
+            double rhs_val;
             if (cond.is_rhs_val) {
-                rhs_val = rhs_type == TYPE_INT ? (float)cond.rhs_val.int_val : cond.rhs_val.float_val;
+                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
             } else {
-                rhs_val = rhs_type == TYPE_INT ? (float)*(int*)rhs_data : *(float*)rhs_data;
+                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*(int*)rhs_data) : *(double*)rhs_data;
             }
             switch (cond.op) {
             case OP_EQ:

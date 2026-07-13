@@ -11,11 +11,13 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <utility>
+#include <vector>
 
 #include "execution_defs.h"
 #include "execution_common.h"
@@ -27,6 +29,27 @@ See the Mulan PSL v2 for more details. */
 
 class IndexScanExecutor : public AbstractExecutor {
 protected:
+    class RidVectorScan : public RecScan {
+    public:
+        explicit RidVectorScan(std::vector<Rid> rids) : rids_(std::move(rids)) {}
+
+        void next() override {
+            ++position_;
+        }
+
+        bool is_end() const override {
+            return position_ >= rids_.size();
+        }
+
+        Rid rid() const override {
+            return rids_[position_];
+        }
+
+    private:
+        std::vector<Rid> rids_;
+        size_t position_{0};
+    };
+
     std::string tab_name_;              // 表名称
     TabMeta tab_;                       // 表的元数据
     std::vector<Condition> conds_;      // 扫描条件
@@ -42,7 +65,7 @@ protected:
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
     bool predicate_recorded_{false};
-    bool use_heap_scan_for_mvcc_{false};
+    bool use_historical_index_candidates_{false};
     std::unique_ptr<RmRecord> buffered_record_;
 
     SmManager* sm_manager_;
@@ -101,7 +124,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            float value = std::numeric_limits<float>::lowest();
+            double value = std::numeric_limits<double>::lowest();
             memcpy(dest, &value, col.len);
             break;
         }
@@ -120,7 +143,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            float value = std::numeric_limits<float>::max();
+            double value = std::numeric_limits<double>::max();
             memcpy(dest, &value, col.len);
             break;
         }
@@ -140,7 +163,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            float converted = value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+            double converted = value.type == TYPE_INT ? static_cast<double>(value.int_val) : value.float_val;
             memcpy(data.data(), &converted, col.len);
             break;
         }
@@ -203,13 +226,22 @@ protected:
         return constraints;
     }
 
-    bool needs_historical_heap_scan() const {
+    bool needs_historical_index_candidates() const {
         if (context_ == nullptr || context_->txn_ == nullptr) {
             return false;
         }
         IsolationLevel level = context_->txn_->get_isolation_level();
-        return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::REPEATABLE_READ ||
-               (level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode());
+        if (level != IsolationLevel::SNAPSHOT_ISOLATION && level != IsolationLevel::REPEATABLE_READ &&
+            !(level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode())) {
+            return false;
+        }
+
+        // The current index can miss a tuple visible to an older snapshot only
+        // after its indexed key was changed or deleted. Those old keys are
+        // tracked by SmManager; non-index updates and post-snapshot inserts are
+        // handled by GetVisibleRecord.
+        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+        return sm_manager_->has_historical_index_keys(tab_name_, index_name);
     }
 
 public:
@@ -243,12 +275,7 @@ public:
     void beginTuple() override {
         record_predicate_read();
 
-        use_heap_scan_for_mvcc_ = needs_historical_heap_scan();
-        if (use_heap_scan_for_mvcc_) {
-            scan_ = std::make_unique<RmScan>(fh_);
-            advance_to_match();
-            return;
-        }
+        use_historical_index_candidates_ = needs_historical_index_candidates();
 
         auto ih =
             sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
@@ -318,7 +345,43 @@ public:
             lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
             upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
         }
-        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+        // READ COMMITTED normally reads only the current index. A writer can
+        // nevertheless remove an exact key before publishing its replacement
+        // tuple meta, leaving a reader unable to reach the writer's undo
+        // version. Probe that one historical key without adopting SI's broad
+        // historical-index scan on the RC hot path.
+        bool use_rc_exact_historical_key = false;
+        std::vector<Rid> rc_exact_historical_rids;
+        if (!use_historical_index_candidates_ && context_ != nullptr && context_->txn_ != nullptr &&
+            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && !lower_exclusive &&
+            upper_inclusive && lower_key == upper_key) {
+            const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+            rc_exact_historical_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, lower_key);
+            use_rc_exact_historical_key = !rc_exact_historical_rids.empty();
+        }
+
+        if (use_historical_index_candidates_ || use_rc_exact_historical_key) {
+            std::vector<Rid> rids;
+            for (IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+                 !index_scan.is_end(); index_scan.next()) {
+                rids.push_back(index_scan.rid());
+            }
+
+            std::vector<Rid> historical_rids = std::move(rc_exact_historical_rids);
+            if (use_historical_index_candidates_) {
+                const std::string index_name =
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+                historical_rids = sm_manager_->get_historical_index_rids(tab_name_, index_name);
+            }
+            for (const Rid& historical_rid : historical_rids) {
+                if (std::find(rids.begin(), rids.end(), historical_rid) == rids.end()) {
+                    rids.push_back(historical_rid);
+                }
+            }
+            scan_ = std::make_unique<RidVectorScan>(std::move(rids));
+        } else {
+            scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+        }
         advance_to_match();
     }
 
@@ -416,7 +479,7 @@ public:
     // it is constrained to a single equality value (so the remaining order is
     // monotonic in `col`).
     bool provides_min_order(const TabCol& col) const override {
-        if (use_heap_scan_for_mvcc_) {
+        if (use_historical_index_candidates_) {
             return false;
         }
         if (!col.tab_name.empty() && col.tab_name != tab_name_) {

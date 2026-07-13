@@ -238,6 +238,8 @@ private:
 
     // 垃圾回收节流计数（在 latch_ 下维护）
     uint64_t commits_since_gc_{0};
+    bool gc_running_{false};
+    bool gc_requested_{false};
 
     /** 节流式触发垃圾回收：按提交计数或 txn_map 规模决定是否真正执行。 */
     void MaybeRunGarbageCollection();

@@ -387,7 +387,7 @@ private:
             return std::make_unique<TypeLen>(SV_TYPE_INT, sizeof(int));
         }
         if (match(TokenType::FLOAT)) {
-            return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
+            return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(double));
         }
         if (match(TokenType::DATETIME)) {
             return std::make_unique<TypeLen>(SV_TYPE_DATETIME, 19);
@@ -477,7 +477,7 @@ private:
 
     std::unique_ptr<FloatLit> parse_float_literal(bool is_negative = false) {
         Token token = expect(TokenType::VALUE_FLOAT, "expected float");
-        float val = static_cast<float>(token.float_value);
+        double val = token.float_value;
         std::string display = token_text(token);
         if (is_negative) {
             val = -val;
@@ -811,7 +811,7 @@ private:
         default:
             error("invalid arithmetic operator");
         }
-        return std::make_unique<FloatLit>(static_cast<float>(res), "");
+        return std::make_unique<FloatLit>(res, "");
     }
 
     std::unique_ptr<FromClause> parse_from_clause() {

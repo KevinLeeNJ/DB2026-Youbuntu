@@ -23,6 +23,8 @@ enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 /* 系统的隔离级别 */
 enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };
 
+// The benchmark and cloud deployment use READ COMMITTED unless a session
+// explicitly selects a stronger isolation level.
 constexpr IsolationLevel DEFAULT_ISOLATION_LEVEL = IsolationLevel::READ_COMMITTED;
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */

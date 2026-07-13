@@ -168,7 +168,7 @@ private:
 
         const char* data = get_operand_data(operand, left_rec, right_rec);
         return operand.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(data))
-                                        : static_cast<double>(*reinterpret_cast<const float*>(data));
+                                        : *reinterpret_cast<const double*>(data);
     }
 
     static std::string_view read_string_operand(const CompiledOperand& operand, const RmRecord& left_rec,
@@ -227,7 +227,7 @@ private:
             val.set_int(*reinterpret_cast<const int*>(data));
             break;
         case TYPE_FLOAT:
-            val.set_float(*reinterpret_cast<const float*>(data));
+            val.set_float(*reinterpret_cast<const double*>(data));
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:

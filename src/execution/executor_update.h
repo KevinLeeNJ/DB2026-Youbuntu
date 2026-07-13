@@ -56,6 +56,9 @@ public:
         for (Rid& rid : rids_) {
             std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
+                if (context_ != nullptr && context_->txn_ != nullptr) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+                }
                 continue;
             }
             bool match = true;
@@ -76,11 +79,11 @@ public:
                         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                     }
                     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
-                        context_->txn_mgr_->BeginStatement(txn);
-                        rec = GetVisibleRecord(fh_, rid, context_);
-                        if (rec == nullptr) {
-                            continue;
+                        auto current_record = GetCurrentRecordForRcWrite(fh_, rid, txn, context_);
+                        if (!current_record.has_value()) {
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
+                        rec = std::move(current_record->record);
                         bool latest_match = true;
                         for (const auto& cond : conds_) {
                             if (!compare(cond, *rec)) {
@@ -89,9 +92,9 @@ public:
                             }
                         }
                         if (!latest_match) {
-                            continue;
+                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
-                        TupleMeta latest_meta = fh_->get_tuple_meta(rid);
+                        const TupleMeta& latest_meta = current_record->meta;
                         if (has_non_self_ref_set && latest_meta.is_committed_ &&
                             latest_meta.writer_txn_id_ != txn->get_transaction_id() &&
                             latest_meta.commit_ts_ > statement_read_ts) {
@@ -250,10 +253,10 @@ public:
                 if (set_clause.op == UpdateOp::ASSIGNMENT) {
                     if (col_meta.type == TYPE_INT && rhs_col_meta.type == TYPE_FLOAT) {
                         *reinterpret_cast<int*>(data) =
-                            static_cast<int>(*reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset));
+                            static_cast<int>(*reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset));
                     } else if (col_meta.type == TYPE_FLOAT && rhs_col_meta.type == TYPE_INT) {
-                        *reinterpret_cast<float*>(data) =
-                            static_cast<float>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset));
+                        *reinterpret_cast<double*>(data) =
+                            static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset));
                     } else if (col_meta.type == TYPE_STRING || col_meta.type == TYPE_DATETIME) {
                         if (rhs_col_meta.type != TYPE_STRING && rhs_col_meta.type != TYPE_DATETIME) {
                             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
@@ -269,7 +272,8 @@ public:
                         if (rhs_col_meta.type != TYPE_FLOAT) {
                             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
                         }
-                        *reinterpret_cast<float*>(data) = *reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset);
+                        *reinterpret_cast<double*>(data) =
+                            *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
                     }
                     continue;
                 }
@@ -279,12 +283,12 @@ public:
                     throw IncompatibleTypeError(coltype2str(rhs_col_meta.type), coltype2str(set_clause.rhs.type));
                 }
 
-                float base = rhs_col_meta.type == TYPE_INT
-                                 ? static_cast<float>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset))
-                                 : *reinterpret_cast<float*>(old_rec.data + rhs_col_meta.offset);
-                float delta = set_clause.rhs.type == TYPE_INT ? static_cast<float>(set_clause.rhs.int_val)
-                                                              : set_clause.rhs.float_val;
-                float result = base;
+                double base = rhs_col_meta.type == TYPE_INT
+                                  ? static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset))
+                                  : *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
+                double delta = set_clause.rhs.type == TYPE_INT ? static_cast<double>(set_clause.rhs.int_val)
+                                                               : set_clause.rhs.float_val;
+                double result = base;
                 switch (set_clause.op) {
                 case UpdateOp::SELF_ADD:
                     result = base + delta;
@@ -311,7 +315,7 @@ public:
                     *reinterpret_cast<int*>(data) = static_cast<int>(result);
                     break;
                 case TYPE_FLOAT:
-                    *reinterpret_cast<float*>(data) = result;
+                    *reinterpret_cast<double*>(data) = result;
                     break;
                 case TYPE_STRING:
                 case TYPE_DATETIME:
@@ -333,9 +337,9 @@ public:
             }
             case TYPE_FLOAT: {
                 if (set_clause.rhs.type == TYPE_FLOAT) {
-                    *(float*)data = set_clause.rhs.float_val;
+                    *(double*)data = set_clause.rhs.float_val;
                 } else {
-                    *(float*)data = (float)set_clause.rhs.int_val;
+                    *(double*)data = static_cast<double>(set_clause.rhs.int_val);
                 }
                 break;
             }

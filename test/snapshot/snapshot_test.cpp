@@ -93,6 +93,124 @@ TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockRejectsSecondWriter) {
         << "A second writer must not be able to concurrently own the same RID";
 }
 
+TEST(SnapshotIsolationConcurrencyTest, ExplicitReadCommittedWriterWaitsForRecordLock) {
+    LockManager lock_manager;
+    Transaction owner(1001, IsolationLevel::READ_COMMITTED);
+    Transaction waiter(1002, IsolationLevel::READ_COMMITTED);
+    waiter.set_txn_mode(true);
+    Rid rid{1, 0};
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    std::atomic<bool> started{false};
+    std::atomic<bool> acquired{false};
+    std::thread waiter_thread([&] {
+        started.store(true);
+        acquired.store(lock_manager.lock_exclusive_on_record(&waiter, rid, 42));
+    });
+
+    while (!started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(acquired.load());
+    ASSERT_TRUE(lock_manager.unlock(&owner, LockDataId(42, rid, LockDataType::RECORD)));
+    waiter_thread.join();
+
+    EXPECT_TRUE(acquired.load());
+    EXPECT_EQ(waiter.get_lock_set()->count(LockDataId(42, rid, LockDataType::RECORD)), 1u);
+    EXPECT_TRUE(lock_manager.unlock(&waiter, LockDataId(42, rid, LockDataType::RECORD)));
+}
+
+TEST(SnapshotIsolationConcurrencyTest, RecordLockWaitersAreGrantedInFifoOrder) {
+    LockManager lock_manager;
+    Transaction owner(1001, IsolationLevel::READ_COMMITTED);
+    Transaction first_waiter(1002, IsolationLevel::READ_COMMITTED);
+    Transaction second_waiter(1003, IsolationLevel::READ_COMMITTED);
+    first_waiter.set_txn_mode(true);
+    second_waiter.set_txn_mode(true);
+    Rid rid{2, 0};
+    LockDataId lock_id(42, rid, LockDataType::RECORD);
+    std::mutex order_latch;
+    std::vector<txn_id_t> grant_order;
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    auto wait_and_release = [&](Transaction* txn) {
+        ASSERT_TRUE(lock_manager.lock_exclusive_on_record(txn, rid, 42));
+        {
+            std::scoped_lock<std::mutex> lock(order_latch);
+            grant_order.push_back(txn->get_transaction_id());
+        }
+        EXPECT_TRUE(lock_manager.unlock(txn, lock_id));
+    };
+
+    std::thread first_thread(wait_and_release, &first_waiter);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::thread second_thread(wait_and_release, &second_waiter);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
+    first_thread.join();
+    second_thread.join();
+
+    ASSERT_EQ(grant_order.size(), 2u);
+    EXPECT_EQ(grant_order[0], first_waiter.get_transaction_id());
+    EXPECT_EQ(grant_order[1], second_waiter.get_transaction_id());
+}
+
+TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAcquiring) {
+    LockManager lock_manager;
+    Transaction owner(1001, IsolationLevel::READ_COMMITTED);
+    Transaction waiter(1002, IsolationLevel::READ_COMMITTED);
+    waiter.set_txn_mode(true);
+    Rid rid{3, 0};
+    LockDataId lock_id(42, rid, LockDataType::RECORD);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    std::atomic<bool> started{false};
+    std::atomic<bool> acquired{true};
+    std::thread waiter_thread([&] {
+        started.store(true);
+        acquired.store(lock_manager.lock_exclusive_on_record(&waiter, rid, 42));
+    });
+
+    while (!started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    lock_manager.cancel_transaction(&waiter);
+    waiter_thread.join();
+
+    EXPECT_FALSE(acquired.load());
+    EXPECT_EQ(waiter.get_lock_set()->count(lock_id), 0u);
+    EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
+    EXPECT_FALSE(lock_manager.unlock(&waiter, lock_id));
+}
+TEST(SnapshotIsolationConcurrencyTest, IndependentRecordLocksProgressConcurrently) {
+    LockManager lock_manager;
+    constexpr int thread_count = 8;
+    constexpr int iterations = 1000;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+
+    for (int thread_no = 0; thread_no < thread_count; ++thread_no) {
+        threads.emplace_back([&, thread_no] {
+            Transaction txn(2000 + thread_no);
+            Rid rid{thread_no + 10, 0};
+            LockDataId lock_id(42, rid, LockDataType::RECORD);
+            for (int iteration = 0; iteration < iterations; ++iteration) {
+                if (!lock_manager.lock_exclusive_on_record(&txn, rid, 42) || !lock_manager.unlock(&txn, lock_id)) {
+                    failures.fetch_add(1);
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(failures.load(), 0);
+}
+
 // =============================================================================
 // SharedTestDB — shared in-process database engine for concurrent session tests
 // =============================================================================
@@ -197,7 +315,8 @@ private:
 
 class TestSession {
 public:
-    explicit TestSession(SharedTestDB* db) : db_(db) {}
+    explicit TestSession(SharedTestDB* db, IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL)
+        : db_(db), session_isolation_(isolation_level) {}
 
     /// Execute a single SQL statement (must include trailing ';').
     /// Returns the captured text output.
@@ -328,8 +447,8 @@ protected:
         db_.reset();
     }
 
-    std::unique_ptr<TestSession> create_session() {
-        return std::make_unique<TestSession>(db_.get());
+    std::unique_ptr<TestSession> create_session(IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL) {
+        return std::make_unique<TestSession>(db_.get(), isolation_level);
     }
 
     std::unique_ptr<SharedTestDB> db_;
@@ -344,8 +463,8 @@ TEST_F(SnapshotTest, RC_DefaultStatementSeesNewCommittedVersion) {
     ASSERT_TRUE(s->exec_sql_ok("create table rc_counter (id int, val int);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_counter values (1, 100);"));
 
-    auto t1 = create_session();
-    auto t2 = create_session();
+    auto t1 = create_session(IsolationLevel::READ_COMMITTED);
+    auto t2 = create_session(IsolationLevel::READ_COMMITTED);
 
     ASSERT_TRUE(t1->exec_sql_ok("begin;"));
     std::string first_read = t1->exec_sql("select * from rc_counter where id = 1;");
@@ -378,9 +497,9 @@ TEST_F(SnapshotTest, RC_DefaultUpdateUsesLatestCommittedVersion) {
     ASSERT_TRUE(s->exec_sql_ok("create table rc_update_latest (id int, val int);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_latest values (1, 100);"));
 
-    auto t1 = create_session();
-    auto t2 = create_session();
-    auto verifier = create_session();
+    auto t1 = create_session(IsolationLevel::READ_COMMITTED);
+    auto t2 = create_session(IsolationLevel::READ_COMMITTED);
+    auto verifier = create_session(IsolationLevel::READ_COMMITTED);
 
     ASSERT_TRUE(t1->exec_sql_ok("begin;"));
     ASSERT_TRUE(t1->exec_sql_ok("select * from rc_update_latest where id = 1;"));
@@ -408,9 +527,9 @@ TEST_F(SnapshotTest, RC_UpdateRechecksLatestVersionAfterWaitingForLock) {
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_recheck values (1, 100);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_recheck values (2, 100);"));
 
-    auto older = create_session();
-    auto writer = create_session();
-    auto verifier = create_session();
+    auto older = create_session(IsolationLevel::READ_COMMITTED);
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto verifier = create_session(IsolationLevel::READ_COMMITTED);
 
     ASSERT_TRUE(older->exec_sql_ok("begin;"));
     ASSERT_TRUE(older->exec_sql_ok("update rc_update_recheck set val = val + 1 where id = 2;"));
@@ -1552,6 +1671,56 @@ TEST_F(SnapshotTest, SI_IndexScanFindsHistoricalIndexedKeyVersion) {
         << "Index scans in a transaction must not miss the visible old version after the current index key changes";
 
     ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+}
+
+TEST_F(SnapshotTest, RC_IndexScanSeesOldKeyDuringUncommittedUpdate) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto reader = create_session(IsolationLevel::READ_COMMITTED);
+
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update t set id = 2 where id = 1;"));
+
+    std::string out = reader->exec_sql("select * from t where id = 1;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "RC index scans must retain an uncommitted writer's old indexed key";
+
+    ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
+}
+
+TEST_F(SnapshotTest, RC_IndexScanSeesDeletedKeyDuringUncommittedDelete) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto reader = create_session(IsolationLevel::READ_COMMITTED);
+
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("delete from t where id = 1;"));
+
+    std::string out = reader->exec_sql("select * from t where id = 1;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "RC index scans must retain an uncommitted delete's indexed key";
+
+    ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
 }
 
 TEST_F(SnapshotTest, SER_IndexScanFindsHistoricalIndexedKeyVersion) {

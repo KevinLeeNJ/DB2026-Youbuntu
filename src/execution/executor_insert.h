@@ -78,7 +78,7 @@ public:
                 }
                 // Convert value type for storage (e.g., INT literal into FLOAT column)
                 if (col.type == TYPE_FLOAT && val.type == TYPE_INT) {
-                    val.set_float(static_cast<float>(val.int_val));
+                    val.set_float(static_cast<double>(val.int_val));
                 } else if (col.type == TYPE_INT && val.type == TYPE_FLOAT) {
                     val.set_int(static_cast<int>(val.float_val));
                 } else if ((col.type == TYPE_STRING || col.type == TYPE_DATETIME) &&
@@ -114,6 +114,13 @@ public:
         bool insert_finished = false;
         try {
             rid_ = prepared_insert.rid;
+            TupleMeta pending_meta;
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                pending_meta.writer_txn_id_ = context_->txn_->get_transaction_id();
+                pending_meta.is_committed_ = false;
+                pending_meta.is_deleted_ = false;
+                pending_meta.version_chain_head_ = UndoLink{};
+            }
             if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
                 InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
                 log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
@@ -121,7 +128,8 @@ public:
                 context_->txn_->set_prev_lsn(lsn);
                 prepared_insert.page_handle.page->set_page_lsn(lsn);
             }
-            fh_->finish_insert_record(prepared_insert, rec.data);
+            fh_->finish_insert_record(prepared_insert, rec.data,
+                                      context_ != nullptr && context_->txn_ != nullptr ? &pending_meta : nullptr);
             insert_finished = true;
         } catch (...) {
             if (!insert_finished) {
@@ -152,13 +160,6 @@ public:
         }
         if (context_ != nullptr && context_->txn_ != nullptr) {
             context_->txn_->append_write_record(std::make_unique<WriteRecord>(WType::INSERT_TUPLE, tab_name_, rid_));
-            // Initialize TupleMeta for MVCC
-            TupleMeta meta;
-            meta.writer_txn_id_ = context_->txn_->get_transaction_id();
-            meta.is_committed_ = false;
-            meta.is_deleted_ = false;
-            meta.version_chain_head_ = UndoLink{};
-            fh_->set_tuple_meta(rid_, meta);
             context_->txn_->append_modified_slot(tab_name_, rid_);
 
             if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE &&

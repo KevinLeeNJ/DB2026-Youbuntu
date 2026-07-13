@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <list>
 #include <memory>
@@ -35,15 +36,23 @@ class LockManager {
         txn_id_t txn_id_;    // 申请加锁的事务ID
         LockMode lock_mode_; // 事务申请加锁的类型
         bool granted_;       // 该事务是否已经被赋予锁
+        bool cancelled_{false};
+        std::condition_variable cv_;
     };
 
     /* 数据项上的加锁队列 */
     class LockRequestQueue {
     public:
-        std::list<LockRequest> request_queue_; // 加锁队列
-        std::condition_variable cv_; // 条件变量，用于唤醒正在等待加锁的申请，在no-wait策略下无需使用
+        std::list<std::shared_ptr<LockRequest>> request_queue_; // 加锁队列
+        std::mutex latch_;
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK; // 加锁队列的锁模式
-        size_t waiting_count_ = 0;
+        size_t active_users_ = 0;                                 // 在分片锁外持有并访问该队列的线程数
+    };
+
+    class LockTableShard {
+    public:
+        std::mutex latch_;
+        std::unordered_map<LockDataId, std::shared_ptr<LockRequestQueue>> lock_table_;
     };
 
 public:
@@ -65,7 +74,17 @@ public:
 
     bool unlock(Transaction* txn, LockDataId lock_data_id);
 
+    // Cancel pending lock requests owned by txn. Granted locks are released by the transaction manager.
+    void cancel_transaction(Transaction* txn);
+
 private:
-    std::mutex latch_;                                                             // 用于锁表的并发
-    std::unordered_map<LockDataId, std::shared_ptr<LockRequestQueue>> lock_table_; // 全局锁表
+    static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
+
+    LockTableShard& get_shard(const LockDataId& lock_data_id);
+    std::shared_ptr<LockRequestQueue> get_or_create_queue(const LockDataId& lock_data_id);
+    std::shared_ptr<LockRequestQueue> get_queue(const LockDataId& lock_data_id);
+    void release_queue_user(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
+    void try_remove_empty_queue(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
+
+    std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
 };

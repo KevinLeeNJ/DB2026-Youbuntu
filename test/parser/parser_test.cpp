@@ -97,7 +97,7 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     EXPECT_EQ(bonus_clause->rhs_col->col_name, "bonus");
     auto bonus_delta = dynamic_cast<const ast::FloatLit*>(bonus_clause->val.get());
     ASSERT_NE(bonus_delta, nullptr);
-    EXPECT_FLOAT_EQ(bonus_delta->val, 0.5F);
+    EXPECT_DOUBLE_EQ(bonus_delta->val, 0.5);
 }
 
 TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
@@ -129,7 +129,7 @@ TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
     EXPECT_EQ(bonus_clause->rhs_col->col_name, "bonus");
     auto bonus_delta = dynamic_cast<const ast::FloatLit*>(bonus_clause->val.get());
     ASSERT_NE(bonus_delta, nullptr);
-    EXPECT_FLOAT_EQ(bonus_delta->val, 0.5F);
+    EXPECT_DOUBLE_EQ(bonus_delta->val, 0.5);
 }
 
 TEST(ParserTest, FoldsConstantArithmeticExpressions) {
@@ -167,7 +167,7 @@ TEST(ParserTest, FoldsConstantArithmeticExpressions) {
         auto sel = as_node<ast::SelectStmt>(parsed);
         auto lit = dynamic_cast<const ast::FloatLit*>(sel->conds.front()->rhs.get());
         ASSERT_NE(lit, nullptr);
-        EXPECT_FLOAT_EQ(lit->val, 8.0F);
+        EXPECT_DOUBLE_EQ(lit->val, 8.0);
     }
     // 括号外接算术
     {
@@ -375,7 +375,7 @@ TEST(ParserTest, ParsesOptionalWhereAndNegativeLiterals) {
     ASSERT_NE(int_lit, nullptr);
     ASSERT_NE(float_lit, nullptr);
     EXPECT_EQ(int_lit->val, -1);
-    EXPECT_FLOAT_EQ(float_lit->val, -2.5F);
+    EXPECT_DOUBLE_EQ(float_lit->val, -2.5);
 }
 
 TEST(ParserTest, RejectsUnterminatedBlockComment) {

@@ -28,6 +28,9 @@ RMDB_DB_DIR=""
 RESTART_TIMEOUT=120
 REGENERATE_DATA=0
 DATA_ARGS="--reuse-data-dir"
+THINK_MS=0
+RECONNECT_EACH_TXN=0
+ISOLATION="read-committed"
 
 usage() {
     cat <<EOF
@@ -45,6 +48,9 @@ Usage: $0 [options]
   --json-out PATH          result.json path
   --rmdb-db-dir PATH       passed through to tpcc_run
   --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 120)
+  --think-ms N             pause N milliseconds between transactions (default: 0)
+  --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
+  --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate (passed to tpcc_run)
   --reuse-data-dir         reuse CSV data (passed to tpcc_run, default)
@@ -67,6 +73,9 @@ while [[ $# -gt 0 ]]; do
         --json-out) JSON_OUT="$2"; shift 2 ;;
         --rmdb-db-dir) RMDB_DB_DIR="$2"; shift 2 ;;
         --restart-timeout) RESTART_TIMEOUT="$2"; shift 2 ;;
+        --think-ms) THINK_MS="$2"; shift 2 ;;
+        --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
+        --isolation) ISOLATION="$2"; shift 2 ;;
         --regenerate-data) REGENERATE_DATA=1; shift ;;
         --overwrite-data-dir) DATA_ARGS="--overwrite-data-dir"; shift ;;
         --reuse-data-dir) DATA_ARGS="--reuse-data-dir"; shift ;;
@@ -74,6 +83,23 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ ! "$THINK_MS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "--think-ms must be a non-negative number" >&2
+    exit 2
+fi
+if [[ "$RECONNECT_EACH_TXN" != "0" && "$RECONNECT_EACH_TXN" != "1" ]]; then
+    echo "--reconnect-each-txn must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$ISOLATION" != "read-committed" && "$ISOLATION" != "snapshot-isolation" ]]; then
+    echo "--isolation must be read-committed or snapshot-isolation" >&2
+    exit 2
+fi
+if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--rounds must be a positive integer" >&2
+    exit 2
+fi
 
 if [[ "$REGENERATE_DATA" -eq 1 ]]; then
     rm -rf "$DATA_DIR"
@@ -95,10 +121,8 @@ PY
     DATA_COMPLETE=1
 fi
 
-PHASES="load run"
 if [[ "$DATA_COMPLETE" -eq 0 ]]; then
     echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
-    PHASES="datagen load run"
     # Force overwrite so datagen proceeds even if some partial CSVs exist.
     DATA_ARGS="--overwrite-data-dir"
 fi
@@ -155,47 +179,82 @@ PY
 RMDB_DB_ARG=()
 [[ -n "$RMDB_DB_DIR" ]] && RMDB_DB_ARG=(--rmdb-db-dir "$RMDB_DB_DIR")
 
-echo "[benchmark] 启动 rmdb server (db=$DB_DIR)"
-"$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
-wait_port 30
+ROUND_RESULTS=()
+for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
+    ROUND_JSON="${JSON_OUT}.round-${ROUND_NO}.tmp"
+    ROUND_RESULTS+=("$ROUND_JSON")
+    rm -rf "$DB_DIR" "$ROUND_JSON"
 
-echo "[benchmark] $PHASES: warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s rounds=$ROUNDS"
-python3 -m benchmark.tpcc.tpcc_run $PHASES \
-    --backend rmdb \
-    --port "$PORT" \
-    --warehouses "$WAREHOUSES" \
-    --workers "$WORKERS" \
-    --warmup "$WARMUP" \
-    --measure "$MEASURE" \
-    --rounds "$ROUNDS" \
-    --progress-interval "$PROGRESS_INTERVAL" \
-    --data-dir "$DATA_DIR" \
-    --json-out "$JSON_OUT" \
-    "${RMDB_DB_ARG[@]}" \
-    $DATA_ARGS
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: 启动全新 rmdb server (db=$DB_DIR)"
+    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    wait_port 30
 
-echo "[benchmark] kill -9 rmdb server (pid=$SERVER_PID) 触发崩溃恢复"
-kill -KILL "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-SERVER_PID=""
+    ROUND_PHASES="load run"
+    if [[ "$ROUND_NO" -eq 1 && "$DATA_COMPLETE" -eq 0 ]]; then
+        ROUND_PHASES="datagen load run"
+    fi
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: $ROUND_PHASES isolation=$ISOLATION warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
+    RMDB_BENCH_THINK_MS="$THINK_MS" \
+    RMDB_BENCH_RECONNECT_EACH_TXN="$RECONNECT_EACH_TXN" \
+    python3 -m benchmark.tpcc.tpcc_run $ROUND_PHASES \
+        --backend rmdb \
+        --port "$PORT" \
+        --isolation "$ISOLATION" \
+        --warehouses "$WAREHOUSES" \
+        --workers "$WORKERS" \
+        --warmup "$WARMUP" \
+        --measure "$MEASURE" \
+        --rounds 1 \
+        --progress-interval "$PROGRESS_INTERVAL" \
+        --data-dir "$DATA_DIR" \
+        --json-out "$ROUND_JSON" \
+        "${RMDB_DB_ARG[@]}" \
+        $DATA_ARGS
 
-echo "[benchmark] 重启 rmdb server，等待恢复就绪 (最长 ${RESTART_TIMEOUT}s)"
-"$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
-wait_port "$RESTART_TIMEOUT"
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: kill -9 rmdb server (pid=$SERVER_PID) 触发崩溃恢复"
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
 
-echo "[benchmark] 一致性检查 (基于 $JSON_OUT)"
-set +e
-python3 -m benchmark.tpcc.tpcc_run consistency \
-    --backend rmdb \
-    --port "$PORT" \
-    --result-json "$JSON_OUT"
-consistency_status=$?
-set -e
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: 重启 rmdb server，等待恢复就绪 (最长 ${RESTART_TIMEOUT}s)"
+    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    wait_port "$RESTART_TIMEOUT"
 
-kill -KILL "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-SERVER_PID=""
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: 恢复后一致性检查"
+    python3 -m benchmark.tpcc.tpcc_run consistency \
+        --backend rmdb \
+        --port "$PORT" \
+        --isolation "$ISOLATION" \
+        --consistency-stage "post-recovery-round-$ROUND_NO" \
+        --result-json "$ROUND_JSON"
 
-exit "$consistency_status"
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+done
+
+python3 - "$JSON_OUT" "$ROUNDS" "${ROUND_RESULTS[@]}" <<'PY'
+import json
+import statistics
+import sys
+from pathlib import Path
+
+output_path = Path(sys.argv[1])
+round_count = int(sys.argv[2])
+result_paths = [Path(value) for value in sys.argv[3:]]
+documents = [json.loads(path.read_text()) for path in result_paths]
+rounds = [document["rounds"][0] for document in documents]
+summary = documents[0]
+summary["config"]["rounds"] = round_count
+summary["median_tpmc"] = float(statistics.median(item["tpmc"] for item in rounds))
+summary["rounds"] = rounds
+output_path.parent.mkdir(parents=True, exist_ok=True)
+output_path.write_text(json.dumps(summary, indent=2))
+print(json.dumps(summary, indent=2))
+for path in result_paths:
+    path.unlink()
+PY
+
+echo "[benchmark] all $ROUNDS independent round(s) complete: result=$JSON_OUT"

@@ -36,18 +36,6 @@ def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def first_row(text: str) -> list[str]:
-    rows = parse_table_rows(text)
-    return rows[0] if rows else []
-
-
-def row_float(text: str, index: int, default: float = 0.0) -> float:
-    row = first_row(text)
-    if index >= len(row):
-        return default
-    return scalar_float(row[index], default)
-
-
 def new_order(backend: Backend, ctx: TxnContext) -> None:
     c_id = random.randint(1, ctx.customers_per_district)
     ol_cnt = random.randint(5, 15)
@@ -57,17 +45,21 @@ def new_order(backend: Backend, ctx: TxnContext) -> None:
             f"select c_discount, c_last, c_credit, w_tax from customer, warehouse where w_id = {ctx.w_id} "
             f"and c_w_id = w_id and c_d_id = {ctx.d_id} and c_id = {c_id};"
         )
-        d_next = scalar_int(
+        # Acquire the district write lock before reading the assigned id. Under
+        # RC, a SELECT followed by a constant UPDATE can allocate the same id
+        # twice; the self-relative UPDATE serializes allocators instead.
+        backend.execute(
+            f"update district set d_next_o_id = d_next_o_id + 1 where d_id = {ctx.d_id} and d_w_id = {ctx.w_id};"
+        )
+        next_after_increment = scalar_int(
             backend.execute(
                 f"select d_next_o_id, d_tax from district where d_id = {ctx.d_id} and d_w_id = {ctx.w_id};"
             ),
             -1,
         )
-        if d_next <= 0:
+        if next_after_increment <= 1:
             raise BackendError("district next order id not found")
-        backend.execute(
-            f"update district set d_next_o_id = {d_next + 1} where d_id = {ctx.d_id} and d_w_id = {ctx.w_id};"
-        )
+        d_next = next_after_increment - 1
         backend.execute(
             f"insert into orders values ({d_next}, {ctx.d_id}, {ctx.w_id}, {c_id}, '{now_text()}', 0, {ol_cnt}, 1);"
         )
@@ -75,6 +67,7 @@ def new_order(backend: Backend, ctx: TxnContext) -> None:
             f"insert into new_orders values ({d_next}, {ctx.d_id}, {ctx.w_id});"
         )
         invalid = random.randint(1, 100) == 1
+        all_local = True
         for number in range(1, ol_cnt + 1):
             item_id = (
                 ctx.item_count + 1
@@ -92,6 +85,15 @@ def new_order(backend: Backend, ctx: TxnContext) -> None:
             if ctx.warehouses > 1 and random.randint(1, 100) == 1:
                 while supply_w_id == ctx.w_id:
                     supply_w_id = random.randint(1, ctx.warehouses)
+                all_local = False
+            remote_increment = 1 if supply_w_id != ctx.w_id else 0
+            # Updating the counters first acquires the stock-row write lock.
+            # The following quantity read/modify step is then protected at RC.
+            backend.execute(
+                f"update stock set s_ytd = s_ytd + {qty}, s_order_cnt = s_order_cnt + 1, "
+                f"s_remote_cnt = s_remote_cnt + {remote_increment} where s_i_id = {item_id} "
+                f"and s_w_id = {supply_w_id};"
+            )
             stock_qty = scalar_int(
                 backend.execute(
                     f"select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, "
@@ -100,13 +102,20 @@ def new_order(backend: Backend, ctx: TxnContext) -> None:
                 ),
                 10,
             )
-            new_qty = stock_qty + 91 - qty if stock_qty - qty < 10 else stock_qty - qty
+            quantity_delta = 91 - qty if stock_qty - qty < 10 else -qty
+            quantity_op = "+" if quantity_delta >= 0 else "-"
             backend.execute(
-                f"update stock set s_quantity = {new_qty} where s_i_id = {item_id} and s_w_id = {supply_w_id};"
+                f"update stock set s_quantity = s_quantity {quantity_op} {abs(quantity_delta)} "
+                f"where s_i_id = {item_id} and s_w_id = {supply_w_id};"
             )
             backend.execute(
                 f"insert into order_line values ({d_next}, {ctx.d_id}, {ctx.w_id}, {number}, {item_id}, {supply_w_id}, "
                 f"'{now_text()}', {qty}, {round(price * qty, 2)}, 'dist');"
+            )
+        if not all_local:
+            backend.execute(
+                f"update orders set o_all_local = 0 where o_id = {d_next} and o_d_id = {ctx.d_id} "
+                f"and o_w_id = {ctx.w_id};"
             )
         backend.commit()
     except InvalidItemRollback:
@@ -131,15 +140,15 @@ def payment(backend: Backend, ctx: TxnContext) -> None:
         f"select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where "
         f"d_w_id = {ctx.w_id} and d_id = {ctx.d_id};"
     )
-    customer_text = backend.execute(
+    backend.execute(
+        f"update customer set c_balance = c_balance - {amount}, "
+        f"c_ytd_payment = c_ytd_payment + {amount}, c_payment_cnt = c_payment_cnt + 1 "
+        f"where c_w_id = {ctx.w_id} and c_d_id = {ctx.d_id} and c_id = {c_id};"
+    )
+    backend.execute(
         f"select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, "
         f"c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where "
         f"c_w_id = {ctx.w_id} and c_d_id = {ctx.d_id} and c_id = {c_id};"
-    )
-    new_balance = round(row_float(customer_text, 12, 0.0) - amount, 2)
-    backend.execute(
-        f"update customer set c_balance = {new_balance} where c_w_id = {ctx.w_id} and c_d_id = {ctx.d_id} "
-        f"and c_id = {c_id};"
     )
     backend.execute(
         f"insert into history values ({c_id}, {ctx.d_id}, {ctx.w_id}, {ctx.d_id}, {ctx.w_id}, '{now_text()}', "
@@ -183,6 +192,12 @@ def delivery(backend: Backend, ctx: TxnContext) -> None:
     carrier_id = random.randint(1, 10)
     backend.begin()
     for d_id in range(1, ctx.districts_per_warehouse + 1):
+        # Serialize Delivery and NewOrder for this district before choosing the
+        # oldest pending order. This prevents two RC transactions from both
+        # processing the same new_orders row.
+        backend.execute(
+            f"update district set d_next_o_id = d_next_o_id + 0 where d_w_id = {ctx.w_id} and d_id = {d_id};"
+        )
         o_id = scalar_int(
             backend.execute(
                 f"select min(no_o_id) from new_orders where no_w_id = {ctx.w_id} and no_d_id = {d_id};"
@@ -210,21 +225,14 @@ def delivery(backend: Backend, ctx: TxnContext) -> None:
         )
         amount = scalar_float(
             backend.execute(
-                f"select sum(ol_amount) from order_line where ol_o_id = {o_id} and ol_d_id = {d_id};"
+                f"select sum(ol_amount) from order_line where ol_o_id = {o_id} and ol_d_id = {d_id} "
+                f"and ol_w_id = {ctx.w_id};"
             ),
             0.0,
         )
         if customer_id > 0:
-            balance = scalar_float(
-                backend.execute(
-                    f"select c_balance from customer where c_id = {customer_id} and c_d_id = {d_id} "
-                    f"and c_w_id = {ctx.w_id};"
-                ),
-                0.0,
-            )
-            new_balance = round(balance + amount, 2)
             backend.execute(
-                f"update customer set c_balance = {new_balance}, c_delivery_cnt = c_delivery_cnt + 1 "
+                f"update customer set c_balance = c_balance + {amount}, c_delivery_cnt = c_delivery_cnt + 1 "
                 f"where c_id = {customer_id} and c_d_id = {d_id} and c_w_id = {ctx.w_id};"
             )
     backend.commit()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
@@ -28,6 +29,16 @@ TXN_FUNCS = {
 }
 
 _RESULT_LOCK = threading.Lock()
+
+
+def _debug_knobs() -> tuple[float, bool]:
+    """Optional timing knobs for reproducing transaction-lifecycle races."""
+    try:
+        think_ms = max(0.0, float(os.getenv("RMDB_BENCH_THINK_MS", "0")))
+    except ValueError:
+        think_ms = 0.0
+    reconnect = os.getenv("RMDB_BENCH_RECONNECT_EACH_TXN", "0") == "1"
+    return think_ms / 1000.0, reconnect
 
 
 @dataclass
@@ -92,6 +103,7 @@ def worker_loop(
     measure_end: float,
 ) -> None:
     backend = backend_factory()
+    think_seconds, reconnect_each_txn = _debug_knobs()
 
     def reconnect_backend() -> None:
         nonlocal backend
@@ -144,5 +156,9 @@ def worker_loop(
             latency_ms = (time.monotonic() - start) * 1000.0
             with _RESULT_LOCK:
                 result.record(phase, txn_type, outcome, latency_ms, error_detail)
+            if reconnect_each_txn:
+                reconnect_backend()
+            if think_seconds > 0:
+                time.sleep(think_seconds)
     finally:
         backend.close()

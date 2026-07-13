@@ -31,8 +31,8 @@ inline int ix_compare(const char* a, const char* b, ColType type, int col_len) {
         return (ia < ib) ? -1 : ((ia > ib) ? 1 : 0);
     }
     case TYPE_FLOAT: {
-        float fa;
-        float fb;
+        double fa;
+        double fb;
         memcpy(&fa, a, sizeof(fa));
         memcpy(&fb, b, sizeof(fb));
         return (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);

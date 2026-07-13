@@ -23,9 +23,13 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     // 1. 获取指定记录所在的page handle
     // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
     RmPageHandle tmp_page_handle = fetch_page_handle(rid.page_no);
-    int size_ = tmp_page_handle.file_hdr->record_size;
-    char* data_ = tmp_page_handle.get_slot(rid.slot_no);
-    std::unique_ptr<RmRecord> record_ptr(new RmRecord(size_, data_));
+    std::unique_ptr<RmRecord> record_ptr;
+    {
+        std::shared_lock<std::shared_mutex> page_lock(tmp_page_handle.page->latch());
+        int size_ = tmp_page_handle.file_hdr->record_size;
+        char* data_ = tmp_page_handle.get_slot(rid.slot_no);
+        record_ptr = std::make_unique<RmRecord>(size_, data_);
+    }
     buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
     return record_ptr;
 }
@@ -33,10 +37,15 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
 RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* context) const {
     (void)context;
     RmPageHandle tmp_page_handle = fetch_page_handle(rid.page_no);
-    TupleMeta meta = tmp_page_handle.get_meta(rid.slot_no);
-    int size_ = tmp_page_handle.file_hdr->record_size;
-    char* data_ = tmp_page_handle.get_slot(rid.slot_no);
-    std::unique_ptr<RmRecord> record_ptr(new RmRecord(size_, data_));
+    TupleMeta meta;
+    std::unique_ptr<RmRecord> record_ptr;
+    {
+        std::shared_lock<std::shared_mutex> page_lock(tmp_page_handle.page->latch());
+        meta = tmp_page_handle.get_meta(rid.slot_no);
+        int size_ = tmp_page_handle.file_hdr->record_size;
+        char* data_ = tmp_page_handle.get_slot(rid.slot_no);
+        record_ptr = std::make_unique<RmRecord>(size_, data_);
+    }
     buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
     return RmRecordWithMeta{meta, std::move(record_ptr)};
 }
@@ -104,20 +113,27 @@ RmPinnedInsert RmFileHandle::prepare_insert_record() {
     return RmPinnedInsert{page_handle, Rid{page_handle.page->get_page_id().page_no, slot_no}};
 }
 
-void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf) {
+void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta) {
     auto& page_handle = insert.page_handle;
-    const int slot_no = insert.rid.slot_no;
-    memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
-    TupleMeta& meta = page_handle.get_meta(slot_no);
-    meta.commit_ts_ = 0;
-    meta.writer_txn_id_ = INVALID_TXN_ID;
-    meta.is_committed_ = true;
-    meta.is_deleted_ = false;
-    meta.version_chain_head_ = UndoLink{};
-    Bitmap::set(page_handle.bitmap, slot_no);
-    page_handle.page_hdr->num_records++;
-    if (page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
-        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        const int slot_no = insert.rid.slot_no;
+        memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
+        TupleMeta& meta = page_handle.get_meta(slot_no);
+        if (tuple_meta != nullptr) {
+            meta = *tuple_meta;
+        } else {
+            meta.commit_ts_ = 0;
+            meta.writer_txn_id_ = INVALID_TXN_ID;
+            meta.is_committed_ = true;
+            meta.is_deleted_ = false;
+            meta.version_chain_head_ = UndoLink{};
+        }
+        Bitmap::set(page_handle.bitmap, slot_no);
+        page_handle.page_hdr->num_records++;
+        if (page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
+            file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+        }
     }
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
@@ -166,21 +182,29 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     (void)context;
+    // InsertExecutor holds this latch while it chooses and publishes a free
+    // slot. Rollback deletes must participate as well: deleting the last slot
+    // from a full page mutates the table-wide free-page chain, so a concurrent
+    // insert must not observe that chain half-updated.
+    std::unique_lock<std::mutex> physical_lock(physical_latch_);
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 更新page_handle.page_hdr中的数据结构
     // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
     RmPageHandle deletepage_handle = fetch_page_handle(rid.page_no);
-    if (!Bitmap::is_set(deletepage_handle.bitmap, rid.slot_no)) {
-        buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), false);
-        return;
+    bool deleted = false;
+    {
+        std::unique_lock<std::shared_mutex> page_lock(deletepage_handle.page->latch());
+        if (Bitmap::is_set(deletepage_handle.bitmap, rid.slot_no)) {
+            Bitmap::reset(deletepage_handle.bitmap, rid.slot_no);
+            deletepage_handle.page_hdr->num_records--;
+            if (deletepage_handle.page_hdr->num_records == (file_hdr_.num_records_per_page - 1)) {
+                release_page_handle(deletepage_handle);
+            }
+            deleted = true;
+        }
     }
-    Bitmap::reset(deletepage_handle.bitmap, rid.slot_no);
-    deletepage_handle.page_hdr->num_records--;
-    if (deletepage_handle.page_hdr->num_records == (file_hdr_.num_records_per_page - 1)) {
-        release_page_handle(deletepage_handle);
-    }
-    buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), deleted);
 }
 
 /**
@@ -195,7 +219,10 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     // 1. 获取指定记录所在的page handle
     // 2. 更新记录
     RmPageHandle updatepage_handle = fetch_page_handle(rid.page_no);
-    memcpy(updatepage_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    {
+        std::unique_lock<std::shared_mutex> page_lock(updatepage_handle.page->latch());
+        memcpy(updatepage_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    }
     buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), true);
 }
 
@@ -266,13 +293,20 @@ RmPageHandle RmFileHandle::create_page_handle() {
  */
 void RmFileHandle::set_tuple_meta(const Rid& rid, const TupleMeta& meta) {
     auto page_handle = fetch_page_handle(rid.page_no);
-    page_handle.get_meta(rid.slot_no) = meta;
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        page_handle.get_meta(rid.slot_no) = meta;
+    }
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
 
 TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
     auto page_handle = fetch_page_handle(rid.page_no);
-    TupleMeta meta = page_handle.get_meta(rid.slot_no);
+    TupleMeta meta;
+    {
+        std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        meta = page_handle.get_meta(rid.slot_no);
+    }
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
     return meta;
 }

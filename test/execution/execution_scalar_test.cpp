@@ -30,7 +30,7 @@ CellValue make_int_cell(int value) {
     return cell;
 }
 
-CellValue make_float_cell(float value) {
+CellValue make_float_cell(double value) {
     CellValue cell;
     cell.type = TYPE_FLOAT;
     cell.float_val = value;
