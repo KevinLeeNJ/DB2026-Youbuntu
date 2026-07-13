@@ -182,6 +182,11 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     (void)context;
+    // InsertExecutor holds this latch while it chooses and publishes a free
+    // slot. Rollback deletes must participate as well: deleting the last slot
+    // from a full page mutates the table-wide free-page chain, so a concurrent
+    // insert must not observe that chain half-updated.
+    std::unique_lock<std::mutex> physical_lock(physical_latch_);
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 更新page_handle.page_hdr中的数据结构

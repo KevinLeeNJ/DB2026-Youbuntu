@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include "gtest/gtest.h"
 #include "system/sm_manager.h"
 #include "storage/buffer_pool_manager.h"
@@ -1321,4 +1322,64 @@ TEST_F(ExecutorTest, gc_concurrent_with_version_chain_reads_is_safe) {
     EXPECT_EQ(errors.load(), 0) << "concurrent GC + version-chain reads must not crash or throw InternalError";
     txn_manager.GarbageCollection();
     EXPECT_LT(txn_manager.txn_map.size(), 100u) << "txn_map should be reclaimed after concurrent run";
+}
+
+// RC aborts are common on TPC-C hot rows. A rolled-back insert frees a slot
+// while other transactions are allocating slots from the same table, so this
+// exercises the free-page chain and bitmap updates under that exact mix.
+TEST_F(ExecutorTest, rc_concurrent_insert_rollback_preserves_committed_rows) {
+    setup_db();
+    sm_manager_->create_table("rc_insert_rollback", make_int_cols({"id"}), nullptr);
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    std::atomic<int> committed{0};
+    std::atomic<int> errors{0};
+
+    constexpr int kWorkers = 8;
+    constexpr int kTransactionsPerWorker = 400;
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkers);
+    for (int worker = 0; worker < kWorkers; ++worker) {
+        workers.emplace_back([&, worker] {
+            for (int i = 0; i < kTransactionsPerWorker; ++i) {
+                auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+                char output[4096]{};
+                int offset = 0;
+                Context context(&lock_manager, nullptr, txn, output, &offset, &txn_manager);
+                Value value;
+                value.set_int(worker * kTransactionsPerWorker + i);
+                try {
+                    InsertExecutor insert(sm_manager_.get(), "rc_insert_rollback", {value}, &context);
+                    insert.Next();
+                    if ((i & 1) == 0) {
+                        txn_manager.commit(txn, nullptr);
+                        ++committed;
+                    } else {
+                        txn_manager.abort(txn, nullptr);
+                    }
+                } catch (...) {
+                    ++errors;
+                    txn_manager.abort(txn, nullptr);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(errors.load(), 0);
+
+    char output[4096]{};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, output, &offset);
+    SeqScanExecutor scan(sm_manager_.get(), "rc_insert_rollback", {}, &context);
+    std::unordered_set<int> ids;
+    for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
+        auto record = scan.Next();
+        ASSERT_NE(record, nullptr);
+        ids.insert(*reinterpret_cast<int*>(record->data));
+    }
+    EXPECT_EQ(ids.size(), static_cast<size_t>(committed.load()));
 }
