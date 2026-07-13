@@ -1673,6 +1673,56 @@ TEST_F(SnapshotTest, SI_IndexScanFindsHistoricalIndexedKeyVersion) {
     ASSERT_TRUE(reader->exec_sql_ok("commit;"));
 }
 
+TEST_F(SnapshotTest, RC_IndexScanSeesOldKeyDuringUncommittedUpdate) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto reader = create_session(IsolationLevel::READ_COMMITTED);
+
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update t set id = 2 where id = 1;"));
+
+    std::string out = reader->exec_sql("select * from t where id = 1;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "RC index scans must retain an uncommitted writer's old indexed key";
+
+    ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
+}
+
+TEST_F(SnapshotTest, RC_IndexScanSeesDeletedKeyDuringUncommittedDelete) {
+    auto s = create_session();
+    ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(s->exec_sql_ok("create index t (id);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto reader = create_session(IsolationLevel::READ_COMMITTED);
+
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("delete from t where id = 1;"));
+
+    std::string out = reader->exec_sql("select * from t where id = 1;");
+    std::string expected = "+------------------+------------------+\n"
+                           "|               id |              val |\n"
+                           "+------------------+------------------+\n"
+                           "|                1 |              100 |\n"
+                           "+------------------+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "RC index scans must retain an uncommitted delete's indexed key";
+
+    ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
+}
+
 TEST_F(SnapshotTest, SER_IndexScanFindsHistoricalIndexedKeyVersion) {
     auto s = create_session();
     ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));

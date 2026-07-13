@@ -345,15 +345,34 @@ public:
             lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
             upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
         }
-        if (use_historical_index_candidates_) {
+        // READ COMMITTED normally reads only the current index. A writer can
+        // nevertheless remove an exact key before publishing its replacement
+        // tuple meta, leaving a reader unable to reach the writer's undo
+        // version. Probe that one historical key without adopting SI's broad
+        // historical-index scan on the RC hot path.
+        bool use_rc_exact_historical_key = false;
+        std::vector<Rid> rc_exact_historical_rids;
+        if (!use_historical_index_candidates_ && context_ != nullptr && context_->txn_ != nullptr &&
+            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && !lower_exclusive &&
+            upper_inclusive && lower_key == upper_key) {
+            const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+            rc_exact_historical_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, lower_key);
+            use_rc_exact_historical_key = !rc_exact_historical_rids.empty();
+        }
+
+        if (use_historical_index_candidates_ || use_rc_exact_historical_key) {
             std::vector<Rid> rids;
             for (IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
                  !index_scan.is_end(); index_scan.next()) {
                 rids.push_back(index_scan.rid());
             }
 
-            const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
-            auto historical_rids = sm_manager_->get_historical_index_rids(tab_name_, index_name);
+            std::vector<Rid> historical_rids = std::move(rc_exact_historical_rids);
+            if (use_historical_index_candidates_) {
+                const std::string index_name =
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+                historical_rids = sm_manager_->get_historical_index_rids(tab_name_, index_name);
+            }
             for (const Rid& historical_rid : historical_rids) {
                 if (std::find(rids.begin(), rids.end(), historical_rid) == rids.end()) {
                     rids.push_back(historical_rid);
