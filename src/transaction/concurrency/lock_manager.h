@@ -36,6 +36,7 @@ class LockManager {
         txn_id_t txn_id_;    // 申请加锁的事务ID
         LockMode lock_mode_; // 事务申请加锁的类型
         bool granted_;       // 该事务是否已经被赋予锁
+        bool cancelled_{false};
         std::condition_variable cv_;
     };
 
@@ -72,6 +73,9 @@ public:
     bool lock_IX_on_table(Transaction* txn, int tab_fd);
 
     bool unlock(Transaction* txn, LockDataId lock_data_id);
+
+    // Cancel pending lock requests owned by txn. Granted locks are released by the transaction manager.
+    void cancel_transaction(Transaction* txn);
 
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;

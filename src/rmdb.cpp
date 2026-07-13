@@ -240,6 +240,15 @@ void client_handler(int fd) {
         }
     }
 
+    // An abruptly closed session may still own an explicit transaction and its locks.
+    if (txn_id != INVALID_TXN_ID) {
+        Transaction* txn = txn_manager->get_transaction(txn_id);
+        if (txn != nullptr && txn->get_state() != TransactionState::COMMITTED &&
+            txn->get_state() != TransactionState::ABORTED) {
+            txn_manager->abort(txn, log_manager.get());
+        }
+    }
+
     // Clear
     LOG_INFO("terminating client connection, sockfd: %d", fd);
     close(fd); // close a file descriptor.

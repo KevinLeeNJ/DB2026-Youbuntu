@@ -156,6 +156,34 @@ TEST(SnapshotIsolationConcurrencyTest, RecordLockWaitersAreGrantedInFifoOrder) {
     EXPECT_EQ(grant_order[1], second_waiter.get_transaction_id());
 }
 
+TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAcquiring) {
+    LockManager lock_manager;
+    Transaction owner(1001, IsolationLevel::READ_COMMITTED);
+    Transaction waiter(1002, IsolationLevel::READ_COMMITTED);
+    waiter.set_txn_mode(true);
+    Rid rid{3, 0};
+    LockDataId lock_id(42, rid, LockDataType::RECORD);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    std::atomic<bool> started{false};
+    std::atomic<bool> acquired{true};
+    std::thread waiter_thread([&] {
+        started.store(true);
+        acquired.store(lock_manager.lock_exclusive_on_record(&waiter, rid, 42));
+    });
+
+    while (!started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    lock_manager.cancel_transaction(&waiter);
+    waiter_thread.join();
+
+    EXPECT_FALSE(acquired.load());
+    EXPECT_EQ(waiter.get_lock_set()->count(lock_id), 0u);
+    EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
+    EXPECT_FALSE(lock_manager.unlock(&waiter, lock_id));
+}
 TEST(SnapshotIsolationConcurrencyTest, IndependentRecordLocksProgressConcurrently) {
     LockManager lock_manager;
     constexpr int thread_count = 8;
@@ -287,7 +315,8 @@ private:
 
 class TestSession {
 public:
-    explicit TestSession(SharedTestDB* db) : db_(db) {}
+    explicit TestSession(SharedTestDB* db, IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL)
+        : db_(db), session_isolation_(isolation_level) {}
 
     /// Execute a single SQL statement (must include trailing ';').
     /// Returns the captured text output.
@@ -418,8 +447,8 @@ protected:
         db_.reset();
     }
 
-    std::unique_ptr<TestSession> create_session() {
-        return std::make_unique<TestSession>(db_.get());
+    std::unique_ptr<TestSession> create_session(IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL) {
+        return std::make_unique<TestSession>(db_.get(), isolation_level);
     }
 
     std::unique_ptr<SharedTestDB> db_;
@@ -434,8 +463,8 @@ TEST_F(SnapshotTest, RC_DefaultStatementSeesNewCommittedVersion) {
     ASSERT_TRUE(s->exec_sql_ok("create table rc_counter (id int, val int);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_counter values (1, 100);"));
 
-    auto t1 = create_session();
-    auto t2 = create_session();
+    auto t1 = create_session(IsolationLevel::READ_COMMITTED);
+    auto t2 = create_session(IsolationLevel::READ_COMMITTED);
 
     ASSERT_TRUE(t1->exec_sql_ok("begin;"));
     std::string first_read = t1->exec_sql("select * from rc_counter where id = 1;");
@@ -468,9 +497,9 @@ TEST_F(SnapshotTest, RC_DefaultUpdateUsesLatestCommittedVersion) {
     ASSERT_TRUE(s->exec_sql_ok("create table rc_update_latest (id int, val int);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_latest values (1, 100);"));
 
-    auto t1 = create_session();
-    auto t2 = create_session();
-    auto verifier = create_session();
+    auto t1 = create_session(IsolationLevel::READ_COMMITTED);
+    auto t2 = create_session(IsolationLevel::READ_COMMITTED);
+    auto verifier = create_session(IsolationLevel::READ_COMMITTED);
 
     ASSERT_TRUE(t1->exec_sql_ok("begin;"));
     ASSERT_TRUE(t1->exec_sql_ok("select * from rc_update_latest where id = 1;"));
@@ -498,9 +527,9 @@ TEST_F(SnapshotTest, RC_UpdateRechecksLatestVersionAfterWaitingForLock) {
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_recheck values (1, 100);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into rc_update_recheck values (2, 100);"));
 
-    auto older = create_session();
-    auto writer = create_session();
-    auto verifier = create_session();
+    auto older = create_session(IsolationLevel::READ_COMMITTED);
+    auto writer = create_session(IsolationLevel::READ_COMMITTED);
+    auto verifier = create_session(IsolationLevel::READ_COMMITTED);
 
     ASSERT_TRUE(older->exec_sql_ok("begin;"));
     ASSERT_TRUE(older->exec_sql_ok("update rc_update_recheck set val = val + 1 where id = 2;"));

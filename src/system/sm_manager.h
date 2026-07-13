@@ -214,16 +214,38 @@ public:
 
     // MVCC: mark all slots modified by txn as committed with the given commit_ts
     void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
-        for (const auto& [tab_name, rid] : txn.get_modified_slots()) {
-            auto it = fhs_.find(tab_name);
-            if (it == fhs_.end())
-                continue;
-            auto page_handle = it->second->fetch_page_handle(rid.page_no);
-            page_handle.get_meta(rid.slot_no).is_committed_ = true;
-            page_handle.get_meta(rid.slot_no).commit_ts_ = commit_ts;
-            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        auto& modified_slots = txn.get_modified_slots();
+        std::sort(modified_slots.begin(), modified_slots.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            if (lhs.second.page_no != rhs.second.page_no) {
+                return lhs.second.page_no < rhs.second.page_no;
+            }
+            return lhs.second.slot_no < rhs.second.slot_no;
+        });
+        modified_slots.erase(std::unique(modified_slots.begin(), modified_slots.end()), modified_slots.end());
+
+        size_t offset = 0;
+        while (offset < modified_slots.size()) {
+            const auto& [tab_name, first_rid] = modified_slots[offset];
+            auto table_it = fhs_.find(tab_name);
+            size_t next = offset + 1;
+            while (next < modified_slots.size() && modified_slots[next].first == tab_name &&
+                   modified_slots[next].second.page_no == first_rid.page_no) {
+                ++next;
+            }
+            if (table_it != fhs_.end()) {
+                auto page_handle = table_it->second->fetch_page_handle(first_rid.page_no);
+                for (size_t i = offset; i < next; ++i) {
+                    page_handle.get_meta(modified_slots[i].second.slot_no).is_committed_ = true;
+                    page_handle.get_meta(modified_slots[i].second.slot_no).commit_ts_ = commit_ts;
+                }
+                buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+            }
+            offset = next;
         }
-        txn.get_modified_slots().clear();
+        modified_slots.clear();
     }
 
     // Bulk-load a CSV file into an existing table. The path is relative to the

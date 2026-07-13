@@ -282,8 +282,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
                 if (current_key == old_key) {
                     continue;
                 }
-                auto ih =
-                    sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
                 ih->delete_entry(current_key.data(), rid, txn);
             }
         }
@@ -297,8 +296,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
                 if (current_key == old_key) {
                     continue;
                 }
-                auto ih =
-                    sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
                 ih->insert_entry(old_key.data(), rid, txn, true);
             }
         }
@@ -374,12 +372,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         return;
     }
     if (txn->get_state() == TransactionState::COMMITTED || txn->get_state() == TransactionState::ABORTED) {
-        {
-            std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
-            active_txn_ids_.erase(txn->get_transaction_id());
-            active_txn_count_ = static_cast<int>(active_txn_ids_.size());
-        }
-        checkpoint_cv_.notify_all();
         RetireTransactionIfSafe(txn);
         return;
     }
@@ -389,14 +381,24 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // Allocate commit_ts (monotonic)
     timestamp_t commit_ts = next_timestamp_.fetch_add(1);
     txn->commit_ts_ = commit_ts;
-    last_commit_ts_ = commit_ts;
 
-    // 先更新提交时间戳，再用读时间戳从水位线移除，保证水位线计算正确
+    // Update the watermark bookkeeping before publishing the commit timestamp.
+    // The latter is published below, after tuple metadata is committed.
     running_txns_.UpdateCommitTs(commit_ts);
     running_txns_.RemoveTxn(txn->get_read_ts());
 
     // Mark all modified slots as committed
     sm_manager_->mark_slots_committed(*txn, commit_ts);
+
+    // Concurrent commits can finish out of commit-ts allocation order. Publish
+    // the largest committed timestamp only; a plain store would allow a later
+    // commit with a smaller timestamp to move last_commit_ts_ backwards and
+    // make READ COMMITTED transactions spuriously report WW_CONFLICT.
+    timestamp_t published_ts = last_commit_ts_.load(std::memory_order_relaxed);
+    while (published_ts < commit_ts &&
+           !last_commit_ts_.compare_exchange_weak(published_ts, commit_ts, std::memory_order_release,
+                                                  std::memory_order_relaxed)) {
+    }
 
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
@@ -413,12 +415,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             PruneSsiState();
         }
     }
-    {
-        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
-        active_txn_ids_.erase(txn->get_transaction_id());
-        active_txn_count_ = static_cast<int>(active_txn_ids_.size());
-    }
-    checkpoint_cv_.notify_all();
     RetireTransactionIfSafe(txn);
     MaybeRunGarbageCollection();
 }
@@ -433,17 +429,14 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         return;
     }
     if (txn->get_state() == TransactionState::ABORTED || txn->get_state() == TransactionState::COMMITTED) {
-        {
-            std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
-            active_txn_ids_.erase(txn->get_transaction_id());
-            active_txn_count_ = static_cast<int>(active_txn_ids_.size());
-        }
-        checkpoint_cv_.notify_all();
         RetireTransactionIfSafe(txn);
         return;
     }
 
     auto& write_set = txn->get_write_set();
+    if (lock_manager_ != nullptr) {
+        lock_manager_->cancel_transaction(txn);
+    }
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
         UndoWriteRecord(this, sm_manager_, it->get(), txn);
     }
@@ -463,12 +456,6 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
             PruneSsiState();
         }
     }
-    {
-        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
-        active_txn_ids_.erase(txn->get_transaction_id());
-        active_txn_count_ = static_cast<int>(active_txn_ids_.size());
-    }
-    checkpoint_cv_.notify_all();
     RetireTransactionIfSafe(txn);
     MaybeRunGarbageCollection();
 }
@@ -944,15 +931,23 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
     if (txn == nullptr) {
         return;
     }
-    std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
-    std::unique_lock<std::mutex> lock(latch_);
-    if (!CanRetireTransactionUnlocked(txn)) {
-        return;
+
+    {
+        // Keep the transaction active-set transition and the txn_map lifetime
+        // decision atomic with respect to GC's active-set snapshot.
+        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        active_txn_ids_.erase(txn->get_transaction_id());
+        active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+
+        std::unique_lock<std::mutex> lock(latch_);
+        if (CanRetireTransactionUnlocked(txn)) {
+            auto it = txn_map.find(txn->get_transaction_id());
+            if (it != txn_map.end() && it->second.get() == txn) {
+                txn_map.erase(it);
+            }
+        }
     }
-    auto it = txn_map.find(txn->get_transaction_id());
-    if (it != txn_map.end() && it->second.get() == txn) {
-        txn_map.erase(it);
-    }
+    checkpoint_cv_.notify_all();
 }
 
 timestamp_t TransactionManager::GetWatermark() {
@@ -965,12 +960,30 @@ void TransactionManager::MaybeRunGarbageCollection() {
         std::unique_lock<std::mutex> lock(latch_);
         ++commits_since_gc_;
         if (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD) {
-            should_run = true;
+            gc_requested_ = true;
             commits_since_gc_ = 0;
         }
+        if (gc_requested_ && !gc_running_) {
+            gc_requested_ = false;
+            gc_running_ = true;
+            should_run = true;
+        }
     }
-    if (should_run) {
+    if (!should_run) {
+        return;
+    }
+
+    try {
         GarbageCollection();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(latch_);
+        gc_running_ = false;
+        throw;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        gc_running_ = false;
     }
 }
 
@@ -980,6 +993,15 @@ void TransactionManager::GarbageCollection() {
     // 事务的版本链遍历访问到，因而可安全从 txn_map 回收。
     // 与 GetUndoLog 互斥：二者都持 latch_。
     timestamp_t watermark = running_txns_.GetWatermark();
+    // active_txn_ids_ is maintained under checkpoint_latch_. Take a conservative
+    // snapshot first, then release that lock before scanning txn_map_ so GC does
+    // not block transaction begin/commit for the duration of the scan.
+    std::unordered_set<txn_id_t> active_txn_snapshot;
+    {
+        std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        active_txn_snapshot = active_txn_ids_;
+    }
+
     std::vector<txn_id_t> to_erase;
     {
         std::unique_lock<std::mutex> lock(latch_);
@@ -993,7 +1015,7 @@ void TransactionManager::GarbageCollection() {
             if (state != TransactionState::COMMITTED && state != TransactionState::ABORTED) {
                 continue;
             }
-            if (active_txn_ids_.count(it->first) > 0) {
+            if (active_txn_snapshot.find(it->first) != active_txn_snapshot.end()) {
                 continue;
             }
             if (TransactionHasRetainedSsiStateUnlocked(it->first)) {

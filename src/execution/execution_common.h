@@ -41,7 +41,7 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
     auto record_with_meta = fh->get_record_with_meta(rid, context);
     TupleMeta meta = record_with_meta.meta;
     auto base_record = std::move(record_with_meta.record);
-    std::vector<UndoLog> undo_stack;
+    std::optional<UndoLog> current_undo;
     constexpr int MAX_DEPTH = 100;
 
     for (int depth = 0; depth < MAX_DEPTH; ++depth) {
@@ -56,8 +56,8 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
             if (!meta.version_chain_head_.IsValid()) {
                 return nullptr;
             }
-            undo_stack.push_back(txn_mgr->GetUndoLog(meta.version_chain_head_));
-            meta = undo_stack.back().old_meta_;
+            current_undo = txn_mgr->GetUndoLog(meta.version_chain_head_);
+            meta = current_undo->old_meta_;
             continue;
         }
 
@@ -66,10 +66,10 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
         }
 
         if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-            if (undo_stack.empty()) {
+            if (!current_undo.has_value()) {
                 return base_record;
             }
-            const auto& log = undo_stack.back();
+            const auto& log = *current_undo;
             auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));
             memcpy(rec->data, log.old_tuple_data_.data(), log.old_tuple_data_.size());
             return rec;
@@ -78,8 +78,8 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
         if (!meta.version_chain_head_.IsValid()) {
             return nullptr;
         }
-        undo_stack.push_back(txn_mgr->GetUndoLog(meta.version_chain_head_));
-        meta = undo_stack.back().old_meta_;
+        current_undo = txn_mgr->GetUndoLog(meta.version_chain_head_);
+        meta = current_undo->old_meta_;
     }
     return nullptr;
 }

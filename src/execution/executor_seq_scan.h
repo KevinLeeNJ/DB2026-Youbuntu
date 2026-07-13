@@ -33,6 +33,7 @@ private:
 
     SmManager* sm_manager_;
     bool predicate_recorded_{false};
+    std::unique_ptr<RmRecord> buffered_record_;
 
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -92,6 +93,7 @@ public:
      */
     void beginTuple() override {
         record_predicate_read();
+        buffered_record_.reset();
         scan_ = std::make_unique<RmScan>(fh_);
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
@@ -109,6 +111,7 @@ public:
             }
             if (match) {
                 record_tuple_read(rid_);
+                buffered_record_ = std::move(rec);
                 break;
             }
             scan_->next();
@@ -118,6 +121,7 @@ public:
      * @brief 从当前scan_指向的记录开始迭代扫描,直到扫描到第一个满足谓词条件和MVCC可见性的元组停止,并赋值给rid_
      */
     void nextTuple() override {
+        buffered_record_.reset();
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
@@ -135,6 +139,7 @@ public:
             }
             if (match) {
                 record_tuple_read(rid_);
+                buffered_record_ = std::move(rec);
                 break;
             }
             scan_->next();
@@ -146,9 +151,9 @@ public:
      * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end())
+        if (is_end() || buffered_record_ == nullptr)
             return nullptr;
-        return visible_record(rid_);
+        return std::make_unique<RmRecord>(*buffered_record_);
     }
 
     Rid& rid() override {

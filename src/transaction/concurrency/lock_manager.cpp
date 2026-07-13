@@ -109,23 +109,86 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         return true;
     }
 
-    // A transaction that does not hold any lock cannot participate in a
-    // wait-for cycle yet, so waiting for its first lock is safe at every
-    // isolation level.  In particular, aborting SI transactions here turns
-    // TPCC's warehouse and district hot rows into an abort storm.
     bool first_lock = txn->get_lock_set()->empty();
-    if (!first_lock && txn->get_transaction_id() > (*owner_it)->txn_id_) {
+    bool first_explicit_rc_lock =
+        first_lock && txn->get_txn_mode() && txn->get_isolation_level() == IsolationLevel::READ_COMMITTED;
+    if (!first_explicit_rc_lock && txn->get_transaction_id() > (*owner_it)->txn_id_) {
+        lock.unlock();
+        release_queue_user(lock_data_id, request_queue);
+        return false;
+    }
+    if (!first_explicit_rc_lock && first_lock) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         return false;
     }
     auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
     request_queue->request_queue_.push_back(request);
-    request->cv_.wait(lock, [&request] { return request->granted_; });
+    request->cv_.wait(lock, [&request] { return request->granted_ || request->cancelled_; });
+    if (request->cancelled_) {
+        lock.unlock();
+        release_queue_user(lock_data_id, request_queue);
+        try_remove_empty_queue(lock_data_id, request_queue);
+        return false;
+    }
     txn->get_lock_set()->insert(lock_data_id);
     lock.unlock();
     release_queue_user(lock_data_id, request_queue);
     return true;
+}
+
+void LockManager::cancel_transaction(Transaction* txn) {
+    if (txn == nullptr) {
+        return;
+    }
+
+    const txn_id_t txn_id = txn->get_transaction_id();
+    for (auto& shard : lock_table_shards_) {
+        std::vector<std::pair<LockDataId, std::shared_ptr<LockRequestQueue>>> queues;
+        {
+            std::lock_guard<std::mutex> shard_lock(shard.latch_);
+            queues.reserve(shard.lock_table_.size());
+            for (const auto& [lock_data_id, request_queue] : shard.lock_table_) {
+                request_queue->active_users_++;
+                queues.emplace_back(lock_data_id, request_queue);
+            }
+        }
+
+        for (auto& [lock_data_id, request_queue] : queues) {
+            std::vector<std::shared_ptr<LockRequest>> cancelled_requests;
+            std::shared_ptr<LockRequest> next_request;
+            {
+                std::unique_lock<std::mutex> lock(request_queue->latch_);
+                for (auto it = request_queue->request_queue_.begin(); it != request_queue->request_queue_.end();) {
+                    const auto& request = *it;
+                    if (request->txn_id_ == txn_id && !request->granted_) {
+                        request->cancelled_ = true;
+                        cancelled_requests.push_back(request);
+                        it = request_queue->request_queue_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                auto owner_it = std::find_if(request_queue->request_queue_.begin(), request_queue->request_queue_.end(),
+                                             [](const auto& request) { return request->granted_; });
+                if (owner_it == request_queue->request_queue_.end() && !request_queue->request_queue_.empty()) {
+                    next_request = request_queue->request_queue_.front();
+                    next_request->granted_ = true;
+                    request_queue->group_lock_mode_ = GroupLockMode::X;
+                }
+            }
+
+            for (const auto& request : cancelled_requests) {
+                request->cv_.notify_one();
+            }
+            if (next_request != nullptr) {
+                next_request->cv_.notify_one();
+            }
+            release_queue_user(lock_data_id, request_queue);
+            try_remove_empty_queue(lock_data_id, request_queue);
+        }
+    }
 }
 
 /**
