@@ -245,6 +245,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     // }
     frame_id_t fid = hit->second;
     Page* page = &(pages_[fid]);
+    std::shared_lock<std::shared_mutex> page_lock(page->latch());
     // 2. 无论P是否为脏都将其写回磁盘。
     flush_log_before_page_write();
     disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
@@ -378,6 +379,7 @@ void BufferPoolManager::flush_all_pages(int fd) {
     for (size_t i = 0; i < pool_size_; i++) {
         Page* page = &pages_[i];
         if (page->id_.fd == fd && page->id_.page_no != INVALID_PAGE_ID && page->is_dirty_) {
+            std::shared_lock<std::shared_mutex> page_lock(page->latch());
             flush_log_before_page_write();
             disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
             page->is_dirty_ = false;

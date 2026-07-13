@@ -237,9 +237,12 @@ public:
             }
             if (table_it != fhs_.end()) {
                 auto page_handle = table_it->second->fetch_page_handle(first_rid.page_no);
-                for (size_t i = offset; i < next; ++i) {
-                    page_handle.get_meta(modified_slots[i].second.slot_no).is_committed_ = true;
-                    page_handle.get_meta(modified_slots[i].second.slot_no).commit_ts_ = commit_ts;
+                {
+                    std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+                    for (size_t i = offset; i < next; ++i) {
+                        page_handle.get_meta(modified_slots[i].second.slot_no).is_committed_ = true;
+                        page_handle.get_meta(modified_slots[i].second.slot_no).commit_ts_ = commit_ts;
+                    }
                 }
                 buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
             }

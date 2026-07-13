@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <shared_mutex>
+
 #include "common/config.h"
 
 /**
@@ -79,6 +81,10 @@ public:
         return is_dirty_;
     }
 
+    std::shared_mutex& latch() {
+        return latch_;
+    }
+
     static constexpr size_t OFFSET_PAGE_START = 0;
     static constexpr size_t OFFSET_LSN = 0;
     static constexpr size_t OFFSET_PAGE_HDR = 4;
@@ -106,6 +112,9 @@ private:
 
     /** 脏页判断 */
     bool is_dirty_ = false;
+
+    // Buffer-pool pinning protects residency; this protects the page payload.
+    std::shared_mutex latch_;
 
     /** The pin count of this page. */
     int pin_count_ = 0;
