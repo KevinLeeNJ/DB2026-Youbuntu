@@ -31,6 +31,7 @@ DATA_ARGS="--reuse-data-dir"
 THINK_MS=0
 RECONNECT_EACH_TXN=0
 ISOLATION="read-committed"
+GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
 
 usage() {
     cat <<EOF
@@ -51,6 +52,7 @@ Usage: $0 [options]
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
   --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
+  --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate (passed to tpcc_run)
   --reuse-data-dir         reuse CSV data (passed to tpcc_run, default)
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --think-ms) THINK_MS="$2"; shift 2 ;;
         --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
         --isolation) ISOLATION="$2"; shift 2 ;;
+        --go-binary) GO_BINARY="$2"; shift 2 ;;
         --regenerate-data) REGENERATE_DATA=1; shift ;;
         --overwrite-data-dir) DATA_ARGS="--overwrite-data-dir"; shift ;;
         --reuse-data-dir) DATA_ARGS="--reuse-data-dir"; shift ;;
@@ -95,6 +98,10 @@ fi
 if [[ "$ISOLATION" != "read-committed" && "$ISOLATION" != "snapshot-isolation" ]]; then
     echo "--isolation must be read-committed or snapshot-isolation" >&2
     exit 2
+fi
+if [[ ! -x "$GO_BINARY" ]]; then
+    echo "missing Go benchmark binary: $GO_BINARY" >&2
+    exit 1
 fi
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
     echo "--rounds must be a positive integer" >&2
@@ -194,10 +201,11 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
     if [[ "$ROUND_NO" -eq 1 && "$DATA_COMPLETE" -eq 0 ]]; then
         ROUND_PHASES="datagen load run"
     fi
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: $ROUND_PHASES isolation=$ISOLATION warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: $ROUND_PHASES runner=go isolation=$ISOLATION warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
+    PYTHON_PHASES="${ROUND_PHASES// run/}"
     RMDB_BENCH_THINK_MS="$THINK_MS" \
     RMDB_BENCH_RECONNECT_EACH_TXN="$RECONNECT_EACH_TXN" \
-    python3 -m benchmark.tpcc.tpcc_run $ROUND_PHASES \
+    python3 -m benchmark.tpcc.tpcc_run $PYTHON_PHASES \
         --backend rmdb \
         --port "$PORT" \
         --isolation "$ISOLATION" \
@@ -211,6 +219,22 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
         --json-out "$ROUND_JSON" \
         "${RMDB_DB_ARG[@]}" \
         $DATA_ARGS
+    GO_RECONNECT_ARGS=()
+    if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
+        GO_RECONNECT_ARGS=(--reconnect-each-txn)
+    fi
+    "$GO_BINARY" \
+        --port "$PORT" \
+        --isolation "$ISOLATION" \
+        --workers "$WORKERS" \
+        --warmup "$WARMUP" \
+        --measure "$MEASURE" \
+        --rounds 1 \
+        --progress-interval "$PROGRESS_INTERVAL" \
+        --warehouse-policy terminal-home \
+        --think "${THINK_MS}ms" \
+        --json-out "$ROUND_JSON" \
+        "${GO_RECONNECT_ARGS[@]}"
 
     echo "[benchmark] round $ROUND_NO/$ROUNDS: kill -9 rmdb server (pid=$SERVER_PID) 触发崩溃恢复"
     kill -KILL "$SERVER_PID" 2>/dev/null || true

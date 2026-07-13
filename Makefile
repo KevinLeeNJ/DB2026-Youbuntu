@@ -1,4 +1,4 @@
-.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark benchmark-clean
+.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark tpcc-go benchmark-clean
 
 BUILD_DIR := build
 BINARY := $(BUILD_DIR)/bin/rmdb
@@ -21,6 +21,7 @@ TPCC_PORT ?= 8765
 TPCC_RESTART_TIMEOUT ?= 120
 TPCC_THINK_MS ?= 0
 TPCC_RECONNECT_EACH_TXN ?= 0
+TPCC_GO_BINARY := $(BUILD_DIR)/bin/tpcc-go
 
 TPCC_DATA_ARGS := --reuse-data-dir
 ifeq ($(TPCC_REGENERATE_DATA),1)
@@ -93,7 +94,11 @@ clean-client:
 run-client: client
 	@./rmdb_client/build/rmdb_client
 
-benchmark: build
+tpcc-go:
+	@mkdir -p $(BUILD_DIR)/bin
+	@cd benchmark/tpcc/go && go build -o ../../../$(TPCC_GO_BINARY) ./cmd/tpcc-go
+
+benchmark: build tpcc-go
 	@scripts/benchmark_tpcc.sh \
 		--binary $(BINARY) \
 		--db-dir $(TPCC_DB) \
@@ -110,6 +115,7 @@ benchmark: build
 		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
 		--think-ms $(TPCC_THINK_MS) \
 		--reconnect-each-txn $(TPCC_RECONNECT_EACH_TXN) \
+		--go-binary $(TPCC_GO_BINARY) \
 		$(TPCC_DATA_ARGS) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 
