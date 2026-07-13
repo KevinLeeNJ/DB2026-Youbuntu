@@ -15,6 +15,9 @@ class RmdbBackend(Backend):
     ):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
+        # TPC-C is request/response traffic with many small commands. Avoid
+        # delaying each command behind Nagle's algorithm on persistent sockets.
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if isolation == "snapshot-isolation":
             self.execute("set transaction isolation level snapshot isolation;")
         elif isolation != "read-committed":

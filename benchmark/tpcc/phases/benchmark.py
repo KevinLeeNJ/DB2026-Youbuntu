@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import multiprocessing
 from typing import Callable
 
 from benchmark.tpcc.core.result import RoundResult, format_progress_line
@@ -94,25 +95,68 @@ def run_round(
             daemon=True,
         )
         monitor.start()
-    threads = [
-        threading.Thread(
-            target=worker_loop,
-            args=(
-                backend_factory,
-                result,
-                worker_id,
-                profile,
-                warehouse_policy,
-                warmup_end,
-                measure_end,
-            ),
-        )
-        for worker_id in range(workers)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    # Transaction construction and response parsing are Python-heavy. With
+    # one thread per worker, the GIL can leave the database mostly idle even
+    # when sockets are waiting for responses. On Linux, fork one process per
+    # worker so each connection has an independent interpreter. The queue
+    # carries batches of statistics, keeping IPC off the SQL request path.
+    if "fork" in multiprocessing.get_all_start_methods():
+        mp_context = multiprocessing.get_context("fork")
+        record_queue = mp_context.Queue(maxsize=max(4, workers * 2))
+        processes = [
+            mp_context.Process(
+                target=worker_loop,
+                args=(
+                    backend_factory,
+                    result,
+                    worker_id,
+                    profile,
+                    warehouse_policy,
+                    warmup_end,
+                    measure_end,
+                    record_queue,
+                ),
+            )
+            for worker_id in range(workers)
+        ]
+        def collect_records() -> None:
+            completed_workers = 0
+            while completed_workers < workers:
+                records = record_queue.get()
+                if records is None:
+                    completed_workers += 1
+                    continue
+                result.record_batch(records)
+
+        collector = threading.Thread(target=collect_records, daemon=True)
+        collector.start()
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join()
+        collector.join()
+        record_queue.close()
+        record_queue.join_thread()
+    else:
+        threads = [
+            threading.Thread(
+                target=worker_loop,
+                args=(
+                    backend_factory,
+                    result,
+                    worker_id,
+                    profile,
+                    warehouse_policy,
+                    warmup_end,
+                    measure_end,
+                ),
+            )
+            for worker_id in range(workers)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
     stop_event.set()
     if monitor is not None:
         monitor.join()

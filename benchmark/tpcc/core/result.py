@@ -44,6 +44,13 @@ class RoundResult:
         elif error_detail:
             self.errors[phase][txn_type][error_detail] += 1
 
+    def record_batch(
+        self, records: list[tuple[str, str, str, float, str | None]]
+    ) -> None:
+        """Merge worker-local records while the caller holds the result lock."""
+        for phase, txn_type, outcome, latency_ms, error_detail in records:
+            self.record(phase, txn_type, outcome, latency_ms, error_detail)
+
     def measured_committed_new_order(self) -> int:
         return self.counts["measure"]["new_order"]["commit"]
 

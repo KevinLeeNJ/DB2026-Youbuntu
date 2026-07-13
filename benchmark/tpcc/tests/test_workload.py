@@ -1,5 +1,6 @@
 import time
 import unittest
+import multiprocessing
 from unittest import mock
 
 from benchmark.tpcc.core.backend import BackendError
@@ -62,6 +63,50 @@ class WorkloadTest(unittest.TestCase):
         self.assertGreaterEqual(len(backends), 2)
         self.assertTrue(backends[0].closed)
         self.assertIn(1, calls)
+
+    def test_worker_queue_preserves_batched_records(self) -> None:
+        records = multiprocessing.get_context("fork").Queue()
+
+        class Backend:
+            def close(self) -> None:
+                pass
+
+        def backend_factory() -> Backend:
+            return Backend()
+
+        profile = DatasetProfile(
+            warehouses=1,
+            districts_per_warehouse=1,
+            customers_per_district=1,
+            item_count=1,
+        )
+        now = time.monotonic()
+        with mock.patch(
+            "benchmark.tpcc.core.workload.choose_txn", return_value="new_order"
+        ), mock.patch.dict(
+            "benchmark.tpcc.core.workload.TXN_FUNCS",
+            {"new_order": lambda _backend, _ctx: None},
+            clear=True,
+        ):
+            worker_loop(
+                backend_factory,
+                RoundResult(measure_seconds=1),
+                worker_id=0,
+                profile=profile,
+                policy="terminal-home",
+                warmup_end=now,
+                measure_end=now + 0.01,
+                record_queue=records,
+            )
+
+        batches = []
+        while True:
+            batch = records.get(timeout=1)
+            if batch is None:
+                break
+            batches.extend(batch)
+        self.assertGreater(len(batches), 0)
+        self.assertTrue(all(record[2] == "commit" for record in batches))
 
 
 if __name__ == "__main__":

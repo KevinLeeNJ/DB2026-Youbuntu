@@ -29,6 +29,7 @@ TXN_FUNCS = {
 }
 
 _RESULT_LOCK = threading.Lock()
+_RESULT_BATCH_SIZE = 32
 
 
 def _debug_knobs() -> tuple[float, bool]:
@@ -101,9 +102,23 @@ def worker_loop(
     policy: str,
     warmup_end: float,
     measure_end: float,
+    record_queue=None,
 ) -> None:
     backend = backend_factory()
     think_seconds, reconnect_each_txn = _debug_knobs()
+    pending_records: list[tuple[str, str, str, float, str | None]] = []
+
+    def flush_records() -> None:
+        if not pending_records:
+            return
+        if record_queue is not None:
+            # Queue serialization happens on a feeder thread; copy before
+            # clearing the worker-owned list.
+            record_queue.put(list(pending_records))
+        else:
+            with _RESULT_LOCK:
+                result.record_batch(pending_records)
+        pending_records.clear()
 
     def reconnect_backend() -> None:
         nonlocal backend
@@ -154,11 +169,17 @@ def worker_loop(
                 outcome = "backend-error"
                 error_detail = f"{type(exc).__name__}: {exc}"
             latency_ms = (time.monotonic() - start) * 1000.0
-            with _RESULT_LOCK:
-                result.record(phase, txn_type, outcome, latency_ms, error_detail)
+            pending_records.append(
+                (phase, txn_type, outcome, latency_ms, error_detail)
+            )
+            if len(pending_records) >= _RESULT_BATCH_SIZE:
+                flush_records()
             if reconnect_each_txn:
                 reconnect_backend()
             if think_seconds > 0:
                 time.sleep(think_seconds)
     finally:
+        flush_records()
         backend.close()
+        if record_queue is not None:
+            record_queue.put(None)
