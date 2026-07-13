@@ -30,6 +30,7 @@ REGENERATE_DATA=0
 DATA_ARGS="--reuse-data-dir"
 THINK_MS=0
 RECONNECT_EACH_TXN=0
+ISOLATION="read-committed"
 
 usage() {
     cat <<EOF
@@ -49,6 +50,7 @@ Usage: $0 [options]
   --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 120)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
+  --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate (passed to tpcc_run)
   --reuse-data-dir         reuse CSV data (passed to tpcc_run, default)
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --restart-timeout) RESTART_TIMEOUT="$2"; shift 2 ;;
         --think-ms) THINK_MS="$2"; shift 2 ;;
         --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
+        --isolation) ISOLATION="$2"; shift 2 ;;
         --regenerate-data) REGENERATE_DATA=1; shift ;;
         --overwrite-data-dir) DATA_ARGS="--overwrite-data-dir"; shift ;;
         --reuse-data-dir) DATA_ARGS="--reuse-data-dir"; shift ;;
@@ -87,6 +90,10 @@ if [[ ! "$THINK_MS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 if [[ "$RECONNECT_EACH_TXN" != "0" && "$RECONNECT_EACH_TXN" != "1" ]]; then
     echo "--reconnect-each-txn must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$ISOLATION" != "read-committed" && "$ISOLATION" != "snapshot-isolation" ]]; then
+    echo "--isolation must be read-committed or snapshot-isolation" >&2
     exit 2
 fi
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
@@ -187,12 +194,13 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
     if [[ "$ROUND_NO" -eq 1 && "$DATA_COMPLETE" -eq 0 ]]; then
         ROUND_PHASES="datagen load run"
     fi
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: $ROUND_PHASES warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
+    echo "[benchmark] round $ROUND_NO/$ROUNDS: $ROUND_PHASES isolation=$ISOLATION warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
     RMDB_BENCH_THINK_MS="$THINK_MS" \
     RMDB_BENCH_RECONNECT_EACH_TXN="$RECONNECT_EACH_TXN" \
     python3 -m benchmark.tpcc.tpcc_run $ROUND_PHASES \
         --backend rmdb \
         --port "$PORT" \
+        --isolation "$ISOLATION" \
         --warehouses "$WAREHOUSES" \
         --workers "$WORKERS" \
         --warmup "$WARMUP" \
@@ -218,6 +226,7 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
     python3 -m benchmark.tpcc.tpcc_run consistency \
         --backend rmdb \
         --port "$PORT" \
+        --isolation "$ISOLATION" \
         --consistency-stage "post-recovery-round-$ROUND_NO" \
         --result-json "$ROUND_JSON"
 

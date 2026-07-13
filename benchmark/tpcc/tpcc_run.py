@@ -25,7 +25,7 @@ from benchmark.tpcc.phases.load import TABLES, execute_sql_file, load_all
 
 
 def rmdb_backend_factory(args):
-    return lambda: RmdbBackend(args.host, args.port, args.timeout)
+    return lambda: RmdbBackend(args.host, args.port, args.timeout, args.isolation)
 
 
 def sqlite_backend_factory(args):
@@ -128,6 +128,12 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--isolation",
+        choices=["read-committed", "snapshot-isolation"],
+        default="read-committed",
+        help="session isolation for RMDB connections; read-committed uses the server default",
+    )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--measure", type=int, default=360)
@@ -225,7 +231,10 @@ def main() -> None:
             phase("datagen complete")
 
     if set(args.command) & {"load", "all"}:
-        phase(f"load start: backend={args.backend}, data_dir={args.data_dir}")
+        phase(
+            f"load start: backend={args.backend}, isolation={args.isolation}, "
+            f"data_dir={args.data_dir}"
+        )
         if args.backend == "sqlite":
             import_csv_to_sqlite(args.sqlite_path, args.data_dir)
         else:
@@ -282,7 +291,7 @@ def main() -> None:
         finally:
             baseline_backend.close()
         phase(
-            f"run start: rounds={args.rounds}, workers={args.workers}, "
+            f"run start: isolation={args.isolation}, rounds={args.rounds}, workers={args.workers}, "
             f"warmup={args.warmup}s, measure={args.measure}s"
         )
         rounds = run_benchmark(
@@ -298,6 +307,7 @@ def main() -> None:
         summary = {
             "config": {
                 "backend": args.backend,
+                "isolation": args.isolation,
                 "warehouses": args.warehouses,
                 "workers": args.workers,
                 "warmup": args.warmup,
