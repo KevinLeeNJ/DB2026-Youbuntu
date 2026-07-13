@@ -143,7 +143,7 @@ void SmManager::open_db(const std::string& db_name) {
     }
     std::string original_cwd = cwd_buf;
     {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
     }
     {
@@ -214,7 +214,7 @@ void SmManager::close_db() {
     db_.name_.clear();
     db_.tabs_.clear();
     {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
     }
     {
@@ -234,7 +234,7 @@ void SmManager::prune_version_history(timestamp_t watermark) {
     // 持锁访问缓冲池造成长时间持锁/死锁。
     std::vector<std::pair<std::string, Rid>> hist_snapshot;
     {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         hist_snapshot.reserve(historical_index_keys_.size() * 2);
         for (const auto& [combined_key, rids] : historical_index_keys_) {
             for (const Rid& rid : rids) {
@@ -264,7 +264,7 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         }
     }
     if (!hist_to_remove.empty()) {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         for (auto& [combined_key, rid] : hist_to_remove) {
             auto it = historical_index_keys_.find(combined_key);
             if (it == historical_index_keys_.end()) {

@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include "common/context.h"
@@ -54,7 +55,7 @@ private:
         return combined;
     }
 
-    mutable std::mutex historical_index_keys_latch_;
+    mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, std::vector<Rid>> historical_index_keys_;
     mutable std::mutex deleted_tuple_candidates_latch_;
     std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
@@ -121,7 +122,7 @@ public:
 
     void remember_historical_index_key(const std::string& tab_name, const std::string& index_name,
                                        const std::vector<char>& key, const Rid& rid) {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         auto& rids = historical_index_keys_[make_historical_index_key(tab_name, index_name, key)];
         if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
             rids.push_back(rid);
@@ -130,7 +131,7 @@ public:
 
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
                                                    const std::vector<char>& key) const {
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, key));
         if (it == historical_index_keys_.end()) {
             return {};
@@ -147,7 +148,7 @@ public:
         prefix.push_back('\0');
 
         std::vector<Rid> result;
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         for (const auto& [key, rids] : historical_index_keys_) {
             if (key.compare(0, prefix.size(), prefix) == 0) {
                 result.insert(result.end(), rids.begin(), rids.end());
@@ -164,7 +165,7 @@ public:
         prefix.append(index_name);
         prefix.push_back('\0');
 
-        std::lock_guard<std::mutex> lock(historical_index_keys_latch_);
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         return std::any_of(historical_index_keys_.begin(), historical_index_keys_.end(),
                            [&](const auto& entry) { return entry.first.compare(0, prefix.size(), prefix) == 0; });
     }
