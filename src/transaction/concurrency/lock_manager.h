@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <atomic>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -86,6 +87,8 @@ public:
     // Cancel pending lock requests owned by txn. Granted locks are released by the transaction manager.
     void cancel_transaction(Transaction* txn);
 
+    uint64_t wait_cycle_abort_count() const { return wait_cycle_abort_count_.load(std::memory_order_acquire); }
+
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
 
@@ -105,10 +108,28 @@ private:
                                const std::shared_ptr<LockRequest>& request);
     void unregister_pending_lock(txn_id_t txn_id, const LockDataId& lock_data_id,
                                  const std::shared_ptr<LockRequest>& request);
+    txn_id_t add_wait_edge_and_find_youngest_victim(txn_id_t waiter, txn_id_t owner);
+    void remove_wait_edge(txn_id_t waiter);
+    void register_waiting_txn(Transaction* txn);
+    void unregister_waiting_txn(txn_id_t txn_id);
+    void cancel_waiting_transaction(txn_id_t txn_id);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
     std::mutex pending_latch_;
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
-    std::mutex unique_key_latch_;
-    std::unordered_map<std::string, txn_id_t> unique_key_owners_;
+    std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
+    std::mutex wait_for_latch_;
+    std::unordered_map<txn_id_t, txn_id_t> waiting_for_;
+    std::atomic<uint64_t> wait_cycle_abort_count_{0};
+    static constexpr size_t UNIQUE_KEY_SHARD_COUNT = 64;
+    struct UniqueKeyQueue {
+        txn_id_t owner{INVALID_TXN_ID};
+        std::deque<txn_id_t> waiters;
+        std::condition_variable cv;
+    };
+    struct UniqueKeyShard {
+        std::mutex latch;
+        std::unordered_map<std::string, std::shared_ptr<UniqueKeyQueue>> queues;
+    };
+    std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
 };

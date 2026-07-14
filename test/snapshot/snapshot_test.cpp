@@ -199,6 +199,87 @@ TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAc
     EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
     EXPECT_FALSE(lock_manager.unlock(&waiter, lock_id));
 }
+
+TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
+    LockManager lock_manager;
+    Transaction older(1001, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction younger(1002, IsolationLevel::SNAPSHOT_ISOLATION);
+    Rid first{4, 0};
+    Rid second{5, 0};
+    LockDataId first_lock(42, first, LockDataType::RECORD);
+    LockDataId second_lock(42, second, LockDataType::RECORD);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&older, first, 42));
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&younger, second, 42));
+
+    std::atomic<bool> younger_started{false};
+    std::atomic<bool> younger_acquired{true};
+    std::thread younger_waiter([&] {
+        younger_started.store(true);
+        younger_acquired.store(lock_manager.lock_exclusive_on_record(&younger, first, 42));
+        if (!younger_acquired.load()) {
+            lock_manager.cancel_transaction(&younger);
+            lock_manager.unlock(&younger, second_lock);
+        }
+    });
+    while (!younger_started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // The older requester closes the cycle. The youngest transaction must be
+    // cancelled and release its second lock so the older transaction wins.
+    const bool older_acquired = lock_manager.lock_exclusive_on_record(&older, second, 42);
+    younger_waiter.join();
+
+    EXPECT_TRUE(older_acquired);
+    EXPECT_FALSE(younger_acquired.load());
+    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
+    EXPECT_TRUE(lock_manager.unlock(&older, second_lock));
+    EXPECT_TRUE(lock_manager.unlock(&older, first_lock));
+}
+
+TEST(SnapshotIsolationConcurrencyTest, UniqueKeyCycleCancelsYoungestVictim) {
+    LockManager lock_manager;
+    Transaction older(1101, IsolationLevel::READ_COMMITTED);
+    Transaction younger(1102, IsolationLevel::READ_COMMITTED);
+    std::vector<char> first_key{'a'};
+    std::vector<char> second_key{'b'};
+    const int index_fd = 7;
+    std::string first_lock(sizeof(index_fd), '\0');
+    std::string second_lock(sizeof(index_fd), '\0');
+    std::memcpy(first_lock.data(), &index_fd, sizeof(index_fd));
+    std::memcpy(second_lock.data(), &index_fd, sizeof(index_fd));
+    first_lock.push_back('a');
+    second_lock.push_back('b');
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&older, index_fd, first_key));
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&younger, index_fd, second_key));
+
+    std::atomic<bool> younger_started{false};
+    std::atomic<bool> younger_acquired{true};
+    std::thread younger_waiter([&] {
+        younger_started.store(true);
+        younger_acquired.store(lock_manager.lock_exclusive_on_unique_key(&younger, index_fd, first_key));
+        if (!younger_acquired.load()) {
+            lock_manager.unlock_unique_key(&younger, second_lock);
+        }
+    });
+    while (!younger_started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const bool older_acquired = lock_manager.lock_exclusive_on_unique_key(&older, index_fd, second_key);
+    younger_waiter.join();
+
+    EXPECT_TRUE(older_acquired);
+    EXPECT_FALSE(younger_acquired.load());
+    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
+    EXPECT_TRUE(lock_manager.unlock_unique_key(&older, second_lock));
+    EXPECT_TRUE(lock_manager.unlock_unique_key(&older, first_lock));
+}
+
 TEST(SnapshotIsolationConcurrencyTest, IndependentRecordLocksProgressConcurrently) {
     LockManager lock_manager;
     constexpr int thread_count = 8;

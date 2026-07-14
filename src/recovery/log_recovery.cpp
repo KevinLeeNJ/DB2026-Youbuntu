@@ -190,7 +190,11 @@ void RecoveryManager::undo() {
     }
     sm_manager_->reset_all_tuple_meta_after_recovery();
     rebuild_indexes();
-    sm_manager_->flush_all_table_and_index_pages();
+    if (!sm_manager_->flush_all_table_and_index_pages()) {
+        // Recovery results are not durable. Keep the complete WAL and refuse
+        // normal startup so the next process can retry recovery.
+        throw InternalError("recovery page flush failed; WAL retained");
+    }
     // 表页与索引页已落盘后，截断日志文件并推进 global_lsn。
     // 这样已 undo 完毕的 loser 日志不再残留，避免下一次重启跨轮重复 undo
     // 同 RID 上的数据（尤其是 RID 复用且内容相同时，仅靠 undo 内容守卫无法区分）。

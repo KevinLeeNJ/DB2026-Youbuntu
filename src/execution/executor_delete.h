@@ -65,7 +65,7 @@ public:
                 auto txn = context_->txn_;
                 if (context_->lock_mgr_ != nullptr &&
                     !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
-                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
                 }
                 if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
                     auto current_record = GetCurrentRecordForRcWrite(fh_, rid, txn, context_);

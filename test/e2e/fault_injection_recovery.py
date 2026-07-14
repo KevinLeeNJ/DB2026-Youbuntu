@@ -72,6 +72,9 @@ class Server:
         else:
             env["RMDB_FAULT_POINT"] = point
             env["RMDB_FAULT_ACTION"] = action
+            # The fault matrix validates the strongest WAL boundary. The
+            # regular benchmark remains PROCESS_CRASH by default.
+            env["RMDB_DURABILITY_MODE"] = "strict"
         out = open(self.work_dir / f"{log_name}.out", "wb")
         err = open(self.work_dir / f"{log_name}.err", "wb")
         self.proc = subprocess.Popen(
@@ -166,10 +169,10 @@ def commit_case(server: Server, point: str, expected: int) -> None:
     server.start("fault", point)
     client = SqlClient()
     try:
-        client.ok("begin;")
-        client.ok("update kv set v = 20 where id = 1;")
         try:
-            client.ok("commit;")
+            # Use one autocommit statement so the selected fault point always
+            # belongs to the transaction being checked, not to BEGIN itself.
+            client.ok("update kv set v = 20 where id = 1;")
         except (OSError, RuntimeError):
             pass
     finally:
@@ -229,8 +232,13 @@ def run_case(name: str, binary: Path, root: Path) -> None:
     server = Server(binary, work_dir, "fault_db")
     if name == "before_commit_wal":
         commit_case(server, name, 10)
+    elif name in {"after_commit_log_append", "during_wal_pwrite"}:
+        # The COMMIT record has not reached the OS page cache yet.
+        commit_case(server, name, 10)
     elif name in {
         "after_commit_wal_write",
+        "before_wal_fsync",
+        "after_wal_fsync",
         "after_commit_wal_sync",
         "before_tuple_publication",
         "mid_tuple_publication",
@@ -254,7 +262,11 @@ def run_case(name: str, binary: Path, root: Path) -> None:
 
 CASES = [
     "before_commit_wal",
+    "after_commit_log_append",
+    "during_wal_pwrite",
     "after_commit_wal_write",
+    "before_wal_fsync",
+    "after_wal_fsync",
     "after_commit_wal_sync",
     "before_tuple_publication",
     "mid_tuple_publication",

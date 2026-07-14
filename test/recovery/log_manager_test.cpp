@@ -246,6 +246,26 @@ TEST(LogManagerTest, FlushDurableUpToHonorsPageLsnTarget) {
     EXPECT_GE(log_mgr.get_persist_lsn(), begin_lsn);
 }
 
+TEST(LogManagerTest, ProcessCrashCommitWaitsForPwriteWithoutFsync) {
+    ScopedTestDir test_dir("log_manager_process_crash_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk, DurabilityMode::PROCESS_CRASH);
+
+    CommitLogRecord commit(102);
+    lsn_t commit_lsn = log_mgr.add_log_to_buffer(&commit);
+    log_mgr.flush_log_to_disk_up_to(commit_lsn);
+
+    EXPECT_EQ(log_mgr.get_persist_lsn(), commit_lsn);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+    EXPECT_EQ(log_mgr.get_commit_count(), 1u);
+    EXPECT_EQ(log_mgr.get_pwrite_count(), 1u);
+    EXPECT_GT(log_mgr.get_pwrite_bytes(), 0u);
+
+    log_mgr.flush_log_to_disk_with_sync();
+    EXPECT_EQ(log_mgr.get_durable_lsn(), commit_lsn);
+}
+
 TEST(LogManagerTest, ConcurrentDurableFlushesShareAGroup) {
     ScopedTestDir test_dir("log_manager_group_commit_test_db");
     DiskManager disk;

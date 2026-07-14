@@ -133,7 +133,14 @@ template <> struct std::hash<LockDataId> {
 };
 
 /* 事务回滚原因 */
-enum class AbortReason { LOCK_ON_SHIRINKING = 0, UPGRADE_CONFLICT, DEADLOCK_PREVENTION, WW_CONFLICT, SSI_DANGER };
+enum class AbortReason {
+    LOCK_ON_SHIRINKING = 0,
+    UPGRADE_CONFLICT,
+    DEADLOCK_PREVENTION,
+    WW_CONFLICT,
+    SSI_DANGER,
+    UNIQUE_KEY_CONFLICT
+};
 
 /* 事务回滚异常，在rmdb.cpp中进行处理 */
 class TransactionAbortException : public std::exception {
@@ -172,6 +179,9 @@ public:
 
         case AbortReason::SSI_DANGER: {
             return "Transaction " + std::to_string(txn_id_) + " aborted because of SSI danger structure";
+        } break;
+        case AbortReason::UNIQUE_KEY_CONFLICT: {
+            return "Transaction " + std::to_string(txn_id_) + " aborted because of unique-key conflict";
         } break;
 
         default: {

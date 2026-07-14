@@ -32,7 +32,7 @@ inline void ReserveUniqueKey(Context* context, int index_fd, const std::vector<c
         return;
     }
     if (!context->lock_mgr_->lock_exclusive_on_unique_key(context->txn_, index_fd, key)) {
-        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
     }
 }
 

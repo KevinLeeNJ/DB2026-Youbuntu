@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <deque>
 
 #include "common/context.h"
 #include "common/fault_injection.h"
@@ -56,6 +57,15 @@ private:
         HistoricalIndexBucket(std::vector<ColType> types, std::vector<int> lens)
             : entries(HistoricalKeyLess{std::move(types), std::move(lens)}) {}
     };
+    struct HistoricalRetireCandidate {
+        std::string bucket_key;
+        std::string encoded_key;
+        Rid rid;
+
+        friend bool operator==(const HistoricalRetireCandidate& a, const HistoricalRetireCandidate& b) {
+            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid;
+        }
+    };
 
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
@@ -75,6 +85,7 @@ private:
 
     mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
+    std::deque<HistoricalRetireCandidate> historical_retire_queue_;
     mutable std::mutex deleted_tuple_candidates_latch_;
     std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
 
@@ -160,6 +171,8 @@ public:
         if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
             rids.push_back(rid);
         }
+        historical_retire_queue_.push_back(
+            HistoricalRetireCandidate{bucket_key, std::string(key.data(), key.size()), rid});
     }
 
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
@@ -174,21 +187,14 @@ public:
     }
 
     std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {
-        std::string prefix;
-        prefix.reserve(tab_name.size() + index_name.size() + 2);
-        prefix.append(tab_name);
-        prefix.push_back('\0');
-        prefix.append(index_name);
-        prefix.push_back('\0');
-
         std::vector<Rid> result;
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (const auto& [bucket_key, bucket] : historical_index_keys_) {
-            if (bucket_key.compare(0, prefix.size(), prefix) == 0) {
-                for (const auto& [key, rids] : bucket.entries) {
-                    result.insert(result.end(), rids.begin(), rids.end());
-                }
-            }
+        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
+        if (it == historical_index_keys_.end()) {
+            return result;
+        }
+        for (const auto& [_, rids] : it->second.entries) {
+            result.insert(result.end(), rids.begin(), rids.end());
         }
         return result;
     }
@@ -215,17 +221,9 @@ public:
     }
 
     bool has_historical_index_keys(const std::string& tab_name, const std::string& index_name) const {
-        std::string prefix;
-        prefix.reserve(tab_name.size() + index_name.size() + 2);
-        prefix.append(tab_name);
-        prefix.push_back('\0');
-        prefix.append(index_name);
-        prefix.push_back('\0');
-
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        return std::any_of(historical_index_keys_.begin(), historical_index_keys_.end(), [&](const auto& entry) {
-            return entry.first.compare(0, prefix.size(), prefix) == 0 && !entry.second.entries.empty();
-        });
+        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
+        return it != historical_index_keys_.end() && !it->second.entries.empty();
     }
 
     void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {

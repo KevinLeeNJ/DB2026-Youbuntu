@@ -294,6 +294,7 @@ void DiskManager::write_log(char* log_data, int size) {
     }
 
     // write from the file_end
+    FaultInjector::Point("during_wal_pwrite");
     ssize_t bytes_write = pwrite(log_fd_, log_data, size, static_cast<off_t>(log_offset_));
     if (bytes_write != size) {
         throw UnixError();
@@ -306,6 +307,7 @@ void DiskManager::fsync_log() {
     if (log_fd_ != -1 && fdatasync(log_fd_) != 0) {
         throw UnixError();
     }
+    FaultInjector::Point("after_wal_fsync");
 }
 
 void DiskManager::sync_file(int fd) {

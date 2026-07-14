@@ -347,6 +347,23 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 	if actual := queryInt("select count(*) from district;", -1); actual != districtTotal {
 		failures = append(failures, fmt.Sprintf("district count: expected %d, got %d", districtTotal, actual))
 	}
+	staticCounts := []struct {
+		table    string
+		expected int
+		label    string
+	}{
+		{"customer", prior.Config.BaselineCustomerTotal, "customer"},
+		{"item", prior.Config.BaselineItemTotal, "item"},
+		{"stock", prior.Config.BaselineStockTotal, "stock"},
+	}
+	for _, check := range staticCounts {
+		if check.expected <= 0 {
+			continue // Backward-compatible with result files written before these fields existed.
+		}
+		if actual := queryInt(fmt.Sprintf("select count(*) from %s;", check.table), -1); actual != check.expected {
+			failures = append(failures, fmt.Sprintf("%s count: expected %d, got %d", check.label, check.expected, actual))
+		}
+	}
 	for wID := 1; wID <= warehouseTotal; wID++ {
 		warehouseText, err := c.exec(fmt.Sprintf("select w_ytd from warehouse where w_id = %d;", wID))
 		if err != nil {

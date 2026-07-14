@@ -156,6 +156,7 @@ void SmManager::open_db(const std::string& db_name) {
     {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
+        historical_retire_queue_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
@@ -262,6 +263,7 @@ void SmManager::close_db() {
     {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
+        historical_retire_queue_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
@@ -273,48 +275,40 @@ void SmManager::close_db() {
 }
 
 void SmManager::prune_version_history(timestamp_t watermark) {
-    // A bucket is keyed by tab_name + '\0' + index_name + '\0'; its ordered
-    // map is keyed only by the encoded index key. Snapshot first, inspect
-    // tuple metadata without the history latch, then erase under the latch.
-    struct HistoricalCandidate {
-        std::string bucket_key;
-        std::string encoded_key;
-        Rid rid;
-    };
-    std::vector<HistoricalCandidate> hist_snapshot;
+    constexpr size_t kHistoryPruneBatch = 512;
+    // Historical entries are placed on a retire queue when created. Each GC
+    // pass examines only a bounded queue prefix; entries that are still
+    // visible to an active snapshot are requeued for a later watermark.
+    std::vector<HistoricalRetireCandidate> hist_snapshot;
     {
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        hist_snapshot.reserve(historical_index_keys_.size() * 2);
-        for (const auto& [bucket_key, bucket] : historical_index_keys_) {
-            for (const auto& [encoded_key, rids] : bucket.entries) {
-                for (const Rid& rid : rids) {
-                    hist_snapshot.push_back(HistoricalCandidate{bucket_key, encoded_key, rid});
-                }
-            }
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        const size_t count = std::min(kHistoryPruneBatch, historical_retire_queue_.size());
+        hist_snapshot.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            hist_snapshot.push_back(std::move(historical_retire_queue_.front()));
+            historical_retire_queue_.pop_front();
         }
     }
-    std::vector<HistoricalCandidate> hist_to_remove;
-    for (auto& candidate : hist_snapshot) {
+    std::vector<HistoricalRetireCandidate> hist_to_requeue;
+    for (const auto& candidate : hist_snapshot) {
         size_t nul = candidate.bucket_key.find('\0');
         std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
         auto fh_it = fhs_.find(tab_name);
         if (fh_it == fhs_.end()) {
-            hist_to_remove.push_back(candidate);
             continue;
         }
         RmFileHandle* fh = fh_it->second.get();
         if (!fh->is_record(candidate.rid)) {
-            hist_to_remove.push_back(candidate);
             continue;
         }
         TupleMeta meta = fh->get_tuple_meta(candidate.rid);
-        if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
-            hist_to_remove.push_back(candidate);
+        if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
+            hist_to_requeue.push_back(candidate);
         }
     }
-    if (!hist_to_remove.empty()) {
+    if (!hist_snapshot.empty()) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (const auto& candidate : hist_to_remove) {
+        for (const auto& candidate : hist_snapshot) {
             auto it = historical_index_keys_.find(candidate.bucket_key);
             if (it == historical_index_keys_.end()) {
                 continue;
@@ -324,12 +318,18 @@ void SmManager::prune_version_history(timestamp_t watermark) {
                 continue;
             }
             auto& rids = key_it->second;
-            rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
-            if (rids.empty()) {
-                it->second.entries.erase(key_it);
-            }
-            if (it->second.entries.empty()) {
-                historical_index_keys_.erase(it);
+            const bool removable = std::find(hist_to_requeue.begin(), hist_to_requeue.end(), candidate) ==
+                                   hist_to_requeue.end();
+            if (removable) {
+                rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
+                if (rids.empty()) {
+                    it->second.entries.erase(key_it);
+                }
+                if (it->second.entries.empty()) {
+                    historical_index_keys_.erase(it);
+                }
+            } else {
+                historical_retire_queue_.push_back(candidate);
             }
         }
     }
@@ -342,7 +342,9 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         for (const auto& [tab_name, rids] : deleted_tuple_candidates_) {
             for (const Rid& rid : rids) {
                 del_snapshot.emplace_back(tab_name, rid);
+                if (del_snapshot.size() >= kHistoryPruneBatch) break;
             }
+            if (del_snapshot.size() >= kHistoryPruneBatch) break;
         }
     }
     std::vector<std::pair<std::string, Rid>> del_to_remove;

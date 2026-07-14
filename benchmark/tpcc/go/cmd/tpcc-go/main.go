@@ -29,6 +29,10 @@ var (
 	errInvalidItem = errors.New("invalid item")
 	integerRE      = regexp.MustCompile(`-?\d+`)
 	floatRE        = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
+	oracleSeq      atomic.Uint64
+	oracleAckMu    sync.Mutex
+	oracleAckFile  string
+	oracleIDPrefix int
 )
 
 type client struct {
@@ -36,6 +40,7 @@ type client struct {
 	timeout time.Duration
 	conn    net.Conn
 	reader  *bufio.Reader
+	txnType string
 }
 
 func newClient(address string, timeout time.Duration, isolation string) (*client, error) {
@@ -128,8 +133,43 @@ func (c *client) begin() error {
 }
 
 func (c *client) commit() error {
-	_, err := c.exec("commit;")
-	return err
+	oracleID := 0
+	if oracleAckFile != "" {
+		seq := oracleSeq.Add(1)
+		if seq >= 1_000_000 {
+			return errors.New("crash oracle transaction sequence exhausted")
+		}
+		oracleID = oracleIDPrefix*1_000_000 + int(seq)
+		payloadHash := 0
+		for _, ch := range c.txnType {
+			payloadHash = (payloadHash*131 + int(ch)) & 0x7fffffff
+		}
+		if _, err := c.exec(fmt.Sprintf("insert into crash_txn_log values (%d, '%s', %d);", oracleID, c.txnType, payloadHash)); err != nil {
+			return err
+		}
+	}
+	if _, err := c.exec("commit;"); err != nil {
+		return err
+	}
+	if oracleID != 0 {
+		oracleAckMu.Lock()
+		defer oracleAckMu.Unlock()
+		file, err := os.OpenFile(oracleAckFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err = fmt.Fprintf(file, "%d\n", oracleID); err == nil {
+			err = file.Sync()
+		}
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
 }
 
 func (c *client) rollback() {
@@ -693,6 +733,7 @@ func chooseContext(p profile, workerID int, policy string, rng *rand.Rand) txnCo
 }
 
 func runTxn(c *client, txnType string, ctx txnContext, rng *rand.Rand) error {
+	c.txnType = txnType
 	switch txnType {
 	case "new_order":
 		return newOrder(c, ctx, rng)
@@ -789,6 +830,9 @@ type config struct {
 	WarehousePolicy        string `json:"warehouse_policy"`
 	BaselineWarehouseTotal int    `json:"baseline_warehouse_total"`
 	BaselineDistrictTotal  int    `json:"baseline_district_total"`
+	BaselineCustomerTotal  int    `json:"baseline_customer_total"`
+	BaselineItemTotal      int    `json:"baseline_item_total"`
+	BaselineStockTotal     int    `json:"baseline_stock_total"`
 	BaselineOrdersTotal    int    `json:"baseline_orders_total"`
 }
 
@@ -798,8 +842,62 @@ type document struct {
 	Rounds     []*result `json:"rounds"`
 }
 
+func verifyCrashOracle(address string, timeout time.Duration, isolation, ackPath string) error {
+	data, err := os.ReadFile(ackPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	acked := make(map[int]struct{})
+	for _, line := range strings.Fields(string(data)) {
+		id, parseErr := strconv.Atoi(line)
+		if parseErr != nil {
+			return fmt.Errorf("invalid ACK transaction id %q: %w", line, parseErr)
+		}
+		acked[id] = struct{}{}
+	}
+	c, err := newClient(address, timeout, isolation)
+	if err != nil {
+		return err
+	}
+	defer c.close()
+	present := make(map[int]struct{})
+	ids := make([]int, 0, len(acked))
+	for id := range acked {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	// Keep each response well below RMDB's fixed response buffer. Querying the
+	// whole oracle table can silently truncate a large result and produce a
+	// false "missing ACK" diagnosis.
+	for begin := 0; begin < len(ids); {
+		lower := ids[begin]
+		upper := lower + 128
+		end := begin
+		for end < len(ids) && ids[end] < upper {
+			end++
+		}
+		text, queryErr := c.exec(fmt.Sprintf("select txn_id from crash_txn_log where txn_id >= %d and txn_id < %d;", lower, upper))
+		if queryErr != nil {
+			return queryErr
+		}
+		for _, row := range parseRows(text) {
+			if len(row) > 0 {
+				present[scalarInt(row[0], -1)] = struct{}{}
+			}
+		}
+		begin = end
+	}
+	for id := range acked {
+		if _, ok := present[id]; !ok {
+			return fmt.Errorf("ACKed transaction %d is missing after recovery", id)
+		}
+	}
+	fmt.Printf("[oracle] verified %d ACKed transactions\n", len(acked))
+	return nil
+}
+
 func main() {
-	command := flag.String("command", "run", "run, data-ready, datagen, load, consistency, wait-port, or merge-results")
+	command := flag.String("command", "run", "run, data-ready, datagen, load, consistency, oracle-init, oracle-verify, wait-port, or merge-results")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
 	port := flag.Int("port", 8765, "RMDB port")
 	warehouses := flag.Int("warehouses", 1, "warehouses for data generation")
@@ -824,6 +922,8 @@ func main() {
 	consistencyStage := flag.String("consistency-stage", "standalone", "consistency stage label")
 	waitTimeout := flag.Duration("wait-timeout", 30*time.Second, "wait-port timeout")
 	resultInputs := flag.String("result-inputs", "", "comma-separated per-round result JSON files for merge-results")
+	oracleAck := flag.String("oracle-ack-file", "", "host-side fsynced ACK file for crash oracle")
+	oraclePrefix := flag.Int("oracle-id-prefix", 0, "positive per-run crash oracle ID prefix")
 	flag.Parse()
 	if *command == "data-ready" {
 		if completeCSVSet(*dataDir) {
@@ -865,6 +965,32 @@ func main() {
 		os.Exit(2)
 	}
 	address := net.JoinHostPort(*host, strconv.Itoa(*port))
+	if *command == "oracle-init" {
+		c, err := newClient(address, *timeout, *isolation)
+		if err == nil {
+			_, err = c.exec("create table crash_txn_log (txn_id int, txn_type char(16), payload_hash int);")
+			if err == nil {
+				_, err = c.exec("create index crash_txn_log(txn_id);")
+			}
+			c.close()
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *command == "oracle-verify" {
+		if *oracleAck == "" {
+			fmt.Fprintln(os.Stderr, "oracle-verify requires --oracle-ack-file")
+			os.Exit(2)
+		}
+		if err := verifyCrashOracle(address, *timeout, *isolation, *oracleAck); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *command == "load" {
 		if err := loadData(address, *timeout, *isolation, *dataDir, *schemaDir, *rmdbDBDir); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -882,6 +1008,15 @@ func main() {
 	if *command != "run" {
 		fmt.Fprintf(os.Stderr, "unsupported command: %s\n", *command)
 		os.Exit(2)
+	}
+	if *oracleAck != "" {
+		if *oraclePrefix <= 0 || *oraclePrefix > 2000 {
+			fmt.Fprintln(os.Stderr, "oracle run requires --oracle-id-prefix in 1..2000")
+			os.Exit(2)
+		}
+		oracleAckFile = *oracleAck
+		oracleIDPrefix = *oraclePrefix
+		oracleSeq.Store(0)
 	}
 	probe, err := newClient(address, *timeout, *isolation)
 	if err != nil {
@@ -902,7 +1037,7 @@ func main() {
 		os.Exit(1)
 	}
 	baseOrders := scalarInt(ordersText, 0)
-	doc := document{Config: config{Backend: "rmdb", Isolation: *isolation, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: 1, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineOrdersTotal: baseOrders}}
+	doc := document{Config: config{Backend: "rmdb", Isolation: *isolation, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: 1, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
 	for round := 1; round <= *rounds; round++ {
 		warmupEnd := time.Now().Add(time.Duration(*warmup) * time.Second)
 		measureEnd := warmupEnd.Add(time.Duration(*measure) * time.Second)

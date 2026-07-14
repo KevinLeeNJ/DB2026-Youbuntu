@@ -46,8 +46,8 @@ constexpr size_t GC_TXN_MAP_THRESHOLD = 1024; // 或 txn_map 超过该阈值立�
 constexpr size_t GC_BATCH_SIZE = 128;
 constexpr size_t GC_SCAN_LIMIT = 512;
 
-[[noreturn]] void FailStopAfterDurableCommit() {
-    std::fprintf(stderr, "FATAL: durable COMMIT publication failed; stopping for recovery\n");
+[[noreturn]] void FailStopAfterCommitMayBePersistent() {
+    std::fprintf(stderr, "FATAL: COMMIT WAL/publication failed; stopping for recovery\n");
     std::fflush(stderr);
     std::_Exit(134);
 }
@@ -226,6 +226,7 @@ void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
     BeginLogRecord record(txn->get_transaction_id());
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
+    FaultInjector::Point("after_commit_log_append");
 }
 
 void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
@@ -238,9 +239,8 @@ void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
     txn->set_prev_lsn(lsn);
     // Returning from COMMIT means the commit record survived an OS crash,
     // not merely that it reached the kernel page cache.
-    log_manager->flush_log_to_disk();
-    FaultInjector::Point("after_commit_wal_write");
     log_manager->flush_log_to_disk_up_to(lsn);
+    FaultInjector::Point("after_commit_wal_write");
 }
 
 lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
@@ -433,8 +433,11 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
 
     FaultInjector::Point("before_commit_wal");
-    WriteCommitLog(txn, log_manager);
     try {
+        // Once COMMITTING is visible, neither a WAL failure nor a publication
+        // failure may fall back to ordinary abort: the COMMIT record may
+        // already be present in the WAL prefix recovered after restart.
+        WriteCommitLog(txn, log_manager);
         FaultInjector::Point("after_commit_wal_sync");
 
         timestamp_t commit_csn;
@@ -481,7 +484,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         // Once WriteCommitLog returned, recovery must treat this transaction
         // as committed. Ordinary abort would make durable WAL and in-memory
         // state disagree and may leave a partially published transaction.
-        FailStopAfterDurableCommit();
+        FailStopAfterCommitMayBePersistent();
     }
 
     // Keep the committing transaction in the watermark until publication is

@@ -443,14 +443,17 @@ public:
 };
 
 /* 日志管理器，负责把日志写入日志缓冲区，以及把日志缓冲区中的内容写入磁盘中 */
+enum class DurabilityMode { PROCESS_CRASH, STRICT };
+
 class LogManager {
 public:
     static constexpr const char* RESTART_FILE_NAME = "db.restart";
 
-    LogManager(DiskManager* disk_manager)
+    explicit LogManager(DiskManager* disk_manager, DurabilityMode durability_mode = DurabilityMode::STRICT)
         : log_buffer_(std::make_unique<LogBuffer>()), flushing_buffer_(std::make_unique<LogBuffer>()) {
         disk_manager_ = disk_manager;
-        persist_lsn_ = INVALID_LSN;
+        durability_mode_ = durability_mode;
+        persist_lsn_.store(INVALID_LSN);
         durable_lsn_ = INVALID_LSN;
     }
 
@@ -467,7 +470,7 @@ public:
     void reset_log(lsn_t next_lsn);
 
     lsn_t get_persist_lsn() const {
-        return persist_lsn_;
+        return persist_lsn_.load(std::memory_order_acquire);
     }
 
     lsn_t get_durable_lsn() const {
@@ -498,6 +501,13 @@ public:
         return group_commit_wait_ns_.load(std::memory_order_acquire);
     }
 
+    uint64_t get_pwrite_count() const { return pwrite_count_.load(std::memory_order_acquire); }
+    uint64_t get_pwrite_bytes() const { return pwrite_bytes_.load(std::memory_order_acquire); }
+    uint64_t get_wal_write_ns() const { return wal_write_ns_.load(std::memory_order_acquire); }
+    uint64_t get_wal_fsync_ns() const { return wal_fsync_ns_.load(std::memory_order_acquire); }
+    uint64_t get_commit_count() const { return commit_count_.load(std::memory_order_acquire); }
+    DurabilityMode durability_mode() const { return durability_mode_; }
+
     void write_restart_offset(int64_t checkpoint_offset);
     int64_t read_restart_offset() const;
 
@@ -508,6 +518,7 @@ public:
 private:
     struct CommitWaiter {
         lsn_t target_lsn{INVALID_LSN};
+        bool require_sync{true};
         bool done{false};
         std::exception_ptr error;
         uint64_t enqueue_time_ns{0};
@@ -515,6 +526,7 @@ private:
     };
 
     void flush_buffer(bool sync);
+    void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync);
 
     // One leader performs the durable flush for all waiters that arrive
     // before it finishes. Waiters are released only after durable_lsn_ moves
@@ -531,12 +543,18 @@ private:
     bool flushing_in_progress_{false};
     lsn_t flushing_lsn_{INVALID_LSN};
     int flushing_bytes_{0};
-    lsn_t persist_lsn_{INVALID_LSN};              // 记录已经持久化到磁盘中的最后一条日志的日志号
+    std::atomic<lsn_t> persist_lsn_{INVALID_LSN}; // 最后一个已 pwrite 到 OS page cache 的日志号
     std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
     std::atomic<uint64_t> fsync_count_{0};
     std::atomic<uint64_t> group_commit_count_{0};
     std::atomic<uint64_t> group_commit_waiter_count_{0};
     std::atomic<uint64_t> group_commit_wait_ns_{0};
+    std::atomic<uint64_t> pwrite_count_{0};
+    std::atomic<uint64_t> pwrite_bytes_{0};
+    std::atomic<uint64_t> wal_write_ns_{0};
+    std::atomic<uint64_t> wal_fsync_ns_{0};
+    std::atomic<uint64_t> commit_count_{0};
     int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
+    DurabilityMode durability_mode_{DurabilityMode::STRICT};
 };

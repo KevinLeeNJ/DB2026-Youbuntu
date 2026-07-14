@@ -102,6 +102,8 @@ fi
 mkdir -p "$(dirname "$DB_DIR")" "$(dirname "$SERVER_LOG")"
 rm -rf "$DB_DIR"
 rm -f "$SERVER_LOG" "$WORK_DIR"/baseline.json "$WORK_DIR"/run-*.json
+ACK_FILE="$WORK_DIR/crash-acked-transactions.log"
+rm -f "$ACK_FILE"
 
 SERVER_PID=""
 WORKLOAD_PID=""
@@ -154,6 +156,7 @@ start_server 30
     --data-dir "$DATA_DIR" \
     --schema-dir "$SCHEMA_DIR" \
     --rmdb-db-dir "$DB_DIR"
+"$GO_BINARY" --command oracle-init --port "$PORT" --isolation "$ISOLATION"
 
 # The consistency checker needs only the initial profile/counts. Generate it
 # before crash cycles; the random-kill workload itself may not reach its normal
@@ -183,6 +186,8 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
         --rounds 1 \
         --progress-interval 0 \
         --warehouse-policy terminal-home \
+        --oracle-ack-file "$ACK_FILE" \
+        --oracle-id-prefix "$cycle" \
         --json-out "$RUN_JSON" \
         >"$WORK_DIR/run-$cycle.out" 2>"$WORK_DIR/run-$cycle.err" &
     WORKLOAD_PID=$!
@@ -224,13 +229,25 @@ PY
     wait "$WORKLOAD_PID" 2>/dev/null || true
     WORKLOAD_PID=""
 
-    echo "[random-kill] cycle $cycle/$CYCLES: recover and check consistency"
+    echo "[random-kill] cycle $cycle/$CYCLES: kill once more during recovery"
+    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    sleep 0.02
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+
+    echo "[random-kill] cycle $cycle/$CYCLES: recover and check consistency/oracle"
     start_server "$RESTART_TIMEOUT"
     "$GO_BINARY" --command consistency \
         --port "$PORT" \
         --isolation "$ISOLATION" \
         --consistency-stage "random-kill-cycle-$cycle" \
         --result-json "$WORK_DIR/baseline.json"
+    "$GO_BINARY" --command oracle-verify \
+        --port "$PORT" \
+        --isolation "$ISOLATION" \
+        --oracle-ack-file "$ACK_FILE"
     stop_server
 done
 

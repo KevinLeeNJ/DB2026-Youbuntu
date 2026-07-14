@@ -83,6 +83,9 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
                 log_record->lsn_ = lsn;
                 log_record->serialize(log_buffer_->buffer_ + log_buffer_->offset_);
                 log_buffer_->offset_ += static_cast<int>(log_record->log_tot_len_);
+                if (log_record->log_type_ == LogType::COMMIT) {
+                    commit_count_.fetch_add(1, std::memory_order_acq_rel);
+                }
                 return lsn;
             }
         }
@@ -103,10 +106,14 @@ void LogManager::flush_log_to_disk_with_sync() {
         flush_buffer(true);
         return;
     }
-    flush_log_to_disk_up_to(target_lsn);
+    flush_log_to_disk_up_to_impl(target_lsn, true);
 }
 
 void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
+    flush_log_to_disk_up_to_impl(target_lsn, durability_mode_ == DurabilityMode::STRICT);
+}
+
+void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync) {
     if (target_lsn == INVALID_LSN) {
         return;
     }
@@ -123,19 +130,24 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
         }
         target_lsn = std::min(target_lsn, latest_lsn);
     }
-    if (durable_lsn_.load(std::memory_order_acquire) >= target_lsn) {
+    const auto completed_lsn = [&] {
+        return require_sync ? durable_lsn_.load(std::memory_order_acquire)
+                            : persist_lsn_.load(std::memory_order_acquire);
+    };
+    if (completed_lsn() >= target_lsn) {
         return;
     }
 
     auto waiter = std::make_shared<CommitWaiter>();
     waiter->target_lsn = target_lsn;
+    waiter->require_sync = require_sync;
     waiter->enqueue_time_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count());
     bool become_leader = false;
     {
         std::unique_lock<std::mutex> group_lock(group_commit_latch_);
-        if (durable_lsn_.load(std::memory_order_acquire) >= target_lsn) {
+        if (completed_lsn() >= target_lsn) {
             return;
         }
         group_commit_waiters_.push_back(waiter);
@@ -161,9 +173,44 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
             // Allow commits arriving together to append before the active
             // buffer is swapped. The swap itself is short; pwrite and
             // fdatasync happen without the append latch.
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-            flush_buffer(true);
-            fsync_count_.fetch_add(1, std::memory_order_acq_rel);
+            size_t waiter_count = 0;
+            uint64_t oldest_wait_ns = 0;
+            bool sync_batch = false;
+            const auto batch_wait_begin = std::chrono::steady_clock::now();
+            // A leader waits until a useful number of waiters arrive or the
+            // oldest waiter reaches the latency bound. The short polling
+            // interval avoids a second condition variable and keeps the
+            // append path independent from the group latch.
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> group_lock(group_commit_latch_);
+                    waiter_count = group_commit_waiters_.size();
+                    const uint64_t now_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
+                    if (!group_commit_waiters_.empty()) {
+                        oldest_wait_ns = now_ns - group_commit_waiters_.front()->enqueue_time_ns;
+                    }
+                    sync_batch = false;
+                    for (const auto& pending : group_commit_waiters_) {
+                        sync_batch = sync_batch || pending->require_sync;
+                    }
+                }
+                const auto waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - batch_wait_begin)
+                                           .count();
+                // At high concurrency four waiters form a useful batch
+                // immediately; otherwise allow a short bounded window for
+                // committers to join the same WAL write.
+                if (waiter_count >= 4 || oldest_wait_ns >= 2'000'000 || waited_us >= 2'000) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+            flush_buffer(sync_batch);
+            if (sync_batch) {
+                fsync_count_.fetch_add(1, std::memory_order_acq_rel);
+            }
         } catch (...) {
             auto error = std::current_exception();
             std::vector<std::shared_ptr<CommitWaiter>> notify;
@@ -185,11 +232,13 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
 
         std::vector<std::shared_ptr<CommitWaiter>> notify;
         bool group_done = false;
+        const lsn_t written_lsn = persist_lsn_.load(std::memory_order_acquire);
         const lsn_t durable_lsn = durable_lsn_.load(std::memory_order_acquire);
         {
             std::lock_guard<std::mutex> group_lock(group_commit_latch_);
             for (auto it = group_commit_waiters_.begin(); it != group_commit_waiters_.end();) {
-                if ((*it)->target_lsn <= durable_lsn) {
+                const lsn_t completion_lsn = (*it)->require_sync ? durable_lsn : written_lsn;
+                if ((*it)->target_lsn <= completion_lsn) {
                     (*it)->done = true;
                     notify.push_back(*it);
                     it = group_commit_waiters_.erase(it);
@@ -240,9 +289,22 @@ void LogManager::flush_buffer(bool sync) {
                     if (!sync) {
                         return;
                     }
+                    // Capture the exact written prefix covered by this sync.
+                    // Another writer may advance persist_lsn_ while the latch
+                    // is released; that newer prefix belongs to a later sync.
+                    target_lsn = persist_lsn_.load(std::memory_order_acquire);
                     lock.unlock();
+                    const auto fsync_begin = std::chrono::steady_clock::now();
                     disk_manager_->fsync_log();
-                    durable_lsn_.store(persist_lsn_, std::memory_order_release);
+                    wal_fsync_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                     std::chrono::steady_clock::now() - fsync_begin)
+                                                                     .count()),
+                                            std::memory_order_acq_rel);
+                    lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+                    while (durable < target_lsn &&
+                           !durable_lsn_.compare_exchange_weak(durable, target_lsn, std::memory_order_release,
+                                                               std::memory_order_acquire)) {
+                    }
                     return;
                 }
                 std::swap(log_buffer_, flushing_buffer_);
@@ -258,16 +320,28 @@ void LogManager::flush_buffer(bool sync) {
         // buffer is written and synced.
         bool write_succeeded = false;
         try {
+            const auto write_begin = std::chrono::steady_clock::now();
             disk_manager_->write_log(flushing_buffer_->buffer_, bytes);
+            wal_write_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                              std::chrono::steady_clock::now() - write_begin)
+                                                              .count()),
+                                    std::memory_order_acq_rel);
+            pwrite_count_.fetch_add(1, std::memory_order_acq_rel);
+            pwrite_bytes_.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_acq_rel);
             write_succeeded = true;
             if (sync) {
+                const auto fsync_begin = std::chrono::steady_clock::now();
                 disk_manager_->fsync_log();
+                wal_fsync_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 std::chrono::steady_clock::now() - fsync_begin)
+                                                                 .count()),
+                                        std::memory_order_acq_rel);
             }
         } catch (...) {
             std::lock_guard<std::mutex> lock(latch_);
             if (write_succeeded) {
                 log_file_offset_ += bytes;
-                persist_lsn_ = target_lsn;
+                persist_lsn_.store(target_lsn, std::memory_order_release);
                 flushing_buffer_->offset_ = 0;
                 flushing_bytes_ = 0;
                 flushing_lsn_ = INVALID_LSN;
@@ -280,13 +354,17 @@ void LogManager::flush_buffer(bool sync) {
         {
             std::lock_guard<std::mutex> lock(latch_);
             log_file_offset_ += flushing_bytes_;
-            persist_lsn_ = flushing_lsn_;
+            persist_lsn_.store(flushing_lsn_, std::memory_order_release);
             flushing_buffer_->offset_ = 0;
             flushing_bytes_ = 0;
             flushing_lsn_ = INVALID_LSN;
             flushing_in_progress_ = false;
             if (sync) {
-                durable_lsn_.store(persist_lsn_, std::memory_order_release);
+                lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+                while (durable < target_lsn &&
+                       !durable_lsn_.compare_exchange_weak(durable, target_lsn, std::memory_order_release,
+                                                           std::memory_order_acquire)) {
+                }
             }
         }
         buffer_cv_.notify_all();
@@ -349,7 +427,7 @@ void LogManager::reset_log(lsn_t next_lsn) {
     log_buffer_->offset_ = 0;
     flushing_buffer_->offset_ = 0;
     global_lsn_.store(next_lsn);
-    persist_lsn_ = INVALID_LSN;
+    persist_lsn_.store(INVALID_LSN, std::memory_order_release);
     // Pages flushed before truncation may still carry their old page LSN.
     // Treat the truncated prefix as durable so those stale LSNs do not cause
     // a false WAL-missing failure after restart.
