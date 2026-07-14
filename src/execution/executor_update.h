@@ -251,11 +251,11 @@ public:
                 auto rhs_col_meta = get_col_offset(set_clause.rhs_col);
                 if (set_clause.op == UpdateOp::ASSIGNMENT) {
                     if (col_meta.type == TYPE_INT && rhs_col_meta.type == TYPE_FLOAT) {
-                        *reinterpret_cast<int*>(data) =
-                            static_cast<int>(*reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset));
+                        write_unaligned(data,
+                                       static_cast<int>(read_unaligned<double>(old_rec.data + rhs_col_meta.offset)));
                     } else if (col_meta.type == TYPE_FLOAT && rhs_col_meta.type == TYPE_INT) {
-                        *reinterpret_cast<double*>(data) =
-                            static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset));
+                        write_unaligned(data,
+                                       static_cast<double>(read_unaligned<int>(old_rec.data + rhs_col_meta.offset)));
                     } else if (col_meta.type == TYPE_STRING || col_meta.type == TYPE_DATETIME) {
                         if (rhs_col_meta.type != TYPE_STRING && rhs_col_meta.type != TYPE_DATETIME) {
                             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
@@ -266,13 +266,12 @@ public:
                         if (rhs_col_meta.type != TYPE_INT) {
                             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
                         }
-                        *reinterpret_cast<int*>(data) = *reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset);
+                        write_unaligned(data, read_unaligned<int>(old_rec.data + rhs_col_meta.offset));
                     } else if (col_meta.type == TYPE_FLOAT) {
                         if (rhs_col_meta.type != TYPE_FLOAT) {
                             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
                         }
-                        *reinterpret_cast<double*>(data) =
-                            *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
+                        write_unaligned(data, read_unaligned<double>(old_rec.data + rhs_col_meta.offset));
                     }
                     continue;
                 }
@@ -283,8 +282,8 @@ public:
                 }
 
                 double base = rhs_col_meta.type == TYPE_INT
-                                  ? static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset))
-                                  : *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
+                                  ? static_cast<double>(read_unaligned<int>(old_rec.data + rhs_col_meta.offset))
+                                  : read_unaligned<double>(old_rec.data + rhs_col_meta.offset);
                 double delta = set_clause.rhs.type == TYPE_INT ? static_cast<double>(set_clause.rhs.int_val)
                                                                : set_clause.rhs.float_val;
                 double result = base;
@@ -311,10 +310,10 @@ public:
 
                 switch (col_meta.type) {
                 case TYPE_INT:
-                    *reinterpret_cast<int*>(data) = static_cast<int>(result);
+                    write_unaligned(data, static_cast<int>(result));
                     break;
                 case TYPE_FLOAT:
-                    *reinterpret_cast<double*>(data) = result;
+                    write_unaligned(data, result);
                     break;
                 case TYPE_STRING:
                 case TYPE_DATETIME:
@@ -328,17 +327,17 @@ public:
             switch (col_meta.type) {
             case TYPE_INT: {
                 if (set_clause.rhs.type == TYPE_INT) {
-                    *(int*)data = set_clause.rhs.int_val;
+                    write_unaligned(data, set_clause.rhs.int_val);
                 } else {
-                    *(int*)data = (int)set_clause.rhs.float_val;
+                    write_unaligned(data, static_cast<int>(set_clause.rhs.float_val));
                 }
                 break;
             }
             case TYPE_FLOAT: {
                 if (set_clause.rhs.type == TYPE_FLOAT) {
-                    *(double*)data = set_clause.rhs.float_val;
+                    write_unaligned(data, set_clause.rhs.float_val);
                 } else {
-                    *(double*)data = static_cast<double>(set_clause.rhs.int_val);
+                    write_unaligned(data, static_cast<double>(set_clause.rhs.int_val));
                 }
                 break;
             }

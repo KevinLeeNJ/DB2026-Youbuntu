@@ -12,8 +12,12 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -39,7 +43,7 @@ static bool ReadRecordPayload(const char* src, uint32_t total_len, int* offset, 
     if (!LogPayloadReadable(total_len, *offset, sizeof(int))) {
         return false;
     }
-    int record_size = *reinterpret_cast<const int*>(src + *offset);
+    int record_size = read_unaligned<int>(src + *offset);
     *offset += sizeof(int);
     if (record_size < 0 || !LogPayloadReadable(total_len, *offset, static_cast<size_t>(record_size))) {
         return false;
@@ -75,11 +79,11 @@ public:
     }
     // 从src中反序列化出一条日志记录
     virtual void deserialize(const char* src) {
-        log_type_ = *reinterpret_cast<const LogType*>(src);
-        lsn_ = *reinterpret_cast<const lsn_t*>(src + OFFSET_LSN);
-        log_tot_len_ = *reinterpret_cast<const uint32_t*>(src + OFFSET_LOG_TOT_LEN);
-        log_tid_ = *reinterpret_cast<const txn_id_t*>(src + OFFSET_LOG_TID);
-        prev_lsn_ = *reinterpret_cast<const lsn_t*>(src + OFFSET_PREV_LSN);
+        log_type_ = read_unaligned<LogType>(src);
+        lsn_ = read_unaligned<lsn_t>(src + OFFSET_LSN);
+        log_tot_len_ = read_unaligned<uint32_t>(src + OFFSET_LOG_TOT_LEN);
+        log_tid_ = read_unaligned<txn_id_t>(src + OFFSET_LOG_TID);
+        prev_lsn_ = read_unaligned<lsn_t>(src + OFFSET_PREV_LSN);
     }
     // used for debug
     virtual void format_print() {
@@ -210,12 +214,12 @@ public:
             !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
             return;
         }
-        rid_ = *reinterpret_cast<const Rid*>(src + offset);
+        rid_ = read_unaligned<Rid>(src + offset);
         offset += sizeof(Rid);
         if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
             return;
         }
-        table_name_size_ = *reinterpret_cast<const size_t*>(src + offset);
+        table_name_size_ = read_unaligned<size_t>(src + offset);
         offset += sizeof(size_t);
         if (!LogPayloadReadable(log_tot_len_, offset, table_name_size_)) {
             table_name_size_ = 0;
@@ -278,12 +282,12 @@ public:
             !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
             return;
         }
-        rid_ = *reinterpret_cast<const Rid*>(src + offset);
+        rid_ = read_unaligned<Rid>(src + offset);
         offset += sizeof(Rid);
         if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
             return;
         }
-        table_name_size_ = *reinterpret_cast<const size_t*>(src + offset);
+        table_name_size_ = read_unaligned<size_t>(src + offset);
         offset += sizeof(size_t);
         if (!LogPayloadReadable(log_tot_len_, offset, table_name_size_)) {
             table_name_size_ = 0;
@@ -348,12 +352,12 @@ public:
             !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
             return;
         }
-        rid_ = *reinterpret_cast<const Rid*>(src + offset);
+        rid_ = read_unaligned<Rid>(src + offset);
         offset += sizeof(Rid);
         if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
             return;
         }
-        table_name_size_ = *reinterpret_cast<const size_t*>(src + offset);
+        table_name_size_ = read_unaligned<size_t>(src + offset);
         offset += sizeof(size_t);
         if (!LogPayloadReadable(log_tot_len_, offset, table_name_size_)) {
             table_name_size_ = 0;
@@ -402,16 +406,16 @@ public:
         if (!LogPayloadReadable(log_tot_len_, offset, sizeof(size_t))) {
             return;
         }
-        size_t active_count = *reinterpret_cast<const size_t*>(src + offset);
+        size_t active_count = read_unaligned<size_t>(src + offset);
         offset += sizeof(size_t);
         if (active_count > (log_tot_len_ - offset) / (sizeof(txn_id_t) + sizeof(lsn_t))) {
             return;
         }
         active_txns_.clear();
         for (size_t i = 0; i < active_count; ++i) {
-            txn_id_t txn_id = *reinterpret_cast<const txn_id_t*>(src + offset);
+            txn_id_t txn_id = read_unaligned<txn_id_t>(src + offset);
             offset += sizeof(txn_id_t);
-            lsn_t last_lsn = *reinterpret_cast<const lsn_t*>(src + offset);
+            lsn_t last_lsn = read_unaligned<lsn_t>(src + offset);
             offset += sizeof(lsn_t);
             active_txns_.emplace(txn_id, last_lsn);
         }
@@ -477,6 +481,22 @@ public:
         return log_file_offset_;
     }
 
+    uint64_t get_fsync_count() const {
+        return fsync_count_.load(std::memory_order_acquire);
+    }
+
+    uint64_t get_group_commit_count() const {
+        return group_commit_count_.load(std::memory_order_acquire);
+    }
+
+    uint64_t get_group_commit_waiter_count() const {
+        return group_commit_waiter_count_.load(std::memory_order_acquire);
+    }
+
+    uint64_t get_group_commit_wait_ns() const {
+        return group_commit_wait_ns_.load(std::memory_order_acquire);
+    }
+
     void write_restart_offset(int64_t checkpoint_offset);
     int64_t read_restart_offset() const;
 
@@ -485,13 +505,32 @@ public:
     }
 
 private:
+    struct CommitWaiter {
+        lsn_t target_lsn{INVALID_LSN};
+        bool done{false};
+        std::exception_ptr error;
+        uint64_t enqueue_time_ns{0};
+        std::condition_variable cv;
+    };
+
     void flush_log_to_disk_unlocked();
+
+    // One leader performs the durable flush for all waiters that arrive
+    // before it finishes. Waiters are released only after durable_lsn_ moves
+    // past their target LSN.
+    std::mutex group_commit_latch_;
+    bool group_commit_leader_active_{false};
+    std::deque<std::shared_ptr<CommitWaiter>> group_commit_waiters_;
 
     std::atomic<lsn_t> global_lsn_{0};            // 全局lsn，递增，用于为每条记录分发lsn
     std::mutex latch_;                            // 用于对log_buffer_的互斥访问
     LogBuffer log_buffer_;                        // 日志缓冲区
     lsn_t persist_lsn_{INVALID_LSN};              // 记录已经持久化到磁盘中的最后一条日志的日志号
     std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
+    std::atomic<uint64_t> fsync_count_{0};
+    std::atomic<uint64_t> group_commit_count_{0};
+    std::atomic<uint64_t> group_commit_waiter_count_{0};
+    std::atomic<uint64_t> group_commit_wait_ns_{0};
     int64_t log_file_offset_{0};                  // 日志文件当前追加偏移
     DiskManager* disk_manager_;
 };

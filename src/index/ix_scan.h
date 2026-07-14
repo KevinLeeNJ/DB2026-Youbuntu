@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "ix_index_handle.h"
 
+#include <shared_mutex>
 #include <utility>
 
 // class IxIndexHandle;
@@ -32,6 +33,7 @@ class IxScan : public RecScan {
     // has not reached the end. Released on destruction / reaching end.
     Page* pinned_leaf_page_ = nullptr;
     IxNodeHandle leaf_;
+    std::shared_lock<std::shared_mutex> leaf_latch_guard_;
 
     void pin_current_leaf() {
         if (pinned_leaf_page_ != nullptr) {
@@ -42,11 +44,13 @@ class IxScan : public RecScan {
         }
         pinned_leaf_page_ = bpm_->fetch_page(PageId{ih_->fd_, iid_.page_no});
         assert(pinned_leaf_page_ != nullptr);
+        leaf_latch_guard_ = std::shared_lock<std::shared_mutex>(pinned_leaf_page_->latch());
         leaf_ = IxNodeHandle(ih_->file_hdr_.get(), pinned_leaf_page_);
     }
 
     void unpin_current_leaf() {
         if (pinned_leaf_page_ != nullptr) {
+            leaf_latch_guard_.unlock();
             bpm_->unpin_page(pinned_leaf_page_->get_page_id(), false);
             pinned_leaf_page_ = nullptr;
         }

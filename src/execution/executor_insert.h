@@ -10,7 +10,6 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
-#include <mutex>
 
 #include "execution_common.h"
 #include "execution_defs.h"
@@ -109,7 +108,6 @@ public:
             index_keys.push_back(std::move(key));
         }
 
-        std::unique_lock<std::mutex> physical_lock(fh_->get_physical_latch());
         auto prepared_insert = fh_->prepare_insert_record();
         bool insert_finished = false;
         try {
@@ -137,8 +135,6 @@ public:
             }
             throw;
         }
-        physical_lock.unlock();
-
         std::vector<size_t> inserted_indexes;
         try {
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {

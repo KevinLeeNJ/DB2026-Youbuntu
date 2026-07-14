@@ -95,7 +95,7 @@ public:
     }
 
     int key_at(int i) {
-        return *(int*)get_key(i);
+        return read_unaligned<int>(get_key(i));
     }
 
     /* 得到第i个孩子结点的page_no */

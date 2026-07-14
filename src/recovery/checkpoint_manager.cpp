@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "checkpoint_manager.h"
 
 #include <atomic>
+#include <chrono>
 
 #include "common/fault_injection.h"
 #include "recovery/log_manager.h"
@@ -50,6 +51,7 @@ bool CheckpointManager::RunCleanCheckpoint() {
         return false;
     }
 
+    const auto block_begin = std::chrono::steady_clock::now();
     struct BlockGuard {
         TransactionManager* txn_mgr;
 
@@ -61,18 +63,49 @@ bool CheckpointManager::RunCleanCheckpoint() {
             txn_mgr->unblock_new_transactions_after_checkpoint();
         }
     } block_guard(txn_mgr_);
+    last_block_new_txn_ns_.store(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - block_begin)
+                                  .count()),
+        std::memory_order_release);
 
+    const auto drain_begin = std::chrono::steady_clock::now();
     txn_mgr_->wait_active_transactions_drained_for_checkpoint();
+    last_drain_ns_.store(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - drain_begin)
+                                  .count()),
+        std::memory_order_release);
+    const auto log_sync_begin = std::chrono::steady_clock::now();
     log_mgr_->flush_log_to_disk_with_sync();
+    last_log_sync_ns_.store(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - log_sync_begin)
+                                  .count()),
+        std::memory_order_release);
     FaultInjector::Point("before_checkpoint_data_sync");
+    const auto data_flush_begin = std::chrono::steady_clock::now();
     sm_mgr_->flush_all_table_and_index_pages();
+    last_data_flush_ns_.store(static_cast<uint64_t>(
+                                  std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                                         data_flush_begin)
+                                      .count()),
+                              std::memory_order_release);
     FaultInjector::Point("after_checkpoint_data_sync");
+    const auto meta_flush_begin = std::chrono::steady_clock::now();
     sm_mgr_->flush_meta();
+    last_meta_flush_ns_.store(static_cast<uint64_t>(
+                                  std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                                         meta_flush_begin)
+                                      .count()),
+                              std::memory_order_release);
     // Publish the restart manifest before truncating WAL. If anything after
     // this point fails, the complete WAL is still available for recovery.
     log_mgr_->write_restart_offset(0);
     FaultInjector::Point("before_wal_truncate");
+    const auto truncate_begin = std::chrono::steady_clock::now();
     log_mgr_->reset_log(log_mgr_->get_global_lsn());
+    last_truncate_ns_.store(static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - truncate_begin)
+                                    .count()),
+                            std::memory_order_release);
     return true;
 }
 

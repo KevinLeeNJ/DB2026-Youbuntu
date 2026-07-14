@@ -305,7 +305,50 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
  */
 page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
                                       bool allow_duplicate) {
-    auto guard = lock_exclusive();
+    // The common case only changes one existing leaf entry. Structure-shared
+    // protects the root-to-leaf route while the leaf latch serializes writers
+    // that target the same page. Splits, separator changes, and inserts at
+    // position zero fall back to the stable tree-exclusive implementation.
+    {
+        auto structure_guard = lock_shared();
+        IxNodeHandle leaf;
+        fetch_node_into(file_hdr_->root_page_, leaf);
+        while (!leaf.is_leaf_page()) {
+            page_id_t child_page_no = leaf.internal_lookup(key);
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            fetch_node_into(child_page_no, leaf);
+        }
+
+        std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
+        int pos = leaf.lower_bound(key);
+        bool duplicate_key =
+            pos < leaf.get_size() && ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
+        if (duplicate_key && !allow_duplicate) {
+            leaf_guard.unlock();
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            throw IndexEntryExistsError();
+        }
+        if (allow_duplicate) {
+            while (pos < leaf.get_size() &&
+                   ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+                ++pos;
+            }
+        }
+
+        const bool needs_structure_change = pos == 0 || leaf.get_size() + 1 >= leaf.get_max_size();
+        if (!needs_structure_change) {
+            const page_id_t inserted_page_no = leaf.get_page_no();
+            leaf.insert_pair(pos, key, value);
+            leaf_guard.unlock();
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
+            return inserted_page_no;
+        }
+
+        leaf_guard.unlock();
+        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+    }
+
+    auto structure_guard = lock_exclusive();
     return insert_entry_unlocked(key, value, transaction, allow_duplicate);
 }
 
@@ -429,7 +472,38 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
-    auto guard = lock_exclusive();
+    {
+        auto structure_guard = lock_shared();
+        IxNodeHandle leaf;
+        fetch_node_into(file_hdr_->root_page_, leaf);
+        while (!leaf.is_leaf_page()) {
+            page_id_t child_page_no = leaf.internal_lookup(key);
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            fetch_node_into(child_page_no, leaf);
+        }
+
+        std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
+        int pos = leaf.lower_bound(key);
+        if (pos >= leaf.get_size() ||
+            ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
+            leaf_guard.unlock();
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            return false;
+        }
+
+        const bool needs_structure_change = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
+        if (!needs_structure_change) {
+            leaf.erase_pair(pos);
+            leaf_guard.unlock();
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
+            return true;
+        }
+
+        leaf_guard.unlock();
+        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+    }
+
+    auto structure_guard = lock_exclusive();
     return delete_entry_unlocked(key, transaction);
 }
 

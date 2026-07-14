@@ -128,7 +128,7 @@ struct RmRecord {
     }
 
     void Deserialize(const char* data_) {
-        size = *reinterpret_cast<const int*>(data_);
+        size = read_unaligned<int>(data_);
         if (allocated_) {
             delete[] data;
         }

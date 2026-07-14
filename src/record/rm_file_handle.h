@@ -15,6 +15,9 @@ See the Mulan PSL v2 for more details. */
 
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <unordered_set>
+#include <vector>
 
 #include "bitmap.h"
 #include "common/context.h"
@@ -55,6 +58,8 @@ struct RmPageHandle {
 struct RmPinnedInsert {
     RmPageHandle page_handle;
     Rid rid;
+    std::unique_ptr<std::unique_lock<std::shared_mutex>> page_lock;
+    bool reserved{false};
 };
 
 /* A record paired with its TupleMeta, fetched in a single buffer-pool pin. */
@@ -73,7 +78,12 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     int fd_;             // 打开文件后产生的文件句柄
     RmFileHdr file_hdr_; // 文件头，维护当前表文件的元数据
-    std::mutex physical_latch_;
+    std::mutex free_space_latch_;
+    std::mutex extension_latch_;
+    mutable std::mutex file_header_latch_;
+    std::vector<page_id_t> free_page_candidates_;
+    std::unordered_set<page_id_t> free_page_candidate_set_;
+    size_t free_page_cursor_{0};
 
 public:
     RmFileHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd)
@@ -86,7 +96,8 @@ public:
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
     }
 
-    RmFileHdr get_file_hdr() {
+    RmFileHdr get_file_hdr() const {
+        std::lock_guard<std::mutex> lock(file_header_latch_);
         return file_hdr_;
     }
     int GetFd() {
@@ -151,10 +162,6 @@ public:
         return buffer_pool_manager_;
     }
 
-    std::mutex& get_physical_latch() {
-        return physical_latch_;
-    }
-
     // Bulk-load: pins data page across rows to skip per-record fetch/unpin.
     struct PinnedInserter {
         RmFileHandle* fh;
@@ -208,6 +215,10 @@ public:
 
 private:
     RmPageHandle create_page_handle();
+    RmPageHandle create_new_page_handle_unlocked();
 
     void release_page_handle(RmPageHandle& page_handle);
+    void add_free_page_candidate(page_id_t page_no);
+    void remove_free_page_candidate(page_id_t page_no, page_id_t next_free_page_no);
+    std::optional<page_id_t> select_free_page_candidate();
 };

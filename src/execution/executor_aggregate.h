@@ -141,10 +141,10 @@ private:
         const char* data = rec.data + col.offset;
         switch (col.type) {
         case TYPE_INT:
-            value.int_val = *reinterpret_cast<const int*>(data);
+            value.int_val = read_unaligned<int>(data);
             break;
         case TYPE_FLOAT:
-            value.float_val = *reinterpret_cast<const double*>(data);
+            value.float_val = read_unaligned<double>(data);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -194,10 +194,10 @@ private:
     void write_cell(char* dest, const ColMeta& col, const CellValue& value) const {
         switch (col.type) {
         case TYPE_INT:
-            *reinterpret_cast<int*>(dest + col.offset) = value.int_val;
+            write_unaligned(dest + col.offset, value.int_val);
             break;
         case TYPE_FLOAT:
-            *reinterpret_cast<double*>(dest + col.offset) = value.float_val;
+            write_unaligned(dest + col.offset, value.float_val);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:

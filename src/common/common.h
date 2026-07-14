@@ -30,9 +30,9 @@ struct TabCol {
 };
 
 struct Value {
-    ColType type; // type of value
+    ColType type = TYPE_INT; // type of value
     union {
-        int int_val;      // int value
+        int int_val = 0;    // int value
         double float_val; // SQL FLOAT value
     };
     std::string str_val; // string value
@@ -59,10 +59,10 @@ struct Value {
         raw = std::make_shared<RmRecord>(len);
         if (type == TYPE_INT) {
             assert(len == sizeof(int));
-            *(int*)(raw->data) = int_val;
+            write_unaligned(raw->data, int_val);
         } else if (type == TYPE_FLOAT) {
             assert(len == sizeof(double));
-            *(double*)(raw->data) = float_val;
+            write_unaligned(raw->data, float_val);
         } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
             if (len < (int)str_val.size()) {
                 throw StringOverflowError();

@@ -92,37 +92,37 @@ public:
 
     void deserialize(char* src) {
         int offset = 0;
-        tot_len_ = *reinterpret_cast<const int*>(src + offset);
+        tot_len_ = read_unaligned<int>(src + offset);
         offset += sizeof(int);
-        first_free_page_no_ = *reinterpret_cast<const page_id_t*>(src + offset);
+        first_free_page_no_ = read_unaligned<page_id_t>(src + offset);
         offset += sizeof(int);
-        num_pages_ = *reinterpret_cast<const int*>(src + offset);
+        num_pages_ = read_unaligned<int>(src + offset);
         offset += sizeof(int);
-        root_page_ = *reinterpret_cast<const page_id_t*>(src + offset);
+        root_page_ = read_unaligned<page_id_t>(src + offset);
         offset += sizeof(page_id_t);
-        col_num_ = *reinterpret_cast<const int*>(src + offset);
+        col_num_ = read_unaligned<int>(src + offset);
         offset += sizeof(int);
         for (int i = 0; i < col_num_; ++i) {
             // col_types_[i] = *reinterpret_cast<const ColType*>(src + offset);
-            ColType type = *reinterpret_cast<const ColType*>(src + offset);
+            ColType type = read_unaligned<ColType>(src + offset);
             offset += sizeof(ColType);
             col_types_.push_back(type);
         }
         for (int i = 0; i < col_num_; ++i) {
             // col_lens_[i] = *reinterpret_cast<const int*>(src + offset);
-            int len = *reinterpret_cast<const int*>(src + offset);
+            int len = read_unaligned<int>(src + offset);
             offset += sizeof(int);
             col_lens_.push_back(len);
         }
-        col_tot_len_ = *reinterpret_cast<const int*>(src + offset);
+        col_tot_len_ = read_unaligned<int>(src + offset);
         offset += sizeof(int);
-        btree_order_ = *reinterpret_cast<const int*>(src + offset);
+        btree_order_ = read_unaligned<int>(src + offset);
         offset += sizeof(int);
-        keys_size_ = *reinterpret_cast<const int*>(src + offset);
+        keys_size_ = read_unaligned<int>(src + offset);
         offset += sizeof(int);
-        first_leaf_ = *reinterpret_cast<const page_id_t*>(src + offset);
+        first_leaf_ = read_unaligned<page_id_t>(src + offset);
         offset += sizeof(page_id_t);
-        last_leaf_ = *reinterpret_cast<const page_id_t*>(src + offset);
+        last_leaf_ = read_unaligned<page_id_t>(src + offset);
         offset += sizeof(page_id_t);
         assert(offset == tot_len_);
     }

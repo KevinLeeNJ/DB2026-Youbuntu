@@ -36,8 +36,8 @@ private:
 
     static void copy_cell(char* dst, const ColMeta& dst_col, const char* src, const ColMeta& src_col) {
         if (dst_col.type == TYPE_FLOAT) {
-            double value = src_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(src))
-                                                    : *reinterpret_cast<const double*>(src);
+            double value = src_col.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(src))
+                                                    : read_unaligned<double>(src);
             if (value == 0.0) {
                 value = 0.0;
             }

@@ -21,6 +21,17 @@ See the Mulan PSL v2 for more details. */
 
 std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> TransactionManager::txn_map = {};
 
+TransactionManager::~TransactionManager() {
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        gc_stop_ = true;
+    }
+    gc_cv_.notify_all();
+    if (gc_thread_.joinable()) {
+        gc_thread_.join();
+    }
+}
+
 namespace {
 
 constexpr uint64_t SSI_FULL_PRUNE_COMMIT_INTERVAL = 4096;
@@ -30,6 +41,8 @@ constexpr size_t SSI_EDGE_PRUNE_THRESHOLD = 8192;
 // 垃圾回收节流：避免每次 commit 都全表扫描 txn_map
 constexpr uint64_t GC_COMMIT_INTERVAL = 256;  // 每 N 次提交尝试一次 GC
 constexpr size_t GC_TXN_MAP_THRESHOLD = 1024; // 或 txn_map 超过该阈值立即 GC
+constexpr size_t GC_BATCH_SIZE = 128;
+constexpr size_t GC_SCAN_LIMIT = 512;
 
 void ClearWriteSet(Transaction* txn) {
     if (txn == nullptr) {
@@ -114,14 +127,14 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
     switch (lhs_type) {
     case TYPE_INT:
     case TYPE_FLOAT: {
-        double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(lhs_data))
-                                              : *reinterpret_cast<double*>(lhs_data);
+        double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
+                                              : read_unaligned<double>(lhs_data);
         double rhs_val;
         if (cond.is_rhs_val) {
             rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
         } else {
-            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(rhs_data))
-                                           : *reinterpret_cast<double*>(rhs_data);
+            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
+                                           : read_unaligned<double>(rhs_data);
         }
         switch (cond.op) {
         case OP_EQ:
@@ -213,7 +226,7 @@ void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
     // not merely that it reached the kernel page cache.
     log_manager->flush_log_to_disk();
     FaultInjector::Point("after_commit_wal_write");
-    log_manager->flush_log_to_disk_with_sync();
+    log_manager->flush_log_to_disk_up_to(lsn);
 }
 
 lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
@@ -259,6 +272,14 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
 
     switch (write_record->GetWriteType()) {
     case WType::INSERT_TUPLE: {
+        // An inserted tuple has no index work to undo when the table has no
+        // indexes. Avoid fetching and copying the record just to discover
+        // that DeleteIndexEntries has nothing to do; this is the hot RC
+        // rollback path for heap-only tables.
+        if (tab.indexes.empty()) {
+            fh->delete_record(rid, nullptr, page_lsn);
+            break;
+        }
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
             DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
@@ -629,14 +650,14 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
                 cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col.len));
             cmp = lhs.compare(rhs);
         } else {
-            double lhs = lhs_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(lhs_data))
-                                                  : *reinterpret_cast<const double*>(lhs_data);
+            double lhs = lhs_col.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
+                                                  : read_unaligned<double>(lhs_data);
             double rhs;
             if (cond.is_rhs_val) {
                 rhs = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
             } else {
-                rhs = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(rhs_data))
-                                           : *reinterpret_cast<const double*>(rhs_data);
+                rhs = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
+                                           : read_unaligned<double>(rhs_data);
             }
             cmp = lhs == rhs ? 0 : (lhs < rhs ? -1 : 1);
         }
@@ -976,12 +997,14 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
         return;
     }
 
+    bool no_active_transactions = false;
     {
         // Keep the transaction active-set transition and the txn_map lifetime
         // decision atomic with respect to GC's active-set snapshot.
         std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
         active_txn_ids_.erase(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+        no_active_transactions = active_txn_count_ == 0;
 
         std::unique_lock<std::mutex> lock(latch_);
         if (CanRetireTransactionUnlocked(txn)) {
@@ -992,6 +1015,9 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
         }
     }
     checkpoint_cv_.notify_all();
+    if (no_active_transactions) {
+        gc_cv_.notify_one();
+    }
 }
 
 timestamp_t TransactionManager::GetWatermark() {
@@ -999,39 +1025,81 @@ timestamp_t TransactionManager::GetWatermark() {
 }
 
 void TransactionManager::MaybeRunGarbageCollection() {
-    bool should_run = false;
+    bool notify_gc = false;
     {
-        std::unique_lock<std::mutex> lock(latch_);
+        std::lock_guard<std::mutex> lock(latch_);
         ++commits_since_gc_;
-        if (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD) {
+        gc_backlog_.store(txn_map.size(), std::memory_order_release);
+        if (!gc_requested_ && (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD)) {
             gc_requested_ = true;
             commits_since_gc_ = 0;
-        }
-        if (gc_requested_ && !gc_running_) {
-            gc_requested_ = false;
-            gc_running_ = true;
-            should_run = true;
+            notify_gc = true;
         }
     }
-    if (!should_run) {
-        return;
+    if (notify_gc) {
+        gc_cv_.notify_one();
     }
+}
 
-    try {
-        GarbageCollection();
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(latch_);
-        gc_running_ = false;
-        throw;
-    }
+void TransactionManager::GarbageCollectionLoop() {
+    std::unique_lock<std::mutex> lock(latch_);
+    while (!gc_stop_.load(std::memory_order_acquire)) {
+        gc_cv_.wait(lock, [this] {
+            return gc_stop_.load(std::memory_order_acquire) || gc_requested_;
+        });
+        if (gc_stop_.load(std::memory_order_acquire)) {
+            break;
+        }
+        // The existing metadata/history collector assumes a quiescent
+        // transaction set. Keep it off the hot commit path and wait for the
+        // active set to drain before touching table-side history.
+        lock.unlock();
+        {
+            std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
+            gc_cv_.wait(checkpoint_lock, [this] {
+                return gc_stop_.load(std::memory_order_acquire) || active_txn_count_ == 0;
+            });
+        }
+        lock.lock();
+        if (gc_stop_.load(std::memory_order_acquire)) {
+            break;
+        }
+        size_t batch_start_size = 0;
+        batch_start_size = txn_map.size();
+        gc_backlog_.store(batch_start_size, std::memory_order_release);
+        gc_requested_ = false;
+        gc_running_ = true;
+        lock.unlock();
 
-    {
-        std::lock_guard<std::mutex> lock(latch_);
+        bool more = false;
+        try {
+            more = GarbageCollectionBatch();
+        } catch (...) {
+            // GC is opportunistic. A transient metadata/storage error must
+            // not terminate the server or strand the worker in gc_running_.
+        }
+
+        lock.lock();
         gc_running_ = false;
+        const size_t batch_end_size = txn_map.size();
+        gc_backlog_.store(batch_end_size, std::memory_order_release);
+        gc_last_batch_size_.store(batch_start_size > batch_end_size ? batch_start_size - batch_end_size : 0,
+                                  std::memory_order_release);
+        if (more && !gc_stop_.load(std::memory_order_acquire)) {
+            gc_requested_ = true;
+        }
     }
 }
 
 void TransactionManager::GarbageCollection() {
+    // Explicit callers (checkpoint/tests) ask for convergence. Keep the
+    // background worker bounded by calling GarbageCollectionBatch() directly
+    // there, while this synchronous API drains successive bounded batches.
+    while (GarbageCollectionBatch()) {
+    }
+}
+
+bool TransactionManager::GarbageCollectionBatch() {
     // 安全条件：水位线是所有活跃事务读时间戳的最小值。只有 commit_ts（已提交）
     // 或 start_ts（已中止）严格小于水位线的事务，其 undo log 才不会被任何活跃
     // 事务的版本链遍历访问到，因而可安全从 txn_map 回收。
@@ -1049,7 +1117,8 @@ void TransactionManager::GarbageCollection() {
     std::vector<txn_id_t> to_erase;
     {
         std::unique_lock<std::mutex> lock(latch_);
-        for (auto it = txn_map.begin(); it != txn_map.end(); ++it) {
+        size_t scanned = 0;
+        for (auto it = txn_map.begin(); it != txn_map.end() && scanned < GC_SCAN_LIMIT; ++it, ++scanned) {
             Transaction* txn = it->second.get();
             if (txn == nullptr) {
                 to_erase.push_back(it->first);
@@ -1082,6 +1151,9 @@ void TransactionManager::GarbageCollection() {
                 continue;
             }
             to_erase.push_back(it->first);
+            if (to_erase.size() >= GC_BATCH_SIZE) {
+                break;
+            }
         }
         for (txn_id_t txn_id : to_erase) {
             txn_map.erase(txn_id);
@@ -1092,6 +1164,7 @@ void TransactionManager::GarbageCollection() {
     if (!to_erase.empty()) {
         sm_manager_->prune_version_history(watermark);
     }
+    return to_erase.size() >= GC_BATCH_SIZE;
 }
 
 bool TransactionManager::TransactionsOverlap(Transaction* lhs, Transaction* rhs) {

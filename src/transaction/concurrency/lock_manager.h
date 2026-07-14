@@ -13,10 +13,11 @@ See the Mulan PSL v2 for more details. */
 
 #include <array>
 #include <condition_variable>
-#include <list>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -43,10 +44,11 @@ class LockManager {
     /* 数据项上的加锁队列 */
     class LockRequestQueue {
     public:
-        std::list<std::shared_ptr<LockRequest>> request_queue_; // 加锁队列
+        txn_id_t owner_txn_id_{INVALID_TXN_ID};
+        std::deque<std::shared_ptr<LockRequest>> waiters_;
         std::mutex latch_;
-        GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK; // 加锁队列的锁模式
-        size_t active_users_ = 0;                                 // 在分片锁外持有并访问该队列的线程数
+        GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;
+        size_t active_users_ = 0; // 在分片锁外持有并访问该队列的线程数
     };
 
     class LockTableShard {
@@ -80,11 +82,24 @@ public:
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
 
+    struct PendingLock {
+        LockDataId lock_data_id;
+        std::shared_ptr<LockRequestQueue> queue;
+        std::shared_ptr<LockRequest> request;
+    };
+
     LockTableShard& get_shard(const LockDataId& lock_data_id);
     std::shared_ptr<LockRequestQueue> get_or_create_queue(const LockDataId& lock_data_id);
     std::shared_ptr<LockRequestQueue> get_queue(const LockDataId& lock_data_id);
     void release_queue_user(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
     void try_remove_empty_queue(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
+    bool register_pending_lock(Transaction* txn, const LockDataId& lock_data_id,
+                               const std::shared_ptr<LockRequestQueue>& request_queue,
+                               const std::shared_ptr<LockRequest>& request);
+    void unregister_pending_lock(txn_id_t txn_id, const LockDataId& lock_data_id,
+                                 const std::shared_ptr<LockRequest>& request);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
+    std::mutex pending_latch_;
+    std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
 };

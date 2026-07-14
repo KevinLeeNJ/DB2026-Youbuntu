@@ -312,7 +312,7 @@ TEST_F(IndexHandleTest, ConcurrentInsertDeleteByRidDoesNotCorruptTree) {
     close_index(ih);
 }
 
-TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
+TEST_F(IndexHandleTest, ScanAllowsNonSplitInsertAndBlocksSplitDelete) {
     auto ih = open_index();
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
@@ -320,7 +320,7 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
     }
 
     auto inserted_key = key(5000);
-    auto deleted_key = key(1000);
+    auto deleted_key = key(1500); // non-first entry in its leaf: optimistic delete path
     std::atomic<bool> scan_ready{false};
     std::atomic<bool> release_scan{false};
     std::atomic<bool> insert_done{false};
@@ -358,7 +358,10 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
     ASSERT_TRUE(scan_ready.load(std::memory_order_acquire));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_FALSE(insert_done.load(std::memory_order_acquire));
+    // PR-09 keeps the structure latch shared for non-split inserts. This
+    // delete leaves a minimum-sized leaf and therefore takes the exclusive
+    // fallback until the scan releases its structure latch.
+    EXPECT_TRUE(insert_done.load(std::memory_order_acquire));
     EXPECT_FALSE(delete_done.load(std::memory_order_acquire));
 
     release_scan.store(true, std::memory_order_release);
@@ -388,7 +391,7 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
 
     ASSERT_EQ(slots.size(), 2000u);
     EXPECT_TRUE(std::is_sorted(slots.begin(), slots.end()));
-    EXPECT_EQ(std::count(slots.begin(), slots.end(), 1000), 0);
+    EXPECT_EQ(std::count(slots.begin(), slots.end(), 1500), 0);
     EXPECT_EQ(std::count(slots.begin(), slots.end(), 5000), 1);
 
     close_index(ih);

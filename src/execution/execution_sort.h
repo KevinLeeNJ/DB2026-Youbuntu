@@ -49,8 +49,8 @@ private:
     static int compare_int_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
-        int lhs_val = *reinterpret_cast<const int*>(lhs_data);
-        int rhs_val = *reinterpret_cast<const int*>(rhs_data);
+        int lhs_val = read_unaligned<int>(lhs_data);
+        int rhs_val = read_unaligned<int>(rhs_data);
         if (lhs_val < rhs_val) {
             return -1;
         }
@@ -63,8 +63,8 @@ private:
     static int compare_float_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
-        double lhs_val = *reinterpret_cast<const double*>(lhs_data);
-        double rhs_val = *reinterpret_cast<const double*>(rhs_data);
+        double lhs_val = read_unaligned<double>(lhs_data);
+        double rhs_val = read_unaligned<double>(rhs_data);
         if (lhs_val < rhs_val) {
             return -1;
         }

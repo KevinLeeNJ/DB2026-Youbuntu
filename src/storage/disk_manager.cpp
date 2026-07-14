@@ -18,6 +18,34 @@ See the Mulan PSL v2 for more details. */
 #include "defs.h"
 #include "common/fault_injection.h"
 
+namespace {
+
+void WritePageAt(int fd, page_id_t page_no, const char* data, int num_bytes) {
+    int written = 0;
+    const off_t offset = static_cast<off_t>(page_no) * PAGE_SIZE;
+    while (written < num_bytes) {
+        const ssize_t count = pwrite(fd, data + written, static_cast<size_t>(num_bytes - written), offset + written);
+        if (count <= 0) {
+            throw InternalError("DiskManager::write_page Error");
+        }
+        written += static_cast<int>(count);
+    }
+}
+
+void ReadPageAt(int fd, page_id_t page_no, char* data, int num_bytes) {
+    int read_bytes = 0;
+    const off_t offset = static_cast<off_t>(page_no) * PAGE_SIZE;
+    while (read_bytes < num_bytes) {
+        const ssize_t count = pread(fd, data + read_bytes, static_cast<size_t>(num_bytes - read_bytes), offset + read_bytes);
+        if (count <= 0) {
+            throw InternalError("DiskManager::read_page Error");
+        }
+        read_bytes += static_cast<int>(count);
+    }
+}
+
+} // namespace
+
 DiskManager::DiskManager() = default;
 
 /**
@@ -35,11 +63,7 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
     if (fd2path_.count(fd) == 0) {
         throw FileNotOpenError(fd);
     }
-    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
-    ssize_t bytes_write = write(fd, offset, num_bytes);
-    if (bytes_write != num_bytes) {
-        throw InternalError("DiskManager::write_page Error");
-    }
+    WritePageAt(fd, page_no, offset, num_bytes);
 }
 
 /**
@@ -57,11 +81,7 @@ void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_byt
     if (fd2path_.count(fd) == 0) {
         throw FileNotOpenError(fd);
     }
-    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
-    ssize_t bytes_read = read(fd, offset, num_bytes);
-    if (bytes_read != num_bytes) {
-        throw InternalError("DiskManager::read_page Error");
-    }
+    ReadPageAt(fd, page_no, offset, num_bytes);
 }
 
 /**

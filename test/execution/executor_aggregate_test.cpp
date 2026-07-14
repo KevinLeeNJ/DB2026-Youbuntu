@@ -188,10 +188,10 @@ RmRecord make_record(const std::vector<ColMeta>& cols, const std::vector<Value>&
         char* dest = rec.data + col.offset;
         switch (col.type) {
         case TYPE_INT:
-            *reinterpret_cast<int*>(dest) = value.int_val;
+            write_unaligned(dest, value.int_val);
             break;
         case TYPE_FLOAT:
-            *reinterpret_cast<double*>(dest) = value.float_val;
+            write_unaligned(dest, value.float_val);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -247,11 +247,11 @@ TestExecutorHavingCondition make_having_with_literal(const TestExecutorQueryExpr
 }
 
 int read_int(const RmRecord& rec, int offset) {
-    return *reinterpret_cast<int*>(rec.data + offset);
+    return read_unaligned<int>(rec.data + offset);
 }
 
 double read_float(const RmRecord& rec, int offset) {
-    return *reinterpret_cast<double*>(rec.data + offset);
+    return read_unaligned<double>(rec.data + offset);
 }
 
 std::string read_string(const RmRecord& rec, int offset, int len) {

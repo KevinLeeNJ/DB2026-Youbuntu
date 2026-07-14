@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <optional>
 #include <functional>
 #include <shared_mutex>
+#include <thread>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -58,9 +59,10 @@ public:
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
+        gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
 
-    ~TransactionManager() = default;
+    ~TransactionManager();
 
     Transaction* begin(Transaction* txn, LogManager* log_manager,
                        IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL);
@@ -209,6 +211,16 @@ public:
     size_t DebugActivePredicateTableCount();
     size_t DebugTxnMapSize();
 
+    // GC observability: the backlog is the current txn-map population waiting
+    // for bounded background collection (including entries not yet eligible).
+    size_t DebugGcBacklog() const {
+        return gc_backlog_.load(std::memory_order_acquire);
+    }
+
+    size_t DebugGcLastBatchSize() const {
+        return gc_last_batch_size_.load(std::memory_order_acquire);
+    }
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
@@ -243,15 +255,24 @@ private:
     uint64_t commits_since_gc_{0};
     bool gc_running_{false};
     bool gc_requested_{false};
+    std::atomic<size_t> gc_backlog_{0};
+    std::atomic<size_t> gc_last_batch_size_{0};
 
     /** 节流式触发垃圾回收：按提交计数或 txn_map 规模决定是否真正执行。 */
     void MaybeRunGarbageCollection();
+
+    void GarbageCollectionLoop();
+    bool GarbageCollectionBatch();
 
     std::mutex checkpoint_latch_;
     std::condition_variable checkpoint_cv_;
     bool checkpoint_blocking_new_txns_{false};
     int active_txn_count_{0};
     std::unordered_set<txn_id_t> active_txn_ids_;
+
+    std::condition_variable gc_cv_;
+    std::thread gc_thread_;
+    std::atomic<bool> gc_stop_{false};
 
     // ---- SSI State (centralized) — protected by latch_ ----
     struct SsiRecordKey {

@@ -60,88 +60,88 @@ RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* con
  */
 Rid RmFileHandle::insert_record(char* buf, Context* context) {
     (void)context;
-    // Todo:
-    // 1. 获取当前未满的page handle
-    // 2. 在page handle中找到空闲slot位置
-    // 3. 将buf复制到空闲slot位置
-    // 4. 更新page_handle.page_hdr中的数据结构
-    // 注意考虑插入一条记录后页面已满的情况，需要更新file_hdr_.first_free_page_no
-    RmPageHandle insertpage_handle = create_page_handle();
-    int slot_no = Bitmap::first_bit(false, insertpage_handle.bitmap, file_hdr_.num_records_per_page);
-    if (slot_no != file_hdr_.num_records_per_page) {
-        memcpy(insertpage_handle.get_slot(slot_no), buf, file_hdr_.record_size);
-        // Initialize TupleMeta to safe defaults (committed, no specific writer)
-        TupleMeta& meta = insertpage_handle.get_meta(slot_no);
+    auto prepared = prepare_insert_record();
+    Rid rid = prepared.rid;
+    finish_insert_record(prepared, buf);
+    return rid;
+}
+
+RmPinnedInsert RmFileHandle::prepare_insert_record() {
+    for (;;) {
+        RmPageHandle page_handle;
+        auto candidate = select_free_page_candidate();
+        if (candidate.has_value()) {
+            page_handle = fetch_page_handle(*candidate);
+        } else {
+            // Several inserters may observe an empty candidate list at the
+            // same time. Serialize only the extension decision, then
+            // re-check the list after acquiring the extension latch so that
+            // waiters reuse the page created by the first inserter.
+            std::lock_guard<std::mutex> extension_lock(extension_latch_);
+            candidate = select_free_page_candidate();
+            page_handle = candidate.has_value() ? fetch_page_handle(*candidate) : create_new_page_handle_unlocked();
+        }
+
+        auto page_lock = std::make_unique<std::unique_lock<std::shared_mutex>>(page_handle.page->latch());
+        int slot_no = Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page);
+        if (slot_no == file_hdr_.num_records_per_page) {
+            const page_id_t next_free_page_no = page_handle.page_hdr->next_free_page_no;
+            page_lock->unlock();
+            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+            remove_free_page_candidate(page_handle.page->get_page_id().page_no, next_free_page_no);
+            continue;
+        }
+
+        Bitmap::set(page_handle.bitmap, slot_no);
+        ++page_handle.page_hdr->num_records;
+        const bool page_is_full = page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page;
+        const page_id_t next_free_page_no = page_handle.page_hdr->next_free_page_no;
+        if (page_is_full) {
+            remove_free_page_candidate(page_handle.page->get_page_id().page_no, next_free_page_no);
+        } else {
+            add_free_page_candidate(page_handle.page->get_page_id().page_no);
+        }
+        return RmPinnedInsert{page_handle,
+                              Rid{page_handle.page->get_page_id().page_no, slot_no},
+                              std::move(page_lock),
+                              true};
+    }
+}
+
+void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta) {
+    auto& page_handle = insert.page_handle;
+    if (insert.page_lock == nullptr || !insert.page_lock->owns_lock()) {
+        throw InternalError("prepared insert page latch is not held");
+    }
+    const int slot_no = insert.rid.slot_no;
+    memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
+    TupleMeta& meta = page_handle.get_meta(slot_no);
+    if (tuple_meta != nullptr) {
+        meta = *tuple_meta;
+    } else {
         meta.commit_ts_ = 0;
         meta.writer_txn_id_ = INVALID_TXN_ID;
         meta.is_committed_ = true;
         meta.is_deleted_ = false;
         meta.version_chain_head_ = UndoLink{};
-        Bitmap::set(insertpage_handle.bitmap, slot_no);
-        insertpage_handle.page_hdr->num_records++;
-        if (insertpage_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
-            file_hdr_.first_free_page_no = insertpage_handle.page_hdr->next_free_page_no;
-        }
-        buffer_pool_manager_->unpin_page(insertpage_handle.page->get_page_id(), true);
-        return Rid{insertpage_handle.page->get_page_id().page_no, slot_no};
     }
-    // Defensive: page should have free space, but if not, create new page and retry
-    buffer_pool_manager_->unpin_page(insertpage_handle.page->get_page_id(), true);
-    auto new_page = create_new_page_handle();
-    slot_no = Bitmap::first_bit(false, new_page.bitmap, file_hdr_.num_records_per_page);
-    assert(slot_no != file_hdr_.num_records_per_page);
-    memcpy(new_page.get_slot(slot_no), buf, file_hdr_.record_size);
-    TupleMeta& meta = new_page.get_meta(slot_no);
-    meta.commit_ts_ = 0;
-    meta.writer_txn_id_ = INVALID_TXN_ID;
-    meta.is_committed_ = true;
-    meta.is_deleted_ = false;
-    meta.version_chain_head_ = UndoLink{};
-    Bitmap::set(new_page.bitmap, slot_no);
-    new_page.page_hdr->num_records++;
-    buffer_pool_manager_->unpin_page(new_page.page->get_page_id(), true);
-    return Rid{new_page.page->get_page_id().page_no, slot_no};
-}
-
-RmPinnedInsert RmFileHandle::prepare_insert_record() {
-    RmPageHandle page_handle = create_page_handle();
-    int slot_no = Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page);
-    if (slot_no == file_hdr_.num_records_per_page) {
-        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
-        page_handle = create_new_page_handle();
-        slot_no = Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page);
-        assert(slot_no != file_hdr_.num_records_per_page);
-    }
-    return RmPinnedInsert{page_handle, Rid{page_handle.page->get_page_id().page_no, slot_no}};
-}
-
-void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta) {
-    auto& page_handle = insert.page_handle;
-    {
-        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
-        const int slot_no = insert.rid.slot_no;
-        memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
-        TupleMeta& meta = page_handle.get_meta(slot_no);
-        if (tuple_meta != nullptr) {
-            meta = *tuple_meta;
-        } else {
-            meta.commit_ts_ = 0;
-            meta.writer_txn_id_ = INVALID_TXN_ID;
-            meta.is_committed_ = true;
-            meta.is_deleted_ = false;
-            meta.version_chain_head_ = UndoLink{};
-        }
-        Bitmap::set(page_handle.bitmap, slot_no);
-        page_handle.page_hdr->num_records++;
-        if (page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page) {
-            file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
-        }
-    }
+    insert.page_lock->unlock();
+    insert.page_lock.reset();
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    insert.reserved = false;
 }
 
 void RmFileHandle::abort_prepared_insert(RmPinnedInsert& insert) {
+    if (insert.page_lock != nullptr && insert.page_lock->owns_lock() && insert.reserved) {
+        auto& page_handle = insert.page_handle;
+        Bitmap::reset(page_handle.bitmap, insert.rid.slot_no);
+        --page_handle.page_hdr->num_records;
+        add_free_page_candidate(page_handle.page->get_page_id().page_no);
+        insert.page_lock->unlock();
+        insert.page_lock.reset();
+    }
     buffer_pool_manager_->unpin_page(insert.page_handle.page->get_page_id(), false);
+    insert.reserved = false;
 }
 
 /**
@@ -187,11 +187,6 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_lsn) {
     (void)context;
-    // InsertExecutor holds this latch while it chooses and publishes a free
-    // slot. Rollback deletes must participate as well: deleting the last slot
-    // from a full page mutates the table-wide free-page chain, so a concurrent
-    // insert must not observe that chain half-updated.
-    std::unique_lock<std::mutex> physical_lock(physical_latch_);
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 更新page_handle.page_hdr中的数据结构
@@ -266,6 +261,11 @@ RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
  * @return {RmPageHandle} 新的PageHandle
  */
 RmPageHandle RmFileHandle::create_new_page_handle() {
+    std::lock_guard<std::mutex> extension_lock(extension_latch_);
+    return create_new_page_handle_unlocked();
+}
+
+RmPageHandle RmFileHandle::create_new_page_handle_unlocked() {
     // Todo:
     // 1.使用缓冲池来创建一个新page
     // 2.更新page handle中的相关信息
@@ -273,11 +273,16 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
     PageId page_id;
     page_id.fd = fd_;
     Page* newpage = buffer_pool_manager_->new_page(&page_id);
-    RmPageHandle newpage_handle = RmPageHandle(&file_hdr_, newpage);
-    newpage_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
-    newpage_handle.page_hdr->num_records = 0;
-    file_hdr_.first_free_page_no = newpage->get_page_id().page_no;
-    file_hdr_.num_pages++;
+    RmPageHandle newpage_handle;
+    {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        newpage_handle = RmPageHandle(&file_hdr_, newpage);
+        newpage_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+        newpage_handle.page_hdr->num_records = 0;
+        file_hdr_.first_free_page_no = newpage->get_page_id().page_no;
+        file_hdr_.num_pages++;
+    }
+    add_free_page_candidate(newpage->get_page_id().page_no);
     return newpage_handle;
 }
 
@@ -293,10 +298,15 @@ RmPageHandle RmFileHandle::create_page_handle() {
     //     1.1 没有空闲页：使用缓冲池来创建一个新page；可直接调用create_new_page_handle()
     //     1.2 有空闲页：直接获取第一个空闲页
     // 2. 生成page handle并返回给上层
-    if (file_hdr_.first_free_page_no == -1) {
+    page_id_t first_free_page_no;
+    {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        first_free_page_no = file_hdr_.first_free_page_no;
+    }
+    if (first_free_page_no == -1) {
         return create_new_page_handle();
     }
-    return fetch_page_handle(file_hdr_.first_free_page_no);
+    return fetch_page_handle(first_free_page_no);
 }
 
 /**
@@ -405,6 +415,17 @@ void RmFileHandle::rebuild_file_header_from_pages() {
     }
     file_hdr_.num_pages = actual_page_count;
     disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
+
+    {
+        std::scoped_lock lock(free_space_latch_, file_header_latch_);
+        free_page_candidates_.clear();
+        free_page_candidate_set_.clear();
+        free_page_cursor_ = 0;
+        for (page_id_t page_no : free_pages) {
+            free_page_candidates_.push_back(page_no);
+            free_page_candidate_set_.insert(page_no);
+        }
+    }
 }
 
 TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
@@ -423,6 +444,58 @@ void RmFileHandle::release_page_handle(RmPageHandle& page_handle) {
     // 当page从已满变成未满，考虑如何更新：
     // 1. page_handle.page_hdr->next_free_page_no
     // 2. file_hdr_.first_free_page_no
-    page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
-    file_hdr_.first_free_page_no = page_handle.page->get_page_id().page_no;
+    std::scoped_lock lock(free_space_latch_, file_header_latch_);
+    const page_id_t page_no = page_handle.page->get_page_id().page_no;
+    if (free_page_candidate_set_.insert(page_no).second) {
+        free_page_candidates_.push_back(page_no);
+        page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+        file_hdr_.first_free_page_no = page_no;
+    }
+}
+
+void RmFileHandle::add_free_page_candidate(page_id_t page_no) {
+    if (page_no == RM_NO_PAGE) {
+        return;
+    }
+    std::scoped_lock lock(free_space_latch_, file_header_latch_);
+    if (free_page_candidate_set_.insert(page_no).second) {
+        free_page_candidates_.push_back(page_no);
+        if (file_hdr_.first_free_page_no == RM_NO_PAGE) {
+            file_hdr_.first_free_page_no = page_no;
+        }
+    }
+}
+
+void RmFileHandle::remove_free_page_candidate(page_id_t page_no, page_id_t next_free_page_no) {
+    (void)next_free_page_no;
+    std::scoped_lock lock(free_space_latch_, file_header_latch_);
+    free_page_candidate_set_.erase(page_no);
+    if (free_page_cursor_ >= free_page_candidates_.size()) {
+        free_page_cursor_ = 0;
+    }
+    free_page_candidates_.erase(
+        std::remove(free_page_candidates_.begin(), free_page_candidates_.end(), page_no), free_page_candidates_.end());
+    // The caller's next pointer can be stale: another inserter/rollback may
+    // have changed the free-page chain while this page was pinned. The
+    // candidate vector is the serialized source of truth, so never publish a
+    // stale full-page link into the file header.
+    if (file_hdr_.first_free_page_no == page_no || free_page_candidates_.empty()) {
+        file_hdr_.first_free_page_no =
+            free_page_candidates_.empty() ? RM_NO_PAGE : free_page_candidates_.front();
+    }
+}
+
+std::optional<page_id_t> RmFileHandle::select_free_page_candidate() {
+    std::scoped_lock lock(free_space_latch_, file_header_latch_);
+    if (free_page_candidates_.empty() && file_hdr_.first_free_page_no != RM_NO_PAGE) {
+        free_page_candidates_.push_back(file_hdr_.first_free_page_no);
+        free_page_candidate_set_.insert(file_hdr_.first_free_page_no);
+    }
+    if (free_page_candidates_.empty()) {
+        return std::nullopt;
+    }
+    if (free_page_cursor_ >= free_page_candidates_.size()) {
+        free_page_cursor_ = 0;
+    }
+    return free_page_candidates_[free_page_cursor_++];
 }

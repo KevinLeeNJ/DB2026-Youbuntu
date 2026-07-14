@@ -12,9 +12,24 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <iostream>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+template <typename T>
+inline T read_unaligned(const void* data) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    T value;
+    std::memcpy(&value, data, sizeof(T));
+    return value;
+}
+
+template <typename T>
+inline void write_unaligned(void* data, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::memcpy(data, &value, sizeof(T));
+}
 
 // 此处重载了<<操作符，在ColMeta中进行了调用
 template <typename T, typename = typename std::enable_if<std::is_enum<T>::value, T>::type>

@@ -29,10 +29,40 @@ public:
     bool RunIfNeeded();
     void SetOptions(CheckpointOptions options);
 
+    uint64_t last_block_new_txn_ns() const {
+        return last_block_new_txn_ns_.load(std::memory_order_acquire);
+    }
+
+    uint64_t last_drain_ns() const {
+        return last_drain_ns_.load(std::memory_order_acquire);
+    }
+
+    uint64_t last_data_flush_ns() const {
+        return last_data_flush_ns_.load(std::memory_order_acquire);
+    }
+
+    uint64_t last_meta_flush_ns() const {
+        return last_meta_flush_ns_.load(std::memory_order_acquire);
+    }
+
+    uint64_t last_log_sync_ns() const {
+        return last_log_sync_ns_.load(std::memory_order_acquire);
+    }
+
+    uint64_t last_truncate_ns() const {
+        return last_truncate_ns_.load(std::memory_order_acquire);
+    }
+
 private:
     TransactionManager* txn_mgr_;
     SmManager* sm_mgr_;
     LogManager* log_mgr_;
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};
+    std::atomic<uint64_t> last_block_new_txn_ns_{0};
+    std::atomic<uint64_t> last_drain_ns_{0};
+    std::atomic<uint64_t> last_data_flush_ns_{0};
+    std::atomic<uint64_t> last_meta_flush_ns_{0};
+    std::atomic<uint64_t> last_log_sync_ns_{0};
+    std::atomic<uint64_t> last_truncate_ns_{0};
 };

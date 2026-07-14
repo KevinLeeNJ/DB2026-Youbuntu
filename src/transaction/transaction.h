@@ -96,6 +96,14 @@ public:
         return state_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
+    inline void mark_lock_cancellation_requested() {
+        lock_cancellation_requested_.store(true, std::memory_order_release);
+    }
+
+    inline bool is_lock_cancellation_requested() const {
+        return lock_cancellation_requested_.load(std::memory_order_acquire);
+    }
+
     inline lsn_t get_prev_lsn() {
         return prev_lsn_;
     }
@@ -198,6 +206,7 @@ public:
 private:
     bool txn_mode_{false};                // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     std::atomic<TransactionState> state_; // 事务状态；GC/SSI may inspect it from another thread
+    std::atomic<bool> lock_cancellation_requested_{false};
     IsolationLevel isolation_level_;      // 事务的隔离级别
     std::thread::id thread_id_;           // 当前事务对应的线程id
     lsn_t prev_lsn_;       // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复

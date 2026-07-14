@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <list>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -39,7 +40,7 @@ private:
     DiskManager* disk_manager_;
     LogManager* log_manager_{nullptr};
     std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
-    std::mutex latch_;                   // 用于共享数据结构的并发控制
+    std::shared_mutex latch_;             // 用于共享数据结构的并发控制
 
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
@@ -89,9 +90,6 @@ public:
     }
 
 private:
-    bool find_victim_page(frame_id_t* frame_id);
-
-    void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
-
     void flush_log_before_page_write(lsn_t page_lsn);
+    bool flush_page_impl(PageId page_id, bool dirty_only);
 };

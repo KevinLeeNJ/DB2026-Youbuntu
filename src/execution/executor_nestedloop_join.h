@@ -167,8 +167,8 @@ private:
         }
 
         const char* data = get_operand_data(operand, left_rec, right_rec);
-        return operand.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(data))
-                                        : *reinterpret_cast<const double*>(data);
+        return operand.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(data))
+                                        : read_unaligned<double>(data);
     }
 
     static std::string_view read_string_operand(const CompiledOperand& operand, const RmRecord& left_rec,
@@ -224,10 +224,10 @@ private:
         const char* data = left_rec.data + left_key_offset_;
         switch (left_key_type_) {
         case TYPE_INT:
-            val.set_int(*reinterpret_cast<const int*>(data));
+            val.set_int(read_unaligned<int>(data));
             break;
         case TYPE_FLOAT:
-            val.set_float(*reinterpret_cast<const double*>(data));
+            val.set_float(read_unaligned<double>(data));
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:

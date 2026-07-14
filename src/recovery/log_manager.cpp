@@ -95,36 +95,129 @@ void LogManager::flush_log_to_disk() {
 }
 
 void LogManager::flush_log_to_disk_with_sync() {
-    std::lock_guard<std::mutex> lock(latch_);
-    flush_log_to_disk_unlocked();
-    disk_manager_->fsync_log();
-    durable_lsn_.store(persist_lsn_, std::memory_order_release);
+    lsn_t target_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
+    if (target_lsn == INVALID_LSN) {
+        std::lock_guard<std::mutex> lock(latch_);
+        flush_log_to_disk_unlocked();
+        disk_manager_->fsync_log();
+        durable_lsn_.store(persist_lsn_, std::memory_order_release);
+        return;
+    }
+    flush_log_to_disk_up_to(target_lsn);
 }
 
 void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
     if (target_lsn == INVALID_LSN) {
         return;
     }
-    std::lock_guard<std::mutex> lock(latch_);
-    // A page can retain an LSN from a previous, already truncated WAL
-    // epoch. If no current WAL record exists at or below this target, there
-    // is nothing to flush for this page.
-    if (log_buffer_.offset_ == 0 && target_lsn >= global_lsn_.load(std::memory_order_acquire)) {
-        return;
+
+    // A page can retain an LSN from a previous WAL epoch, or legacy callers
+    // can pass bytes from the page payload as an LSN. Never wait for a record
+    // that this LogManager has not allocated: WAL durability only needs to
+    // cover the current log prefix.
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        lsn_t latest_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
+        if (latest_lsn == INVALID_LSN) {
+            return;
+        }
+        target_lsn = std::min(target_lsn, latest_lsn);
     }
     if (durable_lsn_.load(std::memory_order_acquire) >= target_lsn) {
         return;
     }
-    flush_log_to_disk_unlocked();
-    disk_manager_->fsync_log();
-    durable_lsn_.store(persist_lsn_, std::memory_order_release);
-    if (durable_lsn_.load(std::memory_order_acquire) < target_lsn) {
-        // Pages created outside the WAL path (or legacy pages whose first
-        // four bytes predate page-LSN initialization) can contain a value
-        // larger than the current WAL tail. They have no WAL dependency to
-        // wait for; valid WAL-backed page LSNs are always <= the appended
-        // tail and are covered by the sync above.
-        return;
+
+    auto waiter = std::make_shared<CommitWaiter>();
+    waiter->target_lsn = target_lsn;
+    waiter->enqueue_time_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    bool become_leader = false;
+    {
+        std::unique_lock<std::mutex> group_lock(group_commit_latch_);
+        if (durable_lsn_.load(std::memory_order_acquire) >= target_lsn) {
+            return;
+        }
+        group_commit_waiters_.push_back(waiter);
+        if (!group_commit_leader_active_) {
+            group_commit_leader_active_ = true;
+            become_leader = true;
+        }
+
+        if (!become_leader) {
+            waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
+            if (waiter->error != nullptr) {
+                std::rethrow_exception(waiter->error);
+            }
+            return;
+        }
+    }
+
+    // A concurrent commit may have joined while the leader was writing or
+    // syncing. Keep extending the batch until every pending target is
+    // covered by the durable LSN.
+    for (;;) {
+        try {
+            {
+                std::lock_guard<std::mutex> log_lock(latch_);
+                flush_log_to_disk_unlocked();
+                disk_manager_->fsync_log();
+                fsync_count_.fetch_add(1, std::memory_order_acq_rel);
+                durable_lsn_.store(persist_lsn_, std::memory_order_release);
+            }
+        } catch (...) {
+            auto error = std::current_exception();
+            std::vector<std::shared_ptr<CommitWaiter>> notify;
+            {
+                std::lock_guard<std::mutex> group_lock(group_commit_latch_);
+                for (const auto& pending : group_commit_waiters_) {
+                    pending->error = error;
+                    pending->done = true;
+                    notify.push_back(pending);
+                }
+                group_commit_waiters_.clear();
+                group_commit_leader_active_ = false;
+            }
+            for (const auto& pending : notify) {
+                pending->cv.notify_one();
+            }
+            std::rethrow_exception(error);
+        }
+
+        std::vector<std::shared_ptr<CommitWaiter>> notify;
+        bool group_done = false;
+        const lsn_t durable_lsn = durable_lsn_.load(std::memory_order_acquire);
+        {
+            std::lock_guard<std::mutex> group_lock(group_commit_latch_);
+            for (auto it = group_commit_waiters_.begin(); it != group_commit_waiters_.end();) {
+                if ((*it)->target_lsn <= durable_lsn) {
+                    (*it)->done = true;
+                    notify.push_back(*it);
+                    it = group_commit_waiters_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (group_commit_waiters_.empty()) {
+                group_commit_leader_active_ = false;
+                group_done = true;
+            }
+        }
+        for (const auto& pending : notify) {
+            pending->cv.notify_one();
+        }
+        if (!notify.empty()) {
+            const uint64_t now_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            group_commit_count_.fetch_add(1, std::memory_order_acq_rel);
+            group_commit_waiter_count_.fetch_add(notify.size(), std::memory_order_acq_rel);
+            for (const auto& pending : notify) {
+                group_commit_wait_ns_.fetch_add(now_ns - pending->enqueue_time_ns, std::memory_order_acq_rel);
+            }
+        }
+        if (group_done) {
+            return;
+        }
     }
 }
 
