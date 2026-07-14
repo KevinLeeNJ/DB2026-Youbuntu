@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "lock_manager.h"
 
 #include <algorithm>
+#include <cstring>
 
 LockManager::LockTableShard& LockManager::get_shard(const LockDataId& lock_data_id) {
     return lock_table_shards_[std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT];
@@ -78,9 +79,10 @@ void LockManager::unregister_pending_lock(txn_id_t txn_id, const LockDataId& loc
         return;
     }
     auto& pending = txn_it->second;
-    pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const PendingLock& item) {
-                     return item.lock_data_id == lock_data_id && item.request == request;
-                 }),
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                 [&](const PendingLock& item) {
+                                     return item.lock_data_id == lock_data_id && item.request == request;
+                                 }),
                   pending.end());
     if (pending.empty()) {
         pending_locks_.erase(txn_it);
@@ -174,6 +176,39 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         return false;
     }
     txn->get_lock_set()->insert(lock_data_id);
+    return true;
+}
+
+bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, const std::vector<char>& key) {
+    if (txn == nullptr) {
+        return false;
+    }
+
+    std::string lock_id(sizeof(index_fd), '\0');
+    std::memcpy(lock_id.data(), &index_fd, sizeof(index_fd));
+    lock_id.append(key.data(), key.size());
+
+    std::lock_guard<std::mutex> lock(unique_key_latch_);
+    auto it = unique_key_owners_.find(lock_id);
+    if (it != unique_key_owners_.end() && it->second != txn->get_transaction_id()) {
+        return false;
+    }
+    unique_key_owners_[lock_id] = txn->get_transaction_id();
+    txn->get_unique_key_lock_set()->insert(std::move(lock_id));
+    return true;
+}
+
+bool LockManager::unlock_unique_key(Transaction* txn, const std::string& lock_id) {
+    if (txn == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(unique_key_latch_);
+    auto it = unique_key_owners_.find(lock_id);
+    if (it == unique_key_owners_.end() || it->second != txn->get_transaction_id()) {
+        return false;
+    }
+    unique_key_owners_.erase(it);
+    txn->get_unique_key_lock_set()->erase(lock_id);
     return true;
 }
 

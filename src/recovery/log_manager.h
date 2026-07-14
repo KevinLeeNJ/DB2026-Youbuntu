@@ -447,7 +447,8 @@ class LogManager {
 public:
     static constexpr const char* RESTART_FILE_NAME = "db.restart";
 
-    LogManager(DiskManager* disk_manager) {
+    LogManager(DiskManager* disk_manager)
+        : log_buffer_(std::make_unique<LogBuffer>()), flushing_buffer_(std::make_unique<LogBuffer>()) {
         disk_manager_ = disk_manager;
         persist_lsn_ = INVALID_LSN;
         durable_lsn_ = INVALID_LSN;
@@ -501,7 +502,7 @@ public:
     int64_t read_restart_offset() const;
 
     LogBuffer* get_log_buffer() {
-        return &log_buffer_;
+        return log_buffer_.get();
     }
 
 private:
@@ -513,7 +514,7 @@ private:
         std::condition_variable cv;
     };
 
-    void flush_log_to_disk_unlocked();
+    void flush_buffer(bool sync);
 
     // One leader performs the durable flush for all waiters that arrive
     // before it finishes. Waiters are released only after durable_lsn_ moves
@@ -522,15 +523,20 @@ private:
     bool group_commit_leader_active_{false};
     std::deque<std::shared_ptr<CommitWaiter>> group_commit_waiters_;
 
-    std::atomic<lsn_t> global_lsn_{0};            // 全局lsn，递增，用于为每条记录分发lsn
-    std::mutex latch_;                            // 用于对log_buffer_的互斥访问
-    LogBuffer log_buffer_;                        // 日志缓冲区
+    std::atomic<lsn_t> global_lsn_{0}; // 全局lsn，递增，用于为每条记录分发lsn
+    std::mutex latch_;                 // protects active/flushing buffers and WAL metadata
+    std::condition_variable buffer_cv_;
+    std::unique_ptr<LogBuffer> log_buffer_;      // active append buffer
+    std::unique_ptr<LogBuffer> flushing_buffer_; // stable buffer written without latch_
+    bool flushing_in_progress_{false};
+    lsn_t flushing_lsn_{INVALID_LSN};
+    int flushing_bytes_{0};
     lsn_t persist_lsn_{INVALID_LSN};              // 记录已经持久化到磁盘中的最后一条日志的日志号
     std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
     std::atomic<uint64_t> fsync_count_{0};
     std::atomic<uint64_t> group_commit_count_{0};
     std::atomic<uint64_t> group_commit_waiter_count_{0};
     std::atomic<uint64_t> group_commit_wait_ns_{0};
-    int64_t log_file_offset_{0};                  // 日志文件当前追加偏移
+    int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
 };

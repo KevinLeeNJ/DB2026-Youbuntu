@@ -242,6 +242,37 @@ TEST_F(IndexHandleTest, EqualRangeMatchesLowerBoundPlusUpperBound) {
     close_index(ih);
 }
 
+TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
+    auto ih = open_index();
+    for (int value = 0; value < 1000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    close_index(ih);
+
+    // Simulate a new server process: fd2pageno_ is process-local and must be
+    // reconstructed from the persisted index header when the index is opened.
+    ix_manager.reset();
+    buffer_pool_manager.reset();
+    disk_manager.reset();
+    disk_manager = std::make_unique<DiskManager>();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    ih = open_index();
+
+    for (int value = 1000; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    auto k = key(1500);
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result.front(), (Rid{1, 1500}));
+    close_index(ih);
+}
+
 TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     auto ih = open_index();
     auto duplicate_key = key(777);

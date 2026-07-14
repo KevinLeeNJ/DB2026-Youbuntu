@@ -54,7 +54,8 @@ public:
         for (Rid& rid : rids_) {
             std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
-                if (context_ != nullptr && context_->txn_ != nullptr) {
+                if (context_ != nullptr && context_->txn_ != nullptr &&
+                    context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }
                 continue;
@@ -79,7 +80,7 @@ public:
                     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
                         auto current_record = GetCurrentRecordForRcWrite(fh_, rid, txn, context_);
                         if (!current_record.has_value()) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+                            continue;
                         }
                         rec = std::move(current_record->record);
                         bool latest_match = true;
@@ -147,6 +148,8 @@ public:
                     }
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
                                   .get();
+                    ReserveUniqueKey(context_, ih->GetFd(), old_key);
+                    ReserveUniqueKey(context_, ih->GetFd(), new_key);
                     std::vector<Rid> result;
                     if (ih->get_value(new_key.data(), &result, txn) &&
                         std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
@@ -189,7 +192,7 @@ public:
                     meta.is_committed_ = false;
                     meta.is_deleted_ = false;
                     meta.version_chain_head_ = undo_link;
-                    fh_->set_tuple_meta(rid, meta, log_lsn);
+                    fh_->apply_tuple_update(rid, new_rec->data, meta, log_lsn);
                 }
 
                 std::vector<size_t> deleted_indexes;
@@ -203,7 +206,7 @@ public:
                         auto index_latch = ih->lock_exclusive();
                         sm_manager_->remember_historical_index_key(
                             tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols),
-                            update.old_key, rid);
+                            update.old_key, rid, *update.index);
                         ih->delete_entry_unlocked(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
                         ih->insert_entry_unlocked(update.new_key.data(), rid, txn); // 插入新索引
@@ -227,7 +230,10 @@ public:
                     }
                     throw; // 仍然抛出错误
                 }
-                fh_->update_record(rid, new_rec->data, context_, log_lsn);
+                if (context_ == nullptr || context_->txn_ == nullptr) {
+                    TupleMeta committed_meta = fh_->get_tuple_meta(rid);
+                    fh_->apply_tuple_update(rid, new_rec->data, committed_meta, log_lsn);
+                }
             }
         }
         return nullptr;
@@ -252,10 +258,10 @@ public:
                 if (set_clause.op == UpdateOp::ASSIGNMENT) {
                     if (col_meta.type == TYPE_INT && rhs_col_meta.type == TYPE_FLOAT) {
                         write_unaligned(data,
-                                       static_cast<int>(read_unaligned<double>(old_rec.data + rhs_col_meta.offset)));
+                                        static_cast<int>(read_unaligned<double>(old_rec.data + rhs_col_meta.offset)));
                     } else if (col_meta.type == TYPE_FLOAT && rhs_col_meta.type == TYPE_INT) {
                         write_unaligned(data,
-                                       static_cast<double>(read_unaligned<int>(old_rec.data + rhs_col_meta.offset)));
+                                        static_cast<double>(read_unaligned<int>(old_rec.data + rhs_col_meta.offset)));
                     } else if (col_meta.type == TYPE_STRING || col_meta.type == TYPE_DATETIME) {
                         if (rhs_col_meta.type != TYPE_STRING && rhs_col_meta.type != TYPE_DATETIME) {
                             throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));

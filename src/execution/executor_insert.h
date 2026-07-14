@@ -99,8 +99,9 @@ public:
         index_keys.reserve(tab_.indexes.size());
         for (const auto& index : tab_.indexes) {
             auto key = make_index_key(index, rec.data);
-            check_mvcc_unique_key_conflict(index, key);
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+            ReserveUniqueKey(context_, ih->GetFd(), key);
+            check_mvcc_unique_key_conflict(index, key);
             std::vector<Rid> result;
             if (ih->get_value(key.data(), &result, context_ == nullptr ? nullptr : context_->txn_)) {
                 throw IndexEntryExistsError();
@@ -112,6 +113,7 @@ public:
         bool insert_finished = false;
         try {
             rid_ = prepared_insert.rid;
+            lsn_t log_lsn = INVALID_LSN;
             TupleMeta pending_meta;
             if (context_ != nullptr && context_->txn_ != nullptr) {
                 pending_meta.writer_txn_id_ = context_->txn_->get_transaction_id();
@@ -124,10 +126,11 @@ public:
                 log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
                 lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
                 context_->txn_->set_prev_lsn(lsn);
-                prepared_insert.page_handle.page->set_page_lsn(lsn);
+                log_lsn = lsn;
             }
             fh_->finish_insert_record(prepared_insert, rec.data,
-                                      context_ != nullptr && context_->txn_ != nullptr ? &pending_meta : nullptr);
+                                      context_ != nullptr && context_->txn_ != nullptr ? &pending_meta : nullptr,
+                                      log_lsn);
             insert_finished = true;
         } catch (...) {
             if (!insert_finished) {

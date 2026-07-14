@@ -128,13 +128,19 @@ public:
 
     RmPinnedInsert prepare_insert_record();
 
-    void finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta = nullptr);
+    void finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta = nullptr,
+                              lsn_t page_lsn = INVALID_LSN);
 
     void abort_prepared_insert(RmPinnedInsert& insert);
 
     void delete_record(const Rid& rid, Context* context, lsn_t page_lsn = INVALID_LSN);
 
     void update_record(const Rid& rid, char* buf, Context* context, lsn_t page_lsn = INVALID_LSN);
+
+    // Apply the tuple image and its MVCC metadata as one page mutation. The
+    // page LSN is installed only after both payloads have been written while
+    // the same exclusive page latch is held.
+    void apply_tuple_update(const Rid& rid, const char* buf, const TupleMeta& meta, lsn_t page_lsn);
 
     RmPageHandle create_new_page_handle();
 

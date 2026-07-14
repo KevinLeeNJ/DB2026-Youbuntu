@@ -20,10 +20,12 @@ See the Mulan PSL v2 for more details. */
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -242,6 +244,46 @@ TEST(LogManagerTest, FlushDurableUpToHonorsPageLsnTarget) {
 
     EXPECT_EQ(log_mgr.get_durable_lsn(), begin_lsn);
     EXPECT_GE(log_mgr.get_persist_lsn(), begin_lsn);
+}
+
+TEST(LogManagerTest, ConcurrentDurableFlushesShareAGroup) {
+    ScopedTestDir test_dir("log_manager_group_commit_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    constexpr int kWaiterCount = 16;
+    lsn_t target_lsn = INVALID_LSN;
+    for (int i = 0; i < kWaiterCount; ++i) {
+        BeginLogRecord begin(200 + i);
+        target_lsn = log_mgr.add_log_to_buffer(&begin);
+    }
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> waiters;
+    waiters.reserve(kWaiterCount);
+    for (int i = 0; i < kWaiterCount; ++i) {
+        waiters.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            log_mgr.flush_log_to_disk_up_to(target_lsn);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kWaiterCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& waiter : waiters) {
+        waiter.join();
+    }
+
+    EXPECT_EQ(log_mgr.get_durable_lsn(), target_lsn);
+    EXPECT_GE(log_mgr.get_group_commit_count(), 1u);
+    EXPECT_GE(log_mgr.get_group_commit_waiter_count(), 1u);
+    EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kWaiterCount));
 }
 
 TEST(LogManagerTest, RestartOffsetRoundTrip) {

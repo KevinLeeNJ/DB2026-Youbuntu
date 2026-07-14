@@ -11,7 +11,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "buffer_pool_manager.h"
 
-
 #include "recovery/log_manager.h"
 
 namespace {
@@ -113,11 +112,13 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
 
         bool loaded = false;
+        bool old_page_write_succeeded = !old_page_dirty || !IsValidPageId(old_page_id);
         try {
             std::unique_lock<std::shared_mutex> page_lock(target_page->latch_);
             if (old_page_dirty && IsValidPageId(old_page_id)) {
                 flush_log_before_page_write(target_page->get_page_lsn());
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, target_page->data_, PAGE_SIZE);
+                old_page_write_succeeded = true;
             }
             target_page->reset_memory();
             disk_manager_->read_page(page_id.fd, page_id.page_no, target_page->data_, PAGE_SIZE);
@@ -132,6 +133,18 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
             auto hit = page_table_.find(page_id);
             if (loaded && hit != page_table_.end() && hit->second == fid && target_page->id_ == page_id) {
                 target_page->state_.store(FrameState::VALID, std::memory_order_release);
+            } else if (!old_page_write_succeeded && IsValidPageId(old_page_id)) {
+                // The frame still contains the old page image. Restore its
+                // ownership instead of discarding the only dirty copy.
+                if (hit != page_table_.end() && hit->second == fid) {
+                    page_table_.erase(hit);
+                }
+                target_page->id_ = old_page_id;
+                target_page->is_dirty_ = true;
+                target_page->pin_count_ = 0;
+                target_page->state_.store(FrameState::VALID, std::memory_order_release);
+                page_table_.insert_or_assign(old_page_id, fid);
+                replacer_->unpin(fid);
             } else {
                 if (hit != page_table_.end() && hit->second == fid) {
                     page_table_.erase(hit);
@@ -318,11 +331,13 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     }
 
     bool initialized = false;
+    bool old_page_write_succeeded = !old_page_dirty || !IsValidPageId(old_page_id);
     try {
         std::unique_lock<std::shared_mutex> page_lock(page->latch_);
         if (old_page_dirty && IsValidPageId(old_page_id)) {
             flush_log_before_page_write(page->get_page_lsn());
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
+            old_page_write_succeeded = true;
         }
         page->reset_memory();
         page->is_dirty_ = false;
@@ -336,6 +351,16 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         auto hit = page_table_.find(*page_id);
         if (initialized && hit != page_table_.end() && hit->second == fid) {
             page->state_.store(FrameState::VALID, std::memory_order_release);
+        } else if (!old_page_write_succeeded && IsValidPageId(old_page_id)) {
+            if (hit != page_table_.end() && hit->second == fid) {
+                page_table_.erase(hit);
+            }
+            page->id_ = old_page_id;
+            page->is_dirty_ = true;
+            page->pin_count_ = 0;
+            page->state_.store(FrameState::VALID, std::memory_order_release);
+            page_table_.insert_or_assign(old_page_id, fid);
+            replacer_->unpin(fid);
         } else {
             if (hit != page_table_.end() && hit->second == fid) {
                 page_table_.erase(hit);
@@ -430,7 +455,8 @@ bool BufferPoolManager::delete_page(PageId page_id) {
  * @description: 将buffer_pool中的所有页写回到磁盘
  * @param {int} fd 文件句柄
  */
-void BufferPoolManager::flush_all_pages(int fd) {
+bool BufferPoolManager::flush_all_pages(int fd) {
+    bool success = true;
     std::vector<PageId> pages_to_flush;
     {
         std::shared_lock lock{latch_};
@@ -446,8 +472,9 @@ void BufferPoolManager::flush_all_pages(int fd) {
         }
     }
     for (const PageId& page_id_to_flush : pages_to_flush) {
-        flush_page_impl(page_id_to_flush, true);
+        success = flush_page_impl(page_id_to_flush, true) && success;
     }
+    return success;
 }
 
 void BufferPoolManager::delete_all_pages(int fd) {

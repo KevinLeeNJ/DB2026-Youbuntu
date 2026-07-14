@@ -162,9 +162,10 @@ IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffe
     file_hdr_ = std::make_unique<IxFileHdr>();
     file_hdr_->deserialize(buf.data());
 
-    // disk_manager管理的fd对应的文件中，设置从file_hdr_->num_pages开始分配page_no
-    int now_page_no = disk_manager_->get_fd2pageno(fd);
-    disk_manager_->set_fd2pageno(fd, now_page_no + 1);
+    // fd2pageno_ is process-local state and is reset when the database is
+    // reopened. Reconstruct the allocation cursor from the persisted index
+    // header instead of incrementing an unrelated value left on this fd.
+    disk_manager_->set_fd2pageno(fd, file_hdr_->num_pages_);
 }
 
 /**
@@ -527,6 +528,64 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transact
 }
 
 bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
+    bool needs_structure_fallback = false;
+    {
+        auto structure_guard = lock_shared();
+        IxNodeHandle leaf;
+        fetch_node_into(file_hdr_->root_page_, leaf);
+        while (!leaf.is_leaf_page()) {
+            int child_idx = leaf.lower_bound(key);
+            if (child_idx >= leaf.get_size()) {
+                child_idx = leaf.get_size() - 1;
+            } else if (child_idx > 0 &&
+                       ix_compare(leaf.get_key(child_idx), key, file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
+                --child_idx;
+            }
+            page_id_t child_page_no = leaf.value_at(child_idx);
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            fetch_node_into(child_page_no, leaf);
+        }
+
+        for (;;) {
+            std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
+            int pos = leaf.lower_bound(key);
+            bool stop_at_leaf = false;
+            while (pos < leaf.get_size()) {
+                int cmp = ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_);
+                if (cmp > 0) {
+                    stop_at_leaf = true;
+                    break;
+                }
+                if (*leaf.get_rid(pos) == value) {
+                    needs_structure_fallback = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
+                    if (!needs_structure_fallback) {
+                        leaf.erase_pair(pos);
+                        leaf_guard.unlock();
+                        buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
+                        return true;
+                    }
+                    break;
+                }
+                ++pos;
+            }
+
+            const bool found_target = needs_structure_fallback ||
+                                       (pos < leaf.get_size() && *leaf.get_rid(pos) == value &&
+                                        ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0);
+            const bool at_last_leaf = leaf.get_page_no() == file_hdr_->last_leaf_;
+            const page_id_t next_leaf = leaf.get_next_leaf();
+            leaf_guard.unlock();
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            if (found_target || stop_at_leaf || at_last_leaf) {
+                break;
+            }
+            fetch_node_into(next_leaf, leaf);
+        }
+    }
+
+    if (!needs_structure_fallback) {
+        return false;
+    }
     auto guard = lock_exclusive();
     return delete_entry_unlocked(key, value, transaction);
 }

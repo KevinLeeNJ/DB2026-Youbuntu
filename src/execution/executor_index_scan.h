@@ -379,7 +379,8 @@ public:
             if (use_historical_index_candidates_) {
                 const std::string index_name =
                     sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
-                historical_rids = sm_manager_->get_historical_index_rids(tab_name_, index_name);
+                historical_rids = sm_manager_->get_historical_index_rids_in_range(
+                    tab_name_, index_name, lower_key, upper_key, lower_exclusive, upper_inclusive);
             }
             std::unordered_set<uint64_t> seen_rids;
             seen_rids.reserve(rids.size() + historical_rids.size());

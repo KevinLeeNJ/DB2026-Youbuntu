@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -44,6 +46,12 @@ constexpr size_t GC_TXN_MAP_THRESHOLD = 1024; // 或 txn_map 超过该阈值立�
 constexpr size_t GC_BATCH_SIZE = 128;
 constexpr size_t GC_SCAN_LIMIT = 512;
 
+[[noreturn]] void FailStopAfterDurableCommit() {
+    std::fprintf(stderr, "FATAL: durable COMMIT publication failed; stopping for recovery\n");
+    std::fflush(stderr);
+    std::_Exit(134);
+}
+
 void ClearWriteSet(Transaction* txn) {
     if (txn == nullptr) {
         return;
@@ -61,6 +69,12 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
         lock_manager->unlock(txn, lock_id);
     }
     lock_set->clear();
+
+    auto unique_key_locks = *txn->get_unique_key_lock_set();
+    for (const auto& lock_id : unique_key_locks) {
+        lock_manager->unlock_unique_key(txn, lock_id);
+    }
+    txn->get_unique_key_lock_set()->clear();
 }
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
@@ -291,11 +305,12 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         RmRecord old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         if (fh->is_record(rid)) {
-            fh->update_record(rid, old_rec.data, nullptr, page_lsn);
+            fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
+                                   page_lsn);
         } else {
             fh->insert_record(rid, old_rec.data, page_lsn);
+            fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
         }
-        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
         InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
         break;
     }
@@ -315,8 +330,10 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
             }
         }
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
-        fh->update_record(rid, old_rec.data, nullptr, page_lsn);
-        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
+        if (fh->is_record(rid)) {
+            fh->apply_tuple_update(rid, old_rec.data,
+                                   undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
+        }
         if (current_rec != nullptr) {
             for (const auto& index : tab.indexes) {
                 auto current_key = MakeIndexKey(index, current_rec->data);
@@ -417,37 +434,60 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 
     FaultInjector::Point("before_commit_wal");
     WriteCommitLog(txn, log_manager);
-    FaultInjector::Point("after_commit_wal_sync");
+    try {
+        FaultInjector::Point("after_commit_wal_sync");
 
-    // WAL durability is intentionally outside the publication latch. The
-    // latch orders only the visibility phase, so a statement snapshot can
-    // never advance past a partially published transaction.
-    std::unique_lock<std::mutex> publish_lock(commit_publish_latch_);
-    if (txn->get_state() != TransactionState::COMMITTING) {
-        publish_lock.unlock();
-        throw InternalError("transaction left COMMITTING during publication");
+        timestamp_t commit_csn;
+        timestamp_t commit_ts;
+        {
+            // CSN and commit timestamp allocation must be ordered together.
+            // Otherwise an out-of-order publisher could move last_commit_ts_
+            // backwards when the frontier is advanced.
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            commit_csn = ++next_commit_csn_;
+            commit_ts = next_timestamp_.fetch_add(1);
+            txn->commit_ts_ = commit_ts;
+        }
+
+        // Publish every modified slot outside the frontier mutex. A new RC
+        // statement still cannot observe this commit until its CSN is part of
+        // the contiguous completed frontier below.
+        FaultInjector::Point("before_tuple_publication");
+        sm_manager_->mark_slots_committed(*txn, commit_ts);
+        FaultInjector::Point("after_tuple_publication");
+        txn->set_state(TransactionState::COMMITTED);
+        FaultInjector::Point("before_published_csn_store");
+        {
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            completed_commits_.emplace(commit_csn, commit_ts);
+            while (true) {
+                auto next = completed_commits_.find(published_commit_csn_ + 1);
+                if (next == completed_commits_.end()) {
+                    break;
+                }
+                last_commit_ts_.store(next->second, std::memory_order_release);
+                ++published_commit_csn_;
+                completed_commits_.erase(next);
+            }
+        }
+        commit_frontier_cv_.notify_all();
+
+        // Do not return from COMMIT until this transaction is covered by the
+        // publication frontier. This provides read-your-commit even when a
+        // later CSN finished publishing first.
+        std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+        commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
+    } catch (...) {
+        // Once WriteCommitLog returned, recovery must treat this transaction
+        // as committed. Ordinary abort would make durable WAL and in-memory
+        // state disagree and may leave a partially published transaction.
+        FailStopAfterDurableCommit();
     }
-
-    // Allocate the timestamp while holding the publication latch. Therefore
-    // commit timestamp order is also publication order.
-    timestamp_t commit_ts = next_timestamp_.fetch_add(1);
-    txn->commit_ts_ = commit_ts;
-
-    // Publish every modified slot before making this commit timestamp visible
-    // to a new RC statement. A multi-page transaction is consequently atomic
-    // from the statement-snapshot point of view.
-    FaultInjector::Point("before_tuple_publication");
-    sm_manager_->mark_slots_committed(*txn, commit_ts);
-    FaultInjector::Point("after_tuple_publication");
-    txn->set_state(TransactionState::COMMITTED);
-    FaultInjector::Point("before_published_csn_store");
-    last_commit_ts_.store(commit_ts, std::memory_order_release);
-    publish_lock.unlock();
 
     // Keep the committing transaction in the watermark until publication is
     // complete; otherwise GC could reclaim its undo state in the publication
     // window.
-    running_txns_.UpdateCommitTs(commit_ts);
+    running_txns_.UpdateCommitTs(txn->get_commit_ts());
     running_txns_.RemoveTxn(txn->get_read_ts());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
@@ -1044,26 +1084,13 @@ void TransactionManager::MaybeRunGarbageCollection() {
 void TransactionManager::GarbageCollectionLoop() {
     std::unique_lock<std::mutex> lock(latch_);
     while (!gc_stop_.load(std::memory_order_acquire)) {
-        gc_cv_.wait(lock, [this] {
-            return gc_stop_.load(std::memory_order_acquire) || gc_requested_;
-        });
+        gc_cv_.wait(lock, [this] { return gc_stop_.load(std::memory_order_acquire) || gc_requested_; });
         if (gc_stop_.load(std::memory_order_acquire)) {
             break;
         }
-        // The existing metadata/history collector assumes a quiescent
-        // transaction set. Keep it off the hot commit path and wait for the
-        // active set to drain before touching table-side history.
-        lock.unlock();
-        {
-            std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
-            gc_cv_.wait(checkpoint_lock, [this] {
-                return gc_stop_.load(std::memory_order_acquire) || active_txn_count_ == 0;
-            });
-        }
-        lock.lock();
-        if (gc_stop_.load(std::memory_order_acquire)) {
-            break;
-        }
+        // GarbageCollectionBatch uses the oldest active read timestamp as
+        // its safety boundary. It must not wait for a globally quiescent
+        // transaction set, otherwise a sustained workload can starve GC.
         size_t batch_start_size = 0;
         batch_start_size = txn_map.size();
         gc_backlog_.store(batch_start_size, std::memory_order_release);
@@ -1161,9 +1188,10 @@ bool TransactionManager::GarbageCollectionBatch() {
     }
     // 回收 SmManager 侧随写操作单调增长的历史索引键/删除候选（需访问 tuple meta，
     // 不在 latch_ 下进行，避免与缓冲池操作死锁）
-    if (!to_erase.empty()) {
-        sm_manager_->prune_version_history(watermark);
-    }
+    // History/index candidates have the same watermark safety rule as txn_map
+    // entries and must be pruned even when this batch found no transaction
+    // object to erase.
+    sm_manager_->prune_version_history(watermark);
     return to_erase.size() >= GC_BATCH_SIZE;
 }
 

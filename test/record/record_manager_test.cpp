@@ -23,6 +23,8 @@ See the Mulan PSL v2 for more details. */
 #include <ctime>
 #include <iostream>
 #include <memory>
+#include <set>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -197,6 +199,114 @@ TEST_F(RecordManagerTest, SimpleTest) {
     assert(mock.size() == add_cnt - del_cnt);
     std::cout << "insert " << add_cnt << '\n' << "delete " << del_cnt << '\n' << "update " << upd_cnt << '\n';
     // clean up
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, ApplyTupleUpdateInstallsTupleAndPageLsnTogether) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "apply_tuple_update_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 64;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+
+    char initial[record_size] = {};
+    Rid rid = file_handle->insert_record(initial, nullptr);
+    char updated[record_size] = {};
+    std::memcpy(updated, "updated", 8);
+    TupleMeta meta;
+    meta.writer_txn_id_ = 7;
+    meta.is_committed_ = false;
+    meta.is_deleted_ = false;
+
+    file_handle->apply_tuple_update(rid, updated, meta, 42);
+
+    auto record = file_handle->get_record(rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(std::memcmp(record->data, updated, record_size), 0);
+    EXPECT_EQ(file_handle->get_tuple_meta(rid).writer_txn_id_, 7);
+    EXPECT_FALSE(file_handle->get_tuple_meta(rid).is_committed_);
+    EXPECT_EQ(file_handle->get_page_lsn(rid), 42);
+
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, PreparedInsertInstallsTupleMetaAndPageLsnTogether) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "prepared_insert_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 64;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+    auto prepared = file_handle->prepare_insert_record();
+    char value[record_size] = {};
+    std::memcpy(value, "inserted", 9);
+    TupleMeta meta;
+    meta.writer_txn_id_ = 11;
+    meta.is_committed_ = false;
+    meta.is_deleted_ = false;
+
+    file_handle->finish_insert_record(prepared, value, &meta, 77);
+
+    auto record = file_handle->get_record(prepared.rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(std::memcmp(record->data, value, record_size), 0);
+    EXPECT_EQ(file_handle->get_tuple_meta(prepared.rid).writer_txn_id_, 11);
+    EXPECT_FALSE(file_handle->get_tuple_meta(prepared.rid).is_committed_);
+    EXPECT_EQ(file_handle->get_page_lsn(prepared.rid), 77);
+
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, ConcurrentInsertsUseMultipleHeapPages) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "concurrent_insert_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 128;
+    constexpr int worker_count = 8;
+    constexpr int inserts_per_worker = 100;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (int worker = 0; worker < worker_count; ++worker) {
+        workers.emplace_back([&, worker] {
+            char record[record_size] = {};
+            std::memcpy(record, &worker, sizeof(worker));
+            for (int i = 0; i < inserts_per_worker; ++i) {
+                file_handle->insert_record(record, nullptr);
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    std::set<page_id_t> pages;
+    int record_count = 0;
+    for (RmScan scan(file_handle.get()); !scan.is_end(); scan.next()) {
+        pages.insert(scan.rid().page_no);
+        ++record_count;
+    }
+    EXPECT_EQ(record_count, worker_count * inserts_per_worker);
+    EXPECT_GT(pages.size(), 1u);
+
     rm_manager->close_file(file_handle.get());
     rm_manager->destroy_file(filename);
 }

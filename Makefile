@@ -1,4 +1,4 @@
-.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark tpcc-go benchmark-clean
+.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark benchmark-random-kill tpcc-go benchmark-clean
 
 BUILD_DIR := build
 BINARY := $(BUILD_DIR)/bin/rmdb
@@ -22,6 +22,14 @@ TPCC_THINK_MS ?= 0
 TPCC_RECONNECT_EACH_TXN ?= 0
 TPCC_ISOLATION ?= read-committed
 TPCC_GO_BINARY := $(BUILD_DIR)/bin/tpcc-go
+TPCC_RANDOM_DB ?= tpcc_random_kill_db
+TPCC_RANDOM_WORKERS ?= 16
+TPCC_RANDOM_WARMUP ?= 2
+TPCC_RANDOM_MEASURE ?= 45
+TPCC_RANDOM_CYCLES ?= 5
+TPCC_RANDOM_MIN_KILL_DELAY ?= 3
+TPCC_RANDOM_MAX_KILL_DELAY ?= 8
+TPCC_RANDOM_SEED ?= 1
 
 all: build
 
@@ -37,6 +45,7 @@ help:
 	@echo "  make client          - Build rmdb_client"
 	@echo "  make client-debug    - Build rmdb_client with debug flags"
 	@echo "  make benchmark       - Run rmdb TPC-C benchmark"
+	@echo "  make benchmark-random-kill - Run TPC-C random kill-9 recovery consistency test"
 	@echo "  make benchmark-clean - Remove benchmark runtime data, keep CSV files"
 
 build:
@@ -114,6 +123,20 @@ benchmark: build tpcc-go
 		--go-binary $(TPCC_GO_BINARY) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 
+benchmark-random-kill: build tpcc-go
+	@scripts/benchmark_tpcc_random_kill.sh \
+		--binary $(BINARY) \
+		--go-binary $(TPCC_GO_BINARY) \
+		--db-dir $(TPCC_RANDOM_DB) \
+		--workers $(TPCC_RANDOM_WORKERS) \
+		--warmup $(TPCC_RANDOM_WARMUP) \
+		--measure $(TPCC_RANDOM_MEASURE) \
+		--cycles $(TPCC_RANDOM_CYCLES) \
+		--min-kill-delay $(TPCC_RANDOM_MIN_KILL_DELAY) \
+		--max-kill-delay $(TPCC_RANDOM_MAX_KILL_DELAY) \
+		--seed $(TPCC_RANDOM_SEED) \
+		--isolation $(TPCC_ISOLATION)
+
 benchmark-clean:
-	@rm -rf $(TPCC_DB) $(TPCC_RESULT) benchmark/tpcc/rmdb-server.log
+	@rm -rf $(TPCC_DB) $(TPCC_RANDOM_DB) $(TPCC_RESULT) benchmark/tpcc/rmdb-server.log rmdb.log
 	@echo "Benchmark runtime data removed; CSV files in $(TPCC_DATA_DIR) were kept."

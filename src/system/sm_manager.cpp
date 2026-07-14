@@ -273,52 +273,62 @@ void SmManager::close_db() {
 }
 
 void SmManager::prune_version_history(timestamp_t watermark) {
-    // 回收 historical_index_keys_：键编码为 tab_name + '\0' + index_name + '\0' + key
-    // 对每个 RID，若其当前 tuple 版本已提交且 commit_ts < watermark，则任何活跃事务
-    // （read_ts >= watermark）都不会回溯其版本链，该历史键不再被冲突检测访问。
-    // 先在锁内快照待检查的 (key, RID) 列表，再在锁外读 meta，最后回锁内删除，避免
-    // 持锁访问缓冲池造成长时间持锁/死锁。
-    std::vector<std::pair<std::string, Rid>> hist_snapshot;
+    // A bucket is keyed by tab_name + '\0' + index_name + '\0'; its ordered
+    // map is keyed only by the encoded index key. Snapshot first, inspect
+    // tuple metadata without the history latch, then erase under the latch.
+    struct HistoricalCandidate {
+        std::string bucket_key;
+        std::string encoded_key;
+        Rid rid;
+    };
+    std::vector<HistoricalCandidate> hist_snapshot;
     {
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         hist_snapshot.reserve(historical_index_keys_.size() * 2);
-        for (const auto& [combined_key, rids] : historical_index_keys_) {
-            for (const Rid& rid : rids) {
-                hist_snapshot.emplace_back(combined_key, rid);
+        for (const auto& [bucket_key, bucket] : historical_index_keys_) {
+            for (const auto& [encoded_key, rids] : bucket.entries) {
+                for (const Rid& rid : rids) {
+                    hist_snapshot.push_back(HistoricalCandidate{bucket_key, encoded_key, rid});
+                }
             }
         }
     }
-    std::vector<std::pair<std::string, Rid>> hist_to_remove;
-    for (auto& [combined_key, rid] : hist_snapshot) {
-        // 解析 tab_name（第一个 '\0' 之前的部分）
-        size_t nul = combined_key.find('\0');
-        std::string tab_name = (nul != std::string::npos) ? combined_key.substr(0, nul) : std::string{};
+    std::vector<HistoricalCandidate> hist_to_remove;
+    for (auto& candidate : hist_snapshot) {
+        size_t nul = candidate.bucket_key.find('\0');
+        std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
         auto fh_it = fhs_.find(tab_name);
         if (fh_it == fhs_.end()) {
-            // 表已不存在，整组历史键失效，直接标记删除
-            hist_to_remove.emplace_back(std::move(combined_key), rid);
+            hist_to_remove.push_back(candidate);
             continue;
         }
         RmFileHandle* fh = fh_it->second.get();
-        if (!fh->is_record(rid)) {
-            hist_to_remove.emplace_back(std::move(combined_key), rid);
+        if (!fh->is_record(candidate.rid)) {
+            hist_to_remove.push_back(candidate);
             continue;
         }
-        TupleMeta meta = fh->get_tuple_meta(rid);
+        TupleMeta meta = fh->get_tuple_meta(candidate.rid);
         if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
-            hist_to_remove.emplace_back(std::move(combined_key), rid);
+            hist_to_remove.push_back(candidate);
         }
     }
     if (!hist_to_remove.empty()) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (auto& [combined_key, rid] : hist_to_remove) {
-            auto it = historical_index_keys_.find(combined_key);
+        for (const auto& candidate : hist_to_remove) {
+            auto it = historical_index_keys_.find(candidate.bucket_key);
             if (it == historical_index_keys_.end()) {
                 continue;
             }
-            auto& rids = it->second;
-            rids.erase(std::remove(rids.begin(), rids.end(), rid), rids.end());
+            auto key_it = it->second.entries.find(candidate.encoded_key);
+            if (key_it == it->second.entries.end()) {
+                continue;
+            }
+            auto& rids = key_it->second;
+            rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
             if (rids.empty()) {
+                it->second.entries.erase(key_it);
+            }
+            if (it->second.entries.empty()) {
                 historical_index_keys_.erase(it);
             }
         }
@@ -651,17 +661,19 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
     }
 }
 
-void SmManager::flush_all_table_and_index_pages() {
+bool SmManager::flush_all_table_and_index_pages() {
+    bool success = true;
     for (const auto& [_, fh] : fhs_) {
         rm_manager_->flush_file_header(fh.get());
-        buffer_pool_manager_->flush_all_pages(fh->GetFd());
+        success = buffer_pool_manager_->flush_all_pages(fh->GetFd()) && success;
         disk_manager_->sync_file(fh->GetFd());
     }
     for (const auto& [_, ih] : ihs_) {
         ix_manager_->flush_index_header(ih.get());
-        buffer_pool_manager_->flush_all_pages(ih->GetFd());
+        success = buffer_pool_manager_->flush_all_pages(ih->GetFd()) && success;
         disk_manager_->sync_file(ih->GetFd());
     }
+    return success;
 }
 void SmManager::rebuild_all_indexes() {
     std::vector<std::pair<std::string, std::vector<IndexMeta>>> indexes_by_table;

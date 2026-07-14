@@ -32,7 +32,7 @@ struct TabCol {
 struct Value {
     ColType type = TYPE_INT; // type of value
     union {
-        int int_val = 0;    // int value
+        int int_val = 0;  // int value
         double float_val; // SQL FLOAT value
     };
     std::string str_val; // string value

@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 #include "log_manager.h"
@@ -74,33 +75,32 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
         throw std::length_error("log record is larger than log buffer");
     }
 
-    std::lock_guard<std::mutex> lock(latch_);
-    if (log_buffer_.is_full(static_cast<int>(log_record->log_tot_len_))) {
-        flush_log_to_disk_unlocked();
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(latch_);
+            if (!log_buffer_->is_full(static_cast<int>(log_record->log_tot_len_))) {
+                lsn_t lsn = global_lsn_.fetch_add(1);
+                log_record->lsn_ = lsn;
+                log_record->serialize(log_buffer_->buffer_ + log_buffer_->offset_);
+                log_buffer_->offset_ += static_cast<int>(log_record->log_tot_len_);
+                return lsn;
+            }
+        }
+        flush_buffer(false);
     }
-
-    lsn_t lsn = global_lsn_.fetch_add(1);
-    log_record->lsn_ = lsn;
-    log_record->serialize(log_buffer_.buffer_ + log_buffer_.offset_);
-    log_buffer_.offset_ += static_cast<int>(log_record->log_tot_len_);
-    return lsn;
 }
 
 /**
  * @description: 把日志缓冲区的内容刷到磁盘中，由于目前只设置了一个缓冲区，因此需要阻塞其他日志操作
  */
 void LogManager::flush_log_to_disk() {
-    std::lock_guard<std::mutex> lock(latch_);
-    flush_log_to_disk_unlocked();
+    flush_buffer(false);
 }
 
 void LogManager::flush_log_to_disk_with_sync() {
     lsn_t target_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
     if (target_lsn == INVALID_LSN) {
-        std::lock_guard<std::mutex> lock(latch_);
-        flush_log_to_disk_unlocked();
-        disk_manager_->fsync_log();
-        durable_lsn_.store(persist_lsn_, std::memory_order_release);
+        flush_buffer(true);
         return;
     }
     flush_log_to_disk_up_to(target_lsn);
@@ -130,7 +130,8 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
     auto waiter = std::make_shared<CommitWaiter>();
     waiter->target_lsn = target_lsn;
     waiter->enqueue_time_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
     bool become_leader = false;
     {
         std::unique_lock<std::mutex> group_lock(group_commit_latch_);
@@ -157,13 +158,12 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
     // covered by the durable LSN.
     for (;;) {
         try {
-            {
-                std::lock_guard<std::mutex> log_lock(latch_);
-                flush_log_to_disk_unlocked();
-                disk_manager_->fsync_log();
-                fsync_count_.fetch_add(1, std::memory_order_acq_rel);
-                durable_lsn_.store(persist_lsn_, std::memory_order_release);
-            }
+            // Allow commits arriving together to append before the active
+            // buffer is swapped. The swap itself is short; pwrite and
+            // fdatasync happen without the append latch.
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            flush_buffer(true);
+            fsync_count_.fetch_add(1, std::memory_order_acq_rel);
         } catch (...) {
             auto error = std::current_exception();
             std::vector<std::shared_ptr<CommitWaiter>> notify;
@@ -206,9 +206,9 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
             pending->cv.notify_one();
         }
         if (!notify.empty()) {
-            const uint64_t now_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-                    .count());
+            const uint64_t now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                              std::chrono::steady_clock::now().time_since_epoch())
+                                                              .count());
             group_commit_count_.fetch_add(1, std::memory_order_acq_rel);
             group_commit_waiter_count_.fetch_add(notify.size(), std::memory_order_acq_rel);
             for (const auto& pending : notify) {
@@ -221,20 +221,85 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
     }
 }
 
-void LogManager::flush_log_to_disk_unlocked() {
-    if (log_buffer_.offset_ == 0) {
+void LogManager::flush_buffer(bool sync) {
+    for (;;) {
+        int bytes = 0;
+        lsn_t target_lsn = INVALID_LSN;
+        {
+            std::unique_lock<std::mutex> lock(latch_);
+            buffer_cv_.wait(lock, [this] { return !flushing_in_progress_; });
+            if (flushing_buffer_->offset_ != 0) {
+                // A previous write failed. Retry that stable buffer before
+                // swapping newer active records behind it.
+                bytes = flushing_buffer_->offset_;
+                target_lsn = flushing_lsn_;
+                flushing_bytes_ = bytes;
+                flushing_in_progress_ = true;
+            } else {
+                if (log_buffer_->offset_ == 0) {
+                    if (!sync) {
+                        return;
+                    }
+                    lock.unlock();
+                    disk_manager_->fsync_log();
+                    durable_lsn_.store(persist_lsn_, std::memory_order_release);
+                    return;
+                }
+                std::swap(log_buffer_, flushing_buffer_);
+                bytes = flushing_buffer_->offset_;
+                target_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
+                flushing_lsn_ = target_lsn;
+                flushing_bytes_ = bytes;
+                flushing_in_progress_ = true;
+            }
+        }
+
+        // The active buffer is available to producers while this stable
+        // buffer is written and synced.
+        bool write_succeeded = false;
+        try {
+            disk_manager_->write_log(flushing_buffer_->buffer_, bytes);
+            write_succeeded = true;
+            if (sync) {
+                disk_manager_->fsync_log();
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(latch_);
+            if (write_succeeded) {
+                log_file_offset_ += bytes;
+                persist_lsn_ = target_lsn;
+                flushing_buffer_->offset_ = 0;
+                flushing_bytes_ = 0;
+                flushing_lsn_ = INVALID_LSN;
+            }
+            flushing_in_progress_ = false;
+            buffer_cv_.notify_all();
+            throw;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(latch_);
+            log_file_offset_ += flushing_bytes_;
+            persist_lsn_ = flushing_lsn_;
+            flushing_buffer_->offset_ = 0;
+            flushing_bytes_ = 0;
+            flushing_lsn_ = INVALID_LSN;
+            flushing_in_progress_ = false;
+            if (sync) {
+                durable_lsn_.store(persist_lsn_, std::memory_order_release);
+            }
+        }
+        buffer_cv_.notify_all();
         return;
     }
-    disk_manager_->write_log(log_buffer_.buffer_, log_buffer_.offset_);
-    log_file_offset_ += log_buffer_.offset_;
-    persist_lsn_ = global_lsn_.load() - 1;
-    log_buffer_.offset_ = 0;
 }
 
 void LogManager::initialize_from_existing_log() {
     std::lock_guard<std::mutex> lock(latch_);
-    log_buffer_.offset_ = 0;
-    memset(log_buffer_.buffer_, 0, sizeof(log_buffer_.buffer_));
+    log_buffer_->offset_ = 0;
+    flushing_buffer_->offset_ = 0;
+    flushing_in_progress_ = false;
+    memset(log_buffer_->buffer_, 0, sizeof(log_buffer_->buffer_));
 
     int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
@@ -275,13 +340,14 @@ void LogManager::initialize_from_existing_log() {
 }
 
 void LogManager::reset_log(lsn_t next_lsn) {
+    // Ensure active WAL is written and durable before truncation.
+    flush_log_to_disk_with_sync();
     std::lock_guard<std::mutex> lock(latch_);
-    // 先把日志缓冲区残留内容落盘，避免截断丢失未刷盘的日志。
-    flush_log_to_disk_unlocked();
     // 截断日志文件为空并重置追加偏移。
     disk_manager_->truncate_log();
     log_file_offset_ = 0;
-    log_buffer_.offset_ = 0;
+    log_buffer_->offset_ = 0;
+    flushing_buffer_->offset_ = 0;
     global_lsn_.store(next_lsn);
     persist_lsn_ = INVALID_LSN;
     // Pages flushed before truncation may still carry their old page LSN.

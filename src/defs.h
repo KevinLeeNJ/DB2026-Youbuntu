@@ -17,16 +17,14 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <type_traits>
 
-template <typename T>
-inline T read_unaligned(const void* data) {
+template <typename T> inline T read_unaligned(const void* data) {
     static_assert(std::is_trivially_copyable_v<T>);
     T value;
     std::memcpy(&value, data, sizeof(T));
     return value;
 }
 
-template <typename T>
-inline void write_unaligned(void* data, const T& value) {
+template <typename T> inline void write_unaligned(void* data, const T& value) {
     static_assert(std::is_trivially_copyable_v<T>);
     std::memcpy(data, &value, sizeof(T));
 }

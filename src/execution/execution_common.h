@@ -27,6 +27,15 @@ auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const T
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction* txn) -> bool;
 
+inline void ReserveUniqueKey(Context* context, int index_fd, const std::vector<char>& key) {
+    if (context == nullptr || context->txn_ == nullptr || context->lock_mgr_ == nullptr) {
+        return;
+    }
+    if (!context->lock_mgr_->lock_exclusive_on_unique_key(context->txn_, index_fd, key)) {
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+    }
+}
+
 inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid, Context* context) {
     if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
         return fh->get_record(rid, context);

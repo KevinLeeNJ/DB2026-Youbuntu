@@ -40,7 +40,7 @@ private:
     DiskManager* disk_manager_;
     LogManager* log_manager_{nullptr};
     std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
-    std::shared_mutex latch_;             // 用于共享数据结构的并发控制
+    std::shared_mutex latch_;            // 用于共享数据结构的并发控制
 
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
@@ -81,7 +81,7 @@ public:
 
     bool delete_page(PageId page_id);
 
-    void flush_all_pages(int fd);
+    bool flush_all_pages(int fd);
 
     void delete_all_pages(int fd);
 

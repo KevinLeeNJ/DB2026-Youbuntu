@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <string>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -66,6 +67,12 @@ public:
 
     bool lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
+    // Reserve a logical unique-index key for the lifetime of txn. This is
+    // separate from the B+ tree structural latch because history/current-index
+    // validation must be protected across the whole write protocol.
+    bool lock_exclusive_on_unique_key(Transaction* txn, int index_fd, const std::vector<char>& key);
+    bool unlock_unique_key(Transaction* txn, const std::string& lock_id);
+
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
 
     bool lock_exclusive_on_table(Transaction* txn, int tab_fd);
@@ -102,4 +109,6 @@ private:
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
     std::mutex pending_latch_;
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
+    std::mutex unique_key_latch_;
+    std::unordered_map<std::string, txn_id_t> unique_key_owners_;
 };

@@ -127,14 +127,16 @@ public:
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
                                   .get();
                     std::vector<char> key(index.col_tot_len);
-                    int offset = 0;
+                    int key_offset = 0;
                     for (int i = 0; i < index.col_num; ++i) {
-                        std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
-                        offset += index.cols[i].len;
+                        std::memcpy(key.data() + key_offset, rec_data + index.cols[i].offset, index.cols[i].len);
+                        key_offset += index.cols[i].len;
                     }
+                    ReserveUniqueKey(context_, ih->GetFd(), key);
                     auto index_latch = ih->lock_exclusive();
                     sm_manager_->remember_historical_index_key(
-                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid);
+                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid,
+                        index);
                     ih->delete_entry_unlocked(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }

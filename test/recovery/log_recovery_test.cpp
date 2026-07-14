@@ -295,6 +295,55 @@ TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }
 
+TEST(RecoveryManagerTest, UncommittedInsertBeyondStaleFileHeaderDoesNotAbortRecovery) {
+    ScopedTestDir test_dir("recovery_stale_file_header_root");
+    const std::string db_name = "recovery_stale_file_header_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{2, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        DiskManager disk;
+        BufferPoolManager bpm(64, &disk);
+        RmManager rm_mgr(&disk, &bpm);
+        IxManager ix_mgr(&disk, &bpm);
+        SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+        sm_mgr.open_db(db_name);
+        LogManager log_mgr(&disk);
+
+        auto begin_lsn = AppendBegin(log_mgr, 100);
+        AppendInsert(log_mgr, 100, begin_lsn, rid, rec);
+        FlushLogs(log_mgr);
+
+        auto* file_handle = sm_mgr.fhs_.at("t").get();
+        const RmFileHdr stale_header = file_handle->get_file_hdr();
+        for (int i = 0; i < 2; ++i) {
+            auto page = file_handle->create_new_page_handle();
+            ASSERT_TRUE(bpm.unpin_page(page.page->get_page_id(), true));
+        }
+        file_handle->insert_record(rid, rec.data);
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        file_handle->set_tuple_meta(rid, meta);
+        ASSERT_TRUE(bpm.flush_all_pages(file_handle->GetFd()));
+
+        // Persist the record pages but deliberately leave the short file
+        // header at its pre-allocation value, as can happen on kill -9.
+        disk.write_page(file_handle->GetFd(), RM_FILE_HDR_PAGE, reinterpret_cast<const char*>(&stale_header),
+                        sizeof(stale_header));
+        bpm.delete_all_pages(file_handle->GetFd());
+    }
+    std::filesystem::current_path("..");
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
 TEST(RecoveryManagerTest, CommittedUpdateSurvivesRecovery) {
     ScopedTestDir test_dir("recovery_committed_update_root");
     const std::string db_name = "recovery_committed_update_db";

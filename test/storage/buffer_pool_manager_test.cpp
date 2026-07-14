@@ -35,6 +35,7 @@ class BufferPoolManagerTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;
     int fd_ = -1; // 此文件描述符为disk_manager_->open_file的返回值
+    bool fd_closed_{false};
 
 public:
     // This function is called before every test.
@@ -65,7 +66,9 @@ public:
 
     // This function is called after every test.
     void TearDown() override {
-        disk_manager_->close_file(fd_);
+        if (!fd_closed_) {
+            disk_manager_->close_file(fd_);
+        }
         // disk_manager_->destroy_file(TEST_FILE_NAME);  // you can choose to delete the file
 
         // 返回上一层目录
@@ -75,6 +78,29 @@ public:
         assert(disk_manager_->is_dir(TEST_DB_NAME));
     }
 };
+
+TEST_F(BufferPoolManagerTest, FailedDirtyEvictionRetainsOriginalPage) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId old_page_id{fd_, INVALID_PAGE_ID};
+    Page* old_page = bpm->new_page(&old_page_id);
+    ASSERT_NE(old_page, nullptr);
+    std::memcpy(old_page->get_data(), "dirty-page", 11);
+    ASSERT_TRUE(bpm->unpin_page(old_page_id, true));
+
+    // Closing the file makes the victim write fail deterministically while the
+    // frame still contains the only copy of the dirty page.
+    disk_manager_->close_file(fd_);
+    fd_closed_ = true;
+
+    PageId missing_page{fd_, 99};
+    EXPECT_EQ(bpm->fetch_page(missing_page), nullptr);
+    EXPECT_TRUE(bpm->is_page_resident(old_page_id));
+
+    Page* retained_page = bpm->fetch_page(old_page_id);
+    ASSERT_NE(retained_page, nullptr);
+    EXPECT_EQ(std::memcmp(retained_page->get_data(), "dirty-page", 11), 0);
+    EXPECT_TRUE(bpm->unpin_page(old_page_id, true));
+}
 
 TEST_F(BufferPoolManagerTest, SampleTest) {
     // create BufferPoolManager

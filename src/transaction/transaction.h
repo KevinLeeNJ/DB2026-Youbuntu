@@ -136,6 +136,10 @@ public:
         return lock_set_.get();
     }
 
+    inline std::unordered_set<std::string>* get_unique_key_lock_set() {
+        return &unique_key_lock_set_;
+    }
+
     inline timestamp_t get_read_ts() const {
         return read_ts_;
     }
@@ -207,14 +211,15 @@ private:
     bool txn_mode_{false};                // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     std::atomic<TransactionState> state_; // 事务状态；GC/SSI may inspect it from another thread
     std::atomic<bool> lock_cancellation_requested_{false};
-    IsolationLevel isolation_level_;      // 事务的隔离级别
-    std::thread::id thread_id_;           // 当前事务对应的线程id
-    lsn_t prev_lsn_;       // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
-    txn_id_t txn_id_;      // 事务的ID，唯一标识符
-    timestamp_t start_ts_; // 事务的开始时间戳
+    IsolationLevel isolation_level_; // 事务的隔离级别
+    std::thread::id thread_id_;      // 当前事务对应的线程id
+    lsn_t prev_lsn_;                 // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
+    txn_id_t txn_id_;                // 事务的ID，唯一标识符
+    timestamp_t start_ts_;           // 事务的开始时间戳
 
     std::deque<std::unique_ptr<WriteRecord>> write_set_;        // 事务包含的所有写操作
     std::unique_ptr<std::unordered_set<LockDataId>> lock_set_;  // 事务申请的所有锁
+    std::unordered_set<std::string> unique_key_lock_set_;       // 事务持有的逻辑唯一键 reservation
     std::unique_ptr<std::deque<Page*>> index_latch_page_set_;   // 维护事务执行过程中加锁的索引页面
     std::unique_ptr<std::deque<Page*>> index_deleted_page_set_; // 维护事务执行过程中删除的索引页面
 

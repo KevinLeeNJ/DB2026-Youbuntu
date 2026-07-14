@@ -40,6 +40,23 @@ public:
     std::unordered_map<std::string, std::unique_ptr<IxIndexHandle>>
         ihs_; // file name -> index file handle, 当前数据库中每个索引的文件
 private:
+    struct HistoricalKeyLess {
+        std::vector<ColType> col_types;
+        std::vector<int> col_lens;
+
+        bool operator()(const std::string& lhs, const std::string& rhs) const {
+            return ix_compare(lhs.data(), rhs.data(), col_types, col_lens) < 0;
+        }
+    };
+
+    struct HistoricalIndexBucket {
+        std::map<std::string, std::vector<Rid>, HistoricalKeyLess> entries;
+
+        HistoricalIndexBucket() = default;
+        HistoricalIndexBucket(std::vector<ColType> types, std::vector<int> lens)
+            : entries(HistoricalKeyLess{std::move(types), std::move(lens)}) {}
+    };
+
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
@@ -57,7 +74,7 @@ private:
     }
 
     mutable std::shared_mutex historical_index_keys_latch_;
-    std::unordered_map<std::string, std::vector<Rid>> historical_index_keys_;
+    std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
     mutable std::mutex deleted_tuple_candidates_latch_;
     std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
 
@@ -122,9 +139,24 @@ public:
                                     const RmRecord& new_rec);
 
     void remember_historical_index_key(const std::string& tab_name, const std::string& index_name,
-                                       const std::vector<char>& key, const Rid& rid) {
+                                       const std::vector<char>& key, const Rid& rid, const IndexMeta& index) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto& rids = historical_index_keys_[make_historical_index_key(tab_name, index_name, key)];
+        std::vector<ColType> col_types;
+        std::vector<int> col_lens;
+        col_types.reserve(index.cols.size());
+        col_lens.reserve(index.cols.size());
+        for (const auto& col : index.cols) {
+            col_types.push_back(col.type);
+            col_lens.push_back(col.len);
+        }
+        auto bucket_key = make_historical_index_key(tab_name, index_name, {});
+        auto bucket_it = historical_index_keys_.find(bucket_key);
+        if (bucket_it == historical_index_keys_.end()) {
+            bucket_it = historical_index_keys_
+                            .emplace(bucket_key, HistoricalIndexBucket(std::move(col_types), std::move(col_lens)))
+                            .first;
+        }
+        auto& rids = bucket_it->second.entries[std::string(key.data(), key.size())];
         if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
             rids.push_back(rid);
         }
@@ -133,11 +165,12 @@ public:
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
                                                    const std::vector<char>& key) const {
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, key));
+        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
         if (it == historical_index_keys_.end()) {
             return {};
         }
-        return it->second;
+        auto key_it = it->second.entries.find(std::string(key.data(), key.size()));
+        return key_it == it->second.entries.end() ? std::vector<Rid>{} : key_it->second;
     }
 
     std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {
@@ -150,10 +183,33 @@ public:
 
         std::vector<Rid> result;
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (const auto& [key, rids] : historical_index_keys_) {
-            if (key.compare(0, prefix.size(), prefix) == 0) {
-                result.insert(result.end(), rids.begin(), rids.end());
+        for (const auto& [bucket_key, bucket] : historical_index_keys_) {
+            if (bucket_key.compare(0, prefix.size(), prefix) == 0) {
+                for (const auto& [key, rids] : bucket.entries) {
+                    result.insert(result.end(), rids.begin(), rids.end());
+                }
             }
+        }
+        return result;
+    }
+
+    std::vector<Rid> get_historical_index_rids_in_range(const std::string& tab_name, const std::string& index_name,
+                                                        const std::vector<char>& lower, const std::vector<char>& upper,
+                                                        bool lower_exclusive, bool upper_inclusive) const {
+        std::vector<Rid> result;
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
+        if (it == historical_index_keys_.end()) {
+            return result;
+        }
+        const auto lower_key = std::string(lower.data(), lower.size());
+        const auto upper_key = std::string(upper.data(), upper.size());
+        auto begin =
+            lower_exclusive ? it->second.entries.upper_bound(lower_key) : it->second.entries.lower_bound(lower_key);
+        auto end =
+            upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
+        for (auto entry = begin; entry != end; ++entry) {
+            result.insert(result.end(), entry->second.begin(), entry->second.end());
         }
         return result;
     }
@@ -167,8 +223,9 @@ public:
         prefix.push_back('\0');
 
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        return std::any_of(historical_index_keys_.begin(), historical_index_keys_.end(),
-                           [&](const auto& entry) { return entry.first.compare(0, prefix.size(), prefix) == 0; });
+        return std::any_of(historical_index_keys_.begin(), historical_index_keys_.end(), [&](const auto& entry) {
+            return entry.first.compare(0, prefix.size(), prefix) == 0 && !entry.second.entries.empty();
+        });
     }
 
     void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid) {
@@ -208,7 +265,7 @@ public:
      *  由 TransactionManager::GarbageCollection 在 txn_map 回收后调用。 */
     void prune_version_history(timestamp_t watermark);
 
-    void flush_all_table_and_index_pages();
+    bool flush_all_table_and_index_pages();
 
     void rebuild_all_indexes();
 

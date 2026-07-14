@@ -36,7 +36,8 @@ void ReadPageAt(int fd, page_id_t page_no, char* data, int num_bytes) {
     int read_bytes = 0;
     const off_t offset = static_cast<off_t>(page_no) * PAGE_SIZE;
     while (read_bytes < num_bytes) {
-        const ssize_t count = pread(fd, data + read_bytes, static_cast<size_t>(num_bytes - read_bytes), offset + read_bytes);
+        const ssize_t count =
+            pread(fd, data + read_bytes, static_cast<size_t>(num_bytes - read_bytes), offset + read_bytes);
         if (count <= 0) {
             throw InternalError("DiskManager::read_page Error");
         }

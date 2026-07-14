@@ -167,8 +167,7 @@ private:
         }
 
         const char* data = get_operand_data(operand, left_rec, right_rec);
-        return operand.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(data))
-                                        : read_unaligned<double>(data);
+        return operand.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(data)) : read_unaligned<double>(data);
     }
 
     static std::string_view read_string_operand(const CompiledOperand& operand, const RmRecord& left_rec,
