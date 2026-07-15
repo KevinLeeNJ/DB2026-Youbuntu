@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,6 +69,13 @@ func TestParseRowsDropsTableHeader(t *testing.T) {
 	rows := parseRows("+---+\n| id |\n+---+\n| 42 |\n+---+\nTotal record(s): 1\n")
 	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != "42" {
 		t.Fatalf("rows = %#v", rows)
+	}
+}
+
+func TestVerifyAtomicSumsAcceptsNegativeSum(t *testing.T) {
+	response := "+---+\n| SUM(value) |\n+---+\n| %d |\n+---+\nTotal record(s): 1\n"
+	if err := verifyAtomicSums(fmt.Sprintf(response, 175), fmt.Sprintf(response, -175)); err != nil {
+		t.Fatalf("verifyAtomicSums() error = %v", err)
 	}
 }
 

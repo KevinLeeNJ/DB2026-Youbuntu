@@ -1050,6 +1050,22 @@ func readIDFile(path string) (map[int]struct{}, error) {
 	return ids, nil
 }
 
+func verifyAtomicSums(sumTextA, sumTextB string) error {
+	sumRowsA, sumRowsB := parseRows(sumTextA), parseRows(sumTextB)
+	if len(sumRowsA) == 0 || len(sumRowsA[0]) == 0 || len(sumRowsB) == 0 || len(sumRowsB[0]) == 0 {
+		return errors.New("atomic oracle invariant query returned no value")
+	}
+	// Parse the complete responses so a negative scalar such as -175 is not
+	// mistaken for a separator when passed through parseRows a second time.
+	sumA, sumB := scalarInt(sumTextA, 0), scalarInt(sumTextB, 0)
+	// The two tables are populated with opposite values for every committed
+	// transaction, so their combined sum must remain zero after recovery.
+	if sumA+sumB != 0 {
+		return fmt.Errorf("atomic oracle sum invariant violated: A=%d B=%d", sumA, sumB)
+	}
+	return nil
+}
+
 func verifyAtomicOracle(address string, timeout time.Duration, isolation, issuedPath, ackPath string) error {
 	issued, err := readIDFile(issuedPath)
 	if err != nil {
@@ -1146,16 +1162,7 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 	if err != nil {
 		return err
 	}
-	sumRowsA, sumRowsB := parseRows(sumTextA), parseRows(sumTextB)
-	if len(sumRowsA) == 0 || len(sumRowsA[0]) == 0 || len(sumRowsB) == 0 || len(sumRowsB[0]) == 0 {
-		return errors.New("atomic oracle invariant query returned no value")
-	}
-	// The two tables are populated with opposite values for every committed
-	// transaction, so their combined sum must remain zero after recovery.
-	if sumA, sumB := scalarInt(sumRowsA[0][0], 0), scalarInt(sumRowsB[0][0], 0); sumA+sumB != 0 {
-		return fmt.Errorf("atomic oracle sum invariant violated: A=%d B=%d", sumA, sumB)
-	}
-	return nil
+	return verifyAtomicSums(sumTextA, sumTextB)
 }
 
 func main() {
