@@ -209,6 +209,7 @@ void SmManager::open_db(const std::string& db_name) {
         // Reset the database-global output_file toggle: opening a (possibly
         // different) database should not inherit the previous database's toggle.
         output_file_enabled_ = true;
+        bump_catalog_generation();
     } catch (...) {
         fhs_.clear();
         ihs_.clear();
@@ -247,6 +248,7 @@ void SmManager::close_db() {
     if (db_.name_.empty()) {
         throw DatabaseNotFoundError("No database is currently open.");
     }
+    bump_catalog_generation();
     flush_meta();
     // 关闭所有表的记录文件
     for (auto& entry : fhs_) {
@@ -501,6 +503,7 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
 
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -520,6 +523,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     db_.tabs_.erase(tab_name);           // 删除对应键值对
     fhs_.erase(tab_name);
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -578,6 +582,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     tab.indexes.emplace_back(index_meta);
     ihs_.emplace(index_name, std::move(index_handle));
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -600,6 +605,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     ix_manager_->destroy_index(tab_name, col_names);
     ihs_.erase(index_name);
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -624,6 +630,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
     ix_manager_->destroy_index(tab_name, col_names);
     ihs_.erase(index_name);
     flush_meta();
+    bump_catalog_generation();
 }
 
 void SmManager::insert_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& rec) {

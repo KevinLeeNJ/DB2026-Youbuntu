@@ -224,6 +224,84 @@ TEST_F(BufferPoolManagerTest, FlushAllPagesSkipsCleanPages) {
     ASSERT_TRUE(reopened_bpm.unpin_page(page_id, false));
 }
 
+TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfReplacer) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&page_id), nullptr);
+
+    for (int iteration = 0; iteration < 1000; ++iteration) {
+        std::atomic<int> ready{0};
+        std::atomic<bool> start{false};
+        Page* fetched = nullptr;
+        std::thread fetcher([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            fetched = bpm->fetch_page(page_id);
+        });
+        std::thread unpinner([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            EXPECT_TRUE(bpm->unpin_page(page_id, false));
+        });
+        while (ready.load(std::memory_order_acquire) != 2) {
+            std::this_thread::yield();
+        }
+        start.store(true, std::memory_order_release);
+        fetcher.join();
+        unpinner.join();
+
+        ASSERT_NE(fetched, nullptr);
+        EXPECT_EQ(bpm->pages_[0].pin_count_, 1);
+        EXPECT_EQ(bpm->replacer_->Size(), 0);
+    }
+
+    EXPECT_TRUE(bpm->unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, FlushDoesNotClearDirtyFromConcurrentWriter) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    Page* page = bpm->new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+    std::strcpy(page->get_data(), "before-flush");
+    ASSERT_TRUE(bpm->unpin_page(page_id, true));
+
+    Page* writer_page = bpm->fetch_page(page_id);
+    ASSERT_NE(writer_page, nullptr);
+    std::unique_lock<std::shared_mutex> block_flush(writer_page->latch());
+    std::atomic<bool> writer_started{false};
+    std::thread flusher([&] { EXPECT_TRUE(bpm->flush_page(page_id)); });
+    while (writer_page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
+        std::this_thread::yield();
+    }
+    std::thread writer([&] {
+        writer_started.store(true, std::memory_order_release);
+        std::unique_lock<std::shared_mutex> page_lock(writer_page->latch());
+        std::strcpy(writer_page->get_data(), "after-flush-started");
+        page_lock.unlock();
+        EXPECT_TRUE(bpm->unpin_page(page_id, true));
+    });
+    while (!writer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    block_flush.unlock();
+    flusher.join();
+    writer.join();
+
+    EXPECT_TRUE(writer_page->is_dirty());
+    ASSERT_TRUE(bpm->flush_page(page_id));
+
+    BufferPoolManager reopened_bpm(1, disk_manager_.get());
+    Page* reopened_page = reopened_bpm.fetch_page(page_id);
+    ASSERT_NE(reopened_page, nullptr);
+    EXPECT_STREQ("after-flush-started", reopened_page->get_data());
+    EXPECT_TRUE(reopened_bpm.unpin_page(page_id, false));
+}
+
 class BufferPoolManagerConcurrencyTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;

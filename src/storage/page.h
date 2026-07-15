@@ -128,6 +128,11 @@ private:
     /** 脏页判断 */
     std::atomic<bool> is_dirty_{false};
 
+    // Distinguishes the page image captured by a flush from writes that arrive
+    // after that image has reached disk.
+    std::atomic<uint64_t> dirty_epoch_{0};
+    std::mutex dirty_latch_;
+
     // Buffer-pool pinning protects residency; this protects the page payload.
     std::shared_mutex latch_;
 
@@ -138,5 +143,6 @@ private:
     std::condition_variable io_cv_;
 
     /** The pin count of this page. */
-    std::atomic<int> pin_count_{0};
+    int pin_count_{0};
+    std::mutex pin_latch_;
 };

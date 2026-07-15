@@ -203,13 +203,12 @@ public:
                         auto ih = sm_manager_->ihs_
                                       .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
                                       .get();
-                        auto index_latch = ih->lock_exclusive();
                         sm_manager_->remember_historical_index_key(
                             tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols),
                             update.old_key, rid, *update.index);
-                        ih->delete_entry_unlocked(update.old_key.data(), rid, txn); // 删除旧索引
+                        ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
-                        ih->insert_entry_unlocked(update.new_key.data(), rid, txn); // 插入新索引
+                        ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
                         inserted_indexes.push_back(i);
                     }
                 } catch (...) // 失败时回滚已经修改过的索引

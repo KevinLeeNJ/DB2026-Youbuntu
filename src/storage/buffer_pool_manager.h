@@ -65,7 +65,9 @@ public:
      * @param {Page*} page 脏页
      */
     static void mark_dirty(Page* page) {
-        page->is_dirty_ = true;
+        std::scoped_lock dirty_lock{page->dirty_latch_};
+        page->dirty_epoch_.fetch_add(1, std::memory_order_release);
+        page->is_dirty_.store(true, std::memory_order_release);
     }
 
 public:

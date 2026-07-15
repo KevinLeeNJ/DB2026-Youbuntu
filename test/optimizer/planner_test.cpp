@@ -110,6 +110,14 @@ Condition value_cond(const std::string& tab_name, const std::string& col_name, C
     return cond;
 }
 
+TabMeta make_reverse_index_tab() {
+    TabMeta tab;
+    tab.name = "reverse_index";
+    tab.cols = {make_int_col("reverse_index", "a", 0), make_int_col("reverse_index", "z", 4)};
+    tab.indexes.push_back(make_index("reverse_index", {tab.cols[1], tab.cols[0]}));
+    return tab;
+}
+
 Condition join_cond(const std::string& lhs_tab, const std::string& lhs_col, const std::string& rhs_tab,
                     const std::string& rhs_col) {
     Condition cond;
@@ -208,6 +216,21 @@ std::unique_ptr<Query> make_order_line_suffix_lookup_query() {
     return query;
 }
 
+std::unique_ptr<Query> make_reverse_index_query(int a_value, int z_value) {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::SelectStmt>(
+        std::vector<std::unique_ptr<ast::SelectItem>>{}, std::vector<ast::TableRef>{ast::TableRef("reverse_index", "")},
+        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
+        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
+        true);
+    query->tables = {"reverse_index"};
+    query->has_aggregate = true;
+    query->select_items.push_back({.expr = make_count_star_expr(), .alias = "", .output_name = "COUNT(*)"});
+    query->output_names = {"COUNT(*)"};
+    query->conds = {value_cond("reverse_index", "a", OP_EQ, a_value), value_cond("reverse_index", "z", OP_EQ, z_value)};
+    return query;
+}
+
 } // namespace
 
 class PlannerAggregateTest : public ::testing::Test {
@@ -299,4 +322,66 @@ TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) 
     ASSERT_EQ(aggregate->subplan_->tag, T_IndexSkipScan);
     auto* scan = static_cast<ScanPlan*>(aggregate->subplan_.get());
     EXPECT_EQ(scan->index_col_names_, (std::vector<std::string>{"ol_w_id", "ol_d_id", "ol_o_id", "ol_number"}));
+}
+
+TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_literal_values) {
+    sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
+    auto first_query = make_order_line_suffix_lookup_query();
+    auto second_query = make_order_line_suffix_lookup_query();
+    second_query->conds[0].rhs_val.set_int(7);
+
+    auto first_plan = planner_.generate_select_plan(std::move(first_query), nullptr);
+    auto second_plan = planner_.generate_select_plan(std::move(second_query), nullptr);
+
+    ASSERT_EQ(planner_.physical_plan_cache_.size(), 1);
+
+    auto* first_projection = static_cast<ProjectionPlan*>(first_plan.get());
+    auto* first_aggregate = static_cast<AggregatePlan*>(first_projection->subplan_.get());
+    auto* first_scan = static_cast<ScanPlan*>(first_aggregate->subplan_.get());
+    ASSERT_EQ(first_scan->conds_.size(), 2);
+    EXPECT_EQ(first_scan->conds_[0].rhs_val.int_val, 1);
+
+    auto* second_projection = static_cast<ProjectionPlan*>(second_plan.get());
+    auto* second_aggregate = static_cast<AggregatePlan*>(second_projection->subplan_.get());
+    auto* second_scan = static_cast<ScanPlan*>(second_aggregate->subplan_.get());
+    ASSERT_EQ(second_scan->conds_.size(), 2);
+    EXPECT_EQ(second_scan->conds_[0].rhs_val.int_val, 7);
+}
+
+TEST_F(PlannerAggregateTest, physical_template_is_invalidated_by_catalog_generation) {
+    sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
+
+    auto first_query = make_order_line_suffix_lookup_query();
+    planner_.generate_select_plan(std::move(first_query), nullptr);
+    ASSERT_EQ(planner_.physical_plan_cache_.size(), 1);
+
+    sm_manager_.bump_catalog_generation();
+    auto second_query = make_order_line_suffix_lookup_query();
+    planner_.generate_select_plan(std::move(second_query), nullptr);
+
+    EXPECT_EQ(planner_.physical_plan_cache_.size(), 1);
+    EXPECT_EQ(planner_.physical_plan_cache_generation_, sm_manager_.get_catalog_generation());
+}
+
+TEST_F(PlannerAggregateTest, physical_template_reorders_current_index_conditions) {
+    sm_manager_.db_.SetTabMeta("reverse_index", make_reverse_index_tab());
+
+    auto first_query = make_reverse_index_query(2, 1);
+    auto second_query = make_reverse_index_query(7, 8);
+    auto first_plan = planner_.generate_select_plan(std::move(first_query), nullptr);
+    auto second_plan = planner_.generate_select_plan(std::move(second_query), nullptr);
+
+    auto* first_projection = static_cast<ProjectionPlan*>(first_plan.get());
+    auto* first_aggregate = static_cast<AggregatePlan*>(first_projection->subplan_.get());
+    auto* first_scan = static_cast<ScanPlan*>(first_aggregate->subplan_.get());
+    ASSERT_EQ(first_scan->conds_.size(), 2);
+    EXPECT_EQ(first_scan->conds_[0].lhs_col.col_name, "z");
+    EXPECT_EQ(first_scan->conds_[0].rhs_val.int_val, 1);
+
+    auto* second_projection = static_cast<ProjectionPlan*>(second_plan.get());
+    auto* second_aggregate = static_cast<AggregatePlan*>(second_projection->subplan_.get());
+    auto* second_scan = static_cast<ScanPlan*>(second_aggregate->subplan_.get());
+    ASSERT_EQ(second_scan->conds_.size(), 2);
+    EXPECT_EQ(second_scan->conds_[0].lhs_col.col_name, "z");
+    EXPECT_EQ(second_scan->conds_[0].rhs_val.int_val, 8);
 }

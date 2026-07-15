@@ -53,8 +53,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 if (target_page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                     wait_page = target_page;
                 } else {
+                    std::scoped_lock pin_lock{target_page->pin_latch_};
                     replacer_->pin(hit->second);
-                    target_page->pin_count_.fetch_add(1, std::memory_order_relaxed);
+                    ++target_page->pin_count_;
                     return target_page;
                 }
             }
@@ -77,8 +78,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 if (target_page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                     wait_page = target_page;
                 } else {
+                    std::scoped_lock pin_lock{target_page->pin_latch_};
                     replacer_->pin(hit->second);
-                    target_page->pin_count_.fetch_add(1, std::memory_order_relaxed);
+                    ++target_page->pin_count_;
                     return target_page;
                 }
             } else {
@@ -98,6 +100,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 target_page->state_.store(FrameState::EVICTING, std::memory_order_release);
                 target_page->id_ = page_id;
                 target_page->is_dirty_ = false;
+                target_page->dirty_epoch_ = 0;
                 target_page->pin_count_ = 1;
                 target_page->state_.store(FrameState::LOADING, std::memory_order_release);
                 page_table_.insert_or_assign(page_id, fid);
@@ -142,7 +145,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                     page_table_.erase(hit);
                 }
                 target_page->id_ = old_page_id;
-                target_page->is_dirty_ = true;
+                mark_dirty(target_page);
                 target_page->pin_count_ = 0;
                 target_page->state_.store(FrameState::VALID, std::memory_order_release);
                 page_table_.insert_or_assign(old_page_id, fid);
@@ -202,21 +205,20 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
         return false;
     }
 
+    std::scoped_lock pin_lock{targetPage->pin_latch_};
     // 2.1 若pin_count_已经等于0,则返回false
-    if (targetPage->pin_count_.load(std::memory_order_relaxed) == 0)
+    if (targetPage->pin_count_ == 0)
         return false;
 
     // 2.2 若pin_count_大于0，则pin_count_自减一
-    if (targetPage->pin_count_.load(std::memory_order_relaxed) > 0) {
-        int pin_count = targetPage->pin_count_.fetch_sub(1, std::memory_order_relaxed);
-        // 2.2.1 若自减后等于0，则调用replacer_的Unpin
-        if (pin_count == 1 && state == FrameState::VALID) {
-            replacer_->unpin(fid);
-        }
+    --targetPage->pin_count_;
+    // 2.2.1 若自减后等于0，则调用replacer_的Unpin
+    if (targetPage->pin_count_ == 0 && state == FrameState::VALID) {
+        replacer_->unpin(fid);
     }
     // 3 根据参数is_dirty，更改P的is_dirty_
     if (is_dirty == true) {
-        targetPage->is_dirty_ = true;
+        mark_dirty(targetPage);
     }
 
     return true;
@@ -270,9 +272,11 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
 
     bool flushed = false;
     lsn_t flushed_lsn = INVALID_LSN;
+    uint64_t flushed_dirty_epoch = 0;
     try {
         std::shared_lock<std::shared_mutex> page_lock(page->latch_);
         flushed_lsn = page->get_page_lsn();
+        flushed_dirty_epoch = page->dirty_epoch_.load(std::memory_order_acquire);
         flush_log_before_page_write(flushed_lsn);
         disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
         flushed = true;
@@ -285,11 +289,15 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
         auto hit = page_table_.find(page_id);
         if (hit != page_table_.end() && hit->second == fid && page->id_ == page_id &&
             page->state_.load(std::memory_order_acquire) == FrameState::FLUSHING) {
-            if (flushed && page->get_page_lsn() <= flushed_lsn) {
-                page->is_dirty_ = false;
+            if (flushed) {
+                std::scoped_lock dirty_lock{page->dirty_latch_};
+                if (page->dirty_epoch_.load(std::memory_order_acquire) == flushed_dirty_epoch) {
+                    page->is_dirty_ = false;
+                }
             }
             page->state_.store(FrameState::VALID, std::memory_order_release);
-            if (page->pin_count_.load(std::memory_order_relaxed) == 0) {
+            std::scoped_lock pin_lock{page->pin_latch_};
+            if (page->pin_count_ == 0) {
                 replacer_->unpin(fid);
             }
         }
@@ -327,6 +335,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         page->state_.store(FrameState::EVICTING, std::memory_order_release);
         page->id_ = *page_id;
         page->is_dirty_ = false;
+        page->dirty_epoch_ = 0;
         page->pin_count_ = 1;
         page->state_.store(FrameState::LOADING, std::memory_order_release);
         page_table_.insert_or_assign(*page_id, fid);
@@ -358,7 +367,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
                 page_table_.erase(hit);
             }
             page->id_ = old_page_id;
-            page->is_dirty_ = true;
+            mark_dirty(page);
             page->pin_count_ = 0;
             page->state_.store(FrameState::VALID, std::memory_order_release);
             page_table_.insert_or_assign(old_page_id, fid);
@@ -405,7 +414,8 @@ bool BufferPoolManager::delete_page(PageId page_id) {
                 wait_page = page;
             } else {
                 replacer_->pin(fid);
-                if (page->pin_count_.load(std::memory_order_relaxed) != 0) {
+                std::scoped_lock pin_lock{page->pin_latch_};
+                if (page->pin_count_ != 0) {
                     replacer_->unpin(fid);
                     return false;
                 }

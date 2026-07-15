@@ -133,11 +133,10 @@ public:
                         key_offset += index.cols[i].len;
                     }
                     ReserveUniqueKey(context_, ih->GetFd(), key);
-                    auto index_latch = ih->lock_exclusive();
                     sm_manager_->remember_historical_index_key(
                         tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), key, rid,
                         index);
-                    ih->delete_entry_unlocked(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
+                    ih->delete_entry(key.data(), rid, context_ == nullptr ? nullptr : context_->txn_);
                     deleted_indexes.push_back(DeletedIndex{&index, std::move(key)});
                 }
             } catch (...) {

@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -71,6 +73,11 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
+    std::atomic<std::uint64_t> catalog_generation_{0};
+
+    void bump_catalog_generation() noexcept {
+        catalog_generation_.fetch_add(1, std::memory_order_release);
+    }
     static std::string make_historical_index_key(const std::string& tab_name, const std::string& index_name,
                                                  const std::vector<char>& key) {
         std::string combined;
@@ -112,6 +119,10 @@ public:
 
     IxManager* get_ix_manager() {
         return ix_manager_;
+    }
+
+    std::uint64_t get_catalog_generation() const noexcept {
+        return catalog_generation_.load(std::memory_order_acquire);
     }
 
     bool is_dir(const std::string& db_name);

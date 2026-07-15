@@ -774,7 +774,7 @@ Rid IxIndexHandle::get_rid(const Iid& iid) const {
  * @note 上层传入的key本来是int类型，通过(const char *)&key进行了转换
  * 可用*(int *)key转换回去
  */
-Iid IxIndexHandle::lower_bound(const char* key) {
+Iid IxIndexHandle::lower_bound(const char* key) const {
     IxNodeHandle leaf;
     fetch_node_into(file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {

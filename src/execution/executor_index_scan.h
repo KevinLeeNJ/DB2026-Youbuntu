@@ -51,13 +51,14 @@ protected:
         size_t position_{0};
     };
 
-    std::string tab_name_;              // 表名称
-    TabMeta tab_;                       // 表的元数据
-    std::vector<Condition> conds_;      // 扫描条件
-    RmFileHandle* fh_;                  // 表的数据文件句柄
-    std::vector<ColMeta> cols_;         // 需要读取的字段
-    size_t len_;                        // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_;  // 扫描条件，和conds_字段相同
+    std::string tab_name_;             // 表名称
+    TabMeta tab_;                      // 表的元数据
+    std::vector<Condition> conds_;     // 扫描条件
+    RmFileHandle* fh_;                 // 表的数据文件句柄
+    std::vector<ColMeta> cols_;        // 需要读取的字段
+    size_t len_;                       // 选取出来的一条记录的长度
+    std::vector<Condition> fed_conds_; // 扫描条件，和conds_字段相同
+    std::vector<ConditionAddress> condition_addresses_;
     std::vector<Condition> base_conds_; // original conditions from construction, for INLJ key injection
 
     std::vector<std::string> index_col_names_; // index scan涉及到的索引包含的字段
@@ -272,6 +273,7 @@ public:
             }
         }
         fed_conds_ = conds_;
+        condition_addresses_ = cache_condition_addresses(fed_conds_);
         base_conds_ = conds_; // save original conditions before any key injection
     }
 
@@ -416,13 +418,7 @@ public:
                 scan_->next();
                 continue;
             }
-            bool match = true;
-            for (const auto& cond : fed_conds_) {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
+            const bool match = conditions_match(fed_conds_, condition_addresses_, *rec);
             if (match) {
                 record_tuple_read(rid_);
                 buffered_record_ = std::move(rec);
@@ -475,6 +471,7 @@ public:
             conds_.push_back(std::move(kc));
         }
         fed_conds_ = conds_;
+        condition_addresses_ = cache_condition_addresses(fed_conds_);
     }
 
     std::string scan_table_name() const override {

@@ -125,7 +125,7 @@ public:
         try {
             parse_tree = ast::parse_sql(sql);
         } catch (...) {
-            abort_implicit_statement(&context);
+            abort_failed_statement(&context);
             throw RMDBError("Parse error for: " + sql);
         }
         if (parse_tree == nullptr) {
@@ -147,7 +147,7 @@ public:
             portal_->drop();
             finish_statement(&context);
         } catch (...) {
-            abort_implicit_statement(&context);
+            abort_failed_statement(&context);
             throw;
         }
 
@@ -205,12 +205,16 @@ private:
         context->txn_ = nullptr;
     }
 
-    void abort_implicit_statement(Context* context) {
-        if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager_->abort(context->txn_, context->log_mgr_);
+    void abort_failed_statement(Context* context) {
+        Transaction* txn = context->txn_;
+        if (txn == nullptr && txn_id_ != INVALID_TXN_ID) {
+            txn = txn_manager_->get_transaction(txn_id_);
         }
+        if (txn != nullptr && txn->get_state() != TransactionState::COMMITTED &&
+            txn->get_state() != TransactionState::ABORTED) {
+            txn_manager_->abort(txn, context->log_mgr_);
+        }
+        txn_id_ = INVALID_TXN_ID;
         context->txn_ = nullptr;
     }
 

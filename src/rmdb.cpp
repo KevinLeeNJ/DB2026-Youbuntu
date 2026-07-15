@@ -132,10 +132,24 @@ void client_handler(int fd) {
         Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
 
+        auto abort_active_transaction = [&]() {
+            Transaction* txn = context->txn_;
+            if (txn == nullptr && txn_id != INVALID_TXN_ID) {
+                txn = txn_manager->get_transaction(txn_id);
+            }
+            if (txn != nullptr && txn->get_state() != TransactionState::ABORTED &&
+                txn->get_state() != TransactionState::COMMITTED) {
+                txn_manager->abort(txn, log_manager.get());
+            }
+            txn_id = INVALID_TXN_ID;
+            context->txn_ = nullptr;
+        };
+
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
             parse_tree = ast::parse_sql(data_recv);
         } catch (const ast::ParseError& e) {
+            abort_active_transaction();
             LOG_ERROR("parse failed for SQL [%s]: %s", data_recv, e.what());
             const char* msg = e.what();
             int msg_len = strlen(msg);
@@ -182,12 +196,7 @@ void client_handler(int fd) {
                 offset = str.length();
 
                 // 回滚事务
-                if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::ABORTED &&
-                    context->txn_->get_state() != TransactionState::COMMITTED) {
-                    txn_manager->abort(context->txn_, log_manager.get());
-                    txn_id = INVALID_TXN_ID;
-                }
-                context->txn_ = nullptr;
+                abort_active_transaction();
                 LOG_INFO("transaction aborted: %s", e.GetInfo().c_str());
 
                 if (sm_manager->output_file_enabled_) {
@@ -205,13 +214,7 @@ void client_handler(int fd) {
                 data_send[e.get_msg_len() + 1] = '\0';
                 offset = e.get_msg_len() + 1;
 
-                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                    context->txn_->get_state() != TransactionState::COMMITTED &&
-                    context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager->abort(context->txn_, context->log_mgr_);
-                    txn_id = INVALID_TXN_ID;
-                }
-                context->txn_ = nullptr;
+                abort_active_transaction();
 
                 // 将报错信息写入output.txt
                 if (sm_manager->output_file_enabled_) {
@@ -223,13 +226,7 @@ void client_handler(int fd) {
             } catch (const std::exception& e) {
                 LOG_ERROR("%s", e.what());
 
-                if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
-                    context->txn_->get_state() != TransactionState::COMMITTED &&
-                    context->txn_->get_state() != TransactionState::ABORTED) {
-                    txn_manager->abort(context->txn_, context->log_mgr_);
-                    txn_id = INVALID_TXN_ID;
-                }
-                context->txn_ = nullptr;
+                abort_active_transaction();
 
                 const char* msg = e.what();
                 int msg_len = strlen(msg);

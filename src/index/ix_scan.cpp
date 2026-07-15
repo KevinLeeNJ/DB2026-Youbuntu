@@ -17,15 +17,21 @@ See the Mulan PSL v2 for more details. */
  */
 void IxScan::next() {
     assert(!is_end());
-    normalize_position();
-    if (is_end()) {
+    if (!coupled_mode_) {
+        normalize_legacy_position();
+        if (!is_end()) {
+            assert(pinned_leaf_page_ != nullptr);
+            ++iid_.slot_no;
+            normalize_legacy_position();
+        }
         return;
     }
-    assert(pinned_leaf_page_ != nullptr);
-    assert(leaf_.is_leaf_page());
-    assert(iid_.slot_no < leaf_.get_size());
 
-    // increment slot no
-    iid_.slot_no++;
-    normalize_position();
+    ++batch_pos_;
+    if (batch_pos_ < batch_.size()) {
+        iid_ = batch_[batch_pos_].iid;
+        return;
+    }
+    remember_completed_batch_tail();
+    load_coupled_batch();
 }

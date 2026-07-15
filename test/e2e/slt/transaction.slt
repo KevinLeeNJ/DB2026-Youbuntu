@@ -141,3 +141,26 @@ SELECT id, name FROM accounts WHERE id = 4;
 |                4 |             dave |
 +------------------+------------------+
 Total record(s): 1
+
+# A failed statement aborts the whole explicit transaction. COMMIT must not
+# publish writes completed by earlier statements in that transaction.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO accounts VALUES (6, 'frank', 60.0);
+
+statement error
+INSERT INTO accounts VALUES (4, 'duplicate', 99.0);
+
+statement ok
+COMMIT;
+
+query
+SELECT id, name FROM accounts WHERE id = 6;
+----
++------------------+------------------+
+|               id |             name |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0

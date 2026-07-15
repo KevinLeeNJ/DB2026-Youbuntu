@@ -27,6 +27,7 @@ private:
     std::vector<ColMeta> cols_;        // scan后生成的记录的字段
     size_t len_;                       // scan后生成的每条记录的长度
     std::vector<Condition> fed_conds_; // 同conds_，两个字段相同
+    std::vector<ConditionAddress> condition_addresses_;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_; // table_iterator
@@ -83,6 +84,7 @@ public:
         context_ = context;
 
         fed_conds_ = conds_;
+        condition_addresses_ = cache_condition_addresses(fed_conds_);
     }
     std::unique_ptr<RmRecord> visible_record(const Rid& rid) {
         return GetVisibleRecord(fh_, rid, context_);
@@ -102,13 +104,7 @@ public:
                 scan_->next();
                 continue;
             }
-            bool match = true;
-            for (const auto& cond : fed_conds_) {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
+            const bool match = conditions_match(fed_conds_, condition_addresses_, *rec);
             if (match) {
                 record_tuple_read(rid_);
                 buffered_record_ = std::move(rec);
@@ -130,13 +126,7 @@ public:
                 scan_->next();
                 continue;
             }
-            bool match = true;
-            for (const auto& cond : fed_conds_) {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
+            const bool match = conditions_match(fed_conds_, condition_addresses_, *rec);
             if (match) {
                 record_tuple_read(rid_);
                 buffered_record_ = std::move(rec);

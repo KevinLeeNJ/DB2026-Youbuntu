@@ -343,7 +343,7 @@ TEST_F(IndexHandleTest, ConcurrentInsertDeleteByRidDoesNotCorruptTree) {
     close_index(ih);
 }
 
-TEST_F(IndexHandleTest, ScanAllowsNonSplitInsertAndBlocksSplitDelete) {
+TEST_F(IndexHandleTest, LongScanAllowsStructuralChangesWithoutMissingOrDuplicatingEntries) {
     auto ih = open_index();
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
@@ -357,12 +357,17 @@ TEST_F(IndexHandleTest, ScanAllowsNonSplitInsertAndBlocksSplitDelete) {
     std::atomic<bool> insert_done{false};
     std::atomic<bool> delete_done{false};
     std::atomic<bool> delete_result{false};
+    std::vector<int> scanned_slots;
 
     std::thread reader([&] {
         IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
         scan_ready.store(true, std::memory_order_release);
         while (!release_scan.load(std::memory_order_acquire)) {
             std::this_thread::yield();
+        }
+        while (!scan.is_end()) {
+            scanned_slots.push_back(scan.rid().slot_no);
+            scan.next();
         }
     });
 
@@ -388,12 +393,15 @@ TEST_F(IndexHandleTest, ScanAllowsNonSplitInsertAndBlocksSplitDelete) {
     }
     ASSERT_TRUE(scan_ready.load(std::memory_order_acquire));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    // PR-09 keeps the structure latch shared for non-split inserts. This
-    // delete leaves a minimum-sized leaf and therefore takes the exclusive
-    // fallback until the scan releases its structure latch.
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while ((!insert_done.load(std::memory_order_acquire) || !delete_done.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    // A scan object may outlive a leaf batch, but it must not retain the
+    // structure latch while its consumer is processing that batch.
     EXPECT_TRUE(insert_done.load(std::memory_order_acquire));
-    EXPECT_FALSE(delete_done.load(std::memory_order_acquire));
+    EXPECT_TRUE(delete_done.load(std::memory_order_acquire));
 
     release_scan.store(true, std::memory_order_release);
     reader.join();
@@ -403,6 +411,10 @@ TEST_F(IndexHandleTest, ScanAllowsNonSplitInsertAndBlocksSplitDelete) {
     EXPECT_TRUE(insert_done.load(std::memory_order_acquire));
     EXPECT_TRUE(delete_done.load(std::memory_order_acquire));
     EXPECT_TRUE(delete_result.load(std::memory_order_acquire));
+    ASSERT_EQ(scanned_slots.size(), 2000u);
+    EXPECT_TRUE(std::is_sorted(scanned_slots.begin(), scanned_slots.end()));
+    EXPECT_EQ(std::count(scanned_slots.begin(), scanned_slots.end(), 1500), 0);
+    EXPECT_EQ(std::count(scanned_slots.begin(), scanned_slots.end(), 5000), 1);
 
     std::vector<Rid> result;
     EXPECT_TRUE(ih->get_value(inserted_key.data(), &result, nullptr));

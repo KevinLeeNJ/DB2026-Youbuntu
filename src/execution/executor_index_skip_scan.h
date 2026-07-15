@@ -130,7 +130,7 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         scan_.reset();
         while (next_range_pos_ < ranges_.size()) {
             const auto range = ranges_[next_range_pos_++];
-            scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, sm_manager_->get_bpm(), false);
+            scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, sm_manager_->get_bpm());
             if (!scan_->is_end()) {
                 return;
             }
@@ -181,6 +181,7 @@ public:
         }
 
         build_ranges(constraints, *suffix_pos);
+        index_latch_guard_.unlock();
         open_next_range();
         advance_to_match();
     }

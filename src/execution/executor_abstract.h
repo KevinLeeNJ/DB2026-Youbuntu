@@ -11,6 +11,9 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstring>
+#include <string_view>
+
 #include "execution_defs.h"
 #include "common/common.h"
 #include "index/ix.h"
@@ -91,34 +94,69 @@ public:
     }
 
 protected:
+    struct ColumnAddress {
+        int offset{0};
+        int len{0};
+        ColType type{TYPE_INT};
+    };
+
+    struct ConditionAddress {
+        ColumnAddress lhs;
+        ColumnAddress rhs;
+    };
+
+    static ColumnAddress make_column_address(const ColMeta& col) {
+        return ColumnAddress{col.offset, col.len, col.type};
+    }
+
+    std::vector<ConditionAddress> cache_condition_addresses(const std::vector<Condition>& conditions) {
+        std::vector<ConditionAddress> addresses;
+        addresses.reserve(conditions.size());
+        for (const auto& condition : conditions) {
+            ConditionAddress address;
+            address.lhs = make_column_address(get_col_offset(condition.lhs_col));
+            if (condition.is_rhs_val) {
+                address.rhs.type = condition.rhs_val.type;
+            } else {
+                address.rhs = make_column_address(get_col_offset(condition.rhs_col));
+            }
+            addresses.push_back(address);
+        }
+        return addresses;
+    }
+
+    bool conditions_match(const std::vector<Condition>& conditions, const std::vector<ConditionAddress>& addresses,
+                          const RmRecord& rec) const {
+        if (conditions.size() != addresses.size()) {
+            throw InternalError("condition address cache is out of date");
+        }
+        for (size_t i = 0; i < conditions.size(); ++i) {
+            if (!compare(conditions[i], rec, addresses[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * @brief 比较条件cond与记录rec是否匹配
      * @param cond 条件
      * @param rec 记录
      * @return true if rec matches cond, false otherwise
      */
-    bool compare(const Condition& cond, const RmRecord& rec) {
-        ColMeta lhs_col_meta = get_col_offset(cond.lhs_col);
-        ColMeta rhs_col_meta;
-        char* lhs_data = rec.data + lhs_col_meta.offset;
-        ColType lhs_type, rhs_type;
-        lhs_type = get_col_offset(cond.lhs_col).type;
-        char* rhs_data = nullptr;
-        if (!cond.is_rhs_val) {
-            rhs_col_meta = get_col_offset(cond.rhs_col);
-            rhs_data = rec.data + rhs_col_meta.offset;
-            rhs_type = rhs_col_meta.type;
-        } else {
-            rhs_type = cond.rhs_val.type;
-        }
+    bool compare(const Condition& cond, const RmRecord& rec, const ConditionAddress& address) const {
+        const ColType lhs_type = address.lhs.type;
+        const ColType rhs_type = cond.is_rhs_val ? cond.rhs_val.type : address.rhs.type;
+        const char* lhs_data = rec.data + address.lhs.offset;
+        const char* rhs_data = cond.is_rhs_val ? nullptr : rec.data + address.rhs.offset;
         if (can_cast(lhs_type, rhs_type) == false) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
         switch (lhs_type) {
         case TYPE_INT:
         case TYPE_FLOAT: {
-            double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
-                                                  : read_unaligned<double>(lhs_data);
+            const double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
+                                                        : read_unaligned<double>(lhs_data);
             double rhs_val;
             if (cond.is_rhs_val) {
                 rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
@@ -144,9 +182,10 @@ protected:
         }
         case TYPE_STRING:
         case TYPE_DATETIME: {
-            std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
-            std::string rhs_val =
-                cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta.len));
+            const std::string_view lhs_val(lhs_data, strnlen(lhs_data, address.lhs.len));
+            const std::string_view rhs_val = cond.is_rhs_val
+                                                 ? std::string_view(cond.rhs_val.str_val)
+                                                 : std::string_view(rhs_data, strnlen(rhs_data, address.rhs.len));
             switch (cond.op) {
             case OP_EQ:
                 return lhs_val == rhs_val;
@@ -164,6 +203,17 @@ protected:
         }
         }
         return false;
+    }
+
+    bool compare(const Condition& cond, const RmRecord& rec) {
+        ConditionAddress address;
+        address.lhs = make_column_address(get_col_offset(cond.lhs_col));
+        if (cond.is_rhs_val) {
+            address.rhs.type = cond.rhs_val.type;
+        } else {
+            address.rhs = make_column_address(get_col_offset(cond.rhs_col));
+        }
+        return compare(cond, rec, address);
     }
     /**
      * @brief 判断两个列类型是否可以进行转换

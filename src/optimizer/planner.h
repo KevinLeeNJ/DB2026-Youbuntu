@@ -12,9 +12,14 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <cassert>
+#include <cstdint>
 #include <cstring>
+#include <list>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "execution/execution_defs.h"
@@ -34,6 +39,37 @@ private:
     bool enable_nestedloop_join = true;
     bool enable_sortmerge_join = false;
 
+    struct PhysicalPlanTemplate {
+        struct ScanDecision {
+            PlanTag tag = T_SeqScan;
+            std::vector<std::string> index_col_names;
+        };
+
+        struct JoinDecision {
+            bool use_inlj = false;
+            TabCol inlj_left_col;
+            TabCol inlj_right_col;
+            std::vector<std::string> inlj_index_col_names;
+        };
+
+        std::vector<std::string> ordered_tables;
+        std::vector<ScanDecision> scan_decisions;
+        std::vector<JoinDecision> join_decisions;
+    };
+
+    using PhysicalPlanCacheLru = std::list<std::string>;
+
+    struct PhysicalPlanCacheEntry {
+        PhysicalPlanTemplate plan_template;
+        PhysicalPlanCacheLru::iterator lru_position;
+    };
+
+    static constexpr size_t kPhysicalPlanCacheCapacity = 256;
+    std::mutex physical_plan_cache_latch_;
+    PhysicalPlanCacheLru physical_plan_cache_lru_;
+    std::unordered_map<std::string, PhysicalPlanCacheEntry> physical_plan_cache_;
+    std::uint64_t physical_plan_cache_generation_ = 0;
+
 public:
     Planner(SmManager* sm_manager) : sm_manager_(sm_manager) {}
 
@@ -50,6 +86,13 @@ public:
 private:
     std::unique_ptr<Query> logical_optimization(std::unique_ptr<Query> query, Context* context);
     std::unique_ptr<Plan> physical_optimization(Query* query, Context* context);
+    std::string make_physical_plan_cache_key(const Query& query, std::uint64_t catalog_generation) const;
+    PhysicalPlanTemplate build_physical_plan_template(const Query& query);
+    std::unique_ptr<Plan> instantiate_physical_plan(const Query& query, const PhysicalPlanTemplate& plan_template);
+    std::optional<PhysicalPlanTemplate> find_physical_plan_template(const std::string& key,
+                                                                    std::uint64_t catalog_generation);
+    void cache_physical_plan_template(std::string key, std::uint64_t catalog_generation,
+                                      PhysicalPlanTemplate plan_template);
 
     std::unique_ptr<Plan> make_one_rel(Query* query);
 
