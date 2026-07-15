@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "buffer_pool_manager.h"
 
+#include <chrono>
+
 #include "recovery/log_manager.h"
 
 namespace {
@@ -60,7 +62,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 
         if (wait_page != nullptr) {
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
-            wait_page->io_cv_.wait(wait_lock, [wait_page] {
+            wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
@@ -104,7 +106,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 
         if (wait_page != nullptr) {
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
-            wait_page->io_cv_.wait(wait_lock, [wait_page] {
+            wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
@@ -257,7 +259,7 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
 
         if (wait_page != nullptr) {
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
-            wait_page->io_cv_.wait(wait_lock, [wait_page] {
+            wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
@@ -413,7 +415,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
 
         if (wait_page != nullptr) {
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
-            wait_page->io_cv_.wait(wait_lock, [wait_page] {
+            wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });

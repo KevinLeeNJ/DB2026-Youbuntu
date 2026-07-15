@@ -8,6 +8,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="$ROOT_DIR/build/bin/rmdb"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
+VERIFY_BINARY="$ROOT_DIR/build/bin/rmdb_verify"
 DB_DIR="tpcc_random_kill_db"
 PORT=8765
 WORKERS=16
@@ -23,12 +24,15 @@ WORK_DIR=""
 SERVER_LOG=""
 ISOLATION="read-committed"
 SEED=1
+SQL_OPS=100
+SQL_THINK=1ms
 
 usage() {
     cat <<EOF
 Usage: $0 [options]
   --binary PATH            rmdb binary (default: build/bin/rmdb)
   --go-binary PATH         Go benchmark binary (default: build/bin/tpcc-go)
+  --verify-binary PATH     heap/index verifier (default: build/bin/rmdb_verify)
   --db-dir PATH            database directory (default: tpcc_random_kill_db)
   --port N                 server port (default: 8765)
   --workers N               concurrent workers (default: 16)
@@ -44,6 +48,8 @@ Usage: $0 [options]
   --server-log PATH         server log path
   --isolation LEVEL         read-committed or snapshot-isolation
   --seed N                  random seed (default: 1)
+  --sql-ops N               completed mixed SQL operations before kill (default: 100)
+  --sql-think DURATION      delay between mixed SQL operations (default: 1ms)
   -h, --help                show this help
 EOF
 }
@@ -52,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --binary) BINARY="$2"; shift 2 ;;
         --go-binary) GO_BINARY="$2"; shift 2 ;;
+        --verify-binary) VERIFY_BINARY="$2"; shift 2 ;;
         --db-dir) DB_DIR="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --workers) WORKERS="$2"; shift 2 ;;
@@ -67,13 +74,19 @@ while [[ $# -gt 0 ]]; do
         --server-log) SERVER_LOG="$2"; shift 2 ;;
         --isolation) ISOLATION="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
+        --sql-ops) SQL_OPS="$2"; shift 2 ;;
+        --sql-think) SQL_THINK="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ || ! "$CYCLES" =~ ^[1-9][0-9]*$ || ! "$MEASURE" =~ ^[1-9][0-9]*$ ]]; then
-    echo "workers, measure, and cycles must be positive integers" >&2
+if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ || ! "$CYCLES" =~ ^[1-9][0-9]*$ || ! "$MEASURE" =~ ^[1-9][0-9]*$ || ! "$SQL_OPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "workers, measure, cycles, and sql-ops must be positive integers" >&2
+    exit 2
+fi
+if (( SQL_OPS < 100 || CYCLES > 1000 )); then
+    echo "sql-ops must be >= 100 and cycles must be <= 1000" >&2
     exit 2
 fi
 if [[ ! "$MIN_KILL_DELAY" =~ ^[0-9]+([.][0-9]+)?$ || ! "$MAX_KILL_DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -84,8 +97,8 @@ if [[ "$ISOLATION" != "read-committed" && "$ISOLATION" != "snapshot-isolation" ]
     echo "--isolation must be read-committed or snapshot-isolation" >&2
     exit 2
 fi
-if [[ ! -x "$BINARY" || ! -x "$GO_BINARY" ]]; then
-    echo "missing rmdb or tpcc-go binary" >&2
+if [[ ! -x "$BINARY" || ! -x "$GO_BINARY" || ! -x "$VERIFY_BINARY" ]]; then
+    echo "missing rmdb, tpcc-go, or rmdb_verify binary" >&2
     exit 1
 fi
 
@@ -103,14 +116,21 @@ mkdir -p "$(dirname "$DB_DIR")" "$(dirname "$SERVER_LOG")"
 rm -rf "$DB_DIR"
 rm -f "$SERVER_LOG" "$WORK_DIR"/baseline.json "$WORK_DIR"/run-*.json
 ACK_FILE="$WORK_DIR/crash-acked-transactions.log"
-rm -f "$ACK_FILE"
+ATOMIC_ACK_FILE="$WORK_DIR/mixed-sql-acked-transactions.log"
+ATOMIC_ISSUED_FILE="$WORK_DIR/mixed-sql-issued-transactions.log"
+rm -f "$ACK_FILE" "$ATOMIC_ACK_FILE" "$ATOMIC_ISSUED_FILE"
 
 SERVER_PID=""
 WORKLOAD_PID=""
+SQL_WORKLOAD_PID=""
 cleanup() {
     if [[ -n "$WORKLOAD_PID" ]] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
         kill -TERM "$WORKLOAD_PID" 2>/dev/null || true
         wait "$WORKLOAD_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$SQL_WORKLOAD_PID" ]] && kill -0 "$SQL_WORKLOAD_PID" 2>/dev/null; then
+        kill -TERM "$SQL_WORKLOAD_PID" 2>/dev/null || true
+        wait "$SQL_WORKLOAD_PID" 2>/dev/null || true
     fi
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill -TERM "$SERVER_PID" 2>/dev/null || true
@@ -176,6 +196,39 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     echo "[random-kill] cycle $cycle/$CYCLES: restart workload server"
     start_server "$RESTART_TIMEOUT"
     RUN_JSON="$WORK_DIR/run-$cycle.json"
+    SQL_READY="$WORK_DIR/sql-ready-$cycle"
+    SQL_ACK="$WORK_DIR/sql-acked-$cycle.log"
+    SQL_ISSUED="$WORK_DIR/sql-issued-$cycle.log"
+    rm -f "$RUN_JSON" "$SQL_READY" "$SQL_ACK" "$SQL_ISSUED"
+
+    echo "[random-kill] cycle $cycle/$CYCLES: execute at least $SQL_OPS mixed SQL operations"
+    SQL_PREFIX=$((cycle * 2))
+    TPCC_PREFIX=$((cycle * 2 - 1))
+    "$GO_BINARY" --command mixed-sql \
+        --port "$PORT" \
+        --isolation "$ISOLATION" \
+        --sql-ops "$SQL_OPS" \
+        --think "$SQL_THINK" \
+        --sql-ready-file "$SQL_READY" \
+        --oracle-ack-file "$SQL_ACK" \
+        --oracle-issued-file "$SQL_ISSUED" \
+        --oracle-id-prefix "$SQL_PREFIX" \
+        >"$WORK_DIR/sql-$cycle.out" 2>"$WORK_DIR/sql-$cycle.err" &
+    SQL_WORKLOAD_PID=$!
+    ready_deadline=$((SECONDS + RESTART_TIMEOUT))
+    while [[ ! -f "$SQL_READY" ]]; do
+        if ! kill -0 "$SQL_WORKLOAD_PID" 2>/dev/null; then
+            echo "[random-kill] mixed SQL workload exited before readiness" >&2
+            cat "$WORK_DIR/sql-$cycle.err" >&2 || true
+            exit 1
+        fi
+        if (( SECONDS >= ready_deadline )); then
+            echo "[random-kill] mixed SQL workload did not reach readiness" >&2
+            exit 1
+        fi
+        sleep 0.01
+    done
+
     rm -f "$RUN_JSON"
     "$GO_BINARY" \
         --port "$PORT" \
@@ -187,7 +240,7 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
         --progress-interval 0 \
         --warehouse-policy terminal-home \
         --oracle-ack-file "$ACK_FILE" \
-        --oracle-id-prefix "$cycle" \
+        --oracle-id-prefix "$TPCC_PREFIX" \
         --json-out "$RUN_JSON" \
         >"$WORK_DIR/run-$cycle.out" 2>"$WORK_DIR/run-$cycle.err" &
     WORKLOAD_PID=$!
@@ -228,6 +281,22 @@ PY
     fi
     wait "$WORKLOAD_PID" 2>/dev/null || true
     WORKLOAD_PID=""
+    if kill -0 "$SQL_WORKLOAD_PID" 2>/dev/null; then
+        for _ in {1..50}; do
+            kill -0 "$SQL_WORKLOAD_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -TERM "$SQL_WORKLOAD_PID" 2>/dev/null || true
+    fi
+    wait "$SQL_WORKLOAD_PID" 2>/dev/null || true
+    SQL_WORKLOAD_PID=""
+    if [[ -f "$SQL_ACK" ]]; then
+        cat "$SQL_ACK" >> "$ACK_FILE"
+        cat "$SQL_ACK" >> "$ATOMIC_ACK_FILE"
+    fi
+    if [[ -f "$SQL_ISSUED" ]]; then
+        cat "$SQL_ISSUED" >> "$ATOMIC_ISSUED_FILE"
+    fi
 
     echo "[random-kill] cycle $cycle/$CYCLES: kill once more during recovery"
     "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
@@ -248,7 +317,13 @@ PY
         --port "$PORT" \
         --isolation "$ISOLATION" \
         --oracle-ack-file "$ACK_FILE"
+    "$GO_BINARY" --command atomic-verify \
+        --port "$PORT" \
+        --isolation "$ISOLATION" \
+        --oracle-issued-file "$ATOMIC_ISSUED_FILE" \
+        --oracle-ack-file "$ATOMIC_ACK_FILE"
     stop_server
+    "$VERIFY_BINARY" "$DB_DIR"
 done
 
 echo "[random-kill] passed $CYCLES random crash/recovery cycles"

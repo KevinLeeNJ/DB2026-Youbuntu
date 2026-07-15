@@ -226,7 +226,6 @@ void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
     BeginLogRecord record(txn->get_transaction_id());
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
-    FaultInjector::Point("after_commit_log_append");
 }
 
 void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
@@ -236,6 +235,7 @@ void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
     CommitLogRecord record(txn->get_transaction_id());
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
+    FaultInjector::Point("after_commit_log_append");
     txn->set_prev_lsn(lsn);
     // Returning from COMMIT means the commit record survived an OS crash,
     // not merely that it reached the kernel page cache.
@@ -331,8 +331,8 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         }
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         if (fh->is_record(rid)) {
-            fh->apply_tuple_update(rid, old_rec.data,
-                                   undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
+            fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
+                                   page_lsn);
         }
         if (current_rec != nullptr) {
             for (const auto& index : tab.indexes) {

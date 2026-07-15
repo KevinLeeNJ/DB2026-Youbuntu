@@ -280,6 +280,107 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyCycleCancelsYoungestVictim) {
     EXPECT_TRUE(lock_manager.unlock_unique_key(&older, first_lock));
 }
 
+TEST(SnapshotIsolationConcurrencyTest, WaitForGraphRebuildsAfterOwnerHandoff) {
+    LockManager lock_manager;
+    Transaction owner(1201, IsolationLevel::READ_COMMITTED);
+    Transaction older(1202, IsolationLevel::READ_COMMITTED);
+    Transaction younger(1203, IsolationLevel::READ_COMMITTED);
+    Rid first{6, 0};
+    Rid second{7, 0};
+    LockDataId first_lock(42, first, LockDataType::RECORD);
+    LockDataId second_lock(42, second, LockDataType::RECORD);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, first, 42));
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&younger, second, 42));
+
+    std::atomic<bool> older_started{false};
+    std::atomic<bool> younger_started{false};
+    std::atomic<bool> older_has_first{false};
+    std::atomic<bool> older_has_second{false};
+    std::thread older_thread([&] {
+        older_started.store(true);
+        if (!lock_manager.lock_exclusive_on_record(&older, first, 42)) {
+            return;
+        }
+        older_has_first.store(true);
+        while (!older_has_second.load()) {
+            std::this_thread::yield();
+        }
+    });
+    while (!older_started.load()) {
+        std::this_thread::yield();
+    }
+
+    std::thread younger_thread([&] {
+        younger_started.store(true);
+        const bool acquired = lock_manager.lock_exclusive_on_record(&younger, first, 42);
+        if (!acquired) {
+            lock_manager.unlock(&younger, second_lock);
+            return;
+        }
+        lock_manager.unlock(&younger, first_lock);
+    });
+    while (!younger_started.load()) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(lock_manager.unlock(&owner, first_lock));
+    while (!older_has_first.load()) {
+        std::this_thread::yield();
+    }
+
+    // T3 is still queued behind T2 on the first lock. T2 now waits for T3's
+    // second lock, so the graph must be rebuilt as T2 -> T3 -> T2.
+    older_has_second.store(lock_manager.lock_exclusive_on_record(&older, second, 42));
+    older_thread.join();
+    younger_thread.join();
+
+    EXPECT_TRUE(older_has_second.load());
+    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
+    EXPECT_TRUE(lock_manager.unlock(&older, second_lock));
+    EXPECT_TRUE(lock_manager.unlock(&older, first_lock));
+}
+
+TEST(SnapshotIsolationConcurrencyTest, UniqueKeyOwnerHandoffPreservesFifoOrder) {
+    LockManager lock_manager;
+    Transaction owner(1301, IsolationLevel::READ_COMMITTED);
+    Transaction first_waiter(1302, IsolationLevel::READ_COMMITTED);
+    Transaction second_waiter(1303, IsolationLevel::READ_COMMITTED);
+    const std::vector<char> key{'h', 'a', 'n', 'd', 'o', 'f', 'f'};
+    std::string lock_id(sizeof(int), '\0');
+    const int index_fd = 77;
+    std::memcpy(lock_id.data(), &index_fd, sizeof(index_fd));
+    lock_id.append(key.data(), key.size());
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&owner, index_fd, key));
+    std::atomic<bool> first_acquired{false};
+    std::atomic<bool> second_acquired{false};
+    std::atomic<bool> release_first{false};
+    std::thread first_thread([&] {
+        first_acquired.store(lock_manager.lock_exclusive_on_unique_key(&first_waiter, index_fd, key));
+        while (!release_first.load()) {
+            std::this_thread::yield();
+        }
+        if (first_acquired.load()) {
+            EXPECT_TRUE(lock_manager.unlock_unique_key(&first_waiter, lock_id));
+        }
+    });
+    std::thread second_thread([&] {
+        second_acquired.store(lock_manager.lock_exclusive_on_unique_key(&second_waiter, index_fd, key));
+        if (second_acquired.load()) {
+            EXPECT_TRUE(lock_manager.unlock_unique_key(&second_waiter, lock_id));
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(lock_manager.unlock_unique_key(&owner, lock_id));
+    while (!first_acquired.load())
+        std::this_thread::yield();
+    release_first.store(true);
+    first_thread.join();
+    second_thread.join();
+    EXPECT_TRUE(second_acquired.load());
+}
+
 TEST(SnapshotIsolationConcurrencyTest, IndependentRecordLocksProgressConcurrently) {
     LockManager lock_manager;
     constexpr int thread_count = 8;
@@ -917,7 +1018,7 @@ TEST_F(SnapshotTest, Example2_SnapshotConsistency_SI) {
     auto t1 = create_session();
     auto t2 = create_session();
 
-    SimpleThreadBarrier barrier(2);
+    SimpleThreadBarrier first_select_done(2), commit_done(2);
     std::string t1b_output, t1c_output;
 
     std::thread th1([&]() {
@@ -928,7 +1029,8 @@ TEST_F(SnapshotTest, Example2_SnapshotConsistency_SI) {
         // t1b: first SELECT — should see val=100
         t1b_output = t1->exec_sql("select * from counter_test where id = 1;");
 
-        barrier.arrive_and_wait(); // barrier 0: T2 has committed its UPDATE
+        first_select_done.arrive_and_wait(); // T2 may update only after T1's snapshot is established.
+        commit_done.arrive_and_wait();       // T2 has committed its UPDATE.
 
         // t1c: second SELECT — should STILL see val=100 (snapshot consistency)
         t1c_output = t1->exec_sql("select * from counter_test where id = 1;");
@@ -937,18 +1039,15 @@ TEST_F(SnapshotTest, Example2_SnapshotConsistency_SI) {
     });
 
     std::thread th2([&]() {
-        // Wait for T1 to do its first SELECT
-        // (We don't need a barrier here — T2 starts after T1's first SELECT
-        //  by the schedule. We use the barrier for synchronization.)
-
         // t2a begin;
         ASSERT_TRUE(t2->exec_sql_ok("begin;"));
+        first_select_done.arrive_and_wait();
         // t2b: UPDATE
         ASSERT_TRUE(t2->exec_sql_ok("update counter_test set val = 200 where id = 1;"));
         // t2c commit;
         ASSERT_TRUE(t2->exec_sql_ok("commit;"));
 
-        barrier.arrive_and_wait(); // barrier 0: signal T1 that T2 is done
+        commit_done.arrive_and_wait(); // signal T1 that T2 is done
     });
 
     th1.join();

@@ -501,12 +501,24 @@ public:
         return group_commit_wait_ns_.load(std::memory_order_acquire);
     }
 
-    uint64_t get_pwrite_count() const { return pwrite_count_.load(std::memory_order_acquire); }
-    uint64_t get_pwrite_bytes() const { return pwrite_bytes_.load(std::memory_order_acquire); }
-    uint64_t get_wal_write_ns() const { return wal_write_ns_.load(std::memory_order_acquire); }
-    uint64_t get_wal_fsync_ns() const { return wal_fsync_ns_.load(std::memory_order_acquire); }
-    uint64_t get_commit_count() const { return commit_count_.load(std::memory_order_acquire); }
-    DurabilityMode durability_mode() const { return durability_mode_; }
+    uint64_t get_pwrite_count() const {
+        return pwrite_count_.load(std::memory_order_acquire);
+    }
+    uint64_t get_pwrite_bytes() const {
+        return pwrite_bytes_.load(std::memory_order_acquire);
+    }
+    uint64_t get_wal_write_ns() const {
+        return wal_write_ns_.load(std::memory_order_acquire);
+    }
+    uint64_t get_wal_fsync_ns() const {
+        return wal_fsync_ns_.load(std::memory_order_acquire);
+    }
+    uint64_t get_commit_count() const {
+        return commit_count_.load(std::memory_order_acquire);
+    }
+    DurabilityMode durability_mode() const {
+        return durability_mode_;
+    }
 
     void write_restart_offset(int64_t checkpoint_offset);
     int64_t read_restart_offset() const;

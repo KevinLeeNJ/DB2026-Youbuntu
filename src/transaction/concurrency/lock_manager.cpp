@@ -13,7 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cstring>
-#include <unordered_set>
+#include <functional>
 
 LockManager::LockTableShard& LockManager::get_shard(const LockDataId& lock_data_id) {
     return lock_table_shards_[std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT];
@@ -106,40 +106,95 @@ void LockManager::unregister_waiting_txn(txn_id_t txn_id) {
     waiting_txns_.erase(txn_id);
 }
 
-txn_id_t LockManager::add_wait_edge_and_find_youngest_victim(txn_id_t waiter, txn_id_t owner) {
-    std::lock_guard<std::mutex> lock(wait_for_latch_);
-    waiting_for_[waiter] = owner;
-    txn_id_t current = owner;
-    std::vector<txn_id_t> cycle;
-    std::unordered_set<txn_id_t> visited;
-    while (current != INVALID_TXN_ID && visited.insert(current).second) {
-        cycle.push_back(current);
-        if (current == waiter) {
-            txn_id_t victim = waiter;
-            for (txn_id_t txn_id : cycle) {
-                victim = std::max(victim, txn_id);
-            }
-            // If the requester itself is the youngest victim, its request
-            // path will remove the edge immediately. Otherwise leave the
-            // requester's edge in place until the selected victim is woken
-            // and its edge is removed by cancel_waiting_transaction().
-            if (victim == waiter) {
-                waiting_for_.erase(waiter);
-            }
-            return victim;
-        }
-        auto it = waiting_for_.find(current);
-        if (it == waiting_for_.end()) {
-            break;
-        }
-        current = it->second;
-    }
-    return INVALID_TXN_ID;
+void LockManager::note_wait_topology_change() {
+    wait_topology_epoch_.fetch_add(1, std::memory_order_release);
 }
 
-void LockManager::remove_wait_edge(txn_id_t waiter) {
-    std::lock_guard<std::mutex> lock(wait_for_latch_);
-    waiting_for_.erase(waiter);
+LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
+    for (;;) {
+        const uint64_t start_epoch = wait_topology_epoch_.load(std::memory_order_acquire);
+        WaitForGraph graph;
+
+        std::vector<std::shared_ptr<LockRequestQueue>> record_queues;
+        for (auto& shard : lock_table_shards_) {
+            std::lock_guard<std::mutex> shard_lock(shard.latch_);
+            record_queues.reserve(record_queues.size() + shard.lock_table_.size());
+            for (const auto& [_, queue] : shard.lock_table_) {
+                if (queue != nullptr) {
+                    record_queues.push_back(queue);
+                }
+            }
+        }
+        for (const auto& queue : record_queues) {
+            std::lock_guard<std::mutex> queue_lock(queue->latch_);
+            txn_id_t predecessor = queue->owner_txn_id_;
+            for (const auto& waiter : queue->waiters_) {
+                if (waiter == nullptr || waiter->cancelled_) {
+                    continue;
+                }
+                if (predecessor != INVALID_TXN_ID) {
+                    graph[waiter->txn_id_].push_back(predecessor);
+                }
+                predecessor = waiter->txn_id_;
+            }
+        }
+
+        for (auto& shard : unique_key_shards_) {
+            std::lock_guard<std::mutex> shard_lock(shard.latch);
+            for (const auto& [_, queue] : shard.queues) {
+                if (queue == nullptr) {
+                    continue;
+                }
+                txn_id_t predecessor = queue->owner;
+                for (txn_id_t waiter : queue->waiters) {
+                    if (predecessor != INVALID_TXN_ID) {
+                        graph[waiter].push_back(predecessor);
+                    }
+                    predecessor = waiter;
+                }
+            }
+        }
+
+        if (start_epoch == wait_topology_epoch_.load(std::memory_order_acquire)) {
+            return graph;
+        }
+    }
+}
+
+txn_id_t LockManager::find_youngest_cycle_victim(txn_id_t requester) {
+    const WaitForGraph graph = build_wait_for_graph_snapshot();
+    std::unordered_map<txn_id_t, int> color;
+    std::unordered_map<txn_id_t, size_t> stack_position;
+    std::vector<txn_id_t> stack;
+    txn_id_t victim = INVALID_TXN_ID;
+
+    std::function<bool(txn_id_t)> visit = [&](txn_id_t txn_id) {
+        color[txn_id] = 1;
+        stack_position[txn_id] = stack.size();
+        stack.push_back(txn_id);
+        auto graph_it = graph.find(txn_id);
+        if (graph_it != graph.end()) {
+            for (txn_id_t dependency : graph_it->second) {
+                if (color[dependency] == 0) {
+                    if (visit(dependency)) {
+                        return true;
+                    }
+                } else if (color[dependency] == 1) {
+                    victim = dependency;
+                    for (size_t index = stack_position[dependency]; index < stack.size(); ++index) {
+                        victim = std::max(victim, stack[index]);
+                    }
+                    return true;
+                }
+            }
+        }
+        stack.pop_back();
+        stack_position.erase(txn_id);
+        color[txn_id] = 2;
+        return false;
+    };
+    visit(requester);
+    return victim;
 }
 
 void LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
@@ -165,6 +220,7 @@ void LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
             if (request_it != item.queue->waiters_.end()) {
                 (*request_it)->cancelled_ = true;
                 item.queue->waiters_.erase(request_it);
+                note_wait_topology_change();
                 cancelled = true;
                 if (txn != nullptr) {
                     txn->mark_lock_cancellation_requested();
@@ -175,6 +231,7 @@ void LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
                     next_request->granted_ = true;
                     item.queue->owner_txn_id_ = next_request->txn_id_;
                     item.queue->group_lock_mode_ = GroupLockMode::X;
+                    note_wait_topology_change();
                 }
             }
         }
@@ -197,6 +254,7 @@ void LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
             queue->waiters.erase(std::remove(queue->waiters.begin(), queue->waiters.end(), txn_id),
                                  queue->waiters.end());
             if (queue->waiters.size() != old_size) {
+                note_wait_topology_change();
                 if (txn != nullptr) {
                     txn->mark_lock_cancellation_requested();
                 }
@@ -209,7 +267,6 @@ void LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
             }
         }
     }
-    remove_wait_edge(txn_id);
 }
 
 /**
@@ -248,6 +305,7 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         request->granted_ = true;
         request_queue->owner_txn_id_ = txn->get_transaction_id();
         request_queue->group_lock_mode_ = GroupLockMode::X;
+        note_wait_topology_change();
         txn->get_lock_set()->insert(lock_data_id);
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
@@ -268,46 +326,35 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     // that has not acquired any other record lock. Once a transaction already
     // owns a record lock, however, waiting is necessary to resolve genuine
     // cross-record cycles (the cycle detector will pick one victim).
-    const bool can_wait_for_cycle = txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ||
-                                    !txn->get_lock_set()->empty();
+    const bool can_wait_for_cycle =
+        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED || !txn->get_lock_set()->empty();
     if (!can_wait_for_cycle) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         return false;
     }
-    const txn_id_t owner_txn_id = request_queue->owner_txn_id_;
     auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
     request_queue->waiters_.push_back(request);
+    note_wait_topology_change();
     if (!register_pending_lock(txn, lock_data_id, request_queue, request)) {
         request->cancelled_ = true;
         request_queue->waiters_.pop_back();
+        note_wait_topology_change();
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
-    const txn_id_t cycle_victim = add_wait_edge_and_find_youngest_victim(txn->get_transaction_id(), owner_txn_id);
+    lock.unlock();
+    const txn_id_t cycle_victim = find_youngest_cycle_victim(txn->get_transaction_id());
     if (cycle_victim != INVALID_TXN_ID) {
         wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
-        if (cycle_victim == txn->get_transaction_id()) {
-            request->cancelled_ = true;
-            request_queue->waiters_.pop_back();
-            unregister_pending_lock(txn->get_transaction_id(), lock_data_id, request);
-            lock.unlock();
-            release_queue_user(lock_data_id, request_queue);
-            try_remove_empty_queue(lock_data_id, request_queue);
-            return false;
-        }
-        // The requester is older than the selected victim. Keep waiting for
-        // the victim's cancellation to release its held lock.
-        lock.unlock();
         cancel_waiting_transaction(cycle_victim);
-        lock.lock();
     }
+    lock.lock();
     request->cv_.wait(lock, [&request] { return request->granted_ || request->cancelled_; });
     const bool cancelled = request->cancelled_;
     lock.unlock();
-    remove_wait_edge(txn->get_transaction_id());
     unregister_pending_lock(txn->get_transaction_id(), lock_data_id, request);
     release_queue_user(lock_data_id, request_queue);
     if (cancelled) {
@@ -340,6 +387,7 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
     }
     if (queue->owner == INVALID_TXN_ID && queue->waiters.empty()) {
         queue->owner = txn_id;
+        note_wait_topology_change();
         txn->get_unique_key_lock_set()->insert(lock_id);
         return true;
     }
@@ -350,21 +398,15 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
         return false;
     }
     queue->waiters.push_back(txn_id);
+    note_wait_topology_change();
     register_waiting_txn(txn);
-    const txn_id_t cycle_victim = add_wait_edge_and_find_youngest_victim(txn_id, queue->owner);
+    lock.unlock();
+    const txn_id_t cycle_victim = find_youngest_cycle_victim(txn_id);
     if (cycle_victim != INVALID_TXN_ID) {
         wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
-        if (cycle_victim == txn_id) {
-            queue->waiters.pop_back();
-            unregister_waiting_txn(txn_id);
-            return false;
-        }
-        // Keep the older requester queued while the youngest transaction is
-        // cancelled and unwinds its own wait/locks.
-        lock.unlock();
         cancel_waiting_transaction(cycle_victim);
-        lock.lock();
     }
+    lock.lock();
     queue->cv.wait(lock, [&] {
         return txn->is_lock_cancellation_requested() ||
                (queue->owner == INVALID_TXN_ID && !queue->waiters.empty() && queue->waiters.front() == txn_id);
@@ -373,16 +415,16 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
         auto it = std::find(queue->waiters.begin(), queue->waiters.end(), txn_id);
         if (it != queue->waiters.end()) {
             queue->waiters.erase(it);
+            note_wait_topology_change();
         }
         unregister_waiting_txn(txn_id);
-        remove_wait_edge(txn_id);
         queue->cv.notify_all();
         return false;
     }
     queue->waiters.pop_front();
     queue->owner = txn_id;
+    note_wait_topology_change();
     unregister_waiting_txn(txn_id);
-    remove_wait_edge(txn_id);
     txn->get_unique_key_lock_set()->insert(lock_id);
     return true;
 }
@@ -399,6 +441,7 @@ bool LockManager::unlock_unique_key(Transaction* txn, const std::string& lock_id
     }
     auto queue = it->second;
     queue->owner = INVALID_TXN_ID;
+    note_wait_topology_change();
     txn->get_unique_key_lock_set()->erase(lock_id);
     queue->cv.notify_all();
     if (queue->waiters.empty()) {
@@ -439,6 +482,7 @@ void LockManager::cancel_transaction(Transaction* txn) {
             if (request_it != item.queue->waiters_.end()) {
                 (*request_it)->cancelled_ = true;
                 item.queue->waiters_.erase(request_it);
+                note_wait_topology_change();
                 cancelled = true;
                 if (item.queue->owner_txn_id_ == INVALID_TXN_ID && !item.queue->waiters_.empty()) {
                     next_request = item.queue->waiters_.front();
@@ -446,6 +490,7 @@ void LockManager::cancel_transaction(Transaction* txn) {
                     next_request->granted_ = true;
                     item.queue->owner_txn_id_ = next_request->txn_id_;
                     item.queue->group_lock_mode_ = GroupLockMode::X;
+                    note_wait_topology_change();
                 }
             }
         }
@@ -535,6 +580,7 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
     }
 
     request_queue->owner_txn_id_ = INVALID_TXN_ID;
+    note_wait_topology_change();
     txn->get_lock_set()->erase(lock_data_id);
     std::shared_ptr<LockRequest> next_request;
     if (request_queue->waiters_.empty()) {
@@ -545,6 +591,7 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
         next_request->granted_ = true;
         request_queue->owner_txn_id_ = next_request->txn_id_;
         request_queue->group_lock_mode_ = GroupLockMode::X;
+        note_wait_topology_change();
     }
     lock.unlock();
     if (next_request != nullptr) {

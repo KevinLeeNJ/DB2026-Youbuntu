@@ -322,8 +322,8 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
 
         std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
         int pos = leaf.lower_bound(key);
-        bool duplicate_key =
-            pos < leaf.get_size() && ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
+        bool duplicate_key = pos < leaf.get_size() &&
+                             ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
         if (duplicate_key && !allow_duplicate) {
             leaf_guard.unlock();
             buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
@@ -569,9 +569,10 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
                 ++pos;
             }
 
-            const bool found_target = needs_structure_fallback ||
-                                       (pos < leaf.get_size() && *leaf.get_rid(pos) == value &&
-                                        ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0);
+            const bool found_target =
+                needs_structure_fallback ||
+                (pos < leaf.get_size() && *leaf.get_rid(pos) == value &&
+                 ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0);
             const bool at_last_leaf = leaf.get_page_no() == file_hdr_->last_leaf_;
             const page_id_t next_leaf = leaf.get_next_leaf();
             leaf_guard.unlock();

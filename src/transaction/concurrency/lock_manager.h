@@ -87,7 +87,9 @@ public:
     // Cancel pending lock requests owned by txn. Granted locks are released by the transaction manager.
     void cancel_transaction(Transaction* txn);
 
-    uint64_t wait_cycle_abort_count() const { return wait_cycle_abort_count_.load(std::memory_order_acquire); }
+    uint64_t wait_cycle_abort_count() const {
+        return wait_cycle_abort_count_.load(std::memory_order_acquire);
+    }
 
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
@@ -108,8 +110,10 @@ private:
                                const std::shared_ptr<LockRequest>& request);
     void unregister_pending_lock(txn_id_t txn_id, const LockDataId& lock_data_id,
                                  const std::shared_ptr<LockRequest>& request);
-    txn_id_t add_wait_edge_and_find_youngest_victim(txn_id_t waiter, txn_id_t owner);
-    void remove_wait_edge(txn_id_t waiter);
+    using WaitForGraph = std::unordered_map<txn_id_t, std::vector<txn_id_t>>;
+    WaitForGraph build_wait_for_graph_snapshot();
+    txn_id_t find_youngest_cycle_victim(txn_id_t requester);
+    void note_wait_topology_change();
     void register_waiting_txn(Transaction* txn);
     void unregister_waiting_txn(txn_id_t txn_id);
     void cancel_waiting_transaction(txn_id_t txn_id);
@@ -118,8 +122,7 @@ private:
     std::mutex pending_latch_;
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
     std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
-    std::mutex wait_for_latch_;
-    std::unordered_map<txn_id_t, txn_id_t> waiting_for_;
+    std::atomic<uint64_t> wait_topology_epoch_{0};
     std::atomic<uint64_t> wait_cycle_abort_count_{0};
     static constexpr size_t UNIQUE_KEY_SHARD_COUNT = 64;
     struct UniqueKeyQueue {

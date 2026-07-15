@@ -318,8 +318,8 @@ void SmManager::prune_version_history(timestamp_t watermark) {
                 continue;
             }
             auto& rids = key_it->second;
-            const bool removable = std::find(hist_to_requeue.begin(), hist_to_requeue.end(), candidate) ==
-                                   hist_to_requeue.end();
+            const bool removable =
+                std::find(hist_to_requeue.begin(), hist_to_requeue.end(), candidate) == hist_to_requeue.end();
             if (removable) {
                 rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
                 if (rids.empty()) {
@@ -342,9 +342,11 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         for (const auto& [tab_name, rids] : deleted_tuple_candidates_) {
             for (const Rid& rid : rids) {
                 del_snapshot.emplace_back(tab_name, rid);
-                if (del_snapshot.size() >= kHistoryPruneBatch) break;
+                if (del_snapshot.size() >= kHistoryPruneBatch)
+                    break;
             }
-            if (del_snapshot.size() >= kHistoryPruneBatch) break;
+            if (del_snapshot.size() >= kHistoryPruneBatch)
+                break;
         }
     }
     std::vector<std::pair<std::string, Rid>> del_to_remove;

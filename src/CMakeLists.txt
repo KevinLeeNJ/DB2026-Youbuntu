@@ -20,6 +20,10 @@ target_link_libraries(parser execution pthread)
 add_executable(rmdb rmdb.cpp)
 target_link_libraries(rmdb parser execution readline pthread planner analyze)
 
+# Offline post-recovery structural verifier used by crash-consistency tests.
+add_executable(rmdb_verify rmdb_verify.cpp)
+target_link_libraries(rmdb_verify parser execution pthread planner analyze storage recovery)
+
 # unit_test
 add_executable(unit_test unit_test.cpp)
 target_link_libraries(unit_test storage lru_replacer record gtest_main)  # add gtest

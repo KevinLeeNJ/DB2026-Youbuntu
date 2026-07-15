@@ -47,11 +47,11 @@ auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_m
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
 auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
-auto log_manager = std::make_unique<LogManager>(
-    disk_manager.get(),
-    std::getenv("RMDB_DURABILITY_MODE") != nullptr && std::string(std::getenv("RMDB_DURABILITY_MODE")) == "strict"
-        ? DurabilityMode::STRICT
-        : DurabilityMode::PROCESS_CRASH);
+auto log_manager = std::make_unique<LogManager>(disk_manager.get(),
+                                                std::getenv("RMDB_DURABILITY_MODE") != nullptr &&
+                                                        std::string(std::getenv("RMDB_DURABILITY_MODE")) == "strict"
+                                                    ? DurabilityMode::STRICT
+                                                    : DurabilityMode::PROCESS_CRASH);
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get(),
                                                   log_manager.get());
 

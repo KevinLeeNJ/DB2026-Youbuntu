@@ -144,24 +144,32 @@ def prepare_db(server: Server) -> None:
         client.ok("create index kv(id);")
         client.ok("begin;")
         client.ok("insert into kv values (1, 10);")
+        client.ok("insert into kv values (2, 10);")
         client.ok("commit;")
     finally:
         client.close()
         server.stop()
 
 
-def query_value(server: Server) -> int:
+def query_values(server: Server) -> dict[int, int]:
     server.start("verify")
     client = SqlClient()
     try:
-        reply = client.ok("select v from kv where id = 1;")
+        reply = client.ok("select id, v from kv order by id;")
     finally:
         client.close()
         server.stop()
-    values = re.findall(r"\|\s*(-?\d+)\s*\|", reply)
-    if not values:
-        raise RuntimeError(f"恢复后没有读到 kv.id=1: {reply}")
-    return int(values[0])
+    rows = re.findall(r"\|\s*(-?\d+)\s*\|\s*(-?\d+)\s*\|", reply)
+    if not rows:
+        raise RuntimeError(f"恢复后没有读到 kv: {reply}")
+    return {int(row_id): int(value) for row_id, value in rows}
+
+
+def query_value(server: Server) -> int:
+    values = query_values(server)
+    if 1 not in values:
+        raise RuntimeError(f"恢复后没有读到 kv.id=1: {values}")
+    return values[1]
 
 
 def commit_case(server: Server, point: str, expected: int) -> None:
@@ -172,15 +180,20 @@ def commit_case(server: Server, point: str, expected: int) -> None:
         try:
             # Use one autocommit statement so the selected fault point always
             # belongs to the transaction being checked, not to BEGIN itself.
+            # Two rows make a partially published transaction observable.
+            client.ok("begin;")
             client.ok("update kv set v = 20 where id = 1;")
+            client.ok("update kv set v = 20 where id = 2;")
+            client.ok("commit;")
         except (OSError, RuntimeError):
             pass
     finally:
         client.close()
     server.wait_exit()
-    actual = query_value(server)
-    if actual != expected:
-        raise RuntimeError(f"{point}: 恢复值为 {actual}，期望 {expected}")
+    actual = query_values(server)
+    expected_rows = {1: expected, 2: expected}
+    if actual != expected_rows:
+        raise RuntimeError(f"{point}: 恢复值为 {actual}，期望 {expected_rows}")
 
 
 def checkpoint_case(server: Server, point: str, action: str = "abort") -> None:
@@ -207,12 +220,26 @@ def recovery_case(server: Server, point: str) -> None:
     prepare_db(server)
     server.start("dirty")
     client = SqlClient()
+    winner = None
     try:
-        client.ok("begin;")
-        client.ok("update kv set v = 20 where id = 1;")
-        client.ok("commit;")
+        if point == "mid_recovery_undo":
+            # Keep a loser transaction active while a second transaction
+            # commits. The winner's WAL flush makes the loser's UPDATE
+            # durable enough for recovery undo to exercise the real path.
+            client.ok("begin;")
+            client.ok("update kv set v = 20 where id = 1;")
+            winner = SqlClient()
+            winner.ok("begin;")
+            winner.ok("update kv set v = 30 where id = 2;")
+            winner.ok("commit;")
+        else:
+            client.ok("begin;")
+            client.ok("update kv set v = 20 where id = 1;")
+            client.ok("commit;")
     finally:
         client.close()
+        if winner is not None:
+            winner.close()
     server.kill()
 
     try:
@@ -221,9 +248,10 @@ def recovery_case(server: Server, point: str) -> None:
         pass
     else:
         server.wait_exit()
-    actual = query_value(server)
-    if actual != 20:
-        raise RuntimeError(f"{point}: redo 后恢复值为 {actual}，期望 20")
+    actual = query_values(server)
+    expected = {1: 10, 2: 30} if point == "mid_recovery_undo" else {1: 20, 2: 10}
+    if actual != expected:
+        raise RuntimeError(f"{point}: recovery 后恢复值为 {actual}，期望 {expected}")
 
 
 def run_case(name: str, binary: Path, root: Path) -> None:
@@ -254,7 +282,7 @@ def run_case(name: str, binary: Path, root: Path) -> None:
         checkpoint_case(server, name)
     elif name == "before_checkpoint_data_sync_throw":
         checkpoint_case(server, "before_checkpoint_data_sync", "throw")
-    elif name in {"mid_recovery_redo", "mid_index_rebuild"}:
+    elif name in {"mid_recovery_redo", "mid_recovery_undo", "mid_index_rebuild", "before_recovery_wal_reset"}:
         recovery_case(server, name)
     else:
         raise ValueError(name)
@@ -277,7 +305,9 @@ CASES = [
     "before_wal_truncate",
     "before_checkpoint_data_sync_throw",
     "mid_recovery_redo",
+    "mid_recovery_undo",
     "mid_index_rebuild",
+    "before_recovery_wal_reset",
 ]
 
 
@@ -289,17 +319,26 @@ def main() -> int:
     parser.add_argument(
         "--case", choices=CASES, action="append", help="只运行指定 case，可重复传入"
     )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="每个 case 使用独立数据库重复执行的次数"
+    )
     args = parser.parse_args()
     if not args.binary.is_file():
         parser.error(f"找不到 rmdb: {args.binary}")
+    if args.repeat < 1:
+        parser.error("--repeat 必须大于 0")
     selected = args.case or CASES
-    with tempfile.TemporaryDirectory(prefix="rmdb-fault-matrix-") as temp_dir:
-        root = Path(temp_dir)
-        for name in selected:
-            started = time.monotonic()
-            run_case(name, args.binary.resolve(), root)
-            print(f"PASS {name} ({time.monotonic() - started:.2f}s)")
-    print(f"{len(selected)}/{len(selected)} fault-injection cases passed")
+    for repetition in range(1, args.repeat + 1):
+        with tempfile.TemporaryDirectory(prefix="rmdb-fault-matrix-") as temp_dir:
+            root = Path(temp_dir)
+            for name in selected:
+                started = time.monotonic()
+                run_case(name, args.binary.resolve(), root)
+                print(
+                    f"PASS repetition={repetition} {name} "
+                    f"({time.monotonic() - started:.2f}s)"
+                )
+    print(f"{len(selected) * args.repeat}/{len(selected) * args.repeat} fault-injection cases passed")
     return 0
 
 

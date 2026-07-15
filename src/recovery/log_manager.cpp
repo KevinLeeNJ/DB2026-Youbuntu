@@ -185,9 +185,10 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
                 {
                     std::lock_guard<std::mutex> group_lock(group_commit_latch_);
                     waiter_count = group_commit_waiters_.size();
-                    const uint64_t now_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-                            .count());
+                    const uint64_t now_ns =
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now().time_since_epoch())
+                                                  .count());
                     if (!group_commit_waiters_.empty()) {
                         oldest_wait_ns = now_ns - group_commit_waiters_.front()->enqueue_time_ns;
                     }
@@ -297,8 +298,8 @@ void LogManager::flush_buffer(bool sync) {
                     const auto fsync_begin = std::chrono::steady_clock::now();
                     disk_manager_->fsync_log();
                     wal_fsync_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                     std::chrono::steady_clock::now() - fsync_begin)
-                                                                     .count()),
+                                                                      std::chrono::steady_clock::now() - fsync_begin)
+                                                                      .count()),
                                             std::memory_order_acq_rel);
                     lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
                     while (durable < target_lsn &&
@@ -333,8 +334,8 @@ void LogManager::flush_buffer(bool sync) {
                 const auto fsync_begin = std::chrono::steady_clock::now();
                 disk_manager_->fsync_log();
                 wal_fsync_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                 std::chrono::steady_clock::now() - fsync_begin)
-                                                                 .count()),
+                                                                  std::chrono::steady_clock::now() - fsync_begin)
+                                                                  .count()),
                                         std::memory_order_acq_rel);
             }
         } catch (...) {

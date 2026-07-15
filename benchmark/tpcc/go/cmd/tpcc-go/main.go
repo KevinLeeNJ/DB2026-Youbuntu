@@ -25,22 +25,25 @@ const (
 )
 
 var (
-	errAbort       = errors.New("rmdb transaction aborted")
-	errInvalidItem = errors.New("invalid item")
-	integerRE      = regexp.MustCompile(`-?\d+`)
-	floatRE        = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
-	oracleSeq      atomic.Uint64
-	oracleAckMu    sync.Mutex
-	oracleAckFile  string
-	oracleIDPrefix int
+	errAbort         = errors.New("rmdb transaction aborted")
+	errInvalidItem   = errors.New("invalid item")
+	integerRE        = regexp.MustCompile(`-?\d+`)
+	floatRE          = regexp.MustCompile(`-?\d+(?:\.\d+)?`)
+	oracleSeq        atomic.Uint64
+	oracleAckMu      sync.Mutex
+	oracleAckFile    string
+	oracleIssuedFile string
+	oracleIDPrefix   int
 )
 
 type client struct {
-	address string
-	timeout time.Duration
-	conn    net.Conn
-	reader  *bufio.Reader
-	txnType string
+	address           string
+	timeout           time.Duration
+	conn              net.Conn
+	reader            *bufio.Reader
+	txnType           string
+	oracleID          int
+	oraclePayloadHash int
 }
 
 func newClient(address string, timeout time.Duration, isolation string) (*client, error) {
@@ -135,14 +138,20 @@ func (c *client) begin() error {
 func (c *client) commit() error {
 	oracleID := 0
 	if oracleAckFile != "" {
-		seq := oracleSeq.Add(1)
-		if seq >= 1_000_000 {
-			return errors.New("crash oracle transaction sequence exhausted")
+		if c.oracleID != 0 {
+			oracleID = c.oracleID
+		} else {
+			seq := oracleSeq.Add(1)
+			if seq >= 1_000_000 {
+				return errors.New("crash oracle transaction sequence exhausted")
+			}
+			oracleID = oracleIDPrefix*1_000_000 + int(seq)
 		}
-		oracleID = oracleIDPrefix*1_000_000 + int(seq)
-		payloadHash := 0
-		for _, ch := range c.txnType {
-			payloadHash = (payloadHash*131 + int(ch)) & 0x7fffffff
+		payloadHash := c.oraclePayloadHash
+		if payloadHash == 0 {
+			for _, ch := range c.txnType {
+				payloadHash = (payloadHash*131 + int(ch)) & 0x7fffffff
+			}
 		}
 		if _, err := c.exec(fmt.Sprintf("insert into crash_txn_log values (%d, '%s', %d);", oracleID, c.txnType, payloadHash)); err != nil {
 			return err
@@ -748,6 +757,127 @@ func runTxn(c *client, txnType string, ctx txnContext, rng *rand.Rand) error {
 	}
 }
 
+// runMixedSQL executes a deterministic SQL stream before entering an open
+// stream. The ready file is published only after minOps complete, allowing a
+// crash harness to guarantee that every cycle exercised ordinary SELECT and
+// UPDATE traffic before killing the server.
+func runMixedSQL(address string, timeout time.Duration, isolation string, minOps int, readyFile string,
+	ackFile string, issuedFile string, oraclePrefix int, think time.Duration) error {
+	if minOps < 100 {
+		return fmt.Errorf("mixed-sql requires at least 100 operations")
+	}
+	if readyFile == "" || ackFile == "" || issuedFile == "" || oraclePrefix <= 0 || oraclePrefix > 2000 {
+		return fmt.Errorf("mixed-sql requires ready, ACK, issued files, and oracle prefix")
+	}
+	oracleAckFile = ackFile
+	oracleIssuedFile = issuedFile
+	oracleIDPrefix = oraclePrefix
+	oracleSeq.Store(0)
+	c, err := newClient(address, timeout, isolation)
+	if err != nil {
+		return err
+	}
+	defer c.close()
+	c.txnType = "mixed_sql"
+
+	appendIssued := func(id int) error {
+		file, err := os.OpenFile(issuedFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		_, writeErr := fmt.Fprintf(file, "%d\n", id)
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		closeErr := file.Close()
+		if writeErr != nil {
+			return writeErr
+		}
+		return closeErr
+	}
+	runOne := func(op int) error {
+		seq := oracleSeq.Add(1)
+		if seq >= 1_000_000 {
+			return errors.New("crash oracle transaction sequence exhausted")
+		}
+		oracleID := oraclePrefix*1_000_000 + int(seq)
+		if err := appendIssued(oracleID); err != nil {
+			return err
+		}
+		c.oracleID = oracleID
+		c.oraclePayloadHash = mixedPayloadHash(oracleID)
+		defer func() {
+			c.oracleID = 0
+			c.oraclePayloadHash = 0
+		}()
+		if err := c.begin(); err != nil {
+			return err
+		}
+		rollback := true
+		defer func() {
+			if rollback {
+				c.rollback()
+			}
+		}()
+		id := op%128 + 1
+		if _, err := c.exec(fmt.Sprintf("select value from crash_sql_state where id = %d;", id)); err != nil {
+			return err
+		}
+		if _, err := c.exec(fmt.Sprintf("update crash_sql_state set value = value + 1 where id = %d;", id)); err != nil {
+			return err
+		}
+		if _, err := c.exec(fmt.Sprintf("insert into crash_atomic_a values (%d, 1);", oracleID)); err != nil {
+			return err
+		}
+		if _, err := c.exec(fmt.Sprintf("insert into crash_atomic_b values (%d, -1);", oracleID)); err != nil {
+			return err
+		}
+		if _, err := c.exec(fmt.Sprintf("insert into crash_atomic_unique values (%d, 1);", oracleID)); err != nil {
+			return err
+		}
+		if op%10 == 0 {
+			if _, err := c.exec("select count(*) from crash_sql_state;"); err != nil {
+				return err
+			}
+		}
+		if err := c.commit(); err != nil {
+			return err
+		}
+		rollback = false
+		return nil
+	}
+
+	for op := 0; op < minOps; op++ {
+		if err := runOne(op); err != nil {
+			return err
+		}
+		if think > 0 {
+			time.Sleep(think)
+		}
+	}
+	readyTmp := readyFile + ".tmp"
+	if err := os.WriteFile(readyTmp, []byte("ready\n"), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(readyTmp, readyFile); err != nil {
+		return err
+	}
+	for op := minOps; ; op++ {
+		if err := runOne(op); err != nil {
+			// A killed server closes the socket; that is the expected terminal
+			// condition for the crash harness.
+			if errors.Is(err, errAbort) || strings.Contains(err.Error(), "closed") ||
+				strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "connection reset") {
+				return nil
+			}
+			return err
+		}
+		if think > 0 {
+			time.Sleep(think)
+		}
+	}
+}
+
 func runWorker(workerID int, p profile, policy, address, isolation string, timeout time.Duration, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, output chan<- *result) {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*7919))
 	local := newResult(measureSeconds)
@@ -896,8 +1026,140 @@ func verifyCrashOracle(address string, timeout time.Duration, isolation, ackPath
 	return nil
 }
 
+func mixedPayloadHash(id int) int {
+	value := 17
+	for _, ch := range fmt.Sprintf("mixed_sql:%d", id) {
+		value = (value*131 + int(ch)) & 0x7fffffff
+	}
+	return value
+}
+
+func readIDFile(path string) (map[int]struct{}, error) {
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	ids := make(map[int]struct{})
+	for _, line := range strings.Fields(string(data)) {
+		id, parseErr := strconv.Atoi(strings.Split(line, ",")[0])
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid transaction id %q: %w", line, parseErr)
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, nil
+}
+
+func verifyAtomicOracle(address string, timeout time.Duration, isolation, issuedPath, ackPath string) error {
+	issued, err := readIDFile(issuedPath)
+	if err != nil {
+		return err
+	}
+	acked, err := readIDFile(ackPath)
+	if err != nil {
+		return err
+	}
+	if len(issued) == 0 {
+		return errors.New("atomic oracle has no issued transactions")
+	}
+	c, err := newClient(address, timeout, isolation)
+	if err != nil {
+		return err
+	}
+	defer c.close()
+
+	ids := make([]int, 0, len(issued))
+	for id := range issued {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	marker := make(map[int]int)
+	aPresent := make(map[int]struct{})
+	bPresent := make(map[int]struct{})
+	uniquePresent := make(map[int]struct{})
+	for begin := 0; begin < len(ids); {
+		lower := ids[begin]
+		upper := lower + 128
+		end := begin
+		for end < len(ids) && ids[end] < upper {
+			end++
+		}
+		queries := []string{
+			fmt.Sprintf("select txn_id, payload_hash from crash_txn_log where txn_id >= %d and txn_id < %d;", lower, upper),
+			fmt.Sprintf("select id from crash_atomic_a where id >= %d and id < %d;", lower, upper),
+			fmt.Sprintf("select id from crash_atomic_b where id >= %d and id < %d;", lower, upper),
+			fmt.Sprintf("select id from crash_atomic_unique where id >= %d and id < %d;", lower, upper),
+		}
+		texts := make([]string, len(queries))
+		for i, query := range queries {
+			texts[i], err = c.exec(query)
+			if err != nil {
+				return err
+			}
+		}
+		for _, row := range parseRows(texts[0]) {
+			if len(row) >= 2 {
+				marker[scalarInt(row[0], -1)] = scalarInt(row[1], -1)
+			}
+		}
+		for _, row := range parseRows(texts[1]) {
+			if len(row) > 0 {
+				aPresent[scalarInt(row[0], -1)] = struct{}{}
+			}
+		}
+		for _, row := range parseRows(texts[2]) {
+			if len(row) > 0 {
+				bPresent[scalarInt(row[0], -1)] = struct{}{}
+			}
+		}
+		for _, row := range parseRows(texts[3]) {
+			if len(row) > 0 {
+				uniquePresent[scalarInt(row[0], -1)] = struct{}{}
+			}
+		}
+		begin = end
+	}
+	for id := range issued {
+		_, hasMarker := marker[id]
+		_, hasA := aPresent[id]
+		_, hasB := bPresent[id]
+		_, hasUnique := uniquePresent[id]
+		if _, ok := acked[id]; ok && !hasMarker {
+			return fmt.Errorf("ACKed transaction %d is missing its commit marker", id)
+		}
+		if hasMarker {
+			if !hasA || !hasB || !hasUnique || marker[id] != mixedPayloadHash(id) {
+				return fmt.Errorf("atomic transaction %d has partial or invalid effects", id)
+			}
+			if _, ok := acked[id]; ok {
+				continue
+			}
+		} else if hasA || hasB || hasUnique {
+			return fmt.Errorf("unmarked transaction %d has partial effects", id)
+		}
+	}
+	sumTextA, err := c.exec("select sum(value) from crash_atomic_a;")
+	if err != nil {
+		return err
+	}
+	sumTextB, err := c.exec("select sum(value) from crash_atomic_b;")
+	if err != nil {
+		return err
+	}
+	sumRowsA, sumRowsB := parseRows(sumTextA), parseRows(sumTextB)
+	if len(sumRowsA) == 0 || len(sumRowsA[0]) == 0 || len(sumRowsB) == 0 || len(sumRowsB[0]) == 0 {
+		return errors.New("atomic oracle invariant query returned no value")
+	}
+	// The two tables are populated with opposite values for every committed
+	// transaction, so their combined sum must remain zero after recovery.
+	if sumA, sumB := scalarInt(sumRowsA[0][0], 0), scalarInt(sumRowsB[0][0], 0); sumA+sumB != 0 {
+		return fmt.Errorf("atomic oracle sum invariant violated: A=%d B=%d", sumA, sumB)
+	}
+	return nil
+}
+
 func main() {
-	command := flag.String("command", "run", "run, data-ready, datagen, load, consistency, oracle-init, oracle-verify, wait-port, or merge-results")
+	command := flag.String("command", "run", "run, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, or merge-results")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
 	port := flag.Int("port", 8765, "RMDB port")
 	warehouses := flag.Int("warehouses", 1, "warehouses for data generation")
@@ -923,7 +1185,10 @@ func main() {
 	waitTimeout := flag.Duration("wait-timeout", 30*time.Second, "wait-port timeout")
 	resultInputs := flag.String("result-inputs", "", "comma-separated per-round result JSON files for merge-results")
 	oracleAck := flag.String("oracle-ack-file", "", "host-side fsynced ACK file for crash oracle")
+	oracleIssued := flag.String("oracle-issued-file", "", "host-side fsynced issued transaction file")
 	oraclePrefix := flag.Int("oracle-id-prefix", 0, "positive per-run crash oracle ID prefix")
+	sqlOps := flag.Int("sql-ops", 100, "minimum mixed-sql operations before publishing readiness")
+	sqlReadyFile := flag.String("sql-ready-file", "", "readiness file for mixed-sql crash workloads")
 	flag.Parse()
 	if *command == "data-ready" {
 		if completeCSVSet(*dataDir) {
@@ -972,9 +1237,52 @@ func main() {
 			if err == nil {
 				_, err = c.exec("create index crash_txn_log(txn_id);")
 			}
+			if err == nil {
+				_, err = c.exec("create table crash_sql_state (id int, value int);")
+			}
+			if err == nil {
+				_, err = c.exec("create index crash_sql_state(id);")
+			}
+			if err == nil {
+				_, err = c.exec("create table crash_atomic_a (id int, value int);")
+			}
+			if err == nil {
+				_, err = c.exec("create index crash_atomic_a(id);")
+			}
+			if err == nil {
+				_, err = c.exec("create table crash_atomic_b (id int, value int);")
+			}
+			if err == nil {
+				_, err = c.exec("create index crash_atomic_b(id);")
+			}
+			if err == nil {
+				_, err = c.exec("create table crash_atomic_unique (id int, value int);")
+			}
+			if err == nil {
+				_, err = c.exec("create index crash_atomic_unique(id);")
+			}
+			if err == nil {
+				if _, err = c.exec("begin;"); err == nil {
+					for id := 1; id <= 128 && err == nil; id++ {
+						_, err = c.exec(fmt.Sprintf("insert into crash_sql_state values (%d, 0);", id))
+					}
+					if err == nil {
+						_, err = c.exec("commit;")
+					} else {
+						c.rollback()
+					}
+				}
+			}
 			c.close()
 		}
 		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *command == "mixed-sql" {
+		if err := runMixedSQL(address, *timeout, *isolation, *sqlOps, *sqlReadyFile, *oracleAck, *oracleIssued, *oraclePrefix, *think); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -989,6 +1297,23 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		return
+	}
+	if *command == "atomic-verify" {
+		if *oracleIssued == "" || *oracleAck == "" {
+			fmt.Fprintln(os.Stderr, "atomic-verify requires --oracle-issued-file and --oracle-ack-file")
+			os.Exit(2)
+		}
+		issued, err := readIDFile(*oracleIssued)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := verifyAtomicOracle(address, *timeout, *isolation, *oracleIssued, *oracleAck); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("[atomic-oracle] verified %d issued transactions\n", len(issued))
 		return
 	}
 	if *command == "load" {

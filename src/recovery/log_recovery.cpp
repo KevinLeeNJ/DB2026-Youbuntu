@@ -137,17 +137,18 @@ void RecoveryManager::redo() {
             continue;
         }
 
-        FaultInjector::Point("mid_recovery_redo");
-
         switch (it->second->log_type_) {
         case LogType::INSERT:
             redo_insert(*static_cast<InsertLogRecord*>(it->second.get()));
+            FaultInjector::Point("mid_recovery_redo");
             break;
         case LogType::DELETE:
             redo_delete(*static_cast<DeleteLogRecord*>(it->second.get()));
+            FaultInjector::Point("mid_recovery_redo");
             break;
         case LogType::UPDATE:
             redo_update(*static_cast<UpdateLogRecord*>(it->second.get()));
+            FaultInjector::Point("mid_recovery_redo");
             break;
         default:
             break;
@@ -172,12 +173,15 @@ void RecoveryManager::undo() {
             switch (record->log_type_) {
             case LogType::INSERT:
                 undo_insert(*static_cast<InsertLogRecord*>(record));
+                FaultInjector::Point("mid_recovery_undo");
                 break;
             case LogType::DELETE:
                 undo_delete(*static_cast<DeleteLogRecord*>(record));
+                FaultInjector::Point("mid_recovery_undo");
                 break;
             case LogType::UPDATE:
                 undo_update(*static_cast<UpdateLogRecord*>(record));
+                FaultInjector::Point("mid_recovery_undo");
                 break;
             case LogType::BEGIN:
                 current_lsn = INVALID_LSN;
@@ -200,6 +204,7 @@ void RecoveryManager::undo() {
     // 同 RID 上的数据（尤其是 RID 复用且内容相同时，仅靠 undo 内容守卫无法区分）。
     if (log_manager_ != nullptr) {
         lsn_t next_lsn = (max_lsn_ == INVALID_LSN) ? 0 : max_lsn_ + 1;
+        FaultInjector::Point("before_recovery_wal_reset");
         log_manager_->reset_log(next_lsn);
     }
 }
