@@ -277,6 +277,7 @@ def run_case(name: str, binary: Path, root: Path) -> None:
     elif name in {
         "before_checkpoint_data_sync",
         "after_checkpoint_data_sync",
+        "after_background_page_write_before_final_wal_flush",
         "before_wal_truncate",
     }:
         checkpoint_case(server, name)
@@ -302,6 +303,7 @@ CASES = [
     "before_published_csn_store",
     "before_checkpoint_data_sync",
     "after_checkpoint_data_sync",
+    "after_background_page_write_before_final_wal_flush",
     "before_wal_truncate",
     "before_checkpoint_data_sync_throw",
     "mid_recovery_redo",

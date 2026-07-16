@@ -240,14 +240,7 @@ std::pair<IxNodeHandle*, bool> IxIndexHandle::find_leaf_page(const char* key, Op
  */
 bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transaction* transaction) {
     (void)transaction;
-    auto guard = lock_shared();
-    Iid lower = lower_bound(key);
-    Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
-    while (!scan.is_end()) {
-        result->push_back(scan.rid());
-        scan.next();
-    }
+    lookup_equal(key, *result);
     return !result->empty();
 }
 
@@ -663,7 +656,6 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Tra
  * Otherwise, merge(Coalesce).
  */
 bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction, bool* root_is_latched) {
-    topology_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (node->is_root_page()) {
         return adjust_root(node);
     }
@@ -678,8 +670,10 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
 
     bool deleted = false;
     if (node->get_size() + neighbor->get_size() >= node->get_min_size() * 2) {
+        topology_epoch_.fetch_add(1, std::memory_order_relaxed);
         redistribute(neighbor, node, parent, index);
     } else {
+        topology_epoch_.fetch_add(1, std::memory_order_relaxed);
         deleted = coalesce(&neighbor, &node, &parent, index, transaction, root_is_latched);
     }
 
@@ -697,8 +691,8 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
  * @note size of root page can be less than min size and this method is only called within coalesce_or_redistribute()
  */
 bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
-    topology_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (!old_root_node->is_leaf_page() && old_root_node->get_size() == 1) {
+        topology_epoch_.fetch_add(1, std::memory_order_relaxed);
         page_id_t child_page_no = old_root_node->value_at(0);
         IxNodeHandle* child = fetch_node(child_page_no);
         child->set_parent_page_no(IX_NO_PAGE);

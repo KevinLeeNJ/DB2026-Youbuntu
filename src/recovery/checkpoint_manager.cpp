@@ -63,16 +63,16 @@ bool CheckpointManager::RunCleanCheckpoint() {
         return false;
     }
 
-    // Establish a WAL durability point before the background page pass. The
-    // per-page flush path can then usually observe that its page LSN is
-    // already durable, while the final WAL flush below still covers writers
-    // that race with this pass.
+    // Writers remain active during this pass. Let each page batch establish
+    // its own WAL-before-data boundary instead of treating the initial flush
+    // as sufficient for pages dirtied concurrently with this checkpoint.
     log_mgr_->flush_log_to_disk_with_sync();
     const auto background_flush_start = std::chrono::steady_clock::now();
-    if (!sm_mgr_->flush_dirty_data_pages(true)) {
+    if (!sm_mgr_->flush_dirty_data_pages(false)) {
         return false;
     }
     const auto background_flush_end = std::chrono::steady_clock::now();
+    FaultInjector::Point("after_background_page_write_before_final_wal_flush");
 
     struct BlockGuard {
         TransactionManager* txn_mgr;
