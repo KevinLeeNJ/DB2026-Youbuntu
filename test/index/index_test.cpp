@@ -141,6 +141,32 @@ TEST_F(IndexHandleTest, InsertsUniqueKeysAndFindsValues) {
     close_index(ih);
 }
 
+TEST_F(IndexHandleTest, UniqueLookupFindsSingleKey) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{7, value}, nullptr);
+    }
+
+    auto found = ih->lookup_unique(key(137).data());
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->page_no, 7);
+    EXPECT_EQ(found->slot_no, 137);
+    EXPECT_FALSE(ih->lookup_unique(key(9999).data()).has_value());
+
+    std::vector<page_id_t> resident_pages(ih->resident_internal_pages_.begin(), ih->resident_internal_pages_.end());
+    ASSERT_FALSE(resident_pages.empty());
+    for (page_id_t page_no : resident_pages) {
+        EXPECT_TRUE(buffer_pool_manager->is_page_resident(PageId{ih->fd_, page_no}));
+    }
+
+    const int index_fd = ih->fd_;
+    close_index(ih);
+    for (page_id_t page_no : resident_pages) {
+        EXPECT_FALSE(buffer_pool_manager->is_page_resident(PageId{index_fd, page_no}));
+    }
+}
+
 TEST_F(IndexHandleTest, RejectsDuplicateKeys) {
     auto ih = open_index();
     auto k10 = key(10);
@@ -198,34 +224,6 @@ TEST_F(IndexHandleTest, HybridUsesPinnedCursorForSingleLeafRange) {
     }
 
     EXPECT_EQ(values, std::vector<int>({10, 20}));
-    close_index(ih);
-}
-
-TEST_F(IndexHandleTest, ScanMetricsReportCoupledBatchesWhenEnabled) {
-    if (std::getenv("RMDB_SCAN_METRICS") == nullptr) {
-        GTEST_SKIP() << "RMDB_SCAN_METRICS is disabled";
-    }
-
-    auto ih = open_index();
-    for (int value = 0; value < 800; ++value) {
-        auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
-    }
-
-    IxScan::reset_stats();
-    IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
-    while (!scan.is_end()) {
-        scan.next();
-    }
-    IxScan::Stats stats = IxScan::get_stats();
-    EXPECT_EQ(stats.scans_total, 1u);
-    EXPECT_EQ(stats.scans_coupled, 1u);
-    EXPECT_GE(stats.batches, 2u);
-    EXPECT_GE(stats.reseeks, 1u);
-    EXPECT_EQ(stats.copied_entries, 800u);
-    EXPECT_GT(stats.bpm_fetches, 0u);
-    EXPECT_GT(stats.root_page_fetches, 0u);
-
     close_index(ih);
 }
 
@@ -819,6 +817,56 @@ TEST_F(IndexScanFeatureTest, UsesSingleColumnIndexForPointAndRangeScans) {
 
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 10)}, {"w_id"}), std::vector<int>({10}));
     EXPECT_EQ(scan_ids({int_cond(OP_LT, 534), int_cond(OP_GT, 100)}, {"w_id"}), std::vector<int>({500}));
+}
+
+TEST_F(IndexScanFeatureTest, ReusesCompiledConstraintsAcrossInjectedLookups) {
+    create_two_int_table("lookup_rows");
+    insert_two_ints("lookup_rows", 10, 1);
+    insert_two_ints("lookup_rows", 20, 2);
+    insert_two_ints("lookup_rows", 30, 3);
+    sm_manager->create_index("lookup_rows", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    IndexScanExecutor executor(sm_manager.get(), "lookup_rows", {}, {"b"}, &context);
+
+    auto scan_for_b = [&](int value) {
+        executor.set_key_conditions({table_int_cond("lookup_rows", "b", OP_EQ, value)});
+        std::vector<int> result;
+        for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+            auto rec = executor.Next();
+            result.push_back(*reinterpret_cast<int*>(rec->data));
+        }
+        return result;
+    };
+
+    EXPECT_EQ(scan_for_b(2), std::vector<int>({20}));
+    EXPECT_EQ(scan_for_b(1), std::vector<int>({10}));
+    EXPECT_EQ(scan_for_b(3), std::vector<int>({30}));
+}
+
+TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
+    create_two_int_table("lookup_direct");
+    insert_two_ints("lookup_direct", 10, 7);
+    insert_two_ints("lookup_direct", 20, 8);
+    sm_manager->create_index("lookup_direct", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    IndexScanExecutor executor(sm_manager.get(), "lookup_direct", {}, {"b"}, &context);
+    int lookup_value = 7;
+    executor.set_lookup_key(TabCol{"lookup_direct", "b"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    std::vector<int> result;
+    for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+        auto rec = executor.Next();
+        ASSERT_NE(rec, nullptr);
+        result.push_back(*reinterpret_cast<int*>(rec->data));
+    }
+    EXPECT_EQ(result, std::vector<int>({10}));
 }
 
 TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRange) {

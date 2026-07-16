@@ -176,6 +176,72 @@ TEST_F(BufferPoolManagerTest, NewPageFromFreshFrameHasOnlyValidPageTableEntry) {
     EXPECT_EQ(0, bpm->page_table_.count(PageId{0, INVALID_PAGE_ID}));
 }
 
+TEST_F(BufferPoolManagerTest, FreeFrameCounterAndRecycleVectorPreserveAllocationPaths) {
+    auto bpm = std::make_unique<BufferPoolManager>(3, disk_manager_.get());
+    EXPECT_EQ(bpm->next_unused_frame_, 0);
+    EXPECT_TRUE(bpm->recycled_frames_.empty());
+
+    PageId first_page{fd_, INVALID_PAGE_ID};
+    PageId second_page{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&first_page), nullptr);
+    ASSERT_NE(bpm->new_page(&second_page), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(first_page, false));
+    ASSERT_TRUE(bpm->unpin_page(second_page, false));
+    EXPECT_EQ(bpm->next_unused_frame_, 2);
+
+    ASSERT_TRUE(bpm->delete_page(first_page));
+    ASSERT_EQ(bpm->recycled_frames_.size(), 1u);
+    EXPECT_EQ(bpm->recycled_frames_.back(), 0);
+
+    PageId recycled_page{fd_, INVALID_PAGE_ID};
+    Page* recycled_frame = bpm->new_page(&recycled_page);
+    ASSERT_NE(recycled_frame, nullptr);
+    EXPECT_EQ(recycled_frame, &bpm->pages_[0]);
+    EXPECT_TRUE(bpm->recycled_frames_.empty());
+
+    PageId fresh_page{fd_, INVALID_PAGE_ID};
+    Page* fresh_frame = bpm->new_page(&fresh_page);
+    ASSERT_NE(fresh_frame, nullptr);
+    EXPECT_EQ(fresh_frame, &bpm->pages_[2]);
+    EXPECT_EQ(bpm->next_unused_frame_, 3);
+}
+
+TEST_F(BufferPoolManagerTest, ReplacerFallbackAndExhaustionRemainUnchanged) {
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
+    PageId first_page{fd_, INVALID_PAGE_ID};
+    PageId second_page{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&first_page), nullptr);
+    ASSERT_NE(bpm->new_page(&second_page), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(first_page, false));
+    ASSERT_TRUE(bpm->recycled_frames_.empty());
+
+    PageId replacement_page{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&replacement_page), nullptr);
+    EXPECT_FALSE(bpm->is_page_resident(first_page));
+
+    PageId exhausted_page{fd_, INVALID_PAGE_ID};
+    EXPECT_EQ(bpm->new_page(&exhausted_page), nullptr);
+    EXPECT_EQ(bpm->fetch_page(first_page), nullptr);
+}
+
+TEST_F(BufferPoolManagerTest, PageTableReserveAndLoadFactorAvoidPoolSizedRehash) {
+    constexpr size_t buffer_pool_size = 10;
+    auto bpm = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get());
+    const size_t initial_bucket_count = bpm->page_table_.bucket_count();
+    const size_t expected_reserved_pages = buffer_pool_size + (buffer_pool_size + 4) / 5;
+
+    EXPECT_FLOAT_EQ(bpm->page_table_.max_load_factor(), 0.7F);
+    EXPECT_GE(initial_bucket_count, expected_reserved_pages);
+
+    for (size_t i = 0; i < buffer_pool_size; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm->new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    }
+    EXPECT_EQ(bpm->page_table_.size(), buffer_pool_size);
+    EXPECT_EQ(bpm->page_table_.bucket_count(), initial_bucket_count);
+}
+
 TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
     auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
     if (disk_manager->is_file(LOG_FILE_NAME)) {
@@ -292,29 +358,6 @@ TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfRep
     }
 
     EXPECT_TRUE(bpm->unpin_page(page_id, false));
-}
-
-TEST_F(BufferPoolManagerTest, BpmMetricsReportPinTransitionsWhenEnabled) {
-    if (std::getenv("RMDB_BPM_METRICS") == nullptr) {
-        GTEST_SKIP() << "RMDB_BPM_METRICS is disabled";
-    }
-
-    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
-    PageId page_id{fd_, INVALID_PAGE_ID};
-    ASSERT_NE(bpm->new_page(&page_id), nullptr);
-    bpm->reset_stats();
-
-    ASSERT_NE(bpm->fetch_page(page_id), nullptr);
-    ASSERT_TRUE(bpm->unpin_page(page_id, false));
-    ASSERT_TRUE(bpm->unpin_page(page_id, false));
-    ASSERT_NE(bpm->fetch_page(page_id), nullptr);
-    ASSERT_TRUE(bpm->unpin_page(page_id, false));
-
-    BufferPoolManager::Stats stats = bpm->get_stats();
-    EXPECT_EQ(stats.fetch_hits, 2u);
-    EXPECT_EQ(stats.fetch_misses, 0u);
-    EXPECT_EQ(stats.pin_0_to_1, 1u);
-    EXPECT_EQ(stats.unpin_1_to_0, 2u);
 }
 
 TEST_F(BufferPoolManagerTest, FlushDoesNotClearDirtyFromConcurrentWriter) {

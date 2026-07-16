@@ -146,6 +146,13 @@ public:
         return std::make_unique<RmRecord>(*buffered_record_);
     }
 
+    TupleView current() const override {
+        if (is_end() || buffered_record_ == nullptr) {
+            return {};
+        }
+        return TupleView{buffered_record_->data, static_cast<uint32_t>(buffered_record_->size)};
+    }
+
     Rid& rid() override {
         return rid_;
     }

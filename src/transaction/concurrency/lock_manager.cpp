@@ -301,8 +301,6 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     std::unique_lock<std::mutex> lock(request_queue->latch_);
 
     if (request_queue->owner_txn_id_ == INVALID_TXN_ID) {
-        auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
-        request->granted_ = true;
         request_queue->owner_txn_id_ = txn->get_transaction_id();
         request_queue->group_lock_mode_ = GroupLockMode::X;
         note_wait_topology_change();

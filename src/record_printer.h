@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -33,8 +34,7 @@ public:
     void print_separator(Context* context) const {
         for (size_t i = 0; i < num_cols; i++) {
             constexpr size_t separator_length = COL_WIDTH + 3;
-            if (!context->ellipsis_ &&
-                *context->offset_ + RECORD_COUNT_LENGTH + separator_length < BUFFER_LENGTH) {
+            if (!context->ellipsis_ && *context->offset_ + RECORD_COUNT_LENGTH + separator_length < BUFFER_LENGTH) {
                 char* dest = context->data_send_ + *context->offset_;
                 dest[0] = '+';
                 memset(dest + 1, '-', COL_WIDTH + 2);

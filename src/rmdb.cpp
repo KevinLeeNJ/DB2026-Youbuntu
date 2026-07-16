@@ -62,26 +62,6 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 
-static bool scan_metrics_enabled() {
-    const char* value = std::getenv("RMDB_SCAN_METRICS");
-    return value != nullptr && std::string(value) != "0";
-}
-
-static void log_scan_metrics() {
-    if (!scan_metrics_enabled()) {
-        return;
-    }
-    const auto scan_stats = IxScan::get_stats();
-    const auto bpm_stats = buffer_pool_manager->get_stats();
-    LOG_WARN("scan_metrics scans=%lu single_leaf=%lu coupled=%lu batches=%lu reseeks=%lu copied_entries=%lu "
-             "copied_key_bytes=%lu bpm_fetches=%lu root_fetches=%lu bpm_hits=%lu bpm_misses=%lu pin_0_to_1=%lu "
-             "unpin_1_to_0=%lu page_table_shared_wait_ns=%lu page_table_exclusive_wait_ns=%lu",
-             scan_stats.scans_total, scan_stats.scans_single_leaf, scan_stats.scans_coupled, scan_stats.batches,
-             scan_stats.reseeks, scan_stats.copied_entries, scan_stats.copied_key_bytes, scan_stats.bpm_fetches,
-             scan_stats.root_page_fetches, bpm_stats.fetch_hits, bpm_stats.fetch_misses, bpm_stats.pin_0_to_1,
-             bpm_stats.unpin_1_to_0, bpm_stats.page_table_shared_wait_ns, bpm_stats.page_table_exclusive_wait_ns);
-}
-
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
     (void)signo;
@@ -387,6 +367,7 @@ int main(int argc, char** argv) {
         recovery->analyze();
         recovery->redo();
         recovery->undo();
+        sm_manager->refresh_index_residency();
         LOG_INFO("database recovery finished");
 
         {
@@ -437,7 +418,6 @@ int main(int argc, char** argv) {
                         break;
                     }
                     checkpoint_mgr.RunIfNeeded();
-                    log_scan_metrics();
                 }
             });
 

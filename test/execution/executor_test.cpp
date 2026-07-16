@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #define private public
 #include "execution/executor_insert.h"
 #include "execution/executor_seq_scan.h"
+#include "execution/executor_filter.h"
 #include "execution/executor_projection.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_delete.h"
@@ -24,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include "gtest/gtest.h"
@@ -50,6 +52,13 @@ RmRecord make_join_record(int value) {
     return rec;
 }
 
+RmRecord make_filter_record(int lhs, int rhs) {
+    RmRecord rec(sizeof(int) * 2);
+    std::memcpy(rec.data, &lhs, sizeof(int));
+    std::memcpy(rec.data + sizeof(int), &rhs, sizeof(int));
+    return rec;
+}
+
 class CountingExecutor : public AbstractExecutor {
 public:
     CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records)
@@ -62,6 +71,9 @@ public:
 
     void beginTuple() override {
         ++begin_calls_;
+        if (throw_on_begin_) {
+            throw std::runtime_error("test child begin failure");
+        }
         cursor_ = 0;
     }
 
@@ -80,6 +92,14 @@ public:
         return std::make_unique<RmRecord>(records_[cursor_]);
     }
 
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        const auto& record = records_[cursor_];
+        return TupleView{record.data, static_cast<uint32_t>(record.size)};
+    }
+
     Rid& rid() override {
         return _abstract_rid;
     }
@@ -89,6 +109,7 @@ public:
     }
 
     const std::vector<ColMeta>& cols() const override {
+        ++cols_calls_;
         return cols_;
     }
 
@@ -108,12 +129,29 @@ public:
     int begin_calls_ = 0;
     int next_calls_ = 0;
     int next_record_calls_ = 0;
+    mutable int cols_calls_ = 0;
+    bool throw_on_begin_ = false;
+
+    std::string scan_table_name() const override {
+        return "t";
+    }
 
 private:
     std::vector<ColMeta> cols_;
     std::vector<RmRecord> records_;
     size_t len_ = 0;
     size_t cursor_ = 0;
+};
+
+class BareExecutor : public AbstractExecutor {
+public:
+    std::unique_ptr<RmRecord> Next() override {
+        return nullptr;
+    }
+
+    Rid& rid() override {
+        return _abstract_rid;
+    }
 };
 
 } // namespace
@@ -177,6 +215,62 @@ public:
         }
     }
 };
+
+TEST(AbstractExecutorFocusedTest, DefaultColsIsSafe) {
+    BareExecutor executor;
+    EXPECT_TRUE(executor.cols().empty());
+}
+
+TEST(FilterExecutorFocusedTest, CachesConditionAddressesAndReusesChildSchema) {
+    const std::vector<ColMeta> cols{make_test_col("t", "id", TYPE_INT, sizeof(int), 0),
+                                    make_test_col("t", "threshold", TYPE_INT, sizeof(int), sizeof(int))};
+    auto child = std::make_unique<CountingExecutor>(
+        cols, std::vector<RmRecord>{make_filter_record(5, 4), make_filter_record(2, 4)});
+    const auto* child_schema = &child->cols();
+    auto* child_ptr = child.get();
+
+    Condition condition;
+    condition.lhs_col = {"t", "id"};
+    condition.op = OP_GT;
+    condition.is_rhs_val = false;
+    condition.rhs_col = {"t", "threshold"};
+
+    FilterExecutor executor(std::move(child), {condition});
+
+    EXPECT_EQ(child_ptr->cols_calls_, 3);
+    EXPECT_EQ(&executor.cols(), child_schema);
+    EXPECT_EQ(child_ptr->cols_calls_, 4);
+
+    executor.beginTuple();
+    ASSERT_FALSE(executor.is_end());
+    auto record = executor.Next();
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(*reinterpret_cast<const int*>(record->data), 5);
+    executor.nextTuple();
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_EQ(child_ptr->cols_calls_, 4);
+    EXPECT_EQ(child_ptr->next_record_calls_, 0);
+}
+
+TEST(FilterExecutorFocusedTest, RestoresContextTrackingWhenChildThrows) {
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, nullptr);
+    Transaction txn(1, IsolationLevel::SERIALIZABLE);
+    char data_send[64] = {};
+    int offset = 0;
+    Context context(&lock_manager, nullptr, &txn, data_send, &offset, &txn_manager);
+    context.enable_ssi_read_tracking_ = true;
+
+    auto child =
+        std::make_unique<CountingExecutor>(std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+                                           std::vector<RmRecord>{make_join_record(1)});
+    child->context_ = &context;
+    child->throw_on_begin_ = true;
+    FilterExecutor executor(std::move(child), {});
+
+    EXPECT_THROW(executor.beginTuple(), std::runtime_error);
+    EXPECT_TRUE(context.enable_ssi_read_tracking_);
+}
 
 TEST_F(ExecutorTest, seq_scan_empty_table) {
     setup_db();

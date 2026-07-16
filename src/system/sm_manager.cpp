@@ -573,6 +573,9 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
             // 插入索引
             index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_);
         }
+        // Index creation is complete, so it is now safe to build the optional
+        // root cache and upper-level residency state.
+        index_handle->refresh_page_residency();
     } catch (...) {
         ix_manager_->close_index(index_handle.get());
         ix_manager_->destroy_index(tab_name, cols);
@@ -788,6 +791,12 @@ void SmManager::rebuild_all_indexes() {
             }
             disk_manager_->sync_directory(".");
         }
+    }
+}
+
+void SmManager::refresh_index_residency() {
+    for (auto& [_, index_handle] : ihs_) {
+        index_handle->refresh_page_residency();
     }
 }
 

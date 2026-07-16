@@ -26,6 +26,28 @@ bool IsValidPageId(const PageId& page_id) {
 
 } // namespace
 
+frame_id_t BufferPoolManager::take_free_frame() {
+    if (!recycled_frames_.empty()) {
+        const frame_id_t frame_id = recycled_frames_.back();
+        recycled_frames_.pop_back();
+        return frame_id;
+    }
+    if (next_unused_frame_ < static_cast<frame_id_t>(pool_size_)) {
+        return next_unused_frame_++;
+    }
+    return INVALID_FRAME_ID;
+}
+
+void BufferPoolManager::recycle_frame(frame_id_t frame_id) {
+    recycled_frames_.push_back(frame_id);
+}
+
+void BufferPoolManager::clear_residency(frame_id_t frame_id) {
+    if (residency_classes_[frame_id] == ResidencyClass::IndexInternal) {
+        residency_classes_[frame_id] = ResidencyClass::Normal;
+    }
+}
+
 void BufferPoolManager::flush_log_before_page_write(lsn_t page_lsn) {
     if (log_manager_ != nullptr) {
         log_manager_->flush_log_to_disk_up_to(page_lsn);
@@ -49,22 +71,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         frame_id_t fid = INVALID_FRAME_ID;
 
         {
-            const bool collect_metrics = metrics_enabled();
-            const auto wait_begin =
-                collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::shared_lock lock{latch_};
-            if (collect_metrics) {
-                page_table_shared_wait_ns_.fetch_add(
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              std::chrono::steady_clock::now() - wait_begin)
-                                              .count()),
-                    std::memory_order_relaxed);
-            }
             auto hit = page_table_.find(page_id);
             if (hit != page_table_.end()) {
-                if (collect_metrics) {
-                    fetch_hits_.fetch_add(1, std::memory_order_relaxed);
-                }
                 target_page = &pages_[hit->second];
                 if (target_page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                     wait_page = target_page;
@@ -72,9 +81,6 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                     std::scoped_lock pin_lock{target_page->pin_latch_};
                     if (target_page->pin_count_ == 0) {
                         replacer_->pin(hit->second);
-                        if (collect_metrics) {
-                            pin_0_to_1_.fetch_add(1, std::memory_order_relaxed);
-                        }
                     }
                     ++target_page->pin_count_;
                     return target_page;
@@ -92,22 +98,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
 
         {
-            const bool collect_metrics = metrics_enabled();
-            const auto wait_begin =
-                collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::unique_lock lock{latch_};
-            if (collect_metrics) {
-                page_table_exclusive_wait_ns_.fetch_add(
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              std::chrono::steady_clock::now() - wait_begin)
-                                              .count()),
-                    std::memory_order_relaxed);
-            }
             auto hit = page_table_.find(page_id);
             if (hit != page_table_.end()) {
-                if (collect_metrics) {
-                    fetch_hits_.fetch_add(1, std::memory_order_relaxed);
-                }
                 target_page = &pages_[hit->second];
                 if (target_page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                     wait_page = target_page;
@@ -115,25 +108,18 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                     std::scoped_lock pin_lock{target_page->pin_latch_};
                     if (target_page->pin_count_ == 0) {
                         replacer_->pin(hit->second);
-                        if (collect_metrics) {
-                            pin_0_to_1_.fetch_add(1, std::memory_order_relaxed);
-                        }
                     }
                     ++target_page->pin_count_;
                     return target_page;
                 }
             } else {
-                if (collect_metrics) {
-                    fetch_misses_.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (!free_list_.empty()) {
-                    fid = free_list_.front();
-                    free_list_.pop_front();
-                } else if (!replacer_->victim(&fid)) {
+                fid = take_free_frame();
+                if (fid == INVALID_FRAME_ID && !replacer_->victim(&fid)) {
                     return nullptr;
                 }
 
                 target_page = &pages_[fid];
+                clear_residency(fid);
                 old_page_id = target_page->id_;
                 old_page_dirty = target_page->is_dirty_;
                 if (IsValidPageId(old_page_id)) {
@@ -191,7 +177,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 target_page->pin_count_ = 0;
                 target_page->state_.store(FrameState::VALID, std::memory_order_release);
                 page_table_.insert_or_assign(old_page_id, fid);
-                replacer_->unpin(fid);
+                if (residency_classes_[fid] == ResidencyClass::Normal) {
+                    replacer_->unpin(fid);
+                }
             } else {
                 if (hit != page_table_.end() && hit->second == fid) {
                     page_table_.erase(hit);
@@ -201,7 +189,8 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 target_page->is_dirty_ = false;
                 target_page->pin_count_ = 0;
                 target_page->state_.store(FrameState::FREE, std::memory_order_release);
-                free_list_.push_back(fid);
+                clear_residency(fid);
+                recycle_frame(fid);
             }
         }
         target_page->io_cv_.notify_all();
@@ -210,18 +199,54 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 }
 
 bool BufferPoolManager::is_page_resident(PageId page_id) {
-    const bool collect_metrics = metrics_enabled();
-    const auto wait_begin =
-        collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_lock lock{latch_};
-    if (collect_metrics) {
-        page_table_shared_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                       std::chrono::steady_clock::now() - wait_begin)
-                                                                       .count()),
-                                             std::memory_order_relaxed);
-    }
     auto hit = page_table_.find(page_id);
     return hit != page_table_.end() && pages_[hit->second].state_.load(std::memory_order_acquire) == FrameState::VALID;
+}
+
+void BufferPoolManager::mark_resident(PageId page_id, ResidencyClass residency_class) {
+    std::unique_lock lock{latch_};
+    auto hit = page_table_.find(page_id);
+    if (hit == page_table_.end()) {
+        return;
+    }
+    Page* page = &pages_[hit->second];
+    if (page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+        return;
+    }
+    ResidencyClass& current = residency_classes_[hit->second];
+    if (current == residency_class) {
+        return;
+    }
+    current = residency_class;
+    if (residency_class == ResidencyClass::IndexInternal) {
+        replacer_->pin(hit->second);
+    } else {
+        std::scoped_lock pin_lock{page->pin_latch_};
+        if (page->pin_count_ == 0) {
+            replacer_->unpin(hit->second);
+        }
+    }
+}
+
+void BufferPoolManager::unmark_resident(PageId page_id) {
+    std::unique_lock lock{latch_};
+    auto hit = page_table_.find(page_id);
+    if (hit == page_table_.end()) {
+        return;
+    }
+    Page* page = &pages_[hit->second];
+    ResidencyClass& current = residency_classes_[hit->second];
+    if (current != ResidencyClass::IndexInternal) {
+        return;
+    }
+    current = ResidencyClass::Normal;
+    if (page->state_.load(std::memory_order_acquire) == FrameState::VALID) {
+        std::scoped_lock pin_lock{page->pin_latch_};
+        if (page->pin_count_ == 0) {
+            replacer_->unpin(hit->second);
+        }
+    }
 }
 
 /**
@@ -240,16 +265,7 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     // 2.2 若pin_count_大于0，则pin_count_自减一
     // 2.2.1 若自减后等于0，则调用replacer_的Unpin
     // 3 根据参数is_dirty，更改P的is_dirty_
-    const bool collect_metrics = metrics_enabled();
-    const auto wait_begin =
-        collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_lock lock{latch_};
-    if (collect_metrics) {
-        page_table_shared_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                       std::chrono::steady_clock::now() - wait_begin)
-                                                                       .count()),
-                                             std::memory_order_relaxed);
-    }
     // 1. 尝试在page_table_中搜寻page_id对应的页P
     // 1.1 P在页表中不存在 return false
     auto hit = page_table_.find(page_id);
@@ -273,11 +289,9 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     // 2.2 若pin_count_大于0，则pin_count_自减一
     --targetPage->pin_count_;
     // 2.2.1 若自减后等于0，则调用replacer_的Unpin
-    if (targetPage->pin_count_ == 0 && state == FrameState::VALID) {
+    if (targetPage->pin_count_ == 0 && state == FrameState::VALID &&
+        residency_classes_[fid] == ResidencyClass::Normal) {
         replacer_->unpin(fid);
-        if (collect_metrics) {
-            unpin_1_to_0_.fetch_add(1, std::memory_order_relaxed);
-        }
     }
     // 3 根据参数is_dirty，更改P的is_dirty_
     if (is_dirty == true) {
@@ -360,7 +374,7 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
             }
             page->state_.store(FrameState::VALID, std::memory_order_release);
             std::scoped_lock pin_lock{page->pin_latch_};
-            if (page->pin_count_ == 0) {
+            if (page->pin_count_ == 0 && residency_classes_[fid] == ResidencyClass::Normal) {
                 replacer_->unpin(fid);
             }
         }
@@ -381,15 +395,14 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     frame_id_t fid = INVALID_FRAME_ID;
     {
         std::scoped_lock lock{latch_};
-        if (!free_list_.empty()) {
-            fid = free_list_.front();
-            free_list_.pop_front();
-        } else if (!replacer_->victim(&fid)) {
+        fid = take_free_frame();
+        if (fid == INVALID_FRAME_ID && !replacer_->victim(&fid)) {
             return nullptr;
         }
 
         page_id->page_no = disk_manager_->allocate_page(page_id->fd);
         page = &pages_[fid];
+        clear_residency(fid);
         old_page_id = page->id_;
         old_page_dirty = page->is_dirty_;
         if (IsValidPageId(old_page_id)) {
@@ -434,7 +447,9 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
             page->pin_count_ = 0;
             page->state_.store(FrameState::VALID, std::memory_order_release);
             page_table_.insert_or_assign(old_page_id, fid);
-            replacer_->unpin(fid);
+            if (residency_classes_[fid] == ResidencyClass::Normal) {
+                replacer_->unpin(fid);
+            }
         } else {
             if (hit != page_table_.end() && hit->second == fid) {
                 page_table_.erase(hit);
@@ -444,7 +459,8 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
             page->is_dirty_ = false;
             page->pin_count_ = 0;
             page->state_.store(FrameState::FREE, std::memory_order_release);
-            free_list_.push_back(fid);
+            clear_residency(fid);
+            recycle_frame(fid);
         }
     }
     page->io_cv_.notify_all();
@@ -459,7 +475,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
 bool BufferPoolManager::delete_page(PageId page_id) {
     // 1.   在page_table_中查找目标页，若不存在返回true
     // 2.   若目标页的pin_count不为0，则返回false
-    // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
+    // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入回收帧集合，返回true
 
     while (true) {
         Page* page = nullptr;
@@ -479,7 +495,9 @@ bool BufferPoolManager::delete_page(PageId page_id) {
                 replacer_->pin(fid);
                 std::scoped_lock pin_lock{page->pin_latch_};
                 if (page->pin_count_ != 0) {
-                    replacer_->unpin(fid);
+                    if (residency_classes_[fid] == ResidencyClass::Normal) {
+                        replacer_->unpin(fid);
+                    }
                     return false;
                 }
                 page->state_.store(FrameState::EVICTING, std::memory_order_release);
@@ -515,10 +533,13 @@ bool BufferPoolManager::delete_page(PageId page_id) {
                 page->pin_count_ = 0;
                 page->is_dirty_ = false;
                 page->state_.store(FrameState::FREE, std::memory_order_release);
-                free_list_.push_back(fid);
+                clear_residency(fid);
+                recycle_frame(fid);
             } else if (!deleted && hit != page_table_.end() && hit->second == fid) {
                 page->state_.store(FrameState::VALID, std::memory_order_release);
-                replacer_->unpin(fid);
+                if (residency_classes_[fid] == ResidencyClass::Normal) {
+                    replacer_->unpin(fid);
+                }
             }
         }
         page->io_cv_.notify_all();
@@ -623,7 +644,8 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
         std::vector<char> image(kClaimPages * PAGE_SIZE);
         while (claimed_begin < claimed.size()) {
             size_t claimed_end = claimed_begin + 1;
-            while (claimed_end < claimed.size() && claimed[claimed_end].page_id.fd == claimed[claimed_begin].page_id.fd &&
+            while (claimed_end < claimed.size() &&
+                   claimed[claimed_end].page_id.fd == claimed[claimed_begin].page_id.fd &&
                    claimed[claimed_end].page_id.page_no == claimed[claimed_end - 1].page_id.page_no + 1) {
                 ++claimed_end;
             }
@@ -647,9 +669,8 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
                     if (!wal_preflushed) {
                         flush_log_before_page_write(max_page_lsn);
                     }
-                    disk_manager_->write_page(claimed[claimed_begin].page_id.fd,
-                                               claimed[claimed_begin].page_id.page_no, image.data(),
-                                               static_cast<int>(page_count * PAGE_SIZE));
+                    disk_manager_->write_page(claimed[claimed_begin].page_id.fd, claimed[claimed_begin].page_id.page_no,
+                                              image.data(), static_cast<int>(page_count * PAGE_SIZE));
                 } catch (...) {
                     copied = false;
                 }
@@ -674,7 +695,7 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
                     }
                     page->state_.store(FrameState::VALID, std::memory_order_release);
                     std::scoped_lock pin_lock{page->pin_latch_};
-                    if (page->pin_count_ == 0) {
+                    if (page->pin_count_ == 0 && residency_classes_[claimed_page.frame_id] == ResidencyClass::Normal) {
                         replacer_->unpin(claimed_page.frame_id);
                     }
                     page->io_cv_.notify_all();
@@ -732,7 +753,8 @@ void BufferPoolManager::delete_all_pages(int fd) {
         }
 
         replacer_->pin(frame_id);
-        free_list_.emplace_back(frame_id);
+        clear_residency(frame_id);
+        recycle_frame(frame_id);
         page->reset_memory();
         page->pin_count_ = 0;
         page->is_dirty_ = false;

@@ -11,13 +11,42 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <string_view>
+#include <utility>
 
 #include "execution_defs.h"
 #include "common/common.h"
 #include "index/ix.h"
 #include "system/sm.h"
+
+struct TupleView {
+    const char* data = nullptr;
+    uint32_t size = 0;
+
+    explicit operator bool() const {
+        return data != nullptr;
+    }
+};
+
+template <typename T> class ScopedValueOverride {
+public:
+    ScopedValueOverride(T& value, T replacement) : value_(value), old_value_(value) {
+        value_ = std::move(replacement);
+    }
+
+    ~ScopedValueOverride() {
+        value_ = std::move(old_value_);
+    }
+
+    ScopedValueOverride(const ScopedValueOverride&) = delete;
+    ScopedValueOverride& operator=(const ScopedValueOverride&) = delete;
+
+private:
+    T& value_;
+    T old_value_;
+};
 
 class AbstractExecutor {
 public:
@@ -32,8 +61,8 @@ public:
     };
 
     virtual const std::vector<ColMeta>& cols() const {
-        std::vector<ColMeta>* _cols = nullptr;
-        return *_cols;
+        static const std::vector<ColMeta> empty_cols;
+        return empty_cols;
     };
 
     virtual std::string getType() {
@@ -52,6 +81,12 @@ public:
 
     virtual std::unique_ptr<RmRecord> Next() = 0;
 
+    // The view is valid until the next beginTuple()/nextTuple() call.
+    // Executors without a borrowed representation keep the legacy Next API.
+    virtual TupleView current() const {
+        return {};
+    }
+
     virtual ColMeta get_col_offset(const TabCol& target) {
         (void)target;
         return ColMeta();
@@ -63,6 +98,10 @@ public:
 
     virtual void set_key_conditions(std::vector<Condition> /*key_conds*/) {
         // no-op default; only IndexScanExecutor overrides
+    }
+
+    virtual void set_lookup_key(const TabCol& /*target*/, const char* /*key*/, size_t /*len*/) {
+        // no-op default; only index-backed scans need dynamic lookup bytes
     }
 
     virtual std::string scan_table_name() const {
@@ -126,16 +165,21 @@ protected:
     }
 
     bool conditions_match(const std::vector<Condition>& conditions, const std::vector<ConditionAddress>& addresses,
-                          const RmRecord& rec) const {
+                          const TupleView& tuple) const {
         if (conditions.size() != addresses.size()) {
             throw InternalError("condition address cache is out of date");
         }
         for (size_t i = 0; i < conditions.size(); ++i) {
-            if (!compare(conditions[i], rec, addresses[i])) {
+            if (!compare(conditions[i], tuple, addresses[i])) {
                 return false;
             }
         }
         return true;
+    }
+
+    bool conditions_match(const std::vector<Condition>& conditions, const std::vector<ConditionAddress>& addresses,
+                          const RmRecord& rec) const {
+        return conditions_match(conditions, addresses, TupleView{rec.data, static_cast<uint32_t>(rec.size)});
     }
 
     /**
@@ -144,11 +188,11 @@ protected:
      * @param rec 记录
      * @return true if rec matches cond, false otherwise
      */
-    bool compare(const Condition& cond, const RmRecord& rec, const ConditionAddress& address) const {
+    bool compare(const Condition& cond, const TupleView& tuple, const ConditionAddress& address) const {
         const ColType lhs_type = address.lhs.type;
         const ColType rhs_type = cond.is_rhs_val ? cond.rhs_val.type : address.rhs.type;
-        const char* lhs_data = rec.data + address.lhs.offset;
-        const char* rhs_data = cond.is_rhs_val ? nullptr : rec.data + address.rhs.offset;
+        const char* lhs_data = tuple.data + address.lhs.offset;
+        const char* rhs_data = cond.is_rhs_val ? nullptr : tuple.data + address.rhs.offset;
         if (can_cast(lhs_type, rhs_type) == false) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
@@ -203,6 +247,10 @@ protected:
         }
         }
         return false;
+    }
+
+    bool compare(const Condition& cond, const RmRecord& rec, const ConditionAddress& address) const {
+        return compare(cond, TupleView{rec.data, static_cast<uint32_t>(rec.size)}, address);
     }
 
     bool compare(const Condition& cond, const RmRecord& rec) {

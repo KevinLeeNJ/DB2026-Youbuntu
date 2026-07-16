@@ -486,8 +486,7 @@ public:
     // not wait for those bytes to reach the file before starting preflush.
     int64_t current_log_offset() const {
         std::lock_guard<std::mutex> lock(latch_);
-        return log_file_offset_ + static_cast<int64_t>(flushing_bytes_) +
-               static_cast<int64_t>(log_buffer_->offset_);
+        return log_file_offset_ + static_cast<int64_t>(flushing_bytes_) + static_cast<int64_t>(log_buffer_->offset_);
     }
 
     uint64_t get_fsync_count() const {

@@ -60,6 +60,9 @@ private:
     int left_key_offset_ = 0;          // pre-compiled offset of left key in left tuple
     int left_key_len_ = 0;             // pre-compiled length of left key
     ColType left_key_type_ = TYPE_INT; // pre-compiled type of left key
+    int right_key_len_ = 0;
+    ColType right_key_type_ = TYPE_INT;
+    bool direct_lookup_key_supported_ = false;
 
     static bool compare_numeric(const int& op, const double& lhs, const double& rhs) {
         switch (op) {
@@ -287,6 +290,13 @@ public:
                 left_key_len_ = meta.len;
                 left_key_type_ = meta.type;
             }
+            auto right_col_iter = cols_map.find(make_col_key(inlj_right_col_));
+            if (right_col_iter != cols_map.end()) {
+                const auto& meta = *(right_col_iter->second);
+                right_key_len_ = meta.len;
+                right_key_type_ = meta.type;
+                direct_lookup_key_supported_ = left_key_len_ == right_key_len_ && left_key_type_ == right_key_type_;
+            }
         }
 
         current_left_rec_ = nullptr; // 初始化 current_left_rec_
@@ -328,7 +338,12 @@ public:
                 left_->nextTuple();
                 // INLJ: inject join key before resetting inner scan
                 if (inlj_mode_) {
-                    right_->set_key_conditions(build_key_conditions(*current_left_rec_));
+                    if (direct_lookup_key_supported_) {
+                        right_->set_lookup_key(inlj_right_col_, current_left_rec_->data + left_key_offset_,
+                                               static_cast<size_t>(left_key_len_));
+                    } else {
+                        right_->set_key_conditions(build_key_conditions(*current_left_rec_));
+                    }
                 }
                 right_->beginTuple();
             }
@@ -376,6 +391,14 @@ public:
     bool is_end() const override {
         return isend;
     }
+
+    TupleView current() const override {
+        if (is_end() || !buffered_record_available_ || _buffered_record == nullptr) {
+            return {};
+        }
+        return TupleView{_buffered_record->data, static_cast<uint32_t>(_buffered_record->size)};
+    }
+
     std::string getType() override {
         return "NestedLoopJoinExecutor";
     }

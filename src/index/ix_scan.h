@@ -15,7 +15,6 @@ See the Mulan PSL v2 for more details. */
 #include "ix_index_handle.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -34,18 +33,6 @@ class IxScan : public RecScan {
 public:
     enum class Mode { LEGACY, HYBRID, COUPLED };
 
-    struct Stats {
-        uint64_t scans_total = 0;
-        uint64_t scans_single_leaf = 0;
-        uint64_t scans_coupled = 0;
-        uint64_t batches = 0;
-        uint64_t reseeks = 0;
-        uint64_t copied_entries = 0;
-        uint64_t copied_key_bytes = 0;
-        uint64_t bpm_fetches = 0;
-        uint64_t root_page_fetches = 0;
-    };
-
     static Mode configured_mode() {
         static const Mode mode = [] {
             const char* value = std::getenv("IX_SCAN_MODE");
@@ -63,45 +50,7 @@ public:
         return mode;
     }
 
-    static Stats get_stats() {
-        return Stats{stats_.scans_total.load(std::memory_order_relaxed),
-                     stats_.scans_single_leaf.load(std::memory_order_relaxed),
-                     stats_.scans_coupled.load(std::memory_order_relaxed),
-                     stats_.batches.load(std::memory_order_relaxed),
-                     stats_.reseeks.load(std::memory_order_relaxed),
-                     stats_.copied_entries.load(std::memory_order_relaxed),
-                     stats_.copied_key_bytes.load(std::memory_order_relaxed),
-                     stats_.bpm_fetches.load(std::memory_order_relaxed),
-                     stats_.root_page_fetches.load(std::memory_order_relaxed)};
-    }
-
-    static void reset_stats() {
-        stats_.scans_total.store(0, std::memory_order_relaxed);
-        stats_.scans_single_leaf.store(0, std::memory_order_relaxed);
-        stats_.scans_coupled.store(0, std::memory_order_relaxed);
-        stats_.batches.store(0, std::memory_order_relaxed);
-        stats_.reseeks.store(0, std::memory_order_relaxed);
-        stats_.copied_entries.store(0, std::memory_order_relaxed);
-        stats_.copied_key_bytes.store(0, std::memory_order_relaxed);
-        stats_.bpm_fetches.store(0, std::memory_order_relaxed);
-        stats_.root_page_fetches.store(0, std::memory_order_relaxed);
-    }
-
 private:
-    struct AtomicStats {
-        std::atomic<uint64_t> scans_total{0};
-        std::atomic<uint64_t> scans_single_leaf{0};
-        std::atomic<uint64_t> scans_coupled{0};
-        std::atomic<uint64_t> batches{0};
-        std::atomic<uint64_t> reseeks{0};
-        std::atomic<uint64_t> copied_entries{0};
-        std::atomic<uint64_t> copied_key_bytes{0};
-        std::atomic<uint64_t> bpm_fetches{0};
-        std::atomic<uint64_t> root_page_fetches{0};
-    };
-
-    static AtomicStats stats_;
-
     const IxIndexHandle* ih_;
     IxIndexHandle::SharedIndexLatch index_latch_guard_;
     Iid iid_;
@@ -139,14 +88,6 @@ private:
     uint64_t resume_topology_epoch_{0};
     bool resume_cursor_valid_{false};
 
-    static bool metrics_enabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("RMDB_SCAN_METRICS");
-            return value != nullptr && std::string(value) != "0";
-        }();
-        return enabled;
-    }
-
     static uint64_t rid_key(const Rid& rid) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) | static_cast<uint32_t>(rid.slot_no);
     }
@@ -157,16 +98,12 @@ private:
     }
 
     Page* fetch_scan_page(page_id_t page_no) {
-        if (ih_->root_cache_enabled() && page_no == ih_->file_hdr_->root_page_ &&
-            ih_->cached_root_page_ != nullptr &&
+        if (ih_->root_cache_enabled() && page_no == ih_->file_hdr_->root_page_ && ih_->cached_root_page_ != nullptr &&
             ih_->cached_root_page_no_ == page_no) {
             return ih_->cached_root_page_;
         }
         Page* page = bpm_->fetch_page(PageId{ih_->fd_, page_no});
         assert(page != nullptr);
-        if (metrics_enabled()) {
-            stats_.bpm_fetches.fetch_add(1, std::memory_order_relaxed);
-        }
         return page;
     }
 
@@ -297,9 +234,6 @@ private:
     // unpin followed by a second fetch of the same leaf.
     Page* fetch_lower_bound_leaf(const char* key, Iid* cursor) {
         Page* page = fetch_scan_page(ih_->file_hdr_->root_page_);
-        if (metrics_enabled()) {
-            stats_.root_page_fetches.fetch_add(1, std::memory_order_relaxed);
-        }
         IxNodeHandle node(ih_->file_hdr_.get(), page);
         while (!node.is_leaf_page()) {
             int child_idx = node.lower_bound(key);
@@ -356,13 +290,6 @@ private:
             }
             batch_tail_rids_.push_back(*leaf.get_rid(slot));
         }
-
-        if (metrics_enabled()) {
-            stats_.copied_entries.fetch_add(count, std::memory_order_relaxed);
-            if (copy_keys_) {
-                stats_.copied_key_bytes.fetch_add(count * ih_->file_hdr_->col_tot_len_, std::memory_order_relaxed);
-            }
-        }
     }
 
     void load_coupled_batch() {
@@ -392,15 +319,11 @@ private:
             page = fetch_scan_page(cursor.page_no);
         } else {
             const bool can_use_fast_resume =
-                resume_cursor_valid_ &&
-                resume_topology_epoch_ == ih_->topology_epoch_.load(std::memory_order_relaxed);
+                resume_cursor_valid_ && resume_topology_epoch_ == ih_->topology_epoch_.load(std::memory_order_relaxed);
             if (can_use_fast_resume) {
                 cursor = Iid{resume_page_no_, 0};
                 page = fetch_scan_page(resume_page_no_);
             } else {
-                if (metrics_enabled()) {
-                    stats_.reseeks.fetch_add(1, std::memory_order_relaxed);
-                }
                 page = fetch_lower_bound_leaf(last_key_.data(), &cursor);
             }
             while (page != nullptr) {
@@ -494,8 +417,7 @@ private:
         if (batch_.empty()) {
             coupled_end_ = true;
         }
-        if (!batch_.empty() && !coupled_end_ && resume_page_no != IX_NO_PAGE &&
-            resume_page_no != IX_LEAF_HEADER_PAGE) {
+        if (!batch_.empty() && !coupled_end_ && resume_page_no != IX_NO_PAGE && resume_page_no != IX_LEAF_HEADER_PAGE) {
             resume_page_no_ = resume_page_no;
             resume_topology_epoch_ = ih_->topology_epoch_.load(std::memory_order_relaxed);
             resume_cursor_valid_ = true;
@@ -503,9 +425,6 @@ private:
             resume_cursor_valid_ = false;
         }
         release_index_latch_if_held();
-        if (metrics_enabled()) {
-            stats_.batches.fetch_add(1, std::memory_order_relaxed);
-        }
     }
 
 public:
@@ -518,25 +437,16 @@ public:
            IxIndexHandle::SharedIndexLatch index_latch_guard, bool copy_keys = false)
         : ih_(ih), index_latch_guard_(std::move(index_latch_guard)), iid_(lower), end_(upper), bpm_(bpm),
           mode_(index_latch_guard_.owns_lock() ? configured_mode() : Mode::LEGACY), copy_keys_(copy_keys) {
-        if (metrics_enabled()) {
-            stats_.scans_total.fetch_add(1, std::memory_order_relaxed);
-        }
         const bool use_single_leaf =
             index_latch_guard_.owns_lock() &&
             (mode_ == Mode::LEGACY || (mode_ == Mode::HYBRID && lower.page_no == upper.page_no));
         if (use_single_leaf) {
-            if (metrics_enabled()) {
-                stats_.scans_single_leaf.fetch_add(1, std::memory_order_relaxed);
-            }
             normalize_legacy_position();
             return;
         }
 
         if (index_latch_guard_.owns_lock()) {
             coupled_mode_ = true;
-            if (metrics_enabled()) {
-                stats_.scans_coupled.fetch_add(1, std::memory_order_relaxed);
-            }
             capture_end_bound();
             load_coupled_batch();
         } else {
@@ -576,5 +486,3 @@ public:
         return iid_;
     }
 };
-
-inline IxScan::AtomicStats IxScan::stats_{};

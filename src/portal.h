@@ -103,6 +103,16 @@ private:
         std::unique_ptr<AbstractExecutor> inner_;
         Plan* plan_;
         bool counting_enabled_ = true;
+        bool current_counted_ = false;
+
+        void count_current_if_available() {
+            current_counted_ = false;
+            if (!counting_enabled_ || inner_->is_end() || !inner_->current()) {
+                return;
+            }
+            ++plan_->runtime_rows_;
+            current_counted_ = true;
+        }
 
     public:
         CountingExecutor(std::unique_ptr<AbstractExecutor> inner, Plan* plan) {
@@ -125,10 +135,12 @@ private:
 
         void beginTuple() override {
             inner_->beginTuple();
+            count_current_if_available();
         }
 
         void nextTuple() override {
             inner_->nextTuple();
+            count_current_if_available();
         }
 
         bool is_end() const override {
@@ -141,10 +153,15 @@ private:
 
         std::unique_ptr<RmRecord> Next() override {
             auto rec = inner_->Next();
-            if (rec != nullptr && counting_enabled_) {
+            if (rec != nullptr && counting_enabled_ && !current_counted_) {
                 ++plan_->runtime_rows_;
             }
+            current_counted_ = false;
             return rec;
+        }
+
+        TupleView current() const override {
+            return inner_->current();
         }
 
         ColMeta get_col_offset(const TabCol& target) override {
@@ -158,6 +175,10 @@ private:
 
         void set_key_conditions(std::vector<Condition> key_conds) override {
             inner_->set_key_conditions(std::move(key_conds));
+        }
+
+        void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+            inner_->set_lookup_key(target, key, len);
         }
 
         std::string scan_table_name() const override {

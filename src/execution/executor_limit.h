@@ -42,6 +42,13 @@ public:
         return prev_->Next();
     }
 
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return prev_->current();
+    }
+
     bool is_end() const override {
         return returned_ >= limit_ || prev_->is_end();
     }

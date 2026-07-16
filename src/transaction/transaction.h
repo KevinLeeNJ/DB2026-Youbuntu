@@ -214,11 +214,11 @@ private:
     txn_id_t txn_id_;                // 事务的ID，唯一标识符
     timestamp_t start_ts_;           // 事务的开始时间戳
 
-    std::deque<std::unique_ptr<WriteRecord>> write_set_;        // 事务包含的所有写操作
-    std::unordered_set<LockDataId> lock_set_;                  // 事务申请的所有锁
-    std::unordered_set<std::string> unique_key_lock_set_;       // 事务持有的逻辑唯一键 reservation
-    std::deque<Page*> index_latch_page_set_;                   // 维护事务执行过程中加锁的索引页面
-    std::deque<Page*> index_deleted_page_set_;                 // 维护事务执行过程中删除的索引页面
+    std::deque<std::unique_ptr<WriteRecord>> write_set_;  // 事务包含的所有写操作
+    std::unordered_set<LockDataId> lock_set_;             // 事务申请的所有锁
+    std::unordered_set<std::string> unique_key_lock_set_; // 事务持有的逻辑唯一键 reservation
+    std::deque<Page*> index_latch_page_set_;              // 维护事务执行过程中加锁的索引页面
+    std::deque<Page*> index_deleted_page_set_;            // 维护事务执行过程中删除的索引页面
 
     std::atomic<timestamp_t> read_ts_{0};
     /**

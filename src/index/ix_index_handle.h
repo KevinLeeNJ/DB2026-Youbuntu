@@ -17,8 +17,10 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
 
@@ -308,6 +310,15 @@ public:
     // exact-key executor probes.
     void lookup_equal(const char* key, std::vector<Rid>& result) const;
 
+    // Exact-key fast path for unique indexes. The caller must only use this
+    // when uniqueness is guaranteed by the catalog; unlike lookup_equal(), it
+    // does not construct or fill a result vector.
+    std::optional<Rid> lookup_unique(const char* key) const;
+
+    // Rebuild the root cache and upper-level residency after recovery has
+    // repaired or rebuilt the on-disk index structure.
+    void refresh_page_residency();
+
     Iid leaf_end() const;
 
     Iid leaf_begin() const;
@@ -326,6 +337,9 @@ private:
 
     void refresh_root_page_cache();
     void release_root_page_cache() const;
+    void register_internal_pages();
+    void mark_internal_page_resident(page_id_t page_no);
+    void unregister_internal_pages() const;
 
     void fetch_root_node_into(IxNodeHandle& out) const {
         if (root_cache_enabled() && cached_root_page_ != nullptr && cached_root_page_no_ == file_hdr_->root_page_) {
@@ -369,4 +383,6 @@ private:
 
     // for index test
     Rid get_rid(const Iid& iid) const;
+
+    mutable std::unordered_set<page_id_t> resident_internal_pages_;
 };
