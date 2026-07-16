@@ -481,8 +481,13 @@ public:
         return global_lsn_.load();
     }
 
+    // Return the logical WAL footprint, including records still in the active
+    // buffer and a buffer currently being written. Checkpoint scheduling must
+    // not wait for those bytes to reach the file before starting preflush.
     int64_t current_log_offset() const {
-        return log_file_offset_;
+        std::lock_guard<std::mutex> lock(latch_);
+        return log_file_offset_ + static_cast<int64_t>(flushing_bytes_) +
+               static_cast<int64_t>(log_buffer_->offset_);
     }
 
     uint64_t get_fsync_count() const {
@@ -548,7 +553,7 @@ private:
     std::deque<std::shared_ptr<CommitWaiter>> group_commit_waiters_;
 
     std::atomic<lsn_t> global_lsn_{0}; // 全局lsn，递增，用于为每条记录分发lsn
-    std::mutex latch_;                 // protects active/flushing buffers and WAL metadata
+    mutable std::mutex latch_;         // protects active/flushing buffers and WAL metadata
     std::condition_variable buffer_cv_;
     std::unique_ptr<LogBuffer> log_buffer_;      // active append buffer
     std::unique_ptr<LogBuffer> flushing_buffer_; // stable buffer written without latch_

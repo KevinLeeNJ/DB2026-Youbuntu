@@ -274,7 +274,10 @@ public:
      *  由 TransactionManager::GarbageCollection 在 txn_map 回收后调用。 */
     void prune_version_history(timestamp_t watermark);
 
-    bool flush_all_table_and_index_pages();
+    bool flush_all_table_and_index_pages(bool wal_preflushed = false);
+    bool flush_dirty_data_pages(bool wal_preflushed = false);
+
+    size_t flush_dirty_pages(size_t max_pages);
 
     void rebuild_all_indexes();
 

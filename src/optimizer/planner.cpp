@@ -1031,11 +1031,11 @@ std::unique_ptr<Plan> Planner::instantiate_physical_plan(const Query& query,
 
 std::optional<std::shared_ptr<const Planner::PhysicalPlanTemplate>>
 Planner::find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation) {
-    std::lock_guard<std::mutex> lock(physical_plan_cache_latch_);
+    std::shared_lock<std::shared_mutex> lock(physical_plan_cache_latch_);
+    // Do not upgrade the reader lock on a miss caused by DDL. The writer path
+    // will invalidate the old generation before publishing the new entry.
     if (physical_plan_cache_generation_ != catalog_generation) {
-        physical_plan_cache_.clear();
-        physical_plan_cache_lru_.clear();
-        physical_plan_cache_generation_ = catalog_generation;
+        return std::nullopt;
     }
 
     auto cache_pos = physical_plan_cache_.find(key);
@@ -1053,7 +1053,7 @@ void Planner::cache_physical_plan_template(std::string key, std::uint64_t catalo
         return;
     }
 
-    std::lock_guard<std::mutex> lock(physical_plan_cache_latch_);
+    std::unique_lock<std::shared_mutex> lock(physical_plan_cache_latch_);
     if (physical_plan_cache_generation_ != catalog_generation) {
         physical_plan_cache_.clear();
         physical_plan_cache_lru_.clear();

@@ -291,8 +291,9 @@ void SmManager::prune_version_history(timestamp_t watermark) {
             historical_retire_queue_.pop_front();
         }
     }
-    std::vector<HistoricalRetireCandidate> hist_to_requeue;
-    for (const auto& candidate : hist_snapshot) {
+    std::vector<bool> hist_requeue(hist_snapshot.size(), false);
+    for (size_t i = 0; i < hist_snapshot.size(); ++i) {
+        const auto& candidate = hist_snapshot[i];
         size_t nul = candidate.bucket_key.find('\0');
         std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
         auto fh_it = fhs_.find(tab_name);
@@ -305,12 +306,13 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         }
         TupleMeta meta = fh->get_tuple_meta(candidate.rid);
         if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
-            hist_to_requeue.push_back(candidate);
+            hist_requeue[i] = true;
         }
     }
     if (!hist_snapshot.empty()) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (const auto& candidate : hist_snapshot) {
+        for (size_t i = 0; i < hist_snapshot.size(); ++i) {
+            const auto& candidate = hist_snapshot[i];
             auto it = historical_index_keys_.find(candidate.bucket_key);
             if (it == historical_index_keys_.end()) {
                 continue;
@@ -320,9 +322,7 @@ void SmManager::prune_version_history(timestamp_t watermark) {
                 continue;
             }
             auto& rids = key_it->second;
-            const bool removable =
-                std::find(hist_to_requeue.begin(), hist_to_requeue.end(), candidate) == hist_to_requeue.end();
-            if (removable) {
+            if (!hist_requeue[i]) {
                 rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
                 if (rids.empty()) {
                     it->second.entries.erase(key_it);
@@ -672,20 +672,41 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
     }
 }
 
-bool SmManager::flush_all_table_and_index_pages() {
+bool SmManager::flush_all_table_and_index_pages(bool wal_preflushed) {
     bool success = true;
+    std::vector<int> fds;
+    fds.reserve(fhs_.size() + ihs_.size());
     for (const auto& [_, fh] : fhs_) {
         rm_manager_->flush_file_header(fh.get());
-        success = buffer_pool_manager_->flush_all_pages(fh->GetFd()) && success;
-        disk_manager_->sync_file(fh->GetFd());
+        fds.push_back(fh->GetFd());
     }
     for (const auto& [_, ih] : ihs_) {
         ix_manager_->flush_index_header(ih.get());
-        success = buffer_pool_manager_->flush_all_pages(ih->GetFd()) && success;
-        disk_manager_->sync_file(ih->GetFd());
+        fds.push_back(ih->GetFd());
+    }
+    success = buffer_pool_manager_->flush_all_pages(fds, wal_preflushed) && success;
+    for (int fd : fds) {
+        disk_manager_->sync_file(fd);
     }
     return success;
 }
+
+bool SmManager::flush_dirty_data_pages(bool wal_preflushed) {
+    std::vector<int> fds;
+    fds.reserve(fhs_.size() + ihs_.size());
+    for (const auto& [_, fh] : fhs_) {
+        fds.push_back(fh->GetFd());
+    }
+    for (const auto& [_, ih] : ihs_) {
+        fds.push_back(ih->GetFd());
+    }
+    return buffer_pool_manager_->flush_all_pages(fds, wal_preflushed);
+}
+
+size_t SmManager::flush_dirty_pages(size_t max_pages) {
+    return buffer_pool_manager_->flush_dirty_pages(max_pages);
+}
+
 void SmManager::rebuild_all_indexes() {
     std::vector<std::pair<std::string, std::vector<IndexMeta>>> indexes_by_table;
     indexes_by_table.reserve(db_.tabs_.size());

@@ -225,6 +225,37 @@ TEST_F(BufferPoolManagerTest, FlushAllPagesSkipsCleanPages) {
     ASSERT_TRUE(reopened_bpm.unpin_page(page_id, false));
 }
 
+TEST_F(BufferPoolManagerTest, FlushDirtyPagesHonorsPageBudget) {
+    auto bpm = std::make_unique<BufferPoolManager>(3, disk_manager_.get());
+    std::vector<PageId> page_ids;
+    for (int i = 0; i < 3; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        Page* page = bpm->new_page(&page_id);
+        ASSERT_NE(page, nullptr);
+        std::strcpy(page->get_data(), "preflush");
+        ASSERT_TRUE(bpm->unpin_page(page_id, true));
+        page_ids.push_back(page_id);
+    }
+
+    EXPECT_EQ(bpm->flush_dirty_pages(1), 1u);
+    size_t dirty_pages = 0;
+    for (const PageId& page_id : page_ids) {
+        Page* page = bpm->fetch_page(page_id);
+        ASSERT_NE(page, nullptr);
+        dirty_pages += page->is_dirty() ? 1u : 0u;
+        ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    }
+    EXPECT_EQ(dirty_pages, 2u);
+
+    EXPECT_EQ(bpm->flush_dirty_pages(3), 2u);
+    for (const PageId& page_id : page_ids) {
+        Page* page = bpm->fetch_page(page_id);
+        ASSERT_NE(page, nullptr);
+        EXPECT_STREQ(page->get_data(), "preflush");
+        ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    }
+}
+
 TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfReplacer) {
     auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
     PageId page_id{fd_, INVALID_PAGE_ID};

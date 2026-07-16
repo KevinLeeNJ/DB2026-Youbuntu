@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 class LogManager;
@@ -19,6 +20,10 @@ class TransactionManager;
 
 struct CheckpointOptions {
     int64_t auto_checkpoint_bytes = 256LL * 1024 * 1024;
+    int64_t preflush_trigger_bytes = 64LL * 1024 * 1024;
+    // Keep the preflush pass bounded so checkpoint I/O does not monopolize
+    // the storage device while foreground transactions are still running.
+    size_t preflush_batch_pages = 4096;
 };
 
 class CheckpointManager {

@@ -905,7 +905,7 @@ private:
 
 } // namespace
 
-std::unique_ptr<TreeNode> parse_sql(const std::string& sql) {
+std::unique_ptr<TreeNode> parse_sql(std::string_view sql) {
     try {
         SqlParser parser(sql);
         return parser.parse();

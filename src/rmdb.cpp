@@ -393,15 +393,43 @@ int main(int argc, char** argv) {
             std::atomic<bool> checkpoint_thread_stop{false};
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
                 CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
-                if (const char* value = std::getenv("RMDB_AUTO_CHECKPOINT_BYTES"); value != nullptr) {
+                CheckpointOptions checkpoint_options;
+                bool has_checkpoint_override = false;
+                auto read_positive_int64 = [&](const char* name, int64_t* target) {
+                    const char* value = std::getenv(name);
+                    if (value == nullptr) {
+                        return;
+                    }
                     try {
-                        const auto threshold = std::stoll(value);
-                        if (threshold > 0) {
-                            checkpoint_mgr.SetOptions(CheckpointOptions{threshold});
+                        const auto parsed = std::stoll(value);
+                        if (parsed > 0) {
+                            *target = parsed;
+                            has_checkpoint_override = true;
                         }
                     } catch (const std::exception&) {
-                        // Keep the default threshold for malformed diagnostic overrides.
+                        // Keep the default for malformed diagnostic overrides.
                     }
+                };
+                auto read_positive_size = [&](const char* name, size_t* target) {
+                    const char* value = std::getenv(name);
+                    if (value == nullptr) {
+                        return;
+                    }
+                    try {
+                        const auto parsed = std::stoull(value);
+                        if (parsed > 0) {
+                            *target = static_cast<size_t>(parsed);
+                            has_checkpoint_override = true;
+                        }
+                    } catch (const std::exception&) {
+                        // Keep the default for malformed diagnostic overrides.
+                    }
+                };
+                read_positive_int64("RMDB_AUTO_CHECKPOINT_BYTES", &checkpoint_options.auto_checkpoint_bytes);
+                read_positive_int64("RMDB_CHECKPOINT_PREFLUSH_BYTES", &checkpoint_options.preflush_trigger_bytes);
+                read_positive_size("RMDB_CHECKPOINT_PREFLUSH_PAGES", &checkpoint_options.preflush_batch_pages);
+                if (has_checkpoint_override) {
+                    checkpoint_mgr.SetOptions(checkpoint_options);
                 }
                 while (!checkpoint_thread_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));

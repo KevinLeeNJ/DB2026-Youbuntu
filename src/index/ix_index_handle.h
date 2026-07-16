@@ -15,8 +15,10 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/transaction.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
 
@@ -223,14 +225,16 @@ private:
     std::unique_ptr<IxFileHdr>
         file_hdr_; // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
     mutable std::shared_mutex index_latch_;
-    std::atomic<uint64_t> structure_epoch_{0};
+    std::atomic<uint64_t> topology_epoch_{0};
+    mutable Page* cached_root_page_{nullptr};
+    mutable page_id_t cached_root_page_no_{IX_NO_PAGE};
 
 public:
     using SharedIndexLatch = std::shared_lock<std::shared_mutex>;
     using UniqueIndexLatch = std::unique_lock<std::shared_mutex>;
 
     IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd);
-    ~IxIndexHandle() = default;
+    ~IxIndexHandle();
 
     int GetFd() const {
         return fd_;
@@ -299,11 +303,45 @@ public:
 
     std::pair<Iid, Iid> equal_range(const char* key);
 
+    // Copy all RIDs for one complete key while holding the appropriate index
+    // and leaf latches. This avoids constructing a general-purpose IxScan for
+    // exact-key executor probes.
+    void lookup_equal(const char* key, std::vector<Rid>& result) const;
+
     Iid leaf_end() const;
 
     Iid leaf_begin() const;
 
 private:
+    // Root pages are shared by every lookup and are cheap to retain. Keep the
+    // cache enabled by default, while allowing deployments with many open
+    // indexes to opt out explicitly.
+    static bool root_cache_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ENABLE_INDEX_ROOT_CACHE");
+            return value == nullptr || std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
+    void refresh_root_page_cache();
+    void release_root_page_cache() const;
+
+    void fetch_root_node_into(IxNodeHandle& out) const {
+        if (root_cache_enabled() && cached_root_page_ != nullptr && cached_root_page_no_ == file_hdr_->root_page_) {
+            out = IxNodeHandle(file_hdr_.get(), cached_root_page_);
+            return;
+        }
+        fetch_node_into(file_hdr_->root_page_, out);
+    }
+
+    void unpin_if_not_cached_root(PageId page_id) const {
+        if (!root_cache_enabled() || cached_root_page_ == nullptr || page_id.page_no != cached_root_page_no_ ||
+            page_id.fd != fd_) {
+            buffer_pool_manager_->unpin_page(page_id, false);
+        }
+    }
+
     // 辅助函数
     void update_root_page_no(page_id_t root) {
         file_hdr_->root_page_ = root;

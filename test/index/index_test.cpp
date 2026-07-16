@@ -343,6 +343,10 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
     ASSERT_EQ(result.size(), inserted.size());
 
+    std::vector<Rid> fast_result;
+    ih->lookup_equal(duplicate_key.data(), fast_result);
+    EXPECT_EQ(fast_result, inserted);
+
     Rid target = inserted[inserted.size() / 2];
     EXPECT_TRUE(ih->delete_entry(duplicate_key.data(), target, nullptr));
 
@@ -350,6 +354,36 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
     EXPECT_EQ(result.size(), inserted.size() - 1);
     EXPECT_TRUE(std::none_of(result.begin(), result.end(), [&](const Rid& rid) { return rid == target; }));
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, LeafLocalMutationDoesNotInvalidateTopologyEpoch) {
+    auto ih = open_index();
+    for (int value = 0; value < 200; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    const auto leaves = leaf_snapshots(ih.get());
+    const int max_size = ih->file_hdr_->btree_order_ + 1;
+    bool tested = false;
+    for (const auto& snapshot : leaves) {
+        if (snapshot.keys.size() < 2 || static_cast<int>(snapshot.keys.size()) + 1 >= max_size) {
+            continue;
+        }
+
+        auto duplicate_key = key(snapshot.keys[1]);
+        const Rid duplicate_rid{9001, snapshot.keys[1]};
+        const auto epoch_before = ih->topology_epoch_.load(std::memory_order_relaxed);
+        ih->insert_entry(duplicate_key.data(), duplicate_rid, nullptr, true);
+        EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
+        ASSERT_TRUE(ih->delete_entry(duplicate_key.data(), duplicate_rid, nullptr));
+        EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
+        tested = true;
+        break;
+    }
+    EXPECT_TRUE(tested);
 
     close_index(ih);
 }

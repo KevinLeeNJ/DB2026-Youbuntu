@@ -342,12 +342,9 @@ public:
             break;
         }
 
+        const bool exact_key_lookup = !lower_exclusive && upper_inclusive && lower_key == upper_key;
         Iid lower, upper;
-        if (!lower_exclusive && upper_inclusive && lower_key == upper_key) {
-            auto [lo, hi] = ih->equal_range(lower_key.data());
-            lower = lo;
-            upper = hi;
-        } else {
+        if (!exact_key_lookup) {
             lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
             upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
         }
@@ -369,12 +366,17 @@ public:
             use_historical_index_candidates_ = false;
         }
 
-        if (use_historical_index_candidates_ || use_rc_exact_historical_key) {
-            historical_candidates_merged_ = true;
+        if (exact_key_lookup || use_historical_index_candidates_ || use_rc_exact_historical_key) {
+            historical_candidates_merged_ = use_historical_index_candidates_ || use_rc_exact_historical_key;
             std::vector<Rid> rids;
-            for (IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
-                 !index_scan.is_end(); index_scan.next()) {
-                rids.push_back(index_scan.rid());
+            if (exact_key_lookup) {
+                index_latch_guard.unlock();
+                ih->lookup_equal(lower_key.data(), rids);
+            } else {
+                for (IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+                     !index_scan.is_end(); index_scan.next()) {
+                    rids.push_back(index_scan.rid());
+                }
             }
 
             std::vector<Rid> historical_rids = std::move(rc_exact_historical_rids);
@@ -384,17 +386,19 @@ public:
                 historical_rids = sm_manager_->get_historical_index_rids_in_range(
                     tab_name_, index_name, lower_key, upper_key, lower_exclusive, upper_inclusive);
             }
-            std::unordered_set<uint64_t> seen_rids;
-            seen_rids.reserve(rids.size() + historical_rids.size());
-            for (const Rid& rid : rids) {
-                seen_rids.insert((static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
-                                 static_cast<uint32_t>(rid.slot_no));
-            }
-            for (const Rid& historical_rid : historical_rids) {
-                uint64_t rid_key = (static_cast<uint64_t>(static_cast<uint32_t>(historical_rid.page_no)) << 32) |
-                                   static_cast<uint32_t>(historical_rid.slot_no);
-                if (seen_rids.insert(rid_key).second) {
-                    rids.push_back(historical_rid);
+            if (!historical_rids.empty()) {
+                std::unordered_set<uint64_t> seen_rids;
+                seen_rids.reserve(rids.size() + historical_rids.size());
+                for (const Rid& rid : rids) {
+                    seen_rids.insert((static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
+                                     static_cast<uint32_t>(rid.slot_no));
+                }
+                for (const Rid& historical_rid : historical_rids) {
+                    uint64_t rid_key = (static_cast<uint64_t>(static_cast<uint32_t>(historical_rid.page_no)) << 32) |
+                                       static_cast<uint32_t>(historical_rid.slot_no);
+                    if (seen_rids.insert(rid_key).second) {
+                        rids.push_back(historical_rid);
+                    }
                 }
             }
             scan_ = std::make_unique<RidVectorScan>(std::move(rids));

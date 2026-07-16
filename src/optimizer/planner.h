@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,7 +69,9 @@ private:
 
     static constexpr size_t kPhysicalPlanCacheCapacity = 256;
     bool enable_physical_plan_cache_{true};
-    std::mutex physical_plan_cache_latch_;
+    // Cache hits only copy an immutable shared_ptr. Allow concurrent readers;
+    // generation changes and insert/evict operations still take the writer lock.
+    mutable std::shared_mutex physical_plan_cache_latch_;
     PhysicalPlanCacheLru physical_plan_cache_lru_;
     std::unordered_map<std::string, PhysicalPlanCacheEntry> physical_plan_cache_;
     std::uint64_t physical_plan_cache_generation_ = 0;

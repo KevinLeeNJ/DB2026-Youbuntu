@@ -246,6 +246,22 @@ TEST(LogManagerTest, FlushDurableUpToHonorsPageLsnTarget) {
     EXPECT_GE(log_mgr.get_persist_lsn(), begin_lsn);
 }
 
+TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {
+    ScopedTestDir test_dir("log_manager_buffered_offset_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    BeginLogRecord begin(103);
+    log_mgr.add_log_to_buffer(&begin);
+
+    EXPECT_GE(log_mgr.current_log_offset(), static_cast<int64_t>(begin.log_tot_len_));
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
+
+    log_mgr.flush_log_to_disk();
+    EXPECT_EQ(log_mgr.current_log_offset(), disk.get_file_size(LOG_FILE_NAME));
+}
+
 TEST(LogManagerTest, ProcessCrashCommitWaitsForPwriteWithoutFsync) {
     ScopedTestDir test_dir("log_manager_process_crash_test_db");
     DiskManager disk;

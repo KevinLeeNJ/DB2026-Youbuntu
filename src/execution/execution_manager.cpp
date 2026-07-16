@@ -224,11 +224,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Print records
     size_t num_rec = 0;
-    std::vector<char> local_send(BUFFER_LENGTH, 0);
-    int local_offset = 0;
-    Context print_context(context->lock_mgr_, context->log_mgr_, context->txn_, local_send.data(), &local_offset,
-                          context->txn_mgr_);
-    print_context.isolation_level_ = context->isolation_level_;
+    const int output_start = *context->offset_;
 
     struct SsiReadTrackingGuard {
         Context* context_;
@@ -248,25 +244,28 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     } ssi_read_tracking_guard(context);
 
-    // Print header into a statement-local buffer. It is copied to the client
-    // and output.txt only after the SELECT completes without aborting.
+    // Format the result directly into the request response buffer. If execution
+    // aborts, client_handler replaces the buffer with the error response.
     RecordPrinter rec_printer(captions.size());
-    rec_printer.print_separator(&print_context);
-    rec_printer.print_record(captions, &print_context);
-    rec_printer.print_separator(&print_context);
+    rec_printer.print_separator(context);
+    rec_printer.print_record(captions, context);
+    rec_printer.print_separator(context);
 
     std::ostringstream out_file_stream;
-    out_file_stream << "|";
-    for (const auto& cap : captions) {
-        out_file_stream << " " << cap << " |";
+    if (sm_manager_->output_file_enabled_) {
+        out_file_stream << "|";
+        for (const auto& cap : captions) {
+            out_file_stream << " " << cap << " |";
+        }
+        out_file_stream << "\n";
     }
-    out_file_stream << "\n";
 
     // 执行query_plan
+    std::vector<std::string> columns;
+    columns.reserve(result_cols.size());
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
-        std::vector<std::string> columns;
-        columns.reserve(result_cols.size());
+        columns.clear();
         for (auto& col : result_cols) {
             std::string col_str;
             char* rec_buf = Tuple->data + col.offset;
@@ -281,30 +280,27 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             columns.push_back(col_str);
         }
         // print record into client buffer
-        rec_printer.print_record(columns, &print_context);
+        rec_printer.print_record(columns, context);
         // print record into output.txt (compact borderless)
-        out_file_stream << "|";
-        for (const auto& col_str : columns) {
-            out_file_stream << " " << col_str << " |";
+        if (sm_manager_->output_file_enabled_) {
+            out_file_stream << "|";
+            for (const auto& col_str : columns) {
+                out_file_stream << " " << col_str << " |";
+            }
+            out_file_stream << "\n";
         }
-        out_file_stream << "\n";
         num_rec++;
     }
     // Print footer into client buffer
-    rec_printer.print_separator(&print_context);
+    rec_printer.print_separator(context);
     // Print record count into client buffer
-    RecordPrinter::print_record_count(num_rec, &print_context);
+    RecordPrinter::print_record_count(num_rec, context);
 
-    if (local_offset > 0) {
-        memcpy(context->data_send_ + *(context->offset_), local_send.data(), local_offset);
-        *(context->offset_) += local_offset;
-
-        if (sm_manager_->output_file_enabled_) {
-            std::fstream outfile;
-            outfile.open("output.txt", std::ios::out | std::ios::app);
-            outfile << out_file_stream.str();
-            outfile.close();
-        }
+    if (sm_manager_->output_file_enabled_ && *context->offset_ > output_start) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << out_file_stream.str();
+        outfile.close();
     }
 }
 

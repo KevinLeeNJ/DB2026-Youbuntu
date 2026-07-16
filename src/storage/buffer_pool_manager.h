@@ -130,6 +130,17 @@ public:
 
     bool flush_all_pages(int fd);
 
+    bool flush_all_pages(const std::vector<int>& fds);
+
+    // Flush a stable checkpoint image after the caller has made the WAL
+    // durable. Adjacent pages in one file may be written with one pwrite.
+    bool flush_all_pages(const std::vector<int>& fds, bool wal_preflushed);
+
+    // Write at most max_pages dirty resident pages without requiring a
+    // checkpoint barrier. The page dirty epoch prevents a concurrent update
+    // from being lost when the write completes.
+    size_t flush_dirty_pages(size_t max_pages);
+
     void delete_all_pages(int fd);
 
     void set_log_manager(LogManager* log_manager) {

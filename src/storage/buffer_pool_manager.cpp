@@ -11,7 +11,10 @@ See the Mulan PSL v2 for more details. */
 
 #include "buffer_pool_manager.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <unordered_set>
 
 #include "recovery/log_manager.h"
 
@@ -547,6 +550,170 @@ bool BufferPoolManager::flush_all_pages(int fd) {
         success = flush_page_impl(page_id_to_flush, true) && success;
     }
     return success;
+}
+
+bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds) {
+    return flush_all_pages(fds, false);
+}
+
+bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_preflushed) {
+    if (fds.empty()) {
+        return true;
+    }
+
+    constexpr size_t kClaimPages = 64;
+    struct CandidatePage {
+        PageId page_id;
+    };
+    struct ClaimedPage {
+        PageId page_id;
+        frame_id_t frame_id;
+        uint64_t dirty_epoch;
+    };
+
+    const std::unordered_set<int> fd_set(fds.begin(), fds.end());
+    std::vector<CandidatePage> candidates;
+    {
+        std::shared_lock lock{latch_};
+        candidates.reserve(page_table_.size());
+        for (const auto& [page_id, frame_id] : page_table_) {
+            (void)frame_id;
+            if (fd_set.find(page_id.fd) == fd_set.end()) {
+                continue;
+            }
+            Page* page = &pages_[frame_id];
+            if (page->state_.load(std::memory_order_acquire) == FrameState::VALID && page->is_dirty_) {
+                candidates.push_back(CandidatePage{page_id});
+            }
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const CandidatePage& lhs, const CandidatePage& rhs) {
+        if (lhs.page_id.fd != rhs.page_id.fd) {
+            return lhs.page_id.fd < rhs.page_id.fd;
+        }
+        return lhs.page_id.page_no < rhs.page_id.page_no;
+    });
+
+    bool success = true;
+    for (size_t candidate_begin = 0; candidate_begin < candidates.size();) {
+        std::vector<ClaimedPage> claimed;
+        claimed.reserve(kClaimPages);
+        {
+            std::unique_lock lock{latch_};
+            while (candidate_begin < candidates.size() && claimed.size() < kClaimPages) {
+                const PageId page_id = candidates[candidate_begin++].page_id;
+                auto hit = page_table_.find(page_id);
+                if (hit == page_table_.end()) {
+                    continue;
+                }
+                Page* page = &pages_[hit->second];
+                if (page->state_.load(std::memory_order_acquire) != FrameState::VALID ||
+                    !page->is_dirty_.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                replacer_->pin(hit->second);
+                page->state_.store(FrameState::FLUSHING, std::memory_order_release);
+                claimed.push_back(
+                    ClaimedPage{page_id, hit->second, page->dirty_epoch_.load(std::memory_order_acquire)});
+            }
+        }
+
+        size_t claimed_begin = 0;
+        std::vector<char> image(kClaimPages * PAGE_SIZE);
+        while (claimed_begin < claimed.size()) {
+            size_t claimed_end = claimed_begin + 1;
+            while (claimed_end < claimed.size() && claimed[claimed_end].page_id.fd == claimed[claimed_begin].page_id.fd &&
+                   claimed[claimed_end].page_id.page_no == claimed[claimed_end - 1].page_id.page_no + 1) {
+                ++claimed_end;
+            }
+
+            const size_t page_count = claimed_end - claimed_begin;
+            bool copied = true;
+            lsn_t max_page_lsn = INVALID_LSN;
+            for (size_t i = claimed_begin; i < claimed_end; ++i) {
+                Page* page = &pages_[claimed[i].frame_id];
+                try {
+                    std::shared_lock page_lock(page->latch_);
+                    std::memcpy(image.data() + (i - claimed_begin) * PAGE_SIZE, page->data_, PAGE_SIZE);
+                    max_page_lsn = std::max(max_page_lsn, page->get_page_lsn());
+                } catch (...) {
+                    copied = false;
+                    break;
+                }
+            }
+            if (copied) {
+                try {
+                    if (!wal_preflushed) {
+                        flush_log_before_page_write(max_page_lsn);
+                    }
+                    disk_manager_->write_page(claimed[claimed_begin].page_id.fd,
+                                               claimed[claimed_begin].page_id.page_no, image.data(),
+                                               static_cast<int>(page_count * PAGE_SIZE));
+                } catch (...) {
+                    copied = false;
+                }
+            }
+            success = copied && success;
+
+            {
+                std::unique_lock lock{latch_};
+                for (size_t i = claimed_begin; i < claimed_end; ++i) {
+                    const auto& claimed_page = claimed[i];
+                    Page* page = &pages_[claimed_page.frame_id];
+                    auto hit = page_table_.find(claimed_page.page_id);
+                    if (hit == page_table_.end() || hit->second != claimed_page.frame_id ||
+                        page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
+                        continue;
+                    }
+                    if (copied) {
+                        std::scoped_lock dirty_lock{page->dirty_latch_};
+                        if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
+                            page->is_dirty_ = false;
+                        }
+                    }
+                    page->state_.store(FrameState::VALID, std::memory_order_release);
+                    std::scoped_lock pin_lock{page->pin_latch_};
+                    if (page->pin_count_ == 0) {
+                        replacer_->unpin(claimed_page.frame_id);
+                    }
+                    page->io_cv_.notify_all();
+                }
+            }
+            claimed_begin = claimed_end;
+        }
+    }
+    return success;
+}
+
+size_t BufferPoolManager::flush_dirty_pages(size_t max_pages) {
+    if (max_pages == 0) {
+        return 0;
+    }
+
+    std::vector<PageId> pages_to_flush;
+    {
+        std::shared_lock lock{latch_};
+        pages_to_flush.reserve(std::min(max_pages, page_table_.size()));
+        for (const auto& [page_id, frame_id] : page_table_) {
+            if (pages_to_flush.size() >= max_pages) {
+                break;
+            }
+            Page* page = &pages_[frame_id];
+            if (page->state_.load(std::memory_order_acquire) == FrameState::VALID &&
+                page->is_dirty_.load(std::memory_order_acquire)) {
+                pages_to_flush.push_back(page_id);
+            }
+        }
+    }
+
+    size_t flushed_pages = 0;
+    for (const PageId& page_id : pages_to_flush) {
+        if (flush_page_impl(page_id, true)) {
+            ++flushed_pages;
+        }
+    }
+    return flushed_pages;
 }
 
 void BufferPoolManager::delete_all_pages(int fd) {

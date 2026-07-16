@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ast {
 
@@ -22,6 +23,6 @@ struct ParseError : public std::runtime_error {
     explicit ParseError(const std::string& message) : std::runtime_error(message) {}
 };
 
-std::unique_ptr<TreeNode> parse_sql(const std::string& sql);
+std::unique_ptr<TreeNode> parse_sql(std::string_view sql);
 
 } // namespace ast

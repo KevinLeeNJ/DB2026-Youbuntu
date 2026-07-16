@@ -136,8 +136,7 @@ private:
     std::unordered_set<uint64_t> emitted_last_key_rid_set_;
     bool emitted_rid_set_active_{false};
     page_id_t resume_page_no_{IX_NO_PAGE};
-    int resume_slot_no_{0};
-    uint64_t resume_structure_epoch_{0};
+    uint64_t resume_topology_epoch_{0};
     bool resume_cursor_valid_{false};
 
     static bool metrics_enabled() {
@@ -158,12 +157,23 @@ private:
     }
 
     Page* fetch_scan_page(page_id_t page_no) {
+        if (ih_->root_cache_enabled() && page_no == ih_->file_hdr_->root_page_ &&
+            ih_->cached_root_page_ != nullptr &&
+            ih_->cached_root_page_no_ == page_no) {
+            return ih_->cached_root_page_;
+        }
         Page* page = bpm_->fetch_page(PageId{ih_->fd_, page_no});
         assert(page != nullptr);
         if (metrics_enabled()) {
             stats_.bpm_fetches.fetch_add(1, std::memory_order_relaxed);
         }
         return page;
+    }
+
+    void unpin_scan_page(Page* page) {
+        if (page != ih_->cached_root_page_) {
+            bpm_->unpin_page(page->get_page_id(), false);
+        }
     }
 
     void clear_emitted_rids() {
@@ -225,7 +235,7 @@ private:
     void unpin_current_leaf() {
         if (pinned_leaf_page_ != nullptr) {
             leaf_latch_guard_.unlock();
-            bpm_->unpin_page(pinned_leaf_page_->get_page_id(), false);
+            unpin_scan_page(pinned_leaf_page_);
             pinned_leaf_page_ = nullptr;
         }
     }
@@ -279,7 +289,7 @@ private:
             unbounded_end_ = end_.page_no == ih_->file_hdr_->last_leaf_;
         }
         leaf_lock.unlock();
-        bpm_->unpin_page(page->get_page_id(), false);
+        unpin_scan_page(page);
     }
 
     // Locate the lower bound while holding the coupled structure latch and
@@ -300,17 +310,21 @@ private:
                 --child_idx;
             }
             page_id_t child_page_no = node.value_at(child_idx);
-            bpm_->unpin_page(page->get_page_id(), false);
+            unpin_scan_page(page);
             page = fetch_scan_page(child_page_no);
             node = IxNodeHandle(ih_->file_hdr_.get(), page);
         }
 
+        std::shared_lock<std::shared_mutex> leaf_guard(page->latch());
         int slot = node.lower_bound(key);
         if (slot == node.get_size() && node.get_page_no() != ih_->file_hdr_->last_leaf_) {
             page_id_t next_leaf = node.get_next_leaf();
-            bpm_->unpin_page(page->get_page_id(), false);
+            leaf_guard.unlock();
+            unpin_scan_page(page);
             page = fetch_scan_page(next_leaf);
             slot = 0;
+        } else {
+            leaf_guard.unlock();
         }
         *cursor = Iid{page->get_page_id().page_no, slot};
         return page;
@@ -379,10 +393,10 @@ private:
         } else {
             const bool can_use_fast_resume =
                 resume_cursor_valid_ &&
-                resume_structure_epoch_ == ih_->structure_epoch_.load(std::memory_order_relaxed);
+                resume_topology_epoch_ == ih_->topology_epoch_.load(std::memory_order_relaxed);
             if (can_use_fast_resume) {
-                cursor = Iid{resume_page_no_, resume_slot_no_};
-                page = fetch_scan_page(cursor.page_no);
+                cursor = Iid{resume_page_no_, 0};
+                page = fetch_scan_page(resume_page_no_);
             } else {
                 if (metrics_enabled()) {
                     stats_.reseeks.fetch_add(1, std::memory_order_relaxed);
@@ -411,7 +425,7 @@ private:
                     cursor.slot_no = slot;
                     break;
                 }
-                bpm_->unpin_page(page->get_page_id(), false);
+                unpin_scan_page(page);
                 if (at_last) {
                     page = nullptr;
                     break;
@@ -423,7 +437,7 @@ private:
         first_batch_ = false;
 
         size_t leaf_count = 0;
-        Iid resume_cursor{IX_NO_PAGE, 0};
+        page_id_t resume_page_no = IX_NO_PAGE;
         while (page != nullptr && !coupled_end_ && (leaf_count < kMaxBatchLeaves || batch_.empty()) &&
                batch_.size() < kMaxBatchEntries) {
             ++leaf_count;
@@ -453,16 +467,18 @@ private:
                 (reached_end_key || (end_key_.empty() && leaf.get_page_no() == end_.page_no && stop >= end_.slot_no))) {
                 coupled_end_ = true;
             }
-            const int slot = stop;
             const bool reached_batch_limit = batch_.size() >= kMaxBatchEntries;
             const bool reached_leaf_limit = leaf_count >= kMaxBatchLeaves && !batch_.empty();
             if (reached_batch_limit) {
-                resume_cursor = Iid{leaf.get_page_no(), slot};
+                resume_page_no = leaf.get_page_no();
             } else if (reached_leaf_limit) {
-                resume_cursor = Iid{next_leaf, 0};
+                // Resume from the leaf containing the batch tail. Starting
+                // directly at next_leaf would miss a concurrent leaf-local
+                // insert whose key sorts after the emitted tail key.
+                resume_page_no = leaf.get_page_no();
             }
             leaf_lock.unlock();
-            bpm_->unpin_page(page->get_page_id(), false);
+            unpin_scan_page(page);
             if (coupled_end_ || at_last || reached_batch_limit || reached_leaf_limit) {
                 break;
             }
@@ -478,11 +494,10 @@ private:
         if (batch_.empty()) {
             coupled_end_ = true;
         }
-        if (!batch_.empty() && !coupled_end_ && resume_cursor.page_no != IX_NO_PAGE &&
-            resume_cursor.page_no != IX_LEAF_HEADER_PAGE) {
-            resume_page_no_ = resume_cursor.page_no;
-            resume_slot_no_ = resume_cursor.slot_no;
-            resume_structure_epoch_ = ih_->structure_epoch_.load(std::memory_order_relaxed);
+        if (!batch_.empty() && !coupled_end_ && resume_page_no != IX_NO_PAGE &&
+            resume_page_no != IX_LEAF_HEADER_PAGE) {
+            resume_page_no_ = resume_page_no;
+            resume_topology_epoch_ = ih_->topology_epoch_.load(std::memory_order_relaxed);
             resume_cursor_valid_ = true;
         } else {
             resume_cursor_valid_ = false;
