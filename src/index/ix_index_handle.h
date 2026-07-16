@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -222,6 +223,7 @@ private:
     std::unique_ptr<IxFileHdr>
         file_hdr_; // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
     mutable std::shared_mutex index_latch_;
+    std::atomic<uint64_t> structure_epoch_{0};
 
 public:
     using SharedIndexLatch = std::shared_lock<std::shared_mutex>;

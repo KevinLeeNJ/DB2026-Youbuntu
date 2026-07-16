@@ -325,6 +325,9 @@ TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) 
 }
 
 TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_literal_values) {
+    if (!planner_.enable_physical_plan_cache_) {
+        GTEST_SKIP() << "physical plan cache is disabled";
+    }
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
     auto first_query = make_order_line_suffix_lookup_query();
     auto second_query = make_order_line_suffix_lookup_query();
@@ -348,7 +351,19 @@ TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_lite
     EXPECT_EQ(second_scan->conds_[0].rhs_val.int_val, 7);
 }
 
+TEST_F(PlannerAggregateTest, physical_plan_cache_can_be_disabled) {
+    sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
+    planner_.enable_physical_plan_cache_ = false;
+
+    auto query = make_order_line_suffix_lookup_query();
+    ASSERT_NE(planner_.generate_select_plan(std::move(query), nullptr), nullptr);
+    EXPECT_TRUE(planner_.physical_plan_cache_.empty());
+}
+
 TEST_F(PlannerAggregateTest, physical_template_is_invalidated_by_catalog_generation) {
+    if (!planner_.enable_physical_plan_cache_) {
+        GTEST_SKIP() << "physical plan cache is disabled";
+    }
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
 
     auto first_query = make_order_line_suffix_lookup_query();

@@ -29,7 +29,6 @@ void IxScan::next() {
 
     ++batch_pos_;
     if (batch_pos_ < batch_.size()) {
-        iid_ = batch_[batch_pos_].iid;
         return;
     }
     remember_completed_batch_tail();

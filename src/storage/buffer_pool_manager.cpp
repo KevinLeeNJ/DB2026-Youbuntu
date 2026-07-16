@@ -46,15 +46,33 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         frame_id_t fid = INVALID_FRAME_ID;
 
         {
+            const bool collect_metrics = metrics_enabled();
+            const auto wait_begin =
+                collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::shared_lock lock{latch_};
+            if (collect_metrics) {
+                page_table_shared_wait_ns_.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - wait_begin)
+                                              .count()),
+                    std::memory_order_relaxed);
+            }
             auto hit = page_table_.find(page_id);
             if (hit != page_table_.end()) {
+                if (collect_metrics) {
+                    fetch_hits_.fetch_add(1, std::memory_order_relaxed);
+                }
                 target_page = &pages_[hit->second];
                 if (target_page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                     wait_page = target_page;
                 } else {
                     std::scoped_lock pin_lock{target_page->pin_latch_};
-                    replacer_->pin(hit->second);
+                    if (target_page->pin_count_ == 0) {
+                        replacer_->pin(hit->second);
+                        if (collect_metrics) {
+                            pin_0_to_1_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
                     ++target_page->pin_count_;
                     return target_page;
                 }
@@ -71,19 +89,40 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
 
         {
+            const bool collect_metrics = metrics_enabled();
+            const auto wait_begin =
+                collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::unique_lock lock{latch_};
+            if (collect_metrics) {
+                page_table_exclusive_wait_ns_.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - wait_begin)
+                                              .count()),
+                    std::memory_order_relaxed);
+            }
             auto hit = page_table_.find(page_id);
             if (hit != page_table_.end()) {
+                if (collect_metrics) {
+                    fetch_hits_.fetch_add(1, std::memory_order_relaxed);
+                }
                 target_page = &pages_[hit->second];
                 if (target_page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                     wait_page = target_page;
                 } else {
                     std::scoped_lock pin_lock{target_page->pin_latch_};
-                    replacer_->pin(hit->second);
+                    if (target_page->pin_count_ == 0) {
+                        replacer_->pin(hit->second);
+                        if (collect_metrics) {
+                            pin_0_to_1_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
                     ++target_page->pin_count_;
                     return target_page;
                 }
             } else {
+                if (collect_metrics) {
+                    fetch_misses_.fetch_add(1, std::memory_order_relaxed);
+                }
                 if (!free_list_.empty()) {
                     fid = free_list_.front();
                     free_list_.pop_front();
@@ -168,7 +207,16 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 }
 
 bool BufferPoolManager::is_page_resident(PageId page_id) {
+    const bool collect_metrics = metrics_enabled();
+    const auto wait_begin =
+        collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_lock lock{latch_};
+    if (collect_metrics) {
+        page_table_shared_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                       std::chrono::steady_clock::now() - wait_begin)
+                                                                       .count()),
+                                             std::memory_order_relaxed);
+    }
     auto hit = page_table_.find(page_id);
     return hit != page_table_.end() && pages_[hit->second].state_.load(std::memory_order_acquire) == FrameState::VALID;
 }
@@ -189,7 +237,16 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     // 2.2 若pin_count_大于0，则pin_count_自减一
     // 2.2.1 若自减后等于0，则调用replacer_的Unpin
     // 3 根据参数is_dirty，更改P的is_dirty_
+    const bool collect_metrics = metrics_enabled();
+    const auto wait_begin =
+        collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_lock lock{latch_};
+    if (collect_metrics) {
+        page_table_shared_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                       std::chrono::steady_clock::now() - wait_begin)
+                                                                       .count()),
+                                             std::memory_order_relaxed);
+    }
     // 1. 尝试在page_table_中搜寻page_id对应的页P
     // 1.1 P在页表中不存在 return false
     auto hit = page_table_.find(page_id);
@@ -215,6 +272,9 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     // 2.2.1 若自减后等于0，则调用replacer_的Unpin
     if (targetPage->pin_count_ == 0 && state == FrameState::VALID) {
         replacer_->unpin(fid);
+        if (collect_metrics) {
+            unpin_1_to_0_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     // 3 根据参数is_dirty，更改P的is_dirty_
     if (is_dirty == true) {

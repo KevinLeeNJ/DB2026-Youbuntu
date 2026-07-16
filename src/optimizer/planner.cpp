@@ -1029,8 +1029,8 @@ std::unique_ptr<Plan> Planner::instantiate_physical_plan(const Query& query,
     return joined;
 }
 
-std::optional<Planner::PhysicalPlanTemplate> Planner::find_physical_plan_template(const std::string& key,
-                                                                                  std::uint64_t catalog_generation) {
+std::optional<std::shared_ptr<const Planner::PhysicalPlanTemplate>>
+Planner::find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation) {
     std::lock_guard<std::mutex> lock(physical_plan_cache_latch_);
     if (physical_plan_cache_generation_ != catalog_generation) {
         physical_plan_cache_.clear();
@@ -1043,9 +1043,7 @@ std::optional<Planner::PhysicalPlanTemplate> Planner::find_physical_plan_templat
         return std::nullopt;
     }
 
-    physical_plan_cache_lru_.splice(physical_plan_cache_lru_.begin(), physical_plan_cache_lru_,
-                                    cache_pos->second.lru_position);
-    cache_pos->second.lru_position = physical_plan_cache_lru_.begin();
+    physical_plan_cache_hits_.fetch_add(1, std::memory_order_relaxed);
     return cache_pos->second.plan_template;
 }
 
@@ -1064,17 +1062,16 @@ void Planner::cache_physical_plan_template(std::string key, std::uint64_t catalo
 
     auto cache_pos = physical_plan_cache_.find(key);
     if (cache_pos != physical_plan_cache_.end()) {
-        cache_pos->second.plan_template = std::move(plan_template);
-        physical_plan_cache_lru_.splice(physical_plan_cache_lru_.begin(), physical_plan_cache_lru_,
-                                        cache_pos->second.lru_position);
-        cache_pos->second.lru_position = physical_plan_cache_lru_.begin();
+        cache_pos->second.plan_template = std::make_shared<const PhysicalPlanTemplate>(std::move(plan_template));
         return;
     }
 
     physical_plan_cache_lru_.push_front(key);
     auto lru_position = physical_plan_cache_lru_.begin();
     try {
-        physical_plan_cache_.emplace(std::move(key), PhysicalPlanCacheEntry{std::move(plan_template), lru_position});
+        physical_plan_cache_.emplace(
+            std::move(key), PhysicalPlanCacheEntry{
+                                std::make_shared<const PhysicalPlanTemplate>(std::move(plan_template)), lru_position});
     } catch (...) {
         physical_plan_cache_lru_.pop_front();
         throw;
@@ -1089,13 +1086,17 @@ void Planner::cache_physical_plan_template(std::string key, std::uint64_t catalo
 
 std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* context) {
     (void)context;
+    if (!enable_physical_plan_cache_) {
+        return instantiate_physical_plan(*query, build_physical_plan_template(*query));
+    }
     const std::uint64_t catalog_generation = sm_manager_->get_catalog_generation();
     const std::string cache_key = make_physical_plan_cache_key(*query, catalog_generation);
     auto cached_template = find_physical_plan_template(cache_key, catalog_generation);
     if (cached_template.has_value()) {
-        return instantiate_physical_plan(*query, *cached_template);
+        return instantiate_physical_plan(*query, *cached_template.value());
     }
 
+    physical_plan_cache_misses_.fetch_add(1, std::memory_order_relaxed);
     auto plan_template = build_physical_plan_template(*query);
     cache_physical_plan_template(cache_key, catalog_generation, plan_template);
     return instantiate_physical_plan(*query, plan_template);

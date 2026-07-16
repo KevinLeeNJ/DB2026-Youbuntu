@@ -10,6 +10,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <fcntl.h>
 #include <unistd.h>
@@ -17,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <list>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -31,6 +35,14 @@ class LogManager;
 
 class BufferPoolManager {
 private:
+    static bool metrics_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("RMDB_BPM_METRICS");
+            return value != nullptr && std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
     std::unique_ptr<Page[]>
         pages_; // buffer_pool中的Page对象数组，在构造空间中申请内存空间，在析构函数中释放，大小为BUFFER_POOL_SIZE
@@ -41,8 +53,23 @@ private:
     LogManager* log_manager_{nullptr};
     std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
     std::shared_mutex latch_;            // 用于共享数据结构的并发控制
+    std::atomic<uint64_t> fetch_hits_{0};
+    std::atomic<uint64_t> fetch_misses_{0};
+    std::atomic<uint64_t> pin_0_to_1_{0};
+    std::atomic<uint64_t> unpin_1_to_0_{0};
+    std::atomic<uint64_t> page_table_shared_wait_ns_{0};
+    std::atomic<uint64_t> page_table_exclusive_wait_ns_{0};
 
 public:
+    struct Stats {
+        uint64_t fetch_hits = 0;
+        uint64_t fetch_misses = 0;
+        uint64_t pin_0_to_1 = 0;
+        uint64_t unpin_1_to_0 = 0;
+        uint64_t page_table_shared_wait_ns = 0;
+        uint64_t page_table_exclusive_wait_ns = 0;
+    };
+
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
         : pool_size_(pool_size), disk_manager_(disk_manager) {
         // 为buffer pool分配一块连续的内存空间
@@ -59,6 +86,24 @@ public:
     }
 
     ~BufferPoolManager() = default;
+
+    Stats get_stats() const {
+        return Stats{fetch_hits_.load(std::memory_order_relaxed),
+                     fetch_misses_.load(std::memory_order_relaxed),
+                     pin_0_to_1_.load(std::memory_order_relaxed),
+                     unpin_1_to_0_.load(std::memory_order_relaxed),
+                     page_table_shared_wait_ns_.load(std::memory_order_relaxed),
+                     page_table_exclusive_wait_ns_.load(std::memory_order_relaxed)};
+    }
+
+    void reset_stats() {
+        fetch_hits_.store(0, std::memory_order_relaxed);
+        fetch_misses_.store(0, std::memory_order_relaxed);
+        pin_0_to_1_.store(0, std::memory_order_relaxed);
+        unpin_1_to_0_.store(0, std::memory_order_relaxed);
+        page_table_shared_wait_ns_.store(0, std::memory_order_relaxed);
+        page_table_exclusive_wait_ns_.store(0, std::memory_order_relaxed);
+    }
 
     /**
      * @description: 将目标页面标记为脏页

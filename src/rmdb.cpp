@@ -17,10 +17,14 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <exception>
 #include <fstream>
+#include <string>
 #include <thread>
 
 #include "errors.h"
+#include "index/ix_scan.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
 #include "recovery/checkpoint_manager.h"
@@ -57,6 +61,26 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
+
+static bool scan_metrics_enabled() {
+    const char* value = std::getenv("RMDB_SCAN_METRICS");
+    return value != nullptr && std::string(value) != "0";
+}
+
+static void log_scan_metrics() {
+    if (!scan_metrics_enabled()) {
+        return;
+    }
+    const auto scan_stats = IxScan::get_stats();
+    const auto bpm_stats = buffer_pool_manager->get_stats();
+    LOG_WARN("scan_metrics scans=%lu single_leaf=%lu coupled=%lu batches=%lu reseeks=%lu copied_entries=%lu "
+             "copied_key_bytes=%lu bpm_fetches=%lu root_fetches=%lu bpm_hits=%lu bpm_misses=%lu pin_0_to_1=%lu "
+             "unpin_1_to_0=%lu page_table_shared_wait_ns=%lu page_table_exclusive_wait_ns=%lu",
+             scan_stats.scans_total, scan_stats.scans_single_leaf, scan_stats.scans_coupled, scan_stats.batches,
+             scan_stats.reseeks, scan_stats.copied_entries, scan_stats.copied_key_bytes, scan_stats.bpm_fetches,
+             scan_stats.root_page_fetches, bpm_stats.fetch_hits, bpm_stats.fetch_misses, bpm_stats.pin_0_to_1,
+             bpm_stats.unpin_1_to_0, bpm_stats.page_table_shared_wait_ns, bpm_stats.page_table_exclusive_wait_ns);
+}
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -369,12 +393,23 @@ int main(int argc, char** argv) {
             std::atomic<bool> checkpoint_thread_stop{false};
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
                 CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
+                if (const char* value = std::getenv("RMDB_AUTO_CHECKPOINT_BYTES"); value != nullptr) {
+                    try {
+                        const auto threshold = std::stoll(value);
+                        if (threshold > 0) {
+                            checkpoint_mgr.SetOptions(CheckpointOptions{threshold});
+                        }
+                    } catch (const std::exception&) {
+                        // Keep the default threshold for malformed diagnostic overrides.
+                    }
+                }
                 while (!checkpoint_thread_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                     if (checkpoint_thread_stop.load()) {
                         break;
                     }
                     checkpoint_mgr.RunIfNeeded();
+                    log_scan_metrics();
                 }
             });
 

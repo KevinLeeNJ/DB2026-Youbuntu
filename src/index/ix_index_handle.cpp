@@ -222,6 +222,7 @@ bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transac
  * 注意：本函数执行完毕后，原node和new node都需要在函数外面进行unpin
  */
 IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node) {
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     IxNodeHandle* new_node = create_node();
     memcpy(new_node->page_hdr, node->page_hdr, sizeof(IxPageHdr));
     new_node->set_parent_page_no(node->get_parent_page_no());
@@ -338,6 +339,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
 
         const bool needs_structure_change = pos == 0 || leaf.get_size() + 1 >= leaf.get_max_size();
         if (!needs_structure_change) {
+            structure_epoch_.fetch_add(1, std::memory_order_relaxed);
             const page_id_t inserted_page_no = leaf.get_page_no();
             leaf.insert_pair(pos, key, value);
             leaf_guard.unlock();
@@ -377,6 +379,7 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
         }
     }
 
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     leaf.insert_pair(pos, key, value);
     page_id_t inserted_page_no = leaf.get_page_no();
     if (leaf.get_size() >= leaf.get_max_size()) {
@@ -445,8 +448,8 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         }
     }
 
+    ih->structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     leaf.insert_pair(pos, key, value);
-
     if (leaf.get_size() >= leaf.get_max_size()) {
         IxNodeHandle* new_leaf = ih->split(&leaf);
         if (ih->file_hdr_->last_leaf_ == leaf.get_page_no()) {
@@ -494,6 +497,7 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 
         const bool needs_structure_change = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
         if (!needs_structure_change) {
+            structure_epoch_.fetch_add(1, std::memory_order_relaxed);
             leaf.erase_pair(pos);
             leaf_guard.unlock();
             buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
@@ -509,6 +513,7 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 }
 
 bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transaction) {
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
@@ -559,6 +564,7 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
                 if (*leaf.get_rid(pos) == value) {
                     needs_structure_fallback = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
                     if (!needs_structure_fallback) {
+                        structure_epoch_.fetch_add(1, std::memory_order_relaxed);
                         leaf.erase_pair(pos);
                         leaf_guard.unlock();
                         buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
@@ -593,6 +599,7 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
 
 bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction) {
     (void)transaction;
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
     IxScan scan(this, lower, upper, buffer_pool_manager_, false);
@@ -625,6 +632,7 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Tra
  * Otherwise, merge(Coalesce).
  */
 bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction, bool* root_is_latched) {
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (node->is_root_page()) {
         return adjust_root(node);
     }
@@ -658,6 +666,7 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
  * @note size of root page can be less than min size and this method is only called within coalesce_or_redistribute()
  */
 bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
+    structure_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (!old_root_node->is_leaf_page() && old_root_node->get_size() == 1) {
         page_id_t child_page_no = old_root_node->value_at(0);
         IxNodeHandle* child = fetch_node(child_page_no);

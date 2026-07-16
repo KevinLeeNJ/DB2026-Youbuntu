@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
@@ -170,6 +171,60 @@ TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
     }
 
     EXPECT_EQ(slots, std::vector<int>({123, 124, 125, 126, 127, 128, 129, 130}));
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, HybridUsesPinnedCursorForSingleLeafRange) {
+    auto ih = open_index();
+    for (int value : {10, 20, 30}) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    auto lower_key = key(10);
+    auto upper_key = key(20);
+    Iid lower = ih->lower_bound(lower_key.data());
+    Iid upper = ih->upper_bound(upper_key.data());
+    ASSERT_EQ(lower.page_no, upper.page_no);
+
+    IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get(), true, true);
+    std::vector<int> values;
+    while (!scan.is_end()) {
+        int value = 0;
+        std::memcpy(&value, scan.key(), sizeof(value));
+        values.push_back(value);
+        scan.next();
+    }
+
+    EXPECT_EQ(values, std::vector<int>({10, 20}));
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ScanMetricsReportCoupledBatchesWhenEnabled) {
+    if (std::getenv("RMDB_SCAN_METRICS") == nullptr) {
+        GTEST_SKIP() << "RMDB_SCAN_METRICS is disabled";
+    }
+
+    auto ih = open_index();
+    for (int value = 0; value < 800; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    IxScan::reset_stats();
+    IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
+    while (!scan.is_end()) {
+        scan.next();
+    }
+    IxScan::Stats stats = IxScan::get_stats();
+    EXPECT_EQ(stats.scans_total, 1u);
+    EXPECT_EQ(stats.scans_coupled, 1u);
+    EXPECT_GE(stats.batches, 2u);
+    EXPECT_GE(stats.reseeks, 1u);
+    EXPECT_EQ(stats.copied_entries, 800u);
+    EXPECT_GT(stats.bpm_fetches, 0u);
+    EXPECT_GT(stats.root_page_fetches, 0u);
 
     close_index(ih);
 }

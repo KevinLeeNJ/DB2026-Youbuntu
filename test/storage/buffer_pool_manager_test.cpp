@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -260,6 +261,29 @@ TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfRep
     }
 
     EXPECT_TRUE(bpm->unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, BpmMetricsReportPinTransitionsWhenEnabled) {
+    if (std::getenv("RMDB_BPM_METRICS") == nullptr) {
+        GTEST_SKIP() << "RMDB_BPM_METRICS is disabled";
+    }
+
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&page_id), nullptr);
+    bpm->reset_stats();
+
+    ASSERT_NE(bpm->fetch_page(page_id), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    ASSERT_NE(bpm->fetch_page(page_id), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+
+    BufferPoolManager::Stats stats = bpm->get_stats();
+    EXPECT_EQ(stats.fetch_hits, 2u);
+    EXPECT_EQ(stats.fetch_misses, 0u);
+    EXPECT_EQ(stats.pin_0_to_1, 1u);
+    EXPECT_EQ(stats.unpin_1_to_0, 2u);
 }
 
 TEST_F(BufferPoolManagerTest, FlushDoesNotClearDirtyFromConcurrentWriter) {

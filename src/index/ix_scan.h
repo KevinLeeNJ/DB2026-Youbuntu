@@ -15,39 +15,117 @@ See the Mulan PSL v2 for more details. */
 #include "ix_index_handle.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <shared_mutex>
+#include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-// Iterates index entries without retaining the structure latch for the whole
-// consumer lifetime. The normal mode copies at most one stable leaf while
-// holding structure-S + leaf-S, releases both, and re-seeks from the root before
-// loading the next leaf. Callers already holding a structure latch can request
-// legacy_mode by passing acquire_index_latch=false.
+// IxScan has two cursor implementations.  The legacy cursor keeps a shared
+// structure latch and a leaf pinned for its lifetime.  The coupled cursor
+// copies a bounded batch while holding the structure latch, then releases all
+// latches before the executor evaluates heap visibility.
 class IxScan : public RecScan {
-    struct BufferedEntry {
-        Rid rid;
-        Iid iid;
+public:
+    enum class Mode { LEGACY, HYBRID, COUPLED };
+
+    struct Stats {
+        uint64_t scans_total = 0;
+        uint64_t scans_single_leaf = 0;
+        uint64_t scans_coupled = 0;
+        uint64_t batches = 0;
+        uint64_t reseeks = 0;
+        uint64_t copied_entries = 0;
+        uint64_t copied_key_bytes = 0;
+        uint64_t bpm_fetches = 0;
+        uint64_t root_page_fetches = 0;
     };
+
+    static Mode configured_mode() {
+        static const Mode mode = [] {
+            const char* value = std::getenv("IX_SCAN_MODE");
+            if (value == nullptr || std::string(value) == "hybrid") {
+                return Mode::HYBRID;
+            }
+            if (std::string(value) == "legacy") {
+                return Mode::LEGACY;
+            }
+            if (std::string(value) == "coupled") {
+                return Mode::COUPLED;
+            }
+            return Mode::HYBRID;
+        }();
+        return mode;
+    }
+
+    static Stats get_stats() {
+        return Stats{stats_.scans_total.load(std::memory_order_relaxed),
+                     stats_.scans_single_leaf.load(std::memory_order_relaxed),
+                     stats_.scans_coupled.load(std::memory_order_relaxed),
+                     stats_.batches.load(std::memory_order_relaxed),
+                     stats_.reseeks.load(std::memory_order_relaxed),
+                     stats_.copied_entries.load(std::memory_order_relaxed),
+                     stats_.copied_key_bytes.load(std::memory_order_relaxed),
+                     stats_.bpm_fetches.load(std::memory_order_relaxed),
+                     stats_.root_page_fetches.load(std::memory_order_relaxed)};
+    }
+
+    static void reset_stats() {
+        stats_.scans_total.store(0, std::memory_order_relaxed);
+        stats_.scans_single_leaf.store(0, std::memory_order_relaxed);
+        stats_.scans_coupled.store(0, std::memory_order_relaxed);
+        stats_.batches.store(0, std::memory_order_relaxed);
+        stats_.reseeks.store(0, std::memory_order_relaxed);
+        stats_.copied_entries.store(0, std::memory_order_relaxed);
+        stats_.copied_key_bytes.store(0, std::memory_order_relaxed);
+        stats_.bpm_fetches.store(0, std::memory_order_relaxed);
+        stats_.root_page_fetches.store(0, std::memory_order_relaxed);
+    }
+
+private:
+    struct AtomicStats {
+        std::atomic<uint64_t> scans_total{0};
+        std::atomic<uint64_t> scans_single_leaf{0};
+        std::atomic<uint64_t> scans_coupled{0};
+        std::atomic<uint64_t> batches{0};
+        std::atomic<uint64_t> reseeks{0};
+        std::atomic<uint64_t> copied_entries{0};
+        std::atomic<uint64_t> copied_key_bytes{0};
+        std::atomic<uint64_t> bpm_fetches{0};
+        std::atomic<uint64_t> root_page_fetches{0};
+    };
+
+    static AtomicStats stats_;
 
     const IxIndexHandle* ih_;
     IxIndexHandle::SharedIndexLatch index_latch_guard_;
     Iid iid_;
     Iid end_;
     BufferPoolManager* bpm_;
+    Mode mode_{Mode::HYBRID};
     bool coupled_mode_{false};
+    bool copy_keys_{false};
 
-    // Legacy cursor used only by internal callers that already hold a
-    // structure latch around the complete scan.
+    // Legacy cursor used for single-leaf hybrid scans and for internal
+    // callers that already hold a structure latch.
     Page* pinned_leaf_page_{nullptr};
     IxNodeHandle leaf_;
     std::shared_lock<std::shared_mutex> leaf_latch_guard_;
 
-    // Coupled/re-seek cursor. Entries contain copies, so no page or structure
-    // latch is retained while the executor evaluates heap visibility.
-    std::vector<BufferedEntry> batch_;
+    // Coupled cursor.  The batch retains only RID/IID by default.  key() is
+    // opt-in for callers that need it; normal IndexScan paths only consume RID.
+    static constexpr size_t kMaxBatchLeaves = 8;
+    static constexpr size_t kMaxBatchEntries = 1024;
+    static constexpr size_t kDuplicateRidVectorLimit = 8;
+    std::vector<Rid> batch_;
     std::vector<char> batch_keys_;
+    std::vector<char> batch_tail_key_;
+    std::vector<Rid> batch_tail_rids_;
     size_t batch_pos_{0};
     bool first_batch_{true};
     bool coupled_end_{false};
@@ -55,39 +133,83 @@ class IxScan : public RecScan {
     std::vector<char> end_key_;
     std::vector<char> last_key_;
     std::vector<uint64_t> emitted_last_key_rids_;
+    std::unordered_set<uint64_t> emitted_last_key_rid_set_;
+    bool emitted_rid_set_active_{false};
+    page_id_t resume_page_no_{IX_NO_PAGE};
+    int resume_slot_no_{0};
+    uint64_t resume_structure_epoch_{0};
+    bool resume_cursor_valid_{false};
+
+    static bool metrics_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("RMDB_SCAN_METRICS");
+            return value != nullptr && std::string(value) != "0";
+        }();
+        return enabled;
+    }
 
     static uint64_t rid_key(const Rid& rid) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) | static_cast<uint32_t>(rid.slot_no);
     }
 
     const char* batch_key(size_t position) const {
+        assert(copy_keys_);
         return batch_keys_.data() + position * ih_->file_hdr_->col_tot_len_;
     }
 
+    Page* fetch_scan_page(page_id_t page_no) {
+        Page* page = bpm_->fetch_page(PageId{ih_->fd_, page_no});
+        assert(page != nullptr);
+        if (metrics_enabled()) {
+            stats_.bpm_fetches.fetch_add(1, std::memory_order_relaxed);
+        }
+        return page;
+    }
+
+    void clear_emitted_rids() {
+        emitted_last_key_rids_.clear();
+        emitted_last_key_rid_set_.clear();
+        emitted_rid_set_active_ = false;
+    }
+
+    void remember_emitted_rid(const Rid& rid) {
+        const uint64_t value = rid_key(rid);
+        if (!emitted_rid_set_active_ && emitted_last_key_rids_.size() < kDuplicateRidVectorLimit) {
+            emitted_last_key_rids_.push_back(value);
+            return;
+        }
+        if (!emitted_rid_set_active_) {
+            emitted_last_key_rid_set_.reserve(emitted_last_key_rids_.size() * 2 + 1);
+            for (uint64_t old_value : emitted_last_key_rids_) {
+                emitted_last_key_rid_set_.insert(old_value);
+            }
+            emitted_last_key_rids_.clear();
+            emitted_rid_set_active_ = true;
+        }
+        emitted_last_key_rid_set_.insert(value);
+    }
+
     bool last_key_rid_was_emitted(const Rid& rid) const {
-        const uint64_t target = rid_key(rid);
-        return std::find(emitted_last_key_rids_.begin(), emitted_last_key_rids_.end(), target) !=
+        const uint64_t value = rid_key(rid);
+        if (emitted_rid_set_active_) {
+            return emitted_last_key_rid_set_.find(value) != emitted_last_key_rid_set_.end();
+        }
+        return std::find(emitted_last_key_rids_.begin(), emitted_last_key_rids_.end(), value) !=
                emitted_last_key_rids_.end();
     }
 
     void remember_completed_batch_tail() {
         assert(!batch_.empty());
-        const size_t tail = batch_.size() - 1;
-        const char* tail_key = batch_key(tail);
+        const char* tail_key = batch_tail_key_.data();
         const bool continues_previous =
             !last_key_.empty() &&
             ix_compare(tail_key, last_key_.data(), ih_->file_hdr_->col_types_, ih_->file_hdr_->col_lens_) == 0;
         if (!continues_previous) {
             last_key_.assign(tail_key, tail_key + ih_->file_hdr_->col_tot_len_);
-            emitted_last_key_rids_.clear();
+            clear_emitted_rids();
         }
-        for (size_t position = batch_.size(); position > 0; --position) {
-            const size_t index = position - 1;
-            if (ix_compare(batch_key(index), last_key_.data(), ih_->file_hdr_->col_types_, ih_->file_hdr_->col_lens_) !=
-                0) {
-                break;
-            }
-            emitted_last_key_rids_.push_back(rid_key(batch_[index].rid));
+        for (const Rid& rid : batch_tail_rids_) {
+            remember_emitted_rid(rid);
         }
     }
 
@@ -95,8 +217,7 @@ class IxScan : public RecScan {
         if (pinned_leaf_page_ != nullptr || iid_ == end_) {
             return;
         }
-        pinned_leaf_page_ = bpm_->fetch_page(PageId{ih_->fd_, iid_.page_no});
-        assert(pinned_leaf_page_ != nullptr);
+        pinned_leaf_page_ = fetch_scan_page(iid_.page_no);
         leaf_latch_guard_ = std::shared_lock<std::shared_mutex>(pinned_leaf_page_->latch());
         leaf_ = IxNodeHandle(ih_->file_hdr_.get(), pinned_leaf_page_);
     }
@@ -138,19 +259,17 @@ class IxScan : public RecScan {
                 return;
             }
             unpin_current_leaf();
-            iid_.page_no = next_leaf;
-            iid_.slot_no = 0;
+            iid_ = Iid{next_leaf, 0};
         }
         move_legacy_to_end();
     }
 
-    void capture_end_key() {
+    void capture_end_bound() {
         if (iid_ == end_) {
             coupled_end_ = true;
             return;
         }
-        Page* page = bpm_->fetch_page(PageId{ih_->fd_, end_.page_no});
-        assert(page != nullptr);
+        Page* page = fetch_scan_page(end_.page_no);
         std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
         IxNodeHandle end_leaf(ih_->file_hdr_.get(), page);
         if (end_.slot_no < end_leaf.get_size()) {
@@ -163,103 +282,247 @@ class IxScan : public RecScan {
         bpm_->unpin_page(page->get_page_id(), false);
     }
 
-    bool at_or_after_end(const char* key) const {
-        return !unbounded_end_ && !end_key_.empty() &&
-               ix_compare(key, end_key_.data(), ih_->file_hdr_->col_types_, ih_->file_hdr_->col_lens_) >= 0;
+    // Locate the lower bound while holding the coupled structure latch and
+    // return the final leaf still pinned.  This avoids lower_bound()'s final
+    // unpin followed by a second fetch of the same leaf.
+    Page* fetch_lower_bound_leaf(const char* key, Iid* cursor) {
+        Page* page = fetch_scan_page(ih_->file_hdr_->root_page_);
+        if (metrics_enabled()) {
+            stats_.root_page_fetches.fetch_add(1, std::memory_order_relaxed);
+        }
+        IxNodeHandle node(ih_->file_hdr_.get(), page);
+        while (!node.is_leaf_page()) {
+            int child_idx = node.lower_bound(key);
+            if (child_idx >= node.get_size()) {
+                child_idx = node.get_size() - 1;
+            } else if (child_idx > 0 && ix_compare(node.get_key(child_idx), key, ih_->file_hdr_->col_types_,
+                                                   ih_->file_hdr_->col_lens_) > 0) {
+                --child_idx;
+            }
+            page_id_t child_page_no = node.value_at(child_idx);
+            bpm_->unpin_page(page->get_page_id(), false);
+            page = fetch_scan_page(child_page_no);
+            node = IxNodeHandle(ih_->file_hdr_.get(), page);
+        }
+
+        int slot = node.lower_bound(key);
+        if (slot == node.get_size() && node.get_page_no() != ih_->file_hdr_->last_leaf_) {
+            page_id_t next_leaf = node.get_next_leaf();
+            bpm_->unpin_page(page->get_page_id(), false);
+            page = fetch_scan_page(next_leaf);
+            slot = 0;
+        }
+        *cursor = Iid{page->get_page_id().page_no, slot};
+        return page;
     }
 
-    Iid find_resume_iid() {
-        Iid cursor = ih_->lower_bound(last_key_.data());
-        while (true) {
-            Page* page = bpm_->fetch_page(PageId{ih_->fd_, cursor.page_no});
-            assert(page != nullptr);
-            std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
-            IxNodeHandle leaf(ih_->file_hdr_.get(), page);
-            int slot = cursor.slot_no;
-            while (slot < leaf.get_size()) {
-                const int cmp = ix_compare(leaf.get_key(slot), last_key_.data(), ih_->file_hdr_->col_types_,
-                                           ih_->file_hdr_->col_lens_);
-                if (cmp > 0 || (cmp == 0 && !last_key_rid_was_emitted(*leaf.get_rid(slot)))) {
-                    Iid result{leaf.get_page_no(), slot};
-                    leaf_lock.unlock();
-                    bpm_->unpin_page(page->get_page_id(), false);
-                    return result;
-                }
-                ++slot;
+    void append_batch_entries(IxNodeHandle& leaf, int begin, int end) {
+        assert(begin >= 0 && begin <= end && end <= leaf.get_size());
+        if (begin == end) {
+            return;
+        }
+
+        const size_t count = static_cast<size_t>(end - begin);
+        const size_t old_size = batch_.size();
+        batch_.resize(old_size + count);
+        std::memcpy(batch_.data() + old_size, leaf.get_rid(begin), count * sizeof(Rid));
+        if (copy_keys_) {
+            const char* first_key = leaf.get_key(begin);
+            batch_keys_.insert(batch_keys_.end(), first_key, first_key + count * ih_->file_hdr_->col_tot_len_);
+        }
+
+        const int tail_slot = end - 1;
+        const char* tail_key = leaf.get_key(tail_slot);
+        batch_tail_key_.assign(tail_key, tail_key + ih_->file_hdr_->col_tot_len_);
+        batch_tail_rids_.clear();
+        for (int slot = tail_slot; slot >= begin; --slot) {
+            if (ix_compare(leaf.get_key(slot), batch_tail_key_.data(), ih_->file_hdr_->col_types_,
+                           ih_->file_hdr_->col_lens_) != 0) {
+                break;
             }
-            const page_id_t next_leaf = leaf.get_next_leaf();
-            const bool at_last = leaf.get_page_no() == ih_->file_hdr_->last_leaf_ || next_leaf == IX_LEAF_HEADER_PAGE;
-            leaf_lock.unlock();
-            bpm_->unpin_page(page->get_page_id(), false);
-            if (at_last) {
-                return ih_->leaf_end();
+            batch_tail_rids_.push_back(*leaf.get_rid(slot));
+        }
+
+        if (metrics_enabled()) {
+            stats_.copied_entries.fetch_add(count, std::memory_order_relaxed);
+            if (copy_keys_) {
+                stats_.copied_key_bytes.fetch_add(count * ih_->file_hdr_->col_tot_len_, std::memory_order_relaxed);
             }
-            cursor = Iid{next_leaf, 0};
         }
     }
 
     void load_coupled_batch() {
         batch_.clear();
         batch_keys_.clear();
+        batch_tail_key_.clear();
+        batch_tail_rids_.clear();
         batch_pos_ = 0;
+        const size_t initial_batch_capacity = std::min(kMaxBatchEntries, static_cast<size_t>(512));
+        if (batch_.capacity() < initial_batch_capacity) {
+            batch_.reserve(initial_batch_capacity);
+        }
+        if (copy_keys_ && batch_keys_.capacity() < initial_batch_capacity * ih_->file_hdr_->col_tot_len_) {
+            batch_keys_.reserve(initial_batch_capacity * ih_->file_hdr_->col_tot_len_);
+        }
         if (coupled_end_) {
+            release_index_latch_if_held();
             return;
         }
         if (!index_latch_guard_.owns_lock()) {
             index_latch_guard_ = ih_->lock_shared();
         }
-        Iid cursor = first_batch_ ? iid_ : find_resume_iid();
-        first_batch_ = false;
 
-        while (batch_.empty()) {
-            Page* page = bpm_->fetch_page(PageId{ih_->fd_, cursor.page_no});
-            assert(page != nullptr);
-            std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
-            IxNodeHandle leaf(ih_->file_hdr_.get(), page);
-            const size_t remaining = static_cast<size_t>(std::max(0, leaf.get_size() - cursor.slot_no));
-            batch_.reserve(remaining);
-            batch_keys_.reserve(remaining * ih_->file_hdr_->col_tot_len_);
-            for (int slot = cursor.slot_no; slot < leaf.get_size(); ++slot) {
-                if (at_or_after_end(leaf.get_key(slot))) {
-                    coupled_end_ = true;
+        Iid cursor = iid_;
+        Page* page = nullptr;
+        if (first_batch_) {
+            page = fetch_scan_page(cursor.page_no);
+        } else {
+            const bool can_use_fast_resume =
+                resume_cursor_valid_ &&
+                resume_structure_epoch_ == ih_->structure_epoch_.load(std::memory_order_relaxed);
+            if (can_use_fast_resume) {
+                cursor = Iid{resume_page_no_, resume_slot_no_};
+                page = fetch_scan_page(cursor.page_no);
+            } else {
+                if (metrics_enabled()) {
+                    stats_.reseeks.fetch_add(1, std::memory_order_relaxed);
+                }
+                page = fetch_lower_bound_leaf(last_key_.data(), &cursor);
+            }
+            while (page != nullptr) {
+                std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
+                IxNodeHandle leaf(ih_->file_hdr_.get(), page);
+                int slot = cursor.slot_no;
+                while (slot < leaf.get_size()) {
+                    const int cmp = ix_compare(leaf.get_key(slot), last_key_.data(), ih_->file_hdr_->col_types_,
+                                               ih_->file_hdr_->col_lens_);
+                    if (cmp > 0 || (cmp == 0 && !last_key_rid_was_emitted(*leaf.get_rid(slot)))) {
+                        cursor.slot_no = slot;
+                        break;
+                    }
+                    ++slot;
+                }
+                const bool found = slot < leaf.get_size();
+                const page_id_t next_leaf = leaf.get_next_leaf();
+                const bool at_last =
+                    leaf.get_page_no() == ih_->file_hdr_->last_leaf_ || next_leaf == IX_LEAF_HEADER_PAGE;
+                leaf_lock.unlock();
+                if (found) {
+                    cursor.slot_no = slot;
                     break;
                 }
-                BufferedEntry entry;
-                entry.rid = *leaf.get_rid(slot);
-                entry.iid = Iid{leaf.get_page_no(), slot};
-                batch_.push_back(std::move(entry));
-                batch_keys_.insert(batch_keys_.end(), leaf.get_key(slot),
-                                   leaf.get_key(slot) + ih_->file_hdr_->col_tot_len_);
+                bpm_->unpin_page(page->get_page_id(), false);
+                if (at_last) {
+                    page = nullptr;
+                    break;
+                }
+                cursor = Iid{next_leaf, 0};
+                page = fetch_scan_page(next_leaf);
             }
+        }
+        first_batch_ = false;
+
+        size_t leaf_count = 0;
+        Iid resume_cursor{IX_NO_PAGE, 0};
+        while (page != nullptr && !coupled_end_ && (leaf_count < kMaxBatchLeaves || batch_.empty()) &&
+               batch_.size() < kMaxBatchEntries) {
+            ++leaf_count;
+            std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
+            IxNodeHandle leaf(ih_->file_hdr_.get(), page);
             const page_id_t next_leaf = leaf.get_next_leaf();
             const bool at_last = leaf.get_page_no() == ih_->file_hdr_->last_leaf_ || next_leaf == IX_LEAF_HEADER_PAGE;
+            const int begin = cursor.slot_no;
+            int stop = leaf.get_size();
+            int logical_end_slot = leaf.get_size();
+            bool end_key_reached_in_leaf = false;
+            if (!unbounded_end_) {
+                if (!end_key_.empty()) {
+                    logical_end_slot = leaf.lower_bound(end_key_.data());
+                    end_key_reached_in_leaf = logical_end_slot < leaf.get_size();
+                    if (end_key_reached_in_leaf) {
+                        stop = logical_end_slot <= begin ? begin : std::min(stop, logical_end_slot);
+                    }
+                } else if (leaf.get_page_no() == end_.page_no) {
+                    stop = std::min(stop, end_.slot_no);
+                }
+            }
+            stop = std::min(stop, begin + static_cast<int>(kMaxBatchEntries - batch_.size()));
+            const bool reached_end_key = end_key_reached_in_leaf && logical_end_slot <= stop;
+            append_batch_entries(leaf, begin, stop);
+            if (!unbounded_end_ &&
+                (reached_end_key || (end_key_.empty() && leaf.get_page_no() == end_.page_no && stop >= end_.slot_no))) {
+                coupled_end_ = true;
+            }
+            const int slot = stop;
+            const bool reached_batch_limit = batch_.size() >= kMaxBatchEntries;
+            const bool reached_leaf_limit = leaf_count >= kMaxBatchLeaves && !batch_.empty();
+            if (reached_batch_limit) {
+                resume_cursor = Iid{leaf.get_page_no(), slot};
+            } else if (reached_leaf_limit) {
+                resume_cursor = Iid{next_leaf, 0};
+            }
             leaf_lock.unlock();
             bpm_->unpin_page(page->get_page_id(), false);
-            if (!batch_.empty() || coupled_end_ || at_last) {
-                if (batch_.empty()) {
-                    coupled_end_ = true;
-                }
+            if (coupled_end_ || at_last || reached_batch_limit || reached_leaf_limit) {
                 break;
             }
             cursor = Iid{next_leaf, 0};
+            page = fetch_scan_page(next_leaf);
+        }
+
+        if (page != nullptr) {
+            // The loop always releases the current page. This guard handles
+            // the case where no entry was available in an empty trailing leaf.
+            page = nullptr;
+        }
+        if (batch_.empty()) {
+            coupled_end_ = true;
+        }
+        if (!batch_.empty() && !coupled_end_ && resume_cursor.page_no != IX_NO_PAGE &&
+            resume_cursor.page_no != IX_LEAF_HEADER_PAGE) {
+            resume_page_no_ = resume_cursor.page_no;
+            resume_slot_no_ = resume_cursor.slot_no;
+            resume_structure_epoch_ = ih_->structure_epoch_.load(std::memory_order_relaxed);
+            resume_cursor_valid_ = true;
+        } else {
+            resume_cursor_valid_ = false;
         }
         release_index_latch_if_held();
-        if (!batch_.empty()) {
-            iid_ = batch_[0].iid;
+        if (metrics_enabled()) {
+            stats_.batches.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
 public:
     IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm,
-           bool acquire_index_latch = true)
-        : IxScan(ih, lower, upper, bpm, acquire_index_latch ? ih->lock_shared() : IxIndexHandle::SharedIndexLatch{}) {}
+           bool acquire_index_latch = true, bool copy_keys = false)
+        : IxScan(ih, lower, upper, bpm, acquire_index_latch ? ih->lock_shared() : IxIndexHandle::SharedIndexLatch{},
+                 copy_keys) {}
 
     IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm,
-           IxIndexHandle::SharedIndexLatch index_latch_guard)
+           IxIndexHandle::SharedIndexLatch index_latch_guard, bool copy_keys = false)
         : ih_(ih), index_latch_guard_(std::move(index_latch_guard)), iid_(lower), end_(upper), bpm_(bpm),
-          coupled_mode_(index_latch_guard_.owns_lock()) {
-        if (coupled_mode_) {
-            capture_end_key();
+          mode_(index_latch_guard_.owns_lock() ? configured_mode() : Mode::LEGACY), copy_keys_(copy_keys) {
+        if (metrics_enabled()) {
+            stats_.scans_total.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool use_single_leaf =
+            index_latch_guard_.owns_lock() &&
+            (mode_ == Mode::LEGACY || (mode_ == Mode::HYBRID && lower.page_no == upper.page_no));
+        if (use_single_leaf) {
+            if (metrics_enabled()) {
+                stats_.scans_single_leaf.fetch_add(1, std::memory_order_relaxed);
+            }
+            normalize_legacy_position();
+            return;
+        }
+
+        if (index_latch_guard_.owns_lock()) {
+            coupled_mode_ = true;
+            if (metrics_enabled()) {
+                stats_.scans_coupled.fetch_add(1, std::memory_order_relaxed);
+            }
+            capture_end_bound();
             load_coupled_batch();
         } else {
             normalize_legacy_position();
@@ -268,6 +531,7 @@ public:
 
     ~IxScan() override {
         unpin_current_leaf();
+        release_index_latch_if_held();
     }
 
     IxScan(const IxScan&) = delete;
@@ -280,14 +544,22 @@ public:
     }
 
     Rid rid() const override {
-        return coupled_mode_ ? batch_[batch_pos_].rid : *leaf_.get_rid(iid_.slot_no);
+        if (!coupled_mode_) {
+            return *leaf_.get_rid(iid_.slot_no);
+        }
+        return batch_[batch_pos_];
     }
 
     const char* key() const {
-        return coupled_mode_ ? batch_key(batch_pos_) : leaf_.get_key(iid_.slot_no);
+        if (!coupled_mode_) {
+            return leaf_.get_key(iid_.slot_no);
+        }
+        return batch_key(batch_pos_);
     }
 
     const Iid& iid() const {
         return iid_;
     }
 };
+
+inline IxScan::AtomicStats IxScan::stats_{};

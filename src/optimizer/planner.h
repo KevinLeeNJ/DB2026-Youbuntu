@@ -11,9 +11,11 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -60,18 +62,26 @@ private:
     using PhysicalPlanCacheLru = std::list<std::string>;
 
     struct PhysicalPlanCacheEntry {
-        PhysicalPlanTemplate plan_template;
+        std::shared_ptr<const PhysicalPlanTemplate> plan_template;
         PhysicalPlanCacheLru::iterator lru_position;
     };
 
     static constexpr size_t kPhysicalPlanCacheCapacity = 256;
+    bool enable_physical_plan_cache_{true};
     std::mutex physical_plan_cache_latch_;
     PhysicalPlanCacheLru physical_plan_cache_lru_;
     std::unordered_map<std::string, PhysicalPlanCacheEntry> physical_plan_cache_;
     std::uint64_t physical_plan_cache_generation_ = 0;
+    std::atomic<std::uint64_t> physical_plan_cache_hits_{0};
+    std::atomic<std::uint64_t> physical_plan_cache_misses_{0};
 
 public:
-    Planner(SmManager* sm_manager) : sm_manager_(sm_manager) {}
+    Planner(SmManager* sm_manager) : sm_manager_(sm_manager) {
+        if (const char* value = std::getenv("ENABLE_PLAN_CACHE"); value != nullptr) {
+            enable_physical_plan_cache_ =
+                std::string(value) != "0" && std::string(value) != "false" && std::string(value) != "off";
+        }
+    }
 
     std::unique_ptr<Plan> do_planner(std::unique_ptr<Query> query, Context* context);
 
@@ -89,8 +99,8 @@ private:
     std::string make_physical_plan_cache_key(const Query& query, std::uint64_t catalog_generation) const;
     PhysicalPlanTemplate build_physical_plan_template(const Query& query);
     std::unique_ptr<Plan> instantiate_physical_plan(const Query& query, const PhysicalPlanTemplate& plan_template);
-    std::optional<PhysicalPlanTemplate> find_physical_plan_template(const std::string& key,
-                                                                    std::uint64_t catalog_generation);
+    std::optional<std::shared_ptr<const PhysicalPlanTemplate>>
+    find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation);
     void cache_physical_plan_template(std::string key, std::uint64_t catalog_generation,
                                       PhysicalPlanTemplate plan_template);
 
