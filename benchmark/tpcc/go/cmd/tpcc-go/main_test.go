@@ -109,6 +109,45 @@ func TestResultMergePreservesCountsAndLatencies(t *testing.T) {
 	}
 }
 
+func TestResultFinalizeIncludesPerTransactionTPM(t *testing.T) {
+	result := newResult(60)
+	result.record("measure", "new_order", "commit", 1, "")
+	result.record("measure", "new_order", "commit", 2, "")
+	result.record("measure", "delivery", "commit", 3, "")
+	result.finalize()
+	if result.TxnTPM["new_order"] != 2 || result.TxnTPM["delivery"] != 1 {
+		t.Fatalf("txn_tpm = %#v", result.TxnTPM)
+	}
+}
+
+func TestSQLiteBackendRoundTrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tpcc.sqlite")
+	backend, err := newSQLiteBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.close()
+	if _, err := backend.exec("create table t (id integer, value text);"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.begin(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.exec("insert into t values (7, 'ok');"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.commit(); err != nil {
+		t.Fatal(err)
+	}
+	text, err := backend.exec("select id, value from t;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "7|ok\n" {
+		t.Fatalf("SQLite result = %q, want %q", text, "7|ok\n")
+	}
+}
+
 func TestCSVSetAndLoadPath(t *testing.T) {
 	dir := t.TempDir()
 	if completeCSVSet(dir) {

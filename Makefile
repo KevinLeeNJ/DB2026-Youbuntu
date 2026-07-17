@@ -1,4 +1,4 @@
-.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark benchmark-random-kill tpcc-go benchmark-clean
+.PHONY: all build test clean run debug release format help client client-debug clean-client benchmark benchmark-sqlite benchmark-random-kill tpcc-go benchmark-clean
 
 BUILD_DIR := build
 BINARY := $(BUILD_DIR)/bin/rmdb
@@ -9,6 +9,9 @@ CLIENT_JOBS := 4
 TPCC_DB ?= tpcc_benchmark_db
 TPCC_DATA_DIR ?= benchmark/tpcc/data
 TPCC_RESULT ?= benchmark/tpcc/result.json
+TPCC_SQLITE_PATH ?= benchmark/tpcc/tpcc.sqlite
+TPCC_SQLITE_RESULT ?= benchmark/tpcc/result-sqlite.json
+TPCC_SQLITE_BEGIN ?= immediate
 TPCC_WAREHOUSES ?= 8
 TPCC_WORKERS ?= 16
 TPCC_WARMUP ?= 10
@@ -45,6 +48,7 @@ help:
 	@echo "  make client          - Build rmdb_client"
 	@echo "  make client-debug    - Build rmdb_client with debug flags"
 	@echo "  make benchmark       - Run rmdb TPC-C benchmark"
+	@echo "  make benchmark-sqlite - Run SQLite TPC-C benchmark"
 	@echo "  make benchmark-random-kill - Run TPC-C random kill-9 recovery consistency test"
 	@echo "  make benchmark-clean - Remove benchmark runtime data, keep CSV files"
 
@@ -123,6 +127,25 @@ benchmark: build tpcc-go
 		--go-binary $(TPCC_GO_BINARY) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 
+benchmark-sqlite: tpcc-go
+	@rm -f $(TPCC_SQLITE_PATH) $(TPCC_SQLITE_PATH)-wal $(TPCC_SQLITE_PATH)-shm $(TPCC_SQLITE_RESULT)
+	@$(TPCC_GO_BINARY) --command load \
+		--backend sqlite \
+		--sqlite-path $(TPCC_SQLITE_PATH) \
+		--data-dir $(TPCC_DATA_DIR) \
+		--schema-dir benchmark/tpcc/schema
+	@$(TPCC_GO_BINARY) --command run \
+		--backend sqlite \
+		--sqlite-path $(TPCC_SQLITE_PATH) \
+		--sqlite-begin $(TPCC_SQLITE_BEGIN) \
+		--workers $(TPCC_WORKERS) \
+		--warmup $(TPCC_WARMUP) \
+		--measure $(TPCC_MEASURE) \
+		--rounds $(TPCC_ROUNDS) \
+		--progress-interval $(TPCC_PROGRESS_INTERVAL) \
+		--warehouse-policy terminal-home \
+		--json-out $(TPCC_SQLITE_RESULT)
+
 benchmark-random-kill: build tpcc-go
 	@scripts/benchmark_tpcc_random_kill.sh \
 		--binary $(BINARY) \
@@ -138,5 +161,5 @@ benchmark-random-kill: build tpcc-go
 		--isolation $(TPCC_ISOLATION)
 
 benchmark-clean:
-	@rm -rf $(TPCC_DB) $(TPCC_RANDOM_DB) $(TPCC_RESULT) benchmark/tpcc/rmdb-server.log rmdb.log
+	@rm -rf $(TPCC_DB) $(TPCC_RANDOM_DB) $(TPCC_RESULT) $(TPCC_SQLITE_PATH) $(TPCC_SQLITE_PATH)-wal $(TPCC_SQLITE_PATH)-shm $(TPCC_SQLITE_RESULT) benchmark/tpcc/rmdb-server.log rmdb.log
 	@echo "Benchmark runtime data removed; CSV files in $(TPCC_DATA_DIR) were kept."

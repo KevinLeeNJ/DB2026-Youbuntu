@@ -201,6 +201,7 @@ type txnContext struct {
 type result struct {
 	MeasureSeconds int                                  `json:"measure_seconds"`
 	TPMC           float64                              `json:"tpmc"`
+	TxnTPM         map[string]float64                   `json:"txn_tpm"`
 	AbortRate      float64                              `json:"abort_rate"`
 	Counts         map[string]map[string]map[string]int `json:"counts"`
 	LatencyMS      map[string]latencySummary            `json:"latency_ms"`
@@ -289,6 +290,7 @@ func monitorProgress(round, rounds, warmupSeconds, measureSeconds, interval int,
 func newResult(measureSeconds int) *result {
 	return &result{
 		MeasureSeconds: measureSeconds,
+		TxnTPM:         make(map[string]float64),
 		Counts:         make(map[string]map[string]map[string]int),
 		LatencyMS:      make(map[string]latencySummary),
 		Errors:         make(map[string]map[string]map[string]int),
@@ -367,6 +369,9 @@ func (r *result) finalize() {
 	}
 	if r.MeasureSeconds > 0 {
 		r.TPMC = float64(newOrderCommitted) / (float64(r.MeasureSeconds) / 60.0)
+		for txnType, outcomes := range r.Counts["measure"] {
+			r.TxnTPM[txnType] = float64(outcomes["commit"]) / (float64(r.MeasureSeconds) / 60.0)
+		}
 	}
 	if committed+aborted > 0 {
 		r.AbortRate = float64(aborted) / float64(committed+aborted)
@@ -463,7 +468,7 @@ func surname(number int) string {
 	return sy[number/100] + sy[(number/10)%10] + sy[number%10]
 }
 
-func newOrder(c *client, ctx txnContext, rng *rand.Rand) error {
+func newOrder(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	cID, olCount := rng.Intn(ctx.customersPerDistrict)+1, rng.Intn(11)+5
 	if err := c.begin(); err != nil {
 		return err
@@ -552,7 +557,7 @@ func newOrder(c *client, ctx txnContext, rng *rand.Rand) error {
 	return err
 }
 
-func payment(c *client, ctx txnContext, rng *rand.Rand) error {
+func payment(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	cID := rng.Intn(ctx.customersPerDistrict) + 1
 	amount := math.Round((rng.Float64()*4999+1)*100) / 100
 	if err := c.begin(); err != nil {
@@ -583,7 +588,7 @@ func payment(c *client, ctx txnContext, rng *rand.Rand) error {
 	return err
 }
 
-func orderStatus(c *client, ctx txnContext, rng *rand.Rand) error {
+func orderStatus(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	if err := c.begin(); err != nil {
 		return err
 	}
@@ -617,7 +622,7 @@ func orderStatus(c *client, ctx txnContext, rng *rand.Rand) error {
 	return err
 }
 
-func delivery(c *client, ctx txnContext, rng *rand.Rand) error {
+func delivery(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	if err := c.begin(); err != nil {
 		return err
 	}
@@ -672,7 +677,7 @@ func delivery(c *client, ctx txnContext, rng *rand.Rand) error {
 	return err
 }
 
-func stockLevel(c *client, ctx txnContext, rng *rand.Rand) error {
+func stockLevel(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	if err := c.begin(); err != nil {
 		return err
 	}
@@ -741,8 +746,10 @@ func chooseContext(p profile, workerID int, policy string, rng *rand.Rand) txnCo
 	return txnContext{wID: wID, dID: rng.Intn(p.districtsPerWarehouse) + 1, profile: p}
 }
 
-func runTxn(c *client, txnType string, ctx txnContext, rng *rand.Rand) error {
-	c.txnType = txnType
+func runTxn(c txnBackend, txnType string, ctx txnContext, rng *rand.Rand) error {
+	if rmdbClient, ok := c.(*client); ok {
+		rmdbClient.txnType = txnType
+	}
 	switch txnType {
 	case "new_order":
 		return newOrder(c, ctx, rng)
@@ -878,10 +885,10 @@ func runMixedSQL(address string, timeout time.Duration, isolation string, minOps
 	}
 }
 
-func runWorker(workerID int, p profile, policy, address, isolation string, timeout time.Duration, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, output chan<- *result) {
+func runWorker(workerID int, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, output chan<- *result, factory backendFactory) {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*7919))
 	local := newResult(measureSeconds)
-	c, err := newClient(address, timeout, isolation)
+	c, err := factory()
 	if err != nil {
 		local.record("warmup", "connect", "backend-error", 0, err.Error())
 		output <- local
@@ -916,13 +923,15 @@ func runWorker(workerID int, p profile, policy, address, isolation string, timeo
 			c.rollback()
 			local.record(phase, txnType, "backend-error", latency, err.Error())
 			stats.record(phase, txnType, "backend-error")
-			if err := c.reconnect(isolation); err != nil {
+			c.close()
+			if c, err = factory(); err != nil {
 				local.record(phase, txnType, "backend-error", 0, err.Error())
 				break
 			}
 		}
 		if reconnectEachTxn {
-			if err := c.reconnect(isolation); err != nil {
+			c.close()
+			if c, err = factory(); err != nil {
 				local.record(phase, txnType, "backend-error", 0, err.Error())
 				break
 			}
@@ -934,7 +943,7 @@ func runWorker(workerID int, p profile, policy, address, isolation string, timeo
 	output <- local
 }
 
-func inspectProfile(c *client) (profile, error) {
+func inspectProfile(c txnBackend) (profile, error) {
 	queries := []string{"select count(*) from warehouse;", "select max(d_id) from district;", "select max(c_id) from customer;", "select max(i_id) from item;"}
 	values := make([]int, len(queries))
 	for i, query := range queries {
@@ -950,6 +959,8 @@ func inspectProfile(c *client) (profile, error) {
 type config struct {
 	Backend                string `json:"backend"`
 	Isolation              string `json:"isolation"`
+	SQLitePath             string `json:"sqlite_path,omitempty"`
+	SQLiteBegin            string `json:"sqlite_begin,omitempty"`
 	Warehouses             int    `json:"warehouses"`
 	Workers                int    `json:"workers"`
 	Warmup                 int    `json:"warmup"`
@@ -1167,6 +1178,7 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 
 func main() {
 	command := flag.String("command", "run", "run, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, or merge-results")
+	backend := flag.String("backend", "rmdb", "rmdb or sqlite")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
 	port := flag.Int("port", 8765, "RMDB port")
 	warehouses := flag.Int("warehouses", 1, "warehouses for data generation")
@@ -1184,6 +1196,8 @@ func main() {
 	dataDir := flag.String("data-dir", "benchmark/tpcc/data", "TPC-C CSV directory")
 	schemaDir := flag.String("schema-dir", "benchmark/tpcc/schema", "RMDB schema directory")
 	rmdbDBDir := flag.String("rmdb-db-dir", "", "RMDB database directory, used to resolve load paths")
+	sqlitePath := flag.String("sqlite-path", "benchmark/tpcc/tpcc.sqlite", "SQLite database path")
+	sqliteBegin := flag.String("sqlite-begin", "immediate", "SQLite transaction begin mode: immediate or deferred")
 	seed := flag.Int64("seed", 1, "data generation seed")
 	overwriteData := flag.Bool("overwrite-data-dir", false, "overwrite existing CSV files")
 	reuseData := flag.Bool("reuse-data-dir", false, "skip data generation when all CSV files exist")
@@ -1197,6 +1211,14 @@ func main() {
 	sqlOps := flag.Int("sql-ops", 100, "minimum mixed-sql operations before publishing readiness")
 	sqlReadyFile := flag.String("sql-ready-file", "", "readiness file for mixed-sql crash workloads")
 	flag.Parse()
+	if *backend != "rmdb" && *backend != "sqlite" {
+		fmt.Fprintln(os.Stderr, "--backend must be rmdb or sqlite")
+		os.Exit(2)
+	}
+	if *sqliteBegin != "immediate" && *sqliteBegin != "deferred" {
+		fmt.Fprintln(os.Stderr, "--sqlite-begin must be immediate or deferred")
+		os.Exit(2)
+	}
 	if *command == "data-ready" {
 		if completeCSVSet(*dataDir) {
 			return
@@ -1324,13 +1346,23 @@ func main() {
 		return
 	}
 	if *command == "load" {
-		if err := loadData(address, *timeout, *isolation, *dataDir, *schemaDir, *rmdbDBDir); err != nil {
+		var err error
+		if *backend == "sqlite" {
+			err = importCSVToSQLite(*sqlitePath, *dataDir, *schemaDir)
+		} else {
+			err = loadData(address, *timeout, *isolation, *dataDir, *schemaDir, *rmdbDBDir)
+		}
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		return
 	}
 	if *command == "consistency" {
+		if *backend != "rmdb" {
+			fmt.Fprintln(os.Stderr, "consistency command is currently supported for rmdb only")
+			os.Exit(2)
+		}
 		if err := checkConsistency(address, *timeout, *isolation, *resultJSON, *consistencyStage); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -1350,12 +1382,24 @@ func main() {
 		oracleIDPrefix = *oraclePrefix
 		oracleSeq.Store(0)
 	}
-	probe, err := newClient(address, *timeout, *isolation)
+	var factory backendFactory
+	if *backend == "sqlite" {
+		factory = func() (txnBackend, error) {
+			return newSQLiteBackendWithBegin(*sqlitePath, *sqliteBegin)
+		}
+	} else {
+		factory = func() (txnBackend, error) {
+			return newClient(address, *timeout, *isolation)
+		}
+	}
+	probe, err := factory()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	_, _ = probe.exec("set output_file off")
+	if *backend == "rmdb" {
+		_, _ = probe.exec("set output_file off")
+	}
 	p, err := inspectProfile(probe)
 	if err != nil {
 		probe.close()
@@ -1369,7 +1413,7 @@ func main() {
 		os.Exit(1)
 	}
 	baseOrders := scalarInt(ordersText, 0)
-	doc := document{Config: config{Backend: "rmdb", Isolation: *isolation, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: 1, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
+	doc := document{Config: config{Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: 1, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
 	for round := 1; round <= *rounds; round++ {
 		warmupEnd := time.Now().Add(time.Duration(*warmup) * time.Second)
 		measureEnd := warmupEnd.Add(time.Duration(*measure) * time.Second)
@@ -1384,7 +1428,7 @@ func main() {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				runWorker(id, p, *policy, address, *isolation, *timeout, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, partials)
+				runWorker(id, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, partials, factory)
 			}(workerID)
 		}
 		go func() { wg.Wait(); close(partials) }()
