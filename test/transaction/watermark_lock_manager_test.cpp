@@ -101,3 +101,16 @@ TEST(WatermarkTest, ConcurrentReadTimestampUpdatesPreserveActiveReaders) {
     }
     EXPECT_EQ(watermark.GetWatermark(), 1000);
 }
+
+TEST(WatermarkTest, StableSlotsHandleDuplicateReadTimestamps) {
+    Watermark watermark(1000, 2);
+    const size_t first = watermark.AddTxnSlot(100);
+    const size_t second = watermark.AddTxnSlot(100);
+
+    watermark.RemoveTxnSlot(first);
+    EXPECT_EQ(watermark.GetWatermark(), 100);
+    watermark.UpdateTxnReadTsSlot(second, 200);
+    EXPECT_EQ(watermark.GetWatermark(), 200);
+    watermark.RemoveTxnSlot(second);
+    EXPECT_EQ(watermark.GetWatermark(), 1000);
+}

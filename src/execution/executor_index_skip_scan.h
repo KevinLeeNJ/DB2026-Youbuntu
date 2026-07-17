@@ -25,6 +25,7 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
     std::vector<char> range_lower_key_;
     std::vector<char> range_upper_key_;
     std::vector<char> next_prefix_key_;
+    std::unique_ptr<RecScan> skip_scan_;
 
     std::optional<size_t> first_suffix_equality_pos() const {
         bool saw_missing_prefix = false;
@@ -106,25 +107,28 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
     }
 
     void open_next_range() {
-        scan_.reset();
+        skip_scan_.reset();
+        scan_ = nullptr;
         while (next_range_pos_ < ranges_.size()) {
             const auto range = ranges_[next_range_pos_++];
-            scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, sm_manager_->get_bpm());
+            skip_scan_ = std::make_unique<IxScan>(ih_, range.lower, range.upper, sm_manager_->get_bpm());
+            scan_ = skip_scan_.get();
             if (!scan_->is_end()) {
                 return;
             }
+            skip_scan_.reset();
+            scan_ = nullptr;
         }
-        scan_.reset();
         if (index_latch_guard_.owns_lock()) {
             index_latch_guard_.unlock();
         }
     }
 
     void advance_to_match() {
-        buffered_record_.reset();
+        buffered_tuple_ = {};
         while (scan_ != nullptr) {
             IndexScanExecutor::advance_to_match();
-            if (buffered_record_ != nullptr) {
+            if (buffered_tuple_.view.data != nullptr) {
                 return;
             }
             open_next_range();
@@ -142,7 +146,8 @@ public:
     }
 
     void beginTuple() override {
-        scan_.reset();
+        skip_scan_.reset();
+        scan_ = nullptr;
         ranges_.clear();
         next_range_pos_ = 0;
         if (index_latch_guard_.owns_lock()) {
@@ -155,7 +160,8 @@ public:
             // The historical fallback is a heap scan, not index order.  Do not
             // let MIN/MAX planning use the ordered-index shortcut here.
             historical_candidates_merged_ = true;
-            scan_ = std::make_unique<RmScan>(fh_);
+            skip_scan_ = std::make_unique<RmScan>(fh_);
+            scan_ = skip_scan_.get();
             IndexScanExecutor::advance_to_match();
             return;
         }
@@ -163,7 +169,6 @@ public:
         index_latch_guard_ = ih_->lock_shared();
         auto suffix_pos = first_suffix_equality_pos();
         if (!suffix_pos.has_value()) {
-            scan_.reset();
             index_latch_guard_.unlock();
             return;
         }

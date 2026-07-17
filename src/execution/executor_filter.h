@@ -21,13 +21,14 @@ private:
     size_t len_;
     std::unique_ptr<RmRecord> fallback_record_;
     TupleView current_view_;
+    mutable std::vector<Condition> scan_conditions_cache_;
     bool isend_ = true;
     bool predicate_recorded_ = false;
 
     bool should_track_ssi_reads() const {
         return context_ != nullptr && context_->enable_ssi_read_tracking_ && context_->txn_ != nullptr &&
                context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr &&
-               !scan_table_name().empty();
+               !scan_table_name_view().empty();
     }
 
     void record_predicate_read() {
@@ -35,7 +36,8 @@ private:
             return;
         }
         predicate_recorded_ = true;
-        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, scan_table_name(), scan_conditions())) {
+        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, std::string(scan_table_name_view()),
+                                                    scan_conditions_ref())) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
@@ -156,10 +158,18 @@ public:
     std::string scan_table_name() const override {
         return prev_->scan_table_name();
     }
+    std::string_view scan_table_name_view() const override {
+        return prev_->scan_table_name_view();
+    }
 
     std::vector<Condition> scan_conditions() const override {
         auto conds = prev_->scan_conditions();
         conds.insert(conds.end(), conds_.begin(), conds_.end());
         return conds;
+    }
+    const std::vector<Condition>& scan_conditions_ref() const override {
+        scan_conditions_cache_ = prev_->scan_conditions_ref();
+        scan_conditions_cache_.insert(scan_conditions_cache_.end(), conds_.begin(), conds_.end());
+        return scan_conditions_cache_;
     }
 };

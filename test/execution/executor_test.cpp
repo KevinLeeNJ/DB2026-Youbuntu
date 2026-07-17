@@ -1181,9 +1181,10 @@ TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches)
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    ASSERT_NE(exec.current_left_rec_, nullptr);
+    ASSERT_TRUE(exec.current_left_view_);
+    EXPECT_EQ(exec.current_left_owned_, nullptr);
     ASSERT_NE(exec._buffered_record, nullptr);
-    const RmRecord* first_left_ptr = exec.current_left_rec_.get();
+    const char* first_left_ptr = exec.current_left_view_.data;
 
     auto first = exec.Next();
     ASSERT_NE(first, nullptr);
@@ -1192,8 +1193,9 @@ TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches)
 
     exec.nextTuple();
     ASSERT_FALSE(exec.is_end());
-    ASSERT_NE(exec.current_left_rec_, nullptr);
-    EXPECT_EQ(exec.current_left_rec_.get(), first_left_ptr);
+    ASSERT_TRUE(exec.current_left_view_);
+    EXPECT_EQ(exec.current_left_owned_, nullptr);
+    EXPECT_EQ(exec.current_left_view_.data, first_left_ptr);
     ASSERT_NE(exec._buffered_record, nullptr);
 
     auto second = exec.Next();
@@ -1203,7 +1205,7 @@ TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches)
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
-    EXPECT_EQ(exec.current_left_rec_, nullptr);
+    EXPECT_FALSE(exec.current_left_view_);
 }
 
 TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
@@ -1233,10 +1235,13 @@ TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
 
     EXPECT_EQ(produced, 3);
     EXPECT_EQ(left_ptr->begin_calls_, 1);
-    EXPECT_EQ(left_ptr->next_record_calls_, 3);
+    EXPECT_EQ(left_ptr->next_record_calls_, 0);
     EXPECT_EQ(left_ptr->next_calls_, 2);
     EXPECT_EQ(right_ptr->begin_calls_, 3);
-    EXPECT_EQ(right_ptr->next_record_calls_, 8);
+    // The join consumes the right child's borrowed current view; only
+    // executors without current() support should use the compatibility Next()
+    // path.
+    EXPECT_EQ(right_ptr->next_record_calls_, 0);
     EXPECT_EQ(right_ptr->next_calls_, 6);
 }
 

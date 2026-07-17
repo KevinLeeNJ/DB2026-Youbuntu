@@ -18,6 +18,27 @@ See the Mulan PSL v2 for more details. */
 void IxScan::next() {
     assert(!is_end());
     if (!coupled_mode_) {
+        if (direction_ == ScanDirection::Backward) {
+            if (iid_ == end_) {
+                move_legacy_to_end();
+                return;
+            }
+            assert(pinned_leaf_page_ != nullptr);
+            if (iid_.slot_no > 0) {
+                --iid_.slot_no;
+                return;
+            } else {
+                const page_id_t prev_leaf = leaf_.get_prev_leaf();
+                if (prev_leaf == IX_LEAF_HEADER_PAGE || prev_leaf == IX_NO_PAGE) {
+                    move_legacy_to_end();
+                    return;
+                }
+                unpin_current_leaf();
+                iid_ = Iid{prev_leaf, std::numeric_limits<int>::max()};
+            }
+            normalize_backward_position();
+            return;
+        }
         normalize_legacy_position();
         if (!is_end()) {
             assert(pinned_leaf_page_ != nullptr);

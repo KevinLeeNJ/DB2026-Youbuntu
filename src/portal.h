@@ -185,8 +185,16 @@ private:
             return inner_->scan_table_name();
         }
 
+        std::string_view scan_table_name_view() const override {
+            return inner_->scan_table_name_view();
+        }
+
         std::vector<Condition> scan_conditions() const override {
             return inner_->scan_conditions();
+        }
+
+        const std::vector<Condition>& scan_conditions_ref() const override {
+            return inner_->scan_conditions_ref();
         }
 
         void record_current_read_for_ssi() override {
@@ -778,8 +786,9 @@ public:
                 executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
                                                                    x->index_col_names_, context);
             } else {
-                executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
-                                                               x->index_col_names_, context);
+                executor = std::make_unique<IndexScanExecutor>(
+                    sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context,
+                    x->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
             }
             return maybe_count(std::move(executor), plan, count_rows);
         }

@@ -14,12 +14,14 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
@@ -230,6 +232,12 @@ private:
     std::atomic<uint64_t> topology_epoch_{0};
     mutable Page* cached_root_page_{nullptr};
     mutable page_id_t cached_root_page_no_{IX_NO_PAGE};
+    mutable std::mutex append_hint_latch_;
+    struct LeafHint {
+        page_id_t page_no = IX_NO_PAGE;
+        uint64_t topology_epoch = 0;
+    };
+    mutable std::unordered_map<std::string, LeafHint> append_hints_;
 
 public:
     using SharedIndexLatch = std::shared_lock<std::shared_mutex>;
@@ -280,7 +288,7 @@ public:
         void insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate = false);
     };
 
-    IxNodeHandle* split(IxNodeHandle* node);
+    IxNodeHandle* split(IxNodeHandle* node, bool right_edge_append = false);
 
     void insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node, Transaction* transaction);
 
@@ -324,6 +332,17 @@ public:
     Iid leaf_begin() const;
 
 private:
+    std::string append_hint_key(const char* key) const {
+        if (file_hdr_->col_num_ == 0) {
+            return {};
+        }
+        const int prefix_len = file_hdr_->col_tot_len_ - file_hdr_->col_lens_.back();
+        return std::string(key, static_cast<size_t>(std::max(prefix_len, 0)));
+    }
+
+    bool try_append_hint(const char* key, IxNodeHandle& leaf) const;
+    void remember_append_hint(const char* key, page_id_t page_no) const;
+
     // Root pages are shared by every lookup and are cheap to retain. Keep the
     // cache enabled by default, while allowing deployments with many open
     // indexes to opt out explicitly.

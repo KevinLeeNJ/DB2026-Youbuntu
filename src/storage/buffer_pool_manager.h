@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -84,6 +85,10 @@ public:
     Page* fetch_page(PageId page_id);
 
     bool is_page_resident(PageId page_id);
+
+    // Returns the replacement classification of a valid resident page. A
+    // missing or in-flight page has no observable residency classification.
+    std::optional<ResidencyClass> get_residency_class(PageId page_id);
 
     // Resident pages remain eligible for normal pin/unpin access but are kept
     // out of the replacer. The caller owns the lifetime of this classification

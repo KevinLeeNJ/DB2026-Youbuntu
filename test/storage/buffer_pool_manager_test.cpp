@@ -242,6 +242,38 @@ TEST_F(BufferPoolManagerTest, PageTableReserveAndLoadFactorAvoidPoolSizedRehash)
     EXPECT_EQ(bpm->page_table_.bucket_count(), initial_bucket_count);
 }
 
+TEST_F(BufferPoolManagerTest, ResidentClassificationSurvivesVictimPressureAndUnmark) {
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
+    PageId resident_id{fd_, INVALID_PAGE_ID};
+    PageId ordinary_id{fd_, INVALID_PAGE_ID};
+    PageId replacement_id{fd_, INVALID_PAGE_ID};
+
+    ASSERT_NE(nullptr, bpm->new_page(&resident_id));
+    ASSERT_TRUE(bpm->unpin_page(resident_id, false));
+    ASSERT_NE(nullptr, bpm->new_page(&ordinary_id));
+    ASSERT_TRUE(bpm->unpin_page(ordinary_id, false));
+
+    bpm->mark_resident(resident_id, ResidencyClass::IndexInternal);
+    ASSERT_EQ(bpm->get_residency_class(resident_id), ResidencyClass::IndexInternal);
+
+    // The ordinary page is the first victim; keep the replacement page pinned
+    // so the resident page is the only possible victim after it is explicitly
+    // made evictable again.
+    ASSERT_NE(nullptr, bpm->new_page(&replacement_id));
+    EXPECT_TRUE(bpm->is_page_resident(resident_id));
+    ASSERT_EQ(bpm->get_residency_class(resident_id), ResidencyClass::IndexInternal);
+
+    bpm->unmark_resident(resident_id);
+    ASSERT_EQ(bpm->get_residency_class(resident_id), ResidencyClass::Normal);
+
+    PageId final_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(nullptr, bpm->new_page(&final_id));
+    EXPECT_FALSE(bpm->is_page_resident(resident_id));
+    EXPECT_FALSE(bpm->get_residency_class(resident_id).has_value());
+    ASSERT_TRUE(bpm->unpin_page(replacement_id, false));
+    ASSERT_TRUE(bpm->unpin_page(final_id, false));
+}
+
 TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
     auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
     if (disk_manager->is_file(LOG_FILE_NAME)) {

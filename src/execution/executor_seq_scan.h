@@ -34,7 +34,7 @@ private:
 
     SmManager* sm_manager_;
     bool predicate_recorded_{false};
-    std::unique_ptr<RmRecord> buffered_record_;
+    RmRecordViewWithMeta buffered_tuple_;
 
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -95,19 +95,20 @@ public:
      */
     void beginTuple() override {
         record_predicate_read();
-        buffered_record_.reset();
+        buffered_tuple_ = {};
         scan_ = std::make_unique<RmScan>(fh_);
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = visible_record(rid_);
-            if (rec == nullptr) {
+            auto tuple = GetVisibleTuple(fh_, rid_, context_);
+            if (tuple.view.data == nullptr) {
                 scan_->next();
                 continue;
             }
-            const bool match = conditions_match(fed_conds_, condition_addresses_, *rec);
+            const TupleView view{tuple.view.data, tuple.view.size};
+            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
             if (match) {
                 record_tuple_read(rid_);
-                buffered_record_ = std::move(rec);
+                buffered_tuple_ = std::move(tuple);
                 break;
             }
             scan_->next();
@@ -117,19 +118,20 @@ public:
      * @brief 从当前scan_指向的记录开始迭代扫描,直到扫描到第一个满足谓词条件和MVCC可见性的元组停止,并赋值给rid_
      */
     void nextTuple() override {
-        buffered_record_.reset();
+        buffered_tuple_ = {};
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = visible_record(rid_);
-            if (rec == nullptr) {
+            auto tuple = GetVisibleTuple(fh_, rid_, context_);
+            if (tuple.view.data == nullptr) {
                 scan_->next();
                 continue;
             }
-            const bool match = conditions_match(fed_conds_, condition_addresses_, *rec);
+            const TupleView view{tuple.view.data, tuple.view.size};
+            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
             if (match) {
                 record_tuple_read(rid_);
-                buffered_record_ = std::move(rec);
+                buffered_tuple_ = std::move(tuple);
                 break;
             }
             scan_->next();
@@ -141,16 +143,18 @@ public:
      * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || buffered_record_ == nullptr)
+        if (is_end() || buffered_tuple_.view.data == nullptr)
             return nullptr;
-        return std::make_unique<RmRecord>(*buffered_record_);
+        auto result = std::make_unique<RmRecord>(static_cast<int>(buffered_tuple_.view.size));
+        memcpy(result->data, buffered_tuple_.view.data, buffered_tuple_.view.size);
+        return result;
     }
 
     TupleView current() const override {
-        if (is_end() || buffered_record_ == nullptr) {
+        if (is_end() || buffered_tuple_.view.data == nullptr) {
             return {};
         }
-        return TupleView{buffered_record_->data, static_cast<uint32_t>(buffered_record_->size)};
+        return TupleView{buffered_tuple_.view.data, buffered_tuple_.view.size};
     }
 
     Rid& rid() override {
@@ -180,7 +184,13 @@ public:
     std::string scan_table_name() const override {
         return tab_name_;
     }
+    std::string_view scan_table_name_view() const override {
+        return tab_name_;
+    }
     std::vector<Condition> scan_conditions() const override {
+        return fed_conds_;
+    }
+    const std::vector<Condition>& scan_conditions_ref() const override {
         return fed_conds_;
     }
     void record_current_read_for_ssi() override {

@@ -158,6 +158,7 @@ TEST_F(IndexHandleTest, UniqueLookupFindsSingleKey) {
     ASSERT_FALSE(resident_pages.empty());
     for (page_id_t page_no : resident_pages) {
         EXPECT_TRUE(buffer_pool_manager->is_page_resident(PageId{ih->fd_, page_no}));
+        ASSERT_EQ(buffer_pool_manager->get_residency_class(PageId{ih->fd_, page_no}), ResidencyClass::IndexInternal);
     }
 
     const int index_fd = ih->fd_;
@@ -198,6 +199,50 @@ TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
 
     EXPECT_EQ(slots, std::vector<int>({123, 124, 125, 126, 127, 128, 129, 130}));
 
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ReverseScanWalksLeafLinksWithoutReSeek) {
+    auto ih = open_index();
+    for (int value = 0; value < 200; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    std::vector<int> values;
+    {
+        IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get(), true, false,
+                    ScanDirection::Backward);
+        while (!scan.is_end()) {
+            values.push_back(scan.rid().slot_no);
+            scan.next();
+        }
+    }
+
+    ASSERT_EQ(values.size(), 200u);
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(values[i], 199 - static_cast<int>(i));
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, AppendSplitsPreserveOrder) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    std::vector<int> values;
+    IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
+    while (!scan.is_end()) {
+        values.push_back(scan.rid().slot_no);
+        scan.next();
+    }
+    ASSERT_EQ(values.size(), 2000u);
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(values[i], static_cast<int>(i));
+    }
     close_index(ih);
 }
 

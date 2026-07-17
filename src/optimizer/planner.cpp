@@ -41,6 +41,62 @@ bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
            (lhs.is_star || same_tab_col(lhs.col, rhs.col));
 }
 
+ScanPlan* find_order_preserving_scan(Plan* plan) {
+    if (plan == nullptr) {
+        return nullptr;
+    }
+    switch (plan->tag) {
+    case T_Projection:
+        return find_order_preserving_scan(static_cast<ProjectionPlan*>(plan)->subplan_.get());
+    case T_Filter:
+        return find_order_preserving_scan(static_cast<FilterPlan*>(plan)->subplan_.get());
+    case T_IndexScan:
+        return static_cast<ScanPlan*>(plan);
+    default:
+        return nullptr;
+    }
+}
+
+bool has_equality_constraint(const ScanPlan& scan, const std::string& col_name) {
+    return std::any_of(scan.conds_.begin(), scan.conds_.end(), [&](const Condition& cond) {
+        return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == col_name;
+    });
+}
+
+bool configure_index_order(Plan* plan, const std::vector<OrderByItem>& order_by_items) {
+    if (order_by_items.size() != 1) {
+        return false;
+    }
+    const auto& order = order_by_items.front();
+    if (order.expr.type != QueryExprType::COLUMN) {
+        return false;
+    }
+
+    ScanPlan* scan = find_order_preserving_scan(plan);
+    if (scan == nullptr || scan->index_col_names_.empty()) {
+        return false;
+    }
+
+    size_t order_pos = scan->index_col_names_.size();
+    for (size_t i = 0; i < scan->index_col_names_.size(); ++i) {
+        if (scan->index_col_names_[i] == order.expr.col.col_name) {
+            order_pos = i;
+            break;
+        }
+    }
+    if (order_pos == scan->index_col_names_.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < order_pos; ++i) {
+        if (!has_equality_constraint(*scan, scan->index_col_names_[i])) {
+            return false;
+        }
+    }
+
+    scan->scan_backward_ = order.is_desc;
+    return true;
+}
+
 bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
     if (lhs.type != rhs.type) {
         return false;
@@ -1223,6 +1279,10 @@ std::unique_ptr<Plan> Planner::generate_sort_plan(const Query* query, std::uniqu
     if (query->order_by_items.empty()) {
         return plan;
     }
+    if (configure_index_order(plan.get(), query->order_by_items)) {
+        plan->order_satisfied_ = true;
+        return plan;
+    }
     int sort_limit = query->has_limit ? query->limit : -1;
     return std::make_unique<SortPlan>(T_Sort, std::move(plan), bind_order_by_output_names(*query), sort_limit);
 }
@@ -1231,7 +1291,7 @@ std::unique_ptr<Plan> Planner::generate_limit_plan(const Query* query, std::uniq
     if (!query->has_limit) {
         return plan;
     }
-    if (!query->order_by_items.empty()) {
+    if (!query->order_by_items.empty() && !plan->order_satisfied_) {
         return plan;
     }
     return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->limit);

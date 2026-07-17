@@ -324,7 +324,41 @@ bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transac
  * @note need to unpin the new node outside
  * 注意：本函数执行完毕后，原node和new node都需要在函数外面进行unpin
  */
-IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node) {
+bool IxIndexHandle::try_append_hint(const char* key, IxNodeHandle& leaf) const {
+    const std::string hint_key = append_hint_key(key);
+    LeafHint hint;
+    {
+        std::lock_guard<std::mutex> guard(append_hint_latch_);
+        auto it = append_hints_.find(hint_key);
+        if (it == append_hints_.end() || it->second.topology_epoch != topology_epoch_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        hint = it->second;
+    }
+    if (hint.page_no == IX_NO_PAGE || hint.page_no == IX_LEAF_HEADER_PAGE || hint.page_no == file_hdr_->root_page_) {
+        return false;
+    }
+
+    fetch_node_into(hint.page_no, leaf);
+    const bool valid =
+        leaf.is_leaf_page() && leaf.get_size() > 0 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE &&
+        ix_compare(key, leaf.get_key(leaf.get_size() - 1), file_hdr_->col_types_, file_hdr_->col_lens_) > 0;
+    if (!valid) {
+        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+        return false;
+    }
+    return true;
+}
+
+void IxIndexHandle::remember_append_hint(const char* key, page_id_t page_no) const {
+    std::lock_guard<std::mutex> guard(append_hint_latch_);
+    if (append_hints_.size() > 4096) {
+        append_hints_.clear();
+    }
+    append_hints_[append_hint_key(key)] = LeafHint{page_no, topology_epoch_.load(std::memory_order_relaxed)};
+}
+
+IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
     topology_epoch_.fetch_add(1, std::memory_order_relaxed);
     IxNodeHandle* new_node = create_node();
     memcpy(new_node->page_hdr, node->page_hdr, sizeof(IxPageHdr));
@@ -332,6 +366,15 @@ IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node) {
 
     int old_size = node->get_size();
     int left_size = old_size / 2;
+    if (right_edge_append && node->is_leaf_page()) {
+        // Keep most historical entries on the old right edge and leave a
+        // small, append-friendly leaf for the next inserts. Non-append and
+        // internal-node splits retain the balanced 50/50 policy.
+        left_size = std::max(1, (old_size * 4) / 5);
+        if (left_size >= old_size) {
+            left_size = old_size / 2;
+        }
+    }
     int right_size = old_size - left_size;
     new_node->set_size(0);
     new_node->insert_pairs(0, node->get_key(left_size), node->get_rid(left_size), right_size);
@@ -419,11 +462,13 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
     {
         auto structure_guard = lock_shared();
         IxNodeHandle leaf;
-        fetch_node_into(file_hdr_->root_page_, leaf);
-        while (!leaf.is_leaf_page()) {
-            page_id_t child_page_no = leaf.internal_lookup(key);
-            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
-            fetch_node_into(child_page_no, leaf);
+        if (!try_append_hint(key, leaf)) {
+            fetch_node_into(file_hdr_->root_page_, leaf);
+            while (!leaf.is_leaf_page()) {
+                page_id_t child_page_no = leaf.internal_lookup(key);
+                buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+                fetch_node_into(child_page_no, leaf);
+            }
         }
 
         std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
@@ -446,6 +491,9 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
         if (!needs_structure_change) {
             const page_id_t inserted_page_no = leaf.get_page_no();
             leaf.insert_pair(pos, key, value);
+            if (pos == leaf.get_size() - 1 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE) {
+                remember_append_hint(key, inserted_page_no);
+            }
             leaf_guard.unlock();
             buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
             return inserted_page_no;
@@ -462,11 +510,13 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
 page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value, Transaction* transaction,
                                                bool allow_duplicate) {
     IxNodeHandle leaf;
-    fetch_node_into(file_hdr_->root_page_, leaf);
-    while (!leaf.is_leaf_page()) {
-        page_id_t child_page_no = leaf.internal_lookup(key);
-        buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
-        fetch_node_into(child_page_no, leaf);
+    if (!try_append_hint(key, leaf)) {
+        fetch_node_into(file_hdr_->root_page_, leaf);
+        while (!leaf.is_leaf_page()) {
+            page_id_t child_page_no = leaf.internal_lookup(key);
+            buffer_pool_manager_->unpin_page(leaf.get_page_id(), false);
+            fetch_node_into(child_page_no, leaf);
+        }
     }
 
     int pos = leaf.lower_bound(key);
@@ -483,16 +533,26 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
         }
     }
 
+    const bool right_edge_append = pos == leaf.get_size() && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE;
     leaf.insert_pair(pos, key, value);
     page_id_t inserted_page_no = leaf.get_page_no();
+    bool did_split = false;
     if (leaf.get_size() >= leaf.get_max_size()) {
-        IxNodeHandle* new_leaf = split(&leaf);
+        did_split = true;
+        IxNodeHandle* new_leaf = split(&leaf, right_edge_append);
         if (file_hdr_->last_leaf_ == leaf.get_page_no()) {
             file_hdr_->last_leaf_ = new_leaf->get_page_no();
         }
         insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, transaction);
+        if (right_edge_append) {
+            remember_append_hint(key, new_leaf->get_page_no());
+        }
         buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
         delete new_leaf;
+    }
+
+    if (right_edge_append && !did_split) {
+        remember_append_hint(key, leaf.get_page_no());
     }
 
     if (pos == 0) {
@@ -551,20 +611,26 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         }
     }
 
+    const bool right_edge_append = pos == leaf.get_size() && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE;
     leaf.insert_pair(pos, key, value);
     if (leaf.get_size() >= leaf.get_max_size()) {
-        IxNodeHandle* new_leaf = ih->split(&leaf);
+        IxNodeHandle* new_leaf = ih->split(&leaf, right_edge_append);
         if (ih->file_hdr_->last_leaf_ == leaf.get_page_no()) {
             ih->file_hdr_->last_leaf_ = new_leaf->get_page_no();
         }
         ih->insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, txn);
         page_id_t new_leaf_page_no = new_leaf->get_page_no();
+        if (right_edge_append) {
+            ih->remember_append_hint(key, new_leaf_page_no);
+        }
         ih->buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
         delete new_leaf;
 
         // Reposition to the right leaf after split.
         ih->buffer_pool_manager_->unpin_page(leaf.get_page_id(), true);
         ih->fetch_node_into(new_leaf_page_no, leaf);
+    } else if (right_edge_append) {
+        ih->remember_append_hint(key, leaf.get_page_no());
     }
 
     if (pos == 0) {

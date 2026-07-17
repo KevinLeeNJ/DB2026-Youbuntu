@@ -112,6 +112,85 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
     return nullptr;
 }
 
+// Borrow the current visible heap version when it is still page-backed. Undo
+// reconstruction remains owned because its bytes live in the transaction
+// manager rather than in the record page.
+inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Context* context) {
+    if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
+        return fh->get_record_view_with_meta(rid);
+    }
+
+    auto* txn = context->txn_;
+    auto* txn_mgr = context->txn_mgr_;
+    const timestamp_t read_ts =
+        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
+    const txn_id_t self_id = txn->get_transaction_id();
+
+    constexpr int MAX_DEPTH = 100;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto base = fh->get_record_view_with_meta(rid);
+        TupleMeta meta = base.meta;
+        std::optional<UndoLog> current_undo;
+        bool retry = false;
+
+        for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+            if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
+                if (meta.is_deleted_) {
+                    return {};
+                }
+                base.meta = meta;
+                return base;
+            }
+
+            if (!meta.is_committed_) {
+                if (!meta.version_chain_head_.IsValid()) {
+                    return {};
+                }
+                current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
+                if (!current_undo.has_value()) {
+                    retry = true;
+                    break;
+                }
+                meta = current_undo->old_meta_;
+                continue;
+            }
+
+            if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+                return {};
+            }
+
+            if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+                if (!current_undo.has_value()) {
+                    base.meta = meta;
+                    return base;
+                }
+                auto owned = std::make_unique<RmRecord>(static_cast<int>(current_undo->old_tuple_data_.size()));
+                memcpy(owned->data, current_undo->old_tuple_data_.data(), current_undo->old_tuple_data_.size());
+                RmRecordViewWithMeta result;
+                result.meta = meta;
+                result.view = RmRecordView{owned->data, static_cast<uint32_t>(owned->size)};
+                result.owned = std::move(owned);
+                return result;
+            }
+
+            if (!meta.version_chain_head_.IsValid()) {
+                return {};
+            }
+            current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
+            if (!current_undo.has_value()) {
+                retry = true;
+                break;
+            }
+            meta = current_undo->old_meta_;
+        }
+
+        if (!retry) {
+            return {};
+        }
+    }
+    return {};
+}
+
 /* The caller must already hold this transaction's record X lock. */
 inline std::optional<RmRecordWithMeta> GetCurrentRecordForRcWrite(RmFileHandle* fh, const Rid& rid, Transaction* txn,
                                                                   Context* context) {

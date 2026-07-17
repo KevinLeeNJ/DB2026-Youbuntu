@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -66,6 +67,76 @@ struct RmPinnedInsert {
 struct RmRecordWithMeta {
     TupleMeta meta;
     std::unique_ptr<RmRecord> record;
+};
+
+// A read-only view of a record slot. The guard keeps both the buffer-pool
+// frame resident and the page payload stable while executors consume view.
+struct RmRecordView {
+    const char* data = nullptr;
+    uint32_t size = 0;
+};
+
+class RmPageReadGuard {
+public:
+    RmPageReadGuard() = default;
+
+    RmPageReadGuard(BufferPoolManager* bpm, PageId page_id, Page* page)
+        : bpm_(bpm), page_id_(page_id), page_(page), page_lock_(page->latch()) {}
+
+    ~RmPageReadGuard() {
+        release();
+    }
+
+    RmPageReadGuard(const RmPageReadGuard&) = delete;
+    RmPageReadGuard& operator=(const RmPageReadGuard&) = delete;
+
+    RmPageReadGuard(RmPageReadGuard&& other) noexcept
+        : bpm_(other.bpm_), page_id_(other.page_id_), page_(other.page_), page_lock_(std::move(other.page_lock_)) {
+        other.bpm_ = nullptr;
+        other.page_ = nullptr;
+    }
+
+    RmPageReadGuard& operator=(RmPageReadGuard&& other) noexcept {
+        if (this != &other) {
+            release();
+            bpm_ = other.bpm_;
+            page_id_ = other.page_id_;
+            page_ = other.page_;
+            page_lock_ = std::move(other.page_lock_);
+            other.bpm_ = nullptr;
+            other.page_ = nullptr;
+        }
+        return *this;
+    }
+
+    Page* page() const {
+        return page_;
+    }
+
+private:
+    void release() {
+        if (page_ == nullptr) {
+            return;
+        }
+        page_lock_.unlock();
+        if (bpm_ != nullptr) {
+            bpm_->unpin_page(page_id_, false);
+        }
+        bpm_ = nullptr;
+        page_ = nullptr;
+    }
+
+    BufferPoolManager* bpm_ = nullptr;
+    PageId page_id_{};
+    Page* page_ = nullptr;
+    std::shared_lock<std::shared_mutex> page_lock_;
+};
+
+struct RmRecordViewWithMeta {
+    TupleMeta meta;
+    RmRecordView view;
+    std::unique_ptr<RmPageReadGuard> guard;
+    std::unique_ptr<RmRecord> owned;
 };
 
 /* 每个RmFileHandle对应一个表的数据文件，里面有多个page，每个page的数据封装在RmPageHandle中 */
@@ -119,8 +190,13 @@ public:
     std::unique_ptr<RmRecord> get_record(const Rid& rid, Context* context) const;
 
     /* Fetch both TupleMeta and record data in a single page pin, halving the
-       buffer-pool latch acquisitions compared to get_tuple_meta + get_record. */
+       buffer-pool latch acquisitions
+     * compared to get_tuple_meta + get_record. */
     RmRecordWithMeta get_record_with_meta(const Rid& rid, Context* context) const;
+
+    // Borrow the current committed slot without copying its payload. The
+    // returned guard must remain alive while view.data is accessed.
+    RmRecordViewWithMeta get_record_view_with_meta(const Rid& rid) const;
 
     Rid insert_record(char* buf, Context* context);
 

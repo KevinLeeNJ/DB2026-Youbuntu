@@ -112,16 +112,23 @@ protected:
     std::vector<char> lookup_key_;
     size_t lookup_key_ordinal_{std::numeric_limits<size_t>::max()};
     bool lookup_key_valid_{false};
+    ScanDirection direction_{ScanDirection::Forward};
     std::vector<Rid> rid_scan_rids_;
     std::vector<Rid> historical_rids_;
     std::unordered_set<uint64_t> seen_rids_;
 
     Rid rid_;
-    std::unique_ptr<RecScan> scan_;
+    // Cursor storage belongs to the executor. Exact lookups and range scans
+    // are reconstructed in place for each beginTuple() instead of allocating
+    // a new polymorphic cursor on every lookup.
+    std::optional<RidVectorScan> rid_vector_cursor_;
+    std::optional<SingleRidScan> single_rid_cursor_;
+    std::optional<IxScan> index_scan_cursor_;
+    RecScan* scan_ = nullptr;
     bool predicate_recorded_{false};
     bool use_historical_index_candidates_{false};
     bool historical_candidates_merged_{false};
-    std::unique_ptr<RmRecord> buffered_record_;
+    RmRecordViewWithMeta buffered_tuple_;
 
     SmManager* sm_manager_;
 
@@ -348,9 +355,11 @@ protected:
 
 public:
     IndexScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
-                      std::vector<std::string> index_col_names, Context* context) {
+                      std::vector<std::string> index_col_names, Context* context,
+                      ScanDirection direction = ScanDirection::Forward) {
         sm_manager_ = sm_manager;
         context_ = context;
+        direction_ = direction;
         tab_name_ = std::move(tab_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
@@ -382,7 +391,10 @@ public:
     }
 
     void beginTuple() override {
-        scan_.reset();
+        scan_ = nullptr;
+        index_scan_cursor_.reset();
+        single_rid_cursor_.reset();
+        rid_vector_cursor_.reset();
         rid_scan_rids_.clear();
         historical_rids_.clear();
         seen_rids_.clear();
@@ -479,12 +491,14 @@ public:
             index_latch_guard.unlock();
             auto unique_rid = ih_->lookup_unique(lower_key_.data());
             if (unique_rid.has_value()) {
-                scan_ = std::make_unique<SingleRidScan>(unique_rid);
+                single_rid_cursor_.emplace(unique_rid);
+                scan_ = &*single_rid_cursor_;
             } else {
                 // LOAD may intentionally append duplicate keys to an index.
                 // Fall back whenever the lookup cannot prove a single RID.
                 ih_->lookup_equal(lower_key_.data(), rid_scan_rids_);
-                scan_ = std::make_unique<RidVectorScan>(&rid_scan_rids_);
+                rid_vector_cursor_.emplace(&rid_scan_rids_);
+                scan_ = &*rid_vector_cursor_;
             }
         } else if (exact_key_lookup || use_historical_index_candidates_ || use_rc_exact_historical_key) {
             historical_candidates_merged_ = use_historical_index_candidates_ || use_rc_exact_historical_key;
@@ -516,9 +530,12 @@ public:
                     }
                 }
             }
-            scan_ = std::make_unique<RidVectorScan>(&rid_scan_rids_);
+            rid_vector_cursor_.emplace(&rid_scan_rids_);
+            scan_ = &*rid_vector_cursor_;
         } else {
-            scan_ = std::make_unique<IxScan>(ih_, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+            index_scan_cursor_.emplace(ih_, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard), false,
+                                       direction_);
+            scan_ = &*index_scan_cursor_;
         }
         advance_to_match();
     }
@@ -529,18 +546,19 @@ public:
     }
 
     void advance_to_match() {
-        buffered_record_.reset();
+        buffered_tuple_ = {};
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = GetVisibleRecord(fh_, rid_, context_);
-            if (rec == nullptr) {
+            auto tuple = GetVisibleTuple(fh_, rid_, context_);
+            if (tuple.view.data == nullptr) {
                 scan_->next();
                 continue;
             }
-            const bool match = conditions_match(fed_conds_, condition_addresses_, *rec);
+            const TupleView view{tuple.view.data, tuple.view.size};
+            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
             if (match) {
                 record_tuple_read(rid_);
-                buffered_record_ = std::move(rec);
+                buffered_tuple_ = std::move(tuple);
                 break;
             }
             scan_->next();
@@ -548,17 +566,19 @@ public:
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || buffered_record_ == nullptr) {
+        if (is_end() || buffered_tuple_.view.data == nullptr) {
             return nullptr;
         }
-        return std::make_unique<RmRecord>(*buffered_record_);
+        auto result = std::make_unique<RmRecord>(static_cast<int>(buffered_tuple_.view.size));
+        memcpy(result->data, buffered_tuple_.view.data, buffered_tuple_.view.size);
+        return result;
     }
 
     TupleView current() const override {
-        if (is_end() || buffered_record_ == nullptr) {
+        if (is_end() || buffered_tuple_.view.data == nullptr) {
             return {};
         }
-        return TupleView{buffered_record_->data, static_cast<uint32_t>(buffered_record_->size)};
+        return TupleView{buffered_tuple_.view.data, buffered_tuple_.view.size};
     }
 
     Rid& rid() override {
@@ -620,8 +640,14 @@ public:
     std::string scan_table_name() const override {
         return tab_name_;
     }
+    std::string_view scan_table_name_view() const override {
+        return tab_name_;
+    }
 
     std::vector<Condition> scan_conditions() const override {
+        return fed_conds_;
+    }
+    const std::vector<Condition>& scan_conditions_ref() const override {
         return fed_conds_;
     }
     void record_current_read_for_ssi() override {

@@ -378,7 +378,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     txn->set_read_ts(last_commit_ts_.load());
     // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
     // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
-    running_txns_.AddTxn(txn->get_read_ts());
+    txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
     WriteBeginLog(txn, log_manager);
 
     std::unique_lock<std::mutex> lock(latch_);
@@ -402,7 +402,7 @@ void TransactionManager::BeginStatement(Transaction* txn) {
         timestamp_t old_read_ts = txn->get_read_ts();
         timestamp_t new_read_ts = last_commit_ts_.load();
         if (new_read_ts != old_read_ts) {
-            running_txns_.UpdateTxnReadTs(old_read_ts, new_read_ts);
+            running_txns_.UpdateTxnReadTsSlot(txn->get_watermark_slot(), new_read_ts);
             txn->set_read_ts(new_read_ts);
         }
     }
@@ -491,7 +491,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // complete; otherwise GC could reclaim its undo state in the publication
     // window.
     running_txns_.UpdateCommitTs(txn->get_commit_ts());
-    running_txns_.RemoveTxn(txn->get_read_ts());
+    running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
@@ -540,7 +540,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
         UndoWriteRecord(this, sm_manager_, it->get(), txn, abort_lsn);
     }
-    running_txns_.RemoveTxn(txn->get_read_ts());
+    running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::ABORTED);

@@ -29,6 +29,8 @@ See the Mulan PSL v2 for more details. */
 // structure latch and a leaf pinned for its lifetime.  The coupled cursor
 // copies a bounded batch while holding the structure latch, then releases all
 // latches before the executor evaluates heap visibility.
+enum class ScanDirection { Forward, Backward };
+
 class IxScan : public RecScan {
 public:
     enum class Mode { LEGACY, HYBRID, COUPLED };
@@ -57,7 +59,9 @@ private:
     Iid end_;
     BufferPoolManager* bpm_;
     Mode mode_{Mode::HYBRID};
+    ScanDirection direction_{ScanDirection::Forward};
     bool coupled_mode_{false};
+    bool backward_end_{false};
     bool copy_keys_{false};
 
     // Legacy cursor used for single-leaf hybrid scans and for internal
@@ -161,7 +165,7 @@ private:
     }
 
     void pin_current_leaf() {
-        if (pinned_leaf_page_ != nullptr || iid_ == end_) {
+        if (pinned_leaf_page_ != nullptr || (direction_ == ScanDirection::Forward && iid_ == end_) || backward_end_) {
             return;
         }
         pinned_leaf_page_ = fetch_scan_page(iid_.page_no);
@@ -186,6 +190,7 @@ private:
     void move_legacy_to_end() {
         unpin_current_leaf();
         iid_ = end_;
+        backward_end_ = direction_ == ScanDirection::Backward;
         release_index_latch_if_held();
     }
 
@@ -209,6 +214,29 @@ private:
             iid_ = Iid{next_leaf, 0};
         }
         move_legacy_to_end();
+    }
+
+    void normalize_backward_position() {
+        while (!backward_end_) {
+            pin_current_leaf();
+            assert(leaf_.is_leaf_page());
+            int slot = std::min(iid_.slot_no, leaf_.get_size());
+            if (iid_.page_no == end_.page_no && slot <= end_.slot_no) {
+                move_legacy_to_end();
+                return;
+            }
+            if (slot > 0) {
+                iid_.slot_no = slot - 1;
+                return;
+            }
+            const page_id_t prev_leaf = leaf_.get_prev_leaf();
+            if (prev_leaf == IX_LEAF_HEADER_PAGE || prev_leaf == IX_NO_PAGE) {
+                move_legacy_to_end();
+                return;
+            }
+            unpin_current_leaf();
+            iid_ = Iid{prev_leaf, std::numeric_limits<int>::max()};
+        }
     }
 
     void capture_end_bound() {
@@ -429,14 +457,23 @@ private:
 
 public:
     IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm,
-           bool acquire_index_latch = true, bool copy_keys = false)
+           bool acquire_index_latch = true, bool copy_keys = false, ScanDirection direction = ScanDirection::Forward)
         : IxScan(ih, lower, upper, bpm, acquire_index_latch ? ih->lock_shared() : IxIndexHandle::SharedIndexLatch{},
-                 copy_keys) {}
+                 copy_keys, direction) {}
 
     IxScan(const IxIndexHandle* ih, const Iid& lower, const Iid& upper, BufferPoolManager* bpm,
-           IxIndexHandle::SharedIndexLatch index_latch_guard, bool copy_keys = false)
-        : ih_(ih), index_latch_guard_(std::move(index_latch_guard)), iid_(lower), end_(upper), bpm_(bpm),
-          mode_(index_latch_guard_.owns_lock() ? configured_mode() : Mode::LEGACY), copy_keys_(copy_keys) {
+           IxIndexHandle::SharedIndexLatch index_latch_guard, bool copy_keys = false,
+           ScanDirection direction = ScanDirection::Forward)
+        : ih_(ih), index_latch_guard_(std::move(index_latch_guard)),
+          iid_(direction == ScanDirection::Forward ? lower : upper),
+          end_(direction == ScanDirection::Forward ? upper : lower), bpm_(bpm),
+          mode_(index_latch_guard_.owns_lock() && direction == ScanDirection::Forward ? configured_mode()
+                                                                                      : Mode::LEGACY),
+          direction_(direction), copy_keys_(copy_keys) {
+        if (direction_ == ScanDirection::Backward) {
+            normalize_backward_position();
+            return;
+        }
         const bool use_single_leaf =
             index_latch_guard_.owns_lock() &&
             (mode_ == Mode::LEGACY || (mode_ == Mode::HYBRID && lower.page_no == upper.page_no));
@@ -465,7 +502,8 @@ public:
     void next() override;
 
     bool is_end() const override {
-        return coupled_mode_ ? (coupled_end_ && batch_pos_ >= batch_.size()) : iid_ == end_;
+        return coupled_mode_ ? (coupled_end_ && batch_pos_ >= batch_.size())
+                             : (direction_ == ScanDirection::Backward ? backward_end_ : iid_ == end_);
     }
 
     Rid rid() const override {

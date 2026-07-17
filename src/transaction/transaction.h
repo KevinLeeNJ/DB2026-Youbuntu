@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -143,6 +144,12 @@ public:
     inline void set_read_ts(timestamp_t ts) {
         read_ts_ = ts;
     }
+    inline size_t get_watermark_slot() const {
+        return watermark_slot_;
+    }
+    inline void set_watermark_slot(size_t slot) {
+        watermark_slot_ = slot;
+    }
     inline timestamp_t get_commit_ts() const {
         return commit_ts_;
     }
@@ -221,6 +228,7 @@ private:
     std::deque<Page*> index_deleted_page_set_;            // 维护事务执行过程中删除的索引页面
 
     std::atomic<timestamp_t> read_ts_{0};
+    size_t watermark_slot_{std::numeric_limits<size_t>::max()};
     /**
      * @brief 存储撤销日志。
      * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。

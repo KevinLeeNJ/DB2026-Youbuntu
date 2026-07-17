@@ -52,6 +52,21 @@ RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* con
     return RmRecordWithMeta{meta, std::move(record_ptr)};
 }
 
+RmRecordViewWithMeta RmFileHandle::get_record_view_with_meta(const Rid& rid) const {
+    const PageId page_id{fd_, rid.page_no};
+    Page* page = buffer_pool_manager_->fetch_page(page_id);
+    if (page == nullptr) {
+        throw PageNotExistError("record", rid.page_no);
+    }
+
+    auto guard = std::make_unique<RmPageReadGuard>(buffer_pool_manager_, page_id, page);
+    RmPageHandle page_handle(&file_hdr_, page);
+    TupleMeta meta = page_handle.get_meta(rid.slot_no);
+    return RmRecordViewWithMeta{
+        meta, RmRecordView{page_handle.get_slot(rid.slot_no), static_cast<uint32_t>(file_hdr_.record_size)},
+        std::move(guard), nullptr};
+}
+
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据

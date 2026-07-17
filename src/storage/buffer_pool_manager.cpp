@@ -204,6 +204,15 @@ bool BufferPoolManager::is_page_resident(PageId page_id) {
     return hit != page_table_.end() && pages_[hit->second].state_.load(std::memory_order_acquire) == FrameState::VALID;
 }
 
+std::optional<ResidencyClass> BufferPoolManager::get_residency_class(PageId page_id) {
+    std::shared_lock lock{latch_};
+    auto hit = page_table_.find(page_id);
+    if (hit == page_table_.end() || pages_[hit->second].state_.load(std::memory_order_acquire) != FrameState::VALID) {
+        return std::nullopt;
+    }
+    return residency_classes_[hit->second];
+}
+
 void BufferPoolManager::mark_resident(PageId page_id, ResidencyClass residency_class) {
     std::unique_lock lock{latch_};
     auto hit = page_table_.find(page_id);

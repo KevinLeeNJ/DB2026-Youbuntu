@@ -63,6 +63,9 @@ class Plan {
 public:
     PlanTag tag;
     size_t runtime_rows_ = 0;
+    // Set when an index-backed child is configured to produce the requested
+    // ORDER BY directly, so LIMIT can be pushed below the projection chain.
+    bool order_satisfied_ = false;
     std::unordered_map<std::string, std::string> table_name_to_display_;
     virtual ~Plan() = default;
 };
@@ -88,6 +91,7 @@ public:
     size_t len_;
     std::vector<Condition> fed_conds_;
     std::vector<std::string> index_col_names_;
+    bool scan_backward_ = false;
 };
 
 class JoinPlan : public Plan {

@@ -216,7 +216,15 @@ public:
         return prev_->scan_table_name();
     }
 
+    std::string_view scan_table_name_view() const override {
+        return prev_->scan_table_name_view();
+    }
+
     std::vector<Condition> scan_conditions() const override {
         return prev_->scan_conditions();
+    }
+
+    const std::vector<Condition>& scan_conditions_ref() const override {
+        return prev_->scan_conditions_ref();
     }
 };

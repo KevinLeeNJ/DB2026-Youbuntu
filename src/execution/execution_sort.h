@@ -46,6 +46,15 @@ private:
     bool materialized_ = false;
     int limit_ = -1;
 
+    static std::unique_ptr<RmRecord> copy_view(TupleView view) {
+        if (!view) {
+            return nullptr;
+        }
+        auto record = std::make_unique<RmRecord>(static_cast<int>(view.size));
+        std::memcpy(record->data, view.data, view.size);
+        return record;
+    }
+
     static int compare_int_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
@@ -160,7 +169,10 @@ private:
     void materialize_all() {
         tuples_.clear();
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            auto rec = prev_->Next();
+            auto rec = copy_view(prev_->current());
+            if (rec == nullptr) {
+                rec = prev_->Next();
+            }
             if (rec != nullptr) {
                 tuples_.emplace_back(*rec);
             }
@@ -184,7 +196,10 @@ private:
         std::priority_queue<MaterializedTuple, std::vector<MaterializedTuple>, HeapCompare> heap(HeapCompare{this});
         size_t ordinal = 0;
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            auto rec = prev_->Next();
+            auto rec = copy_view(prev_->current());
+            if (rec == nullptr) {
+                rec = prev_->Next();
+            }
             if (rec == nullptr) {
                 continue;
             }
@@ -308,6 +323,13 @@ public:
             return nullptr;
         }
         return std::make_unique<RmRecord>(tuples_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return TupleView{tuples_[cursor_].data, static_cast<uint32_t>(tuples_[cursor_].size)};
     }
 
     Rid& rid() override {

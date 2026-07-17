@@ -48,9 +48,11 @@ private:
     std::vector<CompiledCondition> compiled_conds_;
     bool isend;
     std::unordered_map<std::string, std::vector<ColMeta>::iterator>
-        cols_map;                                // 存储链接条件中涉及的列的偏移量和字段长度
-    std::unique_ptr<RmRecord> current_left_rec_; // 当前缓存的左表记录
-    std::unique_ptr<RmRecord> _buffered_record;  // 复用的输出缓冲
+        cols_map;                                  // 存储链接条件中涉及的列的偏移量和字段长度
+    TupleView current_left_view_{};                // 当前左表记录的 borrowed view
+    std::unique_ptr<RmRecord> current_left_owned_; // 仅兼容没有 current() 的旧 executor
+    Rid current_left_rid_{};
+    std::unique_ptr<RmRecord> _buffered_record; // 复用的输出缓冲
     bool buffered_record_available_ = false;
 
     // INLJ support
@@ -149,41 +151,41 @@ private:
         }
     }
 
-    static const char* get_operand_data(const CompiledOperand& operand, const RmRecord& left_rec,
-                                        const RmRecord& right_rec) {
+    static const char* get_operand_data(const CompiledOperand& operand, const TupleView& left_tuple,
+                                        const TupleView& right_tuple) {
         switch (operand.source) {
         case OperandSource::Left:
-            return left_rec.data + operand.offset;
+            return left_tuple.data + operand.offset;
         case OperandSource::Right:
-            return right_rec.data + operand.offset;
+            return right_tuple.data + operand.offset;
         case OperandSource::Literal:
             return nullptr;
         }
         return nullptr;
     }
 
-    static double read_numeric_operand(const CompiledOperand& operand, const RmRecord& left_rec,
-                                       const RmRecord& right_rec) {
+    static double read_numeric_operand(const CompiledOperand& operand, const TupleView& left_tuple,
+                                       const TupleView& right_tuple) {
         if (operand.source == OperandSource::Literal) {
             return operand.type == TYPE_INT ? static_cast<double>(operand.literal.int_val)
                                             : static_cast<double>(operand.literal.float_val);
         }
 
-        const char* data = get_operand_data(operand, left_rec, right_rec);
+        const char* data = get_operand_data(operand, left_tuple, right_tuple);
         return operand.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(data)) : read_unaligned<double>(data);
     }
 
-    static std::string_view read_string_operand(const CompiledOperand& operand, const RmRecord& left_rec,
-                                                const RmRecord& right_rec) {
+    static std::string_view read_string_operand(const CompiledOperand& operand, const TupleView& left_tuple,
+                                                const TupleView& right_tuple) {
         if (operand.source == OperandSource::Literal) {
             return operand.literal.str_val;
         }
 
-        const char* data = get_operand_data(operand, left_rec, right_rec);
+        const char* data = get_operand_data(operand, left_tuple, right_tuple);
         return std::string_view(data, operand.len);
     }
 
-    bool is_condition(const RmRecord& left_rec, const RmRecord& right_rec) const {
+    bool is_condition(const TupleView& left_tuple, const TupleView& right_tuple) const {
         for (const auto& cond : compiled_conds_) {
             const auto lhs_type = cond.lhs.type;
             const auto rhs_type = cond.rhs.type;
@@ -193,12 +195,12 @@ private:
 
             bool condition_result = false;
             if ((lhs_type == TYPE_INT || lhs_type == TYPE_FLOAT) && (rhs_type == TYPE_INT || rhs_type == TYPE_FLOAT)) {
-                condition_result = compare_numeric(cond.op, read_numeric_operand(cond.lhs, left_rec, right_rec),
-                                                   read_numeric_operand(cond.rhs, left_rec, right_rec));
+                condition_result = compare_numeric(cond.op, read_numeric_operand(cond.lhs, left_tuple, right_tuple),
+                                                   read_numeric_operand(cond.rhs, left_tuple, right_tuple));
             } else if ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
                        (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)) {
-                condition_result = compare_string(cond.op, read_string_operand(cond.lhs, left_rec, right_rec),
-                                                  read_string_operand(cond.rhs, left_rec, right_rec));
+                condition_result = compare_string(cond.op, read_string_operand(cond.lhs, left_tuple, right_tuple),
+                                                  read_string_operand(cond.rhs, left_tuple, right_tuple));
             } else {
                 throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
             }
@@ -215,15 +217,45 @@ private:
         buffered_record_available_ = false;
     }
 
+    void clear_current_left() {
+        current_left_view_ = {};
+        current_left_owned_.reset();
+    }
+
+    bool load_current_left() {
+        clear_current_left();
+        if (left_->is_end()) {
+            return false;
+        }
+        current_left_view_ = left_->current();
+        if (!current_left_view_) {
+            current_left_owned_ = left_->Next();
+            if (current_left_owned_ != nullptr) {
+                current_left_view_ =
+                    TupleView{current_left_owned_->data, static_cast<uint32_t>(current_left_owned_->size)};
+            }
+        }
+        if (!current_left_view_) {
+            return false;
+        }
+        current_left_rid_ = left_->rid();
+        return true;
+    }
+
+    void advance_current_left() {
+        left_->nextTuple();
+        clear_current_left();
+    }
+
     void ensure_output_buffer() {
         if (_buffered_record == nullptr || _buffered_record->size != static_cast<int>(len_)) {
             _buffered_record = std::make_unique<RmRecord>(len_);
         }
     }
 
-    Value extract_key_from_left(const RmRecord& left_rec) const {
+    Value extract_key_from_left(const TupleView& left_tuple) const {
         Value val;
-        const char* data = left_rec.data + left_key_offset_;
+        const char* data = left_tuple.data + left_key_offset_;
         switch (left_key_type_) {
         case TYPE_INT:
             val.set_int(read_unaligned<int>(data));
@@ -240,12 +272,12 @@ private:
         return val;
     }
 
-    std::vector<Condition> build_key_conditions(const RmRecord& left_rec) const {
+    std::vector<Condition> build_key_conditions(const TupleView& left_tuple) const {
         Condition key_cond;
         key_cond.lhs_col = inlj_right_col_;
         key_cond.op = OP_EQ;
         key_cond.is_rhs_val = true;
-        key_cond.rhs_val = extract_key_from_left(left_rec);
+        key_cond.rhs_val = extract_key_from_left(left_tuple);
         key_cond.rhs_val.init_raw(left_key_len_);
         return {key_cond};
     }
@@ -299,7 +331,7 @@ public:
             }
         }
 
-        current_left_rec_ = nullptr; // 初始化 current_left_rec_
+        clear_current_left();
         reset_buffered_record();
     }
 
@@ -309,7 +341,7 @@ public:
         right_->beginTuple();
         right_->set_counting_enabled(true);
         isend = false;
-        current_left_rec_ = nullptr; // 获取左表的第一条记录
+        clear_current_left(); // 获取左表的第一条记录
         reset_buffered_record();
         nextTuple();
     }
@@ -326,23 +358,19 @@ public:
 
         while (true) {
             // 如果没有缓存的左表记录，或者右表已经为当前的左表记录扫描完毕
-            if (current_left_rec_ == nullptr) {
-                // 从左表获取下一条记录
-                // left_->nextTuple();
-                current_left_rec_ = left_->Next();
-                if (left_->is_end() || current_left_rec_ == nullptr) {
+            if (!current_left_view_) {
+                if (!load_current_left()) {
                     isend = true;
                     reset_buffered_record();
                     return;
                 }
-                left_->nextTuple();
                 // INLJ: inject join key before resetting inner scan
                 if (inlj_mode_) {
                     if (direct_lookup_key_supported_) {
-                        right_->set_lookup_key(inlj_right_col_, current_left_rec_->data + left_key_offset_,
+                        right_->set_lookup_key(inlj_right_col_, current_left_view_.data + left_key_offset_,
                                                static_cast<size_t>(left_key_len_));
                     } else {
-                        right_->set_key_conditions(build_key_conditions(*current_left_rec_));
+                        right_->set_key_conditions(build_key_conditions(current_left_view_));
                     }
                 }
                 right_->beginTuple();
@@ -350,18 +378,32 @@ public:
 
             // 用当前的左表记录，继续扫描右表
             while (true) {
-                auto right_rec = right_->Next();
-                if (right_->is_end() || right_rec == nullptr) {
+                if (right_->is_end()) {
+                    // Avoid invoking the compatibility Next() path after the
+                    // child has already reached its end marker.
+                    advance_current_left();
+                    break;
+                }
+                std::unique_ptr<RmRecord> fallback_right_record;
+                TupleView right_view = right_->current();
+                if (!right_view) {
+                    fallback_right_record = right_->Next();
+                    if (fallback_right_record != nullptr) {
+                        right_view =
+                            TupleView{fallback_right_record->data, static_cast<uint32_t>(fallback_right_record->size)};
+                    }
+                }
+                if (right_->is_end() || !right_view) {
                     // 右表已为当前左表记录扫描完毕
-                    current_left_rec_ = nullptr; // 清空左表记录，以便外层循环获取下一条
-                    break;                       // 退出内层循环，回到外层循环
+                    advance_current_left();
+                    break; // 退出内层循环，回到外层循环
                 }
 
-                if (is_condition(*current_left_rec_, *right_rec)) {
+                if (is_condition(current_left_view_, right_view)) {
                     // 找到一个匹配项
                     ensure_output_buffer();
-                    memcpy(_buffered_record->data, current_left_rec_->data, left_tuple_len_);
-                    memcpy(_buffered_record->data + left_tuple_len_, right_rec->data, right_tuple_len_);
+                    memcpy(_buffered_record->data, current_left_view_.data, left_tuple_len_);
+                    memcpy(_buffered_record->data + left_tuple_len_, right_view.data, right_tuple_len_);
                     buffered_record_available_ = true;
                     right_->nextTuple(); // 继续扫描右表的下一条记录
 
@@ -383,8 +425,8 @@ public:
         return std::make_unique<RmRecord>(*_buffered_record);
     }
     Rid& rid() override {
-        if (left_ && !left_->is_end()) {
-            return left_->rid();
+        if (current_left_view_) {
+            return current_left_rid_;
         }
         return _abstract_rid;
     }

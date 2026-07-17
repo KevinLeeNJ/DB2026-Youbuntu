@@ -108,8 +108,19 @@ public:
         return "";
     }
 
+    // Stable view used by SSI plumbing; the legacy string-returning API stays
+    // available for compatibility with older executor implementations.
+    virtual std::string_view scan_table_name_view() const {
+        return {};
+    }
+
     virtual std::vector<Condition> scan_conditions() const {
         return {};
+    }
+
+    virtual const std::vector<Condition>& scan_conditions_ref() const {
+        static const std::vector<Condition> empty_conditions;
+        return empty_conditions;
     }
 
     virtual void record_current_read_for_ssi() {}

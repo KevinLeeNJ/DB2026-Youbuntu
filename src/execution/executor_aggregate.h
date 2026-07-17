@@ -113,6 +113,7 @@ private:
     size_t cursor_ = 0;
     bool materialized_ = false;
     bool has_group_by_ = false;
+    mutable std::unique_ptr<RmRecord> current_output_;
 
     static std::string trim_string(const char* data, int len) {
         return execution_scalar::trim_string(data, len);
@@ -136,9 +137,13 @@ private:
     }
 
     CellValue read_cell(const RmRecord& rec, const ColMeta& col) const {
+        return read_cell(TupleView{rec.data, static_cast<uint32_t>(rec.size)}, col);
+    }
+
+    CellValue read_cell(TupleView tuple, const ColMeta& col) const {
         CellValue value;
         value.type = col.type;
-        const char* data = rec.data + col.offset;
+        const char* data = tuple.data + col.offset;
         switch (col.type) {
         case TYPE_INT:
             value.int_val = read_unaligned<int>(data);
@@ -333,9 +338,13 @@ private:
     }
 
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec) const {
+        update_aggregate_state(state, spec, TupleView{rec.data, static_cast<uint32_t>(rec.size)});
+    }
+
+    void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, TupleView tuple) const {
         CellValue current_value;
         if (!spec.is_star && spec.type != LocalAggType::COUNT) {
-            current_value = read_cell(rec, spec.input_col);
+            current_value = read_cell(tuple, spec.input_col);
         }
 
         switch (spec.type) {
@@ -486,15 +495,22 @@ private:
         if (has_group_by_) {
             std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-                auto rec = prev_->Next();
-                if (rec == nullptr) {
+                TupleView tuple = prev_->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!tuple) {
+                    fallback = prev_->Next();
+                    if (fallback != nullptr) {
+                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (!tuple) {
                     continue;
                 }
 
                 GroupKey key;
                 key.values.reserve(group_cols_.size());
                 for (const auto& col : group_cols_) {
-                    key.values.push_back(read_cell(*rec, col));
+                    key.values.push_back(read_cell(tuple, col));
                 }
 
                 auto [it, inserted] = group_indexes.emplace(key, groups_.size());
@@ -502,7 +518,7 @@ private:
                     groups_.push_back(make_group_state(key.values));
                 }
                 for (size_t i = 0; i < aggregates_.size(); ++i) {
-                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec);
+                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], tuple);
                 }
             }
 
@@ -535,11 +551,18 @@ private:
         // stop after consuming it instead of scanning the whole range.
         if (can_use_min_index_shortcut()) {
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-                auto rec = prev_->Next();
-                if (rec == nullptr) {
+                TupleView tuple = prev_->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!tuple) {
+                    fallback = prev_->Next();
+                    if (fallback != nullptr) {
+                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (!tuple) {
                     continue;
                 }
-                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], *rec);
+                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], tuple);
                 groups_.push_back(std::move(global_state));
                 return;
             }
@@ -551,12 +574,19 @@ private:
         }
 
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            auto rec = prev_->Next();
-            if (rec == nullptr) {
+            TupleView tuple = prev_->current();
+            std::unique_ptr<RmRecord> fallback;
+            if (!tuple) {
+                fallback = prev_->Next();
+                if (fallback != nullptr) {
+                    tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                }
+            }
+            if (!tuple) {
                 continue;
             }
             for (size_t i = 0; i < aggregates_.size(); ++i) {
-                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], *rec);
+                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], tuple);
             }
         }
 
@@ -651,6 +681,20 @@ public:
             return nullptr;
         }
         return materialize_group_result(groups_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        // Aggregate results are materialized per call; current() keeps a
+        // reusable compatibility buffer so downstream executors can borrow it.
+        if (current_output_ == nullptr || current_output_->size != static_cast<int>(len_)) {
+            current_output_ = std::make_unique<RmRecord>(static_cast<int>(len_));
+        }
+        auto result = materialize_group_result(groups_[cursor_]);
+        memcpy(current_output_->data, result->data, len_);
+        return TupleView{current_output_->data, static_cast<uint32_t>(len_)};
     }
 
     bool is_end() const override {

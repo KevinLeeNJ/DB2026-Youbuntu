@@ -66,17 +66,34 @@ private:
         return dst_rec;
     }
 
+    RmRecord convert_view(TupleView src_view, const std::vector<ColMeta>& src_cols) const {
+        RmRecord dst_rec(static_cast<int>(len_));
+        for (size_t i = 0; i < cols_.size(); ++i) {
+            const auto& dst_col = cols_[i];
+            const auto& src_col = src_cols[i];
+            copy_cell(dst_rec.data + dst_col.offset, dst_col, src_view.data + src_col.offset, src_col);
+        }
+        return dst_rec;
+    }
+
     void materialize() {
         tuples_.clear();
         seen_.clear();
         for (auto& branch : branches_) {
             const auto& branch_cols = branch->cols();
             for (branch->beginTuple(); !branch->is_end(); branch->nextTuple()) {
-                auto rec = branch->Next();
-                if (rec == nullptr) {
+                TupleView view = branch->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!view) {
+                    fallback = branch->Next();
+                    if (fallback != nullptr) {
+                        view = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (!view) {
                     continue;
                 }
-                RmRecord converted = convert_record(*rec, branch_cols);
+                RmRecord converted = convert_view(view, branch_cols);
                 std::string key(converted.data, static_cast<size_t>(converted.size));
                 if (seen_.insert(key).second) {
                     tuples_.push_back(converted);
@@ -116,6 +133,13 @@ public:
             return nullptr;
         }
         return std::make_unique<RmRecord>(tuples_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return TupleView{tuples_[cursor_].data, static_cast<uint32_t>(tuples_[cursor_].size)};
     }
 
     Rid& rid() override {
