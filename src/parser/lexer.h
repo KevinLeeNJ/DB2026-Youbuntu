@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -25,11 +26,56 @@ struct LexerError : public std::runtime_error {
     explicit LexerError(const std::string& message) : std::runtime_error(message) {}
 };
 
+namespace detail {
+
+// C-locale character classification tables. The server never calls setlocale(),
+// so the C locale is always active; these tables match std::isalpha/isdigit/
+// isalnum/isspace/toupper for every unsigned char value in that locale while
+// avoiding the per-character locale lookup.
+inline constexpr uint8_t kCharAlpha = 0x01;
+inline constexpr uint8_t kCharDigit = 0x02;
+inline constexpr uint8_t kCharSpace = 0x04;
+
+inline constexpr std::array<uint8_t, 256> char_class = [] {
+    std::array<uint8_t, 256> table{};
+    for (unsigned c = '0'; c <= '9'; ++c)
+        table[c] |= kCharDigit;
+    for (unsigned c = 'a'; c <= 'z'; ++c)
+        table[c] |= kCharAlpha;
+    for (unsigned c = 'A'; c <= 'Z'; ++c)
+        table[c] |= kCharAlpha;
+    table[' '] |= kCharSpace;
+    table['\t'] |= kCharSpace;
+    table['\n'] |= kCharSpace;
+    table['\v'] |= kCharSpace;
+    table['\f'] |= kCharSpace;
+    table['\r'] |= kCharSpace;
+    return table;
+}();
+
+inline constexpr std::array<char, 256> upper_char = [] {
+    std::array<char, 256> table{};
+    for (unsigned c = 0; c < 256; ++c)
+        table[c] = static_cast<char>(c);
+    for (unsigned c = 'a'; c <= 'z'; ++c)
+        table[c] = static_cast<char>(c - 'a' + 'A');
+    return table;
+}();
+
+inline bool is_alpha(char c) { return (char_class[static_cast<unsigned char>(c)] & kCharAlpha) != 0; }
+inline bool is_digit(char c) { return (char_class[static_cast<unsigned char>(c)] & kCharDigit) != 0; }
+inline bool is_alnum(char c) { return (char_class[static_cast<unsigned char>(c)] & (kCharAlpha | kCharDigit)) != 0; }
+inline bool is_ident(char c) { return is_alnum(c) || c == '_'; }
+inline bool is_space(char c) { return (char_class[static_cast<unsigned char>(c)] & kCharSpace) != 0; }
+inline char to_upper(char c) { return upper_char[static_cast<unsigned char>(c)]; }
+
+} // namespace detail
+
 struct CIHash {
     size_t operator()(std::string_view s) const {
         size_t h = 0;
         for (char c : s) {
-            h = h * 31 + std::toupper(static_cast<unsigned char>(c));
+            h = h * 31 + detail::to_upper(c);
         }
         return h;
     }
@@ -40,7 +86,7 @@ struct CIEqual {
         if (a.size() != b.size())
             return false;
         for (size_t i = 0; i < a.size(); i++) {
-            if (std::toupper(static_cast<unsigned char>(a[i])) != std::toupper(static_cast<unsigned char>(b[i])))
+            if (detail::to_upper(a[i]) != detail::to_upper(b[i]))
                 return false;
         }
         return true;

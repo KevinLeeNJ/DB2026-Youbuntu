@@ -20,6 +20,12 @@ Value clone_value(const Value& source) {
     Value value;
     value.type = source.type;
     value.lexical_slot = source.lexical_slot;
+    if (source.lexical_slot >= 0) {
+        // Template parameter placeholder: the statement-cache binder overwrites
+        // the scalar/string payload and clears raw before the plan executes, so
+        // copying them here would be discarded work.
+        return value;
+    }
     if (source.type == TYPE_INT) {
         value.int_val = source.int_val;
     } else if (source.type == TYPE_FLOAT) {
@@ -82,17 +88,11 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_IndexScan:
     case T_IndexSkipScan: {
         const auto& scan = static_cast<const ScanPlan&>(source);
-        auto copy = std::make_unique<ScanPlan>(scan.tag, sm_manager, scan.tab_name_, std::vector<Condition>{},
-                                               scan.index_col_names_);
-        copy->cols_ = scan.cols_;
-        copy->conds_.clear();
+        auto copy = std::make_unique<ScanPlan>(ScanPlanCloneTag{}, scan);
         for (const auto& condition : scan.conds_)
             copy->conds_.push_back(clone_condition(condition));
-        copy->fed_conds_.clear();
         for (const auto& condition : scan.fed_conds_)
             copy->fed_conds_.push_back(clone_condition(condition));
-        copy->len_ = scan.len_;
-        copy->scan_backward_ = scan.scan_backward_;
         copy_base(source, copy.get());
         return copy;
     }
@@ -100,6 +100,7 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_SortMerge: {
         const auto& join = static_cast<const JoinPlan&>(source);
         std::vector<Condition> conditions;
+        conditions.reserve(join.conds_.size());
         for (const auto& condition : join.conds_)
             conditions.push_back(clone_condition(condition));
         auto copy = std::make_unique<JoinPlan>(join.tag, clone_plan_impl(*join.left_, sm_manager),
@@ -114,6 +115,7 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_Filter: {
         const auto& filter = static_cast<const FilterPlan&>(source);
         std::vector<Condition> conditions;
+        conditions.reserve(filter.conds_.size());
         for (const auto& condition : filter.conds_)
             conditions.push_back(clone_condition(condition));
         auto copy = std::make_unique<FilterPlan>(T_Filter, clone_plan_impl(*filter.subplan_, sm_manager),
@@ -124,6 +126,7 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_Projection: {
         const auto& projection = static_cast<const ProjectionPlan&>(source);
         std::vector<SelectItem> items;
+        items.reserve(projection.select_items_.size());
         for (const auto& item : projection.select_items_)
             items.push_back(clone_select_item(item));
         auto copy = std::make_unique<ProjectionPlan>(T_Projection, clone_plan_impl(*projection.subplan_, sm_manager),
@@ -135,6 +138,7 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_Aggregate: {
         const auto& aggregate = static_cast<const AggregatePlan&>(source);
         std::vector<HavingCondition> having;
+        having.reserve(aggregate.having_conds_.size());
         for (const auto& condition : aggregate.having_conds_)
             having.push_back(clone_having(condition));
         auto copy = std::make_unique<AggregatePlan>(T_Aggregate, clone_plan_impl(*aggregate.subplan_, sm_manager),
@@ -145,6 +149,7 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_Sort: {
         const auto& sort = static_cast<const SortPlan&>(source);
         std::vector<OrderByItem> items;
+        items.reserve(sort.order_by_items_.size());
         for (const auto& item : sort.order_by_items_)
             items.push_back(clone_order_item(item));
         auto copy = std::make_unique<SortPlan>(T_Sort, clone_plan_impl(*sort.subplan_, sm_manager), std::move(items),
@@ -161,6 +166,7 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_Union: {
         const auto& union_plan = static_cast<const UnionPlan&>(source);
         std::vector<std::unique_ptr<Plan>> branches;
+        branches.reserve(union_plan.branches_.size());
         for (const auto& branch : union_plan.branches_)
             branches.push_back(clone_plan_impl(*branch, sm_manager));
         auto copy =
@@ -175,12 +181,15 @@ std::unique_ptr<Plan> clone_plan_impl(const Plan& source, SmManager* sm_manager)
     case T_ExplainAnalyze: {
         const auto& dml = static_cast<const DMLPlan&>(source);
         std::vector<Value> values;
+        values.reserve(dml.values_.size());
         for (const auto& value : dml.values_)
             values.push_back(clone_value(value));
         std::vector<Condition> conditions;
+        conditions.reserve(dml.conds_.size());
         for (const auto& condition : dml.conds_)
             conditions.push_back(clone_condition(condition));
         std::vector<SetClause> clauses;
+        clauses.reserve(dml.set_clauses_.size());
         for (const auto& clause : dml.set_clauses_)
             clauses.push_back(clone_set_clause(clause));
         auto subplan = dml.subplan_ == nullptr ? nullptr : clone_plan_impl(*dml.subplan_, sm_manager);

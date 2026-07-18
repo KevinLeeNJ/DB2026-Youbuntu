@@ -72,6 +72,10 @@ public:
     virtual ~Plan() = default;
 };
 
+// Tag selecting the ScanPlan blueprint-clone constructor, which copies members
+// directly instead of re-resolving the table through the catalog.
+struct ScanPlanCloneTag {};
+
 class ScanPlan : public Plan {
 public:
     ScanPlan(PlanTag tag, SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
@@ -84,6 +88,16 @@ public:
         len_ = cols_.back().offset + cols_.back().len;
         fed_conds_ = conds_;
         index_col_names_ = index_col_names;
+    }
+
+    // Blueprint clone: memberwise copy without a catalog lookup. Conditions are
+    // left empty for the caller to fill with clone-aware copies.
+    ScanPlan(ScanPlanCloneTag, const ScanPlan& source)
+        : tab_name_(source.tab_name_), cols_(source.cols_), len_(source.len_),
+          index_col_names_(source.index_col_names_), scan_backward_(source.scan_backward_) {
+        Plan::tag = source.tag;
+        conds_.reserve(source.conds_.size());
+        fed_conds_.reserve(source.fed_conds_.size());
     }
     ~ScanPlan() {}
     // 以下变量同ScanExecutor中的变量

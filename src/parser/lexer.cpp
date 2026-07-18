@@ -106,7 +106,7 @@ void Lexer::skip_whitespace_and_comments() {
     while (pos_ < input_.size()) {
         char c = current_char();
 
-        if (std::isspace(static_cast<unsigned char>(c))) {
+        if (detail::is_space(c)) {
             advance();
         } else if (c == '-' && peek_char() == '-') {
             skip_line_comment();
@@ -157,19 +157,19 @@ Token Lexer::next_token() {
 
     // File path (for LOAD): starts with '/', "./" or "../"
     if ((c == '/' &&
-         !(std::isspace(static_cast<unsigned char>(peek_char(1))) ||
-           std::isdigit(static_cast<unsigned char>(peek_char(1))) || peek_char(1) == '-' || peek_char(1) == '\'')) ||
+         !(detail::is_space(peek_char(1)) || detail::is_digit(peek_char(1)) || peek_char(1) == '-' ||
+           peek_char(1) == '\'')) ||
         (c == '.' && (peek_char(1) == '/' || (peek_char(1) == '.' && peek_char(2) == '/')))) {
         return scan_path();
     }
 
     // Identifier or keyword
-    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+    if (detail::is_alpha(c) || c == '_') {
         return scan_identifier_or_keyword();
     }
 
     // Number
-    if (std::isdigit(static_cast<unsigned char>(c))) {
+    if (detail::is_digit(c)) {
         return scan_number();
     }
 
@@ -195,14 +195,11 @@ Token Lexer::scan_identifier_or_keyword() {
     int start_col = column_;
     size_t start_pos = pos_;
 
-    while (pos_ < input_.size()) {
-        char c = current_char();
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
-            advance();
-        } else {
-            break;
-        }
+    // Identifiers never contain '\n', so the column counter can advance in bulk.
+    while (pos_ < input_.size() && detail::is_ident(input_[pos_])) {
+        ++pos_;
     }
+    column_ += static_cast<int>(pos_ - start_pos);
 
     std::string_view text = input_.substr(start_pos, pos_ - start_pos);
 
@@ -224,17 +221,19 @@ Token Lexer::scan_number() {
     size_t start_pos = pos_;
     bool has_dot = false;
 
+    // Numbers never contain '\n', so the column counter can advance in bulk.
     while (pos_ < input_.size()) {
-        char c = current_char();
-        if (std::isdigit(static_cast<unsigned char>(c))) {
-            advance();
+        char c = input_[pos_];
+        if (detail::is_digit(c)) {
+            ++pos_;
         } else if (c == '.' && !has_dot) {
             has_dot = true;
-            advance();
+            ++pos_;
         } else {
             break;
         }
     }
+    column_ += static_cast<int>(pos_ - start_pos);
 
     std::string_view text = input_.substr(start_pos, pos_ - start_pos);
     Token tok(has_dot ? TokenType::VALUE_FLOAT : TokenType::VALUE_INT, text, start_line, start_col);
@@ -350,7 +349,7 @@ Token Lexer::scan_operator() {
 int64_t Lexer::parse_integer(std::string_view text) {
     int64_t value = 0;
     for (char c : text) {
-        if (!std::isdigit(static_cast<unsigned char>(c))) {
+        if (!detail::is_digit(c)) {
             throw LexerError("Lexer Error: integer literal malformed");
         }
         int digit = c - '0';
