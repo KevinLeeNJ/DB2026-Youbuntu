@@ -11,6 +11,9 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "executor_abstract.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_predicate.h"
+#endif
 #include "transaction/transaction_manager.h"
 
 class FilterExecutor : public AbstractExecutor {
@@ -18,6 +21,9 @@ private:
     std::unique_ptr<AbstractExecutor> prev_;
     std::vector<Condition> conds_;
     std::vector<ConditionAddress> condition_addresses_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::PredicateKernel> jit_predicate_;
+#endif
     size_t len_;
     std::unique_ptr<RmRecord> fallback_record_;
     TupleView current_view_;
@@ -43,6 +49,14 @@ private:
     }
 
     bool matches(const TupleView& tuple) {
+#ifdef RMDB_ENABLE_JIT
+        if (jit_predicate_ != nullptr) {
+            auto result = jit_predicate_->evaluate(tuple.data, tuple.size);
+            if (result.has_value()) {
+                return *result;
+            }
+        }
+#endif
         return conditions_match(conds_, condition_addresses_, tuple);
     }
 
@@ -85,6 +99,16 @@ public:
         conds_ = std::move(conds);
         condition_addresses_ = cache_condition_addresses(conds_);
         len_ = prev_->tupleLen();
+#ifdef RMDB_ENABLE_JIT
+        if (jit::predicate_jit_available()) {
+            auto predicate = std::make_unique<jit::PredicateKernel>(
+                T_Filter, conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), prev_->cols()}, std::nullopt,
+                prev_->catalog_generation());
+            if (*predicate) {
+                jit_predicate_ = std::move(predicate);
+            }
+        }
+#endif
     }
 
     void beginTuple() override {
@@ -128,6 +152,10 @@ public:
 
     std::string getType() override {
         return "FilterExecutor";
+    }
+
+    uint64_t catalog_generation() const override {
+        return prev_->catalog_generation();
     }
 
     const std::vector<ColMeta>& cols() const override {

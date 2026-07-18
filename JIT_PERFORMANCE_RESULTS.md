@@ -686,3 +686,20 @@ N/A (no readable perf/flamegraph summary)
 - Tests cover 32 concurrent observations compiling one shape once, queue-full fallback, failure cooldown, catalog-race
   discard, strong-reference safety across eviction, execution-scope drain, and 128-shape cache churn. JIT-on tests pass
   15/15; `make test` passed 339/339; `RMDB_ENABLE_JIT=OFF` builds `rmdb` without registering `jit_test`.
+
+## Phase 4 Decision
+
+- The x86-64 backend now emits Predicate kernels with a stable `JitCallFrame*` ABI. INT/FLOAT operands are loaded and
+  promoted in generated code, preserve left-to-right AND short-circuiting, and explicitly preserve C++ NaN behavior for
+  all six comparison operators. STRING/DATETIME comparisons use a stable helper that retains fixed-width NUL truncation
+  and lexicographic semantics.
+- SeqScan, IndexScan residual filtering, Filter, and numeric NestedLoopJoin conditions can use the service-managed
+  kernel. Any disabled mode, cache miss, queue/compile failure, epoch change, frame validation failure, unsupported join
+  shape, or sampled shadow mismatch transparently executes the pre-existing C++ comparison path. MVCC, SSI, locks,
+  index cursors, WAL, transactions, client protocol, and `output.txt` remain outside generated code.
+- `src/jit/jit_predicate_bench` ran the requested three rounds over 1,000,000 deterministic INT predicates per path:
+  interpreter cycles `[30,739,302, 30,816,328, 31,836,628]`; generated-kernel cycles
+  `[8,383,142, 8,407,614, 9,299,474]`; median reduction `72.717%`. This exceeds the Phase 4 40% predicate-cycle gate.
+- Force-mode full regression passed 343/343. JIT unit coverage includes 60,000 random numeric tuple comparisons across
+  all operators, mixed numeric types, NaN, fixed-width strings, tuple1 join input, cache lifecycle, and a FilterExecutor
+  force-mode cache-hit check.

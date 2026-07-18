@@ -106,6 +106,25 @@ JitManager::ExecutionScope JitManager::enter_execution() {
     return ExecutionScope(this);
 }
 
+void JitManager::discard(const JitProgram& program) {
+    std::shared_ptr<const JitCode> released_code;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto position = impl_->entries.find(program.key.canonical_bytes);
+        if (position == impl_->entries.end() || position->second->program.key != program.key) {
+            return;
+        }
+        auto entry = std::move(position->second);
+        entry->state = JitEntryState::EVICTED;
+        if (entry->code != nullptr) {
+            released_code = std::move(entry->code);
+            impl_->code_bytes -= entry->code_bytes;
+        }
+        impl_->entries.erase(position);
+        ++impl_->evictions;
+    }
+}
+
 void JitManager::leave_execution() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     --impl_->active_execution_count;

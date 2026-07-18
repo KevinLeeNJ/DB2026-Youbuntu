@@ -17,6 +17,9 @@ See the Mulan PSL v2 for more details. */
 
 namespace jit {
 
+struct JitCallFrame;
+struct JitProgram;
+
 enum class JitStatus {
     OK,
     DIVISION_BY_ZERO,
@@ -53,6 +56,7 @@ public:
     }
 
     int32_t test_add_i32(int32_t lhs, int32_t rhs) const;
+    JitStatus invoke_predicate(JitCallFrame* frame) const;
     size_t code_size() const {
         return code_size_;
     }
@@ -61,13 +65,17 @@ private:
     friend class JitRuntime;
 
     using TestAddI32Fn = int32_t (*)(int32_t, int32_t);
+    using PredicateFn = JitStatus (*)(JitCallFrame*);
 
-    JitCode(std::shared_ptr<JitRuntimeImpl> runtime, TestAddI32Fn function, size_t code_size);
+    enum class Kind { TEST_ADD_I32, PREDICATE };
+
+    JitCode(std::shared_ptr<JitRuntimeImpl> runtime, void* function, size_t code_size, Kind kind);
     void reset();
 
     std::shared_ptr<JitRuntimeImpl> runtime_;
-    TestAddI32Fn function_{nullptr};
+    void* function_{nullptr};
     size_t code_size_{0};
+    Kind kind_{Kind::TEST_ADD_I32};
 };
 
 struct JitCompileResult {
@@ -91,6 +99,7 @@ public:
     bool is_supported() const;
     size_t active_code_count() const;
     JitCompileResult compile_test_add_i32(JitCompileOptions options = {});
+    JitCompileResult compile_predicate(const JitProgram& program, JitCompileOptions options = {});
 
 private:
     std::shared_ptr<JitRuntimeImpl> runtime_;

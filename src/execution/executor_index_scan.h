@@ -25,6 +25,9 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record/rm_scan.h"
 #include "system/sm.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_predicate.h"
+#endif
 
 class IndexScanExecutor : public AbstractExecutor {
 protected:
@@ -78,6 +81,9 @@ protected:
     size_t len_;                       // 选取出来的一条记录的长度
     std::vector<Condition> fed_conds_; // 扫描条件，和conds_字段相同
     std::vector<ConditionAddress> condition_addresses_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::PredicateKernel> jit_predicate_;
+#endif
     std::vector<Condition> base_conds_; // original conditions from construction, for INLJ key injection
 
     std::vector<std::string> index_col_names_; // index scan涉及到的索引包含的字段
@@ -381,6 +387,16 @@ public:
         }
         fed_conds_ = conds_;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
+#ifdef RMDB_ENABLE_JIT
+        if (jit::predicate_jit_available()) {
+            auto predicate = std::make_unique<jit::PredicateKernel>(
+                T_IndexScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
+                sm_manager_->get_catalog_generation());
+            if (*predicate) {
+                jit_predicate_ = std::move(predicate);
+            }
+        }
+#endif
         base_conds_ = conds_; // save original conditions before any key injection
         index_name_ = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
         ih_ = sm_manager_->ihs_.at(index_name_).get();
@@ -556,7 +572,7 @@ public:
                 continue;
             }
             const TupleView view{tuple.view.data, tuple.view.size};
-            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
+            const bool match = matches(view);
             if (match) {
                 record_tuple_read(rid_);
                 buffered_tuple_ = std::move(tuple);
@@ -564,6 +580,18 @@ public:
             }
             scan_->next();
         }
+    }
+
+    bool matches(const TupleView& tuple) const {
+#ifdef RMDB_ENABLE_JIT
+        if (jit_predicate_ != nullptr) {
+            auto result = jit_predicate_->evaluate(tuple.data, tuple.size);
+            if (result.has_value()) {
+                return *result;
+            }
+        }
+#endif
+        return conditions_match(fed_conds_, condition_addresses_, tuple);
     }
 
     std::unique_ptr<RmRecord> Next() override {
@@ -606,6 +634,10 @@ public:
         return len_;
     }
 
+    uint64_t catalog_generation() const override {
+        return sm_manager_->get_catalog_generation();
+    }
+
     void set_key_conditions(std::vector<Condition> key_conds) override {
         // Combine base filter conditions with injected key conditions
         conds_ = base_conds_;
@@ -619,6 +651,14 @@ public:
         }
         fed_conds_ = conds_;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
+#ifdef RMDB_ENABLE_JIT
+        if (jit::predicate_jit_available()) {
+            auto predicate = std::make_unique<jit::PredicateKernel>(
+                T_IndexScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
+                sm_manager_->get_catalog_generation());
+            jit_predicate_ = *predicate ? std::move(predicate) : nullptr;
+        }
+#endif
         compile_index_conditions();
         rebuild_constraints();
         lookup_key_valid_ = false;

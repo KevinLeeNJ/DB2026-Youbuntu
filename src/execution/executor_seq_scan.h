@@ -18,6 +18,9 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_predicate.h"
+#endif
 
 class SeqScanExecutor : public AbstractExecutor {
 private:
@@ -28,6 +31,9 @@ private:
     size_t len_;                       // scan后生成的每条记录的长度
     std::vector<Condition> fed_conds_; // 同conds_，两个字段相同
     std::vector<ConditionAddress> condition_addresses_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::PredicateKernel> jit_predicate_;
+#endif
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_; // table_iterator
@@ -71,6 +77,18 @@ private:
         }
     }
 
+    bool matches(const TupleView& tuple) const {
+#ifdef RMDB_ENABLE_JIT
+        if (jit_predicate_ != nullptr) {
+            auto result = jit_predicate_->evaluate(tuple.data, tuple.size);
+            if (result.has_value()) {
+                return *result;
+            }
+        }
+#endif
+        return conditions_match(fed_conds_, condition_addresses_, tuple);
+    }
+
 public:
     SeqScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds, Context* context) {
         sm_manager_ = sm_manager;
@@ -85,6 +103,16 @@ public:
 
         fed_conds_ = conds_;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
+#ifdef RMDB_ENABLE_JIT
+        if (jit::predicate_jit_available()) {
+            auto predicate = std::make_unique<jit::PredicateKernel>(
+                T_SeqScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
+                sm_manager_->get_catalog_generation());
+            if (*predicate) {
+                jit_predicate_ = std::move(predicate);
+            }
+        }
+#endif
     }
     std::unique_ptr<RmRecord> visible_record(const Rid& rid) {
         return GetVisibleRecord(fh_, rid, context_);
@@ -105,7 +133,7 @@ public:
                 continue;
             }
             const TupleView view{tuple.view.data, tuple.view.size};
-            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
+            const bool match = matches(view);
             if (match) {
                 record_tuple_read(rid_);
                 buffered_tuple_ = std::move(tuple);
@@ -128,7 +156,7 @@ public:
                 continue;
             }
             const TupleView view{tuple.view.data, tuple.view.size};
-            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
+            const bool match = matches(view);
             if (match) {
                 record_tuple_read(rid_);
                 buffered_tuple_ = std::move(tuple);
@@ -166,6 +194,10 @@ public:
     }
     std::string getType() override {
         return "SeqScanExecutor"; // 返回执行器的名称
+    }
+
+    uint64_t catalog_generation() const override {
+        return sm_manager_->get_catalog_generation();
     }
     const std::vector<ColMeta>& cols() const override {
         return cols_;

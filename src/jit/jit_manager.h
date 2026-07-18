@@ -84,6 +84,7 @@ public:
 
     std::shared_ptr<const JitCode> observe(const JitProgram& program, JitMode mode, JitObservation observation = {});
     ExecutionScope enter_execution();
+    void discard(const JitProgram& program);
     bool wait_until_idle(std::chrono::milliseconds timeout);
     void shutdown_and_drain();
     JitManagerStats stats() const;

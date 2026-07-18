@@ -18,6 +18,9 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_predicate.h"
+#endif
 
 class NestedLoopJoinExecutor : public AbstractExecutor {
 private:
@@ -46,6 +49,9 @@ private:
 
     std::vector<Condition> fed_conds_; // join条件
     std::vector<CompiledCondition> compiled_conds_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::PredicateKernel> jit_predicate_;
+#endif
     bool isend;
     std::unordered_map<std::string, std::vector<ColMeta>::iterator>
         cols_map;                                  // 存储链接条件中涉及的列的偏移量和字段长度
@@ -188,6 +194,15 @@ private:
     bool is_condition(const TupleView& left_tuple, const TupleView& right_tuple) const {
         phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::JOIN_COMPARE,
                                                    phase_metrics::sample_rate(phase_metrics::Phase::JOIN_COMPARE));
+#ifdef RMDB_ENABLE_JIT
+        if (jit_predicate_ != nullptr) {
+            auto result =
+                jit_predicate_->evaluate(left_tuple.data, left_tuple.size, right_tuple.data, right_tuple.size);
+            if (result.has_value()) {
+                return *result;
+            }
+        }
+#endif
         for (const auto& cond : compiled_conds_) {
             const auto lhs_type = cond.lhs.type;
             const auto rhs_type = cond.rhs.type;
@@ -293,6 +308,8 @@ public:
         right_ = std::move(right);
         left_tuple_len_ = left_->tupleLen();
         right_tuple_len_ = right_->tupleLen();
+        const auto left_cols = left_->cols();
+        const auto right_input_cols = right_->cols();
         len_ = left_tuple_len_ + right_tuple_len_;
         cols_ = left_->cols();
         auto right_cols = right_->cols();
@@ -309,6 +326,22 @@ public:
         isend = false;
         fed_conds_ = std::move(conds);
         compile_conditions();
+#ifdef RMDB_ENABLE_JIT
+        const bool numeric_only =
+            std::all_of(compiled_conds_.begin(), compiled_conds_.end(), [](const auto& condition) {
+                return (condition.lhs.type == TYPE_INT || condition.lhs.type == TYPE_FLOAT) &&
+                       (condition.rhs.type == TYPE_INT || condition.rhs.type == TYPE_FLOAT);
+            });
+        if (numeric_only && jit::predicate_jit_available()) {
+            auto predicate = std::make_unique<jit::PredicateKernel>(
+                T_NestLoop, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(left_tuple_len_), left_cols},
+                jit::JitTupleLayout{static_cast<uint32_t>(right_tuple_len_), right_input_cols},
+                left_->catalog_generation());
+            if (*predicate) {
+                jit_predicate_ = std::move(predicate);
+            }
+        }
+#endif
 
         // INLJ initialization
         if (!inlj_right_col.tab_name.empty()) {
@@ -445,6 +478,10 @@ public:
 
     std::string getType() override {
         return "NestedLoopJoinExecutor";
+    }
+
+    uint64_t catalog_generation() const override {
+        return left_->catalog_generation();
     }
 
     const std::vector<ColMeta>& cols() const override {

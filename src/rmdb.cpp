@@ -41,7 +41,7 @@ See the Mulan PSL v2 for more details. */
 #include "portal.h"
 #include "analyze/analyze.h"
 #ifdef RMDB_ENABLE_JIT
-#include "jit/jit_manager.h"
+#include "jit/jit_predicate.h"
 #endif
 
 #define SOCK_PORT 8765
@@ -141,7 +141,6 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 #ifdef RMDB_ENABLE_JIT
-std::unique_ptr<jit::JitManager> jit_manager;
 #endif
 
 static jmp_buf jmpbuf;
@@ -223,8 +222,7 @@ void client_handler(int fd) {
         }
 
 #ifdef RMDB_ENABLE_JIT
-        auto jit_execution_scope =
-            jit_manager == nullptr ? jit::JitManager::ExecutionScope{} : jit_manager->enter_execution();
+        auto jit_execution_scope = jit::enter_predicate_jit_execution();
 #endif
 
         memset(data_send, '\0', BUFFER_LENGTH);
@@ -481,13 +479,7 @@ int main(int argc, char** argv) {
         LOG_INFO("database opened: %s", db_name.c_str());
 
 #ifdef RMDB_ENABLE_JIT
-        jit_manager = std::make_unique<jit::JitManager>(
-            jit::JitManagerConfig{}, [] { return sm_manager->get_catalog_generation(); },
-            [](const jit::JitProgram&) {
-                return jit::JitCompileResult{jit::JitStatus::UNSUPPORTED_ARCHITECTURE,
-                                             {},
-                                             "predicate code generation is not enabled before phase 4"};
-            });
+        jit::initialize_predicate_jit([] { return sm_manager->get_catalog_generation(); });
 #endif
 
         log_manager->initialize_from_existing_log();
@@ -584,8 +576,7 @@ int main(int argc, char** argv) {
         }
 
 #ifdef RMDB_ENABLE_JIT
-        jit_manager->shutdown_and_drain();
-        jit_manager.reset();
+        jit::shutdown_predicate_jit();
 #endif
         sm_manager->close_db();
         LOG_INFO("database has been closed");
