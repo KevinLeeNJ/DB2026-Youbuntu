@@ -61,8 +61,10 @@ RmRecord make_filter_record(int lhs, int rhs) {
 
 class CountingExecutor : public AbstractExecutor {
 public:
-    CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records)
-        : cols_(std::move(cols)), records_(std::move(records)) {
+    CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records,
+                     int* external_next_record_calls = nullptr)
+        : cols_(std::move(cols)), records_(std::move(records)),
+          external_next_record_calls_(external_next_record_calls) {
         len_ = 0;
         for (const auto& col : cols_) {
             len_ = std::max(len_, static_cast<size_t>(col.offset + col.len));
@@ -86,6 +88,9 @@ public:
 
     std::unique_ptr<RmRecord> Next() override {
         ++next_record_calls_;
+        if (external_next_record_calls_ != nullptr) {
+            ++*external_next_record_calls_;
+        }
         if (is_end()) {
             return nullptr;
         }
@@ -139,6 +144,7 @@ public:
 private:
     std::vector<ColMeta> cols_;
     std::vector<RmRecord> records_;
+    int* external_next_record_calls_ = nullptr;
     size_t len_ = 0;
     size_t cursor_ = 0;
 };
@@ -753,6 +759,129 @@ TEST_F(ExecutorTest, update_single_field) {
     }
 }
 
+TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
+    setup_db();
+    std::vector<ColDef> cols = {
+        {"id", TYPE_INT, 4},         {"source", TYPE_INT, 4},  {"assigned", TYPE_INT, 4},
+        {"arithmetic", TYPE_INT, 4}, {"score", TYPE_FLOAT, 8},
+    };
+    sm_manager_->create_table("mutation_bind", cols, nullptr);
+
+    Value id;
+    id.set_int(1);
+    Value source;
+    source.set_int(7);
+    Value assigned;
+    assigned.set_int(3);
+    Value arithmetic;
+    arithmetic.set_int(4);
+    Value score;
+    score.set_float(1.5);
+    char buf[4096] = {};
+    int offset = 0;
+    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    InsertExecutor insert(sm_manager_.get(), "mutation_bind", {id, source, assigned, arithmetic, score}, &ctx);
+    insert.Next();
+
+    Condition literal_condition;
+    literal_condition.lhs_col = {"mutation_bind", "score"};
+    literal_condition.op = OP_GT;
+    literal_condition.is_rhs_val = true;
+    literal_condition.rhs_val.set_int(1);
+    Condition column_condition;
+    column_condition.lhs_col = {"mutation_bind", "source"};
+    column_condition.op = OP_GT;
+    column_condition.is_rhs_val = false;
+    column_condition.rhs_col = {"mutation_bind", "assigned"};
+    std::vector<Condition> conditions{literal_condition, column_condition};
+
+    const auto& tab = sm_manager_->db_.get_table("mutation_bind");
+    auto bound_conditions = BindMutationConditions(tab, conditions);
+    ASSERT_EQ(bound_conditions.size(), 2U);
+    EXPECT_EQ(bound_conditions[0].lhs.offset, 16U);
+    EXPECT_EQ(bound_conditions[0].lhs.len, 8U);
+    EXPECT_EQ(bound_conditions[0].lhs.type, TYPE_FLOAT);
+    EXPECT_EQ(bound_conditions[0].rhs.offset, 0U);
+    EXPECT_EQ(bound_conditions[0].rhs.len, 0U);
+    EXPECT_EQ(bound_conditions[0].rhs.type, TYPE_INT);
+    EXPECT_EQ(bound_conditions[1].lhs.offset, 4U);
+    EXPECT_EQ(bound_conditions[1].lhs.len, 4U);
+    EXPECT_EQ(bound_conditions[1].lhs.type, TYPE_INT);
+    EXPECT_EQ(bound_conditions[1].rhs.offset, 8U);
+    EXPECT_EQ(bound_conditions[1].rhs.len, 4U);
+    EXPECT_EQ(bound_conditions[1].rhs.type, TYPE_INT);
+
+    SetClause literal_set;
+    literal_set.lhs = {"mutation_bind", "score"};
+    literal_set.rhs.set_int(42);
+    SetClause column_set;
+    column_set.lhs = {"mutation_bind", "assigned"};
+    column_set.is_self_ref = true;
+    column_set.rhs_col = {"mutation_bind", "source"};
+    column_set.op = UpdateOp::ASSIGNMENT;
+    SetClause arithmetic_set;
+    arithmetic_set.lhs = {"mutation_bind", "arithmetic"};
+    arithmetic_set.rhs.set_int(5);
+    arithmetic_set.is_self_ref = true;
+    arithmetic_set.rhs_col = {"mutation_bind", "source"};
+    arithmetic_set.op = UpdateOp::SELF_ADD;
+    std::vector<SetClause> set_clauses{literal_set, column_set, arithmetic_set};
+
+    auto bound_set_clauses = BindMutationSetClauses(tab, set_clauses);
+    ASSERT_EQ(bound_set_clauses.size(), 3U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.offset, 16U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.len, 8U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.type, TYPE_FLOAT);
+    EXPECT_EQ(bound_set_clauses[0].rhs.offset, 0U);
+    EXPECT_EQ(bound_set_clauses[0].rhs.len, 0U);
+    EXPECT_EQ(bound_set_clauses[0].rhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[1].lhs.offset, 8U);
+    EXPECT_EQ(bound_set_clauses[1].lhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[1].lhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[1].rhs.offset, 4U);
+    EXPECT_EQ(bound_set_clauses[1].rhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[1].rhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[2].lhs.offset, 12U);
+    EXPECT_EQ(bound_set_clauses[2].lhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[2].lhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[2].rhs.offset, 4U);
+    EXPECT_EQ(bound_set_clauses[2].rhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[2].rhs.type, TYPE_INT);
+
+    Rid rid;
+    {
+        SeqScanExecutor scan(sm_manager_.get(), "mutation_bind", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    UpdateExecutor update(sm_manager_.get(), "mutation_bind", set_clauses, conditions, {rid}, &ctx);
+    update.Next();
+    auto record = sm_manager_->fhs_.at("mutation_bind")->get_record(rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(record->data + 8), 7);
+    EXPECT_EQ(*reinterpret_cast<int*>(record->data + 12), 12);
+    EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(record->data + 16), 42.0);
+
+    Condition delete_literal;
+    delete_literal.lhs_col = {"mutation_bind", "id"};
+    delete_literal.op = OP_EQ;
+    delete_literal.is_rhs_val = true;
+    delete_literal.rhs_val.set_int(1);
+    Condition delete_column;
+    delete_column.lhs_col = {"mutation_bind", "assigned"};
+    delete_column.op = OP_EQ;
+    delete_column.is_rhs_val = false;
+    delete_column.rhs_col = {"mutation_bind", "source"};
+    DeleteExecutor delete_exec(sm_manager_.get(), "mutation_bind", {delete_literal, delete_column}, {rid}, &ctx);
+    delete_exec.Next();
+
+    SeqScanExecutor after_delete(sm_manager_.get(), "mutation_bind", {}, &ctx);
+    after_delete.beginTuple();
+    EXPECT_TRUE(after_delete.is_end());
+}
+
 TEST_F(ExecutorTest, read_committed_update_rechecks_latest_version) {
     setup_db();
     auto cols = make_int_cols({"id", "next_id"});
@@ -849,6 +978,30 @@ TEST_F(ExecutorTest, transaction_end_commands_clear_session_transaction_id) {
         EXPECT_EQ(txn_id, INVALID_TXN_ID);
         EXPECT_EQ(context.txn_, nullptr);
     }
+}
+
+TEST_F(ExecutorTest, select_from_prefers_current_view_over_next_record) {
+    sm_manager_->output_file_enabled_ = false;
+    int next_record_calls = 0;
+    auto executor = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(10), make_join_record(20)}, &next_record_calls);
+
+    char data_send[4096] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
+
+    ql_manager.select_from(std::move(executor), {"id"}, &context);
+
+    EXPECT_EQ(next_record_calls, 0);
+    EXPECT_EQ(std::string(data_send, offset), "+------------------+\n"
+                                              "|               id |\n"
+                                              "+------------------+\n"
+                                              "|               10 |\n"
+                                              "|               20 |\n"
+                                              "+------------------+\n"
+                                              "Total record(s): 2\n");
 }
 
 TEST_F(ExecutorTest, update_multiple_fields) {

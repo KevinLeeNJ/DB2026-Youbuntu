@@ -26,6 +26,19 @@ See the Mulan PSL v2 for more details. */
 
 enum class Operation { FIND = 0, INSERT, DELETE }; // 三种操作：查找、插入、删除
 
+enum class UniqueLookupStatus {
+    NotFound,
+    Unique,
+    Duplicate,
+};
+
+struct UniqueLookupResult {
+    UniqueLookupStatus status;
+    // Valid only when status == Unique. Duplicate callers must use
+    // lookup_equal() to obtain all matching RIDs; NotFound is definitive.
+    Rid rid;
+};
+
 static const bool binary_search = false;
 
 inline int ix_compare(const char* a, const char* b, ColType type, int col_len) {
@@ -254,7 +267,7 @@ public:
         return SharedIndexLatch(index_latch_);
     }
 
-    UniqueIndexLatch lock_exclusive() {
+    UniqueIndexLatch lock_exclusive() const {
         return UniqueIndexLatch(index_latch_);
     }
 
@@ -318,10 +331,9 @@ public:
     // exact-key executor probes.
     void lookup_equal(const char* key, std::vector<Rid>& result) const;
 
-    // Exact-key fast path for unique indexes. The caller must only use this
-    // when uniqueness is guaranteed by the catalog; unlike lookup_equal(), it
-    // does not construct or fill a result vector.
-    std::optional<Rid> lookup_unique(const char* key) const;
+    // Exact-key probe that distinguishes a missing key from a key with more
+    // than one RID. The rid is valid only for the Unique result.
+    UniqueLookupResult lookup_unique(const char* key) const;
 
     // Rebuild the root cache and upper-level residency after recovery has
     // repaired or rebuilt the on-disk index structure.
@@ -354,11 +366,45 @@ private:
         return enabled;
     }
 
+    static bool internal_page_cache_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ENABLE_INDEX_INTERNAL_CACHE");
+            return value == nullptr || std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
     void refresh_root_page_cache();
     void release_root_page_cache() const;
     void register_internal_pages();
-    void mark_internal_page_resident(page_id_t page_no);
+    void mark_internal_page_resident(page_id_t page_no, Page* page);
     void unregister_internal_pages() const;
+
+    Page* cached_page(page_id_t page_no) const {
+        if (page_no == IX_NO_PAGE) {
+            return nullptr;
+        }
+        if (root_cache_enabled() && cached_root_page_ != nullptr && cached_root_page_no_ == page_no) {
+            return cached_root_page_;
+        }
+        if (!internal_page_cache_enabled()) {
+            return nullptr;
+        }
+        auto it = cached_internal_pages_.find(page_no);
+        return it == cached_internal_pages_.end() ? nullptr : it->second;
+    }
+
+    void unpin_if_not_cached(PageId page_id, bool is_dirty = false) const {
+        if (page_id.fd == fd_) {
+            if (Page* page = cached_page(page_id.page_no); page != nullptr) {
+                if (is_dirty) {
+                    BufferPoolManager::mark_dirty(page);
+                }
+                return;
+            }
+        }
+        buffer_pool_manager_->unpin_page(page_id, is_dirty);
+    }
 
     void fetch_root_node_into(IxNodeHandle& out) const {
         if (root_cache_enabled() && cached_root_page_ != nullptr && cached_root_page_no_ == file_hdr_->root_page_) {
@@ -369,10 +415,7 @@ private:
     }
 
     void unpin_if_not_cached_root(PageId page_id) const {
-        if (!root_cache_enabled() || cached_root_page_ == nullptr || page_id.page_no != cached_root_page_no_ ||
-            page_id.fd != fd_) {
-            buffer_pool_manager_->unpin_page(page_id, false);
-        }
+        unpin_if_not_cached(page_id);
     }
 
     // 辅助函数
@@ -404,4 +447,5 @@ private:
     Rid get_rid(const Iid& iid) const;
 
     mutable std::unordered_set<page_id_t> resident_internal_pages_;
+    mutable std::unordered_map<page_id_t, Page*> cached_internal_pages_;
 };

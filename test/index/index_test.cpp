@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -149,10 +150,12 @@ TEST_F(IndexHandleTest, UniqueLookupFindsSingleKey) {
     }
 
     auto found = ih->lookup_unique(key(137).data());
-    ASSERT_TRUE(found.has_value());
-    EXPECT_EQ(found->page_no, 7);
-    EXPECT_EQ(found->slot_no, 137);
-    EXPECT_FALSE(ih->lookup_unique(key(9999).data()).has_value());
+    ASSERT_EQ(found.status, UniqueLookupStatus::Unique);
+    EXPECT_EQ(found.rid.page_no, 7);
+    EXPECT_EQ(found.rid.slot_no, 137);
+
+    const auto missing = ih->lookup_unique(key(9999).data());
+    EXPECT_EQ(missing.status, UniqueLookupStatus::NotFound);
 
     std::vector<page_id_t> resident_pages(ih->resident_internal_pages_.begin(), ih->resident_internal_pages_.end());
     ASSERT_FALSE(resident_pages.empty());
@@ -371,6 +374,63 @@ TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
     close_index(ih);
 }
 
+TEST_F(IndexHandleTest, CachesMultiLevelInternalPagesAcrossReopen) {
+    cleanup();
+    cols = {ColMeta{.tab_name = table_name, .name = "id", .type = TYPE_STRING, .len = 128, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+
+    const auto wide_key = [](int value) {
+        std::vector<char> buf(128, 0);
+        const std::string encoded = std::to_string(value);
+        std::memcpy(buf.data(), encoded.data(), encoded.size());
+        return buf;
+    };
+    for (int value = 0; value < 4000; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    ih->refresh_page_residency();
+    ASSERT_GT(ih->cached_internal_pages_.size(), 1u);
+
+    const auto cached = *ih->cached_internal_pages_.begin();
+    ASSERT_NE(cached.second, nullptr);
+    const int pin_count_before = cached.second->pin_count_;
+    {
+        auto structure_guard = ih->lock_shared();
+        IxNodeHandle node;
+        ih->fetch_node_into(cached.first, node);
+        EXPECT_EQ(node.page, cached.second);
+        EXPECT_EQ(cached.second->pin_count_, pin_count_before);
+        ih->unpin_if_not_cached(node.get_page_id());
+        EXPECT_EQ(cached.second->pin_count_, pin_count_before);
+    }
+
+    const int index_fd = ih->fd_;
+    close_index(ih);
+    for (page_id_t page_no : {cached.first}) {
+        EXPECT_FALSE(buffer_pool_manager->is_page_resident(PageId{index_fd, page_no}));
+    }
+
+    ix_manager.reset();
+    buffer_pool_manager.reset();
+    disk_manager.reset();
+    disk_manager = std::make_unique<DiskManager>();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    ih = open_index();
+    ih->refresh_page_residency();
+    ASSERT_GT(ih->cached_internal_pages_.size(), 1u);
+
+    auto lookup_key = wide_key(1379);
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(lookup_key.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result.front(), (Rid{1, 1379}));
+    close_index(ih);
+}
+
 TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     auto ih = open_index();
     auto duplicate_key = key(777);
@@ -389,6 +449,9 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     std::vector<Rid> fast_result;
     ih->lookup_equal(duplicate_key.data(), fast_result);
     EXPECT_EQ(fast_result, inserted);
+
+    const auto duplicate_lookup = ih->lookup_unique(duplicate_key.data());
+    EXPECT_EQ(duplicate_lookup.status, UniqueLookupStatus::Duplicate);
 
     Rid target = inserted[inserted.size() / 2];
     EXPECT_TRUE(ih->delete_entry(duplicate_key.data(), target, nullptr));
@@ -647,6 +710,23 @@ TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
 
 namespace {
 
+class ObservableIndexScanExecutor : public IndexScanExecutor {
+public:
+    using IndexScanExecutor::IndexScanExecutor;
+
+    bool uses_single_rid_cursor() const {
+        return single_rid_cursor_.has_value();
+    }
+
+    bool uses_empty_single_rid_cursor() const {
+        return uses_single_rid_cursor() && single_rid_cursor_->is_end();
+    }
+
+    bool uses_rid_vector_cursor() const {
+        return rid_vector_cursor_.has_value();
+    }
+};
+
 class IndexScanFeatureTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager;
@@ -900,9 +980,64 @@ TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
-    IndexScanExecutor executor(sm_manager.get(), "lookup_direct", {}, {"b"}, &context);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_direct", {}, {"b"}, &context);
     int lookup_value = 7;
     executor.set_lookup_key(TabCol{"lookup_direct", "b"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    executor.beginTuple();
+    EXPECT_TRUE(executor.uses_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_empty_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_rid_vector_cursor());
+
+    std::vector<int> result;
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto rec = executor.Next();
+        ASSERT_NE(rec, nullptr);
+        result.push_back(*reinterpret_cast<int*>(rec->data));
+    }
+    EXPECT_EQ(result, std::vector<int>({10}));
+}
+
+TEST_F(IndexScanFeatureTest, ExactLookupMissUsesEmptySingleRidCursor) {
+    create_two_int_table("lookup_miss");
+    insert_two_ints("lookup_miss", 10, 7);
+    sm_manager->create_index("lookup_miss", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_miss", {}, {"b"}, &context);
+    int lookup_value = 8;
+    executor.set_lookup_key(TabCol{"lookup_miss", "b"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    executor.beginTuple();
+
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_TRUE(executor.uses_empty_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_rid_vector_cursor());
+}
+
+TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
+    create_two_int_table("lookup_duplicates");
+    sm_manager->create_index("lookup_duplicates", {"b"}, nullptr);
+
+    const std::string csv_path = db_name + "_duplicate_lookup.csv";
+    {
+        std::ofstream out(csv_path);
+        ASSERT_TRUE(out.is_open());
+        out << "a,b\n10,7\n20,7\n";
+    }
+    sm_manager->load_csv_data(csv_path, "lookup_duplicates", nullptr);
+    std::remove(csv_path.c_str());
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_duplicates", {}, {"b"}, &context);
+    int lookup_value = 7;
+    executor.set_lookup_key(TabCol{"lookup_duplicates", "b"}, reinterpret_cast<const char*>(&lookup_value),
                             sizeof(lookup_value));
 
     std::vector<int> result;
@@ -911,7 +1046,9 @@ TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
         ASSERT_NE(rec, nullptr);
         result.push_back(*reinterpret_cast<int*>(rec->data));
     }
-    EXPECT_EQ(result, std::vector<int>({10}));
+    EXPECT_EQ(result, std::vector<int>({10, 20}));
+    EXPECT_FALSE(executor.uses_single_rid_cursor());
+    EXPECT_TRUE(executor.uses_rid_vector_cursor());
 }
 
 TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRange) {

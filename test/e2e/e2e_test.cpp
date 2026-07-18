@@ -462,6 +462,10 @@ TEST_F(SltFileTest, BasicIndex) {
     run_slt_file("basic_index.slt");
 }
 
+TEST_F(SltFileTest, PointDml) {
+    run_slt_file("point_dml.slt");
+}
+
 TEST_F(SltFileTest, Transaction) {
     run_slt_file("transaction.slt");
 }

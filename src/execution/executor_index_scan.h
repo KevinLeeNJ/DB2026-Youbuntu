@@ -489,13 +489,15 @@ public:
         const bool use_single_rid_lookup =
             exact_key_lookup && !use_historical_index_candidates_ && !use_rc_exact_historical_key;
         if (use_single_rid_lookup) {
-            auto unique_rid = ih_->lookup_unique(lower_key_.data());
-            if (unique_rid.has_value()) {
-                single_rid_cursor_.emplace(unique_rid);
+            const auto lookup = ih_->lookup_unique(lower_key_.data());
+            if (lookup.status == UniqueLookupStatus::Unique) {
+                single_rid_cursor_.emplace(lookup.rid);
+                scan_ = &*single_rid_cursor_;
+            } else if (lookup.status == UniqueLookupStatus::NotFound) {
+                single_rid_cursor_.emplace(std::nullopt);
                 scan_ = &*single_rid_cursor_;
             } else {
                 // LOAD may intentionally append duplicate keys to an index.
-                // Fall back whenever the lookup cannot prove a single RID.
                 ih_->lookup_equal(lower_key_.data(), rid_scan_rids_);
                 rid_vector_cursor_.emplace(&rid_scan_rids_);
                 scan_ = &*rid_vector_cursor_;

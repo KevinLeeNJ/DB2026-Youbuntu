@@ -102,9 +102,8 @@ private:
     }
 
     Page* fetch_scan_page(page_id_t page_no) {
-        if (ih_->root_cache_enabled() && page_no == ih_->file_hdr_->root_page_ && ih_->cached_root_page_ != nullptr &&
-            ih_->cached_root_page_no_ == page_no) {
-            return ih_->cached_root_page_;
+        if (Page* cached = ih_->cached_page(page_no); cached != nullptr) {
+            return cached;
         }
         Page* page = bpm_->fetch_page(PageId{ih_->fd_, page_no});
         assert(page != nullptr);
@@ -112,9 +111,7 @@ private:
     }
 
     void unpin_scan_page(Page* page) {
-        if (page != ih_->cached_root_page_) {
-            bpm_->unpin_page(page->get_page_id(), false);
-        }
+        ih_->unpin_if_not_cached(page->get_page_id());
     }
 
     void clear_emitted_rids() {

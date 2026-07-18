@@ -306,8 +306,11 @@ func (r *result) record(phase, txnType, outcome string, latency float64, detail 
 		r.Counts[phase][txnType] = make(map[string]int)
 	}
 	r.Counts[phase][txnType][outcome]++
-	if outcome == "commit" {
+	if phase == "measure" && outcome == "commit" {
 		r.latencies[txnType] = append(r.latencies[txnType], latency)
+		return
+	}
+	if outcome == "commit" {
 		return
 	}
 	if detail == "" {
@@ -357,13 +360,11 @@ func (r *result) merge(other *result) {
 func (r *result) finalize() {
 	committed, aborted := 0, 0
 	newOrderCommitted := r.Counts["measure"]["new_order"]["commit"]
-	for _, txns := range r.Counts {
-		for _, outcomes := range txns {
-			committed += outcomes["commit"]
-			for outcome, count := range outcomes {
-				if outcome != "commit" {
-					aborted += count
-				}
+	for _, outcomes := range r.Counts["measure"] {
+		committed += outcomes["commit"]
+		for outcome, count := range outcomes {
+			if outcome != "commit" {
+				aborted += count
 			}
 		}
 	}
@@ -385,6 +386,29 @@ func (r *result) finalize() {
 			P50: percentile(values, 50), P95: percentile(values, 95), P99: percentile(values, 99), Max: values[len(values)-1],
 		}
 	}
+}
+
+func (r *result) hasBackendError() bool {
+	for _, txns := range r.Counts {
+		for _, outcomes := range txns {
+			if outcomes["backend-error"] > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func median(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sort.Float64s(values)
+	middle := len(values) / 2
+	if len(values)%2 == 1 {
+		return values[middle]
+	}
+	return (values[middle-1] + values[middle]) / 2
 }
 
 func percentile(values []float64, pct int) float64 {
@@ -885,17 +909,40 @@ func runMixedSQL(address string, timeout time.Duration, isolation string, minOps
 	}
 }
 
-func runWorker(workerID int, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, output chan<- *result, factory backendFactory) {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*7919))
+func workerSeed(seed int64, round, workerID int) int64 {
+	// SplitMix64 gives each stable (seed, round, worker) tuple a well-separated
+	// stream without depending on goroutine scheduling or wall-clock time.
+	value := uint64(seed) + uint64(round)*0x9e3779b97f4a7c15 + uint64(workerID)*0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
+	return int64(value ^ (value >> 31))
+}
+
+type workerReport struct {
+	result *result
+	err    error
+}
+
+func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
+	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	local := newResult(measureSeconds)
+	report := func(err error) {
+		output <- workerReport{result: local, err: err}
+	}
 	c, err := factory()
 	if err != nil {
 		local.record("warmup", "connect", "backend-error", 0, err.Error())
-		output <- local
+		report(fmt.Errorf("worker %d initial connect: %w", workerID, err))
 		return
 	}
-	defer c.close()
+	defer func() { c.close() }()
 	for {
+		select {
+		case <-stop:
+			report(nil)
+			return
+		default:
+		}
 		now := time.Now()
 		phase := ""
 		if now.Before(warmupEnd) {
@@ -923,24 +970,63 @@ func runWorker(workerID int, p profile, policy string, warmupEnd, measureEnd tim
 			c.rollback()
 			local.record(phase, txnType, "backend-error", latency, err.Error())
 			stats.record(phase, txnType, "backend-error")
-			c.close()
-			if c, err = factory(); err != nil {
-				local.record(phase, txnType, "backend-error", 0, err.Error())
-				break
-			}
+			report(fmt.Errorf("worker %d %s transaction: %w", workerID, txnType, err))
+			return
 		}
 		if reconnectEachTxn {
 			c.close()
 			if c, err = factory(); err != nil {
 				local.record(phase, txnType, "backend-error", 0, err.Error())
-				break
+				stats.record(phase, txnType, "backend-error")
+				report(fmt.Errorf("worker %d reconnect after %s: %w", workerID, txnType, err))
+				return
 			}
 		}
 		if think > 0 {
-			time.Sleep(think)
+			select {
+			case <-stop:
+				report(nil)
+				return
+			case <-time.After(think):
+			}
 		}
 	}
-	output <- local
+	report(nil)
+}
+
+func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, factory backendFactory) (*result, error) {
+	partials := make(chan workerReport, workers)
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	var wg sync.WaitGroup
+	for workerID := 0; workerID < workers; workerID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			runWorker(id, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think, reconnectEachTxn, stats, stop, partials, factory)
+		}(workerID)
+	}
+	go func() {
+		wg.Wait()
+		close(partials)
+	}()
+	combined := newResult(measureSeconds)
+	var roundErr error
+	for partial := range partials {
+		combined.merge(partial.result)
+		if partial.err != nil && roundErr == nil {
+			roundErr = partial.err
+			stopOnce.Do(func() { close(stop) })
+		}
+	}
+	if roundErr != nil || combined.hasBackendError() {
+		if roundErr == nil {
+			roundErr = errors.New("round contains a backend error")
+		}
+		return nil, roundErr
+	}
+	combined.finalize()
+	return combined, nil
 }
 
 func inspectProfile(c txnBackend) (profile, error) {
@@ -967,7 +1053,9 @@ type config struct {
 	Measure                int    `json:"measure"`
 	Rounds                 int    `json:"rounds"`
 	ProgressInterval       int    `json:"progress_interval"`
-	Seed                   int    `json:"seed"`
+	Seed                   int64  `json:"seed"`
+	Think                  string `json:"think"`
+	ReconnectEachTxn       bool   `json:"reconnect_each_txn"`
 	WarehousePolicy        string `json:"warehouse_policy"`
 	BaselineWarehouseTotal int    `json:"baseline_warehouse_total"`
 	BaselineDistrictTotal  int    `json:"baseline_district_total"`
@@ -1186,6 +1274,7 @@ func main() {
 	warmup := flag.Int("warmup", 30, "warmup seconds")
 	measure := flag.Int("measure", 360, "measurement seconds")
 	rounds := flag.Int("rounds", 1, "benchmark rounds")
+	roundOffset := flag.Int("round-offset", 0, "zero-based round offset used for deterministic workload streams")
 	isolation := flag.String("isolation", "read-committed", "read-committed or snapshot-isolation")
 	policy := flag.String("warehouse-policy", "terminal-home", "terminal-home or random-per-txn")
 	timeout := flag.Duration("timeout", 30*time.Second, "RMDB connection timeout")
@@ -1220,15 +1309,18 @@ func main() {
 		os.Exit(2)
 	}
 	if *command == "data-ready" {
-		if completeCSVSet(*dataDir) {
-			return
+		if err := validateDataset(*dataDir, *warehouses, *seed); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
-		os.Exit(1)
+		return
 	}
 	if *command == "datagen" {
-		if *reuseData && completeCSVSet(*dataDir) {
-			fmt.Printf("[tpcc] datagen skipped, reusing CSV files in %s\n", *dataDir)
-			return
+		if *reuseData {
+			if err := validateDataset(*dataDir, *warehouses, *seed); err == nil {
+				fmt.Printf("[tpcc] datagen skipped, reusing CSV files in %s\n", *dataDir)
+				return
+			}
 		}
 		if err := generateData(*warehouses, *dataDir, *seed, *overwriteData); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -1250,8 +1342,8 @@ func main() {
 		}
 		return
 	}
-	if *workers < 1 || *warmup < 0 || *measure < 1 || *rounds < 1 {
-		fmt.Fprintln(os.Stderr, "workers must be positive, warmup non-negative, measure and rounds positive")
+	if *workers < 1 || *warmup < 0 || *measure < 1 || *rounds < 1 || *roundOffset < 0 {
+		fmt.Fprintln(os.Stderr, "workers must be positive, warmup and round-offset non-negative, measure and rounds positive")
 		os.Exit(2)
 	}
 	if *policy != "terminal-home" && *policy != "random-per-txn" {
@@ -1382,6 +1474,10 @@ func main() {
 		oracleIDPrefix = *oraclePrefix
 		oracleSeq.Store(0)
 	}
+	if err := os.Remove(*jsonOut); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	var factory backendFactory
 	if *backend == "sqlite" {
 		factory = func() (txnBackend, error) {
@@ -1398,7 +1494,11 @@ func main() {
 		os.Exit(1)
 	}
 	if *backend == "rmdb" {
-		_, _ = probe.exec("set output_file off")
+		if _, err := probe.exec("set output_file off"); err != nil {
+			probe.close()
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	p, err := inspectProfile(probe)
 	if err != nil {
@@ -1413,7 +1513,7 @@ func main() {
 		os.Exit(1)
 	}
 	baseOrders := scalarInt(ordersText, 0)
-	doc := document{Config: config{Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: 1, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
+	doc := document{Config: config{Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
 	for round := 1; round <= *rounds; round++ {
 		warmupEnd := time.Now().Add(time.Duration(*warmup) * time.Second)
 		measureEnd := warmupEnd.Add(time.Duration(*measure) * time.Second)
@@ -1422,23 +1522,13 @@ func main() {
 		monitorStop := make(chan struct{})
 		monitorDone := make(chan struct{})
 		go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
-		partials := make(chan *result, *workers)
-		var wg sync.WaitGroup
-		for workerID := 0; workerID < *workers; workerID++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				runWorker(id, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, partials, factory)
-			}(workerID)
-		}
-		go func() { wg.Wait(); close(partials) }()
-		combined := newResult(*measure)
-		for partial := range partials {
-			combined.merge(partial)
-		}
+		combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory)
 		close(monitorStop)
 		<-monitorDone
-		combined.finalize()
+		if roundErr != nil {
+			fmt.Fprintf(os.Stderr, "round %d invalid: %v\n", round, roundErr)
+			os.Exit(1)
+		}
 		doc.Rounds = append(doc.Rounds, combined)
 		fmt.Printf("[round %d/%d] tpmC=%.2f abort_rate=%.2f%%\n", round, *rounds, combined.TPMC, combined.AbortRate*100)
 	}
@@ -1446,8 +1536,7 @@ func main() {
 	for i, round := range doc.Rounds {
 		values[i] = round.TPMC
 	}
-	sort.Float64s(values)
-	doc.MedianTPMC = values[len(values)/2]
+	doc.MedianTPMC = median(values)
 	encoded, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

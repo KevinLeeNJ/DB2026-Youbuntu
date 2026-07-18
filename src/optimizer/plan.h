@@ -14,12 +14,14 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include "parser/ast.h"
 
 #include "parser/parser.h"
+#include "compiled_point_program.h"
 
 typedef enum PlanTag {
     T_Invalid = 1,
@@ -208,6 +210,11 @@ public:
     std::vector<std::string> output_names_;
 };
 
+struct PointAccessPath {
+    std::vector<std::string> index_cols;
+    std::vector<size_t> condition_positions;
+};
+
 // dml语句，包括insert; delete; update; select语句　
 class DMLPlan : public Plan {
 public:
@@ -226,6 +233,8 @@ public:
     std::vector<Value> values_;
     std::vector<Condition> conds_;
     std::vector<SetClause> set_clauses_;
+    std::optional<PointAccessPath> point_access_;
+    CompiledPointProgramPtr compiled_point_program_;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;

@@ -24,6 +24,8 @@ See the Mulan PSL v2 for more details. */
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -519,6 +521,12 @@ public:
     /// Returns the captured text output.
     /// Throws TransactionAbortException on abort, RMDBError on failure.
     std::string exec_sql(const std::string& sql) {
+        return exec_sql_with_portal_ready_hook(sql, {});
+    }
+
+    /// Execute SQL after allowing a test to observe the fully resolved portal.
+    std::string exec_sql_with_portal_ready_hook(const std::string& sql,
+                                                const std::function<void(const PortalStmt&)>& portal_ready_hook) {
         char data_send[BUFFER_LENGTH];
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
@@ -537,6 +545,9 @@ public:
             std::unique_ptr<Query> query = db_->analyze()->do_analyze(std::move(parse_tree));
             std::unique_ptr<Plan> plan = db_->optimizer()->plan_query(std::move(query), &context);
             std::unique_ptr<PortalStmt> portal_stmt = db_->portal()->start(std::move(plan), &context);
+            if (portal_ready_hook) {
+                portal_ready_hook(*portal_stmt);
+            }
             db_->portal()->run(std::move(portal_stmt), db_->ql(), &txn_id_, &context);
             db_->portal()->drop();
             // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
@@ -758,6 +769,77 @@ TEST_F(SnapshotTest, RC_UpdateRechecksLatestVersionAfterWaitingForLock) {
                                  "+------------------+------------------+\n"
                                  "Total record(s): 1";
     EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
+
+TEST_F(SnapshotTest, RC_PointDmlRechecksResidualPredicateAfterRecordLockWait) {
+    ASSERT_EQ(std::getenv("ENABLE_POINT_DML"), nullptr) << "test requires default-on point DML semantics";
+
+    auto run_case = [&](const std::string& table, const std::string& mutation) {
+        auto setup = create_session();
+        ASSERT_TRUE(setup->exec_sql_ok("create table " + table + " (id int, eligible int, payload int);"));
+        ASSERT_TRUE(setup->exec_sql_ok("create index " + table + " (id);"));
+        ASSERT_TRUE(setup->exec_sql_ok("insert into " + table + " values (1, 1, 10);"));
+
+        auto owner = create_session(IsolationLevel::READ_COMMITTED);
+        auto waiter = create_session(IsolationLevel::READ_COMMITTED);
+        auto verifier = create_session(IsolationLevel::READ_COMMITTED);
+
+        ASSERT_TRUE(owner->exec_sql_ok("begin;"));
+        ASSERT_TRUE(owner->exec_sql_ok("update " + table + " set payload = 11 where id = 1;"));
+        ASSERT_TRUE(waiter->exec_sql_ok("begin;"));
+
+        std::promise<void> candidate_resolved;
+        std::promise<void> release_waiter;
+        std::shared_future<void> release = release_waiter.get_future().share();
+        std::atomic<bool> has_point_access{false};
+        auto mutation_result = std::async(std::launch::async, [&]() {
+            try {
+                waiter->exec_sql_with_portal_ready_hook(mutation, [&](const PortalStmt& portal) {
+                    const auto* dml = static_cast<const DMLPlan*>(portal.plan.get());
+                    has_point_access.store(dml->point_access_.has_value(), std::memory_order_release);
+                    candidate_resolved.set_value();
+                    release.wait();
+                });
+                return true;
+            } catch (const RMDBError&) {
+                return false;
+            } catch (const TransactionAbortException&) {
+                return false;
+            }
+        });
+
+        auto candidate = candidate_resolved.get_future();
+        const bool resolved = candidate.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        EXPECT_TRUE(resolved) << "point DML did not resolve its indexed candidate";
+        EXPECT_TRUE(has_point_access.load(std::memory_order_acquire))
+            << "mutation must use indexed point access with ENABLE_POINT_DML unset";
+
+        release_waiter.set_value();
+        const bool blocked = mutation_result.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+        EXPECT_TRUE(blocked) << "mutation must wait for the owner's row lock";
+
+        const bool owner_changed = owner->exec_sql_ok("update " + table + " set eligible = 0 where id = 1;");
+        const bool owner_committed = owner->exec_sql_ok("commit;");
+        const bool mutation_ok = mutation_result.get();
+        const bool waiter_committed = waiter->exec_sql_ok("commit;");
+        EXPECT_TRUE(owner_changed);
+        EXPECT_TRUE(owner_committed);
+        EXPECT_TRUE(mutation_ok);
+        EXPECT_TRUE(waiter_committed);
+
+        const std::string final_state = verifier->exec_sql("select * from " + table + " where id = 1;");
+        const std::string expected = "+------------------+------------------+------------------+\n"
+                                     "|               id |         eligible |          payload |\n"
+                                     "+------------------+------------------+------------------+\n"
+                                     "|                1 |                0 |               11 |\n"
+                                     "+------------------+------------------+------------------+\n"
+                                     "Total record(s): 1";
+        EXPECT_EQ(TestSession::trim_output(final_state), expected);
+    };
+
+    run_case("rc_point_update_recheck",
+             "update rc_point_update_recheck set payload = 99 where id = 1 and eligible = 1;");
+    run_case("rc_point_delete_recheck", "delete from rc_point_delete_recheck where id = 1 and eligible = 1;");
 }
 
 TEST_F(SnapshotTest, SER_PureAutoCommitInsertsDoNotRetainSsiHistory) {

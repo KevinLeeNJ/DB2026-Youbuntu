@@ -36,6 +36,43 @@ bool same_tab_col(const TabCol& lhs, const TabCol& rhs) {
     return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
 }
 
+std::optional<PointAccessPath> find_point_access_path(SmManager* sm_manager, const std::string& tab_name,
+                                                      const std::vector<Condition>& conditions) {
+    const auto& tab = sm_manager->db_.get_table(tab_name);
+    for (const auto& index : tab.indexes) {
+        PointAccessPath path;
+        path.index_cols.reserve(index.cols.size());
+        path.condition_positions.reserve(index.cols.size());
+        bool complete = true;
+
+        for (const auto& index_col : index.cols) {
+            size_t match = conditions.size();
+            for (size_t i = 0; i < conditions.size(); ++i) {
+                const auto& condition = conditions[i];
+                if (condition.lhs_col.tab_name == tab_name && condition.lhs_col.col_name == index_col.name &&
+                    condition.is_rhs_val && condition.op == OP_EQ) {
+                    if (match != conditions.size()) {
+                        complete = false;
+                        break;
+                    }
+                    match = i;
+                }
+            }
+            if (!complete || match == conditions.size()) {
+                complete = false;
+                break;
+            }
+            path.index_cols.push_back(index_col.name);
+            path.condition_positions.push_back(match);
+        }
+
+        if (complete) {
+            return path;
+        }
+    }
+    return std::nullopt;
+}
+
 bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
     return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.display_name == rhs.display_name &&
            (lhs.is_star || same_tab_col(lhs.col, rhs.col));
@@ -172,6 +209,19 @@ void append_cache_key_part(std::string& key, int value) {
 
 void append_cache_key_part(std::string& key, bool value) {
     append_cache_key_part(key, std::string(value ? "1" : "0"));
+}
+
+void append_set_clause_shape(std::string& key, const SetClause& set_clause) {
+    append_cache_key_part(key, set_clause.lhs.tab_name);
+    append_cache_key_part(key, set_clause.lhs.col_name);
+    append_cache_key_part(key, set_clause.is_self_ref);
+    append_cache_key_part(key, static_cast<int>(set_clause.op));
+    if (set_clause.is_self_ref) {
+        append_cache_key_part(key, set_clause.rhs_col.tab_name);
+        append_cache_key_part(key, set_clause.rhs_col.col_name);
+    } else {
+        append_cache_key_part(key, static_cast<int>(set_clause.rhs.type));
+    }
 }
 
 void append_tab_col_shape(std::string& key, const TabCol& col) {
@@ -1085,6 +1135,118 @@ std::unique_ptr<Plan> Planner::instantiate_physical_plan(const Query& query,
     return joined;
 }
 
+std::string Planner::make_point_program_cache_key(PointProgramKind kind, const std::string& tab_name,
+                                                  const PointAccessPath& point_access,
+                                                  const std::vector<Condition>& conditions,
+                                                  const std::vector<SetClause>& set_clauses,
+                                                  std::uint64_t catalog_generation) const {
+    std::string key;
+    append_cache_key_part(key, std::string("compiled-point-v1"));
+    append_cache_key_part(key, static_cast<int>(kind));
+    append_cache_key_part(key, std::to_string(catalog_generation));
+    append_cache_key_part(key, tab_name);
+    append_cache_key_part(key, static_cast<int>(point_access.index_cols.size()));
+    for (const auto& index_col : point_access.index_cols) {
+        append_cache_key_part(key, index_col);
+    }
+    // key_condition_positions refer to the analyzed condition vector. Keep
+    // condition order in v1; a different AND order is a safe cache miss.
+    append_cache_key_part(key, static_cast<int>(conditions.size()));
+    for (const auto& condition : conditions) {
+        append_cache_key_part(key, condition_shape_key(condition));
+    }
+    append_cache_key_part(key, static_cast<int>(set_clauses.size()));
+    for (const auto& set_clause : set_clauses) {
+        append_set_clause_shape(key, set_clause);
+    }
+    return key;
+}
+
+CompiledPointProgramPtr Planner::build_compiled_point_program(PointProgramKind kind, const std::string& tab_name,
+                                                              const PointAccessPath& point_access,
+                                                              const std::vector<Condition>& conditions,
+                                                              const std::vector<SetClause>& set_clauses,
+                                                              std::uint64_t catalog_generation) const {
+    auto program = std::make_shared<CompiledPointProgram>();
+    program->kind = kind;
+    program->catalog_generation = catalog_generation;
+    program->table_name = tab_name;
+    program->index_col_names = point_access.index_cols;
+    program->key_condition_positions = point_access.condition_positions;
+    program->conditions.reserve(conditions.size());
+    for (const auto& condition : conditions) {
+        program->conditions.push_back(CompiledCondition{condition.lhs_col, condition.op, condition.is_rhs_val,
+                                                        condition.rhs_col,
+                                                        condition.is_rhs_val ? condition.rhs_val.type : TYPE_INT});
+    }
+    program->set_ops.reserve(set_clauses.size());
+    for (const auto& set_clause : set_clauses) {
+        program->set_ops.push_back(CompiledSetOp{set_clause.lhs, set_clause.is_self_ref, set_clause.rhs_col,
+                                                 set_clause.op,
+                                                 set_clause.is_self_ref ? TYPE_INT : set_clause.rhs.type});
+    }
+    return program;
+}
+
+std::optional<CompiledPointProgramPtr> Planner::find_compiled_point_program(const std::string& key,
+                                                                            std::uint64_t catalog_generation) {
+    {
+        std::shared_lock<std::shared_mutex> lock(point_program_cache_latch_);
+        if (point_program_cache_generation_ == catalog_generation) {
+            auto cache_pos = point_program_cache_.find(key);
+            if (cache_pos != point_program_cache_.end()) {
+                point_program_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                return cache_pos->second.program;
+            }
+        }
+    }
+
+    // Generation mismatch is a logical invalidation even if no new DML has
+    // arrived yet. Clear old entries under the writer latch.
+    std::unique_lock<std::shared_mutex> lock(point_program_cache_latch_);
+    if (point_program_cache_generation_ != catalog_generation) {
+        point_program_cache_.clear();
+        point_program_cache_lru_.clear();
+        point_program_cache_generation_ = catalog_generation;
+    }
+    return std::nullopt;
+}
+
+void Planner::cache_compiled_point_program(std::string key, std::uint64_t catalog_generation,
+                                           CompiledPointProgramPtr program) {
+    if (program == nullptr || sm_manager_->get_catalog_generation() != catalog_generation) {
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(point_program_cache_latch_);
+    if (point_program_cache_generation_ != catalog_generation) {
+        point_program_cache_.clear();
+        point_program_cache_lru_.clear();
+        point_program_cache_generation_ = catalog_generation;
+    }
+
+    auto cache_pos = point_program_cache_.find(key);
+    if (cache_pos != point_program_cache_.end()) {
+        cache_pos->second.program = std::move(program);
+        return;
+    }
+
+    point_program_cache_lru_.push_front(key);
+    auto lru_position = point_program_cache_lru_.begin();
+    try {
+        point_program_cache_.emplace(std::move(key), PointProgramCacheEntry{std::move(program), lru_position});
+    } catch (...) {
+        point_program_cache_lru_.pop_front();
+        throw;
+    }
+
+    while (point_program_cache_.size() > kCompiledPointProgramCacheCapacity) {
+        auto oldest = std::prev(point_program_cache_lru_.end());
+        point_program_cache_.erase(*oldest);
+        point_program_cache_lru_.pop_back();
+    }
+}
+
 std::optional<std::shared_ptr<const Planner::PhysicalPlanTemplate>>
 Planner::find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation) {
     std::shared_lock<std::shared_mutex> lock(physical_plan_cache_latch_);
@@ -1405,22 +1567,46 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         // delete;
         // 生成表扫描方式
         std::unique_ptr<Plan> table_scan_executors;
-        // 只有一张表，不需要进行物理优化了
-        // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
         PlanTag scan_tag = choose_scan_plan_tag(x->tab_name, query->conds, index_col_names);
-
         if (scan_tag == T_SeqScan) {
             index_col_names.clear();
-            table_scan_executors =
-                std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
-        } else {
+        }
+        // choose_scan_plan_tag may reorder equality predicates to match the
+        // index column order; compile against this final condition vector.
+        std::optional<PointAccessPath> point_access = find_point_access_path(sm_manager_, x->tab_name, query->conds);
+        CompiledPointProgramPtr compiled_program;
+        bool compiled_hit = false;
+        if (enable_compiled_point_program_cache_ && point_access.has_value()) {
+            const auto catalog_generation = sm_manager_->get_catalog_generation();
+            const auto cache_key = make_point_program_cache_key(PointProgramKind::Delete, x->tab_name, *point_access,
+                                                                query->conds, query->set_clauses, catalog_generation);
+            auto cached = find_compiled_point_program(cache_key, catalog_generation);
+            if (cached.has_value() && cached.value() != nullptr &&
+                (context == nullptr || context->txn_ == nullptr ||
+                 context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED)) {
+                compiled_program = cached.value();
+                compiled_hit = true;
+            } else {
+                point_program_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+                cache_compiled_point_program(cache_key, catalog_generation,
+                                             build_compiled_point_program(PointProgramKind::Delete, x->tab_name,
+                                                                          *point_access, query->conds,
+                                                                          query->set_clauses, catalog_generation));
+            }
+        }
+
+        if (!compiled_hit) {
+            // Cache misses intentionally use the existing scan-plan path.
             table_scan_executors =
                 std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
 
-        plannerRoot = std::make_unique<DMLPlan>(T_Delete, std::move(table_scan_executors), x->tab_name,
-                                                std::vector<Value>(), query->conds, std::vector<SetClause>());
+        auto dml = std::make_unique<DMLPlan>(T_Delete, std::move(table_scan_executors), x->tab_name,
+                                             std::vector<Value>(), query->conds, std::vector<SetClause>());
+        dml->point_access_ = std::move(point_access);
+        dml->compiled_point_program_ = std::move(compiled_program);
+        plannerRoot = std::move(dml);
         break;
     }
     case ast::AstType::UpdateStmt: {
@@ -1428,20 +1614,43 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         // update;
         // 生成表扫描方式
         std::unique_ptr<Plan> table_scan_executors;
-        // 只有一张表，不需要进行物理优化了
-        // int index_no = get_indexNo(x->tab_name, query->conds);
         std::vector<std::string> index_col_names;
         PlanTag scan_tag = choose_scan_plan_tag(x->tab_name, query->conds, index_col_names);
         if (scan_tag == T_SeqScan) {
             index_col_names.clear();
-            table_scan_executors =
-                std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, x->tab_name, query->conds, index_col_names);
-        } else {
+        }
+        std::optional<PointAccessPath> point_access = find_point_access_path(sm_manager_, x->tab_name, query->conds);
+        CompiledPointProgramPtr compiled_program;
+        bool compiled_hit = false;
+        if (enable_compiled_point_program_cache_ && point_access.has_value()) {
+            const auto catalog_generation = sm_manager_->get_catalog_generation();
+            const auto cache_key = make_point_program_cache_key(PointProgramKind::Update, x->tab_name, *point_access,
+                                                                query->conds, query->set_clauses, catalog_generation);
+            auto cached = find_compiled_point_program(cache_key, catalog_generation);
+            if (cached.has_value() && cached.value() != nullptr &&
+                (context == nullptr || context->txn_ == nullptr ||
+                 context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED)) {
+                compiled_program = cached.value();
+                compiled_hit = true;
+            } else {
+                point_program_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+                cache_compiled_point_program(cache_key, catalog_generation,
+                                             build_compiled_point_program(PointProgramKind::Update, x->tab_name,
+                                                                          *point_access, query->conds,
+                                                                          query->set_clauses, catalog_generation));
+            }
+        }
+
+        if (!compiled_hit) {
+            // Cache misses intentionally use the existing scan-plan path.
             table_scan_executors =
                 std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
-        plannerRoot = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
-                                                std::vector<Value>(), query->conds, query->set_clauses);
+        auto dml = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
+                                             std::vector<Value>(), query->conds, query->set_clauses);
+        dml->point_access_ = std::move(point_access);
+        dml->compiled_point_program_ = std::move(compiled_program);
+        plannerRoot = std::move(dml);
         break;
     }
     case ast::AstType::SelectStmt: {

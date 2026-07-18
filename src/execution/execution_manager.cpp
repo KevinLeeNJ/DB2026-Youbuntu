@@ -264,18 +264,24 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     std::vector<std::string> columns;
     columns.reserve(result_cols.size());
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-        auto Tuple = executorTreeRoot->Next();
+        TupleView tuple = executorTreeRoot->current();
+        std::unique_ptr<RmRecord> fallback;
+        if (!tuple) {
+            fallback = executorTreeRoot->Next();
+            if (fallback) {
+                tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+            }
+        }
         columns.clear();
         for (auto& col : result_cols) {
             std::string col_str;
-            char* rec_buf = Tuple->data + col.offset;
+            const char* rec_buf = tuple.data + col.offset;
             if (col.type == TYPE_INT) {
                 col_str = std::to_string(read_unaligned<int>(rec_buf));
             } else if (col.type == TYPE_FLOAT) {
                 col_str = std::to_string(read_unaligned<double>(rec_buf));
             } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
-                col_str = std::string((char*)rec_buf, col.len);
-                col_str.resize(strlen(col_str.c_str()));
+                col_str.assign(rec_buf, strnlen(rec_buf, col.len));
             }
             columns.push_back(col_str);
         }

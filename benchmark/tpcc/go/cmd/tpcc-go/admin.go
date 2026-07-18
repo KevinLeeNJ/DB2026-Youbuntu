@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -20,9 +19,15 @@ const (
 	itemCount                   = 100000
 	initialNewOrdersPerDistrict = 900
 	fixedTimestamp              = "2026-06-29 00:00:00"
+	datasetManifestName         = "tpcc-manifest.json"
 )
 
 var tpccTables = []string{"warehouse", "district", "customer", "history", "new_orders", "orders", "order_line", "item", "stock"}
+
+type datasetManifest struct {
+	Warehouses int   `json:"warehouses"`
+	Seed       int64 `json:"seed"`
+}
 
 func completeCSVSet(dataDir string) bool {
 	for _, table := range tpccTables {
@@ -32,6 +37,36 @@ func completeCSVSet(dataDir string) bool {
 		}
 	}
 	return true
+}
+
+func writeDatasetManifest(dataDir string, warehouses int, seed int64) error {
+	data, err := json.MarshalIndent(datasetManifest{Warehouses: warehouses, Seed: seed}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dataDir, datasetManifestName), append(data, '\n'), 0644)
+}
+
+func validateDataset(dataDir string, warehouses int, seed int64) error {
+	if !completeCSVSet(dataDir) {
+		return fmt.Errorf("TPC-C CSV set is incomplete in %s", dataDir)
+	}
+	path := filepath.Join(dataDir, datasetManifestName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read dataset manifest %s: %w", path, err)
+	}
+	var manifest datasetManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return fmt.Errorf("parse dataset manifest %s: %w", path, err)
+	}
+	if manifest.Warehouses != warehouses {
+		return fmt.Errorf("dataset warehouses mismatch: manifest has %d, requested %d", manifest.Warehouses, warehouses)
+	}
+	if manifest.Seed != seed {
+		return fmt.Errorf("dataset seed mismatch: manifest has %d, requested %d", manifest.Seed, seed)
+	}
+	return nil
 }
 
 func randomString(rng *rand.Rand, length int) string {
@@ -83,6 +118,9 @@ func generateData(warehouses int, dataDir string, seed int64, overwrite bool) er
 		return fmt.Errorf("refusing to overwrite existing CSV files in %s", dataDir)
 	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(dataDir, datasetManifestName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	rng := rand.New(rand.NewSource(seed))
@@ -215,7 +253,7 @@ func generateData(warehouses int, dataDir string, seed int64, overwrite bool) er
 	}); err != nil {
 		return err
 	}
-	return writeCSV(filepath.Join(dataDir, "order_line.csv"), []string{"ol_o_id", "ol_d_id", "ol_w_id", "ol_number", "ol_i_id", "ol_supply_w_id", "ol_delivery_d", "ol_quantity", "ol_amount", "ol_dist_info"}, func(w *csv.Writer) error {
+	if err := writeCSV(filepath.Join(dataDir, "order_line.csv"), []string{"ol_o_id", "ol_d_id", "ol_w_id", "ol_number", "ol_i_id", "ol_supply_w_id", "ol_delivery_d", "ol_quantity", "ol_amount", "ol_dist_info"}, func(w *csv.Writer) error {
 		for wID := 1; wID <= warehouses; wID++ {
 			for dID := 1; dID <= districtsPerWarehouse; dID++ {
 				for oID := 1; oID <= initialOrdersPerDist; oID++ {
@@ -233,7 +271,10 @@ func generateData(warehouses int, dataDir string, seed int64, overwrite bool) er
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return writeDatasetManifest(dataDir, warehouses, seed)
 }
 
 func executeSQLFile(c *client, path string) error {
@@ -431,13 +472,23 @@ func checkDistrict(c *client, wID, dID int, failures *[]string) {
 	}
 }
 
+func mergeComparableConfig(value config) config {
+	value.Rounds = 0
+	value.ProgressInterval = 0
+	return value
+}
+
 func mergeResultFiles(outputPath, inputs string) error {
 	paths := strings.Split(inputs, ",")
-	if len(paths) == 0 || paths[0] == "" {
+	if len(paths) == 0 || strings.TrimSpace(paths[0]) == "" {
 		return errors.New("--result-inputs is required")
 	}
 	documents := make([]document, 0, len(paths))
 	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return errors.New("--result-inputs contains an empty path")
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
@@ -446,6 +497,15 @@ func mergeResultFiles(outputPath, inputs string) error {
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return err
 		}
+		if len(doc.Rounds) != 1 {
+			return fmt.Errorf("%s has %d rounds, want exactly 1", path, len(doc.Rounds))
+		}
+		if doc.Rounds[0].hasBackendError() {
+			return fmt.Errorf("%s contains a backend-error round", path)
+		}
+		if len(documents) > 0 && mergeComparableConfig(documents[0].Config) != mergeComparableConfig(doc.Config) {
+			return fmt.Errorf("%s has a materially different benchmark config", path)
+		}
 		documents = append(documents, doc)
 	}
 	merged := documents[0]
@@ -453,14 +513,10 @@ func mergeResultFiles(outputPath, inputs string) error {
 	merged.Rounds = make([]*result, 0, len(documents))
 	values := make([]float64, 0, len(documents))
 	for _, doc := range documents {
-		if len(doc.Rounds) == 0 {
-			return fmt.Errorf("%s has no rounds", inputs)
-		}
 		merged.Rounds = append(merged.Rounds, doc.Rounds[0])
 		values = append(values, doc.Rounds[0].TPMC)
 	}
-	sort.Float64s(values)
-	merged.MedianTPMC = values[len(values)/2]
+	merged.MedianTPMC = median(values)
 	encoded, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return err

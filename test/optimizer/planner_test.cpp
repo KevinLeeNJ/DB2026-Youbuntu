@@ -118,6 +118,33 @@ TabMeta make_reverse_index_tab() {
     return tab;
 }
 
+TabMeta make_point_program_tab() {
+    TabMeta tab;
+    tab.name = "point_program";
+    tab.cols = {make_int_col("point_program", "id", 0), make_int_col("point_program", "value", 4)};
+    tab.indexes.push_back(make_index("point_program", {tab.cols[0]}));
+    return tab;
+}
+
+std::unique_ptr<Query> make_point_update_query(int id, int value) {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::UpdateStmt>("point_program", std::vector<std::unique_ptr<ast::SetClause>>{},
+                                                     std::vector<std::unique_ptr<ast::BinaryExpr>>{});
+    query->conds = {value_cond("point_program", "id", OP_EQ, id)};
+    SetClause set_clause;
+    set_clause.lhs = {.tab_name = "point_program", .col_name = "value"};
+    set_clause.rhs.set_int(value);
+    query->set_clauses = {set_clause};
+    return query;
+}
+
+std::unique_ptr<Query> make_point_delete_query(int id) {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::DeleteStmt>("point_program", std::vector<std::unique_ptr<ast::BinaryExpr>>{});
+    query->conds = {value_cond("point_program", "id", OP_EQ, id)};
+    return query;
+}
+
 Condition join_cond(const std::string& lhs_tab, const std::string& lhs_col, const std::string& rhs_tab,
                     const std::string& rhs_col) {
     Condition cond;
@@ -399,4 +426,52 @@ TEST_F(PlannerAggregateTest, physical_template_reorders_current_index_conditions
     ASSERT_EQ(second_scan->conds_.size(), 2);
     EXPECT_EQ(second_scan->conds_[0].lhs_col.col_name, "z");
     EXPECT_EQ(second_scan->conds_[0].rhs_val.int_val, 8);
+}
+
+TEST_F(PlannerAggregateTest, compiled_point_program_hits_for_update_and_delete_shapes) {
+    planner_.enable_compiled_point_program_cache_ = true;
+    sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
+
+    auto first_update = planner_.do_planner(make_point_update_query(1, 10), nullptr);
+    auto* first_update_dml = static_cast<DMLPlan*>(first_update.get());
+    ASSERT_EQ(first_update_dml->compiled_point_program_, nullptr);
+    ASSERT_NE(first_update_dml->subplan_, nullptr);
+
+    auto second_update = planner_.do_planner(make_point_update_query(2, 20), nullptr);
+    auto* second_update_dml = static_cast<DMLPlan*>(second_update.get());
+    ASSERT_NE(second_update_dml->compiled_point_program_, nullptr);
+    EXPECT_EQ(second_update_dml->compiled_point_program_->kind, PointProgramKind::Update);
+    EXPECT_EQ(second_update_dml->compiled_point_program_->conditions[0].rhs_type, TYPE_INT);
+    EXPECT_EQ(second_update_dml->subplan_, nullptr);
+
+    auto first_delete = planner_.do_planner(make_point_delete_query(1), nullptr);
+    auto* first_delete_dml = static_cast<DMLPlan*>(first_delete.get());
+    ASSERT_EQ(first_delete_dml->compiled_point_program_, nullptr);
+    ASSERT_NE(first_delete_dml->subplan_, nullptr);
+
+    auto second_delete = planner_.do_planner(make_point_delete_query(2), nullptr);
+    auto* second_delete_dml = static_cast<DMLPlan*>(second_delete.get());
+    ASSERT_NE(second_delete_dml->compiled_point_program_, nullptr);
+    EXPECT_EQ(second_delete_dml->compiled_point_program_->kind, PointProgramKind::Delete);
+    EXPECT_EQ(second_delete_dml->subplan_, nullptr);
+    EXPECT_EQ(planner_.point_program_cache_hits_.load(), 2U);
+}
+
+TEST_F(PlannerAggregateTest, compiled_point_program_is_invalidated_by_catalog_generation) {
+    planner_.enable_compiled_point_program_cache_ = true;
+    sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
+
+    planner_.do_planner(make_point_update_query(1, 10), nullptr);
+    ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
+    const auto old_generation = sm_manager_.get_catalog_generation();
+
+    sm_manager_.bump_catalog_generation();
+    ASSERT_NE(sm_manager_.get_catalog_generation(), old_generation);
+
+    auto after_ddl = planner_.do_planner(make_point_update_query(2, 20), nullptr);
+    auto* after_ddl_dml = static_cast<DMLPlan*>(after_ddl.get());
+    EXPECT_EQ(after_ddl_dml->compiled_point_program_, nullptr);
+    EXPECT_NE(after_ddl_dml->subplan_, nullptr);
+    EXPECT_EQ(planner_.point_program_cache_generation_, sm_manager_.get_catalog_generation());
+    EXPECT_EQ(planner_.point_program_cache_.size(), 1U);
 }
