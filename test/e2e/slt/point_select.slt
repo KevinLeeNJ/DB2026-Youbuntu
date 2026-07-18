@@ -1,0 +1,109 @@
+# Phase 4 point SELECT coverage.  The same SQL must produce identical output
+# through the legacy executor and the compiled interpreter.
+
+statement ok
+CREATE TABLE point_select (id INT, value INT, note CHAR(8));
+
+statement ok
+CREATE INDEX point_select (id);
+
+statement ok
+INSERT INTO point_select VALUES (1, 10, 'one');
+
+statement ok
+INSERT INTO point_select VALUES (2, 20, 'two');
+
+statement ok
+INSERT INTO point_select VALUES (3, 30, 'three');
+
+query
+SELECT * FROM point_select WHERE id = 2;
+----
++------------------+------------------+------------------+
+|               id |            value |             note |
++------------------+------------------+------------------+
+|                2 |               20 |              two |
++------------------+------------------+------------------+
+Total record(s): 1
+
+query
+SELECT note, value FROM point_select WHERE id = 1 AND value = 10;
+----
++------------------+------------------+
+|             note |            value |
++------------------+------------------+
+|              one |               10 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, note FROM point_select WHERE id = 2 AND value = 999;
+----
++------------------+------------------+
+|               id |             note |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+query
+SELECT id, value FROM point_select WHERE id = 99;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+# Range access is intentionally outside the point-interpreter slice.
+query
+SELECT id, value FROM point_select WHERE id > 1;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                2 |               20 |
+|                3 |               30 |
++------------------+------------------+
+Total record(s): 2
+
+# ORDER BY and LIMIT must retain their legacy semantics.
+query
+SELECT note FROM point_select WHERE id = 2 ORDER BY note LIMIT 1;
+----
++------------------+
+|             note |
++------------------+
+|              two |
++------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE point_select_composite (a INT, b INT, value INT);
+
+statement ok
+CREATE INDEX point_select_composite (a, b);
+
+statement ok
+INSERT INTO point_select_composite VALUES (1, 2, 12);
+
+statement ok
+INSERT INTO point_select_composite VALUES (1, 3, 13);
+
+query
+SELECT value, a FROM point_select_composite WHERE b = 2 AND a = 1;
+----
++------------------+------------------+
+|            value |                a |
++------------------+------------------+
+|               12 |                1 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT * FROM point_select_composite WHERE a = 1 AND b = 9;
+----
++------------------+------------------+------------------+
+|                a |                b |            value |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+Total record(s): 0

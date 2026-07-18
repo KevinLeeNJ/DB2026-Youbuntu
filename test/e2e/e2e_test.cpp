@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 #include "common/config.h"
 #include "common/context.h"
+#include "compiled/program_verifier.h"
 #include "errors.h"
 #include "execution/execution_manager.h"
 #include "gtest/gtest.h"
@@ -143,6 +144,15 @@ public:
             std::unique_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
             std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query), &context);
             std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
+            last_compiled_mutation_ = portal_stmt->compiled_mutation != nullptr;
+            last_compiled_mutation_program_ = portal_stmt->compiled_mutation == nullptr
+                                                  ? nullptr
+                                                  : portal_stmt->compiled_mutation->program;
+            auto verification = portal_stmt->compiled_mutation == nullptr
+                                    ? compiled::VerifyResult{true, {}}
+                                    : compiled::VerifyProgram(*portal_stmt->compiled_mutation->program);
+            last_compiled_mutation_valid_ = static_cast<bool>(verification);
+            last_compiled_mutation_error_ = verification.error;
             portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
             portal_->drop();
             finish_statement(&context);
@@ -184,6 +194,22 @@ public:
         return fh->get_tuple_meta(scan.rid());
     }
 
+    bool last_compiled_mutation() const {
+        return last_compiled_mutation_;
+    }
+
+    bool last_compiled_mutation_valid() const {
+        return last_compiled_mutation_valid_;
+    }
+
+    const std::string& last_compiled_mutation_error() const {
+        return last_compiled_mutation_error_;
+    }
+
+    std::shared_ptr<const compiled::CompiledProgram> last_compiled_mutation_program() const {
+        return last_compiled_mutation_program_;
+    }
+
 private:
     void set_transaction(Context* context) {
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
@@ -222,6 +248,10 @@ private:
     std::string original_cwd_;
     bool cleanup_on_destroy_{true};
     txn_id_t txn_id_{INVALID_TXN_ID};
+    bool last_compiled_mutation_{false};
+    bool last_compiled_mutation_valid_{true};
+    std::string last_compiled_mutation_error_;
+    std::shared_ptr<const compiled::CompiledProgram> last_compiled_mutation_program_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<RmManager> rm_manager_;
@@ -466,6 +496,10 @@ TEST_F(SltFileTest, PointDml) {
     run_slt_file("point_dml.slt");
 }
 
+TEST_F(SltFileTest, PointSelect) {
+    run_slt_file("point_select.slt");
+}
+
 TEST_F(SltFileTest, Transaction) {
     run_slt_file("transaction.slt");
 }
@@ -528,6 +562,93 @@ TEST_F(SltFileTest, InsertUniqueIndexRegression) {
 
 TEST_F(SltFileTest, TransactionRepeatedUpdateMerge) {
     run_slt_file("transaction_repeated_update_merge.slt");
+}
+
+TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRanges) {
+    const char* previous = std::getenv("ENABLE_POINT_MUTATION_INTERPRETER");
+    const std::optional<std::string> saved = previous == nullptr ? std::nullopt : std::optional<std::string>(previous);
+    struct RestoreEnv {
+        std::optional<std::string> value;
+        ~RestoreEnv() {
+            if (value.has_value()) {
+                setenv("ENABLE_POINT_MUTATION_INTERPRETER", value->c_str(), 1);
+            } else {
+                unsetenv("ENABLE_POINT_MUTATION_INTERPRETER");
+            }
+        }
+    } restore{saved};
+    setenv("ENABLE_POINT_MUTATION_INTERPRETER", "0", 1);
+
+    ASSERT_NO_THROW(db_->exec_sql("create table compiled_mutation (id int, value int, note char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("create index compiled_mutation(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(0, 0, 'legacy');"));
+    EXPECT_FALSE(db_->last_compiled_mutation());
+    setenv("ENABLE_POINT_MUTATION_INTERPRETER", "1", 1);
+
+    ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(1, 10, 'one');"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+    ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(2, 20, 'two');"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+
+    ASSERT_NO_THROW(
+        db_->exec_sql("update compiled_mutation set value = value * 2, note = 'twenty' where id = 1;"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+    auto update_program = db_->last_compiled_mutation_program();
+    ASSERT_NE(update_program, nullptr);
+    size_t prepare_pc = update_program->instructions().size();
+    uint32_t refreshed_tuple_reg = compiled::kNoOperand;
+    for (size_t pc = 0; pc < update_program->instructions().size(); ++pc) {
+        if (update_program->instructions()[pc].opcode == compiled::Opcode::PREPARE_UPDATE) {
+            prepare_pc = pc;
+            refreshed_tuple_reg = update_program->instructions()[pc].rhs;
+            break;
+        }
+    }
+    ASSERT_LT(prepare_pc, update_program->instructions().size());
+    for (size_t pc = 0; pc < update_program->instructions().size(); ++pc) {
+        const auto& instruction = update_program->instructions()[pc];
+        if (instruction.opcode == compiled::Opcode::LOAD_COLUMN) {
+            EXPECT_GT(pc, prepare_pc);
+            EXPECT_EQ(instruction.lhs, refreshed_tuple_reg);
+        }
+    }
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value += 3 where id = 1;"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value = 999 where id = 1 and value = 77;"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set note = 'changed' where id > 0;"));
+    EXPECT_FALSE(db_->last_compiled_mutation());
+
+    ASSERT_NO_THROW(db_->exec_sql("begin;"));
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value = 100 where id = 1;"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+    ASSERT_NO_THROW(db_->exec_sql("rollback;"));
+
+    EXPECT_THROW(db_->exec_sql("update compiled_mutation set id = 2 where id = 1;"), RMDBError);
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+
+    ASSERT_NO_THROW(db_->exec_sql("delete from compiled_mutation where id = 99;"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid());
+
+    ASSERT_NO_THROW(db_->exec_sql("delete from compiled_mutation where id = 1 and value = 23;"));
+    EXPECT_TRUE(db_->last_compiled_mutation());
+    EXPECT_TRUE(db_->last_compiled_mutation_valid());
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from compiled_mutation where id = 1;"); });
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select value from compiled_mutation where id = 2;"); });
+    EXPECT_NE(output.find("20"), std::string::npos) << output;
 }
 
 TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {

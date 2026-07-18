@@ -39,6 +39,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_skip_scan.h"
 #include "execution/executor_insert.h"
+#include "execution/runtime/point_lookup_runtime.h"
 #include "execution/executor_limit.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_projection.h"
@@ -46,6 +47,9 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_union.h"
 #include "execution/executor_update.h"
 #include "execution/execution_sort.h"
+#include "execution/runtime/database_program_runtime.h"
+#include "compiled/bytecode_interpreter.h"
+#include "compiled/parameter_frame.h"
 #include "common/common.h"
 #include "optimizer/plan.h"
 
@@ -64,6 +68,30 @@ struct PortalStmt {
     std::vector<std::string> output_names;
     std::unique_ptr<AbstractExecutor> root;
     std::unique_ptr<Plan> plan;
+    struct CompiledSelectSpec {
+        std::shared_ptr<const compiled::CompiledProgram> program;
+        std::vector<compiled::ParameterValue> parameters;
+        DatabaseProgramBindings bindings;
+        std::vector<ColMeta> output_cols;
+        std::vector<std::string> output_captions;
+    };
+    std::shared_ptr<CompiledSelectSpec> compiled_select;
+    struct CompiledMutationSpec {
+        std::shared_ptr<const compiled::CompiledProgram> program;
+        std::vector<compiled::ParameterValue> parameters;
+        DatabaseProgramBindings bindings;
+        std::string table_name;
+        std::vector<Condition> conditions;
+        std::vector<SetClause> set_clauses;
+        std::vector<BoundMutationCondition> bound_conditions;
+        std::vector<BoundMutationSetClause> bound_set_clauses;
+        std::vector<RowMutationIndex> indexes;
+        std::vector<bool> affected_index_bitmap;
+        UpdateRuntimeInfo update_info{};
+        DeleteRuntimeInfo delete_info{};
+        InsertRuntimeInfo insert_info{};
+    };
+    std::shared_ptr<CompiledMutationSpec> compiled_mutation;
 
     PortalStmt(portalTag tag_, std::vector<std::string> output_names_, std::unique_ptr<AbstractExecutor> root_,
                std::unique_ptr<Plan> plan_)
@@ -74,6 +102,517 @@ class Portal {
 private:
     SmManager* sm_manager_;
 
+    static compiled::ValueType compiled_type(ColType type) {
+        switch (type) {
+        case TYPE_INT:
+            return compiled::ValueType::INT32;
+        case TYPE_FLOAT:
+            return compiled::ValueType::FLOAT64;
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            return compiled::ValueType::BYTES;
+        default:
+            throw InternalError("unsupported point SELECT column type");
+        }
+    }
+
+    static compiled::CompareOp compiled_op(CompOp op) {
+        switch (op) {
+        case OP_EQ:
+            return compiled::CompareOp::EQ;
+        case OP_NE:
+            return compiled::CompareOp::NE;
+        case OP_LT:
+            return compiled::CompareOp::LT;
+        case OP_GT:
+            return compiled::CompareOp::GT;
+        case OP_LE:
+            return compiled::CompareOp::LE;
+        case OP_GE:
+            return compiled::CompareOp::GE;
+        }
+        throw InternalError("unsupported point SELECT comparison");
+    }
+
+    static compiled::ParameterValue compiled_value(const Value& value) {
+        switch (value.type) {
+        case TYPE_INT:
+            return compiled::ParameterValue::Int(value.int_val);
+        case TYPE_FLOAT:
+            return compiled::ParameterValue::Float(value.float_val);
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            return compiled::ParameterValue::Bytes(value.str_val);
+        default:
+            throw InternalError("unsupported point SELECT literal");
+        }
+    }
+
+    static bool point_select_enabled() {
+        const char* value = std::getenv("ENABLE_POINT_SELECT_INTERPRETER");
+        return value != nullptr && std::string(value) == "1";
+    }
+
+    std::shared_ptr<PortalStmt::CompiledSelectSpec> build_compiled_select(const DMLPlan& dml,
+                                                                          Context* context) const {
+        if (!point_select_enabled() ||
+            (context != nullptr && context->txn_ != nullptr &&
+             context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED)) {
+            return nullptr;
+        }
+        auto projection = dynamic_cast<const ProjectionPlan*>(dml.subplan_.get());
+        if (projection == nullptr || projection->subplan_ == nullptr ||
+            (!projection->is_select_star_ && projection->select_items_.empty())) {
+            return nullptr;
+        }
+        auto scan = dynamic_cast<const ScanPlan*>(projection->subplan_.get());
+        if (scan == nullptr || scan->tag != T_IndexScan || scan->index_col_names_.empty() || scan->conds_.empty()) {
+            return nullptr;
+        }
+        auto& table = sm_manager_->db_.get_table(scan->tab_name_);
+        auto index_it = std::find_if(table.indexes.begin(), table.indexes.end(), [&](const IndexMeta& index) {
+            if (index.cols.size() != scan->index_col_names_.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < index.cols.size(); ++i) {
+                if (index.cols[i].name != scan->index_col_names_[i]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        if (index_it == table.indexes.end()) {
+            return nullptr;
+        }
+        std::vector<size_t> key_positions;
+        key_positions.reserve(index_it->cols.size());
+        std::vector<bool> used(scan->conds_.size(), false);
+        for (const auto& index_col : index_it->cols) {
+            size_t found = scan->conds_.size();
+            for (size_t i = 0; i < scan->conds_.size(); ++i) {
+                const auto& condition = scan->conds_[i];
+                if (!used[i] && condition.is_rhs_val && condition.op == OP_EQ &&
+                    condition.lhs_col.tab_name == scan->tab_name_ && condition.lhs_col.col_name == index_col.name) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found == scan->conds_.size()) {
+                return nullptr;
+            }
+            used[found] = true;
+            key_positions.push_back(found);
+        }
+
+        std::vector<ColMeta> output_cols;
+        std::vector<std::string> captions;
+        if (projection->is_select_star_) {
+            output_cols = scan->cols_;
+            captions.reserve(output_cols.size());
+            for (const auto& col : output_cols) {
+                captions.push_back(col.name);
+            }
+        } else {
+            for (const auto& item : projection->select_items_) {
+                if (item.expr.type != QueryExprType::COLUMN || item.expr.col.tab_name != scan->tab_name_) {
+                    return nullptr;
+                }
+                auto col = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& candidate) {
+                    return candidate.name == item.expr.col.col_name && candidate.tab_name == item.expr.col.tab_name;
+                });
+                if (col == scan->cols_.end()) {
+                    return nullptr;
+                }
+                ColMeta selected = *col;
+                const std::string name = item.output_name.empty()
+                                             ? (item.alias.empty() ? item.expr.col.col_name : item.alias)
+                                             : item.output_name;
+                selected.name = name;
+                selected.tab_name.clear();
+                output_cols.push_back(selected);
+                captions.push_back(name);
+            }
+            if (output_cols.empty()) {
+                return nullptr;
+            }
+        }
+
+        const uint32_t tuple_size = static_cast<uint32_t>(scan->len_);
+        compiled::TupleLayout layout;
+        layout.byte_size = tuple_size;
+        layout.columns.reserve(scan->cols_.size());
+        for (const auto& col : scan->cols_) {
+            layout.columns.push_back({compiled_type(col.type), static_cast<uint32_t>(col.offset),
+                                      static_cast<uint32_t>(col.len)});
+        }
+        std::vector<compiled::ParameterDesc> params;
+        std::vector<compiled::ParameterValue> values;
+        auto parameter_max_length = [&](const Condition& condition) -> uint32_t {
+            const auto type = compiled_type(condition.rhs_val.type);
+            if (type != compiled::ValueType::BYTES) {
+                return 0;
+            }
+            const auto col = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& candidate) {
+                return candidate.tab_name == condition.lhs_col.tab_name &&
+                       candidate.name == condition.lhs_col.col_name;
+            });
+            return col == scan->cols_.end() ? 0U : static_cast<uint32_t>(col->len);
+        };
+        for (const auto& condition : scan->conds_) {
+            if (!condition.is_rhs_val || condition.lhs_col.tab_name != scan->tab_name_) {
+                return nullptr;
+            }
+            params.push_back({compiled_type(condition.rhs_val.type), parameter_max_length(condition)});
+            values.push_back(compiled_value(condition.rhs_val));
+        }
+
+        std::vector<compiled::RegisterDesc> regs;
+        regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+        regs.push_back({compiled::ValueType::POINT_KEY, compiled::kNoOperand, 0});
+        regs.push_back({compiled::ValueType::ROW_HANDLE, compiled::kNoOperand, 0});
+        regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+        std::vector<compiled::Instruction> code;
+        for (size_t i = 0; i < key_positions.size(); ++i) {
+            const size_t condition_pos = key_positions[i];
+            const auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& col) {
+                return col.name == scan->conds_[condition_pos].lhs_col.col_name;
+            });
+            if (col_it == scan->cols_.end()) {
+                return nullptr;
+            }
+            const uint32_t value_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled_type(scan->conds_[condition_pos].rhs_val.type), compiled::kNoOperand,
+                            parameter_max_length(scan->conds_[condition_pos])});
+            code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand, compiled::kNoOperand,
+                            static_cast<uint32_t>(condition_pos)});
+            const size_t col_index = static_cast<size_t>(col_it - scan->cols_.begin());
+            code.push_back({compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand,
+                            static_cast<uint32_t>(col_index)});
+        }
+        code.push_back({compiled::Opcode::MAKE_POINT_KEY, 1, 0, compiled::kNoOperand, 0});
+        code.push_back({compiled::Opcode::POINT_LOOKUP, 3, 1, 2});
+        std::vector<size_t> jump_positions;
+        for (size_t i = 0; i < scan->conds_.size(); ++i) {
+            const auto& condition = scan->conds_[i];
+            auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& col) {
+                return col.name == condition.lhs_col.col_name;
+            });
+            if (col_it == scan->cols_.end()) {
+                return nullptr;
+            }
+            const uint32_t lhs_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled_type(col_it->type), compiled::kNoOperand,
+                            compiled_type(col_it->type) == compiled::ValueType::BYTES
+                                ? static_cast<uint32_t>(col_it->len)
+                                : 0});
+            const uint32_t rhs_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled_type(condition.rhs_val.type), compiled::kNoOperand,
+                            parameter_max_length(condition)});
+            const uint32_t bool_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled::ValueType::BOOL, compiled::kNoOperand, 0});
+            code.push_back({compiled::Opcode::LOAD_COLUMN, lhs_reg, 3, compiled::kNoOperand,
+                            static_cast<uint32_t>(col_it - scan->cols_.begin())});
+            code.push_back({compiled::Opcode::LOAD_PARAM, rhs_reg, compiled::kNoOperand, compiled::kNoOperand,
+                            static_cast<uint32_t>(i)});
+            code.push_back({compiled::Opcode::COMPARE, bool_reg, lhs_reg, rhs_reg, compiled::kNoOperand,
+                            compiled_op(condition.op)});
+            jump_positions.push_back(code.size());
+            code.push_back({compiled::Opcode::JUMP_IF_FALSE, compiled::kNoOperand, bool_reg, compiled::kNoOperand,
+                            compiled::kNoOperand});
+        }
+        code.push_back({compiled::Opcode::EMIT_ROW, compiled::kNoOperand, 3});
+        const uint32_t halt_pc = static_cast<uint32_t>(code.size());
+        code.push_back({compiled::Opcode::HALT});
+        for (size_t jump : jump_positions) {
+            code[jump].aux = halt_pc;
+        }
+
+        auto spec = std::make_shared<PortalStmt::CompiledSelectSpec>();
+        spec->program = std::make_shared<compiled::CompiledProgram>(compiled::COMPILED_IR_VERSION,
+                                                                      compiled::COMPILED_ABI_VERSION,
+                                                                      compiled::ProgramKind::POINT_SELECT,
+                                                                      sm_manager_->get_catalog_generation(),
+                                                                      std::move(params), std::move(regs),
+                                                                      std::vector<compiled::TupleLayout>{std::move(layout)},
+                                                                      std::move(code));
+        spec->parameters = std::move(values);
+        PointIndexRuntimeBinding binding;
+        binding.table_name = scan->tab_name_;
+        binding.index_col_names = scan->index_col_names_;
+        for (const auto& index_col : index_it->cols) {
+            auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& col) {
+                return col.name == index_col.name;
+            });
+            if (col_it == scan->cols_.end()) {
+                return nullptr;
+            }
+            binding.tuple_offsets.push_back(static_cast<uint32_t>(col_it->offset));
+        }
+        spec->bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        spec->bindings.point_indexes.push_back(std::move(binding));
+        spec->output_cols = std::move(output_cols);
+        spec->output_captions = std::move(captions);
+        return spec;
+    }
+
+    static bool point_mutation_interpreter_enabled() {
+        const char* value = std::getenv("ENABLE_POINT_MUTATION_INTERPRETER");
+        return value != nullptr && std::string(value) == "1";
+    }
+
+    std::shared_ptr<PortalStmt::CompiledMutationSpec> build_compiled_mutation(const DMLPlan& dml,
+                                                                              Context* context) const {
+        if (!point_mutation_interpreter_enabled() ||
+            (context != nullptr && context->txn_ != nullptr &&
+             context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED)) {
+            return nullptr;
+        }
+        if (dml.tag != T_Insert && dml.tag != T_Delete && dml.tag != T_Update) {
+            return nullptr;
+        }
+
+        auto& table = sm_manager_->db_.get_table(dml.tab_name_);
+        auto* fh = sm_manager_->fhs_.at(dml.tab_name_).get();
+        if (table.cols.empty() || fh == nullptr) {
+            return nullptr;
+        }
+
+        auto spec = std::make_shared<PortalStmt::CompiledMutationSpec>();
+        spec->table_name = dml.tab_name_;
+        spec->conditions = dml.conds_;
+        spec->set_clauses = dml.set_clauses_;
+        spec->indexes.reserve(table.indexes.size());
+        for (const auto& index : table.indexes) {
+            std::string index_name = sm_manager_->get_ix_manager()->get_index_name(dml.tab_name_, index.cols);
+            auto handle = sm_manager_->ihs_.find(index_name);
+            if (handle == sm_manager_->ihs_.end()) {
+                return nullptr;
+            }
+            spec->indexes.push_back(RowMutationIndex{&index, handle->second.get(), std::move(index_name)});
+        }
+
+        compiled::TupleLayout layout;
+        layout.byte_size = static_cast<uint32_t>(fh->get_file_hdr().record_size);
+        layout.columns.reserve(table.cols.size());
+        for (const auto& col : table.cols) {
+            layout.columns.push_back(
+                {compiled_type(col.type), static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len)});
+        }
+
+        std::vector<compiled::ParameterDesc> params;
+        std::vector<compiled::ParameterValue> values;
+        std::vector<compiled::RegisterDesc> regs;
+        std::vector<compiled::Instruction> code;
+        auto append_parameter = [&](const Value& value, const ColMeta& target) -> uint32_t {
+            const uint32_t parameter = static_cast<uint32_t>(params.size());
+            const auto type = compiled_type(value.type);
+            params.push_back({type, type == compiled::ValueType::BYTES ? static_cast<uint32_t>(target.len) : 0});
+            values.push_back(compiled_value(value));
+            return parameter;
+        };
+        auto append_value_register = [&](const Value& value, const ColMeta& target) -> uint32_t {
+            const uint32_t reg = static_cast<uint32_t>(regs.size());
+            const auto type = compiled_type(value.type);
+            regs.push_back({type, compiled::kNoOperand,
+                            type == compiled::ValueType::BYTES ? static_cast<uint32_t>(target.len) : 0});
+            return reg;
+        };
+
+        if (dml.tag == T_Insert) {
+            if (dml.values_.size() != table.cols.size()) {
+                return nullptr;
+            }
+            regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+            regs.push_back({compiled::ValueType::ROW_HANDLE, compiled::kNoOperand, 0});
+            for (size_t i = 0; i < dml.values_.size(); ++i) {
+                const uint32_t parameter = append_parameter(dml.values_[i], table.cols[i]);
+                const uint32_t value_reg = append_value_register(dml.values_[i], table.cols[i]);
+                code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand,
+                                compiled::kNoOperand, parameter});
+                code.push_back({compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand,
+                                static_cast<uint32_t>(i)});
+            }
+            code.push_back({compiled::Opcode::INSERT_ROW, 1, 0});
+            code.push_back({compiled::Opcode::HALT});
+
+            spec->insert_info = InsertRuntimeInfo{sm_manager_, &spec->table_name, &table, fh, &spec->indexes};
+            spec->bindings.catalog_generation = sm_manager_->get_catalog_generation();
+            spec->bindings.insert_info = &spec->insert_info;
+            spec->program = std::make_shared<compiled::CompiledProgram>(
+                compiled::COMPILED_IR_VERSION, compiled::COMPILED_ABI_VERSION,
+                compiled::ProgramKind::POINT_INSERT, sm_manager_->get_catalog_generation(), std::move(params),
+                std::move(regs), std::vector<compiled::TupleLayout>{std::move(layout)}, std::move(code));
+            spec->parameters = std::move(values);
+            return spec;
+        }
+
+        if (!dml.point_access_.has_value() || dml.subplan_ == nullptr) {
+            return nullptr;
+        }
+        const auto& access = *dml.point_access_;
+        auto index_it = std::find_if(table.indexes.begin(), table.indexes.end(), [&](const IndexMeta& index) {
+            if (index.cols.size() != access.index_cols.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < index.cols.size(); ++i) {
+                if (index.cols[i].name != access.index_cols[i]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        if (index_it == table.indexes.end() || access.condition_positions.size() != index_it->cols.size()) {
+            return nullptr;
+        }
+
+        regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+        regs.push_back({compiled::ValueType::POINT_KEY, compiled::kNoOperand, 0});
+        regs.push_back({compiled::ValueType::ROW_HANDLE, compiled::kNoOperand, 0});
+        regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+        for (size_t i = 0; i < access.condition_positions.size(); ++i) {
+            const size_t condition_pos = access.condition_positions[i];
+            if (condition_pos >= dml.conds_.size()) {
+                return nullptr;
+            }
+            const auto& condition = dml.conds_[condition_pos];
+            if (!condition.is_rhs_val || condition.op != OP_EQ || condition.lhs_col.tab_name != dml.tab_name_ ||
+                condition.lhs_col.col_name != index_it->cols[i].name) {
+                return nullptr;
+            }
+            auto col = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& candidate) {
+                return candidate.name == condition.lhs_col.col_name;
+            });
+            if (col == table.cols.end()) {
+                return nullptr;
+            }
+            const uint32_t parameter = append_parameter(condition.rhs_val, *col);
+            const uint32_t value_reg = append_value_register(condition.rhs_val, *col);
+            code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand,
+                            compiled::kNoOperand, parameter});
+            code.push_back({compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand,
+                            static_cast<uint32_t>(col - table.cols.begin())});
+        }
+        code.push_back({compiled::Opcode::MAKE_POINT_KEY, 1, 0, compiled::kNoOperand, 0});
+        code.push_back({compiled::Opcode::POINT_LOOKUP, 3, 1, 2});
+
+        if (dml.tag == T_Delete) {
+            code.push_back({compiled::Opcode::DELETE_ROW, compiled::kNoOperand, 2});
+        } else {
+            const uint32_t current_tuple_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+            const uint32_t prepared_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled::ValueType::PREPARED_UPDATE, compiled::kNoOperand, 0});
+            const uint32_t proposed_tuple_reg = static_cast<uint32_t>(regs.size());
+            regs.push_back({compiled::ValueType::TUPLE, 0, 0});
+            code.push_back({compiled::Opcode::PREPARE_UPDATE, prepared_reg, 2, current_tuple_reg});
+            code.push_back({compiled::Opcode::COPY_TUPLE, proposed_tuple_reg, current_tuple_reg});
+            for (const auto& set_clause : dml.set_clauses_) {
+                auto lhs = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
+                    return col.name == set_clause.lhs.col_name;
+                });
+                if (lhs == table.cols.end()) {
+                    return nullptr;
+                }
+                const uint32_t lhs_index = static_cast<uint32_t>(lhs - table.cols.begin());
+                if (set_clause.is_self_ref) {
+                    auto rhs = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
+                        return col.name == set_clause.rhs_col.col_name;
+                    });
+                    if (rhs == table.cols.end()) {
+                        return nullptr;
+                    }
+                    const uint32_t base_reg = static_cast<uint32_t>(regs.size());
+                    regs.push_back({compiled_type(rhs->type), compiled::kNoOperand,
+                                    compiled_type(rhs->type) == compiled::ValueType::BYTES
+                                        ? static_cast<uint32_t>(rhs->len)
+                                        : 0});
+                    code.push_back({compiled::Opcode::LOAD_COLUMN, base_reg, current_tuple_reg, compiled::kNoOperand,
+                                    static_cast<uint32_t>(rhs - table.cols.begin())});
+                    if (set_clause.op == UpdateOp::ASSIGNMENT) {
+                        code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, base_reg,
+                                        compiled::kNoOperand,
+                                        lhs_index});
+                        continue;
+                    }
+                    if ((lhs->type != TYPE_INT && lhs->type != TYPE_FLOAT) ||
+                        (rhs->type != TYPE_INT && rhs->type != TYPE_FLOAT) ||
+                        (lhs->type == TYPE_INT && rhs->type != TYPE_INT) || set_clause.rhs.type == TYPE_STRING ||
+                        set_clause.rhs.type == TYPE_DATETIME) {
+                        return nullptr;
+                    }
+                    const uint32_t delta_param = append_parameter(set_clause.rhs, *lhs);
+                    const uint32_t delta_reg = append_value_register(set_clause.rhs, *lhs);
+                    code.push_back({compiled::Opcode::LOAD_PARAM, delta_reg, compiled::kNoOperand,
+                                    compiled::kNoOperand, delta_param});
+                    const uint32_t result_reg = static_cast<uint32_t>(regs.size());
+                    regs.push_back({compiled_type(lhs->type), compiled::kNoOperand, 0});
+                    compiled::Opcode arithmetic = compiled::Opcode::ADD;
+                    if (set_clause.op == UpdateOp::SELF_SUB) {
+                        arithmetic = compiled::Opcode::SUB;
+                    } else if (set_clause.op == UpdateOp::SELF_MUL) {
+                        arithmetic = compiled::Opcode::MUL;
+                    } else if (set_clause.op == UpdateOp::SELF_DIV) {
+                        arithmetic = compiled::Opcode::DIV;
+                    }
+                    code.push_back({arithmetic, result_reg, base_reg, delta_reg});
+                    code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, result_reg,
+                                    compiled::kNoOperand,
+                                    lhs_index});
+                } else {
+                    const uint32_t parameter = append_parameter(set_clause.rhs, *lhs);
+                    const uint32_t value_reg = append_value_register(set_clause.rhs, *lhs);
+                    code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand,
+                                    compiled::kNoOperand, parameter});
+                    code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, value_reg,
+                                    compiled::kNoOperand,
+                                    lhs_index});
+                }
+            }
+            code.push_back(
+                {compiled::Opcode::COMMIT_UPDATE, compiled::kNoOperand, prepared_reg, proposed_tuple_reg});
+        }
+        code.push_back({compiled::Opcode::HALT});
+
+        PointIndexRuntimeBinding point_binding;
+        point_binding.table_name = dml.tab_name_;
+        point_binding.index_col_names = access.index_cols;
+        for (const auto& index_col : index_it->cols) {
+            point_binding.tuple_offsets.push_back(static_cast<uint32_t>(index_col.offset));
+        }
+        spec->bound_conditions = BindMutationConditions(table, spec->conditions);
+        spec->bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        spec->bindings.point_indexes.push_back(std::move(point_binding));
+        compiled::ProgramKind program_kind = compiled::ProgramKind::POINT_DELETE;
+        if (dml.tag == T_Delete) {
+            spec->delete_info = DeleteRuntimeInfo{sm_manager_, &spec->table_name, &table, fh, &spec->conditions,
+                                                  &spec->bound_conditions, &spec->indexes};
+            spec->bindings.delete_info = &spec->delete_info;
+        } else {
+            spec->bound_set_clauses = BindMutationSetClauses(table, spec->set_clauses);
+            spec->affected_index_bitmap.assign(table.indexes.size(), false);
+            for (size_t index_no = 0; index_no < table.indexes.size(); ++index_no) {
+                for (const auto& set_clause : spec->set_clauses) {
+                    if (std::any_of(table.indexes[index_no].cols.begin(), table.indexes[index_no].cols.end(),
+                                    [&](const ColMeta& col) { return col.name == set_clause.lhs.col_name; })) {
+                        spec->affected_index_bitmap[index_no] = true;
+                        break;
+                    }
+                }
+            }
+            spec->update_info = UpdateRuntimeInfo{sm_manager_, &spec->table_name, &table, fh, &spec->conditions,
+                                                  &spec->bound_conditions, &spec->indexes, &spec->set_clauses,
+                                                  &spec->bound_set_clauses, &spec->affected_index_bitmap};
+            spec->bindings.update_info = &spec->update_info;
+            program_kind = compiled::ProgramKind::POINT_UPDATE;
+        }
+        spec->program = std::make_shared<compiled::CompiledProgram>(
+            compiled::COMPILED_IR_VERSION, compiled::COMPILED_ABI_VERSION, program_kind,
+            sm_manager_->get_catalog_generation(), std::move(params), std::move(regs),
+            std::vector<compiled::TupleLayout>{std::move(layout)}, std::move(code));
+        spec->parameters = std::move(values);
+        return spec;
+    }
+
     static bool point_dml_enabled() {
         static const bool enabled = [] {
             const char* value = std::getenv("ENABLE_POINT_DML");
@@ -82,85 +621,19 @@ private:
         return enabled;
     }
 
-    static void write_point_key_part(char* dest, const Value& value, const ColMeta& col) {
-        memset(dest, 0, col.len);
-        switch (col.type) {
-        case TYPE_INT: {
-            const int converted = value.type == TYPE_FLOAT ? static_cast<int>(value.float_val) : value.int_val;
-            memcpy(dest, &converted, col.len);
-            break;
-        }
-        case TYPE_FLOAT: {
-            const double converted = value.type == TYPE_INT ? static_cast<double>(value.int_val) : value.float_val;
-            memcpy(dest, &converted, col.len);
-            break;
-        }
-        case TYPE_STRING:
-        case TYPE_DATETIME:
-            memcpy(dest, value.str_val.data(), std::min(static_cast<size_t>(col.len), value.str_val.size()));
-            break;
-        }
-    }
-
     // nullopt means the point path is not safe and the caller must build the
     // original scan executor. A value with no RID is a proven no-match result.
     std::optional<std::optional<Rid>> resolve_point_rid(const DMLPlan& plan, Context* context) const {
         if (!point_dml_enabled() || !plan.point_access_.has_value()) {
             return std::nullopt;
         }
-        if (context != nullptr && context->txn_ != nullptr &&
-            context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-            return std::nullopt;
-        }
-
         const auto& path = *plan.point_access_;
-        auto& tab = sm_manager_->db_.get_table(plan.tab_name_);
-        auto index_it = tab.get_index_meta(path.index_cols);
-        if (index_it == tab.indexes.end()) {
+        PointLookupRequest request{&plan.tab_name_, &path.index_cols, &plan.conds_, &path.condition_positions};
+        const auto result = PointLookupRuntime::Lookup(request, sm_manager_, context);
+        if (result.status == PointLookupStatus::FALLBACK) {
             return std::nullopt;
         }
-        const IndexMeta& index = *index_it;
-        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(plan.tab_name_, index.cols);
-        auto ih_it = sm_manager_->ihs_.find(index_name);
-        if (ih_it == sm_manager_->ihs_.end()) {
-            return std::nullopt;
-        }
-
-        std::vector<char> key(index.col_tot_len);
-        int key_offset = 0;
-        for (size_t i = 0; i < index.cols.size(); ++i) {
-            const auto& condition = plan.conds_[path.condition_positions[i]];
-            write_point_key_part(key.data() + key_offset, condition.rhs_val, index.cols[i]);
-            key_offset += index.cols[i].len;
-        }
-
-        const auto lookup = ih_it->second->lookup_unique(key.data());
-        if (lookup.status == UniqueLookupStatus::Duplicate) {
-            return std::nullopt;
-        }
-        std::optional<Rid> point_rid;
-        if (lookup.status == UniqueLookupStatus::Unique) {
-            point_rid = lookup.rid;
-        }
-        if (context != nullptr && context->txn_ != nullptr && context->txn_mgr_ != nullptr &&
-            sm_manager_->has_historical_index_keys(plan.tab_name_, index_name)) {
-            std::optional<Rid> historical_rid;
-            for (const Rid& candidate_rid :
-                 sm_manager_->get_historical_index_key_rids(plan.tab_name_, index_name, key)) {
-                if (!historical_rid.has_value()) {
-                    historical_rid = candidate_rid;
-                } else if (*historical_rid != candidate_rid) {
-                    return std::nullopt;
-                }
-            }
-            if (historical_rid.has_value()) {
-                if (point_rid.has_value() && *point_rid != *historical_rid) {
-                    return std::nullopt;
-                }
-                point_rid = historical_rid;
-            }
-        }
-        return point_rid;
+        return result.rid;
     }
 
     struct ExecutorQueryExpr {
@@ -747,10 +1220,16 @@ public:
                 phase_metrics::ScopedSample metrics_sample(
                     phase_metrics::Phase::PORTAL_INSTANTIATE,
                     phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
-                std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_.get(), context);
                 std::vector<std::string> output_names = get_plan_output_names(x->subplan_.get());
-                return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names), std::move(root),
-                                                    std::move(plan));
+                auto compiled_select = build_compiled_select(*x, context);
+                std::unique_ptr<AbstractExecutor> root;
+                if (compiled_select == nullptr) {
+                    root = convert_plan_executor(x->subplan_.get(), context);
+                }
+                auto portal_stmt = std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names),
+                                                                std::move(root), std::move(plan));
+                portal_stmt->compiled_select = std::move(compiled_select);
+                return portal_stmt;
             }
             case T_ExplainAnalyze: {
                 phase_metrics::ScopedSample metrics_sample(
@@ -763,6 +1242,13 @@ public:
             }
 
             case T_Update: {
+                if (auto compiled_mutation = build_compiled_mutation(*x, context); compiled_mutation != nullptr) {
+                    auto portal_stmt = std::make_unique<PortalStmt>(
+                        PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::unique_ptr<AbstractExecutor>(),
+                        std::move(plan));
+                    portal_stmt->compiled_mutation = std::move(compiled_mutation);
+                    return portal_stmt;
+                }
                 std::vector<Rid> rids;
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
@@ -784,9 +1270,9 @@ public:
                     if (compiled_program) {
                         // Duplicate/non-unique lookup or a visibility ambiguity
                         // falls back to the original scan semantics.
-                        auto fallback_plan = std::make_unique<ScanPlan>(
-                            T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
-                            x->compiled_point_program_->index_col_names);
+                        auto fallback_plan =
+                            std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
+                                                       x->compiled_point_program_->index_col_names);
                         scan = convert_plan_executor(fallback_plan.get(), context);
                     } else {
                         scan = convert_plan_executor(x->subplan_.get(), context);
@@ -808,6 +1294,13 @@ public:
                                                     std::move(root), std::move(plan));
             }
             case T_Delete: {
+                if (auto compiled_mutation = build_compiled_mutation(*x, context); compiled_mutation != nullptr) {
+                    auto portal_stmt = std::make_unique<PortalStmt>(
+                        PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::unique_ptr<AbstractExecutor>(),
+                        std::move(plan));
+                    portal_stmt->compiled_mutation = std::move(compiled_mutation);
+                    return portal_stmt;
+                }
                 std::vector<Rid> rids;
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
@@ -826,9 +1319,9 @@ public:
                         phase_metrics::Phase::PORTAL_INSTANTIATE,
                         phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                     if (compiled_program) {
-                        auto fallback_plan = std::make_unique<ScanPlan>(
-                            T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
-                            x->compiled_point_program_->index_col_names);
+                        auto fallback_plan =
+                            std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
+                                                       x->compiled_point_program_->index_col_names);
                         scan = convert_plan_executor(fallback_plan.get(), context);
                     } else {
                         scan = convert_plan_executor(x->subplan_.get(), context);
@@ -853,6 +1346,13 @@ public:
             }
 
             case T_Insert: {
+                if (auto compiled_mutation = build_compiled_mutation(*x, context); compiled_mutation != nullptr) {
+                    auto portal_stmt = std::make_unique<PortalStmt>(
+                        PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::unique_ptr<AbstractExecutor>(),
+                        std::move(plan));
+                    portal_stmt->compiled_mutation = std::move(compiled_mutation);
+                    return portal_stmt;
+                }
                 phase_metrics::ScopedSample metrics_sample(
                     phase_metrics::Phase::PORTAL_INSTANTIATE,
                     phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
@@ -878,7 +1378,47 @@ public:
     void run(std::unique_ptr<PortalStmt> portal, QlManager* ql, txn_id_t* txn_id, Context* context) {
         switch (portal->tag) {
         case PORTAL_ONE_SELECT: {
-            ql->select_from(std::move(portal->root), std::move(portal->output_names), context);
+            auto run_legacy_select = [&]() {
+                if (portal->root == nullptr && portal->plan != nullptr) {
+                    auto* dml = static_cast<DMLPlan*>(portal->plan.get());
+                    portal->root = convert_plan_executor(dml->subplan_.get(), context);
+                }
+                ql->select_from(std::move(portal->root), std::move(portal->output_names), context);
+            };
+            if (portal->compiled_select != nullptr && portal->plan != nullptr) {
+                auto& spec = *portal->compiled_select;
+                ResultSink sink(sm_manager_, context, spec.output_cols, spec.output_captions);
+                spec.bindings.result_sink = &sink;
+                DatabaseProgramRuntime runtime(sm_manager_, context, spec.bindings);
+                std::string bind_error;
+                auto frame = compiled::ParameterFrame::Bind(spec.program->parameters(), spec.parameters, &bind_error);
+                if (frame.has_value()) {
+                    const auto status = compiled::Interpret(*spec.program, *frame, &runtime);
+                    if (status == compiled::ExecStatus::FALLBACK) {
+                        run_legacy_select();
+                        break;
+                    }
+                    if (status == compiled::ExecStatus::ERROR && runtime.fallback_allowed() &&
+                        !runtime.has_pending_exception()) {
+                        run_legacy_select();
+                        break;
+                    }
+                    if (status != compiled::ExecStatus::OK) {
+                        if (status == compiled::ExecStatus::NO_MATCH_RESULT) {
+                            runtime.FinishResult();
+                        } else {
+                            runtime.RethrowPending();
+                        }
+                    } else {
+                        runtime.FinishResult();
+                    }
+                    if (runtime.has_pending_exception()) {
+                        runtime.RethrowPending();
+                    }
+                    break;
+                }
+            }
+            run_legacy_select();
             break;
         }
 
@@ -894,6 +1434,49 @@ public:
         }
 
         case PORTAL_DML_WITHOUT_SELECT: {
+            if (portal->compiled_mutation != nullptr && portal->plan != nullptr) {
+                auto& spec = *portal->compiled_mutation;
+                DatabaseProgramRuntime runtime(sm_manager_, context, spec.bindings);
+                std::string bind_error;
+                auto frame = compiled::ParameterFrame::Bind(spec.program->parameters(), spec.parameters, &bind_error);
+                auto run_legacy_mutation = [&]() {
+                    auto* dml = static_cast<DMLPlan*>(portal->plan.get());
+                    if (dml->tag == T_Insert) {
+                        auto root = std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_, dml->values_, context);
+                        ql->run_dml(std::move(root));
+                        return;
+                    }
+                    auto scan = convert_plan_executor(dml->subplan_.get(), context);
+                    std::vector<Rid> rids;
+                    for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
+                        rids.push_back(scan->rid());
+                    }
+                    if (dml->tag == T_Delete) {
+                        auto root = std::make_unique<DeleteExecutor>(sm_manager_, dml->tab_name_, dml->conds_, rids,
+                                                                      context);
+                        ql->run_dml(std::move(root));
+                    } else if (dml->tag == T_Update) {
+                        auto root = std::make_unique<UpdateExecutor>(sm_manager_, dml->tab_name_, dml->set_clauses_,
+                                                                      dml->conds_, rids, context);
+                        ql->run_dml(std::move(root));
+                    }
+                };
+                if (frame.has_value()) {
+                    const auto status = compiled::Interpret(*spec.program, *frame, &runtime);
+                    if (status == compiled::ExecStatus::FALLBACK ||
+                        (status == compiled::ExecStatus::ERROR && runtime.fallback_allowed() &&
+                         !runtime.has_pending_exception())) {
+                        run_legacy_mutation();
+                        break;
+                    }
+                    if (status == compiled::ExecStatus::TXN_ABORT || status == compiled::ExecStatus::ERROR) {
+                        runtime.RethrowPending();
+                    }
+                    break;
+                }
+                run_legacy_mutation();
+                break;
+            }
             ql->run_dml(std::move(portal->root));
             break;
         }
