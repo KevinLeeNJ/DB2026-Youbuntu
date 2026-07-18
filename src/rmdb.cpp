@@ -30,6 +30,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "errors.h"
+#include "cache/statement_template_cache.h"
 #include "common/phase_metrics.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
@@ -140,6 +141,7 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
+auto statement_template_cache = std::make_unique<cache::StatementTemplateCache>();
 #ifdef RMDB_ENABLE_JIT
 #endif
 
@@ -228,6 +230,19 @@ void client_handler(int fd) {
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
 
+        parser::OwnedTokenStream lexical_shape;
+        const auto statement_cache_mode = cache::configured_statement_cache_mode();
+        if (statement_cache_mode != cache::StatementCacheMode::OFF) {
+            phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
+                                                       phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
+            lexical_shape = parser::normalize_sql(data_recv);
+            if (lexical_shape &&
+                statement_template_cache->lookup(lexical_shape.key, sm_manager->get_catalog_generation())) {
+                LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
+                          lexical_shape.key.low);
+            }
+        }
+
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         auto _context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset,
                                                   txn_manager.get());
@@ -285,6 +300,9 @@ void client_handler(int fd) {
                     phase_metrics::ScopedSample metrics_sample(
                         phase_metrics::Phase::PLANNER, phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
                     plan = optimizer->plan_query(std::move(query), context);
+                }
+                if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF) {
+                    statement_template_cache->publish(lexical_shape.key, sm_manager->get_catalog_generation());
                 }
                 // portal
                 std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);

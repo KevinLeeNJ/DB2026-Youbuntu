@@ -735,3 +735,17 @@ N/A (no readable perf/flamegraph summary)
   `-754.733%`). This is a correctness implementation, not a performance win: the generic descriptor dispatch is slower,
   so no filter/aggregate fusion is enabled and this result is recorded as a failed performance gate rather than claimed
   as an optimization. Network, protocol, and `output.txt` remain outside the measurement.
+
+## Phase 7 Decision
+
+- Added `OwnedTokenStream` normalization on top of the existing Lexer. Identifier and literal bytes are copied into
+  execution-owned storage; canonical bytes retain token order, punctuation, operator types, parameter type markers,
+  identifier spelling, EOF, and a version marker. Literal values are never part of the shape key.
+- Added a bounded, generation-aware `StatementTemplateCache` with shadow lookup/publish, canonical-byte collision
+  checking, LRU-style eviction, and `RMDB_STATEMENT_CACHE=off|shadow|parser|analyzer|full` parsing. This phase only
+  performs shadow lookup and full Parser/Analyzer/Planner execution; bypass modes remain intentionally conservative
+  until their immutable skeleton/blueprint phases are complete.
+- Parser regression passed 21/21; owned-stream/cache tests passed 3/3; JIT-disabled Debug build produced no `jit_test`
+  target and built the server successfully. The normalization path is measured through the existing phase-metrics
+  `normalize` sample; no separate throughput claim is made at this shadow-only phase. Three-round benchmark protocol
+  remains reserved for the subsequent end-to-end template bypass comparison.

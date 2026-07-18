@@ -1,6 +1,7 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(analyze)
+add_subdirectory(cache)
 add_subdirectory(record)
 add_subdirectory(index)
 add_subdirectory(system)
@@ -21,7 +22,7 @@ add_subdirectory(test)
 target_link_libraries(parser execution pthread)
 
 add_executable(rmdb rmdb.cpp)
-target_link_libraries(rmdb parser execution readline pthread planner analyze)
+target_link_libraries(rmdb cache parser execution readline pthread planner analyze)
 if(RMDB_ENABLE_JIT)
     target_link_libraries(rmdb jit)
     target_compile_definitions(rmdb PRIVATE RMDB_ENABLE_JIT=1)

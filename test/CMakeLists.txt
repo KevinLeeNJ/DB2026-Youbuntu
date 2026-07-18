@@ -26,7 +26,7 @@ foreach(DIR ${SUBDIRS})
                         "-Wl,--end-group"
                         gtest_main pthread)
                 if(DIR STREQUAL "jit")
-                    target_link_libraries(${TEST_TARGET} jit)
+                    target_link_libraries(${TEST_TARGET} jit cache)
                     target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_ENABLE_JIT=1)
                 endif()
                 target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_SRC_DIR="${CMAKE_SOURCE_DIR}")
