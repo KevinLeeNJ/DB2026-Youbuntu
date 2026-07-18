@@ -19,13 +19,9 @@ See the Mulan PSL v2 for more details. */
 #include <asmjit/x86.h>
 
 #include "jit/jit_ir.h"
+#include "jit/jit_runtime_internal.h"
 
 namespace jit {
-
-struct JitRuntimeImpl {
-    asmjit::JitRuntime runtime;
-    std::atomic<size_t> active_code_count{0};
-};
 
 namespace {
 
@@ -183,8 +179,10 @@ void emit_numeric_false_branch(asmjit::x86::Compiler& compiler, CompOp operation
 
 } // namespace
 
-JitCode::JitCode(std::shared_ptr<JitRuntimeImpl> runtime, void* function, size_t code_size, Kind kind)
-    : runtime_(std::move(runtime)), function_(function), code_size_(code_size), kind_(kind) {}
+JitCode::JitCode(std::shared_ptr<JitRuntimeImpl> runtime, void* function, size_t code_size, Kind kind,
+                 std::shared_ptr<const compiled::CompiledProgram> program_owner)
+    : runtime_(std::move(runtime)), function_(function), code_size_(code_size), kind_(kind),
+      program_owner_(std::move(program_owner)) {}
 
 JitCode::~JitCode() {
     reset();
@@ -193,6 +191,7 @@ JitCode::~JitCode() {
 JitCode::JitCode(JitCode&& other) noexcept
     : runtime_(std::move(other.runtime_)), function_(other.function_), code_size_(other.code_size_),
       kind_(other.kind_) {
+    program_owner_ = std::move(other.program_owner_);
     other.function_ = nullptr;
     other.code_size_ = 0;
 }
@@ -206,6 +205,7 @@ JitCode& JitCode::operator=(JitCode&& other) noexcept {
     function_ = other.function_;
     code_size_ = other.code_size_;
     kind_ = other.kind_;
+    program_owner_ = std::move(other.program_owner_);
     other.function_ = nullptr;
     other.code_size_ = 0;
     return *this;
@@ -219,6 +219,14 @@ JitStatus JitCode::invoke_predicate(JitCallFrame* frame) const {
     return kind_ == Kind::PREDICATE ? reinterpret_cast<PredicateFn>(function_)(frame) : JitStatus::INVALID_INPUT;
 }
 
+compiled::ExecStatus JitCode::invoke_program(compiled::ProgramRuntime* runtime,
+                                             const compiled::ParameterFrame* parameters) const noexcept {
+    if (kind_ != Kind::PROGRAM || function_ == nullptr) {
+        return compiled::ExecStatus::ERROR;
+    }
+    return reinterpret_cast<NativeEntry>(function_)(runtime, parameters);
+}
+
 void JitCode::reset() {
     if (function_ != nullptr) {
         runtime_->runtime.release(function_);
@@ -226,6 +234,7 @@ void JitCode::reset() {
         function_ = nullptr;
         code_size_ = 0;
     }
+    program_owner_.reset();
     runtime_.reset();
 }
 

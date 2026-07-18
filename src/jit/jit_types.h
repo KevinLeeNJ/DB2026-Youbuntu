@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 
+#include "compiled/bytecode_interpreter.h"
+
 namespace jit {
 
 struct JitCallFrame;
@@ -41,6 +43,8 @@ struct JitCompileOptions {
 
 struct JitRuntimeImpl;
 
+using NativeEntry = compiled::ExecStatus (*)(compiled::ProgramRuntime*, const compiled::ParameterFrame*) noexcept;
+
 class JitCode {
 public:
     JitCode() = default;
@@ -57,6 +61,8 @@ public:
 
     int32_t test_add_i32(int32_t lhs, int32_t rhs) const;
     JitStatus invoke_predicate(JitCallFrame* frame) const;
+    compiled::ExecStatus invoke_program(compiled::ProgramRuntime* runtime,
+                                        const compiled::ParameterFrame* parameters) const noexcept;
     size_t code_size() const {
         return code_size_;
     }
@@ -67,15 +73,17 @@ private:
     using TestAddI32Fn = int32_t (*)(int32_t, int32_t);
     using PredicateFn = JitStatus (*)(JitCallFrame*);
 
-    enum class Kind { TEST_ADD_I32, PREDICATE };
+    enum class Kind { TEST_ADD_I32, PREDICATE, PROGRAM };
 
-    JitCode(std::shared_ptr<JitRuntimeImpl> runtime, void* function, size_t code_size, Kind kind);
+    JitCode(std::shared_ptr<JitRuntimeImpl> runtime, void* function, size_t code_size, Kind kind,
+            std::shared_ptr<const compiled::CompiledProgram> program_owner = {});
     void reset();
 
     std::shared_ptr<JitRuntimeImpl> runtime_;
     void* function_{nullptr};
     size_t code_size_{0};
     Kind kind_{Kind::TEST_ADD_I32};
+    std::shared_ptr<const compiled::CompiledProgram> program_owner_;
 };
 
 struct JitCompileResult {
@@ -100,6 +108,7 @@ public:
     size_t active_code_count() const;
     JitCompileResult compile_test_add_i32(JitCompileOptions options = {});
     JitCompileResult compile_predicate(const JitProgram& program, JitCompileOptions options = {});
+    JitCompileResult compile_program(const compiled::CompiledProgram& program, JitCompileOptions options = {});
 
 private:
     std::shared_ptr<JitRuntimeImpl> runtime_;
