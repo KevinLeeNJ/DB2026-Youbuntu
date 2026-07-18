@@ -10,6 +10,9 @@ RMDB is licensed under Mulan PSL v2. */
 #include "parser/token_stream.h"
 
 class SmManager;
+namespace jit {
+class PointProgramJitManager;
+}
 
 enum class ProgramDispatchStatus { MISS, HANDLED, FALLBACK };
 
@@ -21,6 +24,7 @@ struct ProgramDispatchRequest {
     SmManager* sm_manager{nullptr};
     Context* context{nullptr};
     compiled::ProgramTemplatePtr program_template;
+    jit::PointProgramJitManager* point_jit_manager{nullptr};
 };
 
 ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& request);

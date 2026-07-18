@@ -66,6 +66,9 @@ public:
     size_t code_size() const {
         return code_size_;
     }
+    const void* entry_address() const noexcept {
+        return function_;
+    }
 
 private:
     friend class JitRuntime;

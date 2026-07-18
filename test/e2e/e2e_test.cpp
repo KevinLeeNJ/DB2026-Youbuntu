@@ -8,12 +8,14 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unistd.h>
@@ -29,6 +31,10 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution_manager.h"
 #include "gtest/gtest.h"
 #include "index/ix_manager.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_types.h"
+#include "jit/point_program_jit_manager.h"
+#endif
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
@@ -95,11 +101,33 @@ public:
         recovery_->analyze();
         recovery_->redo();
         recovery_->undo();
+
+#ifdef RMDB_ENABLE_JIT
+        point_program_jit_runtime_ = std::make_unique<jit::JitRuntime>();
+        point_program_jit_manager_ = std::make_unique<jit::PointProgramJitManager>(
+            jit::PointProgramJitConfig{},
+            [this](const compiled::ProgramTemplateIdentity& identity) {
+                const uint64_t catalog_generation = sm_manager_->get_catalog_generation();
+                const uint64_t planner_generation = planner_->planner_knob_generation();
+                const uint64_t statement_generation = catalog_generation ^ (planner_generation * 0x9e3779b97f4a7c15ULL);
+                return identity.catalog_generation == catalog_generation &&
+                       identity.planner_generation == planner_generation &&
+                       identity.statement_generation == statement_generation;
+            },
+            [this](compiled::ProgramTemplatePtr program_template) {
+                jit::JitCompileOptions options;
+                options.force_compile_failure = force_jit_compile_failure_.load(std::memory_order_relaxed);
+                return point_program_jit_runtime_->compile_program(program_template->program(), options);
+            });
+#endif
     }
 
     ~EmbeddedDB() {
         // close_db() does chdir("..") internally — do NOT chdir before it.
         try {
+#ifdef RMDB_ENABLE_JIT
+            point_program_jit_manager_->ShutdownAndDrain();
+#endif
             sm_manager_->close_db();
         } catch (...) {
             // If close_db() throws, we may be stuck inside the db dir.
@@ -149,7 +177,8 @@ public:
                         statement_started = true;
                         const auto dispatched = DispatchCachedPointProgram(
                             {point_program_template_cache_.get(), &lexical, context.statement_template_generation_,
-                             context.planner_generation_, sm_manager_.get(), &context, program_template});
+                             context.planner_generation_, sm_manager_.get(), &context, program_template,
+                             point_program_jit_manager()});
                         if (dispatched == ProgramDispatchStatus::HANDLED) {
                             last_top_level_program_hit_ = true;
                             finish_statement(&context);
@@ -270,7 +299,29 @@ public:
         return point_program_template_cache_->Stats();
     }
 
+#ifdef RMDB_ENABLE_JIT
+    jit::PointProgramJitStats point_program_jit_stats() const {
+        return point_program_jit_manager_->Stats();
+    }
+
+    bool point_program_jit_supported() const {
+        return point_program_jit_runtime_->is_supported();
+    }
+
+    void force_jit_compile_failure(bool force) {
+        force_jit_compile_failure_.store(force, std::memory_order_relaxed);
+    }
+#endif
+
 private:
+    jit::PointProgramJitManager* point_program_jit_manager() {
+#ifdef RMDB_ENABLE_JIT
+        return point_program_jit_manager_.get();
+#else
+        return nullptr;
+#endif
+    }
+
     void set_transaction(Context* context) {
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
         if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
@@ -331,6 +382,11 @@ private:
     std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<RecoveryManager> recovery_;
     std::unique_ptr<compiled::ProgramTemplateCache> point_program_template_cache_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::JitRuntime> point_program_jit_runtime_;
+    std::unique_ptr<jit::PointProgramJitManager> point_program_jit_manager_;
+    std::atomic<bool> force_jit_compile_failure_{false};
+#endif
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };
@@ -630,6 +686,163 @@ TEST_F(SltFileTest, InsertUniqueIndexRegression) {
 TEST_F(SltFileTest, TransactionRepeatedUpdateMerge) {
     run_slt_file("transaction_repeated_update_merge.slt");
 }
+
+#ifdef RMDB_ENABLE_JIT
+namespace {
+
+class ScopedPointProgramJitFlags {
+public:
+    ScopedPointProgramJitFlags()
+        : select_(Read("ENABLE_POINT_SELECT_INTERPRETER")), mutation_(Read("ENABLE_POINT_MUTATION_INTERPRETER")),
+          cache_(Read("ENABLE_POINT_PROGRAM_CACHE")), jit_(Read(rmdb_config::kPointProgramJitEnv)),
+          jit_mode_(rmdb_config::jit_mode) {
+        setenv("ENABLE_POINT_SELECT_INTERPRETER", "1", 1);
+        setenv("ENABLE_POINT_MUTATION_INTERPRETER", "1", 1);
+        setenv("ENABLE_POINT_PROGRAM_CACHE", "1", 1);
+        setenv(rmdb_config::kPointProgramJitEnv, "1", 1);
+        rmdb_config::jit_mode = rmdb_config::JitMode::FORCE;
+    }
+
+    ~ScopedPointProgramJitFlags() {
+        Restore("ENABLE_POINT_SELECT_INTERPRETER", select_);
+        Restore("ENABLE_POINT_MUTATION_INTERPRETER", mutation_);
+        Restore("ENABLE_POINT_PROGRAM_CACHE", cache_);
+        Restore(rmdb_config::kPointProgramJitEnv, jit_);
+        rmdb_config::jit_mode = jit_mode_;
+    }
+
+    ScopedPointProgramJitFlags(const ScopedPointProgramJitFlags&) = delete;
+    ScopedPointProgramJitFlags& operator=(const ScopedPointProgramJitFlags&) = delete;
+
+private:
+    static std::optional<std::string> Read(const char* name) {
+        const char* value = std::getenv(name);
+        return value == nullptr ? std::nullopt : std::optional<std::string>(value);
+    }
+
+    static void Restore(const char* name, const std::optional<std::string>& value) {
+        if (value.has_value()) {
+            setenv(name, value->c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+
+    std::optional<std::string> select_;
+    std::optional<std::string> mutation_;
+    std::optional<std::string> cache_;
+    std::optional<std::string> jit_;
+    rmdb_config::JitMode jit_mode_;
+};
+
+} // namespace
+
+TEST_F(E2ETest, PointProgramJitExecutesCachedSelectUpdateDeleteAndInsertNatively) {
+    ScopedPointProgramJitFlags flags;
+    ASSERT_TRUE(db_->point_program_jit_supported());
+
+    ASSERT_NO_THROW(db_->exec_sql("create table jit_point_native (id int, value int, note char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("create index jit_point_native(id);"));
+
+    ASSERT_NO_THROW(db_->exec_sql("insert into jit_point_native values(1, 10, 'one');"));
+    auto frontend_before = db_->frontend_entries();
+    auto stats_before = db_->point_program_jit_stats();
+    ASSERT_NO_THROW(db_->exec_sql("insert into jit_point_native values(2, 20, 'two');"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), frontend_before);
+    EXPECT_EQ(db_->point_program_jit_stats().native_executions, stats_before.native_executions + 1);
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from jit_point_native where id = 1;"); });
+    EXPECT_NE(output.find("one"), std::string::npos) << output;
+    frontend_before = db_->frontend_entries();
+    stats_before = db_->point_program_jit_stats();
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from jit_point_native where id = 2;"); });
+    EXPECT_NE(output.find("two"), std::string::npos) << output;
+    EXPECT_EQ(output.find("one"), std::string::npos) << output;
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), frontend_before);
+    EXPECT_EQ(db_->point_program_jit_stats().native_executions, stats_before.native_executions + 1);
+
+    ASSERT_NO_THROW(db_->exec_sql("update jit_point_native set value = 11 where id = 1;"));
+    frontend_before = db_->frontend_entries();
+    stats_before = db_->point_program_jit_stats();
+    ASSERT_NO_THROW(db_->exec_sql("update jit_point_native set value = 22 where id = 2;"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), frontend_before);
+    EXPECT_EQ(db_->point_program_jit_stats().native_executions, stats_before.native_executions + 1);
+
+    ASSERT_NO_THROW(db_->exec_sql("delete from jit_point_native where id = 99;"));
+    frontend_before = db_->frontend_entries();
+    stats_before = db_->point_program_jit_stats();
+    ASSERT_NO_THROW(db_->exec_sql("delete from jit_point_native where id = 1;"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), frontend_before);
+    EXPECT_EQ(db_->point_program_jit_stats().native_executions, stats_before.native_executions + 1);
+
+    ASSERT_NO_THROW({ output = db_->exec_sql("select value from jit_point_native where id = 2;"); });
+    EXPECT_NE(output.find("22"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select value from jit_point_native where id = 1;"); });
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
+}
+
+TEST_F(E2ETest, PointProgramJitRejectsRcMutationAfterSwitchToSnapshotIsolation) {
+    ScopedPointProgramJitFlags flags;
+    ASSERT_TRUE(db_->point_program_jit_supported());
+
+    ASSERT_NO_THROW(db_->exec_sql("create table jit_snapshot_fallback (id int, value int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index jit_snapshot_fallback(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into jit_snapshot_fallback values(1, 10);"));
+    ASSERT_NO_THROW(db_->exec_sql("update jit_snapshot_fallback set value = 11 where id = 1;"));
+    ASSERT_NO_THROW(db_->exec_sql("update jit_snapshot_fallback set value = 12 where id = 1;"));
+    ASSERT_TRUE(db_->last_top_level_program_hit());
+
+    ASSERT_NO_THROW(db_->exec_sql("set transaction isolation level snapshot isolation;"));
+    const auto frontend_before = db_->frontend_entries();
+    const auto stats_before = db_->point_program_jit_stats();
+    ASSERT_NO_THROW(db_->exec_sql("update jit_snapshot_fallback set value = 13 where id = 1;"));
+    EXPECT_FALSE(db_->last_top_level_program_hit());
+    EXPECT_FALSE(db_->last_compiled_mutation());
+    EXPECT_EQ(db_->point_program_jit_stats().native_executions, stats_before.native_executions);
+    const auto frontend_after = db_->frontend_entries();
+    for (size_t i = 0; i < frontend_before.size(); ++i) {
+        EXPECT_EQ(frontend_after[i], frontend_before[i] + 1);
+    }
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select value from jit_snapshot_fallback where id = 1;"); });
+    EXPECT_NE(output.find("13"), std::string::npos) << output;
+}
+
+TEST_F(E2ETest, PointProgramJitCompileFailureFallsBackToInterpreterOnce) {
+    ScopedPointProgramJitFlags flags;
+    ASSERT_TRUE(db_->point_program_jit_supported());
+
+    ASSERT_NO_THROW(db_->exec_sql("create table jit_compile_fallback (id int, note char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("create index jit_compile_fallback(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into jit_compile_fallback values(1, 'one');"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into jit_compile_fallback values(2, 'two');"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from jit_compile_fallback where id = 1;"); });
+    EXPECT_NE(output.find("one"), std::string::npos) << output;
+    const auto frontend_before = db_->frontend_entries();
+    const auto stats_before = db_->point_program_jit_stats();
+    db_->force_jit_compile_failure(true);
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from jit_compile_fallback where id = 2;"); });
+    db_->force_jit_compile_failure(false);
+
+    EXPECT_NE(output.find("two"), std::string::npos) << output;
+    EXPECT_EQ(output.find("one"), std::string::npos) << output;
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), frontend_before);
+    const auto stats_after = db_->point_program_jit_stats();
+    EXPECT_EQ(stats_after.compile_attempts, stats_before.compile_attempts + 1);
+    EXPECT_EQ(stats_after.compile_failures, stats_before.compile_failures + 1);
+    EXPECT_EQ(stats_after.interpreter_executions, stats_before.interpreter_executions + 1);
+    EXPECT_EQ(stats_after.native_executions, stats_before.native_executions);
+}
+#endif
 
 TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRanges) {
     const char* previous = std::getenv("ENABLE_POINT_MUTATION_INTERPRETER");

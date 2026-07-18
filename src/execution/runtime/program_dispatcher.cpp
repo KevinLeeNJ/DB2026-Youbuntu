@@ -4,7 +4,9 @@ RMDB is licensed under Mulan PSL v2. */
 #include "execution/runtime/program_dispatcher.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -16,6 +18,9 @@ RMDB is licensed under Mulan PSL v2. */
 #include "execution/result_sink.h"
 #include "execution/runtime/database_program_runtime.h"
 #include "system/sm.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/point_program_jit_manager.h"
+#endif
 
 namespace {
 
@@ -344,7 +349,30 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
         bindings.result_sink = sink.get();
     }
     DatabaseProgramRuntime runtime(request.sm_manager, request.context, std::move(bindings));
-    const auto status = compiled::Interpret(program_template->program(), *frame, &runtime);
+    compiled::ExecStatus status;
+#ifdef RMDB_ENABLE_JIT
+    const char* point_jit_flag = std::getenv(rmdb_config::kPointProgramJitEnv);
+    const bool point_jit_enabled =
+        point_jit_flag != nullptr && std::string(point_jit_flag) == "1" && request.point_jit_manager != nullptr;
+    auto native_code = point_jit_enabled ? request.point_jit_manager->Acquire(program_template, rmdb_config::jit_mode)
+                                         : std::shared_ptr<const jit::JitCode>{};
+    if (native_code != nullptr) {
+        status = native_code->invoke_program(&runtime, &*frame);
+        request.point_jit_manager->RecordNativeExecution();
+    } else {
+        const auto started = std::chrono::steady_clock::now();
+        status = compiled::Interpret(program_template->program(), *frame, &runtime);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        if (point_jit_enabled) {
+            request.point_jit_manager->ObserveInterpreter(
+                program_template,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                rmdb_config::jit_mode);
+        }
+    }
+#else
+    status = compiled::Interpret(program_template->program(), *frame, &runtime);
+#endif
     if (status == compiled::ExecStatus::FALLBACK ||
         (status == compiled::ExecStatus::ERROR && runtime.fallback_allowed() && !runtime.has_pending_exception())) {
         request.cache->RecordFallback();

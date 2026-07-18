@@ -7,12 +7,14 @@ RMDB is licensed under Mulan PSL v2. */
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace jit {
 namespace {
@@ -21,6 +23,23 @@ enum class EntryState { OBSERVING, QUEUED, COMPILING, READY, FAILED_COOLDOWN, EV
 
 void MixHash(size_t* hash, uint64_t value) noexcept {
     *hash ^= static_cast<size_t>(value) + 0x9e3779b97f4a7c15ULL + (*hash << 6U) + (*hash >> 2U);
+}
+
+void RegisterPerfMapSymbol(const JitCode& code, const PointProgramJitKey& key) noexcept {
+#if defined(__linux__)
+    try {
+        std::ofstream output("/tmp/perf-" + std::to_string(getpid()) + ".map", std::ios::out | std::ios::app);
+        if (!output.is_open()) {
+            return;
+        }
+        output << std::hex << reinterpret_cast<uintptr_t>(code.entry_address()) << ' ' << code.code_size()
+               << " rmdb_point_" << static_cast<uint32_t>(key.kind) << '_' << key.shape.high << key.shape.low << '\n';
+    } catch (...) {
+    }
+#else
+    (void)code;
+    (void)key;
+#endif
 }
 
 } // namespace
@@ -83,6 +102,7 @@ struct PointProgramJitManager::Impl {
     uint64_t native_cache_hits{0};
     uint64_t compile_attempts{0};
     uint64_t compile_failures{0};
+    uint64_t compile_ns{0};
     uint64_t evictions{0};
 };
 
@@ -263,8 +283,11 @@ void PointProgramJitManager::RecordNativeExecution() noexcept {
 }
 
 std::shared_ptr<const JitCode> PointProgramJitManager::CompileImmediately(const std::shared_ptr<Entry>& entry) {
+    const auto started = std::chrono::steady_clock::now();
     JitCompileResult result = Compile(entry->program_template);
-    PublishCompileResult(entry, std::move(result));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    PublishCompileResult(entry, std::move(result),
+                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return entry->state == EntryState::READY ? entry->code : std::shared_ptr<const JitCode>{};
 }
@@ -286,16 +309,23 @@ void PointProgramJitManager::WorkerLoop() {
             entry->state = EntryState::COMPILING;
             ++impl_->compiling_count;
         }
-        PublishCompileResult(entry, Compile(entry->program_template));
+        const auto started = std::chrono::steady_clock::now();
+        auto result = Compile(entry->program_template);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        PublishCompileResult(
+            entry, std::move(result),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
     }
 }
 
-void PointProgramJitManager::PublishCompileResult(const std::shared_ptr<Entry>& entry, JitCompileResult result) {
+void PointProgramJitManager::PublishCompileResult(const std::shared_ptr<Entry>& entry, JitCompileResult result,
+                                                  uint64_t compile_ns) {
     const bool identity_current = IdentityCurrent(entry->program_template->identity());
     std::vector<std::shared_ptr<const JitCode>> released_code;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ++impl_->compile_attempts;
+        impl_->compile_ns += compile_ns;
         --impl_->compiling_count;
         const bool current = impl_->accepting && identity_current;
         auto position = impl_->entries.find(entry->key);
@@ -307,6 +337,7 @@ void PointProgramJitManager::PublishCompileResult(const std::shared_ptr<Entry>& 
             entry->code = std::move(code);
             entry->state = EntryState::READY;
             impl_->code_bytes += entry->code_bytes;
+            RegisterPerfMapSymbol(*entry->code, entry->key);
             EvictLocked(entry, &released_code);
         } else if (current && still_cached) {
             if (result.code) {
@@ -402,9 +433,9 @@ void PointProgramJitManager::ShutdownAndDrain() {
 
 PointProgramJitStats PointProgramJitManager::Stats() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return {impl_->entries.size(),         impl_->queue.size(),      impl_->code_bytes,
-            impl_->interpreter_executions, impl_->native_executions, impl_->native_cache_hits,
-            impl_->compile_attempts,       impl_->compile_failures,  impl_->evictions};
+    return {impl_->entries.size(),    impl_->queue.size(),      impl_->code_bytes,       impl_->interpreter_executions,
+            impl_->native_executions, impl_->native_cache_hits, impl_->compile_attempts, impl_->compile_failures,
+            impl_->compile_ns,        impl_->evictions};
 }
 
 } // namespace jit

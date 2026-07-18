@@ -30,6 +30,7 @@ inline StatementCacheMode statement_cache_mode = StatementCacheMode::FULL;
 
 // Optional diagnostics path remains runtime-configurable because it is an output location.
 inline constexpr const char* kPhaseMetricsPathEnv = "RMDB_PHASE_METRICS_PATH";
+inline constexpr const char* kPointProgramJitEnv = "ENABLE_POINT_PROGRAM_JIT";
 
 // Process-local template and generated-code cache limits.
 inline constexpr size_t kStatementTemplateCacheCapacity = 256;

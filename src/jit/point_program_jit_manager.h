@@ -64,6 +64,7 @@ struct PointProgramJitStats {
     uint64_t native_cache_hits{0};
     uint64_t compile_attempts{0};
     uint64_t compile_failures{0};
+    uint64_t compile_ns{0};
     uint64_t evictions{0};
 };
 
@@ -97,7 +98,7 @@ private:
     void RemoveStale(const PointProgramJitKey& key);
     std::shared_ptr<const JitCode> CompileImmediately(const std::shared_ptr<Entry>& entry);
     void WorkerLoop();
-    void PublishCompileResult(const std::shared_ptr<Entry>& entry, JitCompileResult result);
+    void PublishCompileResult(const std::shared_ptr<Entry>& entry, JitCompileResult result, uint64_t compile_ns);
     void EvictLocked(const std::shared_ptr<Entry>& protected_entry,
                      std::vector<std::shared_ptr<const JitCode>>* released_code);
 

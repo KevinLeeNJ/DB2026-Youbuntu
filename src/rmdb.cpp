@@ -46,6 +46,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 #ifdef RMDB_ENABLE_JIT
 #include "jit/jit_predicate.h"
+#include "jit/point_program_jit_manager.h"
 #endif
 
 #define SOCK_PORT 8765
@@ -96,7 +97,8 @@ ClientConnectionTracker client_connections;
 #endif
 
 void write_phase_metrics(const std::string& path, const cache::StatementTemplateCache* template_cache,
-                         const compiled::ProgramTemplateCache* program_cache) {
+                         const compiled::ProgramTemplateCache* program_cache,
+                         const jit::PointProgramJitManager* point_jit_manager) {
     const std::string temporary_path = path + ".tmp." + std::to_string(getpid());
     std::ofstream output(temporary_path, std::ios::out | std::ios::trunc);
     if (!output.is_open()) {
@@ -135,6 +137,20 @@ void write_phase_metrics(const std::string& path, const cache::StatementTemplate
         output << "null";
     }
 #ifdef RMDB_ENABLE_JIT
+    output << ",\n  \"point_program_jit\": ";
+    if (point_jit_manager != nullptr) {
+        const auto stats = point_jit_manager->Stats();
+        output << "{\"entries\": " << stats.entry_count << ", \"queued\": " << stats.queued_count
+               << ", \"code_bytes\": " << stats.code_bytes
+               << ", \"interpreter_executions\": " << stats.interpreter_executions
+               << ", \"native_executions\": " << stats.native_executions
+               << ", \"native_cache_hits\": " << stats.native_cache_hits
+               << ", \"compile_attempts\": " << stats.compile_attempts
+               << ", \"compile_failures\": " << stats.compile_failures << ", \"compile_ns\": "
+               << stats.compile_ns << ", \"evictions\": " << stats.evictions << "}";
+    } else {
+        output << "null";
+    }
     const auto jit_stats = jit::predicate_jit_stats();
     output << ",\n  \"jit\": {\"entry_count\": " << jit_stats.entry_count
            << ", \"queued_count\": " << jit_stats.queued_count << ", \"code_bytes\": "
@@ -143,6 +159,8 @@ void write_phase_metrics(const std::string& path, const cache::StatementTemplate
            << jit_stats.compile_attempts << ", \"compile_failures\": " << jit_stats.compile_failures
            << ", \"evictions\": " << jit_stats.evictions << "}";
 #else
+    (void)point_jit_manager;
+    output << ",\n  \"point_program_jit\": null";
     output << ",\n  \"jit\": null";
 #endif
     output << "\n}\n";
@@ -180,7 +198,27 @@ auto statement_template_generation = []() {
     return sm_manager->get_catalog_generation() ^ (planner->planner_knob_generation() * 0x9e3779b97f4a7c15ULL);
 };
 #ifdef RMDB_ENABLE_JIT
+auto point_program_jit_runtime = std::make_unique<jit::JitRuntime>();
+auto point_program_jit_manager = std::make_unique<jit::PointProgramJitManager>(
+    jit::PointProgramJitConfig{},
+    [](const compiled::ProgramTemplateIdentity& identity) {
+        const uint64_t planner_generation = planner->planner_knob_generation();
+        return identity.catalog_generation == sm_manager->get_catalog_generation() &&
+               identity.planner_generation == planner_generation &&
+               identity.statement_generation == statement_template_generation();
+    },
+    [](compiled::ProgramTemplatePtr program_template) {
+        return point_program_jit_runtime->compile_program(program_template->program());
+    });
 #endif
+
+jit::PointProgramJitManager* point_program_jit_manager_ptr() {
+#ifdef RMDB_ENABLE_JIT
+    return point_program_jit_manager.get();
+#else
+    return nullptr;
+#endif
+}
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -396,7 +434,8 @@ void client_handler(int fd) {
                     statement_started = true;
                     const auto dispatch = DispatchCachedPointProgram(
                         {point_program_template_cache.get(), &lexical_shape, current_statement_template_generation,
-                         current_planner_generation, sm_manager.get(), context, cached_point_program});
+                         current_planner_generation, sm_manager.get(), context, cached_point_program,
+                         point_program_jit_manager_ptr()});
                     cached_program_handled = dispatch == ProgramDispatchStatus::HANDLED;
                     if (!cached_program_handled) {
                         phase_metrics::ScopedSample metrics_sample(
@@ -680,13 +719,13 @@ int main(int argc, char** argv) {
                         if (std::remove((path + ".reset").c_str()) == 0) {
                             phase_metrics::Registry::instance().reset();
                         }
-                        write_phase_metrics(path, template_cache, program_cache);
+                        write_phase_metrics(path, template_cache, program_cache, point_program_jit_manager_ptr());
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
                     if (std::remove((path + ".reset").c_str()) == 0) {
                         phase_metrics::Registry::instance().reset();
                     }
-                    write_phase_metrics(path, template_cache, program_cache);
+                    write_phase_metrics(path, template_cache, program_cache, point_program_jit_manager_ptr());
                 });
             }
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
@@ -752,6 +791,7 @@ int main(int argc, char** argv) {
         }
 
 #ifdef RMDB_ENABLE_JIT
+        point_program_jit_manager->ShutdownAndDrain();
         jit::shutdown_predicate_jit();
 #endif
         sm_manager->close_db();
