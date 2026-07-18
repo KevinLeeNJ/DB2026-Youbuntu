@@ -18,12 +18,16 @@ See the Mulan PSL v2 for more details. */
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <string>
 #include <thread>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
 
 #include "errors.h"
 #include "common/phase_metrics.h"
@@ -36,11 +40,56 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 #include "portal.h"
 #include "analyze/analyze.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_manager.h"
+#endif
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
+
+#ifdef RMDB_ENABLE_JIT
+class ClientConnectionTracker {
+public:
+    bool enter(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) {
+            return false;
+        }
+        active_fds_.insert(fd);
+        return true;
+    }
+
+    void leave(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_fds_.erase(fd);
+        drained_.notify_all();
+    }
+
+    void stop_and_drain() {
+        std::vector<int> fds;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            fds.assign(active_fds_.begin(), active_fds_.end());
+        }
+        for (int fd : fds) {
+            shutdown(fd, SHUT_RDWR);
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        drained_.wait(lock, [&] { return active_fds_.empty(); });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable drained_;
+    std::unordered_set<int> active_fds_;
+    bool stopping_{false};
+};
+
+ClientConnectionTracker client_connections;
+#endif
 
 void write_phase_metrics(const std::string& path) {
     const std::string temporary_path = path + ".tmp." + std::to_string(getpid());
@@ -91,6 +140,9 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
+#ifdef RMDB_ENABLE_JIT
+std::unique_ptr<jit::JitManager> jit_manager;
+#endif
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -115,6 +167,19 @@ void SetTransaction(txn_id_t* txn_id, Context* context) {
 }
 
 void client_handler(int fd) {
+#ifdef RMDB_ENABLE_JIT
+    if (!client_connections.enter(fd)) {
+        close(fd);
+        return;
+    }
+    struct ClientConnectionScope {
+        int fd;
+        ~ClientConnectionScope() {
+            client_connections.leave(fd);
+        }
+    } client_connection_scope{fd};
+#endif
+
     int i_recvBytes;
     // 接收客户端发送的请求
     char data_recv[BUFFER_LENGTH];
@@ -156,6 +221,11 @@ void client_handler(int fd) {
             log_manager->flush_log_to_disk_with_sync();
             exit(1);
         }
+
+#ifdef RMDB_ENABLE_JIT
+        auto jit_execution_scope =
+            jit_manager == nullptr ? jit::JitManager::ExecutionScope{} : jit_manager->enter_execution();
+#endif
 
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
@@ -361,6 +431,9 @@ void start_server() {
 
     // Clear
     LOG_INFO("try to close all client connections");
+#ifdef RMDB_ENABLE_JIT
+    client_connections.stop_and_drain();
+#endif
     int ret = shutdown(sockfd_server, SHUT_WR); // shut down the all or part of a full-duplex connection.
     if (ret == -1) {
         LOG_ERROR("shutdown server socket failed: %s", strerror(errno));
@@ -406,6 +479,16 @@ int main(int argc, char** argv) {
         // Open database
         sm_manager->open_db(db_name);
         LOG_INFO("database opened: %s", db_name.c_str());
+
+#ifdef RMDB_ENABLE_JIT
+        jit_manager = std::make_unique<jit::JitManager>(
+            jit::JitManagerConfig{}, [] { return sm_manager->get_catalog_generation(); },
+            [](const jit::JitProgram&) {
+                return jit::JitCompileResult{jit::JitStatus::UNSUPPORTED_ARCHITECTURE,
+                                             {},
+                                             "predicate code generation is not enabled before phase 4"};
+            });
+#endif
 
         log_manager->initialize_from_existing_log();
         buffer_pool_manager->set_log_manager(log_manager.get());
@@ -500,6 +583,10 @@ int main(int argc, char** argv) {
             }
         }
 
+#ifdef RMDB_ENABLE_JIT
+        jit_manager->shutdown_and_drain();
+        jit_manager.reset();
+#endif
         sm_manager->close_db();
         LOG_INFO("database has been closed");
     } catch (RMDBError& e) {

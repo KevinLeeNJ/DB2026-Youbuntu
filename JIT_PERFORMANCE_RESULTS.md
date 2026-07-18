@@ -671,3 +671,18 @@ N/A (no readable perf/flamegraph summary)
   `AbstractExecutor::compare()` for 100,000 deterministic legal integer tuple/condition combinations, including every
   comparison operator; targeted tests also cover strings, NaN, join tuple separation, binding rejection, and malformed
   IR. `make test` passed 333/333, with no SQL-visible, network, protocol, or `output.txt` format changes.
+
+## Phase 3 Decision
+
+- `JitManager` implements `off`, `auto`, and test-only synchronous `force` modes. `auto` observes executions, tuple
+  evaluations, and interpreted time before a bounded asynchronous queue accepts a shape; callers always fall back while
+  code is queued, compiling, unavailable, failed, or cooling down.
+- The manager uses the canonical IR bytes as its map identity, keeps code in `shared_ptr<const JitCode>`, enforces the
+  256-entry/16 MiB default bounds with LRU eviction, rejects oversized code, and releases code only after it has left
+  the cache lock. Publishing rechecks catalog generation and drops a compilation raced by DDL/open/close.
+- Server shutdown now stops accepting clients, wakes and drains active client handlers, stops JIT publication/work,
+  waits execution scopes, and only then destroys the JIT runtime before closing database files. This is lifecycle
+  protection only; it does not alter normal request communication, protocol, SQL output, or `output.txt`.
+- Tests cover 32 concurrent observations compiling one shape once, queue-full fallback, failure cooldown, catalog-race
+  discard, strong-reference safety across eviction, execution-scope drain, and 128-shape cache churn. JIT-on tests pass
+  15/15; `make test` passed 339/339; `RMDB_ENABLE_JIT=OFF` builds `rmdb` without registering `jit_test`.
