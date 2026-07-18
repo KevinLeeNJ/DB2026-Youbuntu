@@ -11,7 +11,7 @@ RMDB is licensed under Mulan PSL v2. */
 
 namespace compiled {
 
-inline constexpr uint32_t COMPILED_IR_VERSION = 1;
+inline constexpr uint32_t COMPILED_IR_VERSION = 2;
 inline constexpr uint32_t COMPILED_ABI_VERSION = 1;
 
 enum class ProgramKind : uint8_t { POINT_SELECT, POINT_UPDATE, POINT_DELETE, POINT_INSERT };
@@ -19,6 +19,7 @@ enum class ProgramKind : uint8_t { POINT_SELECT, POINT_UPDATE, POINT_DELETE, POI
 struct ParameterDesc {
     ValueType type{ValueType::INT32};
     uint32_t max_length{0};
+    int32_t lexical_slot{-1};
 };
 
 struct ColumnDesc {
