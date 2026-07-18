@@ -188,6 +188,7 @@ protected:
 
 struct Value : public Expr {
     std::string display_text;
+    int parameter_slot = -1;
 
 protected:
     explicit Value(AstType type_, std::string display_text_ = "")
@@ -320,19 +321,27 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
     }
     case AstType::IntLit: {
         auto& lit = static_cast<const IntLit&>(expr);
-        return std::make_unique<IntLit>(lit.val, lit.display_text);
+        auto copy = std::make_unique<IntLit>(lit.val, lit.display_text);
+        copy->parameter_slot = lit.parameter_slot;
+        return copy;
     }
     case AstType::FloatLit: {
         auto& lit = static_cast<const FloatLit&>(expr);
-        return std::make_unique<FloatLit>(lit.val, lit.display_text);
+        auto copy = std::make_unique<FloatLit>(lit.val, lit.display_text);
+        copy->parameter_slot = lit.parameter_slot;
+        return copy;
     }
     case AstType::StringLit: {
         auto& lit = static_cast<const StringLit&>(expr);
-        return std::make_unique<StringLit>(lit.val, lit.display_text);
+        auto copy = std::make_unique<StringLit>(lit.val, lit.display_text);
+        copy->parameter_slot = lit.parameter_slot;
+        return copy;
     }
     case AstType::BoolLit: {
         auto& lit = static_cast<const BoolLit&>(expr);
-        return std::make_unique<BoolLit>(lit.val, lit.display_text);
+        auto copy = std::make_unique<BoolLit>(lit.val, lit.display_text);
+        copy->parameter_slot = lit.parameter_slot;
+        return copy;
     }
     default:
         throw std::logic_error("unsupported expression type for AST clone");
@@ -484,5 +493,6 @@ struct LoadStmt : public TreeNode {
 // Creates an execution-owned copy of a parsed statement. The copy never retains
 // source-buffer views or mutable ownership from the cached skeleton.
 std::unique_ptr<TreeNode> clone_tree(const TreeNode& node);
+void assign_literal_slots(TreeNode& node);
 
 } // namespace ast

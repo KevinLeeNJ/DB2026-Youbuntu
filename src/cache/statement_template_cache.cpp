@@ -19,65 +19,68 @@ namespace {
 
 class LiteralBinder {
 public:
-    explicit LiteralBinder(const parser::OwnedTokenStream& stream) : parameters_(stream.parameters) {}
+    explicit LiteralBinder(const parser::OwnedTokenStream& stream)
+        : parameters_(stream.parameters), used_(stream.parameters.size(), false) {}
 
     bool bind(ast::Value& value) {
-        if (position_ >= parameters_.size())
+        const auto* parameter = take(value.parameter_slot);
+        if (parameter == nullptr)
             return false;
-        const auto& parameter = parameters_[position_++];
         switch (value.type) {
         case ast::AstType::IntLit:
-            if (parameter.type != parser::TokenType::VALUE_INT)
+            if (parameter->type != parser::TokenType::VALUE_INT)
                 return false;
-            static_cast<ast::IntLit&>(value).val = static_cast<int>(parameter.int_value);
+            static_cast<ast::IntLit&>(value).val = static_cast<int>(parameter->int_value);
             break;
         case ast::AstType::FloatLit:
-            if (parameter.type != parser::TokenType::VALUE_FLOAT && parameter.type != parser::TokenType::VALUE_INT) {
+            if (parameter->type != parser::TokenType::VALUE_FLOAT && parameter->type != parser::TokenType::VALUE_INT) {
                 return false;
             }
-            static_cast<ast::FloatLit&>(value).val = parameter.type == parser::TokenType::VALUE_INT
-                                                         ? static_cast<double>(parameter.int_value)
-                                                         : parameter.float_value;
+            static_cast<ast::FloatLit&>(value).val = parameter->type == parser::TokenType::VALUE_INT
+                                                         ? static_cast<double>(parameter->int_value)
+                                                         : parameter->float_value;
             break;
         case ast::AstType::StringLit:
-            if (parameter.type != parser::TokenType::VALUE_STRING)
+            if (parameter->type != parser::TokenType::VALUE_STRING)
                 return false;
-            static_cast<ast::StringLit&>(value).val = parameter.text;
+            static_cast<ast::StringLit&>(value).val = parameter->text;
             break;
         case ast::AstType::BoolLit:
-            if (parameter.type != parser::TokenType::VALUE_BOOL)
+            if (parameter->type != parser::TokenType::VALUE_BOOL)
                 return false;
-            static_cast<ast::BoolLit&>(value).val = parameter.bool_value;
+            static_cast<ast::BoolLit&>(value).val = parameter->bool_value;
             break;
         default:
             return false;
         }
-        value.display_text = parameter.text;
+        value.display_text = parameter->text;
         return true;
     }
 
     bool bind(Value& value) {
-        if (position_ >= parameters_.size())
+        const auto* parameter = take(value.lexical_slot);
+        if (parameter == nullptr)
             return false;
-        const auto& parameter = parameters_[position_++];
         switch (value.type) {
         case TYPE_INT:
-            if (parameter.type != parser::TokenType::VALUE_INT)
+            if (parameter->type != parser::TokenType::VALUE_INT && parameter->type != parser::TokenType::VALUE_FLOAT)
                 return false;
-            value.int_val = static_cast<int>(parameter.int_value);
+            value.int_val = parameter->type == parser::TokenType::VALUE_INT ? static_cast<int>(parameter->int_value)
+                                                                            : static_cast<int>(parameter->float_value);
             break;
         case TYPE_FLOAT:
-            if (parameter.type != parser::TokenType::VALUE_FLOAT && parameter.type != parser::TokenType::VALUE_INT) {
+            if (parameter->type != parser::TokenType::VALUE_FLOAT && parameter->type != parser::TokenType::VALUE_INT) {
                 return false;
             }
-            value.float_val = parameter.type == parser::TokenType::VALUE_INT ? static_cast<double>(parameter.int_value)
-                                                                             : parameter.float_value;
+            value.float_val = parameter->type == parser::TokenType::VALUE_INT
+                                  ? static_cast<double>(parameter->int_value)
+                                  : parameter->float_value;
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
-            if (parameter.type != parser::TokenType::VALUE_STRING)
+            if (parameter->type != parser::TokenType::VALUE_STRING)
                 return false;
-            value.str_val = parameter.text;
+            value.str_val = parameter->text;
             break;
         default:
             return false;
@@ -87,12 +90,28 @@ public:
     }
 
     bool done() const {
-        return position_ == parameters_.size();
+        return std::all_of(used_.begin(), used_.end(), [](bool used) { return used; });
     }
 
 private:
+    const parser::LexicalParam* take(int slot) {
+        size_t index;
+        if (slot >= 0) {
+            index = static_cast<size_t>(slot);
+        } else {
+            while (position_ < used_.size() && used_[position_])
+                ++position_;
+            index = position_++;
+        }
+        if (index >= parameters_.size())
+            return nullptr;
+        used_[index] = true;
+        return &parameters_[index];
+    }
+
     const std::vector<parser::LexicalParam>& parameters_;
     size_t position_{0};
+    std::vector<bool> used_;
 };
 
 bool bind_expr(ast::Expr& expression, LiteralBinder& binder);

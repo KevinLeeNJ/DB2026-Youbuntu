@@ -19,6 +19,7 @@ namespace {
 Value clone_value(const Value& source) {
     Value value;
     value.type = source.type;
+    value.lexical_slot = source.lexical_slot;
     if (source.type == TYPE_INT) {
         value.int_val = source.int_val;
     } else if (source.type == TYPE_FLOAT) {

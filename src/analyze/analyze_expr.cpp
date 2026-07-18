@@ -14,6 +14,7 @@ namespace analyze_internal {
 
 Value convert_ast_value_node(const ast::Value* sv_val) {
     Value val;
+    val.lexical_slot = sv_val->parameter_slot;
     switch (sv_val->type) {
     case ast::AstType::IntLit: {
         auto int_lit = static_cast<const ast::IntLit*>(sv_val);

@@ -252,10 +252,8 @@ void client_handler(int fd) {
                     break;
                 }
             }
-            // Physical-plan literal binding is intentionally conservative until
-            // every node's SQL-order recipe is proven; parameterized plans miss.
-            cacheable_plan = cacheable_skeleton && lexical_shape.parameters.empty();
-            cacheable_query = cacheable_skeleton && lexical_shape.parameters.empty();
+            cacheable_plan = cacheable_skeleton;
+            cacheable_query = cacheable_skeleton;
             if (lexical_shape && cacheable_skeleton && cacheable_query &&
                 static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
                 cached_query = statement_template_cache->lookup_query(lexical_shape.key,
@@ -320,6 +318,7 @@ void client_handler(int fd) {
 
         if (parse_tree != nullptr) {
             try {
+                ast::assign_literal_slots(*parse_tree);
                 std::shared_ptr<const ast::TreeNode> parsed_skeleton;
                 if (lexical_shape && cacheable_skeleton && statement_cache_mode != cache::StatementCacheMode::OFF) {
                     auto clone = ast::clone_tree(*parse_tree);

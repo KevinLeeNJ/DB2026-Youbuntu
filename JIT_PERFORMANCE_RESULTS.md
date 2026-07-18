@@ -811,13 +811,13 @@ N/A (no readable perf/flamegraph summary)
 - Default JIT mode is now `off`; `auto` and `force` remain explicit opt-ins. Default template mode remains `shadow`.
 - Final `RMDB_JIT=off make test` passed 352/352. Parser, analyzer, full, shadow, and off statement-cache e2e suites
   each passed 30/30 in their validated combinations; JIT unit, AST ownership, and literal-binding tests passed.
-- Final fixed `auto/full` TPCC run used exactly three rounds, one worker, eight warehouses, seed `20260718`, 1s
-  warmup and 3s measure: tpmC `[6740, 6700, 6760]`, median `6740`; abort rates remained normal and all three
-  crash/recovery consistency checks passed. The earlier parameterized physical-plan binder failure is retained as a
-  failed diagnostic run; parameterized plans now miss rather than risk stale literals.
+- Final slot-binder `off/full` TPCC run used exactly three rounds, one worker, eight warehouses, seed `20260718`, 1s
+  warmup and 3s measure: tpmC `[7080, 6920, 6920]`, median `6920`; final slot-binder `auto/full` produced
+  `[6520, 6560, 6580]`, median `6560`. Abort rates remained normal and all six crash/recovery consistency checks
+  passed. The earlier pre-slot physical-binder failure is retained as a failed diagnostic run, not hidden.
 - The measured aggregate transition descriptor loop is slower than the scalar oracle, so automatic aggregate/fusion
   execution remains disabled. This is reported as a measured gate result, not hidden; network communication, protocol,
   and `output.txt` were not changed or optimized.
-- The final safety guard keeps parameterized semantic Query and physical Plan blueprints on miss; only the AST parser
-  skeleton uses the proven slot binder. This prevents stale analyzed casts, update values, or index keys while leaving
-  the binder test as an isolated correctness oracle for the next refinement.
+- AST, semantic Query, and supported physical Plan values now carry stable lexical slots; repeated DML root/scan fields
+  bind the same current parameter without relying on traversal order. Unsupported LIMIT/unary-minus recipes and DML plan
+  shapes still miss transparently. This prevents stale analyzed casts, update values, or index keys.

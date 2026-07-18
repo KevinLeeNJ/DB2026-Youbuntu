@@ -917,26 +917,33 @@ std::unique_ptr<TreeNode> parse_sql(std::string_view sql) {
 namespace {
 
 std::unique_ptr<Value> clone_value(const Value& value) {
+    std::unique_ptr<Value> copy;
     switch (value.type) {
     case AstType::IntLit: {
         const auto& lit = static_cast<const IntLit&>(value);
-        return std::make_unique<IntLit>(lit.val, lit.display_text);
+        copy = std::make_unique<IntLit>(lit.val, lit.display_text);
+        break;
     }
     case AstType::FloatLit: {
         const auto& lit = static_cast<const FloatLit&>(value);
-        return std::make_unique<FloatLit>(lit.val, lit.display_text);
+        copy = std::make_unique<FloatLit>(lit.val, lit.display_text);
+        break;
     }
     case AstType::StringLit: {
         const auto& lit = static_cast<const StringLit&>(value);
-        return std::make_unique<StringLit>(lit.val, lit.display_text);
+        copy = std::make_unique<StringLit>(lit.val, lit.display_text);
+        break;
     }
     case AstType::BoolLit: {
         const auto& lit = static_cast<const BoolLit&>(value);
-        return std::make_unique<BoolLit>(lit.val, lit.display_text);
+        copy = std::make_unique<BoolLit>(lit.val, lit.display_text);
+        break;
     }
     default:
         throw std::logic_error("unsupported literal in AST clone");
     }
+    copy->parameter_slot = value.parameter_slot;
+    return copy;
 }
 
 std::unique_ptr<Expr> clone_expr_owned(const Expr& expr) {
@@ -1105,6 +1112,85 @@ std::unique_ptr<TreeNode> clone_tree(const TreeNode& node) {
     }
     default:
         throw std::logic_error("unsupported statement type for AST clone");
+    }
+}
+
+namespace {
+
+void assign_expr_slot(Expr& expression, int* next_slot) {
+    switch (expression.type) {
+    case AstType::IntLit:
+    case AstType::FloatLit:
+    case AstType::StringLit:
+    case AstType::BoolLit:
+        static_cast<Value&>(expression).parameter_slot = (*next_slot)++;
+        break;
+    default:
+        break;
+    }
+}
+
+void assign_binary_slots(BinaryExpr& expression, int* next_slot) {
+    assign_expr_slot(*expression.lhs, next_slot);
+    assign_expr_slot(*expression.rhs, next_slot);
+}
+
+} // namespace
+
+void assign_literal_slots(TreeNode& node) {
+    int next_slot = 0;
+    switch (node.type) {
+    case AstType::InsertStmt:
+        for (auto& value : static_cast<InsertStmt&>(node).vals)
+            value->parameter_slot = next_slot++;
+        break;
+    case AstType::DeleteStmt: {
+        auto& statement = static_cast<DeleteStmt&>(node);
+        for (auto& condition : statement.conds)
+            assign_binary_slots(*condition, &next_slot);
+        break;
+    }
+    case AstType::UpdateStmt: {
+        auto& statement = static_cast<UpdateStmt&>(node);
+        for (auto& clause : statement.set_clauses) {
+            if (clause->val != nullptr)
+                clause->val->parameter_slot = next_slot++;
+        }
+        for (auto& condition : statement.conds)
+            assign_binary_slots(*condition, &next_slot);
+        break;
+    }
+    case AstType::SelectStmt: {
+        auto& statement = static_cast<SelectStmt&>(node);
+        for (auto& item : statement.select_items)
+            assign_expr_slot(*item->expr, &next_slot);
+        for (auto& condition : statement.conds)
+            assign_binary_slots(*condition, &next_slot);
+        for (auto& join : statement.jointree) {
+            for (auto& condition : join->conds)
+                assign_binary_slots(*condition, &next_slot);
+        }
+        for (auto& condition : statement.having_conds) {
+            assign_expr_slot(*condition->lhs, &next_slot);
+            assign_expr_slot(*condition->rhs, &next_slot);
+        }
+        for (auto& item : statement.order_by_items)
+            assign_expr_slot(*item->expr, &next_slot);
+        break;
+    }
+    case AstType::ExplainAnalyze:
+        assign_literal_slots(*static_cast<ExplainAnalyze&>(node).select);
+        break;
+    case AstType::SelectFromUnionStmt: {
+        auto& wrapper = static_cast<SelectFromUnionStmt&>(node);
+        for (auto& branch : wrapper.union_stmt->branches)
+            assign_literal_slots(*branch);
+        for (auto& item : wrapper.order_by_items)
+            assign_expr_slot(*item->expr, &next_slot);
+        break;
+    }
+    default:
+        break;
     }
 }
 

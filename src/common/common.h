@@ -31,6 +31,7 @@ struct TabCol {
 
 struct Value {
     ColType type = TYPE_INT; // type of value
+    int lexical_slot = -1;   // owned-token parameter slot; -1 for non-template values
     union {
         int int_val = 0;  // int value
         double float_val; // SQL FLOAT value
