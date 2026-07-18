@@ -20,14 +20,18 @@ foreach(DIR ${SUBDIRS})
 
                 set_target_properties(${TEST_TARGET} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/test")
 
-                target_link_libraries(${TEST_TARGET}
-                        "-Wl,--start-group"
-                        analyze parser system storage lru_replacer record index transaction planner execution recovery
-                        "-Wl,--end-group"
-                        gtest_main pthread)
-                if(DIR STREQUAL "jit")
-                    target_link_libraries(${TEST_TARGET} jit cache)
-                    target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_ENABLE_JIT=1)
+                if(DIR STREQUAL "compiled")
+                    target_link_libraries(${TEST_TARGET} compiled gtest_main pthread)
+                else()
+                    target_link_libraries(${TEST_TARGET}
+                            "-Wl,--start-group"
+                            analyze parser system storage lru_replacer record index transaction planner execution recovery
+                            "-Wl,--end-group"
+                            gtest_main pthread)
+                    if(DIR STREQUAL "jit")
+                        target_link_libraries(${TEST_TARGET} jit cache)
+                        target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_ENABLE_JIT=1)
+                    endif()
                 endif()
                 target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_SRC_DIR="${CMAKE_SOURCE_DIR}")
                 gtest_discover_tests(${TEST_TARGET})

@@ -2,6 +2,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(analyze)
 add_subdirectory(cache)
+add_subdirectory(compiled)
 add_subdirectory(record)
 add_subdirectory(index)
 add_subdirectory(system)
