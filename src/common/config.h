@@ -33,6 +33,7 @@ inline constexpr const char* kPhaseMetricsPathEnv = "RMDB_PHASE_METRICS_PATH";
 
 // Process-local template and generated-code cache limits.
 inline constexpr size_t kStatementTemplateCacheCapacity = 256;
+inline constexpr size_t kJitPredicateProgramCacheCapacity = 256;
 inline constexpr size_t kJitMaxEntries = 256;
 inline constexpr size_t kJitMaxCodeBytes = 16U * 1024U * 1024U;
 inline constexpr size_t kJitMaxQueueSize = 64;

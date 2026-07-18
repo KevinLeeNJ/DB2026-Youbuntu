@@ -16,23 +16,25 @@ See the Mulan PSL v2 for more details. */
 #include "jit/jit_ir.h"
 #include "jit/jit_manager.h"
 
+class Context;
+
 namespace jit {
 
 class PredicateKernel {
 public:
     PredicateKernel() = default;
     PredicateKernel(PlanTag plan_tag, const std::vector<Condition>& conditions, JitTupleLayout tuple0,
-                    std::optional<JitTupleLayout> tuple1, uint64_t catalog_generation);
+                    std::optional<JitTupleLayout> tuple1, uint64_t catalog_generation, Context* context = nullptr);
 
     explicit operator bool() const {
-        return program_.has_value();
+        return program_ != nullptr;
     }
 
     std::optional<bool> evaluate(const char* tuple0, uint32_t tuple0_len, const char* tuple1 = nullptr,
                                  uint32_t tuple1_len = 0) const;
 
 private:
-    std::optional<JitProgram> program_;
+    std::shared_ptr<const JitProgram> program_;
     JitParamBlock params_;
     mutable std::shared_ptr<const JitCode> code_;
     mutable uint32_t pending_evaluations_{0};

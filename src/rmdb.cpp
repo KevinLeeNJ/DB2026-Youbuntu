@@ -266,6 +266,7 @@ void client_handler(int fd) {
         bool cacheable_skeleton = false;
         bool cacheable_query = false;
         bool cacheable_plan = false;
+        uint64_t current_statement_template_generation = 0;
         if (statement_cache_mode != cache::StatementCacheMode::OFF) {
             phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
                                                        phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
@@ -273,9 +274,10 @@ void client_handler(int fd) {
             cacheable_skeleton = static_cast<bool>(lexical_shape) && !lexical_shape.template_unsupported;
             cacheable_plan = cacheable_skeleton;
             cacheable_query = cacheable_skeleton;
+            current_statement_template_generation = statement_template_generation();
             if (lexical_shape && cacheable_plan && statement_cache_mode == cache::StatementCacheMode::FULL) {
-                auto full = statement_template_cache->lookup_full(lexical_shape.key, statement_template_generation(),
-                                                                  sm_manager.get(), &lexical_shape);
+                auto full = statement_template_cache->lookup_full(
+                    lexical_shape.key, current_statement_template_generation, sm_manager.get(), &lexical_shape);
                 if (full) {
                     cached_statement_type = full.statement_type;
                     cached_plan = std::move(full.plan);
@@ -287,7 +289,7 @@ void client_handler(int fd) {
                 if (lexical_shape && cacheable_skeleton && cacheable_query &&
                     static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
                     cached_query = statement_template_cache->lookup_query(
-                        lexical_shape.key, statement_template_generation(), &lexical_shape);
+                        lexical_shape.key, current_statement_template_generation, &lexical_shape);
                     if (cached_query != nullptr && cached_query->parse != nullptr) {
                         cached_parse_tree = ast::clone_tree(*cached_query->parse);
                         used_cached_parse = true;
@@ -297,10 +299,10 @@ void client_handler(int fd) {
                            static_cast<int>(statement_cache_mode) >=
                                static_cast<int>(cache::StatementCacheMode::PARSER)) {
                     cached_parse_tree = statement_template_cache->lookup_ast(
-                        lexical_shape.key, statement_template_generation(), &lexical_shape);
+                        lexical_shape.key, current_statement_template_generation, &lexical_shape);
                     used_cached_parse = cached_parse_tree != nullptr;
                 } else if (lexical_shape &&
-                           statement_template_cache->lookup(lexical_shape.key, statement_template_generation())) {
+                           statement_template_cache->lookup(lexical_shape.key, current_statement_template_generation)) {
                     LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
                               lexical_shape.key.low);
                 }
@@ -312,6 +314,12 @@ void client_handler(int fd) {
                                                   txn_manager.get());
         Context* context = _context.get();
         context->isolation_level_ = session_isolation_level;
+        if (lexical_shape && cacheable_plan) {
+            context->has_statement_template_identity_ = true;
+            context->statement_shape_high_ = lexical_shape.key.high;
+            context->statement_shape_low_ = lexical_shape.key.low;
+            context->statement_template_generation_ = current_statement_template_generation;
+        }
 
         auto abort_active_transaction = [&]() {
             Transaction* txn = context->txn_;
@@ -358,7 +366,7 @@ void client_handler(int fd) {
                     statement_cache_mode != cache::StatementCacheMode::OFF) {
                     auto clone = ast::clone_tree(*parse_tree);
                     parsed_skeleton = std::shared_ptr<const ast::TreeNode>(std::move(clone));
-                    statement_template_cache->publish(lexical_shape.key, statement_template_generation(),
+                    statement_template_cache->publish(lexical_shape.key, current_statement_template_generation,
                                                       parsed_skeleton);
                 }
                 const auto parsed_type = used_cached_plan ? *cached_statement_type : parse_tree->type;
@@ -382,7 +390,7 @@ void client_handler(int fd) {
                     statement_cache_mode != cache::StatementCacheMode::OFF && query != nullptr) {
                     auto query_copy = clone_query(*query);
                     std::shared_ptr<const Query> semantic_skeleton(std::move(query_copy));
-                    statement_template_cache->publish(lexical_shape.key, statement_template_generation(), nullptr,
+                    statement_template_cache->publish(lexical_shape.key, current_statement_template_generation, nullptr,
                                                       std::move(semantic_skeleton));
                 }
                 LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
@@ -401,7 +409,7 @@ void client_handler(int fd) {
                     statement_cache_mode != cache::StatementCacheMode::OFF && plan != nullptr) {
                     auto plan_copy = clone_plan(*plan, sm_manager.get());
                     std::shared_ptr<const Plan> physical_skeleton(std::move(plan_copy));
-                    statement_template_cache->publish(lexical_shape.key, statement_template_generation(), nullptr,
+                    statement_template_cache->publish(lexical_shape.key, current_statement_template_generation, nullptr,
                                                       nullptr, std::move(physical_skeleton));
                 }
                 // portal

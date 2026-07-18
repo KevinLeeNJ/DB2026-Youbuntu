@@ -336,7 +336,7 @@ public:
             auto predicate = std::make_unique<jit::PredicateKernel>(
                 T_NestLoop, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(left_tuple_len_), left_cols},
                 jit::JitTupleLayout{static_cast<uint32_t>(right_tuple_len_), right_input_cols},
-                left_->catalog_generation());
+                left_->catalog_generation(), left_->context_);
             if (*predicate) {
                 jit_predicate_ = std::move(predicate);
             }

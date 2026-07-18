@@ -118,6 +118,32 @@ TEST(JitPredicateTest, ForceModeExecutesCachedPredicateWithExecutionLocalFrame) 
         EXPECT_TRUE(*cached_match);
         EXPECT_EQ(jit::predicate_jit_stats().cache_hits, hits_before + 1);
 
+        Context first_context(nullptr, nullptr, nullptr);
+        first_context.has_statement_template_identity_ = true;
+        first_context.statement_shape_high_ = 11;
+        first_context.statement_shape_low_ = 22;
+        first_context.statement_template_generation_ = 33;
+        jit::PredicateKernel first_template_kernel(T_SeqScan, {condition}, {sizeof(int), {column}}, std::nullopt,
+                                                   generation.load(), &first_context);
+        const auto first_template_match =
+            first_template_kernel.evaluate(reinterpret_cast<const char*>(&value), sizeof(value));
+        ASSERT_TRUE(first_template_match.has_value());
+        EXPECT_TRUE(*first_template_match);
+
+        Context second_context(nullptr, nullptr, nullptr);
+        second_context.has_statement_template_identity_ = true;
+        second_context.statement_shape_high_ = 11;
+        second_context.statement_shape_low_ = 22;
+        second_context.statement_template_generation_ = 33;
+        Condition rebound_condition = condition;
+        rebound_condition.rhs_val.set_int(10);
+        jit::PredicateKernel rebound_template_kernel(T_SeqScan, {rebound_condition}, {sizeof(int), {column}},
+                                                     std::nullopt, generation.load(), &second_context);
+        const auto rebound_template_match =
+            rebound_template_kernel.evaluate(reinterpret_cast<const char*>(&value), sizeof(value));
+        ASSERT_TRUE(rebound_template_match.has_value());
+        EXPECT_FALSE(*rebound_template_match);
+
         auto child = std::make_unique<TupleSourceExecutor>(std::vector<ColMeta>{column},
                                                            std::vector<RmRecord>{int_record(4), int_record(9)});
         FilterExecutor filter(std::move(child), {condition});

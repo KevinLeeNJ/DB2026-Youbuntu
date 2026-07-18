@@ -286,9 +286,9 @@ protected:
             jit_predicate_.reset();
             return;
         }
-        auto predicate = std::make_unique<jit::PredicateKernel>(T_IndexScan, fed_conds_,
-                                                                jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_},
-                                                                std::nullopt, sm_manager_->get_catalog_generation());
+        auto predicate = std::make_unique<jit::PredicateKernel>(
+            T_IndexScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
+            sm_manager_->get_catalog_generation(), context_);
         jit_predicate_ = *predicate ? std::move(predicate) : nullptr;
     }
 #endif

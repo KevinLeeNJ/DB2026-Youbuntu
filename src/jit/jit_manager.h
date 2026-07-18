@@ -25,6 +25,8 @@ namespace jit {
 
 using JitMode = rmdb_config::JitMode;
 
+class PredicateKernel;
+
 enum class JitEntryState { COLD, OBSERVING, QUEUED, COMPILING, READY, FAILED_COOLDOWN, EVICTED };
 
 struct JitManagerConfig {
@@ -91,8 +93,14 @@ public:
     JitManagerStats stats() const;
 
 private:
+    friend class PredicateKernel;
+
     struct Entry;
 
+    std::shared_ptr<const JitCode> observe_verified(const JitProgram& program, JitMode mode,
+                                                    JitObservation observation = {});
+    std::shared_ptr<const JitCode> observe_impl(const JitProgram& program, JitMode mode, JitObservation observation,
+                                                bool program_verified);
     std::shared_ptr<const JitCode> compile_immediately(const std::shared_ptr<Entry>& entry);
     void worker_loop();
     void publish_compile_result(const std::shared_ptr<Entry>& entry, JitCompileResult result,

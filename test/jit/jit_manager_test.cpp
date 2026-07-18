@@ -36,7 +36,7 @@ jit::JitProgram make_program(CompOp op, uint64_t generation) {
 
 jit::JitProgram make_unique_program(uint32_t id, uint64_t generation) {
     const std::string table = "t" + std::to_string(id);
-    ColMeta column{table, "v", TYPE_INT, static_cast<int>(sizeof(int32_t)), static_cast<int>(id % 16), false};
+    ColMeta column{table, "v", TYPE_INT, static_cast<int>(sizeof(int32_t)), static_cast<int>(id), false};
     Condition condition;
     condition.lhs_col = {table, "v"};
     condition.op = OP_EQ;

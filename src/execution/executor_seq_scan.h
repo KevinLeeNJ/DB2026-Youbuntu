@@ -107,7 +107,7 @@ public:
         if (jit::predicate_jit_available()) {
             auto predicate = std::make_unique<jit::PredicateKernel>(
                 T_SeqScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
-                sm_manager_->get_catalog_generation());
+                sm_manager_->get_catalog_generation(), context_);
             if (*predicate) {
                 jit_predicate_ = std::move(predicate);
             }

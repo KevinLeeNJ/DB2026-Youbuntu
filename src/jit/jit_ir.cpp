@@ -42,14 +42,6 @@ void append_string(std::string& output, const std::string& value) {
 
 void append_layout(std::string& output, const JitTupleLayout& layout) {
     append_u32(output, layout.tuple_len);
-    append_u32(output, static_cast<uint32_t>(layout.columns.size()));
-    for (const auto& column : layout.columns) {
-        append_string(output, column.tab_name);
-        append_string(output, column.name);
-        append_u32(output, static_cast<uint32_t>(column.type));
-        append_u32(output, static_cast<uint32_t>(column.len));
-        append_u32(output, static_cast<uint32_t>(column.offset));
-    }
 }
 
 void append_operand(std::string& output, const JitOperand& operand) {
@@ -125,6 +117,54 @@ bool can_compare(ColType lhs, ColType rhs) {
 bool valid_fixed_length(ColType type, uint32_t len) {
     return (type == TYPE_INT && len == sizeof(int32_t)) || (type == TYPE_FLOAT && len == sizeof(double)) ||
            ((type == TYPE_STRING || type == TYPE_DATETIME) && len > 0);
+}
+
+JitVerifyResult verify_program_structure(const JitProgram& program) {
+    if (program.ir_version != JIT_IR_VERSION || program.abi_version != JIT_ABI_VERSION || program.helper_version != 1 ||
+        program.architecture.empty()) {
+        return {false, "unsupported JIT IR or ABI version"};
+    }
+    if (program.tuple0.tuple_len > kMaxTupleLength ||
+        (program.tuple1.has_value() && program.tuple1->tuple_len > kMaxTupleLength) ||
+        program.predicates.size() > kMaxPredicates || program.parameters.size() > kMaxParameters) {
+        return {false, "JIT program exceeds resource limits"};
+    }
+    auto verify_operand = [&](const JitOperand& operand) -> JitVerifyResult {
+        if (operand.source == JitOperandSource::PARAMETER) {
+            if (operand.parameter_index >= program.parameters.size() ||
+                program.parameters[operand.parameter_index].type != operand.type) {
+                return {false, "predicate references an invalid parameter"};
+            }
+            if ((operand.type == TYPE_STRING || operand.type == TYPE_DATETIME) &&
+                operand.len > program.parameters[operand.parameter_index].max_len) {
+                return {false, "byte parameter length exceeds its descriptor"};
+            }
+            return {true, {}};
+        }
+        const JitTupleLayout* layout = operand.source == JitOperandSource::TUPLE0 ? &program.tuple0 : nullptr;
+        if (operand.source == JitOperandSource::TUPLE1) {
+            layout = program.tuple1.has_value() ? &*program.tuple1 : nullptr;
+        }
+        if (layout == nullptr || !valid_fixed_length(operand.type, operand.len) ||
+            static_cast<uint64_t>(operand.offset) + operand.len > layout->tuple_len) {
+            return {false, "predicate references bytes outside a tuple layout"};
+        }
+        return {true, {}};
+    };
+    for (const auto& predicate : program.predicates) {
+        JitVerifyResult lhs = verify_operand(predicate.lhs);
+        JitVerifyResult rhs = verify_operand(predicate.rhs);
+        if (!lhs) {
+            return lhs;
+        }
+        if (!rhs) {
+            return rhs;
+        }
+        if (!can_compare(predicate.lhs.type, predicate.rhs.type)) {
+            return {false, "predicate has incompatible operand types"};
+        }
+    }
+    return {true, {}};
 }
 
 const ColMeta* find_column(const JitTupleLayout& layout, const TabCol& target) {
@@ -281,12 +321,16 @@ JitBuildResult build_predicate_program(PlanTag plan_tag, const std::vector<Condi
         }
         program.predicates.push_back({condition.op, *lhs, rhs});
     }
-    program.key.canonical_bytes = serialize_program(program);
-    program.key.digest = stable_digest(program.key.canonical_bytes);
-    JitVerifyResult verification = verify_program(program);
+    program.tuple0.columns.clear();
+    if (program.tuple1.has_value()) {
+        program.tuple1->columns.clear();
+    }
+    JitVerifyResult verification = verify_program_structure(program);
     if (!verification) {
         return {{}, {}, std::move(verification.error)};
     }
+    program.key.canonical_bytes = serialize_program(program);
+    program.key.digest = stable_digest(program.key.canonical_bytes);
     JitBindResult binding = bind_parameters(program, conditions);
     if (!binding) {
         return {{}, {}, std::move(binding.error)};
@@ -312,49 +356,9 @@ JitBuildResult build_predicate_program(const JoinPlan& plan, JitTupleLayout left
 }
 
 JitVerifyResult verify_program(const JitProgram& program) {
-    if (program.ir_version != JIT_IR_VERSION || program.abi_version != JIT_ABI_VERSION || program.helper_version != 1 ||
-        program.architecture.empty()) {
-        return {false, "unsupported JIT IR or ABI version"};
-    }
-    if (program.tuple0.tuple_len > kMaxTupleLength ||
-        (program.tuple1.has_value() && program.tuple1->tuple_len > kMaxTupleLength) ||
-        program.predicates.size() > kMaxPredicates || program.parameters.size() > kMaxParameters) {
-        return {false, "JIT program exceeds resource limits"};
-    }
-    auto verify_operand = [&](const JitOperand& operand) -> JitVerifyResult {
-        if (operand.source == JitOperandSource::PARAMETER) {
-            if (operand.parameter_index >= program.parameters.size() ||
-                program.parameters[operand.parameter_index].type != operand.type) {
-                return {false, "predicate references an invalid parameter"};
-            }
-            if ((operand.type == TYPE_STRING || operand.type == TYPE_DATETIME) &&
-                operand.len > program.parameters[operand.parameter_index].max_len) {
-                return {false, "byte parameter length exceeds its descriptor"};
-            }
-            return {true, {}};
-        }
-        const JitTupleLayout* layout = operand.source == JitOperandSource::TUPLE0 ? &program.tuple0 : nullptr;
-        if (operand.source == JitOperandSource::TUPLE1) {
-            layout = program.tuple1.has_value() ? &*program.tuple1 : nullptr;
-        }
-        if (layout == nullptr || !valid_fixed_length(operand.type, operand.len) ||
-            static_cast<uint64_t>(operand.offset) + operand.len > layout->tuple_len) {
-            return {false, "predicate references bytes outside a tuple layout"};
-        }
-        return {true, {}};
-    };
-    for (const auto& predicate : program.predicates) {
-        JitVerifyResult lhs = verify_operand(predicate.lhs);
-        JitVerifyResult rhs = verify_operand(predicate.rhs);
-        if (!lhs) {
-            return lhs;
-        }
-        if (!rhs) {
-            return rhs;
-        }
-        if (!can_compare(predicate.lhs.type, predicate.rhs.type)) {
-            return {false, "predicate has incompatible operand types"};
-        }
+    JitVerifyResult verification = verify_program_structure(program);
+    if (!verification) {
+        return verification;
     }
     const std::string bytes = serialize_program(program);
     if (program.key.canonical_bytes != bytes || program.key.digest != stable_digest(bytes)) {

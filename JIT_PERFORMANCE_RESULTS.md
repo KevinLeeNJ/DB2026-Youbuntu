@@ -864,3 +864,34 @@ N/A (no readable perf/flamegraph summary)
 - Final abort rates were `[0.739%, 0.735%, 0.737%]`; all three crash/restart recovery consistency checks passed.
 - Final validation: `make test` passed `355/355`; the formerly timing-sensitive queue-capacity test passed `50/50`
   deterministic repetitions. Client protocol, network path, SQL/error output, and `output.txt` format were unchanged.
+
+## Perf-driven JIT descriptor cache
+
+- Three isolated 1s-warmup/3s-measure experiments showed why the earlier end-to-end gain was small and why this short
+  window could not rank sub-percent changes reliably. Merged Plan clone/bind produced `[8560, 8600, 8560]`, trusted
+  JIT observe/frame validation produced `[8580, 8520, 8620]`, and move-based Portal/Executor construction produced
+  `[8580, 8560, 8580]`. None exceeded the existing `8580` median, so all three candidate diffs were reverted and not
+  committed. At a three-second measurement, one additional new-order transaction changes the result by 20 tpmC.
+- A 20-second `cycles:u` perf profile over a 30-second run identified the larger remaining software cost instead:
+  `jit::verify_program` used 2.12% of sampled cycles, `jit::build_predicate_program` used 0.97%, JIT serialization
+  helpers used about 1.43%, and parameter binding used 0.21%. Plan clone/bind and Portal conversion were smaller flat
+  symbols, while allocator, index scan, checkpoint, and storage work remained the dominant non-JIT costs.
+- FULL cache execution now carries its 128-bit SQL shape and template generation in the execution Context. A bounded
+  256-entry predicate-program cache, configured in `src/common/config.h`, keys immutable verified descriptors by SQL
+  shape, template generation, catalog generation, PlanTag, and predicate ordinal. Hits reuse only descriptor structure;
+  every execution still binds its own literal parameter block. Cache entries are cleared at JIT service startup and
+  shutdown, and any shape/binding inconsistency erases the entry and falls back to the complete builder.
+- Generated-code identity now serializes tuple lengths and the referenced typed operands rather than unrelated table or
+  column names. The builder discards construction-only column vectors after resolving operands and performs structural
+  verification once. PredicateKernel uses the verified-manager path, while the public JitManager API retains complete
+  verification for untrusted callers. Per-tuple validation keeps pointer/length checks but does not revalidate immutable
+  parameter descriptors.
+- The matching post-change perf profile no longer showed `verify_program`, `build_predicate_program`, or JIT
+  serialization helpers above the sampling threshold; only execution-local parameter binding remained at 0.08%.
+- An accurate baseline used three independent 8-warehouse, 1-worker rounds with a 5-second warmup and 30-second
+  measurement: `[7204, 7210, 7188]`, median `7204`. The descriptor-cache build produced
+  `[7278, 7284, 7270]`, median `7278`, a 1.03% improvement. Every optimized round exceeded the highest baseline round;
+  abort rates stayed near 0.44%, and all six baseline/optimized crash-restart consistency checks passed.
+- Validation passed `355/355` tests, the JIT manager shape-churn test passed 50/50 repetitions, and a separate Release
+  build with `RMDB_ENABLE_JIT=OFF` succeeded. AUTO JIT and FULL statement cache remained enabled. Network transport,
+  client protocol, SQL/error rendering, metrics JSON fields, and `output.txt` were unchanged.

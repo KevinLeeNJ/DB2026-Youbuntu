@@ -103,7 +103,7 @@ public:
         if (jit::predicate_jit_available()) {
             auto predicate = std::make_unique<jit::PredicateKernel>(
                 T_Filter, conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), prev_->cols()}, std::nullopt,
-                prev_->catalog_generation());
+                prev_->catalog_generation(), context_);
             if (*predicate) {
                 jit_predicate_ = std::move(predicate);
             }

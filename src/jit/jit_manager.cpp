@@ -133,7 +133,18 @@ void JitManager::leave_execution() {
 
 std::shared_ptr<const JitCode> JitManager::observe(const JitProgram& program, JitMode mode,
                                                    JitObservation observation) {
-    if (mode == JitMode::OFF || !verify_program(program) || catalog_generation_() != program.catalog_generation) {
+    return observe_impl(program, mode, observation, false);
+}
+
+std::shared_ptr<const JitCode> JitManager::observe_verified(const JitProgram& program, JitMode mode,
+                                                            JitObservation observation) {
+    return observe_impl(program, mode, observation, true);
+}
+
+std::shared_ptr<const JitCode> JitManager::observe_impl(const JitProgram& program, JitMode mode,
+                                                        JitObservation observation, bool program_verified) {
+    if (mode == JitMode::OFF || (!program_verified && !verify_program(program)) ||
+        catalog_generation_() != program.catalog_generation) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ++impl_->fallbacks;
         return {};
