@@ -788,3 +788,20 @@ N/A (no readable perf/flamegraph summary)
   The implementation preserves SQL-visible behavior, transaction ordering, protocol, and `output.txt`; no network
   optimization is claimed. End-to-end performance is deferred to the linked cache/JIT phase because this checkpoint
   only establishes physical correctness and lifecycle ownership.
+
+## Phase 11 Decision
+
+- Connected the independent template and JIT emergency switches. `off/off`, `off/full`, `analyzer/off`,
+  `full/off`, and `full/force` e2e combinations preserve results and errors; cache hits do not enter Parser, Analyzer,
+  or Planner sampling scopes when their corresponding immutable layer is available.
+- A three-round TPCC run (8 warehouses, one worker, seed `20260718`, 1s warmup/3s measure) produced:
+  `off/off` tpmC `[7800, 7820, 7800]`, median `7800`, abort median `0.813%`; fixed `off/full` tpmC
+  `[7380, 7360, 7360]`, median `7360`, abort median `0.872%`; `auto/off` tpmC `[7120, 7120, 6920]`, median
+  `7120`, abort median `0.902%`; `auto/full` tpmC `[6780, 6760, 6840]`, median `6780`, abort median `0.932%`.
+  These short single-worker measurements show overhead rather than a production gain; they are recorded without any
+  network/protocol optimization claim. The required three-round random-kill recovery checks completed with consistency
+  verification for the successful fixed run.
+- An earlier pre-fix `off/full` trial failed with repeated `Index entry already exists` because literal-bearing plans were
+  incorrectly reused. The implementation now marks parameterized shapes non-cacheable until a true lexical-to-semantic
+  binder exists; the corrected three-round run had only the normal deterministic invalid-item rollbacks and no backend
+  errors. This is an explicit correctness guard, not a hidden performance tradeoff.
