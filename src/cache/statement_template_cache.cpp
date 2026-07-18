@@ -62,10 +62,33 @@ std::unique_ptr<ast::TreeNode> StatementTemplateCache::lookup_ast(const parser::
     return ast::clone_tree(*found->second.skeleton);
 }
 
-void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                                     std::shared_ptr<const ast::TreeNode> skeleton) {
+std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenShapeKey& key,
+                                                            uint64_t catalog_generation) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Entry entry{key, catalog_generation, ++clock_, std::move(skeleton)};
+    ++stats_.lookups;
+    auto found = entries_.find(map_key(key));
+    if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key ||
+        found->second.query == nullptr) {
+        ++stats_.misses;
+        return nullptr;
+    }
+    found->second.last_use = ++clock_;
+    ++stats_.hits;
+    return clone_query(*found->second.query);
+}
+
+void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                     std::shared_ptr<const ast::TreeNode> skeleton,
+                                     std::shared_ptr<const Query> query) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto previous = entries_.find(map_key(key));
+    if (previous != entries_.end() && skeleton == nullptr) {
+        skeleton = previous->second.skeleton;
+    }
+    if (previous != entries_.end() && query == nullptr) {
+        query = previous->second.query;
+    }
+    Entry entry{key, catalog_generation, ++clock_, std::move(skeleton), std::move(query)};
     entries_[map_key(key)] = std::move(entry);
     ++stats_.publishes;
     if (entries_.size() <= capacity_) {

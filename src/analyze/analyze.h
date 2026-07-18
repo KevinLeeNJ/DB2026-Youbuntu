@@ -60,6 +60,10 @@ public:
     Query() {}
 };
 
+// Deep-copy the semantic blueprint while allocating fresh AST, Value and raw
+// record ownership for one execution.
+std::unique_ptr<Query> clone_query(const Query& query);
+
 class Analyze {
 private:
     SmManager* sm_manager_;

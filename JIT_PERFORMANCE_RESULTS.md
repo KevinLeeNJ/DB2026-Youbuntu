@@ -762,3 +762,15 @@ N/A (no readable perf/flamegraph summary)
 - Parser regression passed 21/21; AST/cache tests passed 4/4; `RMDB_STATEMENT_CACHE=parser RMDB_JIT=off` e2e passed
   30/30. No separate throughput claim is made before Analyzer/Planner bypass; phase metrics continue to distinguish
   normalize and parser samples. Three-round end-to-end comparison is deferred until full readiness exists.
+
+## Phase 9 Decision
+
+- Added an immutable semantic `Query` blueprint clone with fresh AST, `Value`/raw-record storage, condition, SELECT,
+  HAVING, ORDER, UPDATE, INSERT, and UNION ownership. `RMDB_STATEMENT_CACHE=analyzer` retrieves that blueprint only
+  after catalog-generation validation, recreates execution-local ownership, and skips Analyzer; Parser still runs (or
+  uses the parser skeleton) to preserve statement-kind and transaction setup ordering.
+- Cache publish merges parsed and semantic readiness without replacing the other immutable layer. Any miss, unsupported
+  clone, generation mismatch, or disabled mode uses the complete existing pipeline.
+- `RMDB_STATEMENT_CACHE=analyzer RMDB_JIT=off` e2e passed 30/30; parser and AST/cache tests remain green. No network,
+  protocol, SQL-visible error, transaction, lock, WAL, MVCC, or `output.txt` behavior was changed. Planner bypass is
+  intentionally not claimed until the physical blueprint phase.

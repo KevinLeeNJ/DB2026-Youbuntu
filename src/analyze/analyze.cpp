@@ -20,6 +20,102 @@ using namespace analyze_internal;
 
 namespace {
 
+Value clone_value(const Value& source) {
+    Value value;
+    value.type = source.type;
+    if (source.type == TYPE_INT) {
+        value.int_val = source.int_val;
+    } else if (source.type == TYPE_FLOAT) {
+        value.float_val = source.float_val;
+    } else {
+        value.str_val = source.str_val;
+    }
+    if (source.raw != nullptr) {
+        value.raw = std::make_shared<RmRecord>(*source.raw);
+    }
+    return value;
+}
+
+QueryExpr clone_query_expr(const QueryExpr& source) {
+    QueryExpr expression = source;
+    expression.value = clone_value(source.value);
+    return expression;
+}
+
+Condition clone_condition(const Condition& source) {
+    Condition condition = source;
+    condition.rhs_val = clone_value(source.rhs_val);
+    return condition;
+}
+
+SetClause clone_set_clause(const SetClause& source) {
+    SetClause clause = source;
+    clause.rhs = clone_value(source.rhs);
+    return clause;
+}
+
+HavingCondition clone_having_condition(const HavingCondition& source) {
+    HavingCondition condition = source;
+    condition.lhs = clone_query_expr(source.lhs);
+    condition.rhs_expr = clone_query_expr(source.rhs_expr);
+    condition.rhs_val = clone_value(source.rhs_val);
+    return condition;
+}
+
+} // namespace
+
+std::unique_ptr<Query> clone_query(const Query& source) {
+    auto query = std::make_unique<Query>();
+    if (source.parse != nullptr) {
+        query->parse = ast::clone_tree(*source.parse);
+    }
+    query->conds.reserve(source.conds.size());
+    for (const auto& condition : source.conds)
+        query->conds.push_back(clone_condition(condition));
+    query->cols = source.cols;
+    query->select_items.reserve(source.select_items.size());
+    for (const auto& item : source.select_items) {
+        auto copy = item;
+        copy.expr = clone_query_expr(item.expr);
+        query->select_items.push_back(std::move(copy));
+    }
+    query->group_by_cols = source.group_by_cols;
+    query->having_conds.reserve(source.having_conds.size());
+    for (const auto& condition : source.having_conds)
+        query->having_conds.push_back(clone_having_condition(condition));
+    query->order_by_items.reserve(source.order_by_items.size());
+    for (const auto& item : source.order_by_items) {
+        auto copy = item;
+        copy.expr = clone_query_expr(item.expr);
+        query->order_by_items.push_back(std::move(copy));
+    }
+    query->has_limit = source.has_limit;
+    query->limit = source.limit;
+    query->has_aggregate = source.has_aggregate;
+    query->has_select_star = source.has_select_star;
+    query->output_names = source.output_names;
+    query->is_union = source.is_union;
+    query->union_cols = source.union_cols;
+    query->union_alias = source.union_alias;
+    query->tables = source.tables;
+    query->table_display_names = source.table_display_names;
+    query->table_alias_to_name = source.table_alias_to_name;
+    query->table_name_to_display = source.table_name_to_display;
+    query->is_explain_analyze = source.is_explain_analyze;
+    query->is_set_transaction = source.is_set_transaction;
+    query->set_isolation_level = source.set_isolation_level;
+    query->set_clauses.reserve(source.set_clauses.size());
+    for (const auto& clause : source.set_clauses)
+        query->set_clauses.push_back(clone_set_clause(clause));
+    query->values.reserve(source.values.size());
+    for (const auto& value : source.values)
+        query->values.push_back(clone_value(value));
+    query->union_branches.reserve(source.union_branches.size());
+    for (const auto& branch : source.union_branches)
+        query->union_branches.push_back(clone_query(*branch));
+    return query;
+}
+
 UpdateOp convert_update_op(ast::SetOp op) {
     switch (op) {
     case ast::SetOp::SELF_ADD:
@@ -97,8 +193,6 @@ void populate_table_refs(Query& query, const std::vector<ast::TableRef>& table_r
         }
     }
 }
-
-} // namespace
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分

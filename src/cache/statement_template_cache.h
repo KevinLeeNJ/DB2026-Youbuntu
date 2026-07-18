@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "parser/token_stream.h"
 #include "parser/ast.h"
+#include "analyze/analyze.h"
 
 namespace cache {
 
@@ -40,8 +41,10 @@ public:
 
     bool lookup(const parser::TokenShapeKey& key, uint64_t catalog_generation);
     std::unique_ptr<ast::TreeNode> lookup_ast(const parser::TokenShapeKey& key, uint64_t catalog_generation);
+    std::unique_ptr<Query> lookup_query(const parser::TokenShapeKey& key, uint64_t catalog_generation);
     void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                 std::shared_ptr<const ast::TreeNode> skeleton = nullptr);
+                 std::shared_ptr<const ast::TreeNode> skeleton = nullptr,
+                 std::shared_ptr<const Query> query = nullptr);
     StatementTemplateStats stats() const;
     void clear();
 
@@ -51,6 +54,7 @@ private:
         uint64_t catalog_generation{0};
         uint64_t last_use{0};
         std::shared_ptr<const ast::TreeNode> skeleton;
+        std::shared_ptr<const Query> query;
     };
 
     static std::string map_key(const parser::TokenShapeKey& key) {

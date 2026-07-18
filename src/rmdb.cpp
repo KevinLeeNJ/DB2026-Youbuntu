@@ -233,12 +233,20 @@ void client_handler(int fd) {
         parser::OwnedTokenStream lexical_shape;
         const auto statement_cache_mode = cache::configured_statement_cache_mode();
         std::unique_ptr<ast::TreeNode> cached_parse_tree;
+        std::unique_ptr<Query> cached_query;
         if (statement_cache_mode != cache::StatementCacheMode::OFF) {
             phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
                                                        phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
             lexical_shape = parser::normalize_sql(data_recv);
             if (lexical_shape &&
-                static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::PARSER)) {
+                static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
+                cached_query =
+                    statement_template_cache->lookup_query(lexical_shape.key, sm_manager->get_catalog_generation());
+                if (cached_query != nullptr && cached_query->parse != nullptr) {
+                    cached_parse_tree = ast::clone_tree(*cached_query->parse);
+                }
+            } else if (lexical_shape &&
+                       static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::PARSER)) {
                 cached_parse_tree =
                     statement_template_cache->lookup_ast(lexical_shape.key, sm_manager->get_catalog_generation());
             } else if (lexical_shape &&
@@ -307,7 +315,17 @@ void client_handler(int fd) {
                 {
                     phase_metrics::ScopedSample metrics_sample(
                         phase_metrics::Phase::ANALYZER, phase_metrics::sample_rate(phase_metrics::Phase::ANALYZER));
-                    query = analyze->do_analyze(std::move(parse_tree));
+                    if (cached_query != nullptr) {
+                        query = std::move(cached_query);
+                    } else {
+                        query = analyze->do_analyze(std::move(parse_tree));
+                    }
+                }
+                if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF && query != nullptr) {
+                    auto query_copy = clone_query(*query);
+                    std::shared_ptr<const Query> semantic_skeleton(std::move(query_copy));
+                    statement_template_cache->publish(lexical_shape.key, sm_manager->get_catalog_generation(), nullptr,
+                                                      std::move(semantic_skeleton));
                 }
                 LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                 // 优化器
