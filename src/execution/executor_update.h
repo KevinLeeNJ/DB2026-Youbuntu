@@ -77,14 +77,6 @@ public:
         const size_t rid_count = point_lookup_ ? (point_rid_.has_value() ? 1 : 0) : rids_.size();
         for (size_t rid_index = 0; rid_index < rid_count; ++rid_index) {
             Rid& rid = point_lookup_ ? *point_rid_ : rids_[rid_index];
-            std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
-            if (rec == nullptr) {
-                if (context_ != nullptr && context_->txn_ != nullptr &&
-                    context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-                    throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
-                }
-                continue;
-            }
             UpdateRuntimeInfo info{sm_manager_,
                                    &tab_name_,
                                    &tab_,
@@ -95,7 +87,12 @@ public:
                                    &set_clauses_,
                                    &bound_set_clauses_,
                                    &affected_index_bitmap_};
-            RowMutationEngine::UpdateOne(rid, *rec, info, context_);
+            auto prepared = RowMutationEngine::PrepareUpdate(rid, info, context_);
+            if (!prepared.has_value()) {
+                continue;
+            }
+            auto proposed = RowMutationEngine::ComputeLegacyUpdate(*prepared, info);
+            RowMutationEngine::CommitUpdate(std::move(*prepared), *proposed, info, context_);
         }
         return nullptr;
     }

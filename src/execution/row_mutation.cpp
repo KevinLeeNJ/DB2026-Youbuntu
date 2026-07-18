@@ -15,12 +15,19 @@ See the Mulan PSL v2 for more details.
 #include "common/phase_metrics.h"
 
 #include <algorithm>
+#ifndef NDEBUG
+#include <atomic>
+#endif
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string_view>
 
 namespace {
+
+#ifndef NDEBUG
+std::atomic<MutationFaultHook> mutation_fault_hook{nullptr};
+#endif
 
 const ColMeta& FindColumn(const TabMeta& tab, const TabCol& target) {
     for (const auto& col : tab.cols) {
@@ -152,16 +159,6 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
     return true;
 }
 
-std::vector<char> MakeIndexKey(const IndexMeta& index, const char* record_data) {
-    std::vector<char> key(index.col_tot_len);
-    int offset = 0;
-    for (int i = 0; i < index.col_num; ++i) {
-        std::memcpy(key.data() + offset, record_data + index.cols[i].offset, index.cols[i].len);
-        offset += index.cols[i].len;
-    }
-    return key;
-}
-
 void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRuntimeInfo& info) {
     if (info.bound_set_clauses == nullptr || info.set_clauses->size() != info.bound_set_clauses->size()) {
         throw InternalError("mutation SET binding is out of date");
@@ -286,6 +283,33 @@ void RollbackIndexUpdates(const std::vector<std::pair<const RowMutationIndex*, s
 
 } // namespace
 
+void SetMutationFaultHookForTesting(MutationFaultHook hook) noexcept {
+#ifndef NDEBUG
+    mutation_fault_hook.store(hook, std::memory_order_release);
+#else
+    (void)hook;
+#endif
+}
+
+#ifndef NDEBUG
+void MutationFaultPoint(const char* point) {
+    auto hook = mutation_fault_hook.load(std::memory_order_acquire);
+    if (hook != nullptr) {
+        hook(point);
+    }
+}
+#endif
+
+std::vector<char> MakeRowMutationIndexKey(const IndexMeta& index, const char* record_data) {
+    std::vector<char> key(index.col_tot_len);
+    int offset = 0;
+    for (int i = 0; i < index.col_num; ++i) {
+        std::memcpy(key.data() + offset, record_data + index.cols[i].offset, index.cols[i].len);
+        offset += index.cols[i].len;
+    }
+    return key;
+}
+
 std::vector<BoundMutationCondition> BindMutationConditions(const TabMeta& tab,
                                                            const std::vector<Condition>& conditions) {
     std::vector<BoundMutationCondition> bound;
@@ -316,23 +340,73 @@ std::vector<BoundMutationSetClause> BindMutationSetClauses(const TabMeta& tab,
 
 bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info,
                                   Context* context) {
-    if (!PrepareWrite(rid, visible_record, info, context)) {
+    auto owned_record = std::make_unique<RmRecord>(visible_record);
+    if (!PrepareWrite(rid, *owned_record, info, context)) {
         return false;
     }
+    auto* txn = context == nullptr ? nullptr : context->txn_;
+    PreparedUpdate prepared(rid, std::move(owned_record), info.fh->get_tuple_meta(rid),
+                            txn == nullptr ? INVALID_TXN_ID : txn->get_transaction_id(), info.fh->GetFd(),
+                            info.sm_manager->get_catalog_generation());
+    auto proposed = ComputeLegacyUpdate(prepared, info);
+    CommitUpdate(std::move(prepared), *proposed, info, context);
+    return true;
+}
 
-    auto new_record = std::make_unique<RmRecord>(visible_record);
-    {
-        phase_metrics::ScopedSample metrics_sample(
-            phase_metrics::Phase::UPDATE_ARITHMETIC,
-            phase_metrics::sample_rate(phase_metrics::Phase::UPDATE_ARITHMETIC));
-        ApplyUpdate(*new_record, visible_record, info);
+std::optional<PreparedUpdate> RowMutationEngine::PrepareUpdate(const Rid& rid, const UpdateRuntimeInfo& info,
+                                                               Context* context) {
+    auto visible_record = GetVisibleRecord(info.fh, rid, context);
+    if (visible_record == nullptr) {
+        if (context != nullptr && context->txn_ != nullptr &&
+            context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+        }
+        return std::nullopt;
+    }
+    if (!PrepareWrite(rid, *visible_record, info, context)) {
+        return std::nullopt;
     }
     auto* txn = context == nullptr ? nullptr : context->txn_;
+    return PreparedUpdate(rid, std::move(visible_record), info.fh->get_tuple_meta(rid),
+                          txn == nullptr ? INVALID_TXN_ID : txn->get_transaction_id(), info.fh->GetFd(),
+                          info.sm_manager->get_catalog_generation());
+}
+
+std::unique_ptr<RmRecord> RowMutationEngine::ComputeLegacyUpdate(const PreparedUpdate& prepared,
+                                                                 const UpdateRuntimeInfo& info) {
+    auto new_record = std::make_unique<RmRecord>(prepared.old_record());
+    {
+        phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::UPDATE_ARITHMETIC,
+                                                   phase_metrics::sample_rate(phase_metrics::Phase::UPDATE_ARITHMETIC));
+        ApplyUpdate(*new_record, prepared.old_record(), info);
+    }
+    return new_record;
+}
+
+void RowMutationEngine::CommitUpdate(PreparedUpdate&& prepared, RmRecord& proposed, const UpdateRuntimeInfo& info,
+                                     Context* context) {
+    auto* txn = context == nullptr ? nullptr : context->txn_;
+    const txn_id_t txn_id = txn == nullptr ? INVALID_TXN_ID : txn->get_transaction_id();
+    if (prepared.consumed_) {
+        throw InternalError("prepared UPDATE was already consumed");
+    }
+    if (prepared.old_record_ == nullptr || prepared.old_record_->size != proposed.size ||
+        proposed.size != info.fh->get_file_hdr().record_size) {
+        throw InternalError("prepared UPDATE record size mismatch");
+    }
+    if (prepared.txn_id_ != txn_id || prepared.table_fd_ != info.fh->GetFd() ||
+        prepared.catalog_generation_ != info.sm_manager->get_catalog_generation()) {
+        throw InternalError("prepared UPDATE execution context mismatch");
+    }
+    prepared.consumed_ = true;
+
+    const Rid& rid = prepared.rid_;
+    RmRecord& visible_record = *prepared.old_record_;
 
     if (txn != nullptr && txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context->txn_mgr_ != nullptr) {
         if (context->txn_mgr_->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, *info.tab_name,
                                                         std::optional<RmRecord>(visible_record),
-                                                        std::optional<RmRecord>(*new_record), info.tab->cols)) {
+                                                        std::optional<RmRecord>(proposed), info.tab->cols)) {
             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
@@ -348,8 +422,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
             continue;
         }
         const auto& index = (*info.indexes)[index_idx];
-        auto old_key = MakeIndexKey(*index.meta, visible_record.data);
-        auto new_key = MakeIndexKey(*index.meta, new_record->data);
+        auto old_key = MakeRowMutationIndexKey(*index.meta, visible_record.data);
+        auto new_key = MakeRowMutationIndexKey(*index.meta, proposed.data);
         if (old_key == new_key) {
             continue;
         }
@@ -364,10 +438,15 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
     }
 
+    std::vector<const IndexUpdate*> deleted;
+    std::vector<const IndexUpdate*> inserted;
+    deleted.reserve(index_updates.size());
+    inserted.reserve(index_updates.size());
+
     lsn_t log_lsn = INVALID_LSN;
     if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
         Rid log_rid = rid;
-        UpdateLogRecord log_record(txn->get_transaction_id(), visible_record, *new_record, log_rid, *info.tab_name);
+        UpdateLogRecord log_record(txn->get_transaction_id(), visible_record, proposed, log_rid, *info.tab_name);
         log_record.prev_lsn_ = txn->get_prev_lsn();
         log_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(log_lsn);
@@ -377,7 +456,7 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
             std::make_unique<WriteRecord>(WType::UPDATE_TUPLE, *info.tab_name, rid, visible_record));
         UndoLog undo;
         undo.is_deleted_ = false;
-        undo.old_meta_ = info.fh->get_tuple_meta(rid);
+        undo.old_meta_ = prepared.old_meta_;
         undo.old_tuple_data_.assign(visible_record.data, visible_record.data + visible_record.size);
         undo.prev_version_ = undo.old_meta_.version_chain_head_;
         const UndoLink undo_link = txn->AppendUndoLog(undo);
@@ -387,29 +466,33 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         meta.is_committed_ = false;
         meta.is_deleted_ = false;
         meta.version_chain_head_ = undo_link;
-        info.fh->apply_tuple_update(rid, new_record->data, meta, log_lsn);
+        info.fh->apply_tuple_update(rid, proposed.data, meta, log_lsn);
     }
 
-    std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
-    std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
     try {
         for (const auto& update : index_updates) {
             info.sm_manager->remember_historical_index_key(*info.tab_name, update.index->name, update.old_key, rid,
                                                            *update.index->meta);
             update.index->handle->delete_entry(update.old_key.data(), rid, txn);
-            deleted.emplace_back(update.index, update.old_key);
+            deleted.push_back(&update);
+            MutationFaultPoint("update_after_index_delete");
             update.index->handle->insert_entry(update.new_key.data(), rid, txn);
-            inserted.emplace_back(update.index, update.new_key);
+            inserted.push_back(&update);
         }
+        MutationFaultPoint("update_after_all_index_updates");
     } catch (...) {
-        RollbackIndexUpdates(deleted, inserted, rid, txn);
+        for (auto it = inserted.rbegin(); it != inserted.rend(); ++it) {
+            (*it)->index->handle->delete_entry((*it)->new_key.data(), rid, txn);
+        }
+        for (auto it = deleted.rbegin(); it != deleted.rend(); ++it) {
+            (*it)->index->handle->insert_entry((*it)->old_key.data(), rid, txn, true);
+        }
         throw;
     }
     if (txn == nullptr) {
         const TupleMeta committed_meta = info.fh->get_tuple_meta(rid);
-        info.fh->apply_tuple_update(rid, new_record->data, committed_meta, log_lsn);
+        info.fh->apply_tuple_update(rid, proposed.data, committed_meta, log_lsn);
     }
-    return true;
 }
 
 bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, const DeleteRuntimeInfo& info,
@@ -425,6 +508,9 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
     }
 
+    std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
+    deleted.reserve(info.indexes->size());
+
     lsn_t log_lsn = INVALID_LSN;
     if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
         Rid log_rid = rid;
@@ -434,40 +520,44 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         txn->set_prev_lsn(log_lsn);
     }
 
-    std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
-    try {
-        for (const auto& index : *info.indexes) {
-            auto key = MakeIndexKey(*index.meta, visible_record.data);
-            ReserveUniqueKey(context, index.handle->GetFd(), key);
-            info.sm_manager->remember_historical_index_key(*info.tab_name, index.name, key, rid, *index.meta);
-            index.handle->delete_entry(key.data(), rid, txn);
-            deleted.emplace_back(&index, std::move(key));
-        }
-    } catch (...) {
-        std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
-        RollbackIndexUpdates(deleted, inserted, rid, txn);
-        throw;
-    }
-
+    TupleMeta tombstone;
     if (txn != nullptr) {
         UndoLog undo;
         undo.is_deleted_ = true;
         undo.old_meta_ = info.fh->get_tuple_meta(rid);
         undo.old_tuple_data_.assign(visible_record.data, visible_record.data + visible_record.size);
         undo.prev_version_ = undo.old_meta_.version_chain_head_;
-        const UndoLink undo_link = txn->AppendUndoLog(undo);
-        txn->append_write_record(
-            std::make_unique<WriteRecord>(WType::DELETE_TUPLE, *info.tab_name, rid, visible_record));
+        auto write_record = std::make_unique<WriteRecord>(WType::DELETE_TUPLE, *info.tab_name, rid, visible_record);
+        const UndoLink undo_link = txn->AppendUndoLog(std::move(undo));
+        txn->append_write_record(std::move(write_record));
         txn->append_modified_slot(*info.tab_name, rid);
-        TupleMeta tombstone;
         tombstone.writer_txn_id_ = txn->get_transaction_id();
         tombstone.is_committed_ = false;
         tombstone.is_deleted_ = true;
         tombstone.version_chain_head_ = undo_link;
-        info.fh->set_tuple_meta(rid, tombstone, log_lsn);
-        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid);
-    } else {
-        info.fh->delete_record(rid, context);
+    }
+
+    try {
+        for (const auto& index : *info.indexes) {
+            auto key = MakeRowMutationIndexKey(*index.meta, visible_record.data);
+            ReserveUniqueKey(context, index.handle->GetFd(), key);
+            info.sm_manager->remember_historical_index_key(*info.tab_name, index.name, key, rid, *index.meta);
+            index.handle->delete_entry(key.data(), rid, txn);
+            deleted.emplace_back(&index, std::move(key));
+            MutationFaultPoint("delete_after_index_delete");
+        }
+        MutationFaultPoint("delete_before_heap_tombstone");
+        if (txn != nullptr) {
+            info.fh->set_tuple_meta(rid, tombstone, log_lsn);
+            info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid);
+            MutationFaultPoint("delete_after_heap_tombstone");
+        } else {
+            info.fh->delete_record(rid, context);
+        }
+    } catch (...) {
+        std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
+        RollbackIndexUpdates(deleted, inserted, rid, txn);
+        throw;
     }
     return true;
 }

@@ -8,6 +8,9 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
+#ifdef NDEBUG
+#define RMDB_TEST_RELEASE_BUILD 1
+#endif
 #undef NDEBUG
 
 #define private public
@@ -19,11 +22,17 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_delete.h"
 #include "execution/executor_update.h"
 #include "execution/execution_manager.h"
+#include "execution/runtime/point_lookup_runtime.h"
 #undef private
+
+#include "execution/result_sink.h"
+#include "execution/runtime/database_program_runtime.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -57,6 +66,44 @@ RmRecord make_filter_record(int lhs, int rhs) {
     std::memcpy(rec.data, &lhs, sizeof(int));
     std::memcpy(rec.data + sizeof(int), &rhs, sizeof(int));
     return rec;
+}
+
+std::string mutation_fault_point;
+int mutation_fault_skip = 0;
+int mutation_fault_occurrences = 0;
+
+void ThrowConfiguredMutationFault(const char* point) {
+    if (mutation_fault_point != point) {
+        return;
+    }
+    if (mutation_fault_occurrences++ < mutation_fault_skip) {
+        return;
+    }
+    throw std::runtime_error("injected mutation fault");
+}
+
+class ScopedMutationFault {
+public:
+    explicit ScopedMutationFault(std::string point, int skip = 0) {
+        mutation_fault_point = std::move(point);
+        mutation_fault_skip = skip;
+        mutation_fault_occurrences = 0;
+        SetMutationFaultHookForTesting(ThrowConfiguredMutationFault);
+    }
+
+    ~ScopedMutationFault() {
+        SetMutationFaultHookForTesting(nullptr);
+        mutation_fault_point.clear();
+    }
+
+    ScopedMutationFault(const ScopedMutationFault&) = delete;
+    ScopedMutationFault& operator=(const ScopedMutationFault&) = delete;
+};
+
+size_t CountExactIndexEntry(IxIndexHandle* index, const std::vector<char>& key, const Rid& rid) {
+    std::vector<Rid> matches;
+    index->get_value(key.data(), &matches, nullptr);
+    return static_cast<size_t>(std::count(matches.begin(), matches.end(), rid));
 }
 
 class CountingExecutor : public AbstractExecutor {
@@ -219,6 +266,26 @@ public:
             InsertExecutor exec(sm_manager_.get(), tab_name, vals, &ctx);
             exec.Next();
         }
+    }
+
+    compiled::RuntimeValue lookup_program_row(DatabaseProgramRuntime& runtime, uint32_t index_id,
+                                              const std::vector<int>& key_values) {
+        compiled::RuntimeValue key_tuple;
+        key_tuple.type = compiled::ValueType::TUPLE;
+        key_tuple.initialized = true;
+        key_tuple.tuple.resize(key_values.size() * sizeof(int));
+        for (size_t i = 0; i < key_values.size(); ++i) {
+            write_unaligned(key_tuple.tuple.data() + i * sizeof(int), key_values[i]);
+        }
+        compiled::RuntimeValue key;
+        key.type = compiled::ValueType::POINT_KEY;
+        EXPECT_EQ(runtime.MakePointKey(index_id, key_tuple, &key), compiled::ExecStatus::OK);
+        compiled::RuntimeValue row;
+        row.type = compiled::ValueType::ROW_HANDLE;
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        EXPECT_EQ(runtime.PointLookup(key, &row, &tuple), compiled::ExecStatus::OK);
+        return row;
     }
 };
 
@@ -757,6 +824,960 @@ TEST_F(ExecutorTest, update_single_field) {
     for (int val : results) {
         EXPECT_EQ(val, 110);
     }
+}
+
+TEST_F(ExecutorTest, prepared_update_owns_tuple_and_can_only_commit_once) {
+    setup_db();
+    auto cols = make_int_cols({"id"});
+    sm_manager_->create_table("prepared_update", cols, nullptr);
+    insert_test_rows("prepared_update", {10});
+
+    char buf[4096]{};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buf, &offset);
+    Rid rid;
+    {
+        SeqScanExecutor scan(sm_manager_.get(), "prepared_update", {}, &context);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    std::string table_name = "prepared_update";
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    std::vector<Condition> conditions;
+    std::vector<BoundMutationCondition> bound_conditions;
+    std::vector<RowMutationIndex> indexes;
+    SetClause set_clause;
+    set_clause.lhs = {table_name, "id"};
+    set_clause.rhs.set_int(110);
+    std::vector<SetClause> set_clauses{set_clause};
+    auto bound_set_clauses = BindMutationSetClauses(table, set_clauses);
+    std::vector<bool> affected_indexes;
+    UpdateRuntimeInfo info{sm_manager_.get(),  &table_name,       &table,   fh,
+                           &conditions,        &bound_conditions, &indexes, &set_clauses,
+                           &bound_set_clauses, &affected_indexes};
+
+    auto prepared = RowMutationEngine::PrepareUpdate(rid, info, &context);
+    ASSERT_TRUE(prepared.has_value());
+    EXPECT_EQ(read_unaligned<int>(prepared->old_record().data), 10);
+
+    RmRecord replacement(sizeof(int));
+    write_unaligned(replacement.data, 20);
+    const TupleMeta meta = fh->get_tuple_meta(rid);
+    fh->apply_tuple_update(rid, replacement.data, meta, INVALID_LSN);
+    EXPECT_EQ(read_unaligned<int>(prepared->old_record().data), 10);
+
+    auto proposed = RowMutationEngine::ComputeLegacyUpdate(*prepared, info);
+    RowMutationEngine::CommitUpdate(std::move(*prepared), *proposed, info, &context);
+    auto committed = fh->get_record(rid, nullptr);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(read_unaligned<int>(committed->data), 110);
+    EXPECT_THROW(RowMutationEngine::CommitUpdate(std::move(*prepared), *proposed, info, &context), InternalError);
+}
+
+TEST_F(ExecutorTest, point_lookup_runtime_preserves_tristate_and_composite_keys) {
+    setup_db();
+    auto cols = make_int_cols({"a", "b"});
+    sm_manager_->create_table("point_lookup", cols, nullptr);
+    for (const auto& [a, b] : std::vector<std::pair<int, int>>{{1, 2}, {1, 3}, {9, 9}, {10, 10}}) {
+        Value av;
+        av.set_int(a);
+        Value bv;
+        bv.set_int(b);
+        InsertExecutor insert(sm_manager_.get(), "point_lookup", {av, bv}, nullptr);
+        insert.Next();
+    }
+    sm_manager_->create_index("point_lookup", {"a", "b"}, nullptr);
+
+    auto& table = sm_manager_->db_.get_table("point_lookup");
+    const auto index_it = table.get_index_meta({"a", "b"});
+    ASSERT_NE(index_it, table.indexes.end());
+    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name("point_lookup", index_it->cols);
+    auto* index_handle = sm_manager_->ihs_.at(index_name).get();
+    std::vector<char> key_nine(index_it->col_tot_len);
+    write_unaligned(key_nine.data(), 9);
+    write_unaligned(key_nine.data() + sizeof(int), 9);
+    std::vector<char> key_ten(index_it->col_tot_len);
+    write_unaligned(key_ten.data(), 10);
+    write_unaligned(key_ten.data() + sizeof(int), 10);
+    const auto ten_lookup = index_handle->lookup_unique(key_ten.data());
+    ASSERT_EQ(ten_lookup.status, UniqueLookupStatus::Unique);
+    index_handle->insert_entry(key_nine.data(), ten_lookup.rid, nullptr, true);
+
+    std::string table_name = "point_lookup";
+    std::vector<std::string> index_columns{"a", "b"};
+    Condition b_condition;
+    b_condition.lhs_col = {table_name, "b"};
+    b_condition.op = OP_EQ;
+    b_condition.is_rhs_val = true;
+    b_condition.rhs_val.set_int(2);
+    Condition a_condition;
+    a_condition.lhs_col = {table_name, "a"};
+    a_condition.op = OP_EQ;
+    a_condition.is_rhs_val = true;
+    a_condition.rhs_val.set_int(1);
+    std::vector<Condition> conditions{b_condition, a_condition};
+    std::vector<size_t> positions{1, 0};
+    PointLookupRequest request{&table_name, &index_columns, &conditions, &positions};
+
+    auto found = PointLookupRuntime::Lookup(request, sm_manager_.get(), nullptr);
+    EXPECT_EQ(found.status, PointLookupStatus::FOUND);
+    EXPECT_TRUE(found.rid.has_value());
+
+    conditions[0].rhs_val.set_int(8);
+    auto missing = PointLookupRuntime::Lookup(request, sm_manager_.get(), nullptr);
+    EXPECT_EQ(missing.status, PointLookupStatus::NOT_FOUND);
+    EXPECT_FALSE(missing.rid.has_value());
+
+    conditions[0].rhs_val.set_int(9);
+    conditions[1].rhs_val.set_int(9);
+    auto duplicate = PointLookupRuntime::Lookup(request, sm_manager_.get(), nullptr);
+    EXPECT_EQ(duplicate.status, PointLookupStatus::FALLBACK);
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
+    char buffer[4096]{};
+    int offset = 0;
+    Context context(&lock_manager, nullptr, txn, buffer, &offset, &txn_manager);
+    auto non_rc = PointLookupRuntime::Lookup(request, sm_manager_.get(), &context);
+    EXPECT_EQ(non_rc.status, PointLookupStatus::FALLBACK);
+    txn_manager.abort(txn, nullptr);
+}
+
+TEST_F(ExecutorTest, database_program_runtime_builds_composite_key_and_fetches_tuple) {
+    setup_db();
+    auto cols = make_int_cols({"a", "b"});
+    sm_manager_->create_table("program_lookup", cols, nullptr);
+    Value av;
+    av.set_int(7);
+    Value bv;
+    bv.set_int(11);
+    InsertExecutor insert(sm_manager_.get(), "program_lookup", {av, bv}, nullptr);
+    insert.Next();
+    sm_manager_->create_index("program_lookup", {"a", "b"}, nullptr);
+
+    DatabaseProgramBindings bindings;
+    bindings.catalog_generation = sm_manager_->get_catalog_generation();
+    bindings.point_indexes.push_back(PointIndexRuntimeBinding{"program_lookup", {"a", "b"}, {0, sizeof(int)}});
+    DatabaseProgramRuntime runtime(sm_manager_.get(), nullptr, std::move(bindings));
+
+    compiled::RuntimeValue key_tuple;
+    key_tuple.type = compiled::ValueType::TUPLE;
+    key_tuple.initialized = true;
+    key_tuple.tuple.resize(2 * sizeof(int));
+    write_unaligned(key_tuple.tuple.data(), 7);
+    write_unaligned(key_tuple.tuple.data() + sizeof(int), 11);
+    compiled::RuntimeValue key;
+    key.type = compiled::ValueType::POINT_KEY;
+    EXPECT_EQ(runtime.MakePointKey(0, key_tuple, &key), compiled::ExecStatus::OK);
+    ASSERT_EQ(key.bytes.size(), 2 * sizeof(int));
+    EXPECT_EQ(read_unaligned<int>(key.bytes.data()), 7);
+    EXPECT_EQ(read_unaligned<int>(key.bytes.data() + sizeof(int)), 11);
+
+    compiled::RuntimeValue row;
+    row.type = compiled::ValueType::ROW_HANDLE;
+    compiled::RuntimeValue tuple;
+    tuple.type = compiled::ValueType::TUPLE;
+    EXPECT_EQ(runtime.PointLookup(key, &row, &tuple), compiled::ExecStatus::OK);
+    EXPECT_TRUE(row.initialized);
+    ASSERT_EQ(tuple.tuple.size(), 2 * sizeof(int));
+    EXPECT_EQ(read_unaligned<int>(tuple.tuple.data()), 7);
+    EXPECT_EQ(read_unaligned<int>(tuple.tuple.data() + sizeof(int)), 11);
+}
+
+TEST_F(ExecutorTest, database_program_runtime_refreshes_rc_tuple_before_proposed_commit) {
+    setup_db();
+    auto cols = make_int_cols({"id", "value"});
+    sm_manager_->create_table("program_update", cols, nullptr);
+    Value id;
+    id.set_int(1);
+    Value value;
+    value.set_int(10);
+    InsertExecutor insert(sm_manager_.get(), "program_update", {id, value}, nullptr);
+    insert.Next();
+    sm_manager_->create_index("program_update", {"id"}, nullptr);
+
+    Rid rid;
+    {
+        Context scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor scan(sm_manager_.get(), "program_update", {}, &scan_context);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    std::string table_name = "program_update";
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    std::vector<Condition> conditions;
+    std::vector<BoundMutationCondition> bound_conditions;
+    std::vector<RowMutationIndex> indexes;
+    std::vector<SetClause> set_clauses;
+    std::vector<BoundMutationSetClause> bound_set_clauses;
+    std::vector<bool> affected_indexes;
+    UpdateRuntimeInfo update_info{sm_manager_.get(),  &table_name,       &table,   fh,
+                                  &conditions,        &bound_conditions, &indexes, &set_clauses,
+                                  &bound_set_clauses, &affected_indexes};
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    auto* runtime_txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+    char runtime_buffer[4096]{};
+    int runtime_offset = 0;
+    Context runtime_context(&lock_manager, nullptr, runtime_txn, runtime_buffer, &runtime_offset, &txn_manager);
+    DatabaseProgramBindings bindings;
+    bindings.catalog_generation = sm_manager_->get_catalog_generation();
+    bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+    bindings.update_info = &update_info;
+    DatabaseProgramRuntime runtime(sm_manager_.get(), &runtime_context, std::move(bindings));
+    compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+
+    auto* writer_txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+    char writer_buffer[4096]{};
+    int writer_offset = 0;
+    Context writer_context(&lock_manager, nullptr, writer_txn, writer_buffer, &writer_offset, &txn_manager);
+    SetClause writer_set;
+    writer_set.lhs = {table_name, "value"};
+    writer_set.rhs.set_int(20);
+    UpdateExecutor writer(sm_manager_.get(), table_name, {writer_set}, {}, {rid}, &writer_context);
+    writer.Next();
+    txn_manager.commit(writer_txn, nullptr);
+
+    compiled::RuntimeValue current_tuple;
+    current_tuple.type = compiled::ValueType::TUPLE;
+    current_tuple.initialized = false;
+    current_tuple.tuple.resize(2 * sizeof(int));
+    write_unaligned(current_tuple.tuple.data() + sizeof(int), 10);
+    compiled::RuntimeValue prepared;
+    prepared.type = compiled::ValueType::PREPARED_UPDATE;
+    static_assert(noexcept(runtime.PrepareUpdate(row, &current_tuple, &prepared)));
+    EXPECT_EQ(runtime.PrepareUpdate(row, &current_tuple, &prepared), compiled::ExecStatus::OK);
+    EXPECT_EQ(read_unaligned<int>(current_tuple.tuple.data() + sizeof(int)), 20);
+
+    compiled::RuntimeValue proposed = current_tuple;
+    write_unaligned(proposed.tuple.data() + sizeof(int), 99);
+    static_assert(noexcept(runtime.CommitUpdate(prepared, proposed)));
+    EXPECT_EQ(runtime.CommitUpdate(prepared, proposed), compiled::ExecStatus::OK);
+    txn_manager.commit(runtime_txn, nullptr);
+
+    auto committed = fh->get_record(rid, nullptr);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(read_unaligned<int>(committed->data + sizeof(int)), 99);
+}
+
+TEST_F(ExecutorTest, database_program_runtime_maps_exceptions_and_disallows_late_fallback) {
+    setup_db();
+    auto cols = make_int_cols({"id", "value"});
+    sm_manager_->create_table("program_status", cols, nullptr);
+    sm_manager_->create_index("program_status", {"id"}, nullptr);
+    std::string table_name = "program_status";
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    std::vector<Condition> conditions;
+    std::vector<BoundMutationCondition> bound_conditions;
+    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(table_name, table.indexes[0].cols);
+    std::vector<RowMutationIndex> indexes{
+        RowMutationIndex{&table.indexes[0], sm_manager_->ihs_.at(index_name).get(), index_name}};
+    std::vector<SetClause> set_clauses;
+    std::vector<BoundMutationSetClause> bound_set_clauses;
+    std::vector<bool> affected_indexes{false};
+    UpdateRuntimeInfo update_info{sm_manager_.get(),  &table_name,       &table,   fh,
+                                  &conditions,        &bound_conditions, &indexes, &set_clauses,
+                                  &bound_set_clauses, &affected_indexes};
+    InsertRuntimeInfo insert_info{sm_manager_.get(), &table_name, &table, fh, &indexes};
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    char stale_buffer[4096]{};
+    int stale_offset = 0;
+    Context stale_context(&lock_manager, nullptr, nullptr, stale_buffer, &stale_offset, &txn_manager);
+    DatabaseProgramBindings bindings;
+    bindings.catalog_generation = sm_manager_->get_catalog_generation();
+    bindings.update_info = &update_info;
+    bindings.insert_info = &insert_info;
+    DatabaseProgramRuntime runtime(sm_manager_.get(), &stale_context, std::move(bindings));
+
+    compiled::RuntimeValue inserted_tuple;
+    inserted_tuple.type = compiled::ValueType::TUPLE;
+    inserted_tuple.initialized = true;
+    inserted_tuple.tuple.resize(2 * sizeof(int));
+    write_unaligned(inserted_tuple.tuple.data(), 1);
+    write_unaligned(inserted_tuple.tuple.data() + sizeof(int), 10);
+    compiled::RuntimeValue row;
+    ASSERT_EQ(runtime.InsertRow(inserted_tuple, &row), compiled::ExecStatus::OK);
+    Rid rid;
+    {
+        Context scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor scan(sm_manager_.get(), table_name, {}, &scan_context);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    auto* stale_txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
+    stale_context.txn_ = stale_txn;
+
+    auto* writer_txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+    char writer_buffer[4096]{};
+    int writer_offset = 0;
+    Context writer_context(&lock_manager, nullptr, writer_txn, writer_buffer, &writer_offset, &txn_manager);
+    SetClause writer_set;
+    writer_set.lhs = {table_name, "value"};
+    writer_set.rhs.set_int(20);
+    UpdateExecutor writer(sm_manager_.get(), table_name, {writer_set}, {}, {rid}, &writer_context);
+    writer.Next();
+    txn_manager.commit(writer_txn, nullptr);
+
+    compiled::RuntimeValue tuple;
+    tuple.type = compiled::ValueType::TUPLE;
+    compiled::RuntimeValue prepared;
+    prepared.type = compiled::ValueType::PREPARED_UPDATE;
+    EXPECT_EQ(runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::TXN_ABORT);
+    EXPECT_TRUE(runtime.has_pending_exception());
+    EXPECT_FALSE(runtime.fallback_allowed());
+    EXPECT_THROW(runtime.RethrowPending(), TransactionAbortException);
+
+    compiled::RuntimeValue key;
+    EXPECT_EQ(runtime.MakePointKey(0, tuple, &key), compiled::ExecStatus::TXN_ABORT);
+    txn_manager.abort(stale_txn, nullptr);
+
+    DatabaseProgramBindings missing_binding;
+    missing_binding.catalog_generation = sm_manager_->get_catalog_generation();
+    DatabaseProgramRuntime missing(sm_manager_.get(), nullptr, std::move(missing_binding));
+    tuple.initialized = true;
+    tuple.tuple.resize(2 * sizeof(int));
+    EXPECT_EQ(missing.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::FALLBACK);
+    EXPECT_TRUE(missing.fallback_allowed());
+    EXPECT_FALSE(missing.has_pending_exception());
+}
+
+TEST_F(ExecutorTest, database_program_runtime_rejects_invalid_and_reused_update_tokens) {
+    setup_db();
+    auto cols = make_int_cols({"id", "value"});
+    sm_manager_->create_table("program_token", cols, nullptr);
+    Value id;
+    id.set_int(1);
+    Value value;
+    value.set_int(10);
+    InsertExecutor insert(sm_manager_.get(), "program_token", {id, value}, nullptr);
+    insert.Next();
+    sm_manager_->create_index("program_token", {"id"}, nullptr);
+
+    Rid rid;
+    {
+        Context scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor scan(sm_manager_.get(), "program_token", {}, &scan_context);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+    std::string table_name = "program_token";
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    std::vector<Condition> conditions;
+    std::vector<BoundMutationCondition> bound_conditions;
+    std::vector<RowMutationIndex> indexes;
+    std::vector<SetClause> set_clauses;
+    std::vector<BoundMutationSetClause> bound_set_clauses;
+    std::vector<bool> affected_indexes;
+    UpdateRuntimeInfo update_info{sm_manager_.get(),  &table_name,       &table,   fh,
+                                  &conditions,        &bound_conditions, &indexes, &set_clauses,
+                                  &bound_set_clauses, &affected_indexes};
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buffer[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer, &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+        bindings.update_info = &update_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue prepared;
+        prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        ASSERT_EQ(runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::OK);
+        compiled::RuntimeValue wrong_size = tuple;
+        wrong_size.tuple.resize(sizeof(int));
+        EXPECT_EQ(runtime.CommitUpdate(prepared, wrong_size), compiled::ExecStatus::ERROR);
+        EXPECT_TRUE(runtime.has_pending_exception());
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        EXPECT_EQ(runtime.CommitUpdate(prepared, tuple), compiled::ExecStatus::ERROR);
+        txn_manager.abort(txn, nullptr);
+    }
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buffer[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer, &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+        bindings.update_info = &update_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue prepared;
+        prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        ASSERT_EQ(runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::OK);
+        write_unaligned(tuple.tuple.data() + sizeof(int), 77);
+        ASSERT_EQ(runtime.CommitUpdate(prepared, tuple), compiled::ExecStatus::OK);
+        EXPECT_EQ(runtime.CommitUpdate(prepared, tuple), compiled::ExecStatus::ERROR);
+        EXPECT_TRUE(runtime.has_pending_exception());
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        txn_manager.abort(txn, nullptr);
+        auto restored = fh->get_record(rid, nullptr);
+        ASSERT_NE(restored, nullptr);
+        EXPECT_EQ(read_unaligned<int>(restored->data + sizeof(int)), 10);
+    }
+
+    {
+        auto* owner = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        auto* other = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buffer[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, owner, buffer, &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+        bindings.update_info = &update_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue prepared;
+        prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        ASSERT_EQ(runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::OK);
+        context.txn_ = other;
+        EXPECT_EQ(runtime.CommitUpdate(prepared, tuple), compiled::ExecStatus::ERROR);
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        txn_manager.abort(owner, nullptr);
+        txn_manager.abort(other, nullptr);
+    }
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buffer[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer, &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+        bindings.update_info = &update_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue prepared;
+        prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        ASSERT_EQ(runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::OK);
+        compiled::RuntimeValue oversized = tuple;
+        oversized.tuple.resize(tuple.tuple.size() + sizeof(int));
+        EXPECT_EQ(runtime.CommitUpdate(prepared, oversized), compiled::ExecStatus::ERROR);
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        auto unchanged = fh->get_record(rid, nullptr);
+        ASSERT_NE(unchanged, nullptr);
+        EXPECT_EQ(read_unaligned<int>(unchanged->data + sizeof(int)), 10);
+        txn_manager.abort(txn, nullptr);
+    }
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buffer[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer, &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+        bindings.update_info = &update_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+        compiled::RuntimeValue first_tuple;
+        first_tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue first_prepared;
+        first_prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        ASSERT_EQ(runtime.PrepareUpdate(row, &first_tuple, &first_prepared), compiled::ExecStatus::OK);
+        compiled::RuntimeValue second_tuple;
+        second_tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue second_prepared;
+        second_prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        EXPECT_EQ(runtime.PrepareUpdate(row, &second_tuple, &second_prepared), compiled::ExecStatus::ERROR);
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        txn_manager.abort(txn, nullptr);
+    }
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char buffer[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer, &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.point_indexes.push_back(PointIndexRuntimeBinding{table_name, {"id"}, {0}});
+        bindings.update_info = &update_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue row = lookup_program_row(runtime, 0, {1});
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        compiled::RuntimeValue prepared;
+        prepared.type = compiled::ValueType::PREPARED_UPDATE;
+        ASSERT_EQ(runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::OK);
+        sm_manager_->create_table("catalog_changed_after_prepare", make_int_cols({"id"}), nullptr);
+        EXPECT_EQ(runtime.CommitUpdate(prepared, tuple), compiled::ExecStatus::ERROR);
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        txn_manager.abort(txn, nullptr);
+    }
+}
+
+TEST_F(ExecutorTest, database_program_runtime_rejects_cross_table_and_cross_runtime_capabilities) {
+    setup_db();
+    sm_manager_->create_table("cap_source", make_int_cols({"id", "value"}), nullptr);
+    sm_manager_->create_table("cap_target", make_int_cols({"id", "value"}), nullptr);
+    Value id;
+    id.set_int(1);
+    Value value;
+    value.set_int(10);
+    InsertExecutor source_insert(sm_manager_.get(), "cap_source", {id, value}, nullptr);
+    source_insert.Next();
+    id.set_int(2);
+    value.set_int(20);
+    InsertExecutor target_insert(sm_manager_.get(), "cap_target", {id, value}, nullptr);
+    target_insert.Next();
+    id.set_int(3);
+    value.set_int(30);
+    InsertExecutor second_source_insert(sm_manager_.get(), "cap_source", {id, value}, nullptr);
+    second_source_insert.Next();
+    sm_manager_->create_index("cap_source", {"id"}, nullptr);
+
+    std::string source_name = "cap_source";
+    std::string target_name = "cap_target";
+    TabMeta source_table = sm_manager_->db_.get_table(source_name);
+    TabMeta target_table = sm_manager_->db_.get_table(target_name);
+    auto* source_fh = sm_manager_->fhs_.at(source_name).get();
+    auto* target_fh = sm_manager_->fhs_.at(target_name).get();
+    std::vector<Condition> conditions;
+    std::vector<BoundMutationCondition> bound_conditions;
+    std::vector<RowMutationIndex> indexes;
+    std::vector<SetClause> set_clauses;
+    std::vector<BoundMutationSetClause> bound_set_clauses;
+    std::vector<bool> affected_indexes;
+    UpdateRuntimeInfo update_info{sm_manager_.get(),  &source_name,      &source_table, source_fh,
+                                  &conditions,        &bound_conditions, &indexes,      &set_clauses,
+                                  &bound_set_clauses, &affected_indexes};
+    DeleteRuntimeInfo delete_info{sm_manager_.get(), &target_name,      &target_table, target_fh,
+                                  &conditions,       &bound_conditions, &indexes};
+
+    DatabaseProgramBindings delete_bindings;
+    delete_bindings.catalog_generation = sm_manager_->get_catalog_generation();
+    delete_bindings.point_indexes.push_back(PointIndexRuntimeBinding{source_name, {"id"}, {0}});
+    delete_bindings.delete_info = &delete_info;
+    DatabaseProgramRuntime delete_runtime(sm_manager_.get(), nullptr, std::move(delete_bindings));
+    compiled::RuntimeValue wrong_table_row = lookup_program_row(delete_runtime, 0, {1});
+    EXPECT_EQ(delete_runtime.DeleteRow(wrong_table_row), compiled::ExecStatus::ERROR);
+    EXPECT_THROW(delete_runtime.RethrowPending(), InternalError);
+
+    Rid source_rid;
+    Rid second_source_rid;
+    {
+        Context source_scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor source_scan(sm_manager_.get(), source_name, {}, &source_scan_context);
+        for (source_scan.beginTuple(); !source_scan.is_end(); source_scan.nextTuple()) {
+            auto record = source_fh->get_record(source_scan.rid(), nullptr);
+            ASSERT_NE(record, nullptr);
+            if (read_unaligned<int>(record->data) == 1) {
+                source_rid = source_scan.rid();
+            } else if (read_unaligned<int>(record->data) == 3) {
+                second_source_rid = source_scan.rid();
+            }
+        }
+    }
+    auto source_record = source_fh->get_record(source_rid, nullptr);
+    ASSERT_NE(source_record, nullptr);
+    EXPECT_EQ(read_unaligned<int>(source_record->data + sizeof(int)), 10);
+    {
+        Context target_scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor target_scan(sm_manager_.get(), target_name, {}, &target_scan_context);
+        target_scan.beginTuple();
+        ASSERT_FALSE(target_scan.is_end());
+    }
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+    char first_buffer[4096]{};
+    char second_buffer[4096]{};
+    int first_offset = 0;
+    int second_offset = 0;
+    Context first_context(&lock_manager, nullptr, txn, first_buffer, &first_offset, &txn_manager);
+    Context second_context(&lock_manager, nullptr, txn, second_buffer, &second_offset, &txn_manager);
+    DatabaseProgramBindings first_bindings;
+    first_bindings.catalog_generation = sm_manager_->get_catalog_generation();
+    first_bindings.point_indexes.push_back(PointIndexRuntimeBinding{source_name, {"id"}, {0}});
+    first_bindings.update_info = &update_info;
+    DatabaseProgramBindings second_bindings = first_bindings;
+    DatabaseProgramRuntime first_runtime(sm_manager_.get(), &first_context, std::move(first_bindings));
+    DatabaseProgramRuntime second_runtime(sm_manager_.get(), &second_context, std::move(second_bindings));
+    compiled::RuntimeValue row = lookup_program_row(first_runtime, 0, {1});
+    compiled::RuntimeValue tuple;
+    tuple.type = compiled::ValueType::TUPLE;
+    compiled::RuntimeValue prepared;
+    prepared.type = compiled::ValueType::PREPARED_UPDATE;
+    ASSERT_EQ(first_runtime.PrepareUpdate(row, &tuple, &prepared), compiled::ExecStatus::OK);
+    compiled::RuntimeValue second_row = lookup_program_row(second_runtime, 0, {3});
+    compiled::RuntimeValue second_tuple;
+    second_tuple.type = compiled::ValueType::TUPLE;
+    compiled::RuntimeValue second_prepared;
+    second_prepared.type = compiled::ValueType::PREPARED_UPDATE;
+    ASSERT_EQ(second_runtime.PrepareUpdate(second_row, &second_tuple, &second_prepared), compiled::ExecStatus::OK);
+    write_unaligned(tuple.tuple.data() + sizeof(int), 99);
+    EXPECT_EQ(second_runtime.CommitUpdate(prepared, tuple), compiled::ExecStatus::ERROR);
+    EXPECT_THROW(second_runtime.RethrowPending(), InternalError);
+    source_record = source_fh->get_record(source_rid, nullptr);
+    ASSERT_NE(source_record, nullptr);
+    EXPECT_EQ(read_unaligned<int>(source_record->data + sizeof(int)), 10);
+    auto second_source_record = source_fh->get_record(second_source_rid, nullptr);
+    ASSERT_NE(second_source_record, nullptr);
+    EXPECT_EQ(read_unaligned<int>(second_source_record->data), 3);
+    EXPECT_EQ(read_unaligned<int>(second_source_record->data + sizeof(int)), 30);
+    txn_manager.abort(txn, nullptr);
+}
+
+TEST_F(ExecutorTest, database_program_runtime_rejects_invalid_insert_sizes_before_side_effects) {
+    setup_db();
+    std::string table_name = "program_insert_size";
+    sm_manager_->create_table(table_name, make_int_cols({"id", "value"}), nullptr);
+    sm_manager_->create_index(table_name, {"id"}, nullptr);
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(table_name, table.indexes[0].cols);
+    auto* index_handle = sm_manager_->ihs_.at(index_name).get();
+    std::vector<RowMutationIndex> indexes{RowMutationIndex{&table.indexes[0], index_handle, index_name}};
+    InsertRuntimeInfo insert_info{sm_manager_.get(), &table_name, &table, fh, &indexes};
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    LogManager log_manager(disk_manager_.get());
+    const size_t record_size = static_cast<size_t>(fh->get_file_hdr().record_size);
+    for (size_t tuple_size : {record_size - 1, record_size + 1}) {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        std::array<char, 4096> buffer{};
+        int offset = 0;
+        Context context(&lock_manager, &log_manager, txn, buffer.data(), &offset, &txn_manager);
+        DatabaseProgramBindings bindings;
+        bindings.catalog_generation = sm_manager_->get_catalog_generation();
+        bindings.insert_info = &insert_info;
+        DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+        compiled::RuntimeValue tuple;
+        tuple.type = compiled::ValueType::TUPLE;
+        tuple.initialized = true;
+        tuple.tuple.resize(tuple_size);
+        compiled::RuntimeValue row;
+        const lsn_t global_lsn = log_manager.get_global_lsn();
+        const int64_t log_offset = log_manager.current_log_offset();
+        const lsn_t prev_lsn = txn->get_prev_lsn();
+        EXPECT_EQ(runtime.InsertRow(tuple, &row), compiled::ExecStatus::ERROR);
+        EXPECT_THROW(runtime.RethrowPending(), InternalError);
+        EXPECT_EQ(log_manager.get_global_lsn(), global_lsn);
+        EXPECT_EQ(log_manager.current_log_offset(), log_offset);
+        EXPECT_EQ(txn->get_prev_lsn(), prev_lsn);
+        int key = 0;
+        EXPECT_EQ(index_handle->lookup_unique(reinterpret_cast<const char*>(&key)).status,
+                  UniqueLookupStatus::NotFound);
+        Context scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor scan(sm_manager_.get(), table_name, {}, &scan_context);
+        scan.beginTuple();
+        EXPECT_TRUE(scan.is_end());
+        txn_manager.abort(txn, nullptr);
+    }
+}
+
+TEST_F(ExecutorTest, mutation_faults_restore_update_and_delete_after_outer_abort) {
+#ifdef RMDB_TEST_RELEASE_BUILD
+    GTEST_SKIP() << "mutation fault hooks are compiled out of Release builds";
+#endif
+    setup_db();
+    std::string table_name = "mutation_fault_restore";
+    sm_manager_->create_table(table_name, make_int_cols({"id", "a", "b"}), nullptr);
+    Value id;
+    id.set_int(1);
+    Value a;
+    a.set_int(10);
+    Value b;
+    b.set_int(20);
+    InsertExecutor insert(sm_manager_.get(), table_name, {id, a, b}, nullptr);
+    insert.Next();
+    sm_manager_->create_index(table_name, {"a"}, nullptr);
+    sm_manager_->create_index(table_name, {"b"}, nullptr);
+
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    std::vector<RowMutationIndex> indexes;
+    for (const auto& index : table.indexes) {
+        std::string index_name = sm_manager_->get_ix_manager()->get_index_name(table_name, index.cols);
+        indexes.push_back(RowMutationIndex{&index, sm_manager_->ihs_.at(index_name).get(), std::move(index_name)});
+    }
+    ASSERT_EQ(indexes.size(), 2);
+    Rid rid;
+    {
+        Context scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor scan(sm_manager_.get(), table_name, {}, &scan_context);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+    const TupleMeta original_meta = fh->get_tuple_meta(rid);
+    auto original = fh->get_record(rid, nullptr);
+    ASSERT_NE(original, nullptr);
+    std::vector<std::vector<char>> old_keys;
+    for (const auto& index : indexes) {
+        old_keys.push_back(MakeRowMutationIndexKey(*index.meta, original->data));
+    }
+
+    auto expect_restored = [&] {
+        auto record = fh->get_record(rid, nullptr);
+        ASSERT_NE(record, nullptr);
+        EXPECT_EQ(read_unaligned<int>(record->data), 1);
+        EXPECT_EQ(read_unaligned<int>(record->data + sizeof(int)), 10);
+        EXPECT_EQ(read_unaligned<int>(record->data + 2 * sizeof(int)), 20);
+        EXPECT_EQ(fh->get_tuple_meta(rid), original_meta);
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            EXPECT_EQ(CountExactIndexEntry(indexes[i].handle, old_keys[i], rid), 1);
+        }
+    };
+
+    std::vector<Condition> conditions;
+    std::vector<BoundMutationCondition> bound_conditions;
+    std::vector<SetClause> set_clauses;
+    std::vector<BoundMutationSetClause> bound_set_clauses;
+    std::vector<bool> affected_indexes{true, true};
+    UpdateRuntimeInfo update_info{sm_manager_.get(),  &table_name,       &table,   fh,
+                                  &conditions,        &bound_conditions, &indexes, &set_clauses,
+                                  &bound_set_clauses, &affected_indexes};
+    DeleteRuntimeInfo delete_info{sm_manager_.get(), &table_name, &table, fh, &conditions, &bound_conditions, &indexes};
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+
+    const std::vector<std::pair<std::string, int>> update_faults = {{"update_after_index_delete", 1},
+                                                                    {"update_after_all_index_updates", 0}};
+    for (const auto& [fault_point, skip] : update_faults) {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        const txn_id_t txn_id = txn->get_transaction_id();
+        std::array<char, 4096> buffer{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer.data(), &offset, &txn_manager);
+        auto prepared = RowMutationEngine::PrepareUpdate(rid, update_info, &context);
+        ASSERT_TRUE(prepared.has_value());
+        RmRecord proposed(prepared->old_record());
+        write_unaligned(proposed.data + sizeof(int), 11);
+        write_unaligned(proposed.data + 2 * sizeof(int), 21);
+        {
+            ScopedMutationFault fault(fault_point, skip);
+            EXPECT_THROW(RowMutationEngine::CommitUpdate(std::move(*prepared), proposed, update_info, &context),
+                         std::runtime_error);
+        }
+        txn_manager.abort(txn, nullptr);
+        EXPECT_TRUE(txn->get_modified_slots().empty());
+        txn_manager.abort(txn_manager.get_transaction(txn_id), nullptr);
+        expect_restored();
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            auto new_key = MakeRowMutationIndexKey(*indexes[i].meta, proposed.data);
+            EXPECT_EQ(CountExactIndexEntry(indexes[i].handle, new_key, rid), 0);
+        }
+    }
+
+    for (const auto& fault_point :
+         {"delete_after_index_delete", "delete_before_heap_tombstone", "delete_after_heap_tombstone"}) {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        const txn_id_t txn_id = txn->get_transaction_id();
+        std::array<char, 4096> buffer{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, buffer.data(), &offset, &txn_manager);
+        auto visible = fh->get_record(rid, nullptr);
+        ASSERT_NE(visible, nullptr);
+        {
+            ScopedMutationFault fault(fault_point);
+            EXPECT_THROW(RowMutationEngine::DeleteOne(rid, *visible, delete_info, &context), std::runtime_error);
+        }
+        txn_manager.abort(txn, nullptr);
+        EXPECT_TRUE(txn->get_modified_slots().empty());
+        txn_manager.abort(txn_manager.get_transaction(txn_id), nullptr);
+        expect_restored();
+    }
+}
+
+TEST_F(ExecutorTest, mutation_faults_restore_insert_after_outer_abort) {
+#ifdef RMDB_TEST_RELEASE_BUILD
+    GTEST_SKIP() << "mutation fault hooks are compiled out of Release builds";
+#endif
+    setup_db();
+    std::string table_name = "insert_fault_restore";
+    sm_manager_->create_table(table_name, make_int_cols({"id", "a", "b"}), nullptr);
+    Value id;
+    id.set_int(1);
+    Value a;
+    a.set_int(10);
+    Value b;
+    b.set_int(20);
+    InsertExecutor base_insert(sm_manager_.get(), table_name, {id, a, b}, nullptr);
+    base_insert.Next();
+    sm_manager_->create_index(table_name, {"a"}, nullptr);
+    sm_manager_->create_index(table_name, {"b"}, nullptr);
+
+    TabMeta table = sm_manager_->db_.get_table(table_name);
+    auto* fh = sm_manager_->fhs_.at(table_name).get();
+    std::vector<RowMutationIndex> indexes;
+    for (const auto& index : table.indexes) {
+        std::string index_name = sm_manager_->get_ix_manager()->get_index_name(table_name, index.cols);
+        indexes.push_back(RowMutationIndex{&index, sm_manager_->ihs_.at(index_name).get(), std::move(index_name)});
+    }
+    InsertRuntimeInfo insert_info{sm_manager_.get(), &table_name, &table, fh, &indexes};
+    RmRecord inserted(3 * sizeof(int));
+    write_unaligned(inserted.data, 2);
+    write_unaligned(inserted.data + sizeof(int), 30);
+    write_unaligned(inserted.data + 2 * sizeof(int), 40);
+    std::vector<std::vector<char>> inserted_keys;
+    for (const auto& index : indexes) {
+        inserted_keys.push_back(MakeRowMutationIndexKey(*index.meta, inserted.data));
+    }
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    LogManager log_manager(disk_manager_.get());
+    const std::vector<std::pair<std::string, int>> faults = {{"insert_after_rollback_registration", 0},
+                                                             {"insert_after_heap_finish", 0},
+                                                             {"insert_after_index_insert", 0},
+                                                             {"insert_after_all_index_inserts", 0}};
+    for (const auto& [fault_point, skip] : faults) {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        const txn_id_t txn_id = txn->get_transaction_id();
+        std::array<char, 4096> buffer{};
+        int offset = 0;
+        Context context(&lock_manager, &log_manager, txn, buffer.data(), &offset, &txn_manager);
+        const lsn_t lsn_before = log_manager.get_global_lsn();
+        const int64_t log_offset_before = log_manager.current_log_offset();
+        {
+            ScopedMutationFault fault(fault_point, skip);
+            EXPECT_THROW(InsertRuntime::InsertOne(inserted, insert_info, &context), std::runtime_error);
+        }
+        if (fault_point == "insert_after_rollback_registration") {
+            EXPECT_EQ(log_manager.get_global_lsn(), lsn_before);
+            EXPECT_EQ(log_manager.current_log_offset(), log_offset_before);
+            EXPECT_EQ(txn->get_prev_lsn(), INVALID_LSN);
+        }
+        txn_manager.abort(txn, nullptr);
+        EXPECT_TRUE(txn->get_modified_slots().empty());
+        txn_manager.abort(txn_manager.get_transaction(txn_id), nullptr);
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            std::vector<Rid> matches;
+            indexes[i].handle->get_value(inserted_keys[i].data(), &matches, nullptr);
+            EXPECT_TRUE(matches.empty());
+        }
+        size_t row_count = 0;
+        Context scan_context(nullptr, nullptr, nullptr);
+        SeqScanExecutor scan(sm_manager_.get(), table_name, {}, &scan_context);
+        for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
+            ++row_count;
+        }
+        EXPECT_EQ(row_count, 1);
+    }
+}
+
+TEST_F(ExecutorTest, result_sink_stages_output_until_finish) {
+    setup_db();
+    std::remove("output.txt");
+    sm_manager_->output_file_enabled_ = true;
+
+    std::array<char, BUFFER_LENGTH> buffer{};
+    memcpy(buffer.data(), "prefix\n", 7);
+    int offset = 7;
+    Context context(nullptr, nullptr, nullptr, buffer.data(), &offset);
+    std::vector<ColMeta> result_cols{make_test_col("sink", "id", TYPE_INT, sizeof(int), 0)};
+
+    {
+        ResultSink sink(sm_manager_.get(), &context, result_cols, {"id"});
+        RmRecord record(sizeof(int));
+        write_unaligned(record.data, 42);
+        sink.Emit(TupleView{record.data, static_cast<uint32_t>(record.size)});
+    }
+    EXPECT_EQ(offset, 7);
+    EXPECT_EQ(std::string(buffer.data(), static_cast<size_t>(offset)), "prefix\n");
+    std::ifstream discarded_file("output.txt");
+    EXPECT_FALSE(discarded_file.good());
+
+    {
+        ResultSink sink(sm_manager_.get(), &context, result_cols, {"id"});
+        sink.Finish();
+        sink.Finish();
+    }
+    EXPECT_EQ(std::string(buffer.data(), static_cast<size_t>(offset)), "prefix\n"
+                                                                       "+------------------+\n"
+                                                                       "|               id |\n"
+                                                                       "+------------------+\n"
+                                                                       "+------------------+\n"
+                                                                       "Total record(s): 0\n");
+
+    std::ifstream output_file("output.txt");
+    std::stringstream output_contents;
+    output_contents << output_file.rdbuf();
+    EXPECT_EQ(output_contents.str(), "| id |\n");
+    output_file.close();
+    std::remove("output.txt");
+}
+
+TEST_F(ExecutorTest, result_sink_rejects_invalid_column_ranges_without_publishing) {
+    setup_db();
+    sm_manager_->output_file_enabled_ = true;
+
+    auto expect_rejected = [&](ColMeta column, size_t tuple_size) {
+        std::remove("output.txt");
+        std::array<char, BUFFER_LENGTH> buffer{};
+        memcpy(buffer.data(), "prefix\n", 7);
+        int offset = 7;
+        Context context(nullptr, nullptr, nullptr, buffer.data(), &offset);
+        {
+            ResultSink sink(sm_manager_.get(), &context, {std::move(column)}, {"value"});
+            std::vector<char> tuple(tuple_size, 0);
+            EXPECT_THROW(sink.Emit(TupleView{tuple.data(), static_cast<uint32_t>(tuple.size())}), InternalError);
+        }
+        EXPECT_EQ(offset, 7);
+        EXPECT_EQ(std::string(buffer.data(), static_cast<size_t>(offset)), "prefix\n");
+        std::ifstream output_file("output.txt");
+        EXPECT_FALSE(output_file.good());
+    };
+
+    expect_rejected(make_test_col("sink", "short", TYPE_INT, sizeof(int), 0), sizeof(int) - 1);
+    expect_rejected(make_test_col("sink", "small_len", TYPE_INT, 1, 0), 1);
+    expect_rejected(make_test_col("sink", "extreme", TYPE_INT, sizeof(int), std::numeric_limits<int>::max()),
+                    sizeof(int));
+    std::remove("output.txt");
+}
+
+TEST_F(ExecutorTest, database_program_runtime_finishes_empty_result_after_no_match) {
+    setup_db();
+    std::array<char, BUFFER_LENGTH> buffer{};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buffer.data(), &offset);
+    std::vector<ColMeta> result_cols{make_test_col("sink", "id", TYPE_INT, sizeof(int), 0)};
+    ResultSink sink(sm_manager_.get(), &context, result_cols, {"id"});
+    DatabaseProgramBindings bindings;
+    bindings.catalog_generation = sm_manager_->get_catalog_generation();
+    bindings.result_sink = &sink;
+    DatabaseProgramRuntime runtime(sm_manager_.get(), &context, std::move(bindings));
+    runtime.SetError(compiled::ExecStatus::NO_MATCH_RESULT, "");
+
+    EXPECT_EQ(runtime.FinishResult(), compiled::ExecStatus::OK);
+    EXPECT_EQ(runtime.last_status(), compiled::ExecStatus::OK);
+    EXPECT_NE(std::string(buffer.data(), static_cast<size_t>(offset)).find("Total record(s): 0\n"), std::string::npos);
 }
 
 TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {

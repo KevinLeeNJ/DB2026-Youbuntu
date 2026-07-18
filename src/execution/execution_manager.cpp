@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/checkpoint_manager.h"
 #include "recovery/log_manager.h"
 #include "record_printer.h"
+#include "result_sink.h"
 
 const char* help_info = "Supported SQL syntax:\n"
                         "  command ;\n"
@@ -213,18 +214,6 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
                             Context* context) {
     const auto& result_cols = executorTreeRoot->cols();
-    std::vector<std::string> captions = std::move(output_names);
-    if (captions.size() != result_cols.size()) {
-        captions.clear();
-        captions.reserve(result_cols.size());
-        for (const auto& col : result_cols) {
-            captions.push_back(col.name);
-        }
-    }
-
-    // Print records
-    size_t num_rec = 0;
-    const int output_start = *context->offset_;
 
     struct SsiReadTrackingGuard {
         Context* context_;
@@ -244,25 +233,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     } ssi_read_tracking_guard(context);
 
-    // Format the result directly into the request response buffer. If execution
-    // aborts, client_handler replaces the buffer with the error response.
-    RecordPrinter rec_printer(captions.size());
-    rec_printer.print_separator(context);
-    rec_printer.print_record(captions, context);
-    rec_printer.print_separator(context);
-
-    std::ostringstream out_file_stream;
-    if (sm_manager_->output_file_enabled_) {
-        out_file_stream << "|";
-        for (const auto& cap : captions) {
-            out_file_stream << " " << cap << " |";
-        }
-        out_file_stream << "\n";
-    }
+    ResultSink result_sink(sm_manager_, context, result_cols, std::move(output_names));
 
     // 执行query_plan
-    std::vector<std::string> columns;
-    columns.reserve(result_cols.size());
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         TupleView tuple = executorTreeRoot->current();
         std::unique_ptr<RmRecord> fallback;
@@ -272,42 +245,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
                 tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
             }
         }
-        columns.clear();
-        for (auto& col : result_cols) {
-            std::string col_str;
-            const char* rec_buf = tuple.data + col.offset;
-            if (col.type == TYPE_INT) {
-                col_str = std::to_string(read_unaligned<int>(rec_buf));
-            } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(read_unaligned<double>(rec_buf));
-            } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
-                col_str.assign(rec_buf, strnlen(rec_buf, col.len));
-            }
-            columns.push_back(col_str);
-        }
-        // print record into client buffer
-        rec_printer.print_record(columns, context);
-        // print record into output.txt (compact borderless)
-        if (sm_manager_->output_file_enabled_) {
-            out_file_stream << "|";
-            for (const auto& col_str : columns) {
-                out_file_stream << " " << col_str << " |";
-            }
-            out_file_stream << "\n";
-        }
-        num_rec++;
+        result_sink.Emit(tuple);
     }
-    // Print footer into client buffer
-    rec_printer.print_separator(context);
-    // Print record count into client buffer
-    RecordPrinter::print_record_count(num_rec, context);
-
-    if (sm_manager_->output_file_enabled_ && *context->offset_ > output_start) {
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << out_file_stream.str();
-        outfile.close();
-    }
+    result_sink.Finish();
 }
 
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,

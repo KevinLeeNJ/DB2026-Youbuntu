@@ -13,6 +13,8 @@ See the Mulan PSL v2 for more details.
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include "execution_common.h"
@@ -45,6 +47,7 @@ std::vector<BoundMutationCondition> BindMutationConditions(const TabMeta& tab,
                                                            const std::vector<Condition>& conditions);
 std::vector<BoundMutationSetClause> BindMutationSetClauses(const TabMeta& tab,
                                                            const std::vector<SetClause>& set_clauses);
+std::vector<char> MakeRowMutationIndexKey(const IndexMeta& index, const char* record_data);
 
 struct RowMutationRuntimeInfo {
     SmManager* sm_manager;
@@ -64,8 +67,58 @@ struct UpdateRuntimeInfo : RowMutationRuntimeInfo {
 
 struct DeleteRuntimeInfo : RowMutationRuntimeInfo {};
 
+using MutationFaultHook = void (*)(const char* point);
+void SetMutationFaultHookForTesting(MutationFaultHook hook) noexcept;
+#ifndef NDEBUG
+void MutationFaultPoint(const char* point);
+#else
+inline void MutationFaultPoint(const char*) {}
+#endif
+
+class PreparedUpdate {
+public:
+    PreparedUpdate(const PreparedUpdate&) = delete;
+    PreparedUpdate& operator=(const PreparedUpdate&) = delete;
+    PreparedUpdate(PreparedUpdate&&) noexcept = default;
+    PreparedUpdate& operator=(PreparedUpdate&&) noexcept = default;
+
+    const Rid& rid() const {
+        return rid_;
+    }
+
+    const RmRecord& old_record() const {
+        return *old_record_;
+    }
+
+private:
+    friend class RowMutationEngine;
+
+    PreparedUpdate(const Rid& rid, std::unique_ptr<RmRecord> old_record, TupleMeta old_meta, txn_id_t txn_id,
+                   int table_fd, uint64_t catalog_generation)
+        : rid_(rid), old_record_(std::move(old_record)), old_meta_(old_meta), txn_id_(txn_id), table_fd_(table_fd),
+          catalog_generation_(catalog_generation) {}
+
+    Rid rid_;
+    std::unique_ptr<RmRecord> old_record_;
+    TupleMeta old_meta_;
+    txn_id_t txn_id_{INVALID_TXN_ID};
+    int table_fd_{-1};
+    uint64_t catalog_generation_{0};
+    bool consumed_{false};
+};
+
 class RowMutationEngine {
 public:
+    // Returns no value when the row no longer belongs to the statement's
+    // target set. The returned tuple is owned and reflects the RC post-lock
+    // re-read when one was required.
+    static std::optional<PreparedUpdate> PrepareUpdate(const Rid& rid, const UpdateRuntimeInfo& info, Context* context);
+
+    static std::unique_ptr<RmRecord> ComputeLegacyUpdate(const PreparedUpdate& prepared, const UpdateRuntimeInfo& info);
+
+    static void CommitUpdate(PreparedUpdate&& prepared, RmRecord& proposed, const UpdateRuntimeInfo& info,
+                             Context* context);
+
     // Returns false when the row no longer belongs to the statement's target
     // set (including the READ COMMITTED post-lock recheck).
     static bool UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info, Context* context);

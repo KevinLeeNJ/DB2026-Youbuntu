@@ -57,6 +57,7 @@ void ClearWriteSet(Transaction* txn) {
         return;
     }
     txn->get_write_set().clear();
+    txn->clear_modified_slots();
 }
 
 void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
@@ -96,12 +97,21 @@ void DeleteIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::st
     }
 }
 
+void InsertIndexEntryIfMissing(IxIndexHandle* ih, const std::vector<char>& key, const Rid& rid, Transaction* txn) {
+    std::vector<Rid> existing;
+    if (ih->get_value(key.data(), &existing, txn) &&
+        std::find(existing.begin(), existing.end(), rid) != existing.end()) {
+        return;
+    }
+    ih->insert_entry(key.data(), rid, txn, true);
+}
+
 void InsertIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
                         const Rid& rid, Transaction* txn) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->insert_entry(key.data(), rid, txn, true);
+        InsertIndexEntryIfMissing(ih, key, rid, txn);
     }
 }
 
@@ -342,7 +352,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
                     continue;
                 }
                 auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-                ih->insert_entry(old_key.data(), rid, txn, true);
+                InsertIndexEntryIfMissing(ih, old_key, rid, txn);
             }
         }
         break;

@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "row_mutation.h"
+#include "runtime/delete_runtime.h"
 #include "system/sm.h"
 
 class DeleteExecutor : public AbstractExecutor {
@@ -65,12 +66,8 @@ public:
         const size_t rid_count = point_lookup_ ? (point_rid_.has_value() ? 1 : 0) : rids_.size();
         for (size_t rid_index = 0; rid_index < rid_count; ++rid_index) {
             Rid rid = point_lookup_ ? *point_rid_ : rids_[rid_index];
-            auto rec = GetVisibleRecord(fh_, rid, context_);
-            if (rec == nullptr) {
-                continue;
-            }
             DeleteRuntimeInfo info{sm_manager_, &tab_name_, &tab_, fh_, &conds_, &bound_conditions_, &cached_indexes_};
-            RowMutationEngine::DeleteOne(rid, *rec, info, context_);
+            DeleteRuntime::DeleteOne(rid, info, context_);
         }
         return nullptr;
     }
