@@ -9,6 +9,7 @@ CLIENT_JOBS := 4
 TPCC_DB ?= tpcc_benchmark_db
 TPCC_DATA_DIR ?= benchmark/tpcc/data
 TPCC_RESULT ?= benchmark/tpcc/result.json
+TPCC_SERVER_LOG ?= benchmark/tpcc/rmdb-server.log
 TPCC_SQLITE_PATH ?= benchmark/tpcc/tpcc.sqlite
 TPCC_SQLITE_RESULT ?= benchmark/tpcc/result-sqlite.json
 TPCC_SQLITE_BEGIN ?= immediate
@@ -17,6 +18,7 @@ TPCC_WORKERS ?= 16
 TPCC_WARMUP ?= 10
 TPCC_MEASURE ?= 60
 TPCC_ROUNDS ?= 1
+TPCC_RUN_SEED ?= 0
 TPCC_PROGRESS_INTERVAL ?= 5
 TPCC_REGENERATE_DATA ?= 0
 TPCC_PORT ?= 8765
@@ -116,9 +118,11 @@ benchmark: build tpcc-go
 		--warmup $(TPCC_WARMUP) \
 		--measure $(TPCC_MEASURE) \
 		--rounds $(TPCC_ROUNDS) \
+		--run-seed $(TPCC_RUN_SEED) \
 		--progress-interval $(TPCC_PROGRESS_INTERVAL) \
 		--data-dir $(TPCC_DATA_DIR) \
 		--json-out $(TPCC_RESULT) \
+		--server-log $(TPCC_SERVER_LOG) \
 		--rmdb-db-dir $(TPCC_DB) \
 		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
 		--think-ms $(TPCC_THINK_MS) \

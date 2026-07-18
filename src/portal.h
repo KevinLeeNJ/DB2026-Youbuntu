@@ -719,15 +719,23 @@ public:
         case T_SetKnob:
         case T_SetTransaction:
         case T_SetOutputFile:
-        case T_LoadData:
+        case T_LoadData: {
+            phase_metrics::ScopedSample metrics_sample(
+                phase_metrics::Phase::PORTAL_INSTANTIATE,
+                phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
             return std::make_unique<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), std::move(plan));
+        }
         case T_CreateTable:
         case T_DropTable:
         case T_CreateIndex:
-        case T_DropIndex:
+        case T_DropIndex: {
+            phase_metrics::ScopedSample metrics_sample(
+                phase_metrics::Phase::PORTAL_INSTANTIATE,
+                phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
             return std::make_unique<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), std::move(plan));
+        }
         case T_select:
         case T_ExplainAnalyze:
         case T_Update:
@@ -736,12 +744,18 @@ public:
             auto* x = static_cast<DMLPlan*>(plan.get());
             switch (x->tag) {
             case T_select: {
+                phase_metrics::ScopedSample metrics_sample(
+                    phase_metrics::Phase::PORTAL_INSTANTIATE,
+                    phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                 std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_.get(), context);
                 std::vector<std::string> output_names = get_plan_output_names(x->subplan_.get());
                 return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names), std::move(root),
                                                     std::move(plan));
             }
             case T_ExplainAnalyze: {
+                phase_metrics::ScopedSample metrics_sample(
+                    phase_metrics::Phase::PORTAL_INSTANTIATE,
+                    phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                 reset_runtime_rows(x->subplan_.get());
                 std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_.get(), context, true);
                 return std::make_unique<PortalStmt>(PORTAL_EXPLAIN_ANALYZE, std::vector<std::string>(), std::move(root),
@@ -753,6 +767,9 @@ public:
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
                 if (point_rid.has_value()) {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::PORTAL_INSTANTIATE,
+                        phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                     std::unique_ptr<AbstractExecutor> root =
                         std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_,
                                                          PointMutationTarget{*point_rid}, context, true);
@@ -760,18 +777,31 @@ public:
                                                         std::move(root), std::move(plan));
                 }
                 std::unique_ptr<AbstractExecutor> scan;
-                if (compiled_program) {
-                    // Duplicate/non-unique lookup or a visibility ambiguity
-                    // falls back to the original scan semantics.
-                    auto fallback_plan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
-                                                                    x->compiled_point_program_->index_col_names);
-                    scan = convert_plan_executor(fallback_plan.get(), context);
-                } else {
-                    scan = convert_plan_executor(x->subplan_.get(), context);
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::PORTAL_INSTANTIATE,
+                        phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
+                    if (compiled_program) {
+                        // Duplicate/non-unique lookup or a visibility ambiguity
+                        // falls back to the original scan semantics.
+                        auto fallback_plan = std::make_unique<ScanPlan>(
+                            T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
+                            x->compiled_point_program_->index_col_names);
+                        scan = convert_plan_executor(fallback_plan.get(), context);
+                    } else {
+                        scan = convert_plan_executor(x->subplan_.get(), context);
+                    }
                 }
-                for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
-                    rids.push_back(scan->rid());
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::EXECUTOR, phase_metrics::sample_rate(phase_metrics::Phase::EXECUTOR));
+                    for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
+                        rids.push_back(scan->rid());
+                    }
                 }
+                phase_metrics::ScopedSample metrics_sample(
+                    phase_metrics::Phase::PORTAL_INSTANTIATE,
+                    phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                 std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
                     sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
@@ -782,23 +812,39 @@ public:
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
                 if (point_rid.has_value()) {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::PORTAL_INSTANTIATE,
+                        phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                     std::unique_ptr<AbstractExecutor> root = std::make_unique<DeleteExecutor>(
                         sm_manager_, x->tab_name_, x->conds_, PointMutationTarget{*point_rid}, context, true);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                         std::move(root), std::move(plan));
                 }
                 std::unique_ptr<AbstractExecutor> scan;
-                if (compiled_program) {
-                    auto fallback_plan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
-                                                                    x->compiled_point_program_->index_col_names);
-                    scan = convert_plan_executor(fallback_plan.get(), context);
-                } else {
-                    scan = convert_plan_executor(x->subplan_.get(), context);
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::PORTAL_INSTANTIATE,
+                        phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
+                    if (compiled_program) {
+                        auto fallback_plan = std::make_unique<ScanPlan>(
+                            T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
+                            x->compiled_point_program_->index_col_names);
+                        scan = convert_plan_executor(fallback_plan.get(), context);
+                    } else {
+                        scan = convert_plan_executor(x->subplan_.get(), context);
+                    }
                 }
-                for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
-                    rids.push_back(scan->rid());
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::EXECUTOR, phase_metrics::sample_rate(phase_metrics::Phase::EXECUTOR));
+                    for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
+                        rids.push_back(scan->rid());
+                    }
                 }
 
+                phase_metrics::ScopedSample metrics_sample(
+                    phase_metrics::Phase::PORTAL_INSTANTIATE,
+                    phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                 std::unique_ptr<AbstractExecutor> root =
                     std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
 
@@ -807,6 +853,9 @@ public:
             }
 
             case T_Insert: {
+                phase_metrics::ScopedSample metrics_sample(
+                    phase_metrics::Phase::PORTAL_INSTANTIATE,
+                    phase_metrics::sample_rate(phase_metrics::Phase::PORTAL_INSTANTIATE));
                 std::unique_ptr<AbstractExecutor> root =
                     std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
 

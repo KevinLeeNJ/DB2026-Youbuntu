@@ -30,6 +30,7 @@ REGENERATE_DATA=0
 THINK_MS=0
 RECONNECT_EACH_TXN=0
 ISOLATION="read-committed"
+RUN_SEED=0
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
 
 usage() {
@@ -46,11 +47,13 @@ Usage: $0 [options]
   --progress-interval N    progress print interval seconds (default: 5)
   --data-dir PATH          CSV data directory
   --json-out PATH          result.json path
+  --server-log PATH        server stdout/stderr log path
   --rmdb-db-dir PATH       RMDB directory used to resolve CSV load paths
   --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 120)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
   --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
+  --run-seed N             deterministic workload seed; 0 reuses --seed
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate
@@ -72,11 +75,13 @@ while [[ $# -gt 0 ]]; do
         --progress-interval) PROGRESS_INTERVAL="$2"; shift 2 ;;
         --data-dir) DATA_DIR="$2"; shift 2 ;;
         --json-out) JSON_OUT="$2"; shift 2 ;;
+        --server-log) SERVER_LOG="$2"; shift 2 ;;
         --rmdb-db-dir) RMDB_DB_DIR="$2"; shift 2 ;;
         --restart-timeout) RESTART_TIMEOUT="$2"; shift 2 ;;
         --think-ms) THINK_MS="$2"; shift 2 ;;
         --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
         --isolation) ISOLATION="$2"; shift 2 ;;
+        --run-seed) RUN_SEED="$2"; shift 2 ;;
         --go-binary) GO_BINARY="$2"; shift 2 ;;
         --regenerate-data|--overwrite-data-dir) REGENERATE_DATA=1; shift ;;
         --reuse-data-dir) shift ;;
@@ -103,6 +108,10 @@ if [[ ! -x "$GO_BINARY" ]]; then
 fi
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
     echo "--rounds must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "$RUN_SEED" =~ ^[0-9]+$ ]]; then
+    echo "--run-seed must be a non-negative integer" >&2
     exit 2
 fi
 
@@ -158,6 +167,10 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
         --data-dir "$DATA_DIR" \
         --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
         --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
+    if [[ -n "${RMDB_PHASE_METRICS_PATH:-}" ]]; then
+        touch "${RMDB_PHASE_METRICS_PATH}.reset"
+        sleep 2
+    fi
     GO_RECONNECT_ARGS=()
     if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
         GO_RECONNECT_ARGS=(--reconnect-each-txn)
@@ -171,6 +184,7 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
         --rounds 1 \
         --progress-interval "$PROGRESS_INTERVAL" \
         --warehouse-policy terminal-home \
+        --run-seed "$RUN_SEED" \
         --think "${THINK_MS}ms" \
         --json-out "$ROUND_JSON" \
         "${GO_RECONNECT_ARGS[@]}"
@@ -181,7 +195,7 @@ for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
     SERVER_PID=""
 
     echo "[benchmark] round $ROUND_NO/$ROUNDS: 重启 rmdb server，等待恢复就绪 (最长 ${RESTART_TIMEOUT}s)"
-    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+    env -u RMDB_PHASE_METRICS_PATH "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     wait_port "$RESTART_TIMEOUT"
 

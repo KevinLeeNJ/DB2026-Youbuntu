@@ -18,6 +18,7 @@
 #   -m, --minwidth PX     最小可见帧宽度，默认 0.5（更小的帧不绘制）
 #   --demangle            对 C++ mangled 符号做 demangle（更易读）
 #   --reuse               跳过采样，复用已有 perf_out/perf.data 只重跑渲染
+#   --keep-artifacts      保留 perf.data 和 folded 中间文件（默认只保留 SVG）
 #
 # 示例：
 #   ./scripts/perf_flamegraph.sh                       # 默认采样 30s
@@ -25,7 +26,7 @@
 #   ./scripts/perf_flamegraph.sh -d 60 -p 12345        # 指定 PID 采样 60s
 #   ./scripts/perf_flamegraph.sh --reuse --demangle -w 6000   # 复用数据、demangle、放大画布重渲染
 #
-# 依赖：perf、perl、git。perf 采集需要 root 权限，脚本会自动 sudo。
+# 依赖：perf、perl、git。当前环境已为普通用户配置 perf 采集权限。
 
 set -euo pipefail
 
@@ -35,6 +36,7 @@ WIDTH=2000
 MINWIDTH=0.5
 DEMANGLE=0
 REUSE=0
+KEEP_ARTIFACTS=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         -m|--minwidth)  MINWIDTH="$2"; shift 2 ;;
         --demangle)     DEMANGLE=1; shift ;;
         --reuse)        REUSE=1; shift ;;
+        --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
         -h|--help)
             sed -n '2,30p' "$0"; exit 0 ;;
         *) err "未知参数：$1"; exit 1 ;;
@@ -104,9 +107,9 @@ do_record() {
 
     # -g 启用调用栈；--call-graph dwarf 更可靠地展开 C++ 用户态栈
     local perf_cmd=(perf record -F 99 -p "${pid}" -g --call-graph dwarf -o "${perf_data}")
-    ( set -x; sudo "${perf_cmd[@]}" -- sleep "${DURATION}" ) || {
+    ( set -x; "${perf_cmd[@]}" -- sleep "${DURATION}" ) || {
         err "perf record 失败（退出码 $?）"
-        err "可能原因：1) 进程已退出 2) perf_event_paranoid 限制 3) 磁盘空间不足"
+        err "可能原因：1) 进程已退出 2) 当前用户的 perf 权限配置失效 3) 磁盘空间不足"
         exit 1
     }
     echo "${perf_data}"
@@ -119,8 +122,7 @@ generate_flamegraph() {
     local svg="${perf_data%.data}.svg"
 
     log "perf script 解析采样数据..."
-    # sudo 是因为 perf.data 通常由 root 写入，普通用户无读权限
-    sudo perf script -i "${perf_data}" \
+    perf script -i "${perf_data}" \
         | "${FLAMEGRAPH_DIR}/stackcollapse-perf.pl" \
         > "${folded}"
     log "折叠栈完成：${folded}"
@@ -154,6 +156,19 @@ generate_flamegraph() {
     log "火焰图生成完成：${svg}（画布宽 ${WIDTH}px，最小帧 ${MINWIDTH}px）"
 }
 
+cleanup_intermediates() {
+    local perf_data="$1"
+    if [[ "${KEEP_ARTIFACTS}" -eq 1 ]]; then
+        log "保留 perf 中间文件：${perf_data}"
+        return
+    fi
+
+    local folded="${perf_data%.data}.folded"
+    local demangled="${folded%.folded}.demangled.folded"
+    rm -f -- "${perf_data}" "${folded}" "${demangled}"
+    log "已删除 perf.data 和 folded 中间文件，保留 SVG"
+}
+
 main() {
     command -v perf >/dev/null 2>&1 || { err "缺少 perf"; exit 1; }
     command -v perl >/dev/null 2>&1 || { err "缺少 perl"; exit 1; }
@@ -173,6 +188,7 @@ main() {
         perf_data="$(do_record "${TARGET_PID}")"
     fi
     generate_flamegraph "${perf_data}"
+    cleanup_intermediates "${perf_data}"
 
     local svg="${perf_data%.data}.svg"
     log "完成。用浏览器打开：${svg}"

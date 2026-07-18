@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_defs.h"
 #include "common/common.h"
+#include "common/phase_metrics.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
@@ -177,6 +178,8 @@ protected:
 
     bool conditions_match(const std::vector<Condition>& conditions, const std::vector<ConditionAddress>& addresses,
                           const TupleView& tuple) const {
+        phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PREDICATE,
+                                                   phase_metrics::sample_rate(phase_metrics::Phase::PREDICATE));
         if (conditions.size() != addresses.size()) {
             throw InternalError("condition address cache is out of date");
         }

@@ -29,6 +29,8 @@ private:
     TupleView current_view_;
 
     bool materialize_view(TupleView input) {
+        phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PROJECTION_COPY,
+                                                   phase_metrics::sample_rate(phase_metrics::Phase::PROJECTION_COPY));
         if (!input) {
             return false;
         }

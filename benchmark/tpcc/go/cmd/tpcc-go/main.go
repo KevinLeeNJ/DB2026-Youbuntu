@@ -1054,6 +1054,7 @@ type config struct {
 	Rounds                 int    `json:"rounds"`
 	ProgressInterval       int    `json:"progress_interval"`
 	Seed                   int64  `json:"seed"`
+	RunSeed                int64  `json:"run_seed,omitempty"`
 	Think                  string `json:"think"`
 	ReconnectEachTxn       bool   `json:"reconnect_each_txn"`
 	WarehousePolicy        string `json:"warehouse_policy"`
@@ -1288,6 +1289,7 @@ func main() {
 	sqlitePath := flag.String("sqlite-path", "benchmark/tpcc/tpcc.sqlite", "SQLite database path")
 	sqliteBegin := flag.String("sqlite-begin", "immediate", "SQLite transaction begin mode: immediate or deferred")
 	seed := flag.Int64("seed", 1, "data generation seed")
+	runSeed := flag.Int64("run-seed", 0, "workload seed; zero reuses --seed")
 	overwriteData := flag.Bool("overwrite-data-dir", false, "overwrite existing CSV files")
 	reuseData := flag.Bool("reuse-data-dir", false, "skip data generation when all CSV files exist")
 	resultJSON := flag.String("result-json", "", "existing result JSON used by consistency")
@@ -1513,7 +1515,11 @@ func main() {
 		os.Exit(1)
 	}
 	baseOrders := scalarInt(ordersText, 0)
-	doc := document{Config: config{Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
+	workloadSeed := *runSeed
+	if workloadSeed == 0 {
+		workloadSeed = *seed
+	}
+	doc := document{Config: config{Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, RunSeed: *runSeed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
 	for round := 1; round <= *rounds; round++ {
 		warmupEnd := time.Now().Add(time.Duration(*warmup) * time.Second)
 		measureEnd := warmupEnd.Add(time.Duration(*measure) * time.Second)
@@ -1522,7 +1528,7 @@ func main() {
 		monitorStop := make(chan struct{})
 		monitorDone := make(chan struct{})
 		go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
-		combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory)
+		combined, roundErr := runRound(*roundOffset+round, *workers, workloadSeed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory)
 		close(monitorStop)
 		<-monitorDone
 		if roundErr != nil {

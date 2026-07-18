@@ -186,6 +186,8 @@ private:
     }
 
     bool is_condition(const TupleView& left_tuple, const TupleView& right_tuple) const {
+        phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::JOIN_COMPARE,
+                                                   phase_metrics::sample_rate(phase_metrics::Phase::JOIN_COMPARE));
         for (const auto& cond : compiled_conds_) {
             const auto lhs_type = cond.lhs.type;
             const auto rhs_type = cond.rhs.type;

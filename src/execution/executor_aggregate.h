@@ -342,6 +342,9 @@ private:
     }
 
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, TupleView tuple) const {
+        phase_metrics::ScopedSample metrics_sample(
+            phase_metrics::Phase::AGGREGATE_TRANSITION,
+            phase_metrics::sample_rate(phase_metrics::Phase::AGGREGATE_TRANSITION));
         CellValue current_value;
         if (!spec.is_star && spec.type != LocalAggType::COUNT) {
             current_value = read_cell(tuple, spec.input_col);

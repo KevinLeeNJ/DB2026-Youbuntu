@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include <cstdlib>
 #include <limits>
 
+#include "common/phase_metrics.h"
+
 namespace parser {
 
 const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::keywords_ = {
@@ -138,6 +140,8 @@ void Lexer::skip_block_comment() {
 }
 
 Token Lexer::next_token() {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::LEXER,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::LEXER));
     if (has_peeked_) {
         has_peeked_ = false;
         return peeked_;

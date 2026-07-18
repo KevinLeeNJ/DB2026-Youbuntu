@@ -15,8 +15,10 @@ See the Mulan PSL v2 for more details. */
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -24,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <thread>
 
 #include "errors.h"
+#include "common/phase_metrics.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
@@ -38,6 +41,33 @@ See the Mulan PSL v2 for more details. */
 #define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
+
+void write_phase_metrics(const std::string& path) {
+    const std::string temporary_path = path + ".tmp." + std::to_string(getpid());
+    std::ofstream output(temporary_path, std::ios::out | std::ios::trunc);
+    if (!output.is_open()) {
+        return;
+    }
+
+    output << "{\n  \"format_version\": 1,\n  \"clock\": \"steady_clock_ns\",\n  \"phases\": {\n";
+    constexpr size_t phase_count = static_cast<size_t>(phase_metrics::Phase::COUNT);
+    for (size_t i = 0; i < phase_count; ++i) {
+        const auto phase = static_cast<phase_metrics::Phase>(i);
+        const auto snapshot = phase_metrics::Registry::instance().snapshot(phase);
+        const auto rate = phase_metrics::sample_rate(phase);
+        output << "    \"" << phase_metrics::phase_name(phase) << "\": {\"sample_rate\": " << rate
+               << ", \"samples\": " << snapshot.samples << ", \"estimated_calls\": " << snapshot.samples * rate
+               << ", \"sampled_ns\": " << snapshot.sampled_ns << ", \"estimated_ns\": " << snapshot.sampled_ns * rate
+               << ", \"sampled_cycles\": " << snapshot.sampled_cycles
+               << ", \"estimated_cycles\": " << snapshot.sampled_cycles * rate << "}";
+        output << (i + 1 == phase_count ? "\n" : ",\n");
+    }
+    output << "  }\n}\n";
+    output.close();
+    if (output) {
+        std::rename(temporary_path.c_str(), path.c_str());
+    }
+}
 
 // 构建全局所需的管理器对象
 auto disk_manager = std::make_unique<DiskManager>();
@@ -151,6 +181,8 @@ void client_handler(int fd) {
 
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
+            phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PARSER,
+                                                       phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
             parse_tree = ast::parse_sql(data_recv);
         } catch (const ast::ParseError& e) {
             abort_active_transaction();
@@ -172,13 +204,27 @@ void client_handler(int fd) {
                     SetTransaction(&txn_id, context);
                 }
                 // analyze and rewrite
-                std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
+                std::unique_ptr<Query> query;
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::ANALYZER, phase_metrics::sample_rate(phase_metrics::Phase::ANALYZER));
+                    query = analyze->do_analyze(std::move(parse_tree));
+                }
                 LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                 // 优化器
-                std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), context);
+                std::unique_ptr<Plan> plan;
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::PLANNER, phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
+                    plan = optimizer->plan_query(std::move(query), context);
+                }
                 // portal
                 std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
-                portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
+                {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::EXECUTOR, phase_metrics::sample_rate(phase_metrics::Phase::EXECUTOR));
+                    portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
+                }
                 // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
                 session_isolation_level = context->isolation_level_;
                 // Note: "set output_file on|off" is a database-global toggle stored
@@ -324,7 +370,8 @@ void start_server() {
 }
 
 int main(int argc, char** argv) {
-    minilog::Logger::get().init("rmdb.log");
+    const char* configured_log_path = std::getenv("RMDB_LOG_PATH");
+    minilog::Logger::get().init(configured_log_path == nullptr ? "rmdb.log" : configured_log_path);
     minilog::Logger::get().set_level(minilog::LogLevel::WARN);
 
     if (argc != 2) {
@@ -372,6 +419,25 @@ int main(int argc, char** argv) {
 
         {
             std::atomic<bool> checkpoint_thread_stop{false};
+            std::atomic<bool> metrics_thread_stop{false};
+            std::thread metrics_thread;
+            const char* metrics_path = std::getenv("RMDB_PHASE_METRICS_PATH");
+            if (metrics_path != nullptr) {
+                const std::string path(metrics_path);
+                metrics_thread = std::thread([&metrics_thread_stop, path] {
+                    while (!metrics_thread_stop.load()) {
+                        if (std::remove((path + ".reset").c_str()) == 0) {
+                            phase_metrics::Registry::instance().reset();
+                        }
+                        write_phase_metrics(path);
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+                    if (std::remove((path + ".reset").c_str()) == 0) {
+                        phase_metrics::Registry::instance().reset();
+                    }
+                    write_phase_metrics(path);
+                });
+            }
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
                 CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
                 CheckpointOptions checkpoint_options;
@@ -425,8 +491,12 @@ int main(int argc, char** argv) {
             start_server();
 
             checkpoint_thread_stop.store(true);
+            metrics_thread_stop.store(true);
             if (checkpoint_thread.joinable()) {
                 checkpoint_thread.join();
+            }
+            if (metrics_thread.joinable()) {
+                metrics_thread.join();
             }
         }
 
