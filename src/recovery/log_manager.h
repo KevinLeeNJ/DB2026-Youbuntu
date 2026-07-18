@@ -548,6 +548,7 @@ private:
     // before it finishes. Waiters are released only after durable_lsn_ moves
     // past their target LSN.
     std::mutex group_commit_latch_;
+    std::condition_variable group_commit_cv_;
     bool group_commit_leader_active_{false};
     std::deque<std::shared_ptr<CommitWaiter>> group_commit_waiters_;
 

@@ -28,6 +28,14 @@ private:
     std::vector<SetClause> set_clauses_;
     SmManager* sm_manager_;
 
+    struct CachedIndex {
+        const IndexMeta* meta;
+        IxIndexHandle* handle;
+        std::string name;
+    };
+    std::vector<bool> affected_index_bitmap_;
+    std::vector<CachedIndex> cached_indexes_;
+
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
         std::vector<char> key(index.col_tot_len);
         int offset = 0;
@@ -49,6 +57,23 @@ public:
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+
+        affected_index_bitmap_.assign(tab_.indexes.size(), false);
+        cached_indexes_.reserve(tab_.indexes.size());
+        for (size_t index_idx = 0; index_idx < tab_.indexes.size(); ++index_idx) {
+            const auto& index = tab_.indexes[index_idx];
+            std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+            cached_indexes_.push_back(
+                CachedIndex{&index, sm_manager_->ihs_.at(index_name).get(), std::move(index_name)});
+
+            for (const auto& set_clause : set_clauses_) {
+                if (std::any_of(index.cols.begin(), index.cols.end(),
+                                [&](const ColMeta& index_col) { return index_col.name == set_clause.lhs.col_name; })) {
+                    affected_index_bitmap_[index_idx] = true;
+                    break;
+                }
+            }
+        }
     }
     std::unique_ptr<RmRecord> Next() override {
         for (Rid& rid : rids_) {
@@ -133,21 +158,24 @@ public:
                 }
 
                 struct IndexUpdate {
-                    const IndexMeta* index;
+                    const CachedIndex* index;
                     std::vector<char> old_key;
                     std::vector<char> new_key;
                 };
                 std::vector<IndexUpdate> index_updates;
                 auto txn = context_ == nullptr ? nullptr : context_->txn_;
 
-                for (const auto& index : tab_.indexes) {
-                    auto old_key = make_index_key(index, rec->data);
-                    auto new_key = make_index_key(index, new_rec->data);
+                for (size_t index_idx = 0; index_idx < cached_indexes_.size(); ++index_idx) {
+                    if (!affected_index_bitmap_[index_idx]) {
+                        continue;
+                    }
+                    const auto& cached_index = cached_indexes_[index_idx];
+                    auto old_key = make_index_key(*cached_index.meta, rec->data);
+                    auto new_key = make_index_key(*cached_index.meta, new_rec->data);
                     if (old_key == new_key) {
                         continue;
                     }
-                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                  .get();
+                    auto ih = cached_index.handle;
                     ReserveUniqueKey(context_, ih->GetFd(), old_key);
                     ReserveUniqueKey(context_, ih->GetFd(), new_key);
                     std::vector<Rid> result;
@@ -155,15 +183,15 @@ public:
                         std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
                         throw IndexEntryExistsError();
                     }
-                    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-                    auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, new_key);
+                    auto candidate_rids =
+                        sm_manager_->get_historical_index_key_rids(tab_name_, cached_index.name, new_key);
                     for (const auto& candidate_rid : candidate_rids) {
-                        if (candidate_rid != rid &&
-                            HistoricalIndexKeyConflictsWithTxn(fh_, candidate_rid, index, new_key, context_)) {
+                        if (candidate_rid != rid && HistoricalIndexKeyConflictsWithTxn(
+                                                        fh_, candidate_rid, *cached_index.meta, new_key, context_)) {
                             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
                         }
                     }
-                    index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
+                    index_updates.push_back(IndexUpdate{&cached_index, std::move(old_key), std::move(new_key)});
                 }
                 if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
                     UpdateLogRecord log_record(context_->txn_->get_transaction_id(), *rec, *new_rec, rid, tab_name_);
@@ -200,12 +228,9 @@ public:
                 try {
                     for (size_t i = 0; i < index_updates.size(); ++i) {
                         const auto& update = index_updates[i];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        sm_manager_->remember_historical_index_key(
-                            tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols),
-                            update.old_key, rid, *update.index);
+                        auto ih = update.index->handle;
+                        sm_manager_->remember_historical_index_key(tab_name_, update.index->name, update.old_key, rid,
+                                                                   *update.index->meta);
                         ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
                         deleted_indexes.push_back(i);
                         ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
@@ -215,16 +240,12 @@ public:
                 {
                     for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
                         const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
+                        auto ih = update.index->handle;
                         ih->delete_entry(update.new_key.data(), rid, txn); // 删除新索引
                     }
                     for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
                         const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
+                        auto ih = update.index->handle;
                         ih->insert_entry(update.old_key.data(), rid, txn, true); // 恢复旧索引
                     }
                     throw; // 仍然抛出错误

@@ -102,10 +102,6 @@ public:
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
             ReserveUniqueKey(context_, ih->GetFd(), key);
             check_mvcc_unique_key_conflict(index, key);
-            std::vector<Rid> result;
-            if (ih->get_value(key.data(), &result, context_ == nullptr ? nullptr : context_->txn_)) {
-                throw IndexEntryExistsError();
-            }
             index_keys.push_back(std::move(key));
         }
 

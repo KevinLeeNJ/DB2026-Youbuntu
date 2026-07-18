@@ -11,10 +11,12 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <memory>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -46,6 +48,39 @@ struct UndoLog {
 };
 
 class Transaction {
+private:
+    struct UpdateWriteKey {
+        std::string tab_name_;
+        Rid rid_;
+    };
+
+    struct UpdateUndoEntry {
+        UpdateWriteKey key_;
+        UndoLink undo_link_;
+    };
+
+    struct ModifiedSlotKey {
+        std::string tab_name_;
+        Rid rid_;
+
+        bool operator==(const ModifiedSlotKey& other) const {
+            return tab_name_ == other.tab_name_ && rid_ == other.rid_;
+        }
+    };
+
+    struct ModifiedSlotKeyHash {
+        size_t operator()(const ModifiedSlotKey& key) const {
+            size_t hash = std::hash<std::string>{}(key.tab_name_);
+            hash ^= std::hash<int>{}(key.rid_.page_no) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+            hash ^= std::hash<int>{}(key.rid_.slot_no) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+            return hash;
+        }
+    };
+
+    std::optional<UpdateWriteKey> pending_update_key_;
+    std::optional<UndoLink> pending_update_undo_link_;
+    std::vector<UpdateUndoEntry> update_undo_entries_;
+
 public:
     explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {
@@ -113,6 +148,31 @@ public:
         return write_set_;
     }
     inline void append_write_record(std::unique_ptr<WriteRecord> write_record) {
+        pending_update_key_.reset();
+        pending_update_undo_link_.reset();
+
+        if (write_record != nullptr && write_record->GetWriteType() == WType::UPDATE_TUPLE) {
+            UpdateWriteKey key{write_record->GetTableName(), write_record->GetRid()};
+            for (const auto& entry : update_undo_entries_) {
+                if (entry.key_.tab_name_ == key.tab_name_ && entry.key_.rid_ == key.rid_) {
+                    // Keep the first WriteRecord and its original undo link. The
+                    // executor still applies each later update to the current tuple.
+                    pending_update_undo_link_ = entry.undo_link_;
+                    return;
+                }
+            }
+            pending_update_key_ = std::move(key);
+        } else if (write_record != nullptr) {
+            // An INSERT/DELETE on the same RID starts a different write lifecycle.
+            const std::string& tab_name = write_record->GetTableName();
+            const Rid& rid = write_record->GetRid();
+            update_undo_entries_.erase(std::remove_if(update_undo_entries_.begin(), update_undo_entries_.end(),
+                                                      [&](const auto& entry) {
+                                                          return entry.key_.tab_name_ == tab_name &&
+                                                                 entry.key_.rid_ == rid;
+                                                      }),
+                                       update_undo_entries_.end());
+        }
         write_set_.push_back(std::move(write_record));
     }
 
@@ -162,11 +222,15 @@ public:
         return modified_slots_;
     }
     inline void append_modified_slot(const std::string& tab_name, const Rid& rid) {
-        if (!modified_slots_.empty() && modified_slots_.back().first == tab_name &&
-            modified_slots_.back().second == rid) {
+        if (!modified_slot_set_.emplace(ModifiedSlotKey{tab_name, rid}).second) {
             return;
         }
         modified_slots_.emplace_back(tab_name, rid);
+    }
+
+    inline void clear_modified_slots() {
+        modified_slots_.clear();
+        modified_slot_set_.clear();
     }
 
     /** 修改现有的撤销日志 */
@@ -178,10 +242,21 @@ public:
     /** @return an UndoLink pointing to the appended undo log.
      *  Uses the undo log index as the slot offset for in-memory undo storage. */
     inline auto AppendUndoLog(UndoLog log) -> UndoLink {
+        if (pending_update_undo_link_.has_value()) {
+            UndoLink undo_link = *pending_update_undo_link_;
+            pending_update_undo_link_.reset();
+            return undo_link;
+        }
+
         std::scoped_lock<std::mutex> lck(latch_);
         int idx = static_cast<int>(undo_logs_.size());
         undo_logs_.emplace_back(std::move(log));
-        return UndoLink{0, idx, txn_id_}; // in-memory: page=0, slot=idx, txn=self
+        UndoLink undo_link{0, idx, txn_id_}; // in-memory: page=0, slot=idx, txn=self
+        if (pending_update_key_.has_value()) {
+            update_undo_entries_.push_back(UpdateUndoEntry{std::move(*pending_update_key_), undo_link});
+            pending_update_key_.reset();
+        }
+        return undo_link;
     }
     inline auto GetUndoLog(size_t log_id) -> UndoLog {
         std::scoped_lock<std::mutex> lck(latch_);
@@ -196,6 +271,7 @@ public:
 
     // MVCC: slots modified by this txn (tab_name, rid) — for commit-time TupleMeta update
     std::vector<std::pair<std::string, Rid>> modified_slots_;
+    std::unordered_set<ModifiedSlotKey, ModifiedSlotKeyHash> modified_slot_set_;
 
     // SSI dependency tracking (SER only)
     struct PredicateRead {

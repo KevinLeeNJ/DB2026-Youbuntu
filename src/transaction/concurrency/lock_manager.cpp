@@ -344,10 +344,15 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         return false;
     }
     lock.unlock();
-    const txn_id_t cycle_victim = find_youngest_cycle_victim(txn->get_transaction_id());
-    if (cycle_victim != INVALID_TXN_ID) {
-        wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
-        cancel_waiting_transaction(cycle_victim);
+    // A transaction with no granted record or unique-key lock cannot be the
+    // predecessor of another wait-for edge, so this first wait cannot close a
+    // cycle. Avoid scanning all lock shards on the common hot-row path.
+    if (!txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty()) {
+        const txn_id_t cycle_victim = find_youngest_cycle_victim(txn->get_transaction_id());
+        if (cycle_victim != INVALID_TXN_ID) {
+            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
+            cancel_waiting_transaction(cycle_victim);
+        }
     }
     lock.lock();
     request->cv_.wait(lock, [&request] { return request->granted_ || request->cancelled_; });
@@ -399,10 +404,15 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
     note_wait_topology_change();
     register_waiting_txn(txn);
     lock.unlock();
-    const txn_id_t cycle_victim = find_youngest_cycle_victim(txn_id);
-    if (cycle_victim != INVALID_TXN_ID) {
-        wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
-        cancel_waiting_transaction(cycle_victim);
+    // The first unique-key wait of a lock-free transaction cannot form a
+    // cycle. Defer graph construction until the transaction already owns a
+    // lock and can therefore have an outgoing wait-for edge.
+    if (!txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty()) {
+        const txn_id_t cycle_victim = find_youngest_cycle_victim(txn_id);
+        if (cycle_victim != INVALID_TXN_ID) {
+            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
+            cancel_waiting_transaction(cycle_victim);
+        }
     }
     lock.lock();
     queue->cv.wait(lock, [&] {

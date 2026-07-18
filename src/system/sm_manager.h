@@ -357,7 +357,7 @@ public:
             buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
             offset = next;
         }
-        modified_slots.clear();
+        txn.clear_modified_slots();
     }
 
     // Bulk-load a CSV file into an existing table. The path is relative to the

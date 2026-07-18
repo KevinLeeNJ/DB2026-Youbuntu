@@ -514,6 +514,18 @@ TEST_F(SltFileTest, PerformanceLoadQuery) {
     run_slt_file("performance_load_query.slt");
 }
 
+TEST_F(SltFileTest, UpdateIndexOptimization) {
+    run_slt_file("update_index_optimization.slt");
+}
+
+TEST_F(SltFileTest, InsertUniqueIndexRegression) {
+    run_slt_file("insert_unique_index_regression.slt");
+}
+
+TEST_F(SltFileTest, TransactionRepeatedUpdateMerge) {
+    run_slt_file("transaction_repeated_update_merge.slt");
+}
+
 TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {
     ASSERT_NO_THROW(db_->exec_sql("create table dup_heap (id int, val int);"));
     ASSERT_NO_THROW(db_->exec_sql("insert into dup_heap values(1, 10);"));

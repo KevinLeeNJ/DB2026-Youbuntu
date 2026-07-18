@@ -155,6 +155,7 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
             group_commit_leader_active_ = true;
             become_leader = true;
         }
+        group_commit_cv_.notify_one();
 
         if (!become_leader) {
             waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
@@ -173,40 +174,20 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
             // Allow commits arriving together to append before the active
             // buffer is swapped. The swap itself is short; pwrite and
             // fdatasync happen without the append latch.
-            size_t waiter_count = 0;
-            uint64_t oldest_wait_ns = 0;
             bool sync_batch = false;
             const auto batch_wait_begin = std::chrono::steady_clock::now();
-            // A leader waits until a useful number of waiters arrive or the
-            // oldest waiter reaches the latency bound. The short polling
-            // interval avoids a second condition variable and keeps the
-            // append path independent from the group latch.
-            for (;;) {
-                {
-                    std::lock_guard<std::mutex> group_lock(group_commit_latch_);
-                    waiter_count = group_commit_waiters_.size();
-                    const uint64_t now_ns =
-                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                  std::chrono::steady_clock::now().time_since_epoch())
-                                                  .count());
-                    if (!group_commit_waiters_.empty()) {
-                        oldest_wait_ns = now_ns - group_commit_waiters_.front()->enqueue_time_ns;
-                    }
-                    sync_batch = false;
-                    for (const auto& pending : group_commit_waiters_) {
-                        sync_batch = sync_batch || pending->require_sync;
-                    }
+            // At high concurrency four waiters form a useful batch
+            // immediately; otherwise allow a short bounded window for
+            // committers to join the same WAL write. New waiters wake the
+            // leader, so the common low-contention path does not poll.
+            {
+                std::unique_lock<std::mutex> group_lock(group_commit_latch_);
+                const auto deadline = batch_wait_begin + std::chrono::milliseconds(2);
+                group_commit_cv_.wait_until(group_lock, deadline, [this] { return group_commit_waiters_.size() >= 4; });
+                sync_batch = false;
+                for (const auto& pending : group_commit_waiters_) {
+                    sync_batch = sync_batch || pending->require_sync;
                 }
-                const auto waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                           std::chrono::steady_clock::now() - batch_wait_begin)
-                                           .count();
-                // At high concurrency four waiters form a useful batch
-                // immediately; otherwise allow a short bounded window for
-                // committers to join the same WAL write.
-                if (waiter_count >= 4 || oldest_wait_ns >= 2'000'000 || waited_us >= 2'000) {
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
             }
             flush_buffer(sync_batch);
             if (sync_batch) {

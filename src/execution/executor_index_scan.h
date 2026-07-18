@@ -401,7 +401,7 @@ public:
         historical_candidates_merged_ = false;
         record_predicate_read();
 
-        auto index_latch_guard = ih_->lock_shared();
+        std::optional<IxIndexHandle::SharedIndexLatch> index_latch_guard;
         const bool historical_candidates_available = needs_historical_index_candidates();
         use_historical_index_candidates_ = historical_candidates_available;
         reset_key_bounds();
@@ -466,6 +466,7 @@ public:
         const bool exact_key_lookup = !lower_exclusive && upper_inclusive && lower_key_ == upper_key_;
         Iid lower, upper;
         if (!exact_key_lookup) {
+            index_latch_guard.emplace(ih_->lock_shared());
             lower = lower_exclusive ? ih_->upper_bound(lower_key_.data()) : ih_->lower_bound(lower_key_.data());
             upper = upper_inclusive ? ih_->upper_bound(upper_key_.data()) : ih_->lower_bound(upper_key_.data());
         }
@@ -488,7 +489,6 @@ public:
         const bool use_single_rid_lookup =
             exact_key_lookup && !use_historical_index_candidates_ && !use_rc_exact_historical_key;
         if (use_single_rid_lookup) {
-            index_latch_guard.unlock();
             auto unique_rid = ih_->lookup_unique(lower_key_.data());
             if (unique_rid.has_value()) {
                 single_rid_cursor_.emplace(unique_rid);
@@ -503,10 +503,9 @@ public:
         } else if (exact_key_lookup || use_historical_index_candidates_ || use_rc_exact_historical_key) {
             historical_candidates_merged_ = use_historical_index_candidates_ || use_rc_exact_historical_key;
             if (exact_key_lookup) {
-                index_latch_guard.unlock();
                 ih_->lookup_equal(lower_key_.data(), rid_scan_rids_);
             } else {
-                for (IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+                for (IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm(), std::move(*index_latch_guard));
                      !index_scan.is_end(); index_scan.next()) {
                     rid_scan_rids_.push_back(index_scan.rid());
                 }
@@ -533,7 +532,7 @@ public:
             rid_vector_cursor_.emplace(&rid_scan_rids_);
             scan_ = &*rid_vector_cursor_;
         } else {
-            index_scan_cursor_.emplace(ih_, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard), false,
+            index_scan_cursor_.emplace(ih_, lower, upper, sm_manager_->get_bpm(), std::move(*index_latch_guard), false,
                                        direction_);
             scan_ = &*index_scan_cursor_;
         }
