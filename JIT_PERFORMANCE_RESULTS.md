@@ -821,3 +821,17 @@ N/A (no readable perf/flamegraph summary)
 - AST, semantic Query, and supported physical Plan values now carry stable lexical slots; repeated DML root/scan fields
   bind the same current parameter without relying on traversal order. Unsupported LIMIT/unary-minus recipes and DML plan
   shapes still miss transparently. This prevents stale analyzed casts, update values, or index keys.
+
+## Phase 12 Observability Supplement
+
+- Added version-2 phase metrics fields for `statement_template_cache` (`lookups`, `hits`, `misses`, `publishes`,
+  `evictions`) and JIT (`entry_count`, `queued_count`, `code_bytes`, `cache_hits`, `fallbacks`, `compile_attempts`,
+  `compile_failures`, `evictions`). The fields are written to the existing independent metrics JSON only; client
+  protocol, SQL output, `output.txt`, and benchmark JSON semantics are unchanged.
+- Metrics smoke validation produced valid JSON in a JIT-enabled server run with both counter groups present. `make test`
+  passed `352/352` on the final rerun. The first immediately preceding run had one transient
+  `JitManagerTest.FailureCooldownAndQueueCapacityFallbackWithoutBlocking` failure; the isolated test passed 10/10
+  repetitions and the complete rerun passed without code changes beyond the metrics patch.
+- This instrumentation is intended to settle the TPCC diagnosis: nonzero cache hits with zero/low evictions or compile
+  attempts indicate fixed lookup/bind/observe overhead, while high evictions or compile attempts would indicate genuine
+  invalidation/recompilation pressure.

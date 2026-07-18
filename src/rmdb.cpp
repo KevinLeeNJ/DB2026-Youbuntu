@@ -92,14 +92,14 @@ private:
 ClientConnectionTracker client_connections;
 #endif
 
-void write_phase_metrics(const std::string& path) {
+void write_phase_metrics(const std::string& path, const cache::StatementTemplateCache* template_cache) {
     const std::string temporary_path = path + ".tmp." + std::to_string(getpid());
     std::ofstream output(temporary_path, std::ios::out | std::ios::trunc);
     if (!output.is_open()) {
         return;
     }
 
-    output << "{\n  \"format_version\": 1,\n  \"clock\": \"steady_clock_ns\",\n  \"phases\": {\n";
+    output << "{\n  \"format_version\": 2,\n  \"clock\": \"steady_clock_ns\",\n  \"phases\": {\n";
     constexpr size_t phase_count = static_cast<size_t>(phase_metrics::Phase::COUNT);
     for (size_t i = 0; i < phase_count; ++i) {
         const auto phase = static_cast<phase_metrics::Phase>(i);
@@ -112,7 +112,27 @@ void write_phase_metrics(const std::string& path) {
                << ", \"estimated_cycles\": " << snapshot.sampled_cycles * rate << "}";
         output << (i + 1 == phase_count ? "\n" : ",\n");
     }
-    output << "  }\n}\n";
+    output << "  },\n  \"statement_template_cache\": ";
+    if (template_cache != nullptr) {
+        const auto stats = template_cache->stats();
+        output << "{\"lookups\": " << stats.lookups << ", \"hits\": " << stats.hits
+               << ", \"misses\": " << stats.misses << ", \"publishes\": " << stats.publishes
+               << ", \"evictions\": " << stats.evictions << "}";
+    } else {
+        output << "null";
+    }
+#ifdef RMDB_ENABLE_JIT
+    const auto jit_stats = jit::predicate_jit_stats();
+    output << ",\n  \"jit\": {\"entry_count\": " << jit_stats.entry_count
+           << ", \"queued_count\": " << jit_stats.queued_count << ", \"code_bytes\": "
+           << jit_stats.code_bytes << ", \"cache_hits\": " << jit_stats.cache_hits
+           << ", \"fallbacks\": " << jit_stats.fallbacks << ", \"compile_attempts\": "
+           << jit_stats.compile_attempts << ", \"compile_failures\": " << jit_stats.compile_failures
+           << ", \"evictions\": " << jit_stats.evictions << "}";
+#else
+    output << ",\n  \"jit\": null";
+#endif
+    output << "\n}\n";
     output.close();
     if (output) {
         std::rename(temporary_path.c_str(), path.c_str());
@@ -580,18 +600,19 @@ int main(int argc, char** argv) {
             const char* metrics_path = std::getenv("RMDB_PHASE_METRICS_PATH");
             if (metrics_path != nullptr) {
                 const std::string path(metrics_path);
-                metrics_thread = std::thread([&metrics_thread_stop, path] {
+                auto* template_cache = statement_template_cache.get();
+                metrics_thread = std::thread([&metrics_thread_stop, path, template_cache] {
                     while (!metrics_thread_stop.load()) {
                         if (std::remove((path + ".reset").c_str()) == 0) {
                             phase_metrics::Registry::instance().reset();
                         }
-                        write_phase_metrics(path);
+                        write_phase_metrics(path, template_cache);
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
                     if (std::remove((path + ".reset").c_str()) == 0) {
                         phase_metrics::Registry::instance().reset();
                     }
-                    write_phase_metrics(path);
+                    write_phase_metrics(path, template_cache);
                 });
             }
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
