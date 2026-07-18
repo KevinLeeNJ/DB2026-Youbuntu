@@ -703,3 +703,22 @@ N/A (no readable perf/flamegraph summary)
 - Force-mode full regression passed 343/343. JIT unit coverage includes 60,000 random numeric tuple comparisons across
   all operators, mixed numeric types, NaN, fixed-width strings, tuple1 join input, cache lifecycle, and a FilterExecutor
   force-mode cache-hit check.
+
+## Phase 5 Decision
+
+- Projection now builds a tuple-layout-only `CopySpan` list. Adjacent source and destination spans are merged only when
+  both offsets are contiguous; reordered and repeated columns remain independent spans. The kernel retains no tuple,
+  executor, transaction, or output-buffer pointer.
+- Update tuple computation covers assignment, self add/subtract/multiply/divide, the existing INT/FLOAT casts, and
+  fixed-width string/DATETIME assignment. It preflights every self-division before modifying the execution-local new
+  tuple and reports `DIVISION_BY_ZERO`; `UpdateExecutor` maps that to the unchanged `division by zero in UPDATE`
+  exception before any WAL, MVCC, heap, or index side effect. Locks, predicates, index maintenance, WAL, undo, and
+  transaction state remain in C++.
+- Validation: `RMDB_JIT=force make test` passed 345/345; the JIT-disabled Debug server build succeeded; tuple-kernel
+  tests cover reorder/repeat/adjacent projection spans plus numeric casts, string truncation, negative arithmetic, and
+  division-by-zero non-mutation. `make benchmark-random-kill` completed 3 crash/recovery cycles with one worker,
+  one-second measure windows, and no consistency failure.
+- Predicate microbenchmark, 3 rounds and 1,000,000 deterministic evaluations per path: interpreter cycles
+  `[40,660,076, 40,678,696, 40,715,936]`; generated-kernel cycles
+  `[10,070,152, 10,364,196, 10,375,254]`; median reduction `74.5218%`. This remains a process-local compute result;
+  network communication, protocol, and `output.txt` were neither changed nor counted as JIT optimization.

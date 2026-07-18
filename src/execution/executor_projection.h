@@ -16,6 +16,9 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_tuple_kernels.h"
+#endif
 #include "system/sm.h"
 
 class ProjectionExecutor : public AbstractExecutor {
@@ -27,6 +30,9 @@ private:
     std::unique_ptr<RmRecord> current_output_;
     std::unique_ptr<RmRecord> fallback_input_;
     TupleView current_view_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::ProjectionKernel> jit_projection_;
+#endif
 
     bool materialize_view(TupleView input) {
         phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PROJECTION_COPY,
@@ -37,11 +43,19 @@ private:
         if (current_output_ == nullptr || current_output_->size != static_cast<int>(len_)) {
             current_output_ = std::make_unique<RmRecord>(static_cast<int>(len_));
         }
-        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
-            const auto& col = cols_[i];
-            const auto& src_col = prev_->cols()[sel_idxs_[i]];
-            std::memcpy(current_output_->data + col.offset, input.data + src_col.offset, col.len);
+#ifdef RMDB_ENABLE_JIT
+        if (jit_projection_ != nullptr && jit_projection_->valid()) {
+            jit_projection_->project(input.data, current_output_->data);
+        } else {
+#endif
+            for (size_t i = 0; i < sel_idxs_.size(); ++i) {
+                const auto& col = cols_[i];
+                const auto& src_col = prev_->cols()[sel_idxs_[i]];
+                std::memcpy(current_output_->data + col.offset, input.data + src_col.offset, col.len);
+            }
+#ifdef RMDB_ENABLE_JIT
         }
+#endif
         current_view_ = TupleView{current_output_->data, static_cast<uint32_t>(current_output_->size)};
         return true;
     }
@@ -125,6 +139,11 @@ public:
             auto pos = get_col(prev_cols, sel_col);
             append_projection_col(static_cast<size_t>(pos - prev_cols.begin()));
         }
+#ifdef RMDB_ENABLE_JIT
+        if (jit::tuple_jit_enabled()) {
+            jit_projection_ = std::make_unique<jit::ProjectionKernel>(cols_, sel_idxs_, prev_cols);
+        }
+#endif
     }
 
     template <typename SelectItemT, typename = std::enable_if_t<!std::is_same_v<SelectItemT, TabCol>>>
@@ -132,6 +151,11 @@ public:
         prev_ = std::move(prev);
         len_ = 0;
         build_from_select_items(select_items);
+#ifdef RMDB_ENABLE_JIT
+        if (jit::tuple_jit_enabled()) {
+            jit_projection_ = std::make_unique<jit::ProjectionKernel>(cols_, sel_idxs_, prev_->cols());
+        }
+#endif
     }
 
     void beginTuple() override {

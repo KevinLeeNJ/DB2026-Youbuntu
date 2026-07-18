@@ -1,4 +1,4 @@
-set(SOURCES jit_runtime.cpp jit_ir.cpp jit_manager.cpp jit_predicate.cpp)
+set(SOURCES jit_runtime.cpp jit_ir.cpp jit_manager.cpp jit_predicate.cpp jit_tuple_kernels.cpp)
 
 add_library(jit STATIC ${SOURCES})
 target_include_directories(jit PUBLIC ${CMAKE_SOURCE_DIR}/src)
