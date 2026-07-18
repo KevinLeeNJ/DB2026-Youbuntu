@@ -39,6 +39,16 @@ TEST(StatementTemplateTest, IdentifierAndMalformedShapeDoNotAlias) {
     EXPECT_FALSE(malformed.error.empty());
 }
 
+TEST(StatementTemplateTest, LightweightNormalizationKeepsBindingDataWithoutOwnedTokens) {
+    auto shape = parser::normalize_sql("select id from users where id = 7 limit 1;", false);
+    ASSERT_TRUE(shape);
+    EXPECT_TRUE(shape.tokens.empty());
+    ASSERT_EQ(shape.parameters.size(), 2U);
+    EXPECT_EQ(shape.parameters[0].int_value, 7);
+    EXPECT_EQ(shape.parameters[1].int_value, 1);
+    EXPECT_TRUE(shape.template_unsupported);
+}
+
 TEST(StatementTemplateTest, CacheChecksGenerationAndEvictsByCapacity) {
     auto shape = parser::normalize_sql("select id from users where id = 1;");
     ASSERT_TRUE(shape);
@@ -80,4 +90,57 @@ TEST(StatementTemplateTest, BindsCurrentLiteralValuesOnParameterizedAstHit) {
     auto* update = static_cast<ast::UpdateStmt*>(rebound.get());
     EXPECT_EQ(static_cast<ast::IntLit*>(update->set_clauses[0]->val.get())->val, 99);
     EXPECT_EQ(static_cast<ast::IntLit*>(update->conds[0]->rhs.get())->val, 42);
+}
+
+TEST(StatementTemplateTest, FullLookupReturnsStatementTypeAndFreshPlanWithOneCacheProbe) {
+    auto shape = parser::normalize_sql("begin;");
+    ASSERT_TRUE(shape);
+    auto parsed = ast::parse_sql("begin;");
+    auto plan = std::make_unique<OtherPlan>(T_Transaction_begin, "");
+    SmManager sm_manager{nullptr, nullptr, nullptr, nullptr};
+
+    cache::StatementTemplateCache cache;
+    cache.publish(shape.key, 1, std::shared_ptr<const ast::TreeNode>(std::move(parsed)), nullptr,
+                  std::shared_ptr<const Plan>(std::move(plan)));
+
+    auto first = cache.lookup_full(shape.key, 1, &sm_manager, &shape);
+    auto second = cache.lookup_full(shape.key, 1, &sm_manager, &shape);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first.statement_type, ast::AstType::TxnBegin);
+    EXPECT_EQ(first.plan->tag, T_Transaction_begin);
+    EXPECT_EQ(second.statement_type, ast::AstType::TxnBegin);
+    EXPECT_NE(first.plan.get(), second.plan.get());
+    EXPECT_EQ(cache.stats().lookups, 2U);
+    EXPECT_EQ(cache.stats().hits, 2U);
+}
+
+TEST(StatementTemplateTest, FullLookupBindsCurrentInsertValues) {
+    auto first_shape = parser::normalize_sql("insert into users values (1, 'alice');");
+    auto second_shape = parser::normalize_sql("insert into users values (42, 'bob');");
+    ASSERT_TRUE(first_shape);
+    ASSERT_TRUE(second_shape);
+    ASSERT_EQ(first_shape.key, second_shape.key);
+
+    auto parsed = ast::parse_sql("insert into users values (1, 'alice');");
+    ast::assign_literal_slots(*parsed);
+    Value id;
+    id.set_int(1);
+    id.lexical_slot = 0;
+    Value name;
+    name.set_str("alice");
+    name.lexical_slot = 1;
+    auto plan = std::make_unique<DMLPlan>(T_Insert, nullptr, "users", std::vector<Value>{id, name},
+                                          std::vector<Condition>{}, std::vector<SetClause>{});
+    SmManager sm_manager{nullptr, nullptr, nullptr, nullptr};
+
+    cache::StatementTemplateCache cache;
+    cache.publish(first_shape.key, 1, std::shared_ptr<const ast::TreeNode>(std::move(parsed)), nullptr,
+                  std::shared_ptr<const Plan>(std::move(plan)));
+    auto rebound = cache.lookup_full(second_shape.key, 1, &sm_manager, &second_shape);
+    ASSERT_TRUE(rebound);
+    const auto& insert = static_cast<const DMLPlan&>(*rebound.plan);
+    ASSERT_EQ(insert.values_.size(), 2U);
+    EXPECT_EQ(insert.values_[0].int_val, 42);
+    EXPECT_EQ(insert.values_[1].str_val, "bob");
 }

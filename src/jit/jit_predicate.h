@@ -34,6 +34,9 @@ public:
 private:
     std::optional<JitProgram> program_;
     JitParamBlock params_;
+    mutable std::shared_ptr<const JitCode> code_;
+    mutable uint32_t pending_evaluations_{0};
+    mutable bool observed_once_{false};
 };
 
 void initialize_predicate_jit(std::function<uint64_t()> catalog_generation);

@@ -277,6 +277,22 @@ protected:
         }
     }
 
+#ifdef RMDB_ENABLE_JIT
+    void rebuild_jit_predicate() {
+        const bool exact_index_lookup = compiled_index_conditions_.size() == fed_conds_.size() &&
+                                        std::all_of(constraints_.begin(), constraints_.end(),
+                                                    [](const auto& constraint) { return constraint.eq_present; });
+        if (exact_index_lookup || !jit::predicate_jit_available()) {
+            jit_predicate_.reset();
+            return;
+        }
+        auto predicate = std::make_unique<jit::PredicateKernel>(T_IndexScan, fed_conds_,
+                                                                jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_},
+                                                                std::nullopt, sm_manager_->get_catalog_generation());
+        jit_predicate_ = *predicate ? std::move(predicate) : nullptr;
+    }
+#endif
+
     void rebuild_constraints() {
         for (auto& constraint : constraints_) {
             constraint.eq_present = false;
@@ -387,16 +403,6 @@ public:
         }
         fed_conds_ = conds_;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
-#ifdef RMDB_ENABLE_JIT
-        if (jit::predicate_jit_available()) {
-            auto predicate = std::make_unique<jit::PredicateKernel>(
-                T_IndexScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
-                sm_manager_->get_catalog_generation());
-            if (*predicate) {
-                jit_predicate_ = std::move(predicate);
-            }
-        }
-#endif
         base_conds_ = conds_; // save original conditions before any key injection
         index_name_ = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
         ih_ = sm_manager_->ihs_.at(index_name_).get();
@@ -404,6 +410,9 @@ public:
         rid_scan_rids_.reserve(1);
         compile_index_conditions();
         rebuild_constraints();
+#ifdef RMDB_ENABLE_JIT
+        rebuild_jit_predicate();
+#endif
     }
 
     void beginTuple() override {
@@ -651,16 +660,11 @@ public:
         }
         fed_conds_ = conds_;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
-#ifdef RMDB_ENABLE_JIT
-        if (jit::predicate_jit_available()) {
-            auto predicate = std::make_unique<jit::PredicateKernel>(
-                T_IndexScan, fed_conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), cols_}, std::nullopt,
-                sm_manager_->get_catalog_generation());
-            jit_predicate_ = *predicate ? std::move(predicate) : nullptr;
-        }
-#endif
         compile_index_conditions();
         rebuild_constraints();
+#ifdef RMDB_ENABLE_JIT
+        rebuild_jit_predicate();
+#endif
         lookup_key_valid_ = false;
     }
 

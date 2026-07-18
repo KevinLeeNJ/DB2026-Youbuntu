@@ -35,6 +35,15 @@ struct StatementTemplateStats {
     uint64_t evictions{0};
 };
 
+struct FullTemplateLookup {
+    ast::AstType statement_type{ast::AstType::Help};
+    std::unique_ptr<Plan> plan;
+
+    explicit operator bool() const {
+        return plan != nullptr;
+    }
+};
+
 class StatementTemplateCache {
 public:
     explicit StatementTemplateCache(size_t capacity = rmdb_config::kStatementTemplateCacheCapacity)
@@ -47,6 +56,8 @@ public:
                                         const parser::OwnedTokenStream* lexical = nullptr);
     std::unique_ptr<Plan> lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                                       SmManager* sm_manager, const parser::OwnedTokenStream* lexical = nullptr);
+    FullTemplateLookup lookup_full(const parser::TokenShapeKey& key, uint64_t catalog_generation, SmManager* sm_manager,
+                                   const parser::OwnedTokenStream* lexical = nullptr);
     void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                  std::shared_ptr<const ast::TreeNode> skeleton = nullptr, std::shared_ptr<const Query> query = nullptr,
                  std::shared_ptr<const Plan> plan = nullptr);
@@ -63,13 +74,9 @@ private:
         std::shared_ptr<const Plan> plan;
     };
 
-    static std::string map_key(const parser::TokenShapeKey& key) {
-        return key.canonical_bytes;
-    }
-
     size_t capacity_;
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, Entry> entries_;
+    std::unordered_map<parser::TokenShapeKey, Entry, parser::TokenShapeKeyHash> entries_;
     uint64_t clock_{0};
     StatementTemplateStats stats_;
 };

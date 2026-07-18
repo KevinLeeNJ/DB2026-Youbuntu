@@ -314,11 +314,34 @@ bool bind_plan_node(Plan& plan, LiteralBinder& binder) {
         }
         return true;
     }
-    case T_Insert:
-    case T_Update:
-    case T_Delete:
-    case T_ExplainAnalyze:
-        return false;
+    case T_Insert: {
+        auto& dml = static_cast<DMLPlan&>(plan);
+        for (auto& value : dml.values_) {
+            if (!binder.bind(value))
+                return false;
+        }
+        return true;
+    }
+    case T_Update: {
+        auto& dml = static_cast<DMLPlan&>(plan);
+        if (!bind_plan_conditions(dml.conds_, binder))
+            return false;
+        for (auto& clause : dml.set_clauses_) {
+            if (!binder.bind(clause.rhs))
+                return false;
+        }
+        return dml.subplan_ == nullptr || bind_plan_node(*dml.subplan_, binder);
+    }
+    case T_Delete: {
+        auto& dml = static_cast<DMLPlan&>(plan);
+        return bind_plan_conditions(dml.conds_, binder) &&
+               (dml.subplan_ == nullptr || bind_plan_node(*dml.subplan_, binder));
+    }
+    case T_select:
+    case T_ExplainAnalyze: {
+        auto& dml = static_cast<DMLPlan&>(plan);
+        return dml.subplan_ == nullptr || bind_plan_node(*dml.subplan_, binder);
+    }
     default:
         return true;
     }
@@ -329,7 +352,7 @@ bool bind_plan_node(Plan& plan, LiteralBinder& binder) {
 bool StatementTemplateCache::lookup(const parser::TokenShapeKey& key, uint64_t catalog_generation) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.lookups;
-    auto found = entries_.find(map_key(key));
+    auto found = entries_.find(key);
     if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key) {
         ++stats_.misses;
         return false;
@@ -342,17 +365,21 @@ bool StatementTemplateCache::lookup(const parser::TokenShapeKey& key, uint64_t c
 std::unique_ptr<ast::TreeNode> StatementTemplateCache::lookup_ast(const parser::TokenShapeKey& key,
                                                                   uint64_t catalog_generation,
                                                                   const parser::OwnedTokenStream* lexical) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++stats_.lookups;
-    auto found = entries_.find(map_key(key));
-    if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key ||
-        found->second.skeleton == nullptr) {
-        ++stats_.misses;
-        return nullptr;
+    std::shared_ptr<const ast::TreeNode> skeleton;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.lookups;
+        auto found = entries_.find(key);
+        if (found == entries_.end() || found->second.catalog_generation != catalog_generation ||
+            found->second.key != key || found->second.skeleton == nullptr) {
+            ++stats_.misses;
+            return nullptr;
+        }
+        found->second.last_use = ++clock_;
+        ++stats_.hits;
+        skeleton = found->second.skeleton;
     }
-    found->second.last_use = ++clock_;
-    ++stats_.hits;
-    auto result = ast::clone_tree(*found->second.skeleton);
+    auto result = ast::clone_tree(*skeleton);
     if (lexical != nullptr) {
         LiteralBinder binder(*lexical);
         if (!bind_tree(*result, binder) || !binder.done())
@@ -364,17 +391,21 @@ std::unique_ptr<ast::TreeNode> StatementTemplateCache::lookup_ast(const parser::
 std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenShapeKey& key,
                                                             uint64_t catalog_generation,
                                                             const parser::OwnedTokenStream* lexical) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++stats_.lookups;
-    auto found = entries_.find(map_key(key));
-    if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key ||
-        found->second.query == nullptr) {
-        ++stats_.misses;
-        return nullptr;
+    std::shared_ptr<const Query> query;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.lookups;
+        auto found = entries_.find(key);
+        if (found == entries_.end() || found->second.catalog_generation != catalog_generation ||
+            found->second.key != key || found->second.query == nullptr) {
+            ++stats_.misses;
+            return nullptr;
+        }
+        found->second.last_use = ++clock_;
+        ++stats_.hits;
+        query = found->second.query;
     }
-    found->second.last_use = ++clock_;
-    ++stats_.hits;
-    auto result = clone_query(*found->second.query);
+    auto result = clone_query(*query);
     if (lexical != nullptr && result->parse != nullptr) {
         LiteralBinder binder(*lexical);
         if (!bind_tree(*result->parse, binder) || !binder.done())
@@ -388,17 +419,21 @@ std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenS
 std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                                                           SmManager* sm_manager,
                                                           const parser::OwnedTokenStream* lexical) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++stats_.lookups;
-    auto found = entries_.find(map_key(key));
-    if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key ||
-        found->second.plan == nullptr) {
-        ++stats_.misses;
-        return nullptr;
+    std::shared_ptr<const Plan> plan;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.lookups;
+        auto found = entries_.find(key);
+        if (found == entries_.end() || found->second.catalog_generation != catalog_generation ||
+            found->second.key != key || found->second.plan == nullptr) {
+            ++stats_.misses;
+            return nullptr;
+        }
+        found->second.last_use = ++clock_;
+        ++stats_.hits;
+        plan = found->second.plan;
     }
-    found->second.last_use = ++clock_;
-    ++stats_.hits;
-    auto result = clone_plan(*found->second.plan, sm_manager);
+    auto result = clone_plan(*plan, sm_manager);
     if (lexical != nullptr) {
         LiteralBinder binder(*lexical);
         if (!bind_plan_node(*result, binder) || !binder.done())
@@ -407,11 +442,44 @@ std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenSha
     return result;
 }
 
+FullTemplateLookup StatementTemplateCache::lookup_full(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                                       SmManager* sm_manager, const parser::OwnedTokenStream* lexical) {
+    ast::AstType statement_type{ast::AstType::Help};
+    std::shared_ptr<const Plan> plan;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.lookups;
+        auto found = entries_.find(key);
+        if (found == entries_.end() || found->second.catalog_generation != catalog_generation ||
+            found->second.key != key || found->second.skeleton == nullptr || found->second.plan == nullptr) {
+            ++stats_.misses;
+            return {};
+        }
+        found->second.last_use = ++clock_;
+        ++stats_.hits;
+        statement_type = found->second.skeleton->type;
+        plan = found->second.plan;
+    }
+
+    FullTemplateLookup result{statement_type, clone_plan(*plan, sm_manager)};
+    if (!result) {
+        return {};
+    }
+    if (lexical == nullptr) {
+        return result;
+    }
+    LiteralBinder plan_binder(*lexical);
+    if (!bind_plan_node(*result.plan, plan_binder) || !plan_binder.done()) {
+        return {};
+    }
+    return result;
+}
+
 void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                                      std::shared_ptr<const ast::TreeNode> skeleton, std::shared_ptr<const Query> query,
                                      std::shared_ptr<const Plan> plan) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto previous = entries_.find(map_key(key));
+    auto previous = entries_.find(key);
     if (previous != entries_.end() && skeleton == nullptr) {
         skeleton = previous->second.skeleton;
     }
@@ -422,7 +490,7 @@ void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t 
         plan = previous->second.plan;
     }
     Entry entry{key, catalog_generation, ++clock_, std::move(skeleton), std::move(query), std::move(plan)};
-    entries_[map_key(key)] = std::move(entry);
+    entries_[key] = std::move(entry);
     ++stats_.publishes;
     if (entries_.size() <= capacity_) {
         return;

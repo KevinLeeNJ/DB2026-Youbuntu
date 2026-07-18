@@ -53,17 +53,24 @@ struct TokenShapeKey {
     }
 };
 
+struct TokenShapeKeyHash {
+    size_t operator()(const TokenShapeKey& key) const noexcept {
+        return static_cast<size_t>(key.low ^ (key.high + 0x9e3779b97f4a7c15ULL + (key.low << 6U) + (key.low >> 2U)));
+    }
+};
+
 struct OwnedTokenStream {
     std::vector<OwnedToken> tokens;
     std::vector<LexicalParam> parameters;
     TokenShapeKey key;
     std::string error;
+    bool template_unsupported{false};
 
     explicit operator bool() const {
         return error.empty();
     }
 };
 
-OwnedTokenStream normalize_sql(std::string_view sql);
+OwnedTokenStream normalize_sql(std::string_view sql, bool retain_tokens = true);
 
 } // namespace parser

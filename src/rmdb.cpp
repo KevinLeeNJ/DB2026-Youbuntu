@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <mutex>
@@ -256,44 +257,53 @@ void client_handler(int fd) {
         parser::OwnedTokenStream lexical_shape;
         const auto statement_cache_mode = rmdb_config::statement_cache_mode;
         std::unique_ptr<ast::TreeNode> cached_parse_tree;
+        std::optional<ast::AstType> cached_statement_type;
         std::unique_ptr<Query> cached_query;
         std::unique_ptr<Plan> cached_plan;
+        bool used_cached_parse = false;
+        bool used_cached_query = false;
+        bool used_cached_plan = false;
         bool cacheable_skeleton = false;
         bool cacheable_query = false;
         bool cacheable_plan = false;
         if (statement_cache_mode != cache::StatementCacheMode::OFF) {
             phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
                                                        phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
-            lexical_shape = parser::normalize_sql(data_recv);
-            cacheable_skeleton = static_cast<bool>(lexical_shape);
-            for (const auto& token : lexical_shape.tokens) {
-                if (token.type == parser::TokenType::MINUS || token.type == parser::TokenType::LIMIT) {
-                    cacheable_skeleton = false;
-                    break;
-                }
-            }
+            lexical_shape = parser::normalize_sql(data_recv, false);
+            cacheable_skeleton = static_cast<bool>(lexical_shape) && !lexical_shape.template_unsupported;
             cacheable_plan = cacheable_skeleton;
             cacheable_query = cacheable_skeleton;
-            if (lexical_shape && cacheable_skeleton && cacheable_query &&
-                static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
-                cached_query = statement_template_cache->lookup_query(lexical_shape.key,
-                                                                      statement_template_generation(), &lexical_shape);
-                if (cached_query != nullptr && cached_query->parse != nullptr) {
-                    cached_parse_tree = ast::clone_tree(*cached_query->parse);
+            if (lexical_shape && cacheable_plan && statement_cache_mode == cache::StatementCacheMode::FULL) {
+                auto full = statement_template_cache->lookup_full(lexical_shape.key, statement_template_generation(),
+                                                                  sm_manager.get(), &lexical_shape);
+                if (full) {
+                    cached_statement_type = full.statement_type;
+                    cached_plan = std::move(full.plan);
+                    used_cached_parse = true;
+                    used_cached_plan = true;
                 }
-                if (cached_query != nullptr && cacheable_plan &&
-                    statement_cache_mode == cache::StatementCacheMode::FULL) {
-                    cached_plan = statement_template_cache->lookup_plan(
-                        lexical_shape.key, statement_template_generation(), sm_manager.get(), &lexical_shape);
+            }
+            if (cached_plan == nullptr) {
+                if (lexical_shape && cacheable_skeleton && cacheable_query &&
+                    static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
+                    cached_query = statement_template_cache->lookup_query(
+                        lexical_shape.key, statement_template_generation(), &lexical_shape);
+                    if (cached_query != nullptr && cached_query->parse != nullptr) {
+                        cached_parse_tree = ast::clone_tree(*cached_query->parse);
+                        used_cached_parse = true;
+                        used_cached_query = true;
+                    }
+                } else if (lexical_shape && cacheable_skeleton &&
+                           static_cast<int>(statement_cache_mode) >=
+                               static_cast<int>(cache::StatementCacheMode::PARSER)) {
+                    cached_parse_tree = statement_template_cache->lookup_ast(
+                        lexical_shape.key, statement_template_generation(), &lexical_shape);
+                    used_cached_parse = cached_parse_tree != nullptr;
+                } else if (lexical_shape &&
+                           statement_template_cache->lookup(lexical_shape.key, statement_template_generation())) {
+                    LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
+                              lexical_shape.key.low);
                 }
-            } else if (lexical_shape && cacheable_skeleton &&
-                       static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::PARSER)) {
-                cached_parse_tree = statement_template_cache->lookup_ast(
-                    lexical_shape.key, statement_template_generation(), &lexical_shape);
-            } else if (lexical_shape &&
-                       statement_template_cache->lookup(lexical_shape.key, statement_template_generation())) {
-                LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
-                          lexical_shape.key.low);
             }
         }
 
@@ -318,12 +328,14 @@ void client_handler(int fd) {
 
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
-            if (cached_parse_tree != nullptr) {
-                parse_tree = std::move(cached_parse_tree);
-            } else {
-                phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PARSER,
-                                                           phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
-                parse_tree = ast::parse_sql(data_recv);
+            if (!used_cached_plan) {
+                if (cached_parse_tree != nullptr) {
+                    parse_tree = std::move(cached_parse_tree);
+                } else {
+                    phase_metrics::ScopedSample metrics_sample(
+                        phase_metrics::Phase::PARSER, phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
+                    parse_tree = ast::parse_sql(data_recv);
+                }
             }
         } catch (const ast::ParseError& e) {
             abort_active_transaction();
@@ -336,17 +348,20 @@ void client_handler(int fd) {
             offset = msg_len + 1;
         }
 
-        if (parse_tree != nullptr) {
+        if (used_cached_plan || parse_tree != nullptr) {
             try {
-                ast::assign_literal_slots(*parse_tree);
+                if (!used_cached_plan) {
+                    ast::assign_literal_slots(*parse_tree);
+                }
                 std::shared_ptr<const ast::TreeNode> parsed_skeleton;
-                if (lexical_shape && cacheable_skeleton && statement_cache_mode != cache::StatementCacheMode::OFF) {
+                if (!used_cached_parse && lexical_shape && cacheable_skeleton &&
+                    statement_cache_mode != cache::StatementCacheMode::OFF) {
                     auto clone = ast::clone_tree(*parse_tree);
                     parsed_skeleton = std::shared_ptr<const ast::TreeNode>(std::move(clone));
                     statement_template_cache->publish(lexical_shape.key, statement_template_generation(),
                                                       parsed_skeleton);
                 }
-                auto parsed_type = parse_tree->type;
+                const auto parsed_type = used_cached_plan ? *cached_statement_type : parse_tree->type;
                 bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
                 bool is_load = parsed_type == ast::AstType::LoadStmt;
                 if (!is_checkpoint && !is_load) {
@@ -354,15 +369,17 @@ void client_handler(int fd) {
                 }
                 // analyze and rewrite
                 std::unique_ptr<Query> query;
-                if (cached_query != nullptr) {
-                    query = std::move(cached_query);
-                } else {
-                    phase_metrics::ScopedSample metrics_sample(
-                        phase_metrics::Phase::ANALYZER, phase_metrics::sample_rate(phase_metrics::Phase::ANALYZER));
-                    query = analyze->do_analyze(std::move(parse_tree));
+                if (!used_cached_plan) {
+                    if (cached_query != nullptr) {
+                        query = std::move(cached_query);
+                    } else {
+                        phase_metrics::ScopedSample metrics_sample(
+                            phase_metrics::Phase::ANALYZER, phase_metrics::sample_rate(phase_metrics::Phase::ANALYZER));
+                        query = analyze->do_analyze(std::move(parse_tree));
+                    }
                 }
-                if (lexical_shape && cacheable_query && statement_cache_mode != cache::StatementCacheMode::OFF &&
-                    query != nullptr) {
+                if (!used_cached_query && lexical_shape && cacheable_query &&
+                    statement_cache_mode != cache::StatementCacheMode::OFF && query != nullptr) {
                     auto query_copy = clone_query(*query);
                     std::shared_ptr<const Query> semantic_skeleton(std::move(query_copy));
                     statement_template_cache->publish(lexical_shape.key, statement_template_generation(), nullptr,
@@ -380,8 +397,8 @@ void client_handler(int fd) {
                         plan = optimizer->plan_query(std::move(query), context);
                     }
                 }
-                if (lexical_shape && cacheable_plan && statement_cache_mode != cache::StatementCacheMode::OFF &&
-                    plan != nullptr && cached_plan == nullptr) {
+                if (!used_cached_plan && lexical_shape && cacheable_plan &&
+                    statement_cache_mode != cache::StatementCacheMode::OFF && plan != nullptr) {
                     auto plan_copy = clone_plan(*plan, sm_manager.get());
                     std::shared_ptr<const Plan> physical_skeleton(std::move(plan_copy));
                     statement_template_cache->publish(lexical_shape.key, statement_template_generation(), nullptr,

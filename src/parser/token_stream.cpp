@@ -50,24 +50,34 @@ TokenShapeKey digest(std::string canonical) {
 
 } // namespace
 
-OwnedTokenStream normalize_sql(std::string_view sql) {
+OwnedTokenStream normalize_sql(std::string_view sql, bool retain_tokens) {
     OwnedTokenStream result;
     std::string canonical;
+    canonical.reserve(sql.size() + 32);
+    result.parameters.reserve(16);
+    if (retain_tokens) {
+        result.tokens.reserve(sql.size() / 4 + 1);
+    }
     append_string(canonical, "RMDB-TOKEN-SHAPE");
     append_u32(canonical, TOKEN_STREAM_VERSION);
     try {
         Lexer lexer(sql);
         while (true) {
             Token token = lexer.next_token();
-            OwnedToken owned;
-            owned.type = token.type;
-            owned.text.assign(token.text.data(), token.text.size());
-            owned.line = token.line;
-            owned.column = token.column;
-            owned.int_value = token.int_value;
-            owned.float_value = token.float_value;
-            owned.bool_value = token.bool_value;
-            result.tokens.push_back(std::move(owned));
+            if (retain_tokens) {
+                OwnedToken owned;
+                owned.type = token.type;
+                owned.text.assign(token.text.data(), token.text.size());
+                owned.line = token.line;
+                owned.column = token.column;
+                owned.int_value = token.int_value;
+                owned.float_value = token.float_value;
+                owned.bool_value = token.bool_value;
+                result.tokens.push_back(std::move(owned));
+            }
+
+            result.template_unsupported =
+                result.template_unsupported || token.type == TokenType::MINUS || token.type == TokenType::LIMIT;
 
             append_token_type(canonical, token.type);
             if (token.type == TokenType::IDENTIFIER) {

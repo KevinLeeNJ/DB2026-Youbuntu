@@ -835,3 +835,32 @@ N/A (no readable perf/flamegraph summary)
 - This instrumentation is intended to settle the TPCC diagnosis: nonzero cache hits with zero/low evictions or compile
   attempts indicate fixed lookup/bind/observe overhead, while high evictions or compile attempts would indicate genuine
   invalidation/recompilation pressure.
+
+## JIT/Cache Fast-Path Optimization
+
+- Configuration is centralized in `src/common/config.h`; the production build used `JitMode::AUTO` and
+  `StatementCacheMode::FULL`. Neither JIT nor StatementTemplate Cache was disabled. Runtime mode `getenv()` parsing was
+  removed from request/tuple hot paths.
+- Fixed a cache-hit ownership bug that re-published cloned AST, Query, and Plan objects after their `unique_ptr`s had
+  been moved. Full lookup now performs one map probe, clones/binds outside the cache mutex, avoids execution-time AST
+  cloning, and uses the precomputed token digest directly without allocating a temporary string map key.
+- Added generic INSERT/UPDATE/DELETE physical-plan binding. In a metrics-enabled diagnostic run, template publishes
+  fell from `26132` to `204`, and estimated Planner calls fell from `29504` to `3904`; evictions and JIT compile failures
+  remained zero.
+- Predicate JIT now keeps a ready code handle in each execution-local kernel, batches cold observations, uses a
+  lifecycle-safe atomic service pointer, and performs thread-local shadow sampling. Exact equality lookups fully covered
+  by an index use the scalar one-row recheck; range scans, residual index predicates, SeqScan, Filter, and Join remain
+  eligible for AUTO JIT.
+- Lexer normalization has a lightweight server mode that retains the canonical key, parsed literal parameters, lexical
+  errors, and unsupported-token marker without constructing an unused owned-token array.
+
+### Three-round Release comparison
+
+- Common configuration: 8 warehouses, 1 worker, seed `20260718`, 1s warmup, 3s measurement, three independent fresh
+  databases, read committed, no phase-metrics instrumentation during the comparison.
+- Baseline commit `9da2af3eaeb1efa5ddb4d756a82a4f2c34308ac4`: tpmC `[8360, 8340, 8360]`, median `8360`.
+- Final AUTO/FULL build: tpmC `[8560, 8580, 8580]`, median `8580`, an improvement of `2.63%` over the baseline and
+  `30.79%` over the earlier AUTO/FULL median `6560`.
+- Final abort rates were `[0.739%, 0.735%, 0.737%]`; all three crash/restart recovery consistency checks passed.
+- Final validation: `make test` passed `355/355`; the formerly timing-sensitive queue-capacity test passed `50/50`
+  deterministic repetitions. Client protocol, network path, SQL/error output, and `output.txt` format were unchanged.

@@ -20,7 +20,8 @@ namespace {
 std::mutex service_mutex;
 std::unique_ptr<JitRuntime> service_runtime;
 std::unique_ptr<JitManager> service_manager;
-std::atomic<uint64_t> shadow_counter{0};
+std::atomic<JitManager*> service_manager_fast{nullptr};
+thread_local uint32_t shadow_counter = 0;
 
 bool valid_frame(const JitProgram& program, const JitCallFrame& frame) {
     if (frame.tuple0 == nullptr || frame.tuple0_len < program.tuple0.tuple_len ||
@@ -59,11 +60,7 @@ std::optional<bool> PredicateKernel::evaluate(const char* tuple0, uint32_t tuple
     if (!program_.has_value() || mode == JitMode::OFF) {
         return std::nullopt;
     }
-    JitManager* manager = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(service_mutex);
-        manager = service_manager.get();
-    }
+    JitManager* manager = service_manager_fast.load(std::memory_order_acquire);
     if (manager == nullptr) {
         return std::nullopt;
     }
@@ -73,14 +70,23 @@ std::optional<bool> PredicateKernel::evaluate(const char* tuple0, uint32_t tuple
     if (!valid_frame(*program_, frame)) {
         return std::nullopt;
     }
-    auto code = manager->observe(*program_, mode, {1, 1});
-    if (code == nullptr || code->invoke_predicate(&frame) != JitStatus::OK) {
+    if (code_ == nullptr) {
+        ++pending_evaluations_;
+        if (!observed_once_ || pending_evaluations_ >= rmdb_config::kJitObserveBatchSize) {
+            code_ = manager->observe(*program_, mode, {1, pending_evaluations_});
+            pending_evaluations_ = 0;
+            observed_once_ = true;
+        }
+    }
+    if (code_ == nullptr || code_->invoke_predicate(&frame) != JitStatus::OK) {
         return std::nullopt;
     }
-    if ((shadow_counter.fetch_add(1, std::memory_order_relaxed) & 1023U) == 0) {
+    if (++shadow_counter == rmdb_config::kJitShadowSampleRate) {
+        shadow_counter = 0;
         JitCallFrame interpreted = frame;
         if (interpret_predicate(*program_, &interpreted) != JitStatus::OK || interpreted.match != frame.match) {
             manager->discard(*program_);
+            code_.reset();
             return std::nullopt;
         }
     }
@@ -96,6 +102,7 @@ void initialize_predicate_jit(std::function<uint64_t()> catalog_generation) {
         std::make_unique<JitManager>(config, std::move(catalog_generation), [](const JitProgram& program) {
             return service_runtime->compile_predicate(program);
         });
+    service_manager_fast.store(service_manager.get(), std::memory_order_release);
 }
 
 bool predicate_jit_available() {
@@ -118,6 +125,7 @@ void shutdown_predicate_jit() {
     std::unique_ptr<JitRuntime> runtime;
     {
         std::lock_guard<std::mutex> lock(service_mutex);
+        service_manager_fast.store(nullptr, std::memory_order_release);
         manager = std::move(service_manager);
         runtime = std::move(service_runtime);
     }

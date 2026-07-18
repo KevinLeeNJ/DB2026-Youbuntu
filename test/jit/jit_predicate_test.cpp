@@ -103,6 +103,20 @@ TEST(JitPredicateTest, ForceModeExecutesCachedPredicateWithExecutionLocalFrame) 
         const auto match = kernel.evaluate(reinterpret_cast<const char*>(&value), sizeof(value));
         ASSERT_TRUE(match.has_value());
         EXPECT_TRUE(*match);
+        const auto hits_before = jit::predicate_jit_stats().cache_hits;
+        for (int iteration = 0; iteration < 100; ++iteration) {
+            const auto repeated = kernel.evaluate(reinterpret_cast<const char*>(&value), sizeof(value));
+            ASSERT_TRUE(repeated.has_value());
+            EXPECT_TRUE(*repeated);
+        }
+        EXPECT_EQ(jit::predicate_jit_stats().cache_hits, hits_before);
+
+        jit::PredicateKernel second_kernel(T_SeqScan, {condition}, {sizeof(int), {column}}, std::nullopt,
+                                           generation.load());
+        const auto cached_match = second_kernel.evaluate(reinterpret_cast<const char*>(&value), sizeof(value));
+        ASSERT_TRUE(cached_match.has_value());
+        EXPECT_TRUE(*cached_match);
+        EXPECT_EQ(jit::predicate_jit_stats().cache_hits, hits_before + 1);
 
         auto child = std::make_unique<TupleSourceExecutor>(std::vector<ColMeta>{column},
                                                            std::vector<RmRecord>{int_record(4), int_record(9)});

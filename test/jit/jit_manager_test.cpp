@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -89,25 +91,52 @@ TEST(JitManagerTest, ConcurrentAutoObservationsCompileOneShapeOnce) {
 TEST(JitManagerTest, FailureCooldownAndQueueCapacityFallbackWithoutBlocking) {
     std::atomic<uint64_t> generation{8};
     std::atomic<int> compile_count{0};
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool first_compile_started = false;
+    bool release_first_compile = false;
     auto config = eager_config();
     config.max_queue_size = 1;
     config.failure_cooldown = std::chrono::seconds(60);
     jit::JitManager manager(
         config, [&] { return generation.load(); },
         [&](const jit::JitProgram&) {
-            ++compile_count;
+            const int attempt = ++compile_count;
+            if (attempt == 1) {
+                std::unique_lock<std::mutex> lock(gate_mutex);
+                first_compile_started = true;
+                gate_cv.notify_all();
+                gate_cv.wait(lock, [&] { return release_first_compile; });
+            }
             return jit::JitCompileResult{jit::JitStatus::COMPILE_ERROR, {}, "test failure"};
         });
     const auto first = make_program(OP_EQ, generation.load());
     const auto second = make_program(OP_NE, generation.load());
+    const auto third = make_program(OP_LT, generation.load());
     EXPECT_EQ(manager.observe(first, jit::JitMode::AUTO, {1, 1}), nullptr);
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        started = gate_cv.wait_for(lock, std::chrono::seconds(2), [&] { return first_compile_started; });
+        if (!started) {
+            release_first_compile = true;
+        }
+    }
+    gate_cv.notify_all();
+    ASSERT_TRUE(started);
     EXPECT_EQ(manager.observe(second, jit::JitMode::AUTO, {1, 1}), nullptr);
-    EXPECT_LE(manager.stats().queued_count, 1U);
+    EXPECT_EQ(manager.observe(third, jit::JitMode::AUTO, {1, 1}), nullptr);
+    EXPECT_EQ(manager.stats().queued_count, 1U);
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release_first_compile = true;
+    }
+    gate_cv.notify_all();
     ASSERT_TRUE(manager.wait_until_idle(std::chrono::seconds(2)));
-    EXPECT_EQ(compile_count.load(), 1);
+    EXPECT_EQ(compile_count.load(), 2);
     EXPECT_EQ(manager.observe(first, jit::JitMode::FORCE, {1, 1}), nullptr);
-    EXPECT_EQ(compile_count.load(), 1);
-    EXPECT_GE(manager.stats().fallbacks, 3U);
+    EXPECT_EQ(compile_count.load(), 2);
+    EXPECT_GE(manager.stats().fallbacks, 4U);
 }
 
 TEST(JitManagerTest, InvalidatesEpochAndReleasesEvictedCodeOutsideTheCache) {
