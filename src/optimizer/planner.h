@@ -41,6 +41,7 @@ private:
 
     bool enable_nestedloop_join = true;
     bool enable_sortmerge_join = false;
+    std::atomic<std::uint64_t> planner_knob_generation_{0};
 
     struct PhysicalPlanTemplate {
         struct ScanDecision {
@@ -110,11 +111,19 @@ public:
     std::unique_ptr<Plan> do_planner(std::unique_ptr<Query> query, Context* context);
 
     void set_enable_nestedloop_join(bool set_val) {
+        if (enable_nestedloop_join != set_val)
+            planner_knob_generation_.fetch_add(1, std::memory_order_release);
         enable_nestedloop_join = set_val;
     }
 
     void set_enable_sortmerge_join(bool set_val) {
+        if (enable_sortmerge_join != set_val)
+            planner_knob_generation_.fetch_add(1, std::memory_order_release);
         enable_sortmerge_join = set_val;
+    }
+
+    std::uint64_t planner_knob_generation() const noexcept {
+        return planner_knob_generation_.load(std::memory_order_acquire);
     }
 
 private:

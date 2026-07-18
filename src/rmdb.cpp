@@ -142,6 +142,9 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 auto statement_template_cache = std::make_unique<cache::StatementTemplateCache>();
+auto statement_template_generation = []() {
+    return sm_manager->get_catalog_generation() ^ (planner->planner_knob_generation() * 0x9e3779b97f4a7c15ULL);
+};
 #ifdef RMDB_ENABLE_JIT
 #endif
 
@@ -234,6 +237,7 @@ void client_handler(int fd) {
         const auto statement_cache_mode = cache::configured_statement_cache_mode();
         std::unique_ptr<ast::TreeNode> cached_parse_tree;
         std::unique_ptr<Query> cached_query;
+        std::unique_ptr<Plan> cached_plan;
         if (statement_cache_mode != cache::StatementCacheMode::OFF) {
             phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
                                                        phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
@@ -241,16 +245,20 @@ void client_handler(int fd) {
             if (lexical_shape &&
                 static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
                 cached_query =
-                    statement_template_cache->lookup_query(lexical_shape.key, sm_manager->get_catalog_generation());
+                    statement_template_cache->lookup_query(lexical_shape.key, statement_template_generation());
                 if (cached_query != nullptr && cached_query->parse != nullptr) {
                     cached_parse_tree = ast::clone_tree(*cached_query->parse);
+                }
+                if (cached_query != nullptr && statement_cache_mode == cache::StatementCacheMode::FULL) {
+                    cached_plan = statement_template_cache->lookup_plan(
+                        lexical_shape.key, statement_template_generation(), sm_manager.get());
                 }
             } else if (lexical_shape &&
                        static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::PARSER)) {
                 cached_parse_tree =
-                    statement_template_cache->lookup_ast(lexical_shape.key, sm_manager->get_catalog_generation());
+                    statement_template_cache->lookup_ast(lexical_shape.key, statement_template_generation());
             } else if (lexical_shape &&
-                       statement_template_cache->lookup(lexical_shape.key, sm_manager->get_catalog_generation())) {
+                       statement_template_cache->lookup(lexical_shape.key, statement_template_generation())) {
                 LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
                           lexical_shape.key.low);
             }
@@ -301,7 +309,7 @@ void client_handler(int fd) {
                 if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF) {
                     auto clone = ast::clone_tree(*parse_tree);
                     parsed_skeleton = std::shared_ptr<const ast::TreeNode>(std::move(clone));
-                    statement_template_cache->publish(lexical_shape.key, sm_manager->get_catalog_generation(),
+                    statement_template_cache->publish(lexical_shape.key, statement_template_generation(),
                                                       parsed_skeleton);
                 }
                 auto parsed_type = parse_tree->type;
@@ -324,16 +332,27 @@ void client_handler(int fd) {
                 if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF && query != nullptr) {
                     auto query_copy = clone_query(*query);
                     std::shared_ptr<const Query> semantic_skeleton(std::move(query_copy));
-                    statement_template_cache->publish(lexical_shape.key, sm_manager->get_catalog_generation(), nullptr,
+                    statement_template_cache->publish(lexical_shape.key, statement_template_generation(), nullptr,
                                                       std::move(semantic_skeleton));
                 }
                 LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
                 // 优化器
                 std::unique_ptr<Plan> plan;
                 {
-                    phase_metrics::ScopedSample metrics_sample(
-                        phase_metrics::Phase::PLANNER, phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
-                    plan = optimizer->plan_query(std::move(query), context);
+                    if (cached_plan != nullptr) {
+                        plan = std::move(cached_plan);
+                    } else {
+                        phase_metrics::ScopedSample metrics_sample(
+                            phase_metrics::Phase::PLANNER, phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
+                        plan = optimizer->plan_query(std::move(query), context);
+                    }
+                }
+                if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF && plan != nullptr &&
+                    cached_plan == nullptr) {
+                    auto plan_copy = clone_plan(*plan, sm_manager.get());
+                    std::shared_ptr<const Plan> physical_skeleton(std::move(plan_copy));
+                    statement_template_cache->publish(lexical_shape.key, statement_template_generation(), nullptr,
+                                                      nullptr, std::move(physical_skeleton));
                 }
                 // portal
                 std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);

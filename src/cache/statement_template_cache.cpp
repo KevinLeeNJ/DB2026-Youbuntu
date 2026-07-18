@@ -77,9 +77,24 @@ std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenS
     return clone_query(*found->second.query);
 }
 
+std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                                          SmManager* sm_manager) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.lookups;
+    auto found = entries_.find(map_key(key));
+    if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key ||
+        found->second.plan == nullptr) {
+        ++stats_.misses;
+        return nullptr;
+    }
+    found->second.last_use = ++clock_;
+    ++stats_.hits;
+    return clone_plan(*found->second.plan, sm_manager);
+}
+
 void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                                     std::shared_ptr<const ast::TreeNode> skeleton,
-                                     std::shared_ptr<const Query> query) {
+                                     std::shared_ptr<const ast::TreeNode> skeleton, std::shared_ptr<const Query> query,
+                                     std::shared_ptr<const Plan> plan) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto previous = entries_.find(map_key(key));
     if (previous != entries_.end() && skeleton == nullptr) {
@@ -88,7 +103,10 @@ void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t 
     if (previous != entries_.end() && query == nullptr) {
         query = previous->second.query;
     }
-    Entry entry{key, catalog_generation, ++clock_, std::move(skeleton), std::move(query)};
+    if (previous != entries_.end() && plan == nullptr) {
+        plan = previous->second.plan;
+    }
+    Entry entry{key, catalog_generation, ++clock_, std::move(skeleton), std::move(query), std::move(plan)};
     entries_[map_key(key)] = std::move(entry);
     ++stats_.publishes;
     if (entries_.size() <= capacity_) {

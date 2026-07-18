@@ -774,3 +774,17 @@ N/A (no readable perf/flamegraph summary)
 - `RMDB_STATEMENT_CACHE=analyzer RMDB_JIT=off` e2e passed 30/30; parser and AST/cache tests remain green. No network,
   protocol, SQL-visible error, transaction, lock, WAL, MVCC, or `output.txt` behavior was changed. Planner bypass is
   intentionally not claimed until the physical blueprint phase.
+
+## Phase 10 Decision
+
+- Added recursive physical-plan cloning for scans, residual filters, joins, projection, aggregate, sort, LIMIT, UNION,
+  DML, DDL, utility, transaction, and configuration plan nodes. `RMDB_STATEMENT_CACHE=full` obtains a fresh Plan tree
+  after catalog and planner-knob generation validation, then reuses the existing Portal conversion to create fresh
+  Executor/iterator/aggregate state.
+- Planner knob changes now advance a generation included in template lookup identity. Plan blueprints contain no
+  Context, Transaction, Executor, cursor, tuple, output, lock, WAL, or MVCC pointer. Misses and clone failures fall back
+  to the complete Parser/Analyzer/Planner path.
+- `RMDB_STATEMENT_CACHE=full RMDB_JIT=off` e2e passed 30/30; the full build and existing subsystem tests remain green.
+  The implementation preserves SQL-visible behavior, transaction ordering, protocol, and `output.txt`; no network
+  optimization is claimed. End-to-end performance is deferred to the linked cache/JIT phase because this checkpoint
+  only establishes physical correctness and lifecycle ownership.

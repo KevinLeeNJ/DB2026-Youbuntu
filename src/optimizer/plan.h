@@ -317,3 +317,5 @@ public:
     std::vector<SetClause> set_clauses;
     plannerInfo(const ast::SelectStmt* parse_) : parse(parse_) {}
 };
+
+std::unique_ptr<Plan> clone_plan(const Plan& plan, SmManager* sm_manager);
