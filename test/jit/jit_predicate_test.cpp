@@ -11,7 +11,6 @@ See the Mulan PSL v2 for more details. */
 #include <gtest/gtest.h>
 
 #include <atomic>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -87,7 +86,8 @@ RmRecord int_record(int value) {
 
 TEST(JitPredicateTest, ForceModeExecutesCachedPredicateWithExecutionLocalFrame) {
     std::atomic<uint64_t> generation{0};
-    setenv("RMDB_JIT", "force", 1);
+    const auto saved_mode = rmdb_config::jit_mode;
+    rmdb_config::jit_mode = rmdb_config::JitMode::FORCE;
     jit::initialize_predicate_jit([&] { return generation.load(); });
     {
         auto scope = jit::enter_predicate_jit_execution();
@@ -116,5 +116,5 @@ TEST(JitPredicateTest, ForceModeExecutesCachedPredicateWithExecutionLocalFrame) 
         EXPECT_GE(jit::predicate_jit_stats().cache_hits, 1U);
     }
     jit::shutdown_predicate_jit();
-    unsetenv("RMDB_JIT");
+    rmdb_config::jit_mode = saved_mode;
 }

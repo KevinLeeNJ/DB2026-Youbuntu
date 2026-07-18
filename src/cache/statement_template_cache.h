@@ -20,13 +20,12 @@ See the Mulan PSL v2 for more details. */
 #include "parser/token_stream.h"
 #include "parser/ast.h"
 #include "analyze/analyze.h"
+#include "common/config.h"
 #include "optimizer/plan.h"
 
 namespace cache {
 
-enum class StatementCacheMode : uint8_t { OFF, SHADOW, PARSER, ANALYZER, FULL };
-
-StatementCacheMode configured_statement_cache_mode();
+using StatementCacheMode = rmdb_config::StatementCacheMode;
 
 struct StatementTemplateStats {
     uint64_t lookups{0};
@@ -38,7 +37,8 @@ struct StatementTemplateStats {
 
 class StatementTemplateCache {
 public:
-    explicit StatementTemplateCache(size_t capacity = 256) : capacity_(capacity) {}
+    explicit StatementTemplateCache(size_t capacity = rmdb_config::kStatementTemplateCacheCapacity)
+        : capacity_(capacity) {}
 
     bool lookup(const parser::TokenShapeKey& key, uint64_t catalog_generation);
     std::unique_ptr<ast::TreeNode> lookup_ast(const parser::TokenShapeKey& key, uint64_t catalog_generation,

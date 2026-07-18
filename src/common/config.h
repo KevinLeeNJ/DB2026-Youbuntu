@@ -15,8 +15,33 @@ See the Mulan PSL v2 for more details. */
 #include <chrono>
 #include <string>
 #include <cstdint>
+#include <cstddef>
 
 #define BUFFER_LENGTH 8192
+
+namespace rmdb_config {
+
+enum class JitMode : uint8_t { OFF, AUTO, FORCE };
+enum class StatementCacheMode : uint8_t { OFF, SHADOW, PARSER, ANALYZER, FULL };
+
+// Process-wide execution modes. Change these values here before building.
+inline JitMode jit_mode = JitMode::AUTO;
+inline StatementCacheMode statement_cache_mode = StatementCacheMode::SHADOW;
+
+// Optional diagnostics path remains runtime-configurable because it is an output location.
+inline constexpr const char* kPhaseMetricsPathEnv = "RMDB_PHASE_METRICS_PATH";
+
+// Process-local template and generated-code cache limits.
+inline constexpr size_t kStatementTemplateCacheCapacity = 256;
+inline constexpr size_t kJitMaxEntries = 256;
+inline constexpr size_t kJitMaxCodeBytes = 16U * 1024U * 1024U;
+inline constexpr size_t kJitMaxQueueSize = 64;
+inline constexpr uint64_t kJitMinExecutions = 32;
+inline constexpr uint64_t kJitMinTupleEvaluations = 256;
+inline constexpr uint64_t kJitMinInterpretedNs = 100000;
+inline constexpr int64_t kJitFailureCooldownSeconds = 60;
+
+} // namespace rmdb_config
 
 /** Cycle detection is performed every CYCLE_DETECTION_INTERVAL milliseconds. */
 extern std::chrono::milliseconds cycle_detection_interval;

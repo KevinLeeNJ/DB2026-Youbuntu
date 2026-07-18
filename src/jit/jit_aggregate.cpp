@@ -11,9 +11,9 @@ See the Mulan PSL v2 for more details. */
 #include "jit/jit_aggregate.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
-#include <string_view>
+
+#include "common/config.h"
 
 namespace jit {
 namespace {
@@ -91,10 +91,9 @@ JitStatus AggregateKernel::update(const char* tuple, uint32_t tuple_len) {
 }
 
 bool aggregate_jit_enabled() {
-    const char* mode = std::getenv("RMDB_JIT");
     // The generic descriptor loop is retained for force-mode correctness tests only;
     // its measured dispatch overhead is higher than the existing scalar transition.
-    return mode != nullptr && std::string_view(mode) == "force";
+    return rmdb_config::jit_mode == rmdb_config::JitMode::FORCE;
 }
 
 } // namespace jit

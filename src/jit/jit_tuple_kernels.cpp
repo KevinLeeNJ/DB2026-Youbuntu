@@ -11,10 +11,9 @@ See the Mulan PSL v2 for more details. */
 #include "jit/jit_tuple_kernels.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
-#include <string_view>
 
+#include "common/config.h"
 #include "execution/execution_common.h"
 
 namespace jit {
@@ -40,8 +39,7 @@ bool can_cast(ColType target, ColType source) {
 } // namespace
 
 bool tuple_jit_enabled() {
-    const char* mode = std::getenv("RMDB_JIT");
-    return mode == nullptr || std::string_view(mode) != "off";
+    return rmdb_config::jit_mode != rmdb_config::JitMode::OFF;
 }
 
 ProjectionKernel::ProjectionKernel(const std::vector<ColMeta>& output_columns,

@@ -254,7 +254,7 @@ void client_handler(int fd) {
         offset = 0;
 
         parser::OwnedTokenStream lexical_shape;
-        const auto statement_cache_mode = cache::configured_statement_cache_mode();
+        const auto statement_cache_mode = rmdb_config::statement_cache_mode;
         std::unique_ptr<ast::TreeNode> cached_parse_tree;
         std::unique_ptr<Query> cached_query;
         std::unique_ptr<Plan> cached_plan;
@@ -597,7 +597,7 @@ int main(int argc, char** argv) {
             std::atomic<bool> checkpoint_thread_stop{false};
             std::atomic<bool> metrics_thread_stop{false};
             std::thread metrics_thread;
-            const char* metrics_path = std::getenv("RMDB_PHASE_METRICS_PATH");
+            const char* metrics_path = std::getenv(rmdb_config::kPhaseMetricsPathEnv);
             if (metrics_path != nullptr) {
                 const std::string path(metrics_path);
                 auto* template_cache = statement_template_cache.get();

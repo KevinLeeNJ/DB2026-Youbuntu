@@ -11,8 +11,6 @@ See the Mulan PSL v2 for more details. */
 #include "cache/statement_template_cache.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <string_view>
 
 namespace cache {
 namespace {
@@ -327,24 +325,6 @@ bool bind_plan_node(Plan& plan, LiteralBinder& binder) {
 }
 
 } // namespace
-
-StatementCacheMode configured_statement_cache_mode() {
-    const char* value = std::getenv("RMDB_STATEMENT_CACHE");
-    if (value == nullptr || std::string_view(value) == "off") {
-        return value == nullptr ? StatementCacheMode::SHADOW : StatementCacheMode::OFF;
-    }
-    const std::string_view mode(value);
-    if (mode == "parser") {
-        return StatementCacheMode::PARSER;
-    }
-    if (mode == "analyzer") {
-        return StatementCacheMode::ANALYZER;
-    }
-    if (mode == "full") {
-        return StatementCacheMode::FULL;
-    }
-    return StatementCacheMode::SHADOW;
-}
 
 bool StatementTemplateCache::lookup(const parser::TokenShapeKey& key, uint64_t catalog_generation) {
     std::lock_guard<std::mutex> lock(mutex_);

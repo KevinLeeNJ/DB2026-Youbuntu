@@ -18,22 +18,23 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+#include "common/config.h"
 #include "jit/jit_ir.h"
 
 namespace jit {
 
-enum class JitMode { OFF, AUTO, FORCE };
+using JitMode = rmdb_config::JitMode;
 
 enum class JitEntryState { COLD, OBSERVING, QUEUED, COMPILING, READY, FAILED_COOLDOWN, EVICTED };
 
 struct JitManagerConfig {
-    size_t max_entries{256};
-    size_t max_code_bytes{16U * 1024U * 1024U};
-    size_t max_queue_size{64};
-    uint64_t min_executions{32};
-    uint64_t min_tuple_evaluations{256};
-    uint64_t min_interpreted_ns{100000};
-    std::chrono::seconds failure_cooldown{60};
+    size_t max_entries{rmdb_config::kJitMaxEntries};
+    size_t max_code_bytes{rmdb_config::kJitMaxCodeBytes};
+    size_t max_queue_size{rmdb_config::kJitMaxQueueSize};
+    uint64_t min_executions{rmdb_config::kJitMinExecutions};
+    uint64_t min_tuple_evaluations{rmdb_config::kJitMinTupleEvaluations};
+    uint64_t min_interpreted_ns{rmdb_config::kJitMinInterpretedNs};
+    std::chrono::seconds failure_cooldown{rmdb_config::kJitFailureCooldownSeconds};
 };
 
 struct JitObservation {

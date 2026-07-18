@@ -11,10 +11,8 @@ See the Mulan PSL v2 for more details. */
 #include "jit/jit_predicate.h"
 
 #include <atomic>
-#include <cstdlib>
 #include <memory>
 #include <mutex>
-#include <string_view>
 
 namespace jit {
 namespace {
@@ -23,20 +21,6 @@ std::mutex service_mutex;
 std::unique_ptr<JitRuntime> service_runtime;
 std::unique_ptr<JitManager> service_manager;
 std::atomic<uint64_t> shadow_counter{0};
-
-JitMode configured_mode() {
-    const char* value = std::getenv("RMDB_JIT");
-    if (value == nullptr || std::string_view(value) == "off") {
-        return JitMode::OFF;
-    }
-    if (std::string_view(value) == "auto") {
-        return JitMode::AUTO;
-    }
-    if (std::string_view(value) == "force") {
-        return JitMode::FORCE;
-    }
-    return JitMode::OFF;
-}
 
 bool valid_frame(const JitProgram& program, const JitCallFrame& frame) {
     if (frame.tuple0 == nullptr || frame.tuple0_len < program.tuple0.tuple_len ||
@@ -71,7 +55,8 @@ PredicateKernel::PredicateKernel(PlanTag plan_tag, const std::vector<Condition>&
 
 std::optional<bool> PredicateKernel::evaluate(const char* tuple0, uint32_t tuple0_len, const char* tuple1,
                                               uint32_t tuple1_len) const {
-    if (!program_.has_value() || configured_mode() == JitMode::OFF) {
+    const auto mode = rmdb_config::jit_mode;
+    if (!program_.has_value() || mode == JitMode::OFF) {
         return std::nullopt;
     }
     JitManager* manager = nullptr;
@@ -88,7 +73,7 @@ std::optional<bool> PredicateKernel::evaluate(const char* tuple0, uint32_t tuple
     if (!valid_frame(*program_, frame)) {
         return std::nullopt;
     }
-    auto code = manager->observe(*program_, configured_mode(), {1, 1});
+    auto code = manager->observe(*program_, mode, {1, 1});
     if (code == nullptr || code->invoke_predicate(&frame) != JitStatus::OK) {
         return std::nullopt;
     }

@@ -17,6 +17,8 @@ See the Mulan PSL v2 for more details. */
 #include <cstdint>
 #include <cstdlib>
 
+#include "common/config.h"
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <x86intrin.h>
 #endif
@@ -83,7 +85,7 @@ public:
     }
 
 private:
-    Registry() : enabled_(std::getenv("RMDB_PHASE_METRICS_PATH") != nullptr) {}
+    Registry() : enabled_(std::getenv(rmdb_config::kPhaseMetricsPathEnv) != nullptr) {}
 
     bool enabled_;
     std::array<std::atomic<uint64_t>, static_cast<size_t>(Phase::COUNT)> samples_{};
