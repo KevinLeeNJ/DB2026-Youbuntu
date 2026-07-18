@@ -322,6 +322,7 @@ void PointProgramJitManager::PublishCompileResult(const std::shared_ptr<Entry>& 
                                                   uint64_t compile_ns) {
     const bool identity_current = IdentityCurrent(entry->program_template->identity());
     std::vector<std::shared_ptr<const JitCode>> released_code;
+    std::shared_ptr<const JitCode> registered_code;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ++impl_->compile_attempts;
@@ -337,7 +338,7 @@ void PointProgramJitManager::PublishCompileResult(const std::shared_ptr<Entry>& 
             entry->code = std::move(code);
             entry->state = EntryState::READY;
             impl_->code_bytes += entry->code_bytes;
-            RegisterPerfMapSymbol(*entry->code, entry->key);
+            registered_code = entry->code;
             EvictLocked(entry, &released_code);
         } else if (current && still_cached) {
             if (result.code) {
@@ -357,6 +358,9 @@ void PointProgramJitManager::PublishCompileResult(const std::shared_ptr<Entry>& 
             }
         }
         impl_->idle_cv.notify_all();
+    }
+    if (registered_code != nullptr) {
+        RegisterPerfMapSymbol(*registered_code, entry->key);
     }
     released_code.clear();
 }
