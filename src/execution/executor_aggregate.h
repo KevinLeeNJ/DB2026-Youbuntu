@@ -25,6 +25,9 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_scalar.h"
 #include "executor_abstract.h"
+#ifdef RMDB_ENABLE_JIT
+#include "jit/jit_aggregate.h"
+#endif
 
 class AggregateExecutor : public AbstractExecutor {
 private:
@@ -114,6 +117,9 @@ private:
     bool materialized_ = false;
     bool has_group_by_ = false;
     mutable std::unique_ptr<RmRecord> current_output_;
+#ifdef RMDB_ENABLE_JIT
+    std::unique_ptr<jit::AggregateKernel> jit_aggregate_;
+#endif
 
     static std::string trim_string(const char* data, int len) {
         return execution_scalar::trim_string(data, len);
@@ -576,6 +582,50 @@ private:
             return;
         }
 
+#ifdef RMDB_ENABLE_JIT
+        if (jit_aggregate_ != nullptr && jit_aggregate_->valid()) {
+            for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
+                TupleView tuple = prev_->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!tuple) {
+                    fallback = prev_->Next();
+                    if (fallback != nullptr) {
+                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (tuple) {
+                    const auto status = jit_aggregate_->update(tuple.data, tuple.size);
+                    if (status != jit::JitStatus::OK) {
+                        jit_aggregate_.reset();
+                        break;
+                    }
+                }
+            }
+            if (jit_aggregate_ != nullptr) {
+                const auto& slots = jit_aggregate_->slots();
+                for (size_t i = 0; i < aggregates_.size(); ++i) {
+                    auto& state = global_state.aggregate_states[i];
+                    const auto& slot = slots[i];
+                    state.count = slot.count;
+                    state.sum = slot.sum;
+                    state.has_value = slot.has_value;
+                    if (aggregates_[i].input_type == TYPE_INT) {
+                        state.value.type = TYPE_INT;
+                        state.value.int_val = static_cast<int>(slot.value);
+                    } else {
+                        state.value.type = TYPE_FLOAT;
+                        state.value.float_val = slot.value;
+                    }
+                }
+                if (passes_having(global_state)) {
+                    groups_.push_back(std::move(global_state));
+                }
+                return;
+            }
+            global_state = make_group_state({});
+        }
+#endif
+
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             TupleView tuple = prev_->current();
             std::unique_ptr<RmRecord> fallback;
@@ -663,6 +713,36 @@ public:
         init_group_cols(group_by_cols);
         init_aggregate_cols(aggregate_exprs);
         init_having_conds(having_conds);
+#ifdef RMDB_ENABLE_JIT
+        if (!has_group_by_ && having_conds_.empty() && !can_count_star_by_cursor_only() &&
+            !can_use_min_index_shortcut() && jit::aggregate_jit_enabled()) {
+            std::vector<jit::AggregateDescriptor> descriptors;
+            descriptors.reserve(aggregates_.size());
+            for (const auto& aggregate : aggregates_) {
+                jit::AggregateOp op = jit::AggregateOp::COUNT;
+                switch (aggregate.type) {
+                case LocalAggType::COUNT:
+                    op = jit::AggregateOp::COUNT;
+                    break;
+                case LocalAggType::SUM:
+                    op = jit::AggregateOp::SUM;
+                    break;
+                case LocalAggType::MIN:
+                    op = jit::AggregateOp::MIN;
+                    break;
+                case LocalAggType::MAX:
+                    op = jit::AggregateOp::MAX;
+                    break;
+                case LocalAggType::AVG:
+                    op = jit::AggregateOp::AVG;
+                    break;
+                }
+                descriptors.push_back({op, aggregate.input_type, static_cast<uint32_t>(aggregate.input_col.offset),
+                                       static_cast<uint32_t>(aggregate.input_col.len), aggregate.is_star});
+            }
+            jit_aggregate_ = std::make_unique<jit::AggregateKernel>(std::move(descriptors));
+        }
+#endif
     }
 
     void beginTuple() override {

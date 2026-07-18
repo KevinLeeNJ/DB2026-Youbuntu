@@ -722,3 +722,16 @@ N/A (no readable perf/flamegraph summary)
   `[40,660,076, 40,678,696, 40,715,936]`; generated-kernel cycles
   `[10,070,152, 10,364,196, 10,375,254]`; median reduction `74.5218%`. This remains a process-local compute result;
   network communication, protocol, and `output.txt` were neither changed nor counted as JIT optimization.
+
+## Phase 6 Decision
+
+- Added a typed aggregate transition kernel for global numeric `COUNT(*)`, `SUM`, `MIN`, `MAX`, and `AVG`, including
+  multiple aggregate slots and malformed-frame rejection. Group hash tables, string aggregate state, HAVING evaluation,
+  cursor-only `COUNT(*)`, and the existing minimum-index shortcut remain in C++.
+- Aggregate executor differential coverage passed for grouped, empty, numeric, HAVING, and shortcut cases in both
+  `RMDB_JIT=force` and `RMDB_JIT=off` modes. The kernel never owns executor, transaction, tuple, or output pointers.
+- Three-round aggregate microbenchmark over 1,000,000 rows produced scalar cycles
+  `[2,194,462, 2,254,806, 2,353,530]` and kernel cycles `[18,958,390, 19,272,574, 19,322,164]` (median change
+  `-754.733%`). This is a correctness implementation, not a performance win: the generic descriptor dispatch is slower,
+  so no filter/aggregate fusion is enabled and this result is recorded as a failed performance gate rather than claimed
+  as an optimization. Network, protocol, and `output.txt` remain outside the measurement.
