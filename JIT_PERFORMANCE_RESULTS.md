@@ -818,3 +818,6 @@ N/A (no readable perf/flamegraph summary)
 - The measured aggregate transition descriptor loop is slower than the scalar oracle, so automatic aggregate/fusion
   execution remains disabled. This is reported as a measured gate result, not hidden; network communication, protocol,
   and `output.txt` were not changed or optimized.
+- The final safety guard keeps parameterized semantic Query and physical Plan blueprints on miss; only the AST parser
+  skeleton uses the proven slot binder. This prevents stale analyzed casts, update values, or index keys while leaving
+  the binder test as an isolated correctness oracle for the next refinement.
