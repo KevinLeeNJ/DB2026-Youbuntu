@@ -23,6 +23,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/config.h"
 #include "common/context.h"
 #include "compiled/program_verifier.h"
+#include "compiled/program_cache.h"
+#include "execution/runtime/program_dispatcher.h"
 #include "errors.h"
 #include "execution/execution_manager.h"
 #include "gtest/gtest.h"
@@ -76,7 +78,8 @@ public:
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
+        point_program_template_cache_ = std::make_unique<compiled::ProgramTemplateCache>();
+        portal_ = std::make_unique<Portal>(sm_manager_.get(), point_program_template_cache_.get());
         analyze_ = std::make_unique<Analyze>(sm_manager_.get());
 
         // Create and open the database
@@ -118,12 +121,52 @@ public:
         int offset = 0;
 
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
+        context.isolation_level_ = session_isolation_level_;
         // output_file toggle is now a database-global on SmManager; no per-session
         // mirror needed here.
+
+        bool statement_started = false;
+        last_top_level_program_hit_ = false;
+        parser::OwnedTokenStream lexical;
+        const char* cache_flag = std::getenv("ENABLE_POINT_PROGRAM_CACHE");
+        if (cache_flag != nullptr && std::string(cache_flag) == "1") {
+            lexical = parser::normalize_sql(sql, false);
+            if (lexical) {
+                context.has_statement_template_identity_ = true;
+                context.statement_shape_high_ = lexical.key.high;
+                context.statement_shape_low_ = lexical.key.low;
+                context.statement_shape_canonical_ = lexical.key.canonical_bytes;
+                context.planner_generation_ = planner_->planner_knob_generation();
+                context.statement_template_generation_ =
+                    sm_manager_->get_catalog_generation() ^
+                    (context.planner_generation_ * 0x9e3779b97f4a7c15ULL);
+                auto program_template = point_program_template_cache_->LookupAny(
+                    lexical.key, context.statement_template_generation_, context.planner_generation_,
+                    sm_manager_->get_catalog_generation());
+                if (program_template != nullptr) {
+                    try {
+                        set_transaction(&context);
+                        statement_started = true;
+                        const auto dispatched = DispatchCachedPointProgram(
+                            {point_program_template_cache_.get(), &lexical, context.statement_template_generation_,
+                             context.planner_generation_, sm_manager_.get(), &context, program_template});
+                        if (dispatched == ProgramDispatchStatus::HANDLED) {
+                            last_top_level_program_hit_ = true;
+                            finish_statement(&context);
+                            return std::string(data_send, offset);
+                        }
+                    } catch (...) {
+                        abort_failed_statement(&context);
+                        throw;
+                    }
+                }
+            }
+        }
 
         // Parse
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
+            ++parser_entries_;
             parse_tree = ast::parse_sql(sql);
         } catch (...) {
             abort_failed_statement(&context);
@@ -133,16 +176,20 @@ public:
             finish_statement(&context);
             return ""; // EXIT or EOF
         }
+        ast::assign_literal_slots(*parse_tree);
         bool is_checkpoint = parse_tree->type == ast::AstType::StaticCheckpoint;
         bool is_load = parse_tree->type == ast::AstType::LoadStmt;
-        if (!is_checkpoint && !is_load) {
+        if (!is_checkpoint && !is_load && !statement_started) {
             set_transaction(&context);
         }
 
         // Analyze → Optimize → Portal → Execute
         try {
+            ++analyzer_entries_;
             std::unique_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
+            ++planner_entries_;
             std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query), &context);
+            ++portal_entries_;
             std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
             last_compiled_mutation_ = portal_stmt->compiled_mutation != nullptr;
             last_compiled_mutation_program_ = portal_stmt->compiled_mutation == nullptr
@@ -155,6 +202,7 @@ public:
             last_compiled_mutation_error_ = verification.error;
             portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
             portal_->drop();
+            session_isolation_level_ = context.isolation_level_;
             finish_statement(&context);
         } catch (...) {
             abort_failed_statement(&context);
@@ -210,6 +258,18 @@ public:
         return last_compiled_mutation_program_;
     }
 
+    bool last_top_level_program_hit() const {
+        return last_top_level_program_hit_;
+    }
+
+    std::array<uint64_t, 4> frontend_entries() const {
+        return {parser_entries_, analyzer_entries_, planner_entries_, portal_entries_};
+    }
+
+    compiled::ProgramCacheStats point_program_template_cache_stats() const {
+        return point_program_template_cache_->Stats();
+    }
+
 private:
     void set_transaction(Context* context) {
         context->txn_ = txn_id_ == INVALID_TXN_ID ? nullptr : txn_manager_->get_transaction(txn_id_);
@@ -248,10 +308,16 @@ private:
     std::string original_cwd_;
     bool cleanup_on_destroy_{true};
     txn_id_t txn_id_{INVALID_TXN_ID};
+    IsolationLevel session_isolation_level_{DEFAULT_ISOLATION_LEVEL};
     bool last_compiled_mutation_{false};
     bool last_compiled_mutation_valid_{true};
     std::string last_compiled_mutation_error_;
     std::shared_ptr<const compiled::CompiledProgram> last_compiled_mutation_program_;
+    bool last_top_level_program_hit_{false};
+    uint64_t parser_entries_{0};
+    uint64_t analyzer_entries_{0};
+    uint64_t planner_entries_{0};
+    uint64_t portal_entries_{0};
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<RmManager> rm_manager_;
@@ -264,6 +330,7 @@ private:
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<RecoveryManager> recovery_;
+    std::unique_ptr<compiled::ProgramTemplateCache> point_program_template_cache_;
     std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };
@@ -566,18 +633,26 @@ TEST_F(SltFileTest, TransactionRepeatedUpdateMerge) {
 
 TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRanges) {
     const char* previous = std::getenv("ENABLE_POINT_MUTATION_INTERPRETER");
+    const char* previous_cache = std::getenv("ENABLE_POINT_PROGRAM_CACHE");
     const std::optional<std::string> saved = previous == nullptr ? std::nullopt : std::optional<std::string>(previous);
     struct RestoreEnv {
         std::optional<std::string> value;
+        std::optional<std::string> cache;
         ~RestoreEnv() {
             if (value.has_value()) {
                 setenv("ENABLE_POINT_MUTATION_INTERPRETER", value->c_str(), 1);
             } else {
                 unsetenv("ENABLE_POINT_MUTATION_INTERPRETER");
             }
+            if (cache.has_value()) {
+                setenv("ENABLE_POINT_PROGRAM_CACHE", cache->c_str(), 1);
+            } else {
+                unsetenv("ENABLE_POINT_PROGRAM_CACHE");
+            }
         }
-    } restore{saved};
+    } restore{saved, previous_cache == nullptr ? std::nullopt : std::optional<std::string>(previous_cache)};
     setenv("ENABLE_POINT_MUTATION_INTERPRETER", "0", 1);
+    setenv("ENABLE_POINT_PROGRAM_CACHE", "1", 1);
 
     ASSERT_NO_THROW(db_->exec_sql("create table compiled_mutation (id int, value int, note char(8));"));
     ASSERT_NO_THROW(db_->exec_sql("create index compiled_mutation(id);"));
@@ -588,14 +663,34 @@ TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRan
     ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(1, 10, 'one');"));
     EXPECT_TRUE(db_->last_compiled_mutation());
     EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+    const auto before_cached_insert = db_->frontend_entries();
     ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(2, 20, 'two');"));
-    EXPECT_TRUE(db_->last_compiled_mutation());
-    EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), before_cached_insert);
+    ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(3, 20, 'three');"));
+    const auto before_float_residual_hit = db_->frontend_entries();
+    ASSERT_NO_THROW(
+        db_->exec_sql("update compiled_mutation set note = 'float1' where id = 3 and value = 20.9;"));
+    ASSERT_NO_THROW(
+        db_->exec_sql("update compiled_mutation set note = 'float2' where id = 3 and value = 20.1;"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries()[0], before_float_residual_hit[0] + 1);
 
     ASSERT_NO_THROW(
         db_->exec_sql("update compiled_mutation set value = value * 2, note = 'twenty' where id = 1;"));
     EXPECT_TRUE(db_->last_compiled_mutation());
     EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+
+    ASSERT_NO_THROW(db_->exec_sql("create table cached_datetime (id int, created_at datetime);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index cached_datetime(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into cached_datetime values(1, '2026-07-01 00:00:00');"));
+    ASSERT_NO_THROW(db_->exec_sql("update cached_datetime set created_at = '2026-07-02 00:00:00' "
+                                  "where id = 1 and created_at = '2026-07-01 00:00:00';"));
+    const auto before_datetime_hit = db_->frontend_entries();
+    ASSERT_NO_THROW(db_->exec_sql("update cached_datetime set created_at = '2026-07-03 00:00:00' "
+                                  "where id = 1 and created_at = '2026-07-02 00:00:00';"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), before_datetime_hit);
     auto update_program = db_->last_compiled_mutation_program();
     ASSERT_NE(update_program, nullptr);
     size_t prepare_pc = update_program->instructions().size();
@@ -618,6 +713,10 @@ TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRan
     ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value += 3 where id = 1;"));
     EXPECT_TRUE(db_->last_compiled_mutation());
     EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
+    const auto before_cached_update = db_->frontend_entries();
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value += 4 where id = 1;"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), before_cached_update);
 
     ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value = 999 where id = 1 and value = 77;"));
     EXPECT_TRUE(db_->last_compiled_mutation());
@@ -639,8 +738,12 @@ TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRan
     ASSERT_NO_THROW(db_->exec_sql("delete from compiled_mutation where id = 99;"));
     EXPECT_TRUE(db_->last_compiled_mutation());
     EXPECT_TRUE(db_->last_compiled_mutation_valid());
+    const auto before_cached_delete = db_->frontend_entries();
+    ASSERT_NO_THROW(db_->exec_sql("delete from compiled_mutation where id = 98;"));
+    EXPECT_TRUE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries(), before_cached_delete);
 
-    ASSERT_NO_THROW(db_->exec_sql("delete from compiled_mutation where id = 1 and value = 23;"));
+    ASSERT_NO_THROW(db_->exec_sql("delete from compiled_mutation where id = 1 and value = 27;"));
     EXPECT_TRUE(db_->last_compiled_mutation());
     EXPECT_TRUE(db_->last_compiled_mutation_valid());
 
@@ -649,6 +752,112 @@ TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRan
     EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select value from compiled_mutation where id = 2;"); });
     EXPECT_NE(output.find("20"), std::string::npos) << output;
+}
+
+TEST_F(E2ETest, CachedMutationFallsBackOutsideReadCommitted) {
+    const char* previous_mutation = std::getenv("ENABLE_POINT_MUTATION_INTERPRETER");
+    const char* previous_cache = std::getenv("ENABLE_POINT_PROGRAM_CACHE");
+    struct RestoreFlags {
+        std::optional<std::string> mutation;
+        std::optional<std::string> cache;
+        ~RestoreFlags() {
+            mutation.has_value() ? setenv("ENABLE_POINT_MUTATION_INTERPRETER", mutation->c_str(), 1)
+                                 : unsetenv("ENABLE_POINT_MUTATION_INTERPRETER");
+            cache.has_value() ? setenv("ENABLE_POINT_PROGRAM_CACHE", cache->c_str(), 1)
+                              : unsetenv("ENABLE_POINT_PROGRAM_CACHE");
+        }
+    } restore{previous_mutation == nullptr ? std::nullopt : std::optional<std::string>(previous_mutation),
+              previous_cache == nullptr ? std::nullopt : std::optional<std::string>(previous_cache)};
+    setenv("ENABLE_POINT_MUTATION_INTERPRETER", "1", 1);
+    setenv("ENABLE_POINT_PROGRAM_CACHE", "1", 1);
+
+    ASSERT_NO_THROW(db_->exec_sql("create table cached_isolation (id int, value int);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index cached_isolation(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into cached_isolation values(1, 10);"));
+    ASSERT_NO_THROW(db_->exec_sql("update cached_isolation set value = 11 where id = 1;"));
+    ASSERT_NO_THROW(db_->exec_sql("update cached_isolation set value = 12 where id = 1;"));
+    ASSERT_TRUE(db_->last_top_level_program_hit());
+
+    ASSERT_NO_THROW(db_->exec_sql("set transaction isolation level snapshot isolation;"));
+    const auto before_fallback = db_->frontend_entries();
+    const auto stats_before_fallback = db_->point_program_template_cache_stats();
+    ASSERT_NO_THROW(db_->exec_sql("update cached_isolation set value = 13 where id = 1;"));
+    EXPECT_FALSE(db_->last_top_level_program_hit());
+    EXPECT_FALSE(db_->last_compiled_mutation());
+    const auto after_fallback = db_->frontend_entries();
+    for (size_t i = 0; i < before_fallback.size(); ++i) {
+        EXPECT_EQ(after_fallback[i], before_fallback[i] + 1);
+    }
+    EXPECT_EQ(db_->point_program_template_cache_stats().fallbacks, stats_before_fallback.fallbacks + 1);
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select value from cached_isolation where id = 1;"); });
+    EXPECT_NE(output.find("13"), std::string::npos) << output;
+}
+
+TEST_F(E2ETest, PointProgramCacheHitBypassesFrontendAndBindsCurrentLexicalSlots) {
+    const char* previous_select = std::getenv("ENABLE_POINT_SELECT_INTERPRETER");
+    const char* previous_cache = std::getenv("ENABLE_POINT_PROGRAM_CACHE");
+    struct RestoreFlags {
+        std::optional<std::string> select;
+        std::optional<std::string> cache;
+        ~RestoreFlags() {
+            select.has_value() ? setenv("ENABLE_POINT_SELECT_INTERPRETER", select->c_str(), 1)
+                               : unsetenv("ENABLE_POINT_SELECT_INTERPRETER");
+            cache.has_value() ? setenv("ENABLE_POINT_PROGRAM_CACHE", cache->c_str(), 1)
+                              : unsetenv("ENABLE_POINT_PROGRAM_CACHE");
+        }
+    } restore{previous_select == nullptr ? std::nullopt : std::optional<std::string>(previous_select),
+              previous_cache == nullptr ? std::nullopt : std::optional<std::string>(previous_cache)};
+    setenv("ENABLE_POINT_SELECT_INTERPRETER", "1", 1);
+    setenv("ENABLE_POINT_PROGRAM_CACHE", "1", 1);
+
+    ASSERT_NO_THROW(db_->exec_sql("create table cached_select (id int, note char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("create index cached_select(id);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into cached_select values(1, 'one');"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into cached_select values(2, 'two');"));
+
+    std::string output;
+    const auto before_first = db_->frontend_entries();
+    const auto entries_before_first = db_->point_program_template_cache_stats().entries;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from cached_select where id = 1;"); });
+    EXPECT_NE(output.find("one"), std::string::npos) << output;
+    EXPECT_FALSE(db_->last_top_level_program_hit());
+    const auto after_first = db_->frontend_entries();
+    EXPECT_EQ(db_->point_program_template_cache_stats().entries, entries_before_first + 1);
+    for (size_t i = 0; i < before_first.size(); ++i) {
+        EXPECT_EQ(after_first[i], before_first[i] + 1);
+    }
+
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from cached_select where id = 2;"); });
+    EXPECT_NE(output.find("two"), std::string::npos) << output;
+    EXPECT_EQ(output.find("one"), std::string::npos) << output;
+    auto stats = db_->point_program_template_cache_stats();
+    EXPECT_TRUE(db_->last_top_level_program_hit()) << "hits=" << stats.hits << " misses=" << stats.misses
+                                                  << " fallbacks=" << stats.fallbacks;
+    EXPECT_EQ(db_->frontend_entries(), after_first);
+    stats = db_->point_program_template_cache_stats();
+    EXPECT_GE(stats.hits, 1U);
+    EXPECT_GE(stats.handled, 1U);
+
+    ASSERT_NO_THROW(db_->exec_sql("create table cache_generation_bump (v int);"));
+    const auto after_ddl = db_->frontend_entries();
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from cached_select where id = 1;"); });
+    EXPECT_FALSE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries()[0], after_ddl[0] + 1);
+
+    setenv("ENABLE_POINT_PROGRAM_CACHE", "0", 1);
+    const auto before_disabled = db_->frontend_entries();
+    const auto stats_before_disabled = db_->point_program_template_cache_stats();
+    ASSERT_NO_THROW({ output = db_->exec_sql("select note from cached_select where id = 2;"); });
+    EXPECT_FALSE(db_->last_top_level_program_hit());
+    EXPECT_EQ(db_->frontend_entries()[0], before_disabled[0] + 1);
+    const auto stats_after_disabled = db_->point_program_template_cache_stats();
+    EXPECT_EQ(stats_after_disabled.hits, stats_before_disabled.hits);
+    EXPECT_EQ(stats_after_disabled.misses, stats_before_disabled.misses);
+    EXPECT_EQ(stats_after_disabled.handled, stats_before_disabled.handled);
+    EXPECT_EQ(stats_after_disabled.fallbacks, stats_before_disabled.fallbacks);
+    EXPECT_EQ(stats_after_disabled.entries, stats_before_disabled.entries);
 }
 
 TEST_F(E2ETest, HeapTableAllowsDuplicateRows) {

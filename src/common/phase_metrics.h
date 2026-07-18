@@ -28,6 +28,7 @@ namespace phase_metrics {
 enum class Phase : size_t {
     LEXER,
     NORMALIZE,
+    PROGRAM_TEMPLATE_CACHE,
     PARSER,
     ANALYZER,
     PLANNER,
@@ -143,6 +144,8 @@ inline constexpr const char* phase_name(Phase phase) {
         return "lexer";
     case Phase::NORMALIZE:
         return "normalize";
+    case Phase::PROGRAM_TEMPLATE_CACHE:
+        return "program_template_cache";
     case Phase::PARSER:
         return "parser";
     case Phase::ANALYZER:

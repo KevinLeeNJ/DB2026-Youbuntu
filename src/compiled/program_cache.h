@@ -42,39 +42,13 @@ struct ProgramCacheStats {
     size_t entries{0};
 };
 
-class ProgramCache {
-public:
-    explicit ProgramCache(size_t capacity = 256) : capacity_(capacity) {}
-
-    std::shared_ptr<const CompiledProgram> Lookup(const ProgramCacheKey& key);
-    std::shared_ptr<const CompiledProgram> Publish(const ProgramCacheKey& key,
-                                                   std::shared_ptr<const CompiledProgram> program);
-    void RecordFallback() noexcept;
-    void RecordHandled() noexcept;
-    ProgramCacheStats Stats() const;
-    void Clear();
-
-private:
-    struct Entry {
-        std::shared_ptr<const CompiledProgram> program;
-        uint64_t last_use{0};
-    };
-
-    const size_t capacity_;
-    mutable std::mutex mutex_;
-    std::unordered_map<ProgramCacheKey, Entry, ProgramCacheKeyHash> entries_;
-    uint64_t clock_{0};
-    std::atomic<uint64_t> hits_{0};
-    std::atomic<uint64_t> misses_{0};
-    std::atomic<uint64_t> fallbacks_{0};
-    std::atomic<uint64_t> handled_{0};
-};
-
 class ProgramTemplateCache {
 public:
     explicit ProgramTemplateCache(size_t capacity = 256) : capacity_(capacity) {}
 
     ProgramTemplatePtr Lookup(const ProgramCacheKey& key);
+    ProgramTemplatePtr LookupAny(const parser::TokenShapeKey& shape, uint64_t statement_generation,
+                                 uint64_t planner_generation, uint64_t catalog_generation);
     ProgramTemplatePtr Publish(const ProgramCacheKey& key, ProgramTemplatePtr program_template);
     void RecordFallback() noexcept;
     void RecordHandled() noexcept;

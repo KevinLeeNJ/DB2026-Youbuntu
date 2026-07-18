@@ -10,6 +10,7 @@ RMDB is licensed under Mulan PSL v2. */
 #include <vector>
 
 #include "compiled/program_template.h"
+#include "compiled/program_cache.h"
 
 namespace {
 
@@ -149,6 +150,65 @@ TEST(ProgramTemplateTest, RejectsStaleIdentityAndMalformedSlotOrBindingMetadata)
                                                 {{0, 0, ValueType::INT32, 0}}, std::move(bad_bindings), &error),
               nullptr);
     EXPECT_NE(error.find("index"), std::string::npos);
+}
+
+TEST(ProgramTemplateCacheTest, IsOwnerScopedAndChecksPlannerGeneration) {
+    std::string error;
+    auto program_template = compiled::ProgramTemplate::Create(
+        Identity(ProgramKind::POINT_SELECT),
+        Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+        {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
+    ASSERT_NE(program_template, nullptr) << error;
+    compiled::ProgramCacheKey key{{11, 12, "point ?"}, 17, 19, 7, ProgramKind::POINT_SELECT};
+
+    compiled::ProgramTemplateCache first_database;
+    compiled::ProgramTemplateCache second_database;
+    first_database.Publish(key, program_template);
+    EXPECT_EQ(first_database.Lookup(key), program_template);
+    EXPECT_EQ(second_database.Lookup(key), nullptr);
+
+    auto changed_planner = key;
+    changed_planner.planner_generation = 20;
+    EXPECT_EQ(first_database.Lookup(changed_planner), nullptr);
+}
+
+TEST(ProgramTemplateCacheTest, LookupAnyCountsOnceAndEvictsLeastRecentlyUsedTemplate) {
+    const auto make_template = [](std::string canonical, uint64_t statement_generation) {
+        auto identity = Identity(ProgramKind::POINT_SELECT);
+        identity.token_shape.canonical_bytes = std::move(canonical);
+        identity.statement_generation = statement_generation;
+        std::string error;
+        auto result = compiled::ProgramTemplate::Create(
+            identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+            {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
+        EXPECT_NE(result, nullptr) << error;
+        return result;
+    };
+    compiled::ProgramTemplateCache cache(2);
+    auto first = make_template("first ?", 1);
+    auto second = make_template("second ?", 2);
+    auto third = make_template("third ?", 3);
+    const auto key = [](const compiled::ProgramTemplate& value) {
+        const auto& identity = value.identity();
+        return compiled::ProgramCacheKey{identity.token_shape, identity.statement_generation,
+                                         identity.planner_generation, identity.catalog_generation, identity.kind};
+    };
+    cache.Publish(key(*first), first);
+    cache.Publish(key(*second), second);
+    EXPECT_EQ(cache.LookupAny(first->identity().token_shape, 1, 19, 7), first);
+    cache.Publish(key(*third), third);
+    EXPECT_EQ(cache.LookupAny(second->identity().token_shape, 2, 19, 7), nullptr);
+    EXPECT_EQ(cache.LookupAny(first->identity().token_shape, 1, 19, 7), first);
+    EXPECT_EQ(cache.LookupAny(third->identity().token_shape, 3, 19, 7), third);
+
+    cache.RecordHandled();
+    cache.RecordFallback();
+    const auto stats = cache.Stats();
+    EXPECT_EQ(stats.entries, 2U);
+    EXPECT_EQ(stats.hits, 3U);
+    EXPECT_EQ(stats.misses, 1U);
+    EXPECT_EQ(stats.handled, 1U);
+    EXPECT_EQ(stats.fallbacks, 1U);
 }
 
 } // namespace

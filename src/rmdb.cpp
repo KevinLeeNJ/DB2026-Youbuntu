@@ -32,6 +32,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "errors.h"
 #include "cache/statement_template_cache.h"
+#include "compiled/program_cache.h"
+#include "execution/runtime/program_dispatcher.h"
 #include "common/phase_metrics.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
@@ -93,7 +95,8 @@ private:
 ClientConnectionTracker client_connections;
 #endif
 
-void write_phase_metrics(const std::string& path, const cache::StatementTemplateCache* template_cache) {
+void write_phase_metrics(const std::string& path, const cache::StatementTemplateCache* template_cache,
+                         const compiled::ProgramTemplateCache* program_cache) {
     const std::string temporary_path = path + ".tmp." + std::to_string(getpid());
     std::ofstream output(temporary_path, std::ios::out | std::ios::trunc);
     if (!output.is_open()) {
@@ -119,6 +122,15 @@ void write_phase_metrics(const std::string& path, const cache::StatementTemplate
         output << "{\"lookups\": " << stats.lookups << ", \"hits\": " << stats.hits
                << ", \"misses\": " << stats.misses << ", \"publishes\": " << stats.publishes
                << ", \"evictions\": " << stats.evictions << "}";
+    } else {
+        output << "null";
+    }
+    output << ",\n  \"program_template_cache\": ";
+    if (program_cache != nullptr) {
+        const auto stats = program_cache->Stats();
+        output << "{\"hits\": " << stats.hits << ", \"misses\": " << stats.misses
+               << ", \"fallbacks\": " << stats.fallbacks << ", \"handled\": " << stats.handled
+               << ", \"entries\": " << stats.entries << "}";
     } else {
         output << "null";
     }
@@ -160,7 +172,8 @@ auto log_manager = std::make_unique<LogManager>(disk_manager.get(),
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get(),
                                                   log_manager.get());
 
-auto portal = std::make_unique<Portal>(sm_manager.get());
+auto point_program_template_cache = std::make_unique<compiled::ProgramTemplateCache>();
+auto portal = std::make_unique<Portal>(sm_manager.get(), point_program_template_cache.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 auto statement_template_cache = std::make_unique<cache::StatementTemplateCache>();
 auto statement_template_generation = []() {
@@ -267,15 +280,31 @@ void client_handler(int fd) {
         bool cacheable_query = false;
         bool cacheable_plan = false;
         uint64_t current_statement_template_generation = 0;
-        if (statement_cache_mode != cache::StatementCacheMode::OFF) {
+        uint64_t current_planner_generation = 0;
+        compiled::ProgramTemplatePtr cached_point_program;
+        const bool point_program_cache_enabled = [] {
+            const char* value = std::getenv("ENABLE_POINT_PROGRAM_CACHE");
+            return value != nullptr && std::string(value) == "1";
+        }();
+        if (statement_cache_mode != cache::StatementCacheMode::OFF || point_program_cache_enabled) {
             phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
                                                        phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
             lexical_shape = parser::normalize_sql(data_recv, false);
             cacheable_skeleton = static_cast<bool>(lexical_shape) && !lexical_shape.template_unsupported;
             cacheable_plan = cacheable_skeleton;
             cacheable_query = cacheable_skeleton;
+            current_planner_generation = planner->planner_knob_generation();
             current_statement_template_generation = statement_template_generation();
-            if (lexical_shape && cacheable_plan && statement_cache_mode == cache::StatementCacheMode::FULL) {
+            if (point_program_cache_enabled && lexical_shape && cacheable_plan) {
+                phase_metrics::ScopedSample program_cache_sample(
+                    phase_metrics::Phase::PROGRAM_TEMPLATE_CACHE,
+                    phase_metrics::sample_rate(phase_metrics::Phase::PROGRAM_TEMPLATE_CACHE));
+                cached_point_program = point_program_template_cache->LookupAny(
+                    lexical_shape.key, current_statement_template_generation, current_planner_generation,
+                    sm_manager->get_catalog_generation());
+            }
+            if (cached_point_program == nullptr && lexical_shape && cacheable_plan &&
+                statement_cache_mode == cache::StatementCacheMode::FULL) {
                 auto full = statement_template_cache->lookup_full(
                     lexical_shape.key, current_statement_template_generation, sm_manager.get(), &lexical_shape);
                 if (full) {
@@ -285,7 +314,7 @@ void client_handler(int fd) {
                     used_cached_plan = true;
                 }
             }
-            if (cached_plan == nullptr) {
+            if (cached_point_program == nullptr && cached_plan == nullptr) {
                 if (lexical_shape && cacheable_skeleton && cacheable_query &&
                     static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
                     cached_query = statement_template_cache->lookup_query(
@@ -301,7 +330,7 @@ void client_handler(int fd) {
                     cached_parse_tree = statement_template_cache->lookup_ast(
                         lexical_shape.key, current_statement_template_generation, &lexical_shape);
                     used_cached_parse = cached_parse_tree != nullptr;
-                } else if (lexical_shape &&
+                } else if (statement_cache_mode != cache::StatementCacheMode::OFF && lexical_shape &&
                            statement_template_cache->lookup(lexical_shape.key, current_statement_template_generation)) {
                     LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
                               lexical_shape.key.low);
@@ -318,7 +347,9 @@ void client_handler(int fd) {
             context->has_statement_template_identity_ = true;
             context->statement_shape_high_ = lexical_shape.key.high;
             context->statement_shape_low_ = lexical_shape.key.low;
+            context->statement_shape_canonical_ = lexical_shape.key.canonical_bytes;
             context->statement_template_generation_ = current_statement_template_generation;
+            context->planner_generation_ = current_planner_generation;
         }
 
         auto abort_active_transaction = [&]() {
@@ -336,7 +367,7 @@ void client_handler(int fd) {
 
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
-            if (!used_cached_plan) {
+            if (!used_cached_plan && cached_point_program == nullptr) {
                 if (cached_parse_tree != nullptr) {
                     parse_tree = std::move(cached_parse_tree);
                 } else {
@@ -356,8 +387,24 @@ void client_handler(int fd) {
             offset = msg_len + 1;
         }
 
-        if (used_cached_plan || parse_tree != nullptr) {
+        if (cached_point_program != nullptr || used_cached_plan || parse_tree != nullptr) {
             try {
+                bool cached_program_handled = false;
+                bool statement_started = false;
+                if (cached_point_program != nullptr) {
+                    SetTransaction(&txn_id, context);
+                    statement_started = true;
+                    const auto dispatch = DispatchCachedPointProgram(
+                        {point_program_template_cache.get(), &lexical_shape, current_statement_template_generation,
+                         current_planner_generation, sm_manager.get(), context, cached_point_program});
+                    cached_program_handled = dispatch == ProgramDispatchStatus::HANDLED;
+                    if (!cached_program_handled) {
+                        phase_metrics::ScopedSample metrics_sample(
+                            phase_metrics::Phase::PARSER, phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
+                        parse_tree = ast::parse_sql(data_recv);
+                    }
+                }
+                if (!cached_program_handled) {
                 if (!used_cached_plan) {
                     ast::assign_literal_slots(*parse_tree);
                 }
@@ -372,7 +419,7 @@ void client_handler(int fd) {
                 const auto parsed_type = used_cached_plan ? *cached_statement_type : parse_tree->type;
                 bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
                 bool is_load = parsed_type == ast::AstType::LoadStmt;
-                if (!is_checkpoint && !is_load) {
+                if (!is_checkpoint && !is_load && !statement_started) {
                     SetTransaction(&txn_id, context);
                 }
                 // analyze and rewrite
@@ -425,6 +472,7 @@ void client_handler(int fd) {
                 // on SmManager (see execution_manager.cpp T_SetOutputFile), so it
                 // persists across connections without per-session mirroring here.
                 portal->drop();
+                }
                 if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                     context->txn_->get_state() != TransactionState::COMMITTED &&
                     context->txn_->get_state() != TransactionState::ABORTED) {
@@ -626,18 +674,19 @@ int main(int argc, char** argv) {
             if (metrics_path != nullptr) {
                 const std::string path(metrics_path);
                 auto* template_cache = statement_template_cache.get();
-                metrics_thread = std::thread([&metrics_thread_stop, path, template_cache] {
+                auto* program_cache = point_program_template_cache.get();
+                metrics_thread = std::thread([&metrics_thread_stop, path, template_cache, program_cache] {
                     while (!metrics_thread_stop.load()) {
                         if (std::remove((path + ".reset").c_str()) == 0) {
                             phase_metrics::Registry::instance().reset();
                         }
-                        write_phase_metrics(path, template_cache);
+                        write_phase_metrics(path, template_cache, program_cache);
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
                     if (std::remove((path + ".reset").c_str()) == 0) {
                         phase_metrics::Registry::instance().reset();
                     }
-                    write_phase_metrics(path, template_cache);
+                    write_phase_metrics(path, template_cache, program_cache);
                 });
             }
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
