@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 
 #include "parser/token_stream.h"
+#include "parser/ast.h"
 
 namespace cache {
 
@@ -38,7 +39,9 @@ public:
     explicit StatementTemplateCache(size_t capacity = 256) : capacity_(capacity) {}
 
     bool lookup(const parser::TokenShapeKey& key, uint64_t catalog_generation);
-    void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation);
+    std::unique_ptr<ast::TreeNode> lookup_ast(const parser::TokenShapeKey& key, uint64_t catalog_generation);
+    void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                 std::shared_ptr<const ast::TreeNode> skeleton = nullptr);
     StatementTemplateStats stats() const;
     void clear();
 
@@ -47,6 +50,7 @@ private:
         parser::TokenShapeKey key;
         uint64_t catalog_generation{0};
         uint64_t last_use{0};
+        std::shared_ptr<const ast::TreeNode> skeleton;
     };
 
     static std::string map_key(const parser::TokenShapeKey& key) {

@@ -47,9 +47,25 @@ bool StatementTemplateCache::lookup(const parser::TokenShapeKey& key, uint64_t c
     return true;
 }
 
-void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation) {
+std::unique_ptr<ast::TreeNode> StatementTemplateCache::lookup_ast(const parser::TokenShapeKey& key,
+                                                                  uint64_t catalog_generation) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Entry entry{key, catalog_generation, ++clock_};
+    ++stats_.lookups;
+    auto found = entries_.find(map_key(key));
+    if (found == entries_.end() || found->second.catalog_generation != catalog_generation || found->second.key != key ||
+        found->second.skeleton == nullptr) {
+        ++stats_.misses;
+        return nullptr;
+    }
+    found->second.last_use = ++clock_;
+    ++stats_.hits;
+    return ast::clone_tree(*found->second.skeleton);
+}
+
+void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                     std::shared_ptr<const ast::TreeNode> skeleton) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry entry{key, catalog_generation, ++clock_, std::move(skeleton)};
     entries_[map_key(key)] = std::move(entry);
     ++stats_.publishes;
     if (entries_.size() <= capacity_) {

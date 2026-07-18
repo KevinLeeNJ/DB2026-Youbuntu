@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include <gtest/gtest.h>
 
 #include "cache/statement_template_cache.h"
+#include "parser/parser.h"
 #include "parser/token_stream.h"
 
 TEST(StatementTemplateTest, NormalizesLiteralValuesButOwnsIdentifiersAndStrings) {
@@ -50,4 +51,17 @@ TEST(StatementTemplateTest, CacheChecksGenerationAndEvictsByCapacity) {
     cache.publish(second.key, 3);
     EXPECT_FALSE(cache.lookup(shape.key, 3));
     EXPECT_EQ(cache.stats().evictions, 1U);
+}
+
+TEST(StatementTemplateTest, ClonesStatementSkeletonWithFreshOwnership) {
+    auto parsed = ast::parse_sql("update users set score = score + 1 where id = 7;");
+    ASSERT_NE(parsed, nullptr);
+    auto clone = ast::clone_tree(*parsed);
+    ASSERT_NE(clone, nullptr);
+    ASSERT_EQ(clone->type, ast::AstType::UpdateStmt);
+    auto* original_update = static_cast<ast::UpdateStmt*>(parsed.get());
+    auto* clone_update = static_cast<ast::UpdateStmt*>(clone.get());
+    ASSERT_NE(original_update->set_clauses[0]->val, clone_update->set_clauses[0]->val);
+    original_update->tab_name = "changed";
+    EXPECT_EQ(clone_update->tab_name, "users");
 }

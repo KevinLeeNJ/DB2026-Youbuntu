@@ -232,12 +232,17 @@ void client_handler(int fd) {
 
         parser::OwnedTokenStream lexical_shape;
         const auto statement_cache_mode = cache::configured_statement_cache_mode();
+        std::unique_ptr<ast::TreeNode> cached_parse_tree;
         if (statement_cache_mode != cache::StatementCacheMode::OFF) {
             phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::NORMALIZE,
                                                        phase_metrics::sample_rate(phase_metrics::Phase::NORMALIZE));
             lexical_shape = parser::normalize_sql(data_recv);
             if (lexical_shape &&
-                statement_template_cache->lookup(lexical_shape.key, sm_manager->get_catalog_generation())) {
+                static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::PARSER)) {
+                cached_parse_tree =
+                    statement_template_cache->lookup_ast(lexical_shape.key, sm_manager->get_catalog_generation());
+            } else if (lexical_shape &&
+                       statement_template_cache->lookup(lexical_shape.key, sm_manager->get_catalog_generation())) {
                 LOG_DEBUG("statement template shadow hit digest=%016lx%016lx", lexical_shape.key.high,
                           lexical_shape.key.low);
             }
@@ -264,9 +269,13 @@ void client_handler(int fd) {
 
         std::unique_ptr<ast::TreeNode> parse_tree;
         try {
-            phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PARSER,
-                                                       phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
-            parse_tree = ast::parse_sql(data_recv);
+            if (cached_parse_tree != nullptr) {
+                parse_tree = std::move(cached_parse_tree);
+            } else {
+                phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PARSER,
+                                                           phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
+                parse_tree = ast::parse_sql(data_recv);
+            }
         } catch (const ast::ParseError& e) {
             abort_active_transaction();
             LOG_ERROR("parse failed for SQL [%s]: %s", data_recv, e.what());
@@ -280,6 +289,13 @@ void client_handler(int fd) {
 
         if (parse_tree != nullptr) {
             try {
+                std::shared_ptr<const ast::TreeNode> parsed_skeleton;
+                if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF) {
+                    auto clone = ast::clone_tree(*parse_tree);
+                    parsed_skeleton = std::shared_ptr<const ast::TreeNode>(std::move(clone));
+                    statement_template_cache->publish(lexical_shape.key, sm_manager->get_catalog_generation(),
+                                                      parsed_skeleton);
+                }
                 auto parsed_type = parse_tree->type;
                 bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
                 bool is_load = parsed_type == ast::AstType::LoadStmt;
@@ -300,9 +316,6 @@ void client_handler(int fd) {
                     phase_metrics::ScopedSample metrics_sample(
                         phase_metrics::Phase::PLANNER, phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
                     plan = optimizer->plan_query(std::move(query), context);
-                }
-                if (lexical_shape && statement_cache_mode != cache::StatementCacheMode::OFF) {
-                    statement_template_cache->publish(lexical_shape.key, sm_manager->get_catalog_generation());
                 }
                 // portal
                 std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
@@ -397,7 +410,7 @@ void client_handler(int fd) {
 void start_server() {
     int sockfd_server;
     int fd_temp;
-    struct sockaddr_in s_addr_in {};
+    struct sockaddr_in s_addr_in{};
 
     // 初始化连接
     sockfd_server = socket(AF_INET, SOCK_STREAM, 0); // ipv4,TCP
@@ -426,7 +439,7 @@ void start_server() {
 
     while (!should_exit) {
         LOG_DEBUG("waiting for new connection");
-        struct sockaddr_in s_addr_client {};
+        struct sockaddr_in s_addr_client{};
         int client_length = sizeof(s_addr_client);
 
         if (setjmp(jmpbuf)) {

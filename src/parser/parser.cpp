@@ -914,4 +914,198 @@ std::unique_ptr<TreeNode> parse_sql(std::string_view sql) {
     }
 }
 
+namespace {
+
+std::unique_ptr<Value> clone_value(const Value& value) {
+    switch (value.type) {
+    case AstType::IntLit: {
+        const auto& lit = static_cast<const IntLit&>(value);
+        return std::make_unique<IntLit>(lit.val, lit.display_text);
+    }
+    case AstType::FloatLit: {
+        const auto& lit = static_cast<const FloatLit&>(value);
+        return std::make_unique<FloatLit>(lit.val, lit.display_text);
+    }
+    case AstType::StringLit: {
+        const auto& lit = static_cast<const StringLit&>(value);
+        return std::make_unique<StringLit>(lit.val, lit.display_text);
+    }
+    case AstType::BoolLit: {
+        const auto& lit = static_cast<const BoolLit&>(value);
+        return std::make_unique<BoolLit>(lit.val, lit.display_text);
+    }
+    default:
+        throw std::logic_error("unsupported literal in AST clone");
+    }
+}
+
+std::unique_ptr<Expr> clone_expr_owned(const Expr& expr) {
+    if (expr.type == AstType::AggExpr) {
+        const auto& aggregate = static_cast<const AggExpr&>(expr);
+        return std::make_unique<AggExpr>(aggregate.func, aggregate.is_star,
+                                         aggregate.col == nullptr ? nullptr : clone_col(*aggregate.col));
+    }
+    if (expr.type == AstType::Col) {
+        return clone_col(static_cast<const Col&>(expr));
+    }
+    return clone_value(static_cast<const Value&>(expr));
+}
+
+std::unique_ptr<BinaryExpr> clone_binary(const BinaryExpr& binary) {
+    return std::make_unique<BinaryExpr>(clone_expr_owned(*binary.lhs), binary.op, clone_expr_owned(*binary.rhs));
+}
+
+std::unique_ptr<HavingExpr> clone_having(const HavingExpr& having) {
+    return std::make_unique<HavingExpr>(clone_expr_owned(*having.lhs), having.op, clone_expr_owned(*having.rhs));
+}
+
+std::unique_ptr<SetClause> clone_set_clause(const SetClause& clause) {
+    if (clause.is_self_ref) {
+        return std::make_unique<SetClause>(clause.col_name,
+                                           clause.rhs_col == nullptr ? nullptr : clone_col(*clause.rhs_col),
+                                           clause.val == nullptr ? nullptr : clone_value(*clause.val), clause.op);
+    }
+    return std::make_unique<SetClause>(clause.col_name, clause.val == nullptr ? nullptr : clone_value(*clause.val));
+}
+
+std::unique_ptr<SelectItem> clone_select_item(const SelectItem& item) {
+    return std::make_unique<SelectItem>(clone_expr_owned(*item.expr), item.alias);
+}
+
+std::unique_ptr<OrderByItem> clone_order_item(const OrderByItem& item) {
+    return std::make_unique<OrderByItem>(clone_expr_owned(*item.expr), item.orderby_dir);
+}
+
+std::unique_ptr<JoinExpr> clone_join(const JoinExpr& join) {
+    std::vector<std::unique_ptr<BinaryExpr>> conditions;
+    for (const auto& condition : join.conds)
+        conditions.push_back(clone_binary(*condition));
+    return std::make_unique<JoinExpr>(join.left, join.right, std::move(conditions), join.join_type);
+}
+
+std::unique_ptr<SelectStmt> clone_select(const SelectStmt& select) {
+    std::vector<std::unique_ptr<SelectItem>> items;
+    for (const auto& item : select.select_items)
+        items.push_back(clone_select_item(*item));
+    std::vector<std::unique_ptr<BinaryExpr>> conditions;
+    for (const auto& condition : select.conds)
+        conditions.push_back(clone_binary(*condition));
+    std::vector<std::unique_ptr<Col>> groups;
+    for (const auto& group : select.group_by_cols)
+        groups.push_back(clone_col(*group));
+    std::vector<std::unique_ptr<HavingExpr>> having;
+    for (const auto& condition : select.having_conds)
+        having.push_back(clone_having(*condition));
+    std::vector<std::unique_ptr<OrderByItem>> order;
+    for (const auto& item : select.order_by_items)
+        order.push_back(clone_order_item(*item));
+    std::vector<std::unique_ptr<JoinExpr>> joins;
+    for (const auto& join : select.jointree)
+        joins.push_back(clone_join(*join));
+    return std::make_unique<SelectStmt>(std::move(items), select.tabs, std::move(conditions), std::move(groups),
+                                        std::move(having), std::move(order), select.has_limit, select.limit,
+                                        select.has_select_star, std::move(joins));
+}
+
+} // namespace
+
+std::unique_ptr<TreeNode> clone_tree(const TreeNode& node) {
+    switch (node.type) {
+    case AstType::Help:
+        return std::make_unique<Help>();
+    case AstType::ShowTables:
+        return std::make_unique<ShowTables>();
+    case AstType::ShowIndex:
+        return std::make_unique<ShowIndex>(static_cast<const ShowIndex&>(node).tab_name);
+    case AstType::TxnBegin:
+        return std::make_unique<TxnBegin>();
+    case AstType::TxnCommit:
+        return std::make_unique<TxnCommit>();
+    case AstType::TxnAbort:
+        return std::make_unique<TxnAbort>();
+    case AstType::TxnRollback:
+        return std::make_unique<TxnRollback>();
+    case AstType::CreateTable: {
+        const auto& source = static_cast<const CreateTable&>(node);
+        std::vector<std::unique_ptr<Field>> fields;
+        for (const auto& field : source.fields) {
+            const auto& column = static_cast<const ColDef&>(*field);
+            fields.push_back(std::make_unique<ColDef>(
+                column.col_name, std::make_unique<TypeLen>(column.type_len->type, column.type_len->len)));
+        }
+        return std::make_unique<CreateTable>(source.tab_name, std::move(fields));
+    }
+    case AstType::DropTable:
+        return std::make_unique<DropTable>(static_cast<const DropTable&>(node).tab_name);
+    case AstType::DescTable:
+        return std::make_unique<DescTable>(static_cast<const DescTable&>(node).tab_name);
+    case AstType::CreateIndex: {
+        const auto& source = static_cast<const CreateIndex&>(node);
+        return std::make_unique<CreateIndex>(source.tab_name, source.col_names);
+    }
+    case AstType::DropIndex: {
+        const auto& source = static_cast<const DropIndex&>(node);
+        return std::make_unique<DropIndex>(source.tab_name, source.col_names);
+    }
+    case AstType::InsertStmt: {
+        const auto& source = static_cast<const InsertStmt&>(node);
+        std::vector<std::unique_ptr<Value>> values;
+        for (const auto& value : source.vals)
+            values.push_back(clone_value(*value));
+        return std::make_unique<InsertStmt>(source.tab_name, std::move(values));
+    }
+    case AstType::DeleteStmt: {
+        const auto& source = static_cast<const DeleteStmt&>(node);
+        std::vector<std::unique_ptr<BinaryExpr>> conditions;
+        for (const auto& condition : source.conds)
+            conditions.push_back(clone_binary(*condition));
+        return std::make_unique<DeleteStmt>(source.tab_name, std::move(conditions));
+    }
+    case AstType::UpdateStmt: {
+        const auto& source = static_cast<const UpdateStmt&>(node);
+        std::vector<std::unique_ptr<SetClause>> clauses;
+        for (const auto& clause : source.set_clauses)
+            clauses.push_back(clone_set_clause(*clause));
+        std::vector<std::unique_ptr<BinaryExpr>> conditions;
+        for (const auto& condition : source.conds)
+            conditions.push_back(clone_binary(*condition));
+        return std::make_unique<UpdateStmt>(source.tab_name, std::move(clauses), std::move(conditions));
+    }
+    case AstType::SelectStmt:
+        return clone_select(static_cast<const SelectStmt&>(node));
+    case AstType::ExplainAnalyze: {
+        const auto& source = static_cast<const ExplainAnalyze&>(node);
+        return std::make_unique<ExplainAnalyze>(clone_select(*source.select));
+    }
+    case AstType::SetStmt: {
+        const auto& source = static_cast<const SetStmt&>(node);
+        auto type = source.set_knob_type_;
+        return std::make_unique<SetStmt>(type, source.bool_val_);
+    }
+    case AstType::SetTransaction:
+        return std::make_unique<SetTransaction>(static_cast<const SetTransaction&>(node).isolation_level_);
+    case AstType::SetOutputFile:
+        return std::make_unique<SetOutputFile>(static_cast<const SetOutputFile&>(node).enable_);
+    case AstType::StaticCheckpoint:
+        return std::make_unique<StaticCheckpoint>();
+    case AstType::LoadStmt: {
+        const auto& source = static_cast<const LoadStmt&>(node);
+        return std::make_unique<LoadStmt>(source.file_name_, source.tab_name_);
+    }
+    case AstType::SelectFromUnionStmt: {
+        const auto& source = static_cast<const SelectFromUnionStmt&>(node);
+        std::vector<std::unique_ptr<SelectStmt>> branches;
+        for (const auto& branch : source.union_stmt->branches)
+            branches.push_back(clone_select(*branch));
+        auto union_node = std::make_unique<UnionStmt>(std::move(branches));
+        std::vector<std::unique_ptr<OrderByItem>> order;
+        for (const auto& item : source.order_by_items)
+            order.push_back(clone_order_item(*item));
+        return std::make_unique<SelectFromUnionStmt>(std::move(union_node), source.alias, std::move(order));
+    }
+    default:
+        throw std::logic_error("unsupported statement type for AST clone");
+    }
+}
+
 } // namespace ast

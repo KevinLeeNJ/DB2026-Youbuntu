@@ -481,4 +481,8 @@ struct LoadStmt : public TreeNode {
         : TreeNode(AstType::LoadStmt), file_name_(std::move(file_name)), tab_name_(std::move(tab_name)) {}
 };
 
+// Creates an execution-owned copy of a parsed statement. The copy never retains
+// source-buffer views or mutable ownership from the cached skeleton.
+std::unique_ptr<TreeNode> clone_tree(const TreeNode& node);
+
 } // namespace ast

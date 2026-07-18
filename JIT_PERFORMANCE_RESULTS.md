@@ -749,3 +749,16 @@ N/A (no readable perf/flamegraph summary)
   target and built the server successfully. The normalization path is measured through the existing phase-metrics
   `normalize` sample; no separate throughput claim is made at this shadow-only phase. Three-round benchmark protocol
   remains reserved for the subsequent end-to-end template bypass comparison.
+
+## Phase 8 Decision
+
+- Added statement-level AST cloning for utility, DDL, DML, SELECT/JOIN, aggregation, UNION, EXPLAIN, transaction, and
+  configuration nodes. Cached entries own a const skeleton; each hit returns fresh `unique_ptr` ownership, so no AST,
+  source buffer, literal, or execution state is shared between requests.
+- `RMDB_STATEMENT_CACHE=parser` (and higher modes while later readiness is unavailable) now binds a valid owned token
+  shape to a fresh AST and skips the recursive-descent Parser. Shadow/off/miss/generation mismatch paths retain the
+  complete old Parser path. Analyzer, Planner, Portal, transaction, lock, WAL, MVCC, client protocol and output remain
+  unchanged.
+- Parser regression passed 21/21; AST/cache tests passed 4/4; `RMDB_STATEMENT_CACHE=parser RMDB_JIT=off` e2e passed
+  30/30. No separate throughput claim is made before Analyzer/Planner bypass; phase metrics continue to distinguish
+  normalize and parser samples. Three-round end-to-end comparison is deferred until full readiness exists.
