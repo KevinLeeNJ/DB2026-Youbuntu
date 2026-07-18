@@ -41,10 +41,12 @@ public:
     explicit StatementTemplateCache(size_t capacity = 256) : capacity_(capacity) {}
 
     bool lookup(const parser::TokenShapeKey& key, uint64_t catalog_generation);
-    std::unique_ptr<ast::TreeNode> lookup_ast(const parser::TokenShapeKey& key, uint64_t catalog_generation);
-    std::unique_ptr<Query> lookup_query(const parser::TokenShapeKey& key, uint64_t catalog_generation);
+    std::unique_ptr<ast::TreeNode> lookup_ast(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                              const parser::OwnedTokenStream* lexical = nullptr);
+    std::unique_ptr<Query> lookup_query(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                        const parser::OwnedTokenStream* lexical = nullptr);
     std::unique_ptr<Plan> lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                                      SmManager* sm_manager);
+                                      SmManager* sm_manager, const parser::OwnedTokenStream* lexical = nullptr);
     void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                  std::shared_ptr<const ast::TreeNode> skeleton = nullptr, std::shared_ptr<const Query> query = nullptr,
                  std::shared_ptr<const Plan> plan = nullptr);

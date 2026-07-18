@@ -805,3 +805,16 @@ N/A (no readable perf/flamegraph summary)
   incorrectly reused. The implementation now marks parameterized shapes non-cacheable until a true lexical-to-semantic
   binder exists; the corrected three-round run had only the normal deterministic invalid-item rollbacks and no backend
   errors. This is an explicit correctness guard, not a hidden performance tradeoff.
+
+## Phase 12 Validation
+
+- Default JIT mode is now `off`; `auto` and `force` remain explicit opt-ins. Default template mode remains `shadow`.
+- Final `RMDB_JIT=off make test` passed 352/352. Parser, analyzer, full, shadow, and off statement-cache e2e suites
+  each passed 30/30 in their validated combinations; JIT unit, AST ownership, and literal-binding tests passed.
+- Final fixed `auto/full` TPCC run used exactly three rounds, one worker, eight warehouses, seed `20260718`, 1s
+  warmup and 3s measure: tpmC `[6740, 6700, 6760]`, median `6740`; abort rates remained normal and all three
+  crash/recovery consistency checks passed. The earlier parameterized physical-plan binder failure is retained as a
+  failed diagnostic run; parameterized plans now miss rather than risk stale literals.
+- The measured aggregate transition descriptor loop is slower than the scalar oracle, so automatic aggregate/fusion
+  execution remains disabled. This is reported as a measured gate result, not hidden; network communication, protocol,
+  and `output.txt` were not changed or optimized.

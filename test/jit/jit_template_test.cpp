@@ -65,3 +65,19 @@ TEST(StatementTemplateTest, ClonesStatementSkeletonWithFreshOwnership) {
     original_update->tab_name = "changed";
     EXPECT_EQ(clone_update->tab_name, "users");
 }
+
+TEST(StatementTemplateTest, BindsCurrentLiteralValuesOnParameterizedAstHit) {
+    auto first_shape = parser::normalize_sql("update users set score = 7 where id = 1;");
+    auto second_shape = parser::normalize_sql("update users set score = 99 where id = 42;");
+    ASSERT_TRUE(first_shape);
+    ASSERT_TRUE(second_shape);
+    ASSERT_EQ(first_shape.key, second_shape.key);
+    auto first_ast = ast::parse_sql("update users set score = 7 where id = 1;");
+    cache::StatementTemplateCache cache;
+    cache.publish(first_shape.key, 1, std::shared_ptr<const ast::TreeNode>(std::move(first_ast)));
+    auto rebound = cache.lookup_ast(second_shape.key, 1, &second_shape);
+    ASSERT_NE(rebound, nullptr);
+    auto* update = static_cast<ast::UpdateStmt*>(rebound.get());
+    EXPECT_EQ(static_cast<ast::IntLit*>(update->set_clauses[0]->val.get())->val, 99);
+    EXPECT_EQ(static_cast<ast::IntLit*>(update->conds[0]->rhs.get())->val, 42);
+}

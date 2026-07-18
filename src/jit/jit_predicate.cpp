@@ -26,7 +26,10 @@ std::atomic<uint64_t> shadow_counter{0};
 
 JitMode configured_mode() {
     const char* value = std::getenv("RMDB_JIT");
-    if (value == nullptr || std::string_view(value) == "auto") {
+    if (value == nullptr || std::string_view(value) == "off") {
+        return JitMode::OFF;
+    }
+    if (std::string_view(value) == "auto") {
         return JitMode::AUTO;
     }
     if (std::string_view(value) == "force") {

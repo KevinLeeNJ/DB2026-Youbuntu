@@ -15,6 +15,299 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 
 namespace cache {
+namespace {
+
+class LiteralBinder {
+public:
+    explicit LiteralBinder(const parser::OwnedTokenStream& stream) : parameters_(stream.parameters) {}
+
+    bool bind(ast::Value& value) {
+        if (position_ >= parameters_.size())
+            return false;
+        const auto& parameter = parameters_[position_++];
+        switch (value.type) {
+        case ast::AstType::IntLit:
+            if (parameter.type != parser::TokenType::VALUE_INT)
+                return false;
+            static_cast<ast::IntLit&>(value).val = static_cast<int>(parameter.int_value);
+            break;
+        case ast::AstType::FloatLit:
+            if (parameter.type != parser::TokenType::VALUE_FLOAT && parameter.type != parser::TokenType::VALUE_INT) {
+                return false;
+            }
+            static_cast<ast::FloatLit&>(value).val = parameter.type == parser::TokenType::VALUE_INT
+                                                         ? static_cast<double>(parameter.int_value)
+                                                         : parameter.float_value;
+            break;
+        case ast::AstType::StringLit:
+            if (parameter.type != parser::TokenType::VALUE_STRING)
+                return false;
+            static_cast<ast::StringLit&>(value).val = parameter.text;
+            break;
+        case ast::AstType::BoolLit:
+            if (parameter.type != parser::TokenType::VALUE_BOOL)
+                return false;
+            static_cast<ast::BoolLit&>(value).val = parameter.bool_value;
+            break;
+        default:
+            return false;
+        }
+        value.display_text = parameter.text;
+        return true;
+    }
+
+    bool bind(Value& value) {
+        if (position_ >= parameters_.size())
+            return false;
+        const auto& parameter = parameters_[position_++];
+        switch (value.type) {
+        case TYPE_INT:
+            if (parameter.type != parser::TokenType::VALUE_INT)
+                return false;
+            value.int_val = static_cast<int>(parameter.int_value);
+            break;
+        case TYPE_FLOAT:
+            if (parameter.type != parser::TokenType::VALUE_FLOAT && parameter.type != parser::TokenType::VALUE_INT) {
+                return false;
+            }
+            value.float_val = parameter.type == parser::TokenType::VALUE_INT ? static_cast<double>(parameter.int_value)
+                                                                             : parameter.float_value;
+            break;
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            if (parameter.type != parser::TokenType::VALUE_STRING)
+                return false;
+            value.str_val = parameter.text;
+            break;
+        default:
+            return false;
+        }
+        value.raw.reset();
+        return true;
+    }
+
+    bool done() const {
+        return position_ == parameters_.size();
+    }
+
+private:
+    const std::vector<parser::LexicalParam>& parameters_;
+    size_t position_{0};
+};
+
+bool bind_expr(ast::Expr& expression, LiteralBinder& binder);
+
+bool bind_binary(ast::BinaryExpr& expression, LiteralBinder& binder) {
+    return bind_expr(*expression.lhs, binder) && bind_expr(*expression.rhs, binder);
+}
+
+bool bind_expr(ast::Expr& expression, LiteralBinder& binder) {
+    switch (expression.type) {
+    case ast::AstType::IntLit:
+    case ast::AstType::FloatLit:
+    case ast::AstType::StringLit:
+    case ast::AstType::BoolLit:
+        return binder.bind(static_cast<ast::Value&>(expression));
+    case ast::AstType::Col:
+        return true;
+    case ast::AstType::AggExpr:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool bind_tree(ast::TreeNode& node, LiteralBinder& binder) {
+    switch (node.type) {
+    case ast::AstType::InsertStmt: {
+        for (auto& value : static_cast<ast::InsertStmt&>(node).vals) {
+            if (!binder.bind(*value))
+                return false;
+        }
+        return true;
+    }
+    case ast::AstType::DeleteStmt: {
+        for (auto& condition : static_cast<ast::DeleteStmt&>(node).conds) {
+            if (!bind_binary(*condition, binder))
+                return false;
+        }
+        return true;
+    }
+    case ast::AstType::UpdateStmt: {
+        auto& update = static_cast<ast::UpdateStmt&>(node);
+        for (auto& clause : update.set_clauses) {
+            if (clause->val != nullptr && !binder.bind(*clause->val))
+                return false;
+        }
+        for (auto& condition : update.conds) {
+            if (!bind_binary(*condition, binder))
+                return false;
+        }
+        return true;
+    }
+    case ast::AstType::SelectStmt: {
+        auto& select = static_cast<ast::SelectStmt&>(node);
+        for (auto& item : select.select_items) {
+            if (!bind_expr(*item->expr, binder))
+                return false;
+        }
+        for (auto& condition : select.conds) {
+            if (!bind_binary(*condition, binder))
+                return false;
+        }
+        for (auto& join : select.jointree) {
+            for (auto& condition : join->conds) {
+                if (!bind_binary(*condition, binder))
+                    return false;
+            }
+        }
+        for (auto& condition : select.having_conds) {
+            if (!bind_expr(*condition->lhs, binder) || !bind_expr(*condition->rhs, binder))
+                return false;
+        }
+        for (auto& item : select.order_by_items) {
+            if (!bind_expr(*item->expr, binder))
+                return false;
+        }
+        return true;
+    }
+    case ast::AstType::ExplainAnalyze:
+        return bind_tree(*static_cast<ast::ExplainAnalyze&>(node).select, binder);
+    case ast::AstType::SelectFromUnionStmt: {
+        auto& wrapper = static_cast<ast::SelectFromUnionStmt&>(node);
+        for (auto& branch : wrapper.union_stmt->branches) {
+            if (!bind_tree(*branch, binder))
+                return false;
+        }
+        for (auto& item : wrapper.order_by_items) {
+            if (!bind_expr(*item->expr, binder))
+                return false;
+        }
+        return true;
+    }
+    default:
+        return true;
+    }
+}
+
+bool bind_query_expr(QueryExpr& expression, LiteralBinder& binder) {
+    return expression.type != QueryExprType::VALUE || binder.bind(expression.value);
+}
+
+bool bind_query_semantic(Query& query, const parser::OwnedTokenStream& lexical) {
+    LiteralBinder binder(lexical);
+    for (auto& item : query.select_items) {
+        if (!bind_query_expr(item.expr, binder))
+            return false;
+    }
+    for (auto& condition : query.conds) {
+        if (condition.is_rhs_val && !binder.bind(condition.rhs_val))
+            return false;
+    }
+    for (auto& condition : query.having_conds) {
+        if (!bind_query_expr(condition.lhs, binder) ||
+            (!condition.is_rhs_val && !bind_query_expr(condition.rhs_expr, binder)) ||
+            (condition.is_rhs_val && !binder.bind(condition.rhs_val))) {
+            return false;
+        }
+    }
+    for (auto& item : query.order_by_items) {
+        if (!bind_query_expr(item.expr, binder))
+            return false;
+    }
+    for (auto& clause : query.set_clauses) {
+        if (!binder.bind(clause.rhs))
+            return false;
+    }
+    for (auto& value : query.values) {
+        if (!binder.bind(value))
+            return false;
+    }
+    return binder.done();
+}
+
+bool bind_plan_conditions(std::vector<Condition>& conditions, LiteralBinder& binder) {
+    for (auto& condition : conditions) {
+        if (condition.is_rhs_val && !binder.bind(condition.rhs_val))
+            return false;
+    }
+    return true;
+}
+
+bool bind_plan_expr(QueryExpr& expression, LiteralBinder& binder) {
+    return expression.type != QueryExprType::VALUE || binder.bind(expression.value);
+}
+
+bool bind_plan_node(Plan& plan, LiteralBinder& binder) {
+    switch (plan.tag) {
+    case T_Projection: {
+        auto& projection = static_cast<ProjectionPlan&>(plan);
+        for (auto& item : projection.select_items_) {
+            if (!bind_plan_expr(item.expr, binder))
+                return false;
+        }
+        return bind_plan_node(*projection.subplan_, binder);
+    }
+    case T_Aggregate: {
+        auto& aggregate = static_cast<AggregatePlan&>(plan);
+        if (!bind_plan_node(*aggregate.subplan_, binder))
+            return false;
+        for (auto& condition : aggregate.having_conds_) {
+            if (!bind_plan_expr(condition.lhs, binder) ||
+                (!condition.is_rhs_val && !bind_plan_expr(condition.rhs_expr, binder)) ||
+                (condition.is_rhs_val && !binder.bind(condition.rhs_val)))
+                return false;
+        }
+        return true;
+    }
+    case T_Sort: {
+        auto& sort = static_cast<SortPlan&>(plan);
+        if (!bind_plan_node(*sort.subplan_, binder))
+            return false;
+        for (auto& item : sort.order_by_items_) {
+            if (!bind_plan_expr(item.expr, binder))
+                return false;
+        }
+        return true;
+    }
+    case T_Limit:
+        return bind_plan_node(*static_cast<LimitPlan&>(plan).subplan_, binder);
+    case T_Filter: {
+        auto& filter = static_cast<FilterPlan&>(plan);
+        if (!bind_plan_conditions(filter.conds_, binder))
+            return false;
+        return bind_plan_node(*filter.subplan_, binder);
+    }
+    case T_SeqScan:
+    case T_IndexScan:
+    case T_IndexSkipScan:
+        return bind_plan_conditions(static_cast<ScanPlan&>(plan).conds_, binder);
+    case T_NestLoop:
+    case T_SortMerge: {
+        auto& join = static_cast<JoinPlan&>(plan);
+        if (!bind_plan_conditions(join.conds_, binder))
+            return false;
+        return bind_plan_node(*join.left_, binder) && bind_plan_node(*join.right_, binder);
+    }
+    case T_Union: {
+        auto& union_plan = static_cast<UnionPlan&>(plan);
+        for (auto& branch : union_plan.branches_) {
+            if (!bind_plan_node(*branch, binder))
+                return false;
+        }
+        return true;
+    }
+    case T_Insert:
+    case T_Update:
+    case T_Delete:
+    case T_ExplainAnalyze:
+        return false;
+    default:
+        return true;
+    }
+}
+
+} // namespace
 
 StatementCacheMode configured_statement_cache_mode() {
     const char* value = std::getenv("RMDB_STATEMENT_CACHE");
@@ -48,7 +341,8 @@ bool StatementTemplateCache::lookup(const parser::TokenShapeKey& key, uint64_t c
 }
 
 std::unique_ptr<ast::TreeNode> StatementTemplateCache::lookup_ast(const parser::TokenShapeKey& key,
-                                                                  uint64_t catalog_generation) {
+                                                                  uint64_t catalog_generation,
+                                                                  const parser::OwnedTokenStream* lexical) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.lookups;
     auto found = entries_.find(map_key(key));
@@ -59,11 +353,18 @@ std::unique_ptr<ast::TreeNode> StatementTemplateCache::lookup_ast(const parser::
     }
     found->second.last_use = ++clock_;
     ++stats_.hits;
-    return ast::clone_tree(*found->second.skeleton);
+    auto result = ast::clone_tree(*found->second.skeleton);
+    if (lexical != nullptr) {
+        LiteralBinder binder(*lexical);
+        if (!bind_tree(*result, binder) || !binder.done())
+            return nullptr;
+    }
+    return result;
 }
 
 std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenShapeKey& key,
-                                                            uint64_t catalog_generation) {
+                                                            uint64_t catalog_generation,
+                                                            const parser::OwnedTokenStream* lexical) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.lookups;
     auto found = entries_.find(map_key(key));
@@ -74,11 +375,20 @@ std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenS
     }
     found->second.last_use = ++clock_;
     ++stats_.hits;
-    return clone_query(*found->second.query);
+    auto result = clone_query(*found->second.query);
+    if (lexical != nullptr && result->parse != nullptr) {
+        LiteralBinder binder(*lexical);
+        if (!bind_tree(*result->parse, binder) || !binder.done())
+            return nullptr;
+        if (!bind_query_semantic(*result, *lexical))
+            return nullptr;
+    }
+    return result;
 }
 
 std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                                                          SmManager* sm_manager) {
+                                                          SmManager* sm_manager,
+                                                          const parser::OwnedTokenStream* lexical) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.lookups;
     auto found = entries_.find(map_key(key));
@@ -89,7 +399,13 @@ std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenSha
     }
     found->second.last_use = ++clock_;
     ++stats_.hits;
-    return clone_plan(*found->second.plan, sm_manager);
+    auto result = clone_plan(*found->second.plan, sm_manager);
+    if (lexical != nullptr) {
+        LiteralBinder binder(*lexical);
+        if (!bind_plan_node(*result, binder) || !binder.done())
+            return nullptr;
+    }
+    return result;
 }
 
 void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
