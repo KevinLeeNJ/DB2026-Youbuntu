@@ -657,3 +657,17 @@ N/A (no readable perf/flamegraph summary)
   publishing generated code, leaving future executor integration free to use the interpreter fallback.
 - Validation passed in Release and Debug JIT builds, the JIT-disabled server build, and the full `make test` suite
   (327/327). This phase does not change query execution, client communication, protocol, or `output.txt` behavior.
+
+## Phase 2 Decision
+
+- The typed predicate IR carries versioned IR/ABI/helper identifiers, host architecture and CPU tier, catalog generation,
+  plan tag, tuple layouts, column identity/type/offset, parameter descriptors, and ordered comparison operations. Its
+  cache identity is a stable two-word digest plus canonical bytes, so a digest match alone cannot cause code reuse.
+- Scan, filter, and nested-loop join predicate builders produce parameterized programs. Literal values are stored only in
+  an execution-local POD parameter block; they do not enter the code key or any cached IR object.
+- The verifier rejects version, layout, parameter, type, resource-limit, canonical-key, and bounds violations before an
+  interpreter call. Parameter binding independently checks slot count, type, and byte length.
+- No Executor calls machine code in this phase. The interpreter is the oracle path and was differentially checked against
+  `AbstractExecutor::compare()` for 100,000 deterministic legal integer tuple/condition combinations, including every
+  comparison operator; targeted tests also cover strings, NaN, join tuple separation, binding rejection, and malformed
+  IR. `make test` passed 333/333, with no SQL-visible, network, protocol, or `output.txt` format changes.

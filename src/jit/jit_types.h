@@ -19,6 +19,9 @@ namespace jit {
 
 enum class JitStatus {
     OK,
+    DIVISION_BY_ZERO,
+    INVALID_INPUT,
+    HELPER_ERROR,
     UNSUPPORTED_ARCHITECTURE,
     COMPILE_ERROR,
     ALLOCATION_ERROR,
