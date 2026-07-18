@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details.
 
 #include "row_mutation.h"
 
+#include "common/phase_metrics.h"
+
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -319,7 +321,12 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
     }
 
     auto new_record = std::make_unique<RmRecord>(visible_record);
-    ApplyUpdate(*new_record, visible_record, info);
+    {
+        phase_metrics::ScopedSample metrics_sample(
+            phase_metrics::Phase::UPDATE_ARITHMETIC,
+            phase_metrics::sample_rate(phase_metrics::Phase::UPDATE_ARITHMETIC));
+        ApplyUpdate(*new_record, visible_record, info);
+    }
     auto* txn = context == nullptr ? nullptr : context->txn_;
 
     if (txn != nullptr && txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context->txn_mgr_ != nullptr) {

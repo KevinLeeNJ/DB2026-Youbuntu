@@ -95,8 +95,6 @@ public:
                                    &set_clauses_,
                                    &bound_set_clauses_,
                                    &affected_index_bitmap_};
-            phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::UPDATE_ARITHMETIC,
-                                                       phase_metrics::sample_rate(phase_metrics::Phase::UPDATE_ARITHMETIC));
             RowMutationEngine::UpdateOne(rid, *rec, info, context_);
         }
         return nullptr;
