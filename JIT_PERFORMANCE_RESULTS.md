@@ -629,3 +629,31 @@ N/A (no readable perf/flamegraph summary)
   is intentionally outside this task because the communication mechanism and client protocol must remain unchanged.
   User-space profiles instead identify allocator/copy, index scan, aggregate, and analyzer/planner allocation paths.
   See the timestamped profile entries above for commands, flamegraph hashes, and cleanup records.
+
+### phase1-20260718T070255Z-125419-5686 | jit-runtime-debug-smoke | pass
+
+- Context: phase=1; started=2026-07-18T07:02:55Z; ended=2026-07-18T07:02:55Z; duration_s=0; commit=752890d; dirty_tracked_files=4; build=Release; cpu=AMD Ryzen 7 7700 8-Core Processor
+- Command: `/tmp/rmdb-jit-debug/bin/test/jit_test `
+- Modes: RMDB_JIT=unset; RMDB_STATEMENT_CACHE=unset; workers=N/A; warehouses=N/A; warmup_s=N/A; measure_s=N/A; rounds=N/A; seed=N/A
+- Result: status=pass; exit_code=0; log=/tmp/rmdb-jit-runs/phase1-20260718T070255Z-125419-5686/command.log
+- Error summary: N/A (command passed)
+- TPC-C: N/A (no readable TPC-C result JSON)
+- Phase metrics: N/A (no readable phase metrics JSON)
+- CPU/profile:
+```text
+N/A (no readable perf/flamegraph summary)
+```
+- Cache/JIT metrics: N/A before their implementation phase.
+- Cleanup preflight: available_bytes=12830101504; repository_bytes=1290325200; status=pending
+- Cleanup result for phase1-20260718T070255Z-125419-5686: status=pass; available_bytes=12830101504; repository_bytes=1290475329; registered_artifacts=0
+
+## Phase 1 Decision
+
+- AsmJit is integrated as an optional static dependency behind `RMDB_ENABLE_JIT`; disabling that option builds the
+  server without the JIT library or JIT tests.
+- The x86-64 runtime smoke test generated and executed a parameterized `int32_t add(int32_t, int32_t)` function. Code
+  ownership is move-only RAII, and the runtime releases executable memory when the final code object is destroyed.
+- Deterministic compile, executable-allocation, and unsupported-architecture failures return an explicit status without
+  publishing generated code, leaving future executor integration free to use the interpreter fallback.
+- Validation passed in Release and Debug JIT builds, the JIT-disabled server build, and the full `make test` suite
+  (327/327). This phase does not change query execution, client communication, protocol, or `output.txt` behavior.

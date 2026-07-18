@@ -12,6 +12,9 @@ add_subdirectory(common)
 add_subdirectory(replacer)
 add_subdirectory(transaction)
 add_subdirectory(recovery)
+if(RMDB_ENABLE_JIT)
+    add_subdirectory(jit)
+endif()
 add_subdirectory(test)
 
 

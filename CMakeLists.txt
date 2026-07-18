@@ -1,5 +1,7 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.24)
 project(RMDB)
+
+option(RMDB_ENABLE_JIT "Build the optional AsmJit runtime" ON)
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -16,6 +18,6 @@ set(CMAKE_C_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG -march=native -funroll-loops")
 
 enable_testing()
-add_subdirectory(src)
 add_subdirectory(deps)
+add_subdirectory(src)
 add_subdirectory(test)

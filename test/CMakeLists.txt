@@ -6,6 +6,9 @@ include(GoogleTest)
 file(GLOB SUBDIRS CONFIGURE_DEPENDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *)
 
 foreach(DIR ${SUBDIRS})
+    if(DIR STREQUAL "jit" AND NOT RMDB_ENABLE_JIT)
+        continue()
+    endif()
     if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${DIR})
         file(GLOB_RECURSE DIR_SOURCES CONFIGURE_DEPENDS ${DIR}/*.cpp)
         
@@ -22,6 +25,9 @@ foreach(DIR ${SUBDIRS})
                         analyze parser system storage lru_replacer record index transaction planner execution recovery
                         "-Wl,--end-group"
                         gtest_main pthread)
+                if(DIR STREQUAL "jit")
+                    target_link_libraries(${TEST_TARGET} jit)
+                endif()
                 target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_SRC_DIR="${CMAKE_SOURCE_DIR}")
                 gtest_discover_tests(${TEST_TARGET})
             endif()
