@@ -90,6 +90,10 @@ JitStatus AggregateKernel::update(const char* tuple, uint32_t tuple_len) {
     return JitStatus::OK;
 }
 
+void AggregateKernel::reset() {
+    std::fill(slots_.begin(), slots_.end(), AggregateSlot{});
+}
+
 bool aggregate_jit_enabled() {
     // The generic descriptor loop is retained for force-mode correctness tests only;
     // its measured dispatch overhead is higher than the existing scalar transition.

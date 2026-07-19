@@ -68,9 +68,6 @@ private:
     int left_key_offset_ = 0;          // pre-compiled offset of left key in left tuple
     int left_key_len_ = 0;             // pre-compiled length of left key
     ColType left_key_type_ = TYPE_INT; // pre-compiled type of left key
-    int right_key_len_ = 0;
-    ColType right_key_type_ = TYPE_INT;
-    bool direct_lookup_key_supported_ = false;
 
     static bool compare_numeric(const int& op, const double& lhs, const double& rhs) {
         switch (op) {
@@ -270,35 +267,6 @@ private:
         }
     }
 
-    Value extract_key_from_left(const TupleView& left_tuple) const {
-        Value val;
-        const char* data = left_tuple.data + left_key_offset_;
-        switch (left_key_type_) {
-        case TYPE_INT:
-            val.set_int(read_unaligned<int>(data));
-            break;
-        case TYPE_FLOAT:
-            val.set_float(read_unaligned<double>(data));
-            break;
-        case TYPE_STRING:
-        case TYPE_DATETIME:
-            val.set_str(std::string(data, strnlen(data, left_key_len_)));
-            val.type = left_key_type_;
-            break;
-        }
-        return val;
-    }
-
-    std::vector<Condition> build_key_conditions(const TupleView& left_tuple) const {
-        Condition key_cond;
-        key_cond.lhs_col = inlj_right_col_;
-        key_cond.op = OP_EQ;
-        key_cond.is_rhs_val = true;
-        key_cond.rhs_val = extract_key_from_left(left_tuple);
-        key_cond.rhs_val.init_raw(left_key_len_);
-        return {key_cond};
-    }
-
 public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
                            std::vector<Condition> conds, TabCol inlj_left_col = {}, TabCol inlj_right_col = {},
@@ -357,13 +325,6 @@ public:
                 left_key_len_ = meta.len;
                 left_key_type_ = meta.type;
             }
-            auto right_col_iter = cols_map.find(make_col_key(inlj_right_col_));
-            if (right_col_iter != cols_map.end()) {
-                const auto& meta = *(right_col_iter->second);
-                right_key_len_ = meta.len;
-                right_key_type_ = meta.type;
-                direct_lookup_key_supported_ = left_key_len_ == right_key_len_ && left_key_type_ == right_key_type_;
-            }
         }
 
         clear_current_left();
@@ -401,12 +362,9 @@ public:
                 }
                 // INLJ: inject join key before resetting inner scan
                 if (inlj_mode_) {
-                    if (direct_lookup_key_supported_) {
-                        right_->set_lookup_key(inlj_right_col_, current_left_view_.data + left_key_offset_,
-                                               static_cast<size_t>(left_key_len_));
-                    } else {
-                        right_->set_key_conditions(build_key_conditions(current_left_view_));
-                    }
+                    right_->bind_lookup_key(inlj_right_col_,
+                                            LookupKeyView{current_left_view_.data + left_key_offset_,
+                                                          static_cast<size_t>(left_key_len_), left_key_type_});
                 }
                 right_->beginTuple();
             }

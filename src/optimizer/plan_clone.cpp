@@ -77,7 +77,6 @@ HavingCondition clone_having(const HavingCondition& source) {
 }
 
 void copy_base(const Plan& source, Plan* destination) {
-    destination->runtime_rows_ = source.runtime_rows_;
     destination->order_satisfied_ = source.order_satisfied_;
     destination->table_name_to_display_ = source.table_name_to_display_;
 }

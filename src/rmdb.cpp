@@ -309,7 +309,7 @@ void client_handler(int fd) {
         std::unique_ptr<ast::TreeNode> cached_parse_tree;
         std::optional<ast::AstType> cached_statement_type;
         std::unique_ptr<Query> cached_query;
-        std::unique_ptr<Plan> cached_plan;
+        BoundPlan cached_plan;
         std::shared_ptr<const PreparedSelectDescriptor> cached_prepared_select;
         bool used_cached_parse = false;
         bool used_cached_query = false;
@@ -350,14 +350,14 @@ void client_handler(int fd) {
                     cached_prepared_select = std::move(full.prepared_select);
                     used_cached_parse = true;
                     used_cached_plan = true;
-                } else if (full.plan != nullptr) {
+                } else if (full.plan) {
                     cached_statement_type = full.statement_type;
                     cached_plan = std::move(full.plan);
                     used_cached_parse = true;
                     used_cached_plan = true;
                 }
             }
-            if (cached_point_program == nullptr && cached_plan == nullptr && cached_prepared_select == nullptr) {
+            if (cached_point_program == nullptr && !cached_plan && cached_prepared_select == nullptr) {
                 if (lexical_shape && cacheable_skeleton && cacheable_query &&
                     static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
                     cached_query = statement_template_cache->lookup_query(
@@ -390,7 +390,7 @@ void client_handler(int fd) {
             context->has_statement_template_identity_ = true;
             context->statement_shape_high_ = lexical_shape.key.high;
             context->statement_shape_low_ = lexical_shape.key.low;
-            context->statement_shape_canonical_ = lexical_shape.key.canonical_bytes;
+            context->statement_shape_size_ = lexical_shape.key.canonical_size;
             context->statement_template_generation_ = current_statement_template_generation;
             context->planner_generation_ = current_planner_generation;
         }
@@ -502,9 +502,7 @@ void client_handler(int fd) {
                     // 优化器
                     std::unique_ptr<Plan> plan;
                     {
-                        if (cached_plan != nullptr) {
-                            plan = std::move(cached_plan);
-                        } else {
+                        if (!cached_plan) {
                             phase_metrics::ScopedSample metrics_sample(
                                 phase_metrics::Phase::PLANNER,
                                 phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
@@ -521,7 +519,9 @@ void client_handler(int fd) {
                                                           std::move(prepared_select));
                     }
                     // portal
-                    std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
+                    std::unique_ptr<PortalStmt> portalStmt = cached_plan
+                                                                 ? portal->start(std::move(cached_plan), context)
+                                                                 : portal->start(std::move(plan), context);
                     {
                         phase_metrics::ScopedSample metrics_sample(
                             phase_metrics::Phase::EXECUTOR, phase_metrics::sample_rate(phase_metrics::Phase::EXECUTOR));

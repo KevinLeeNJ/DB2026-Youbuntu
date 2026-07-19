@@ -72,6 +72,42 @@ public:
     virtual ~Plan() = default;
 };
 
+struct PlanLiteralOverlay {
+    const Value* Find(int lexical_slot) const {
+        if (lexical_slot < 0 || static_cast<size_t>(lexical_slot) >= values.size() || !present[lexical_slot]) {
+            return nullptr;
+        }
+        return &values[lexical_slot];
+    }
+
+    std::vector<Value> values;
+    std::vector<bool> present;
+};
+
+struct BoundPlan {
+    struct RuntimeState {
+        std::unordered_map<const Plan*, size_t> rows;
+    };
+
+    std::shared_ptr<const Plan> blueprint;
+    std::shared_ptr<const PlanLiteralOverlay> literals;
+    std::shared_ptr<RuntimeState> runtime;
+
+    const Plan* get() const {
+        return blueprint.get();
+    }
+    const Plan* operator->() const {
+        return blueprint.get();
+    }
+    const Plan& operator*() const {
+        return *blueprint;
+    }
+
+    explicit operator bool() const {
+        return blueprint != nullptr && literals != nullptr && runtime != nullptr;
+    }
+};
+
 // Tag selecting the ScanPlan blueprint-clone constructor, which copies members
 // directly instead of re-resolving the table through the catalog.
 struct ScanPlanCloneTag {};

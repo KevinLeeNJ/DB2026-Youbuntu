@@ -163,7 +163,7 @@ public:
                 context.has_statement_template_identity_ = true;
                 context.statement_shape_high_ = lexical.key.high;
                 context.statement_shape_low_ = lexical.key.low;
-                context.statement_shape_canonical_ = lexical.key.canonical_bytes;
+                context.statement_shape_size_ = lexical.key.canonical_size;
                 context.planner_generation_ = planner_->planner_knob_generation();
                 context.statement_template_generation_ =
                     sm_manager_->get_catalog_generation() ^ (context.planner_generation_ * 0x9e3779b97f4a7c15ULL);

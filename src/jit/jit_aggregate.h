@@ -44,6 +44,7 @@ public:
         return valid_;
     }
     JitStatus update(const char* tuple, uint32_t tuple_len);
+    void reset();
     const std::vector<AggregateSlot>& slots() const {
         return slots_;
     }

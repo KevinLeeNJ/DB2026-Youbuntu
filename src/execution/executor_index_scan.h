@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <unordered_set>
@@ -21,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_common.h"
 #include "execution_manager.h"
+#include "prepared_parameter_binding.h"
 #include "executor_abstract.h"
 #include "index_scan_descriptor.h"
 #include "index/ix.h"
@@ -74,13 +77,16 @@ protected:
         bool consumed_{false};
     };
 
-    std::string tab_name_;             // 表名称
-    TabMeta tab_;                      // 表的元数据
-    std::vector<Condition> conds_;     // 扫描条件
-    RmFileHandle* fh_;                 // 表的数据文件句柄
-    std::vector<ColMeta> cols_;        // 需要读取的字段
-    size_t len_;                       // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_; // 扫描条件，和conds_字段相同
+    std::string tab_name_;                   // 表名称
+    TabMeta tab_;                            // 表的元数据
+    std::vector<Condition> conds_;           // 扫描条件
+    RmFileHandle* fh_;                       // 表的数据文件句柄
+    std::vector<ColMeta> cols_;              // 需要读取的字段
+    size_t len_;                             // 选取出来的一条记录的长度
+    std::vector<Condition> fed_conds_;       // 扫描条件，和conds_字段相同
+    std::vector<Condition> predicate_conds_; // fed conditions plus the current INLJ key for SSI tracking
+    bool lookup_predicate_active_{false};
+    std::vector<CompactCondition> compact_conds_;
     std::vector<ConditionAddress> condition_addresses_;
 #ifdef RMDB_ENABLE_JIT
     std::unique_ptr<jit::PredicateKernel> jit_predicate_;
@@ -92,8 +98,8 @@ protected:
 
     struct CompiledIndexCondition {
         size_t index_col_ordinal;
+        size_t condition_position;
         CompOp op;
-        Value literal;
     };
 
     struct BoundValue {
@@ -119,6 +125,7 @@ protected:
     std::vector<char> lookup_key_;
     size_t lookup_key_ordinal_{std::numeric_limits<size_t>::max()};
     bool lookup_key_valid_{false};
+    bool lookup_key_no_match_{false};
     ScanDirection direction_{ScanDirection::Forward};
     std::vector<Rid> rid_scan_rids_;
     std::vector<Rid> historical_rids_;
@@ -138,6 +145,24 @@ protected:
     RmRecordViewWithMeta buffered_tuple_;
 
     SmManager* sm_manager_;
+    bool prepared_mode_{false};
+    uint64_t constraint_rebuild_count_{0};
+#ifdef RMDB_ENABLE_JIT
+    uint64_t jit_rebuild_count_{0};
+#endif
+
+    void clear_request_state() {
+        scan_ = nullptr;
+        index_scan_cursor_.reset();
+        single_rid_cursor_.reset();
+        rid_vector_cursor_.reset();
+        rid_scan_rids_.clear();
+        historical_rids_.clear();
+        seen_rids_.clear();
+        historical_candidates_merged_ = false;
+        use_historical_index_candidates_ = false;
+        buffered_tuple_ = {};
+    }
 
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -146,11 +171,12 @@ protected:
             return;
         }
         predicate_recorded_ = true;
-        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, fed_conds_)) {
+        const auto& predicate_conds = lookup_predicate_active_ ? predicate_conds_ : fed_conds_;
+        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, predicate_conds)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
         if (context_->txn_mgr_->CheckPredicateInvisibleWrites(context_->txn_->get_transaction_id(), tab_name_,
-                                                              fed_conds_, fh_, cols_)) {
+                                                              predicate_conds, fh_, cols_)) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
@@ -266,7 +292,8 @@ protected:
     void compile_index_conditions() {
         compiled_index_conditions_.clear();
         compiled_index_conditions_.reserve(conds_.size());
-        for (const auto& cond : conds_) {
+        for (size_t condition_position = 0; condition_position < conds_.size(); ++condition_position) {
+            const auto& cond = conds_[condition_position];
             if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_ || cond.op == OP_NE) {
                 continue;
             }
@@ -274,12 +301,13 @@ protected:
             if (ordinal == index_meta_.cols.size()) {
                 continue;
             }
-            compiled_index_conditions_.push_back(CompiledIndexCondition{ordinal, cond.op, cond.rhs_val});
+            compiled_index_conditions_.push_back(CompiledIndexCondition{ordinal, condition_position, cond.op});
         }
     }
 
 #ifdef RMDB_ENABLE_JIT
     void rebuild_jit_predicate() {
+        ++jit_rebuild_count_;
         const bool exact_index_lookup = compiled_index_conditions_.size() == fed_conds_.size() &&
                                         std::all_of(constraints_.begin(), constraints_.end(),
                                                     [](const auto& constraint) { return constraint.eq_present; });
@@ -295,6 +323,7 @@ protected:
 #endif
 
     void rebuild_constraints() {
+        ++constraint_rebuild_count_;
         for (auto& constraint : constraints_) {
             constraint.eq_present = false;
             constraint.lower.present = false;
@@ -306,15 +335,17 @@ protected:
         for (const auto& compiled : compiled_index_conditions_) {
             const auto& col = index_meta_.cols[compiled.index_col_ordinal];
             auto& constraint = constraints_[compiled.index_col_ordinal];
+            const Value& literal = prepared_mode_ ? compact_conds_[compiled.condition_position].rhs_val
+                                                  : conds_[compiled.condition_position].rhs_val;
             switch (compiled.op) {
             case OP_EQ:
-                write_value_to_key_part(constraint.eq.data(), compiled.literal, col);
+                write_value_to_key_part(constraint.eq.data(), literal, col);
                 constraint.eq_present = true;
                 break;
             case OP_GT:
             case OP_GE: {
                 bool inclusive = compiled.op == OP_GE;
-                write_value_to_key_part(value_key_scratch_.data(), compiled.literal, col);
+                write_value_to_key_part(value_key_scratch_.data(), literal, col);
                 bool replace = !constraint.lower.present;
                 if (!replace) {
                     int cmp = compare_key_part(value_key_scratch_.data(), constraint.lower.data.data(), col);
@@ -330,7 +361,7 @@ protected:
             case OP_LT:
             case OP_LE: {
                 bool inclusive = compiled.op == OP_LE;
-                write_value_to_key_part(value_key_scratch_.data(), compiled.literal, col);
+                write_value_to_key_part(value_key_scratch_.data(), literal, col);
                 bool replace = !constraint.upper.present;
                 if (!replace) {
                     int cmp = compare_key_part(value_key_scratch_.data(), constraint.upper.data.data(), col);
@@ -378,7 +409,20 @@ protected:
 
 public:
     IndexScanExecutor(SmManager* sm_manager, const IndexScanDescriptor& descriptor, Context* context)
-        : IndexScanExecutor(sm_manager, descriptor, descriptor.conditions(), context) {}
+        : IndexScanExecutor(sm_manager, descriptor, descriptor.conditions(), context) {
+        prepared_mode_ = true;
+        compact_conds_.reserve(fed_conds_.size());
+        for (const auto& condition : fed_conds_) {
+            compact_conds_.push_back(CompactCondition{condition.op, condition.is_rhs_val, condition.rhs_val});
+        }
+#ifdef RMDB_ENABLE_JIT
+        // Prepared predicates are rebound through compact value slots. The
+        // current predicate JIT embeds literal payloads, so it cannot be reused
+        // safely across requests with different parameters.
+        jit_predicate_.reset();
+#endif
+        rebuild_constraints();
+    }
 
     IndexScanExecutor(SmManager* sm_manager, const IndexScanDescriptor& descriptor,
                       std::vector<Condition> bound_conditions, Context* context) {
@@ -418,7 +462,7 @@ public:
                 throw InternalError("bound index scan condition position is invalid");
             }
             compiled_index_conditions_.push_back(
-                {condition.index_col_ordinal, condition.op, conds_[condition.condition_position].rhs_val});
+                {condition.index_col_ordinal, condition.condition_position, condition.op});
         }
 
         initialize_constraint_storage();
@@ -455,6 +499,8 @@ public:
             }
         }
         fed_conds_ = conds_;
+        predicate_conds_.clear();
+        lookup_predicate_active_ = false;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
         base_conds_ = conds_; // save original conditions before any key injection
         index_name_ = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
@@ -468,20 +514,54 @@ public:
 #endif
     }
 
+    bool ResetPreparedRequest(const PreparedParameterLayout& parameters, const compiled::ParameterFrame& frame,
+                              Context* context) {
+        if (!prepared_mode_ || compact_conds_.size() != fed_conds_.size()) {
+            return false;
+        }
+        clear_request_state();
+        context_ = context;
+        predicate_recorded_ = false;
+        lookup_key_valid_ = false;
+        lookup_key_no_match_ = false;
+        lookup_predicate_active_ = false;
+        predicate_conds_.clear();
+        for (size_t i = 0; i < compact_conds_.size(); ++i) {
+            if (!compact_conds_[i].is_rhs_val) {
+                continue;
+            }
+            if (!parameters.Apply(frame, &compact_conds_[i].rhs_val)) {
+                return false;
+            }
+            fed_conds_[i].rhs_val = compact_conds_[i].rhs_val;
+        }
+        rebuild_constraints();
+        return true;
+    }
+
+    void ResetForPreparedPool() noexcept {
+        clear_request_state();
+        context_ = nullptr;
+        predicate_recorded_ = false;
+        lookup_key_valid_ = false;
+        lookup_key_no_match_ = false;
+        lookup_predicate_active_ = false;
+        predicate_conds_.clear();
+    }
+
     void beginTuple() override {
-        scan_ = nullptr;
-        index_scan_cursor_.reset();
-        single_rid_cursor_.reset();
-        rid_vector_cursor_.reset();
-        rid_scan_rids_.clear();
-        historical_rids_.clear();
-        seen_rids_.clear();
-        historical_candidates_merged_ = false;
+        clear_request_state();
         record_predicate_read();
 
         std::optional<IxIndexHandle::SharedIndexLatch> index_latch_guard;
         const bool historical_candidates_available = needs_historical_index_candidates();
         use_historical_index_candidates_ = historical_candidates_available;
+
+        if (lookup_key_no_match_) {
+            single_rid_cursor_.emplace(std::nullopt);
+            scan_ = &*single_rid_cursor_;
+            return;
+        }
 
         if (lookup_key_valid_) {
             auto& lookup_constraint = constraints_[lookup_key_ordinal_];
@@ -669,13 +749,16 @@ public:
 
     bool matches(const TupleView& tuple) const {
 #ifdef RMDB_ENABLE_JIT
-        if (jit_predicate_ != nullptr) {
+        if (!prepared_mode_ && jit_predicate_ != nullptr) {
             auto result = jit_predicate_->evaluate(tuple.data, tuple.size);
             if (result.has_value()) {
                 return *result;
             }
         }
 #endif
+        if (prepared_mode_) {
+            return conditions_match(compact_conds_, condition_addresses_, tuple);
+        }
         return conditions_match(fed_conds_, condition_addresses_, tuple);
     }
 
@@ -735,6 +818,8 @@ public:
             conds_.push_back(std::move(kc));
         }
         fed_conds_ = conds_;
+        predicate_conds_.clear();
+        lookup_predicate_active_ = false;
         condition_addresses_ = cache_condition_addresses(fed_conds_);
         compile_index_conditions();
         rebuild_constraints();
@@ -742,20 +827,95 @@ public:
         rebuild_jit_predicate();
 #endif
         lookup_key_valid_ = false;
+        lookup_key_no_match_ = false;
+        predicate_conds_.clear();
+        lookup_predicate_active_ = false;
     }
 
-    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+    void bind_lookup_key(const TabCol& target, LookupKeyView key) override {
         const size_t ordinal = find_index_col_ordinal(target.col_name);
-        if (ordinal == index_meta_.cols.size()) {
+        if (ordinal == index_meta_.cols.size() || (!target.tab_name.empty() && target.tab_name != tab_name_)) {
             throw ColumnNotFoundError(target.col_name);
         }
         const auto& col = index_meta_.cols[ordinal];
-        if (len != static_cast<size_t>(col.len)) {
-            throw InternalError("INLJ lookup key length does not match index column");
+        if (key.data == nullptr) {
+            throw InternalError("INLJ lookup key data is null");
         }
-        memcpy(lookup_key_.data(), key, len);
+        if ((key.type == TYPE_INT && key.size != sizeof(int)) ||
+            (key.type == TYPE_FLOAT && key.size != sizeof(double))) {
+            throw InternalError("INLJ lookup key length does not match source type");
+        }
+        if (!can_cast(col.type, key.type)) {
+            throw IncompatibleTypeError(coltype2str(col.type), coltype2str(key.type));
+        }
+
+        Value predicate_value;
+        bool no_match = false;
+        switch (key.type) {
+        case TYPE_INT:
+            predicate_value.set_int(read_unaligned<int>(key.data));
+            break;
+        case TYPE_FLOAT:
+            predicate_value.set_float(read_unaligned<double>(key.data));
+            break;
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            predicate_value.set_str(std::string(key.data, strnlen(key.data, key.size)));
+            predicate_value.type = key.type;
+            break;
+        }
+
+        memset(lookup_key_.data(), 0, col.len);
+        switch (col.type) {
+        case TYPE_INT: {
+            int converted = 0;
+            if (key.type == TYPE_FLOAT) {
+                const double value = predicate_value.float_val;
+                no_match = !std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) ||
+                           value > static_cast<double>(std::numeric_limits<int>::max()) || std::trunc(value) != value;
+                if (!no_match) {
+                    converted = static_cast<int>(value);
+                }
+            } else {
+                converted = predicate_value.int_val;
+            }
+            if (!no_match) {
+                memcpy(lookup_key_.data(), &converted, col.len);
+            }
+            break;
+        }
+        case TYPE_FLOAT: {
+            const double converted =
+                key.type == TYPE_INT ? static_cast<double>(predicate_value.int_val) : predicate_value.float_val;
+            memcpy(lookup_key_.data(), &converted, col.len);
+            break;
+        }
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            no_match = predicate_value.str_val.size() > static_cast<size_t>(col.len);
+            if (no_match) {
+                break;
+            }
+            memcpy(lookup_key_.data(), predicate_value.str_val.data(),
+                   std::min(static_cast<size_t>(col.len), predicate_value.str_val.size()));
+            break;
+        }
+
+        if (!lookup_predicate_active_) {
+            predicate_conds_ = fed_conds_;
+            predicate_conds_.reserve(fed_conds_.size() + 1);
+            Condition condition;
+            condition.lhs_col = target;
+            condition.op = OP_EQ;
+            condition.is_rhs_val = true;
+            predicate_conds_.push_back(std::move(condition));
+            lookup_predicate_active_ = true;
+        }
+        predicate_conds_.back().rhs_val = std::move(predicate_value);
+        predicate_recorded_ = false;
         lookup_key_ordinal_ = ordinal;
         lookup_key_valid_ = true;
+        lookup_key_no_match_ = no_match;
     }
 
     std::string scan_table_name() const override {
@@ -766,10 +926,10 @@ public:
     }
 
     std::vector<Condition> scan_conditions() const override {
-        return fed_conds_;
+        return lookup_predicate_active_ ? predicate_conds_ : fed_conds_;
     }
     const std::vector<Condition>& scan_conditions_ref() const override {
-        return fed_conds_;
+        return lookup_predicate_active_ ? predicate_conds_ : fed_conds_;
     }
     void record_current_read_for_ssi() override {
         if (!is_end()) {

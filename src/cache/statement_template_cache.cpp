@@ -245,104 +245,133 @@ bool bind_query_semantic(Query& query, const parser::OwnedTokenStream& lexical) 
     return binder.done();
 }
 
-bool bind_plan_conditions(std::vector<Condition>& conditions, LiteralBinder& binder) {
-    for (auto& condition : conditions) {
-        if (condition.is_rhs_val && !binder.bind(condition.rhs_val))
+bool bind_overlay_value(const Value& prototype, LiteralBinder& binder, PlanLiteralOverlay* overlay) {
+    if (prototype.lexical_slot < 0) {
+        return true;
+    }
+    Value bound = prototype;
+    if (!binder.bind(bound)) {
+        return false;
+    }
+    const size_t slot = static_cast<size_t>(prototype.lexical_slot);
+    if (slot >= overlay->values.size()) {
+        return false;
+    }
+    if (overlay->present[slot] && overlay->values[slot].type != bound.type) {
+        return false;
+    }
+    overlay->values[slot] = std::move(bound);
+    overlay->present[slot] = true;
+    return true;
+}
+
+bool bind_overlay_conditions(const std::vector<Condition>& conditions, LiteralBinder& binder,
+                             PlanLiteralOverlay* overlay) {
+    for (const auto& condition : conditions) {
+        if (condition.is_rhs_val && !bind_overlay_value(condition.rhs_val, binder, overlay)) {
             return false;
+        }
     }
     return true;
 }
 
-bool bind_plan_expr(QueryExpr& expression, LiteralBinder& binder) {
-    return expression.type != QueryExprType::VALUE || binder.bind(expression.value);
+bool bind_overlay_expr(const QueryExpr& expression, LiteralBinder& binder, PlanLiteralOverlay* overlay) {
+    return expression.type != QueryExprType::VALUE || bind_overlay_value(expression.value, binder, overlay);
 }
 
-bool bind_plan_node(Plan& plan, LiteralBinder& binder) {
+bool bind_plan_overlay(const Plan& plan, LiteralBinder& binder, PlanLiteralOverlay* overlay) {
     switch (plan.tag) {
     case T_Projection: {
-        auto& projection = static_cast<ProjectionPlan&>(plan);
-        for (auto& item : projection.select_items_) {
-            if (!bind_plan_expr(item.expr, binder))
+        const auto& projection = static_cast<const ProjectionPlan&>(plan);
+        for (const auto& item : projection.select_items_) {
+            if (!bind_overlay_expr(item.expr, binder, overlay)) {
                 return false;
+            }
         }
-        return bind_plan_node(*projection.subplan_, binder);
+        return bind_plan_overlay(*projection.subplan_, binder, overlay);
     }
     case T_Aggregate: {
-        auto& aggregate = static_cast<AggregatePlan&>(plan);
-        if (!bind_plan_node(*aggregate.subplan_, binder))
+        const auto& aggregate = static_cast<const AggregatePlan&>(plan);
+        if (!bind_plan_overlay(*aggregate.subplan_, binder, overlay)) {
             return false;
-        for (auto& condition : aggregate.having_conds_) {
-            if (!bind_plan_expr(condition.lhs, binder) ||
-                (!condition.is_rhs_val && !bind_plan_expr(condition.rhs_expr, binder)) ||
-                (condition.is_rhs_val && !binder.bind(condition.rhs_val)))
+        }
+        for (const auto& condition : aggregate.having_conds_) {
+            if (!bind_overlay_expr(condition.lhs, binder, overlay) ||
+                (!condition.is_rhs_val && !bind_overlay_expr(condition.rhs_expr, binder, overlay)) ||
+                (condition.is_rhs_val && !bind_overlay_value(condition.rhs_val, binder, overlay))) {
                 return false;
+            }
         }
         return true;
     }
     case T_Sort: {
-        auto& sort = static_cast<SortPlan&>(plan);
-        if (!bind_plan_node(*sort.subplan_, binder))
+        const auto& sort = static_cast<const SortPlan&>(plan);
+        if (!bind_plan_overlay(*sort.subplan_, binder, overlay)) {
             return false;
-        for (auto& item : sort.order_by_items_) {
-            if (!bind_plan_expr(item.expr, binder))
+        }
+        for (const auto& item : sort.order_by_items_) {
+            if (!bind_overlay_expr(item.expr, binder, overlay)) {
                 return false;
+            }
         }
         return true;
     }
     case T_Limit:
-        return bind_plan_node(*static_cast<LimitPlan&>(plan).subplan_, binder);
+        return bind_plan_overlay(*static_cast<const LimitPlan&>(plan).subplan_, binder, overlay);
     case T_Filter: {
-        auto& filter = static_cast<FilterPlan&>(plan);
-        if (!bind_plan_conditions(filter.conds_, binder))
-            return false;
-        return bind_plan_node(*filter.subplan_, binder);
+        const auto& filter = static_cast<const FilterPlan&>(plan);
+        return bind_overlay_conditions(filter.conds_, binder, overlay) &&
+               bind_plan_overlay(*filter.subplan_, binder, overlay);
     }
     case T_SeqScan:
     case T_IndexScan:
     case T_IndexSkipScan:
-        return bind_plan_conditions(static_cast<ScanPlan&>(plan).conds_, binder);
+        return bind_overlay_conditions(static_cast<const ScanPlan&>(plan).conds_, binder, overlay);
     case T_NestLoop:
     case T_SortMerge: {
-        auto& join = static_cast<JoinPlan&>(plan);
-        if (!bind_plan_conditions(join.conds_, binder))
-            return false;
-        return bind_plan_node(*join.left_, binder) && bind_plan_node(*join.right_, binder);
+        const auto& join = static_cast<const JoinPlan&>(plan);
+        return bind_overlay_conditions(join.conds_, binder, overlay) &&
+               bind_plan_overlay(*join.left_, binder, overlay) && bind_plan_overlay(*join.right_, binder, overlay);
     }
     case T_Union: {
-        auto& union_plan = static_cast<UnionPlan&>(plan);
-        for (auto& branch : union_plan.branches_) {
-            if (!bind_plan_node(*branch, binder))
+        const auto& union_plan = static_cast<const UnionPlan&>(plan);
+        for (const auto& branch : union_plan.branches_) {
+            if (!bind_plan_overlay(*branch, binder, overlay)) {
                 return false;
+            }
         }
         return true;
     }
     case T_Insert: {
-        auto& dml = static_cast<DMLPlan&>(plan);
-        for (auto& value : dml.values_) {
-            if (!binder.bind(value))
+        const auto& dml = static_cast<const DMLPlan&>(plan);
+        for (const auto& value : dml.values_) {
+            if (!bind_overlay_value(value, binder, overlay)) {
                 return false;
+            }
         }
         return true;
     }
     case T_Update: {
-        auto& dml = static_cast<DMLPlan&>(plan);
-        if (!bind_plan_conditions(dml.conds_, binder))
+        const auto& dml = static_cast<const DMLPlan&>(plan);
+        if (!bind_overlay_conditions(dml.conds_, binder, overlay)) {
             return false;
-        for (auto& clause : dml.set_clauses_) {
-            if (!binder.bind(clause.rhs))
-                return false;
         }
-        return dml.subplan_ == nullptr || bind_plan_node(*dml.subplan_, binder);
+        for (const auto& clause : dml.set_clauses_) {
+            if (!bind_overlay_value(clause.rhs, binder, overlay)) {
+                return false;
+            }
+        }
+        return dml.subplan_ == nullptr || bind_plan_overlay(*dml.subplan_, binder, overlay);
     }
     case T_Delete: {
-        auto& dml = static_cast<DMLPlan&>(plan);
-        return bind_plan_conditions(dml.conds_, binder) &&
-               (dml.subplan_ == nullptr || bind_plan_node(*dml.subplan_, binder));
+        const auto& dml = static_cast<const DMLPlan&>(plan);
+        return bind_overlay_conditions(dml.conds_, binder, overlay) &&
+               (dml.subplan_ == nullptr || bind_plan_overlay(*dml.subplan_, binder, overlay));
     }
     case T_select:
     case T_ExplainAnalyze: {
-        auto& dml = static_cast<DMLPlan&>(plan);
-        return dml.subplan_ == nullptr || bind_plan_node(*dml.subplan_, binder);
+        const auto& dml = static_cast<const DMLPlan&>(plan);
+        return dml.subplan_ == nullptr || bind_plan_overlay(*dml.subplan_, binder, overlay);
     }
     default:
         return true;
@@ -418,9 +447,8 @@ std::unique_ptr<Query> StatementTemplateCache::lookup_query(const parser::TokenS
     return result;
 }
 
-std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                                                          SmManager* sm_manager,
-                                                          const parser::OwnedTokenStream* lexical) {
+BoundPlan StatementTemplateCache::lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
+                                              SmManager* sm_manager, const parser::OwnedTokenStream* lexical) {
     std::shared_ptr<const Plan> plan;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -429,19 +457,23 @@ std::unique_ptr<Plan> StatementTemplateCache::lookup_plan(const parser::TokenSha
         if (found == entries_.end() || found->second.catalog_generation != catalog_generation ||
             found->second.key != key || found->second.plan == nullptr) {
             ++stats_.misses;
-            return nullptr;
+            return {};
         }
         found->second.last_use = ++clock_;
         ++stats_.hits;
         plan = found->second.plan;
     }
-    auto result = clone_plan(*plan, sm_manager);
+    (void)sm_manager;
+    auto literals = std::make_shared<PlanLiteralOverlay>();
     if (lexical != nullptr) {
+        literals->values.resize(lexical->parameters.size());
+        literals->present.resize(lexical->parameters.size(), false);
         LiteralBinder binder(*lexical);
-        if (!bind_plan_node(*result, binder) || !binder.done())
-            return nullptr;
+        if (!bind_plan_overlay(*plan, binder, literals.get()) || !binder.done()) {
+            return {};
+        }
     }
-    return result;
+    return BoundPlan{std::move(plan), std::move(literals), std::make_shared<BoundPlan::RuntimeState>()};
 }
 
 FullTemplateLookup StatementTemplateCache::lookup_full(const parser::TokenShapeKey& key, uint64_t catalog_generation,
@@ -466,18 +498,22 @@ FullTemplateLookup StatementTemplateCache::lookup_full(const parser::TokenShapeK
     }
 
     if (prepared_select != nullptr && prepared_select->Matches(sm_manager)) {
-        return FullTemplateLookup{statement_type, nullptr, std::move(prepared_select)};
+        return FullTemplateLookup{statement_type, {}, std::move(prepared_select)};
     }
 
-    FullTemplateLookup result{statement_type, clone_plan(*plan, sm_manager), nullptr};
+    auto literals = std::make_shared<PlanLiteralOverlay>();
+    if (lexical != nullptr) {
+        literals->values.resize(lexical->parameters.size());
+        literals->present.resize(lexical->parameters.size(), false);
+        LiteralBinder plan_binder(*lexical);
+        if (!bind_plan_overlay(*plan, plan_binder, literals.get()) || !plan_binder.done()) {
+            return {};
+        }
+    }
+    FullTemplateLookup result{
+        statement_type, BoundPlan{std::move(plan), std::move(literals), std::make_shared<BoundPlan::RuntimeState>()},
+        nullptr};
     if (!result) {
-        return {};
-    }
-    if (lexical == nullptr) {
-        return result;
-    }
-    LiteralBinder plan_binder(*lexical);
-    if (!bind_plan_node(*result.plan, plan_binder) || !plan_binder.done()) {
         return {};
     }
     return result;

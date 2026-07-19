@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -726,6 +727,16 @@ public:
     bool uses_rid_vector_cursor() const {
         return rid_vector_cursor_.has_value();
     }
+
+    uint64_t constraint_rebuild_count() const {
+        return constraint_rebuild_count_;
+    }
+
+#ifdef RMDB_ENABLE_JIT
+    uint64_t jit_rebuild_count() const {
+        return jit_rebuild_count_;
+    }
+#endif
 };
 
 class IndexScanFeatureTest : public ::testing::Test {
@@ -1044,6 +1055,21 @@ TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorBindsEachRequestWithoutClon
 
     EXPECT_EQ(execute("select w_id from warehouse where w_id >= 10 and name = 'qweruiop';"), std::vector<int>({10}));
     EXPECT_EQ(execute("select w_id from warehouse where w_id >= 100 and name = 'qwerghjk';"), std::vector<int>({100}));
+    const auto pool_stats = descriptor->pool_stats();
+    EXPECT_EQ(pool_stats.constructed, 1U);
+    EXPECT_EQ(pool_stats.reused, 1U);
+    EXPECT_EQ(pool_stats.available, 1U);
+
+    auto lexical = parser::normalize_sql("select w_id from warehouse where w_id >= 500 and name = 'asdfghjk';", false);
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    auto executor = descriptor->Instantiate(lexical, sm_manager.get(), &context);
+    ASSERT_NE(executor, nullptr);
+    const auto& ssi_conditions = executor->scan_conditions_ref();
+    ASSERT_EQ(ssi_conditions.size(), 2U);
+    EXPECT_EQ(ssi_conditions[0].rhs_val.int_val, 500);
+    EXPECT_EQ(ssi_conditions[1].rhs_val.str_val, "asdfghjk");
 }
 
 TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorComposesSharedAggregateWithRequestLocalState) {
@@ -1138,6 +1164,18 @@ TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorComposesSharedAggregateWith
     EXPECT_EQ(read_unaligned<int>(first_tuple.data + sizeof(int)), 30);
     EXPECT_EQ(read_unaligned<int>(second_tuple.data), 1);
     EXPECT_EQ(read_unaligned<int>(second_tuple.data + sizeof(int)), 20);
+
+    first.reset();
+    second.reset();
+    auto reused = descriptor->Instantiate(first_lexical, sm_manager.get(), &first_context);
+    ASSERT_NE(reused, nullptr);
+    reused->beginTuple();
+    ASSERT_FALSE(reused->is_end());
+    auto reused_tuple = reused->current();
+    ASSERT_TRUE(reused_tuple);
+    EXPECT_EQ(read_unaligned<int>(reused_tuple.data), 1);
+    EXPECT_EQ(read_unaligned<int>(reused_tuple.data + sizeof(int)), 30);
+    EXPECT_GE(descriptor->pool_stats().reused, 1U);
 }
 
 TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorRejectsParameterizedHavingCapability) {
@@ -1219,6 +1257,9 @@ TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorSupportsConcurrentRequestLo
         worker.join();
     }
     EXPECT_FALSE(failed.load());
+    const auto pool_stats = descriptor->pool_stats();
+    EXPECT_GE(pool_stats.constructed, 1U);
+    EXPECT_EQ(pool_stats.available, pool_stats.constructed);
 }
 
 TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorFallsBackAfterCatalogGenerationChanges) {
@@ -1336,8 +1377,8 @@ TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
     ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_direct", {}, {"b"}, &context);
     int lookup_value = 7;
-    executor.set_lookup_key(TabCol{"lookup_direct", "b"}, reinterpret_cast<const char*>(&lookup_value),
-                            sizeof(lookup_value));
+    executor.bind_lookup_key(TabCol{"lookup_direct", "b"}, LookupKeyView{reinterpret_cast<const char*>(&lookup_value),
+                                                                         sizeof(lookup_value), TYPE_INT});
 
     executor.beginTuple();
     EXPECT_TRUE(executor.uses_single_rid_cursor());
@@ -1363,8 +1404,8 @@ TEST_F(IndexScanFeatureTest, ExactLookupMissUsesEmptySingleRidCursor) {
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
     ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_miss", {}, {"b"}, &context);
     int lookup_value = 8;
-    executor.set_lookup_key(TabCol{"lookup_miss", "b"}, reinterpret_cast<const char*>(&lookup_value),
-                            sizeof(lookup_value));
+    executor.bind_lookup_key(TabCol{"lookup_miss", "b"}, LookupKeyView{reinterpret_cast<const char*>(&lookup_value),
+                                                                       sizeof(lookup_value), TYPE_INT});
 
     executor.beginTuple();
 
@@ -1391,8 +1432,9 @@ TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
     Context context(nullptr, nullptr, nullptr, data_send, &offset);
     ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_duplicates", {}, {"b"}, &context);
     int lookup_value = 7;
-    executor.set_lookup_key(TabCol{"lookup_duplicates", "b"}, reinterpret_cast<const char*>(&lookup_value),
-                            sizeof(lookup_value));
+    executor.bind_lookup_key(
+        TabCol{"lookup_duplicates", "b"},
+        LookupKeyView{reinterpret_cast<const char*>(&lookup_value), sizeof(lookup_value), TYPE_INT});
 
     std::vector<int> result;
     for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
@@ -1403,6 +1445,82 @@ TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
     EXPECT_EQ(result, std::vector<int>({10, 20}));
     EXPECT_FALSE(executor.uses_single_rid_cursor());
     EXPECT_TRUE(executor.uses_rid_vector_cursor());
+}
+
+TEST_F(IndexScanFeatureTest, TypedLookupConvertsValuesWithoutRebuildingScanStructures) {
+    create_two_int_table("typed_lookup_int");
+    insert_two_ints("typed_lookup_int", 10, 7);
+    insert_two_ints("typed_lookup_int", 20, 8);
+    sm_manager->create_index("typed_lookup_int", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "typed_lookup_int", {}, {"b"}, &context);
+    const auto constraint_builds = executor.constraint_rebuild_count();
+#ifdef RMDB_ENABLE_JIT
+    const auto jit_builds = executor.jit_rebuild_count();
+#endif
+
+    double integral = 7.0;
+    executor.bind_lookup_key(TabCol{"typed_lookup_int", "b"},
+                             LookupKeyView{reinterpret_cast<const char*>(&integral), sizeof(integral), TYPE_FLOAT});
+    executor.beginTuple();
+    ASSERT_FALSE(executor.is_end());
+    EXPECT_EQ(read_unaligned<int>(executor.Next()->data), 10);
+    EXPECT_EQ(executor.constraint_rebuild_count(), constraint_builds);
+#ifdef RMDB_ENABLE_JIT
+    EXPECT_EQ(executor.jit_rebuild_count(), jit_builds);
+#endif
+
+    double fractional = 7.5;
+    executor.bind_lookup_key(TabCol{"typed_lookup_int", "b"},
+                             LookupKeyView{reinterpret_cast<const char*>(&fractional), sizeof(fractional), TYPE_FLOAT});
+    executor.beginTuple();
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_TRUE(executor.uses_empty_single_rid_cursor());
+    EXPECT_EQ(executor.constraint_rebuild_count(), constraint_builds);
+
+    double nan = std::numeric_limits<double>::quiet_NaN();
+    executor.bind_lookup_key(TabCol{"typed_lookup_int", "b"},
+                             LookupKeyView{reinterpret_cast<const char*>(&nan), sizeof(nan), TYPE_FLOAT});
+    executor.beginTuple();
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_TRUE(executor.uses_empty_single_rid_cursor());
+
+    double out_of_range = static_cast<double>(std::numeric_limits<int>::max()) * 2.0;
+    executor.bind_lookup_key(
+        TabCol{"typed_lookup_int", "b"},
+        LookupKeyView{reinterpret_cast<const char*>(&out_of_range), sizeof(out_of_range), TYPE_FLOAT});
+    executor.beginTuple();
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_TRUE(executor.uses_empty_single_rid_cursor());
+    EXPECT_EQ(executor.constraint_rebuild_count(), constraint_builds);
+}
+
+TEST_F(IndexScanFeatureTest, TypedLookupRejectsStringOverflowWithoutTruncatingProbe) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"name"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "warehouse", {}, {"name"}, &context);
+    const auto constraint_builds = executor.constraint_rebuild_count();
+    const char oversized[] = "qweruiopX";
+    executor.bind_lookup_key(TabCol{"warehouse", "name"}, LookupKeyView{oversized, sizeof(oversized) - 1, TYPE_STRING});
+    executor.beginTuple();
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_TRUE(executor.uses_empty_single_rid_cursor());
+    EXPECT_EQ(executor.constraint_rebuild_count(), constraint_builds);
+
+    char wider_source[16] = "qweruiop";
+    executor.bind_lookup_key(TabCol{"warehouse", "name"},
+                             LookupKeyView{wider_source, sizeof(wider_source), TYPE_STRING});
+    executor.beginTuple();
+    ASSERT_FALSE(executor.is_end());
+    EXPECT_EQ(read_unaligned<int>(executor.Next()->data), 10);
+    EXPECT_EQ(executor.constraint_rebuild_count(), constraint_builds);
 }
 
 TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRange) {

@@ -32,7 +32,6 @@ public:
         size_t index_col_ordinal;
         size_t condition_position;
         CompOp op;
-        Value literal;
     };
 
     static IndexScanDescriptor Build(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conditions,
@@ -85,8 +84,8 @@ public:
                 continue;
             }
             descriptor.compiled_index_conditions_.push_back(
-                {static_cast<size_t>(index_col - descriptor.index_meta_.cols.begin()), condition_position, condition.op,
-                 condition.rhs_val});
+                {static_cast<size_t>(index_col - descriptor.index_meta_.cols.begin()), condition_position,
+                 condition.op});
         }
         return descriptor;
     }

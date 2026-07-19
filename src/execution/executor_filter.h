@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "executor_abstract.h"
+#include "prepared_parameter_binding.h"
 #ifdef RMDB_ENABLE_JIT
 #include "jit/jit_predicate.h"
 #endif
@@ -20,6 +21,7 @@ class FilterExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
     std::vector<Condition> conds_;
+    std::vector<CompactCondition> compact_conds_;
     std::vector<ConditionAddress> condition_addresses_;
 #ifdef RMDB_ENABLE_JIT
     std::unique_ptr<jit::PredicateKernel> jit_predicate_;
@@ -30,6 +32,7 @@ private:
     mutable std::vector<Condition> scan_conditions_cache_;
     bool isend_ = true;
     bool predicate_recorded_ = false;
+    bool prepared_mode_ = false;
 
     bool should_track_ssi_reads() const {
         return context_ != nullptr && context_->enable_ssi_read_tracking_ && context_->txn_ != nullptr &&
@@ -50,13 +53,16 @@ private:
 
     bool matches(const TupleView& tuple) {
 #ifdef RMDB_ENABLE_JIT
-        if (jit_predicate_ != nullptr) {
+        if (!prepared_mode_ && jit_predicate_ != nullptr) {
             auto result = jit_predicate_->evaluate(tuple.data, tuple.size);
             if (result.has_value()) {
                 return *result;
             }
         }
 #endif
+        if (prepared_mode_) {
+            return conditions_match(compact_conds_, condition_addresses_, tuple);
+        }
         return conditions_match(conds_, condition_addresses_, tuple);
     }
 
@@ -93,14 +99,24 @@ private:
     }
 
 public:
-    FilterExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<Condition> conds) {
+    FilterExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<Condition> conds)
+        : FilterExecutor(std::move(prev), std::move(conds), false) {}
+
+    FilterExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<Condition> conds, bool prepared_mode) {
         prev_ = std::move(prev);
         context_ = prev_->context_;
         conds_ = std::move(conds);
+        prepared_mode_ = prepared_mode;
+        if (prepared_mode_) {
+            compact_conds_.reserve(conds_.size());
+            for (const auto& condition : conds_) {
+                compact_conds_.push_back(CompactCondition{condition.op, condition.is_rhs_val, condition.rhs_val});
+            }
+        }
         condition_addresses_ = cache_condition_addresses(conds_);
         len_ = prev_->tupleLen();
 #ifdef RMDB_ENABLE_JIT
-        if (jit::predicate_jit_available()) {
+        if (!prepared_mode_ && jit::predicate_jit_available()) {
             auto predicate = std::make_unique<jit::PredicateKernel>(
                 T_Filter, conds_, jit::JitTupleLayout{static_cast<uint32_t>(len_), prev_->cols()}, std::nullopt,
                 prev_->catalog_generation(), context_);
@@ -109,6 +125,38 @@ public:
             }
         }
 #endif
+    }
+
+    bool ResetPreparedRequest(const PreparedParameterLayout& parameters, const compiled::ParameterFrame& frame,
+                              Context* context) {
+        if (!prepared_mode_ || compact_conds_.size() != conds_.size()) {
+            return false;
+        }
+        context_ = context;
+        predicate_recorded_ = false;
+        fallback_record_.reset();
+        current_view_ = {};
+        scan_conditions_cache_.clear();
+        isend_ = true;
+        for (size_t i = 0; i < compact_conds_.size(); ++i) {
+            if (!compact_conds_[i].is_rhs_val) {
+                continue;
+            }
+            if (!parameters.Apply(frame, &compact_conds_[i].rhs_val)) {
+                return false;
+            }
+            conds_[i].rhs_val = compact_conds_[i].rhs_val;
+        }
+        return true;
+    }
+
+    void ResetForPreparedPool() noexcept {
+        context_ = nullptr;
+        predicate_recorded_ = false;
+        fallback_record_.reset();
+        current_view_ = {};
+        scan_conditions_cache_.clear();
+        isend_ = true;
     }
 
     void beginTuple() override {
@@ -179,8 +227,8 @@ public:
         prev_->set_key_conditions(std::move(key_conds));
     }
 
-    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
-        prev_->set_lookup_key(target, key, len);
+    void bind_lookup_key(const TabCol& target, LookupKeyView key) override {
+        prev_->bind_lookup_key(target, key);
     }
 
     std::string scan_table_name() const override {

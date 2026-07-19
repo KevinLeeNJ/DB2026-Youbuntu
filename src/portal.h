@@ -70,6 +70,7 @@ struct PortalStmt {
     std::vector<std::string> output_names;
     std::unique_ptr<AbstractExecutor> root;
     std::unique_ptr<Plan> plan;
+    BoundPlan bound_plan;
     struct CompiledSelectSpec {
         std::shared_ptr<const compiled::CompiledProgram> program;
         std::vector<compiled::ParameterValue> parameters;
@@ -102,9 +103,21 @@ struct PortalStmt {
     std::shared_ptr<CompiledMutationSpec> compiled_mutation;
     compiled::ProgramTemplatePtr compiled_template;
 
+    const Plan* execution_plan() const {
+        return bound_plan ? bound_plan.get() : plan.get();
+    }
+
+    Plan* mutable_plan() const {
+        return plan.get();
+    }
+
     PortalStmt(portalTag tag_, std::vector<std::string> output_names_, std::unique_ptr<AbstractExecutor> root_,
                std::unique_ptr<Plan> plan_)
         : tag(tag_), output_names(std::move(output_names_)), root(std::move(root_)), plan(std::move(plan_)) {}
+
+    PortalStmt(portalTag tag_, std::vector<std::string> output_names_, std::unique_ptr<AbstractExecutor> root_,
+               BoundPlan plan_)
+        : tag(tag_), output_names(std::move(output_names_)), root(std::move(root_)), bound_plan(std::move(plan_)) {}
 };
 
 class Portal {
@@ -413,7 +426,7 @@ private:
         if (point_program_cache_enabled() && context != nullptr && context->has_statement_template_identity_) {
             compiled::ProgramTemplateIdentity identity{
                 parser::TokenShapeKey{context->statement_shape_high_, context->statement_shape_low_,
-                                      context->statement_shape_canonical_},
+                                      context->statement_shape_size_},
                 sm_manager_->get_catalog_generation(), context->statement_template_generation_,
                 context->planner_generation_, compiled::ProgramKind::POINT_SELECT};
             std::string error;
@@ -548,7 +561,7 @@ private:
 
         compiled::ProgramTemplateIdentity identity{
             parser::TokenShapeKey{context->statement_shape_high_, context->statement_shape_low_,
-                                  context->statement_shape_canonical_},
+                                  context->statement_shape_size_},
             sm_manager_->get_catalog_generation(), context->statement_template_generation_,
             context->planner_generation_, spec->program->kind()};
         std::string error;
@@ -871,7 +884,7 @@ private:
     class CountingExecutor : public AbstractExecutor {
     private:
         std::unique_ptr<AbstractExecutor> inner_;
-        Plan* plan_;
+        size_t* runtime_rows_;
         bool counting_enabled_ = true;
         bool current_counted_ = false;
 
@@ -880,14 +893,14 @@ private:
             if (!counting_enabled_ || inner_->is_end() || !inner_->current()) {
                 return;
             }
-            ++plan_->runtime_rows_;
+            ++*runtime_rows_;
             current_counted_ = true;
         }
 
     public:
-        CountingExecutor(std::unique_ptr<AbstractExecutor> inner, Plan* plan) {
+        CountingExecutor(std::unique_ptr<AbstractExecutor> inner, size_t* runtime_rows) {
             inner_ = std::move(inner);
-            plan_ = plan;
+            runtime_rows_ = runtime_rows;
             context_ = inner_->context_;
         }
 
@@ -924,7 +937,7 @@ private:
         std::unique_ptr<RmRecord> Next() override {
             auto rec = inner_->Next();
             if (rec != nullptr && counting_enabled_ && !current_counted_) {
-                ++plan_->runtime_rows_;
+                ++*runtime_rows_;
             }
             current_counted_ = false;
             return rec;
@@ -947,8 +960,8 @@ private:
             inner_->set_key_conditions(std::move(key_conds));
         }
 
-        void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
-            inner_->set_lookup_key(target, key, len);
+        void bind_lookup_key(const TabCol& target, LookupKeyView key) override {
+            inner_->bind_lookup_key(target, key);
         }
 
         std::string scan_table_name() const override {
@@ -981,6 +994,37 @@ private:
         executor_expr.value = expr.value;
         executor_expr.display_name = expr.display_name;
         return executor_expr;
+    }
+
+    static Value bind_value(const Value& value, const PlanLiteralOverlay* literals) {
+        if (literals == nullptr || value.lexical_slot < 0) {
+            return value;
+        }
+        const Value* bound = literals->Find(value.lexical_slot);
+        if (bound == nullptr) {
+            throw InternalError("cached plan literal binding is missing");
+        }
+        return *bound;
+    }
+
+    static std::vector<Condition> bind_conditions(const std::vector<Condition>& conditions,
+                                                  const PlanLiteralOverlay* literals) {
+        std::vector<Condition> bound = conditions;
+        for (auto& condition : bound) {
+            if (condition.is_rhs_val) {
+                condition.rhs_val = bind_value(condition.rhs_val, literals);
+            }
+        }
+        return bound;
+    }
+
+    static std::vector<SetClause> bind_set_clauses(const std::vector<SetClause>& clauses,
+                                                   const PlanLiteralOverlay* literals) {
+        std::vector<SetClause> bound = clauses;
+        for (auto& clause : bound) {
+            clause.rhs = bind_value(clause.rhs, literals);
+        }
+        return bound;
     }
 
     static std::vector<ExecutorSelectItem> to_executor_select_items(const std::vector<SelectItem>& select_items) {
@@ -1108,18 +1152,18 @@ private:
         return output_names;
     }
 
-    std::vector<std::string> get_plan_output_names(Plan* plan) const {
+    std::vector<std::string> get_plan_output_names(const Plan* plan) const {
         switch (plan->tag) {
         case T_Projection:
-            return build_projection_output_names(*static_cast<ProjectionPlan*>(plan));
+            return build_projection_output_names(*static_cast<const ProjectionPlan*>(plan));
         case T_Sort:
-            return get_plan_output_names(static_cast<SortPlan*>(plan)->subplan_.get());
+            return get_plan_output_names(static_cast<const SortPlan*>(plan)->subplan_.get());
         case T_Limit:
-            return get_plan_output_names(static_cast<LimitPlan*>(plan)->subplan_.get());
+            return get_plan_output_names(static_cast<const LimitPlan*>(plan)->subplan_.get());
         case T_Aggregate:
-            return build_aggregate_output_names(*static_cast<AggregatePlan*>(plan));
+            return build_aggregate_output_names(*static_cast<const AggregatePlan*>(plan));
         case T_Union: {
-            auto union_plan = static_cast<UnionPlan*>(plan);
+            auto union_plan = static_cast<const UnionPlan*>(plan);
             if (!union_plan->output_names_.empty()) {
                 return union_plan->output_names_;
             }
@@ -1134,7 +1178,7 @@ private:
         case T_IndexSkipScan:
         case T_IndexScan: {
             std::vector<std::string> output_names;
-            const auto& cols = static_cast<ScanPlan*>(plan)->cols_;
+            const auto& cols = static_cast<const ScanPlan*>(plan)->cols_;
             output_names.reserve(cols.size());
             for (const auto& col : cols) {
                 output_names.push_back(col.name);
@@ -1143,7 +1187,7 @@ private:
         }
         case T_NestLoop:
         case T_SortMerge: {
-            auto join_plan = static_cast<JoinPlan*>(plan);
+            auto join_plan = static_cast<const JoinPlan*>(plan);
             auto output_names = get_plan_output_names(join_plan->left_.get());
             auto right_output_names = get_plan_output_names(join_plan->right_.get());
             output_names.insert(output_names.end(), right_output_names.begin(), right_output_names.end());
@@ -1236,22 +1280,33 @@ private:
         return values;
     }
 
-    static void collect_tables(Plan* plan, std::set<std::string>& tables) {
+    static std::vector<std::string> condition_strings(const Plan& plan, const std::vector<Condition>& conds,
+                                                      const PlanLiteralOverlay* literals) {
+        auto bound = bind_conditions(conds, literals);
+        for (auto& condition : bound) {
+            if (condition.is_rhs_val && condition.rhs_val.lexical_slot >= 0) {
+                condition.rhs_display.clear();
+            }
+        }
+        return condition_strings(plan, bound);
+    }
+
+    static void collect_tables(const Plan* plan, std::set<std::string>& tables) {
         switch (plan->tag) {
         case T_SeqScan:
         case T_IndexSkipScan:
         case T_IndexScan:
-            tables.insert(static_cast<ScanPlan*>(plan)->tab_name_);
+            tables.insert(static_cast<const ScanPlan*>(plan)->tab_name_);
             break;
         case T_Filter:
-            collect_tables(static_cast<FilterPlan*>(plan)->subplan_.get(), tables);
+            collect_tables(static_cast<const FilterPlan*>(plan)->subplan_.get(), tables);
             break;
         case T_Projection:
-            collect_tables(static_cast<ProjectionPlan*>(plan)->subplan_.get(), tables);
+            collect_tables(static_cast<const ProjectionPlan*>(plan)->subplan_.get(), tables);
             break;
         case T_NestLoop:
         case T_SortMerge: {
-            auto join = static_cast<JoinPlan*>(plan);
+            auto join = static_cast<const JoinPlan*>(plan);
             collect_tables(join->left_.get(), tables);
             collect_tables(join->right_.get(), tables);
             break;
@@ -1351,6 +1406,55 @@ private:
         }
     }
 
+    static void render_bound_explain_plan(const Plan* plan, const PlanLiteralOverlay* literals,
+                                          const BoundPlan::RuntimeState& runtime, int depth, std::ostringstream& out) {
+        const auto found = runtime.rows.find(plan);
+        const size_t rows = found == runtime.rows.end() ? 0 : found->second;
+        out << std::string(static_cast<size_t>(depth), '\t');
+        switch (plan->tag) {
+        case T_SeqScan: {
+            const auto* scan = static_cast<const ScanPlan*>(plan);
+            out << "Scan(table=" << scan->tab_name_ << ", type=SeqScan, rows=" << rows << ")\n";
+            break;
+        }
+        case T_IndexScan:
+        case T_IndexSkipScan: {
+            const auto* scan = static_cast<const ScanPlan*>(plan);
+            out << "Scan(table=" << scan->tab_name_
+                << ", type=" << (plan->tag == T_IndexScan ? "IndexScan" : "IndexSkipScan") << ", using_index=("
+                << scan->index_col_names_[0] << "), rows=" << rows << ")\n";
+            break;
+        }
+        case T_Filter: {
+            const auto* filter = static_cast<const FilterPlan*>(plan);
+            out << "Filter(condition=[" << join_strings(condition_strings(*plan, filter->conds_, literals))
+                << "], rows=" << rows << ")\n";
+            render_bound_explain_plan(filter->subplan_.get(), literals, runtime, depth + 1, out);
+            break;
+        }
+        case T_Projection: {
+            const auto* projection = static_cast<const ProjectionPlan*>(plan);
+            out << "Project(columns=[" << join_strings(projection_columns(*projection)) << "], rows=" << rows << ")\n";
+            render_bound_explain_plan(projection->subplan_.get(), literals, runtime, depth + 1, out);
+            break;
+        }
+        case T_NestLoop:
+        case T_SortMerge: {
+            const auto* join = static_cast<const JoinPlan*>(plan);
+            std::set<std::string> table_set;
+            collect_tables(plan, table_set);
+            std::vector<std::string> tables(table_set.begin(), table_set.end());
+            out << "Join(tables=[" << join_strings(std::move(tables)) << "], condition=["
+                << join_strings(condition_strings(*plan, join->conds_, literals)) << "], rows=" << rows << ")\n";
+            render_bound_explain_plan(join->left_.get(), literals, runtime, depth + 1, out);
+            render_bound_explain_plan(join->right_.get(), literals, runtime, depth + 1, out);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
     static void append_to_context(const std::string& text, Context* context) {
         if (context == nullptr || context->data_send_ == nullptr || context->offset_ == nullptr) {
             return;
@@ -1374,7 +1478,15 @@ private:
         if (!count_rows) {
             return executor;
         }
-        return std::make_unique<CountingExecutor>(std::move(executor), plan);
+        return std::make_unique<CountingExecutor>(std::move(executor), &plan->runtime_rows_);
+    }
+
+    static std::unique_ptr<AbstractExecutor> maybe_count(std::unique_ptr<AbstractExecutor> executor, const Plan* plan,
+                                                         bool count_rows, BoundPlan::RuntimeState* runtime) {
+        if (!count_rows) {
+            return executor;
+        }
+        return std::make_unique<CountingExecutor>(std::move(executor), &runtime->rows[plan]);
     }
 
 public:
@@ -1602,6 +1714,87 @@ public:
         return nullptr;
     }
 
+    std::unique_ptr<PortalStmt> start(BoundPlan plan, Context* context) {
+        if (!plan) {
+            return nullptr;
+        }
+        switch (plan->tag) {
+        case T_Help:
+        case T_ShowTable:
+        case T_ShowIndex:
+        case T_DescTable:
+        case T_Transaction_begin:
+        case T_Transaction_commit:
+        case T_Transaction_abort:
+        case T_Transaction_rollback:
+        case T_SetKnob:
+        case T_SetTransaction:
+        case T_SetOutputFile:
+        case T_LoadData:
+        case T_StaticCheckpoint:
+            return std::make_unique<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
+                                                std::unique_ptr<AbstractExecutor>(), std::move(plan));
+        case T_CreateTable:
+        case T_DropTable:
+        case T_CreateIndex:
+        case T_DropIndex:
+            return std::make_unique<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<std::string>(),
+                                                std::unique_ptr<AbstractExecutor>(), std::move(plan));
+        default:
+            break;
+        }
+        const auto* dml = dynamic_cast<const DMLPlan*>(plan.get());
+        if (dml == nullptr) {
+            throw InternalError("cached plan is not a DML statement");
+        }
+        const auto* literals = plan.literals.get();
+        switch (dml->tag) {
+        case T_select: {
+            std::vector<std::string> output_names = get_plan_output_names(dml->subplan_.get());
+            auto root = convert_bound_plan_executor(dml->subplan_.get(), context, literals, plan.runtime.get());
+            return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names), std::move(root),
+                                                std::move(plan));
+        }
+        case T_ExplainAnalyze: {
+            auto root = convert_bound_plan_executor(dml->subplan_.get(), context, literals, plan.runtime.get(), true);
+            return std::make_unique<PortalStmt>(PORTAL_EXPLAIN_ANALYZE, std::vector<std::string>(), std::move(root),
+                                                std::move(plan));
+        }
+        case T_Insert: {
+            std::vector<Value> values;
+            values.reserve(dml->values_.size());
+            for (const auto& value : dml->values_) {
+                values.push_back(bind_value(value, literals));
+            }
+            auto root = std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_, std::move(values), context);
+            return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::move(root),
+                                                std::move(plan));
+        }
+        case T_Update:
+        case T_Delete: {
+            const auto conditions = bind_conditions(dml->conds_, literals);
+            std::vector<Rid> rids;
+            auto scan = convert_bound_plan_executor(dml->subplan_.get(), context, literals, plan.runtime.get());
+            for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
+                rids.push_back(scan->rid());
+            }
+            std::unique_ptr<AbstractExecutor> root;
+            if (dml->tag == T_Delete) {
+                root =
+                    std::make_unique<DeleteExecutor>(sm_manager_, dml->tab_name_, conditions, std::move(rids), context);
+            } else {
+                root = std::make_unique<UpdateExecutor>(sm_manager_, dml->tab_name_,
+                                                        bind_set_clauses(dml->set_clauses_, literals), conditions,
+                                                        std::move(rids), context);
+            }
+            return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::move(root),
+                                                std::move(plan));
+        }
+        default:
+            throw InternalError("cached plan kind is unsupported");
+        }
+    }
+
     // 遍历算子树并执行算子生成执行结果
     void run(std::unique_ptr<PortalStmt> portal, QlManager* ql, txn_id_t* txn_id, Context* context) {
         switch (portal->tag) {
@@ -1660,9 +1853,15 @@ public:
             for (portal->root->beginTuple(); !portal->root->is_end(); portal->root->nextTuple()) {
                 (void)portal->root->Next();
             }
-            auto* dml = static_cast<DMLPlan*>(portal->plan.get());
             std::ostringstream out;
-            render_explain_plan(dml->subplan_.get(), 0, out);
+            if (portal->bound_plan) {
+                const auto& dml = static_cast<const DMLPlan&>(*portal->bound_plan);
+                render_bound_explain_plan(dml.subplan_.get(), portal->bound_plan.literals.get(),
+                                          *portal->bound_plan.runtime, 0, out);
+            } else {
+                auto* dml = static_cast<DMLPlan*>(portal->plan.get());
+                render_explain_plan(dml->subplan_.get(), 0, out);
+            }
             write_explain_output(out.str(), context);
             break;
         }
@@ -1719,11 +1918,11 @@ public:
             break;
         }
         case PORTAL_MULTI_QUERY: {
-            ql->run_mutli_query(portal->plan.get(), context);
+            ql->run_mutli_query(portal->execution_plan(), context);
             break;
         }
         case PORTAL_CMD_UTILITY: {
-            ql->run_cmd_utility(portal->plan.get(), txn_id, context);
+            ql->run_cmd_utility(portal->execution_plan(), txn_id, context);
             break;
         }
         default: {
@@ -1734,6 +1933,113 @@ public:
 
     // 清空资源
     void drop() {}
+
+    std::unique_ptr<AbstractExecutor> convert_bound_plan_executor(const Plan* plan, Context* context,
+                                                                  const PlanLiteralOverlay* literals,
+                                                                  BoundPlan::RuntimeState* runtime,
+                                                                  bool count_rows = false) {
+        switch (plan->tag) {
+        case T_Projection: {
+            const auto* projection = static_cast<const ProjectionPlan*>(plan);
+            auto child =
+                convert_bound_plan_executor(projection->subplan_.get(), context, literals, runtime, count_rows);
+            std::unique_ptr<AbstractExecutor> executor;
+            if (projection->preserve_col_names_) {
+                std::vector<TabCol> cols;
+                cols.reserve(projection->select_items_.size());
+                for (const auto& item : projection->select_items_) {
+                    cols.push_back(item.expr.col);
+                }
+                executor = std::make_unique<ProjectionExecutor>(std::move(child), cols);
+            } else {
+                executor = std::make_unique<ProjectionExecutor>(std::move(child),
+                                                                to_executor_select_items(projection->select_items_));
+            }
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_Filter: {
+            const auto* filter = static_cast<const FilterPlan*>(plan);
+            auto executor = std::make_unique<FilterExecutor>(
+                convert_bound_plan_executor(filter->subplan_.get(), context, literals, runtime, count_rows),
+                bind_conditions(filter->conds_, literals));
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_Aggregate: {
+            const auto* aggregate = static_cast<const AggregatePlan*>(plan);
+            auto having = aggregate->having_conds_;
+            for (auto& condition : having) {
+                if (condition.is_rhs_val) {
+                    condition.rhs_val = bind_value(condition.rhs_val, literals);
+                }
+                if (condition.lhs.type == QueryExprType::VALUE) {
+                    condition.lhs.value = bind_value(condition.lhs.value, literals);
+                }
+                if (!condition.is_rhs_val && condition.rhs_expr.type == QueryExprType::VALUE) {
+                    condition.rhs_expr.value = bind_value(condition.rhs_expr.value, literals);
+                }
+            }
+            auto executor = std::make_unique<AggregateExecutor>(
+                convert_bound_plan_executor(aggregate->subplan_.get(), context, literals, runtime, count_rows),
+                aggregate->group_by_cols_, aggregate->agg_exprs_, to_executor_having_conds(having), context);
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_SeqScan:
+        case T_IndexSkipScan:
+        case T_IndexScan: {
+            const auto* scan = static_cast<const ScanPlan*>(plan);
+            auto conditions = bind_conditions(scan->conds_, literals);
+            std::unique_ptr<AbstractExecutor> executor;
+            if (scan->tag == T_SeqScan) {
+                executor =
+                    std::make_unique<SeqScanExecutor>(sm_manager_, scan->tab_name_, std::move(conditions), context);
+            } else if (scan->tag == T_IndexSkipScan) {
+                executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, scan->tab_name_, std::move(conditions),
+                                                                   scan->index_col_names_, context);
+            } else {
+                executor = std::make_unique<IndexScanExecutor>(
+                    sm_manager_, scan->tab_name_, std::move(conditions), scan->index_col_names_, context,
+                    scan->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
+            }
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_NestLoop:
+        case T_SortMerge: {
+            const auto* join = static_cast<const JoinPlan*>(plan);
+            auto executor = std::make_unique<NestedLoopJoinExecutor>(
+                convert_bound_plan_executor(join->left_.get(), context, literals, runtime, count_rows),
+                convert_bound_plan_executor(join->right_.get(), context, literals, runtime, count_rows),
+                bind_conditions(join->conds_, literals), join->inlj_left_col_, join->inlj_right_col_,
+                join->inlj_index_col_name_);
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_Sort: {
+            const auto* sort = static_cast<const SortPlan*>(plan);
+            auto executor = std::make_unique<SortExecutor>(
+                convert_bound_plan_executor(sort->subplan_.get(), context, literals, runtime, count_rows),
+                bind_sort_output_names(*sort), sort->limit_);
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_Limit: {
+            const auto* limit = static_cast<const LimitPlan*>(plan);
+            auto executor = std::make_unique<LimitExecutor>(
+                convert_bound_plan_executor(limit->subplan_.get(), context, literals, runtime, count_rows),
+                static_cast<size_t>(limit->limit_));
+            return maybe_count(std::move(executor), plan, count_rows, runtime);
+        }
+        case T_Union: {
+            const auto* union_plan = static_cast<const UnionPlan*>(plan);
+            std::vector<std::unique_ptr<AbstractExecutor>> branches;
+            branches.reserve(union_plan->branches_.size());
+            for (const auto& branch : union_plan->branches_) {
+                branches.push_back(convert_bound_plan_executor(branch.get(), context, literals, runtime, count_rows));
+            }
+            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), union_plan->cols_), plan,
+                               count_rows, runtime);
+        }
+        default:
+            return nullptr;
+        }
+    }
 
     std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false,
                                                             bool consume_plan_data = false) {

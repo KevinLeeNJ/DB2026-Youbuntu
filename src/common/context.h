@@ -44,7 +44,7 @@ public:
     bool has_statement_template_identity_{false};
     uint64_t statement_shape_high_{0};
     uint64_t statement_shape_low_{0};
-    std::string statement_shape_canonical_;
+    uint32_t statement_shape_size_{0};
     uint64_t statement_template_generation_{0};
     uint64_t planner_generation_{0};
     uint32_t jit_predicate_ordinal_{0};

@@ -42,10 +42,10 @@ struct OwnedToken {
 struct TokenShapeKey {
     uint64_t high{0};
     uint64_t low{0};
-    std::string canonical_bytes;
+    uint32_t canonical_size{0};
 
     friend bool operator==(const TokenShapeKey& lhs, const TokenShapeKey& rhs) {
-        return lhs.high == rhs.high && lhs.low == rhs.low && lhs.canonical_bytes == rhs.canonical_bytes;
+        return lhs.high == rhs.high && lhs.low == rhs.low && lhs.canonical_size == rhs.canonical_size;
     }
 
     friend bool operator!=(const TokenShapeKey& lhs, const TokenShapeKey& rhs) {

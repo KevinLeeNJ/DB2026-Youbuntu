@@ -4,6 +4,7 @@ RMDB is licensed under Mulan PSL v2. */
 #pragma once
 
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <variant>
 #include <vector>
@@ -15,6 +16,13 @@ RMDB is licensed under Mulan PSL v2. */
 
 class AbstractExecutor;
 class Context;
+class PreparedSelectExecutorPool;
+
+struct PreparedSelectPoolStats {
+    uint64_t constructed{0};
+    uint64_t reused{0};
+    uint64_t available{0};
+};
 
 struct PreparedIndexScanNode {
     IndexScanDescriptor descriptor;
@@ -62,9 +70,13 @@ public:
         return parameters_;
     }
 
+    PreparedSelectPoolStats pool_stats() const noexcept;
+
 private:
+    SmManager* owner_{nullptr};
     uint64_t catalog_generation_{0};
     std::vector<PreparedSelectNode> nodes_;
     std::vector<std::string> output_names_;
     PreparedParameterLayout parameters_;
+    std::shared_ptr<PreparedSelectExecutorPool> executor_pool_;
 };

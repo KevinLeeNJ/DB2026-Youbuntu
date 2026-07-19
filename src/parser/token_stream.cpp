@@ -15,51 +15,60 @@ See the Mulan PSL v2 for more details. */
 namespace parser {
 namespace {
 
-void append_u32(std::string& bytes, uint32_t value) {
-    for (unsigned shift = 0; shift < 32; shift += 8) {
-        bytes.push_back(static_cast<char>((value >> shift) & 0xffU));
+class ShapeHasher {
+public:
+    void append_byte(unsigned char byte) {
+        low_ ^= byte;
+        low_ *= 1099511628211ULL;
+        high_ ^= byte + 0x9dU;
+        high_ *= 14029467366897019727ULL;
+        high_ ^= high_ >> 29;
+        ++size_;
     }
-}
 
-void append_string(std::string& bytes, std::string_view value) {
-    append_u32(bytes, static_cast<uint32_t>(value.size()));
-    bytes.append(value.data(), value.size());
-}
-
-void append_token_type(std::string& bytes, TokenType type) {
-    append_u32(bytes, static_cast<uint32_t>(type));
-}
-
-void append_param_marker(std::string& bytes, TokenType type) {
-    bytes.push_back(static_cast<char>(0xff));
-    append_token_type(bytes, type);
-}
-
-TokenShapeKey digest(std::string canonical) {
-    uint64_t low = 1469598103934665603ULL;
-    uint64_t high = 1099511628211ULL;
-    for (unsigned char byte : canonical) {
-        low ^= byte;
-        low *= 1099511628211ULL;
-        high ^= byte + 0x9dU;
-        high *= 14029467366897019727ULL;
-        high ^= high >> 29;
+    void append_u32(uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            append_byte(static_cast<unsigned char>((value >> shift) & 0xffU));
+        }
     }
-    return {high, low, std::move(canonical)};
-}
+
+    void append_string(std::string_view value) {
+        append_u32(static_cast<uint32_t>(value.size()));
+        for (unsigned char byte : value) {
+            append_byte(byte);
+        }
+    }
+
+    void append_token_type(TokenType type) {
+        append_u32(static_cast<uint32_t>(type));
+    }
+
+    void append_param_marker(TokenType type) {
+        append_byte(0xffU);
+        append_token_type(type);
+    }
+
+    TokenShapeKey finish() const {
+        return {high_, low_, size_};
+    }
+
+private:
+    uint64_t low_{1469598103934665603ULL};
+    uint64_t high_{1099511628211ULL};
+    uint32_t size_{0};
+};
 
 } // namespace
 
 OwnedTokenStream normalize_sql(std::string_view sql, bool retain_tokens) {
     OwnedTokenStream result;
-    std::string canonical;
-    canonical.reserve(sql.size() + 32);
+    ShapeHasher shape;
     result.parameters.reserve(16);
     if (retain_tokens) {
         result.tokens.reserve(sql.size() / 4 + 1);
     }
-    append_string(canonical, "RMDB-TOKEN-SHAPE");
-    append_u32(canonical, TOKEN_STREAM_VERSION);
+    shape.append_string("RMDB-TOKEN-SHAPE");
+    shape.append_u32(TOKEN_STREAM_VERSION);
     try {
         Lexer lexer(sql);
         while (true) {
@@ -79,12 +88,12 @@ OwnedTokenStream normalize_sql(std::string_view sql, bool retain_tokens) {
             result.template_unsupported =
                 result.template_unsupported || token.type == TokenType::MINUS || token.type == TokenType::LIMIT;
 
-            append_token_type(canonical, token.type);
+            shape.append_token_type(token.type);
             if (token.type == TokenType::IDENTIFIER) {
-                append_string(canonical, token.text);
+                shape.append_string(token.text);
             } else if (token.type == TokenType::VALUE_INT || token.type == TokenType::VALUE_FLOAT ||
                        token.type == TokenType::VALUE_STRING || token.type == TokenType::VALUE_BOOL) {
-                append_param_marker(canonical, token.type);
+                shape.append_param_marker(token.type);
                 result.parameters.push_back(
                     {token.type, std::string(token.text), token.int_value, token.float_value, token.bool_value});
             } else if (token.type == TokenType::T_ERROR) {
@@ -99,7 +108,7 @@ OwnedTokenStream normalize_sql(std::string_view sql, bool retain_tokens) {
         result.error = error.what();
     }
     if (result.error.empty()) {
-        result.key = digest(std::move(canonical));
+        result.key = shape.finish();
     }
     return result;
 }

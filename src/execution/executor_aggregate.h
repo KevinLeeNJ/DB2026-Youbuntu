@@ -782,6 +782,27 @@ public:
         request_state_.cursor_ = 0;
     }
 
+    void ResetPreparedRequest(Context* context) {
+        context_ = context;
+        request_state_.groups_.clear();
+        request_state_.cursor_ = 0;
+        request_state_.materialized_ = false;
+#ifdef RMDB_ENABLE_JIT
+        if (jit_aggregate_ != nullptr) {
+            jit_aggregate_->reset();
+        } else {
+            initialize_jit_aggregate();
+        }
+#endif
+    }
+
+    void ResetForPreparedPool() noexcept {
+        context_ = nullptr;
+        request_state_.groups_.clear();
+        request_state_.cursor_ = 0;
+        request_state_.materialized_ = false;
+    }
+
     void nextTuple() override {
         if (!is_end()) {
             ++request_state_.cursor_;

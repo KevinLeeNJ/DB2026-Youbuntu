@@ -39,11 +39,11 @@ struct StatementTemplateStats {
 
 struct FullTemplateLookup {
     ast::AstType statement_type{ast::AstType::Help};
-    std::unique_ptr<Plan> plan;
+    BoundPlan plan;
     std::shared_ptr<const PreparedSelectDescriptor> prepared_select;
 
     explicit operator bool() const {
-        return plan != nullptr || prepared_select != nullptr;
+        return static_cast<bool>(plan) || prepared_select != nullptr;
     }
 };
 
@@ -57,8 +57,8 @@ public:
                                               const parser::OwnedTokenStream* lexical = nullptr);
     std::unique_ptr<Query> lookup_query(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                                         const parser::OwnedTokenStream* lexical = nullptr);
-    std::unique_ptr<Plan> lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation,
-                                      SmManager* sm_manager, const parser::OwnedTokenStream* lexical = nullptr);
+    BoundPlan lookup_plan(const parser::TokenShapeKey& key, uint64_t catalog_generation, SmManager* sm_manager,
+                          const parser::OwnedTokenStream* lexical = nullptr);
     FullTemplateLookup lookup_full(const parser::TokenShapeKey& key, uint64_t catalog_generation, SmManager* sm_manager,
                                    const parser::OwnedTokenStream* lexical = nullptr);
     void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,

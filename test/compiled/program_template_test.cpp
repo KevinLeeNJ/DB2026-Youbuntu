@@ -29,7 +29,7 @@ std::shared_ptr<const compiled::CompiledProgram> Program(ProgramKind kind, uint6
 }
 
 compiled::ProgramTemplateIdentity Identity(ProgramKind kind, uint64_t generation = 7) {
-    return {parser::TokenShapeKey{11, 12, "point ?"}, generation, 17, 19, kind};
+    return {parser::TokenShapeKey{11, 12, 7}, generation, 17, 19, kind};
 }
 
 compiled::TemplateTableDesc Table() {
@@ -78,9 +78,9 @@ TEST(ProgramTemplateTest, OwnsImmutableSelectMetadataAndMatchesEveryGeneration) 
     EXPECT_EQ(result->FindLexicalParameter(99), nullptr);
     EXPECT_EQ(result->FindProgramParameter(0)->lexical_slot, 0);
     EXPECT_EQ(result->FindProgramParameter(99), nullptr);
-    EXPECT_TRUE(result->Matches({11, 12, "point ?"}, 7, 17, 19, ProgramKind::POINT_SELECT));
-    EXPECT_FALSE(result->Matches({11, 12, "point ?"}, 7, 17, 20, ProgramKind::POINT_SELECT));
-    EXPECT_FALSE(result->Matches({11, 12, "point ?"}, 8, 17, 19, ProgramKind::POINT_SELECT));
+    EXPECT_TRUE(result->Matches({11, 12, 7}, 7, 17, 19, ProgramKind::POINT_SELECT));
+    EXPECT_FALSE(result->Matches({11, 12, 7}, 7, 17, 20, ProgramKind::POINT_SELECT));
+    EXPECT_FALSE(result->Matches({11, 12, 7}, 8, 17, 19, ProgramKind::POINT_SELECT));
 }
 
 TEST(ProgramTemplateTest, RetainsRuntimeOnlyResidualSlotsForUpdateRebinding) {
@@ -189,7 +189,7 @@ TEST(ProgramTemplateCacheTest, IsOwnerScopedAndChecksPlannerGeneration) {
         Identity(ProgramKind::POINT_SELECT), Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
         {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
     ASSERT_NE(program_template, nullptr) << error;
-    compiled::ProgramCacheKey key{{11, 12, "point ?"}, 17, 19, 7, ProgramKind::POINT_SELECT};
+    compiled::ProgramCacheKey key{{11, 12, 7}, 17, 19, 7, ProgramKind::POINT_SELECT};
 
     compiled::ProgramTemplateCache first_database;
     compiled::ProgramTemplateCache second_database;
@@ -203,9 +203,9 @@ TEST(ProgramTemplateCacheTest, IsOwnerScopedAndChecksPlannerGeneration) {
 }
 
 TEST(ProgramTemplateCacheTest, LookupAnyCountsOnceAndEvictsLeastRecentlyUsedTemplate) {
-    const auto make_template = [](std::string canonical, uint64_t statement_generation) {
+    const auto make_template = [](uint32_t shape_size, uint64_t statement_generation) {
         auto identity = Identity(ProgramKind::POINT_SELECT);
-        identity.token_shape.canonical_bytes = std::move(canonical);
+        identity.token_shape.canonical_size = shape_size;
         identity.statement_generation = statement_generation;
         std::string error;
         auto result = compiled::ProgramTemplate::Create(
@@ -215,9 +215,9 @@ TEST(ProgramTemplateCacheTest, LookupAnyCountsOnceAndEvictsLeastRecentlyUsedTemp
         return result;
     };
     compiled::ProgramTemplateCache cache(2);
-    auto first = make_template("first ?", 1);
-    auto second = make_template("second ?", 2);
-    auto third = make_template("third ?", 3);
+    auto first = make_template(7, 1);
+    auto second = make_template(8, 2);
+    auto third = make_template(9, 3);
     const auto key = [](const compiled::ProgramTemplate& value) {
         const auto& identity = value.identity();
         return compiled::ProgramCacheKey{identity.token_shape, identity.statement_generation,
@@ -243,7 +243,7 @@ TEST(ProgramTemplateCacheTest, LookupAnyCountsOnceAndEvictsLeastRecentlyUsedTemp
 
 TEST(ProgramTemplateCacheTest, LookupAnyIsSafeForConcurrentLongShapeHits) {
     auto identity = Identity(ProgramKind::POINT_SELECT);
-    identity.token_shape.canonical_bytes = std::string(4096, 'x') + " ?";
+    identity.token_shape.canonical_size = 4098;
     std::string error;
     auto program_template =
         compiled::ProgramTemplate::Create(identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),

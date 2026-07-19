@@ -4,6 +4,8 @@ RMDB is licensed under Mulan PSL v2. */
 #include "execution/prepared_select_descriptor.h"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 
 #include "execution/executor_aggregate.h"
 #include "execution/executor_filter.h"
@@ -30,17 +32,6 @@ bool register_conditions(const std::vector<Condition>& conditions, const std::ve
     return true;
 }
 
-bool bind_conditions(const std::vector<Condition>& source, const PreparedParameterLayout& parameters,
-                     const compiled::ParameterFrame& frame, std::vector<Condition>* destination) {
-    *destination = source;
-    for (auto& condition : *destination) {
-        if (condition.is_rhs_val && !parameters.Apply(frame, &condition.rhs_val)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 std::vector<std::string> projection_output_names(const ProjectionPlan& projection) {
     if (!projection.output_names_.empty()) {
         return projection.output_names_;
@@ -60,6 +51,235 @@ std::vector<std::string> projection_output_names(const ProjectionPlan& projectio
     }
     return names;
 }
+
+} // namespace
+
+class PreparedSelectExecutorChain {
+public:
+    static std::unique_ptr<PreparedSelectExecutorChain> Build(const std::vector<PreparedSelectNode>& nodes,
+                                                              SmManager* sm_manager) {
+        auto chain = std::make_unique<PreparedSelectExecutorChain>();
+        std::unique_ptr<AbstractExecutor> executor;
+        for (const auto& node : nodes) {
+            if (const auto* scan = std::get_if<PreparedIndexScanNode>(&node)) {
+                auto next = std::make_unique<IndexScanExecutor>(sm_manager, scan->descriptor, nullptr);
+                chain->scan_ = next.get();
+                executor = std::move(next);
+            } else if (const auto* filter = std::get_if<PreparedFilterNode>(&node)) {
+                if (executor == nullptr) {
+                    throw InternalError("prepared filter has no child executor");
+                }
+                auto next = std::make_unique<FilterExecutor>(std::move(executor), filter->conditions, true);
+                chain->filter_ = next.get();
+                executor = std::move(next);
+            } else if (const auto* aggregate = std::get_if<PreparedAggregateNode>(&node)) {
+                if (executor == nullptr || aggregate->descriptor == nullptr) {
+                    throw InternalError("prepared aggregate has no descriptor or child executor");
+                }
+                auto next = std::make_unique<AggregateExecutor>(std::move(executor), aggregate->descriptor, nullptr);
+                chain->aggregate_ = next.get();
+                executor = std::move(next);
+            } else if (const auto* projection = std::get_if<PreparedProjectionNode>(&node)) {
+                if (executor == nullptr) {
+                    throw InternalError("prepared projection has no child executor");
+                }
+                if (projection->preserve_column_names) {
+                    auto next = std::make_unique<ProjectionExecutor>(std::move(executor), projection->columns);
+                    chain->projection_ = next.get();
+                    executor = std::move(next);
+                } else {
+                    auto next = std::make_unique<ProjectionExecutor>(std::move(executor), projection->items);
+                    chain->projection_ = next.get();
+                    executor = std::move(next);
+                }
+            }
+        }
+        if (chain->scan_ == nullptr || executor == nullptr) {
+            throw InternalError("prepared SELECT executor chain is incomplete");
+        }
+        chain->root_ = std::move(executor);
+        return chain;
+    }
+
+    bool Reset(compiled::ParameterFrame frame, const PreparedParameterLayout& parameters, Context* context) {
+        frame_ = std::move(frame);
+        if (!scan_->ResetPreparedRequest(parameters, *frame_, context)) {
+            return false;
+        }
+        if (filter_ != nullptr && !filter_->ResetPreparedRequest(parameters, *frame_, context)) {
+            return false;
+        }
+        if (aggregate_ != nullptr) {
+            aggregate_->ResetPreparedRequest(context);
+        }
+        if (projection_ != nullptr) {
+            projection_->ResetPreparedRequest(context);
+        }
+        return true;
+    }
+
+    void ResetForPool() noexcept {
+        if (projection_ != nullptr) {
+            projection_->ResetForPreparedPool();
+        }
+        if (aggregate_ != nullptr) {
+            aggregate_->ResetForPreparedPool();
+        }
+        if (filter_ != nullptr) {
+            filter_->ResetForPreparedPool();
+        }
+        scan_->ResetForPreparedPool();
+        frame_.reset();
+    }
+
+    AbstractExecutor* root() const noexcept {
+        return root_.get();
+    }
+
+private:
+    std::unique_ptr<AbstractExecutor> root_;
+    IndexScanExecutor* scan_{nullptr};
+    FilterExecutor* filter_{nullptr};
+    AggregateExecutor* aggregate_{nullptr};
+    ProjectionExecutor* projection_{nullptr};
+    std::optional<compiled::ParameterFrame> frame_;
+};
+
+class PreparedSelectExecutorPool {
+public:
+    PreparedSelectExecutorPool() {
+        available_.reserve(kMaxAvailableChains);
+    }
+
+    std::unique_ptr<PreparedSelectExecutorChain> Acquire(const std::vector<PreparedSelectNode>& nodes,
+                                                         SmManager* sm_manager) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!available_.empty()) {
+                auto chain = std::move(available_.back());
+                available_.pop_back();
+                reused_.fetch_add(1, std::memory_order_relaxed);
+                return chain;
+            }
+        }
+        auto chain = PreparedSelectExecutorChain::Build(nodes, sm_manager);
+        constructed_.fetch_add(1, std::memory_order_relaxed);
+        return chain;
+    }
+
+    void Release(std::unique_ptr<PreparedSelectExecutorChain> chain) noexcept {
+        if (chain == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (available_.size() < kMaxAvailableChains) {
+            available_.push_back(std::move(chain));
+        }
+    }
+
+    PreparedSelectPoolStats Stats() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {constructed_.load(std::memory_order_relaxed), reused_.load(std::memory_order_relaxed),
+                static_cast<uint64_t>(available_.size())};
+    }
+
+private:
+    static constexpr size_t kMaxAvailableChains = 16;
+    mutable std::mutex mutex_;
+    std::vector<std::unique_ptr<PreparedSelectExecutorChain>> available_;
+    std::atomic<uint64_t> constructed_{0};
+    std::atomic<uint64_t> reused_{0};
+};
+
+namespace {
+
+class PreparedSelectExecutorLease final : public AbstractExecutor {
+public:
+    PreparedSelectExecutorLease(std::shared_ptr<PreparedSelectExecutorPool> pool, Context* context)
+        : pool_(std::move(pool)) {
+        context_ = context;
+    }
+
+    void Attach(std::unique_ptr<PreparedSelectExecutorChain> chain) noexcept {
+        chain_ = std::move(chain);
+    }
+
+    ~PreparedSelectExecutorLease() override {
+        if (chain_ != nullptr) {
+            chain_->ResetForPool();
+            pool_->Release(std::move(chain_));
+        }
+    }
+
+    size_t tupleLen() const override {
+        return root()->tupleLen();
+    }
+    const std::vector<ColMeta>& cols() const override {
+        return root()->cols();
+    }
+    std::string getType() override {
+        return root()->getType();
+    }
+    void beginTuple() override {
+        root()->beginTuple();
+    }
+    void nextTuple() override {
+        root()->nextTuple();
+    }
+    bool is_end() const override {
+        return root()->is_end();
+    }
+    Rid& rid() override {
+        return root()->rid();
+    }
+    std::unique_ptr<RmRecord> Next() override {
+        return root()->Next();
+    }
+    TupleView current() const override {
+        return root()->current();
+    }
+    ColMeta get_col_offset(const TabCol& target) override {
+        return root()->get_col_offset(target);
+    }
+    void set_counting_enabled(bool enabled) override {
+        root()->set_counting_enabled(enabled);
+    }
+    void set_key_conditions(std::vector<Condition> key_conds) override {
+        root()->set_key_conditions(std::move(key_conds));
+    }
+    void bind_lookup_key(const TabCol& target, LookupKeyView key) override {
+        root()->bind_lookup_key(target, key);
+    }
+    std::string scan_table_name() const override {
+        return root()->scan_table_name();
+    }
+    std::string_view scan_table_name_view() const override {
+        return root()->scan_table_name_view();
+    }
+    std::vector<Condition> scan_conditions() const override {
+        return root()->scan_conditions();
+    }
+    const std::vector<Condition>& scan_conditions_ref() const override {
+        return root()->scan_conditions_ref();
+    }
+    void record_current_read_for_ssi() override {
+        root()->record_current_read_for_ssi();
+    }
+    bool provides_min_order(const TabCol& col) const override {
+        return root()->provides_min_order(col);
+    }
+    uint64_t catalog_generation() const override {
+        return root()->catalog_generation();
+    }
+
+private:
+    AbstractExecutor* root() const noexcept {
+        return chain_->root();
+    }
+
+    std::shared_ptr<PreparedSelectExecutorPool> pool_;
+    std::unique_ptr<PreparedSelectExecutorChain> chain_;
+};
 
 } // namespace
 
@@ -116,6 +336,7 @@ std::shared_ptr<const PreparedSelectDescriptor> PreparedSelectDescriptor::Build(
     }
 
     auto descriptor = std::shared_ptr<PreparedSelectDescriptor>(new PreparedSelectDescriptor());
+    descriptor->owner_ = sm_manager;
     descriptor->catalog_generation_ = sm_manager->get_catalog_generation();
     auto scan_descriptor =
         IndexScanDescriptor::Build(sm_manager, scan.tab_name_, scan.conds_, scan.index_col_names_,
@@ -147,11 +368,16 @@ std::shared_ptr<const PreparedSelectDescriptor> PreparedSelectDescriptor::Build(
     }
     descriptor->nodes_.push_back(std::move(projection_node));
     descriptor->output_names_ = projection_output_names(projection);
+    descriptor->executor_pool_ = std::make_shared<PreparedSelectExecutorPool>();
     return descriptor;
 }
 
 bool PreparedSelectDescriptor::Matches(const SmManager* sm_manager) const noexcept {
-    return sm_manager != nullptr && catalog_generation_ == sm_manager->get_catalog_generation();
+    return sm_manager != nullptr && sm_manager == owner_ && catalog_generation_ == sm_manager->get_catalog_generation();
+}
+
+PreparedSelectPoolStats PreparedSelectDescriptor::pool_stats() const noexcept {
+    return executor_pool_ == nullptr ? PreparedSelectPoolStats{} : executor_pool_->Stats();
 }
 
 std::unique_ptr<AbstractExecutor> PreparedSelectDescriptor::Instantiate(const parser::OwnedTokenStream& lexical,
@@ -164,39 +390,31 @@ std::unique_ptr<AbstractExecutor> PreparedSelectDescriptor::Instantiate(const pa
         return nullptr;
     }
 
-    std::unique_ptr<AbstractExecutor> executor;
-    for (const auto& node : nodes_) {
-        if (const auto* scan = std::get_if<PreparedIndexScanNode>(&node)) {
-            std::vector<Condition> conditions;
-            if (!bind_conditions(scan->descriptor.conditions(), parameters_, *frame, &conditions)) {
-                return nullptr;
-            }
-            executor =
-                std::make_unique<IndexScanExecutor>(sm_manager, scan->descriptor, std::move(conditions), context);
-        } else if (const auto* filter = std::get_if<PreparedFilterNode>(&node)) {
-            if (executor == nullptr) {
-                return nullptr;
-            }
-            std::vector<Condition> conditions;
-            if (!bind_conditions(filter->conditions, parameters_, *frame, &conditions)) {
-                return nullptr;
-            }
-            executor = std::make_unique<FilterExecutor>(std::move(executor), std::move(conditions));
-        } else if (const auto* aggregate = std::get_if<PreparedAggregateNode>(&node)) {
-            if (executor == nullptr || aggregate->descriptor == nullptr) {
-                return nullptr;
-            }
-            executor = std::make_unique<AggregateExecutor>(std::move(executor), aggregate->descriptor, context);
-        } else if (const auto* projection = std::get_if<PreparedProjectionNode>(&node)) {
-            if (executor == nullptr) {
-                return nullptr;
-            }
-            if (projection->preserve_column_names) {
-                executor = std::make_unique<ProjectionExecutor>(std::move(executor), projection->columns);
-            } else {
-                executor = std::make_unique<ProjectionExecutor>(std::move(executor), projection->items);
-            }
-        }
+    if (executor_pool_ == nullptr) {
+        return nullptr;
     }
-    return executor;
+    auto chain = executor_pool_->Acquire(nodes_, sm_manager);
+    bool reset = false;
+    try {
+        reset = chain->Reset(std::move(*frame), parameters_, context);
+    } catch (...) {
+        chain->ResetForPool();
+        executor_pool_->Release(std::move(chain));
+        throw;
+    }
+    if (!reset) {
+        chain->ResetForPool();
+        executor_pool_->Release(std::move(chain));
+        return nullptr;
+    }
+    std::unique_ptr<PreparedSelectExecutorLease> lease;
+    try {
+        lease = std::make_unique<PreparedSelectExecutorLease>(executor_pool_, context);
+    } catch (...) {
+        chain->ResetForPool();
+        executor_pool_->Release(std::move(chain));
+        throw;
+    }
+    lease->Attach(std::move(chain));
+    return lease;
 }

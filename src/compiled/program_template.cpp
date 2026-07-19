@@ -50,8 +50,8 @@ std::shared_ptr<const ProgramTemplate> ProgramTemplate::Create(ProgramTemplateId
     if (program == nullptr) {
         return Fail("compiled program template has no program", error);
     }
-    if (identity.token_shape.canonical_bytes.empty()) {
-        return Fail("compiled program template has no canonical token shape", error);
+    if (identity.token_shape.canonical_size == 0) {
+        return Fail("compiled program template has no token shape", error);
     }
     if (identity.kind != program->kind() || identity.catalog_generation != program->catalog_generation()) {
         return Fail("compiled program template identity does not match its program", error);

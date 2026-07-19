@@ -49,6 +49,12 @@ private:
     T old_value_;
 };
 
+struct LookupKeyView {
+    const char* data{nullptr};
+    size_t size{0};
+    ColType type{TYPE_INT};
+};
+
 class AbstractExecutor {
 public:
     Rid _abstract_rid;
@@ -101,7 +107,7 @@ public:
         // no-op default; only IndexScanExecutor overrides
     }
 
-    virtual void set_lookup_key(const TabCol& /*target*/, const char* /*key*/, size_t /*len*/) {
+    virtual void bind_lookup_key(const TabCol& /*target*/, LookupKeyView /*key*/) {
         // no-op default; only index-backed scans need dynamic lookup bytes
     }
 
@@ -160,6 +166,12 @@ protected:
         ColumnAddress rhs;
     };
 
+    struct CompactCondition {
+        CompOp op{OP_EQ};
+        bool is_rhs_val{true};
+        Value rhs_val;
+    };
+
     static ColumnAddress make_column_address(const ColMeta& col) {
         return ColumnAddress{col.offset, col.len, col.type};
     }
@@ -200,6 +212,21 @@ protected:
         return conditions_match(conditions, addresses, TupleView{rec.data, static_cast<uint32_t>(rec.size)});
     }
 
+    bool conditions_match(const std::vector<CompactCondition>& conditions,
+                          const std::vector<ConditionAddress>& addresses, const TupleView& tuple) const {
+        phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PREDICATE,
+                                                   phase_metrics::sample_rate(phase_metrics::Phase::PREDICATE));
+        if (conditions.size() != addresses.size()) {
+            throw InternalError("compact condition address cache is out of date");
+        }
+        for (size_t i = 0; i < conditions.size(); ++i) {
+            if (!compare(conditions[i].op, conditions[i].is_rhs_val, conditions[i].rhs_val, tuple, addresses[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * @brief 比较条件cond与记录rec是否匹配
      * @param cond 条件
@@ -207,10 +234,15 @@ protected:
      * @return true if rec matches cond, false otherwise
      */
     bool compare(const Condition& cond, const TupleView& tuple, const ConditionAddress& address) const {
+        return compare(cond.op, cond.is_rhs_val, cond.rhs_val, tuple, address);
+    }
+
+    bool compare(CompOp op, bool is_rhs_val, const Value& rhs_value, const TupleView& tuple,
+                 const ConditionAddress& address) const {
         const ColType lhs_type = address.lhs.type;
-        const ColType rhs_type = cond.is_rhs_val ? cond.rhs_val.type : address.rhs.type;
+        const ColType rhs_type = is_rhs_val ? rhs_value.type : address.rhs.type;
         const char* lhs_data = tuple.data + address.lhs.offset;
-        const char* rhs_data = cond.is_rhs_val ? nullptr : tuple.data + address.rhs.offset;
+        const char* rhs_data = is_rhs_val ? nullptr : tuple.data + address.rhs.offset;
         if (can_cast(lhs_type, rhs_type) == false) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
@@ -220,13 +252,13 @@ protected:
             const double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
                                                         : read_unaligned<double>(lhs_data);
             double rhs_val;
-            if (cond.is_rhs_val) {
-                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
+            if (is_rhs_val) {
+                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(rhs_value.int_val) : rhs_value.float_val;
             } else {
                 rhs_val = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
                                                : read_unaligned<double>(rhs_data);
             }
-            switch (cond.op) {
+            switch (op) {
             case OP_EQ:
                 return lhs_val == rhs_val;
             case OP_NE:
@@ -245,10 +277,10 @@ protected:
         case TYPE_STRING:
         case TYPE_DATETIME: {
             const std::string_view lhs_val(lhs_data, strnlen(lhs_data, address.lhs.len));
-            const std::string_view rhs_val = cond.is_rhs_val
-                                                 ? std::string_view(cond.rhs_val.str_val)
+            const std::string_view rhs_val = is_rhs_val
+                                                 ? std::string_view(rhs_value.str_val)
                                                  : std::string_view(rhs_data, strnlen(rhs_data, address.rhs.len));
-            switch (cond.op) {
+            switch (op) {
             case OP_EQ:
                 return lhs_val == rhs_val;
             case OP_NE:

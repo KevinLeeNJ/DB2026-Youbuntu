@@ -165,6 +165,18 @@ public:
         materialize_current();
     }
 
+    void ResetPreparedRequest(Context* context) {
+        context_ = context;
+        current_view_ = {};
+        fallback_input_.reset();
+    }
+
+    void ResetForPreparedPool() noexcept {
+        context_ = nullptr;
+        current_view_ = {};
+        fallback_input_.reset();
+    }
+
     void nextTuple() override {
         prev_->nextTuple();           // 调用儿子节点的nextTuple方法，获取下一条记录
         _abstract_rid = prev_->rid(); // 更新抽象记录号
@@ -234,8 +246,8 @@ public:
         prev_->set_key_conditions(std::move(key_conds));
     }
 
-    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
-        prev_->set_lookup_key(target, key, len);
+    void bind_lookup_key(const TabCol& target, LookupKeyView key) override {
+        prev_->bind_lookup_key(target, key);
     }
 
     std::string scan_table_name() const override {

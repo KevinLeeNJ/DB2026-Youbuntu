@@ -31,7 +31,7 @@ compiled::ProgramTemplatePtr MakeTemplate(std::string canonical, uint64_t statem
     bindings.point_indexes.push_back({"accounts", "accounts_id", {"id"}, {0}});
     bindings.output_columns.push_back({{"accounts", "id", compiled::ValueType::INT32, 0, sizeof(int32_t)}, "id"});
     bindings.conditions.push_back({{"accounts", "id"}, compiled::CompareOp::EQ, true, {}, 0});
-    compiled::ProgramTemplateIdentity identity{{101, 202, std::move(canonical)},
+    compiled::ProgramTemplateIdentity identity{{101, 202, static_cast<uint32_t>(canonical.size())},
                                                catalog_generation,
                                                statement_generation,
                                                planner_generation,
@@ -57,7 +57,7 @@ jit::PointProgramJitConfig EagerConfig() {
 TEST(PointProgramJitManagerTest, KeyIncludesCanonicalShapeEveryGenerationKindAndAbi) {
     const auto base = jit::MakePointProgramJitKey(*MakeTemplate("select id where id = ?"));
     auto changed = base;
-    changed.shape.canonical_bytes = "select id where other = ?";
+    ++changed.shape.canonical_size;
     EXPECT_NE(base, changed);
     changed = base;
     ++changed.shape.high;

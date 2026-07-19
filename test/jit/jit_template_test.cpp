@@ -98,6 +98,21 @@ TEST(StatementTemplateTest, IdentifierAndMalformedShapeDoNotAlias) {
     EXPECT_FALSE(malformed.error.empty());
 }
 
+TEST(StatementTemplateTest, StreamingShapeDigestIsDeterministicAndTracksCanonicalSize) {
+    const std::string long_identifier(4096, 'x');
+    const std::string sql = "select " + long_identifier + " from users where id = 1;";
+    auto first = parser::normalize_sql(sql, false);
+    auto second = parser::normalize_sql(sql, false);
+    auto changed = parser::normalize_sql("select " + long_identifier + "y from users where id = 1;", false);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(changed);
+    EXPECT_EQ(first.key, second.key);
+    EXPECT_GT(first.key.canonical_size, long_identifier.size());
+    EXPECT_NE(first.key, changed.key);
+    EXPECT_EQ(first.key.canonical_size + 1, changed.key.canonical_size);
+}
+
 TEST(StatementTemplateTest, LightweightNormalizationKeepsBindingDataWithoutOwnedTokens) {
     auto shape = parser::normalize_sql("select id from users where id = 7 limit 1;", false);
     ASSERT_TRUE(shape);
@@ -151,7 +166,7 @@ TEST(StatementTemplateTest, BindsCurrentLiteralValuesOnParameterizedAstHit) {
     EXPECT_EQ(static_cast<ast::IntLit*>(update->conds[0]->rhs.get())->val, 42);
 }
 
-TEST(StatementTemplateTest, FullLookupReturnsStatementTypeAndFreshPlanWithOneCacheProbe) {
+TEST(StatementTemplateTest, FullLookupSharesImmutablePlanWithRequestLocalState) {
     auto shape = parser::normalize_sql("begin;");
     ASSERT_TRUE(shape);
     auto parsed = ast::parse_sql("begin;");
@@ -169,7 +184,9 @@ TEST(StatementTemplateTest, FullLookupReturnsStatementTypeAndFreshPlanWithOneCac
     EXPECT_EQ(first.statement_type, ast::AstType::TxnBegin);
     EXPECT_EQ(first.plan->tag, T_Transaction_begin);
     EXPECT_EQ(second.statement_type, ast::AstType::TxnBegin);
-    EXPECT_NE(first.plan.get(), second.plan.get());
+    EXPECT_EQ(first.plan.get(), second.plan.get());
+    EXPECT_NE(first.plan.literals.get(), second.plan.literals.get());
+    EXPECT_NE(first.plan.runtime.get(), second.plan.runtime.get());
     EXPECT_EQ(cache.stats().lookups, 2U);
     EXPECT_EQ(cache.stats().hits, 2U);
 }
@@ -200,8 +217,98 @@ TEST(StatementTemplateTest, FullLookupBindsCurrentInsertValues) {
     ASSERT_TRUE(rebound);
     const auto& insert = static_cast<const DMLPlan&>(*rebound.plan);
     ASSERT_EQ(insert.values_.size(), 2U);
-    EXPECT_EQ(insert.values_[0].int_val, 42);
-    EXPECT_EQ(insert.values_[1].str_val, "bob");
+    ASSERT_NE(rebound.plan.literals->Find(insert.values_[0].lexical_slot), nullptr);
+    ASSERT_NE(rebound.plan.literals->Find(insert.values_[1].lexical_slot), nullptr);
+    EXPECT_EQ(rebound.plan.literals->Find(insert.values_[0].lexical_slot)->int_val, 42);
+    EXPECT_EQ(rebound.plan.literals->Find(insert.values_[1].lexical_slot)->str_val, "bob");
+    EXPECT_EQ(insert.values_[0].int_val, 1);
+    EXPECT_EQ(insert.values_[1].str_val, "alice");
+}
+
+TEST(StatementTemplateTest, ConcurrentDmlLookupsKeepLiteralOverlaysIsolated) {
+    struct Case {
+        std::string first_sql;
+        std::string second_sql;
+        std::unique_ptr<Plan> plan;
+        std::vector<int> slots;
+    };
+    Value insert_id;
+    insert_id.set_int(1);
+    insert_id.lexical_slot = 0;
+    Condition delete_condition;
+    delete_condition.lhs_col = {"users", "id"};
+    delete_condition.op = OP_EQ;
+    delete_condition.is_rhs_val = true;
+    delete_condition.rhs_val.set_int(1);
+    delete_condition.rhs_val.lexical_slot = 0;
+    SetClause self_reference;
+    self_reference.lhs = {"users", "score"};
+    self_reference.is_self_ref = true;
+    self_reference.rhs_col = {"users", "score"};
+    self_reference.op = UpdateOp::SELF_ADD;
+    self_reference.rhs.set_int(1);
+    self_reference.rhs.lexical_slot = 0;
+    Condition update_condition = delete_condition;
+    update_condition.rhs_val.lexical_slot = 1;
+
+    std::vector<Case> cases;
+    cases.push_back({"insert into users values (1);",
+                     "insert into users values (9);",
+                     std::make_unique<DMLPlan>(T_Insert, nullptr, "users", std::vector<Value>{insert_id},
+                                               std::vector<Condition>{}, std::vector<SetClause>{}),
+                     {0}});
+    cases.push_back({"delete from users where id = 1;",
+                     "delete from users where id = 9;",
+                     std::make_unique<DMLPlan>(T_Delete, nullptr, "users", std::vector<Value>{},
+                                               std::vector<Condition>{delete_condition}, std::vector<SetClause>{}),
+                     {0}});
+    cases.push_back(
+        {"update users set score = score + 1 where id = 1;",
+         "update users set score = score + 1 where id = 9;",
+         std::make_unique<DMLPlan>(T_Update, nullptr, "users", std::vector<Value>{},
+                                   std::vector<Condition>{update_condition}, std::vector<SetClause>{self_reference}),
+         {1}});
+
+    for (auto& test_case : cases) {
+        auto first = parser::normalize_sql(test_case.first_sql);
+        auto second = parser::normalize_sql(test_case.second_sql);
+        ASSERT_TRUE(first);
+        ASSERT_TRUE(second);
+        ASSERT_EQ(first.key, second.key);
+        auto parsed = ast::parse_sql(test_case.first_sql);
+        ast::assign_literal_slots(*parsed);
+        cache::StatementTemplateCache cache;
+        cache.publish(first.key, 1, std::shared_ptr<const ast::TreeNode>(std::move(parsed)), nullptr,
+                      std::shared_ptr<const Plan>(std::move(test_case.plan)));
+
+        BoundPlan first_plan;
+        BoundPlan second_plan;
+        std::thread first_thread([&] { first_plan = cache.lookup_full(first.key, 1, nullptr, &first).plan; });
+        std::thread second_thread([&] { second_plan = cache.lookup_full(second.key, 1, nullptr, &second).plan; });
+        first_thread.join();
+        second_thread.join();
+        ASSERT_TRUE(first_plan);
+        ASSERT_TRUE(second_plan);
+        EXPECT_EQ(first_plan.get(), second_plan.get());
+        EXPECT_NE(first_plan.literals.get(), second_plan.literals.get());
+        ASSERT_NE(first_plan.literals->Find(test_case.slots[0]), nullptr);
+        ASSERT_NE(second_plan.literals->Find(test_case.slots[0]), nullptr);
+        EXPECT_EQ(first_plan.literals->Find(test_case.slots[0])->int_val, 1);
+        EXPECT_EQ(second_plan.literals->Find(test_case.slots[0])->int_val, 9);
+    }
+}
+
+TEST(StatementTemplateTest, LiteralFreeDmlPlanLookupKeepsEmptyOverlay) {
+    auto shape = parser::normalize_sql("delete from users;");
+    auto parsed = ast::parse_sql("delete from users;");
+    cache::StatementTemplateCache cache;
+    cache.publish(
+        shape.key, 1, std::shared_ptr<const ast::TreeNode>(std::move(parsed)), nullptr,
+        std::shared_ptr<const Plan>(std::make_unique<DMLPlan>(T_Delete, nullptr, "users", std::vector<Value>{},
+                                                              std::vector<Condition>{}, std::vector<SetClause>{})));
+    auto lookup = cache.lookup_full(shape.key, 1, nullptr, &shape);
+    ASSERT_TRUE(lookup.plan);
+    EXPECT_TRUE(lookup.plan.literals->values.empty());
 }
 
 TEST_F(StatementTemplateDatabaseTest, ReplacingPlanAtomicallyClearsUnsupportedPreparedDescriptor) {
@@ -223,7 +330,7 @@ TEST_F(StatementTemplateDatabaseTest, ReplacingPlanAtomicallyClearsUnsupportedPr
 
     auto lookup = cache.lookup_full(shape.key, 1, sm_manager.get(), &shape);
     EXPECT_EQ(lookup.prepared_select, nullptr);
-    ASSERT_NE(lookup.plan, nullptr);
+    ASSERT_TRUE(lookup.plan);
     const auto& select = static_cast<const DMLPlan&>(*lookup.plan);
     const auto& projection = static_cast<const ProjectionPlan&>(*select.subplan_);
     EXPECT_EQ(projection.subplan_->tag, T_SeqScan);

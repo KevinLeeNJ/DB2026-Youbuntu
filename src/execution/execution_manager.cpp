@@ -49,8 +49,8 @@ const char* help_info = "Supported SQL syntax:\n"
                         "  {* | column [, column ...]}\n";
 
 // 主要负责执行DDL语句
-void QlManager::run_mutli_query(Plan* plan, Context* context) {
-    auto* x = static_cast<DDLPlan*>(plan);
+void QlManager::run_mutli_query(const Plan* plan, Context* context) {
+    auto* x = static_cast<const DDLPlan*>(plan);
     switch (plan->tag) {
     case T_CreateTable: {
         sm_manager_->create_table(x->tab_name_, x->cols_, context);
@@ -75,7 +75,7 @@ void QlManager::run_mutli_query(Plan* plan, Context* context) {
 }
 
 // 执行help; show tables; desc table; begin; commit; abort;语句
-void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) {
+void QlManager::run_cmd_utility(const Plan* plan, txn_id_t* txn_id, Context* context) {
     switch (plan->tag) {
     case T_Help:
     case T_ShowTable:
@@ -85,7 +85,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     case T_Transaction_commit:
     case T_Transaction_abort:
     case T_Transaction_rollback: {
-        auto* x = static_cast<OtherPlan*>(plan);
+        auto* x = static_cast<const OtherPlan*>(plan);
         switch (plan->tag) {
         case T_Help: {
             memcpy(context->data_send_ + *(context->offset_), help_info, strlen(help_info));
@@ -149,7 +149,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         break;
     }
     case T_SetTransaction: {
-        auto* x = static_cast<SetTransactionPlan*>(plan);
+        auto* x = static_cast<const SetTransactionPlan*>(plan);
         switch (x->isolation_level_) {
         case ast::IsolationLevelType::SNAPSHOT_ISOLATION: {
             context->isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
@@ -163,7 +163,7 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         break;
     }
     case T_SetKnob: {
-        auto* x = static_cast<SetKnobPlan*>(plan);
+        auto* x = static_cast<const SetKnobPlan*>(plan);
         switch (x->set_knob_type_) {
         case ast::SetKnobType::EnableNestLoop: {
             planner_->set_enable_nestedloop_join(x->bool_value_);
@@ -181,14 +181,14 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         break;
     }
     case T_SetOutputFile: {
-        auto* x = static_cast<SetOutputFilePlan*>(plan);
+        auto* x = static_cast<const SetOutputFilePlan*>(plan);
         // output_file is a database-global toggle shared across all connections;
         // store it on SmManager so it persists across connection lifetimes.
         sm_manager_->output_file_enabled_ = x->enable_;
         break;
     }
     case T_LoadData: {
-        auto* x = static_cast<LoadDataPlan*>(plan);
+        auto* x = static_cast<const LoadDataPlan*>(plan);
         sm_manager_->load_csv_data(x->file_name_, x->tab_name_, context);
         break;
     }
