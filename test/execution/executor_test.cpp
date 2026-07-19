@@ -961,7 +961,9 @@ TEST_F(ExecutorTest, database_program_runtime_builds_composite_key_and_fetches_t
 
     DatabaseProgramBindings bindings;
     bindings.catalog_generation = sm_manager_->get_catalog_generation();
-    bindings.point_indexes.push_back(PointIndexRuntimeBinding{"program_lookup", {"a", "b"}, {0, sizeof(int)}});
+    bindings.point_indexes.push_back(PointIndexRuntimeBinding{
+        "program_lookup", {"a", "b"}, {0, sizeof(int)},
+        sm_manager_->get_ix_manager()->get_index_name("program_lookup", std::vector<std::string>{"a", "b"})});
     DatabaseProgramRuntime runtime(sm_manager_.get(), nullptr, std::move(bindings));
 
     compiled::RuntimeValue key_tuple;

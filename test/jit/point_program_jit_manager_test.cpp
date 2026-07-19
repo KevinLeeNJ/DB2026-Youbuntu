@@ -8,6 +8,7 @@ RMDB is licensed under Mulan PSL v2. */
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -119,6 +120,223 @@ TEST(PointProgramJitManagerTest, ForceCompilesOnceAndManagersAreOwnerScoped) {
     EXPECT_EQ(second_compiles.load(), 1);
     EXPECT_NE(first_code, second_code);
     EXPECT_EQ(first.Stats().native_cache_hits, 1U);
+}
+
+TEST(PointProgramJitManagerTest, CurrentTemplateUsesThreadLocalRecentCodeWithoutIdentityCallback) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    std::atomic<uint64_t> identity_calls{0};
+    jit::PointProgramJitManager manager(
+        EagerConfig(),
+        [&](const compiled::ProgramTemplateIdentity&) {
+            identity_calls.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        },
+        [&](compiled::ProgramTemplatePtr) { return runtime.compile_test_add_i32(); });
+    auto program_template = MakeTemplate("thread local recent ?");
+
+    auto first = manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(first, nullptr);
+    const uint64_t calls_after_compile = identity_calls.load(std::memory_order_relaxed);
+    auto second = manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true);
+    EXPECT_EQ(second, first);
+    EXPECT_EQ(identity_calls.load(std::memory_order_relaxed), calls_after_compile);
+    EXPECT_EQ(manager.Stats().native_cache_hits, 1U);
+}
+
+TEST(PointProgramJitManagerTest, ThreadLocalRecentCodePeriodicallyRefreshesManagerLru) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    std::atomic<uint64_t> identity_calls{0};
+    jit::PointProgramJitManager manager(
+        EagerConfig(),
+        [&](const compiled::ProgramTemplateIdentity&) {
+            identity_calls.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        },
+        [&](compiled::ProgramTemplatePtr) { return runtime.compile_test_add_i32(); });
+    auto program_template = MakeTemplate("thread local lru refresh ?");
+
+    ASSERT_NE(manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    const uint64_t calls_after_compile = identity_calls.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < 64; ++i) {
+        ASSERT_NE(manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    }
+    EXPECT_EQ(identity_calls.load(std::memory_order_relaxed), calls_after_compile + 1);
+    EXPECT_EQ(manager.Stats().native_cache_hits, 64U);
+    ASSERT_NE(manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    EXPECT_EQ(identity_calls.load(std::memory_order_relaxed), calls_after_compile + 1);
+    EXPECT_EQ(manager.Stats().native_cache_hits, 65U);
+}
+
+TEST(PointProgramJitManagerTest, PeriodicRefreshProtectsHotThreadLocalEntryFromLruEviction) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    auto config = EagerConfig();
+    config.max_entries = 2;
+    std::atomic<uint64_t> compile_count{0};
+    jit::PointProgramJitManager manager(
+        config, [](const compiled::ProgramTemplateIdentity&) { return true; },
+        [&](compiled::ProgramTemplatePtr) {
+            compile_count.fetch_add(1, std::memory_order_relaxed);
+            return runtime.compile_test_add_i32();
+        });
+    auto hot = MakeTemplate("thread local hot ?", 1);
+    auto cold = MakeTemplate("thread local cold ?", 2);
+    auto incoming = MakeTemplate("thread local incoming ?", 3);
+
+    ASSERT_NE(manager.AcquireCurrent(hot, rmdb_config::JitMode::FORCE, true), nullptr);
+    std::thread cold_thread(
+        [&] { EXPECT_NE(manager.AcquireCurrent(cold, rmdb_config::JitMode::FORCE, true), nullptr); });
+    cold_thread.join();
+    for (size_t i = 0; i < 64; ++i) {
+        ASSERT_NE(manager.AcquireCurrent(hot, rmdb_config::JitMode::FORCE, true), nullptr);
+    }
+    std::thread incoming_thread(
+        [&] { EXPECT_NE(manager.AcquireCurrent(incoming, rmdb_config::JitMode::FORCE, true), nullptr); });
+    incoming_thread.join();
+    ASSERT_EQ(compile_count.load(std::memory_order_relaxed), 3U);
+
+    ASSERT_NE(manager.AcquireCurrent(hot, rmdb_config::JitMode::FORCE, true), nullptr);
+    EXPECT_EQ(compile_count.load(std::memory_order_relaxed), 3U);
+    ASSERT_NE(manager.AcquireCurrent(cold, rmdb_config::JitMode::FORCE, true), nullptr);
+    EXPECT_EQ(compile_count.load(std::memory_order_relaxed), 4U);
+}
+
+TEST(PointProgramJitManagerTest, ThreadLocalRecentCodeInvalidatesOnTemplateSwitchAndEviction) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    auto config = EagerConfig();
+    config.max_entries = 1;
+    std::atomic<uint64_t> compile_count{0};
+    jit::PointProgramJitManager manager(
+        config, [](const compiled::ProgramTemplateIdentity&) { return true; },
+        [&](compiled::ProgramTemplatePtr) {
+            compile_count.fetch_add(1, std::memory_order_relaxed);
+            return runtime.compile_test_add_i32();
+        });
+    auto first_template = MakeTemplate("thread local first ?", 1);
+    auto second_template = MakeTemplate("thread local second ?", 2);
+
+    ASSERT_NE(manager.AcquireCurrent(first_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    ASSERT_NE(manager.AcquireCurrent(second_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    ASSERT_NE(manager.AcquireCurrent(first_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    EXPECT_EQ(compile_count.load(std::memory_order_relaxed), 3U);
+    EXPECT_EQ(manager.Stats().entry_count, 1U);
+    EXPECT_GE(manager.Stats().evictions, 2U);
+}
+
+TEST(PointProgramJitManagerTest, ThreadLocalRecentCodeInvalidatesOnModeOffAndShutdown) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    jit::PointProgramJitManager manager(
+        EagerConfig(), [](const compiled::ProgramTemplateIdentity&) { return true; },
+        [&](compiled::ProgramTemplatePtr) { return runtime.compile_test_add_i32(); });
+    auto program_template = MakeTemplate("thread local shutdown ?");
+
+    ASSERT_NE(manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    EXPECT_EQ(manager.AcquireCurrent(program_template, rmdb_config::JitMode::OFF, true), nullptr);
+    auto lease = manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(lease, nullptr);
+    std::weak_ptr<const jit::JitCode> weak_code = lease;
+    lease.reset();
+    manager.ShutdownAndDrain();
+    EXPECT_TRUE(weak_code.expired());
+    EXPECT_EQ(runtime.active_code_count(), 0U);
+    EXPECT_EQ(manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true), nullptr);
+}
+
+TEST(PointProgramJitManagerTest, ThreadLocalHintDoesNotRetainCodeAfterEviction) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    auto config = EagerConfig();
+    config.max_entries = 1;
+    std::atomic<uint64_t> compile_count{0};
+    jit::PointProgramJitManager manager(
+        config, [](const compiled::ProgramTemplateIdentity&) { return true; },
+        [&](compiled::ProgramTemplatePtr) {
+            compile_count.fetch_add(1, std::memory_order_relaxed);
+            return runtime.compile_test_add_i32();
+        });
+    auto first_template = MakeTemplate("thread local weak first ?", 1);
+    auto second_template = MakeTemplate("thread local weak second ?", 2);
+
+    auto first = manager.AcquireCurrent(first_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(first, nullptr);
+    std::weak_ptr<const jit::JitCode> first_weak = first;
+    first.reset();
+    ASSERT_NE(manager.AcquireCurrent(first_template, rmdb_config::JitMode::FORCE, true), nullptr);
+
+    auto second = manager.AcquireCurrent(second_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(second, nullptr);
+    EXPECT_TRUE(first_weak.expired());
+    EXPECT_EQ(runtime.active_code_count(), 1U);
+    EXPECT_EQ(compile_count.load(std::memory_order_relaxed), 2U);
+
+    auto replacement = manager.AcquireCurrent(first_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_EQ(compile_count.load(std::memory_order_relaxed), 3U);
+    second.reset();
+    replacement.reset();
+    manager.ShutdownAndDrain();
+    EXPECT_EQ(runtime.active_code_count(), 0U);
+}
+
+TEST(PointProgramJitManagerTest, ThreadLocalRecentCodeRejectsStaleIdentityWithoutInvalidatingLease) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    std::atomic<bool> current{true};
+    jit::PointProgramJitManager manager(
+        EagerConfig(), [&](const compiled::ProgramTemplateIdentity&) { return current.load(); },
+        [&](compiled::ProgramTemplatePtr) { return runtime.compile_test_add_i32(); });
+    auto program_template = MakeTemplate("thread local stale ?");
+
+    auto lease = manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(lease, nullptr);
+    current.store(false);
+    EXPECT_EQ(manager.AcquireCurrent(program_template, rmdb_config::JitMode::AUTO, false), nullptr);
+    EXPECT_EQ(manager.Stats().entry_count, 0U);
+    EXPECT_EQ(manager.Stats().code_bytes, 0U);
+    EXPECT_EQ(manager.Stats().evictions, 1U);
+    EXPECT_EQ(lease->test_add_i32(8, 9), 17);
+}
+
+TEST(PointProgramJitManagerTest, RequestIdentityMismatchNeverFallsBackToExecutableCode) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    jit::PointProgramJitManager manager(
+        EagerConfig(), [](const compiled::ProgramTemplateIdentity&) { return true; },
+        [&](compiled::ProgramTemplatePtr) { return runtime.compile_test_add_i32(); });
+    auto program_template = MakeTemplate("thread local request mismatch ?");
+
+    ASSERT_NE(manager.AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true), nullptr);
+    EXPECT_EQ(manager.AcquireCurrent(program_template, rmdb_config::JitMode::AUTO, false), nullptr);
+    EXPECT_EQ(manager.Stats().entry_count, 1U);
+}
+
+TEST(PointProgramJitManagerTest, ThreadLocalRecentCodeRejectsReusedManagerAddress) {
+    jit::JitRuntime runtime;
+    ASSERT_TRUE(runtime.is_supported());
+    std::atomic<uint64_t> compile_count{0};
+    auto current = [](const compiled::ProgramTemplateIdentity&) { return true; };
+    auto compile = [&](compiled::ProgramTemplatePtr) {
+        compile_count.fetch_add(1, std::memory_order_relaxed);
+        return runtime.compile_test_add_i32();
+    };
+    auto program_template = MakeTemplate("thread local manager address ?");
+    alignas(jit::PointProgramJitManager) unsigned char storage[sizeof(jit::PointProgramJitManager)];
+
+    auto* first = new (storage) jit::PointProgramJitManager(EagerConfig(), current, compile);
+    auto first_code = first->AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(first_code, nullptr);
+    first->~PointProgramJitManager();
+
+    auto* second = new (storage) jit::PointProgramJitManager(EagerConfig(), current, compile);
+    auto second_code = second->AcquireCurrent(program_template, rmdb_config::JitMode::FORCE, true);
+    ASSERT_NE(second_code, nullptr);
+    EXPECT_NE(second_code, first_code);
+    EXPECT_EQ(compile_count.load(std::memory_order_relaxed), 2U);
+    second->~PointProgramJitManager();
 }
 
 TEST(PointProgramJitManagerTest, ConcurrentAutoObservationsQueueOneCompilation) {
@@ -360,6 +578,27 @@ TEST(PointProgramJitManagerTest, IdentityCallbackCanReenterStatsWithoutDeadlock)
     ASSERT_NE(code, nullptr);
     manager.ObserveInterpreter(program_template, 1, rmdb_config::JitMode::AUTO);
     EXPECT_EQ(code->test_add_i32(10, 5), 15);
+}
+
+TEST(PointProgramJitManagerTest, ConcurrentNativeExecutionAccountingIsExact) {
+    jit::PointProgramJitManager manager(
+        EagerConfig(), [](const compiled::ProgramTemplateIdentity&) { return true; },
+        [](compiled::ProgramTemplatePtr) { return jit::JitCompileResult{}; });
+    constexpr size_t kThreads = 8;
+    constexpr size_t kExecutionsPerThread = 10000;
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (size_t i = 0; i < kThreads; ++i) {
+        workers.emplace_back([&manager] {
+            for (size_t j = 0; j < kExecutionsPerThread; ++j) {
+                manager.RecordNativeExecution();
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    EXPECT_EQ(manager.Stats().native_executions, kThreads * kExecutionsPerThread);
 }
 
 TEST(PointProgramJitManagerTest, StaleReadyEntryIsRemovedWithoutInvalidatingLease) {

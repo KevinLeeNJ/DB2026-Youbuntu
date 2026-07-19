@@ -3,8 +3,11 @@ RMDB is licensed under Mulan PSL v2. */
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -73,6 +76,8 @@ TEST(ProgramTemplateTest, OwnsImmutableSelectMetadataAndMatchesEveryGeneration) 
     EXPECT_EQ(result->bindings().output_columns[0].caption, "id");
     EXPECT_EQ(result->FindLexicalParameter(0)->program_parameter, 0U);
     EXPECT_EQ(result->FindLexicalParameter(99), nullptr);
+    EXPECT_EQ(result->FindProgramParameter(0)->lexical_slot, 0);
+    EXPECT_EQ(result->FindProgramParameter(99), nullptr);
     EXPECT_TRUE(result->Matches({11, 12, "point ?"}, 7, 17, 19, ProgramKind::POINT_SELECT));
     EXPECT_FALSE(result->Matches({11, 12, "point ?"}, 7, 17, 20, ProgramKind::POINT_SELECT));
     EXPECT_FALSE(result->Matches({11, 12, "point ?"}, 8, 17, 19, ProgramKind::POINT_SELECT));
@@ -139,7 +144,9 @@ TEST(ProgramTemplateTest, RejectsStaleIdentityAndMalformedSlotOrBindingMetadata)
 
     EXPECT_EQ(compiled::ProgramTemplate::Create(Identity(ProgramKind::POINT_SELECT),
                                                 Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
-                                                {{0, 1, ValueType::INT32, 0}}, SelectBindings(), &error),
+                                                {{compiled::kNoOperand, 0, ValueType::INT32, 0},
+                                                 {0, 1, ValueType::INT32, 0}},
+                                                SelectBindings(), &error),
               nullptr);
     EXPECT_NE(error.find("does not match"), std::string::npos);
 
@@ -150,6 +157,32 @@ TEST(ProgramTemplateTest, RejectsStaleIdentityAndMalformedSlotOrBindingMetadata)
                                                 {{0, 0, ValueType::INT32, 0}}, std::move(bad_bindings), &error),
               nullptr);
     EXPECT_NE(error.find("index"), std::string::npos);
+
+    bad_bindings = SelectBindings();
+    bad_bindings.point_indexes[0].index_name.clear();
+    EXPECT_EQ(compiled::ProgramTemplate::Create(Identity(ProgramKind::POINT_SELECT),
+                                                Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+                                                {{0, 0, ValueType::INT32, 0}}, std::move(bad_bindings), &error),
+              nullptr);
+    EXPECT_NE(error.find("index"), std::string::npos);
+}
+
+TEST(ProgramTemplateTest, RejectsUnboundedOrSparseLexicalSlots) {
+    std::string error;
+    EXPECT_EQ(compiled::ProgramTemplate::Create(
+                  Identity(ProgramKind::POINT_SELECT),
+                  Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, std::numeric_limits<int32_t>::max()}}),
+                  {{0, std::numeric_limits<int32_t>::max(), ValueType::INT32, 0}}, SelectBindings(), &error),
+              nullptr);
+    EXPECT_NE(error.find("lexical parameter descriptor"), std::string::npos);
+
+    EXPECT_EQ(compiled::ProgramTemplate::Create(
+                  Identity(ProgramKind::POINT_SELECT),
+                  Program(ProgramKind::POINT_SELECT, 7,
+                          {{ValueType::INT32, 0, 0}, {ValueType::INT32, 0, 2}}),
+                  {{0, 0, ValueType::INT32, 0}, {1, 2, ValueType::INT32, 0}}, SelectBindings(), &error),
+              nullptr);
+    EXPECT_NE(error.find("lexical parameter descriptor"), std::string::npos);
 }
 
 TEST(ProgramTemplateCacheTest, IsOwnerScopedAndChecksPlannerGeneration) {
@@ -209,6 +242,46 @@ TEST(ProgramTemplateCacheTest, LookupAnyCountsOnceAndEvictsLeastRecentlyUsedTemp
     EXPECT_EQ(stats.misses, 1U);
     EXPECT_EQ(stats.handled, 1U);
     EXPECT_EQ(stats.fallbacks, 1U);
+}
+
+TEST(ProgramTemplateCacheTest, LookupAnyIsSafeForConcurrentLongShapeHits) {
+    auto identity = Identity(ProgramKind::POINT_SELECT);
+    identity.token_shape.canonical_bytes = std::string(4096, 'x') + " ?";
+    std::string error;
+    auto program_template = compiled::ProgramTemplate::Create(
+        identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+        {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
+    ASSERT_NE(program_template, nullptr) << error;
+
+    compiled::ProgramTemplateCache cache;
+    const compiled::ProgramCacheKey key{identity.token_shape, identity.statement_generation, identity.planner_generation,
+                                        identity.catalog_generation, identity.kind};
+    cache.Publish(key, program_template);
+
+    constexpr int kThreadCount = 8;
+    constexpr int kLookupsPerThread = 1000;
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (int thread = 0; thread < kThreadCount; ++thread) {
+        threads.emplace_back([&] {
+            for (int lookup = 0; lookup < kLookupsPerThread; ++lookup) {
+                if (cache.LookupAny(identity.token_shape, identity.statement_generation, identity.planner_generation,
+                                    identity.catalog_generation) != program_template) {
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_FALSE(failed.load(std::memory_order_relaxed));
+    const auto stats = cache.Stats();
+    EXPECT_EQ(stats.hits, static_cast<uint64_t>(kThreadCount * kLookupsPerThread));
+    EXPECT_EQ(stats.misses, 0U);
+    EXPECT_EQ(stats.entries, 1U);
 }
 
 } // namespace

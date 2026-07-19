@@ -4,6 +4,7 @@ RMDB is licensed under Mulan PSL v2. */
 #include "jit/point_program_jit_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -20,6 +21,9 @@ namespace jit {
 namespace {
 
 enum class EntryState { OBSERVING, QUEUED, COMPILING, READY, FAILED_COOLDOWN, EVICTED };
+
+std::atomic<uint64_t> next_manager_instance_id{1};
+constexpr uint32_t kRecentCodeRefreshInterval = 64;
 
 void MixHash(size_t* hash, uint64_t value) noexcept {
     *hash ^= static_cast<size_t>(value) + 0x9e3779b97f4a7c15ULL + (*hash << 6U) + (*hash >> 2U);
@@ -98,8 +102,9 @@ struct PointProgramJitManager::Impl {
     uint64_t clock{0};
     size_t code_bytes{0};
     uint64_t interpreter_executions{0};
-    uint64_t native_executions{0};
-    uint64_t native_cache_hits{0};
+    std::atomic<uint64_t> native_executions{0};
+    std::atomic<uint64_t> native_cache_hits{0};
+    std::atomic<uint64_t> cache_epoch{1};
     uint64_t compile_attempts{0};
     uint64_t compile_failures{0};
     uint64_t compile_ns{0};
@@ -109,7 +114,7 @@ struct PointProgramJitManager::Impl {
 PointProgramJitManager::PointProgramJitManager(PointProgramJitConfig config, IdentityCurrentFunction identity_current,
                                                CompileFunction compile)
     : config_(std::move(config)), identity_current_(std::move(identity_current)), compile_(std::move(compile)),
-      impl_(std::make_unique<Impl>()) {
+      instance_id_(next_manager_instance_id.fetch_add(1, std::memory_order_relaxed)), impl_(std::make_unique<Impl>()) {
     config_.max_entries = std::max<size_t>(1, config_.max_entries);
     config_.max_code_bytes = std::max<size_t>(1, config_.max_code_bytes);
     config_.max_queue_size = std::max<size_t>(1, config_.max_queue_size);
@@ -160,6 +165,7 @@ void PointProgramJitManager::RemoveStale(const PointProgramJitKey& key) {
         }
         impl_->entries.erase(position);
         ++impl_->evictions;
+        impl_->cache_epoch.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -192,7 +198,7 @@ std::shared_ptr<const JitCode> PointProgramJitManager::Acquire(compiled::Program
         }
         entry->last_use = ++impl_->clock;
         if (entry->state == EntryState::READY && entry->code != nullptr) {
-            ++impl_->native_cache_hits;
+            impl_->native_cache_hits.fetch_add(1, std::memory_order_relaxed);
             return entry->code;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -223,6 +229,55 @@ std::shared_ptr<const JitCode> PointProgramJitManager::Acquire(compiled::Program
         std::lock_guard<std::mutex> lock(impl_->mutex);
         --impl_->active_force_calls;
         impl_->idle_cv.notify_all();
+    }
+    return code;
+}
+
+std::shared_ptr<const JitCode> PointProgramJitManager::AcquireCurrent(compiled::ProgramTemplatePtr program_template,
+                                                                      rmdb_config::JitMode mode,
+                                                                      bool identity_current) {
+    struct RecentCode {
+        PointProgramJitManager* manager{nullptr};
+        uint64_t manager_instance_id{0};
+        uint64_t cache_epoch{0};
+        rmdb_config::JitMode mode{rmdb_config::JitMode::OFF};
+        uint32_t hits_until_refresh{0};
+        // A live manager entry owns the template while this epoch is valid;
+        // eviction/stale removal advances the epoch before releasing it.
+        const compiled::ProgramTemplate* program_template{nullptr};
+        std::weak_ptr<const JitCode> code;
+    };
+    thread_local RecentCode recent;
+
+    if (mode == rmdb_config::JitMode::OFF || program_template == nullptr) {
+        recent = {};
+        return {};
+    }
+    if (!identity_current) {
+        recent = {};
+        if (!IdentityCurrent(program_template->identity())) {
+            RemoveStale(MakePointProgramJitKey(*program_template));
+        }
+        return {};
+    }
+
+    const uint64_t epoch = impl_->cache_epoch.load(std::memory_order_acquire);
+    if (recent.manager == this && recent.manager_instance_id == instance_id_ && recent.cache_epoch == epoch &&
+        recent.mode == mode && recent.program_template == program_template.get()) {
+        auto code = recent.code.lock();
+        if (code != nullptr && --recent.hits_until_refresh != 0) {
+            impl_->native_cache_hits.fetch_add(1, std::memory_order_relaxed);
+            return code;
+        }
+    }
+
+    const uint64_t epoch_before = epoch;
+    auto code = Acquire(program_template, mode);
+    const uint64_t epoch_after = impl_->cache_epoch.load(std::memory_order_acquire);
+    if (code != nullptr && epoch_before == epoch_after) {
+        recent = {this, instance_id_, epoch_after, mode, kRecentCodeRefreshInterval, program_template.get(), code};
+    } else {
+        recent = {};
     }
     return code;
 }
@@ -278,8 +333,9 @@ void PointProgramJitManager::ObserveInterpreter(compiled::ProgramTemplatePtr pro
 }
 
 void PointProgramJitManager::RecordNativeExecution() noexcept {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    ++impl_->native_executions;
+    // This counter is independent of entry lifetime and can be updated without
+    // contending with the manager mutex on every native dispatch.
+    impl_->native_executions.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::shared_ptr<const JitCode> PointProgramJitManager::CompileImmediately(const std::shared_ptr<Entry>& entry) {
@@ -391,6 +447,7 @@ void PointProgramJitManager::EvictLocked(const std::shared_ptr<Entry>& protected
         }
         impl_->entries.erase(victim);
         ++impl_->evictions;
+        impl_->cache_epoch.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -409,6 +466,7 @@ void PointProgramJitManager::ShutdownAndDrain() {
         }
         impl_->accepting = false;
         impl_->stop_worker = true;
+        impl_->cache_epoch.fetch_add(1, std::memory_order_release);
         for (const auto& entry : impl_->queue) {
             entry->state = EntryState::EVICTED;
         }
@@ -437,9 +495,16 @@ void PointProgramJitManager::ShutdownAndDrain() {
 
 PointProgramJitStats PointProgramJitManager::Stats() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    return {impl_->entries.size(),    impl_->queue.size(),      impl_->code_bytes,       impl_->interpreter_executions,
-            impl_->native_executions, impl_->native_cache_hits, impl_->compile_attempts, impl_->compile_failures,
-            impl_->compile_ns,        impl_->evictions};
+    return {impl_->entries.size(),
+            impl_->queue.size(),
+            impl_->code_bytes,
+            impl_->interpreter_executions,
+            impl_->native_executions.load(std::memory_order_relaxed),
+            impl_->native_cache_hits.load(std::memory_order_relaxed),
+            impl_->compile_attempts,
+            impl_->compile_failures,
+            impl_->compile_ns,
+            impl_->evictions};
 }
 
 } // namespace jit

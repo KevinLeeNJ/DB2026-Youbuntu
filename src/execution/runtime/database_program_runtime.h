@@ -21,6 +21,9 @@ struct PointIndexRuntimeBinding {
     std::string table_name;
     std::vector<std::string> index_col_names;
     std::vector<uint32_t> tuple_offsets;
+    // Set by cached-program dispatch after catalog generation and index shape
+    // validation. Empty keeps direct runtime callers on the compatibility path.
+    std::string index_name{};
 };
 
 struct DatabaseProgramBindings {

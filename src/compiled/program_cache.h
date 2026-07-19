@@ -25,8 +25,8 @@ struct ProgramCacheKey {
 
     friend bool operator==(const ProgramCacheKey& lhs, const ProgramCacheKey& rhs) {
         return lhs.shape == rhs.shape && lhs.statement_generation == rhs.statement_generation &&
-               lhs.planner_generation == rhs.planner_generation &&
-               lhs.catalog_generation == rhs.catalog_generation && lhs.kind == rhs.kind;
+               lhs.planner_generation == rhs.planner_generation && lhs.catalog_generation == rhs.catalog_generation &&
+               lhs.kind == rhs.kind;
     }
 };
 

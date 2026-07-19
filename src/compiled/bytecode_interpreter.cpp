@@ -51,7 +51,8 @@ ExecStatus CheckHelperResult(ExecStatus status, ProgramRuntime* runtime, const c
         if (status == ExecStatus::OK) {
             return status;
         }
-        const std::string message = status == ExecStatus::NO_MATCH_RESULT ? std::string() : std::string(helper) + " failed";
+        const std::string message =
+            status == ExecStatus::NO_MATCH_RESULT ? std::string() : std::string(helper) + " failed";
         return runtime->SetError(status, message);
     }
     return runtime->SetError(ExecStatus::ERROR, std::string(helper) + " returned an invalid status");

@@ -35,14 +35,15 @@ ProgramTemplatePtr ProgramTemplateCache::Lookup(const ProgramCacheKey& key) {
 
 ProgramTemplatePtr ProgramTemplateCache::LookupAny(const parser::TokenShapeKey& shape, uint64_t statement_generation,
                                                    uint64_t planner_generation, uint64_t catalog_generation) {
+    ProgramCacheKey key{shape, statement_generation, planner_generation, catalog_generation, ProgramKind::POINT_SELECT};
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto kind : {ProgramKind::POINT_SELECT, ProgramKind::POINT_UPDATE, ProgramKind::POINT_DELETE,
-                      ProgramKind::POINT_INSERT}) {
-        ProgramCacheKey key{shape, statement_generation, planner_generation, catalog_generation, kind};
+    for (auto kind :
+         {ProgramKind::POINT_SELECT, ProgramKind::POINT_UPDATE, ProgramKind::POINT_DELETE, ProgramKind::POINT_INSERT}) {
+        key.kind = kind;
         auto found = entries_.find(key);
         if (found == entries_.end() || found->second.program_template == nullptr ||
             !found->second.program_template->Matches(shape, catalog_generation, statement_generation,
-                                                      planner_generation, kind)) {
+                                                     planner_generation, kind)) {
             continue;
         }
         found->second.last_use = ++clock_;
@@ -55,8 +56,8 @@ ProgramTemplatePtr ProgramTemplateCache::LookupAny(const parser::TokenShapeKey& 
 
 ProgramTemplatePtr ProgramTemplateCache::Publish(const ProgramCacheKey& key, ProgramTemplatePtr program_template) {
     if (program_template == nullptr || capacity_ == 0 ||
-        !program_template->Matches(key.shape, key.catalog_generation, key.statement_generation,
-                                   key.planner_generation, key.kind)) {
+        !program_template->Matches(key.shape, key.catalog_generation, key.statement_generation, key.planner_generation,
+                                   key.kind)) {
         return program_template;
     }
     std::lock_guard<std::mutex> lock(mutex_);

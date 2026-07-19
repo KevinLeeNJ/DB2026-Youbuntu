@@ -112,4 +112,36 @@ std::optional<ParameterFrame> ParameterFrame::Bind(const std::vector<ParameterDe
     return ParameterFrame(std::move(bound));
 }
 
+std::optional<ParameterFrame> ParameterFrame::Bind(const std::vector<ParameterDesc>& descriptors,
+                                                   std::vector<ParameterValue>&& values, std::string* error) {
+    auto fail = [&](std::string message) -> std::optional<ParameterFrame> {
+        if (error != nullptr) {
+            *error = std::move(message);
+        }
+        return std::nullopt;
+    };
+    if (descriptors.size() != values.size()) {
+        return fail("parameter count does not match the program");
+    }
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (descriptors[index].type != values[index].type()) {
+            return fail("parameter type does not match its descriptor");
+        }
+        if (values[index].type() == ValueType::BYTES &&
+            values[index].value().bytes.size() > descriptors[index].max_length) {
+            return fail("byte parameter exceeds its descriptor length");
+        }
+    }
+
+    std::vector<RuntimeValue> bound;
+    bound.reserve(values.size());
+    for (ParameterValue& value : values) {
+        bound.push_back(std::move(value).value());
+    }
+    if (error != nullptr) {
+        error->clear();
+    }
+    return ParameterFrame(std::move(bound));
+}
+
 } // namespace compiled

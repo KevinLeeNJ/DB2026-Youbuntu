@@ -34,5 +34,6 @@ public:
     static PointLookupResult Lookup(const PointLookupRequest& request, SmManager* sm_manager, Context* context);
     static PointLookupResult LookupEncoded(const std::string& table_name,
                                            const std::vector<std::string>& index_col_names, const char* key,
-                                           size_t key_size, SmManager* sm_manager, Context* context);
+                                           size_t key_size, SmManager* sm_manager, Context* context,
+                                           const std::string* validated_index_name = nullptr);
 };

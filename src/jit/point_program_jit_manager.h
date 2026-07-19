@@ -81,6 +81,11 @@ public:
     PointProgramJitManager& operator=(const PointProgramJitManager&) = delete;
 
     std::shared_ptr<const JitCode> Acquire(compiled::ProgramTemplatePtr program_template, rmdb_config::JitMode mode);
+    // The dispatcher may use this after checking the template identity against
+    // the current request and catalog generations. Its thread-local hint does
+    // not extend template or native-code lifetime beyond the manager entry.
+    std::shared_ptr<const JitCode> AcquireCurrent(compiled::ProgramTemplatePtr program_template,
+                                                  rmdb_config::JitMode mode, bool identity_current);
     void ObserveInterpreter(compiled::ProgramTemplatePtr program_template, uint64_t elapsed_ns,
                             rmdb_config::JitMode mode);
     void RecordNativeExecution() noexcept;
@@ -105,6 +110,7 @@ private:
     PointProgramJitConfig config_;
     IdentityCurrentFunction identity_current_;
     CompileFunction compile_;
+    uint64_t instance_id_{0};
     std::unique_ptr<Impl> impl_;
 };
 

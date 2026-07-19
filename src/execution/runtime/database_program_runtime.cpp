@@ -171,7 +171,8 @@ ExecStatus DatabaseProgramRuntime::PointLookup(const RuntimeValue& key, RuntimeV
     try {
         const auto& binding = bindings_.point_indexes[key.opaque];
         auto result = PointLookupRuntime::LookupEncoded(binding.table_name, binding.index_col_names, key.bytes.data(),
-                                                        key.bytes.size(), sm_manager_, context_);
+                                                        key.bytes.size(), sm_manager_, context_,
+                                                        binding.index_name.empty() ? nullptr : &binding.index_name);
         if (result.status == PointLookupStatus::FALLBACK) {
             return Fallback("point lookup is ambiguous");
         }

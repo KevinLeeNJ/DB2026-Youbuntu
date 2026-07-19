@@ -107,7 +107,8 @@ PointLookupResult PointLookupRuntime::Lookup(const PointLookupRequest& request, 
 
 PointLookupResult PointLookupRuntime::LookupEncoded(const std::string& table_name,
                                                     const std::vector<std::string>& index_col_names, const char* key,
-                                                    size_t key_size, SmManager* sm_manager, Context* context) {
+                                                    size_t key_size, SmManager* sm_manager, Context* context,
+                                                    const std::string* validated_index_name) {
     if (sm_manager == nullptr || key == nullptr) {
         return {PointLookupStatus::FALLBACK, std::nullopt};
     }
@@ -122,7 +123,10 @@ PointLookupResult PointLookupRuntime::LookupEncoded(const std::string& table_nam
         return {PointLookupStatus::FALLBACK, std::nullopt};
     }
     const IndexMeta& index = *index_it;
-    const std::string index_name = sm_manager->get_ix_manager()->get_index_name(table_name, index.cols);
+    const std::string computed_index_name = validated_index_name == nullptr
+                                                ? sm_manager->get_ix_manager()->get_index_name(table_name, index.cols)
+                                                : std::string{};
+    const std::string& index_name = validated_index_name == nullptr ? computed_index_name : *validated_index_name;
     auto ih_it = sm_manager->ihs_.find(index_name);
     if (ih_it == sm_manager->ihs_.end()) {
         return {PointLookupStatus::FALLBACK, std::nullopt};

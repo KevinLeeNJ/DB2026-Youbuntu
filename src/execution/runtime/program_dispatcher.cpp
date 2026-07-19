@@ -66,11 +66,8 @@ std::optional<std::vector<compiled::ParameterValue>> BindProgramParameters(
     values.reserve(program_template.program().parameters().size());
     for (uint32_t program_parameter = 0; program_parameter < program_template.program().parameters().size();
          ++program_parameter) {
-        auto mapping = std::find_if(program_template.lexical_parameters().begin(),
-                                    program_template.lexical_parameters().end(), [&](const auto& descriptor) {
-                                        return descriptor.program_parameter == program_parameter;
-                                    });
-        if (mapping == program_template.lexical_parameters().end() || mapping->lexical_slot < 0 ||
+        const auto* mapping = program_template.FindProgramParameter(program_parameter);
+        if (mapping == nullptr || mapping->lexical_slot < 0 ||
             static_cast<size_t>(mapping->lexical_slot) >= lexical.parameters.size()) {
             return std::nullopt;
         }
@@ -153,6 +150,14 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
         return false;
     }
     const auto& description = program_template.bindings();
+    bindings->point_indexes.reserve(description.point_indexes.size());
+    state->conditions.reserve(description.conditions.size());
+    state->set_clauses.reserve(description.set_clauses.size());
+    state->indexes.reserve(description.mutation_indexes.size());
+    state->bound_conditions.reserve(description.conditions.size());
+    state->bound_set_clauses.reserve(description.set_clauses.size());
+    output_cols->reserve(description.output_columns.size());
+    captions->reserve(description.output_columns.size());
     if (!sm_manager->db_.is_table(description.table.table_name)) {
         return false;
     }
@@ -189,8 +194,8 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
         if (live_name != cached_index.index_name || sm_manager->ihs_.find(live_name) == sm_manager->ihs_.end()) {
             return false;
         }
-        bindings->point_indexes.push_back(
-            {description.table.table_name, cached_index.column_names, cached_index.tuple_offsets});
+        bindings->point_indexes.push_back({description.table.table_name, cached_index.column_names,
+                                           cached_index.tuple_offsets, cached_index.index_name});
     }
     state->table_name = description.table.table_name;
     if (program_template.identity().kind != compiled::ProgramKind::POINT_SELECT &&
@@ -338,7 +343,8 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
         return ProgramDispatchStatus::FALLBACK;
     }
     std::string bind_error;
-    auto frame = compiled::ParameterFrame::Bind(program_template->program().parameters(), *values, &bind_error);
+    auto frame =
+        compiled::ParameterFrame::Bind(program_template->program().parameters(), std::move(*values), &bind_error);
     if (!frame.has_value()) {
         request.cache->RecordFallback();
         return ProgramDispatchStatus::FALLBACK;
@@ -354,8 +360,15 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
     const char* point_jit_flag = std::getenv(rmdb_config::kPointProgramJitEnv);
     const bool point_jit_enabled =
         point_jit_flag != nullptr && std::string(point_jit_flag) == "1" && request.point_jit_manager != nullptr;
-    auto native_code = point_jit_enabled ? request.point_jit_manager->Acquire(program_template, rmdb_config::jit_mode)
-                                         : std::shared_ptr<const jit::JitCode>{};
+    const auto& identity = program_template->identity();
+    const bool identity_current =
+        identity.token_shape == request.lexical->key && identity.statement_generation == request.statement_generation &&
+        identity.planner_generation == request.planner_generation &&
+        identity.catalog_generation == request.sm_manager->get_catalog_generation();
+    auto native_code = point_jit_enabled
+                           ? request.point_jit_manager->AcquireCurrent(program_template, rmdb_config::jit_mode,
+                                                                       identity_current)
+                           : std::shared_ptr<const jit::JitCode>{};
     if (native_code != nullptr) {
         status = native_code->invoke_program(&runtime, &*frame);
         request.point_jit_manager->RecordNativeExecution();

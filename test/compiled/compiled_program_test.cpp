@@ -224,6 +224,24 @@ TEST(ParameterFrameTest, OwnsStringBytesAndRejectsTypeOrLengthMismatch) {
     EXPECT_NE(error.find("length"), std::string::npos);
 }
 
+TEST(ParameterFrameTest, MoveBindTransfersStringStorageAndPreservesScalarValues) {
+    const std::vector<ParameterDesc> descriptors{{ValueType::BYTES, 64}, {ValueType::INT32, 0}};
+    std::vector<ParameterValue> values{ParameterValue::Bytes(std::string(48, 'x')), ParameterValue::Int(37)};
+    const char* source_bytes = values[0].value().bytes.data();
+    std::string error = "stale";
+
+    auto frame = ParameterFrame::Bind(descriptors, std::move(values), &error);
+
+    ASSERT_TRUE(frame.has_value()) << error;
+    EXPECT_TRUE(error.empty());
+    EXPECT_EQ(frame->value(0).bytes, std::string(48, 'x'));
+    EXPECT_EQ(frame->value(0).bytes.data(), source_bytes);
+    EXPECT_EQ(frame->slot(0).bytes, frame->value(0).bytes.data());
+    EXPECT_EQ(frame->slot(0).bytes_length, 48U);
+    EXPECT_EQ(frame->value(1).int_value, 37);
+    EXPECT_EQ(frame->slot(1).int_value, 37);
+}
+
 TEST(CompiledProgramTest, CopiesTupleAndPreservesFixedWidthStringSemantics) {
     TupleLayout layout{16, {{ValueType::INT32, 0, 4}, {ValueType::BYTES, 4, 8}}};
     TupleLayout key_layout{8, {{ValueType::BYTES, 0, 8}}};

@@ -122,16 +122,30 @@ public:
     bool Matches(const parser::TokenShapeKey& token_shape, uint64_t catalog_generation, uint64_t statement_generation,
                  uint64_t planner_generation, ProgramKind kind) const;
     const LexicalParameterDesc* FindLexicalParameter(int32_t lexical_slot) const noexcept;
+    const LexicalParameterDesc* FindProgramParameter(uint32_t program_parameter) const noexcept;
 
 private:
     ProgramTemplate(ProgramTemplateIdentity identity, std::shared_ptr<const CompiledProgram> program,
                     std::vector<LexicalParameterDesc> lexical_parameters, ProgramBindingTemplate bindings)
         : identity_(std::move(identity)), program_(std::move(program)),
-          lexical_parameters_(std::move(lexical_parameters)), bindings_(std::move(bindings)) {}
+          lexical_parameters_(std::move(lexical_parameters)), bindings_(std::move(bindings)) {
+        program_parameter_descriptors_.assign(program_->parameters().size(), -1);
+        lexical_slot_descriptors_.assign(lexical_parameters_.size(), -1);
+        for (size_t i = 0; i < lexical_parameters_.size(); ++i) {
+            const auto parameter = lexical_parameters_[i].program_parameter;
+            if (parameter != kNoOperand) {
+                program_parameter_descriptors_[parameter] = static_cast<int32_t>(i);
+            }
+            lexical_slot_descriptors_[static_cast<size_t>(lexical_parameters_[i].lexical_slot)] =
+                static_cast<int32_t>(i);
+        }
+    }
 
     ProgramTemplateIdentity identity_;
     std::shared_ptr<const CompiledProgram> program_;
     std::vector<LexicalParameterDesc> lexical_parameters_;
+    std::vector<int32_t> program_parameter_descriptors_;
+    std::vector<int32_t> lexical_slot_descriptors_;
     ProgramBindingTemplate bindings_;
 };
 

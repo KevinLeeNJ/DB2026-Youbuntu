@@ -38,8 +38,11 @@ public:
     ValueType type() const {
         return value_.type;
     }
-    const RuntimeValue& value() const {
+    const RuntimeValue& value() const& {
         return value_;
+    }
+    RuntimeValue&& value() && {
+        return std::move(value_);
     }
 
 private:
@@ -56,6 +59,8 @@ public:
 
     static std::optional<ParameterFrame> Bind(const std::vector<ParameterDesc>& descriptors,
                                               const std::vector<ParameterValue>& values, std::string* error);
+    static std::optional<ParameterFrame> Bind(const std::vector<ParameterDesc>& descriptors,
+                                              std::vector<ParameterValue>&& values, std::string* error);
 
     size_t size() const {
         return values_.size();

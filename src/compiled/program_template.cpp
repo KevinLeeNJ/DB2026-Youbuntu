@@ -64,7 +64,8 @@ std::shared_ptr<const ProgramTemplate> ProgramTemplate::Create(ProgramTemplateId
     std::unordered_set<int32_t> lexical_slots;
     std::vector<bool> mapped_program_parameters(program->parameters().size(), false);
     for (const auto& parameter : lexical_parameters) {
-        if (parameter.lexical_slot < 0 || !lexical_slots.insert(parameter.lexical_slot).second ||
+        if (parameter.lexical_slot < 0 || static_cast<size_t>(parameter.lexical_slot) >= lexical_parameters.size() ||
+            !lexical_slots.insert(parameter.lexical_slot).second ||
             !ValidParameterShape(parameter.type, parameter.max_length)) {
             return Fail("invalid or duplicate lexical parameter descriptor", error);
         }
@@ -103,7 +104,7 @@ std::shared_ptr<const ProgramTemplate> ProgramTemplate::Create(ProgramTemplateId
 
     const auto validate_indexes = [&](const std::vector<TemplateIndexDesc>& indexes) {
         for (const auto& index : indexes) {
-            if (index.table_name != table.table_name || index.column_names.empty() ||
+            if (index.table_name != table.table_name || index.index_name.empty() || index.column_names.empty() ||
                 index.column_names.size() != index.tuple_offsets.size()) {
                 return false;
             }
@@ -207,10 +208,19 @@ bool ProgramTemplate::Matches(const parser::TokenShapeKey& token_shape, uint64_t
 }
 
 const LexicalParameterDesc* ProgramTemplate::FindLexicalParameter(int32_t lexical_slot) const noexcept {
-    auto found =
-        std::find_if(lexical_parameters_.begin(), lexical_parameters_.end(),
-                     [&](const LexicalParameterDesc& parameter) { return parameter.lexical_slot == lexical_slot; });
-    return found == lexical_parameters_.end() ? nullptr : &*found;
+    if (lexical_slot < 0 || static_cast<size_t>(lexical_slot) >= lexical_slot_descriptors_.size()) {
+        return nullptr;
+    }
+    const int32_t descriptor = lexical_slot_descriptors_[static_cast<size_t>(lexical_slot)];
+    return descriptor < 0 ? nullptr : &lexical_parameters_[static_cast<size_t>(descriptor)];
+}
+
+const LexicalParameterDesc* ProgramTemplate::FindProgramParameter(uint32_t program_parameter) const noexcept {
+    if (program_parameter >= program_parameter_descriptors_.size()) {
+        return nullptr;
+    }
+    const int32_t descriptor = program_parameter_descriptors_[program_parameter];
+    return descriptor < 0 ? nullptr : &lexical_parameters_[static_cast<size_t>(descriptor)];
 }
 
 } // namespace compiled
