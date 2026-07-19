@@ -68,6 +68,7 @@ struct IndexMeta {
 
 /* 表元数据 */
 struct TabMeta {
+    oid_t id{0};                    // stable table id used by WAL
     std::string name;               // 表名称
     std::vector<ColMeta> cols;      // 表包含的字段
     std::vector<IndexMeta> indexes; // 表上建立的索引

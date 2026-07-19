@@ -52,6 +52,17 @@ public:
         return mode;
     }
 
+    // Prefetching is deliberately limited to pages already resident in the
+    // index cache.  Calling fetch_page speculatively would change pin counts
+    // and eviction behavior, while a cache-only prefetch is a pure CPU hint.
+    static bool prefetch_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("IX_SCAN_PREFETCH");
+            return value == nullptr || std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
 private:
     const IxIndexHandle* ih_;
     IxIndexHandle::SharedIndexLatch index_latch_guard_;
@@ -67,6 +78,7 @@ private:
     // Legacy cursor used for single-leaf hybrid scans and for internal
     // callers that already hold a structure latch.
     Page* pinned_leaf_page_{nullptr};
+    bool pinned_leaf_has_bpm_pin_{false};
     IxNodeHandle leaf_;
     std::shared_lock<std::shared_mutex> leaf_latch_guard_;
 
@@ -89,6 +101,7 @@ private:
     std::unordered_set<uint64_t> emitted_last_key_rid_set_;
     bool emitted_rid_set_active_{false};
     page_id_t resume_page_no_{IX_NO_PAGE};
+    int resume_slot_no_{0};
     uint64_t resume_topology_epoch_{0};
     bool resume_cursor_valid_{false};
 
@@ -108,6 +121,19 @@ private:
         Page* page = bpm_->fetch_page(PageId{ih_->fd_, page_no});
         assert(page != nullptr);
         return page;
+    }
+
+    void prefetch_cached_page(page_id_t page_no) const {
+#if defined(__GNUC__) || defined(__clang__)
+        if (!prefetch_enabled()) {
+            return;
+        }
+        if (Page* cached = ih_->cached_page(page_no); cached != nullptr) {
+            __builtin_prefetch(cached->get_data(), 0, 3);
+        }
+#else
+        (void)page_no;
+#endif
     }
 
     void unpin_scan_page(Page* page) {
@@ -165,7 +191,14 @@ private:
         if (pinned_leaf_page_ != nullptr || (direction_ == ScanDirection::Forward && iid_ == end_) || backward_end_) {
             return;
         }
-        pinned_leaf_page_ = fetch_scan_page(iid_.page_no);
+        if (Page* cached = ih_->cached_page(iid_.page_no); cached != nullptr) {
+            pinned_leaf_page_ = cached;
+            pinned_leaf_has_bpm_pin_ = false;
+        } else {
+            pinned_leaf_page_ = bpm_->fetch_page(PageId{ih_->fd_, iid_.page_no});
+            assert(pinned_leaf_page_ != nullptr);
+            pinned_leaf_has_bpm_pin_ = true;
+        }
         leaf_latch_guard_ = std::shared_lock<std::shared_mutex>(pinned_leaf_page_->latch());
         leaf_ = IxNodeHandle(ih_->file_hdr_.get(), pinned_leaf_page_);
     }
@@ -173,8 +206,12 @@ private:
     void unpin_current_leaf() {
         if (pinned_leaf_page_ != nullptr) {
             leaf_latch_guard_.unlock();
-            unpin_scan_page(pinned_leaf_page_);
+            if (pinned_leaf_has_bpm_pin_) {
+                bpm_->unpin_page(pinned_leaf_page_->get_page_id(), false);
+            }
+            // Cache-owned pages carry no scan-owned BPM pin to release.
             pinned_leaf_page_ = nullptr;
+            pinned_leaf_has_bpm_pin_ = false;
         }
     }
 
@@ -269,6 +306,7 @@ private:
                 --child_idx;
             }
             page_id_t child_page_no = node.value_at(child_idx);
+            prefetch_cached_page(child_page_no);
             unpin_scan_page(page);
             page = fetch_scan_page(child_page_no);
             node = IxNodeHandle(ih_->file_hdr_.get(), page);
@@ -346,7 +384,7 @@ private:
             const bool can_use_fast_resume =
                 resume_cursor_valid_ && resume_topology_epoch_ == ih_->topology_epoch_.load(std::memory_order_relaxed);
             if (can_use_fast_resume) {
-                cursor = Iid{resume_page_no_, 0};
+                cursor = Iid{resume_page_no_, resume_slot_no_};
                 page = fetch_scan_page(resume_page_no_);
             } else {
                 page = fetch_lower_bound_leaf(last_key_.data(), &cursor);
@@ -355,6 +393,13 @@ private:
                 std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
                 IxNodeHandle leaf(ih_->file_hdr_.get(), page);
                 int slot = cursor.slot_no;
+                if (can_use_fast_resume && page->get_page_id().page_no == resume_page_no_) {
+                    // Leaf-local inserts and deletes do not advance the
+                    // topology epoch. Re-seek within the same leaf so slot
+                    // shifts cannot skip an entry; emitted-RID filtering below
+                    // still handles duplicates equal to the batch tail.
+                    slot = leaf.lower_bound(last_key_.data());
+                }
                 while (slot < leaf.get_size()) {
                     const int cmp = ix_compare(leaf.get_key(slot), last_key_.data(), ih_->file_hdr_->col_types_,
                                                ih_->file_hdr_->col_lens_);
@@ -373,6 +418,7 @@ private:
                     cursor.slot_no = slot;
                     break;
                 }
+                prefetch_cached_page(next_leaf);
                 unpin_scan_page(page);
                 if (at_last) {
                     page = nullptr;
@@ -386,6 +432,7 @@ private:
 
         size_t leaf_count = 0;
         page_id_t resume_page_no = IX_NO_PAGE;
+        int resume_slot_no = 0;
         while (page != nullptr && !coupled_end_ && (leaf_count < kMaxBatchLeaves || batch_.empty()) &&
                batch_.size() < kMaxBatchEntries) {
             ++leaf_count;
@@ -419,11 +466,16 @@ private:
             const bool reached_leaf_limit = leaf_count >= kMaxBatchLeaves && !batch_.empty();
             if (reached_batch_limit) {
                 resume_page_no = leaf.get_page_no();
+                resume_slot_no = stop;
             } else if (reached_leaf_limit) {
                 // Resume from the leaf containing the batch tail. Starting
                 // directly at next_leaf would miss a concurrent leaf-local
                 // insert whose key sorts after the emitted tail key.
                 resume_page_no = leaf.get_page_no();
+                resume_slot_no = stop;
+            }
+            if (!at_last && !coupled_end_ && !reached_batch_limit && !reached_leaf_limit) {
+                prefetch_cached_page(next_leaf);
             }
             leaf_lock.unlock();
             unpin_scan_page(page);
@@ -444,9 +496,11 @@ private:
         }
         if (!batch_.empty() && !coupled_end_ && resume_page_no != IX_NO_PAGE && resume_page_no != IX_LEAF_HEADER_PAGE) {
             resume_page_no_ = resume_page_no;
+            resume_slot_no_ = resume_slot_no;
             resume_topology_epoch_ = ih_->topology_epoch_.load(std::memory_order_relaxed);
             resume_cursor_valid_ = true;
         } else {
+            resume_slot_no_ = 0;
             resume_cursor_valid_ = false;
         }
         release_index_latch_if_held();
@@ -476,6 +530,15 @@ public:
             (mode_ == Mode::LEGACY || (mode_ == Mode::HYBRID && lower.page_no == upper.page_no));
         if (use_single_leaf) {
             normalize_legacy_position();
+            const bool pinned_root =
+                pinned_leaf_page_ != nullptr && pinned_leaf_page_->get_page_id().page_no == ih_->file_hdr_->root_page_;
+            if (mode_ == Mode::HYBRID && !pinned_root) {
+                // The leaf S latch is acquired while the tree S latch is still
+                // held. Structural writers take tree X before leaf X, so a
+                // single-leaf scan no longer needs to retain tree S while its
+                // consumer processes tuples.
+                release_index_latch_if_held();
+            }
             return;
         }
 

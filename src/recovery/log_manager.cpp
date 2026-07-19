@@ -34,12 +34,15 @@ std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size) {
     std::unique_ptr<LogRecord> record;
     switch (header.log_type_) {
     case LogType::UPDATE:
+    case LogType::UPDATE_TABLE_ID:
         record = std::make_unique<UpdateLogRecord>();
         break;
     case LogType::INSERT:
+    case LogType::INSERT_TABLE_ID:
         record = std::make_unique<InsertLogRecord>();
         break;
     case LogType::DELETE:
+    case LogType::DELETE_TABLE_ID:
         record = std::make_unique<DeleteLogRecord>();
         break;
     case LogType::BEGIN:
@@ -58,7 +61,32 @@ std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size) {
         return nullptr;
     }
 
-    record->deserialize(src);
+    switch (header.log_type_) {
+    case LogType::UPDATE:
+    case LogType::UPDATE_TABLE_ID:
+        static_cast<UpdateLogRecord*>(record.get())->deserialize(src);
+        break;
+    case LogType::INSERT:
+    case LogType::INSERT_TABLE_ID:
+        static_cast<InsertLogRecord*>(record.get())->deserialize(src);
+        break;
+    case LogType::DELETE:
+    case LogType::DELETE_TABLE_ID:
+        static_cast<DeleteLogRecord*>(record.get())->deserialize(src);
+        break;
+    case LogType::BEGIN:
+        static_cast<BeginLogRecord*>(record.get())->deserialize(src);
+        break;
+    case LogType::COMMIT:
+        static_cast<CommitLogRecord*>(record.get())->deserialize(src);
+        break;
+    case LogType::ABORT:
+        static_cast<AbortLogRecord*>(record.get())->deserialize(src);
+        break;
+    case LogType::CHECKPOINT:
+        static_cast<CheckpointLogRecord*>(record.get())->deserialize(src);
+        break;
+    }
     return record;
 }
 
@@ -81,7 +109,33 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
             if (!log_buffer_->is_full(static_cast<int>(log_record->log_tot_len_))) {
                 lsn_t lsn = global_lsn_.fetch_add(1);
                 log_record->lsn_ = lsn;
-                log_record->serialize(log_buffer_->buffer_ + log_buffer_->offset_);
+                char* dest = log_buffer_->buffer_ + log_buffer_->offset_;
+                switch (log_record->log_type_) {
+                case LogType::UPDATE:
+                case LogType::UPDATE_TABLE_ID:
+                    static_cast<UpdateLogRecord*>(log_record)->serialize(dest);
+                    break;
+                case LogType::INSERT:
+                case LogType::INSERT_TABLE_ID:
+                    static_cast<InsertLogRecord*>(log_record)->serialize(dest);
+                    break;
+                case LogType::DELETE:
+                case LogType::DELETE_TABLE_ID:
+                    static_cast<DeleteLogRecord*>(log_record)->serialize(dest);
+                    break;
+                case LogType::BEGIN:
+                    static_cast<BeginLogRecord*>(log_record)->serialize(dest);
+                    break;
+                case LogType::COMMIT:
+                    static_cast<CommitLogRecord*>(log_record)->serialize(dest);
+                    break;
+                case LogType::ABORT:
+                    static_cast<AbortLogRecord*>(log_record)->serialize(dest);
+                    break;
+                case LogType::CHECKPOINT:
+                    static_cast<CheckpointLogRecord*>(log_record)->serialize(dest);
+                    break;
+                }
                 log_buffer_->offset_ += static_cast<int>(log_record->log_tot_len_);
                 if (log_record->log_type_ == LogType::COMMIT) {
                     commit_count_.fetch_add(1, std::memory_order_acq_rel);

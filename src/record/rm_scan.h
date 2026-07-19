@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -16,18 +17,20 @@ class RmFileHandle;
 
 class RmScan : public RecScan {
     const RmFileHandle* file_handle_;
+    RmFileHdr file_hdr_snapshot_;
     Rid rid_;
+    std::vector<int> page_slots_;
+    std::vector<TupleMeta> page_metas_;
+    std::vector<char> page_records_;
+    size_t page_index_{0};
 
-    // Pinned current data page. Stays pinned while walking slots on the same
-    // page; released on move to next page / destruction / reaching end.
-    Page* pinned_page_ = nullptr;
-
-    void release_page();
+    bool load_page(page_id_t page_no);
+    int record_size() const;
 
 public:
     RmScan(const RmFileHandle* file_handle);
 
-    ~RmScan() override;
+    ~RmScan() override = default;
 
     RmScan(const RmScan&) = delete;
     RmScan& operator=(const RmScan&) = delete;
@@ -37,4 +40,13 @@ public:
     bool is_end() const override;
 
     Rid rid() const override;
+
+    const TupleMeta& current_meta() const {
+        return page_metas_[page_index_];
+    }
+
+    const char* current_data() const {
+        const size_t offset = page_index_ * static_cast<size_t>(record_size());
+        return page_records_.data() + offset;
+    }
 };

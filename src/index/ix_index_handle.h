@@ -219,10 +219,20 @@ public:
      * @return int
      */
     int find_child(IxNodeHandle* child) {
-        int rid_idx;
-        for (rid_idx = 0; rid_idx < page_hdr->num_key; rid_idx++) {
-            if (get_rid(rid_idx)->page_no == child->get_page_no()) {
-                break;
+        const page_id_t child_page_no = child->get_page_no();
+        if (child->get_size() > 0) {
+            const int candidate = lower_bound(child->get_key(0));
+            if (candidate < get_size() && value_at(candidate) == child_page_no) {
+                return candidate;
+            }
+        }
+
+        // A child's first key can temporarily differ from its parent separator
+        // during deletion maintenance; duplicate separators are also possible.
+        int rid_idx = 0;
+        for (; rid_idx < page_hdr->num_key; ++rid_idx) {
+            if (value_at(rid_idx) == child_page_no) {
+                return rid_idx;
             }
         }
         assert(rid_idx < page_hdr->num_key);
@@ -437,7 +447,7 @@ private:
     // for maintain data structure
     void maintain_parent(IxNodeHandle* node);
 
-    void erase_leaf(IxNodeHandle* leaf);
+    void erase_leaf(IxNodeHandle* leaf, page_id_t locked_prev_page_no = IX_NO_PAGE);
 
     void release_node_handle(IxNodeHandle& node);
 

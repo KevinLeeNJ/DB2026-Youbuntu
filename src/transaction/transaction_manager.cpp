@@ -71,11 +71,13 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
     }
     lock_set->clear();
 
-    auto unique_key_locks = *txn->get_unique_key_lock_set();
-    for (const auto& lock_id : unique_key_locks) {
-        lock_manager->unlock_unique_key(txn, lock_id);
+    auto* unique_key_locks = txn->get_unique_key_lock_set();
+    while (!unique_key_locks->empty()) {
+        const auto lock_id = *unique_key_locks->begin();
+        if (!lock_manager->unlock_unique_key(txn, lock_id)) {
+            unique_key_locks->erase(lock_id);
+        }
     }
-    txn->get_unique_key_lock_set()->clear();
 }
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {

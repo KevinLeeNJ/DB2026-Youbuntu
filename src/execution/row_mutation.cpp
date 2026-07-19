@@ -493,7 +493,7 @@ void RowMutationEngine::CommitUpdate(PreparedUpdate&& prepared, RmRecord& propos
     lsn_t log_lsn = INVALID_LSN;
     if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
         Rid log_rid = rid;
-        UpdateLogRecord log_record(txn->get_transaction_id(), visible_record, proposed, log_rid, *info.tab_name);
+        UpdateLogRecord log_record(txn->get_transaction_id(), visible_record, proposed, log_rid, info.tab->id);
         log_record.prev_lsn_ = txn->get_prev_lsn();
         log_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(log_lsn);
@@ -565,7 +565,7 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
     lsn_t log_lsn = INVALID_LSN;
     if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
         Rid log_rid = rid;
-        DeleteLogRecord log_record(txn->get_transaction_id(), visible_record, log_rid, *info.tab_name);
+        DeleteLogRecord log_record(txn->get_transaction_id(), visible_record, log_rid, info.tab->id);
         log_record.prev_lsn_ = txn->get_prev_lsn();
         log_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(log_lsn);

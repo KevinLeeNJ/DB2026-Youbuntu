@@ -48,4 +48,7 @@ public:
     uint64_t statement_template_generation_{0};
     uint64_t planner_generation_{0};
     uint32_t jit_predicate_ordinal_{0};
+    // Cached at scan begin; INVALID_TS keeps non-transactional callers on the
+    // existing visibility path.
+    timestamp_t visibility_watermark_{INVALID_TS};
 };

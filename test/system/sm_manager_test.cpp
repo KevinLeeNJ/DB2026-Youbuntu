@@ -129,6 +129,34 @@ TEST_F(SmManagerTest, open_db_success) {
     db_opened_ = false;
 }
 
+TEST_F(SmManagerTest, table_id_is_stable_and_not_reused) {
+    setup_db();
+    sm_manager_->create_table("first", make_int_cols({"id"}), nullptr);
+    const oid_t first_id = sm_manager_->db_.get_table("first").id;
+    ASSERT_NE(first_id, 0);
+
+    sm_manager_->close_db();
+    db_opened_ = false;
+    sm_manager_->open_db(TEST_DB_NAME);
+    db_opened_ = true;
+    EXPECT_EQ(sm_manager_->db_.get_table("first").id, first_id);
+    EXPECT_EQ(sm_manager_->get_table_name(first_id), std::optional<std::string>("first"));
+
+    sm_manager_->drop_table("first", nullptr);
+    sm_manager_->create_table("first", make_int_cols({"id"}), nullptr);
+    const oid_t recreated_id = sm_manager_->db_.get_table("first").id;
+    EXPECT_NE(recreated_id, first_id);
+    EXPECT_FALSE(sm_manager_->get_table_name(first_id).has_value());
+    EXPECT_TRUE(sm_manager_->is_known_table_id(first_id));
+
+    sm_manager_->close_db();
+    db_opened_ = false;
+    sm_manager_->open_db(TEST_DB_NAME);
+    db_opened_ = true;
+    EXPECT_EQ(sm_manager_->db_.get_table("first").id, recreated_id);
+    EXPECT_EQ(sm_manager_->get_table_name(recreated_id), std::optional<std::string>("first"));
+}
+
 TEST_F(SmManagerTest, open_db_not_found_throws) {
     EXPECT_THROW(sm_manager_->open_db(TEST_DB_NAME), DatabaseNotFoundError);
 }

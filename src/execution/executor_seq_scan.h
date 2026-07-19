@@ -36,7 +36,7 @@ private:
 #endif
 
     Rid rid_;
-    std::unique_ptr<RecScan> scan_; // table_iterator
+    std::unique_ptr<RmScan> scan_; // table_iterator
 
     SmManager* sm_manager_;
     bool predicate_recorded_{false};
@@ -122,12 +122,13 @@ public:
      * @brief 构建表迭代器scan_,并开始迭代扫描,直到扫描到第一个满足谓词条件和MVCC可见性的元组停止,并赋值给rid_
      */
     void beginTuple() override {
+        RefreshVisibilityWatermark(context_);
         record_predicate_read();
         buffered_tuple_ = {};
         scan_ = std::make_unique<RmScan>(fh_);
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto tuple = GetVisibleTuple(fh_, rid_, context_);
+            auto tuple = GetVisibleTupleFromSnapshot(fh_, rid_, scan_->current_meta(), scan_->current_data(), context_);
             if (tuple.view.data == nullptr) {
                 scan_->next();
                 continue;
@@ -150,7 +151,7 @@ public:
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto tuple = GetVisibleTuple(fh_, rid_, context_);
+            auto tuple = GetVisibleTupleFromSnapshot(fh_, rid_, scan_->current_meta(), scan_->current_data(), context_);
             if (tuple.view.data == nullptr) {
                 scan_->next();
                 continue;

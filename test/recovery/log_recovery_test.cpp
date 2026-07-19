@@ -111,6 +111,14 @@ lsn_t AppendInsert(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const R
     return log_mgr.add_log_to_buffer(&insert);
 }
 
+lsn_t AppendInsertById(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const Rid& rid, RmRecord& rec,
+                       oid_t table_id) {
+    Rid log_rid = rid;
+    InsertLogRecord insert(txn_id, rec, log_rid, table_id);
+    insert.prev_lsn_ = prev_lsn;
+    return log_mgr.add_log_to_buffer(&insert);
+}
+
 lsn_t AppendDelete(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const Rid& rid, RmRecord& rec) {
     Rid log_rid = rid;
     DeleteLogRecord del(txn_id, rec, log_rid, "t");
@@ -247,6 +255,37 @@ TEST(RecoveryManagerTest, CommittedInsertSurvivesRecovery) {
     auto file_hdr = db.sm_mgr_.fhs_.at("t")->get_file_hdr();
     EXPECT_EQ(file_hdr.num_pages, 2);
     EXPECT_EQ(file_hdr.first_free_page_no, 1);
+}
+
+TEST(RecoveryManagerTest, TombstonedTableIdWalDoesNotReplayIntoRecreatedTable) {
+    ScopedTestDir test_dir("recovery_table_id_incarnation_root");
+    const std::string db_name = "recovery_table_id_incarnation_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        const oid_t old_id = db.sm_mgr_.db_.get_table("t").id;
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto insert_lsn = AppendInsertById(*db.log_mgr_, 100, begin_lsn, rid, old_rec, old_id);
+        AppendCommit(*db.log_mgr_, 100, insert_lsn);
+        FlushLogs(*db.log_mgr_);
+
+        db.sm_mgr_.drop_table("t", nullptr);
+        db.sm_mgr_.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
+        db.sm_mgr_.create_index("t", {"id"}, nullptr);
+        const oid_t new_id = db.sm_mgr_.db_.get_table("t").id;
+        ASSERT_NE(new_id, old_id);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, new_rec);
+        ASSERT_TRUE(db.sm_mgr_.flush_all_table_and_index_pages());
+    }
+
+    RunRecovery(db_name);
+    OpenRecoveryDb reopened(db_name);
+    ASSERT_TRUE(RecordExists(reopened.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(reopened.sm_mgr_, rid), 20);
 }
 
 TEST(RecoveryManagerTest, InterruptedIndexSwapIsRepairedOnOpen) {

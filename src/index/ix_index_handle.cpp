@@ -339,9 +339,11 @@ bool IxIndexHandle::try_append_hint(const char* key, IxNodeHandle& leaf) const {
     }
 
     fetch_node_into(hint.page_no, leaf);
+    std::shared_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
     const bool valid =
         leaf.is_leaf_page() && leaf.get_size() > 0 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE &&
         ix_compare(key, leaf.get_key(leaf.get_size() - 1), file_hdr_->col_types_, file_hdr_->col_lens_) > 0;
+    leaf_guard.unlock();
     if (!valid) {
         unpin_if_not_cached(leaf.get_page_id());
         return false;
@@ -385,7 +387,9 @@ IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
         if (node->get_next_leaf() != IX_LEAF_HEADER_PAGE) {
             IxNodeHandle next_leaf;
             fetch_node_into(node->get_next_leaf(), next_leaf);
+            std::unique_lock<std::shared_mutex> next_leaf_guard(next_leaf.page->latch());
             next_leaf.set_prev_leaf(new_node->get_page_no());
+            next_leaf_guard.unlock();
             unpin_if_not_cached(next_leaf.get_page_id(), true);
         }
         node->set_next_leaf(new_node->get_page_no());
@@ -518,10 +522,12 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
         }
     }
 
+    std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
     int pos = leaf.lower_bound(key);
     bool duplicate_key =
         pos < leaf.get_size() && ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
     if (duplicate_key && !allow_duplicate) {
+        leaf_guard.unlock();
         unpin_if_not_cached(leaf.get_page_id());
         throw IndexEntryExistsError();
     }
@@ -542,6 +548,7 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
         if (file_hdr_->last_leaf_ == leaf.get_page_no()) {
             file_hdr_->last_leaf_ = new_leaf->get_page_no();
         }
+        leaf_guard.unlock();
         insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, transaction);
         if (right_edge_append) {
             remember_append_hint(key, new_leaf->get_page_no());
@@ -556,6 +563,9 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
 
     if (pos == 0) {
         maintain_parent(&leaf);
+    }
+    if (leaf_guard.owns_lock()) {
+        leaf_guard.unlock();
     }
     unpin_if_not_cached(leaf.get_page_id(), true);
     return inserted_page_no;
@@ -597,6 +607,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         }
     }
 
+    std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
     int pos = leaf.lower_bound(key);
     bool duplicate_key = pos < leaf.get_size() &&
                          ix_compare(leaf.get_key(pos), key, ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_) == 0;
@@ -617,6 +628,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         if (ih->file_hdr_->last_leaf_ == leaf.get_page_no()) {
             ih->file_hdr_->last_leaf_ = new_leaf->get_page_no();
         }
+        leaf_guard.unlock();
         ih->insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, txn);
         page_id_t new_leaf_page_no = new_leaf->get_page_no();
         if (right_edge_append) {
@@ -680,18 +692,22 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 
 bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transaction) {
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
+    std::unique_lock<std::shared_mutex> leaf_guard(leaf->page->latch());
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
     if (pos >= old_size || ix_compare(leaf->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
+        leaf_guard.unlock();
         unpin_if_not_cached(leaf->get_page_id());
         delete leaf;
         return false;
     }
 
     leaf->erase_pair(pos);
+    leaf_guard.unlock();
     if (leaf->get_size() > 0) {
         maintain_parent(leaf);
     }
+    coalesce_or_redistribute(leaf, transaction, &root_is_latched);
     unpin_if_not_cached(leaf->get_page_id(), true);
     delete leaf;
     return true;
@@ -763,24 +779,48 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
 
 bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction) {
     (void)transaction;
-    Iid lower = lower_bound(key);
-    Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
-    while (!scan.is_end()) {
-        Iid iid = scan.iid();
-        if (scan.rid() == value) {
-            IxNodeHandle leaf;
-            fetch_node_into(iid.page_no, leaf);
-            leaf.erase_pair(iid.slot_no);
-            if (leaf.get_size() > 0) {
-                maintain_parent(&leaf);
-            }
-            unpin_if_not_cached(leaf.get_page_id(), true);
-            return true;
+    IxNodeHandle leaf;
+    fetch_node_into(file_hdr_->root_page_, leaf);
+    while (!leaf.is_leaf_page()) {
+        int child_idx = leaf.lower_bound(key);
+        if (child_idx >= leaf.get_size()) {
+            child_idx = leaf.get_size() - 1;
+        } else if (child_idx > 0 &&
+                   ix_compare(leaf.get_key(child_idx), key, file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
+            --child_idx;
         }
-        scan.next();
+        const page_id_t child_page_no = leaf.value_at(child_idx);
+        unpin_if_not_cached(leaf.get_page_id());
+        fetch_node_into(child_page_no, leaf);
     }
-    return false;
+
+    while (true) {
+        std::unique_lock<std::shared_mutex> leaf_guard(leaf.page->latch());
+        int pos = leaf.lower_bound(key);
+        while (pos < leaf.get_size() &&
+               ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+            if (*leaf.get_rid(pos) == value) {
+                leaf.erase_pair(pos);
+                leaf_guard.unlock();
+                if (leaf.get_size() > 0) {
+                    maintain_parent(&leaf);
+                }
+                coalesce_or_redistribute(&leaf, transaction, nullptr);
+                unpin_if_not_cached(leaf.get_page_id(), true);
+                return true;
+            }
+            ++pos;
+        }
+        const bool key_may_continue = pos == leaf.get_size() && leaf.get_page_no() != file_hdr_->last_leaf_ &&
+                                      leaf.get_next_leaf() != IX_LEAF_HEADER_PAGE;
+        const page_id_t next_leaf = leaf.get_next_leaf();
+        leaf_guard.unlock();
+        unpin_if_not_cached(leaf.get_page_id());
+        if (!key_may_continue) {
+            return false;
+        }
+        fetch_node_into(next_leaf, leaf);
+    }
 }
 
 /**
@@ -802,14 +842,19 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
         return false;
     }
 
+    const page_id_t parent_page_no = node->get_parent_page_no();
+    const bool parent_was_cached = cached_page(parent_page_no) != nullptr;
     IxNodeHandle parent_storage;
-    fetch_node_into(node->get_parent_page_no(), parent_storage);
+    fetch_node_into(parent_page_no, parent_storage);
     IxNodeHandle* parent = &parent_storage;
     int index = parent->find_child(node);
     int neighbor_index = index == 0 ? 1 : index - 1;
+    const page_id_t neighbor_page_no = parent->value_at(neighbor_index);
+    const bool neighbor_was_cached = cached_page(neighbor_page_no) != nullptr;
     IxNodeHandle neighbor_storage;
-    fetch_node_into(parent->value_at(neighbor_index), neighbor_storage);
+    fetch_node_into(neighbor_page_no, neighbor_storage);
     IxNodeHandle* neighbor = &neighbor_storage;
+    std::unique_lock<std::shared_mutex> neighbor_guard(neighbor->page->latch());
 
     bool deleted = false;
     if (node->get_size() + neighbor->get_size() >= node->get_min_size() * 2) {
@@ -817,11 +862,24 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
         redistribute(neighbor, node, parent, index);
     } else {
         topology_epoch_.fetch_add(1, std::memory_order_relaxed);
-        deleted = coalesce(&neighbor, &node, &parent, index, transaction, root_is_latched);
+        coalesce(&neighbor, &node, &parent, index, transaction, root_is_latched);
+        deleted = true;
     }
 
-    unpin_if_not_cached(neighbor->get_page_id(), true);
-    unpin_if_not_cached(parent->get_page_id(), true);
+    // coalesce() swaps its local node pointers for a left-edge merge. The
+    // fetched neighbor handle and its pin/cache ownership never change.
+    BufferPoolManager::mark_dirty(neighbor_storage.page);
+    BufferPoolManager::mark_dirty(parent->page);
+    neighbor_guard.unlock();
+    if (!neighbor_was_cached) {
+        buffer_pool_manager_->unpin_page(neighbor_storage.get_page_id(), true);
+    }
+    if (deleted) {
+        deleted = coalesce_or_redistribute(parent, transaction, root_is_latched);
+    }
+    if (!parent_was_cached) {
+        buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
+    }
     return deleted;
 }
 
@@ -837,9 +895,11 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
         page_id_t child_page_no = old_root_node->value_at(0);
         IxNodeHandle child;
         fetch_node_into(child_page_no, child);
+        std::unique_lock<std::shared_mutex> child_guard(child.page->latch());
         child.set_parent_page_no(IX_NO_PAGE);
         update_root_page_no(child_page_no);
         refresh_root_page_cache();
+        child_guard.unlock();
         unpin_if_not_cached(child.get_page_id(), true);
         return true;
     }
@@ -864,18 +924,17 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
  * 注意更新parent结点的相关kv对
  */
 void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node, IxNodeHandle* parent, int index) {
-    (void)parent;
     if (index == 0) {
         node->insert_pair(node->get_size(), neighbor_node->get_key(0), *neighbor_node->get_rid(0));
         neighbor_node->erase_pair(0);
         maintain_child(node, node->get_size() - 1);
-        maintain_parent(neighbor_node);
+        parent->set_key(1, neighbor_node->get_key(0));
     } else {
         int move_pos = neighbor_node->get_size() - 1;
         node->insert_pair(0, neighbor_node->get_key(move_pos), *neighbor_node->get_rid(move_pos));
         neighbor_node->erase_pair(move_pos);
         maintain_child(node, 0);
-        maintain_parent(node);
+        parent->set_key(index, node->get_key(0));
     }
 }
 
@@ -895,6 +954,8 @@ void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node
  */
 bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, IxNodeHandle** parent, int index,
                              Transaction* transaction, bool* root_is_latched) {
+    (void)transaction;
+    (void)root_is_latched;
     if (index == 0) {
         std::swap(*neighbor_node, *node);
         index = 1;
@@ -912,12 +973,12 @@ bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, 
         if (file_hdr_->last_leaf_ == right->get_page_no()) {
             file_hdr_->last_leaf_ = left->get_page_no();
         }
-        erase_leaf(right);
+        erase_leaf(right, left->get_page_no());
     }
 
     (*parent)->erase_pair(index);
     release_node_handle(*right);
-    return coalesce_or_redistribute(*parent, transaction, root_is_latched);
+    return true;
 }
 
 /**
@@ -930,13 +991,17 @@ bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, 
  * @note iid和rid存的不是一个东西，rid是上层传过来的记录位置，iid是索引内部生成的索引槽位置
  */
 Rid IxIndexHandle::get_rid(const Iid& iid) const {
+    auto structure_guard = lock_shared();
     IxNodeHandle node;
     fetch_node_into(iid.page_no, node);
+    std::shared_lock<std::shared_mutex> leaf_guard(node.page->latch());
     if (iid.slot_no >= node.get_size()) {
+        leaf_guard.unlock();
         unpin_if_not_cached(node.get_page_id());
         throw IndexEntryNotFoundError();
     }
     Rid rid = *node.get_rid(iid.slot_no);
+    leaf_guard.unlock();
     unpin_if_not_cached(node.get_page_id());
     return rid;
 }
@@ -950,6 +1015,7 @@ Rid IxIndexHandle::get_rid(const Iid& iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char* key) const {
+    auto structure_guard = lock_shared();
     IxNodeHandle leaf;
     fetch_root_node_into(leaf);
     while (!leaf.is_leaf_page()) {
@@ -982,6 +1048,7 @@ Iid IxIndexHandle::lower_bound(const char* key) const {
  * @return Iid
  */
 Iid IxIndexHandle::upper_bound(const char* key) {
+    auto structure_guard = lock_shared();
     IxNodeHandle leaf;
     fetch_root_node_into(leaf);
     while (!leaf.is_leaf_page()) {
@@ -1006,6 +1073,7 @@ Iid IxIndexHandle::upper_bound(const char* key) {
  * equality lookup. Avoids the double tree walk of lower_bound + upper_bound.
  */
 std::pair<Iid, Iid> IxIndexHandle::equal_range(const char* key) {
+    auto structure_guard = lock_shared();
     IxNodeHandle leaf;
     fetch_root_node_into(leaf);
     while (!leaf.is_leaf_page()) {
@@ -1145,9 +1213,12 @@ UniqueLookupResult IxIndexHandle::lookup_unique(const char* key) const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_end() const {
+    auto structure_guard = lock_shared();
     IxNodeHandle node;
     fetch_node_into(file_hdr_->last_leaf_, node);
+    std::shared_lock<std::shared_mutex> leaf_guard(node.page->latch());
     Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node.get_size()};
+    leaf_guard.unlock();
     unpin_if_not_cached(node.get_page_id());
     return iid;
 }
@@ -1159,6 +1230,7 @@ Iid IxIndexHandle::leaf_end() const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_begin() const {
+    auto structure_guard = lock_shared();
     Iid iid = {.page_no = file_hdr_->first_leaf_, .slot_no = 0};
     return iid;
 }
@@ -1250,17 +1322,26 @@ void IxIndexHandle::maintain_parent(IxNodeHandle* node) {
  *
  * @param leaf 要删除的leaf
  */
-void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
+void IxIndexHandle::erase_leaf(IxNodeHandle* leaf, page_id_t locked_prev_page_no) {
     assert(leaf->is_leaf_page());
 
     IxNodeHandle prev;
     fetch_node_into(leaf->get_prev_leaf(), prev);
+    std::unique_lock<std::shared_mutex> prev_guard(prev.page->latch(), std::defer_lock);
+    if (prev.get_page_no() != locked_prev_page_no) {
+        prev_guard.lock();
+    }
     prev.set_next_leaf(leaf->get_next_leaf());
+    if (prev_guard.owns_lock()) {
+        prev_guard.unlock();
+    }
     unpin_if_not_cached(prev.get_page_id(), true);
 
     IxNodeHandle next;
     fetch_node_into(leaf->get_next_leaf(), next);
+    std::unique_lock<std::shared_mutex> next_guard(next.page->latch());
     next.set_prev_leaf(leaf->get_prev_leaf()); // 注意此处是SetPrevLeaf()
+    next_guard.unlock();
     unpin_if_not_cached(next.get_page_id(), true);
 }
 
@@ -1274,12 +1355,10 @@ void IxIndexHandle::release_node_handle(IxNodeHandle& node) {
         cached_internal_pages_.erase(node.get_page_no());
         buffer_pool_manager_->unmark_resident(node.get_page_id());
         resident_internal_pages_.erase(node.get_page_no());
-        // Cached pages normally have no BPM pin. This also releases the
-        // creation pin if a just-created internal page is merged before its
-        // caller's normal cleanup path runs.
-        buffer_pool_manager_->unpin_page(node.get_page_id(), false);
     }
-    file_hdr_->num_pages_--;
+    // Detached pages are deliberately not reused. num_pages_ is the persisted
+    // allocation high-water mark used to reconstruct DiskManager's page cursor.
+    // Decrementing it here could reuse a still-pinned page number after reopen.
 }
 
 /**
@@ -1291,7 +1370,9 @@ void IxIndexHandle::maintain_child(IxNodeHandle* node, int child_idx) {
         int child_page_no = node->value_at(child_idx);
         IxNodeHandle child;
         fetch_node_into(child_page_no, child);
+        std::unique_lock<std::shared_mutex> child_guard(child.page->latch());
         child.set_parent_page_no(node->get_page_no());
+        child_guard.unlock();
         unpin_if_not_cached(child.get_page_id(), true);
     }
 }

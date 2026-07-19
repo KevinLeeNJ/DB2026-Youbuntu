@@ -551,6 +551,7 @@ public:
 
     void beginTuple() override {
         clear_request_state();
+        RefreshVisibilityWatermark(context_);
         record_predicate_read();
 
         std::optional<IxIndexHandle::SharedIndexLatch> index_latch_guard;

@@ -122,6 +122,43 @@ public:
     }
 };
 
+TEST(IxNodeHandleTest, FindsChildBySeparatorWithSafeFallbacks) {
+    constexpr int order = 8;
+    IxFileHdr file_hdr(IX_NO_PAGE, 4, 10, 1, sizeof(int), order, IxKeysSize(order + 1, sizeof(int)), 101, 103);
+    file_hdr.col_types_ = {TYPE_INT};
+    file_hdr.col_lens_ = {sizeof(int)};
+
+    Page parent_page;
+    Page child_page;
+    std::memset(parent_page.get_data(), 0, PAGE_SIZE);
+    std::memset(child_page.get_data(), 0, PAGE_SIZE);
+    parent_page.id_ = PageId{1, 10};
+    child_page.id_ = PageId{1, 102};
+
+    IxNodeHandle parent(&file_hdr, &parent_page);
+    IxNodeHandle child(&file_hdr, &child_page);
+    parent.set_parent_page_no(IX_NO_PAGE);
+    child.set_parent_page_no(parent.get_page_no());
+
+    for (const auto [separator, page_no] : {std::pair{10, 101}, std::pair{20, 102}, std::pair{30, 103}}) {
+        parent.insert_pair(parent.get_size(), reinterpret_cast<const char*>(&separator), Rid{page_no, -1});
+    }
+    int child_first_key = 20;
+    child.insert_pair(0, reinterpret_cast<const char*>(&child_first_key), Rid{7, 0});
+
+    EXPECT_EQ(parent.find_child(&child), 1);
+
+    child_first_key = 25;
+    child.set_key(0, reinterpret_cast<const char*>(&child_first_key));
+    EXPECT_EQ(parent.find_child(&child), 1);
+
+    int duplicate_separator = 20;
+    parent.set_key(2, reinterpret_cast<const char*>(&duplicate_separator));
+    child_page.id_ = PageId{1, 103};
+    child.set_key(0, reinterpret_cast<const char*>(&duplicate_separator));
+    EXPECT_EQ(parent.find_child(&child), 2);
+}
+
 TEST_F(IndexHandleTest, InsertsUniqueKeysAndFindsValues) {
     auto ih = open_index();
     auto k10 = key(10);
@@ -260,20 +297,107 @@ TEST_F(IndexHandleTest, HybridUsesPinnedCursorForSingleLeafRange) {
 
     auto lower_key = key(10);
     auto upper_key = key(20);
+    ih->refresh_page_residency();
     Iid lower = ih->lower_bound(lower_key.data());
     Iid upper = ih->upper_bound(upper_key.data());
     ASSERT_EQ(lower.page_no, upper.page_no);
 
-    IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get(), true, true);
     std::vector<int> values;
-    while (!scan.is_end()) {
-        int value = 0;
-        std::memcpy(&value, scan.key(), sizeof(value));
-        values.push_back(value);
-        scan.next();
+    {
+        IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get(), true, true);
+        while (!scan.is_end()) {
+            int value = 0;
+            std::memcpy(&value, scan.key(), sizeof(value));
+            values.push_back(value);
+            scan.next();
+        }
+    }
+    EXPECT_EQ(values, std::vector<int>({10, 20}));
+
+    Page* cached_root = ih->cached_page(ih->file_hdr_->root_page_);
+    if (cached_root == nullptr) {
+        ADD_FAILURE() << "refresh_page_residency did not cache the leaf root";
+        close_index(ih);
+        return;
+    }
+    const int baseline_pin_count = cached_root->pin_count_.load(std::memory_order_relaxed);
+    {
+        IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get(), true, true);
+        EXPECT_EQ(scan.pinned_leaf_page_, cached_root);
+        EXPECT_FALSE(scan.pinned_leaf_has_bpm_pin_);
+    }
+    EXPECT_EQ(cached_root->pin_count_.load(std::memory_order_relaxed), baseline_pin_count);
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, SingleLeafHybridScanDoesNotRetainTreeLatch) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
     }
 
-    EXPECT_EQ(values, std::vector<int>({10, 20}));
+    auto lower_key = key(10);
+    auto upper_key = key(20);
+    auto scan = std::make_unique<IxScan>(ih.get(), ih->lower_bound(lower_key.data()), ih->upper_bound(upper_key.data()),
+                                         buffer_pool_manager.get());
+    std::atomic<bool> writer_done{false};
+    std::thread writer([&] {
+        for (int value = 5000; value < 5400; ++value) {
+            auto k = key(value);
+            ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!writer_done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool writer_progressed_while_scan_alive = writer_done.load(std::memory_order_acquire);
+    scan.reset();
+    writer.join();
+
+    EXPECT_TRUE(writer_progressed_while_scan_alive);
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, CoupledResumeReseeksAfterEarlierLeafLocalDelete) {
+    auto ih = open_index();
+    for (int value = 0; value < 2500; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    std::vector<int> values;
+    {
+        IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
+        ASSERT_TRUE(scan.coupled_mode_);
+        const size_t first_batch_size = scan.batch_.size();
+        ASSERT_GT(first_batch_size, 2u);
+
+        values.reserve(2500);
+        for (size_t index = 0; index < first_batch_size; ++index) {
+            values.push_back(scan.rid().slot_no);
+            if (index + 1 == first_batch_size) {
+                const int earlier_value = values.back() - 1;
+                const auto epoch_before = ih->topology_epoch_.load(std::memory_order_relaxed);
+                auto earlier_key = key(earlier_value);
+                ASSERT_TRUE(ih->delete_entry(earlier_key.data(), nullptr));
+                EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
+            }
+            scan.next();
+        }
+        while (!scan.is_end()) {
+            values.push_back(scan.rid().slot_no);
+            scan.next();
+        }
+    }
+
+    ASSERT_EQ(values.size(), 2500u);
+    for (int value = 0; value < 2500; ++value) {
+        EXPECT_EQ(values[static_cast<size_t>(value)], value);
+    }
     close_index(ih);
 }
 
@@ -665,7 +789,7 @@ TEST_F(IndexHandleTest, DeletesKeysAndKeepsRemainingEntriesSearchable) {
     close_index(ih);
 }
 
-TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
+TEST_F(IndexHandleTest, DeleteMergesUnderfullLeafAndKeepsRangeScanCorrect) {
     auto ih = open_index();
     for (int value = 0; value < 2500; ++value) {
         auto k = key(value);
@@ -687,24 +811,251 @@ TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
     }
 
     leaves = leaf_snapshots(ih.get());
-    auto emptied_leaf = std::find_if(leaves.begin(), leaves.end(),
+    auto removed_leaf = std::find_if(leaves.begin(), leaves.end(),
                                      [&](const LeafSnapshot& leaf) { return leaf.page_no == emptied_page; });
-    ASSERT_NE(emptied_leaf, leaves.end());
-    ASSERT_TRUE(emptied_leaf->keys.empty());
+    EXPECT_EQ(removed_leaf, leaves.end());
 
     auto lower_key = key(before_empty);
     auto upper_key = key(after_empty);
-    IxScan scan(ih.get(), ih->lower_bound(lower_key.data()), ih->upper_bound(upper_key.data()),
-                buffer_pool_manager.get());
-
     std::vector<int> slots;
-    while (!scan.is_end()) {
-        slots.push_back(scan.rid().slot_no);
-        scan.next();
+    {
+        IxScan scan(ih.get(), ih->lower_bound(lower_key.data()), ih->upper_bound(upper_key.data()),
+                    buffer_pool_manager.get());
+        while (!scan.is_end()) {
+            slots.push_back(scan.rid().slot_no);
+            scan.next();
+        }
     }
 
     EXPECT_EQ(slots, std::vector<int>({before_empty, after_empty}));
 
+    close_index(ih);
+    ih = open_index();
+    auto post_merge_key = key(10000);
+    ih->insert_entry(post_merge_key.data(), Rid{10, 10000}, nullptr);
+    std::vector<Rid> post_merge_result;
+    ASSERT_TRUE(ih->get_value(post_merge_key.data(), &post_merge_result, nullptr));
+    ASSERT_EQ(post_merge_result.size(), 1u);
+    EXPECT_EQ(post_merge_result.front(), (Rid{10, 10000}));
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, LeftEdgeMergeReleasesTheFetchedRightNeighborPin) {
+    auto ih = open_index();
+    for (int value = 0; value < 2500; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    const auto leaves = leaf_snapshots(ih.get());
+    ASSERT_GE(leaves.size(), 3u);
+    const page_id_t left_page_no = leaves[0].page_no;
+    const page_id_t fetched_neighbor_page_no = leaves[1].page_no;
+    Page* fetched_neighbor = buffer_pool_manager->fetch_page(PageId{ih->fd_, fetched_neighbor_page_no});
+    ASSERT_NE(fetched_neighbor, nullptr);
+    ASSERT_TRUE(buffer_pool_manager->unpin_page(fetched_neighbor->get_page_id(), false));
+    const int baseline_pin_count = fetched_neighbor->pin_count_;
+
+    for (int value : leaves[0].keys) {
+        auto k = key(value);
+        ASSERT_TRUE(ih->delete_entry(k.data(), nullptr)) << value;
+    }
+
+    const auto after_merge = leaf_snapshots(ih.get());
+    EXPECT_NE(std::find_if(after_merge.begin(), after_merge.end(),
+                           [&](const LeafSnapshot& leaf) { return leaf.page_no == left_page_no; }),
+              after_merge.end());
+    EXPECT_EQ(std::find_if(after_merge.begin(), after_merge.end(),
+                           [&](const LeafSnapshot& leaf) { return leaf.page_no == fetched_neighbor_page_no; }),
+              after_merge.end());
+    EXPECT_EQ(fetched_neighbor->pin_count_, baseline_pin_count);
+
+    for (int value : {leaves[1].keys.front(), leaves[1].keys.back(), 2499}) {
+        auto k = key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr));
+        ASSERT_EQ(result.size(), 1u);
+        EXPECT_EQ(result.front(), (Rid{1, value}));
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ConcurrentAppendWritersPreserveHintAndCacheSafety) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    constexpr int writer_count = 6;
+    constexpr int values_per_writer = 500;
+    constexpr int first_value = 10000;
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < writer_count; ++writer) {
+        writers.emplace_back([&, writer] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int offset = 0; offset < values_per_writer; ++offset) {
+                const int value = first_value + offset * writer_count + writer;
+                try {
+                    auto k = key(value);
+                    ih->insert_entry(k.data(), Rid{writer + 2, value}, nullptr);
+                } catch (...) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    std::thread cache_reader([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int iteration = 0; iteration < 1000; ++iteration) {
+            const int value = iteration % 2000;
+            auto k = key(value);
+            std::vector<Rid> result;
+            if (!ih->get_value(k.data(), &result, nullptr) || result.size() != 1) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    cache_reader.join();
+
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+    for (int offset = 0; offset < values_per_writer; ++offset) {
+        for (int writer = 0; writer < writer_count; ++writer) {
+            const int value = first_value + offset * writer_count + writer;
+            auto k = key(value);
+            std::vector<Rid> result;
+            ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr));
+            ASSERT_EQ(result.size(), 1u);
+            EXPECT_EQ(result.front(), (Rid{writer + 2, value}));
+        }
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ConcurrentReadsSurviveRootInternalSplitsAndMerges) {
+    cleanup();
+    cols = {ColMeta{.tab_name = table_name, .name = "id", .type = TYPE_STRING, .len = 128, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+
+    const auto wide_key = [](int value) {
+        std::vector<char> buf(128, 0);
+        std::snprintf(buf.data(), buf.size(), "%08d", value);
+        return buf;
+    };
+    constexpr int stable_count = 4000;
+    constexpr int transient_count = 1600;
+    for (int value = 0; value < stable_count; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    auto tree_height = [&] {
+        auto structure_guard = ih->lock_shared();
+        IxNodeHandle node;
+        ih->fetch_node_into(ih->file_hdr_->root_page_, node);
+        int height = 1;
+        while (!node.is_leaf_page()) {
+            const page_id_t child = node.value_at(0);
+            ih->unpin_if_not_cached(node.get_page_id());
+            ih->fetch_node_into(child, node);
+            ++height;
+        }
+        ih->unpin_if_not_cached(node.get_page_id());
+        return height;
+    };
+    ASSERT_GE(tree_height(), 3);
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> inserted{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> failures{0};
+
+    auto point_reader = [&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int iteration = 0; iteration < 3000 && !stop.load(std::memory_order_acquire); ++iteration) {
+            const int value = (iteration * 7919) % stable_count;
+            auto k = wide_key(value);
+            std::vector<Rid> result;
+            if (!ih->get_value(k.data(), &result, nullptr) || result.size() != 1 || result.front() != Rid{1, value}) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::thread reader_a(point_reader);
+    std::thread reader_b(point_reader);
+    std::thread range_reader([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int iteration = 0; iteration < 12 && !stop.load(std::memory_order_acquire); ++iteration) {
+            auto lower_key = wide_key(500);
+            auto upper_key = wide_key(3499);
+            IxScan scan(ih.get(), ih->lower_bound(lower_key.data()), ih->upper_bound(upper_key.data()),
+                        buffer_pool_manager.get());
+            int expected = 500;
+            while (!scan.is_end()) {
+                if (scan.rid() != Rid{1, expected}) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                ++expected;
+                scan.next();
+            }
+            if (expected != 3500) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int value = stable_count; value < stable_count + transient_count; ++value) {
+            auto k = wide_key(value);
+            ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        }
+        inserted.store(true, std::memory_order_release);
+        for (int value = stable_count; value < stable_count + transient_count; ++value) {
+            auto k = wide_key(value);
+            if (!ih->delete_entry(k.data(), nullptr)) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    start.store(true, std::memory_order_release);
+    reader_a.join();
+    reader_b.join();
+    range_reader.join();
+    writer.join();
+
+    EXPECT_TRUE(inserted.load(std::memory_order_acquire));
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+    EXPECT_GE(tree_height(), 3);
+
+    for (int value : {0, 137, 2048, stable_count - 1}) {
+        auto k = wide_key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr));
+        ASSERT_EQ(result.size(), 1u);
+        EXPECT_EQ(result.front(), (Rid{1, value}));
+    }
     close_index(ih);
 }
 

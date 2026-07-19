@@ -17,6 +17,10 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <cassert>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -38,14 +42,25 @@ enum class ResidencyClass : uint8_t {
 
 class BufferPoolManager {
 private:
+    static constexpr size_t kPageTableShardCount = 16;
+    struct PageTableShard {
+        mutable std::mutex latch;
+        std::unordered_map<PageId, frame_id_t, PageIdHash> entries;
+        // Reserves an old PageId while its frame writes back and changes
+        // identity. Readers wait instead of loading a stale second copy.
+        std::unordered_map<PageId, frame_id_t, PageIdHash> evicting_entries;
+    };
+
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
     std::unique_ptr<Page[]>
         pages_; // buffer_pool中的Page对象数组，在构造空间中申请内存空间，在析构函数中释放，大小为BUFFER_POOL_SIZE
-    std::unordered_map<PageId, frame_id_t, PageIdHash>
-        page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
+    // Compatibility snapshot for existing diagnostics/tests. Runtime lookups
+    // use page_table_shards_; this map is updated only while latch_ is held.
+    std::unordered_map<PageId, frame_id_t, PageIdHash> page_table_;
+    std::array<PageTableShard, kPageTableShardCount> page_table_shards_;
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
-    std::vector<ResidencyClass> residency_classes_;
+    std::unique_ptr<std::atomic<ResidencyClass>[]> residency_classes_;
     DiskManager* disk_manager_;
     LogManager* log_manager_{nullptr};
     std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
@@ -55,7 +70,10 @@ public:
         : pool_size_(pool_size), disk_manager_(disk_manager) {
         // 为buffer pool分配一块连续的内存空间
         pages_ = std::make_unique<Page[]>(pool_size_);
-        residency_classes_.assign(pool_size_, ResidencyClass::Normal);
+        residency_classes_ = std::make_unique<std::atomic<ResidencyClass>[]>(pool_size_);
+        for (size_t i = 0; i < pool_size_; ++i) {
+            residency_classes_[i].store(ResidencyClass::Normal, std::memory_order_relaxed);
+        }
         if (REPLACER_TYPE == "CLOCK") {
             replacer_ = std::make_unique<ClockReplacer>(pool_size_);
         } else {
@@ -67,6 +85,12 @@ public:
         page_table_.max_load_factor(0.7F);
         const size_t expected_resident_pages = pool_size_ + (pool_size_ + 4) / 5;
         page_table_.reserve(expected_resident_pages);
+        const size_t expected_per_shard = (expected_resident_pages + kPageTableShardCount - 1) / kPageTableShardCount;
+        for (auto& shard : page_table_shards_) {
+            shard.entries.max_load_factor(0.7F);
+            shard.entries.reserve(expected_per_shard);
+            shard.evicting_entries.max_load_factor(0.7F);
+        }
     }
 
     ~BufferPoolManager() = default;
@@ -124,7 +148,30 @@ public:
     }
 
 private:
+    size_t page_table_shard(PageId page_id) const {
+        return PageIdHash{}(page_id) % kPageTableShardCount;
+    }
+
+    template <typename Fn> void with_shards_locked(size_t first_index, size_t second_index, Fn&& fn) {
+        if (first_index == second_index) {
+            std::unique_lock first_lock(page_table_shards_[first_index].latch);
+            fn();
+            return;
+        }
+        const size_t low_index = std::min(first_index, second_index);
+        const size_t high_index = std::max(first_index, second_index);
+        std::unique_lock low_lock(page_table_shards_[low_index].latch);
+        std::unique_lock high_lock(page_table_shards_[high_index].latch);
+        fn();
+    }
+
+    std::vector<std::pair<PageId, frame_id_t>> snapshot_page_table() const;
+    bool try_pin_page(PageId page_id, Page** page, Page** wait_page);
     frame_id_t take_free_frame();
+    // Called with latch_ held exclusively.  Replacer entries can be stale
+    // after a concurrent pin/unpin transition, so every victim is validated
+    // against the frame's current state before it is claimed.
+    frame_id_t claim_frame();
     void recycle_frame(frame_id_t frame_id);
     void clear_residency(frame_id_t frame_id);
     void flush_log_before_page_write(lsn_t page_lsn);

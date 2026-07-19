@@ -68,7 +68,7 @@ Rid InsertRuntime::InsertOne(RmRecord& record, const InsertRuntimeInfo& info, Co
             pending_meta.version_chain_head_ = UndoLink{};
         }
         if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
-            InsertLogRecord log_record(txn->get_transaction_id(), record, rid, *info.tab_name);
+            InsertLogRecord log_record(txn->get_transaction_id(), record, rid, info.tab->id);
             log_record.prev_lsn_ = txn->get_prev_lsn();
             lsn_t lsn = context->log_mgr_->add_log_to_buffer(&log_record);
             txn->set_prev_lsn(lsn);

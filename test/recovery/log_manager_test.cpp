@@ -165,6 +165,38 @@ TEST(LogRecordTest, UpdateRoundTripKeepsOldAndNewRecord) {
     ExpectRecordEq(decoded.new_value_, new_rec);
 }
 
+TEST(LogRecordTest, TableIdDmlRoundTripKeepsCompactIdentifier) {
+    auto old_rec = MakeRecord("old");
+    auto new_rec = MakeRecord("new");
+    Rid rid{4, 2};
+    constexpr oid_t table_id = 37;
+
+    InsertLogRecord insert(1, new_rec, rid, table_id);
+    DeleteLogRecord remove(2, old_rec, rid, table_id);
+    UpdateLogRecord update(3, old_rec, new_rec, rid, table_id);
+    for (LogRecord* base :
+         {static_cast<LogRecord*>(&insert), static_cast<LogRecord*>(&remove), static_cast<LogRecord*>(&update)}) {
+        std::vector<char> buf(base->log_tot_len_);
+        if (base->log_type_ == LogType::INSERT_TABLE_ID) {
+            insert.serialize(buf.data());
+        } else if (base->log_type_ == LogType::DELETE_TABLE_ID) {
+            remove.serialize(buf.data());
+        } else {
+            update.serialize(buf.data());
+        }
+        auto decoded = DeserializeLogRecord(buf.data(), static_cast<int>(buf.size()));
+        ASSERT_NE(decoded, nullptr);
+        if (decoded->log_type_ == LogType::INSERT_TABLE_ID) {
+            EXPECT_EQ(static_cast<InsertLogRecord*>(decoded.get())->table_id_, table_id);
+        } else if (decoded->log_type_ == LogType::DELETE_TABLE_ID) {
+            EXPECT_EQ(static_cast<DeleteLogRecord*>(decoded.get())->table_id_, table_id);
+        } else {
+            ASSERT_EQ(decoded->log_type_, LogType::UPDATE_TABLE_ID);
+            EXPECT_EQ(static_cast<UpdateLogRecord*>(decoded.get())->table_id_, table_id);
+        }
+    }
+}
+
 TEST(LogRecordTest, CheckpointRoundTripKeepsActiveTxnTable) {
     std::unordered_map<txn_id_t, lsn_t> active_txns{{1, 10}, {2, 20}};
     CheckpointLogRecord log(active_txns);
@@ -322,6 +354,41 @@ TEST(LogManagerTest, ConcurrentDurableFlushesShareAGroup) {
     EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kWaiterCount));
 }
 
+TEST(LogManagerTest, ConcurrentCommitTargetsNeedOnlyOneDurableFlush) {
+    ScopedTestDir test_dir("log_manager_distinct_group_commit_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    constexpr int kCommitCount = 16;
+    std::atomic<int> appended{0};
+    std::atomic<int> durable_violations{0};
+    std::vector<std::thread> committers;
+    committers.reserve(kCommitCount);
+    for (int i = 0; i < kCommitCount; ++i) {
+        committers.emplace_back([&, i] {
+            CommitLogRecord commit(300 + i);
+            const lsn_t own_lsn = log_mgr.add_log_to_buffer(&commit);
+            appended.fetch_add(1, std::memory_order_acq_rel);
+            while (appended.load(std::memory_order_acquire) != kCommitCount) {
+                std::this_thread::yield();
+            }
+            log_mgr.flush_log_to_disk_up_to(own_lsn);
+            if (log_mgr.get_durable_lsn() < own_lsn) {
+                durable_violations.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& committer : committers) {
+        committer.join();
+    }
+
+    EXPECT_EQ(durable_violations.load(), 0);
+    EXPECT_EQ(log_mgr.get_commit_count(), static_cast<uint64_t>(kCommitCount));
+    EXPECT_EQ(log_mgr.get_durable_lsn(), kCommitCount - 1);
+    EXPECT_EQ(log_mgr.get_fsync_count(), 1u);
+}
+
 TEST(LogManagerTest, RestartOffsetRoundTrip) {
     ScopedTestDir test_dir("log_manager_restart_test_db");
     DiskManager disk;
@@ -450,18 +517,20 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     auto logs = ReadAllLogs(disk);
     ASSERT_GE(logs.size(), 5);
     EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
-    EXPECT_EQ(logs[1]->log_type_, LogType::INSERT);
-    EXPECT_EQ(logs[2]->log_type_, LogType::UPDATE);
-    EXPECT_EQ(logs[3]->log_type_, LogType::DELETE);
+    EXPECT_EQ(logs[1]->log_type_, LogType::INSERT_TABLE_ID);
+    EXPECT_EQ(logs[2]->log_type_, LogType::UPDATE_TABLE_ID);
+    EXPECT_EQ(logs[3]->log_type_, LogType::DELETE_TABLE_ID);
     EXPECT_EQ(logs[4]->log_type_, LogType::COMMIT);
 
     auto* update_log = dynamic_cast<UpdateLogRecord*>(logs[2].get());
     ASSERT_NE(update_log, nullptr);
+    EXPECT_EQ(update_log->table_id_, sm_mgr.db_.get_table("t").id);
     ASSERT_EQ(update_log->old_value_.size, update_log->new_value_.size);
     EXPECT_NE(memcmp(update_log->old_value_.data, update_log->new_value_.data, update_log->old_value_.size), 0);
 
     auto* delete_log = dynamic_cast<DeleteLogRecord*>(logs[3].get());
     ASSERT_NE(delete_log, nullptr);
+    EXPECT_EQ(delete_log->table_id_, sm_mgr.db_.get_table("t").id);
     ASSERT_EQ(delete_log->delete_value_.size, update_log->new_value_.size);
     EXPECT_EQ(memcmp(delete_log->delete_value_.data, update_log->new_value_.data, delete_log->delete_value_.size), 0);
 

@@ -83,6 +83,8 @@ public:
     RmPageReadGuard(BufferPoolManager* bpm, PageId page_id, Page* page)
         : bpm_(bpm), page_id_(page_id), page_(page), page_lock_(page->latch()) {}
 
+    explicit RmPageReadGuard(Page* page) : page_(page), page_lock_(page->latch()) {}
+
     ~RmPageReadGuard() {
         release();
     }
@@ -174,6 +176,17 @@ public:
         std::lock_guard<std::mutex> lock(file_header_latch_);
         return file_hdr_;
     }
+
+    RmFileHdr get_scan_file_hdr() const {
+        std::lock_guard<std::mutex> lock(file_header_latch_);
+        return RmFileHdr{file_hdr_.record_size, file_hdr_.num_pages, file_hdr_.num_records_per_page, RM_NO_PAGE,
+                         file_hdr_.bitmap_size};
+    }
+
+    int get_num_pages() const {
+        std::lock_guard<std::mutex> lock(file_header_latch_);
+        return file_hdr_.num_pages;
+    }
     int GetFd() {
         return fd_;
     }
@@ -200,6 +213,9 @@ public:
     // Borrow the current committed slot without copying its payload. The
     // returned guard must remain alive while view.data is accessed.
     RmRecordViewWithMeta get_record_view_with_meta(const Rid& rid) const;
+
+    // Variant for an RmScan page that is already pinned by the caller.
+    RmRecordViewWithMeta get_record_view_with_meta(Page* pinned_page, const Rid& rid) const;
 
     Rid insert_record(char* buf, Context* context);
 

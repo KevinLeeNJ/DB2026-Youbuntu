@@ -22,7 +22,6 @@ See the Mulan PSL v2 for more details. */
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -248,12 +247,8 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyCycleCancelsYoungestVictim) {
     std::vector<char> first_key{'a'};
     std::vector<char> second_key{'b'};
     const int index_fd = 7;
-    std::string first_lock(sizeof(index_fd), '\0');
-    std::string second_lock(sizeof(index_fd), '\0');
-    std::memcpy(first_lock.data(), &index_fd, sizeof(index_fd));
-    std::memcpy(second_lock.data(), &index_fd, sizeof(index_fd));
-    first_lock.push_back('a');
-    second_lock.push_back('b');
+    UniqueKeyId first_lock(index_fd, first_key);
+    UniqueKeyId second_lock(index_fd, second_key);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&older, index_fd, first_key));
     ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&younger, index_fd, second_key));
@@ -280,6 +275,44 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyCycleCancelsYoungestVictim) {
     EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
     EXPECT_TRUE(lock_manager.unlock_unique_key(&older, second_lock));
     EXPECT_TRUE(lock_manager.unlock_unique_key(&older, first_lock));
+}
+
+TEST(SnapshotIsolationConcurrencyTest, MixedRecordUniqueCycleCancelsYoungestVictim) {
+    LockManager lock_manager;
+    Transaction older(1151, IsolationLevel::READ_COMMITTED);
+    Transaction younger(1152, IsolationLevel::READ_COMMITTED);
+    Rid record{8, 0};
+    LockDataId record_lock(42, record, LockDataType::RECORD);
+    const int index_fd = 8;
+    const std::vector<char> key{'m', 'i', 'x'};
+    UniqueKeyId unique_lock(index_fd, key);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&older, record, 42));
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&younger, index_fd, key));
+
+    std::atomic<bool> younger_started{false};
+    std::atomic<bool> younger_acquired{true};
+    std::thread younger_waiter([&] {
+        younger_started.store(true, std::memory_order_release);
+        younger_acquired.store(lock_manager.lock_exclusive_on_record(&younger, record, 42), std::memory_order_release);
+        if (!younger_acquired.load(std::memory_order_acquire)) {
+            lock_manager.cancel_transaction(&younger);
+            lock_manager.unlock_unique_key(&younger, unique_lock);
+        }
+    });
+    while (!younger_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const bool older_acquired = lock_manager.lock_exclusive_on_unique_key(&older, index_fd, key);
+    younger_waiter.join();
+
+    EXPECT_TRUE(older_acquired);
+    EXPECT_FALSE(younger_acquired.load(std::memory_order_acquire));
+    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
+    EXPECT_TRUE(lock_manager.unlock_unique_key(&older, unique_lock));
+    EXPECT_TRUE(lock_manager.unlock(&older, record_lock));
 }
 
 TEST(SnapshotIsolationConcurrencyTest, WaitForGraphRebuildsAfterOwnerHandoff) {
@@ -348,11 +381,12 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyOwnerHandoffPreservesFifoOrder) 
     Transaction owner(1301, IsolationLevel::READ_COMMITTED);
     Transaction first_waiter(1302, IsolationLevel::READ_COMMITTED);
     Transaction second_waiter(1303, IsolationLevel::READ_COMMITTED);
-    const std::vector<char> key{'h', 'a', 'n', 'd', 'o', 'f', 'f'};
-    std::string lock_id(sizeof(int), '\0');
     const int index_fd = 77;
-    std::memcpy(lock_id.data(), &index_fd, sizeof(index_fd));
-    lock_id.append(key.data(), key.size());
+    std::vector<char> key(48);
+    for (size_t index = 0; index < key.size(); ++index) {
+        key[index] = static_cast<char>(index);
+    }
+    UniqueKeyId lock_id(index_fd, key);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&owner, index_fd, key));
     std::atomic<bool> first_acquired{false};

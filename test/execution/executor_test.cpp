@@ -445,6 +445,31 @@ TEST_F(ExecutorTest, seq_scan_all_records) {
     EXPECT_EQ(*reinterpret_cast<int*>(results[2]->data), 30);
 }
 
+TEST_F(ExecutorTest, seq_scan_batches_across_page_boundary) {
+    setup_db();
+    sm_manager_->create_table("batch_t", make_int_cols({"id"}), nullptr);
+    const int row_count = sm_manager_->fhs_.at("batch_t")->get_file_hdr().num_records_per_page + 3;
+    std::vector<int> ids;
+    ids.reserve(row_count);
+    for (int id = 0; id < row_count; ++id) {
+        ids.push_back(id);
+    }
+    insert_test_rows("batch_t", ids);
+
+    char buf[4096];
+    int offset = 0;
+    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    SeqScanExecutor exec(sm_manager_.get(), "batch_t", {}, &ctx);
+    int seen = 0;
+    for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
+        auto record = exec.Next();
+        ASSERT_NE(record, nullptr);
+        EXPECT_EQ(*reinterpret_cast<int*>(record->data), seen);
+        ++seen;
+    }
+    EXPECT_EQ(seen, row_count);
+}
+
 TEST_F(ExecutorTest, seq_scan_with_equality_condition) {
     setup_db();
     auto cols = make_int_cols({"id"});

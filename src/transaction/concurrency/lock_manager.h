@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 #include <string>
 #include <atomic>
+#include <thread>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -60,9 +61,9 @@ class LockManager {
     };
 
 public:
-    LockManager() {}
+    LockManager();
 
-    ~LockManager() {}
+    ~LockManager();
 
     bool lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
@@ -72,7 +73,7 @@ public:
     // separate from the B+ tree structural latch because history/current-index
     // validation must be protected across the whole write protocol.
     bool lock_exclusive_on_unique_key(Transaction* txn, int index_fd, const std::vector<char>& key);
-    bool unlock_unique_key(Transaction* txn, const std::string& lock_id);
+    bool unlock_unique_key(Transaction* txn, const UniqueKeyId& lock_id);
 
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
 
@@ -112,7 +113,8 @@ private:
                                  const std::shared_ptr<LockRequest>& request);
     using WaitForGraph = std::unordered_map<txn_id_t, std::vector<txn_id_t>>;
     WaitForGraph build_wait_for_graph_snapshot();
-    txn_id_t find_youngest_cycle_victim(txn_id_t requester);
+    txn_id_t find_youngest_cycle_victim();
+    void deadlock_detection_loop();
     void note_wait_topology_change();
     void register_waiting_txn(Transaction* txn);
     void unregister_waiting_txn(txn_id_t txn_id);
@@ -123,6 +125,7 @@ private:
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
     std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
     std::atomic<uint64_t> wait_topology_epoch_{0};
+    std::atomic<size_t> waiting_txn_count_{0};
     std::atomic<uint64_t> wait_cycle_abort_count_{0};
     static constexpr size_t UNIQUE_KEY_SHARD_COUNT = 64;
     struct UniqueKeyQueue {
@@ -132,7 +135,11 @@ private:
     };
     struct UniqueKeyShard {
         std::mutex latch;
-        std::unordered_map<std::string, std::shared_ptr<UniqueKeyQueue>> queues;
+        std::unordered_map<UniqueKeyId, std::shared_ptr<UniqueKeyQueue>, UniqueKeyIdHash> queues;
     };
     std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
+    std::mutex deadlock_detector_latch_;
+    std::condition_variable deadlock_detector_cv_;
+    std::atomic<bool> stop_deadlock_detector_{false};
+    std::thread deadlock_detector_thread_;
 };

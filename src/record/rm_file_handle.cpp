@@ -69,6 +69,19 @@ RmRecordViewWithMeta RmFileHandle::get_record_view_with_meta(const Rid& rid) con
     return result;
 }
 
+RmRecordViewWithMeta RmFileHandle::get_record_view_with_meta(Page* pinned_page, const Rid& rid) const {
+    if (pinned_page == nullptr || !(pinned_page->get_page_id() == PageId{fd_, rid.page_no})) {
+        throw PageNotExistError("record", rid.page_no);
+    }
+
+    RmRecordViewWithMeta result;
+    result.guard.emplace(pinned_page);
+    RmPageHandle page_handle(&file_hdr_, pinned_page);
+    result.meta = page_handle.get_meta(rid.slot_no);
+    result.view = RmRecordView{page_handle.get_slot(rid.slot_no), static_cast<uint32_t>(file_hdr_.record_size)};
+    return result;
+}
+
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据

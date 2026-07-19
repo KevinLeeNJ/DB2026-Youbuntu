@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -44,21 +45,63 @@ private:
     using HavingSpec = aggregate_execution::HavingSpec;
 
     struct GroupKey {
-        std::vector<CellValue> values;
+        // The key is deliberately a flat byte string.  Building it directly
+        // from a tuple avoids allocating one CellValue/string per input row.
+        std::string bytes;
+
+        GroupKey() = default;
+
+        GroupKey(std::initializer_list<CellValue> values) {
+            bytes.reserve(values.size() * (sizeof(std::uint64_t) + 1));
+            for (const auto& value : values) {
+                append_cell(bytes, value);
+            }
+        }
 
         bool operator==(const GroupKey& other) const {
-            return values == other.values;
+            return bytes.size() == other.bytes.size() &&
+                   std::memcmp(bytes.data(), other.bytes.data(), bytes.size()) == 0;
+        }
+
+    private:
+        static void append_bytes(std::string& out, const void* data, size_t len) {
+            out.append(static_cast<const char*>(data), len);
+        }
+
+        static void append_u8(std::string& out, std::uint8_t value) {
+            out.push_back(static_cast<char>(value));
+        }
+
+        static void append_u32(std::string& out, std::uint32_t value) {
+            append_bytes(out, &value, sizeof(value));
+        }
+
+        static void append_cell(std::string& out, const CellValue& value) {
+            if (execution_scalar::is_numeric_type(value.type)) {
+                append_u8(out, 0);
+                double normalized = execution_scalar::promote_numeric_value(value);
+                if (normalized == 0.0) {
+                    normalized = 0.0;
+                }
+                std::uint64_t bits = 0;
+                std::memcpy(&bits, &normalized, sizeof(bits));
+                append_bytes(out, &bits, sizeof(bits));
+                return;
+            }
+
+            append_u8(out, static_cast<std::uint8_t>(value.type));
+            if (value.type == TYPE_STRING || value.type == TYPE_DATETIME) {
+                append_u32(out, static_cast<std::uint32_t>(value.str_val.size()));
+                append_bytes(out, value.str_val.data(), value.str_val.size());
+            } else {
+                append_bytes(out, &value.int_val, sizeof(value.int_val));
+            }
         }
     };
 
     struct GroupKeyHash {
         size_t operator()(const GroupKey& key) const {
-            size_t seed = 0;
-            CellValueHash hash_cell;
-            for (const auto& value : key.values) {
-                execution_scalar::hash_combine(seed, hash_cell(value));
-            }
-            return seed;
+            return std::hash<std::string_view>()(std::string_view(key.bytes));
         }
     };
 
@@ -129,6 +172,59 @@ private:
             break;
         }
         return value;
+    }
+
+    static void append_group_key_cell(std::string& out, TupleView tuple, const ColMeta& col) {
+        const char* data = tuple.data + col.offset;
+        if (execution_scalar::is_numeric_type(col.type)) {
+            out.push_back(0);
+            double normalized = 0.0;
+            if (col.type == TYPE_INT) {
+                normalized = static_cast<double>(read_unaligned<int>(data));
+            } else {
+                normalized = read_unaligned<double>(data);
+            }
+            if (normalized == 0.0) {
+                normalized = 0.0;
+            }
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &normalized, sizeof(bits));
+            out.append(reinterpret_cast<const char*>(&bits), sizeof(bits));
+            return;
+        }
+
+        out.push_back(static_cast<char>(col.type));
+        if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
+            const auto len = execution_scalar::trimmed_string_length(data, col.len);
+            const auto narrow_len = static_cast<std::uint32_t>(len);
+            out.append(reinterpret_cast<const char*>(&narrow_len), sizeof(narrow_len));
+            out.append(data, len);
+        } else {
+            out.append(data, sizeof(int));
+        }
+    }
+
+    static GroupKey make_group_key(TupleView tuple, const std::vector<ColMeta>& cols) {
+        GroupKey key;
+        size_t reserve = 0;
+        for (const auto& col : cols) {
+            reserve += execution_scalar::is_numeric_type(col.type) ? 1 + sizeof(std::uint64_t)
+                                                                   : 1 + sizeof(std::uint32_t) + col.len;
+        }
+        key.bytes.reserve(reserve);
+        for (const auto& col : cols) {
+            append_group_key_cell(key.bytes, tuple, col);
+        }
+        return key;
+    }
+
+    std::vector<CellValue> read_group_values(TupleView tuple) const {
+        std::vector<CellValue> values;
+        values.reserve(descriptor_->group_cols_.size());
+        for (const auto& col : descriptor_->group_cols_) {
+            values.push_back(read_cell(tuple, col));
+        }
+        return values;
     }
 
     static int compare_cells(const CellValue& lhs, const CellValue& rhs) {
@@ -481,7 +577,12 @@ private:
         if (descriptor_->has_group_by()) {
             std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
             GroupKey key;
-            key.values.reserve(descriptor_->group_cols_.size());
+            size_t key_reserve = 0;
+            for (const auto& col : descriptor_->group_cols_) {
+                key_reserve += execution_scalar::is_numeric_type(col.type) ? 1 + sizeof(std::uint64_t)
+                                                                           : 1 + sizeof(std::uint32_t) + col.len;
+            }
+            key.bytes.reserve(key_reserve);
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 TupleView tuple = prev_->current();
                 std::unique_ptr<RmRecord> fallback;
@@ -495,15 +596,17 @@ private:
                     continue;
                 }
 
-                key.values.clear();
-                key.values.reserve(descriptor_->group_cols_.size());
+                key.bytes.clear();
                 for (const auto& col : descriptor_->group_cols_) {
-                    key.values.push_back(read_cell(tuple, col));
+                    append_group_key_cell(key.bytes, tuple, col);
                 }
 
                 auto [it, inserted] = group_indexes.try_emplace(std::move(key), request_state_.groups_.size());
+                // Insertion transfers the scratch buffer to the map.  Keep a
+                // reserved buffer available for the next input row.
+                key.bytes.reserve(key_reserve);
                 if (inserted) {
-                    request_state_.groups_.push_back(make_group_state(it->first.values));
+                    request_state_.groups_.push_back(make_group_state(read_group_values(tuple)));
                 }
                 for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
                     update_aggregate_state(request_state_.groups_[it->second].aggregate_states[i],

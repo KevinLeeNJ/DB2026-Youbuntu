@@ -85,3 +85,4 @@ static const std::string LOG_FILE_NAME = "db.log";
 static const std::string REPLACER_TYPE = "CLOCK";
 
 static const std::string DB_META_NAME = "db.meta";
+static const std::string TABLE_ID_META_NAME = "db.table_ids";

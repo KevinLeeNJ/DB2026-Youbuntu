@@ -36,6 +36,21 @@ inline void ReserveUniqueKey(Context* context, int index_fd, const std::vector<c
     }
 }
 
+inline void RefreshVisibilityWatermark(Context* context) {
+    if (context == nullptr) {
+        return;
+    }
+    if (context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
+        context->visibility_watermark_ = INVALID_TS;
+        return;
+    }
+    context->visibility_watermark_ = context->txn_mgr_->GetWatermark();
+}
+
+inline bool IsCommittedBeforeWatermark(const TupleMeta& meta, timestamp_t watermark) {
+    return watermark != INVALID_TS && meta.is_committed_ && meta.commit_ts_ < watermark;
+}
+
 inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid, Context* context) {
     if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
         return fh->get_record(rid, context);
@@ -115,9 +130,11 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
 // Borrow the current visible heap version when it is still page-backed. Undo
 // reconstruction remains owned because its bytes live in the transaction
 // manager rather than in the record page.
-inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Context* context) {
+inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Context* context,
+                                            Page* pinned_page = nullptr) {
     if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
-        return fh->get_record_view_with_meta(rid);
+        return pinned_page == nullptr ? fh->get_record_view_with_meta(rid)
+                                      : fh->get_record_view_with_meta(pinned_page, rid);
     }
 
     auto* txn = context->txn_;
@@ -125,16 +142,26 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
     const timestamp_t read_ts =
         txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
     const txn_id_t self_id = txn->get_transaction_id();
+    const timestamp_t visibility_watermark = context->visibility_watermark_;
 
     constexpr int MAX_DEPTH = 100;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        auto base = fh->get_record_view_with_meta(rid);
+        auto base = pinned_page == nullptr ? fh->get_record_view_with_meta(rid)
+                                           : fh->get_record_view_with_meta(pinned_page, rid);
         TupleMeta meta = base.meta;
         std::optional<UndoLog> current_undo;
         bool retry = false;
 
         for (int depth = 0; depth < MAX_DEPTH; ++depth) {
             if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
+                if (meta.is_deleted_) {
+                    return {};
+                }
+                base.meta = meta;
+                return base;
+            }
+
+            if (!current_undo.has_value() && IsCommittedBeforeWatermark(meta, visibility_watermark)) {
                 if (meta.is_deleted_) {
                     return {};
                 }
@@ -187,6 +214,83 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
         if (!retry) {
             return {};
         }
+    }
+    return {};
+}
+
+// Evaluate a page snapshot captured by RmScan. The snapshot keeps predicate
+// and undo work outside the page latch. If an undo owner retires concurrently,
+// fall back to the regular two-attempt loader to preserve its retry semantics.
+inline RmRecordViewWithMeta GetVisibleTupleFromSnapshot(RmFileHandle* fh, const Rid& rid,
+                                                        const TupleMeta& snapshot_meta, const char* snapshot_data,
+                                                        Context* context) {
+    RmRecordViewWithMeta base;
+    base.meta = snapshot_meta;
+    base.view = RmRecordView{snapshot_data, static_cast<uint32_t>(fh->get_file_hdr().record_size)};
+    if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
+        return base;
+    }
+
+    auto* txn = context->txn_;
+    auto* txn_mgr = context->txn_mgr_;
+    const timestamp_t read_ts =
+        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
+    const txn_id_t self_id = txn->get_transaction_id();
+    const timestamp_t visibility_watermark = context->visibility_watermark_;
+
+    TupleMeta meta = snapshot_meta;
+    std::optional<UndoLog> current_undo;
+    constexpr int MAX_DEPTH = 100;
+    for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+        if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
+            if (meta.is_deleted_) {
+                return {};
+            }
+            base.meta = meta;
+            return base;
+        }
+        if (!current_undo.has_value() && IsCommittedBeforeWatermark(meta, visibility_watermark)) {
+            if (meta.is_deleted_) {
+                return {};
+            }
+            base.meta = meta;
+            return base;
+        }
+        if (!meta.is_committed_) {
+            if (!meta.version_chain_head_.IsValid()) {
+                return {};
+            }
+            current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
+            if (!current_undo.has_value()) {
+                return GetVisibleTuple(fh, rid, context);
+            }
+            meta = current_undo->old_meta_;
+            continue;
+        }
+        if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+            return {};
+        }
+        if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
+            if (!current_undo.has_value()) {
+                base.meta = meta;
+                return base;
+            }
+            auto owned = std::make_unique<RmRecord>(static_cast<int>(current_undo->old_tuple_data_.size()));
+            memcpy(owned->data, current_undo->old_tuple_data_.data(), current_undo->old_tuple_data_.size());
+            RmRecordViewWithMeta result;
+            result.meta = meta;
+            result.view = RmRecordView{owned->data, static_cast<uint32_t>(owned->size)};
+            result.owned = std::move(owned);
+            return result;
+        }
+        if (!meta.version_chain_head_.IsValid()) {
+            return {};
+        }
+        current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
+        if (!current_undo.has_value()) {
+            return GetVisibleTuple(fh, rid, context);
+        }
+        meta = current_undo->old_meta_;
     }
     return {};
 }

@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -108,6 +109,18 @@ void SmManager::create_db(const std::string& db_name) {
     ofs.close();
     disk_manager_->sync_path(DB_META_NAME);
 
+    std::ofstream table_ids(TABLE_ID_META_NAME, std::ios::trunc);
+    if (!table_ids.is_open()) {
+        throw UnixError();
+    }
+    table_ids << "RMDB_TABLE_IDS_V2 " << 1 << ' ' << 0 << '\n';
+    table_ids.flush();
+    if (!table_ids) {
+        throw UnixError();
+    }
+    table_ids.close();
+    disk_manager_->sync_path(TABLE_ID_META_NAME);
+
     // 创建日志文件
     disk_manager_->create_file(LOG_FILE_NAME);
 
@@ -173,6 +186,7 @@ void SmManager::open_db(const std::string& db_name) {
             throw UnixError();
         }
         db_ = std::move(loaded_db);
+        load_table_ids();
         // ifs.close();
         //  打开所有表的记录文件
         for (auto& entry : db_.tabs_) {
@@ -213,6 +227,9 @@ void SmManager::open_db(const std::string& db_name) {
     } catch (...) {
         fhs_.clear();
         ihs_.clear();
+        table_name_to_id_.clear();
+        table_id_to_name_.clear();
+        next_table_id_ = 1;
         db_ = DbMeta();
         chdir(original_cwd.c_str());
         throw;
@@ -241,6 +258,145 @@ void SmManager::flush_meta() {
     disk_manager_->sync_directory(".");
 }
 
+void SmManager::load_table_ids() {
+    table_name_to_id_.clear();
+    table_id_to_name_.clear();
+    next_table_id_ = 1;
+
+    std::ifstream input(TABLE_ID_META_NAME);
+    uint32_t stored_next = 1;
+    size_t count = 0;
+    bool changed = !input.is_open();
+    bool version_two = false;
+    std::string header;
+    if (input >> header) {
+        if (header == "RMDB_TABLE_IDS_V2") {
+            version_two = true;
+            if (!(input >> stored_next >> count)) {
+                throw UnixError();
+            }
+        } else {
+            try {
+                size_t parsed = 0;
+                const unsigned long value = std::stoul(header, &parsed);
+                if (parsed != header.size() || value > std::numeric_limits<uint32_t>::max() || !(input >> count)) {
+                    throw UnixError();
+                }
+                stored_next = static_cast<uint32_t>(value);
+                changed = true;
+            } catch (const RMDBError&) {
+                throw;
+            } catch (...) {
+                throw UnixError();
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            uint32_t raw_id = 0;
+            int active = 0;
+            std::string name;
+            if (version_two) {
+                if (!(input >> raw_id >> active >> name) || (active != 0 && active != 1)) {
+                    throw UnixError();
+                }
+            } else if (!(input >> raw_id >> name)) {
+                throw UnixError();
+            }
+            if (raw_id == 0 || raw_id > std::numeric_limits<oid_t>::max() ||
+                table_id_to_name_.count(static_cast<oid_t>(raw_id)) != 0) {
+                throw UnixError();
+            }
+            oid_t id = static_cast<oid_t>(raw_id);
+            table_id_to_name_.emplace(id, name);
+            if (version_two && active != 0) {
+                if (!table_name_to_id_.emplace(name, id).second) {
+                    throw UnixError();
+                }
+            }
+        }
+    } else if (input.is_open()) {
+        throw UnixError();
+    }
+
+    for (auto it = table_name_to_id_.begin(); it != table_name_to_id_.end();) {
+        if (!db_.is_table(it->first)) {
+            it = table_name_to_id_.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    for (auto& [name, tab] : db_.tabs_) {
+        auto it = table_name_to_id_.find(name);
+        if (it != table_name_to_id_.end()) {
+            tab.id = it->second;
+            continue;
+        }
+        oid_t latest_id = 0;
+        for (const auto& [id, historical_name] : table_id_to_name_) {
+            if (historical_name == name && id > latest_id) {
+                latest_id = id;
+            }
+        }
+        if (latest_id != 0) {
+            tab.id = latest_id;
+            table_name_to_id_[name] = latest_id;
+        } else {
+            assign_table_id(tab);
+        }
+        changed = true;
+    }
+    uint32_t minimum_next = 1;
+    for (const auto& [id, _] : table_id_to_name_) {
+        minimum_next = std::max<uint32_t>(minimum_next, static_cast<uint32_t>(id) + 1);
+    }
+    next_table_id_ = std::max(stored_next, minimum_next);
+    changed = changed || next_table_id_ != stored_next;
+    if (changed) {
+        flush_table_ids();
+    }
+}
+
+oid_t SmManager::assign_table_id(TabMeta& tab) {
+    if (tab.id != 0) {
+        return tab.id;
+    }
+    while (next_table_id_ <= std::numeric_limits<oid_t>::max() &&
+           table_id_to_name_.count(static_cast<oid_t>(next_table_id_)) != 0) {
+        ++next_table_id_;
+    }
+    if (next_table_id_ > std::numeric_limits<oid_t>::max()) {
+        throw InternalError("table id space exhausted");
+    }
+    tab.id = static_cast<oid_t>(next_table_id_++);
+    table_name_to_id_[tab.name] = tab.id;
+    table_id_to_name_[tab.id] = tab.name;
+    return tab.id;
+}
+
+void SmManager::flush_table_ids() {
+    const std::string temp_meta = std::string(TABLE_ID_META_NAME) + ".tmp";
+    std::ofstream output(temp_meta, std::ios::trunc);
+    if (!output.is_open()) {
+        throw UnixError();
+    }
+    output << "RMDB_TABLE_IDS_V2 " << next_table_id_ << ' ' << table_id_to_name_.size() << '\n';
+    for (const auto& [id, name] : table_id_to_name_) {
+        const auto active = table_name_to_id_.find(name);
+        const bool is_active = active != table_name_to_id_.end() && active->second == id && db_.is_table(name);
+        output << static_cast<uint32_t>(id) << ' ' << (is_active ? 1 : 0) << ' ' << name << '\n';
+    }
+    output.flush();
+    if (!output) {
+        throw UnixError();
+    }
+    output.close();
+    disk_manager_->sync_path(temp_meta);
+    if (rename(temp_meta.c_str(), TABLE_ID_META_NAME.c_str()) != 0) {
+        throw UnixError();
+    }
+    disk_manager_->sync_directory(".");
+}
+
 /**
  * @description: 关闭数据库并把数据落盘
  */
@@ -249,6 +405,7 @@ void SmManager::close_db() {
         throw DatabaseNotFoundError("No database is currently open.");
     }
     bump_catalog_generation();
+    flush_table_ids();
     flush_meta();
     // 关闭所有表的记录文件
     for (auto& entry : fhs_) {
@@ -262,6 +419,9 @@ void SmManager::close_db() {
     ihs_.clear();
     db_.name_.clear();
     db_.tabs_.clear();
+    table_name_to_id_.clear();
+    table_id_to_name_.clear();
+    next_table_id_ = 1;
     {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
@@ -484,6 +644,8 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     int curr_offset = 0;
     TabMeta tab;
     tab.name = tab_name;
+    assign_table_id(tab);
+    flush_table_ids();
     tab.cols.reserve(col_defs.size());
     for (auto& col_def : col_defs) {
         ColMeta col = {.tab_name = tab_name,
@@ -522,6 +684,8 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     rm_manager_->destroy_file(tab_name); // 删除表的磁盘文件
     db_.tabs_.erase(tab_name);           // 删除对应键值对
     fhs_.erase(tab_name);
+    table_name_to_id_.erase(tab_name);
+    flush_table_ids();
     flush_meta();
     bump_catalog_generation();
 }

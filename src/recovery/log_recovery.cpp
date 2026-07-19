@@ -16,6 +16,47 @@ See the Mulan PSL v2 for more details. */
 #include <fstream>
 #include <vector>
 
+namespace {
+
+bool ResolveTableIdLog(LogRecord* record, SmManager* sm_manager) {
+    oid_t table_id = 0;
+    std::string* table_name = nullptr;
+    switch (record->log_type_) {
+    case LogType::INSERT_TABLE_ID: {
+        auto* log = static_cast<InsertLogRecord*>(record);
+        table_id = log->table_id_;
+        table_name = &log->table_name_;
+        break;
+    }
+    case LogType::DELETE_TABLE_ID: {
+        auto* log = static_cast<DeleteLogRecord*>(record);
+        table_id = log->table_id_;
+        table_name = &log->table_name_;
+        break;
+    }
+    case LogType::UPDATE_TABLE_ID: {
+        auto* log = static_cast<UpdateLogRecord*>(record);
+        table_id = log->table_id_;
+        table_name = &log->table_name_;
+        break;
+    }
+    default:
+        return true;
+    }
+    auto resolved = sm_manager->get_table_name(table_id);
+    if (resolved.has_value()) {
+        *table_name = std::move(*resolved);
+        return true;
+    }
+    if (sm_manager->is_known_table_id(table_id)) {
+        table_name->clear();
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
 /**
  * @description: analyze阶段，需要获得脏页表（DPT）和未完成的事务列表（ATT）
  */
@@ -86,6 +127,9 @@ void RecoveryManager::analyze() {
         if (record == nullptr) {
             break;
         }
+        if (!ResolveTableIdLog(record.get(), sm_manager_)) {
+            throw InternalError("WAL references an unknown table id");
+        }
 
         const lsn_t lsn = record->lsn_;
         const txn_id_t txn_id = record->log_tid_;
@@ -94,8 +138,11 @@ void RecoveryManager::analyze() {
             active_txn_last_lsn_[txn_id] = lsn;
             break;
         case LogType::INSERT:
+        case LogType::INSERT_TABLE_ID:
         case LogType::DELETE:
+        case LogType::DELETE_TABLE_ID:
         case LogType::UPDATE:
+        case LogType::UPDATE_TABLE_ID:
             active_txn_last_lsn_[txn_id] = lsn;
             break;
         case LogType::COMMIT:
@@ -139,14 +186,17 @@ void RecoveryManager::redo() {
 
         switch (it->second->log_type_) {
         case LogType::INSERT:
+        case LogType::INSERT_TABLE_ID:
             redo_insert(*static_cast<InsertLogRecord*>(it->second.get()));
             FaultInjector::Point("mid_recovery_redo");
             break;
         case LogType::DELETE:
+        case LogType::DELETE_TABLE_ID:
             redo_delete(*static_cast<DeleteLogRecord*>(it->second.get()));
             FaultInjector::Point("mid_recovery_redo");
             break;
         case LogType::UPDATE:
+        case LogType::UPDATE_TABLE_ID:
             redo_update(*static_cast<UpdateLogRecord*>(it->second.get()));
             FaultInjector::Point("mid_recovery_redo");
             break;
@@ -172,14 +222,17 @@ void RecoveryManager::undo() {
             auto* record = it->second.get();
             switch (record->log_type_) {
             case LogType::INSERT:
+            case LogType::INSERT_TABLE_ID:
                 undo_insert(*static_cast<InsertLogRecord*>(record));
                 FaultInjector::Point("mid_recovery_undo");
                 break;
             case LogType::DELETE:
+            case LogType::DELETE_TABLE_ID:
                 undo_delete(*static_cast<DeleteLogRecord*>(record));
                 FaultInjector::Point("mid_recovery_undo");
                 break;
             case LogType::UPDATE:
+            case LogType::UPDATE_TABLE_ID:
                 undo_update(*static_cast<UpdateLogRecord*>(record));
                 FaultInjector::Point("mid_recovery_undo");
                 break;

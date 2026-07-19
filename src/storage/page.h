@@ -142,7 +142,11 @@ private:
     std::mutex io_latch_;
     std::condition_variable io_cv_;
 
-    /** The pin count of this page. */
-    int pin_count_{0};
-    std::mutex pin_latch_;
+    /**
+     * The pin count of this frame. The owning page-table shard serializes page
+     * identity and zero-count
+     * transitions; the atomic lets eviction validate
+     * a candidate without taking a per-frame pin mutex.
+     */
+    std::atomic<int32_t> pin_count_{0};
 };

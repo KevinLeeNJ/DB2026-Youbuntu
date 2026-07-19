@@ -12,8 +12,20 @@ See the Mulan PSL v2 for more details. */
 #include "lock_manager.h"
 
 #include <algorithm>
-#include <cstring>
+#include <chrono>
 #include <functional>
+
+LockManager::LockManager() {
+    deadlock_detector_thread_ = std::thread(&LockManager::deadlock_detection_loop, this);
+}
+
+LockManager::~LockManager() {
+    stop_deadlock_detector_.store(true, std::memory_order_release);
+    deadlock_detector_cv_.notify_one();
+    if (deadlock_detector_thread_.joinable()) {
+        deadlock_detector_thread_.join();
+    }
+}
 
 LockManager::LockTableShard& LockManager::get_shard(const LockDataId& lock_data_id) {
     return lock_table_shards_[std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT];
@@ -68,8 +80,11 @@ bool LockManager::register_pending_lock(Transaction* txn, const LockDataId& lock
     if (txn->is_lock_cancellation_requested()) {
         return false;
     }
-    pending_locks_[txn->get_transaction_id()].push_back(PendingLock{lock_data_id, request_queue, request});
-    waiting_txns_[txn->get_transaction_id()] = txn;
+    const txn_id_t txn_id = txn->get_transaction_id();
+    pending_locks_[txn_id].push_back(PendingLock{lock_data_id, request_queue, request});
+    if (waiting_txns_.insert_or_assign(txn_id, txn).second) {
+        waiting_txn_count_.fetch_add(1, std::memory_order_release);
+    }
     return true;
 }
 
@@ -78,7 +93,9 @@ void LockManager::unregister_pending_lock(txn_id_t txn_id, const LockDataId& loc
     std::lock_guard<std::mutex> lock(pending_latch_);
     auto txn_it = pending_locks_.find(txn_id);
     if (txn_it == pending_locks_.end()) {
-        waiting_txns_.erase(txn_id);
+        if (waiting_txns_.erase(txn_id) > 0) {
+            waiting_txn_count_.fetch_sub(1, std::memory_order_release);
+        }
         return;
     }
     auto& pending = txn_it->second;
@@ -89,7 +106,9 @@ void LockManager::unregister_pending_lock(txn_id_t txn_id, const LockDataId& loc
                   pending.end());
     if (pending.empty()) {
         pending_locks_.erase(txn_it);
-        waiting_txns_.erase(txn_id);
+        if (waiting_txns_.erase(txn_id) > 0) {
+            waiting_txn_count_.fetch_sub(1, std::memory_order_release);
+        }
     }
 }
 
@@ -98,20 +117,30 @@ void LockManager::register_waiting_txn(Transaction* txn) {
         return;
     }
     std::lock_guard<std::mutex> lock(pending_latch_);
-    waiting_txns_[txn->get_transaction_id()] = txn;
+    if (waiting_txns_.insert_or_assign(txn->get_transaction_id(), txn).second) {
+        waiting_txn_count_.fetch_add(1, std::memory_order_release);
+    }
 }
 
 void LockManager::unregister_waiting_txn(txn_id_t txn_id) {
     std::lock_guard<std::mutex> lock(pending_latch_);
-    waiting_txns_.erase(txn_id);
+    if (waiting_txns_.erase(txn_id) > 0) {
+        waiting_txn_count_.fetch_sub(1, std::memory_order_release);
+    }
 }
 
 void LockManager::note_wait_topology_change() {
     wait_topology_epoch_.fetch_add(1, std::memory_order_release);
+    if (waiting_txn_count_.load(std::memory_order_acquire) > 0) {
+        deadlock_detector_cv_.notify_one();
+    }
 }
 
 LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
     for (;;) {
+        if (stop_deadlock_detector_.load(std::memory_order_acquire)) {
+            return {};
+        }
         const uint64_t start_epoch = wait_topology_epoch_.load(std::memory_order_acquire);
         WaitForGraph graph;
 
@@ -161,7 +190,7 @@ LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
     }
 }
 
-txn_id_t LockManager::find_youngest_cycle_victim(txn_id_t requester) {
+txn_id_t LockManager::find_youngest_cycle_victim() {
     const WaitForGraph graph = build_wait_for_graph_snapshot();
     std::unordered_map<txn_id_t, int> color;
     std::unordered_map<txn_id_t, size_t> stack_position;
@@ -193,8 +222,44 @@ txn_id_t LockManager::find_youngest_cycle_victim(txn_id_t requester) {
         color[txn_id] = 2;
         return false;
     };
-    visit(requester);
+    for (const auto& [txn_id, _] : graph) {
+        if (color[txn_id] == 0 && visit(txn_id)) {
+            break;
+        }
+    }
     return victim;
+}
+
+void LockManager::deadlock_detection_loop() {
+    uint64_t observed_epoch = wait_topology_epoch_.load(std::memory_order_acquire);
+    std::unique_lock<std::mutex> lock(deadlock_detector_latch_);
+    while (!stop_deadlock_detector_.load(std::memory_order_acquire)) {
+        deadlock_detector_cv_.wait(lock, [&] {
+            return stop_deadlock_detector_.load(std::memory_order_acquire) ||
+                   wait_topology_epoch_.load(std::memory_order_acquire) != observed_epoch;
+        });
+        if (stop_deadlock_detector_.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        // Coalesce bursts of queue mutations while bounding deadlock detection
+        // latency. The foreground lock path only publishes topology changes.
+        if (deadlock_detector_cv_.wait_for(lock, std::chrono::milliseconds(5),
+                                           [&] { return stop_deadlock_detector_.load(std::memory_order_acquire); })) {
+            break;
+        }
+        observed_epoch = wait_topology_epoch_.load(std::memory_order_acquire);
+        if (waiting_txn_count_.load(std::memory_order_acquire) == 0) {
+            continue;
+        }
+        lock.unlock();
+        const txn_id_t victim = find_youngest_cycle_victim();
+        if (!stop_deadlock_detector_.load(std::memory_order_acquire) && victim != INVALID_TXN_ID) {
+            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
+            cancel_waiting_transaction(victim);
+        }
+        lock.lock();
+    }
 }
 
 void LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
@@ -297,6 +362,17 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     }
 
     LockDataId lock_data_id(tab_fd, rid, LockDataType::RECORD);
+    // A transaction keeps every granted record lock until commit/abort.  DML
+    // can visit the same RID more than once (for example, an UPDATE followed
+    // by a second matching pass), so avoid the shard and queue lookup when the
+    // lock is already owned by this transaction.  The lock set is mutated by
+    // the transaction's execution thread and is also the source used by
+    // unlock/transaction cleanup, making this an idempotent ownership check,
+    // not an optimistic write shortcut.
+    auto* lock_set = txn->get_lock_set();
+    if (lock_set->find(lock_data_id) != lock_set->end()) {
+        return true;
+    }
     auto request_queue = get_or_create_queue(lock_data_id);
     std::unique_lock<std::mutex> lock(request_queue->latch_);
 
@@ -333,7 +409,6 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     }
     auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
     request_queue->waiters_.push_back(request);
-    note_wait_topology_change();
     if (!register_pending_lock(txn, lock_data_id, request_queue, request)) {
         request->cancelled_ = true;
         request_queue->waiters_.pop_back();
@@ -343,17 +418,8 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
+    note_wait_topology_change();
     lock.unlock();
-    // A transaction with no granted record or unique-key lock cannot be the
-    // predecessor of another wait-for edge, so this first wait cannot close a
-    // cycle. Avoid scanning all lock shards on the common hot-row path.
-    if (!txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty()) {
-        const txn_id_t cycle_victim = find_youngest_cycle_victim(txn->get_transaction_id());
-        if (cycle_victim != INVALID_TXN_ID) {
-            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
-            cancel_waiting_transaction(cycle_victim);
-        }
-    }
     lock.lock();
     request->cv_.wait(lock, [&request] { return request->granted_ || request->cancelled_; });
     const bool cancelled = request->cancelled_;
@@ -373,11 +439,9 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
         return false;
     }
 
-    std::string lock_id(sizeof(index_fd), '\0');
-    std::memcpy(lock_id.data(), &index_fd, sizeof(index_fd));
-    lock_id.append(key.data(), key.size());
+    const UniqueKeyId lock_id(index_fd, key);
 
-    auto& shard = unique_key_shards_[std::hash<std::string>{}(lock_id) % UNIQUE_KEY_SHARD_COUNT];
+    auto& shard = unique_key_shards_[UniqueKeyIdHash{}(lock_id) % UNIQUE_KEY_SHARD_COUNT];
     std::unique_lock<std::mutex> lock(shard.latch);
     auto& queue = shard.queues[lock_id];
     if (queue == nullptr) {
@@ -401,19 +465,9 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
         return false;
     }
     queue->waiters.push_back(txn_id);
-    note_wait_topology_change();
     register_waiting_txn(txn);
+    note_wait_topology_change();
     lock.unlock();
-    // The first unique-key wait of a lock-free transaction cannot form a
-    // cycle. Defer graph construction until the transaction already owns a
-    // lock and can therefore have an outgoing wait-for edge.
-    if (!txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty()) {
-        const txn_id_t cycle_victim = find_youngest_cycle_victim(txn_id);
-        if (cycle_victim != INVALID_TXN_ID) {
-            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
-            cancel_waiting_transaction(cycle_victim);
-        }
-    }
     lock.lock();
     queue->cv.wait(lock, [&] {
         return txn->is_lock_cancellation_requested() ||
@@ -437,11 +491,11 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
     return true;
 }
 
-bool LockManager::unlock_unique_key(Transaction* txn, const std::string& lock_id) {
+bool LockManager::unlock_unique_key(Transaction* txn, const UniqueKeyId& lock_id) {
     if (txn == nullptr) {
         return false;
     }
-    auto& shard = unique_key_shards_[std::hash<std::string>{}(lock_id) % UNIQUE_KEY_SHARD_COUNT];
+    auto& shard = unique_key_shards_[UniqueKeyIdHash{}(lock_id) % UNIQUE_KEY_SHARD_COUNT];
     std::lock_guard<std::mutex> lock(shard.latch);
     auto it = shard.queues.find(lock_id);
     if (it == shard.queues.end() || it->second->owner != txn->get_transaction_id()) {

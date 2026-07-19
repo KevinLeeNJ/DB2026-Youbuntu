@@ -12,66 +12,77 @@ See the Mulan PSL v2 for more details. */
 #include "rm_scan.h"
 #include "rm_file_handle.h"
 
-void RmScan::release_page() {
-    if (pinned_page_ != nullptr) {
-        file_handle_->buffer_pool_manager_->unpin_page(pinned_page_->get_page_id(), false);
-        pinned_page_ = nullptr;
-    }
-}
-
-RmScan::~RmScan() {
-    release_page();
-}
-
 /**
  * @brief 初始化file_handle和rid
  * @param file_handle
  */
-RmScan::RmScan(const RmFileHandle* file_handle) : file_handle_(file_handle) {
-    // Todo:
-    // 初始化file_handle和rid（指向第一个存放了记录的位置）
-    rid_.page_no = 1; // 从1开始，因为0页是文件头
-    rid_.slot_no = -1;
-    next(); // 寻找第一个存放了记录的位置
+RmScan::RmScan(const RmFileHandle* file_handle)
+    : file_handle_(file_handle), file_hdr_snapshot_(file_handle->get_scan_file_hdr()) {
+    page_slots_.reserve(file_hdr_snapshot_.num_records_per_page);
+    page_metas_.reserve(file_hdr_snapshot_.num_records_per_page);
+    page_records_.reserve(static_cast<size_t>(file_hdr_snapshot_.num_records_per_page) *
+                          file_hdr_snapshot_.record_size);
+    rid_ = Rid{-1, -1};
+    for (page_id_t page_no = RM_FIRST_RECORD_PAGE; page_no < file_hdr_snapshot_.num_pages; ++page_no) {
+        if (load_page(page_no)) {
+            return;
+        }
+    }
+}
+
+int RmScan::record_size() const {
+    return file_hdr_snapshot_.record_size;
+}
+
+bool RmScan::load_page(page_id_t page_no) {
+    Page* page = file_handle_->buffer_pool_manager_->fetch_page(PageId{file_handle_->fd_, page_no});
+    if (page == nullptr) {
+        throw PageNotExistError("record", page_no);
+    }
+
+    page_slots_.clear();
+    page_metas_.clear();
+    page_records_.clear();
+    {
+        RmPageReadGuard page_guard(file_handle_->buffer_pool_manager_, page->get_page_id(), page);
+        RmPageHandle page_handle(&file_hdr_snapshot_, page);
+        for (int slot = Bitmap::first_bit(true, page_handle.bitmap, file_hdr_snapshot_.num_records_per_page);
+             slot < file_hdr_snapshot_.num_records_per_page;
+             slot = Bitmap::next_bit(true, page_handle.bitmap, file_hdr_snapshot_.num_records_per_page, slot)) {
+            page_slots_.push_back(slot);
+            page_metas_.push_back(page_handle.get_meta(slot));
+            const char* record = page_handle.get_slot(slot);
+            page_records_.insert(page_records_.end(), record, record + file_hdr_snapshot_.record_size);
+        }
+    }
+
+    if (page_slots_.empty()) {
+        return false;
+    }
+    page_index_ = 0;
+    rid_ = Rid{page_no, page_slots_[0]};
+    return true;
 }
 
 /**
  * @brief 找到文件中下一个存放了记录的位置
- *        当前页保持 pinned，在同一页内连续扫描 bitmap；仅在换页或结束时 unpin。
+ *        每页在一个读锁临界区内复制有效 slot，随后无锁遍历页快照。
  */
 void RmScan::next() {
-    // Todo:
-    // 找到文件中下一个存放了记录的非空闲位置，用rid_来指向这个位置
-    bool flag = false;                                       // 用于标记是否找到下一个有效的记录
-    while (rid_.page_no < file_handle_->file_hdr_.num_pages) // 没到最后一页
-    {
-        if (pinned_page_ == nullptr) {
-            pinned_page_ = file_handle_->buffer_pool_manager_->fetch_page(PageId{file_handle_->fd_, rid_.page_no});
-        }
-        RmPageHandle page_handle(&file_handle_->file_hdr_, pinned_page_);
-        int next_slot;
-        {
-            std::shared_lock<std::shared_mutex> page_lock(pinned_page_->latch());
-            next_slot = Bitmap::next_bit(true, page_handle.bitmap, file_handle_->file_hdr_.num_records_per_page,
-                                         rid_.slot_no); // 找到下一个存放了记录的slot
-        }
-        if (next_slot != file_handle_->file_hdr_.num_records_per_page) // 成功找到
-        {
-            flag = true;
-            rid_.slot_no = next_slot;
-            break;
-        }
-        // 当前页扫描完毕，unpin 并移动到下一页
-        release_page();
-        rid_.page_no++;
-        rid_.slot_no = -1;
+    if (is_end()) {
+        return;
     }
-    if (!flag) // 没有找到下一个有效的记录
-    {
-        rid_.page_no = -1; // 没有更多记录
-        release_page();
+    if (++page_index_ < page_slots_.size()) {
+        rid_.slot_no = page_slots_[page_index_];
+        return;
     }
-    return;
+    const page_id_t page_upper_bound = file_handle_->get_num_pages();
+    for (page_id_t page_no = rid_.page_no + 1; page_no < page_upper_bound; ++page_no) {
+        if (load_page(page_no)) {
+            return;
+        }
+    }
+    rid_ = Rid{-1, -1};
 }
 
 /**

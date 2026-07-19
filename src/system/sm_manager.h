@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <shared_mutex>
 #include <unordered_map>
 #include <deque>
+#include <optional>
 
 #include "common/context.h"
 #include "common/fault_injection.h"
@@ -74,6 +75,13 @@ private:
     RmManager* rm_manager_;
     IxManager* ix_manager_;
     std::atomic<std::uint64_t> catalog_generation_{0};
+    std::unordered_map<std::string, oid_t> table_name_to_id_;
+    std::unordered_map<oid_t, std::string> table_id_to_name_;
+    uint32_t next_table_id_{1};
+
+    void load_table_ids();
+    void flush_table_ids();
+    oid_t assign_table_id(TabMeta& tab);
 
     void bump_catalog_generation() noexcept {
         catalog_generation_.fetch_add(1, std::memory_order_release);
@@ -123,6 +131,22 @@ public:
 
     std::uint64_t get_catalog_generation() const noexcept {
         return catalog_generation_.load(std::memory_order_acquire);
+    }
+
+    std::optional<std::string> get_table_name(oid_t table_id) const {
+        auto it = table_id_to_name_.find(table_id);
+        if (it == table_id_to_name_.end()) {
+            return std::nullopt;
+        }
+        auto active = table_name_to_id_.find(it->second);
+        if (active == table_name_to_id_.end() || active->second != table_id) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    bool is_known_table_id(oid_t table_id) const {
+        return table_id_to_name_.count(table_id) != 0;
     }
 
     bool is_dir(const std::string& db_name);

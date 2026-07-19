@@ -16,6 +16,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <cstring>
 #include <cstdlib>
+#include <array>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -390,6 +392,201 @@ TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfRep
     }
 
     EXPECT_TRUE(bpm->unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, EvictionClaimRejectsStalePinnedFrame) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    Page* page = bpm->new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+    std::strcpy(page->get_data(), "must-remain-resident");
+
+    // Model the stale replacer membership that can be produced by a racing
+    // zero-count transition.  The frame is still pinned, so a claim must
+    // reject it instead of evicting the live page.
+    bpm->replacer_->unpin(0);
+    PageId replacement_id{fd_, INVALID_PAGE_ID};
+    EXPECT_EQ(nullptr, bpm->new_page(&replacement_id));
+    EXPECT_TRUE(bpm->is_page_resident(page_id));
+    EXPECT_STREQ("must-remain-resident", page->get_data());
+    EXPECT_EQ(1, bpm->pages_[0].pin_count_.load(std::memory_order_acquire));
+
+    EXPECT_TRUE(bpm->unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, ConcurrentFetchWaitsForDirtyVictimWriteback) {
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
+
+    PageId old_page_id{fd_, INVALID_PAGE_ID};
+    Page* old_page = bpm->new_page(&old_page_id);
+    ASSERT_NE(old_page, nullptr);
+    std::strcpy(old_page->get_data(), "stale-on-disk");
+    ASSERT_TRUE(bpm->unpin_page(old_page_id, true));
+    ASSERT_TRUE(bpm->flush_page(old_page_id));
+
+    old_page = bpm->fetch_page(old_page_id);
+    ASSERT_NE(old_page, nullptr);
+    std::unique_lock<std::shared_mutex> block_writeback(old_page->latch());
+    std::strcpy(old_page->get_data(), "fresh-dirty-image");
+    ASSERT_TRUE(bpm->unpin_page(old_page_id, true));
+
+    PageId blocker_page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&blocker_page_id), nullptr);
+
+    PageId replacement_page_id{fd_, INVALID_PAGE_ID};
+    Page* replacement_page = nullptr;
+    std::thread evictor([&] { replacement_page = bpm->new_page(&replacement_page_id); });
+
+    const auto claim_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (old_page->state_.load(std::memory_order_acquire) != FrameState::LOADING &&
+           std::chrono::steady_clock::now() < claim_deadline) {
+        std::this_thread::yield();
+    }
+    const bool eviction_claimed = old_page->state_.load(std::memory_order_acquire) == FrameState::LOADING;
+    EXPECT_TRUE(eviction_claimed);
+
+    // Make the second frame available. Without the old-PageId tombstone, the
+    // concurrent fetch can now read and return the stale on-disk image while
+    // the dirty victim is still blocked before writeback.
+    EXPECT_TRUE(bpm->unpin_page(blocker_page_id, false));
+    std::atomic<bool> fetch_started{false};
+    std::atomic<bool> fetch_finished{false};
+    Page* refetched_page = nullptr;
+    std::thread refetcher([&] {
+        fetch_started.store(true, std::memory_order_release);
+        refetched_page = bpm->fetch_page(old_page_id);
+        fetch_finished.store(true, std::memory_order_release);
+    });
+
+    while (!fetch_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto blocked_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (!fetch_finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < blocked_deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(fetch_finished.load(std::memory_order_acquire));
+
+    block_writeback.unlock();
+    evictor.join();
+    refetcher.join();
+
+    ASSERT_NE(replacement_page, nullptr);
+    ASSERT_NE(refetched_page, nullptr);
+    EXPECT_STREQ("fresh-dirty-image", refetched_page->get_data());
+    EXPECT_TRUE(bpm->unpin_page(replacement_page_id, false));
+    EXPECT_TRUE(bpm->unpin_page(old_page_id, false));
+
+    const size_t old_shard = bpm->page_table_shard(old_page_id);
+    std::lock_guard shard_lock(bpm->page_table_shards_[old_shard].latch);
+    EXPECT_EQ(bpm->page_table_shards_[old_shard].evicting_entries.count(old_page_id), 0u);
+}
+
+TEST_F(BufferPoolManagerTest, ResidentHitDoesNotWaitForGlobalStructureLatch) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&page_id), nullptr);
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> fetched{false};
+    Page* fetched_page = nullptr;
+    std::unique_lock structure_lock(bpm->latch_);
+    std::thread fetcher([&] {
+        started.store(true, std::memory_order_release);
+        fetched_page = bpm->fetch_page(page_id);
+        fetched.store(true, std::memory_order_release);
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (!fetched.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(fetched.load(std::memory_order_acquire));
+    structure_lock.unlock();
+    fetcher.join();
+
+    ASSERT_NE(fetched_page, nullptr);
+    EXPECT_TRUE(bpm->unpin_page(page_id, false));
+    EXPECT_TRUE(bpm->unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, StaleShardMappingCannotPinReusedFrame) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId resident_id{fd_, INVALID_PAGE_ID};
+    Page* resident_page = bpm->new_page(&resident_id);
+    ASSERT_NE(resident_page, nullptr);
+
+    PageId stale_id{fd_, resident_id.page_no + 1};
+    while (bpm->page_table_shard(stale_id) == bpm->page_table_shard(resident_id)) {
+        ++stale_id.page_no;
+    }
+    const size_t stale_shard = bpm->page_table_shard(stale_id);
+    {
+        std::lock_guard shard_lock(bpm->page_table_shards_[stale_shard].latch);
+        bpm->page_table_shards_[stale_shard].entries.insert_or_assign(stale_id, 0);
+    }
+
+    EXPECT_EQ(nullptr, bpm->fetch_page(stale_id));
+    EXPECT_EQ(resident_page->get_page_id(), resident_id);
+    EXPECT_EQ(resident_page->pin_count_.load(std::memory_order_acquire), 1);
+    {
+        std::lock_guard shard_lock(bpm->page_table_shards_[stale_shard].latch);
+        EXPECT_EQ(bpm->page_table_shards_[stale_shard].entries.count(stale_id), 0u);
+    }
+    EXPECT_TRUE(bpm->unpin_page(resident_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, CrossShardEvictionPreservesPinnedPageIdentity) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    std::array<PageId, 2> page_ids;
+    for (size_t i = 0; i < page_ids.size(); ++i) {
+        page_ids[i] = PageId{fd_, INVALID_PAGE_ID};
+        Page* page = bpm->new_page(&page_ids[i]);
+        ASSERT_NE(page, nullptr);
+        std::snprintf(page->get_data(), PAGE_SIZE, "cross-shard-%zu", i);
+        ASSERT_TRUE(bpm->unpin_page(page_ids[i], true));
+        ASSERT_TRUE(bpm->flush_page(page_ids[i]));
+    }
+    ASSERT_NE(bpm->page_table_shard(page_ids[0]), bpm->page_table_shard(page_ids[1]));
+
+    std::atomic<int> successful_fetches{0};
+    std::atomic<int> identity_failures{0};
+    std::atomic<int> unpin_failures{0};
+    std::vector<std::thread> workers;
+    for (int thread_id = 0; thread_id < 4; ++thread_id) {
+        workers.emplace_back([&, thread_id] {
+            for (int iteration = 0; iteration < 500; ++iteration) {
+                const size_t page_index = static_cast<size_t>((thread_id + iteration) & 1);
+                Page* page = nullptr;
+                for (int attempt = 0; attempt < 1000 && page == nullptr; ++attempt) {
+                    page = bpm->fetch_page(page_ids[page_index]);
+                    if (page == nullptr) {
+                        std::this_thread::yield();
+                    }
+                }
+                if (page == nullptr) {
+                    continue;
+                }
+                successful_fetches.fetch_add(1, std::memory_order_relaxed);
+                char expected[32];
+                std::snprintf(expected, sizeof(expected), "cross-shard-%zu", page_index);
+                if (!(page->get_page_id() == page_ids[page_index]) || std::strcmp(page->get_data(), expected) != 0) {
+                    identity_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!bpm->unpin_page(page_ids[page_index], false)) {
+                    unpin_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    EXPECT_GT(successful_fetches.load(std::memory_order_acquire), 500);
+    EXPECT_EQ(identity_failures.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(unpin_failures.load(std::memory_order_acquire), 0);
 }
 
 TEST_F(BufferPoolManagerTest, FlushDoesNotClearDirtyFromConcurrentWriter) {

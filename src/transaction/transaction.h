@@ -12,7 +12,10 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstring>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <limits>
@@ -20,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "common/common.h"
@@ -45,6 +49,70 @@ struct UndoLog {
     // MVCC old version fields
     TupleMeta old_meta_;               // TupleMeta before the modification
     std::vector<char> old_tuple_data_; // old record data (for version chain traversal)
+};
+
+class UniqueKeyId {
+public:
+    static constexpr size_t INLINE_KEY_CAPACITY = 20;
+    using InlineKey = std::array<char, INLINE_KEY_CAPACITY>;
+
+    UniqueKeyId(int index_fd, const std::vector<char>& key)
+        : index_fd_(index_fd), key_size_(key.size()), storage_(InlineKey{}) {
+        if (key_size_ <= INLINE_KEY_CAPACITY) {
+            if (key_size_ > 0) {
+                std::memcpy(std::get<InlineKey>(storage_).data(), key.data(), key_size_);
+            }
+        } else {
+            storage_ = std::make_shared<const std::string>(key.data(), key_size_);
+        }
+    }
+
+    int index_fd() const noexcept {
+        return index_fd_;
+    }
+
+    size_t key_size() const noexcept {
+        return key_size_;
+    }
+
+    const char* key_data() const noexcept {
+        if (uses_inline_storage()) {
+            return std::get<InlineKey>(storage_).data();
+        }
+        return std::get<std::shared_ptr<const std::string>>(storage_)->data();
+    }
+
+    bool uses_inline_storage() const noexcept {
+        return std::holds_alternative<InlineKey>(storage_);
+    }
+
+    bool operator==(const UniqueKeyId& other) const noexcept {
+        return index_fd_ == other.index_fd_ && key_size_ == other.key_size_ &&
+               (key_size_ == 0 || std::memcmp(key_data(), other.key_data(), key_size_) == 0);
+    }
+
+private:
+    int index_fd_;
+    size_t key_size_;
+    std::variant<InlineKey, std::shared_ptr<const std::string>> storage_;
+};
+
+struct UniqueKeyIdHash {
+    size_t operator()(const UniqueKeyId& key) const noexcept {
+        uint64_t hash = 14695981039346656037ULL;
+        const uint32_t index_fd = static_cast<uint32_t>(key.index_fd());
+        for (size_t offset = 0; offset < sizeof(index_fd); ++offset) {
+            hash ^= static_cast<uint8_t>(index_fd >> (offset * 8U));
+            hash *= 1099511628211ULL;
+        }
+        for (size_t offset = 0; offset < key.key_size(); ++offset) {
+            hash ^= static_cast<uint8_t>(key.key_data()[offset]);
+            hash *= 1099511628211ULL;
+        }
+        hash ^= key.key_size();
+        hash *= 1099511628211ULL;
+        return static_cast<size_t>(hash);
+    }
 };
 
 class Transaction {
@@ -194,7 +262,7 @@ public:
         return &lock_set_;
     }
 
-    inline std::unordered_set<std::string>* get_unique_key_lock_set() {
+    inline std::unordered_set<UniqueKeyId, UniqueKeyIdHash>* get_unique_key_lock_set() {
         return &unique_key_lock_set_;
     }
 
@@ -297,11 +365,11 @@ private:
     txn_id_t txn_id_;                // 事务的ID，唯一标识符
     timestamp_t start_ts_;           // 事务的开始时间戳
 
-    std::deque<std::unique_ptr<WriteRecord>> write_set_;  // 事务包含的所有写操作
-    std::unordered_set<LockDataId> lock_set_;             // 事务申请的所有锁
-    std::unordered_set<std::string> unique_key_lock_set_; // 事务持有的逻辑唯一键 reservation
-    std::deque<Page*> index_latch_page_set_;              // 维护事务执行过程中加锁的索引页面
-    std::deque<Page*> index_deleted_page_set_;            // 维护事务执行过程中删除的索引页面
+    std::deque<std::unique_ptr<WriteRecord>> write_set_;                   // 事务包含的所有写操作
+    std::unordered_set<LockDataId> lock_set_;                              // 事务申请的所有锁
+    std::unordered_set<UniqueKeyId, UniqueKeyIdHash> unique_key_lock_set_; // 事务持有的逻辑唯一键 reservation
+    std::deque<Page*> index_latch_page_set_;   // 维护事务执行过程中加锁的索引页面
+    std::deque<Page*> index_deleted_page_set_; // 维护事务执行过程中删除的索引页面
 
     std::atomic<timestamp_t> read_ts_{0};
     size_t watermark_slot_{std::numeric_limits<size_t>::max()};
