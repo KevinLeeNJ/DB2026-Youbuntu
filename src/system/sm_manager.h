@@ -188,13 +188,26 @@ public:
 
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
                                                    const std::vector<char>& key) const {
+        std::vector<Rid> result;
+        get_historical_index_key_rids(tab_name, index_name, key, &result);
+        return result;
+    }
+
+    void get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
+                                       const std::vector<char>& key, std::vector<Rid>* result) const {
+        if (result == nullptr) {
+            return;
+        }
+        result->clear();
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
         if (it == historical_index_keys_.end()) {
-            return {};
+            return;
         }
         auto key_it = it->second.entries.find(std::string(key.data(), key.size()));
-        return key_it == it->second.entries.end() ? std::vector<Rid>{} : key_it->second;
+        if (key_it != it->second.entries.end()) {
+            result->assign(key_it->second.begin(), key_it->second.end());
+        }
     }
 
     std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {

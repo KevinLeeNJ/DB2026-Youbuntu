@@ -142,12 +142,11 @@ TEST(ProgramTemplateTest, RejectsStaleIdentityAndMalformedSlotOrBindingMetadata)
               nullptr);
     EXPECT_NE(error.find("identity"), std::string::npos);
 
-    EXPECT_EQ(compiled::ProgramTemplate::Create(Identity(ProgramKind::POINT_SELECT),
-                                                Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
-                                                {{compiled::kNoOperand, 0, ValueType::INT32, 0},
-                                                 {0, 1, ValueType::INT32, 0}},
-                                                SelectBindings(), &error),
-              nullptr);
+    EXPECT_EQ(
+        compiled::ProgramTemplate::Create(
+            Identity(ProgramKind::POINT_SELECT), Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+            {{compiled::kNoOperand, 0, ValueType::INT32, 0}, {0, 1, ValueType::INT32, 0}}, SelectBindings(), &error),
+        nullptr);
     EXPECT_NE(error.find("does not match"), std::string::npos);
 
     auto bad_bindings = SelectBindings();
@@ -178,8 +177,7 @@ TEST(ProgramTemplateTest, RejectsUnboundedOrSparseLexicalSlots) {
 
     EXPECT_EQ(compiled::ProgramTemplate::Create(
                   Identity(ProgramKind::POINT_SELECT),
-                  Program(ProgramKind::POINT_SELECT, 7,
-                          {{ValueType::INT32, 0, 0}, {ValueType::INT32, 0, 2}}),
+                  Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}, {ValueType::INT32, 0, 2}}),
                   {{0, 0, ValueType::INT32, 0}, {1, 2, ValueType::INT32, 0}}, SelectBindings(), &error),
               nullptr);
     EXPECT_NE(error.find("lexical parameter descriptor"), std::string::npos);
@@ -188,8 +186,7 @@ TEST(ProgramTemplateTest, RejectsUnboundedOrSparseLexicalSlots) {
 TEST(ProgramTemplateCacheTest, IsOwnerScopedAndChecksPlannerGeneration) {
     std::string error;
     auto program_template = compiled::ProgramTemplate::Create(
-        Identity(ProgramKind::POINT_SELECT),
-        Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+        Identity(ProgramKind::POINT_SELECT), Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
         {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
     ASSERT_NE(program_template, nullptr) << error;
     compiled::ProgramCacheKey key{{11, 12, "point ?"}, 17, 19, 7, ProgramKind::POINT_SELECT};
@@ -212,8 +209,8 @@ TEST(ProgramTemplateCacheTest, LookupAnyCountsOnceAndEvictsLeastRecentlyUsedTemp
         identity.statement_generation = statement_generation;
         std::string error;
         auto result = compiled::ProgramTemplate::Create(
-            identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
-            {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
+            identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}), {{0, 0, ValueType::INT32, 0}},
+            SelectBindings(), &error);
         EXPECT_NE(result, nullptr) << error;
         return result;
     };
@@ -248,14 +245,14 @@ TEST(ProgramTemplateCacheTest, LookupAnyIsSafeForConcurrentLongShapeHits) {
     auto identity = Identity(ProgramKind::POINT_SELECT);
     identity.token_shape.canonical_bytes = std::string(4096, 'x') + " ?";
     std::string error;
-    auto program_template = compiled::ProgramTemplate::Create(
-        identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
-        {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
+    auto program_template =
+        compiled::ProgramTemplate::Create(identity, Program(ProgramKind::POINT_SELECT, 7, {{ValueType::INT32, 0, 0}}),
+                                          {{0, 0, ValueType::INT32, 0}}, SelectBindings(), &error);
     ASSERT_NE(program_template, nullptr) << error;
 
     compiled::ProgramTemplateCache cache;
-    const compiled::ProgramCacheKey key{identity.token_shape, identity.statement_generation, identity.planner_generation,
-                                        identity.catalog_generation, identity.kind};
+    const compiled::ProgramCacheKey key{identity.token_shape, identity.statement_generation,
+                                        identity.planner_generation, identity.catalog_generation, identity.kind};
     cache.Publish(key, program_template);
 
     constexpr int kThreadCount = 8;

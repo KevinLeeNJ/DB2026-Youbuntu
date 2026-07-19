@@ -38,6 +38,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_filter.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_skip_scan.h"
+#include "execution/prepared_select_descriptor.h"
 #include "execution/executor_insert.h"
 #include "execution/runtime/point_lookup_runtime.h"
 #include "execution/executor_limit.h"
@@ -181,9 +182,8 @@ private:
     }
 
     std::shared_ptr<PortalStmt::CompiledSelectSpec> build_compiled_select(const DMLPlan& dml, Context* context) {
-        if (!point_select_enabled() ||
-            (context != nullptr && context->txn_ != nullptr &&
-             context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED)) {
+        if (!point_select_enabled() || (context != nullptr && context->txn_ != nullptr &&
+                                        context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED)) {
             return nullptr;
         }
         auto projection = dynamic_cast<const ProjectionPlan*>(dml.subplan_.get());
@@ -268,8 +268,8 @@ private:
         layout.byte_size = tuple_size;
         layout.columns.reserve(scan->cols_.size());
         for (const auto& col : scan->cols_) {
-            layout.columns.push_back({compiled_type(col.type), static_cast<uint32_t>(col.offset),
-                                      static_cast<uint32_t>(col.len)});
+            layout.columns.push_back(
+                {compiled_type(col.type), static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len)});
         }
         std::vector<compiled::ParameterDesc> params;
         std::vector<compiled::ParameterValue> values;
@@ -279,8 +279,7 @@ private:
                 return 0;
             }
             const auto col = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& candidate) {
-                return candidate.tab_name == condition.lhs_col.tab_name &&
-                       candidate.name == condition.lhs_col.col_name;
+                return candidate.tab_name == condition.lhs_col.tab_name && candidate.name == condition.lhs_col.col_name;
             });
             return col == scan->cols_.end() ? 0U : static_cast<uint32_t>(col->len);
         };
@@ -313,28 +312,26 @@ private:
             code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand, compiled::kNoOperand,
                             static_cast<uint32_t>(condition_pos)});
             const size_t col_index = static_cast<size_t>(col_it - scan->cols_.begin());
-            code.push_back({compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand,
-                            static_cast<uint32_t>(col_index)});
+            code.push_back(
+                {compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand, static_cast<uint32_t>(col_index)});
         }
         code.push_back({compiled::Opcode::MAKE_POINT_KEY, 1, 0, compiled::kNoOperand, 0});
         code.push_back({compiled::Opcode::POINT_LOOKUP, 3, 1, 2});
         std::vector<size_t> jump_positions;
         for (size_t i = 0; i < scan->conds_.size(); ++i) {
             const auto& condition = scan->conds_[i];
-            auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& col) {
-                return col.name == condition.lhs_col.col_name;
-            });
+            auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(),
+                                       [&](const ColMeta& col) { return col.name == condition.lhs_col.col_name; });
             if (col_it == scan->cols_.end()) {
                 return nullptr;
             }
             const uint32_t lhs_reg = static_cast<uint32_t>(regs.size());
-            regs.push_back({compiled_type(col_it->type), compiled::kNoOperand,
-                            compiled_type(col_it->type) == compiled::ValueType::BYTES
-                                ? static_cast<uint32_t>(col_it->len)
-                                : 0});
+            regs.push_back(
+                {compiled_type(col_it->type), compiled::kNoOperand,
+                 compiled_type(col_it->type) == compiled::ValueType::BYTES ? static_cast<uint32_t>(col_it->len) : 0});
             const uint32_t rhs_reg = static_cast<uint32_t>(regs.size());
-            regs.push_back({compiled_type(condition.rhs_val.type), compiled::kNoOperand,
-                            parameter_max_length(condition)});
+            regs.push_back(
+                {compiled_type(condition.rhs_val.type), compiled::kNoOperand, parameter_max_length(condition)});
             const uint32_t bool_reg = static_cast<uint32_t>(regs.size());
             regs.push_back({compiled::ValueType::BOOL, compiled::kNoOperand, 0});
             code.push_back({compiled::Opcode::LOAD_COLUMN, lhs_reg, 3, compiled::kNoOperand,
@@ -355,21 +352,17 @@ private:
         }
 
         auto spec = std::make_shared<PortalStmt::CompiledSelectSpec>();
-        spec->program = std::make_shared<compiled::CompiledProgram>(compiled::COMPILED_IR_VERSION,
-                                                                      compiled::COMPILED_ABI_VERSION,
-                                                                      compiled::ProgramKind::POINT_SELECT,
-                                                                      sm_manager_->get_catalog_generation(),
-                                                                      std::move(params), std::move(regs),
-                                                                      std::vector<compiled::TupleLayout>{std::move(layout)},
-                                                                      std::move(code));
+        spec->program = std::make_shared<compiled::CompiledProgram>(
+            compiled::COMPILED_IR_VERSION, compiled::COMPILED_ABI_VERSION, compiled::ProgramKind::POINT_SELECT,
+            sm_manager_->get_catalog_generation(), std::move(params), std::move(regs),
+            std::vector<compiled::TupleLayout>{std::move(layout)}, std::move(code));
         spec->parameters = std::move(values);
         PointIndexRuntimeBinding binding;
         binding.table_name = scan->tab_name_;
         binding.index_col_names = scan->index_col_names_;
         for (const auto& index_col : index_it->cols) {
-            auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(), [&](const ColMeta& col) {
-                return col.name == index_col.name;
-            });
+            auto col_it = std::find_if(scan->cols_.begin(), scan->cols_.end(),
+                                       [&](const ColMeta& col) { return col.name == index_col.name; });
             if (col_it == scan->cols_.end()) {
                 return nullptr;
             }
@@ -382,9 +375,9 @@ private:
         spec->template_bindings.table.table_name = scan->tab_name_;
         spec->template_bindings.table.tuple_width = tuple_size;
         for (const auto& col : scan->cols_) {
-            spec->template_bindings.table.columns.push_back(
-                {scan->tab_name_, col.name, compiled_type(col.type), static_cast<uint32_t>(col.offset),
-                 static_cast<uint32_t>(col.len)});
+            spec->template_bindings.table.columns.push_back({scan->tab_name_, col.name, compiled_type(col.type),
+                                                             static_cast<uint32_t>(col.offset),
+                                                             static_cast<uint32_t>(col.len)});
         }
         compiled::TemplateIndexDesc template_index;
         template_index.table_name = scan->tab_name_;
@@ -406,9 +399,11 @@ private:
                  spec->output_captions[i]});
         }
         for (const auto& condition : scan->conds_) {
-            spec->template_bindings.conditions.push_back(
-                {{condition.lhs_col.tab_name, condition.lhs_col.col_name}, compiled_op(condition.op), true, {},
-                 condition.rhs_val.lexical_slot});
+            spec->template_bindings.conditions.push_back({{condition.lhs_col.tab_name, condition.lhs_col.col_name},
+                                                          compiled_op(condition.op),
+                                                          true,
+                                                          {},
+                                                          condition.rhs_val.lexical_slot});
         }
         for (size_t i = 0; i < spec->program->parameters().size(); ++i) {
             const auto& parameter = spec->program->parameters()[i];
@@ -425,11 +420,10 @@ private:
             auto program_template = compiled::ProgramTemplate::Create(
                 std::move(identity), spec->program, spec->template_parameters, spec->template_bindings, &error);
             if (program_template != nullptr) {
-                compiled::ProgramCacheKey key{program_template->identity().token_shape,
-                                              program_template->identity().statement_generation,
-                                              program_template->identity().planner_generation,
-                                              program_template->identity().catalog_generation,
-                                              program_template->identity().kind};
+                compiled::ProgramCacheKey key{
+                    program_template->identity().token_shape, program_template->identity().statement_generation,
+                    program_template->identity().planner_generation, program_template->identity().catalog_generation,
+                    program_template->identity().kind};
                 spec->compiled_template = template_cache_->Publish(key, std::move(program_template));
             }
         }
@@ -449,12 +443,12 @@ private:
         }
         auto& bindings = spec->template_bindings;
         bindings.table.table_name = dml.tab_name_;
-        bindings.table.tuple_width = static_cast<uint32_t>(spec->insert_info.fh != nullptr
-                                                                ? spec->insert_info.fh->get_file_hdr().record_size
-                                                                : table.cols.back().offset + table.cols.back().len);
+        bindings.table.tuple_width =
+            static_cast<uint32_t>(spec->insert_info.fh != nullptr ? spec->insert_info.fh->get_file_hdr().record_size
+                                                                  : table.cols.back().offset + table.cols.back().len);
         for (const auto& col : table.cols) {
             bindings.table.columns.push_back({dml.tab_name_, col.name, compiled_type(col.type),
-                                               static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len)});
+                                              static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len)});
         }
         const auto make_index = [&](const IndexMeta& index) {
             compiled::TemplateIndexDesc result;
@@ -558,16 +552,15 @@ private:
             sm_manager_->get_catalog_generation(), context->statement_template_generation_,
             context->planner_generation_, spec->program->kind()};
         std::string error;
-        auto program_template = compiled::ProgramTemplate::Create(
-            std::move(identity), spec->program, spec->template_parameters, bindings, &error);
+        auto program_template = compiled::ProgramTemplate::Create(std::move(identity), spec->program,
+                                                                  spec->template_parameters, bindings, &error);
         if (program_template == nullptr) {
             return;
         }
-        compiled::ProgramCacheKey key{program_template->identity().token_shape,
-                                      program_template->identity().statement_generation,
-                                      program_template->identity().planner_generation,
-                                      program_template->identity().catalog_generation,
-                                      program_template->identity().kind};
+        compiled::ProgramCacheKey key{
+            program_template->identity().token_shape, program_template->identity().statement_generation,
+            program_template->identity().planner_generation, program_template->identity().catalog_generation,
+            program_template->identity().kind};
         spec->compiled_template = template_cache_->Publish(key, std::move(program_template));
     }
 
@@ -616,8 +609,8 @@ private:
         auto append_parameter = [&](const Value& value, const ColMeta& target) -> uint32_t {
             const uint32_t parameter = static_cast<uint32_t>(params.size());
             const auto type = compiled_type(value.type);
-            params.push_back({type, type == compiled::ValueType::BYTES ? static_cast<uint32_t>(target.len) : 0,
-                              value.lexical_slot});
+            params.push_back(
+                {type, type == compiled::ValueType::BYTES ? static_cast<uint32_t>(target.len) : 0, value.lexical_slot});
             values.push_back(compiled_value(value));
             return parameter;
         };
@@ -638,10 +631,10 @@ private:
             for (size_t i = 0; i < dml.values_.size(); ++i) {
                 const uint32_t parameter = append_parameter(dml.values_[i], table.cols[i]);
                 const uint32_t value_reg = append_value_register(dml.values_[i], table.cols[i]);
-                code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand,
-                                compiled::kNoOperand, parameter});
-                code.push_back({compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand,
-                                static_cast<uint32_t>(i)});
+                code.push_back(
+                    {compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand, compiled::kNoOperand, parameter});
+                code.push_back(
+                    {compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand, static_cast<uint32_t>(i)});
             }
             code.push_back({compiled::Opcode::INSERT_ROW, 1, 0});
             code.push_back({compiled::Opcode::HALT});
@@ -650,9 +643,9 @@ private:
             spec->bindings.catalog_generation = sm_manager_->get_catalog_generation();
             spec->bindings.insert_info = &spec->insert_info;
             spec->program = std::make_shared<compiled::CompiledProgram>(
-                compiled::COMPILED_IR_VERSION, compiled::COMPILED_ABI_VERSION,
-                compiled::ProgramKind::POINT_INSERT, sm_manager_->get_catalog_generation(), std::move(params),
-                std::move(regs), std::vector<compiled::TupleLayout>{std::move(layout)}, std::move(code));
+                compiled::COMPILED_IR_VERSION, compiled::COMPILED_ABI_VERSION, compiled::ProgramKind::POINT_INSERT,
+                sm_manager_->get_catalog_generation(), std::move(params), std::move(regs),
+                std::vector<compiled::TupleLayout>{std::move(layout)}, std::move(code));
             spec->parameters = std::move(values);
             publish_mutation_template(spec.get(), dml, table, context);
             return spec;
@@ -699,8 +692,8 @@ private:
             }
             const uint32_t parameter = append_parameter(condition.rhs_val, *col);
             const uint32_t value_reg = append_value_register(condition.rhs_val, *col);
-            code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand,
-                            compiled::kNoOperand, parameter});
+            code.push_back(
+                {compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand, compiled::kNoOperand, parameter});
             code.push_back({compiled::Opcode::STORE_COLUMN, 0, value_reg, compiled::kNoOperand,
                             static_cast<uint32_t>(col - table.cols.begin())});
         }
@@ -719,9 +712,8 @@ private:
             code.push_back({compiled::Opcode::PREPARE_UPDATE, prepared_reg, 2, current_tuple_reg});
             code.push_back({compiled::Opcode::COPY_TUPLE, proposed_tuple_reg, current_tuple_reg});
             for (const auto& set_clause : dml.set_clauses_) {
-                auto lhs = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
-                    return col.name == set_clause.lhs.col_name;
-                });
+                auto lhs = std::find_if(table.cols.begin(), table.cols.end(),
+                                        [&](const ColMeta& col) { return col.name == set_clause.lhs.col_name; });
                 if (lhs == table.cols.end()) {
                     return nullptr;
                 }
@@ -734,16 +726,14 @@ private:
                         return nullptr;
                     }
                     const uint32_t base_reg = static_cast<uint32_t>(regs.size());
-                    regs.push_back({compiled_type(rhs->type), compiled::kNoOperand,
-                                    compiled_type(rhs->type) == compiled::ValueType::BYTES
-                                        ? static_cast<uint32_t>(rhs->len)
-                                        : 0});
+                    regs.push_back(
+                        {compiled_type(rhs->type), compiled::kNoOperand,
+                         compiled_type(rhs->type) == compiled::ValueType::BYTES ? static_cast<uint32_t>(rhs->len) : 0});
                     code.push_back({compiled::Opcode::LOAD_COLUMN, base_reg, current_tuple_reg, compiled::kNoOperand,
                                     static_cast<uint32_t>(rhs - table.cols.begin())});
                     if (set_clause.op == UpdateOp::ASSIGNMENT) {
                         code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, base_reg,
-                                        compiled::kNoOperand,
-                                        lhs_index});
+                                        compiled::kNoOperand, lhs_index});
                         continue;
                     }
                     if ((lhs->type != TYPE_INT && lhs->type != TYPE_FLOAT) ||
@@ -754,8 +744,8 @@ private:
                     }
                     const uint32_t delta_param = append_parameter(set_clause.rhs, *lhs);
                     const uint32_t delta_reg = append_value_register(set_clause.rhs, *lhs);
-                    code.push_back({compiled::Opcode::LOAD_PARAM, delta_reg, compiled::kNoOperand,
-                                    compiled::kNoOperand, delta_param});
+                    code.push_back({compiled::Opcode::LOAD_PARAM, delta_reg, compiled::kNoOperand, compiled::kNoOperand,
+                                    delta_param});
                     const uint32_t result_reg = static_cast<uint32_t>(regs.size());
                     regs.push_back({compiled_type(lhs->type), compiled::kNoOperand, 0});
                     compiled::Opcode arithmetic = compiled::Opcode::ADD;
@@ -768,20 +758,17 @@ private:
                     }
                     code.push_back({arithmetic, result_reg, base_reg, delta_reg});
                     code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, result_reg,
-                                    compiled::kNoOperand,
-                                    lhs_index});
+                                    compiled::kNoOperand, lhs_index});
                 } else {
                     const uint32_t parameter = append_parameter(set_clause.rhs, *lhs);
                     const uint32_t value_reg = append_value_register(set_clause.rhs, *lhs);
-                    code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand,
-                                    compiled::kNoOperand, parameter});
-                    code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, value_reg,
-                                    compiled::kNoOperand,
+                    code.push_back({compiled::Opcode::LOAD_PARAM, value_reg, compiled::kNoOperand, compiled::kNoOperand,
+                                    parameter});
+                    code.push_back({compiled::Opcode::STORE_COLUMN, proposed_tuple_reg, value_reg, compiled::kNoOperand,
                                     lhs_index});
                 }
             }
-            code.push_back(
-                {compiled::Opcode::COMMIT_UPDATE, compiled::kNoOperand, prepared_reg, proposed_tuple_reg});
+            code.push_back({compiled::Opcode::COMMIT_UPDATE, compiled::kNoOperand, prepared_reg, proposed_tuple_reg});
         }
         code.push_back({compiled::Opcode::HALT});
 
@@ -796,8 +783,8 @@ private:
         spec->bindings.point_indexes.push_back(std::move(point_binding));
         compiled::ProgramKind program_kind = compiled::ProgramKind::POINT_DELETE;
         if (dml.tag == T_Delete) {
-            spec->delete_info = DeleteRuntimeInfo{sm_manager_, &spec->table_name, &table, fh, &spec->conditions,
-                                                  &spec->bound_conditions, &spec->indexes};
+            spec->delete_info = DeleteRuntimeInfo{sm_manager_,       &spec->table_name,       &table,        fh,
+                                                  &spec->conditions, &spec->bound_conditions, &spec->indexes};
             spec->bindings.delete_info = &spec->delete_info;
         } else {
             spec->bound_set_clauses = BindMutationSetClauses(table, spec->set_clauses);
@@ -811,9 +798,16 @@ private:
                     }
                 }
             }
-            spec->update_info = UpdateRuntimeInfo{sm_manager_, &spec->table_name, &table, fh, &spec->conditions,
-                                                  &spec->bound_conditions, &spec->indexes, &spec->set_clauses,
-                                                  &spec->bound_set_clauses, &spec->affected_index_bitmap};
+            spec->update_info = UpdateRuntimeInfo{sm_manager_,
+                                                  &spec->table_name,
+                                                  &table,
+                                                  fh,
+                                                  &spec->conditions,
+                                                  &spec->bound_conditions,
+                                                  &spec->indexes,
+                                                  &spec->set_clauses,
+                                                  &spec->bound_set_clauses,
+                                                  &spec->affected_index_bitmap};
             spec->bindings.update_info = &spec->update_info;
             program_kind = compiled::ProgramKind::POINT_UPDATE;
         }
@@ -1385,8 +1379,19 @@ private:
 
 public:
     explicit Portal(SmManager* sm_manager, compiled::ProgramTemplateCache* template_cache = nullptr)
-        : sm_manager_(sm_manager), template_cache_(template_cache == nullptr ? &owned_template_cache_ : template_cache) {}
+        : sm_manager_(sm_manager),
+          template_cache_(template_cache == nullptr ? &owned_template_cache_ : template_cache) {}
     ~Portal() {}
+
+    bool run_prepared_select(const PreparedSelectDescriptor& descriptor, const parser::OwnedTokenStream& lexical,
+                             QlManager* ql, Context* context) {
+        auto root = descriptor.Instantiate(lexical, sm_manager_, context);
+        if (root == nullptr) {
+            return false;
+        }
+        ql->select_from(std::move(root), descriptor.output_names(), context);
+        return true;
+    }
 
     compiled::ProgramCacheStats point_program_cache_stats() const {
         return template_cache_->Stats();
@@ -1442,11 +1447,12 @@ public:
                 auto compiled_select = build_compiled_select(*x, context);
                 std::unique_ptr<AbstractExecutor> root;
                 if (compiled_select == nullptr) {
-                    root = convert_plan_executor(x->subplan_.get(), context);
+                    root = convert_plan_executor(x->subplan_.get(), context, false, true);
                 }
                 auto portal_stmt = std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names),
                                                                 std::move(root), std::move(plan));
-                portal_stmt->compiled_template = compiled_select == nullptr ? nullptr : compiled_select->compiled_template;
+                portal_stmt->compiled_template =
+                    compiled_select == nullptr ? nullptr : compiled_select->compiled_template;
                 portal_stmt->compiled_select = std::move(compiled_select);
                 return portal_stmt;
             }
@@ -1462,9 +1468,9 @@ public:
 
             case T_Update: {
                 if (auto compiled_mutation = build_compiled_mutation(*x, context); compiled_mutation != nullptr) {
-                    auto portal_stmt = std::make_unique<PortalStmt>(
-                        PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::unique_ptr<AbstractExecutor>(),
-                        std::move(plan));
+                    auto portal_stmt =
+                        std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                     std::unique_ptr<AbstractExecutor>(), std::move(plan));
                     portal_stmt->compiled_template = compiled_mutation->compiled_template;
                     portal_stmt->compiled_mutation = std::move(compiled_mutation);
                     return portal_stmt;
@@ -1493,9 +1499,9 @@ public:
                         auto fallback_plan =
                             std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
                                                        x->compiled_point_program_->index_col_names);
-                        scan = convert_plan_executor(fallback_plan.get(), context);
+                        scan = convert_plan_executor(fallback_plan.get(), context, false, true);
                     } else {
-                        scan = convert_plan_executor(x->subplan_.get(), context);
+                        scan = convert_plan_executor(x->subplan_.get(), context, false, true);
                     }
                 }
                 {
@@ -1515,9 +1521,9 @@ public:
             }
             case T_Delete: {
                 if (auto compiled_mutation = build_compiled_mutation(*x, context); compiled_mutation != nullptr) {
-                    auto portal_stmt = std::make_unique<PortalStmt>(
-                        PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::unique_ptr<AbstractExecutor>(),
-                        std::move(plan));
+                    auto portal_stmt =
+                        std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                     std::unique_ptr<AbstractExecutor>(), std::move(plan));
                     portal_stmt->compiled_template = compiled_mutation->compiled_template;
                     portal_stmt->compiled_mutation = std::move(compiled_mutation);
                     return portal_stmt;
@@ -1543,9 +1549,9 @@ public:
                         auto fallback_plan =
                             std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
                                                        x->compiled_point_program_->index_col_names);
-                        scan = convert_plan_executor(fallback_plan.get(), context);
+                        scan = convert_plan_executor(fallback_plan.get(), context, false, true);
                     } else {
-                        scan = convert_plan_executor(x->subplan_.get(), context);
+                        scan = convert_plan_executor(x->subplan_.get(), context, false, true);
                     }
                 }
                 {
@@ -1568,9 +1574,9 @@ public:
 
             case T_Insert: {
                 if (auto compiled_mutation = build_compiled_mutation(*x, context); compiled_mutation != nullptr) {
-                    auto portal_stmt = std::make_unique<PortalStmt>(
-                        PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(), std::unique_ptr<AbstractExecutor>(),
-                        std::move(plan));
+                    auto portal_stmt =
+                        std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                     std::unique_ptr<AbstractExecutor>(), std::move(plan));
                     portal_stmt->compiled_template = compiled_mutation->compiled_template;
                     portal_stmt->compiled_mutation = std::move(compiled_mutation);
                     return portal_stmt;
@@ -1603,7 +1609,7 @@ public:
             auto run_legacy_select = [&]() {
                 if (portal->root == nullptr && portal->plan != nullptr) {
                     auto* dml = static_cast<DMLPlan*>(portal->plan.get());
-                    portal->root = convert_plan_executor(dml->subplan_.get(), context);
+                    portal->root = convert_plan_executor(dml->subplan_.get(), context, false, true);
                 }
                 ql->select_from(std::move(portal->root), std::move(portal->output_names), context);
             };
@@ -1670,22 +1676,23 @@ public:
                 auto run_legacy_mutation = [&]() {
                     auto* dml = static_cast<DMLPlan*>(portal->plan.get());
                     if (dml->tag == T_Insert) {
-                        auto root = std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_, dml->values_, context);
+                        auto root =
+                            std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_, dml->values_, context);
                         ql->run_dml(std::move(root));
                         return;
                     }
-                    auto scan = convert_plan_executor(dml->subplan_.get(), context);
+                    auto scan = convert_plan_executor(dml->subplan_.get(), context, false, true);
                     std::vector<Rid> rids;
                     for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                         rids.push_back(scan->rid());
                     }
                     if (dml->tag == T_Delete) {
-                        auto root = std::make_unique<DeleteExecutor>(sm_manager_, dml->tab_name_, dml->conds_, rids,
-                                                                      context);
+                        auto root =
+                            std::make_unique<DeleteExecutor>(sm_manager_, dml->tab_name_, dml->conds_, rids, context);
                         ql->run_dml(std::move(root));
                     } else if (dml->tag == T_Update) {
                         auto root = std::make_unique<UpdateExecutor>(sm_manager_, dml->tab_name_, dml->set_clauses_,
-                                                                      dml->conds_, rids, context);
+                                                                     dml->conds_, rids, context);
                         ql->run_dml(std::move(root));
                     }
                 };
@@ -1728,11 +1735,14 @@ public:
     // 清空资源
     void drop() {}
 
-    std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false) {
+    std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false,
+                                                            bool consume_plan_data = false) {
+        consume_plan_data = consume_plan_data && !count_rows;
         switch (plan->tag) {
         case T_Projection: {
             auto x = static_cast<ProjectionPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> subplan = convert_plan_executor(x->subplan_.get(), context, count_rows);
+            std::unique_ptr<AbstractExecutor> subplan =
+                convert_plan_executor(x->subplan_.get(), context, count_rows, consume_plan_data);
             std::unique_ptr<AbstractExecutor> executor;
             if (x->preserve_col_names_) {
                 std::vector<TabCol> cols;
@@ -1749,31 +1759,36 @@ public:
         }
         case T_Filter: {
             auto x = static_cast<FilterPlan*>(plan);
+            auto conds = consume_plan_data ? std::move(x->conds_) : x->conds_;
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<FilterExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), x->conds_);
+                convert_plan_executor(x->subplan_.get(), context, count_rows, consume_plan_data), std::move(conds));
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Aggregate: {
             auto x = static_cast<AggregatePlan*>(plan);
             auto having_conds = to_executor_having_conds(x->having_conds_);
-            std::unique_ptr<AbstractExecutor> executor =
-                std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
-                                                    x->group_by_cols_, x->agg_exprs_, having_conds, context);
+            std::unique_ptr<AbstractExecutor> executor = std::make_unique<AggregateExecutor>(
+                convert_plan_executor(x->subplan_.get(), context, count_rows, consume_plan_data), x->group_by_cols_,
+                x->agg_exprs_, having_conds, context);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_SeqScan:
         case T_IndexSkipScan:
         case T_IndexScan: {
             auto x = static_cast<ScanPlan*>(plan);
+            auto tab_name = consume_plan_data ? std::move(x->tab_name_) : x->tab_name_;
+            auto conds = consume_plan_data ? std::move(x->conds_) : x->conds_;
+            auto index_col_names = consume_plan_data ? std::move(x->index_col_names_) : x->index_col_names_;
             std::unique_ptr<AbstractExecutor> executor;
             if (x->tag == T_SeqScan) {
-                executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
+                executor =
+                    std::make_unique<SeqScanExecutor>(sm_manager_, std::move(tab_name), std::move(conds), context);
             } else if (x->tag == T_IndexSkipScan) {
-                executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
-                                                                   x->index_col_names_, context);
+                executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, std::move(tab_name), std::move(conds),
+                                                                   std::move(index_col_names), context);
             } else {
                 executor = std::make_unique<IndexScanExecutor>(
-                    sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context,
+                    sm_manager_, std::move(tab_name), std::move(conds), std::move(index_col_names), context,
                     x->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
             }
             return maybe_count(std::move(executor), plan, count_rows);
@@ -1781,23 +1796,30 @@ public:
         case T_NestLoop:
         case T_SortMerge: {
             auto x = static_cast<JoinPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_.get(), context, count_rows);
-            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_.get(), context, count_rows);
+            std::unique_ptr<AbstractExecutor> left =
+                convert_plan_executor(x->left_.get(), context, count_rows, consume_plan_data);
+            std::unique_ptr<AbstractExecutor> right =
+                convert_plan_executor(x->right_.get(), context, count_rows, consume_plan_data);
+            auto conds = consume_plan_data ? std::move(x->conds_) : x->conds_;
+            auto inlj_left_col = consume_plan_data ? std::move(x->inlj_left_col_) : x->inlj_left_col_;
+            auto inlj_right_col = consume_plan_data ? std::move(x->inlj_right_col_) : x->inlj_right_col_;
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
-                std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
-                x->inlj_index_col_name_);
+                std::move(left), std::move(right), std::move(conds), std::move(inlj_left_col),
+                std::move(inlj_right_col), x->inlj_index_col_name_);
             return maybe_count(std::move(join), plan, count_rows);
         }
         case T_Sort: {
             auto x = static_cast<SortPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<SortExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), bind_sort_output_names(*x), x->limit_);
+                convert_plan_executor(x->subplan_.get(), context, count_rows, consume_plan_data),
+                bind_sort_output_names(*x), x->limit_);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Limit: {
             auto x = static_cast<LimitPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<LimitExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), static_cast<size_t>(x->limit_));
+                convert_plan_executor(x->subplan_.get(), context, count_rows, consume_plan_data),
+                static_cast<size_t>(x->limit_));
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Union: {
@@ -1805,9 +1827,10 @@ public:
             std::vector<std::unique_ptr<AbstractExecutor>> branches;
             branches.reserve(x->branches_.size());
             for (const auto& branch_plan : x->branches_) {
-                branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows));
+                branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows, consume_plan_data));
             }
-            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), x->cols_), plan, count_rows);
+            auto cols = consume_plan_data ? std::move(x->cols_) : x->cols_;
+            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), std::move(cols)), plan, count_rows);
         }
         default:
             break;

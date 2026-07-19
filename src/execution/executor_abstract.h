@@ -138,7 +138,7 @@ public:
         return 0;
     }
 
-    std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
+    std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) const {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;
         });

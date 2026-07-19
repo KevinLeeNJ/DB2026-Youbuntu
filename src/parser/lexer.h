@@ -62,12 +62,24 @@ inline constexpr std::array<char, 256> upper_char = [] {
     return table;
 }();
 
-inline bool is_alpha(char c) { return (char_class[static_cast<unsigned char>(c)] & kCharAlpha) != 0; }
-inline bool is_digit(char c) { return (char_class[static_cast<unsigned char>(c)] & kCharDigit) != 0; }
-inline bool is_alnum(char c) { return (char_class[static_cast<unsigned char>(c)] & (kCharAlpha | kCharDigit)) != 0; }
-inline bool is_ident(char c) { return is_alnum(c) || c == '_'; }
-inline bool is_space(char c) { return (char_class[static_cast<unsigned char>(c)] & kCharSpace) != 0; }
-inline char to_upper(char c) { return upper_char[static_cast<unsigned char>(c)]; }
+inline bool is_alpha(char c) {
+    return (char_class[static_cast<unsigned char>(c)] & kCharAlpha) != 0;
+}
+inline bool is_digit(char c) {
+    return (char_class[static_cast<unsigned char>(c)] & kCharDigit) != 0;
+}
+inline bool is_alnum(char c) {
+    return (char_class[static_cast<unsigned char>(c)] & (kCharAlpha | kCharDigit)) != 0;
+}
+inline bool is_ident(char c) {
+    return is_alnum(c) || c == '_';
+}
+inline bool is_space(char c) {
+    return (char_class[static_cast<unsigned char>(c)] & kCharSpace) != 0;
+}
+inline char to_upper(char c) {
+    return upper_char[static_cast<unsigned char>(c)];
+}
 
 } // namespace detail
 

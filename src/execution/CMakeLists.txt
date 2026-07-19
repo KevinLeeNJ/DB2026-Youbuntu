@@ -1,4 +1,5 @@
-set(SOURCES execution_manager.cpp result_sink.cpp row_mutation.cpp runtime/database_program_runtime.cpp
+set(SOURCES execution_manager.cpp result_sink.cpp row_mutation.cpp prepared_parameter_binding.cpp
+            prepared_select_descriptor.cpp runtime/database_program_runtime.cpp
             runtime/delete_runtime.cpp runtime/insert_runtime.cpp runtime/point_lookup_runtime.cpp
             runtime/program_dispatcher.cpp)
 add_library(execution STATIC ${SOURCES})

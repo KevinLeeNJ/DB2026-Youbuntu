@@ -3,7 +3,6 @@ RMDB is licensed under Mulan PSL v2. */
 
 #include "execution/runtime/program_dispatcher.h"
 
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -60,8 +59,8 @@ std::optional<compiled::ParameterValue> BindParameter(const compiled::LexicalPar
     }
 }
 
-std::optional<std::vector<compiled::ParameterValue>> BindProgramParameters(
-    const compiled::ProgramTemplate& program_template, const parser::OwnedTokenStream& lexical) {
+std::optional<std::vector<compiled::ParameterValue>>
+BindProgramParameters(const compiled::ProgramTemplate& program_template, const parser::OwnedTokenStream& lexical) {
     std::vector<compiled::ParameterValue> values;
     values.reserve(program_template.program().parameters().size());
     for (uint32_t program_parameter = 0; program_parameter < program_template.program().parameters().size();
@@ -78,16 +77,6 @@ std::optional<std::vector<compiled::ParameterValue>> BindProgramParameters(
         values.push_back(std::move(*value));
     }
     return values;
-}
-
-compiled::ValueType LiveType(ColType type) {
-    if (type == TYPE_INT) {
-        return compiled::ValueType::INT32;
-    }
-    if (type == TYPE_FLOAT) {
-        return compiled::ValueType::FLOAT64;
-    }
-    return compiled::ValueType::BYTES;
 }
 
 CompOp LiveCompare(compiled::CompareOp op) {
@@ -146,7 +135,8 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
                           DatabaseProgramBindings* bindings, std::vector<ColMeta>* output_cols,
                           std::vector<std::string>* captions, const parser::OwnedTokenStream& lexical,
                           RuntimeBindingState* state) {
-    if (sm_manager == nullptr || program_template.identity().catalog_generation != sm_manager->get_catalog_generation()) {
+    if (sm_manager == nullptr ||
+        program_template.identity().catalog_generation != sm_manager->get_catalog_generation()) {
         return false;
     }
     const auto& description = program_template.bindings();
@@ -158,68 +148,24 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
     state->bound_set_clauses.reserve(description.set_clauses.size());
     output_cols->reserve(description.output_columns.size());
     captions->reserve(description.output_columns.size());
-    if (!sm_manager->db_.is_table(description.table.table_name)) {
-        return false;
-    }
     auto& table = sm_manager->db_.get_table(description.table.table_name);
-    if (table.cols.size() != description.table.columns.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < table.cols.size(); ++i) {
-        const auto& live = table.cols[i];
-        const auto& cached = description.table.columns[i];
-        if (live.name != cached.column_name || live.tab_name != cached.table_name || LiveType(live.type) != cached.type ||
-            live.offset != static_cast<int>(cached.offset) || live.len != static_cast<int>(cached.width)) {
-            return false;
-        }
-    }
-    for (const auto& cached_index : description.point_indexes) {
-        auto index = std::find_if(table.indexes.begin(), table.indexes.end(), [&](const IndexMeta& live) {
-            if (live.cols.size() != cached_index.column_names.size()) {
-                return false;
-            }
-            for (size_t i = 0; i < live.cols.size(); ++i) {
-                if (live.cols[i].name != cached_index.column_names[i] ||
-                    live.cols[i].offset != static_cast<int>(cached_index.tuple_offsets[i])) {
-                    return false;
-                }
-            }
-            return true;
-        });
-        if (index == table.indexes.end()) {
-            return false;
-        }
-        const std::string live_name =
-            sm_manager->get_ix_manager()->get_index_name(description.table.table_name, index->cols);
-        if (live_name != cached_index.index_name || sm_manager->ihs_.find(live_name) == sm_manager->ihs_.end()) {
-            return false;
-        }
-        bindings->point_indexes.push_back({description.table.table_name, cached_index.column_names,
-                                           cached_index.tuple_offsets, cached_index.index_name});
-    }
-    state->table_name = description.table.table_name;
     if (program_template.identity().kind != compiled::ProgramKind::POINT_SELECT &&
         description.mutation_indexes.size() != table.indexes.size()) {
         return false;
     }
+    for (const auto& cached_index : description.point_indexes) {
+        bindings->point_indexes.push_back({description.table.table_name, cached_index.column_names,
+                                           cached_index.tuple_offsets, cached_index.index_name});
+    }
+    state->table_name = description.table.table_name;
     for (size_t i = 0; i < description.mutation_indexes.size(); ++i) {
         const auto& cached = description.mutation_indexes[i];
-        const auto& live = table.indexes[i];
-        if (live.cols.size() != cached.column_names.size()) {
+        const auto& live = table.indexes.at(i);
+        auto handle = sm_manager->ihs_.find(cached.index_name);
+        if (handle == sm_manager->ihs_.end()) {
             return false;
         }
-        for (size_t j = 0; j < live.cols.size(); ++j) {
-            if (live.cols[j].name != cached.column_names[j] ||
-                live.cols[j].offset != static_cast<int>(cached.tuple_offsets[j])) {
-                return false;
-            }
-        }
-        const std::string index_name = sm_manager->get_ix_manager()->get_index_name(state->table_name, live.cols);
-        auto handle = sm_manager->ihs_.find(index_name);
-        if (index_name != cached.index_name || handle == sm_manager->ihs_.end()) {
-            return false;
-        }
-        state->indexes.push_back({&live, handle->second.get(), index_name});
+        state->indexes.push_back({&live, handle->second.get(), cached.index_name});
     }
     for (const auto& output : description.output_columns) {
         ColMeta col;
@@ -264,7 +210,7 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
                         : cached.op == compiled::TemplateSetOp::SUB ? UpdateOp::SELF_SUB
                         : cached.op == compiled::TemplateSetOp::MUL ? UpdateOp::SELF_MUL
                         : cached.op == compiled::TemplateSetOp::DIV ? UpdateOp::SELF_DIV
-                                                                   : UpdateOp::ASSIGNMENT;
+                                                                    : UpdateOp::ASSIGNMENT;
         if (cached.rhs_lexical_slot >= 0) {
             const auto* descriptor = program_template.FindLexicalParameter(cached.rhs_lexical_slot);
             if (descriptor == nullptr || static_cast<size_t>(cached.rhs_lexical_slot) >= lexical.parameters.size()) {
@@ -289,16 +235,23 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
         return false;
     }
     if (program_template.identity().kind == compiled::ProgramKind::POINT_DELETE) {
-        state->delete_info = {sm_manager, &state->table_name, &table, fh, &state->conditions,
-                              &state->bound_conditions, &state->indexes};
+        state->delete_info = {sm_manager,         &state->table_name,       &table,         fh,
+                              &state->conditions, &state->bound_conditions, &state->indexes};
         bindings->delete_info = &state->delete_info;
         return true;
     }
     state->bound_set_clauses = BindMutationSetClauses(table, state->set_clauses);
     state->affected_indexes = description.affected_mutation_indexes;
-    state->update_info = {sm_manager, &state->table_name, &table, fh, &state->conditions,
-                          &state->bound_conditions, &state->indexes, &state->set_clauses,
-                          &state->bound_set_clauses, &state->affected_indexes};
+    state->update_info = {sm_manager,
+                          &state->table_name,
+                          &table,
+                          fh,
+                          &state->conditions,
+                          &state->bound_conditions,
+                          &state->indexes,
+                          &state->set_clauses,
+                          &state->bound_set_clauses,
+                          &state->affected_indexes};
     bindings->update_info = &state->update_info;
     return true;
 }
@@ -312,9 +265,9 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
     }
     compiled::ProgramTemplatePtr program_template = request.program_template;
     if (program_template == nullptr) {
-        program_template = request.cache->LookupAny(request.lexical->key, request.statement_generation,
-                                                    request.planner_generation,
-                                                    request.sm_manager->get_catalog_generation());
+        program_template =
+            request.cache->LookupAny(request.lexical->key, request.statement_generation, request.planner_generation,
+                                     request.sm_manager->get_catalog_generation());
     }
     if (program_template == nullptr) {
         return ProgramDispatchStatus::MISS;
@@ -332,9 +285,8 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
     RuntimeBindingState state;
     bool valid_bindings = false;
     try {
-        valid_bindings = values.has_value() &&
-                         ValidateLiveBindings(*program_template, request.sm_manager, &bindings, &output_cols,
-                                              &captions, *request.lexical, &state);
+        valid_bindings = values.has_value() && ValidateLiveBindings(*program_template, request.sm_manager, &bindings,
+                                                                    &output_cols, &captions, *request.lexical, &state);
     } catch (...) {
         valid_bindings = false;
     }
@@ -361,14 +313,14 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
     const bool point_jit_enabled =
         point_jit_flag != nullptr && std::string(point_jit_flag) == "1" && request.point_jit_manager != nullptr;
     const auto& identity = program_template->identity();
-    const bool identity_current =
-        identity.token_shape == request.lexical->key && identity.statement_generation == request.statement_generation &&
-        identity.planner_generation == request.planner_generation &&
-        identity.catalog_generation == request.sm_manager->get_catalog_generation();
-    auto native_code = point_jit_enabled
-                           ? request.point_jit_manager->AcquireCurrent(program_template, rmdb_config::jit_mode,
-                                                                       identity_current)
-                           : std::shared_ptr<const jit::JitCode>{};
+    const bool identity_current = identity.token_shape == request.lexical->key &&
+                                  identity.statement_generation == request.statement_generation &&
+                                  identity.planner_generation == request.planner_generation &&
+                                  identity.catalog_generation == request.sm_manager->get_catalog_generation();
+    auto native_code =
+        point_jit_enabled
+            ? request.point_jit_manager->AcquireCurrent(program_template, rmdb_config::jit_mode, identity_current)
+            : std::shared_ptr<const jit::JitCode>{};
     if (native_code != nullptr) {
         status = native_code->invoke_program(&runtime, &*frame);
         request.point_jit_manager->RecordNativeExecution();

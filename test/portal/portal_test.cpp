@@ -48,6 +48,15 @@ QueryExpr make_agg_expr(AggType type, const std::string& col_name, const std::st
     return expr;
 }
 
+Condition make_int_condition(const std::string& table_name, const std::string& col_name, int value) {
+    Condition cond;
+    cond.lhs_col = {.tab_name = table_name, .col_name = col_name};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = true;
+    cond.rhs_val.set_int(value);
+    return cond;
+}
+
 } // namespace
 
 class PortalAggregateTest : public ::testing::Test {
@@ -185,4 +194,67 @@ TEST_F(PortalAggregateTest, start_builds_limit_sort_projection_aggregate_executo
     ASSERT_NE(aggregate, nullptr);
     ASSERT_NE(aggregate->prev_, nullptr);
     EXPECT_EQ(aggregate->prev_->getType(), "SeqScanExecutor");
+}
+
+TEST_F(PortalAggregateTest, convert_plan_executor_preserves_plan_data_by_default) {
+    char buffer[256];
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buffer, &offset);
+
+    auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade",
+                                           std::vector<Condition>{make_int_condition("grade", "id", 1)},
+                                           std::vector<std::string>{});
+    auto filter = std::make_unique<FilterPlan>(T_Filter, std::move(scan),
+                                               std::vector<Condition>{make_int_condition("grade", "score", 90)});
+    auto* scan_plan = static_cast<ScanPlan*>(filter->subplan_.get());
+
+    auto executor = portal_->convert_plan_executor(filter.get(), &context);
+
+    ASSERT_NE(executor, nullptr);
+    EXPECT_EQ(filter->conds_.size(), 1);
+    EXPECT_EQ(scan_plan->tab_name_, "grade");
+    EXPECT_EQ(scan_plan->conds_.size(), 1);
+}
+
+TEST_F(PortalAggregateTest, convert_plan_executor_can_consume_owned_plan_data) {
+    char buffer[256];
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buffer, &offset);
+
+    auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade",
+                                           std::vector<Condition>{make_int_condition("grade", "id", 1)},
+                                           std::vector<std::string>{});
+    auto filter = std::make_unique<FilterPlan>(T_Filter, std::move(scan),
+                                               std::vector<Condition>{make_int_condition("grade", "score", 90)});
+    auto* scan_plan = static_cast<ScanPlan*>(filter->subplan_.get());
+
+    auto executor = portal_->convert_plan_executor(filter.get(), &context, false, true);
+
+    auto* filter_executor = dynamic_cast<FilterExecutor*>(executor.get());
+    ASSERT_NE(filter_executor, nullptr);
+    ASSERT_EQ(filter_executor->conds_.size(), 1);
+    EXPECT_EQ(filter_executor->conds_[0].lhs_col.col_name, "score");
+    auto* scan_executor = dynamic_cast<SeqScanExecutor*>(filter_executor->prev_.get());
+    ASSERT_NE(scan_executor, nullptr);
+    ASSERT_EQ(scan_executor->conds_.size(), 1);
+    EXPECT_EQ(scan_executor->conds_[0].lhs_col.col_name, "id");
+    EXPECT_TRUE(filter->conds_.empty());
+    EXPECT_TRUE(scan_plan->tab_name_.empty());
+    EXPECT_TRUE(scan_plan->conds_.empty());
+}
+
+TEST_F(PortalAggregateTest, count_rows_conversion_does_not_consume_plan_data) {
+    char buffer[256];
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buffer, &offset);
+
+    auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade",
+                                           std::vector<Condition>{make_int_condition("grade", "id", 1)},
+                                           std::vector<std::string>{});
+
+    auto executor = portal_->convert_plan_executor(scan.get(), &context, true, true);
+
+    ASSERT_NE(executor, nullptr);
+    EXPECT_EQ(scan->tab_name_, "grade");
+    EXPECT_EQ(scan->conds_.size(), 1);
 }

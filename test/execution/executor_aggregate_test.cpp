@@ -414,6 +414,44 @@ TEST(AggregateExecutorTest, GlobalCountStarOverScanDoesNotMaterializeRows) {
     EXPECT_EQ(read_int(*row, 0), 5);
 }
 
+TEST(AggregateExecutorTest, SharedDescriptorKeepsRequestStateIndependent) {
+    std::vector<ColMeta> cols = {
+        make_col("t", "value", TYPE_INT, 4, 0),
+    };
+    std::vector<TabCol> group_by;
+    std::vector<AggExpr> aggs = {make_count_star("cnt")};
+    std::vector<TestExecutorHavingCondition> having;
+
+    std::shared_ptr<const aggregate_execution::AggregateDescriptor> descriptor;
+    {
+        AggregateExecutor descriptor_source(make_child_executor(cols, {{make_int_value(0)}}), group_by, aggs, having);
+        descriptor = descriptor_source.descriptor();
+    }
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_TRUE(descriptor->group_cols().empty());
+    ASSERT_EQ(descriptor->aggregates().size(), 1);
+    EXPECT_EQ(descriptor->aggregates()[0].type, aggregate_execution::AggregateType::COUNT);
+
+    AggregateExecutor first(make_child_executor(cols, {{make_int_value(1)}, {make_int_value(2)}}), descriptor);
+    AggregateExecutor second(make_child_executor(cols, {{make_int_value(3)}, {make_int_value(4)}, {make_int_value(5)}}),
+                             descriptor);
+    EXPECT_EQ(first.descriptor().get(), descriptor.get());
+    EXPECT_EQ(second.descriptor().get(), descriptor.get());
+
+    first.beginTuple();
+    second.beginTuple();
+    auto first_row = first.Next();
+    auto second_row = second.Next();
+    ASSERT_NE(first_row, nullptr);
+    ASSERT_NE(second_row, nullptr);
+    EXPECT_EQ(read_int(*first_row, 0), 2);
+    EXPECT_EQ(read_int(*second_row, 0), 3);
+
+    first.nextTuple();
+    EXPECT_TRUE(first.is_end());
+    EXPECT_FALSE(second.is_end());
+}
+
 TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {
     std::vector<ColMeta> cols = {
         make_col("t", "dept", TYPE_STRING, 8, 0),

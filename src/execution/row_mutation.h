@@ -47,7 +47,44 @@ std::vector<BoundMutationCondition> BindMutationConditions(const TabMeta& tab,
                                                            const std::vector<Condition>& conditions);
 std::vector<BoundMutationSetClause> BindMutationSetClauses(const TabMeta& tab,
                                                            const std::vector<SetClause>& set_clauses);
+void MakeRowMutationIndexKey(const IndexMeta& index, const char* record_data, std::vector<char>& out);
 std::vector<char> MakeRowMutationIndexKey(const IndexMeta& index, const char* record_data);
+
+struct RowMutationKeyScratch {
+    void PrepareUpdate(size_t index_count) {
+        if (old_keys.size() < index_count) {
+            old_keys.resize(index_count);
+        }
+        if (new_keys.size() < index_count) {
+            new_keys.resize(index_count);
+        }
+    }
+
+    void PrepareSingle(size_t index_count) {
+        if (keys.size() < index_count) {
+            keys.resize(index_count);
+        }
+    }
+
+    std::vector<std::vector<char>> old_keys;
+    std::vector<std::vector<char>> new_keys;
+    std::vector<std::vector<char>> keys;
+};
+
+class RowMutationKeyScratchLease {
+public:
+    RowMutationKeyScratchLease();
+    ~RowMutationKeyScratchLease();
+    RowMutationKeyScratchLease(const RowMutationKeyScratchLease&) = delete;
+    RowMutationKeyScratchLease& operator=(const RowMutationKeyScratchLease&) = delete;
+
+    RowMutationKeyScratch& get() const {
+        return *scratch_;
+    }
+
+private:
+    RowMutationKeyScratch* scratch_{nullptr};
+};
 
 struct RowMutationRuntimeInfo {
     SmManager* sm_manager;

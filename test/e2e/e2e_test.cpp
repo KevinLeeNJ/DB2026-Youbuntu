@@ -166,8 +166,7 @@ public:
                 context.statement_shape_canonical_ = lexical.key.canonical_bytes;
                 context.planner_generation_ = planner_->planner_knob_generation();
                 context.statement_template_generation_ =
-                    sm_manager_->get_catalog_generation() ^
-                    (context.planner_generation_ * 0x9e3779b97f4a7c15ULL);
+                    sm_manager_->get_catalog_generation() ^ (context.planner_generation_ * 0x9e3779b97f4a7c15ULL);
                 auto program_template = point_program_template_cache_->LookupAny(
                     lexical.key, context.statement_template_generation_, context.planner_generation_,
                     sm_manager_->get_catalog_generation());
@@ -221,9 +220,8 @@ public:
             ++portal_entries_;
             std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
             last_compiled_mutation_ = portal_stmt->compiled_mutation != nullptr;
-            last_compiled_mutation_program_ = portal_stmt->compiled_mutation == nullptr
-                                                  ? nullptr
-                                                  : portal_stmt->compiled_mutation->program;
+            last_compiled_mutation_program_ =
+                portal_stmt->compiled_mutation == nullptr ? nullptr : portal_stmt->compiled_mutation->program;
             auto verification = portal_stmt->compiled_mutation == nullptr
                                     ? compiled::VerifyResult{true, {}}
                                     : compiled::VerifyProgram(*portal_stmt->compiled_mutation->program);
@@ -882,15 +880,12 @@ TEST_F(E2ETest, PointMutationInterpreterBuildsVerifiedProgramsAndFallsBackForRan
     EXPECT_EQ(db_->frontend_entries(), before_cached_insert);
     ASSERT_NO_THROW(db_->exec_sql("insert into compiled_mutation values(3, 20, 'three');"));
     const auto before_float_residual_hit = db_->frontend_entries();
-    ASSERT_NO_THROW(
-        db_->exec_sql("update compiled_mutation set note = 'float1' where id = 3 and value = 20.9;"));
-    ASSERT_NO_THROW(
-        db_->exec_sql("update compiled_mutation set note = 'float2' where id = 3 and value = 20.1;"));
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set note = 'float1' where id = 3 and value = 20.9;"));
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set note = 'float2' where id = 3 and value = 20.1;"));
     EXPECT_TRUE(db_->last_top_level_program_hit());
     EXPECT_EQ(db_->frontend_entries()[0], before_float_residual_hit[0] + 1);
 
-    ASSERT_NO_THROW(
-        db_->exec_sql("update compiled_mutation set value = value * 2, note = 'twenty' where id = 1;"));
+    ASSERT_NO_THROW(db_->exec_sql("update compiled_mutation set value = value * 2, note = 'twenty' where id = 1;"));
     EXPECT_TRUE(db_->last_compiled_mutation());
     EXPECT_TRUE(db_->last_compiled_mutation_valid()) << db_->last_compiled_mutation_error();
 
@@ -1046,8 +1041,8 @@ TEST_F(E2ETest, PointProgramCacheHitBypassesFrontendAndBindsCurrentLexicalSlots)
     EXPECT_NE(output.find("two"), std::string::npos) << output;
     EXPECT_EQ(output.find("one"), std::string::npos) << output;
     auto stats = db_->point_program_template_cache_stats();
-    EXPECT_TRUE(db_->last_top_level_program_hit()) << "hits=" << stats.hits << " misses=" << stats.misses
-                                                  << " fallbacks=" << stats.fallbacks;
+    EXPECT_TRUE(db_->last_top_level_program_hit())
+        << "hits=" << stats.hits << " misses=" << stats.misses << " fallbacks=" << stats.fallbacks;
     EXPECT_EQ(db_->frontend_entries(), after_first);
     stats = db_->point_program_template_cache_stats();
     EXPECT_GE(stats.hits, 1U);

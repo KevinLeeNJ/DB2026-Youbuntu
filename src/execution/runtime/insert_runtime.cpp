@@ -8,11 +8,15 @@ You can use this software according to the terms and conditions of the Mulan PSL
 namespace {
 
 void CheckMvccUniqueKeyConflict(const InsertRuntimeInfo& info, const RowMutationIndex& index,
-                                const std::vector<char>& key, Context* context) {
+                                const std::vector<char>& key, Context* context,
+                                std::vector<Rid>* historical_rids = nullptr) {
     if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
         return;
     }
-    for (const auto& existing_rid : info.sm_manager->get_historical_index_key_rids(*info.tab_name, index.name, key)) {
+    std::vector<Rid> local_rids;
+    auto* candidates = historical_rids != nullptr ? historical_rids : &local_rids;
+    info.sm_manager->get_historical_index_key_rids(*info.tab_name, index.name, key, candidates);
+    for (const auto& existing_rid : *candidates) {
         if (HistoricalIndexKeyConflictsWithTxn(info.fh, existing_rid, *index.meta, key, context)) {
             throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
         }
@@ -28,13 +32,18 @@ Rid InsertRuntime::InsertOne(RmRecord& record, const InsertRuntimeInfo& info, Co
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
     }
 
-    std::vector<std::vector<char>> index_keys;
-    index_keys.reserve(info.indexes->size());
-    for (const auto& index : *info.indexes) {
-        auto key = MakeRowMutationIndexKey(*index.meta, record.data);
+    RowMutationKeyScratchLease key_scratch_lease;
+    auto& key_scratch = key_scratch_lease.get();
+    key_scratch.PrepareSingle(info.indexes->size());
+    auto& index_keys = key_scratch.keys;
+    std::vector<Rid> historical_rids;
+    historical_rids.reserve(1);
+    for (size_t index_idx = 0; index_idx < info.indexes->size(); ++index_idx) {
+        const auto& index = (*info.indexes)[index_idx];
+        auto& key = index_keys[index_idx];
+        MakeRowMutationIndexKey(*index.meta, record.data, key);
         ReserveUniqueKey(context, index.handle->GetFd(), key);
-        CheckMvccUniqueKeyConflict(info, index, key, context);
-        index_keys.push_back(std::move(key));
+        CheckMvccUniqueKeyConflict(info, index, key, context, &historical_rids);
     }
 
     std::vector<size_t> inserted_indexes;

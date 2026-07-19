@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "errors.h"
+#include "aggregate_descriptor.h"
 #include "execution_defs.h"
 #include "execution_scalar.h"
 #include "executor_abstract.h"
@@ -31,11 +32,16 @@ See the Mulan PSL v2 for more details. */
 
 class AggregateExecutor : public AbstractExecutor {
 private:
-    enum class LocalAggType { COUNT = 0, MAX = 1, MIN = 2, SUM = 3, AVG = 4 };
-    enum class OperandKind { GROUP_COL, AGG_RESULT, VALUE };
+    using LocalAggType = aggregate_execution::AggregateType;
+    using OperandKind = aggregate_execution::HavingOperandKind;
 
     using CellValue = execution_scalar::CellValue;
     using CellValueHash = execution_scalar::CellValueHash;
+    using AggregateSpec = aggregate_execution::AggregateSpec;
+    using AggregateState = aggregate_execution::AggregateValueState;
+    using GroupState = aggregate_execution::AggregateGroupState;
+    using HavingOperand = aggregate_execution::HavingOperand;
+    using HavingSpec = aggregate_execution::HavingSpec;
 
     struct GroupKey {
         std::vector<CellValue> values;
@@ -56,40 +62,6 @@ private:
         }
     };
 
-    struct AggregateSpec {
-        LocalAggType type = LocalAggType::COUNT;
-        bool is_star = false;
-        TabCol col;
-        std::string output_name;
-        ColType input_type = TYPE_INT;
-        int input_len = static_cast<int>(sizeof(int));
-        ColMeta input_col;
-    };
-
-    struct AggregateState {
-        int64_t count = 0;
-        double sum = 0.0;
-        bool has_value = false;
-        CellValue value;
-    };
-
-    struct GroupState {
-        std::vector<CellValue> group_values;
-        std::vector<AggregateState> aggregate_states;
-    };
-
-    struct HavingOperand {
-        OperandKind kind = OperandKind::VALUE;
-        size_t index = 0;
-        CellValue literal;
-    };
-
-    struct HavingSpec {
-        HavingOperand lhs;
-        CompOp op = OP_EQ;
-        HavingOperand rhs;
-    };
-
     template <typename T, typename = void> struct has_member_val : std::false_type {};
 
     template <typename T>
@@ -107,16 +79,10 @@ private:
 
     std::unique_ptr<AbstractExecutor> prev_;
     Context* context_ = nullptr;
-    std::vector<ColMeta> cols_;
-    size_t len_ = 0;
-    std::vector<ColMeta> group_cols_;
-    std::vector<AggregateSpec> aggregates_;
-    std::vector<HavingSpec> having_conds_;
-    std::vector<GroupState> groups_;
-    size_t cursor_ = 0;
-    bool materialized_ = false;
-    bool has_group_by_ = false;
-    mutable std::unique_ptr<RmRecord> current_output_;
+    std::shared_ptr<const aggregate_execution::AggregateDescriptor> descriptor_;
+    aggregate_execution::AggregateDescriptor* descriptor_builder_ = nullptr;
+    const std::vector<ColMeta>* descriptor_input_cols_ = nullptr;
+    aggregate_execution::AggregateRequestState request_state_;
 #ifdef RMDB_ENABLE_JIT
     std::unique_ptr<jit::AggregateKernel> jit_aggregate_;
 #endif
@@ -219,17 +185,21 @@ private:
     }
 
     ColMeta find_input_col(const TabCol& target) const {
+        if (descriptor_input_cols_ != nullptr) {
+            auto pos = get_col(*descriptor_input_cols_, target);
+            return *pos;
+        }
         return prev_->get_col_offset(target);
     }
 
     void append_output_col(ColMeta col, const std::string& output_name) {
-        col.offset = static_cast<int>(len_);
+        col.offset = static_cast<int>(descriptor_builder_->output_len_);
         if (!output_name.empty()) {
             col.name = output_name;
             col.tab_name.clear();
         }
-        len_ += static_cast<size_t>(col.len);
-        cols_.push_back(col);
+        descriptor_builder_->output_len_ += static_cast<size_t>(col.len);
+        descriptor_builder_->output_cols_.push_back(col);
     }
 
     template <typename GroupByT> static const TabCol& extract_group_col(const GroupByT& item) {
@@ -284,13 +254,14 @@ private:
         }
 
         if (expr_type == 0) {
-            for (size_t i = 0; i < group_cols_.size(); ++i) {
-                if (group_cols_[i].tab_name == expr.col.tab_name && group_cols_[i].name == expr.col.col_name) {
+            for (size_t i = 0; i < descriptor_->group_cols_.size(); ++i) {
+                if (descriptor_->group_cols_[i].tab_name == expr.col.tab_name &&
+                    descriptor_->group_cols_[i].name == expr.col.col_name) {
                     operand.kind = OperandKind::GROUP_COL;
                     operand.index = i;
                     return operand;
                 }
-                if (group_cols_[i].name == expr.col.col_name) {
+                if (descriptor_->group_cols_[i].name == expr.col.col_name) {
                     operand.kind = OperandKind::GROUP_COL;
                     operand.index = i;
                     return operand;
@@ -299,8 +270,8 @@ private:
             throw ColumnNotFoundError(expr.col.col_name);
         }
 
-        for (size_t i = 0; i < aggregates_.size(); ++i) {
-            const auto& agg = aggregates_[i];
+        for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
+            const auto& agg = descriptor_->aggregates_[i];
             if (!expr.display_name.empty() && agg.output_name == expr.display_name) {
                 operand.kind = OperandKind::AGG_RESULT;
                 operand.index = i;
@@ -321,7 +292,7 @@ private:
         HavingSpec spec;
         spec.lhs = make_operand_from_expr(cond.lhs);
         spec.op = cond.op;
-        if (cond.is_rhs_value) {
+        if (cond.is_rhs_val) {
             spec.rhs.kind = OperandKind::VALUE;
             spec.rhs.literal.type = cond.rhs_val.type;
             if (cond.rhs_val.type == TYPE_INT) {
@@ -386,9 +357,10 @@ private:
 
     std::vector<CellValue> finalize_aggregate_values(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values;
-        aggregate_values.reserve(aggregates_.size());
-        for (size_t i = 0; i < aggregates_.size(); ++i) {
-            aggregate_values.push_back(finalize_aggregate(aggregates_[i], group_state.aggregate_states[i]));
+        aggregate_values.reserve(descriptor_->aggregates_.size());
+        for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
+            aggregate_values.push_back(
+                finalize_aggregate(descriptor_->aggregates_[i], group_state.aggregate_states[i]));
         }
         return aggregate_values;
     }
@@ -442,7 +414,7 @@ private:
 
     bool passes_having(const std::vector<CellValue>& group_values,
                        const std::vector<CellValue>& aggregate_values) const {
-        for (const auto& cond : having_conds_) {
+        for (const auto& cond : descriptor_->having_) {
             CellValue lhs = resolve_having_operand(cond.lhs, group_values, aggregate_values);
             CellValue rhs = resolve_having_operand(cond.rhs, group_values, aggregate_values);
             if (!compare_with_op(cond.op, compare_cells(lhs, rhs))) {
@@ -458,51 +430,58 @@ private:
     }
 
     bool can_count_star_by_cursor_only() const {
-        return !has_group_by_ && having_conds_.empty() && aggregates_.size() == 1 &&
-               aggregates_[0].type == LocalAggType::COUNT && aggregates_[0].is_star &&
+        return !descriptor_->has_group_by() && descriptor_->having_.empty() && descriptor_->aggregates_.size() == 1 &&
+               descriptor_->aggregates_[0].type == LocalAggType::COUNT && descriptor_->aggregates_[0].is_star &&
                !prev_->scan_table_name().empty();
     }
 
     // min(col) can stop at the first row if the child provides ascending order
     // on col. Only applies to a single min() with no GROUP BY / HAVING.
     bool can_use_min_index_shortcut() const {
-        if (has_group_by_ || !having_conds_.empty() || aggregates_.size() != 1) {
+        if (descriptor_->has_group_by() || !descriptor_->having_.empty() || descriptor_->aggregates_.size() != 1) {
             return false;
         }
-        const auto& agg = aggregates_[0];
+        const auto& agg = descriptor_->aggregates_[0];
         if (agg.type != LocalAggType::MIN || agg.is_star) {
             return false;
         }
         return prev_->provides_min_order(agg.col);
     }
 
-    std::unique_ptr<RmRecord> materialize_group_result(const GroupState& group_state) const {
-        std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
-        RmRecord rec(static_cast<int>(len_));
-        std::memset(rec.data, 0, len_);
+    void write_group_result(const GroupState& group_state, char* output) const {
+        std::memset(output, 0, descriptor_->output_len_);
         for (size_t i = 0; i < group_state.group_values.size(); ++i) {
-            write_cell(rec.data, cols_[i], group_state.group_values[i]);
+            write_cell(output, descriptor_->output_cols_[i], group_state.group_values[i]);
         }
-        for (size_t i = 0; i < aggregate_values.size(); ++i) {
-            write_cell(rec.data, cols_[group_state.group_values.size() + i], aggregate_values[i]);
+        for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
+            CellValue aggregate_value =
+                finalize_aggregate(descriptor_->aggregates_[i], group_state.aggregate_states[i]);
+            write_cell(output, descriptor_->output_cols_[group_state.group_values.size() + i], aggregate_value);
         }
-        return std::make_unique<RmRecord>(rec);
+    }
+
+    std::unique_ptr<RmRecord> materialize_group_result(const GroupState& group_state) const {
+        auto result = std::make_unique<RmRecord>(static_cast<int>(descriptor_->output_len_));
+        write_group_result(group_state, result->data);
+        return result;
     }
 
     GroupState make_group_state(const std::vector<CellValue>& group_values) const {
         GroupState state;
         state.group_values = group_values;
-        state.aggregate_states.reserve(aggregates_.size());
-        for (const auto& aggregate : aggregates_) {
+        state.aggregate_states.reserve(descriptor_->aggregates_.size());
+        for (const auto& aggregate : descriptor_->aggregates_) {
             state.aggregate_states.push_back(init_aggregate_state(aggregate));
         }
         return state;
     }
 
     void materialize_groups() {
-        groups_.clear();
-        if (has_group_by_) {
+        request_state_.groups_.clear();
+        if (descriptor_->has_group_by()) {
             std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
+            GroupKey key;
+            key.values.reserve(descriptor_->group_cols_.size());
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 TupleView tuple = prev_->current();
                 std::unique_ptr<RmRecord> fallback;
@@ -516,32 +495,33 @@ private:
                     continue;
                 }
 
-                GroupKey key;
-                key.values.reserve(group_cols_.size());
-                for (const auto& col : group_cols_) {
+                key.values.clear();
+                key.values.reserve(descriptor_->group_cols_.size());
+                for (const auto& col : descriptor_->group_cols_) {
                     key.values.push_back(read_cell(tuple, col));
                 }
 
-                auto [it, inserted] = group_indexes.emplace(key, groups_.size());
+                auto [it, inserted] = group_indexes.try_emplace(std::move(key), request_state_.groups_.size());
                 if (inserted) {
-                    groups_.push_back(make_group_state(key.values));
+                    request_state_.groups_.push_back(make_group_state(it->first.values));
                 }
-                for (size_t i = 0; i < aggregates_.size(); ++i) {
-                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], tuple);
+                for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
+                    update_aggregate_state(request_state_.groups_[it->second].aggregate_states[i],
+                                           descriptor_->aggregates_[i], tuple);
                 }
             }
 
             size_t kept = 0;
-            for (size_t i = 0; i < groups_.size(); ++i) {
-                if (!passes_having(groups_[i])) {
+            for (size_t i = 0; i < request_state_.groups_.size(); ++i) {
+                if (!passes_having(request_state_.groups_[i])) {
                     continue;
                 }
                 if (kept != i) {
-                    groups_[kept] = std::move(groups_[i]);
+                    request_state_.groups_[kept] = std::move(request_state_.groups_[i]);
                 }
                 ++kept;
             }
-            groups_.resize(kept);
+            request_state_.groups_.resize(kept);
             return;
         }
 
@@ -550,7 +530,7 @@ private:
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 ++global_state.aggregate_states[0].count;
             }
-            groups_.push_back(std::move(global_state));
+            request_state_.groups_.push_back(std::move(global_state));
             return;
         }
 
@@ -571,13 +551,13 @@ private:
                 if (!tuple) {
                     continue;
                 }
-                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], tuple);
-                groups_.push_back(std::move(global_state));
+                update_aggregate_state(global_state.aggregate_states[0], descriptor_->aggregates_[0], tuple);
+                request_state_.groups_.push_back(std::move(global_state));
                 return;
             }
             // No visible rows: result is the zero/empty value.
             if (passes_having(global_state)) {
-                groups_.push_back(std::move(global_state));
+                request_state_.groups_.push_back(std::move(global_state));
             }
             return;
         }
@@ -603,13 +583,13 @@ private:
             }
             if (jit_aggregate_ != nullptr) {
                 const auto& slots = jit_aggregate_->slots();
-                for (size_t i = 0; i < aggregates_.size(); ++i) {
+                for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
                     auto& state = global_state.aggregate_states[i];
                     const auto& slot = slots[i];
                     state.count = slot.count;
                     state.sum = slot.sum;
                     state.has_value = slot.has_value;
-                    if (aggregates_[i].input_type == TYPE_INT) {
+                    if (descriptor_->aggregates_[i].input_type == TYPE_INT) {
                         state.value.type = TYPE_INT;
                         state.value.int_val = static_cast<int>(slot.value);
                     } else {
@@ -618,7 +598,7 @@ private:
                     }
                 }
                 if (passes_having(global_state)) {
-                    groups_.push_back(std::move(global_state));
+                    request_state_.groups_.push_back(std::move(global_state));
                 }
                 return;
             }
@@ -638,21 +618,20 @@ private:
             if (!tuple) {
                 continue;
             }
-            for (size_t i = 0; i < aggregates_.size(); ++i) {
-                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], tuple);
+            for (size_t i = 0; i < descriptor_->aggregates_.size(); ++i) {
+                update_aggregate_state(global_state.aggregate_states[i], descriptor_->aggregates_[i], tuple);
             }
         }
 
         if (passes_having(global_state)) {
-            groups_.push_back(std::move(global_state));
+            request_state_.groups_.push_back(std::move(global_state));
         }
     }
 
     void init_group_cols(const std::vector<TabCol>& group_by_cols) {
-        has_group_by_ = !group_by_cols.empty();
         for (const auto& group_by_col : group_by_cols) {
             ColMeta input_col = find_input_col(group_by_col);
-            group_cols_.push_back(input_col);
+            descriptor_builder_->group_cols_.push_back(input_col);
             append_output_col(input_col, "");
         }
     }
@@ -669,7 +648,7 @@ private:
     template <typename AggExprT> void init_aggregate_cols(const std::vector<AggExprT>& aggregate_exprs) {
         for (const auto& aggregate_expr : aggregate_exprs) {
             AggregateSpec spec = make_aggregate_spec(aggregate_expr);
-            aggregates_.push_back(spec);
+            descriptor_builder_->aggregates_.push_back(spec);
 
             ColMeta output_col;
             output_col.tab_name.clear();
@@ -698,64 +677,114 @@ private:
     }
 
     template <typename HavingCondT> void init_having_conds(const std::vector<HavingCondT>& having_conds) {
-        having_conds_.reserve(having_conds.size());
+        descriptor_builder_->having_.reserve(having_conds.size());
         for (const auto& having_cond : having_conds) {
-            having_conds_.push_back(make_having_spec(having_cond));
+            descriptor_builder_->having_.push_back(make_having_spec(having_cond));
         }
     }
 
+#ifdef RMDB_ENABLE_JIT
+    void initialize_jit_aggregate() {
+        if (descriptor_->has_group_by() || !descriptor_->having_.empty() || can_count_star_by_cursor_only() ||
+            can_use_min_index_shortcut() || !jit::aggregate_jit_enabled()) {
+            return;
+        }
+        std::vector<jit::AggregateDescriptor> descriptors;
+        descriptors.reserve(descriptor_->aggregates_.size());
+        for (const auto& aggregate : descriptor_->aggregates_) {
+            jit::AggregateOp op = jit::AggregateOp::COUNT;
+            switch (aggregate.type) {
+            case LocalAggType::COUNT:
+                op = jit::AggregateOp::COUNT;
+                break;
+            case LocalAggType::SUM:
+                op = jit::AggregateOp::SUM;
+                break;
+            case LocalAggType::MIN:
+                op = jit::AggregateOp::MIN;
+                break;
+            case LocalAggType::MAX:
+                op = jit::AggregateOp::MAX;
+                break;
+            case LocalAggType::AVG:
+                op = jit::AggregateOp::AVG;
+                break;
+            }
+            descriptors.push_back({op, aggregate.input_type, static_cast<uint32_t>(aggregate.input_col.offset),
+                                   static_cast<uint32_t>(aggregate.input_col.len), aggregate.is_star});
+        }
+        jit_aggregate_ = std::make_unique<jit::AggregateKernel>(std::move(descriptors));
+    }
+#else
+    void initialize_jit_aggregate() {}
+#endif
+
+    struct DescriptorBuildTag {};
+
+    template <typename GroupByT, typename AggExprT, typename HavingCondT>
+    AggregateExecutor(DescriptorBuildTag, const std::vector<ColMeta>& input_cols,
+                      const std::vector<GroupByT>& group_by_cols, const std::vector<AggExprT>& aggregate_exprs,
+                      const std::vector<HavingCondT>& having_conds)
+        : descriptor_input_cols_(&input_cols) {
+        auto descriptor = std::make_shared<aggregate_execution::AggregateDescriptor>();
+        descriptor_builder_ = descriptor.get();
+        descriptor_ = std::move(descriptor);
+        init_group_cols(group_by_cols);
+        init_aggregate_cols(aggregate_exprs);
+        init_having_conds(having_conds);
+        descriptor_builder_ = nullptr;
+        descriptor_input_cols_ = nullptr;
+    }
+
 public:
+    template <typename GroupByT, typename AggExprT, typename HavingCondT>
+    static std::shared_ptr<const aggregate_execution::AggregateDescriptor>
+    BuildDescriptor(const std::vector<ColMeta>& input_cols, const std::vector<GroupByT>& group_by_cols,
+                    const std::vector<AggExprT>& aggregate_exprs, const std::vector<HavingCondT>& having_conds) {
+        AggregateExecutor builder(DescriptorBuildTag{}, input_cols, group_by_cols, aggregate_exprs, having_conds);
+        return builder.descriptor();
+    }
+
     template <typename GroupByT, typename AggExprT, typename HavingCondT>
     AggregateExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<GroupByT>& group_by_cols,
                       const std::vector<AggExprT>& aggregate_exprs, const std::vector<HavingCondT>& having_conds,
                       Context* context = nullptr)
         : prev_(std::move(prev)), context_(context) {
+        auto descriptor = std::make_shared<aggregate_execution::AggregateDescriptor>();
+        descriptor_builder_ = descriptor.get();
+        descriptor_ = std::move(descriptor);
         init_group_cols(group_by_cols);
         init_aggregate_cols(aggregate_exprs);
         init_having_conds(having_conds);
-#ifdef RMDB_ENABLE_JIT
-        if (!has_group_by_ && having_conds_.empty() && !can_count_star_by_cursor_only() &&
-            !can_use_min_index_shortcut() && jit::aggregate_jit_enabled()) {
-            std::vector<jit::AggregateDescriptor> descriptors;
-            descriptors.reserve(aggregates_.size());
-            for (const auto& aggregate : aggregates_) {
-                jit::AggregateOp op = jit::AggregateOp::COUNT;
-                switch (aggregate.type) {
-                case LocalAggType::COUNT:
-                    op = jit::AggregateOp::COUNT;
-                    break;
-                case LocalAggType::SUM:
-                    op = jit::AggregateOp::SUM;
-                    break;
-                case LocalAggType::MIN:
-                    op = jit::AggregateOp::MIN;
-                    break;
-                case LocalAggType::MAX:
-                    op = jit::AggregateOp::MAX;
-                    break;
-                case LocalAggType::AVG:
-                    op = jit::AggregateOp::AVG;
-                    break;
-                }
-                descriptors.push_back({op, aggregate.input_type, static_cast<uint32_t>(aggregate.input_col.offset),
-                                       static_cast<uint32_t>(aggregate.input_col.len), aggregate.is_star});
-            }
-            jit_aggregate_ = std::make_unique<jit::AggregateKernel>(std::move(descriptors));
+        descriptor_builder_ = nullptr;
+        initialize_jit_aggregate();
+    }
+
+    AggregateExecutor(std::unique_ptr<AbstractExecutor> prev,
+                      std::shared_ptr<const aggregate_execution::AggregateDescriptor> descriptor,
+                      Context* context = nullptr)
+        : prev_(std::move(prev)), context_(context), descriptor_(std::move(descriptor)) {
+        if (descriptor_ == nullptr) {
+            throw InternalError("aggregate descriptor is null");
         }
-#endif
+        initialize_jit_aggregate();
+    }
+
+    const std::shared_ptr<const aggregate_execution::AggregateDescriptor>& descriptor() const noexcept {
+        return descriptor_;
     }
 
     void beginTuple() override {
-        if (!materialized_) {
+        if (!request_state_.materialized_) {
             materialize_groups();
-            materialized_ = true;
+            request_state_.materialized_ = true;
         }
-        cursor_ = 0;
+        request_state_.cursor_ = 0;
     }
 
     void nextTuple() override {
         if (!is_end()) {
-            ++cursor_;
+            ++request_state_.cursor_;
         }
     }
 
@@ -763,7 +792,7 @@ public:
         if (is_end()) {
             return nullptr;
         }
-        return materialize_group_result(groups_[cursor_]);
+        return materialize_group_result(request_state_.groups_[request_state_.cursor_]);
     }
 
     TupleView current() const override {
@@ -772,16 +801,16 @@ public:
         }
         // Aggregate results are materialized per call; current() keeps a
         // reusable compatibility buffer so downstream executors can borrow it.
-        if (current_output_ == nullptr || current_output_->size != static_cast<int>(len_)) {
-            current_output_ = std::make_unique<RmRecord>(static_cast<int>(len_));
+        if (request_state_.current_output_ == nullptr ||
+            request_state_.current_output_->size != static_cast<int>(descriptor_->output_len_)) {
+            request_state_.current_output_ = std::make_unique<RmRecord>(static_cast<int>(descriptor_->output_len_));
         }
-        auto result = materialize_group_result(groups_[cursor_]);
-        memcpy(current_output_->data, result->data, len_);
-        return TupleView{current_output_->data, static_cast<uint32_t>(len_)};
+        write_group_result(request_state_.groups_[request_state_.cursor_], request_state_.current_output_->data);
+        return TupleView{request_state_.current_output_->data, static_cast<uint32_t>(descriptor_->output_len_)};
     }
 
     bool is_end() const override {
-        return cursor_ >= groups_.size();
+        return request_state_.cursor_ >= request_state_.groups_.size();
     }
 
     Rid& rid() override {
@@ -793,21 +822,22 @@ public:
     }
 
     const std::vector<ColMeta>& cols() const override {
-        return cols_;
+        return descriptor_->output_cols_;
     }
 
     size_t tupleLen() const override {
-        return len_;
+        return descriptor_->output_len_;
     }
 
     ColMeta get_col_offset(const TabCol& target) override {
-        auto pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta& col) {
-            if (!target.tab_name.empty()) {
-                return col.tab_name == target.tab_name && col.name == target.col_name;
-            }
-            return col.name == target.col_name;
-        });
-        if (pos == cols_.end()) {
+        auto pos =
+            std::find_if(descriptor_->output_cols_.begin(), descriptor_->output_cols_.end(), [&](const ColMeta& col) {
+                if (!target.tab_name.empty()) {
+                    return col.tab_name == target.tab_name && col.name == target.col_name;
+                }
+                return col.name == target.col_name;
+            });
+        if (pos == descriptor_->output_cols_.end()) {
             throw ColumnNotFoundError(target.col_name);
         }
         return *pos;

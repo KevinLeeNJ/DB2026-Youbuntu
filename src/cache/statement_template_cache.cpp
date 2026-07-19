@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 
+#include "execution/prepared_select_descriptor.h"
+
 namespace cache {
 namespace {
 
@@ -446,6 +448,7 @@ FullTemplateLookup StatementTemplateCache::lookup_full(const parser::TokenShapeK
                                                        SmManager* sm_manager, const parser::OwnedTokenStream* lexical) {
     ast::AstType statement_type{ast::AstType::Help};
     std::shared_ptr<const Plan> plan;
+    std::shared_ptr<const PreparedSelectDescriptor> prepared_select;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++stats_.lookups;
@@ -459,9 +462,14 @@ FullTemplateLookup StatementTemplateCache::lookup_full(const parser::TokenShapeK
         ++stats_.hits;
         statement_type = found->second.skeleton->type;
         plan = found->second.plan;
+        prepared_select = found->second.prepared_select;
     }
 
-    FullTemplateLookup result{statement_type, clone_plan(*plan, sm_manager)};
+    if (prepared_select != nullptr && prepared_select->Matches(sm_manager)) {
+        return FullTemplateLookup{statement_type, nullptr, std::move(prepared_select)};
+    }
+
+    FullTemplateLookup result{statement_type, clone_plan(*plan, sm_manager), nullptr};
     if (!result) {
         return {};
     }
@@ -477,7 +485,8 @@ FullTemplateLookup StatementTemplateCache::lookup_full(const parser::TokenShapeK
 
 void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                                      std::shared_ptr<const ast::TreeNode> skeleton, std::shared_ptr<const Query> query,
-                                     std::shared_ptr<const Plan> plan) {
+                                     std::shared_ptr<const Plan> plan,
+                                     std::shared_ptr<const PreparedSelectDescriptor> prepared_select) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto previous = entries_.find(key);
     if (previous != entries_.end() && skeleton == nullptr) {
@@ -488,8 +497,15 @@ void StatementTemplateCache::publish(const parser::TokenShapeKey& key, uint64_t 
     }
     if (previous != entries_.end() && plan == nullptr) {
         plan = previous->second.plan;
+        prepared_select = previous->second.prepared_select;
     }
-    Entry entry{key, catalog_generation, ++clock_, std::move(skeleton), std::move(query), std::move(plan)};
+    Entry entry{key,
+                catalog_generation,
+                ++clock_,
+                std::move(skeleton),
+                std::move(query),
+                std::move(plan),
+                std::move(prepared_select)};
     entries_[key] = std::move(entry);
     ++stats_.publishes;
     if (entries_.size() <= capacity_) {

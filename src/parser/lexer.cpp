@@ -156,9 +156,8 @@ Token Lexer::next_token() {
     char c = current_char();
 
     // File path (for LOAD): starts with '/', "./" or "../"
-    if ((c == '/' &&
-         !(detail::is_space(peek_char(1)) || detail::is_digit(peek_char(1)) || peek_char(1) == '-' ||
-           peek_char(1) == '\'')) ||
+    if ((c == '/' && !(detail::is_space(peek_char(1)) || detail::is_digit(peek_char(1)) || peek_char(1) == '-' ||
+                       peek_char(1) == '\'')) ||
         (c == '.' && (peek_char(1) == '/' || (peek_char(1) == '.' && peek_char(2) == '/')))) {
         return scan_path();
     }

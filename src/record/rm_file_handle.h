@@ -135,7 +135,10 @@ private:
 struct RmRecordViewWithMeta {
     TupleMeta meta;
     RmRecordView view;
-    std::unique_ptr<RmPageReadGuard> guard;
+    // Keep the page pin/latch guard inline.  A view is already returned by
+    // value, so allocating the guard separately adds one heap operation per
+    // visible tuple without extending its lifetime.
+    std::optional<RmPageReadGuard> guard;
     std::unique_ptr<RmRecord> owned;
 };
 

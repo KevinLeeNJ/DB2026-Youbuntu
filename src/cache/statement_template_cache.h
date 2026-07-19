@@ -23,6 +23,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/config.h"
 #include "optimizer/plan.h"
 
+class PreparedSelectDescriptor;
+
 namespace cache {
 
 using StatementCacheMode = rmdb_config::StatementCacheMode;
@@ -38,9 +40,10 @@ struct StatementTemplateStats {
 struct FullTemplateLookup {
     ast::AstType statement_type{ast::AstType::Help};
     std::unique_ptr<Plan> plan;
+    std::shared_ptr<const PreparedSelectDescriptor> prepared_select;
 
     explicit operator bool() const {
-        return plan != nullptr;
+        return plan != nullptr || prepared_select != nullptr;
     }
 };
 
@@ -60,7 +63,8 @@ public:
                                    const parser::OwnedTokenStream* lexical = nullptr);
     void publish(const parser::TokenShapeKey& key, uint64_t catalog_generation,
                  std::shared_ptr<const ast::TreeNode> skeleton = nullptr, std::shared_ptr<const Query> query = nullptr,
-                 std::shared_ptr<const Plan> plan = nullptr);
+                 std::shared_ptr<const Plan> plan = nullptr,
+                 std::shared_ptr<const PreparedSelectDescriptor> prepared_select = nullptr);
     StatementTemplateStats stats() const;
     void clear();
 
@@ -72,6 +76,7 @@ private:
         std::shared_ptr<const ast::TreeNode> skeleton;
         std::shared_ptr<const Query> query;
         std::shared_ptr<const Plan> plan;
+        std::shared_ptr<const PreparedSelectDescriptor> prepared_select;
     };
 
     size_t capacity_;

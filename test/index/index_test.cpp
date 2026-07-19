@@ -31,6 +31,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_skip_scan.h"
+#include "execution/prepared_select_descriptor.h"
 #include "execution/executor_delete.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_update.h"
@@ -893,6 +894,19 @@ public:
         return ids;
     }
 
+    std::vector<int> scan_descriptor_ids(const IndexScanDescriptor& descriptor) {
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        IndexScanExecutor executor(sm_manager.get(), descriptor, &context);
+        std::vector<int> ids;
+        for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+            auto rec = executor.Next();
+            ids.push_back(*reinterpret_cast<int*>(rec->data));
+        }
+        return ids;
+    }
+
     std::vector<int> scan_table_ints(const std::string& tab_name, const std::vector<Condition>& conds,
                                      const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
@@ -942,6 +956,346 @@ TEST_F(IndexScanFeatureTest, UsesSingleColumnIndexForPointAndRangeScans) {
 
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 10)}, {"w_id"}), std::vector<int>({10}));
     EXPECT_EQ(scan_ids({int_cond(OP_LT, 534), int_cond(OP_GT, 100)}, {"w_id"}), std::vector<int>({500}));
+}
+
+TEST_F(IndexScanFeatureTest, DescriptorPathMatchesLegacyConstruction) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+
+    const std::vector<Condition> range_conditions = {int_cond(OP_GE, 100), int_cond(OP_LT, 534)};
+    auto descriptor = IndexScanDescriptor::Build(sm_manager.get(), "warehouse", range_conditions, {"w_id"});
+
+    EXPECT_EQ(descriptor.catalog_generation(), sm_manager->get_catalog_generation());
+    ASSERT_EQ(descriptor.condition_layouts().size(), range_conditions.size());
+    EXPECT_EQ(descriptor.condition_layouts()[0].lhs.offset, 0);
+    EXPECT_EQ(descriptor.condition_layouts()[0].lhs.type, TYPE_INT);
+    ASSERT_EQ(descriptor.compiled_index_conditions().size(), range_conditions.size());
+    EXPECT_EQ(scan_descriptor_ids(descriptor), scan_ids(range_conditions, {"w_id"}));
+
+    const std::vector<Condition> point_conditions = {int_cond(OP_EQ, 500)};
+    auto point_descriptor = IndexScanDescriptor::Build(sm_manager.get(), "warehouse", point_conditions, {"w_id"});
+    EXPECT_EQ(scan_descriptor_ids(point_descriptor), scan_ids(point_conditions, {"w_id"}));
+}
+
+TEST_F(IndexScanFeatureTest, DescriptorRejectsStaleCatalogGenerationBeforeResolvingHandles) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+    auto descriptor = IndexScanDescriptor::Build(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 100)}, {"w_id"});
+
+    sm_manager->drop_index("warehouse", {"w_id"}, nullptr);
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    EXPECT_THROW((IndexScanExecutor(sm_manager.get(), descriptor, &context)), InternalError);
+
+    auto refreshed = IndexScanDescriptor::Build(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 100)}, {"w_id"});
+    EXPECT_EQ(scan_descriptor_ids(refreshed), std::vector<int>({100}));
+}
+
+TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorBindsEachRequestWithoutCloningPlan) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+
+    auto scan_condition = int_cond(OP_GE, 10);
+    scan_condition.rhs_val.lexical_slot = 0;
+    auto filter_condition = string_cond(OP_EQ, "qweruiop");
+    filter_condition.rhs_val.lexical_slot = 1;
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager.get(), "warehouse",
+                                           std::vector<Condition>{scan_condition}, std::vector<std::string>{"w_id"});
+    auto filter = std::make_unique<FilterPlan>(T_Filter, std::move(scan), std::vector<Condition>{filter_condition});
+    SelectItem item;
+    item.expr.type = QueryExprType::COLUMN;
+    item.expr.col = {"warehouse", "w_id"};
+    item.output_name = "selected_id";
+    auto projection = std::make_unique<ProjectionPlan>(T_Projection, std::move(filter), std::vector<SelectItem>{item},
+                                                       std::vector<std::string>{"selected_id"});
+    DMLPlan select(T_select, std::move(projection), "warehouse", {}, {}, {});
+    auto descriptor = PreparedSelectDescriptor::Build(select, sm_manager.get());
+    ASSERT_NE(descriptor, nullptr);
+    ASSERT_EQ(descriptor->nodes().size(), 3U);
+    EXPECT_TRUE(std::holds_alternative<PreparedIndexScanNode>(descriptor->nodes()[0]));
+    EXPECT_TRUE(std::holds_alternative<PreparedFilterNode>(descriptor->nodes()[1]));
+    EXPECT_TRUE(std::holds_alternative<PreparedProjectionNode>(descriptor->nodes()[2]));
+
+    auto execute = [&](const std::string& sql) -> std::vector<int> {
+        auto lexical = parser::normalize_sql(sql, false);
+        EXPECT_TRUE(lexical);
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        auto executor = descriptor->Instantiate(lexical, sm_manager.get(), &context);
+        EXPECT_NE(executor, nullptr);
+        std::vector<int> values;
+        if (executor == nullptr) {
+            return values;
+        }
+        for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) {
+            auto tuple = executor->current();
+            if (!tuple) {
+                ADD_FAILURE() << "prepared executor returned an empty current tuple";
+                break;
+            }
+            values.push_back(read_unaligned<int>(tuple.data));
+        }
+        return values;
+    };
+
+    EXPECT_EQ(execute("select w_id from warehouse where w_id >= 10 and name = 'qweruiop';"), std::vector<int>({10}));
+    EXPECT_EQ(execute("select w_id from warehouse where w_id >= 100 and name = 'qwerghjk';"), std::vector<int>({100}));
+}
+
+TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorComposesSharedAggregateWithRequestLocalState) {
+    const std::string table_name = "prepared_agg";
+    create_two_int_table(table_name);
+    insert_two_ints(table_name, 1, 10);
+    insert_two_ints(table_name, 1, 20);
+    insert_two_ints(table_name, 2, 7);
+    sm_manager->create_index(table_name, {"a", "b"}, nullptr);
+
+    auto scan_condition = table_int_cond(table_name, "a", OP_GE, 1);
+    scan_condition.rhs_val.lexical_slot = 0;
+    auto filter_condition = table_int_cond(table_name, "b", OP_GE, 10);
+    filter_condition.rhs_val.lexical_slot = 1;
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager.get(), table_name,
+                                           std::vector<Condition>{scan_condition}, std::vector<std::string>{"a", "b"});
+    auto filter = std::make_unique<FilterPlan>(T_Filter, std::move(scan), std::vector<Condition>{filter_condition});
+
+    AggExpr sum;
+    sum.type = AggType::SUM;
+    sum.col = {table_name, "b"};
+    sum.display_name = "SUM(b)";
+    AggExpr count;
+    count.type = AggType::COUNT;
+    count.is_star = true;
+    count.display_name = "COUNT(*)";
+    HavingCondition having;
+    having.lhs.type = QueryExprType::AGGREGATE;
+    having.lhs.agg = sum;
+    having.lhs.display_name = sum.display_name;
+    having.op = OP_GT;
+    having.is_rhs_val = false;
+    having.rhs_expr.type = QueryExprType::AGGREGATE;
+    having.rhs_expr.agg = count;
+    having.rhs_expr.display_name = count.display_name;
+
+    auto aggregate =
+        std::make_unique<AggregatePlan>(T_Aggregate, std::move(filter), std::vector<TabCol>{{table_name, "a"}},
+                                        std::vector<AggExpr>{sum, count}, std::vector<HavingCondition>{having});
+    SelectItem group_item;
+    group_item.expr.type = QueryExprType::COLUMN;
+    group_item.expr.col = {table_name, "a"};
+    SelectItem sum_item;
+    sum_item.expr.type = QueryExprType::AGGREGATE;
+    sum_item.expr.agg = sum;
+    sum_item.expr.display_name = sum.display_name;
+    sum_item.output_name = sum.display_name;
+    auto projection = std::make_unique<ProjectionPlan>(T_Projection, std::move(aggregate),
+                                                       std::vector<SelectItem>{group_item, sum_item},
+                                                       std::vector<std::string>{"a", sum.display_name});
+    DMLPlan select(T_select, std::move(projection), table_name, {}, {}, {});
+
+    auto descriptor = PreparedSelectDescriptor::Build(select, sm_manager.get());
+    ASSERT_NE(descriptor, nullptr);
+    ASSERT_EQ(descriptor->nodes().size(), 4U);
+    EXPECT_TRUE(std::holds_alternative<PreparedIndexScanNode>(descriptor->nodes()[0]));
+    EXPECT_TRUE(std::holds_alternative<PreparedFilterNode>(descriptor->nodes()[1]));
+    ASSERT_TRUE(std::holds_alternative<PreparedAggregateNode>(descriptor->nodes()[2]));
+    EXPECT_TRUE(std::holds_alternative<PreparedProjectionNode>(descriptor->nodes()[3]));
+    const auto& shared_aggregate = std::get<PreparedAggregateNode>(descriptor->nodes()[2]).descriptor;
+    ASSERT_NE(shared_aggregate, nullptr);
+    EXPECT_EQ(shared_aggregate->group_cols().size(), 1U);
+    EXPECT_EQ(shared_aggregate->aggregates().size(), 2U);
+    EXPECT_EQ(shared_aggregate->having().size(), 1U);
+
+    auto first_lexical = parser::normalize_sql(
+        "select a, sum(b) from prepared_agg where a >= 1 and b >= 10 group by a having sum(b) > count(*);", false);
+    auto second_lexical = parser::normalize_sql(
+        "select a, sum(b) from prepared_agg where a >= 1 and b >= 20 group by a having sum(b) > count(*);", false);
+    ASSERT_TRUE(first_lexical);
+    ASSERT_TRUE(second_lexical);
+    char first_buffer[BUFFER_LENGTH] = {};
+    char second_buffer[BUFFER_LENGTH] = {};
+    int first_offset = 0;
+    int second_offset = 0;
+    Context first_context(nullptr, nullptr, nullptr, first_buffer, &first_offset);
+    Context second_context(nullptr, nullptr, nullptr, second_buffer, &second_offset);
+    auto first = descriptor->Instantiate(first_lexical, sm_manager.get(), &first_context);
+    auto second = descriptor->Instantiate(second_lexical, sm_manager.get(), &second_context);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    first->beginTuple();
+    second->beginTuple();
+    ASSERT_FALSE(first->is_end());
+    ASSERT_FALSE(second->is_end());
+    auto first_tuple = first->current();
+    auto second_tuple = second->current();
+    ASSERT_TRUE(first_tuple);
+    ASSERT_TRUE(second_tuple);
+    EXPECT_EQ(read_unaligned<int>(first_tuple.data), 1);
+    EXPECT_EQ(read_unaligned<int>(first_tuple.data + sizeof(int)), 30);
+    EXPECT_EQ(read_unaligned<int>(second_tuple.data), 1);
+    EXPECT_EQ(read_unaligned<int>(second_tuple.data + sizeof(int)), 20);
+}
+
+TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorRejectsParameterizedHavingCapability) {
+    const std::string table_name = "prepared_having";
+    create_two_int_table(table_name);
+    insert_two_ints(table_name, 1, 10);
+    sm_manager->create_index(table_name, {"a", "b"}, nullptr);
+
+    auto scan_condition = table_int_cond(table_name, "a", OP_GE, 1);
+    scan_condition.rhs_val.lexical_slot = 0;
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager.get(), table_name,
+                                           std::vector<Condition>{scan_condition}, std::vector<std::string>{"a", "b"});
+    AggExpr sum;
+    sum.type = AggType::SUM;
+    sum.col = {table_name, "b"};
+    sum.display_name = "SUM(b)";
+    HavingCondition having;
+    having.lhs.type = QueryExprType::AGGREGATE;
+    having.lhs.agg = sum;
+    having.lhs.display_name = sum.display_name;
+    having.op = OP_GT;
+    having.is_rhs_val = true;
+    having.rhs_val.set_int(5);
+    having.rhs_val.lexical_slot = 1;
+    auto aggregate = std::make_unique<AggregatePlan>(T_Aggregate, std::move(scan), std::vector<TabCol>{},
+                                                     std::vector<AggExpr>{sum}, std::vector<HavingCondition>{having});
+    SelectItem item;
+    item.expr.type = QueryExprType::AGGREGATE;
+    item.expr.agg = sum;
+    item.expr.display_name = sum.display_name;
+    item.output_name = sum.display_name;
+    auto projection = std::make_unique<ProjectionPlan>(
+        T_Projection, std::move(aggregate), std::vector<SelectItem>{item}, std::vector<std::string>{sum.display_name});
+    DMLPlan select(T_select, std::move(projection), table_name, {}, {}, {});
+
+    EXPECT_EQ(PreparedSelectDescriptor::Build(select, sm_manager.get()), nullptr);
+}
+
+TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorSupportsConcurrentRequestLocalFrames) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+
+    auto condition = int_cond(OP_EQ, 10);
+    condition.rhs_val.lexical_slot = 0;
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager.get(), "warehouse",
+                                           std::vector<Condition>{condition}, std::vector<std::string>{"w_id"});
+    SelectItem item;
+    item.expr.type = QueryExprType::COLUMN;
+    item.expr.col = {"warehouse", "w_id"};
+    auto projection = std::make_unique<ProjectionPlan>(T_Projection, std::move(scan), std::vector<SelectItem>{item},
+                                                       std::vector<std::string>{"w_id"}, true);
+    DMLPlan select(T_select, std::move(projection), "warehouse", {}, {}, {});
+    auto descriptor = PreparedSelectDescriptor::Build(select, sm_manager.get());
+    ASSERT_NE(descriptor, nullptr);
+
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 8; ++i) {
+        workers.emplace_back([&, i] {
+            const int expected = i % 2 == 0 ? 100 : 500;
+            auto lexical = parser::normalize_sql(
+                "select w_id from warehouse where w_id = " + std::to_string(expected) + ";", false);
+            char data_send[BUFFER_LENGTH] = {};
+            int offset = 0;
+            Context context(nullptr, nullptr, nullptr, data_send, &offset);
+            auto executor = descriptor->Instantiate(lexical, sm_manager.get(), &context);
+            if (executor == nullptr) {
+                failed = true;
+                return;
+            }
+            executor->beginTuple();
+            auto tuple = executor->current();
+            if (!tuple || read_unaligned<int>(tuple.data) != expected) {
+                failed = true;
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    EXPECT_FALSE(failed.load());
+}
+
+TEST_F(IndexScanFeatureTest, PreparedSelectDescriptorFallsBackAfterCatalogGenerationChanges) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+    auto condition = int_cond(OP_EQ, 100);
+    condition.rhs_val.lexical_slot = 0;
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager.get(), "warehouse",
+                                           std::vector<Condition>{condition}, std::vector<std::string>{"w_id"});
+    SelectItem item;
+    item.expr.type = QueryExprType::COLUMN;
+    item.expr.col = {"warehouse", "w_id"};
+    auto projection = std::make_unique<ProjectionPlan>(T_Projection, std::move(scan), std::vector<SelectItem>{item},
+                                                       std::vector<std::string>{"w_id"}, true);
+    DMLPlan select(T_select, std::move(projection), "warehouse", {}, {}, {});
+    auto descriptor = PreparedSelectDescriptor::Build(select, sm_manager.get());
+    ASSERT_NE(descriptor, nullptr);
+
+    sm_manager->drop_index("warehouse", {"w_id"}, nullptr);
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+    auto lexical = parser::normalize_sql("select w_id from warehouse where w_id = 100;", false);
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    EXPECT_EQ(descriptor->Instantiate(lexical, sm_manager.get(), &context), nullptr);
+}
+
+TEST_F(IndexScanFeatureTest, DegenerateClosedRangeUsesPointLookup) {
+    create_warehouse();
+    sm_manager->create_index("warehouse", {"w_id"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "warehouse", {int_cond(OP_GE, 100), int_cond(OP_LE, 100)},
+                                         {"w_id"}, &context);
+
+    executor.beginTuple();
+    EXPECT_TRUE(executor.uses_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_rid_vector_cursor());
+    std::vector<int> result;
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto rec = executor.Next();
+        ASSERT_NE(rec, nullptr);
+        result.push_back(*reinterpret_cast<int*>(rec->data));
+    }
+    EXPECT_EQ(result, std::vector<int>({100}));
+}
+
+TEST_F(IndexScanFeatureTest, CompoundEqAndDegenerateClosedRangeUsesPointLookup) {
+    create_two_int_table("compound_rows");
+    insert_two_ints("compound_rows", 7, 41);
+    insert_two_ints("compound_rows", 7, 42);
+    insert_two_ints("compound_rows", 7, 43);
+    insert_two_ints("compound_rows", 8, 42);
+    sm_manager->create_index("compound_rows", {"a", "b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "compound_rows",
+                                         {table_int_cond("compound_rows", "a", OP_EQ, 7),
+                                          table_int_cond("compound_rows", "b", OP_GE, 42),
+                                          table_int_cond("compound_rows", "b", OP_LE, 42)},
+                                         {"a", "b"}, &context);
+
+    executor.beginTuple();
+    EXPECT_TRUE(executor.uses_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_rid_vector_cursor());
+    std::vector<std::pair<int, int>> result;
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto rec = executor.Next();
+        ASSERT_NE(rec, nullptr);
+        result.emplace_back(*reinterpret_cast<int*>(rec->data), *reinterpret_cast<int*>(rec->data + sizeof(int)));
+    }
+    const std::vector<std::pair<int, int>> expected = {{7, 42}};
+    EXPECT_EQ(result, expected);
 }
 
 TEST_F(IndexScanFeatureTest, ReusesCompiledConstraintsAcrossInjectedLookups) {

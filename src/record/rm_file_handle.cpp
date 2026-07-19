@@ -59,12 +59,14 @@ RmRecordViewWithMeta RmFileHandle::get_record_view_with_meta(const Rid& rid) con
         throw PageNotExistError("record", rid.page_no);
     }
 
-    auto guard = std::make_unique<RmPageReadGuard>(buffer_pool_manager_, page_id, page);
+    RmRecordViewWithMeta result;
+    // Acquire the shared page latch before exposing either the metadata or
+    // the borrowed slot pointer in the returned view.
+    result.guard.emplace(buffer_pool_manager_, page_id, page);
     RmPageHandle page_handle(&file_hdr_, page);
-    TupleMeta meta = page_handle.get_meta(rid.slot_no);
-    return RmRecordViewWithMeta{
-        meta, RmRecordView{page_handle.get_slot(rid.slot_no), static_cast<uint32_t>(file_hdr_.record_size)},
-        std::move(guard), nullptr};
+    result.meta = page_handle.get_meta(rid.slot_no);
+    result.view = RmRecordView{page_handle.get_slot(rid.slot_no), static_cast<uint32_t>(file_hdr_.record_size)};
+    return result;
 }
 
 /**

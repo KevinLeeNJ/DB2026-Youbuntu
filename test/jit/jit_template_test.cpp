@@ -11,8 +11,67 @@ See the Mulan PSL v2 for more details. */
 #include <gtest/gtest.h>
 
 #include "cache/statement_template_cache.h"
+#include "execution/prepared_select_descriptor.h"
 #include "parser/parser.h"
 #include "parser/token_stream.h"
+#include "record/rm_manager.h"
+#include "storage/buffer_pool_manager.h"
+#include "storage/disk_manager.h"
+#include "system/sm_manager.h"
+
+namespace {
+
+class StatementTemplateDatabaseTest : public ::testing::Test {
+protected:
+    std::unique_ptr<DiskManager> disk_manager;
+    std::unique_ptr<BufferPoolManager> buffer_pool_manager;
+    std::unique_ptr<RmManager> rm_manager;
+    std::unique_ptr<IxManager> ix_manager;
+    std::unique_ptr<SmManager> sm_manager;
+    std::string db_name;
+
+    void SetUp() override {
+        db_name = "statement_template_db_" + std::to_string(reinterpret_cast<uintptr_t>(this));
+        disk_manager = std::make_unique<DiskManager>();
+        buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+        rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
+        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+        sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(),
+                                                 ix_manager.get());
+        if (sm_manager->is_dir(db_name)) {
+            sm_manager->drop_db(db_name);
+        }
+        sm_manager->create_db(db_name);
+        sm_manager->open_db(db_name);
+        sm_manager->create_table("users", {{"id", TYPE_INT, 4}}, nullptr);
+        sm_manager->create_index("users", {"id"}, nullptr);
+    }
+
+    void TearDown() override {
+        sm_manager->close_db();
+        sm_manager->drop_db(db_name);
+    }
+
+    std::unique_ptr<Plan> select_plan(PlanTag scan_tag) {
+        Condition condition;
+        condition.lhs_col = {"users", "id"};
+        condition.op = OP_EQ;
+        condition.is_rhs_val = true;
+        condition.rhs_val.set_int(1);
+        condition.rhs_val.lexical_slot = 0;
+        auto scan = std::make_unique<ScanPlan>(scan_tag, sm_manager.get(), "users", std::vector<Condition>{condition},
+                                               std::vector<std::string>{"id"});
+        SelectItem item;
+        item.expr.type = QueryExprType::COLUMN;
+        item.expr.col = {"users", "id"};
+        auto projection = std::make_unique<ProjectionPlan>(T_Projection, std::move(scan), std::vector<SelectItem>{item},
+                                                           std::vector<std::string>{"id"}, true);
+        return std::make_unique<DMLPlan>(T_select, std::move(projection), "users", std::vector<Value>{},
+                                         std::vector<Condition>{}, std::vector<SetClause>{});
+    }
+};
+
+} // namespace
 
 TEST(StatementTemplateTest, NormalizesLiteralValuesButOwnsIdentifiersAndStrings) {
     auto first = parser::normalize_sql("select id from users where id = 7 and name = 'alice';");
@@ -143,4 +202,29 @@ TEST(StatementTemplateTest, FullLookupBindsCurrentInsertValues) {
     ASSERT_EQ(insert.values_.size(), 2U);
     EXPECT_EQ(insert.values_[0].int_val, 42);
     EXPECT_EQ(insert.values_[1].str_val, "bob");
+}
+
+TEST_F(StatementTemplateDatabaseTest, ReplacingPlanAtomicallyClearsUnsupportedPreparedDescriptor) {
+    auto shape = parser::normalize_sql("select id from users where id = 1;");
+    ASSERT_TRUE(shape);
+    auto parsed = ast::parse_sql("select id from users where id = 1;");
+    ast::assign_literal_slots(*parsed);
+
+    auto prepared_plan = select_plan(T_IndexScan);
+    auto prepared = PreparedSelectDescriptor::Build(*prepared_plan, sm_manager.get());
+    ASSERT_NE(prepared, nullptr);
+    cache::StatementTemplateCache cache;
+    cache.publish(shape.key, 1, std::shared_ptr<const ast::TreeNode>(std::move(parsed)), nullptr,
+                  std::shared_ptr<const Plan>(std::move(prepared_plan)), prepared);
+
+    auto unsupported_plan = select_plan(T_SeqScan);
+    EXPECT_EQ(PreparedSelectDescriptor::Build(*unsupported_plan, sm_manager.get()), nullptr);
+    cache.publish(shape.key, 1, nullptr, nullptr, std::shared_ptr<const Plan>(std::move(unsupported_plan)), nullptr);
+
+    auto lookup = cache.lookup_full(shape.key, 1, sm_manager.get(), &shape);
+    EXPECT_EQ(lookup.prepared_select, nullptr);
+    ASSERT_NE(lookup.plan, nullptr);
+    const auto& select = static_cast<const DMLPlan&>(*lookup.plan);
+    const auto& projection = static_cast<const ProjectionPlan&>(*select.subplan_);
+    EXPECT_EQ(projection.subplan_->tag, T_SeqScan);
 }

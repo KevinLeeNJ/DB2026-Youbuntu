@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "index_scan_descriptor.h"
 #include "index/ix.h"
 #include "record/rm_scan.h"
 #include "system/sm.h"
@@ -376,6 +377,58 @@ protected:
     }
 
 public:
+    IndexScanExecutor(SmManager* sm_manager, const IndexScanDescriptor& descriptor, Context* context)
+        : IndexScanExecutor(sm_manager, descriptor, descriptor.conditions(), context) {}
+
+    IndexScanExecutor(SmManager* sm_manager, const IndexScanDescriptor& descriptor,
+                      std::vector<Condition> bound_conditions, Context* context) {
+        if (descriptor.catalog_generation() != sm_manager->get_catalog_generation()) {
+            throw InternalError("stale index scan descriptor");
+        }
+        if (bound_conditions.size() != descriptor.conditions().size()) {
+            throw InternalError("bound index scan condition shape mismatch");
+        }
+
+        sm_manager_ = sm_manager;
+        context_ = context;
+        direction_ = descriptor.direction();
+        tab_name_ = descriptor.table_name();
+        tab_ = sm_manager_->db_.get_table(tab_name_);
+        conds_ = std::move(bound_conditions);
+        index_col_names_ = descriptor.index_column_names();
+        index_meta_ = descriptor.index_meta();
+        fh_ = sm_manager_->fhs_.at(tab_name_).get();
+        cols_ = descriptor.columns();
+        len_ = descriptor.tuple_len();
+        fed_conds_ = conds_;
+        base_conds_ = conds_;
+        index_name_ = descriptor.index_name();
+        ih_ = sm_manager_->ihs_.at(index_name_).get();
+
+        condition_addresses_.reserve(descriptor.condition_layouts().size());
+        for (const auto& layout : descriptor.condition_layouts()) {
+            ConditionAddress address;
+            address.lhs = ColumnAddress{layout.lhs.offset, layout.lhs.len, layout.lhs.type};
+            address.rhs = ColumnAddress{layout.rhs.offset, layout.rhs.len, layout.rhs.type};
+            condition_addresses_.push_back(address);
+        }
+        compiled_index_conditions_.reserve(descriptor.compiled_index_conditions().size());
+        for (const auto& condition : descriptor.compiled_index_conditions()) {
+            if (condition.condition_position >= conds_.size()) {
+                throw InternalError("bound index scan condition position is invalid");
+            }
+            compiled_index_conditions_.push_back(
+                {condition.index_col_ordinal, condition.op, conds_[condition.condition_position].rhs_val});
+        }
+
+        initialize_constraint_storage();
+        rid_scan_rids_.reserve(1);
+        rebuild_constraints();
+#ifdef RMDB_ENABLE_JIT
+        rebuild_jit_predicate();
+#endif
+    }
+
     IndexScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
                       std::vector<std::string> index_col_names, Context* context,
                       ScanDirection direction = ScanDirection::Forward) {
@@ -429,7 +482,6 @@ public:
         std::optional<IxIndexHandle::SharedIndexLatch> index_latch_guard;
         const bool historical_candidates_available = needs_historical_index_candidates();
         use_historical_index_candidates_ = historical_candidates_available;
-        reset_key_bounds();
 
         if (lookup_key_valid_) {
             auto& lookup_constraint = constraints_[lookup_key_ordinal_];
@@ -440,17 +492,42 @@ public:
             lookup_constraint.upper.present = false;
         }
 
+        bool exact_key_lookup = !constraints_.empty();
+        for (size_t ordinal = 0; ordinal < constraints_.size(); ++ordinal) {
+            const auto& constraint = constraints_[ordinal];
+            if (constraint.eq_present) {
+                continue;
+            }
+            const bool closed_degenerate_range =
+                constraint.lower.present && constraint.upper.present && constraint.lower.inclusive &&
+                constraint.upper.inclusive &&
+                compare_key_part(constraint.lower.data.data(), constraint.upper.data.data(),
+                                 index_meta_.cols[ordinal]) == 0;
+            if (!closed_degenerate_range) {
+                exact_key_lookup = false;
+                break;
+            }
+        }
         bool lower_exclusive = false;
         bool upper_inclusive = true;
         bool saw_range = false;
         int offset = 0;
+        if (!exact_key_lookup) {
+            reset_key_bounds();
+        }
         for (size_t ordinal = 0; ordinal < index_meta_.cols.size(); ++ordinal) {
             const auto& col = index_meta_.cols[ordinal];
+            const auto& constraint = constraints_[ordinal];
+            if (exact_key_lookup) {
+                const char* exact_value = constraint.eq_present ? constraint.eq.data() : constraint.lower.data.data();
+                memcpy(lower_key_.data() + offset, exact_value, col.len);
+                offset += col.len;
+                continue;
+            }
             if (saw_range) {
                 break;
             }
 
-            const auto& constraint = constraints_[ordinal];
             if (!constraint.eq_present && !constraint.lower.present && !constraint.upper.present) {
                 break;
             }
@@ -488,7 +565,6 @@ public:
             break;
         }
 
-        const bool exact_key_lookup = !lower_exclusive && upper_inclusive && lower_key_ == upper_key_;
         Iid lower, upper;
         if (!exact_key_lookup) {
             index_latch_guard.emplace(ih_->lock_shared());
@@ -502,8 +578,7 @@ public:
         // historical-index scan on the RC hot path.
         bool use_rc_exact_historical_key = false;
         if (historical_candidates_available && context_ != nullptr && context_->txn_ != nullptr &&
-            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && !lower_exclusive &&
-            upper_inclusive && lower_key_ == upper_key_) {
+            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && exact_key_lookup) {
             historical_rids_ = sm_manager_->get_historical_index_key_rids(tab_name_, index_name_, lower_key_);
             use_rc_exact_historical_key = !historical_rids_.empty();
             // Exact RC probes only need history for the requested key. Range,
@@ -540,7 +615,8 @@ public:
 
             if (use_historical_index_candidates_) {
                 historical_rids_ = sm_manager_->get_historical_index_rids_in_range(
-                    tab_name_, index_name_, lower_key_, upper_key_, lower_exclusive, upper_inclusive);
+                    tab_name_, index_name_, lower_key_, exact_key_lookup ? lower_key_ : upper_key_, lower_exclusive,
+                    upper_inclusive);
             }
             if (!historical_rids_.empty()) {
                 seen_rids_.reserve(rid_scan_rids_.size() + historical_rids_.size());

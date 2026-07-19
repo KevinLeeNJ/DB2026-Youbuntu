@@ -121,9 +121,8 @@ void write_phase_metrics(const std::string& path, const cache::StatementTemplate
     output << "  },\n  \"statement_template_cache\": ";
     if (template_cache != nullptr) {
         const auto stats = template_cache->stats();
-        output << "{\"lookups\": " << stats.lookups << ", \"hits\": " << stats.hits
-               << ", \"misses\": " << stats.misses << ", \"publishes\": " << stats.publishes
-               << ", \"evictions\": " << stats.evictions << "}";
+        output << "{\"lookups\": " << stats.lookups << ", \"hits\": " << stats.hits << ", \"misses\": " << stats.misses
+               << ", \"publishes\": " << stats.publishes << ", \"evictions\": " << stats.evictions << "}";
     } else {
         output << "null";
     }
@@ -146,18 +145,18 @@ void write_phase_metrics(const std::string& path, const cache::StatementTemplate
                << ", \"native_executions\": " << stats.native_executions
                << ", \"native_cache_hits\": " << stats.native_cache_hits
                << ", \"compile_attempts\": " << stats.compile_attempts
-               << ", \"compile_failures\": " << stats.compile_failures << ", \"compile_ns\": "
-               << stats.compile_ns << ", \"evictions\": " << stats.evictions << "}";
+               << ", \"compile_failures\": " << stats.compile_failures << ", \"compile_ns\": " << stats.compile_ns
+               << ", \"evictions\": " << stats.evictions << "}";
     } else {
         output << "null";
     }
     const auto jit_stats = jit::predicate_jit_stats();
     output << ",\n  \"jit\": {\"entry_count\": " << jit_stats.entry_count
-           << ", \"queued_count\": " << jit_stats.queued_count << ", \"code_bytes\": "
-           << jit_stats.code_bytes << ", \"cache_hits\": " << jit_stats.cache_hits
-           << ", \"fallbacks\": " << jit_stats.fallbacks << ", \"compile_attempts\": "
-           << jit_stats.compile_attempts << ", \"compile_failures\": " << jit_stats.compile_failures
-           << ", \"evictions\": " << jit_stats.evictions << "}";
+           << ", \"queued_count\": " << jit_stats.queued_count << ", \"code_bytes\": " << jit_stats.code_bytes
+           << ", \"cache_hits\": " << jit_stats.cache_hits << ", \"fallbacks\": " << jit_stats.fallbacks
+           << ", \"compile_attempts\": " << jit_stats.compile_attempts
+           << ", \"compile_failures\": " << jit_stats.compile_failures << ", \"evictions\": " << jit_stats.evictions
+           << "}";
 #else
     (void)point_jit_manager;
     output << ",\n  \"point_program_jit\": null";
@@ -311,6 +310,7 @@ void client_handler(int fd) {
         std::optional<ast::AstType> cached_statement_type;
         std::unique_ptr<Query> cached_query;
         std::unique_ptr<Plan> cached_plan;
+        std::shared_ptr<const PreparedSelectDescriptor> cached_prepared_select;
         bool used_cached_parse = false;
         bool used_cached_query = false;
         bool used_cached_plan = false;
@@ -345,14 +345,19 @@ void client_handler(int fd) {
                 statement_cache_mode == cache::StatementCacheMode::FULL) {
                 auto full = statement_template_cache->lookup_full(
                     lexical_shape.key, current_statement_template_generation, sm_manager.get(), &lexical_shape);
-                if (full) {
+                if (full.prepared_select != nullptr) {
+                    cached_statement_type = full.statement_type;
+                    cached_prepared_select = std::move(full.prepared_select);
+                    used_cached_parse = true;
+                    used_cached_plan = true;
+                } else if (full.plan != nullptr) {
                     cached_statement_type = full.statement_type;
                     cached_plan = std::move(full.plan);
                     used_cached_parse = true;
                     used_cached_plan = true;
                 }
             }
-            if (cached_point_program == nullptr && cached_plan == nullptr) {
+            if (cached_point_program == nullptr && cached_plan == nullptr && cached_prepared_select == nullptr) {
                 if (lexical_shape && cacheable_skeleton && cacheable_query &&
                     static_cast<int>(statement_cache_mode) >= static_cast<int>(cache::StatementCacheMode::ANALYZER)) {
                     cached_query = statement_template_cache->lookup_query(
@@ -443,74 +448,91 @@ void client_handler(int fd) {
                         parse_tree = ast::parse_sql(data_recv);
                     }
                 }
-                if (!cached_program_handled) {
-                if (!used_cached_plan) {
-                    ast::assign_literal_slots(*parse_tree);
-                }
-                std::shared_ptr<const ast::TreeNode> parsed_skeleton;
-                if (!used_cached_parse && lexical_shape && cacheable_skeleton &&
-                    statement_cache_mode != cache::StatementCacheMode::OFF) {
-                    auto clone = ast::clone_tree(*parse_tree);
-                    parsed_skeleton = std::shared_ptr<const ast::TreeNode>(std::move(clone));
-                    statement_template_cache->publish(lexical_shape.key, current_statement_template_generation,
-                                                      parsed_skeleton);
-                }
-                const auto parsed_type = used_cached_plan ? *cached_statement_type : parse_tree->type;
-                bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
-                bool is_load = parsed_type == ast::AstType::LoadStmt;
-                if (!is_checkpoint && !is_load && !statement_started) {
+                if (!cached_program_handled && cached_prepared_select != nullptr) {
                     SetTransaction(&txn_id, context);
-                }
-                // analyze and rewrite
-                std::unique_ptr<Query> query;
-                if (!used_cached_plan) {
-                    if (cached_query != nullptr) {
-                        query = std::move(cached_query);
-                    } else {
+                    statement_started = true;
+                    cached_program_handled =
+                        portal->run_prepared_select(*cached_prepared_select, lexical_shape, ql_manager.get(), context);
+                    if (!cached_program_handled) {
                         phase_metrics::ScopedSample metrics_sample(
-                            phase_metrics::Phase::ANALYZER, phase_metrics::sample_rate(phase_metrics::Phase::ANALYZER));
-                        query = analyze->do_analyze(std::move(parse_tree));
+                            phase_metrics::Phase::PARSER, phase_metrics::sample_rate(phase_metrics::Phase::PARSER));
+                        parse_tree = ast::parse_sql(data_recv);
+                        used_cached_parse = false;
+                        used_cached_plan = false;
                     }
                 }
-                if (!used_cached_query && lexical_shape && cacheable_query &&
-                    statement_cache_mode != cache::StatementCacheMode::OFF && query != nullptr) {
-                    auto query_copy = clone_query(*query);
-                    std::shared_ptr<const Query> semantic_skeleton(std::move(query_copy));
-                    statement_template_cache->publish(lexical_shape.key, current_statement_template_generation, nullptr,
-                                                      std::move(semantic_skeleton));
-                }
-                LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
-                // 优化器
-                std::unique_ptr<Plan> plan;
-                {
-                    if (cached_plan != nullptr) {
-                        plan = std::move(cached_plan);
-                    } else {
-                        phase_metrics::ScopedSample metrics_sample(
-                            phase_metrics::Phase::PLANNER, phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
-                        plan = optimizer->plan_query(std::move(query), context);
+                if (!cached_program_handled) {
+                    if (!used_cached_plan) {
+                        ast::assign_literal_slots(*parse_tree);
                     }
-                }
-                if (!used_cached_plan && lexical_shape && cacheable_plan &&
-                    statement_cache_mode != cache::StatementCacheMode::OFF && plan != nullptr) {
-                    auto plan_copy = clone_plan(*plan, sm_manager.get());
-                    std::shared_ptr<const Plan> physical_skeleton(std::move(plan_copy));
-                    statement_template_cache->publish(lexical_shape.key, current_statement_template_generation, nullptr,
-                                                      nullptr, std::move(physical_skeleton));
-                }
-                // portal
-                std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
-                {
-                    phase_metrics::ScopedSample metrics_sample(
-                        phase_metrics::Phase::EXECUTOR, phase_metrics::sample_rate(phase_metrics::Phase::EXECUTOR));
-                    portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
-                }
-                // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
-                session_isolation_level = context->isolation_level_;
-                // Note: "set output_file on|off" is a database-global toggle stored
-                // on SmManager (see execution_manager.cpp T_SetOutputFile), so it
-                // persists across connections without per-session mirroring here.
-                portal->drop();
+                    std::shared_ptr<const ast::TreeNode> parsed_skeleton;
+                    if (!used_cached_parse && lexical_shape && cacheable_skeleton &&
+                        statement_cache_mode != cache::StatementCacheMode::OFF) {
+                        auto clone = ast::clone_tree(*parse_tree);
+                        parsed_skeleton = std::shared_ptr<const ast::TreeNode>(std::move(clone));
+                        statement_template_cache->publish(lexical_shape.key, current_statement_template_generation,
+                                                          parsed_skeleton);
+                    }
+                    const auto parsed_type = used_cached_plan ? *cached_statement_type : parse_tree->type;
+                    bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
+                    bool is_load = parsed_type == ast::AstType::LoadStmt;
+                    if (!is_checkpoint && !is_load && !statement_started) {
+                        SetTransaction(&txn_id, context);
+                    }
+                    // analyze and rewrite
+                    std::unique_ptr<Query> query;
+                    if (!used_cached_plan) {
+                        if (cached_query != nullptr) {
+                            query = std::move(cached_query);
+                        } else {
+                            phase_metrics::ScopedSample metrics_sample(
+                                phase_metrics::Phase::ANALYZER,
+                                phase_metrics::sample_rate(phase_metrics::Phase::ANALYZER));
+                            query = analyze->do_analyze(std::move(parse_tree));
+                        }
+                    }
+                    if (!used_cached_query && lexical_shape && cacheable_query &&
+                        statement_cache_mode != cache::StatementCacheMode::OFF && query != nullptr) {
+                        auto query_copy = clone_query(*query);
+                        std::shared_ptr<const Query> semantic_skeleton(std::move(query_copy));
+                        statement_template_cache->publish(lexical_shape.key, current_statement_template_generation,
+                                                          nullptr, std::move(semantic_skeleton));
+                    }
+                    LOG_DEBUG("Parse successful for sockfd: %d, type: %d", fd, static_cast<int>(parsed_type));
+                    // 优化器
+                    std::unique_ptr<Plan> plan;
+                    {
+                        if (cached_plan != nullptr) {
+                            plan = std::move(cached_plan);
+                        } else {
+                            phase_metrics::ScopedSample metrics_sample(
+                                phase_metrics::Phase::PLANNER,
+                                phase_metrics::sample_rate(phase_metrics::Phase::PLANNER));
+                            plan = optimizer->plan_query(std::move(query), context);
+                        }
+                    }
+                    if (!used_cached_plan && lexical_shape && cacheable_plan &&
+                        statement_cache_mode != cache::StatementCacheMode::OFF && plan != nullptr) {
+                        auto plan_copy = clone_plan(*plan, sm_manager.get());
+                        std::shared_ptr<const Plan> physical_skeleton(std::move(plan_copy));
+                        auto prepared_select = PreparedSelectDescriptor::Build(*physical_skeleton, sm_manager.get());
+                        statement_template_cache->publish(lexical_shape.key, current_statement_template_generation,
+                                                          nullptr, nullptr, std::move(physical_skeleton),
+                                                          std::move(prepared_select));
+                    }
+                    // portal
+                    std::unique_ptr<PortalStmt> portalStmt = portal->start(std::move(plan), context);
+                    {
+                        phase_metrics::ScopedSample metrics_sample(
+                            phase_metrics::Phase::EXECUTOR, phase_metrics::sample_rate(phase_metrics::Phase::EXECUTOR));
+                        portal->run(std::move(portalStmt), ql_manager.get(), &txn_id, context);
+                    }
+                    // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
+                    session_isolation_level = context->isolation_level_;
+                    // Note: "set output_file on|off" is a database-global toggle stored
+                    // on SmManager (see execution_manager.cpp T_SetOutputFile), so it
+                    // persists across connections without per-session mirroring here.
+                    portal->drop();
                 }
                 if (context->txn_ != nullptr && !context->txn_->get_txn_mode() &&
                     context->txn_->get_state() != TransactionState::COMMITTED &&
@@ -592,7 +614,7 @@ void client_handler(int fd) {
 void start_server() {
     int sockfd_server;
     int fd_temp;
-    struct sockaddr_in s_addr_in{};
+    struct sockaddr_in s_addr_in {};
 
     // 初始化连接
     sockfd_server = socket(AF_INET, SOCK_STREAM, 0); // ipv4,TCP
@@ -621,7 +643,7 @@ void start_server() {
 
     while (!should_exit) {
         LOG_DEBUG("waiting for new connection");
-        struct sockaddr_in s_addr_client{};
+        struct sockaddr_in s_addr_client {};
         int client_length = sizeof(s_addr_client);
 
         if (setjmp(jmpbuf)) {

@@ -294,6 +294,49 @@ TEST(AbstractExecutorFocusedTest, DefaultColsIsSafe) {
     EXPECT_TRUE(executor.cols().empty());
 }
 
+TEST(RowMutationKeyScratchTest, ReusesCapacityAndIsolatesReentrantCalls) {
+    IndexMeta index{
+        "scratch_table",
+        2 * static_cast<int>(sizeof(int)),
+        2,
+        {{"scratch_table", "a", TYPE_INT, static_cast<int>(sizeof(int)), 0, false},
+         {"scratch_table", "b", TYPE_INT, static_cast<int>(sizeof(int)), static_cast<int>(sizeof(int)), false}}};
+    std::array<char, 2 * sizeof(int)> record{};
+    write_unaligned(record.data(), 11);
+    write_unaligned(record.data() + sizeof(int), 22);
+
+    RowMutationKeyScratch* first_scratch = nullptr;
+    const char* data = nullptr;
+    size_t capacity = 0;
+    {
+        RowMutationKeyScratchLease first_lease;
+        first_scratch = &first_lease.get();
+        first_scratch->PrepareSingle(1);
+        MakeRowMutationIndexKey(index, record.data(), first_scratch->keys[0]);
+        data = first_scratch->keys[0].data();
+        capacity = first_scratch->keys[0].capacity();
+
+        RowMutationKeyScratchLease nested_lease;
+        auto& nested_scratch = nested_lease.get();
+        EXPECT_NE(&nested_scratch, first_scratch);
+        nested_scratch.PrepareSingle(8);
+        EXPECT_EQ(read_unaligned<int>(first_scratch->keys[0].data()), 11);
+        EXPECT_EQ(read_unaligned<int>(first_scratch->keys[0].data() + sizeof(int)), 22);
+    }
+
+    write_unaligned(record.data(), 33);
+    RowMutationKeyScratchLease second_lease;
+    auto& second_scratch = second_lease.get();
+    second_scratch.PrepareSingle(1);
+    MakeRowMutationIndexKey(index, record.data(), second_scratch.keys[0]);
+
+    EXPECT_EQ(&second_scratch, first_scratch);
+    EXPECT_EQ(second_scratch.keys[0].data(), data);
+    EXPECT_EQ(second_scratch.keys[0].capacity(), capacity);
+    EXPECT_EQ(read_unaligned<int>(second_scratch.keys[0].data()), 33);
+    EXPECT_EQ(read_unaligned<int>(second_scratch.keys[0].data() + sizeof(int)), 22);
+}
+
 TEST(FilterExecutorFocusedTest, CachesConditionAddressesAndReusesChildSchema) {
     const std::vector<ColMeta> cols{make_test_col("t", "id", TYPE_INT, sizeof(int), 0),
                                     make_test_col("t", "threshold", TYPE_INT, sizeof(int), sizeof(int))};
@@ -962,7 +1005,9 @@ TEST_F(ExecutorTest, database_program_runtime_builds_composite_key_and_fetches_t
     DatabaseProgramBindings bindings;
     bindings.catalog_generation = sm_manager_->get_catalog_generation();
     bindings.point_indexes.push_back(PointIndexRuntimeBinding{
-        "program_lookup", {"a", "b"}, {0, sizeof(int)},
+        "program_lookup",
+        {"a", "b"},
+        {0, sizeof(int)},
         sm_manager_->get_ix_manager()->get_index_name("program_lookup", std::vector<std::string>{"a", "b"})});
     DatabaseProgramRuntime runtime(sm_manager_.get(), nullptr, std::move(bindings));
 
