@@ -294,6 +294,48 @@ TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {
     EXPECT_EQ(log_mgr.current_log_offset(), disk.get_file_size(LOG_FILE_NAME));
 }
 
+TEST(LogManagerTest, ResetRotatesWalAndKeepsLsnMonotonicAcrossRestart) {
+    ScopedTestDir test_dir("log_manager_rotation_test_db");
+    lsn_t next_lsn = INVALID_LSN;
+    int old_log_fd = -1;
+
+    {
+        DiskManager disk;
+        disk.create_file(LOG_FILE_NAME);
+        LogManager log_mgr(&disk);
+
+        BeginLogRecord begin(104);
+        log_mgr.add_log_to_buffer(&begin);
+        CommitLogRecord commit(104);
+        log_mgr.add_log_to_buffer(&commit);
+        log_mgr.flush_log_to_disk_with_sync();
+        old_log_fd = disk.GetLogFd();
+        next_lsn = log_mgr.get_global_lsn();
+
+        log_mgr.reset_log(next_lsn);
+        EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
+        EXPECT_NE(disk.GetLogFd(), old_log_fd);
+        EXPECT_EQ(log_mgr.current_log_offset(), 0);
+        EXPECT_EQ(log_mgr.get_persist_lsn(), INVALID_LSN);
+        EXPECT_EQ(log_mgr.get_durable_lsn(), next_lsn - 1);
+
+        BeginLogRecord after_rotation(105);
+        EXPECT_EQ(log_mgr.add_log_to_buffer(&after_rotation), next_lsn);
+        log_mgr.flush_log_to_disk_with_sync();
+    }
+
+    DiskManager restarted_disk;
+    LogManager restarted_log(&restarted_disk);
+    restarted_log.initialize_from_existing_log();
+    EXPECT_EQ(restarted_log.get_durable_lsn(), next_lsn);
+    EXPECT_EQ(restarted_log.get_global_lsn(), next_lsn + 1);
+
+    auto logs = ReadAllLogs(restarted_disk);
+    ASSERT_EQ(logs.size(), 1);
+    EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
+    EXPECT_EQ(logs[0]->lsn_, next_lsn);
+}
+
 TEST(LogManagerTest, ProcessCrashCommitWaitsForPwriteWithoutFsync) {
     ScopedTestDir test_dir("log_manager_process_crash_test_db");
     DiskManager disk;

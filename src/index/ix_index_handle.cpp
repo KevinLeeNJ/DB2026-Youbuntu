@@ -22,11 +22,16 @@ See the Mulan PSL v2 for more details. */
  * @note 返回key index（同时也是rid index），作为slot no
  */
 int IxNodeHandle::lower_bound(const char* target) const {
+    const bool fixed_int_key = ix_all_fixed_int_columns(file_hdr->col_types_, file_hdr->col_lens_);
+    const auto compare = [fixed_int_key, this](const char* lhs, const char* rhs) {
+        return fixed_int_key ? ix_compare_fixed_int_columns(lhs, rhs, file_hdr->col_types_.size())
+                             : ix_compare(lhs, rhs, file_hdr->col_types_, file_hdr->col_lens_);
+    };
     int left = 0;
     int right = page_hdr->num_key;
     while (left < right) {
         int mid = left + (right - left) / 2;
-        if (ix_compare(get_key(mid), target, file_hdr->col_types_, file_hdr->col_lens_) < 0) {
+        if (compare(get_key(mid), target) < 0) {
             left = mid + 1;
         } else {
             right = mid;
@@ -42,11 +47,16 @@ int IxNodeHandle::lower_bound(const char* target) const {
  * @note 注意此处的范围从1开始
  */
 int IxNodeHandle::upper_bound(const char* target) const {
+    const bool fixed_int_key = ix_all_fixed_int_columns(file_hdr->col_types_, file_hdr->col_lens_);
+    const auto compare = [fixed_int_key, this](const char* lhs, const char* rhs) {
+        return fixed_int_key ? ix_compare_fixed_int_columns(lhs, rhs, file_hdr->col_types_.size())
+                             : ix_compare(lhs, rhs, file_hdr->col_types_, file_hdr->col_lens_);
+    };
     int left = 0;
     int right = page_hdr->num_key;
     while (left < right) {
         int mid = left + (right - left) / 2;
-        if (ix_compare(get_key(mid), target, file_hdr->col_types_, file_hdr->col_lens_) <= 0) {
+        if (compare(get_key(mid), target) <= 0) {
             left = mid + 1;
         } else {
             right = mid;

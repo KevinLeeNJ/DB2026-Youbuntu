@@ -79,8 +79,8 @@ public:
     void sync_path(const std::string& path);
     void sync_directory(const std::string& path);
 
-    // 将日志文件截断为空，并把追加偏移归零。recovery/checkpoint 完成后调用，
-    // 消除已处理完毕的 loser 日志，避免跨轮 recovery 重复 undo 同 RID 上的数据。
+    // Atomically replace the WAL with a durable empty file and reset its append
+    // offset. Recovery/checkpoint calls this only after covered pages are durable.
     void truncate_log();
     // Drop an incomplete WAL tail while preserving the complete prefix.
     void truncate_log_to(int64_t offset);

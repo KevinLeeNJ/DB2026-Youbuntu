@@ -279,6 +279,9 @@ def run_case(name: str, binary: Path, root: Path) -> None:
         "after_checkpoint_data_sync",
         "after_background_page_write_before_final_wal_flush",
         "before_wal_truncate",
+        "before_wal_rotate_rename",
+        "after_wal_rotate_rename_before_directory_sync",
+        "after_wal_rotate_directory_sync",
     }:
         checkpoint_case(server, name)
     elif name == "before_checkpoint_data_sync_throw":
@@ -305,6 +308,9 @@ CASES = [
     "after_checkpoint_data_sync",
     "after_background_page_write_before_final_wal_flush",
     "before_wal_truncate",
+    "before_wal_rotate_rename",
+    "after_wal_rotate_rename_before_directory_sync",
+    "after_wal_rotate_directory_sync",
     "before_checkpoint_data_sync_throw",
     "mid_recovery_redo",
     "mid_recovery_undo",

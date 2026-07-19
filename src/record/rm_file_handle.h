@@ -230,6 +230,12 @@ public:
 
     void delete_record(const Rid& rid, Context* context, lsn_t page_lsn = INVALID_LSN);
 
+    // Reclaim a committed tombstone once the watermark proves that no active
+    // snapshot can traverse its undo chain. Returns true when the candidate
+    // no longer needs to be retained (missing or already reused slots also
+    // resolve the candidate).
+    bool vacuum_deleted_record(const Rid& rid, timestamp_t watermark);
+
     void update_record(const Rid& rid, char* buf, Context* context, lsn_t page_lsn = INVALID_LSN);
 
     // Apply the tuple image and its MVCC metadata as one page mutation. The

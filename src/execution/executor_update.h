@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "row_mutation.h"
 #include "system/sm.h"
 #include <algorithm>
+#include <tuple>
 
 class UpdateExecutor : public AbstractExecutor {
 private:
@@ -46,6 +47,9 @@ public:
         fh_ = sm_manager_->fhs_.at(tab_name).get();
         conds_ = conds;
         rids_ = rids;
+        std::sort(rids_.begin(), rids_.end(), [](const Rid& lhs, const Rid& rhs) {
+            return std::tie(lhs.page_no, lhs.slot_no) < std::tie(rhs.page_no, rhs.slot_no);
+        });
         context_ = context;
         bound_conditions_ = BindMutationConditions(tab_, conds_);
         bound_set_clauses_ = BindMutationSetClauses(tab_, set_clauses_);

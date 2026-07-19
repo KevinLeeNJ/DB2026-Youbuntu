@@ -423,6 +423,48 @@ TEST_F(ExecutorTest, tombstone_candidates_are_deduplicated_and_removable) {
     EXPECT_EQ(candidates[0], second);
 }
 
+TEST_F(ExecutorTest, vacuum_reclaims_committed_tombstone_only_after_watermark) {
+    setup_db();
+    sm_manager_->create_table("vacuum_t", make_int_cols({"id"}), nullptr);
+    insert_test_rows("vacuum_t", {7});
+
+    Rid rid;
+    {
+        char buf[4096];
+        int offset = 0;
+        Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+        SeqScanExecutor scan(sm_manager_.get(), "vacuum_t", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    auto* fh = sm_manager_->fhs_.at("vacuum_t").get();
+    TupleMeta tombstone;
+    tombstone.commit_ts_ = 5;
+    tombstone.writer_txn_id_ = INVALID_TXN_ID;
+    tombstone.is_committed_ = true;
+    tombstone.is_deleted_ = true;
+    fh->set_tuple_meta(rid, tombstone);
+    sm_manager_->remember_deleted_tuple_candidate("vacuum_t", rid);
+
+    EXPECT_FALSE(fh->vacuum_deleted_record(rid, 5));
+    EXPECT_TRUE(fh->is_record(rid));
+    EXPECT_TRUE(fh->vacuum_deleted_record(rid, 6));
+    EXPECT_FALSE(fh->is_record(rid));
+
+    // The reclaimed slot is immediately available to the normal inserter.
+    std::vector<Value> values;
+    Value value;
+    value.set_int(8);
+    values.push_back(value);
+    char buf[4096];
+    int offset = 0;
+    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    InsertExecutor exec(sm_manager_.get(), "vacuum_t", values, &ctx);
+    EXPECT_NO_THROW(exec.Next());
+}
+
 TEST_F(ExecutorTest, seq_scan_all_records) {
     setup_db();
     auto cols = make_int_cols({"id"});

@@ -519,14 +519,10 @@ void SmManager::prune_version_history(timestamp_t watermark) {
             continue;
         }
         RmFileHandle* fh = fh_it->second.get();
-        if (!fh->is_record(rid)) {
-            del_to_remove.emplace_back(std::move(tab_name), rid);
-            continue;
-        }
-        TupleMeta meta = fh->get_tuple_meta(rid);
-        // 候选仅在 tombstone 仍可能被并发 INSERT 检测时需要保留；若当前版本已提交
-        // 且 commit_ts < watermark，则无活跃事务会再把它视为并发删除。
-        if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
+        // The file handle rechecks the bitmap and tombstone under one page-X
+        // latch, so a candidate cannot be reclaimed between is_record() and
+        // metadata inspection. Missing or reused slots resolve stale entries.
+        if (fh->vacuum_deleted_record(rid, watermark)) {
             del_to_remove.emplace_back(std::move(tab_name), rid);
         }
     }

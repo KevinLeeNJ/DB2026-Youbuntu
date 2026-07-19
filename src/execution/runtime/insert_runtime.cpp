@@ -5,6 +5,8 @@ You can use this software according to the terms and conditions of the Mulan PSL
 
 #include "insert_runtime.h"
 
+#include <algorithm>
+
 namespace {
 
 void CheckMvccUniqueKeyConflict(const InsertRuntimeInfo& info, const RowMutationIndex& index,
@@ -42,8 +44,29 @@ Rid InsertRuntime::InsertOne(RmRecord& record, const InsertRuntimeInfo& info, Co
         const auto& index = (*info.indexes)[index_idx];
         auto& key = index_keys[index_idx];
         MakeRowMutationIndexKey(*index.meta, record.data, key);
-        ReserveUniqueKey(context, index.handle->GetFd(), key);
-        CheckMvccUniqueKeyConflict(info, index, key, context, &historical_rids);
+    }
+
+    struct UniqueKeyTarget {
+        int index_fd;
+        const std::vector<char>* key;
+    };
+    std::vector<UniqueKeyTarget> unique_keys;
+    unique_keys.reserve(info.indexes->size());
+    for (size_t index_idx = 0; index_idx < info.indexes->size(); ++index_idx) {
+        unique_keys.push_back(UniqueKeyTarget{(*info.indexes)[index_idx].handle->GetFd(), &index_keys[index_idx]});
+    }
+    std::sort(unique_keys.begin(), unique_keys.end(), [](const UniqueKeyTarget& lhs, const UniqueKeyTarget& rhs) {
+        if (lhs.index_fd != rhs.index_fd) {
+            return lhs.index_fd < rhs.index_fd;
+        }
+        return std::lexicographical_compare(lhs.key->begin(), lhs.key->end(), rhs.key->begin(), rhs.key->end());
+    });
+    for (const auto& target : unique_keys) {
+        ReserveUniqueKey(context, target.index_fd, *target.key);
+    }
+    for (size_t index_idx = 0; index_idx < info.indexes->size(); ++index_idx) {
+        const auto& index = (*info.indexes)[index_idx];
+        CheckMvccUniqueKeyConflict(info, index, index_keys[index_idx], context, &historical_rids);
     }
 
     std::vector<size_t> inserted_indexes;

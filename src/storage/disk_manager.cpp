@@ -352,18 +352,53 @@ void DiskManager::truncate_log() {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
-    if (log_fd_ != -1) {
-        if (ftruncate(log_fd_, 0) != 0) {
-            throw UnixError();
-        }
-        if (fdatasync(log_fd_) != 0) {
-            throw UnixError();
-        }
-        if (lseek(log_fd_, 0, SEEK_SET) < 0) {
-            throw UnixError();
-        }
+    if (log_fd_ == -1) {
+        throw UnixError();
     }
+
+    // The caller has already made every page covered by the old WAL durable.
+    // Replace the WAL pathname with a durable empty inode instead of truncating
+    // the old btrfs inode and synchronously reclaiming all of its extents.
+    const std::string replacement_path = LOG_FILE_NAME + ".rotate.tmp";
+    int replacement_fd = open(replacement_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (replacement_fd < 0 || replacement_fd >= MAX_FD) {
+        if (replacement_fd >= 0) {
+            close(replacement_fd);
+            unlink(replacement_path.c_str());
+        }
+        throw UnixError();
+    }
+
+    try {
+        if (fdatasync(replacement_fd) != 0) {
+            throw UnixError();
+        }
+        FaultInjector::Point("before_wal_rotate_rename");
+        if (rename(replacement_path.c_str(), LOG_FILE_NAME.c_str()) != 0) {
+            throw UnixError();
+        }
+    } catch (...) {
+        close(replacement_fd);
+        unlink(replacement_path.c_str());
+        throw;
+    }
+
+    const int old_log_fd = log_fd_;
+    auto old_path = fd2path_.find(old_log_fd);
+    if (old_path != fd2path_.end()) {
+        fd2path_.erase(old_path);
+    }
+    path2fd_[LOG_FILE_NAME] = replacement_fd;
+    fd2path_[replacement_fd] = LOG_FILE_NAME;
+    fd2pageno_[replacement_fd] = 0;
+    log_fd_ = replacement_fd;
     log_offset_ = 0;
+    fd2pageno_[old_log_fd] = 0;
+    close(old_log_fd);
+
+    FaultInjector::Point("after_wal_rotate_rename_before_directory_sync");
+    sync_directory(".");
+    FaultInjector::Point("after_wal_rotate_directory_sync");
 }
 
 void DiskManager::truncate_log_to(int64_t offset) {

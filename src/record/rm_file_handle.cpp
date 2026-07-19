@@ -260,6 +260,35 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_ls
     buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), deleted);
 }
 
+bool RmFileHandle::vacuum_deleted_record(const Rid& rid, timestamp_t watermark) {
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    bool resolved = false;
+    bool changed = false;
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        if (rid.slot_no < 0 || rid.slot_no >= file_hdr_.num_records_per_page ||
+            !Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+            resolved = true;
+        } else {
+            const TupleMeta& meta = page_handle.get_meta(rid.slot_no);
+            if (!meta.is_deleted_) {
+                // The slot was reused after the old candidate was queued.
+                resolved = true;
+            } else if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
+                Bitmap::reset(page_handle.bitmap, rid.slot_no);
+                --page_handle.page_hdr->num_records;
+                if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page - 1) {
+                    release_page_handle(page_handle);
+                }
+                resolved = true;
+                changed = true;
+            }
+        }
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), changed);
+    return resolved;
+}
+
 /**
  * @description: 更新记录文件中记录号为rid的记录
  * @param {Rid&} rid 要更新的记录的记录号（位置）

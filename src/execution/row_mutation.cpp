@@ -475,14 +475,38 @@ void RowMutationEngine::CommitUpdate(PreparedUpdate&& prepared, RmRecord& propos
         if (old_key == new_key) {
             continue;
         }
-        ReserveUniqueKey(context, index.handle->GetFd(), old_key);
-        ReserveUniqueKey(context, index.handle->GetFd(), new_key);
+        index_updates.push_back(IndexUpdate{&index, &old_key, &new_key});
+    }
+
+    struct UniqueKeyTarget {
+        int index_fd;
+        const std::vector<char>* key;
+    };
+    std::vector<UniqueKeyTarget> unique_keys;
+    unique_keys.reserve(index_updates.size() * 2);
+    for (const auto& update : index_updates) {
+        const int index_fd = update.index->handle->GetFd();
+        unique_keys.push_back(UniqueKeyTarget{index_fd, update.old_key});
+        unique_keys.push_back(UniqueKeyTarget{index_fd, update.new_key});
+    }
+    std::sort(unique_keys.begin(), unique_keys.end(), [](const UniqueKeyTarget& lhs, const UniqueKeyTarget& rhs) {
+        if (lhs.index_fd != rhs.index_fd) {
+            return lhs.index_fd < rhs.index_fd;
+        }
+        return std::lexicographical_compare(lhs.key->begin(), lhs.key->end(), rhs.key->begin(), rhs.key->end());
+    });
+    for (const auto& target : unique_keys) {
+        ReserveUniqueKey(context, target.index_fd, *target.key);
+    }
+
+    for (const auto& update : index_updates) {
+        const auto& index = *update.index;
+        const auto& new_key = *update.new_key;
         if (index.handle->get_value(new_key.data(), &matching_rids, txn) &&
             std::any_of(matching_rids.begin(), matching_rids.end(), [&](const Rid& found) { return found != rid; })) {
             throw IndexEntryExistsError();
         }
         CheckHistoricalIndexConflicts(info, index, new_key, rid, context, &matching_rids);
-        index_updates.push_back(IndexUpdate{&index, &old_key, &new_key});
     }
 
     std::vector<const IndexUpdate*> deleted;

@@ -176,8 +176,7 @@ private:
         assert(!batch_.empty());
         const char* tail_key = batch_tail_key_.data();
         const bool continues_previous =
-            !last_key_.empty() &&
-            ix_compare(tail_key, last_key_.data(), ih_->file_hdr_->col_types_, ih_->file_hdr_->col_lens_) == 0;
+            !last_key_.empty() && ix_compare(tail_key, last_key_.data(), *ih_->file_hdr_) == 0;
         if (!continues_previous) {
             last_key_.assign(tail_key, tail_key + ih_->file_hdr_->col_tot_len_);
             clear_emitted_rids();
@@ -301,8 +300,7 @@ private:
             int child_idx = node.lower_bound(key);
             if (child_idx >= node.get_size()) {
                 child_idx = node.get_size() - 1;
-            } else if (child_idx > 0 && ix_compare(node.get_key(child_idx), key, ih_->file_hdr_->col_types_,
-                                                   ih_->file_hdr_->col_lens_) > 0) {
+            } else if (child_idx > 0 && ix_compare(node.get_key(child_idx), key, *ih_->file_hdr_) > 0) {
                 --child_idx;
             }
             page_id_t child_page_no = node.value_at(child_idx);
@@ -347,8 +345,7 @@ private:
         batch_tail_key_.assign(tail_key, tail_key + ih_->file_hdr_->col_tot_len_);
         batch_tail_rids_.clear();
         for (int slot = tail_slot; slot >= begin; --slot) {
-            if (ix_compare(leaf.get_key(slot), batch_tail_key_.data(), ih_->file_hdr_->col_types_,
-                           ih_->file_hdr_->col_lens_) != 0) {
+            if (ix_compare(leaf.get_key(slot), batch_tail_key_.data(), *ih_->file_hdr_) != 0) {
                 break;
             }
             batch_tail_rids_.push_back(*leaf.get_rid(slot));
@@ -401,8 +398,7 @@ private:
                     slot = leaf.lower_bound(last_key_.data());
                 }
                 while (slot < leaf.get_size()) {
-                    const int cmp = ix_compare(leaf.get_key(slot), last_key_.data(), ih_->file_hdr_->col_types_,
-                                               ih_->file_hdr_->col_lens_);
+                    const int cmp = ix_compare(leaf.get_key(slot), last_key_.data(), *ih_->file_hdr_);
                     if (cmp > 0 || (cmp == 0 && !last_key_rid_was_emitted(*leaf.get_rid(slot)))) {
                         cursor.slot_no = slot;
                         break;

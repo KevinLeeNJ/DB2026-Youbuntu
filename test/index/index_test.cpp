@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 #undef private
 
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -157,6 +158,60 @@ TEST(IxNodeHandleTest, FindsChildBySeparatorWithSafeFallbacks) {
     child_page.id_ = PageId{1, 103};
     child.set_key(0, reinterpret_cast<const char*>(&duplicate_separator));
     EXPECT_EQ(parent.find_child(&child), 2);
+}
+
+TEST(IxNodeHandleTest, SignedIntegerAndCompositeKeysKeepNumericOrder) {
+    constexpr int order = 8;
+    IxFileHdr file_hdr(IX_NO_PAGE, 4, 2, 1, sizeof(int), order, IxKeysSize(order + 1, sizeof(int)), 2, 2);
+    file_hdr.col_types_ = {TYPE_INT};
+    file_hdr.col_lens_ = {sizeof(int)};
+    Page page;
+    page.id_ = PageId{1, 2};
+    std::memset(page.get_data(), 0, PAGE_SIZE);
+    IxNodeHandle node(&file_hdr, &page);
+
+    for (int value : {0, std::numeric_limits<int>::max(), -1, std::numeric_limits<int>::min()}) {
+        node.insert(reinterpret_cast<const char*>(&value), Rid{1, value});
+    }
+    ASSERT_EQ(node.get_size(), 4);
+    for (int index = 1; index < node.get_size(); ++index) {
+        EXPECT_LT(node.key_at(index - 1), node.key_at(index));
+    }
+    for (int index = 0; index < node.get_size(); ++index) {
+        EXPECT_EQ(node.lower_bound(node.get_key(index)), index);
+        EXPECT_EQ(node.upper_bound(node.get_key(index)), index + 1);
+    }
+    EXPECT_EQ(node.key_at(0), std::numeric_limits<int>::min());
+    EXPECT_EQ(node.key_at(node.get_size() - 1), std::numeric_limits<int>::max());
+
+    IxFileHdr composite_hdr(IX_NO_PAGE, 4, 2, 2, 2 * static_cast<int>(sizeof(int)), order,
+                            IxKeysSize(order + 1, 2 * sizeof(int)), 2, 2);
+    composite_hdr.col_types_ = {TYPE_INT, TYPE_INT};
+    composite_hdr.col_lens_ = {sizeof(int), sizeof(int)};
+    Page composite_page;
+    composite_page.id_ = PageId{1, 3};
+    std::memset(composite_page.get_data(), 0, PAGE_SIZE);
+    IxNodeHandle composite(&composite_hdr, &composite_page);
+    const std::array<std::array<int, 2>, 5> keys{{
+        {0, std::numeric_limits<int>::max()},
+        {std::numeric_limits<int>::min(), -1},
+        {std::numeric_limits<int>::max(), std::numeric_limits<int>::min()},
+        {0, std::numeric_limits<int>::min()},
+        {std::numeric_limits<int>::min(), std::numeric_limits<int>::max()},
+    }};
+    for (const auto& key : keys) {
+        composite.insert(reinterpret_cast<const char*>(key.data()), Rid{1, key[1]});
+    }
+    ASSERT_EQ(composite.get_size(), static_cast<int>(keys.size()));
+    for (int index = 1; index < composite.get_size(); ++index) {
+        EXPECT_LT(ix_compare(composite.get_key(index - 1), composite.get_key(index), composite_hdr.col_types_,
+                             composite_hdr.col_lens_),
+                  0);
+    }
+    for (int index = 0; index < composite.get_size(); ++index) {
+        EXPECT_EQ(composite.lower_bound(composite.get_key(index)), index);
+        EXPECT_EQ(composite.upper_bound(composite.get_key(index)), index + 1);
+    }
 }
 
 TEST_F(IndexHandleTest, InsertsUniqueKeysAndFindsValues) {

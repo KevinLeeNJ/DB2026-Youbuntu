@@ -77,6 +77,41 @@ inline int ix_compare(const char* a, const char* b, const std::vector<ColType>& 
     return 0;
 }
 
+// Index keys store integer columns in native binary form.  A bytewise compare
+// is therefore not equivalent to numeric order (signed values and host
+// endianness both matter).  This fixed-width path keeps the numeric semantics
+// while avoiding per-column type/length dispatch in B-tree binary searches.
+inline bool ix_all_fixed_int_columns(const std::vector<ColType>& col_types, const std::vector<int>& col_lens) {
+    if (col_types.empty() || col_types.size() != col_lens.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < col_types.size(); ++index) {
+        if (col_types[index] != TYPE_INT || col_lens[index] != static_cast<int>(sizeof(int))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline int ix_compare_fixed_int_columns(const char* a, const char* b, size_t column_count) {
+    for (size_t index = 0; index < column_count; ++index) {
+        const int ia = read_unaligned<int>(a);
+        const int ib = read_unaligned<int>(b);
+        if (ia != ib) {
+            return ia < ib ? -1 : 1;
+        }
+        a += sizeof(int);
+        b += sizeof(int);
+    }
+    return 0;
+}
+
+inline int ix_compare(const char* a, const char* b, const IxFileHdr& file_hdr) {
+    return ix_all_fixed_int_columns(file_hdr.col_types_, file_hdr.col_lens_)
+               ? ix_compare_fixed_int_columns(a, b, file_hdr.col_types_.size())
+               : ix_compare(a, b, file_hdr.col_types_, file_hdr.col_lens_);
+}
+
 /* 管理B+树中的每个节点 */
 class IxNodeHandle {
     friend class IxIndexHandle;
