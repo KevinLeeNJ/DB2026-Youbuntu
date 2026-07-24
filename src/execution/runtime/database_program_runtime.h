@@ -12,27 +12,27 @@ You can use this software according to the terms and conditions of the Mulan PSL
 #include <vector>
 
 #include "compiled/program_runtime.h"
+#include "execution/runtime/bound_point_program.h"
 #include "execution/result_sink.h"
 #include "execution/runtime/delete_runtime.h"
 #include "execution/runtime/insert_runtime.h"
 #include "execution/runtime/point_lookup_runtime.h"
 
-struct PointIndexRuntimeBinding {
-    std::string table_name;
-    std::vector<std::string> index_col_names;
-    std::vector<uint32_t> tuple_offsets;
-    // Set by cached-program dispatch after catalog generation and index shape
-    // validation. Empty keeps direct runtime callers on the compatibility path.
-    std::string index_name{};
-};
-
 struct DatabaseProgramBindings {
     uint64_t catalog_generation{0};
     std::vector<PointIndexRuntimeBinding> point_indexes;
+    // Cached point-program dispatch can share catalog-scoped index metadata
+    // without copying it into every request. Direct runtime callers continue
+    // to use point_indexes above.
+    BoundPointProgramPtr bound_point_program;
     const UpdateRuntimeInfo* update_info{nullptr};
     const DeleteRuntimeInfo* delete_info{nullptr};
     const InsertRuntimeInfo* insert_info{nullptr};
     ResultSink* result_sink{nullptr};
+
+    const std::vector<PointIndexRuntimeBinding>& PointIndexes() const noexcept {
+        return bound_point_program == nullptr ? point_indexes : bound_point_program->point_indexes;
+    }
 };
 
 class DatabaseProgramRuntime : public compiled::ProgramRuntime {

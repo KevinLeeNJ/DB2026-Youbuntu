@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <readline/readline.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <array>
 #include <atomic>
@@ -21,10 +22,12 @@ See the Mulan PSL v2 for more details. */
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <mutex>
 #include <unordered_set>
@@ -96,6 +99,55 @@ private:
 ClientConnectionTracker client_connections;
 #endif
 
+std::string json_quote(std::string_view value) {
+    std::string quoted;
+    quoted.reserve(value.size() + 2);
+    quoted.push_back('"');
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '"':
+            quoted += "\\\"";
+            break;
+        case '\\':
+            quoted += "\\\\";
+            break;
+        case '\n':
+            quoted += "\\n";
+            break;
+        case '\r':
+            quoted += "\\r";
+            break;
+        case '\t':
+            quoted += "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                quoted += "?";
+            } else {
+                quoted.push_back(static_cast<char>(ch));
+            }
+            break;
+        }
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+std::string environment_value(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? "unknown" : value;
+}
+
+std::string executable_path() {
+    std::array<char, 4096> buffer{};
+    const ssize_t length = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+    if (length <= 0) {
+        return "unknown";
+    }
+    buffer[static_cast<size_t>(length)] = '\0';
+    return buffer.data();
+}
+
 void write_phase_metrics(const std::string& path, const cache::StatementTemplateCache* template_cache,
                          const compiled::ProgramTemplateCache* program_cache,
                          const jit::PointProgramJitManager* point_jit_manager) {
@@ -105,7 +157,14 @@ void write_phase_metrics(const std::string& path, const cache::StatementTemplate
         return;
     }
 
-    output << "{\n  \"format_version\": 2,\n  \"clock\": \"steady_clock_ns\",\n  \"phases\": {\n";
+    output << "{\n  \"format_version\": 2,\n  \"clock\": \"steady_clock_ns\",\n  \"provenance\": {\n"
+           << "    \"binary\": " << json_quote(executable_path()) << ",\n"
+           << "    \"pid\": " << getpid() << ",\n"
+           << "    \"git_commit\": " << json_quote(environment_value("RMDB_GIT_COMMIT")) << ",\n"
+           << "    \"binary_sha256\": " << json_quote(environment_value("RMDB_BINARY_SHA256")) << ",\n"
+           << "    \"runner\": " << json_quote(environment_value("RMDB_BENCHMARK_RUNNER")) << ",\n"
+           << "    \"endpoint\": " << json_quote(environment_value("RMDB_BENCHMARK_ENDPOINT")) << "\n"
+           << "  },\n  \"phases\": {\n";
     constexpr size_t phase_count = static_cast<size_t>(phase_metrics::Phase::COUNT);
     for (size_t i = 0; i < phase_count; ++i) {
         const auto phase = static_cast<phase_metrics::Phase>(i);

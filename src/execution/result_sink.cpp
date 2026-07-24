@@ -8,9 +8,13 @@ You can use this software according to the terms and conditions of the Mulan PSL
 #include <cstring>
 #include <fstream>
 
+#include "common/phase_metrics.h"
+
 ResultSink::ResultSink(SmManager* sm_manager, Context* context, const std::vector<ColMeta>& result_cols,
                        std::vector<std::string> captions)
     : sm_manager_(sm_manager), context_(context), result_cols_(result_cols), captions_(std::move(captions)) {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::RESULT_SINK,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::RESULT_SINK));
     if (sm_manager_ == nullptr || context_ == nullptr || context_->data_send_ == nullptr ||
         context_->offset_ == nullptr) {
         throw InternalError("result sink requires an output context");
@@ -53,6 +57,8 @@ ResultSink::ResultSink(SmManager* sm_manager, Context* context, const std::vecto
 }
 
 void ResultSink::Emit(TupleView tuple) {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::RESULT_SINK,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::RESULT_SINK));
     if (finished_) {
         throw InternalError("cannot emit a row after result sink finish");
     }
@@ -104,6 +110,8 @@ void ResultSink::Emit(TupleView tuple) {
 }
 
 void ResultSink::Finish() {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::RESULT_SINK,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::RESULT_SINK));
     if (finished_) {
         return;
     }

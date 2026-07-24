@@ -32,6 +32,41 @@ bool register_conditions(const std::vector<Condition>& conditions, const std::ve
     return true;
 }
 
+const ColMeta* resolve_projection_column(const std::vector<ColMeta>& columns, const TabCol& target) {
+    const auto found = std::find_if(columns.begin(), columns.end(), [&](const ColMeta& column) {
+        return column.tab_name == target.tab_name && column.name == target.col_name;
+    });
+    return found == columns.end() ? nullptr : &*found;
+}
+
+std::optional<PreparedSelectPipelineLayout> build_pipeline_layout(const std::vector<ColMeta>& input_columns,
+                                                                  const PreparedProjectionNode& projection) {
+    const size_t output_count = projection.preserve_column_names ? projection.columns.size() : projection.items.size();
+    if (output_count == 0) {
+        return std::nullopt;
+    }
+
+    PreparedSelectPipelineLayout layout;
+    layout.output_columns.reserve(output_count);
+    for (size_t i = 0; i < output_count; ++i) {
+        const TabCol& target = projection.preserve_column_names ? projection.columns[i] : projection.items[i].expr.col;
+        const auto* source = resolve_projection_column(input_columns, target);
+        if (source == nullptr) {
+            return std::nullopt;
+        }
+
+        auto output = *source;
+        if (!projection.preserve_column_names) {
+            output.name = projection.items[i].display_name;
+            output.tab_name.clear();
+        }
+        output.offset =
+            layout.output_columns.empty() ? 0 : layout.output_columns.back().offset + layout.output_columns.back().len;
+        layout.output_columns.push_back(std::move(output));
+    }
+    return layout;
+}
+
 std::vector<std::string> projection_output_names(const ProjectionPlan& projection) {
     if (!projection.output_names_.empty()) {
         return projection.output_names_;
@@ -136,6 +171,14 @@ public:
         return root_.get();
     }
 
+    AbstractExecutor* pipeline_input() const noexcept {
+        return filter_ != nullptr ? static_cast<AbstractExecutor*>(filter_) : static_cast<AbstractExecutor*>(scan_);
+    }
+
+    ProjectionExecutor* pipeline_projection() const noexcept {
+        return projection_;
+    }
+
 private:
     std::unique_ptr<AbstractExecutor> root_;
     IndexScanExecutor* scan_{nullptr};
@@ -192,6 +235,35 @@ private:
 };
 
 namespace {
+
+class PreparedSelectPipelineLeaseImpl final : public PreparedSelectPipelineLease {
+public:
+    explicit PreparedSelectPipelineLeaseImpl(std::shared_ptr<PreparedSelectExecutorPool> pool)
+        : pool_(std::move(pool)) {}
+
+    void Attach(std::unique_ptr<PreparedSelectExecutorChain> chain) noexcept {
+        chain_ = std::move(chain);
+    }
+
+    ~PreparedSelectPipelineLeaseImpl() override {
+        if (chain_ != nullptr) {
+            chain_->ResetForPool();
+            pool_->Release(std::move(chain_));
+        }
+    }
+
+    AbstractExecutor& input() noexcept override {
+        return *chain_->pipeline_input();
+    }
+
+    ProjectionExecutor& projection() noexcept override {
+        return *chain_->pipeline_projection();
+    }
+
+private:
+    std::shared_ptr<PreparedSelectExecutorPool> pool_;
+    std::unique_ptr<PreparedSelectExecutorChain> chain_;
+};
 
 class PreparedSelectExecutorLease final : public AbstractExecutor {
 public:
@@ -369,6 +441,14 @@ std::shared_ptr<const PreparedSelectDescriptor> PreparedSelectDescriptor::Build(
     descriptor->nodes_.push_back(std::move(projection_node));
     descriptor->output_names_ = projection_output_names(projection);
     descriptor->executor_pool_ = std::make_shared<PreparedSelectExecutorPool>();
+
+    const auto* prepared_projection = std::get_if<PreparedProjectionNode>(&descriptor->nodes_.back());
+    if (aggregate == nullptr && prepared_projection != nullptr) {
+        auto pipeline_layout = build_pipeline_layout(scan_columns, *prepared_projection);
+        if (pipeline_layout.has_value()) {
+            descriptor->pipeline_layout_ = std::move(*pipeline_layout);
+        }
+    }
     return descriptor;
 }
 
@@ -378,6 +458,34 @@ bool PreparedSelectDescriptor::Matches(const SmManager* sm_manager) const noexce
 
 PreparedSelectPoolStats PreparedSelectDescriptor::pool_stats() const noexcept {
     return executor_pool_ == nullptr ? PreparedSelectPoolStats{} : executor_pool_->Stats();
+}
+
+std::unique_ptr<PreparedSelectPipelineLease>
+PreparedSelectDescriptor::AcquirePipelineScan(const parser::OwnedTokenStream& lexical, SmManager* sm_manager,
+                                              Context* context) const {
+    if (!Matches(sm_manager) || context == nullptr || executor_pool_ == nullptr || !pipeline_layout_.has_value()) {
+        return nullptr;
+    }
+    auto frame = parameters_.Bind(lexical);
+    if (!frame.has_value()) {
+        return nullptr;
+    }
+
+    auto chain = executor_pool_->Acquire(nodes_, sm_manager);
+    try {
+        if (!chain->Reset(std::move(*frame), parameters_, context)) {
+            chain->ResetForPool();
+            executor_pool_->Release(std::move(chain));
+            return nullptr;
+        }
+        auto lease = std::make_unique<PreparedSelectPipelineLeaseImpl>(executor_pool_);
+        lease->Attach(std::move(chain));
+        return lease;
+    } catch (...) {
+        chain->ResetForPool();
+        executor_pool_->Release(std::move(chain));
+        throw;
+    }
 }
 
 std::unique_ptr<AbstractExecutor> PreparedSelectDescriptor::Instantiate(const parser::OwnedTokenStream& lexical,

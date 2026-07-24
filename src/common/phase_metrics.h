@@ -39,6 +39,14 @@ enum class Phase : size_t {
     PROJECTION_COPY,
     UPDATE_ARITHMETIC,
     AGGREGATE_TRANSITION,
+    PROGRAM_BIND,
+    PARAMETER_BIND,
+    FRAME_CREATE,
+    NATIVE_HELPER,
+    POINT_LOOKUP,
+    PREPARE_UPDATE,
+    COMMIT_UPDATE,
+    RESULT_SINK,
     COUNT,
 };
 
@@ -166,6 +174,22 @@ inline constexpr const char* phase_name(Phase phase) {
         return "update_arithmetic";
     case Phase::AGGREGATE_TRANSITION:
         return "aggregate_transition";
+    case Phase::PROGRAM_BIND:
+        return "program_bind";
+    case Phase::PARAMETER_BIND:
+        return "parameter_bind";
+    case Phase::FRAME_CREATE:
+        return "frame_create";
+    case Phase::NATIVE_HELPER:
+        return "native_helper";
+    case Phase::POINT_LOOKUP:
+        return "point_lookup";
+    case Phase::PREPARE_UPDATE:
+        return "prepare_update";
+    case Phase::COMMIT_UPDATE:
+        return "commit_update";
+    case Phase::RESULT_SINK:
+        return "result_sink";
     case Phase::COUNT:
         break;
     }
@@ -180,12 +204,20 @@ inline constexpr uint32_t sample_rate(Phase phase) {
     case Phase::PROJECTION_COPY:
     case Phase::UPDATE_ARITHMETIC:
     case Phase::AGGREGATE_TRANSITION:
+    case Phase::NATIVE_HELPER:
         return 1024;
     case Phase::PARSER:
     case Phase::ANALYZER:
     case Phase::PLANNER:
     case Phase::PORTAL_INSTANTIATE:
     case Phase::EXECUTOR:
+    case Phase::PROGRAM_BIND:
+    case Phase::PARAMETER_BIND:
+    case Phase::FRAME_CREATE:
+    case Phase::POINT_LOOKUP:
+    case Phase::PREPARE_UPDATE:
+    case Phase::COMMIT_UPDATE:
+    case Phase::RESULT_SINK:
         return 64;
     default:
         return 1;

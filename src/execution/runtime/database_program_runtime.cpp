@@ -8,6 +8,8 @@ You can use this software according to the terms and conditions of the Mulan PSL
 #include <atomic>
 #include <cstring>
 
+#include "common/phase_metrics.h"
+
 namespace {
 
 using compiled::ExecStatus;
@@ -122,21 +124,28 @@ ExecStatus DatabaseProgramRuntime::MakePointKey(uint32_t index_id, const Runtime
     if (!CatalogMatches()) {
         return Fallback("catalog generation changed before point-key construction");
     }
-    if (key == nullptr || value.type != ValueType::TUPLE || !value.initialized ||
-        index_id >= bindings_.point_indexes.size()) {
+    const auto& point_indexes = bindings_.PointIndexes();
+    if (key == nullptr || value.type != ValueType::TUPLE || !value.initialized || index_id >= point_indexes.size()) {
         return Fallback("point-key binding is unavailable");
     }
     try {
-        const auto& binding = bindings_.point_indexes[index_id];
-        auto& table = sm_manager_->db_.get_table(binding.table_name);
-        auto index_it = table.get_index_meta(binding.index_col_names);
-        if (index_it == table.indexes.end() || binding.tuple_offsets.size() != index_it->cols.size()) {
+        const auto& binding = point_indexes[index_id];
+        const IndexMeta* index_meta = binding.meta;
+        if (index_meta == nullptr) {
+            auto& table = sm_manager_->db_.get_table(binding.table_name);
+            auto index_it = table.get_index_meta(binding.index_col_names);
+            if (index_it == table.indexes.end()) {
+                return Fallback("point-key index metadata changed");
+            }
+            index_meta = &*index_it;
+        }
+        if (binding.tuple_offsets.size() != index_meta->cols.size()) {
             return Fallback("point-key index metadata changed");
         }
-        std::string encoded(static_cast<size_t>(index_it->col_tot_len), '\0');
+        std::string encoded(static_cast<size_t>(index_meta->col_tot_len), '\0');
         size_t key_offset = 0;
-        for (size_t i = 0; i < index_it->cols.size(); ++i) {
-            const auto& column = index_it->cols[i];
+        for (size_t i = 0; i < index_meta->cols.size(); ++i) {
+            const auto& column = index_meta->cols[i];
             const size_t tuple_offset = binding.tuple_offsets[i];
             if (tuple_offset + static_cast<size_t>(column.len) > value.tuple.size()) {
                 return Fallback("point-key tuple is too small");
@@ -158,18 +167,21 @@ ExecStatus DatabaseProgramRuntime::MakePointKey(uint32_t index_id, const Runtime
 
 ExecStatus DatabaseProgramRuntime::PointLookup(const RuntimeValue& key, RuntimeValue* row,
                                                RuntimeValue* tuple) noexcept {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::POINT_LOOKUP,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::POINT_LOOKUP));
     if (Sticky() != ExecStatus::OK) {
         return Sticky();
     }
     if (!CatalogMatches()) {
         return Fallback("catalog generation changed before point lookup");
     }
+    const auto& point_indexes = bindings_.PointIndexes();
     if (row == nullptr || tuple == nullptr || key.type != ValueType::POINT_KEY || !key.initialized ||
-        key.opaque >= bindings_.point_indexes.size()) {
+        key.opaque >= point_indexes.size()) {
         return Fallback("point lookup binding is unavailable");
     }
     try {
-        const auto& binding = bindings_.point_indexes[key.opaque];
+        const auto& binding = point_indexes[key.opaque];
         auto result = PointLookupRuntime::LookupEncoded(binding.table_name, binding.index_col_names, key.bytes.data(),
                                                         key.bytes.size(), sm_manager_, context_,
                                                         binding.index_name.empty() ? nullptr : &binding.index_name);
@@ -179,7 +191,9 @@ ExecStatus DatabaseProgramRuntime::PointLookup(const RuntimeValue& key, RuntimeV
         if (result.status == PointLookupStatus::NOT_FOUND || !result.rid.has_value()) {
             return Fail(ExecStatus::NO_MATCH_RESULT, nullptr);
         }
-        auto* fh = sm_manager_->fhs_.at(binding.table_name).get();
+        auto* fh = bindings_.bound_point_program != nullptr && bindings_.bound_point_program->fh != nullptr
+                       ? bindings_.bound_point_program->fh
+                       : sm_manager_->fhs_.at(binding.table_name).get();
         auto visible = GetVisibleRecord(fh, *result.rid, context_);
         if (visible == nullptr) {
             return Fail(ExecStatus::NO_MATCH_RESULT, nullptr);
@@ -201,6 +215,8 @@ ExecStatus DatabaseProgramRuntime::PointLookup(const RuntimeValue& key, RuntimeV
 
 ExecStatus DatabaseProgramRuntime::PrepareUpdate(const RuntimeValue& row, RuntimeValue* current_tuple,
                                                  RuntimeValue* prepared) noexcept {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PREPARE_UPDATE,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::PREPARE_UPDATE));
     if (Sticky() != ExecStatus::OK) {
         return Sticky();
     }
@@ -246,6 +262,8 @@ ExecStatus DatabaseProgramRuntime::PrepareUpdate(const RuntimeValue& row, Runtim
 
 ExecStatus DatabaseProgramRuntime::CommitUpdate(const RuntimeValue& prepared,
                                                 const RuntimeValue& proposed_tuple) noexcept {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::COMMIT_UPDATE,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::COMMIT_UPDATE));
     if (!BeginStateful()) {
         return Sticky();
     }

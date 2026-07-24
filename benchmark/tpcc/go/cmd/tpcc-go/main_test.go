@@ -90,6 +90,34 @@ func TestSurnameAcceptsTPCCTokenRange(t *testing.T) {
 	}
 }
 
+func TestDeliveryQueriesKeepWarehousePredicates(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func delivery(")
+	if start < 0 {
+		t.Fatal("delivery transaction source was not found")
+	}
+	end := strings.Index(text[start:], "\nfunc stockLevel(")
+	if end < 0 {
+		t.Fatal("stock-level transaction boundary was not found")
+	}
+	deliverySource := text[start : start+end]
+	for _, predicate := range []string{
+		"d_w_id = %d",
+		"no_w_id = %d",
+		"o_w_id = %d",
+		"ol_w_id = %d",
+		"c_w_id = %d",
+	} {
+		if !strings.Contains(deliverySource, predicate) {
+			t.Fatalf("delivery query shape is missing warehouse predicate %q", predicate)
+		}
+	}
+}
+
 func TestResultMergePreservesCountsAndLatencies(t *testing.T) {
 	combined := newResult(60)
 	first := newResult(60)

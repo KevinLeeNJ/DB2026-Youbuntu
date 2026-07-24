@@ -8,11 +8,14 @@ RMDB is licensed under Mulan PSL v2. */
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "compiled/bytecode_interpreter.h"
+#include "common/phase_metrics.h"
 #include "compiled/parameter_frame.h"
 #include "execution/result_sink.h"
 #include "execution/runtime/database_program_runtime.h"
@@ -61,6 +64,8 @@ std::optional<compiled::ParameterValue> BindParameter(const compiled::LexicalPar
 
 std::optional<std::vector<compiled::ParameterValue>>
 BindProgramParameters(const compiled::ProgramTemplate& program_template, const parser::OwnedTokenStream& lexical) {
+    phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PARAMETER_BIND,
+                                               phase_metrics::sample_rate(phase_metrics::Phase::PARAMETER_BIND));
     std::vector<compiled::ParameterValue> values;
     values.reserve(program_template.program().parameters().size());
     for (uint32_t program_parameter = 0; program_parameter < program_template.program().parameters().size();
@@ -124,49 +129,62 @@ struct RuntimeBindingState {
     std::vector<SetClause> set_clauses;
     std::vector<BoundMutationCondition> bound_conditions;
     std::vector<BoundMutationSetClause> bound_set_clauses;
-    std::vector<RowMutationIndex> indexes;
-    std::vector<bool> affected_indexes;
     UpdateRuntimeInfo update_info{};
     DeleteRuntimeInfo delete_info{};
     InsertRuntimeInfo insert_info{};
+    BoundPointProgramPtr bound_point_program;
 };
 
-bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmManager* sm_manager,
-                          DatabaseProgramBindings* bindings, std::vector<ColMeta>* output_cols,
-                          std::vector<std::string>* captions, const parser::OwnedTokenStream& lexical,
-                          RuntimeBindingState* state) {
+struct BoundPointProgramCacheEntry {
+    std::weak_ptr<const compiled::ProgramTemplate> owner;
+    BoundPointProgramPtr bound;
+};
+
+std::mutex bound_point_program_cache_latch;
+std::unordered_map<const compiled::ProgramTemplate*, BoundPointProgramCacheEntry> bound_point_program_cache;
+
+BoundPointProgramPtr BuildBoundPointProgram(const compiled::ProgramTemplate& program_template, SmManager* sm_manager) {
     if (sm_manager == nullptr ||
         program_template.identity().catalog_generation != sm_manager->get_catalog_generation()) {
-        return false;
+        return nullptr;
     }
+
     const auto& description = program_template.bindings();
-    bindings->point_indexes.reserve(description.point_indexes.size());
-    state->conditions.reserve(description.conditions.size());
-    state->set_clauses.reserve(description.set_clauses.size());
-    state->indexes.reserve(description.mutation_indexes.size());
-    state->bound_conditions.reserve(description.conditions.size());
-    state->bound_set_clauses.reserve(description.set_clauses.size());
-    output_cols->reserve(description.output_columns.size());
-    captions->reserve(description.output_columns.size());
-    auto& table = sm_manager->db_.get_table(description.table.table_name);
+    auto bound = std::make_shared<BoundPointProgram>();
+    bound->owner = sm_manager;
+    bound->catalog_generation = program_template.identity().catalog_generation;
+    bound->table_name = description.table.table_name;
+    bound->table = &sm_manager->db_.get_table(bound->table_name);
+    bound->fh = sm_manager->fhs_.at(bound->table_name).get();
+
     if (program_template.identity().kind != compiled::ProgramKind::POINT_SELECT &&
-        description.mutation_indexes.size() != table.indexes.size()) {
-        return false;
+        description.mutation_indexes.size() != bound->table->indexes.size()) {
+        return nullptr;
     }
+
+    bound->point_indexes.reserve(description.point_indexes.size());
     for (const auto& cached_index : description.point_indexes) {
-        bindings->point_indexes.push_back({description.table.table_name, cached_index.column_names,
-                                           cached_index.tuple_offsets, cached_index.index_name});
+        auto index_it = bound->table->get_index_meta(cached_index.column_names);
+        if (index_it == bound->table->indexes.end() || cached_index.tuple_offsets.size() != index_it->cols.size()) {
+            return nullptr;
+        }
+        bound->point_indexes.push_back({bound->table_name, cached_index.column_names, cached_index.tuple_offsets,
+                                        cached_index.index_name, &*index_it});
     }
-    state->table_name = description.table.table_name;
+
+    bound->mutation_indexes.reserve(description.mutation_indexes.size());
     for (size_t i = 0; i < description.mutation_indexes.size(); ++i) {
         const auto& cached = description.mutation_indexes[i];
-        const auto& live = table.indexes.at(i);
+        const auto& live = bound->table->indexes.at(i);
         auto handle = sm_manager->ihs_.find(cached.index_name);
         if (handle == sm_manager->ihs_.end()) {
-            return false;
+            return nullptr;
         }
-        state->indexes.push_back({&live, handle->second.get(), cached.index_name});
+        bound->mutation_indexes.push_back({&live, handle->second.get(), cached.index_name});
     }
+
+    bound->output_cols.reserve(description.output_columns.size());
+    bound->captions.reserve(description.output_columns.size());
     for (const auto& output : description.output_columns) {
         ColMeta col;
         col.tab_name = output.source.table_name;
@@ -176,11 +194,82 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
                                                                         : TYPE_STRING;
         col.offset = static_cast<int>(output.source.offset);
         col.len = static_cast<int>(output.source.width);
-        output_cols->push_back(std::move(col));
-        captions->push_back(output.caption);
+        bound->output_cols.push_back(std::move(col));
+        bound->captions.push_back(output.caption);
     }
-    bindings->catalog_generation = program_template.identity().catalog_generation;
-    auto* fh = sm_manager->fhs_.at(state->table_name).get();
+    bound->affected_indexes = description.affected_mutation_indexes;
+
+    if (program_template.identity().kind == compiled::ProgramKind::POINT_SELECT) {
+        if (bound->point_indexes.empty() || bound->output_cols.empty()) {
+            return nullptr;
+        }
+    } else if (program_template.identity().kind != compiled::ProgramKind::POINT_INSERT &&
+               bound->point_indexes.empty()) {
+        return nullptr;
+    }
+
+    return bound;
+}
+
+BoundPointProgramPtr GetBoundPointProgram(const std::shared_ptr<const compiled::ProgramTemplate>& program_template,
+                                          SmManager* sm_manager) {
+    if (program_template == nullptr || sm_manager == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(bound_point_program_cache_latch);
+    const auto key = program_template.get();
+    auto it = bound_point_program_cache.find(key);
+    if (it != bound_point_program_cache.end()) {
+        const auto cached_owner = it->second.owner.lock();
+        if (cached_owner == program_template && it->second.bound != nullptr && it->second.bound->owner == sm_manager &&
+            it->second.bound->catalog_generation == sm_manager->get_catalog_generation()) {
+            return it->second.bound;
+        }
+        if (cached_owner == nullptr || cached_owner != program_template) {
+            bound_point_program_cache.erase(it);
+        }
+    }
+
+    auto bound = BuildBoundPointProgram(*program_template, sm_manager);
+    if (bound == nullptr) {
+        return nullptr;
+    }
+    bound_point_program_cache[key] = BoundPointProgramCacheEntry{program_template, bound};
+    if (bound_point_program_cache.size() > 512) {
+        for (auto cache_it = bound_point_program_cache.begin(); cache_it != bound_point_program_cache.end();) {
+            if (cache_it->second.owner.expired()) {
+                cache_it = bound_point_program_cache.erase(cache_it);
+            } else {
+                ++cache_it;
+            }
+        }
+    }
+    return bound;
+}
+
+bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, const BoundPointProgramPtr& bound,
+                          SmManager* sm_manager, DatabaseProgramBindings* bindings, std::vector<ColMeta>* output_cols,
+                          std::vector<std::string>* captions, const parser::OwnedTokenStream& lexical,
+                          RuntimeBindingState* state) {
+    if (sm_manager == nullptr || bound == nullptr || bound->owner != sm_manager ||
+        bound->catalog_generation != sm_manager->get_catalog_generation() ||
+        program_template.identity().catalog_generation != bound->catalog_generation || bound->table == nullptr ||
+        bound->fh == nullptr) {
+        return false;
+    }
+    const auto& description = program_template.bindings();
+    bindings->bound_point_program = bound;
+    bindings->catalog_generation = bound->catalog_generation;
+    state->bound_point_program = bound;
+    state->conditions.reserve(description.conditions.size());
+    state->set_clauses.reserve(description.set_clauses.size());
+    state->bound_conditions.reserve(description.conditions.size());
+    state->bound_set_clauses.reserve(description.set_clauses.size());
+    *output_cols = bound->output_cols;
+    *captions = bound->captions;
+    state->table_name = bound->table_name;
+    auto& table = *bound->table;
+    auto* fh = bound->fh;
     for (const auto& cached : description.conditions) {
         Condition condition;
         condition.lhs_col = {cached.lhs.table_name, cached.lhs.column_name};
@@ -224,34 +313,38 @@ bool ValidateLiveBindings(const compiled::ProgramTemplate& program_template, SmM
     }
     state->bound_conditions = BindMutationConditions(table, state->conditions);
     if (program_template.identity().kind == compiled::ProgramKind::POINT_SELECT) {
-        return !bindings->point_indexes.empty() && !output_cols->empty();
+        return !bound->point_indexes.empty() && !output_cols->empty();
     }
     if (program_template.identity().kind == compiled::ProgramKind::POINT_INSERT) {
-        state->insert_info = {sm_manager, &state->table_name, &table, fh, &state->indexes};
+        state->insert_info = {sm_manager, &bound->table_name, bound->table, fh, &bound->mutation_indexes};
         bindings->insert_info = &state->insert_info;
         return true;
     }
-    if (bindings->point_indexes.empty()) {
+    if (bound->point_indexes.empty()) {
         return false;
     }
     if (program_template.identity().kind == compiled::ProgramKind::POINT_DELETE) {
-        state->delete_info = {sm_manager,         &state->table_name,       &table,         fh,
-                              &state->conditions, &state->bound_conditions, &state->indexes};
+        state->delete_info = {sm_manager,
+                              &bound->table_name,
+                              bound->table,
+                              fh,
+                              &state->conditions,
+                              &state->bound_conditions,
+                              &bound->mutation_indexes};
         bindings->delete_info = &state->delete_info;
         return true;
     }
     state->bound_set_clauses = BindMutationSetClauses(table, state->set_clauses);
-    state->affected_indexes = description.affected_mutation_indexes;
     state->update_info = {sm_manager,
-                          &state->table_name,
-                          &table,
+                          &bound->table_name,
+                          bound->table,
                           fh,
                           &state->conditions,
                           &state->bound_conditions,
-                          &state->indexes,
+                          &bound->mutation_indexes,
                           &state->set_clauses,
                           &state->bound_set_clauses,
-                          &state->affected_indexes};
+                          &bound->affected_indexes};
     bindings->update_info = &state->update_info;
     return true;
 }
@@ -283,10 +376,15 @@ ProgramDispatchStatus DispatchCachedPointProgram(const ProgramDispatchRequest& r
     std::vector<ColMeta> output_cols;
     std::vector<std::string> captions;
     RuntimeBindingState state;
+    BoundPointProgramPtr bound_point_program;
     bool valid_bindings = false;
     try {
-        valid_bindings = values.has_value() && ValidateLiveBindings(*program_template, request.sm_manager, &bindings,
-                                                                    &output_cols, &captions, *request.lexical, &state);
+        phase_metrics::ScopedSample metrics_sample(phase_metrics::Phase::PROGRAM_BIND,
+                                                   phase_metrics::sample_rate(phase_metrics::Phase::PROGRAM_BIND));
+        bound_point_program = GetBoundPointProgram(program_template, request.sm_manager);
+        valid_bindings =
+            values.has_value() && ValidateLiveBindings(*program_template, bound_point_program, request.sm_manager,
+                                                       &bindings, &output_cols, &captions, *request.lexical, &state);
     } catch (...) {
         valid_bindings = false;
     }

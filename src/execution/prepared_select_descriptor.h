@@ -5,6 +5,7 @@ RMDB is licensed under Mulan PSL v2. */
 
 #include <memory>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -17,6 +18,21 @@ RMDB is licensed under Mulan PSL v2. */
 class AbstractExecutor;
 class Context;
 class PreparedSelectExecutorPool;
+class ProjectionExecutor;
+
+class PreparedSelectPipelineLease {
+public:
+    virtual ~PreparedSelectPipelineLease() = default;
+
+    PreparedSelectPipelineLease(const PreparedSelectPipelineLease&) = delete;
+    PreparedSelectPipelineLease& operator=(const PreparedSelectPipelineLease&) = delete;
+
+    virtual AbstractExecutor& input() noexcept = 0;
+    virtual ProjectionExecutor& projection() noexcept = 0;
+
+protected:
+    PreparedSelectPipelineLease() = default;
+};
 
 struct PreparedSelectPoolStats {
     uint64_t constructed{0};
@@ -47,6 +63,10 @@ struct PreparedProjectionNode {
     std::vector<PreparedProjectionItem> items;
 };
 
+struct PreparedSelectPipelineLayout {
+    std::vector<ColMeta> output_columns;
+};
+
 using PreparedSelectNode =
     std::variant<PreparedIndexScanNode, PreparedFilterNode, PreparedAggregateNode, PreparedProjectionNode>;
 
@@ -59,6 +79,8 @@ public:
     bool Matches(const SmManager* sm_manager) const noexcept;
     std::unique_ptr<AbstractExecutor> Instantiate(const parser::OwnedTokenStream& lexical, SmManager* sm_manager,
                                                   Context* context) const;
+    std::unique_ptr<PreparedSelectPipelineLease> AcquirePipelineScan(const parser::OwnedTokenStream& lexical,
+                                                                     SmManager* sm_manager, Context* context) const;
 
     const std::vector<std::string>& output_names() const noexcept {
         return output_names_;
@@ -70,6 +92,10 @@ public:
         return parameters_;
     }
 
+    const std::optional<PreparedSelectPipelineLayout>& pipeline_layout() const noexcept {
+        return pipeline_layout_;
+    }
+
     PreparedSelectPoolStats pool_stats() const noexcept;
 
 private:
@@ -79,4 +105,5 @@ private:
     std::vector<std::string> output_names_;
     PreparedParameterLayout parameters_;
     std::shared_ptr<PreparedSelectExecutorPool> executor_pool_;
+    std::optional<PreparedSelectPipelineLayout> pipeline_layout_;
 };

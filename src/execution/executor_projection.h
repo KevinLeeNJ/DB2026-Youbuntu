@@ -165,6 +165,11 @@ public:
         materialize_current();
     }
 
+    TupleView ProjectForPipeline(TupleView input) {
+        current_view_ = {};
+        return materialize_view(input) ? current_view_ : TupleView{};
+    }
+
     void ResetPreparedRequest(Context* context) {
         context_ = context;
         current_view_ = {};

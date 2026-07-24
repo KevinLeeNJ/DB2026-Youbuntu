@@ -39,6 +39,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_skip_scan.h"
 #include "execution/prepared_select_descriptor.h"
+#include "execution/runtime/prepared_select_pipeline.h"
 #include "execution/executor_insert.h"
 #include "execution/runtime/point_lookup_runtime.h"
 #include "execution/executor_limit.h"
@@ -1497,6 +1498,10 @@ public:
 
     bool run_prepared_select(const PreparedSelectDescriptor& descriptor, const parser::OwnedTokenStream& lexical,
                              QlManager* ql, Context* context) {
+        if (prepared_select_pipeline::Run(descriptor, lexical, sm_manager_, context) ==
+            prepared_select_pipeline::RunStatus::HANDLED) {
+            return true;
+        }
         auto root = descriptor.Instantiate(lexical, sm_manager_, context);
         if (root == nullptr) {
             return false;

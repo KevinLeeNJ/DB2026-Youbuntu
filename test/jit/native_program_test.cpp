@@ -3,15 +3,20 @@ RMDB is licensed under Mulan PSL v2. */
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <array>
 #include <limits>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
 #include "compiled/bytecode_interpreter.h"
 #include "compiled/program_verifier.h"
+#include "jit/native_abi.h"
 #include "jit/jit_types.h"
 
 namespace {
@@ -134,6 +139,159 @@ public:
     std::vector<std::vector<uint8_t>> emitted;
 };
 
+struct NativeV2Context {
+    std::array<const char*, 8> calls{};
+    size_t call_count{0};
+    ExecStatus status{ExecStatus::OK};
+
+    void Record(const char* call) noexcept {
+        if (call_count < calls.size())
+            calls[call_count++] = call;
+    }
+};
+
+ExecStatus V2Status(NativeV2Context* context) noexcept {
+    return context->status;
+}
+
+ExecStatus V2MakePointKey(void* opaque, uint32_t index, const jit::native::NativeSlot* tuple,
+                          jit::native::NativeSlot* key) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("key");
+    if (V2Status(context) != ExecStatus::OK)
+        return context->status;
+    key->type = ValueType::POINT_KEY;
+    key->opaque = index;
+    key->length = tuple->length;
+    key->initialized = 1;
+    if (key->length != 0)
+        std::memcpy(key->data, tuple->data, key->length);
+    return ExecStatus::OK;
+}
+
+ExecStatus V2PointLookup(void* opaque, const jit::native::NativeSlot*, jit::native::NativeSlot* row,
+                         jit::native::NativeSlot* tuple, uint32_t tuple_size) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("lookup");
+    if (V2Status(context) != ExecStatus::OK)
+        return context->status;
+    row->type = ValueType::ROW_HANDLE;
+    row->opaque = 19;
+    row->initialized = 1;
+    tuple->type = ValueType::TUPLE;
+    tuple->length = tuple_size;
+    tuple->initialized = 1;
+    for (uint32_t i = 0; i < tuple_size; ++i)
+        tuple->data[i] = static_cast<uint8_t>(i + 1);
+    return ExecStatus::OK;
+}
+
+ExecStatus V2PrepareUpdate(void* opaque, const jit::native::NativeSlot* row, jit::native::NativeSlot* tuple,
+                           jit::native::NativeSlot* prepared, uint32_t tuple_size) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("prepare");
+    if (V2Status(context) != ExecStatus::OK)
+        return context->status;
+    EXPECT_EQ(row->opaque, 19U);
+    tuple->type = ValueType::TUPLE;
+    tuple->length = tuple_size;
+    tuple->initialized = 1;
+    for (uint32_t i = 0; i < tuple_size; ++i)
+        tuple->data[i] = static_cast<uint8_t>(10 + i);
+    prepared->type = ValueType::PREPARED_UPDATE;
+    prepared->opaque = 23;
+    prepared->initialized = 1;
+    return ExecStatus::OK;
+}
+
+ExecStatus V2CommitUpdate(void* opaque, const jit::native::NativeSlot* prepared,
+                          const jit::native::NativeSlot*) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("commit");
+    if (V2Status(context) != ExecStatus::OK)
+        return context->status;
+    return prepared->opaque == 23 ? ExecStatus::OK : ExecStatus::ERROR;
+}
+
+ExecStatus V2DeleteRow(void* opaque, const jit::native::NativeSlot* row) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("delete");
+    if (V2Status(context) != ExecStatus::OK)
+        return context->status;
+    return row->opaque == 19 ? ExecStatus::OK : ExecStatus::ERROR;
+}
+
+ExecStatus V2InsertRow(void* opaque, const jit::native::NativeSlot* tuple, jit::native::NativeSlot* row) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("insert");
+    if (V2Status(context) != ExecStatus::OK)
+        return context->status;
+    row->type = ValueType::ROW_HANDLE;
+    row->opaque = tuple->length;
+    row->initialized = 1;
+    return ExecStatus::OK;
+}
+
+ExecStatus V2EmitRow(void* opaque, const jit::native::NativeSlot*) noexcept {
+    auto* context = static_cast<NativeV2Context*>(opaque);
+    context->Record("emit");
+    return V2Status(context);
+}
+
+jit::native::NativeRuntimeV2 V2Table(NativeV2Context* context) {
+    return {jit::native::kNativeRuntimeV2AbiVersion,
+            sizeof(jit::native::NativeRuntimeV2),
+            context,
+            V2MakePointKey,
+            V2PointLookup,
+            V2PrepareUpdate,
+            V2CommitUpdate,
+            V2DeleteRow,
+            V2InsertRow,
+            V2EmitRow};
+}
+
+TEST(NativeRuntimeV2Test, OptInCallbacksDispatchWithoutChangingLegacyFallback) {
+    DifferentialRuntime runtime;
+    NativeV2Context v2_context;
+    auto table = V2Table(&v2_context);
+    const jit::native::NativeRuntimeV2View view{&table, jit::native::kNativeRuntimeV2AbiVersion,
+                                                sizeof(jit::native::NativeRuntimeV2View)};
+    jit::native::NativeRuntimeV2Binding binding{};
+
+    std::array<uint8_t, 8> tuple_bytes{1, 2, 3, 4, 0, 0, 0, 0};
+    std::array<uint8_t, 8> key_bytes{};
+    std::array<uint8_t, 8> output_bytes{};
+    jit::native::NativeSlot tuple{ValueType::TUPLE, 1, 0, 0, 0, 0, tuple_bytes.data(), 4, 8, 0};
+    jit::native::NativeSlot key{ValueType::POINT_KEY, 0, 0, 0, 0, 0, key_bytes.data(), 0, 8, 0};
+    jit::native::NativeSlot row{ValueType::ROW_HANDLE, 0, 0, 0, 0, 0, nullptr, 0, 0, 0};
+    jit::native::NativeSlot prepared{ValueType::PREPARED_UPDATE, 0, 0, 0, 0, 0, nullptr, 0, 0, 0};
+    jit::native::NativeSlot output{ValueType::ROW_HANDLE, 0, 0, 0, 0, 0, output_bytes.data(), 0, 8, 0};
+
+    jit::native::PushRuntimeV2(&binding, &runtime, &view);
+    EXPECT_EQ(jit::native::MakePointKey(&runtime, 7, &tuple, &key), ExecStatus::OK);
+    EXPECT_EQ(jit::native::PointLookup(&runtime, &key, &row, &tuple, 4), ExecStatus::OK);
+    EXPECT_EQ(jit::native::PrepareUpdate(&runtime, &row, &tuple, &prepared, 4), ExecStatus::OK);
+    EXPECT_EQ(jit::native::CommitUpdate(&runtime, &prepared, &tuple), ExecStatus::OK);
+    EXPECT_EQ(jit::native::DeleteRow(&runtime, &row), ExecStatus::OK);
+    EXPECT_EQ(jit::native::InsertRow(&runtime, &tuple, &output), ExecStatus::OK);
+    EXPECT_EQ(jit::native::EmitRow(&runtime, &tuple), ExecStatus::OK);
+    jit::native::PopRuntimeV2(&binding);
+
+    ASSERT_EQ(v2_context.call_count, 7U);
+    EXPECT_EQ(v2_context.calls[0], std::string("key"));
+    EXPECT_EQ(v2_context.calls[1], std::string("lookup"));
+    EXPECT_EQ(v2_context.calls[2], std::string("prepare"));
+    EXPECT_EQ(v2_context.calls[3], std::string("commit"));
+    EXPECT_EQ(v2_context.calls[4], std::string("delete"));
+    EXPECT_EQ(v2_context.calls[5], std::string("insert"));
+    EXPECT_EQ(v2_context.calls[6], std::string("emit"));
+
+    // Pop restores the legacy RuntimeValue-based path for the same runtime.
+    EXPECT_EQ(jit::native::MakePointKey(&runtime, 3, &tuple, &key), ExecStatus::OK);
+    EXPECT_EQ(runtime.calls.back(), "key");
+}
+
 void ExpectSame(const DifferentialRuntime& interpreted, const DifferentialRuntime& native) {
     EXPECT_EQ(native.calls, interpreted.calls);
     EXPECT_EQ(native.committed, interpreted.committed);
@@ -141,6 +299,184 @@ void ExpectSame(const DifferentialRuntime& interpreted, const DifferentialRuntim
     EXPECT_EQ(native.emitted, interpreted.emitted);
     EXPECT_EQ(native.seen_opaque, interpreted.seen_opaque);
     EXPECT_EQ(native.error_message(), interpreted.error_message());
+}
+
+CompiledProgram FrameProgram() {
+    TupleLayout layout{8, {{ValueType::INT32, 0, 4}, {ValueType::INT32, 4, 4}}};
+    return Program({},
+                   {{ValueType::INT32},
+                    {ValueType::BYTES, compiled::kNoOperand, 5},
+                    {ValueType::TUPLE, 0},
+                    {ValueType::POINT_KEY}},
+                   {layout}, {Op(Opcode::HALT)});
+}
+
+TEST(NativeProgramFrameTest, UsesSingleArenaAndReusesThreadLocalFrame) {
+    auto program = FrameProgram();
+    auto parameters = Bind(program, {});
+    DifferentialRuntime runtime;
+
+    auto* first = jit::native::CreateFrame(&program, &parameters, &runtime);
+    ASSERT_NE(first, nullptr);
+    const auto* first_layout = jit::native::FrameLayoutData(first);
+    ASSERT_NE(first_layout, nullptr);
+    ASSERT_EQ(first_layout->register_count, 4U);
+    ASSERT_EQ(first_layout->offsets, (std::vector<uint32_t>{0, 0, 5, 13}));
+    ASSERT_EQ(first_layout->capacities, (std::vector<uint32_t>{0, 5, 8, compiled::MAX_PROGRAM_VALUE_BYTES}));
+    EXPECT_EQ(first_layout->storage_size, 13U + compiled::MAX_PROGRAM_VALUE_BYTES);
+    EXPECT_EQ(first_layout->types,
+              (std::vector<ValueType>{ValueType::INT32, ValueType::BYTES, ValueType::TUPLE, ValueType::POINT_KEY}));
+
+    auto* first_registers = first->registers;
+    EXPECT_EQ(first_registers[0].data, nullptr);
+    ASSERT_NE(first_registers[1].data, nullptr);
+    ASSERT_NE(first_registers[2].data, nullptr);
+    ASSERT_NE(first_registers[3].data, nullptr);
+    EXPECT_EQ(first_registers[2].data, first_registers[1].data + first_registers[1].capacity);
+    EXPECT_EQ(first_registers[3].data, first_registers[2].data + first_registers[2].capacity);
+
+    // Reuse must reset request-local register state, including the tuple's
+    // fixed initialized state and non-tuple registers' cleared state.
+    first_registers[1].initialized = 1;
+    first_registers[1].length = 4;
+    first_registers[2].initialized = 0;
+    first_registers[2].length = 0;
+    auto* first_data = first_registers[1].data;
+    jit::native::DestroyFrame(first);
+    EXPECT_EQ(jit::native::FrameLayoutData(first), nullptr);
+
+    auto* second = jit::native::CreateFrame(&program, &parameters, &runtime);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second, first);
+    EXPECT_EQ(second->registers, first_registers);
+    EXPECT_EQ(second->registers[1].data, first_data);
+    EXPECT_EQ(second->registers[1].initialized, 0);
+    EXPECT_EQ(second->registers[1].length, 0U);
+    EXPECT_EQ(second->registers[2].initialized, 1);
+    EXPECT_EQ(second->registers[2].length, second->registers[2].capacity);
+    jit::native::DestroyFrame(second);
+}
+
+TEST(NativeProgramFrameTest, ActiveFramesAreNotSharedAcrossThreads) {
+    auto program = FrameProgram();
+    auto parameters = Bind(program, {});
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool ready = false;
+    bool release = false;
+    jit::native::ExecutionFrame* worker_frame = nullptr;
+
+    std::thread worker([&] {
+        DifferentialRuntime runtime;
+        auto* frame = jit::native::CreateFrame(&program, &parameters, &runtime);
+        {
+            std::lock_guard lock(mutex);
+            worker_frame = frame;
+            ready = true;
+        }
+        condition.notify_one();
+        {
+            std::unique_lock lock(mutex);
+            condition.wait(lock, [&] { return release; });
+        }
+        jit::native::DestroyFrame(frame);
+    });
+
+    bool worker_ready = false;
+    {
+        std::unique_lock lock(mutex);
+        worker_ready = condition.wait_for(lock, std::chrono::seconds(2), [&] { return ready; });
+    }
+    EXPECT_TRUE(worker_ready);
+    auto* active_worker_frame = worker_frame;
+    DifferentialRuntime main_runtime;
+    auto* main_frame = jit::native::CreateFrame(&program, &parameters, &main_runtime);
+    EXPECT_NE(active_worker_frame, nullptr);
+    EXPECT_NE(main_frame, nullptr);
+    EXPECT_NE(main_frame, active_worker_frame);
+    if (main_frame != nullptr)
+        jit::native::DestroyFrame(main_frame);
+
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    condition.notify_one();
+    worker.join();
+}
+
+TEST(NativeProgramAbiTest, V2TableAndBorrowedViewsHaveStablePODLayout) {
+    static_assert(std::is_standard_layout_v<jit::native::NativeRuntimeV2>);
+    static_assert(std::is_trivially_copyable_v<jit::native::NativeRuntimeV2>);
+    static_assert(std::is_standard_layout_v<jit::native::NativeRuntimeV2View>);
+    static_assert(std::is_trivially_copyable_v<jit::native::NativeRuntimeV2View>);
+    static_assert(std::is_standard_layout_v<jit::native::NativeRuntimeV2Binding>);
+    static_assert(std::is_trivially_copyable_v<jit::native::NativeRuntimeV2Binding>);
+
+    EXPECT_EQ(sizeof(jit::native::NativeRuntimeV2View),
+              sizeof(const jit::native::NativeRuntimeV2*) + 2 * sizeof(uint32_t));
+    EXPECT_EQ(offsetof(jit::native::NativeRuntimeV2, abi_version), 0U);
+    EXPECT_EQ(offsetof(jit::native::NativeRuntimeV2, struct_size), sizeof(uint32_t));
+    EXPECT_EQ(jit::native::kNativeRuntimeV2AbiVersion, 1U);
+}
+
+TEST(NativeProgramAbiTest, ExplicitV2BindingUsesCallbacksAndUnboundRuntimeUsesLegacyFallback) {
+    DifferentialRuntime runtime;
+    NativeV2Context context;
+    const auto table = V2Table(&context);
+    const jit::native::NativeRuntimeV2View view{&table, jit::native::kNativeRuntimeV2AbiVersion,
+                                                sizeof(jit::native::NativeRuntimeV2View)};
+    jit::native::NativeRuntimeV2Binding binding{};
+    jit::native::PushRuntimeV2(&binding, &runtime, &view);
+
+    std::array<uint8_t, 8> tuple_data{1, 2, 3, 4, 0, 0, 0, 0};
+    std::array<uint8_t, 8> key_data{};
+    jit::native::NativeSlot tuple{};
+    tuple.type = ValueType::TUPLE;
+    tuple.initialized = 1;
+    tuple.data = tuple_data.data();
+    tuple.length = 4;
+    tuple.capacity = tuple_data.size();
+    jit::native::NativeSlot key{};
+    key.type = ValueType::POINT_KEY;
+    key.data = key_data.data();
+    key.capacity = key_data.size();
+    jit::native::NativeSlot row{};
+    row.type = ValueType::ROW_HANDLE;
+    jit::native::NativeSlot prepared{};
+    prepared.type = ValueType::PREPARED_UPDATE;
+
+    EXPECT_EQ(jit::native::MakePointKey(&runtime, 7, &tuple, &key), ExecStatus::OK);
+    EXPECT_EQ(key.opaque, 7U);
+    EXPECT_EQ(std::memcmp(key.data, tuple.data, tuple.length), 0);
+    EXPECT_EQ(jit::native::PointLookup(&runtime, &key, &row, &tuple, 4), ExecStatus::OK);
+    EXPECT_EQ(row.opaque, 19U);
+    EXPECT_EQ(jit::native::PrepareUpdate(&runtime, &row, &tuple, &prepared, 4), ExecStatus::OK);
+    EXPECT_EQ(prepared.opaque, 23U);
+    EXPECT_EQ(jit::native::CommitUpdate(&runtime, &prepared, &tuple), ExecStatus::OK);
+    EXPECT_EQ(jit::native::DeleteRow(&runtime, &row), ExecStatus::OK);
+    EXPECT_EQ(jit::native::InsertRow(&runtime, &tuple, &row), ExecStatus::OK);
+    EXPECT_EQ(row.opaque, 4U);
+    EXPECT_EQ(jit::native::EmitRow(&runtime, &tuple), ExecStatus::OK);
+    EXPECT_TRUE(runtime.calls.empty());
+    ASSERT_EQ(context.call_count, 7U);
+    EXPECT_EQ(std::vector<const char*>(context.calls.begin(), context.calls.begin() + context.call_count),
+              (std::vector<const char*>{"key", "lookup", "prepare", "commit", "delete", "insert", "emit"}));
+
+    runtime.ClearError();
+    context.status = ExecStatus::NO_MATCH_RESULT;
+    const auto old_key_length = key.length;
+    EXPECT_EQ(jit::native::MakePointKey(&runtime, 7, &tuple, &key), ExecStatus::NO_MATCH_RESULT);
+    EXPECT_EQ(runtime.last_status(), ExecStatus::NO_MATCH_RESULT);
+    EXPECT_EQ(key.length, old_key_length);
+
+    jit::native::PopRuntimeV2(&binding);
+    runtime.ClearError();
+    context.status = ExecStatus::OK;
+    EXPECT_EQ(jit::native::MakePointKey(&runtime, 9, &tuple, &key), ExecStatus::OK);
+    ASSERT_FALSE(runtime.calls.empty());
+    EXPECT_EQ(runtime.calls.back(), "key");
+    EXPECT_EQ(context.call_count, 8U);
 }
 
 TEST(NativeProgramTest, ScalarControlFlowBytesAndFixedTupleMatchInterpreter) {
