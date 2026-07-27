@@ -507,6 +507,21 @@ func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 	for key, edges := range grouped {
 		current := initial[key]
 		for len(edges) > 0 {
+			// A positive binary32 amount can round away at a sufficiently large
+			// current value. Consume every such current->current edge before
+			// choosing the sole edge, if any, that advances the chain.
+			remaining := edges[:0]
+			for _, edge := range edges {
+				if equalFloat32Bits(edge.BeforeBits, current) && equalFloat32Bits(edge.AfterBits, current) {
+					continue
+				}
+				remaining = append(remaining, edge)
+			}
+			edges = remaining
+			if len(edges) == 0 {
+				break
+			}
+
 			match := -1
 			for i, edge := range edges {
 				if equalFloat32Bits(edge.BeforeBits, current) {
