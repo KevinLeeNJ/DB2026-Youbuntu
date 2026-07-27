@@ -38,21 +38,9 @@ constexpr lsn_t LSN_EXHAUSTION_MARGIN = 1 << 24;
     std::_Exit(134);
 }
 
-// Group-commit batch sizing. Both values were swept on the 50-warehouse,
-// 50-connection ranking workload; the numbers below are NewOrder/min over one
-// 60 s window each:
-//
-//   waiters >= 1   43947    waiters >= 4   45997 (this setting)   waiters >= 16   38198
-//
-// A saturated closed workload forms its own batch: the leader picks up every
-// commit that arrived during the previous fdatasync, which measured 6.68
-// commits per fdatasync at 260 fdatasync/s. Waiting for a *larger* batch loses
-// throughput, because the arrival rate is the commit rate and the extra wait is
-// what Little's law divides throughput by. Waiting for a *smaller* one loses
-// too: it raises fdatasync to 317/s and the extra device time is taken from the
-// page reads the same disk has to serve. Four sits at the measured optimum, and
-// is low enough that the saturated path never actually waits for it.
-constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 4;
+// Start the flush as soon as a full commit wave has assembled. The bounded
+// window below remains the latency cap when the workload is not saturated.
+constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 2;
 // Upper bound on the coalescing window, reachable only below saturation where
 // no other committer is competing for the disk. PostgreSQL's commit_delay plays
 // the same role and is likewise capped in the millisecond range.

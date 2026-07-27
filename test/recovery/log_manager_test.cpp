@@ -395,6 +395,55 @@ TEST(LogManagerTest, SaturatedGroupCommitReleasesEveryWaiterOnlyWhenDurable) {
     EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kThreads * kCommitsPerThread));
 }
 
+TEST(LogManagerTest, GroupCommitPropagatesFlushErrorToEveryWaiter) {
+    ScopedTestDir test_dir("log_manager_group_commit_error_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    constexpr int kWaiterCount = 8;
+    lsn_t target_lsn = INVALID_LSN;
+    for (int i = 0; i < kWaiterCount; ++i) {
+        CommitLogRecord commit(400 + i);
+        target_lsn = log_mgr.add_log_to_buffer(&commit);
+    }
+    log_mgr.flush_log_to_disk();
+    ASSERT_EQ(log_mgr.get_persist_lsn(), target_lsn);
+    ASSERT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+
+    // An invalid descriptor makes every group fdatasync fail, exercising the
+    // leader's error propagation to all callers.
+    disk.SetLogFd(-2);
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> errors{0};
+    std::vector<std::thread> waiters;
+    waiters.reserve(kWaiterCount);
+    for (int i = 0; i < kWaiterCount; ++i) {
+        waiters.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            try {
+                log_mgr.flush_log_to_disk_up_to(target_lsn);
+            } catch (const UnixError&) {
+                errors.fetch_add(1, std::memory_order_acq_rel);
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kWaiterCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& waiter : waiters) {
+        waiter.join();
+    }
+
+    EXPECT_EQ(errors.load(), kWaiterCount);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+}
+
 TEST(LogManagerTest, RestartOffsetRoundTrip) {
     ScopedTestDir test_dir("log_manager_restart_test_db");
     DiskManager disk;
