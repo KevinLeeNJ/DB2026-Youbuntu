@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 
 #include "ix_scan.h"
+#include "minilog.h"
 
 /**
  * @brief 在当前node中查找第一个>=target的key_idx
@@ -168,6 +169,23 @@ IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffe
     // fd2pageno_ is process-local state and is reset when the database is
     // reopened. Reconstruct the allocation cursor from the persisted index
     // header instead of incrementing an unrelated value left on this fd.
+    //
+    // num_pages_ lives only in this in-memory header: create_node() bumps it
+    // without logging, and the header reaches disk only through the checkpoint
+    // path. After a crash it can therefore name fewer pages than the file
+    // actually holds, and trusting it would make create_node() hand out page
+    // numbers that live nodes already occupy - recovery would overwrite a live
+    // subtree with a fresh node. The file length is a safe upper bound: a page
+    // number that has ever been written is inside the file, so starting after
+    // the last written page can never reuse one.
+    const int64_t file_size = disk_manager_->get_file_size(disk_manager_->get_file_name(fd));
+    if (file_size > 0) {
+        const auto pages_on_disk = static_cast<page_id_t>((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
+        // Keep num_pages_ equal to the allocation cursor: the page-number range
+        // checks in validate_structure() and elsewhere read it as "pages below
+        // this may exist", and pages above the old value are simply unreachable.
+        file_hdr_->num_pages_ = std::max(file_hdr_->num_pages_, pages_on_disk);
+    }
     disk_manager_->set_fd2pageno(fd, file_hdr_->num_pages_);
     // SmManager opens catalog handles before WAL recovery. Do not fetch any
     // index page here: after a crash, the persisted header/tree may be
@@ -1154,11 +1172,8 @@ UniqueLookupResult IxIndexHandle::lookup_unique(const char* key) const {
     return result;
 }
 
-bool IxIndexHandle::validate_structure() const {
-    auto structure_guard = lock_shared();
-    if (file_hdr_->num_pages_ < IX_INIT_NUM_PAGES) {
-        return false;
-    }
+bool IxIndexHandle::refresh_leaf_chain_endpoint() {
+    auto structure_guard = lock_exclusive();
     if (file_hdr_->root_page_ == IX_NO_PAGE) {
         return true;
     }
@@ -1166,18 +1181,76 @@ bool IxIndexHandle::validate_structure() const {
         return false;
     }
 
+    // The last leaf is the rightmost one, so descend the right edge of the tree
+    // instead of walking the leaf chain. That costs one page read per level
+    // rather than one per leaf, and it still works when the chain itself has a
+    // hole - which is what makes validate_structure's endpoint check usable as
+    // a gate rather than a guaranteed failure after every crash.
+    page_id_t current = file_hdr_->root_page_;
+    for (page_id_t level = 0; level <= file_hdr_->num_pages_; ++level) {
+        IxNodeHandle node;
+        try {
+            fetch_node_into(current, node);
+        } catch (...) {
+            return false;
+        }
+        if (node.is_leaf_page()) {
+            unpin_if_not_cached(node.get_page_id());
+            file_hdr_->last_leaf_ = current;
+            return true;
+        }
+        const int size = node.get_size();
+        if (size <= 0 || size > node.get_max_size()) {
+            unpin_if_not_cached(node.get_page_id());
+            return false;
+        }
+        const page_id_t child = node.value_at(size - 1);
+        unpin_if_not_cached(node.get_page_id());
+        if (child < IX_INIT_ROOT_PAGE || child >= file_hdr_->num_pages_) {
+            return false;
+        }
+        current = child;
+    }
+    return false;
+}
+
+bool IxIndexHandle::validate_structure() const {
+    // Recovery decides from this result whether to repair the index key by key
+    // or to rebuild it from the heap, so every rejection reports which
+    // invariant broke. Without that an unexpected rebuild cannot be diagnosed
+    // after the fact.
+    const auto reject = [this](const char* reason, page_id_t page_no) {
+        LOG_WARN("index %s failed structure validation: %s (page %d)", disk_manager_->get_file_name(fd_).c_str(),
+                 reason, static_cast<int>(page_no));
+        return false;
+    };
+
+    auto structure_guard = lock_shared();
+    if (file_hdr_->num_pages_ < IX_INIT_NUM_PAGES) {
+        return reject("page count below the initial layout", file_hdr_->num_pages_);
+    }
+    if (file_hdr_->root_page_ == IX_NO_PAGE) {
+        return true;
+    }
+    if (file_hdr_->root_page_ < IX_INIT_ROOT_PAGE || file_hdr_->root_page_ >= file_hdr_->num_pages_) {
+        return reject("root page out of range", file_hdr_->root_page_);
+    }
+
     std::unordered_set<page_id_t> visited;
     std::unordered_set<page_id_t> leaves;
     std::function<bool(page_id_t, page_id_t)> visit = [&](page_id_t page_no, page_id_t expected_parent) {
-        if (page_no < IX_INIT_ROOT_PAGE || page_no >= file_hdr_->num_pages_ || !visited.insert(page_no).second) {
-            return false;
+        if (page_no < IX_INIT_ROOT_PAGE || page_no >= file_hdr_->num_pages_) {
+            return reject("child page out of range", page_no);
+        }
+        if (!visited.insert(page_no).second) {
+            return reject("page reachable more than once", page_no);
         }
 
         IxNodeHandle node;
         try {
             fetch_node_into(page_no, node);
         } catch (...) {
-            return false;
+            return reject("page could not be read", page_no);
         }
         auto finish = [&](bool valid) {
             unpin_if_not_cached(node.get_page_id());
@@ -1185,12 +1258,15 @@ bool IxIndexHandle::validate_structure() const {
         };
 
         const int size = node.get_size();
-        if (size <= 0 || size > node.get_max_size() || node.get_parent_page_no() != expected_parent) {
-            return finish(false);
+        if (size <= 0 || size > node.get_max_size()) {
+            return finish(reject("node key count out of range", page_no));
+        }
+        if (node.get_parent_page_no() != expected_parent) {
+            return finish(reject("parent back pointer does not match", page_no));
         }
         for (int i = 1; i < size; ++i) {
             if (ix_compare(node.get_key(i - 1), node.get_key(i), file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
-                return finish(false);
+                return finish(reject("keys out of order inside the page", page_no));
             }
         }
 
@@ -1202,7 +1278,10 @@ bool IxIndexHandle::validate_structure() const {
                 previous == IX_LEAF_HEADER_PAGE || (previous >= IX_INIT_ROOT_PAGE && previous < file_hdr_->num_pages_);
             const bool next_valid =
                 next == IX_LEAF_HEADER_PAGE || (next >= IX_INIT_ROOT_PAGE && next < file_hdr_->num_pages_);
-            return finish(previous_valid && next_valid);
+            if (!previous_valid || !next_valid) {
+                return finish(reject("leaf link out of range", page_no));
+            }
+            return finish(true);
         }
 
         std::vector<page_id_t> children;
@@ -1224,30 +1303,41 @@ bool IxIndexHandle::validate_structure() const {
             return false;
         }
         if (file_hdr_->first_leaf_ == IX_NO_PAGE || file_hdr_->last_leaf_ == IX_NO_PAGE) {
-            return false;
+            return reject("leaf chain endpoints unset", file_hdr_->first_leaf_);
         }
 
         std::unordered_set<page_id_t> chain;
         page_id_t previous = IX_LEAF_HEADER_PAGE;
         page_id_t current = file_hdr_->first_leaf_;
         while (current != IX_LEAF_HEADER_PAGE) {
-            if (current < IX_INIT_ROOT_PAGE || current >= file_hdr_->num_pages_ || !leaves.count(current) ||
-                !chain.insert(current).second) {
-                return false;
+            if (current < IX_INIT_ROOT_PAGE || current >= file_hdr_->num_pages_) {
+                return reject("leaf chain leaves the file", current);
+            }
+            if (!leaves.count(current)) {
+                return reject("leaf chain names a page the tree walk did not reach", current);
+            }
+            if (!chain.insert(current).second) {
+                return reject("leaf chain contains a cycle", current);
             }
             IxNodeHandle leaf;
             fetch_node_into(current, leaf);
             if (!leaf.is_leaf_page() || leaf.get_prev_leaf() != previous) {
                 unpin_if_not_cached(leaf.get_page_id());
-                return false;
+                return reject("leaf back link does not match the chain", current);
             }
             previous = current;
             current = leaf.get_next_leaf();
             unpin_if_not_cached(leaf.get_page_id());
         }
-        return chain == leaves && previous == file_hdr_->last_leaf_;
+        if (chain != leaves) {
+            return reject("tree walk and leaf chain disagree on the leaf set", file_hdr_->first_leaf_);
+        }
+        if (previous != file_hdr_->last_leaf_) {
+            return reject("leaf chain does not end at last_leaf_", previous);
+        }
+        return true;
     } catch (...) {
-        return false;
+        return reject("validation threw while reading a page", file_hdr_->root_page_);
     }
 }
 

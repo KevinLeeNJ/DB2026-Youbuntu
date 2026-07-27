@@ -1,0 +1,373 @@
+# ORDER BY on columns that are not in the SELECT list, and LIMIT n OFFSET m
+
+statement ok
+CREATE TABLE t (a int, b int, c char(8));
+
+statement ok
+INSERT INTO t VALUES (1, 50, 'e');
+
+statement ok
+INSERT INTO t VALUES (2, 40, 'd');
+
+statement ok
+INSERT INTO t VALUES (3, 30, 'c');
+
+statement ok
+INSERT INTO t VALUES (4, 20, 'b');
+
+statement ok
+INSERT INTO t VALUES (5, 10, 'a');
+
+# ---- single table, ORDER BY a column that is not projected ----
+
+query
+SELECT a FROM t ORDER BY b;
+----
++------------------+
+|                a |
++------------------+
+|                5 |
+|                4 |
+|                3 |
+|                2 |
+|                1 |
++------------------+
+Total record(s): 5
+
+query
+SELECT a FROM t ORDER BY b DESC;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
+|                3 |
+|                4 |
+|                5 |
++------------------+
+Total record(s): 5
+
+query
+SELECT a FROM t ORDER BY t.b;
+----
++------------------+
+|                a |
++------------------+
+|                5 |
+|                4 |
+|                3 |
+|                2 |
+|                1 |
++------------------+
+Total record(s): 5
+
+# ---- non-projected sort key combined with LIMIT: LIMIT must not be dropped ----
+
+query
+SELECT a FROM t ORDER BY b LIMIT 2;
+----
++------------------+
+|                a |
++------------------+
+|                5 |
+|                4 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t ORDER BY b DESC LIMIT 3;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
+|                3 |
++------------------+
+Total record(s): 3
+
+query
+SELECT a FROM t ORDER BY c DESC LIMIT 3;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
+|                3 |
++------------------+
+Total record(s): 3
+
+query
+SELECT c FROM t ORDER BY b, a DESC;
+----
++------------------+
+|                c |
++------------------+
+|                a |
+|                b |
+|                c |
+|                d |
+|                e |
++------------------+
+Total record(s): 5
+
+# ---- LIMIT n OFFSET m ----
+
+query
+SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 0;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 2;
+----
++------------------+
+|                a |
++------------------+
+|                3 |
+|                4 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t ORDER BY a LIMIT 10 OFFSET 3;
+----
++------------------+
+|                a |
++------------------+
+|                4 |
+|                5 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 5;
+----
++------------------+
+|                a |
++------------------+
++------------------+
+Total record(s): 0
+
+query
+SELECT a FROM t ORDER BY b LIMIT 2 OFFSET 1;
+----
++------------------+
+|                a |
++------------------+
+|                4 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t LIMIT 2 OFFSET 1;
+----
++------------------+
+|                a |
++------------------+
+|                2 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t LIMIT 0 OFFSET 1;
+----
++------------------+
+|                a |
++------------------+
++------------------+
+Total record(s): 0
+
+# ---- no regression: ORDER BY a projected column or an alias ----
+
+query
+SELECT a, b FROM t ORDER BY b;
+----
++------------------+------------------+
+|                a |                b |
++------------------+------------------+
+|                5 |               10 |
+|                4 |               20 |
+|                3 |               30 |
+|                2 |               40 |
+|                1 |               50 |
++------------------+------------------+
+Total record(s): 5
+
+query
+SELECT a AS x FROM t ORDER BY x DESC LIMIT 2;
+----
++------------------+
+|                x |
++------------------+
+|                5 |
+|                4 |
++------------------+
+Total record(s): 2
+
+# ---- join: ORDER BY a non-projected column of the right table ----
+
+statement ok
+CREATE TABLE s (id int, sv int, note char(4));
+
+statement ok
+INSERT INTO s VALUES (1, 100, 'p');
+
+statement ok
+INSERT INTO s VALUES (2, 300, 'q');
+
+statement ok
+INSERT INTO s VALUES (3, 200, 'r');
+
+query
+SELECT t.a FROM t, s WHERE t.a = s.id ORDER BY s.sv DESC;
+----
++------------------+
+|                a |
++------------------+
+|                2 |
+|                3 |
+|                1 |
++------------------+
+Total record(s): 3
+
+query
+SELECT t.a, t.b FROM t, s WHERE t.a = s.id ORDER BY s.sv DESC LIMIT 2;
+----
++------------------+------------------+
+|                a |                b |
++------------------+------------------+
+|                2 |               40 |
+|                3 |               30 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT t.a FROM t, s WHERE t.a = s.id ORDER BY s.note DESC LIMIT 2 OFFSET 1;
+----
++------------------+
+|                a |
++------------------+
+|                2 |
+|                1 |
++------------------+
+Total record(s): 2
+
+# ---- ordering supplied by an index, plus LIMIT / OFFSET ----
+
+statement ok
+CREATE INDEX t(b);
+
+query
+SELECT a FROM t WHERE b > 0 ORDER BY b LIMIT 2;
+----
++------------------+
+|                a |
++------------------+
+|                5 |
+|                4 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t WHERE b > 0 ORDER BY b DESC LIMIT 2;
+----
++------------------+
+|                a |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t WHERE b > 0 ORDER BY b LIMIT 2 OFFSET 2;
+----
++------------------+
+|                a |
++------------------+
+|                3 |
+|                2 |
++------------------+
+Total record(s): 2
+
+query
+SELECT a FROM t WHERE b > 0 ORDER BY b LIMIT 2 OFFSET 10;
+----
++------------------+
+|                a |
++------------------+
++------------------+
+Total record(s): 0
+
+# ---- no regression: grouped queries keep sorting above the projection ----
+
+statement ok
+CREATE TABLE g (k int, v int);
+
+statement ok
+INSERT INTO g VALUES (1, 1);
+
+statement ok
+INSERT INTO g VALUES (1, 2);
+
+statement ok
+INSERT INTO g VALUES (2, 10);
+
+query
+SELECT k, COUNT(*) FROM g GROUP BY k ORDER BY COUNT(*) DESC;
+----
++------------------+------------------+
+|                k |         COUNT(*) |
++------------------+------------------+
+|                1 |                2 |
+|                2 |                1 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT k, SUM(v) AS sv2 FROM g GROUP BY k ORDER BY sv2 DESC;
+----
++------------------+------------------+
+|                k |              sv2 |
++------------------+------------------+
+|                2 |               10 |
+|                1 |                3 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT k, COUNT(*) FROM g GROUP BY k ORDER BY COUNT(*) DESC LIMIT 1 OFFSET 1;
+----
++------------------+------------------+
+|                k |         COUNT(*) |
++------------------+------------------+
+|                2 |                1 |
++------------------+------------------+
+Total record(s): 1
+
+# ---- ORDER BY stays restricted for aggregated / grouped queries ----
+
+statement error
+SELECT COUNT(*) FROM t ORDER BY b;
+
+statement error
+SELECT a FROM t GROUP BY a ORDER BY b;
+
+statement error
+SELECT k FROM g GROUP BY k ORDER BY COUNT(*) DESC;
+
+# ---- unknown columns are still rejected ----
+
+statement error
+SELECT a FROM t ORDER BY nosuchcol;

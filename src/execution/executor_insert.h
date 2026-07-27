@@ -68,9 +68,16 @@ public:
     std::unique_ptr<RmRecord> Next() override {
         // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
+        // 尾部的 null bitmap 不在列循环的覆盖范围内，必须先清零
+        std::memset(rec.data, 0, static_cast<size_t>(rec.size));
         for (size_t i = 0; i < values_.size(); i++) {
             auto& col = tab_.cols[i];
             auto& val = values_[i];
+            // NULL 与列类型无关：只置位，数据字节保持全零
+            if (val.is_null) {
+                set_null(rec.data, col);
+                continue;
+            }
             if (col.type != val.type) {
                 if (!can_cast(col.type, val.type)) {
                     throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
@@ -135,6 +142,15 @@ public:
             throw;
         }
         std::vector<size_t> inserted_indexes;
+        const auto rollback_index_inserts = [&] {
+            for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
+                auto& index = tab_.indexes[*it];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->delete_entry(index_keys[*it].data(), context_ == nullptr ? nullptr : context_->txn_);
+            }
+            fh_->delete_record(rid_, context_);
+        };
         try {
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
@@ -143,14 +159,18 @@ public:
                 ih->insert_entry(index_keys[i].data(), rid_, context_ == nullptr ? nullptr : context_->txn_);
                 inserted_indexes.push_back(i);
             }
-        } catch (...) {
-            for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
-                auto& index = tab_.indexes[*it];
-                auto ih =
-                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                ih->delete_entry(index_keys[*it].data(), context_ == nullptr ? nullptr : context_->txn_);
+        } catch (const IndexEntryExistsError&) {
+            // The B+tree has no transaction context, so translate here: losing a
+            // race for a unique key inside an explicit transaction is a retryable
+            // conflict. A duplicate produced by an autocommit statement, CREATE
+            // INDEX or LOAD is deterministic and stays a permanent SQL error.
+            rollback_index_inserts();
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->txn_->get_txn_mode()) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
             }
-            fh_->delete_record(rid_, context_);
+            throw;
+        } catch (...) {
+            rollback_index_inserts();
             throw;
         }
         if (context_ != nullptr && context_->txn_ != nullptr) {

@@ -347,6 +347,18 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
     for (const auto& expr : sv_conds) {
         Condition cond;
         cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
+
+        // `IS [NOT] NULL` 不是二元比较：只标记 null_test，rhs 记为 NULL 字面量，
+        // 让下游的类型检查/索引选择统一通过 rhs_val.is_null 把它排除掉。
+        if (expr->op == ast::SV_OP_IS_NULL || expr->op == ast::SV_OP_IS_NOT_NULL) {
+            cond.op = OP_EQ;
+            cond.null_test = expr->op == ast::SV_OP_IS_NULL ? NullTest::IS_NULL : NullTest::IS_NOT_NULL;
+            cond.is_rhs_val = true;
+            cond.rhs_val.set_null();
+            cond.rhs_display = "NULL";
+            conds.push_back(cond);
+            continue;
+        }
         cond.op = convert_sv_comp_op(expr->op);
 
         if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
@@ -374,6 +386,12 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
         ColType rhs_type;
         if (cond.is_rhs_val) {
+            // NULL 与列类型无关（`IS [NOT] NULL` 以及 `col = NULL`）：不做类型
+            // 检查，也不需要 raw 字节。
+            if (cond.rhs_val.is_null) {
+                cond.rhs_val.type = lhs_type;
+                continue;
+            }
             rhs_type = cond.rhs_val.type;
             if (!can_cast(lhs_type, rhs_type)) {
                 throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
@@ -398,6 +416,10 @@ Value Analyze::convert_sv_value(const ast::Value* sv_val) {
 }
 
 void Analyze::cast_value(Value& val, ColType to) {
+    if (val.is_null) {
+        val.type = to;
+        return;
+    }
     if (to == TYPE_FLOAT && val.type == TYPE_INT) {
         val.set_float(static_cast<float>(val.int_val));
         return;
@@ -430,6 +452,10 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         return OP_LE;
     case ast::SV_OP_GE:
         return OP_GE;
+    case ast::SV_OP_IS_NULL:
+    case ast::SV_OP_IS_NOT_NULL:
+        // 由 get_clause 提前处理成 Condition::null_test，不会走到这里
+        throw InternalError("IS [NOT] NULL is not a comparison operator");
     }
     throw InternalError("Unexpected comparison operator");
 }

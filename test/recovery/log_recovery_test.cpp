@@ -53,7 +53,11 @@ private:
 };
 
 RmRecord MakeTuple(int id, int value) {
-    RmRecord rec(static_cast<int>(sizeof(int) * 2));
+    // 必须与 CreateRecoveryTestDb 里 create_table 算出的 record_size 一致：
+    // 2 个 INT 列的数据区 + 1 字节尾部 null bitmap。长度不一致会让
+    // RecoveryManager::record_equals 的幂等守卫因 size 不同而跳过 undo。
+    RmRecord rec(static_cast<int>(sizeof(int) * 2) + null_bitmap_bytes(2));
+    memset(rec.data, 0, static_cast<size_t>(rec.size));
     memcpy(rec.data, &id, sizeof(int));
     memcpy(rec.data + sizeof(int), &value, sizeof(int));
     return rec;
@@ -652,6 +656,212 @@ TEST(RecoveryManagerTest, AbortedInsertWithStaleFlushedPageIsUndone) {
     OpenRecoveryDb db(db_name);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+// The index repair no longer deletes and reinstalls every key the WAL mentions.
+// It probes each key once and skips the delete/insert pair only when the tree
+// already holds exactly the entries the pair would produce. The tests below pin
+// down the cases where that condition must not hold, i.e. where a mutation is
+// still mandatory, plus the case where skipping must preserve a correct entry.
+
+// A loser update whose index write reached disk while its heap write did not.
+// Both index sides need work: the new key is a stale entry, and the old key is
+// missing even though the heap still holds the old row.
+TEST(RecoveryManagerTest, LoserUpdateWithFlushedIndexWriteRestoresTheOldKey) {
+    ScopedTestDir test_dir("recovery_loser_update_index_flushed_root");
+    const std::string db_name = "recovery_loser_update_index_flushed_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
+        FlushLogs(*db.log_mgr_);
+
+        // Only the index moved to the new key; the heap still holds the old row.
+        auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
+        index->delete_entry(MakeIntKey(1).data(), rid, nullptr);
+        index->insert_entry(MakeIntKey(2).data(), rid, nullptr, true);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+// A committed update where the index already holds the new key and still holds
+// the old one. The new key must survive the repair (the skip condition applies
+// to it) while the old key must be removed (it does not).
+TEST(RecoveryManagerTest, CommittedUpdateRemovesStaleKeyAndKeepsTheAlreadyWrittenOne) {
+    ScopedTestDir test_dir("recovery_committed_update_stale_key_root");
+    const std::string db_name = "recovery_committed_update_stale_key_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        // The new index entry reached disk but the old one was not removed, and
+        // the heap page never made it out.
+        auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
+        index->insert_entry(MakeIntKey(2).data(), rid, nullptr, true);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
+        AppendCommit(*db.log_mgr_, 100, update_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+// A loser insert whose index entry reached disk, followed by a committed
+// transaction reusing the same RID with a different key. The loser's key must
+// go and the committed key must be installed, and the tuple ownership guard
+// must keep undo from deleting the committed row.
+TEST(RecoveryManagerTest, LoserInsertFollowedByCommittedRidReuseKeepsOnlyTheCommittedKey) {
+    ScopedTestDir test_dir("recovery_rid_reuse_root");
+    const std::string db_name = "recovery_rid_reuse_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto loser_rec = MakeTuple(1, 10);
+    auto committed_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto loser_begin = AppendBegin(*db.log_mgr_, 100);
+        AppendInsert(*db.log_mgr_, 100, loser_begin, rid, loser_rec);
+
+        auto committed_begin = AppendBegin(*db.log_mgr_, 200);
+        auto committed_insert = AppendInsert(*db.log_mgr_, 200, committed_begin, rid, committed_rec);
+        AppendCommit(*db.log_mgr_, 200, committed_insert);
+        FlushLogs(*db.log_mgr_);
+
+        // The loser's index entry is the only thing that reached disk.
+        db.sm_mgr_.insert_record_with_indexes("t", rid, loser_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+        db.sm_mgr_.fhs_.at("t")->delete_record(rid, nullptr);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+// Deduplicating the repair set must not weaken the cleanup of an index that
+// somehow holds the same pair twice: the old repair removed one copy per WAL
+// record that mentioned it, so the new one drains duplicates instead.
+TEST(RecoveryManagerTest, DuplicateIndexEntriesForOneRidAreAllRemoved) {
+    ScopedTestDir test_dir("recovery_duplicate_index_entry_root");
+    const std::string db_name = "recovery_duplicate_index_entry_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
+        index->insert_entry(MakeIntKey(1).data(), rid, nullptr, true);
+        std::vector<Rid> duplicated;
+        ASSERT_TRUE(index->get_value(MakeIntKey(1).data(), &duplicated, nullptr));
+        ASSERT_EQ(duplicated.size(), 2u);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto delete_lsn = AppendDelete(*db.log_mgr_, 100, begin_lsn, rid, rec);
+        AppendCommit(*db.log_mgr_, 100, delete_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+    auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
+    std::vector<Rid> remaining;
+    index->get_value(MakeIntKey(1).data(), &remaining, nullptr);
+    EXPECT_TRUE(remaining.empty());
+}
+
+// One slot written by a transaction that aborted at run time and then by a
+// transaction that was still open at the crash, with the index key moving both
+// times. Recovery has to roll the slot back to the value before either of them,
+// and the index has to end up holding only the key that value carries. This is
+// the reachable shape of "several losers on one RID": write-write conflict
+// prevention means the second writer only sees the first one's rolled-back row.
+TEST(RecoveryManagerTest, AbortedThenLoserUpdateOnOneSlotRollsBackToTheBaseRow) {
+    ScopedTestDir test_dir("recovery_abort_then_loser_root");
+    const std::string db_name = "recovery_abort_then_loser_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto base_rec = MakeTuple(1, 10);
+    auto aborted_rec = MakeTuple(2, 20);
+    auto loser_rec = MakeTuple(3, 30);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, base_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto aborted_begin = AppendBegin(*db.log_mgr_, 100);
+        auto aborted_update = AppendUpdate(*db.log_mgr_, 100, aborted_begin, rid, base_rec, aborted_rec);
+        AppendAbort(*db.log_mgr_, 100, aborted_update);
+
+        // 100 rolled itself back at run time, so 200 reads the base row.
+        auto loser_begin = AppendBegin(*db.log_mgr_, 200);
+        AppendUpdate(*db.log_mgr_, 200, loser_begin, rid, base_rec, loser_rec);
+        FlushLogs(*db.log_mgr_);
+
+        // Only the open transaction's heap write and index write reached disk.
+        TupleMeta meta;
+        meta.writer_txn_id_ = 200;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->apply_tuple_update(rid, loser_rec.data, meta, INVALID_LSN);
+        auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
+        index->delete_entry(MakeIntKey(1).data(), rid, nullptr);
+        index->insert_entry(MakeIntKey(3).data(), rid, nullptr, true);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 3, rid));
 }
 
 TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {

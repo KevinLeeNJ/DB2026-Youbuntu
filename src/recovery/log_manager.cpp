@@ -10,7 +10,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -19,6 +21,24 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <vector>
 #include "log_manager.h"
+#include "wal_reader.h"
+#include "minilog.h"
+
+namespace {
+
+// lsn_t is int32_t. Signed overflow is undefined behaviour and would also
+// invalidate every page_lsn comparison, so stop the process well before the
+// counter can wrap. At the observed consumption rate this margin is hours away.
+constexpr lsn_t LSN_EXHAUSTION_MARGIN = 1 << 24;
+
+[[noreturn]] void FailStopOnLsnExhaustion(lsn_t lsn) {
+    std::fprintf(stderr, "FATAL: WAL LSN space nearly exhausted (lsn=%d); stopping for recovery\n",
+                 static_cast<int>(lsn));
+    std::fflush(stderr);
+    std::_Exit(134);
+}
+
+} // namespace
 
 std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size) {
     if (src == nullptr || size < LOG_HEADER_SIZE) {
@@ -80,6 +100,9 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
             std::unique_lock<std::mutex> lock(latch_);
             if (!log_buffer_->is_full(static_cast<int>(log_record->log_tot_len_))) {
                 lsn_t lsn = global_lsn_.fetch_add(1);
+                if (lsn > INT32_MAX - LSN_EXHAUSTION_MARGIN) {
+                    FailStopOnLsnExhaustion(lsn);
+                }
                 log_record->lsn_ = lsn;
                 log_record->serialize(log_buffer_->buffer_ + log_buffer_->offset_);
                 log_buffer_->offset_ += static_cast<int>(log_record->log_tot_len_);
@@ -370,24 +393,25 @@ void LogManager::initialize_from_existing_log() {
         return;
     }
 
-    int64_t offset = 0;
+    // Stream the file once instead of issuing a stat plus a pread per record:
+    // this runs before recovery on the full retained WAL, so it used to pay the
+    // same read amplification analyze did.
+    const auto scan_begin = std::chrono::steady_clock::now();
     lsn_t max_lsn = INVALID_LSN;
-    std::vector<char> header_buf(LOG_HEADER_SIZE);
-    while (offset + LOG_HEADER_SIZE <= file_size) {
-        int bytes_read = disk_manager_->read_log(header_buf.data(), LOG_HEADER_SIZE, offset);
-        if (bytes_read != LOG_HEADER_SIZE) {
-            break;
-        }
-
-        LogRecord header;
-        header.deserialize(header_buf.data());
-        if (header.log_tot_len_ < LOG_HEADER_SIZE || offset + static_cast<int64_t>(header.log_tot_len_) > file_size) {
-            break;
-        }
-
-        max_lsn = std::max(max_lsn, header.lsn_);
-        offset += static_cast<int64_t>(header.log_tot_len_);
+    uint64_t record_count = 0;
+    WalReader reader(disk_manager_, 0, file_size);
+    WalRecordView record;
+    while (reader.next(&record)) {
+        max_lsn = std::max(max_lsn, record.lsn);
+        ++record_count;
     }
+    const int64_t offset = reader.next_offset();
+    LOG_INFO("wal startup scan: %llu records, %lld bytes, %llu preads, %lld ms",
+             static_cast<unsigned long long>(record_count), static_cast<long long>(offset),
+             static_cast<unsigned long long>(reader.read_count()),
+             static_cast<long long>(
+                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scan_begin)
+                     .count()));
 
     log_file_offset_ = offset;
     persist_lsn_ = max_lsn;
@@ -402,7 +426,13 @@ void LogManager::initialize_from_existing_log() {
 void LogManager::reset_log(lsn_t next_lsn) {
     // Ensure active WAL is written and durable before truncation.
     flush_log_to_disk_with_sync();
-    std::lock_guard<std::mutex> lock(latch_);
+    std::unique_lock<std::mutex> lock(latch_);
+    // flush_buffer releases latch_ before its pwrite/fsync, so holding latch_
+    // is not enough. Truncating while a write is in flight would let that
+    // writer append previous-epoch bytes after the truncation point and move
+    // log_file_offset_/persist_lsn_ backwards; recovery would then replay them.
+    buffer_cv_.wait(lock, [this] { return !flushing_in_progress_; });
+    assert(log_buffer_->offset_ == 0 && flushing_buffer_->offset_ == 0);
     // 截断日志文件为空并重置追加偏移。
     disk_manager_->truncate_log();
     log_file_offset_ = 0;

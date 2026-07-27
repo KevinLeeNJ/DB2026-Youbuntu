@@ -50,7 +50,7 @@ std::optional<PointAccessPath> find_point_access_path(SmManager* sm_manager, con
             for (size_t i = 0; i < conditions.size(); ++i) {
                 const auto& condition = conditions[i];
                 if (condition.lhs_col.tab_name == tab_name && condition.lhs_col.col_name == index_col.name &&
-                    condition.is_rhs_val && condition.op == OP_EQ) {
+                    is_indexable_value_condition(condition) && condition.op == OP_EQ) {
                     if (match != conditions.size()) {
                         complete = false;
                         break;
@@ -96,7 +96,7 @@ ScanPlan* find_order_preserving_scan(Plan* plan) {
 
 bool has_equality_constraint(const ScanPlan& scan, const std::string& col_name) {
     return std::any_of(scan.conds_.begin(), scan.conds_.end(), [&](const Condition& cond) {
-        return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == col_name;
+        return is_indexable_value_condition(cond) && cond.op == OP_EQ && cond.lhs_col.col_name == col_name;
     });
 }
 
@@ -174,7 +174,9 @@ std::string condition_sort_key(const Condition& cond) {
         key += ">=";
         break;
     }
-    if (cond.is_rhs_val) {
+    if (cond.null_test != NullTest::NONE) {
+        key += cond.null_test == NullTest::IS_NULL ? " IS NULL" : " IS NOT NULL";
+    } else if (cond.is_rhs_val) {
         if (!cond.rhs_display.empty()) {
             key += cond.rhs_display;
         } else {
@@ -221,6 +223,7 @@ void append_set_clause_shape(std::string& key, const SetClause& set_clause) {
         append_cache_key_part(key, set_clause.rhs_col.tab_name);
         append_cache_key_part(key, set_clause.rhs_col.col_name);
     } else {
+        append_cache_key_part(key, set_clause.rhs.is_null);
         append_cache_key_part(key, static_cast<int>(set_clause.rhs.type));
     }
 }
@@ -254,8 +257,10 @@ std::string condition_shape_key(const Condition& cond) {
     std::string key;
     append_tab_col_shape(key, cond.lhs_col);
     append_cache_key_part(key, static_cast<int>(cond.op));
+    append_cache_key_part(key, static_cast<int>(cond.null_test));
     append_cache_key_part(key, cond.is_rhs_val);
     if (cond.is_rhs_val) {
+        append_cache_key_part(key, cond.rhs_val.is_null);
         append_cache_key_part(key, static_cast<int>(cond.rhs_val.type));
     } else {
         append_tab_col_shape(key, cond.rhs_col);
@@ -290,7 +295,7 @@ void reorder_index_scan_conditions(PlanTag scan_tag, const std::string& tab_name
             std::vector<size_t> range_conditions;
             for (size_t condition_no = 0; condition_no < conditions.size(); ++condition_no) {
                 const auto& condition = conditions[condition_no];
-                if (!condition.is_rhs_val || condition.lhs_col.tab_name != tab_name ||
+                if (!is_indexable_value_condition(condition) || condition.lhs_col.tab_name != tab_name ||
                     condition.lhs_col.col_name != index_col_name || condition.op == OP_NE) {
                     continue;
                 }
@@ -317,8 +322,8 @@ void reorder_index_scan_conditions(PlanTag scan_tag, const std::string& tab_name
             std::vector<size_t> equality_conditions;
             for (size_t condition_no = 0; condition_no < conditions.size(); ++condition_no) {
                 const auto& condition = conditions[condition_no];
-                if (condition.is_rhs_val && condition.op == OP_EQ && condition.lhs_col.tab_name == tab_name &&
-                    condition.lhs_col.col_name == index_col_name) {
+                if (is_indexable_value_condition(condition) && condition.op == OP_EQ &&
+                    condition.lhs_col.tab_name == tab_name && condition.lhs_col.col_name == index_col_name) {
                     equality_conditions.push_back(condition_no);
                 }
             }
@@ -435,15 +440,15 @@ std::string get_select_item_output_name(const SelectItem& item) {
 
 bool has_value_equality(const std::vector<Condition>& conds, const std::string& tab_name, const std::string& col_name) {
     return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
-        return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name == tab_name &&
+        return is_indexable_value_condition(cond) && cond.op == OP_EQ && cond.lhs_col.tab_name == tab_name &&
                cond.lhs_col.col_name == col_name;
     });
 }
 
 bool has_value_range(const std::vector<Condition>& conds, const std::string& tab_name, const std::string& col_name) {
     return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
-        return cond.is_rhs_val && cond.op != OP_EQ && cond.op != OP_NE && cond.lhs_col.tab_name == tab_name &&
-               cond.lhs_col.col_name == col_name;
+        return is_indexable_value_condition(cond) && cond.op != OP_EQ && cond.op != OP_NE &&
+               cond.lhs_col.tab_name == tab_name && cond.lhs_col.col_name == col_name;
     });
 }
 
@@ -581,8 +586,8 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_
             std::vector<int> range_conds;
             for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
                 const auto& cond = curr_conds[cond_no];
-                if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name || cond.lhs_col.col_name != index_col.name ||
-                    cond.op == OP_NE) {
+                if (!is_indexable_value_condition(cond) || cond.lhs_col.tab_name != tab_name ||
+                    cond.lhs_col.col_name != index_col.name || cond.op == OP_NE) {
                     continue;
                 }
                 if (cond.op == OP_EQ) {
@@ -676,7 +681,7 @@ bool Planner::get_skip_scan_index_cols(std::string tab_name, std::vector<Conditi
             std::vector<int> eq_conds;
             for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
                 const auto& cond = curr_conds[cond_no];
-                if (!cond.is_rhs_val || cond.op != OP_EQ || cond.lhs_col.tab_name != tab_name ||
+                if (!is_indexable_value_condition(cond) || cond.op != OP_EQ || cond.lhs_col.tab_name != tab_name ||
                     cond.lhs_col.col_name != index_col.name) {
                     continue;
                 }
@@ -1048,6 +1053,13 @@ std::unique_ptr<Plan> Planner::instantiate_physical_plan(const Query& query,
             if (!cond.is_rhs_val) {
                 needed_cols[cond.lhs_col.tab_name].insert(cond.lhs_col);
                 needed_cols[cond.rhs_col.tab_name].insert(cond.rhs_col);
+            }
+        }
+        // ORDER BY may reference columns that are not projected; the sort runs above the join,
+        // so those columns must survive the projection pushdown.
+        for (const auto& item : query.order_by_items) {
+            if (item.expr.type == QueryExprType::COLUMN) {
+                needed_cols[item.expr.col.tab_name].insert(item.expr.col);
             }
         }
     }
@@ -1447,7 +1459,9 @@ std::unique_ptr<Plan> Planner::generate_sort_plan(const Query* query, std::uniqu
         plan->order_satisfied_ = true;
         return plan;
     }
-    int sort_limit = query->has_limit ? query->limit : -1;
+    // top-k must keep the rows discarded by OFFSET, otherwise nothing is left to skip over
+    const long long top_k = static_cast<long long>(query->limit) + query->offset;
+    int sort_limit = (query->has_limit && top_k <= std::numeric_limits<int>::max()) ? static_cast<int>(top_k) : -1;
     return std::make_unique<SortPlan>(T_Sort, std::move(plan), bind_order_by_output_names(*query), sort_limit);
 }
 
@@ -1455,10 +1469,11 @@ std::unique_ptr<Plan> Planner::generate_limit_plan(const Query* query, std::uniq
     if (!query->has_limit) {
         return plan;
     }
-    if (!query->order_by_items.empty() && !plan->order_satisfied_) {
+    // A sort below already truncated the stream to limit rows, unless OFFSET still has to be skipped.
+    if (!query->order_by_items.empty() && !plan->order_satisfied_ && query->offset == 0) {
         return plan;
     }
-    return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->limit);
+    return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->limit, query->offset);
 }
 
 /**
@@ -1476,18 +1491,29 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
     std::unique_ptr<Plan> plannerRoot = physical_optimization(query.get(), context);
 
     // aggregate / group by / having
-    if (needs_aggregate_plan(*query)) {
+    const bool has_aggregate_plan = needs_aggregate_plan(*query);
+    if (has_aggregate_plan) {
         plannerRoot = std::make_unique<AggregatePlan>(T_Aggregate, std::move(plannerRoot), query->group_by_cols,
                                                       collect_aggregate_exprs(*query), query->having_conds);
     }
 
+    // An ungrouped query may ORDER BY columns that are not projected, so its sort has to run below
+    // the projection where those columns are still visible.
+    if (!has_aggregate_plan) {
+        plannerRoot = generate_sort_plan(query.get(), std::move(plannerRoot));
+    }
+
     // final select projection
+    const bool order_satisfied = plannerRoot->order_satisfied_;
     plannerRoot = std::make_unique<ProjectionPlan>(T_Projection, std::move(plannerRoot), query->select_items,
                                                    query->output_names, false, query->has_select_star);
+    plannerRoot->order_satisfied_ = order_satisfied;
     attach_display_names(plannerRoot.get(), query->table_name_to_display);
 
     // final order by
-    plannerRoot = generate_sort_plan(query.get(), std::move(plannerRoot));
+    if (has_aggregate_plan) {
+        plannerRoot = generate_sort_plan(query.get(), std::move(plannerRoot));
+    }
 
     // final limit
     plannerRoot = generate_limit_plan(query.get(), std::move(plannerRoot));

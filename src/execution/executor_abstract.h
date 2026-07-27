@@ -89,7 +89,7 @@ public:
 
     virtual ColMeta get_col_offset(const TabCol& target) {
         (void)target;
-        return ColMeta();
+        throw InternalError("get_col_offset is not implemented for " + getType());
     };
 
     virtual void set_counting_enabled(bool enabled) {
@@ -148,6 +148,8 @@ protected:
         int offset{0};
         int len{0};
         ColType type{TYPE_INT};
+        int null_byte{-1};
+        uint8_t null_mask{0};
     };
 
     struct ConditionAddress {
@@ -156,7 +158,7 @@ protected:
     };
 
     static ColumnAddress make_column_address(const ColMeta& col) {
-        return ColumnAddress{col.offset, col.len, col.type};
+        return ColumnAddress{col.offset, col.len, col.type, col.null_byte, col.null_mask};
     }
 
     std::vector<ConditionAddress> cache_condition_addresses(const std::vector<Condition>& conditions) {
@@ -200,6 +202,17 @@ protected:
      * @return true if rec matches cond, false otherwise
      */
     bool compare(const Condition& cond, const TupleView& tuple, const ConditionAddress& address) const {
+        // 三值逻辑先行：`IS [NOT] NULL` 在这里定值并直接返回，不读数据字节；
+        // 任一操作数为 NULL 时整个比较为假（含 `<>`）。
+        switch (eval_condition_nulls(cond, tuple.data, address.lhs.null_byte, address.lhs.null_mask,
+                                     address.rhs.null_byte, address.rhs.null_mask)) {
+        case NullEval::DECIDED_TRUE:
+            return true;
+        case NullEval::DECIDED_FALSE:
+            return false;
+        case NullEval::COMPARE:
+            break;
+        }
         const ColType lhs_type = address.lhs.type;
         const ColType rhs_type = cond.is_rhs_val ? cond.rhs_val.type : address.rhs.type;
         const char* lhs_data = tuple.data + address.lhs.offset;

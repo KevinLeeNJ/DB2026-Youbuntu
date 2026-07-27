@@ -337,9 +337,30 @@ public:
     // than one RID. The rid is valid only for the Unique result.
     UniqueLookupResult lookup_unique(const char* key) const;
 
+    // last_leaf_ is an append hint that reaches disk only when a checkpoint
+    // publishes the header. After a crash it can therefore name a leaf that has
+    // since been split, which makes the leaf chain look broken and makes
+    // delete_entry stop scanning early. Recompute it by descending the right
+    // edge of the tree: one page read per level. Returns false when even that
+    // spine is unusable, which means the index has to be rebuilt.
+    bool refresh_leaf_chain_endpoint();
+
     // Validate persisted parent/child relationships, key ordering, and the
     // complete leaf chain before crash recovery attempts incremental repair.
     bool validate_structure() const;
+
+    // Key ordering of this index. Recovery sorts a whole batch of keys into
+    // tree order before touching the index, which turns a random walk over the
+    // leaves into a left-to-right sweep.
+    const std::vector<ColType>& get_col_types() const {
+        return file_hdr_->col_types_;
+    }
+    const std::vector<int>& get_col_lens() const {
+        return file_hdr_->col_lens_;
+    }
+    int get_col_tot_len() const {
+        return file_hdr_->col_tot_len_;
+    }
 
     // Rebuild the root cache and upper-level residency after recovery has
     // repaired or rebuilt the on-disk index structure.

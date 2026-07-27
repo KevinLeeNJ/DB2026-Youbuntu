@@ -81,7 +81,7 @@ public:
         conds_ = std::move(conds);
         TabMeta& tab = sm_manager->db_.get_table(tab_name_);
         cols_ = tab.cols;
-        len_ = cols_.back().offset + cols_.back().len;
+        len_ = tab.record_len(); // 数据区 + 尾部 null bitmap，与 Scan 执行器一致
         fed_conds_ = conds_;
         index_col_names_ = index_col_names;
     }
@@ -185,14 +185,16 @@ public:
 
 class LimitPlan : public Plan {
 public:
-    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit) {
+    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit, int offset = 0) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         limit_ = limit;
+        offset_ = offset;
     }
     ~LimitPlan() {}
     std::unique_ptr<Plan> subplan_;
     int limit_;
+    int offset_ = 0;
 };
 
 class UnionPlan : public Plan {

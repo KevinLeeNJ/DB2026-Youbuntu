@@ -77,7 +77,14 @@ void validate_order_by(Query& query, const std::vector<ColMeta>& all_cols) {
             throw RMDBError("ORDER BY does not support literal expressions");
         }
 
-        if (!contains_select_expr(query, item.expr)) {
+        if (contains_select_expr(query, item.expr)) {
+            continue;
+        }
+        // SQL standard: ORDER BY may reference any column of the FROM tables when the query is
+        // neither grouped nor aggregated. normalize_query_expr above already rejected unknown
+        // columns, so reaching here with a COLUMN expr means the column exists in the FROM list.
+        if (query.has_aggregate || !query.group_by_cols.empty() || !query.having_conds.empty() ||
+            item.expr.type != QueryExprType::COLUMN) {
             throw RMDBError("ORDER BY must reference output columns or aliases");
         }
     }
@@ -156,6 +163,10 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols) {
 
     if (query.has_limit && query.limit < 0) {
         throw RMDBError("LIMIT must be non-negative");
+    }
+
+    if (query.offset < 0) {
+        throw RMDBError("OFFSET must be non-negative");
     }
 }
 

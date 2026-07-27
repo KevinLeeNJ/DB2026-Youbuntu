@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 
 #include <assert.h>   // for assert
+#include <cerrno>     // for errno
 #include <sys/stat.h> // for stat
 #include <unistd.h>   // for lseek
 
@@ -64,6 +65,7 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
     if (fd2path_.count(fd) == 0) {
         throw FileNotOpenError(fd);
     }
+    page_write_count_.fetch_add(1, std::memory_order_relaxed);
     WritePageAt(fd, page_no, offset, num_bytes);
 }
 
@@ -82,6 +84,7 @@ void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_byt
     if (fd2path_.count(fd) == 0) {
         throw FileNotOpenError(fd);
     }
+    page_read_count_.fetch_add(1, std::memory_order_relaxed);
     ReadPageAt(fd, page_no, offset, num_bytes);
 }
 
@@ -252,6 +255,17 @@ int DiskManager::get_file_fd(const std::string& file_name) {
     return path2fd_[file_name];
 }
 
+void DiskManager::open_log_fd() {
+    if (log_fd_ != -1) {
+        return;
+    }
+    log_fd_ = open_file(LOG_FILE_NAME);
+    log_offset_ = get_file_size(LOG_FILE_NAME);
+    if (log_offset_ < 0) {
+        log_offset_ = 0;
+    }
+}
+
 /**
  * @description:  读取日志文件内容
  * @return {int} 返回读取的数据量，若为-1说明读取数据的起始位置超过了文件大小
@@ -261,11 +275,8 @@ int DiskManager::get_file_fd(const std::string& file_name) {
  */
 int DiskManager::read_log(char* log_data, int size, int64_t offset) {
     // read log file from the previous end
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-    }
+    open_log_fd();
     int64_t file_size = get_file_size(LOG_FILE_NAME);
-    log_offset_ = file_size;
     if (offset > file_size) {
         return -1;
     }
@@ -275,9 +286,63 @@ int DiskManager::read_log(char* log_data, int size, int64_t offset) {
     if (size == 0) {
         return 0;
     }
-    ssize_t bytes_read = pread(log_fd_, log_data, size, static_cast<off_t>(offset));
-    assert(bytes_read == size);
-    return static_cast<int>(bytes_read);
+    // A short pread must never be reported as a short log: callers treat that
+    // as end-of-log and would silently drop committed records. The requested
+    // range was just measured against the file size, so it is fully readable.
+    int bytes_read = 0;
+    while (bytes_read < size) {
+        const ssize_t count =
+            pread(log_fd_, log_data + bytes_read, static_cast<size_t>(size - bytes_read), offset + bytes_read);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw UnixError();
+        }
+        if (count == 0) {
+            throw InternalError("DiskManager::read_log truncated read");
+        }
+        bytes_read += static_cast<int>(count);
+    }
+    log_read_count_.fetch_add(1, std::memory_order_relaxed);
+    log_read_bytes_.fetch_add(static_cast<uint64_t>(bytes_read), std::memory_order_relaxed);
+    return bytes_read;
+}
+
+int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
+    if (size <= 0 || offset < 0) {
+        return 0;
+    }
+    open_log_fd();
+    int bytes_read = 0;
+    while (bytes_read < size) {
+        const ssize_t count =
+            pread(log_fd_, log_data + bytes_read, static_cast<size_t>(size - bytes_read), offset + bytes_read);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw UnixError();
+        }
+        if (count == 0) {
+            // Genuine end of file. The caller bounds its own scan, so a short
+            // result here is information, not a lost record.
+            break;
+        }
+        bytes_read += static_cast<int>(count);
+    }
+    log_read_count_.fetch_add(1, std::memory_order_relaxed);
+    log_read_bytes_.fetch_add(static_cast<uint64_t>(bytes_read), std::memory_order_relaxed);
+    return bytes_read;
+}
+
+void DiskManager::prefetch_page(int fd, page_id_t page_no) {
+    if (fd < 0 || page_no < 0) {
+        return;
+    }
+    // Advisory only: recovery stays single threaded and deterministic, this
+    // just lets the kernel keep more than one read in flight.
+    (void)posix_fadvise(fd, static_cast<off_t>(page_no) * PAGE_SIZE, PAGE_SIZE, POSIX_FADV_WILLNEED);
 }
 
 /**
@@ -286,20 +351,27 @@ int DiskManager::read_log(char* log_data, int size, int64_t offset) {
  * @param {int} size 要写入的内容大小
  */
 void DiskManager::write_log(char* log_data, int size) {
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-        log_offset_ = get_file_size(LOG_FILE_NAME);
-        if (log_offset_ < 0)
-            log_offset_ = 0;
-    }
+    open_log_fd();
 
     // write from the file_end
     FaultInjector::Point("during_wal_pwrite");
-    ssize_t bytes_write = pwrite(log_fd_, log_data, size, static_cast<off_t>(log_offset_));
-    if (bytes_write != size) {
-        throw UnixError();
+    const int64_t begin_offset = log_offset_;
+    int bytes_write = 0;
+    while (bytes_write < size) {
+        const ssize_t count = pwrite(log_fd_, log_data + bytes_write, static_cast<size_t>(size - bytes_write),
+                                     static_cast<off_t>(begin_offset + bytes_write));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            // log_offset_ still holds the entry value, so a retry rewrites this
+            // buffer from the same offset instead of leaving a hole. Nothing in
+            // this range has been fsynced yet, so overwriting is safe.
+            throw UnixError();
+        }
+        bytes_write += static_cast<int>(count);
     }
-    log_offset_ += size;
+    log_offset_ = begin_offset + size;
 }
 
 void DiskManager::fsync_log() {
@@ -349,9 +421,7 @@ void DiskManager::sync_directory(const std::string& path) {
 }
 
 void DiskManager::truncate_log() {
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-    }
+    open_log_fd();
     if (log_fd_ != -1) {
         if (ftruncate(log_fd_, 0) != 0) {
             throw UnixError();
@@ -370,9 +440,7 @@ void DiskManager::truncate_log_to(int64_t offset) {
     if (offset < 0) {
         throw InternalError("negative WAL truncation offset");
     }
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-    }
+    open_log_fd();
     if (ftruncate(log_fd_, static_cast<off_t>(offset)) != 0) {
         throw UnixError();
     }

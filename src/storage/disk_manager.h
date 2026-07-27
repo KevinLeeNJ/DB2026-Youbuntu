@@ -69,7 +69,17 @@ public:
     /*日志操作*/
     int read_log(char* log_data, int size, int64_t offset);
 
+    // Bulk WAL read for the streaming recovery scan. Unlike read_log it does
+    // not stat the file per call and does not touch the append offset: the
+    // caller owns the scan bound. Returns the number of bytes read, which is
+    // short only at end of file.
+    int read_log_chunk(char* log_data, int size, int64_t offset);
+
     void write_log(char* log_data, int size);
+
+    // Ask the kernel to start reading pages recovery is about to fetch. Purely
+    // advisory: failures are ignored and the caller's behaviour is unchanged.
+    void prefetch_page(int fd, page_id_t page_no);
 
     void fsync_log();
 
@@ -106,6 +116,21 @@ public:
         fd2pageno_[fd] = start_page_no;
     }
 
+    // I/O counters used to report recovery cost once, after recovery finishes.
+    // They must never be printed per transaction on the measured hot path.
+    uint64_t get_page_read_count() const {
+        return page_read_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t get_page_write_count() const {
+        return page_write_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t get_log_read_count() const {
+        return log_read_count_.load(std::memory_order_relaxed);
+    }
+    uint64_t get_log_read_bytes() const {
+        return log_read_bytes_.load(std::memory_order_relaxed);
+    }
+
     /**
      * @description: 获得文件目前已分配的页面个数，即如果文件要分配一个新页面，需要从fd2pagenp_[fd]开始分配
      * @return {page_id_t} 已分配的页面个数
@@ -118,11 +143,22 @@ public:
     static constexpr int MAX_FD = 8192;
 
 private:
+    // Opens the WAL lazily. The append offset is initialized here, together
+    // with the descriptor, so that "log_fd_ != -1" always implies "log_offset_
+    // is the real append offset". read_log used to reassign log_offset_ on
+    // every call, which left correctness depending on the order in which
+    // readers and writers happened to run.
+    void open_log_fd();
+
     // 文件打开列表，用于记录文件是否被打开
     std::unordered_map<std::string, int> path2fd_; //<Page文件磁盘路径,Page fd>哈希表
     std::unordered_map<int, std::string> fd2path_; //<Page fd,Page文件磁盘路径>哈希表
 
     int log_fd_ = -1;        // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
     int64_t log_offset_ = 0; // 日志文件追加偏移
+    std::atomic<uint64_t> page_read_count_{0};
+    std::atomic<uint64_t> page_write_count_{0};
+    std::atomic<uint64_t> log_read_count_{0};
+    std::atomic<uint64_t> log_read_bytes_{0};
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0
 };

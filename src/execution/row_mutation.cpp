@@ -30,7 +30,8 @@ const ColMeta& FindColumn(const TabMeta& tab, const TabCol& target) {
 }
 
 BoundMutationColumn BindColumn(const ColMeta& col) {
-    return BoundMutationColumn{static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len), col.type};
+    return BoundMutationColumn{static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len), col.type,
+                               col.null_byte, col.null_mask};
 }
 
 bool CanCast(ColType lhs, ColType rhs) {
@@ -44,6 +45,16 @@ bool CanCast(ColType lhs, ColType rhs) {
 }
 
 bool CompareCondition(const Condition& condition, const BoundMutationCondition& bound, const RmRecord& record) {
+    // 与执行器 compare() 共用同一份三值逻辑，见 common/common.h
+    switch (eval_condition_nulls(condition, record.data, bound.lhs.null_byte, bound.lhs.null_mask, bound.rhs.null_byte,
+                                 bound.rhs.null_mask)) {
+    case NullEval::DECIDED_TRUE:
+        return true;
+    case NullEval::DECIDED_FALSE:
+        return false;
+    case NullEval::COMPARE:
+        break;
+    }
     const ColType rhs_type = condition.is_rhs_val ? condition.rhs_val.type : bound.rhs.type;
     const char* lhs_data = record.data + bound.lhs.offset;
     const char* rhs_data = condition.is_rhs_val ? nullptr : record.data + bound.rhs.offset;
@@ -168,6 +179,18 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
         const auto& set_clause = (*info.set_clauses)[i];
         const auto& bound = (*info.bound_set_clauses)[i];
         char* data = record.data + bound.lhs.offset;
+        // 目标列的 NULL 位由本次赋值重新决定：先算出新值是否为 NULL，是则置位
+        // 并把数据字节清零，否则清位后走下面原有的写入路径。
+        // SET col = NULL 与 SET col = <非 NULL> 都要经过这里，才能双向切换。
+        const bool assigns_null = set_clause.is_self_ref ? is_null_at(old_record.data, bound.rhs.null_byte,
+                                                                      bound.rhs.null_mask) // NULL 参与算术仍是 NULL
+                                                         : set_clause.rhs.is_null;
+        if (assigns_null) {
+            std::memset(data, 0, bound.lhs.len);
+            set_null_at(record.data, bound.lhs.null_byte, bound.lhs.null_mask);
+            continue;
+        }
+        clear_null_at(record.data, bound.lhs.null_byte, bound.lhs.null_mask);
         if (set_clause.is_self_ref) {
             if (set_clause.op == UpdateOp::ASSIGNMENT) {
                 if (bound.lhs.type == TYPE_INT && bound.rhs.type == TYPE_FLOAT) {
@@ -351,6 +374,13 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         std::vector<Rid> result;
         if (index.handle->get_value(new_key.data(), &result, txn) &&
             std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
+            // Losing a race for a unique key inside an explicit transaction is
+            // a retryable conflict. A duplicate produced by an autocommit
+            // statement, CREATE INDEX or LOAD is deterministic: retrying it
+            // cannot help, so it stays a permanent SQL error.
+            if (txn != nullptr && txn->get_txn_mode()) {
+                throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+            }
             throw IndexEntryExistsError();
         }
         CheckHistoricalIndexConflicts(info, index, new_key, rid, context);
@@ -394,6 +424,13 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
             update.index->handle->insert_entry(update.new_key.data(), rid, txn);
             inserted.emplace_back(update.index, update.new_key);
         }
+    } catch (const IndexEntryExistsError&) {
+        // The B+tree has no transaction context, so translate here.
+        RollbackIndexUpdates(deleted, inserted, rid, txn);
+        if (txn != nullptr && txn->get_txn_mode()) {
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+        }
+        throw;
     } catch (...) {
         RollbackIndexUpdates(deleted, inserted, rid, txn);
         throw;

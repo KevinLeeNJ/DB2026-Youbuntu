@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <map>
 #include <unordered_map>
@@ -78,7 +79,10 @@ public:
 
     void unblock_new_transactions_after_checkpoint();
 
-    std::unordered_map<txn_id_t, lsn_t> wait_active_transactions_drained_for_checkpoint();
+    // Wait until no transaction is active. Returns false when the timeout
+    // expires with transactions still running, so the caller can abandon the
+    // checkpoint instead of holding the "block new transactions" window open.
+    bool wait_active_transactions_drained_for_checkpoint(std::chrono::milliseconds timeout);
 
     std::unordered_map<txn_id_t, lsn_t> get_active_txn_lsn_snapshot();
 

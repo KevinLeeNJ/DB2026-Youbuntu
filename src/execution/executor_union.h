@@ -24,7 +24,8 @@ class UnionExecutor : public AbstractExecutor {
 private:
     std::vector<std::unique_ptr<AbstractExecutor>> branches_;
     std::vector<ColMeta> cols_;
-    size_t len_ = 0;
+    size_t len_ = 0;      // 输出元组总长度（数据区 + null bitmap）
+    size_t data_len_ = 0; // 数据区长度，即 null bitmap 的起始偏移
     std::vector<RmRecord> tuples_;
     std::unordered_set<std::string> seen_;
     size_t cursor_ = 0;
@@ -56,20 +57,22 @@ private:
     }
 
     RmRecord convert_record(const RmRecord& src_rec, const std::vector<ColMeta>& src_cols) const {
-        RmRecord dst_rec(static_cast<int>(len_));
-        for (size_t i = 0; i < cols_.size(); ++i) {
-            const auto& dst_col = cols_[i];
-            const auto& src_col = src_cols[i];
-            copy_cell(dst_rec.data + dst_col.offset, dst_col, src_rec.data + src_col.offset, src_col);
-        }
-        return dst_rec;
+        return convert_view(TupleView{src_rec.data, static_cast<uint32_t>(src_rec.size)}, src_cols);
     }
 
+    // UNION 重新打包元组，因此按输出列顺序重建尾部 null bitmap。NULL 单元的数据
+    // 字节置零，使去重用的 seen_ 键对同一个 NULL 稳定。
     RmRecord convert_view(TupleView src_view, const std::vector<ColMeta>& src_cols) const {
         RmRecord dst_rec(static_cast<int>(len_));
+        std::memset(dst_rec.data + data_len_, 0, static_cast<size_t>(len_) - data_len_);
         for (size_t i = 0; i < cols_.size(); ++i) {
             const auto& dst_col = cols_[i];
             const auto& src_col = src_cols[i];
+            if (is_null(src_view.data, src_col)) {
+                std::memset(dst_rec.data + dst_col.offset, 0, static_cast<size_t>(dst_col.len));
+                set_null(dst_rec.data, dst_col);
+                continue;
+            }
             copy_cell(dst_rec.data + dst_col.offset, dst_col, src_view.data + src_col.offset, src_col);
         }
         return dst_rec;
@@ -106,8 +109,10 @@ public:
     UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches, std::vector<ColMeta> cols)
         : branches_(std::move(branches)), cols_(std::move(cols)) {
         if (!cols_.empty()) {
-            len_ = static_cast<size_t>(cols_.back().offset + cols_.back().len);
+            data_len_ = static_cast<size_t>(cols_.back().offset + cols_.back().len);
         }
+        bind_null_positions(cols_, static_cast<int>(data_len_));
+        len_ = data_len_ + static_cast<size_t>(null_bitmap_bytes(cols_.size()));
     }
 
     void beginTuple() override {

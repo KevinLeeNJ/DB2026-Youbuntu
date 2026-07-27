@@ -30,6 +30,9 @@ Value convert_ast_value_node(const ast::Value* sv_val) {
         val.set_str(str_lit->val);
         break;
     }
+    case ast::AstType::NullLit:
+        val.set_null();
+        break;
     case ast::AstType::BoolLit:
     default:
         throw InternalError("Unexpected sv value type");

@@ -31,7 +31,6 @@ static constexpr int INVALID_FRAME_ID = -1;        // invalid frame id
 static constexpr int INVALID_PAGE_ID = -1;         // invalid page id
 static constexpr int INVALID_TXN_ID = -1;          // invalid transaction id
 static constexpr int INVALID_TIMESTAMP = -1;       // invalid transaction timestamp
-static constexpr int64_t INVALID_LSN = -1;         // invalid log sequence number
 static constexpr int64_t TXN_START_ID = 1LL << 62; // first txn id
 static constexpr int64_t INVALID_TS = -1;          // invalid log sequence number
 static constexpr int HEADER_PAGE_ID = 0;           // the header page id
@@ -48,6 +47,10 @@ using lsn_t = int32_t;        // log sequence number type
 using slot_offset_t = size_t; // slot offset type
 using oid_t = uint16_t;
 using timestamp_t = int64_t; // timestamp type, used for transaction concurrency
+
+// Declared after lsn_t so the sentinel has exactly the width of the LSN fields
+// that are serialized into the WAL header and read back with read_unaligned.
+static constexpr lsn_t INVALID_LSN = -1; // invalid log sequence number
 
 // log file
 static const std::string LOG_FILE_NAME = "db.log";

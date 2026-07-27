@@ -418,6 +418,96 @@ TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
     close_index(ih);
 }
 
+// num_pages_ only ever reaches disk through the checkpoint path, so a crash
+// leaves the persisted header naming fewer pages than the file actually holds.
+// Trusting it would make the next create_node() hand out page numbers that
+// live nodes already occupy, and recovery would overwrite a live subtree.
+TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
+    constexpr int kCheckpointedKeys = 1000;
+    constexpr int kKeysAfterCheckpoint = 1400;
+    const auto index_name = ix_manager->get_index_name(table_name, cols);
+
+    // A checkpoint publishes a fully consistent header.
+    auto ih = open_index();
+    for (int value = 0; value < kCheckpointedKeys; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    close_index(ih);
+
+    // More leaf splits allocate pages after that header was published. The
+    // root does not move, so only num_pages_ goes stale - which is the case
+    // the fix has to survive. A stale root_page_ needs its own WAL record and
+    // is out of scope here.
+    ih = open_index();
+    const page_id_t root_before = ih->file_hdr_->root_page_;
+    const page_id_t pages_at_checkpoint = ih->file_hdr_->num_pages_;
+    for (int value = kCheckpointedKeys; value < kKeysAfterCheckpoint; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    ASSERT_EQ(ih->file_hdr_->root_page_, root_before) << "test needs a workload that does not move the root";
+    ASSERT_GT(ih->file_hdr_->num_pages_, pages_at_checkpoint);
+
+    // Persist the node pages but not the header, which is exactly what kill -9
+    // leaves behind: close_index()/flush_index_header() never ran.
+    const int fd = ih->GetFd();
+    ASSERT_TRUE(buffer_pool_manager->flush_all_pages(fd));
+    ih->release_root_page_cache();
+    buffer_pool_manager->delete_all_pages(fd);
+    disk_manager->close_file(fd);
+    ih.reset();
+
+    // The precondition the fix exists for: the persisted page count is behind
+    // the real file length.
+    const int64_t file_size = disk_manager->get_file_size(index_name);
+    ASSERT_GT(file_size, 0);
+    {
+        std::vector<char> header_bytes(PAGE_SIZE, 0);
+        const int header_fd = disk_manager->open_file(index_name);
+        disk_manager->read_page(header_fd, IX_FILE_HDR_PAGE, header_bytes.data(), PAGE_SIZE);
+        IxFileHdr persisted;
+        persisted.deserialize(header_bytes.data());
+        disk_manager->close_file(header_fd);
+        EXPECT_LT(static_cast<int64_t>(persisted.num_pages_) * PAGE_SIZE, file_size)
+            << "test no longer reproduces the stale-header case";
+    }
+
+    // Simulate the restarted process.
+    ix_manager.reset();
+    buffer_pool_manager.reset();
+    disk_manager.reset();
+    disk_manager = std::make_unique<DiskManager>();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    ih = open_index();
+
+    // The allocation cursor must start past every page the file already holds.
+    const page_id_t pages_on_disk = static_cast<page_id_t>((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
+    EXPECT_GE(disk_manager->get_fd2pageno(ih->GetFd()), pages_on_disk);
+
+    // Inserting more keys now calls create_node(); with a stale cursor those
+    // new nodes would land on top of the leaves holding the old keys.
+    constexpr int kKeysAfterRestart = 2400;
+    for (int value = kKeysAfterCheckpoint; value < kKeysAfterRestart; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    for (int value = 0; value < kKeysAfterRestart; ++value) {
+        auto k = key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << "lost key " << value;
+        ASSERT_EQ(result.size(), 1u) << "key " << value;
+        EXPECT_EQ(result.front(), (Rid{1, value}));
+    }
+    // last_leaf_ went stale together with num_pages_, so the structure gate
+    // has to recompute it before it can trust the leaf chain.
+    EXPECT_FALSE(ih->validate_structure());
+    ASSERT_TRUE(ih->refresh_leaf_chain_endpoint());
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+}
+
 TEST_F(IndexHandleTest, CachesMultiLevelInternalPagesAcrossReopen) {
     cleanup();
     cols = {ColMeta{.tab_name = table_name, .name = "id", .type = TYPE_STRING, .len = 128, .offset = 0, .index = true}};

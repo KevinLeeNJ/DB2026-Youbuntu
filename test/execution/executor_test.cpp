@@ -459,8 +459,8 @@ TEST_F(ExecutorTest, projection_subset_columns) {
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
     auto rec = exec.Next();
-    // Should have 2 columns: id(4 bytes) + score(4 bytes) = 8 bytes
-    EXPECT_EQ(exec.tupleLen(), 8);
+    // 2 columns: id(4) + score(4) + 1 byte trailing NULL bitmap
+    EXPECT_EQ(exec.tupleLen(), 8 + 1);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 42);     // id at offset 0
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data + 4), 99); // score at offset 4
 }
@@ -496,7 +496,8 @@ TEST_F(ExecutorTest, projection_all_columns) {
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
     auto rec = exec.Next();
-    EXPECT_EQ(exec.tupleLen(), 8);
+    // a(4) + b(4) + 1 byte trailing NULL bitmap
+    EXPECT_EQ(exec.tupleLen(), 8 + 1);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 10);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data + 4), 20);
 }
@@ -581,11 +582,15 @@ TEST_F(ExecutorTest, nljoin_cross_product) {
     auto right = std::make_unique<SeqScanExecutor>(sm_manager_.get(), "jr", std::vector<Condition>{}, &ctx);
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {});
 
+    // The joined tuple concatenates both child tuples, each with its own
+    // trailing NULL bitmap, so column offsets must come from cols().
+    const int l_off = exec.cols()[0].offset;
+    const int r_off = exec.cols()[1].offset;
     std::vector<std::pair<int, int>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
         auto rec = exec.Next();
-        int l_val = *reinterpret_cast<int*>(rec->data);
-        int r_val = *reinterpret_cast<int*>(rec->data + 4);
+        int l_val = read_unaligned<int>(rec->data + l_off);
+        int r_val = read_unaligned<int>(rec->data + r_off);
         results.push_back({l_val, r_val});
     }
     ASSERT_EQ(results.size(), 6); // 2 x 3
@@ -628,11 +633,13 @@ TEST_F(ExecutorTest, nljoin_with_condition) {
 
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond});
 
+    const int l_off = exec.cols()[0].offset;
+    const int r_off = exec.cols()[1].offset;
     std::vector<std::pair<int, int>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
         auto rec = exec.Next();
-        int l_val = *reinterpret_cast<int*>(rec->data);
-        int r_val = *reinterpret_cast<int*>(rec->data + 4);
+        int l_val = read_unaligned<int>(rec->data + l_off);
+        int r_val = read_unaligned<int>(rec->data + r_off);
         results.push_back({l_val, r_val});
     }
     ASSERT_EQ(results.size(), 2);

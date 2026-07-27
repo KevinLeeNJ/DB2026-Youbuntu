@@ -260,7 +260,8 @@ protected:
         compiled_index_conditions_.clear();
         compiled_index_conditions_.reserve(conds_.size());
         for (const auto& cond : conds_) {
-            if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_ || cond.op == OP_NE) {
+            // NULL 不进索引键：`IS [NOT] NULL` 与 `col = NULL` 留给 fed_conds_ 过滤
+            if (!is_indexable_value_condition(cond) || cond.lhs_col.tab_name != tab_name_ || cond.op == OP_NE) {
                 continue;
             }
             size_t ordinal = find_index_col_ordinal(cond.lhs_col.col_name);
@@ -368,7 +369,8 @@ public:
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
-        len_ = cols_.back().offset + cols_.back().len;
+        // 同 SeqScanExecutor：包含尾部 null bitmap
+        len_ = static_cast<size_t>(fh_->get_file_hdr().record_size);
 
         for (auto& cond : conds_) {
             if (cond.lhs_col.tab_name != tab_name_) {

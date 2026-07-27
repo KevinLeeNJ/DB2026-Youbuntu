@@ -405,7 +405,12 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
     ASSERT_FALSE(exec.is_end());
     auto row = exec.Next();
     ASSERT_NE(row, nullptr);
+    // COUNT(*) over an empty input is 0; SUM/AVG have no non-NULL input and are
+    // therefore SQL NULL (their data bytes stay zeroed).
     EXPECT_EQ(read_int(*row, 0), 0);
+    EXPECT_FALSE(is_null(row->data, exec.cols()[0]));
+    EXPECT_TRUE(is_null(row->data, exec.cols()[1]));
+    EXPECT_TRUE(is_null(row->data, exec.cols()[2]));
     EXPECT_EQ(read_int(*row, 4), 0);
     EXPECT_FLOAT_EQ(read_float_value(*row, 8), 0.0f);
 
@@ -487,7 +492,8 @@ TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {
 
     AggregateExecutor exec(std::move(child), group_by, aggs, having);
 
-    ASSERT_EQ(exec.tupleLen(), 16);
+    // dept(8) + best_score(4) + avg_bonus(4) + 1 byte trailing NULL bitmap
+    ASSERT_EQ(exec.tupleLen(), 16 + 1);
     ASSERT_EQ(exec.cols().size(), 3);
 
     EXPECT_EQ(exec.cols()[0].tab_name, "t");

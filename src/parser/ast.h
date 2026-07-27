@@ -21,7 +21,9 @@ namespace ast {
 
 enum SvType { SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL, SV_TYPE_DATETIME };
 
-enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE };
+// SV_OP_IS_NULL / SV_OP_IS_NOT_NULL 不是二元比较，rhs 恒为 NullLit 占位。
+// 它们与 `col = NULL`（恒假）语义不同，因此不能复用 SV_OP_EQ / SV_OP_NE。
+enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE, SV_OP_IS_NULL, SV_OP_IS_NOT_NULL };
 
 enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 
@@ -52,6 +54,7 @@ enum class AstType {
     FloatLit,
     StringLit,
     BoolLit,
+    NullLit,
     Parameter,
     Col,
     AggExpr,
@@ -221,6 +224,11 @@ struct BoolLit : public Value {
     BoolLit(bool val_, std::string display_text_ = "") : Value(AstType::BoolLit, std::move(display_text_)), val(val_) {}
 };
 
+/* SQL NULL 字面量。没有值，只有类型标记；display_text 固定为 "NULL"。 */
+struct NullLit : public Value {
+    NullLit() : Value(AstType::NullLit, "NULL") {}
+};
+
 struct Parameter : public Value {
     std::size_t ordinal;
 
@@ -346,6 +354,8 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
         auto& lit = static_cast<const BoolLit&>(expr);
         return std::make_unique<BoolLit>(lit.val, lit.display_text);
     }
+    case AstType::NullLit:
+        return std::make_unique<NullLit>();
     case AstType::Parameter: {
         auto& parameter = static_cast<const Parameter&>(expr);
         return std::make_unique<Parameter>(parameter.ordinal);
@@ -373,6 +383,8 @@ inline std::unique_ptr<Value> clone_value(const Value& value) {
         const auto& x = static_cast<const BoolLit&>(value);
         return std::make_unique<BoolLit>(x.val, x.display_text);
     }
+    case AstType::NullLit:
+        return std::make_unique<NullLit>();
     case AstType::Parameter: {
         const auto& x = static_cast<const Parameter&>(value);
         return std::make_unique<Parameter>(x.ordinal);
@@ -395,7 +407,7 @@ inline std::unique_ptr<Value> clone_bound_value(const Value& value,
 
 inline std::unique_ptr<Expr> clone_expr_bound(const Expr& expr, const std::vector<std::unique_ptr<Value>>& bindings) {
     if (expr.type == AstType::Parameter || expr.type == AstType::IntLit || expr.type == AstType::FloatLit ||
-        expr.type == AstType::StringLit || expr.type == AstType::BoolLit) {
+        expr.type == AstType::StringLit || expr.type == AstType::BoolLit || expr.type == AstType::NullLit) {
         return clone_bound_value(static_cast<const Value&>(expr), bindings);
     }
     if (expr.type == AstType::Col)
@@ -478,18 +490,23 @@ struct SelectStmt : public TreeNode {
     int limit;
     bool limit_is_parameter;
     std::size_t limit_parameter;
+    int offset;
+    bool offset_is_parameter;
+    std::size_t offset_parameter;
 
     SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
                std::vector<std::unique_ptr<HavingExpr>> having_conds_,
                std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
                bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {},
-               bool limit_is_parameter_ = false, std::size_t limit_parameter_ = 0)
+               bool limit_is_parameter_ = false, std::size_t limit_parameter_ = 0, int offset_ = 0,
+               bool offset_is_parameter_ = false, std::size_t offset_parameter_ = 0)
         : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
           conds(std::move(conds_)), jointree(std::move(jointree_)), has_select_star(has_select_star_),
           group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
           has_sort(!order_by_items_.empty()), order_by_items(std::move(order_by_items_)), has_limit(has_limit_),
-          limit(limit_), limit_is_parameter(limit_is_parameter_), limit_parameter(limit_parameter_) {
+          limit(limit_), limit_is_parameter(limit_is_parameter_), limit_parameter(limit_parameter_), offset(offset_),
+          offset_is_parameter(offset_is_parameter_), offset_parameter(offset_parameter_) {
         if (!order_by_items.empty()) {
             std::vector<std::unique_ptr<OrderByItem>> order_items;
             order_items.reserve(order_by_items.size());
@@ -609,9 +626,16 @@ inline std::unique_ptr<SelectStmt> clone_select_bound(const SelectStmt& x,
             throw std::logic_error("LIMIT parameter must be INT32");
         limit = static_cast<const IntLit*>(b[x.limit_parameter - 1].get())->val;
     }
+    int offset = x.offset;
+    if (x.offset_is_parameter) {
+        if (x.offset_parameter == 0 || x.offset_parameter > b.size() || b[x.offset_parameter - 1] == nullptr ||
+            b[x.offset_parameter - 1]->type != AstType::IntLit)
+            throw std::logic_error("OFFSET parameter must be INT32");
+        offset = static_cast<const IntLit*>(b[x.offset_parameter - 1].get())->val;
+    }
     return std::make_unique<SelectStmt>(std::move(items), x.tabs, std::move(conds), std::move(groups),
                                         std::move(having), std::move(order), x.has_limit, limit, x.has_select_star,
-                                        std::move(joins));
+                                        std::move(joins), false, 0, offset);
 }
 
 inline std::unique_ptr<TreeNode> clone_bound_tree(const TreeNode& root, const std::vector<std::unique_ptr<Value>>& b) {

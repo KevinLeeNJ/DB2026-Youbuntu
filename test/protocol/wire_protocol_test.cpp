@@ -113,6 +113,56 @@ TEST(WireProtocolTest, EncodesNullAndIntegerBitsWithoutCoercion) {
     EXPECT_NO_THROW(null_reader.require_end());
 }
 
+// 一行里 NULL 与非 NULL 混排是 protocol_row 的实际输出形状（例如
+// `select ol_i_id, ol_amount, ol_delivery_d ...` 里 ol_delivery_d 为 NULL）。
+// present == 0 的 cell 后面不能有任何值字节，NULL 也不得编码为空字符串
+// （final.md:608 / :761）。
+TEST(WireProtocolTest, MixedNullRowRoundTripsForEveryType) {
+    const std::vector<wire_protocol::Type> types = {
+        wire_protocol::Type::INT32, wire_protocol::Type::INT32,   wire_protocol::Type::FLOAT32,
+        wire_protocol::Type::CHAR,  wire_protocol::Type::FLOAT32, wire_protocol::Type::CHAR,
+    };
+
+    std::vector<wire_protocol::Value> row(types.size());
+    for (std::size_t i = 0; i < types.size(); ++i) {
+        row[i].type = types[i];
+    }
+    row[0].int32 = 42;
+    row[1].present = false; // NULL INT32
+    row[2].float_bits = 0x3f800000U;
+    row[3].present = false; // NULL CHAR
+    row[3].text = "must not be encoded";
+    row[4].present = false; // NULL FLOAT32
+    row[4].float_bits = 0xdeadbeefU;
+    row[5].text = "dist";
+
+    wire_protocol::Writer writer;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        wire_protocol::encode_value(writer, row[i], types[i]);
+    }
+    // 3 个 NULL 各占 1 字节，INT32/FLOAT32 各 5 字节，CHAR 是 1 + 4 + 4 字节。
+    EXPECT_EQ(writer.data().size(), 3U + 5U + 5U + 9U);
+
+    wire_protocol::Reader reader(writer.data());
+    std::vector<wire_protocol::Value> decoded;
+    for (const auto type : types) {
+        decoded.push_back(wire_protocol::decode_value(reader, type));
+    }
+    EXPECT_NO_THROW(reader.require_end());
+
+    ASSERT_EQ(decoded.size(), types.size());
+    EXPECT_TRUE(decoded[0].present);
+    EXPECT_EQ(decoded[0].int32, 42);
+    EXPECT_FALSE(decoded[1].present);
+    EXPECT_TRUE(decoded[2].present);
+    EXPECT_EQ(decoded[2].float_bits, 0x3f800000U);
+    EXPECT_FALSE(decoded[3].present);
+    EXPECT_TRUE(decoded[3].text.empty()); // NULL CHAR 不是空字符串，它没有值字节
+    EXPECT_FALSE(decoded[4].present);
+    EXPECT_TRUE(decoded[5].present);
+    EXPECT_EQ(decoded[5].text, "dist");
+}
+
 TEST(WireProtocolTest, RejectsInvalidTypedValueBoundaries) {
     const auto invalid_type = static_cast<wire_protocol::Type>(0xff);
     wire_protocol::Value value;

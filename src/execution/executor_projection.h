@@ -22,12 +22,15 @@ class ProjectionExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_; // 投影节点的儿子节点
     std::vector<ColMeta> cols_;              // 需要投影的字段
-    size_t len_;                             // 字段总长度
+    size_t len_;                             // 输出元组总长度（数据区 + null bitmap）
+    size_t data_len_ = 0;                    // 输出元组数据区长度，即 null bitmap 的起始偏移
     std::vector<size_t> sel_idxs_;
     std::unique_ptr<RmRecord> current_output_;
     std::unique_ptr<RmRecord> fallback_input_;
     TupleView current_view_;
 
+    // 投影会重新打包元组，所以输出的 null bitmap 也要重排：输出列 i 的 NULL 位
+    // 在 data_len_ + i/8 处，与输入侧的位置无关。
     bool materialize_view(TupleView input) {
         if (!input) {
             return false;
@@ -35,12 +38,18 @@ private:
         if (current_output_ == nullptr || current_output_->size != static_cast<int>(len_)) {
             current_output_ = std::make_unique<RmRecord>(static_cast<int>(len_));
         }
+        char* out = current_output_->data;
+        std::memset(out + data_len_, 0, static_cast<size_t>(len_) - data_len_);
+        const auto& prev_cols = prev_->cols();
         for (size_t i = 0; i < sel_idxs_.size(); ++i) {
             const auto& col = cols_[i];
-            const auto& src_col = prev_->cols()[sel_idxs_[i]];
-            std::memcpy(current_output_->data + col.offset, input.data + src_col.offset, col.len);
+            const auto& src_col = prev_cols[sel_idxs_[i]];
+            std::memcpy(out + col.offset, input.data + src_col.offset, col.len);
+            if (is_null(input.data, src_col)) {
+                set_null(out, col);
+            }
         }
-        current_view_ = TupleView{current_output_->data, static_cast<uint32_t>(current_output_->size)};
+        current_view_ = TupleView{out, static_cast<uint32_t>(current_output_->size)};
         return true;
     }
 
@@ -58,6 +67,13 @@ private:
         len_ += col.len;
         cols_.push_back(col);
         sel_idxs_.push_back(prev_idx);
+    }
+
+    // 所有输出列就位后才能确定 bitmap 的起始偏移，因此布局在构造末尾一次算定。
+    void finalize_layout() {
+        data_len_ = len_;
+        bind_null_positions(cols_, static_cast<int>(data_len_));
+        len_ = data_len_ + static_cast<size_t>(null_bitmap_bytes(cols_.size()));
     }
 
     static std::vector<ColMeta>::const_iterator find_col_by_name(const std::vector<ColMeta>& cols,
@@ -123,6 +139,7 @@ public:
             auto pos = get_col(prev_cols, sel_col);
             append_projection_col(static_cast<size_t>(pos - prev_cols.begin()));
         }
+        finalize_layout();
     }
 
     template <typename SelectItemT, typename = std::enable_if_t<!std::is_same_v<SelectItemT, TabCol>>>
@@ -130,6 +147,7 @@ public:
         prev_ = std::move(prev);
         len_ = 0;
         build_from_select_items(select_items);
+        finalize_layout();
     }
 
     void beginTuple() override {

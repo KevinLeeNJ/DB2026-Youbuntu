@@ -1,0 +1,219 @@
+# null_join_sort.slt — NULL 穿过 Projection 重打包 / NestedLoopJoin 拼接 /
+# Sort 排序 / LIMIT / UNION 时不能丢失也不能串位。
+
+statement ok
+CREATE TABLE jl (id INT, a INT, na INT, t CHAR(6));
+
+statement ok
+CREATE TABLE jr (id INT, b INT, nb INT, u CHAR(6));
+
+statement ok
+INSERT INTO jl VALUES (1, 100, NULL, 'l1');
+
+statement ok
+INSERT INTO jl VALUES (2, 200, 22, NULL);
+
+statement ok
+INSERT INTO jr VALUES (1, 300, 33, 'r1');
+
+statement ok
+INSERT INTO jr VALUES (2, 400, NULL, NULL);
+
+# 投影重打包：只选一部分列 / 打乱列序，NULL 位都要跟着重排到新位置
+query
+SELECT na, t FROM jl ORDER BY id;
+----
++------------------+------------------+
+|               na |                t |
++------------------+------------------+
+|             NULL |               l1 |
+|               22 |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT t, na, a FROM jl ORDER BY id;
+----
++------------------+------------------+------------------+
+|                t |               na |                a |
++------------------+------------------+------------------+
+|               l1 |             NULL |              100 |
+|             NULL |               22 |              200 |
++------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT t FROM jl ORDER BY id;
+----
++------------------+
+|                t |
++------------------+
+|               l1 |
+|             NULL |
++------------------+
+Total record(s): 2
+
+query
+SELECT na FROM jl ORDER BY id;
+----
++------------------+
+|               na |
++------------------+
+|             NULL |
+|               22 |
++------------------+
+Total record(s): 2
+
+# join 原样拼接两侧完整元组（各带尾部 bitmap），两侧的 NULL 都要正确
+query
+SELECT jl.id, jl.na, jl.t, jr.nb, jr.u FROM jl, jr WHERE jl.id = jr.id ORDER BY jl.id;
+----
++------------------+------------------+------------------+------------------+------------------+
+|               id |               na |                t |               nb |                u |
++------------------+------------------+------------------+------------------+------------------+
+|                1 |             NULL |               l1 |               33 |               r1 |
+|                2 |               22 |             NULL |             NULL |             NULL |
++------------------+------------------+------------------+------------------+------------------+
+Total record(s): 2
+
+# 只投影 join 结果的右侧列
+query
+SELECT jr.nb, jr.u FROM jl, jr WHERE jl.id = jr.id ORDER BY jr.id;
+----
++------------------+------------------+
+|               nb |                u |
++------------------+------------------+
+|               33 |               r1 |
+|             NULL |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+# join 条件里任一侧为 NULL 时该组合不匹配；jl.na=22 与 jr.nb=33 的 <> 仍为真
+query
+SELECT jl.id, jr.id FROM jl, jr WHERE jl.na = jr.nb;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+query
+SELECT jl.id, jr.id FROM jl, jr WHERE jl.na <> jr.nb;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
+|                2 |                1 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT jl.id FROM jl, jr WHERE jl.id = jr.id AND jl.na IS NULL;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+# ORDER BY：NULL 视为最大值，ASC 时排在最后、DESC 时排在最前（无显式 NULLS 语法）
+statement ok
+CREATE TABLE so (id INT, v INT);
+
+statement ok
+INSERT INTO so VALUES (1, 30);
+
+statement ok
+INSERT INTO so VALUES (2, NULL);
+
+statement ok
+INSERT INTO so VALUES (3, 10);
+
+statement ok
+INSERT INTO so VALUES (4, 20);
+
+query
+SELECT id, v FROM so ORDER BY v;
+----
++------------------+------------------+
+|               id |                v |
++------------------+------------------+
+|                3 |               10 |
+|                4 |               20 |
+|                1 |               30 |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 4
+
+query
+SELECT id, v FROM so ORDER BY v DESC;
+----
++------------------+------------------+
+|               id |                v |
++------------------+------------------+
+|                2 |             NULL |
+|                1 |               30 |
+|                4 |               20 |
+|                3 |               10 |
++------------------+------------------+
+Total record(s): 4
+
+# ORDER BY + LIMIT 走 top-k 堆路径，NULL 顺序必须与全排序一致
+query
+SELECT id, v FROM so ORDER BY v LIMIT 2;
+----
++------------------+------------------+
+|               id |                v |
++------------------+------------------+
+|                3 |               10 |
+|                4 |               20 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, v FROM so ORDER BY v DESC LIMIT 1;
+----
++------------------+------------------+
+|               id |                v |
++------------------+------------------+
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, v FROM so ORDER BY v LIMIT 4;
+----
++------------------+------------------+
+|               id |                v |
++------------------+------------------+
+|                3 |               10 |
+|                4 |               20 |
+|                1 |               30 |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 4
+
+# UNION 同样重新打包元组，两个 NULL 视为同一个值参与去重
+query
+SELECT * FROM (SELECT v FROM so WHERE id = 2 UNION SELECT v FROM so WHERE id = 2) AS un1;
+----
++------------------+
+|                v |
++------------------+
+|             NULL |
++------------------+
+Total record(s): 1
+
+query
+SELECT * FROM (SELECT v FROM so WHERE v IS NULL UNION SELECT v FROM so WHERE id = 3) AS un2 ORDER BY v;
+----
++------------------+
+|                v |
++------------------+
+|               10 |
+|             NULL |
++------------------+
+Total record(s): 2
+

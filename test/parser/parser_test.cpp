@@ -438,6 +438,29 @@ TEST(ParserTest, ParsesPreparedMarkersAndQuotedDollarText) {
     EXPECT_TRUE(select->limit_is_parameter);
     EXPECT_EQ(select->limit_parameter, 2u);
 }
+
+TEST(ParserTest, ParsesLimitOffsetClause) {
+    auto literal_node = parse_ok("select a from tb limit 3 offset 7;");
+    auto literal_select = as_node<ast::SelectStmt>(literal_node);
+    ASSERT_NE(literal_select, nullptr);
+    EXPECT_TRUE(literal_select->has_limit);
+    EXPECT_EQ(literal_select->limit, 3);
+    EXPECT_EQ(literal_select->offset, 7);
+    EXPECT_FALSE(literal_select->offset_is_parameter);
+
+    auto plain_node = parse_ok("select a from tb limit 3;");
+    EXPECT_EQ(as_node<ast::SelectStmt>(plain_node)->offset, 0);
+
+    auto param_node = parse_ok("select a from tb order by a limit 1 offset $2;");
+    auto param_select = as_node<ast::SelectStmt>(param_node);
+    ASSERT_NE(param_select, nullptr);
+    EXPECT_EQ(param_select->limit, 1);
+    EXPECT_TRUE(param_select->offset_is_parameter);
+    EXPECT_EQ(param_select->offset_parameter, 2u);
+
+    expect_parse_error("select a from tb offset 2;");
+    expect_parse_error("select a from tb limit 2 offset;");
+}
 TEST(ParserTest, RejectsUnterminatedBlockComment) {
     expect_parse_error("select * from tb /* missing close ;");
 }
@@ -489,4 +512,74 @@ TEST(ParserTest, ParsesLoadStmt) {
     ASSERT_NE(load2, nullptr);
     EXPECT_EQ(load2->file_name_, "./x.csv");
     EXPECT_EQ(load2->tab_name_, "t");
+}
+
+TEST(ParserTest, ParsesNullLiteral) {
+    auto node = parse_ok("insert into tb values (1, NULL, 'x');");
+    auto insert = as_node<ast::InsertStmt>(node);
+    ASSERT_NE(insert, nullptr);
+    ASSERT_EQ(insert->vals.size(), 3U);
+    EXPECT_EQ(insert->vals[0]->type, ast::AstType::IntLit);
+    EXPECT_EQ(insert->vals[1]->type, ast::AstType::NullLit);
+    EXPECT_EQ(insert->vals[2]->type, ast::AstType::StringLit);
+    EXPECT_EQ(insert->vals[1]->display_text, "NULL");
+
+    // 大小写不敏感，和其他关键字一致
+    auto lower = parse_ok("insert into tb values (null);");
+    auto lower_insert = as_node<ast::InsertStmt>(lower);
+    ASSERT_NE(lower_insert, nullptr);
+    ASSERT_EQ(lower_insert->vals.size(), 1U);
+    EXPECT_EQ(lower_insert->vals[0]->type, ast::AstType::NullLit);
+
+    // NULL 不能参与常量算术
+    expect_parse_error("insert into tb values (NULL + 1);");
+    expect_parse_error("insert into tb values (-NULL);");
+}
+
+TEST(ParserTest, ParsesSetColumnToNull) {
+    auto node = parse_ok("update tb set a = NULL where id = 1;");
+    auto update = as_node<ast::UpdateStmt>(node);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    EXPECT_EQ(update->set_clauses[0]->col_name, "a");
+    ASSERT_NE(update->set_clauses[0]->val, nullptr);
+    EXPECT_EQ(update->set_clauses[0]->val->type, ast::AstType::NullLit);
+    EXPECT_FALSE(update->set_clauses[0]->is_self_ref);
+}
+
+TEST(ParserTest, ParsesIsNullPredicates) {
+    // `IS [NOT] NULL` 有专门的比较算子，不能退化成 `= NULL` / `<> NULL`
+    auto is_null = parse_ok("select a from tb where a is null;");
+    auto select = as_node<ast::SelectStmt>(is_null);
+    ASSERT_NE(select, nullptr);
+    ASSERT_EQ(select->conds.size(), 1U);
+    EXPECT_EQ(select->conds[0]->op, ast::SV_OP_IS_NULL);
+    EXPECT_EQ(select->conds[0]->lhs->type, ast::AstType::Col);
+    EXPECT_EQ(select->conds[0]->rhs->type, ast::AstType::NullLit);
+
+    auto is_not_null = parse_ok("select a from tb where tb.a IS NOT NULL;");
+    auto select2 = as_node<ast::SelectStmt>(is_not_null);
+    ASSERT_NE(select2, nullptr);
+    ASSERT_EQ(select2->conds.size(), 1U);
+    EXPECT_EQ(select2->conds[0]->op, ast::SV_OP_IS_NOT_NULL);
+
+    // `= NULL` 仍然是普通的相等比较（语义上恒假，但语法上不是 IS NULL）
+    auto eq_null = parse_ok("select a from tb where a = NULL;");
+    auto select3 = as_node<ast::SelectStmt>(eq_null);
+    ASSERT_NE(select3, nullptr);
+    ASSERT_EQ(select3->conds.size(), 1U);
+    EXPECT_EQ(select3->conds[0]->op, ast::SV_OP_EQ);
+    EXPECT_EQ(select3->conds[0]->rhs->type, ast::AstType::NullLit);
+
+    // 多个 IS NULL 用 AND 连接
+    auto both = parse_ok("delete from tb where a is null and b is not null;");
+    auto del = as_node<ast::DeleteStmt>(both);
+    ASSERT_NE(del, nullptr);
+    ASSERT_EQ(del->conds.size(), 2U);
+    EXPECT_EQ(del->conds[0]->op, ast::SV_OP_IS_NULL);
+    EXPECT_EQ(del->conds[1]->op, ast::SV_OP_IS_NOT_NULL);
+
+    expect_parse_error("select a from tb where a is;");
+    expect_parse_error("select a from tb where a is not;");
+    expect_parse_error("select a from tb where a is not 1;");
 }

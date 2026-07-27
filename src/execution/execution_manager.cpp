@@ -299,7 +299,11 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         for (auto& col : result_cols) {
             std::string col_str;
             const char* rec_buf = tuple.data + col.offset;
-            if (col.type == TYPE_INT) {
+            if (is_null(tuple.data, col)) {
+                // NULL 是新增的值形态，此前不可能出现，因此不影响 output.txt
+                // 既有格式；不能写成空串（final.md:761）。
+                col_str = NULL_DISPLAY_TEXT;
+            } else if (col.type == TYPE_INT) {
                 col_str = std::to_string(read_unaligned<int>(rec_buf));
             } else if (col.type == TYPE_FLOAT) {
                 col_str = std::to_string(read_float(rec_buf));

@@ -29,6 +29,9 @@ struct BoundMutationColumn {
     uint32_t offset;
     uint32_t len;
     ColType type;
+    // 元组内该列 NULL 位的地址；null_byte < 0 表示该列不可能为 NULL
+    int null_byte = -1;
+    uint8_t null_mask = 0;
 };
 
 struct BoundMutationCondition {

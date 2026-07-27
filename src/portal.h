@@ -936,8 +936,9 @@ public:
         }
         case T_Limit: {
             auto x = static_cast<LimitPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> executor = std::make_unique<LimitExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), static_cast<size_t>(x->limit_));
+            std::unique_ptr<AbstractExecutor> executor =
+                std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
+                                                static_cast<size_t>(x->limit_), static_cast<size_t>(x->offset_));
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Union: {

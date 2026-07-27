@@ -24,10 +24,20 @@ See the Mulan PSL v2 for more details. */
 struct ColMeta {
     std::string tab_name; // 字段所属表名称
     std::string name;     // 字段名称
-    ColType type;         // 字段类型
-    int len;              // 字段长度
-    int offset;           // 字段位于记录中的偏移量
-    bool index;           /** unused */
+    // 以下四个标量给默认值，是因为 `ColMeta x;` 这种默认构造在代码里很常见
+    // （如 AggregateSpec::input_col、init_aggregate_cols 的局部变量），而
+    // ColMeta 的拷贝构造会逐成员读取它们；不初始化会让 UBSan 报出
+    // "load of value N, which is not a valid value for type 'bool'/'ColType'"。
+    ColType type = TYPE_INT; // 字段类型
+    int len = 0;             // 字段长度
+    int offset = 0;          // 字段位于记录中的偏移量
+    bool index = false;      /** unused */
+
+    // 以下两个字段只存在于内存中，不参与下面的磁盘序列化：元组内该列 NULL 位的
+    // 绝对地址，由 TabMeta::bind_null_positions 推导。详见 defs.h 的布局说明。
+    // null_byte < 0 表示该列永远非 NULL。
+    int null_byte = -1;
+    uint8_t null_mask = 0;
 
     friend std::ostream& operator<<(std::ostream& os, const ColMeta& col) {
         // ColMeta中有各个基本类型的变量，然后调用重载的这些变量的操作符<<（具体实现逻辑在defs.h）
@@ -39,6 +49,33 @@ struct ColMeta {
         return is >> col.tab_name >> col.name >> col.type >> col.len >> col.offset >> col.index;
     }
 };
+
+/* 元组中该列当前是否为 SQL NULL */
+inline bool is_null(const char* tuple, const ColMeta& col) {
+    return is_null_at(tuple, col.null_byte, col.null_mask);
+}
+
+inline void set_null(char* tuple, const ColMeta& col) {
+    set_null_at(tuple, col.null_byte, col.null_mask);
+}
+
+inline void clear_null(char* tuple, const ColMeta& col) {
+    clear_null_at(tuple, col.null_byte, col.null_mask);
+}
+
+/* 一组连续列的 null bitmap 字节数（每列 1 bit） */
+inline int null_bitmap_bytes(size_t num_cols) {
+    return static_cast<int>((num_cols + 7) / 8);
+}
+
+/* 为一段自成一体的元组布局（数据区紧跟尾部 bitmap）绑定各列的 NULL 位地址。
+   Projection / Aggregate / Union 这类重新打包元组的执行器用它给输出列建址。 */
+inline void bind_null_positions(std::vector<ColMeta>& cols, int data_len) {
+    for (size_t i = 0; i < cols.size(); ++i) {
+        cols[i].null_byte = data_len + static_cast<int>(i / 8);
+        cols[i].null_mask = static_cast<uint8_t>(0x80u >> (i % 8));
+    }
+}
 
 /* 索引元数据 */
 struct IndexMeta {
@@ -75,6 +112,30 @@ struct TabMeta {
     TabMeta() = default;
     TabMeta(const TabMeta& other) = default;
     TabMeta& operator=(const TabMeta& other) = default;
+
+    /* 记录数据区的长度，不含尾部 null bitmap */
+    int data_len() const {
+        return cols.empty() ? 0 : cols.back().offset + cols.back().len;
+    }
+
+    /* 记录总长度：数据区 + 尾部 null bitmap，即数据文件头里的 record_size */
+    int record_len() const {
+        return data_len() + null_bitmap_bytes(cols.size());
+    }
+
+    /* 由数据文件头的 record_size 推导各列的 NULL 位地址。
+       record_size 容不下 bitmap 说明这是 NULL 支持之前写入的旧文件，
+       此时把所有列标记为不可为 NULL，避免读写越界。 */
+    void bind_null_positions(int record_size) {
+        if (record_size < record_len()) {
+            for (auto& col : cols) {
+                col.null_byte = -1;
+                col.null_mask = 0;
+            }
+            return;
+        }
+        ::bind_null_positions(cols, data_len());
+    }
 
     /* 判断当前表中是否存在名为col_name的字段 */
     bool is_col(const std::string& col_name) const {

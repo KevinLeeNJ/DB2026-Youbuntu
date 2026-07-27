@@ -207,11 +207,18 @@ template <typename... Conds> std::vector<std::unique_ptr<ast::HavingExpr>> havin
 
 std::unique_ptr<ast::SelectStmt> make_select_stmt(std::vector<std::unique_ptr<ast::SelectItem>> select_items,
                                                   std::vector<std::unique_ptr<ast::Col>> group_by_cols = {},
-                                                  std::vector<std::unique_ptr<ast::HavingExpr>> having_conds = {}) {
-    return std::make_unique<ast::SelectStmt>(
-        std::move(select_items), std::vector<ast::TableRef>{ast::TableRef("grade", "")},
-        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols), std::move(having_conds),
-        std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0, false);
+                                                  std::vector<std::unique_ptr<ast::HavingExpr>> having_conds = {},
+                                                  std::vector<std::unique_ptr<ast::OrderByItem>> order_by_items = {}) {
+    return std::make_unique<ast::SelectStmt>(std::move(select_items),
+                                             std::vector<ast::TableRef>{ast::TableRef("grade", "")},
+                                             std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::move(group_by_cols),
+                                             std::move(having_conds), std::move(order_by_items), false, 0, false);
+}
+
+std::vector<std::unique_ptr<ast::OrderByItem>> order_by_col(const std::string& col_name) {
+    std::vector<std::unique_ptr<ast::OrderByItem>> items;
+    items.push_back(std::make_unique<ast::OrderByItem>(std::make_unique<ast::Col>("", col_name), ast::OrderBy_DEFAULT));
+    return items;
 }
 
 } // namespace
@@ -311,4 +318,39 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_mixed_aggregate_without_group_by
                             "GROUP BY"),
                   std::string::npos);
     }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_accepts_order_by_column_outside_select_list) {
+    auto stmt =
+        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), "")), {},
+                         {}, order_by_col("score"));
+
+    auto query = analyze_.do_analyze(std::move(stmt));
+
+    ASSERT_EQ(query->order_by_items.size(), 1);
+    EXPECT_EQ(query->order_by_items[0].expr.type, QueryExprType::COLUMN);
+    EXPECT_EQ(query->order_by_items[0].expr.col.tab_name, "grade");
+    EXPECT_EQ(query->order_by_items[0].expr.col.col_name, "score");
+    EXPECT_EQ(query->output_names, (std::vector<std::string>{"id"}));
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_order_by_column_outside_select_list_when_grouped) {
+    auto stmt =
+        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), "")),
+                         group_cols(std::make_unique<ast::Col>("", "id")), {}, order_by_col("score"));
+
+    try {
+        (void)analyze_.do_analyze(std::move(stmt));
+        FAIL() << "expected order-by validation failure";
+    } catch (const RMDBError& err) {
+        EXPECT_NE(std::string(err.what()).find("ORDER BY must reference output columns or aliases"), std::string::npos);
+    }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_order_by_unknown_column) {
+    auto stmt =
+        make_select_stmt(select_items(std::make_unique<ast::SelectItem>(std::make_unique<ast::Col>("", "id"), "")), {},
+                         {}, order_by_col("nosuchcol"));
+
+    EXPECT_THROW((void)analyze_.do_analyze(std::move(stmt)), ColumnNotFoundError);
 }

@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -110,11 +111,16 @@ void SmManager::create_db(const std::string& db_name) {
 
     // 创建日志文件
     disk_manager_->create_file(LOG_FILE_NAME);
+    // The new WAL segment's directory entry must be durable before the segment
+    // can be used to cover a COMMIT.
+    disk_manager_->sync_directory(".");
 
     // 回到根目录
     if (chdir("..") < 0) {
         throw UnixError();
     }
+    // Make the database directory entry itself durable as well.
+    disk_manager_->sync_directory(".");
 }
 
 /**
@@ -177,7 +183,10 @@ void SmManager::open_db(const std::string& db_name) {
         //  打开所有表的记录文件
         for (auto& entry : db_.tabs_) {
             auto& tab_meta = entry.second;
-            fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
+            auto file_handle = rm_manager_->open_file(tab_meta.name);
+            // NULL 位地址不进磁盘元数据，每次打开库时按数据文件的 record_size 推导。
+            tab_meta.bind_null_positions(file_handle->get_file_hdr().record_size);
+            fhs_.emplace(tab_meta.name, std::move(file_handle));
             for (auto& index : tab_meta.indexes) {
                 // 打开索引文件
                 const std::string index_name = ix_manager_->get_index_name(tab_meta.name, index.cols);
@@ -502,7 +511,9 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
         tab.cols.emplace_back(col);
     }
     // Create & open record file
-    int record_size = curr_offset; // record_size就是col meta所占的大小（表的元数据也是以记录的形式进行存储的）
+    // record_size = 数据区 + 尾部 null bitmap（每列 1 bit），列偏移量不受影响。
+    int record_size = tab.record_len();
+    tab.bind_null_positions(record_size);
     rm_manager_->create_file(tab_name, record_size);
     db_.tabs_[tab_name] = tab;
     // fhs_[tab_name] = rm_manager_->open_file(tab_name);
@@ -914,27 +925,86 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
         }
     };
 
-    // Build column-name -> CSV-field-index map from the header row.
-    std::string header_line;
-    if (!std::getline(infile, header_line)) {
+    // 就地按 RFC 4180 切分一行，结果是指向 line 内部的 NUL 结尾字段。
+    // 解引号只会删字符，所以写指针永不超过读指针，可以原地改写；末尾多留的
+    // 一个字节用于给最后一个字段写 NUL。不支持引号内换行（TPC-C 数据不含换行，
+    // Go 的 encoding/csv 也只在字段含 , " \n 时才加引号）。
+    auto split_csv_line = [](std::string& s, std::vector<const char*>& out) {
+        out.clear();
+        s.push_back('\0');
+        char* write = s.data();
+        const char* read = s.data();
+        const char* end = s.data() + s.size() - 1;
+        while (true) {
+            char* field_begin = write;
+            if (read < end && *read == '"') {
+                ++read; // 起始引号
+                while (read < end) {
+                    if (*read != '"') {
+                        *write++ = *read++;
+                        continue;
+                    }
+                    if (read + 1 < end && read[1] == '"') {
+                        *write++ = '"'; // "" 还原成一个 "
+                        read += 2;
+                        continue;
+                    }
+                    ++read; // 结束引号
+                    break;
+                }
+                while (read < end && *read != ',') {
+                    ++read; // 容忍结束引号与逗号之间的多余字符
+                }
+            } else {
+                while (read < end && *read != ',') {
+                    *write++ = *read++;
+                }
+            }
+            *write++ = '\0';
+            out.push_back(field_begin);
+            if (read >= end) {
+                break;
+            }
+            ++read; // 跳过字段分隔符
+        }
+        s.pop_back();
+    };
+
+    // 复用的字段指针数组：提到循环外，省掉每行一次 malloc/free。
+    std::vector<const char*> fields;
+    fields.reserve(cols.size() * 2);
+
+    // 表头嗅探：只有"字段数 == DDL 列数 ∧ 每个字段（trim 后）都命中列名 ∧ 互不
+    // 重复"才认定为表头，否则按 DDL 列序做位置映射并把这一行也当数据行。
+    // final.md 全文对表头未作规定，因此必须同时支持有/无表头两种 CSV。
+    // TPC-C 列名是标识符，数据行是数字/时间戳/随机串，不可能凑巧全部命中。
+    std::string line;
+    if (!std::getline(infile, line)) {
         throw RMDBError("load file is empty: " + file_path);
     }
-    strip_cr(header_line);
-    std::vector<std::string> header_fields;
-    {
-        std::stringstream ss(header_line);
-        std::string field;
-        while (std::getline(ss, field, ',')) {
-            header_fields.push_back(field);
-        }
-    }
+    strip_cr(line);
+    split_csv_line(line, fields);
+
     std::unordered_map<std::string, size_t> col_index;
-    for (size_t i = 0; i < header_fields.size(); ++i) {
-        col_index[header_fields[i]] = i;
-    }
-    for (const auto& col : cols) {
-        if (col_index.find(col.name) == col_index.end()) {
-            throw RMDBError("load file missing column: " + col.name);
+    bool has_header = fields.size() == cols.size();
+    if (has_header) {
+        auto trim = [](const char* text) {
+            const char* begin = text;
+            const char* stop = text + std::strlen(text);
+            while (begin < stop && std::isspace(static_cast<unsigned char>(*begin))) {
+                ++begin;
+            }
+            while (stop > begin && std::isspace(static_cast<unsigned char>(stop[-1]))) {
+                --stop;
+            }
+            return std::string(begin, static_cast<size_t>(stop - begin));
+        };
+        for (size_t i = 0; i < fields.size() && has_header; ++i) {
+            std::string name = trim(fields[i]);
+            has_header = tab.is_col(name) && col_index.emplace(std::move(name), i).second;
+        }
+        if (!has_header) {
+            col_index.clear();
         }
     }
 
@@ -944,11 +1014,15 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
         ColType type;
         int len;
         int offset;
+        int null_byte;
+        uint8_t null_mask;
     };
     std::vector<ColSrc> col_src;
     col_src.reserve(cols.size());
-    for (const auto& col : cols) {
-        col_src.push_back({col_index[col.name], col.type, col.len, col.offset});
+    for (size_t i = 0; i < cols.size(); ++i) {
+        const auto& col = cols[i];
+        const size_t csv_idx = has_header ? col_index.at(col.name) : i;
+        col_src.push_back({csv_idx, col.type, col.len, col.offset, col.null_byte, col.null_mask});
     }
 
     struct LoadIndexTarget {
@@ -967,37 +1041,16 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     RmFileHandle::PinnedInserter rm_inserter(fh);
     std::vector<char> record(record_size, 0);
 
-    std::string line;
-    size_t line_no = 1; // header was line 1
-    while (std::getline(infile, line)) {
-        ++line_no;
-        strip_cr(line);
-        if (line.empty()) {
-            continue; // skip trailing blank lines
-        }
-
-        std::vector<const char*> fields;
-        fields.reserve(col_src.size() * 2);
-        {
-            const char* field_start = line.data();
-            for (char* p = line.data(); *p != '\0'; ++p) {
-                if (*p == ',') {
-                    *p = '\0';
-                    fields.push_back(field_start);
-                    field_start = p + 1;
-                }
-            }
-            fields.push_back(field_start);
-        }
-
+    // 把当前 fields 组装成一条记录并写入表和索引。
+    auto emit_row = [&](size_t line_no) {
         std::memset(record.data(), 0, record_size);
         for (const auto& cs : col_src) {
-            if (cs.csv_idx >= fields.size()) {
-                throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected");
-            }
-            const char* raw = fields[cs.csv_idx];
-            if (std::strchr(raw, '"') != nullptr) {
-                throw RMDBError("load file row " + std::to_string(line_no) + " contains an unexpected quote character");
+            // 缺失字段和空字段都记为 SQL NULL：数据字节保持全零，只置 NULL 位。
+            // 字段数超出 DDL 列数时多出来的字段被忽略。
+            const char* raw = cs.csv_idx < fields.size() ? fields[cs.csv_idx] : nullptr;
+            if (raw == nullptr || *raw == '\0') {
+                set_null_at(record.data(), cs.null_byte, cs.null_mask);
+                continue;
             }
             if (cs.type == TYPE_INT) {
                 errno = 0;
@@ -1037,6 +1090,20 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
             }
             target.inserter->insert(target.key.data(), rid, nullptr, true);
         }
+    };
+
+    size_t line_no = 1;
+    if (!has_header && !line.empty()) {
+        emit_row(line_no); // 第一行不是表头，它已经切分好了
+    }
+    while (std::getline(infile, line)) {
+        ++line_no;
+        strip_cr(line);
+        if (line.empty()) {
+            continue; // skip trailing blank lines
+        }
+        split_csv_line(line, fields);
+        emit_row(line_no);
     }
 
     idx_inserters.clear();

@@ -112,12 +112,19 @@ std::vector<Value> protocol_row(const std::vector<ColMeta>& columns, const char*
     std::vector<Value> row;
     row.reserve(columns.size());
     for (const auto& column : columns) {
-        if (column.offset < 0 || static_cast<std::size_t>(column.offset) + column.len > size) {
+        if (column.offset < 0 || static_cast<std::size_t>(column.offset) + column.len > size ||
+            static_cast<std::size_t>(column.null_byte + 1) > size) {
             throw wire_protocol::ProtocolError("executor returned an invalid tuple");
         }
         Value value;
         value.type = protocol_type(column.type);
         const char* cell = data + column.offset;
+        if (is_null(data, column)) {
+            // present == 0 后不写任何值字节；NULL 不得编码为空字符串（final.md:761）
+            value.present = false;
+            row.push_back(std::move(value));
+            continue;
+        }
         if (column.type == TYPE_INT) {
             value.int32 = read_unaligned<int>(cell);
         } else if (column.type == TYPE_FLOAT) {
@@ -503,6 +510,11 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                             throw wire_protocol::ProtocolError("parameter marker is out of range");
                         seen[select.limit_parameter - 1] = true;
                     }
+                    if (select.offset_is_parameter) {
+                        if (select.offset_parameter == 0 || select.offset_parameter > statement.parameters.size())
+                            throw wire_protocol::ProtocolError("parameter marker is out of range");
+                        seen[select.offset_parameter - 1] = true;
+                    }
                 }
             };
             std::function<void(const ast::Expr&)> visit_expr = [&](const ast::Expr& expr) {
@@ -627,11 +639,13 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                 std::vector<std::unique_ptr<ast::Value>> values;
                 values.reserve(operations[i].values.size());
                 for (const auto& value : operations[i].values) {
-                    if (!value.present)
-                        throw wire_protocol::ProtocolError(
-                            "SQL NULL parameters are not supported by this storage engine");
                     if (value.type != operations[i].statement->parameters[values.size()])
                         throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
+                    if (!value.present) {
+                        // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
+                        values.push_back(std::make_unique<ast::NullLit>());
+                        continue;
+                    }
                     if (value.type == Type::INT32)
                         values.push_back(std::make_unique<ast::IntLit>(value.int32));
                     else if (value.type == Type::FLOAT32) {
@@ -656,7 +670,9 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         response.u16(executed);
         response.u8(1);
         response.u16(failed);
-        const auto text = diagnostic(exception);
+        // TransactionAbortException does not override what(); use the same
+        // diagnostic text the EXEC_STREAM path reports.
+        const auto text = exception.GetInfo();
         response.u32(static_cast<std::uint32_t>(text.size()));
         response.bytes(text);
         response.u16(0);
@@ -831,11 +847,52 @@ int main(int argc, char** argv) {
         buffer_pool_manager->set_log_manager(log_manager.get());
 
         // recovery database
-        recovery->analyze();
-        recovery->redo();
-        recovery->undo();
-        sm_manager->refresh_index_residency();
-        LOG_INFO("database recovery finished");
+        // Per-phase cost is reported once, here, so recovery tuning is not
+        // guesswork. Nothing below runs on the measured transaction path.
+        {
+            // The default level is WARN, which would swallow the numbers this
+            // block exists to produce. The window is startup only and closes
+            // before any transaction runs, so no measured path is affected.
+            minilog::Logger::get().set_level(minilog::LogLevel::INFO);
+            const auto phase_elapsed_ms = [](std::chrono::steady_clock::time_point begin) {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
+                    .count();
+            };
+            const uint64_t page_reads_before = disk_manager->get_page_read_count();
+            const uint64_t page_writes_before = disk_manager->get_page_write_count();
+            const auto recovery_begin = std::chrono::steady_clock::now();
+
+            auto phase_begin = recovery_begin;
+            recovery->analyze();
+            LOG_INFO("recovery analyze: %lld ms, wal reads: %llu (%llu bytes), page reads: %llu",
+                     static_cast<long long>(phase_elapsed_ms(phase_begin)),
+                     static_cast<unsigned long long>(disk_manager->get_log_read_count()),
+                     static_cast<unsigned long long>(disk_manager->get_log_read_bytes()),
+                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - page_reads_before));
+
+            phase_begin = std::chrono::steady_clock::now();
+            const uint64_t redo_page_reads_before = disk_manager->get_page_read_count();
+            recovery->redo();
+            LOG_INFO("recovery redo: %lld ms, page reads: %llu", static_cast<long long>(phase_elapsed_ms(phase_begin)),
+                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - redo_page_reads_before));
+
+            phase_begin = std::chrono::steady_clock::now();
+            const uint64_t undo_page_reads_before = disk_manager->get_page_read_count();
+            recovery->undo();
+            LOG_INFO("recovery undo: %lld ms, page reads: %llu", static_cast<long long>(phase_elapsed_ms(phase_begin)),
+                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - undo_page_reads_before));
+
+            phase_begin = std::chrono::steady_clock::now();
+            sm_manager->refresh_index_residency();
+            LOG_INFO("recovery index residency refresh: %lld ms",
+                     static_cast<long long>(phase_elapsed_ms(phase_begin)));
+
+            LOG_INFO("database recovery finished in %lld ms, page reads: %llu, page writes: %llu",
+                     static_cast<long long>(phase_elapsed_ms(recovery_begin)),
+                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - page_reads_before),
+                     static_cast<unsigned long long>(disk_manager->get_page_write_count() - page_writes_before));
+            minilog::Logger::get().set_level(minilog::LogLevel::WARN);
+        }
 
         {
             std::atomic<bool> checkpoint_thread_stop{false};

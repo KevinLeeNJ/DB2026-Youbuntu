@@ -359,10 +359,11 @@ private:
         auto group_by = parse_opt_group_clause();
         auto having = parse_opt_having_clause();
         auto order = parse_opt_order_clause();
-        auto [has_limit, limit_value, limit_parameter] = parse_opt_limit_clause();
+        auto [has_limit, limit_value, limit_parameter, offset_value, offset_parameter] = parse_opt_limit_clause();
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
                                             std::move(having), std::move(order), has_limit, limit_value, has_star,
-                                            std::move(from->jointree), limit_parameter != 0, limit_parameter);
+                                            std::move(from->jointree), limit_parameter != 0, limit_parameter,
+                                            offset_value, offset_parameter != 0, offset_parameter);
     }
 
     std::unique_ptr<UnionStmt> parse_union_query() {
@@ -460,6 +461,9 @@ private:
         if (check(TokenType::VALUE_BOOL)) {
             return parse_bool_literal();
         }
+        if (match(TokenType::NULL_KW)) {
+            return std::make_unique<NullLit>();
+        }
         error("expected value");
     }
 
@@ -537,6 +541,12 @@ private:
 
     std::unique_ptr<BinaryExpr> parse_condition() {
         auto lhs = parse_col();
+        if (match(TokenType::IS)) {
+            const bool negated = match(TokenType::NOT);
+            expect(TokenType::NULL_KW, "expected NULL after IS");
+            return std::make_unique<BinaryExpr>(std::move(lhs), negated ? SV_OP_IS_NOT_NULL : SV_OP_IS_NULL,
+                                                std::make_unique<NullLit>());
+        }
         auto op = parse_op();
         auto rhs = parse_general_expr();
         return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
@@ -924,27 +934,44 @@ private:
         return std::make_unique<OrderByItem>(std::move(expr), dir);
     }
 
-    std::tuple<bool, int, std::size_t> parse_opt_limit_clause() {
+    std::size_t parse_row_count_parameter(const char* message) {
+        Token token = expect(TokenType::PARAMETER, message);
+        std::size_t ordinal = 0;
+        for (std::size_t i = 1; i < token.text.size(); ++i) {
+            const auto digit = static_cast<std::size_t>(token.text[i] - '0');
+            if (ordinal > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+                error("parameter ordinal is too large");
+            }
+            ordinal = ordinal * 10 + digit;
+        }
+        if (ordinal == 0) {
+            error("parameter ordinal must be positive");
+        }
+        return ordinal;
+    }
+
+    // returns {has_limit, limit, limit_parameter, offset, offset_parameter}
+    std::tuple<bool, int, std::size_t, int, std::size_t> parse_opt_limit_clause() {
         if (!match(TokenType::LIMIT)) {
-            return {false, 0, 0};
+            return {false, 0, 0, 0, 0};
         }
+        int limit_value = 0;
+        std::size_t limit_parameter = 0;
         if (check(TokenType::PARAMETER)) {
-            Token token = expect(TokenType::PARAMETER, "expected limit");
-            std::size_t ordinal = 0;
-            for (std::size_t i = 1; i < token.text.size(); ++i) {
-                const auto digit = static_cast<std::size_t>(token.text[i] - '0');
-                if (ordinal > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
-                    error("parameter ordinal is too large");
-                }
-                ordinal = ordinal * 10 + digit;
-            }
-            if (ordinal == 0) {
-                error("parameter ordinal must be positive");
-            }
-            return {true, 0, ordinal};
+            limit_parameter = parse_row_count_parameter("expected limit");
+        } else {
+            limit_value = parse_int_literal()->val;
         }
-        auto lit = parse_int_literal();
-        return {true, lit->val, 0};
+        int offset_value = 0;
+        std::size_t offset_parameter = 0;
+        if (match(TokenType::OFFSET)) {
+            if (check(TokenType::PARAMETER)) {
+                offset_parameter = parse_row_count_parameter("expected offset");
+            } else {
+                offset_value = parse_int_literal()->val;
+            }
+        }
+        return {true, limit_value, limit_parameter, offset_value, offset_parameter};
     }
 
     std::string parse_identifier() {

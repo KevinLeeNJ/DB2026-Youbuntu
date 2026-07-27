@@ -36,6 +36,9 @@ private:
         int len = 0;
         ColType type = TYPE_INT;
         Value literal;
+        // NULL 位地址，与 offset 一样相对于所属那一侧的元组
+        int null_byte = -1;
+        uint8_t null_mask = 0;
     };
 
     struct CompiledCondition {
@@ -123,14 +126,27 @@ private:
         CompiledOperand operand;
         operand.type = col_meta.type;
         operand.len = col_meta.len;
+        operand.null_mask = col_meta.null_mask;
         if (col_meta.offset < static_cast<int>(left_tuple_len_)) {
             operand.source = OperandSource::Left;
             operand.offset = col_meta.offset;
+            operand.null_byte = col_meta.null_byte;
         } else {
             operand.source = OperandSource::Right;
             operand.offset = col_meta.offset - static_cast<int>(left_tuple_len_);
+            operand.null_byte = col_meta.null_byte < 0 ? -1 : col_meta.null_byte - static_cast<int>(left_tuple_len_);
         }
         return operand;
+    }
+
+    /* join 条件的操作数是否为 SQL NULL */
+    static bool is_operand_null(const CompiledOperand& operand, const TupleView& left_tuple,
+                                const TupleView& right_tuple) {
+        if (operand.source == OperandSource::Literal) {
+            return operand.literal.is_null;
+        }
+        const char* tuple = operand.source == OperandSource::Left ? left_tuple.data : right_tuple.data;
+        return is_null_at(tuple, operand.null_byte, operand.null_mask);
     }
 
     void compile_conditions() {
@@ -188,6 +204,11 @@ private:
 
     bool is_condition(const TupleView& left_tuple, const TupleView& right_tuple) const {
         for (const auto& cond : compiled_conds_) {
+            // 任一操作数为 NULL 时条件为假（含 `<>`），且不读数据字节
+            if (is_operand_null(cond.lhs, left_tuple, right_tuple) ||
+                is_operand_null(cond.rhs, left_tuple, right_tuple)) {
+                return false;
+            }
             const auto lhs_type = cond.lhs.type;
             const auto rhs_type = cond.rhs.type;
             if (!can_cast(lhs_type, rhs_type)) {
@@ -297,6 +318,11 @@ public:
         auto right_cols = right_->cols();
         for (auto col = right_cols.begin(); col != right_cols.end(); ++col) {
             col->offset += left_tuple_len_; // 更新右儿子节点的列偏移量
+            // join 原样拼接两侧完整元组（各自带尾部 null bitmap），因此右侧列的
+            // NULL 位地址和数据偏移量一起平移即可，无需重排 bitmap。
+            if (col->null_byte >= 0) {
+                col->null_byte += static_cast<int>(left_tuple_len_);
+            }
         }
 
         cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
@@ -451,5 +477,18 @@ public:
     }
     size_t tupleLen() const override {
         return len_;
+    }
+
+    ColMeta get_col_offset(const TabCol& target) override {
+        auto pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta& col) {
+            if (!target.tab_name.empty()) {
+                return col.tab_name == target.tab_name && col.name == target.col_name;
+            }
+            return col.name == target.col_name;
+        });
+        if (pos == cols_.end()) {
+            throw ColumnNotFoundError(target.col_name);
+        }
+        return *pos;
     }
 };

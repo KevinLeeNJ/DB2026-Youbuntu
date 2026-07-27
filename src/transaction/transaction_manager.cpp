@@ -130,6 +130,18 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         rhs_type = rhs_col_meta->type;
     }
 
+    // SSI 的谓词匹配必须与执行器 compare() 用同一份三值逻辑，否则会漏判/误判冲突
+    switch (eval_condition_nulls(cond, rec.data, lhs_col_meta.null_byte, lhs_col_meta.null_mask,
+                                 rhs_col_meta == nullptr ? -1 : rhs_col_meta->null_byte,
+                                 rhs_col_meta == nullptr ? 0 : rhs_col_meta->null_mask)) {
+    case NullEval::DECIDED_TRUE:
+        return true;
+    case NullEval::DECIDED_FALSE:
+        return false;
+    case NullEval::COMPARE:
+        break;
+    }
+
     bool can_cast = lhs_type == rhs_type || (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
                     (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
                     ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
@@ -572,10 +584,12 @@ void TransactionManager::unblock_new_transactions_after_checkpoint() {
     checkpoint_cv_.notify_all();
 }
 
-std::unordered_map<txn_id_t, lsn_t> TransactionManager::wait_active_transactions_drained_for_checkpoint() {
+bool TransactionManager::wait_active_transactions_drained_for_checkpoint(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
-    checkpoint_cv_.wait(checkpoint_lock, [&] { return active_txn_count_ == 0; });
-    return {};
+    // A client that ran BEGIN and then went silent keeps active_txn_count_
+    // above zero indefinitely. Waiting without a bound would keep every new
+    // transaction in the process blocked behind the checkpoint.
+    return checkpoint_cv_.wait_for(checkpoint_lock, timeout, [&] { return active_txn_count_ == 0; });
 }
 
 std::unordered_map<txn_id_t, lsn_t> TransactionManager::get_active_txn_lsn_snapshot() {
@@ -685,6 +699,17 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
               ((lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) &&
                (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)))) {
             throw IncompatibleTypeError(coltype2str(lhs_col.type), coltype2str(rhs_type));
+        }
+        // 同上：与执行器 compare() 共用三值逻辑
+        switch (eval_condition_nulls(cond, rec.data, lhs_col.null_byte, lhs_col.null_mask,
+                                     cond.is_rhs_val ? -1 : rhs_col.null_byte,
+                                     cond.is_rhs_val ? 0 : rhs_col.null_mask)) {
+        case NullEval::DECIDED_TRUE:
+            continue;
+        case NullEval::DECIDED_FALSE:
+            return false;
+        case NullEval::COMPARE:
+            break;
         }
         int cmp = 0;
         if (lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) {

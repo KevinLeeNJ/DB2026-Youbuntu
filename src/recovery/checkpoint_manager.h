@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -40,4 +41,9 @@ private:
     LogManager* log_mgr_;
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};
+    // Backoff state for automatic checkpoints after a drain failure. Retrying
+    // every scheduler tick would make the whole process flap between blocked
+    // and unblocked while a stuck transaction stays open.
+    std::chrono::steady_clock::time_point drain_retry_time_{};
+    int64_t drain_retry_log_offset_{0};
 };

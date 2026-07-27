@@ -138,9 +138,21 @@ private:
         sort_keys_.push_back({col, is_desc, bind_compare_fn(col.type)});
     }
 
+    // NULL 排在所有非 NULL 之后（即视为最大值），两个 NULL 相等。这个约定使
+    // ASC 时 NULLS LAST、DESC 时 NULLS FIRST，与 PostgreSQL 的默认行为一致；
+    // 引擎不提供显式的 NULLS FIRST/LAST 语法。
+    static int compare_sort_key(const SortKey& key, const RmRecord& lhs, const RmRecord& rhs) {
+        const bool lhs_null = is_null(lhs.data, key.col);
+        const bool rhs_null = is_null(rhs.data, key.col);
+        if (lhs_null || rhs_null) {
+            return lhs_null == rhs_null ? 0 : (lhs_null ? 1 : -1);
+        }
+        return key.compare_fn(lhs, rhs, key.col);
+    }
+
     int compare_records(const RmRecord& lhs, const RmRecord& rhs) const {
         for (const auto& key : sort_keys_) {
-            int cmp = key.compare_fn(lhs, rhs, key.col);
+            int cmp = compare_sort_key(key, lhs, rhs);
             if (cmp != 0) {
                 return key.is_desc ? -cmp : cmp;
             }
@@ -237,7 +249,7 @@ private:
         }
         std::stable_sort(tuples_.begin(), tuples_.end(), [&](const RmRecord& lhs, const RmRecord& rhs) {
             for (const auto& key : sort_keys_) {
-                int cmp = key.compare_fn(lhs, rhs, key.col);
+                int cmp = compare_sort_key(key, lhs, rhs);
                 if (cmp == 0) {
                     continue;
                 }

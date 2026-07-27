@@ -421,7 +421,17 @@ protected:
                 break;
             }
             case SltDirective::STATEMENT_ERROR: {
-                EXPECT_THROW({ db_->exec_sql(tc.sql); }, RMDBError) << "Expected RMDBError but no exception thrown";
+                // `statement error` only asserts that the statement fails. A retryable conflict is
+                // reported as TransactionAbortException instead of RMDBError, and both are failures.
+                bool failed = false;
+                try {
+                    db_->exec_sql(tc.sql);
+                } catch (const RMDBError&) {
+                    failed = true;
+                } catch (const TransactionAbortException&) {
+                    failed = true;
+                }
+                EXPECT_TRUE(failed) << "Expected the statement to fail but it succeeded";
                 db_->clean_output_txt();
                 break;
             }
@@ -485,8 +495,24 @@ TEST_F(SltFileTest, Aggregate) {
     run_slt_file("aggregate.slt");
 }
 
+TEST_F(SltFileTest, AggregateJoin) {
+    run_slt_file("aggregate_join.slt");
+}
+
 TEST_F(SltFileTest, StringMinMax) {
     run_slt_file("string_min_max.slt");
+}
+
+TEST_F(SltFileTest, NullBasic) {
+    run_slt_file("null_basic.slt");
+}
+
+TEST_F(SltFileTest, NullAggregate) {
+    run_slt_file("null_aggregate.slt");
+}
+
+TEST_F(SltFileTest, NullJoinSort) {
+    run_slt_file("null_join_sort.slt");
 }
 
 TEST_F(SltFileTest, OutputFile) {
@@ -499,6 +525,10 @@ TEST_F(SltFileTest, Union) {
 
 TEST_F(SltFileTest, QueryOptimize) {
     run_slt_file("query_optimize.slt");
+}
+
+TEST_F(SltFileTest, OrderByNonProjected) {
+    run_slt_file("order_by_nonprojected.slt");
 }
 
 TEST_F(SltFileTest, NestNljInlj) {
@@ -710,6 +740,191 @@ TEST_F(E2ETest, LoadCsvStoresRowsAsCommittedBaseData) {
     EXPECT_FALSE(meta.version_chain_head_.IsValid());
 
     std::remove(dest_csv.c_str());
+}
+
+// ---- LOAD CSV 表头嗅探与容错 -------------------------------------------------
+// final.md:273 只承诺 "load <csv路径> into <改写表名>;"，对表头/分隔符/引号/NULL
+// 表示一字未提，所以有表头、无表头、列序打乱、空字段、引号字段、字段数不匹配
+// 都必须能装载而不是抛错。
+
+// 把 CSV 写到 db 目录（open_db 之后的 cwd），装载路径就只是文件名。
+class LoadCsvFixture : public E2ETest {
+protected:
+    std::string write_csv(const std::string& name, const std::string& body) {
+        char cwd_buf[1024];
+        getcwd(cwd_buf, sizeof(cwd_buf));
+        std::string path = std::string(cwd_buf) + "/" + name;
+        std::ofstream out(path, std::ios::binary);
+        out << body;
+        out.close();
+        temp_files_.push_back(path);
+        return "./" + name;
+    }
+
+    void TearDown() override {
+        for (const auto& path : temp_files_) {
+            std::remove(path.c_str());
+        }
+        E2ETest::TearDown();
+    }
+
+private:
+    std::vector<std::string> temp_files_;
+};
+
+TEST_F(LoadCsvFixture, HeaderlessCsvUsesDdlColumnOrder) {
+    const std::string path = write_csv("load_no_header.csv", "1,10,alpha\n2,20,beta\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lnh (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lnh;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnh;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select val, name from lnh where id = 1;"); });
+    EXPECT_NE(output.find("10"), std::string::npos) << output;
+    EXPECT_NE(output.find("alpha"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select name from lnh where id = 2;"); });
+    EXPECT_NE(output.find("beta"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, HeaderCsvMapsByName) {
+    const std::string path = write_csv("load_header.csv", "id,val,name\n1,10,alpha\n2,20,beta\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lh (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lh;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lh;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select name from lh where val = 20;"); });
+    EXPECT_NE(output.find("beta"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, ShuffledHeaderCsvMapsByName) {
+    const std::string path = write_csv("load_shuffled.csv", "name, val ,id\nalpha,10,1\nbeta,20,2\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lsh (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lsh;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select val, name from lsh where id = 2;"); });
+    EXPECT_NE(output.find("20"), std::string::npos) << output;
+    EXPECT_NE(output.find("beta"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, EmptyFieldsBecomeNullForEveryColumnType) {
+    // 每种列类型各留一个空字段：INT / FLOAT / CHAR / DATETIME。
+    const std::string path = write_csv("load_nulls.csv", "id,i,f,c,d\n"
+                                                         "1,10,1.5,aa,2026-01-01 00:00:00\n"
+                                                         "2,,,,\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table ln (id int, i int, f float, c char(8), d datetime);"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into ln;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ln;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+
+    // 装载完整性校验第 7 条就是这种 "空配送时间行数" 计数。
+    for (const char* column : {"i", "f", "c", "d"}) {
+        ASSERT_NO_THROW(
+            { output = db_->exec_sql(std::string("select count(*) from ln where ") + column + " is null;"); });
+        EXPECT_NE(output.find("1"), std::string::npos) << column << ": " << output;
+        ASSERT_NO_THROW(
+            { output = db_->exec_sql(std::string("select count(*) from ln where ") + column + " is not null;"); });
+        EXPECT_NE(output.find("1"), std::string::npos) << column << ": " << output;
+    }
+    // 空字段必须存成 NULL 而不是空串 / 0。
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from ln where c = '';"); });
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from ln where i = 0;"); });
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from ln where i is null;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, QuotedFieldsAreUnescapedInsteadOfRejected) {
+    // RFC 4180：外层引号剥掉，"" 还原成一个 "，引号内的逗号不是分隔符。
+    const std::string path = write_csv("load_quoted.csv", "id,name\n"
+                                                          "1,\"x,y\"\n"
+                                                          "2,\"a\"\"b\"\n"
+                                                          "3,\"\"\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lq (id int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lq;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lq;"); });
+    EXPECT_NE(output.find("3"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select name from lq where id = 1;"); });
+    EXPECT_NE(output.find("x,y"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select name from lq where id = 2;"); });
+    EXPECT_NE(output.find("a\"b"), std::string::npos) << output;
+    // 引号里的空字段同样按 NULL 处理（空字段一律是 NULL）。
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lq where name is null;"); });
+    EXPECT_NE(output.find("3"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, MissingAndExtraFieldsAreToleratedNotRejected) {
+    // 第 2 行字段不足 -> 缺的列按 NULL；第 3 行字段超出 -> 多的字段忽略。
+    const std::string path = write_csv("load_ragged.csv", "id,val,name\n"
+                                                          "1,10,alpha\n"
+                                                          "2,20\n"
+                                                          "3,30,gamma,999,extra\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lr (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lr;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lr;"); });
+    EXPECT_NE(output.find("3"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lr where name is null;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select val, name from lr where id = 3;"); });
+    EXPECT_NE(output.find("30"), std::string::npos) << output;
+    EXPECT_NE(output.find("gamma"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, FirstRowThatOnlyPartlyMatchesColumnNamesIsData) {
+    // 只有"字段数相等 ∧ 全部命中列名 ∧ 不重复"才算表头。这里 "id,val,zzz" 的
+    // 第三个字段不是列名，所以整行按数据处理（zzz 落到 char 列里）。
+    const std::string path = write_csv("load_partial_header.csv", "1,10,zzz\n2,20,beta\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lph (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lph;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lph;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select name from lph where id = 1;"); });
+    EXPECT_NE(output.find("zzz"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, DuplicateHeaderNamesAreTreatedAsData) {
+    // 列名重复不能当表头（映射有歧义），按位置映射并把该行当数据。
+    ASSERT_NO_THROW(db_->exec_sql("create table ldh (a char(4), b char(4));"));
+    const std::string path = write_csv("load_dup_header.csv", "a,a\nxx,yy\n");
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into ldh;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ldh;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, LoadedNullsSurviveIndexesAndUpdate) {
+    // Delivery 事务的形状：装载出 NULL 的配送时间，之后 UPDATE 成非 NULL。
+    const std::string path = write_csv("load_null_update.csv", "k,v,dts\n"
+                                                               "1,10,\n"
+                                                               "2,20,2026-02-02 00:00:00\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lnu (k int, v int, dts datetime);"));
+    ASSERT_NO_THROW(db_->exec_sql("create index lnu(k);"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lnu;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts is null;"); });
+    EXPECT_NE(output.find("1"), std::string::npos) << output;
+    ASSERT_NO_THROW(db_->exec_sql("update lnu set dts = '2026-03-03 00:00:00' where k = 1;"));
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts is null;"); });
+    EXPECT_NE(output.find("0"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts is not null;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    // 索引点查仍然可用
+    ASSERT_NO_THROW({ output = db_->exec_sql("select v from lnu where k = 2;"); });
+    EXPECT_NE(output.find("20"), std::string::npos) << output;
 }
 
 TEST_F(E2ETest, LoadCsvAllowsDuplicateSecondaryIndexKeys) {

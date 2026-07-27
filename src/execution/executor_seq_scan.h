@@ -79,7 +79,9 @@ public:
         TabMeta& tab = sm_manager_->db_.get_table(tab_name_);
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab.cols;
-        len_ = cols_.back().offset + cols_.back().len;
+        // 元组长度取数据文件的 record_size，包含尾部 null bitmap，使 cols_ 里
+        // 缓存的 null_byte 始终落在元组内（join 平移偏移量时同样依赖这一点）。
+        len_ = static_cast<size_t>(fh_->get_file_hdr().record_size);
 
         context_ = context;
 

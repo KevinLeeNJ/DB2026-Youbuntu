@@ -22,6 +22,21 @@ namespace {
 std::atomic<bool> g_checkpoint_running{false};
 std::atomic<bool> g_preflush_running{false};
 
+// Longest the checkpoint may keep new transactions blocked while waiting for
+// active ones to finish. Saturated connections drain well inside this window,
+// while a stuck transaction can never stall the startup liveness probe.
+constexpr std::chrono::milliseconds kDrainTimeout{2000};
+// Wall-clock budget for one checkpoint round.
+constexpr std::chrono::seconds kCheckpointDeadline{10};
+// After an abandoned round, an automatic checkpoint waits for both this much
+// time and this much extra WAL before blocking writers again.
+constexpr std::chrono::seconds kDrainRetryBackoff{30};
+constexpr int64_t kDrainRetryBackoffBytes = 32LL * 1024 * 1024;
+// Bounded extra preflush rounds before the blocking window opens. A round that
+// finds fewer than this many dirty pages is not worth another pass.
+constexpr int kPreblockFlushRounds = 4;
+constexpr size_t kPreblockFlushProgressPages = 256;
+
 struct PreflushGuard {
     std::atomic<bool>* running;
 
@@ -59,12 +74,24 @@ bool CheckpointManager::RunCleanCheckpoint() {
         return false;
     }
 
+    const auto deadline = std::chrono::steady_clock::now() + kCheckpointDeadline;
+
     // Writers remain active during this pass. Let each page batch establish
     // its own WAL-before-data boundary instead of treating the initial flush
     // as sufficient for pages dirtied concurrently with this checkpoint.
     log_mgr_->flush_log_to_disk_with_sync();
     if (!sm_mgr_->flush_dirty_data_pages(false)) {
         return false;
+    }
+    // Keep draining the dirty set while writers are still running, so the
+    // blocking window below only has to write the residue.
+    for (int round = 0; round < kPreblockFlushRounds; ++round) {
+        if (sm_mgr_->flush_dirty_pages(options_.preflush_batch_pages) < kPreblockFlushProgressPages) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
     }
     FaultInjector::Point("after_background_page_write_before_final_wal_flush");
 
@@ -79,7 +106,17 @@ bool CheckpointManager::RunCleanCheckpoint() {
             txn_mgr->unblock_new_transactions_after_checkpoint();
         }
     } block_guard(txn_mgr_);
-    txn_mgr_->wait_active_transactions_drained_for_checkpoint();
+    if (!txn_mgr_->wait_active_transactions_drained_for_checkpoint(kDrainTimeout)) {
+        // Abandon this round. ~BlockGuard releases the block immediately, so a
+        // stuck transaction can never freeze every other transaction. The WAL
+        // keeps growing, which only makes the next recovery slower.
+        drain_retry_time_ = std::chrono::steady_clock::now() + kDrainRetryBackoff;
+        drain_retry_log_offset_ = log_mgr_->current_log_offset() + kDrainRetryBackoffBytes;
+        return false;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+    }
     log_mgr_->flush_log_to_disk_with_sync();
     FaultInjector::Point("before_checkpoint_data_sync");
     if (!sm_mgr_->flush_all_table_and_index_pages(true)) {
@@ -113,6 +150,9 @@ bool CheckpointManager::RunIfNeeded() {
     }
 
     if (log_offset < options_.auto_checkpoint_bytes) {
+        return false;
+    }
+    if (std::chrono::steady_clock::now() < drain_retry_time_ && log_offset < drain_retry_log_offset_) {
         return false;
     }
     return RunCleanCheckpoint();
