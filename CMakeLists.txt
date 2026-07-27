@@ -11,9 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra)
 
 set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -march=native -funroll-loops")
 set(CMAKE_C_FLAGS_DEBUG "-O2 -g -ggdb3 -fno-omit-frame-pointer")
-set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG -march=native -funroll-loops")
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     find_program(RMDB_LLD_EXECUTABLE NAMES ld.lld)
