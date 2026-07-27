@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -23,6 +24,17 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
+
+struct LockObservabilitySnapshot {
+    uint64_t immediate_conflict{0};
+    uint64_t wait_enqueued{0};
+    uint64_t wait_granted{0};
+    uint64_t wait_cancelled{0};
+    uint64_t wait_ns{0};
+    uint64_t queue_depth_max{0};
+    uint64_t cycle_checks{0};
+    uint64_t cycle_victims{0};
+};
 
 class LockManager {
     /* 加锁类型，包括共享锁、排他锁、意向共享锁、意向排他锁、SIX（意向排他锁+共享锁） */
@@ -91,6 +103,9 @@ public:
         return wait_cycle_abort_count_.load(std::memory_order_acquire);
     }
 
+    LockObservabilitySnapshot record_lock_observability() const;
+    LockObservabilitySnapshot unique_key_lock_observability() const;
+
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
 
@@ -117,6 +132,7 @@ private:
     void register_waiting_txn(Transaction* txn);
     void unregister_waiting_txn(txn_id_t txn_id);
     void cancel_waiting_transaction(txn_id_t txn_id);
+    static void observe_queue_depth(std::atomic<uint64_t>& maximum, size_t depth);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
     std::mutex pending_latch_;
@@ -124,6 +140,14 @@ private:
     std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
     std::atomic<uint64_t> wait_topology_epoch_{0};
     std::atomic<uint64_t> wait_cycle_abort_count_{0};
+    std::atomic<uint64_t> record_immediate_conflict_{0};
+    std::atomic<uint64_t> record_wait_enqueued_{0};
+    std::atomic<uint64_t> record_wait_granted_{0};
+    std::atomic<uint64_t> record_wait_cancelled_{0};
+    std::atomic<uint64_t> record_wait_ns_{0};
+    std::atomic<uint64_t> record_queue_depth_max_{0};
+    std::atomic<uint64_t> record_cycle_checks_{0};
+    std::atomic<uint64_t> record_cycle_victims_{0};
     static constexpr size_t UNIQUE_KEY_SHARD_COUNT = 64;
     struct UniqueKeyQueue {
         txn_id_t owner{INVALID_TXN_ID};
@@ -135,4 +159,12 @@ private:
         std::unordered_map<std::string, std::shared_ptr<UniqueKeyQueue>> queues;
     };
     std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
+    std::atomic<uint64_t> unique_immediate_conflict_{0};
+    std::atomic<uint64_t> unique_wait_enqueued_{0};
+    std::atomic<uint64_t> unique_wait_granted_{0};
+    std::atomic<uint64_t> unique_wait_cancelled_{0};
+    std::atomic<uint64_t> unique_wait_ns_{0};
+    std::atomic<uint64_t> unique_queue_depth_max_{0};
+    std::atomic<uint64_t> unique_cycle_checks_{0};
+    std::atomic<uint64_t> unique_cycle_victims_{0};
 };

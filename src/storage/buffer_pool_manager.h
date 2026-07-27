@@ -10,7 +10,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <atomic>
 #include <cstdlib>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <fcntl.h>
@@ -36,6 +38,15 @@ enum class ResidencyClass : uint8_t {
     IndexInternal,
 };
 
+struct BufferPoolObservabilitySnapshot {
+    uint64_t fetch_miss{0};
+    uint64_t inflight_wait{0};
+    uint64_t inflight_wait_ns{0};
+    uint64_t no_victim{0};
+    uint64_t eviction_clean{0};
+    uint64_t eviction_dirty{0};
+};
+
 class BufferPoolManager {
 private:
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
@@ -50,6 +61,13 @@ private:
     LogManager* log_manager_{nullptr};
     std::unique_ptr<Replacer> replacer_; // buffer_pool的置换策略，当前赛题中为LRU置换策略
     std::shared_mutex latch_;            // 用于共享数据结构的并发控制
+    std::atomic<uint64_t> fetch_miss_{0};
+    std::atomic<uint64_t> inflight_wait_{0};
+    std::atomic<uint64_t> inflight_wait_ns_{0};
+    std::atomic<uint64_t> no_victim_{0};
+    std::atomic<uint64_t> eviction_clean_{0};
+    std::atomic<uint64_t> eviction_dirty_{0};
+
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
         : pool_size_(pool_size), disk_manager_(disk_manager) {
@@ -141,6 +159,8 @@ public:
     void set_log_manager(LogManager* log_manager) {
         log_manager_ = log_manager;
     }
+
+    BufferPoolObservabilitySnapshot observability_snapshot() const;
 
 private:
     // Env-gated (RMDB_LOG_BPM_STATS=1) snapshot of how much of the pool is

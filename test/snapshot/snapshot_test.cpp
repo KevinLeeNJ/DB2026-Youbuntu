@@ -137,6 +137,11 @@ TEST(SnapshotIsolationConcurrencyTest, ExplicitReadCommittedWriterWaitsForRecord
     EXPECT_TRUE(acquired.load());
     EXPECT_EQ(waiter.get_lock_set()->count(LockDataId(42, rid, LockDataType::RECORD)), 1u);
     EXPECT_TRUE(lock_manager.unlock(&waiter, LockDataId(42, rid, LockDataType::RECORD)));
+    const auto stats = lock_manager.record_lock_observability();
+    EXPECT_EQ(stats.wait_enqueued, 1u);
+    EXPECT_EQ(stats.wait_granted, 1u);
+    EXPECT_EQ(stats.wait_cancelled, 0u);
+    EXPECT_GT(stats.wait_ns, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, RecordLockWaitersAreGrantedInFifoOrder) {
@@ -201,6 +206,25 @@ TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAc
     EXPECT_EQ(waiter.get_lock_set()->count(lock_id), 0u);
     EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
     EXPECT_FALSE(lock_manager.unlock(&waiter, lock_id));
+    const auto stats = lock_manager.record_lock_observability();
+    EXPECT_EQ(stats.wait_enqueued, 1u);
+    EXPECT_EQ(stats.wait_cancelled, 1u);
+    EXPECT_GT(stats.wait_ns, 0u);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, RecordImmediateConflictIsObservable) {
+    LockManager lock_manager;
+    Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction loser(1002, IsolationLevel::SNAPSHOT_ISOLATION);
+    Rid rid{30, 0};
+    LockDataId lock_id(42, rid, LockDataType::RECORD);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    EXPECT_FALSE(lock_manager.lock_exclusive_on_record(&loser, rid, 42));
+    EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
+    const auto stats = lock_manager.record_lock_observability();
+    EXPECT_EQ(stats.immediate_conflict, 1u);
+    EXPECT_EQ(stats.wait_enqueued, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
