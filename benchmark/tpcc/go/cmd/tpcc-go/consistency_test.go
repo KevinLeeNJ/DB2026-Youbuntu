@@ -765,19 +765,95 @@ func TestPaymentFloatChainsLinkWithoutClientCompletionOrder(t *testing.T) {
 	}
 }
 
-func TestPaymentFloatChainsRejectALostUpdateFork(t *testing.T) {
+func TestPaymentFloatChainsAcceptSelfLoopBeforeAdvanceInAnyOrder(t *testing.T) {
+	warehouseStart := float32(300000)
+	districtStart := float32(30000)
+	selfAmount, advanceAmount := float32(0.001), float32(10.25)
+	warehouseEnd := warehouseStart + advanceAmount
+	districtMiddle := districtStart + selfAmount
+	districtEnd := districtMiddle + advanceAmount
+	doc := document{
+		Ledger: map[string]float64{ledgerPaymentCommits: 2},
+		PaymentEdges: []paymentFloatEdge{
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(warehouseStart),
+				AmountBits: math.Float32bits(advanceAmount), AfterBits: math.Float32bits(warehouseEnd)},
+			{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(districtMiddle),
+				AmountBits: math.Float32bits(advanceAmount), AfterBits: math.Float32bits(districtEnd)},
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(warehouseStart),
+				AmountBits: math.Float32bits(selfAmount), AfterBits: math.Float32bits(warehouseStart)},
+			{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(districtStart),
+				AmountBits: math.Float32bits(selfAmount), AfterBits: math.Float32bits(districtMiddle)},
+		},
+	}
+	terminals, err := validatePaymentFloatChains(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := terminals["warehouse:1"]; got != math.Float32bits(warehouseEnd) {
+		t.Fatalf("warehouse terminal = 0x%08x, want 0x%08x", got, math.Float32bits(warehouseEnd))
+	}
+}
+
+func TestPaymentFloatChainsAcceptMultipleSelfLoops(t *testing.T) {
+	warehouseStart := float32(300000)
+	districtStart := float32(30000)
+	a1, a2 := float32(0.0001), float32(0.0002)
+	doc := document{
+		Ledger: map[string]float64{ledgerPaymentCommits: 2},
+		PaymentEdges: []paymentFloatEdge{
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(warehouseStart),
+				AmountBits: math.Float32bits(a2), AfterBits: math.Float32bits(warehouseStart)},
+			{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(districtStart),
+				AmountBits: math.Float32bits(a1), AfterBits: math.Float32bits(districtStart)},
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(warehouseStart),
+				AmountBits: math.Float32bits(a1), AfterBits: math.Float32bits(warehouseStart)},
+			{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(districtStart),
+				AmountBits: math.Float32bits(a2), AfterBits: math.Float32bits(districtStart)},
+		},
+	}
+	if _, err := validatePaymentFloatChains(doc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPaymentFloatChainsRejectTwoNonSelfEdgesFromSameValue(t *testing.T) {
 	start := float32(300000)
-	amount := float32(10)
+	a1, a2 := float32(10), float32(20)
 	doc := document{
 		Ledger: map[string]float64{ledgerPaymentCommits: 1},
 		PaymentEdges: []paymentFloatEdge{
 			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start),
-				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(start + amount)},
+				AmountBits: math.Float32bits(a1), AfterBits: math.Float32bits(start + a1)},
 			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start),
-				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(start + amount)},
+				AmountBits: math.Float32bits(a2), AfterBits: math.Float32bits(start + a2)},
 		},
 	}
 	if _, err := validatePaymentFloatChains(doc); err == nil || !strings.Contains(err.Error(), "forks") {
 		t.Fatalf("lost-update fork reported %v", err)
+	}
+}
+
+func TestPaymentFloatChainsKeepCurrentValueAsTerminalAfterOnlySelfLoops(t *testing.T) {
+	warehouseStart := float32(300000)
+	districtStart := float32(30000)
+	amount := float32(0.0001)
+	doc := document{
+		Ledger: map[string]float64{ledgerPaymentCommits: 1},
+		PaymentEdges: []paymentFloatEdge{
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(warehouseStart),
+				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(warehouseStart)},
+			{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(districtStart),
+				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(districtStart)},
+		},
+	}
+	terminals, err := validatePaymentFloatChains(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := terminals["warehouse:1"]; got != math.Float32bits(warehouseStart) {
+		t.Fatalf("warehouse terminal = 0x%08x, want 0x%08x", got, math.Float32bits(warehouseStart))
+	}
+	if got := terminals["district:1:1"]; got != math.Float32bits(districtStart) {
+		t.Fatalf("district terminal = 0x%08x, want 0x%08x", got, math.Float32bits(districtStart))
 	}
 }
