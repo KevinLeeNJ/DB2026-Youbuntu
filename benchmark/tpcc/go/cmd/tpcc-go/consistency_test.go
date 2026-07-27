@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,17 +17,192 @@ import (
 // pass.
 type scriptedAggregateExecutor struct {
 	answers    map[string]float64
+	rows       map[string][]aggregateValue
+	multiRows  map[string][][]aggregateValue
+	errors     map[string]error
 	statements []string
+}
+
+type scriptedConsistencyTxnClient struct {
+	events    []string
+	beginErr  error
+	commitErr error
+}
+
+func (c *scriptedConsistencyTxnClient) exec(sql string) (string, error) {
+	c.events = append(c.events, "exec:"+sql)
+	return "", nil
+}
+
+func (c *scriptedConsistencyTxnClient) begin() error {
+	c.events = append(c.events, "begin")
+	return c.beginErr
+}
+
+func (c *scriptedConsistencyTxnClient) commit() error {
+	c.events = append(c.events, "commit")
+	return c.commitErr
+}
+
+func (c *scriptedConsistencyTxnClient) rollback() {
+	c.events = append(c.events, "rollback")
 }
 
 func (e *scriptedAggregateExecutor) exec(sql string) (string, error) {
 	e.statements = append(e.statements, sql)
+	if err := e.errors[sql]; err != nil {
+		return "", err
+	}
+	if rows, ok := e.multiRows[sql]; ok {
+		return formatScriptedAggregateRows(rows), nil
+	}
+	if row, ok := e.rows[sql]; ok {
+		return formatScriptedAggregateRows([][]aggregateValue{row}), nil
+	}
 	value, ok := e.answers[sql]
 	if !ok {
 		return "", fmt.Errorf("unexpected SQL %q", sql)
 	}
 	text := strconv.FormatFloat(value, 'f', -1, 64)
 	return fmt.Sprintf("+---+\n| n |\n+---+\n| %s |\n+---+\nTotal record(s): 1\n", text), nil
+}
+
+func formatScriptedAggregateRows(rows [][]aggregateValue) string {
+	columns := 1
+	if len(rows) > 0 {
+		columns = len(rows[0])
+	}
+	var result strings.Builder
+	fmt.Fprintf(&result, "| %s |\n", strings.Repeat("h |", columns))
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for i, value := range row {
+			if !value.present {
+				cells[i] = "NULL"
+				continue
+			}
+			cells[i] = strconv.FormatFloat(value.number, 'f', -1, 64)
+		}
+		fmt.Fprintf(&result, "| %s |\n", strings.Join(cells, " | "))
+	}
+	fmt.Fprintf(&result, "Total record(s): %d\n", len(rows))
+	return result.String()
+}
+
+func TestRunConsistencyTransactionLifecycle(t *testing.T) {
+	checkErr := fmt.Errorf("check failed")
+	commitErr := fmt.Errorf("commit failed")
+	beginErr := fmt.Errorf("begin failed")
+	tests := []struct {
+		name       string
+		client     *scriptedConsistencyTxnClient
+		checkError error
+		wantError  string
+		wantEvents string
+	}{
+		{
+			name:       "success commits",
+			client:     &scriptedConsistencyTxnClient{},
+			wantEvents: "begin,exec:check,commit",
+		},
+		{
+			name:       "validation failure rolls back",
+			client:     &scriptedConsistencyTxnClient{},
+			checkError: checkErr,
+			wantError:  "check failed",
+			wantEvents: "begin,exec:check,rollback",
+		},
+		{
+			name:       "commit failure rolls back",
+			client:     &scriptedConsistencyTxnClient{commitErr: commitErr},
+			wantError:  "commit consistency transaction: commit failed",
+			wantEvents: "begin,exec:check,commit,rollback",
+		},
+		{
+			name:       "begin failure has no transaction to roll back",
+			client:     &scriptedConsistencyTxnClient{beginErr: beginErr},
+			wantError:  "begin consistency transaction: begin failed",
+			wantEvents: "begin",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runConsistencyTransaction(tt.client, func() error {
+				if _, execErr := tt.client.exec("check"); execErr != nil {
+					return execErr
+				}
+				return tt.checkError
+			})
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("runConsistencyTransaction returned %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("runConsistencyTransaction returned %v, want %q", err, tt.wantError)
+			}
+			if got := strings.Join(tt.client.events, ","); got != tt.wantEvents {
+				t.Fatalf("events = %q, want %q", got, tt.wantEvents)
+			}
+		})
+	}
+}
+
+func TestRunConsistencyTransactionThenPublishesOnlyAfterCommit(t *testing.T) {
+	const original = "original result bytes"
+	const replacement = "replacement result bytes"
+	tests := []struct {
+		name        string
+		commitErr   error
+		wantError   string
+		wantContent string
+		wantEvents  string
+	}{
+		{
+			name:        "commit failure leaves result unchanged",
+			commitErr:   fmt.Errorf("commit failed"),
+			wantError:   "commit consistency transaction: commit failed",
+			wantContent: original,
+			wantEvents:  "begin,exec:check,commit,rollback",
+		},
+		{
+			name:        "success publishes after commit",
+			wantContent: replacement,
+			wantEvents:  "begin,exec:check,commit,publish",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "result.json")
+			if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			client := &scriptedConsistencyTxnClient{commitErr: tt.commitErr}
+			err := runConsistencyTransactionThen(client, func() error {
+				_, execErr := client.exec("check")
+				return execErr
+			}, func() error {
+				client.events = append(client.events, "publish")
+				return os.WriteFile(path, []byte(replacement), 0o644)
+			})
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("runConsistencyTransactionThen returned %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("runConsistencyTransactionThen returned %v, want %q", err, tt.wantError)
+			}
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if got := string(content); got != tt.wantContent {
+				t.Fatalf("result content = %q, want %q", got, tt.wantContent)
+			}
+			if got := strings.Join(client.events, ","); got != tt.wantEvents {
+				t.Fatalf("events = %q, want %q", got, tt.wantEvents)
+			}
+		})
+	}
 }
 
 func testConsistencyModel() consistencyModel {
@@ -162,6 +340,78 @@ func onePartitionAnswers(wID, dID int) map[string]float64 {
 	}
 }
 
+func addPartitionBatchRows(executor *scriptedAggregateExecutor, m consistencyModel, nulls map[string]bool) {
+	if executor.rows == nil {
+		executor.rows = make(map[string][]aggregateValue)
+	}
+	for wID := 1; wID <= m.warehouses; wID++ {
+		for dID := 1; dID <= m.districtsPerWarehouse; dID++ {
+			for _, query := range partitionQuerySpecs(wID, dID) {
+				row := make([]aggregateValue, len(query.aggregates))
+				for i, aggregate := range query.aggregates {
+					if nulls[aggregate.scalarSQL] {
+						continue
+					}
+					value, ok := executor.answers[aggregate.scalarSQL]
+					if !ok {
+						continue
+					}
+					row[i] = aggregateValue{number: value, present: true}
+				}
+				executor.rows[query.sql] = row
+			}
+		}
+	}
+	addGroupedPartitionRows(executor, m, nulls)
+}
+
+func addGroupedPartitionRows(executor *scriptedAggregateExecutor, m consistencyModel, nulls map[string]bool) {
+	if executor.multiRows == nil {
+		executor.multiRows = make(map[string][][]aggregateValue)
+	}
+	for queryIndex, grouped := range groupedPartitionQuerySpecs() {
+		rows := make([][]aggregateValue, 0, m.warehouses*m.districtsPerWarehouse)
+		for wID := 1; wID <= m.warehouses; wID++ {
+			for dID := 1; dID <= m.districtsPerWarehouse; dID++ {
+				scalars := partitionScalarSpecs(queryIndex, wID, dID)
+				if grouped.districtHead {
+					value := executor.answers[scalars[0].scalarSQL]
+					rows = append(rows, []aggregateValue{
+						{number: float64(wID), present: true},
+						{number: float64(dID), present: true},
+						{number: 1, present: true},
+						{number: value, present: !nulls[scalars[0].scalarSQL]},
+						{number: value, present: !nulls[scalars[0].scalarSQL]},
+					})
+					continue
+				}
+				row := []aggregateValue{
+					{number: float64(wID), present: true},
+					{number: float64(dID), present: true},
+				}
+				for _, scalar := range scalars {
+					value, ok := executor.answers[scalar.scalarSQL]
+					row = append(row, aggregateValue{
+						number:  value,
+						present: ok && !nulls[scalar.scalarSQL],
+					})
+				}
+				rows = append(rows, row)
+			}
+		}
+		executor.multiRows[grouped.sql] = rows
+	}
+}
+
+func partitionExecutor(answers map[string]float64, wID, dID int, nulls map[string]bool) *scriptedAggregateExecutor {
+	executor := &scriptedAggregateExecutor{answers: answers}
+	addPartitionBatchRows(executor, consistencyModel{
+		warehouses:            wID,
+		districtsPerWarehouse: dID,
+	}, nulls)
+	return executor
+}
+
 func passingPostRecoveryAnswers(m consistencyModel) map[string]float64 {
 	answers := passingIntAnswers(m, postRecoveryIntRules(m))
 	answers = passingAmountAnswers(answers, postRecoveryAmountRules(m))
@@ -231,8 +481,73 @@ func TestOnlineRulesCaptureSevenDistinctFloatAggregates(t *testing.T) {
 func TestPostRecoveryConsistencyAcceptsAReconciledDatabase(t *testing.T) {
 	m := testConsistencyModel()
 	executor := &scriptedAggregateExecutor{answers: passingPostRecoveryAnswers(m)}
+	addPartitionBatchRows(executor, m, nil)
 	if err := checkPostRecoveryConsistency(executor, m, "unit"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPostRecoveryConsistencyExecutesEveryRuleAndPartitionQuery(t *testing.T) {
+	t.Setenv(groupedPartitionModeEnv, "")
+	m := testConsistencyModel()
+	logicalValues := 0
+	for _, query := range partitionQuerySpecs(1, 1) {
+		logicalValues += len(query.aggregates)
+	}
+	if logicalValues != 12 {
+		t.Fatalf("partition query shape covers %d logical values, want 12", logicalValues)
+	}
+	if got := len(partitionQuerySpecs(1, 1)); got != 6 {
+		t.Fatalf("partition query shape has %d wire round trips, want 6", got)
+	}
+	executor := &scriptedAggregateExecutor{answers: passingPostRecoveryAnswers(m)}
+	addPartitionBatchRows(executor, m, nil)
+	if err := checkPostRecoveryConsistency(executor, m, "unit"); err != nil {
+		t.Fatal(err)
+	}
+
+	wantCounts := make(map[string]int)
+	for _, rule := range postRecoveryIntRules(m) {
+		wantCounts[rule.sql]++
+		if rule.wantSQL != "" {
+			wantCounts[rule.wantSQL]++
+		}
+	}
+	for _, rule := range postRecoveryAmountRules(m) {
+		wantCounts[rule.sql]++
+	}
+	for wID := 1; wID <= m.warehouses; wID++ {
+		wantCounts[fmt.Sprintf("select w_ytd from warehouse where w_id = %d;", wID)]++
+		wantCounts[fmt.Sprintf("select sum(d_ytd) from district where d_w_id = %d;", wID)]++
+	}
+	for _, query := range groupedPartitionQuerySpecs() {
+		wantCounts[query.sql]++
+	}
+
+	gotCounts := make(map[string]int)
+	for _, sql := range executor.statements {
+		gotCounts[sql]++
+	}
+	wantTotal := 0
+	for _, count := range wantCounts {
+		wantTotal += count
+	}
+	if len(executor.statements) != wantTotal {
+		t.Fatalf("executed %d statements, want %d", len(executor.statements), wantTotal)
+	}
+	partitions := m.warehouses * m.districtsPerWarehouse
+	if saved := partitions*len(partitionQuerySpecs(1, 1)) - len(groupedPartitionQuerySpecs()); saved != partitions*6-6 {
+		t.Fatalf("global grouping saved %d point-query round trips, want %d", saved, partitions*6-6)
+	}
+	for sql, want := range wantCounts {
+		if got := gotCounts[sql]; got != want {
+			t.Errorf("%q executed %d time(s), want %d", sql, got, want)
+		}
+	}
+	for sql, got := range gotCounts {
+		if _, ok := wantCounts[sql]; !ok {
+			t.Errorf("unexpected query %q executed %d time(s)", sql, got)
+		}
 	}
 }
 
@@ -267,7 +582,9 @@ func TestPostRecoveryConsistencyRejectsEveryViolation(t *testing.T) {
 			answers[key] = value
 		}
 		answers[sql] = base[sql] + 1
-		err := checkPostRecoveryConsistency(&scriptedAggregateExecutor{answers: answers}, m, "unit")
+		executor := &scriptedAggregateExecutor{answers: answers}
+		addPartitionBatchRows(executor, m, nil)
+		err := checkPostRecoveryConsistency(executor, m, "unit")
 		if err == nil {
 			t.Errorf("violating %q was accepted", sql)
 			continue
@@ -282,7 +599,9 @@ func TestPostRecoveryConsistencyRejectsEveryViolation(t *testing.T) {
 			answers[key] = value
 		}
 		answers[rule.sql] = rule.want + 2*amountToleranceWithDrift(rule.want, rule.want, rule.drift) + 1
-		err := checkPostRecoveryConsistency(&scriptedAggregateExecutor{answers: answers}, m, "unit")
+		executor := &scriptedAggregateExecutor{answers: answers}
+		addPartitionBatchRows(executor, m, nil)
+		err := checkPostRecoveryConsistency(executor, m, "unit")
 		if err == nil || !strings.Contains(err.Error(), rule.name) {
 			t.Errorf("violating %q reported %v, want the rule name %q", rule.sql, err, rule.name)
 		}
@@ -356,7 +675,9 @@ func TestPostRecoveryConsistencyDetectsLeakedOrderNumber(t *testing.T) {
 	answers := passingPostRecoveryAnswers(m)
 	const sql = "select sum(d_next_o_id) from district;"
 	answers[sql] += float64(m.l(ledgerNewOrderRollbacks))
-	err := checkPostRecoveryConsistency(&scriptedAggregateExecutor{answers: answers}, m, "unit")
+	executor := &scriptedAggregateExecutor{answers: answers}
+	addPartitionBatchRows(executor, m, nil)
+	err := checkPostRecoveryConsistency(executor, m, "unit")
 	if err == nil {
 		t.Fatal("a leaked order number was accepted")
 	}
@@ -368,7 +689,7 @@ func TestPostRecoveryConsistencyDetectsLeakedOrderNumber(t *testing.T) {
 func TestPartitionCheckRejectsEveryPartitionViolation(t *testing.T) {
 	base := onePartitionAnswers(3, 7)
 	// A healthy partition must pass.
-	runner := &ruleRunner{exec: &scriptedAggregateExecutor{answers: base}}
+	runner := &ruleRunner{exec: partitionExecutor(base, 3, 7, nil)}
 	checkPartition(runner, 3, 7)
 	if len(runner.failures) != 0 {
 		t.Fatalf("healthy partition failed: %v", runner.failures)
@@ -379,7 +700,7 @@ func TestPartitionCheckRejectsEveryPartitionViolation(t *testing.T) {
 			answers[key] = value
 		}
 		answers[sql] = base[sql] + 1
-		runner := &ruleRunner{exec: &scriptedAggregateExecutor{answers: answers}}
+		runner := &ruleRunner{exec: partitionExecutor(answers, 3, 7, nil)}
 		checkPartition(runner, 3, 7)
 		if len(runner.failures) == 0 {
 			t.Errorf("perturbing %q in a partition was accepted", sql)
@@ -400,7 +721,7 @@ func TestPartitionCheckCoversEmptyDeliveryTime(t *testing.T) {
 		answers[key] = value
 	}
 	answers[sql] = base[sql] - 5
-	runner := &ruleRunner{exec: &scriptedAggregateExecutor{answers: answers}}
+	runner := &ruleRunner{exec: partitionExecutor(answers, 2, 4, nil)}
 	checkPartition(runner, 2, 4)
 	joined := strings.Join(runner.failures, "\n")
 	if !strings.Contains(joined, "empty delivery time mismatch") {
@@ -416,10 +737,10 @@ func TestPartitionCheckAcceptsAnEmptyNewOrderQueue(t *testing.T) {
 	answers["select count(o_id) from orders where o_w_id = 1 and o_d_id = 1 and o_carrier_id = 0;"] = 0
 	answers["select sum(o_ol_cnt) from orders where o_w_id = 1 and o_d_id = 1 and o_carrier_id = 0;"] = 0
 	answers["select count(*) from order_line where ol_w_id = 1 and ol_d_id = 1 and ol_delivery_d = '';"] = 0
-	executor := &nullableAggregateExecutor{scriptedAggregateExecutor{answers: answers}, map[string]bool{
+	executor := partitionExecutor(answers, 1, 1, map[string]bool{
 		"select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;": true,
 		"select max(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;": true,
-	}}
+	})
 	runner := &ruleRunner{exec: executor}
 	checkPartition(runner, 1, 1)
 	if len(runner.failures) != 0 {
@@ -427,17 +748,169 @@ func TestPartitionCheckAcceptsAnEmptyNewOrderQueue(t *testing.T) {
 	}
 }
 
-type nullableAggregateExecutor struct {
-	scriptedAggregateExecutor
-	nulls map[string]bool
+func TestPartitionBatchFailureNamesEveryLogicalValue(t *testing.T) {
+	const wID, dID = 3, 7
+	executor := partitionExecutor(onePartitionAnswers(wID, dID), wID, dID, nil)
+	ordersQuery := partitionQuerySpecs(wID, dID)[1]
+	executor.errors = map[string]error{ordersQuery.sql: errors.New("wire read failed")}
+	runner := &ruleRunner{exec: executor}
+	checkPartition(runner, wID, dID)
+	if len(runner.failures) != len(ordersQuery.aggregates) {
+		t.Fatalf("batched query failure produced %d diagnostics, want %d: %v",
+			len(runner.failures), len(ordersQuery.aggregates), runner.failures)
+	}
+	joined := strings.Join(runner.failures, "\n")
+	for _, aggregate := range ordersQuery.aggregates {
+		if !strings.Contains(joined, aggregate.name) || !strings.Contains(joined, aggregate.scalarSQL) {
+			t.Errorf("batched query failure omitted %q / %q: %s", aggregate.name, aggregate.scalarSQL, joined)
+		}
+	}
 }
 
-func (e *nullableAggregateExecutor) exec(sql string) (string, error) {
-	if e.nulls[sql] {
-		e.statements = append(e.statements, sql)
-		return "+------+\n| n    |\n+------+\n| NULL |\n+------+\nTotal record(s): 1\n", nil
+func TestGroupedPartitionCheckAcceptsUnorderedMultiRowResults(t *testing.T) {
+	m := testConsistencyModel()
+	executor := &scriptedAggregateExecutor{answers: passingPostRecoveryAnswers(m)}
+	addGroupedPartitionRows(executor, m, nil)
+	for sql, rows := range executor.multiRows {
+		for left, right := 0, len(rows)-1; left < right; left, right = left+1, right-1 {
+			rows[left], rows[right] = rows[right], rows[left]
+		}
+		executor.multiRows[sql] = rows
 	}
-	return e.scriptedAggregateExecutor.exec(sql)
+	runner := &ruleRunner{exec: executor}
+	checkPartitionsGrouped(runner, m, "grouped-unit")
+	if len(runner.failures) != 0 {
+		t.Fatalf("healthy unordered grouped results failed: %v", runner.failures)
+	}
+	if got, want := len(executor.statements), len(groupedPartitionQuerySpecs()); got != want {
+		t.Fatalf("grouped partition check executed %d queries, want %d", got, want)
+	}
+}
+
+func TestGroupedPartitionCheckSynthesizesEmptyConditionalGroups(t *testing.T) {
+	m := consistencyModel{warehouses: 1, districtsPerWarehouse: 2}
+	answers := partitionAnswers(map[string]float64{}, m)
+	executor := &scriptedAggregateExecutor{answers: answers}
+	addGroupedPartitionRows(executor, m, nil)
+	for _, queryIndex := range []int{2, 3, 5} {
+		query := groupedPartitionQuerySpecs()[queryIndex]
+		rows := executor.multiRows[query.sql]
+		executor.multiRows[query.sql] = rows[:1]
+	}
+	runner := &ruleRunner{exec: executor}
+	checkPartitionsGrouped(runner, m, "grouped-unit")
+	if len(runner.failures) != 0 {
+		t.Fatalf("missing empty-queue groups changed scalar empty-input semantics: %v", runner.failures)
+	}
+}
+
+func TestGroupedPartitionCheckRejectsMissingExtraAndDuplicatePartitions(t *testing.T) {
+	m := consistencyModel{warehouses: 1, districtsPerWarehouse: 2}
+	tests := []struct {
+		name string
+		edit func(*scriptedAggregateExecutor)
+		want []string
+	}{
+		{
+			name: "missing district",
+			edit: func(executor *scriptedAggregateExecutor) {
+				query := groupedPartitionQuerySpecs()[0]
+				executor.multiRows[query.sql] = executor.multiRows[query.sql][:1]
+			},
+			want: []string{"w=1 d=2", partitionDNext, "did not return the district partition"},
+		},
+		{
+			name: "extra partition",
+			edit: func(executor *scriptedAggregateExecutor) {
+				query := groupedPartitionQuerySpecs()[4]
+				executor.multiRows[query.sql] = append(executor.multiRows[query.sql], []aggregateValue{
+					{number: 9, present: true}, {number: 1, present: true}, {number: 10, present: true},
+				})
+			},
+			want: []string{"w=9 d=1", partitionLineCount, "unexpected partition"},
+		},
+		{
+			name: "duplicate partition",
+			edit: func(executor *scriptedAggregateExecutor) {
+				query := groupedPartitionQuerySpecs()[1]
+				executor.multiRows[query.sql] = append(executor.multiRows[query.sql], executor.multiRows[query.sql][0])
+			},
+			want: []string{"w=1 d=1", partitionOrderMax, "duplicate partition"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &scriptedAggregateExecutor{answers: partitionAnswers(map[string]float64{}, m)}
+			addGroupedPartitionRows(executor, m, nil)
+			tt.edit(executor)
+			runner := &ruleRunner{exec: executor}
+			checkPartitionsGrouped(runner, m, "grouped-unit")
+			joined := strings.Join(runner.failures, "\n")
+			for _, want := range tt.want {
+				if !strings.Contains(joined, want) {
+					t.Errorf("failures = %q, want %q", joined, want)
+				}
+			}
+		})
+	}
+}
+
+func TestGroupedPartitionCheckPreservesNullAggregateSemantics(t *testing.T) {
+	m := consistencyModel{warehouses: 1, districtsPerWarehouse: 1}
+	answers := partitionAnswers(map[string]float64{}, m)
+	answers["select count(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;"] = 0
+	answers["select count(o_id) from orders where o_w_id = 1 and o_d_id = 1 and o_carrier_id = 0;"] = 0
+	answers["select count(*) from order_line where ol_w_id = 1 and ol_d_id = 1 and ol_delivery_d = '';"] = 0
+	executor := &scriptedAggregateExecutor{answers: answers}
+	addGroupedPartitionRows(executor, m, map[string]bool{
+		"select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;":                 true,
+		"select max(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;":                 true,
+		"select sum(o_ol_cnt) from orders where o_w_id = 1 and o_d_id = 1 and o_carrier_id = 0;": true,
+	})
+	runner := &ruleRunner{exec: executor}
+	checkPartitionsGrouped(runner, m, "grouped-unit")
+	if len(runner.failures) != 0 {
+		t.Fatalf("NULL MIN/MAX/SUM over an empty queue was rejected: %v", runner.failures)
+	}
+}
+
+func TestGroupedPartitionQueryErrorNamesEveryLogicalValueAndScalarSQL(t *testing.T) {
+	m := consistencyModel{warehouses: 1, districtsPerWarehouse: 2}
+	executor := &scriptedAggregateExecutor{answers: partitionAnswers(map[string]float64{}, m)}
+	addGroupedPartitionRows(executor, m, nil)
+	queryIndex := 1
+	grouped := groupedPartitionQuerySpecs()[queryIndex]
+	executor.errors = map[string]error{grouped.sql: errors.New("wire read failed")}
+	runner := &ruleRunner{exec: executor}
+	checkPartitionsGrouped(runner, m, "grouped-unit")
+	joined := strings.Join(runner.failures, "\n")
+	for dID := 1; dID <= m.districtsPerWarehouse; dID++ {
+		for _, aggregate := range partitionScalarSpecs(queryIndex, 1, dID) {
+			if !strings.Contains(joined, aggregate.name) || !strings.Contains(joined, aggregate.scalarSQL) {
+				t.Errorf("grouped query failure omitted %q / %q: %s", aggregate.name, aggregate.scalarSQL, joined)
+			}
+		}
+	}
+	if got, want := len(runner.failures), m.districtsPerWarehouse*len(grouped.aggregates); got != want {
+		t.Fatalf("grouped query failure produced %d diagnostics, want %d: %v", got, want, runner.failures)
+	}
+}
+
+func TestPointPartitionModeRemainsAvailableForAB(t *testing.T) {
+	t.Setenv(groupedPartitionModeEnv, "point")
+	m := testConsistencyModel()
+	executor := &scriptedAggregateExecutor{answers: passingPostRecoveryAnswers(m)}
+	addPartitionBatchRows(executor, m, nil)
+	if err := checkPostRecoveryConsistency(executor, m, "point-unit"); err != nil {
+		t.Fatal(err)
+	}
+	for _, grouped := range groupedPartitionQuerySpecs() {
+		for _, statement := range executor.statements {
+			if statement == grouped.sql {
+				t.Fatalf("point A/B mode executed grouped query %q", statement)
+			}
+		}
+	}
 }
 
 func TestNewConsistencyModelRejectsResultsWithoutReconciliationData(t *testing.T) {
@@ -762,6 +1235,94 @@ func TestPaymentFloatChainsLinkWithoutClientCompletionOrder(t *testing.T) {
 	}
 	if got := terminals["warehouse:1"]; got != math.Float32bits(end) {
 		t.Fatalf("warehouse terminal = 0x%08x, want 0x%08x", got, math.Float32bits(end))
+	}
+}
+
+func TestPaymentFloatChainsScaleLinearlyOnOfficialSizedEvidence(t *testing.T) {
+	const commits = 100000
+	amount := float32(1)
+	warehouseValue := float32(300000)
+	districtValue := float32(30000)
+	edges := make([]paymentFloatEdge, 0, commits*2)
+	for i := 0; i < commits; i++ {
+		nextWarehouse := warehouseValue + amount
+		nextDistrict := districtValue + amount
+		edges = append(edges,
+			paymentFloatEdge{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(warehouseValue),
+				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(nextWarehouse)},
+			paymentFloatEdge{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(districtValue),
+				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(nextDistrict)},
+		)
+		warehouseValue = nextWarehouse
+		districtValue = nextDistrict
+	}
+	for left, right := 0, len(edges)-1; left < right; left, right = left+1, right-1 {
+		edges[left], edges[right] = edges[right], edges[left]
+	}
+
+	terminals, err := validatePaymentFloatChains(document{
+		Ledger:       map[string]float64{ledgerPaymentCommits: commits},
+		PaymentEdges: edges,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := terminals["warehouse:1"]; got != math.Float32bits(warehouseValue) {
+		t.Fatalf("warehouse terminal = 0x%08x, want 0x%08x", got, math.Float32bits(warehouseValue))
+	}
+	if got := terminals["district:1:1"]; got != math.Float32bits(districtValue) {
+		t.Fatalf("district terminal = 0x%08x, want 0x%08x", got, math.Float32bits(districtValue))
+	}
+}
+
+func TestPaymentTerminalBitsUseTwoGroupedQueries(t *testing.T) {
+	warehouseValue := float32(300010.25)
+	districtValue := float32(30020.5)
+	value := func(number float64) aggregateValue {
+		return aggregateValue{number: number, present: true}
+	}
+	executor := &scriptedAggregateExecutor{
+		multiRows: map[string][][]aggregateValue{
+			warehousePaymentTerminalsSQL: {
+				{value(1), value(float64(warehouseValue))},
+				{value(2), value(300000)},
+			},
+			districtPaymentTerminalsSQL: {
+				{value(1), value(1), value(float64(districtValue))},
+				{value(1), value(2), value(30000)},
+			},
+		},
+		errors: map[string]error{},
+	}
+	err := checkPaymentTerminalBits(executor, map[string]uint32{
+		"warehouse:1":  math.Float32bits(warehouseValue),
+		"district:1:1": math.Float32bits(districtValue),
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(executor.statements, "\n"); got != warehousePaymentTerminalsSQL+"\n"+districtPaymentTerminalsSQL {
+		t.Fatalf("terminal queries = %q", got)
+	}
+}
+
+func TestPaymentTerminalBitsRejectMissingGroupedRow(t *testing.T) {
+	value := func(number float64) aggregateValue {
+		return aggregateValue{number: number, present: true}
+	}
+	executor := &scriptedAggregateExecutor{
+		multiRows: map[string][][]aggregateValue{
+			warehousePaymentTerminalsSQL: {
+				{value(2), value(300000)},
+			},
+		},
+		errors: map[string]error{},
+	}
+	err := checkPaymentTerminalBits(executor, map[string]uint32{
+		"warehouse:1": math.Float32bits(float32(300000)),
+	}, "test")
+	if err == nil || !strings.Contains(err.Error(), "was not returned by grouped query") {
+		t.Fatalf("missing terminal row reported %v", err)
 	}
 }
 

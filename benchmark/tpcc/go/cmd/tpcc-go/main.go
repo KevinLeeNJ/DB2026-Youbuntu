@@ -2318,6 +2318,42 @@ type officialWorkerReport struct {
 	err    error
 }
 
+type conflictRetryOutcome int
+
+const (
+	conflictRetryCompleted conflictRetryOutcome = iota
+	conflictRetryDeadline
+	conflictRetryStopped
+)
+
+const defaultMaxConflictRetries = -1
+
+// runTxnWithConflictRetries keeps the logical transaction inputs in the caller:
+// attempt must recreate only the per-attempt RNG from the same seed. A finite
+// retry budget reports the final TRANSACTION_ABORT as a completed attempt so the
+// existing worker result path records server-abort. Only the phase deadline is
+// classified as abandoned.
+func runTxnWithConflictRetries(phaseEnd time.Time, maxConflictRetries int, stop <-chan struct{},
+	now func() time.Time, attempt func() error) (error, conflictRetryOutcome) {
+	retries := 0
+	for now().Before(phaseEnd) {
+		select {
+		case <-stop:
+			return nil, conflictRetryStopped
+		default:
+		}
+		err := attempt()
+		if !errors.Is(err, errAbort) {
+			return err, conflictRetryCompleted
+		}
+		if maxConflictRetries >= 0 && retries >= maxConflictRetries {
+			return err, conflictRetryCompleted
+		}
+		retries++
+	}
+	return nil, conflictRetryDeadline
+}
+
 // attribute maps a transaction completion instant onto the bucket that owns it.
 // The official rate counts the NewOrder transactions whose COMMIT succeeded
 // inside the window (final.md:214), so attribution follows the completion time
@@ -2334,7 +2370,9 @@ func (r *officialWorkerReport) attribute(finish, warmupEnd time.Time, measure ti
 	return "measure", r.windows[window], window
 }
 
-func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
+func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
+	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
+	stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	local := newResult(measureSeconds)
 	total, attempt := newTxnLedger(), newTxnLedger()
@@ -2373,23 +2411,15 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			phaseEnd = warmupEnd
 		}
 		start := time.Now()
-		var err error
-		completed := false
-		for time.Now().Before(phaseEnd) {
-			select {
-			case <-stop:
-				report(nil)
-				return
-			default:
-			}
+		err, retryOutcome := runTxnWithConflictRetries(phaseEnd, maxConflictRetries, stop, time.Now, func() error {
 			attempt.reset()
-			err = runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
-			if !errors.Is(err, errAbort) {
-				completed = true
-				break
-			}
+			return runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
+		})
+		if retryOutcome == conflictRetryStopped {
+			report(nil)
+			return
 		}
-		if !completed {
+		if retryOutcome == conflictRetryDeadline {
 			latency := float64(time.Since(start).Microseconds()) / 1000.0
 			local.record(phase, txnType, "abandoned", latency, "phase deadline reached during conflict retry")
 			stats.record(phase, txnType, "abandoned")
@@ -2437,7 +2467,9 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 	report(nil)
 }
 
-func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, factory backendFactory, ledger *txnLedger) (*result, error) {
+func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
+	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
+	factory backendFactory, ledger *txnLedger) (*result, error) {
 	partials := make(chan workerReport, workers)
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -2446,7 +2478,8 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			runWorker(id, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think, reconnectEachTxn, stats, stop, partials, factory)
+			runWorker(id, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think, reconnectEachTxn,
+				maxConflictRetries, stats, stop, partials, factory)
 		}(workerID)
 	}
 	go func() {
@@ -2474,7 +2507,7 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 }
 
 func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officialRoutingPlan, warmupEnd time.Time,
-	measure time.Duration, windows int, think time.Duration, stats []*liveStats, stop <-chan struct{},
+	measure time.Duration, windows int, think time.Duration, maxConflictRetries int, stats []*liveStats, stop <-chan struct{},
 	output chan<- officialWorkerReport, c txnBackend) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	router := newOfficialRouter(plan, workerID)
@@ -2512,22 +2545,14 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 			phaseEnd = warmupEnd
 		}
 		start := time.Now()
-		var err error
-		completed := false
-		for time.Now().Before(phaseEnd) {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		err, retryOutcome := runTxnWithConflictRetries(phaseEnd, maxConflictRetries, stop, time.Now, func() error {
 			attempt.reset()
-			err = runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
-			if !errors.Is(err, errAbort) {
-				completed = true
-				break
-			}
+			return runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
+		})
+		if retryOutcome == conflictRetryStopped {
+			return
 		}
-		if !completed {
+		if retryOutcome == conflictRetryDeadline {
 			phase, local, window := report.attribute(start, warmupEnd, measure)
 			if local != nil {
 				latency := float64(time.Since(start).Microseconds()) / 1000.0
@@ -2612,7 +2637,8 @@ func monitorOfficialProgress(rounds, warmup, measure, interval int, start time.T
 }
 
 func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
-	reconnectEachTxn bool, roundOffset int, factory backendFactory, ledger *txnLedger) ([]*result, error) {
+	maxConflictRetries int, reconnectEachTxn bool, roundOffset int, factory backendFactory,
+	ledger *txnLedger) ([]*result, error) {
 	if reconnectEachTxn {
 		return nil, errors.New("official-equivalent does not allow reconnect-each-txn")
 	}
@@ -2646,7 +2672,8 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	printProgress(0, rounds, "warmup", 0, warmup, stats[0])
 	go monitorOfficialProgress(rounds, warmup, measure, progress, start, stats, monitorStop, monitorDone)
 	for workerID, backend := range backends {
-		go runOfficialWorker(workerID, roundOffset+1, seed, p, plan, warmupEnd, measureDuration, rounds, think, stats, stop, partials, backend)
+		go runOfficialWorker(workerID, roundOffset+1, seed, p, plan, warmupEnd, measureDuration, rounds, think,
+			maxConflictRetries, stats, stop, partials, backend)
 	}
 
 	warmupResult := newResult(0)
@@ -2737,6 +2764,7 @@ type config struct {
 	Seed                   int64  `json:"seed"`
 	Think                  string `json:"think"`
 	ReconnectEachTxn       bool   `json:"reconnect_each_txn"`
+	MaxConflictRetries     int    `json:"max_conflict_retries"`
 	WarehousePolicy        string `json:"warehouse_policy"`
 	BaselineWarehouseTotal int    `json:"baseline_warehouse_total"`
 	BaselineDistrictTotal  int    `json:"baseline_district_total"`
@@ -2744,6 +2772,16 @@ type config struct {
 	BaselineItemTotal      int    `json:"baseline_item_total"`
 	BaselineStockTotal     int    `json:"baseline_stock_total"`
 	BaselineOrdersTotal    int    `json:"baseline_orders_total"`
+}
+
+func (value *config) UnmarshalJSON(data []byte) error {
+	type configJSON config
+	decoded := configJSON{MaxConflictRetries: defaultMaxConflictRetries}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*value = config(decoded)
+	return nil
 }
 
 type document struct {
@@ -2768,7 +2806,17 @@ type document struct {
 	Rounds          []*result         `json:"rounds"`
 }
 
+func validateMaxConflictRetries(value int) error {
+	if value < defaultMaxConflictRetries {
+		return fmt.Errorf("max_conflict_retries must be -1 or greater, got %d", value)
+	}
+	return nil
+}
+
 func validateResultDocument(doc document) error {
+	if err := validateMaxConflictRetries(doc.Config.MaxConflictRetries); err != nil {
+		return fmt.Errorf("result config: %w", err)
+	}
 	if doc.Config.Rounds < 1 || len(doc.Rounds) != doc.Config.Rounds {
 		return fmt.Errorf("result has %d rounds, want %d", len(doc.Rounds), doc.Config.Rounds)
 	}
@@ -3164,6 +3212,8 @@ func main() {
 	progress := flag.Int("progress-interval", 5, "seconds between live progress lines; 0 disables")
 	think := flag.Duration("think", 0, "delay between transactions")
 	reconnectEachTxn := flag.Bool("reconnect-each-txn", false, "reconnect after every transaction")
+	maxConflictRetries := flag.Int("max-conflict-retries", defaultMaxConflictRetries,
+		"maximum retries after the first TRANSACTION_ABORT; -1 retries until the phase deadline")
 	dataDir := flag.String("data-dir", "benchmark/tpcc/data", "TPC-C CSV directory")
 	schemaDir := flag.String("schema-dir", "benchmark/tpcc/schema", "RMDB schema directory")
 	rmdbDBDir := flag.String("rmdb-db-dir", "", "RMDB database directory, used to resolve load paths")
@@ -3193,6 +3243,10 @@ func main() {
 		os.Exit(2)
 	}
 	if *command == "run" {
+		if err := validateMaxConflictRetries(*maxConflictRetries); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 		if err := validateBenchmarkMode(*mode, *workers, *warmup, *measure, *rounds, *think, *allowNonOfficialTiming); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -3418,7 +3472,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "consistency command is currently supported for rmdb only")
 			os.Exit(2)
 		}
-		if err := checkConsistency(address, *timeout, *isolation, *resultJSON, *consistencyStage); err != nil {
+		if err := checkConsistency(address, *timeout, *isolation, *resultJSON, *consistencyStage,
+			time.Duration(*progress)*time.Second); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -3445,6 +3500,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unsupported command: %s\n", *command)
 		os.Exit(2)
 	}
+	fmt.Printf("[run] max_conflict_retries=%d (-1 retries until phase deadline)\n", *maxConflictRetries)
 	if *oracleAck != "" {
 		if *oraclePrefix <= 0 || *oraclePrefix > 2000 {
 			fmt.Fprintln(os.Stderr, "oracle run requires --oracle-id-prefix in 1..2000")
@@ -3543,10 +3599,10 @@ func main() {
 		*policy = "official-terminal-home"
 	}
 	ledger := newTxnLedger()
-	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}, Baselines: baselines}
+	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, MaxConflictRetries: *maxConflictRetries, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}, Baselines: baselines}
 	if *mode == "official-equivalent" {
 		windows, runErr := runOfficialWindows(*rounds, *workers, *seed, p, *warmup, *measure, *progress, *think,
-			*reconnectEachTxn, *roundOffset, factory, ledger)
+			*maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger)
 		if runErr != nil {
 			fmt.Fprintln(os.Stderr, runErr)
 			os.Exit(1)
@@ -3561,7 +3617,8 @@ func main() {
 			monitorStop := make(chan struct{})
 			monitorDone := make(chan struct{})
 			go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
-			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory, ledger)
+			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd,
+				*measure, *think, *reconnectEachTxn, *maxConflictRetries, stats, factory, ledger)
 			close(monitorStop)
 			<-monitorDone
 			if roundErr != nil {
