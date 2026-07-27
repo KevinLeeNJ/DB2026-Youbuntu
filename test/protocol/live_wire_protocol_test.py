@@ -396,6 +396,143 @@ def test_stream_result_sink_ssi(port):
         writer.close()
 
 
+def test_empty_integer_aggregates_use_typed_zero(port):
+    client = WireClient(port)
+    try:
+        client.command("CREATE TABLE aggregate_empty_probe (id INT, value INT);")
+        client.command("INSERT INTO aggregate_empty_probe VALUES (1, NULL);")
+
+        schema, rows = client.query(
+            "SELECT SUM(value) AS total, MIN(value) AS lowest, MAX(value) AS highest "
+            "FROM aggregate_empty_probe WHERE id = 999;"
+        )
+        require(schema == [("total", INT32), ("lowest", INT32), ("highest", INT32)],
+                "empty integer aggregates must retain INT32 schema")
+        require(rows == [[0, 0, 0]], "empty integer aggregates must use the evaluator's typed-zero convention")
+
+        _, rows = client.query(
+            "SELECT SUM(value) AS total, MIN(value) AS lowest, MAX(value) AS highest "
+            "FROM aggregate_empty_probe WHERE id = 1;"
+        )
+        require(rows == [[None, None, None]], "nonempty all-NULL aggregate input must remain NULL")
+    finally:
+        client.close()
+
+
+def test_direct_column_update(port):
+    client = WireClient(port)
+    try:
+        client.command(
+            "CREATE TABLE wire_copy ("
+            "id INT, i_src INT, i_dst INT, f_src FLOAT, f_dst FLOAT, "
+            "c_src CHAR(8), c_dst CHAR(8), n_src INT, n_dst INT);"
+        )
+        client.command("INSERT INTO wire_copy VALUES (2, 7, 3, 1.5, 9.5, 'source', 'dest', NULL, 8);")
+        client.command(
+            "UPDATE wire_copy SET "
+            "i_src = i_dst, i_dst = i_src, f_dst = f_src, c_dst = c_src, n_dst = n_src "
+            "WHERE id = (1 + 1);"
+        )
+
+        schema, rows = client.query(
+            "SELECT i_src, i_dst, f_dst, c_dst, n_dst FROM wire_copy WHERE id = 2;"
+        )
+        require(
+            schema == [
+                ("i_src", INT32),
+                ("i_dst", INT32),
+                ("f_dst", FLOAT32),
+                ("c_dst", CHAR),
+                ("n_dst", INT32),
+            ],
+            "direct column UPDATE changed typed result schema",
+        )
+        require(
+            rows == [[3, 7, 0x3FC00000, "source", None]],
+            "direct column UPDATE did not copy old-row INT/FLOAT/CHAR/NULL values",
+        )
+
+        tag, diagnostic = client.stream_raw("UPDATE wire_copy SET i_dst = c_src WHERE id = 2;")
+        require(tag == ERROR, "incompatible direct column UPDATE must return ERROR")
+        require(diagnostic, "incompatible direct column UPDATE must include a diagnostic")
+    finally:
+        client.close()
+
+
+def test_chained_update(port):
+    client = WireClient(port)
+    try:
+        client.command("CREATE TABLE wire_chain (id INT, a INT, b INT, c INT, d INT, f FLOAT, n INT);")
+        client.command("INSERT INTO wire_chain VALUES (2, 10, 20, 30, 40, 16777216.0, NULL);")
+        client.command(
+            "UPDATE wire_chain SET "
+            "a = a - 1 + 91, b = b + 3, c = c + 4, d = d + 5 "
+            "WHERE id = (1 + 1);"
+        )
+        client.command("UPDATE wire_chain SET f = f + 1 - 1, n = n - 1 + 91 WHERE id = 2;")
+
+        schema, rows = client.query("SELECT a, b, c, d, f, n FROM wire_chain WHERE id = 2;")
+        require(
+            schema == [
+                ("a", INT32),
+                ("b", INT32),
+                ("c", INT32),
+                ("d", INT32),
+                ("f", FLOAT32),
+                ("n", INT32),
+            ],
+            "chained UPDATE changed typed result schema",
+        )
+        require(
+            rows == [[100, 23, 34, 45, 0x4B7FFFFF, None]],
+            "chained UPDATE was not left-associative binary32 or did not propagate NULL",
+        )
+
+        statements = [
+            (100, False, [INT32, INT32], "UPDATE wire_chain SET a = a - $1 + $2 WHERE id = 2;"),
+            (101, True, [INT32], "SELECT a FROM wire_chain WHERE id = $1;"),
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {statement_id: types for statement_id, _, types, _ in statements}
+        executed, status, failed, diagnostic, results = client.batch(
+            [(100, [10, 5]), (101, [2])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
+            "prepared chained UPDATE batch failed",
+        )
+        require(results == [(1, [[95]])], "prepared chained UPDATE produced a misordered first result")
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [(100, [3, 20]), (101, [2])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
+            "repeated prepared chained UPDATE batch failed",
+        )
+        require(results == [(1, [[112]])], "prepared chained UPDATE reused stale scalar terms")
+
+        tag, diagnostic = client.stream_raw("UPDATE wire_chain SET a = b + 1 + 2 WHERE id = 2;")
+        require(tag == ERROR and diagnostic, "cross-column chained UPDATE must return diagnostic ERROR")
+        tag, diagnostic = client.stream_raw("UPDATE wire_chain SET a = a + 1 + 'bad' WHERE id = 2;")
+        require(tag == ERROR and diagnostic, "incompatible chained UPDATE term must return diagnostic ERROR")
+
+        client.command("CREATE TABLE wire_chain_atomic (id INT, a INT, source INT, b INT);")
+        client.command("CREATE INDEX wire_chain_atomic(a);")
+        client.command("INSERT INTO wire_chain_atomic VALUES (1, 1, 5, 10);")
+        client.command("INSERT INTO wire_chain_atomic VALUES (2, 2, 5, 20);")
+        tag, diagnostic = client.stream_raw(
+            "UPDATE wire_chain_atomic SET a = source, b = b + 1 + 1 WHERE id >= 1;"
+        )
+        require(tag == ERROR and diagnostic, "indexed chained UPDATE collision must return diagnostic ERROR")
+        _, rows = client.query("SELECT a, b FROM wire_chain_atomic WHERE id = 1;")
+        require(rows == [[1, 10]], "failed chained UPDATE did not roll back its earlier row")
+        _, rows = client.query("SELECT a, b FROM wire_chain_atomic WHERE id = 2;")
+        require(rows == [[2, 20]], "failed chained UPDATE changed the conflicting row")
+    finally:
+        client.close()
+
+
 def test_crash_recovery_smoke(server):
     client = WireClient(server.port)
     client.command("CREATE TABLE durable_wire (id INT);")
@@ -417,6 +554,9 @@ def main():
         test_stream_prepare_float_and_auto_abort(server.port)
         test_snapshot_write_conflict(server.port)
         test_stream_result_sink_ssi(server.port)
+        test_empty_integer_aggregates_use_typed_zero(server.port)
+        test_direct_column_update(server.port)
+        test_chained_update(server.port)
         test_crash_recovery_smoke(server)
         print("live Wire v3 server baseline: PASS")
         return 0

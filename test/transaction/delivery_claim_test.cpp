@@ -360,18 +360,18 @@ TEST_F(DeliveryClaimTest, LockLoserSeesWinnersCommittedDelete) {
     EXPECT_TRUE(loser_error.empty()) << "loser failed unexpectedly: " << loser_error;
     // The whole point: the statement that runs once the lock is finally granted
     // must see the winner's committed DELETE, so MIN over the now-empty match
-    // set is NULL rather than the value the loser read before it blocked.
-    EXPECT_EQ("NULL", loser_confirmation) << "the loser's confirmation read resurrected the deleted queue row";
+    // set is the finalv3 A.3 integer zero rather than the value the loser read
+    // before it blocked.
+    EXPECT_EQ("0", loser_confirmation) << "the loser's confirmation read resurrected the deleted queue row";
     EXPECT_FALSE(loser_claimed.load()) << "both transactions claimed the same queue row";
     EXPECT_EQ(0, CountQueue());
     EXPECT_EQ(1, CreditedCount()) << "the queue row was credited more than once";
 }
 
-// A claim that lost the race is reported as one row holding SQL NULL, never as
-// an empty result. Pinned here because a claim protocol that tests for
-// emptiness instead of comparing the value confirms every lost claim, and that
-// mistake is invisible in any test whose fake backend returns no rows.
-TEST_F(DeliveryClaimTest, LostClaimConfirmationIsOneNullRowNotAnEmptyResult) {
+// A claim that lost the race is reported as one row holding the finalv3 A.3
+// integer zero, never as an empty result. The claim protocol must compare that
+// value with the candidate order id.
+TEST_F(DeliveryClaimTest, LostClaimConfirmationIsOneZeroRowNotAnEmptyResult) {
     auto session = db_->new_session();
     session.exec("begin;");
     ASSERT_TRUE(ConfirmAndFinishClaim(session, 1));
@@ -382,7 +382,7 @@ TEST_F(DeliveryClaimTest, LostClaimConfirmationIsOneNullRowNotAnEmptyResult) {
     EXPECT_NE(std::string::npos, output.find("Total record(s): 1"))
         << "an aggregate without GROUP BY must return exactly one row\n"
         << output;
-    EXPECT_EQ("NULL", ScalarOf(output));
+    EXPECT_EQ("0", ScalarOf(output));
 }
 
 // Same invariant without any hand-placed ordering: two threads racing over a

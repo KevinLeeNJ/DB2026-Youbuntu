@@ -17,7 +17,7 @@ import (
 var float32Columns = map[string]struct{}{
 	"w_tax": {}, "w_ytd": {},
 	"d_tax": {}, "d_ytd": {},
-	"c_credit_lim": {}, "c_discount": {}, "c_balance": {}, "c_ytd_payment": {},
+	"c_discount": {}, "c_balance": {}, "c_ytd_payment": {},
 	"h_amount": {}, "ol_amount": {}, "i_price": {}, "s_ytd": {},
 }
 
@@ -273,13 +273,13 @@ func sampleKeyPredicate(sample map[string]string, keys []string) (string, error)
 }
 
 // compareSampledValue compares one generated CSV value against what the database
-// returned. An empty CSV field means the generator emitted no value, which the
-// loader must turn into SQL NULL.
+// returned. An empty CSV field in the finalv3 TPC-C data is a non-NULL empty
+// CHAR value.
 func compareSampledValue(column, want, got string) error {
 	got = strings.TrimSpace(got)
 	if want == "" {
-		if got != "NULL" {
-			return fmt.Errorf("%s: got %q, want NULL", column, got)
+		if got != "" {
+			return fmt.Errorf("%s: got %q, want empty CHAR", column, got)
 		}
 		return nil
 	}

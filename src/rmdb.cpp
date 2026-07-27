@@ -621,9 +621,12 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                     break;
                 case ast::AstType::UpdateStmt: {
                     const auto& x = static_cast<const ast::UpdateStmt&>(node);
-                    for (const auto& s : x.set_clauses)
+                    for (const auto& s : x.set_clauses) {
                         if (s->val)
                             visit_expr(*s->val);
+                        for (const auto& term : s->additional_terms)
+                            visit_expr(*term.val);
+                    }
                     for (const auto& c : x.conds) {
                         visit_expr(*c->lhs);
                         visit_expr(*c->rhs);

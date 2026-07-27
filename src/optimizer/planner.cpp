@@ -222,9 +222,19 @@ void append_set_clause_shape(std::string& key, const SetClause& set_clause) {
     if (set_clause.is_self_ref) {
         append_cache_key_part(key, set_clause.rhs_col.tab_name);
         append_cache_key_part(key, set_clause.rhs_col.col_name);
+        if (set_clause.op != UpdateOp::ASSIGNMENT) {
+            append_cache_key_part(key, set_clause.rhs.is_null);
+            append_cache_key_part(key, static_cast<int>(set_clause.rhs.type));
+        }
     } else {
         append_cache_key_part(key, set_clause.rhs.is_null);
         append_cache_key_part(key, static_cast<int>(set_clause.rhs.type));
+    }
+    append_cache_key_part(key, static_cast<int>(set_clause.additional_terms.size()));
+    for (const auto& term : set_clause.additional_terms) {
+        append_cache_key_part(key, static_cast<int>(term.op));
+        append_cache_key_part(key, term.rhs.is_null);
+        append_cache_key_part(key, static_cast<int>(term.rhs.type));
     }
 }
 
@@ -1195,9 +1205,18 @@ CompiledPointProgramPtr Planner::build_compiled_point_program(PointProgramKind k
     }
     program->set_ops.reserve(set_clauses.size());
     for (const auto& set_clause : set_clauses) {
-        program->set_ops.push_back(CompiledSetOp{set_clause.lhs, set_clause.is_self_ref, set_clause.rhs_col,
-                                                 set_clause.op,
-                                                 set_clause.is_self_ref ? TYPE_INT : set_clause.rhs.type});
+        CompiledSetOp compiled{set_clause.lhs,
+                               set_clause.is_self_ref,
+                               set_clause.rhs_col,
+                               set_clause.op,
+                               set_clause.is_self_ref && set_clause.op == UpdateOp::ASSIGNMENT ? TYPE_INT
+                                                                                               : set_clause.rhs.type,
+                               {}};
+        compiled.additional_terms.reserve(set_clause.additional_terms.size());
+        for (const auto& term : set_clause.additional_terms) {
+            compiled.additional_terms.emplace_back(term.op, term.rhs.type);
+        }
+        program->set_ops.push_back(std::move(compiled));
     }
     return program;
 }

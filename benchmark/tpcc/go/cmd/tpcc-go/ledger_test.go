@@ -21,6 +21,29 @@ type sqlRecordingBatcher struct {
 	sqls []string
 }
 
+type sqlRecordingBackend struct {
+	sqls []string
+}
+
+func (r *sqlRecordingBackend) exec(sql string) (string, error) {
+	r.sqls = append(r.sqls, sql)
+	switch {
+	case strings.HasPrefix(sql, "select d_next_o_id"):
+		return "2", nil
+	case strings.HasPrefix(sql, "select i_price"):
+		return "1.0", nil
+	case strings.HasPrefix(sql, "select s_quantity"):
+		return "15", nil
+	default:
+		return "1", nil
+	}
+}
+
+func (r *sqlRecordingBackend) begin() error  { return nil }
+func (r *sqlRecordingBackend) commit() error { return nil }
+func (r *sqlRecordingBackend) rollback()     {}
+func (r *sqlRecordingBackend) close()        {}
+
 func newSQLRecordingBatcher(t *testing.T) *sqlRecordingBatcher {
 	t.Helper()
 	return &sqlRecordingBatcher{fakeRankingBatcher: newFakeRankingBatcher(t)}
@@ -154,6 +177,64 @@ func TestNewOrderLocksSortedUniqueStockKeysBeforeReading(t *testing.T) {
 			t.Fatalf("stock locks are not strictly sorted and unique: %v", locks)
 		}
 	}
+}
+
+func TestProjectedStockQuantityDeltasFollowOriginalLineOrderForDuplicateKey(t *testing.T) {
+	deltas := projectedStockQuantityDeltas(
+		[]int{7, 7},
+		[]int{1, 1},
+		[]int{5, 5},
+		[]int{15, 15},
+	)
+	wantDeltas := []int{-5, 86}
+	quantity := 15
+	wantAfter := []int{10, 96}
+	for i, delta := range deltas {
+		if delta != wantDeltas[i] {
+			t.Fatalf("line %d delta = %d, want %d", i+1, delta, wantDeltas[i])
+		}
+		quantity += delta
+		if quantity != wantAfter[i] {
+			t.Fatalf("line %d projected quantity = %d, want %d", i+1, quantity, wantAfter[i])
+		}
+	}
+}
+
+func TestNewOrderUsesEmptyStringForUndeliveredOrderLines(t *testing.T) {
+	assertSentinel := func(t *testing.T, sqls []string) {
+		t.Helper()
+		inserts := 0
+		for _, sql := range sqls {
+			if !strings.HasPrefix(sql, "insert into order_line") {
+				continue
+			}
+			inserts++
+			if strings.Contains(sql, "NULL") || !strings.Contains(sql, ", '', ") {
+				t.Fatalf("order_line insert does not use the empty-string delivery sentinel: %s", sql)
+			}
+		}
+		if inserts == 0 {
+			t.Fatal("NewOrder emitted no order_line inserts")
+		}
+	}
+
+	t.Run("ranking", func(t *testing.T) {
+		batcher := newSQLRecordingBatcher(t)
+		err := rankingNewOrder(batcher, ledgerContext(newTxnLedger()), rand.New(rand.NewSource(1)))
+		if err != nil && !errors.Is(err, errInvalidItem) {
+			t.Fatal(err)
+		}
+		assertSentinel(t, batcher.sqls)
+	})
+
+	t.Run("non-ranking", func(t *testing.T) {
+		backend := &sqlRecordingBackend{}
+		ctx := rankingTestContext()
+		if err := newOrder(backend, ctx, rand.New(rand.NewSource(1))); err != nil {
+			t.Fatal(err)
+		}
+		assertSentinel(t, backend.sqls)
+	})
 }
 
 func TestPaymentLedgerMatchesTheEmittedSQL(t *testing.T) {

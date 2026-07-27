@@ -855,6 +855,13 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     arithmetic_set.is_self_ref = true;
     arithmetic_set.rhs_col = {"mutation_bind", "source"};
     arithmetic_set.op = UpdateOp::SELF_ADD;
+    UpdateTerm subtract_term;
+    subtract_term.op = UpdateOp::SELF_SUB;
+    subtract_term.rhs.set_int(2);
+    UpdateTerm add_term;
+    add_term.op = UpdateOp::SELF_ADD;
+    add_term.rhs.set_int(3);
+    arithmetic_set.additional_terms = {subtract_term, add_term};
     std::vector<SetClause> set_clauses{literal_set, column_set, arithmetic_set};
 
     auto bound_set_clauses = BindMutationSetClauses(tab, set_clauses);
@@ -891,7 +898,7 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     auto record = sm_manager_->fhs_.at("mutation_bind")->get_record(rid, nullptr);
     ASSERT_NE(record, nullptr);
     EXPECT_EQ(*reinterpret_cast<int*>(record->data + 8), 7);
-    EXPECT_EQ(*reinterpret_cast<int*>(record->data + 12), 12);
+    EXPECT_EQ(*reinterpret_cast<int*>(record->data + 12), 13);
     EXPECT_FLOAT_EQ(read_float(record->data + 16), 42.0f);
 
     Condition delete_literal;

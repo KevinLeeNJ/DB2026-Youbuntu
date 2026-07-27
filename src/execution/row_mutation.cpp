@@ -124,6 +124,33 @@ bool Matches(const std::vector<Condition>* conditions, const std::vector<BoundMu
     return true;
 }
 
+double ApplyNumericUpdateOp(double base, double delta, UpdateOp op) {
+    double result = base;
+    switch (op) {
+    case UpdateOp::SELF_ADD:
+        result = base + delta;
+        break;
+    case UpdateOp::SELF_SUB:
+        result = base - delta;
+        break;
+    case UpdateOp::SELF_MUL:
+        result = base * delta;
+        break;
+    case UpdateOp::SELF_DIV:
+        if (delta == 0.0) {
+            throw InternalError("division by zero in UPDATE");
+        }
+        result = base / delta;
+        break;
+    case UpdateOp::ASSIGNMENT:
+        throw InternalError("assignment is not an arithmetic UPDATE operation");
+    }
+    if (!std::isfinite(result)) {
+        throw RMDBError("FLOAT arithmetic result must be finite");
+    }
+    return result;
+}
+
 bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info, Context* context) {
     if (!Matches(info.conditions, info.bound_conditions, visible_record)) {
         return false;
@@ -183,9 +210,18 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
         // 目标列的 NULL 位由本次赋值重新决定：先算出新值是否为 NULL，是则置位
         // 并把数据字节清零，否则清位后走下面原有的写入路径。
         // SET col = NULL 与 SET col = <非 NULL> 都要经过这里，才能双向切换。
-        const bool assigns_null = set_clause.is_self_ref ? is_null_at(old_record.data, bound.rhs.null_byte,
-                                                                      bound.rhs.null_mask) // NULL 参与算术仍是 NULL
-                                                         : set_clause.rhs.is_null;
+        bool assigns_null = set_clause.is_self_ref ? is_null_at(old_record.data, bound.rhs.null_byte,
+                                                                bound.rhs.null_mask) // NULL 参与算术仍是 NULL
+                                                   : set_clause.rhs.is_null;
+        if (set_clause.is_self_ref && set_clause.op != UpdateOp::ASSIGNMENT && set_clause.rhs.is_null) {
+            assigns_null = true;
+        }
+        for (const auto& term : set_clause.additional_terms) {
+            if (term.rhs.is_null) {
+                assigns_null = true;
+                break;
+            }
+        }
         if (assigns_null) {
             std::memset(data, 0, bound.lhs.len);
             set_null_at(record.data, bound.lhs.null_byte, bound.lhs.null_mask);
@@ -227,38 +263,38 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
                                     : static_cast<double>(read_float(old_record.data + bound.rhs.offset));
             const double delta = set_clause.rhs.type == TYPE_INT ? static_cast<double>(set_clause.rhs.int_val)
                                                                  : set_clause.rhs.float_val;
-            double result = base;
-            switch (set_clause.op) {
-            case UpdateOp::SELF_ADD:
-                result = base + delta;
-                break;
-            case UpdateOp::SELF_SUB:
-                result = base - delta;
-                break;
-            case UpdateOp::SELF_MUL:
-                result = base * delta;
-                break;
-            case UpdateOp::SELF_DIV:
-                if (delta == 0.0F) {
-                    throw InternalError("division by zero in UPDATE");
-                }
-                result = base / delta;
-                break;
-            case UpdateOp::ASSIGNMENT:
-                result = base;
-                break;
-            }
-            if (!std::isfinite(result)) {
-                throw RMDBError("FLOAT arithmetic result must be finite");
-            }
             switch (bound.lhs.type) {
-            case TYPE_INT:
+            case TYPE_INT: {
+                double result = ApplyNumericUpdateOp(base, delta, set_clause.op);
+                for (const auto& term : set_clause.additional_terms) {
+                    if (term.rhs.type != TYPE_INT && term.rhs.type != TYPE_FLOAT) {
+                        throw IncompatibleTypeError(coltype2str(bound.lhs.type), coltype2str(term.rhs.type));
+                    }
+                    const double term_value =
+                        term.rhs.type == TYPE_INT ? static_cast<double>(term.rhs.int_val) : term.rhs.float_val;
+                    result = ApplyNumericUpdateOp(result, term_value, term.op);
+                }
                 write_unaligned(data, static_cast<int>(result));
                 break;
+            }
             case TYPE_FLOAT: {
-                const float float_result = static_cast<float>(result);
+                float float_result = static_cast<float>(ApplyNumericUpdateOp(base, delta, set_clause.op));
                 if (!std::isfinite(float_result)) {
                     throw RMDBError("FLOAT arithmetic result must be finite");
+                }
+                // Each SQL +/- node consumes the previous binary32 result and
+                // rounds once back to binary32. Do not combine the scalar terms.
+                for (const auto& term : set_clause.additional_terms) {
+                    if (term.rhs.type != TYPE_INT && term.rhs.type != TYPE_FLOAT) {
+                        throw IncompatibleTypeError(coltype2str(bound.lhs.type), coltype2str(term.rhs.type));
+                    }
+                    const double term_value =
+                        term.rhs.type == TYPE_INT ? static_cast<double>(term.rhs.int_val) : term.rhs.float_val;
+                    float_result = static_cast<float>(
+                        ApplyNumericUpdateOp(static_cast<double>(float_result), term_value, term.op));
+                    if (!std::isfinite(float_result)) {
+                        throw RMDBError("FLOAT arithmetic result must be finite");
+                    }
                 }
                 write_float(data, float_result);
                 break;

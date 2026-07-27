@@ -118,6 +118,60 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     EXPECT_DOUBLE_EQ(bonus_delta->val, 0.5);
 }
 
+TEST(ParserTest, ParsesAndClonesDirectColumnAssignmentWithConstantWhereExpression) {
+    auto parsed = parse_ok("update tb set a = b where id = (1 + 1);");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    const auto* clause = update->set_clauses[0].get();
+    EXPECT_TRUE(clause->is_self_ref);
+    EXPECT_EQ(clause->op, ast::SetOp::ASSIGNMENT);
+    EXPECT_EQ(clause->col_name, "a");
+    ASSERT_NE(clause->rhs_col, nullptr);
+    EXPECT_EQ(clause->rhs_col->tab_name, "");
+    EXPECT_EQ(clause->rhs_col->col_name, "b");
+    EXPECT_EQ(clause->val, nullptr);
+    ASSERT_EQ(update->conds.size(), 1U);
+    const auto* where_value = dynamic_cast<const ast::IntLit*>(update->conds[0]->rhs.get());
+    ASSERT_NE(where_value, nullptr);
+    EXPECT_EQ(where_value->val, 2);
+
+    const std::vector<std::unique_ptr<ast::Value>> no_bindings;
+    auto cloned = ast::clone_bound_tree(*parsed, no_bindings);
+    const auto* cloned_update = as_node<ast::UpdateStmt>(cloned);
+    ASSERT_NE(cloned_update, nullptr);
+    ASSERT_EQ(cloned_update->set_clauses.size(), 1U);
+    ASSERT_NE(cloned_update->set_clauses[0]->rhs_col, nullptr);
+    EXPECT_EQ(cloned_update->set_clauses[0]->rhs_col->col_name, "b");
+}
+
+TEST(ParserTest, ParsesAndBindsOrderedChainedUpdateTerms) {
+    auto parsed = parse_ok("update chain_tab set a = a - 1 + 91 - 3, b = b + $1 - $2 where id = $3;");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 2U);
+
+    const auto* a_clause = update->set_clauses[0].get();
+    EXPECT_EQ(a_clause->op, ast::SetOp::SELF_SUB);
+    ASSERT_EQ(a_clause->additional_terms.size(), 2U);
+    EXPECT_EQ(a_clause->additional_terms[0].op, ast::SetOp::SELF_ADD);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(a_clause->additional_terms[0].val.get())->val, 91);
+    EXPECT_EQ(a_clause->additional_terms[1].op, ast::SetOp::SELF_SUB);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(a_clause->additional_terms[1].val.get())->val, 3);
+
+    std::vector<std::unique_ptr<ast::Value>> bindings;
+    bindings.push_back(std::make_unique<ast::IntLit>(5));
+    bindings.push_back(std::make_unique<ast::IntLit>(2));
+    bindings.push_back(std::make_unique<ast::IntLit>(7));
+    auto bound = ast::clone_bound_tree(*parsed, bindings);
+    const auto* bound_update = as_node<ast::UpdateStmt>(bound);
+    ASSERT_NE(bound_update, nullptr);
+    ASSERT_EQ(bound_update->set_clauses[1]->additional_terms.size(), 1U);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->set_clauses[1]->val.get())->val, 5);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->set_clauses[1]->additional_terms[0].val.get())->val, 2);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->conds[0]->rhs.get())->val, 7);
+}
+
 TEST(ParserTest, BindsPreparedSelfReferentialUpdateAndWhereParameters) {
     auto parsed = parse_ok("update stock set s_ytd = s_ytd + $3 where s_w_id = $1 and s_i_id = $2;");
     const auto* update = as_node<ast::UpdateStmt>(parsed);
@@ -384,7 +438,7 @@ TEST(ParserTest, RejectsMalformedStatements) {
     expect_parse_error("select from tb;");
     expect_parse_error("insert into tb values (1, );");
     expect_parse_error("set enable_nestloop = maybe;");
-    expect_parse_error("update tb set a = b where x = 1;");
+    EXPECT_EQ(parse_ok("update tb set a = b where x = 1;")->type, ast::AstType::UpdateStmt);
     EXPECT_EQ(parse_ok("update tb set a = a where x = 1;")->type, ast::AstType::UpdateStmt);
     expect_parse_error("update tb set a = b * 'bad' where x = 1;");
 }

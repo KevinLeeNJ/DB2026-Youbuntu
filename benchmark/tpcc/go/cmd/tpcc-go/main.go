@@ -578,18 +578,22 @@ func (l *txnLedger) snapshot() map[string]float64 {
 }
 
 type result struct {
-	MeasureSeconds int                                  `json:"measure_seconds"`
-	TPMC           float64                              `json:"tpmc"`
-	NewOrderPerMin float64                              `json:"NewOrder/min"`
-	TxnTPM         map[string]float64                   `json:"txn_tpm"`
-	Committed      map[string]int                       `json:"committed"`
-	AbortRate      float64                              `json:"abort_rate"`
-	Counts         map[string]map[string]map[string]int `json:"counts"`
-	LatencyMS      map[string]latencySummary            `json:"latency_ms"`
-	Errors         map[string]map[string]map[string]int `json:"errors"`
-	Coverage       coverageSummary                      `json:"coverage"`
-	latencies      map[string][]float64
-	covered        map[int]struct{}
+	MeasureSeconds   int                                  `json:"measure_seconds"`
+	TPMC             float64                              `json:"tpmc"`
+	NewOrderPerMin   float64                              `json:"NewOrder/min"`
+	TxnTPM           map[string]float64                   `json:"txn_tpm"`
+	Attempted        map[string]int                       `json:"attempted"`
+	Committed        map[string]int                       `json:"committed"`
+	ExpectedRollback map[string]int                       `json:"expected_rollback"`
+	Abandoned        map[string]int                       `json:"abandoned"`
+	Completion       map[string]float64                   `json:"completion"`
+	AbortRate        float64                              `json:"abort_rate"`
+	Counts           map[string]map[string]map[string]int `json:"counts"`
+	LatencyMS        map[string]latencySummary            `json:"latency_ms"`
+	Errors           map[string]map[string]map[string]int `json:"errors"`
+	Coverage         coverageSummary                      `json:"coverage"`
+	latencies        map[string][]float64
+	covered          map[int]struct{}
 }
 
 type coverageSummary struct {
@@ -611,10 +615,12 @@ type latencySummary struct {
 }
 
 type liveStats struct {
-	commits         [2]atomic.Uint64
-	aborts          [2]atomic.Uint64
-	newOrderCommits [2]atomic.Uint64
-	newOrderAborts  [2]atomic.Uint64
+	attempted            [2]atomic.Uint64
+	commits              [2]atomic.Uint64
+	serverAborts         [2]atomic.Uint64
+	newOrderAttempted    [2]atomic.Uint64
+	newOrderCommits      [2]atomic.Uint64
+	newOrderServerAborts [2]atomic.Uint64
 }
 
 func phaseIndex(phase string) int {
@@ -626,6 +632,10 @@ func phaseIndex(phase string) int {
 
 func (s *liveStats) record(phase, txnType, outcome string) {
 	index := phaseIndex(phase)
+	s.attempted[index].Add(1)
+	if txnType == "new_order" {
+		s.newOrderAttempted[index].Add(1)
+	}
 	if outcome == "commit" {
 		s.commits[index].Add(1)
 		if txnType == "new_order" {
@@ -633,25 +643,33 @@ func (s *liveStats) record(phase, txnType, outcome string) {
 		}
 		return
 	}
-	s.aborts[index].Add(1)
-	if txnType == "new_order" {
-		s.newOrderAborts[index].Add(1)
+	if outcome == "server-abort" {
+		s.serverAborts[index].Add(1)
+		if txnType == "new_order" {
+			s.newOrderServerAborts[index].Add(1)
+		}
 	}
+}
+
+func liveAbortRatePercent(attempted, serverAborts uint64) float64 {
+	if attempted == 0 {
+		return 0
+	}
+	return float64(serverAborts) / float64(attempted) * 100
 }
 
 func printProgress(round, rounds int, phase string, elapsed, total int, stats *liveStats) {
 	index := phaseIndex(phase)
+	attempted := stats.attempted[index].Load()
 	commits := stats.commits[index].Load()
-	aborts := stats.aborts[index].Load()
+	serverAborts := stats.serverAborts[index].Load()
+	newOrderAttempted := stats.newOrderAttempted[index].Load()
 	newOrderCommits := stats.newOrderCommits[index].Load()
-	newOrderAborts := stats.newOrderAborts[index].Load()
-	totalTransactions := commits + aborts
-	abortRate := 0.0
-	if totalTransactions > 0 {
-		abortRate = float64(aborts) / float64(totalTransactions) * 100
-	}
-	fmt.Printf("[round %d/%d %s %d/%ds] commits=%d aborts=%d new_order_commit=%d new_order_abort=%d tpmC=deferred abort_rate=%.2f%%\n",
-		round, rounds, phase, elapsed, total, commits, aborts, newOrderCommits, newOrderAborts, abortRate)
+	newOrderServerAborts := stats.newOrderServerAborts[index].Load()
+	abortRate := liveAbortRatePercent(attempted, serverAborts)
+	fmt.Printf("[round %d/%d %s %d/%ds] attempted=%d commits=%d server_aborts=%d new_order_attempted=%d new_order_commit=%d new_order_server_abort=%d tpmC=deferred abort_rate=%.2f%%\n",
+		round, rounds, phase, elapsed, total, attempted, commits, serverAborts, newOrderAttempted, newOrderCommits,
+		newOrderServerAborts, abortRate)
 }
 
 func monitorProgress(round, rounds, warmupSeconds, measureSeconds, interval int, warmupEnd, measureEnd time.Time, stats *liveStats, stop <-chan struct{}, done chan<- struct{}) {
@@ -679,14 +697,18 @@ func monitorProgress(round, rounds, warmupSeconds, measureSeconds, interval int,
 
 func newResult(measureSeconds int) *result {
 	return &result{
-		MeasureSeconds: measureSeconds,
-		TxnTPM:         make(map[string]float64),
-		Committed:      make(map[string]int),
-		Counts:         make(map[string]map[string]map[string]int),
-		LatencyMS:      make(map[string]latencySummary),
-		Errors:         make(map[string]map[string]map[string]int),
-		latencies:      make(map[string][]float64),
-		covered:        make(map[int]struct{}),
+		MeasureSeconds:   measureSeconds,
+		TxnTPM:           make(map[string]float64),
+		Attempted:        make(map[string]int),
+		Committed:        make(map[string]int),
+		ExpectedRollback: make(map[string]int),
+		Abandoned:        make(map[string]int),
+		Completion:       make(map[string]float64),
+		Counts:           make(map[string]map[string]map[string]int),
+		LatencyMS:        make(map[string]latencySummary),
+		Errors:           make(map[string]map[string]map[string]int),
+		latencies:        make(map[string][]float64),
+		covered:          make(map[int]struct{}),
 	}
 }
 
@@ -761,26 +783,50 @@ func (r *result) merge(other *result) {
 }
 
 func (r *result) finalize() {
-	committed, aborted := 0, 0
+	attemptedTotal, serverAborts := 0, 0
 	newOrderCommitted := r.Counts["measure"]["new_order"]["commit"]
-	for _, outcomes := range r.Counts["measure"] {
-		committed += outcomes["commit"]
-		for outcome, count := range outcomes {
-			if outcome != "commit" {
-				aborted += count
-			}
+	if r.Attempted == nil {
+		r.Attempted = make(map[string]int)
+	}
+	if r.Committed == nil {
+		r.Committed = make(map[string]int)
+	}
+	if r.ExpectedRollback == nil {
+		r.ExpectedRollback = make(map[string]int)
+	}
+	if r.Abandoned == nil {
+		r.Abandoned = make(map[string]int)
+	}
+	if r.Completion == nil {
+		r.Completion = make(map[string]float64)
+	}
+	for txnType, outcomes := range r.Counts["measure"] {
+		attempted := 0
+		for _, count := range outcomes {
+			attempted += count
 		}
+		expectedRollback := outcomes["invalid-item-rollback"]
+		r.Attempted[txnType] = attempted
+		r.Committed[txnType] = outcomes["commit"]
+		r.ExpectedRollback[txnType] = expectedRollback
+		r.Abandoned[txnType] = outcomes["abandoned"]
+		if attempted > 0 {
+			r.Completion[txnType] = float64(outcomes["commit"]+expectedRollback) / float64(attempted)
+		}
+		attemptedTotal += attempted
+		serverAborts += outcomes["server-abort"]
 	}
 	if r.MeasureSeconds > 0 {
 		r.TPMC = float64(newOrderCommitted) / (float64(r.MeasureSeconds) / 60.0)
 		r.NewOrderPerMin = r.TPMC
 		for txnType, outcomes := range r.Counts["measure"] {
-			r.Committed[txnType] = outcomes["commit"]
 			r.TxnTPM[txnType] = float64(outcomes["commit"]) / (float64(r.MeasureSeconds) / 60.0)
 		}
 	}
-	if committed+aborted > 0 {
-		r.AbortRate = float64(aborted) / float64(committed+aborted)
+	if attemptedTotal > 0 {
+		// Expected business rollbacks and deadline abandonment have their own
+		// report fields. Neither is a server transaction abort.
+		r.AbortRate = float64(serverAborts) / float64(attemptedTotal)
 	}
 	for txnType, values := range r.latencies {
 		if len(values) == 0 {
@@ -808,6 +854,19 @@ func (r *result) hasBackendError() bool {
 		}
 	}
 	return false
+}
+
+func (r *result) reportTotals() (attempted, committed, expectedRollback, abandoned int, completion float64) {
+	for txnType, count := range r.Attempted {
+		attempted += count
+		committed += r.Committed[txnType]
+		expectedRollback += r.ExpectedRollback[txnType]
+		abandoned += r.Abandoned[txnType]
+	}
+	if attempted > 0 {
+		completion = float64(committed+expectedRollback) / float64(attempted)
+	}
+	return
 }
 
 func median(values []float64) float64 {
@@ -1013,7 +1072,7 @@ func newOrder(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 			return err
 		}
 		amount := math.Round(scalarFloat(priceText, 1.0)*float64(qty)*100) / 100
-		if _, err := c.exec(fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, '%s', %d, %.2f, 'dist');", dNext, ctx.dID, ctx.wID, number, itemID, supplyWID, nowText(), qty, amount)); err != nil {
+		if _, err := c.exec(fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, '', %d, %.2f, 'dist');", dNext, ctx.dID, ctx.wID, number, itemID, supplyWID, qty, amount)); err != nil {
 			return err
 		}
 	}
@@ -1305,12 +1364,44 @@ func verifyRankingFloat32Update(result batchResult, beforeOp, afterOp int, delta
 	return nil
 }
 
-func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+type stockKey struct {
+	wID, iID int
+}
+
+func projectedStockQuantityDeltas(itemIDs, supplyWIDs, quantities, initialQuantities []int) []int {
+	deltas := make([]int, len(itemIDs))
+	projectedQuantities := make(map[stockKey]int, len(itemIDs))
+	for i, itemID := range itemIDs {
+		key := stockKey{wID: supplyWIDs[i], iID: itemID}
+		current, ok := projectedQuantities[key]
+		if !ok {
+			current = initialQuantities[i]
+		}
+		delta := -quantities[i]
+		if current-quantities[i] < 10 {
+			delta = 91 - quantities[i]
+		}
+		deltas[i] = delta
+		projectedQuantities[key] = current + delta
+	}
+	return deltas
+}
+
+type rankingNewOrderInput struct {
+	cID        int
+	itemIDs    []int
+	quantities []int
+	supplyWIDs []int
+	invalid    bool
+	allLocal   bool
+}
+
+func makeRankingNewOrderInput(ctx txnContext, rng *rand.Rand, forceInvalid bool) rankingNewOrderInput {
 	cID, lineCount := rng.Intn(ctx.customersPerDistrict)+1, rng.Intn(11)+5
 	itemIDs := make([]int, lineCount)
 	quantities := make([]int, lineCount)
 	supplyWIDs := make([]int, lineCount)
-	invalid := rng.Intn(100) == 0
+	invalid := rng.Intn(100) == 0 || forceInvalid
 	allLocal := true
 	for i := range itemIDs {
 		if len(ctx.hotItemIDs) > 0 && rng.Intn(100) < 25 {
@@ -1335,6 +1426,21 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 			allLocal = false
 		}
 	}
+	return rankingNewOrderInput{
+		cID: cID, itemIDs: itemIDs, quantities: quantities, supplyWIDs: supplyWIDs,
+		invalid: invalid, allLocal: allLocal,
+	}
+}
+
+func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+	return runRankingNewOrder(c, ctx, makeRankingNewOrderInput(ctx, rng, false))
+}
+
+func runRankingNewOrder(c rankingBatcher, ctx txnContext, input rankingNewOrderInput) error {
+	cID := input.cID
+	itemIDs, quantities, supplyWIDs := input.itemIDs, input.quantities, input.supplyWIDs
+	invalid, allLocal := input.invalid, input.allLocal
+	lineCount := len(itemIDs)
 
 	stage1 := []string{
 		"begin;",
@@ -1344,9 +1450,6 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	}
 	for _, itemID := range itemIDs {
 		stage1 = append(stage1, fmt.Sprintf("select i_price, i_name, i_data from item where i_id = %d;", itemID))
-	}
-	type stockKey struct {
-		wID, iID int
 	}
 	lockKeys := make([]stockKey, len(itemIDs))
 	for i := range itemIDs {
@@ -1413,10 +1516,10 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		fmt.Sprintf("insert into orders values (%d, %d, %d, %d, '%s', 0, %d, 1);", dNext, ctx.dID, ctx.wID, cID, nowText(), lineCount),
 		fmt.Sprintf("insert into new_orders values (%d, %d, %d);", dNext, ctx.dID, ctx.wID),
 	}
-	// stockQuantityDeltas records the signed change each line applies to
-	// s_quantity. The update is relative, so the applied delta is exact even when
-	// the s_quantity that decided between "subtract" and "restock" was stale.
-	stockQuantityDeltas := make([]int, lineCount)
+	// Stage 1 reads each key's starting quantity. Project repeated keys through
+	// the original order-line sequence so every later line chooses its branch
+	// from the quantity produced by the preceding line for that key.
+	stockQuantityDeltas := projectedStockQuantityDeltas(itemIDs, supplyWIDs, quantities, stockQtys)
 	stockAfterOps := make([]int, lineCount)
 	for i, itemID := range itemIDs {
 		if invalid && i == lineCount-1 {
@@ -1432,19 +1535,15 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		stockAfterOps[i] = len(stage2)
 		stage2 = append(stage2,
 			fmt.Sprintf("select s_ytd from stock where s_i_id = %d and s_w_id = %d;", itemID, supplyWIDs[i]))
-		delta := -quantities[i]
+		delta := stockQuantityDeltas[i]
 		op := "+"
-		if stockQtys[i]-quantities[i] < 10 {
-			delta = 91 - quantities[i]
-		}
-		stockQuantityDeltas[i] = delta
 		if delta < 0 {
 			op, delta = "-", -delta
 		}
 		amount := float32(float64(prices[i]) * float64(quantities[i]))
 		stage2 = append(stage2,
 			fmt.Sprintf("update stock set s_quantity = s_quantity %s %d where s_i_id = %d and s_w_id = %d;", op, delta, itemID, supplyWIDs[i]),
-			fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, NULL, %d, %s, 'dist');", dNext, ctx.dID, ctx.wID, i+1, itemID, supplyWIDs[i], quantities[i], float32SQL(amount)),
+			fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, '', %d, %s, 'dist');", dNext, ctx.dID, ctx.wID, i+1, itemID, supplyWIDs[i], quantities[i], float32SQL(amount)),
 		)
 	}
 	if !allLocal {
@@ -1845,6 +1944,95 @@ func verifyBenchmarkFeatures(c txnBackend, p profile) error {
 	return nil
 }
 
+func preparedInvalidItemSnapshotQueries(ctx txnContext, input rankingNewOrderInput, orderID int) []string {
+	queries := []string{
+		fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
+		fmt.Sprintf("select count(*) from orders where o_w_id = %d and o_d_id = %d and o_id = %d;",
+			ctx.wID, ctx.dID, orderID),
+		fmt.Sprintf("select count(*) from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;",
+			ctx.wID, ctx.dID, orderID),
+		fmt.Sprintf("select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id = %d;",
+			ctx.wID, ctx.dID, orderID),
+	}
+	keys := make([]stockKey, 0, len(input.itemIDs))
+	for i, itemID := range input.itemIDs {
+		if input.invalid && i == len(input.itemIDs)-1 {
+			continue
+		}
+		keys = append(keys, stockKey{wID: input.supplyWIDs[i], iID: itemID})
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].wID != keys[j].wID {
+			return keys[i].wID < keys[j].wID
+		}
+		return keys[i].iID < keys[j].iID
+	})
+	for i, key := range keys {
+		if i > 0 && keys[i-1] == key {
+			continue
+		}
+		queries = append(queries, fmt.Sprintf(
+			"select s_quantity, s_ytd, s_order_cnt, s_remote_cnt from stock where s_w_id = %d and s_i_id = %d;",
+			key.wID, key.iID))
+	}
+	return queries
+}
+
+func captureQueryResults(c txnBackend, queries []string) ([]string, error) {
+	results := make([]string, len(queries))
+	for i, query := range queries {
+		text, err := c.exec(query)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot query %d: %w", i+1, err)
+		}
+		results[i] = strings.TrimSpace(text)
+	}
+	return results, nil
+}
+
+func verifyPreparedInvalidItemRollback(c txnBackend, p profile) error {
+	batcher, ok := c.(rankingBatcher)
+	if !ok {
+		return errors.New("prepared invalid-item check requires a prepared ranking client")
+	}
+	ctx := txnContext{wID: 1, dID: 1, official: true, profile: p}
+	input := makeRankingNewOrderInput(ctx, rand.New(rand.NewSource(1)), true)
+	if len(input.itemIDs) < 2 || !input.invalid || input.itemIDs[len(input.itemIDs)-1] != p.itemCount+1 {
+		return errors.New("prepared invalid-item check did not generate valid writes followed by an invalid item")
+	}
+	nextText, err := c.exec("select d_next_o_id from district where d_w_id = 1 and d_id = 1;")
+	if err != nil {
+		return fmt.Errorf("prepared invalid-item check district lookup: %w", err)
+	}
+	orderID, err := scalarIntStrict(nextText)
+	if err != nil || orderID < 1 {
+		if err != nil {
+			return fmt.Errorf("prepared invalid-item check district boundary: %w", err)
+		}
+		return fmt.Errorf("prepared invalid-item check district boundary is invalid: %d", orderID)
+	}
+	queries := preparedInvalidItemSnapshotQueries(ctx, input, orderID)
+	before, err := captureQueryResults(c, queries)
+	if err != nil {
+		return fmt.Errorf("prepared invalid-item check before rollback: %w", err)
+	}
+	err = runRankingNewOrder(batcher, ctx, input)
+	if !errors.Is(err, errInvalidItem) {
+		return fmt.Errorf("prepared invalid-item check returned %v, want business rollback", err)
+	}
+	after, err := captureQueryResults(c, queries)
+	if err != nil {
+		return fmt.Errorf("prepared invalid-item check after rollback: %w", err)
+	}
+	for i := range queries {
+		if before[i] != after[i] {
+			return fmt.Errorf("prepared invalid-item rollback changed snapshot query %d", i+1)
+		}
+	}
+	fmt.Printf("[feature-check] prepared invalid-item NewOrder rolled back %d prior valid line(s)\n", len(input.itemIDs)-1)
+	return nil
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -2207,6 +2395,9 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			}
 		}
 		if !completed {
+			latency := float64(time.Since(start).Microseconds()) / 1000.0
+			local.record(phase, txnType, "abandoned", latency, "phase deadline reached during conflict retry")
+			stats.record(phase, txnType, "abandoned")
 			continue
 		}
 		latency := float64(time.Since(start).Microseconds()) / 1000.0
@@ -2342,6 +2533,12 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 			}
 		}
 		if !completed {
+			phase, local, window := report.attribute(start, warmupEnd, measure)
+			if local != nil {
+				latency := float64(time.Since(start).Microseconds()) / 1000.0
+				local.record(phase, txnType, "abandoned", latency, "phase deadline reached during conflict retry")
+				stats[window+1].record(phase, txnType, "abandoned")
+			}
 			continue
 		}
 		finish := time.Now()
@@ -2509,8 +2706,10 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 		return nil, fmt.Errorf("official combined windows: %w", err)
 	}
 	for round, window := range windows {
-		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f abort_rate=%.2f%%\n", round+1, rounds, window.NewOrderPerMin,
-			window.AbortRate*100)
+		attempted, committed, expectedRollback, abandoned, completion := window.reportTotals()
+		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f attempted=%d committed=%d expected_rollback=%d abandoned=%d completion=%.2f%% abort_rate=%.2f%%\n",
+			round+1, rounds, window.NewOrderPerMin, attempted, committed, expectedRollback, abandoned,
+			completion*100, window.AbortRate*100)
 	}
 	return windows, nil
 }
@@ -2651,21 +2850,38 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 		return fmt.Errorf("result round %d new_order throughput mismatch", round)
 	}
 	measureCounts := window.Counts["measure"]
-	commits, nonCommits := 0, 0
+	attemptedTotal, committedTotal, serverAborts := 0, 0, 0
 	for txnType, outcomes := range measureCounts {
+		attempted := 0
 		for outcome, count := range outcomes {
 			if count < 0 {
 				return fmt.Errorf("result round %d has negative count for %s/%s", round, txnType, outcome)
 			}
-			if outcome == "commit" {
-				commits += count
-			} else {
-				nonCommits += count
-			}
+			attempted += count
+		}
+		attemptedTotal += attempted
+		committedTotal += outcomes["commit"]
+		serverAborts += outcomes["server-abort"]
+		expectedRollback := outcomes["invalid-item-rollback"]
+		if window.Attempted[txnType] != attempted {
+			return fmt.Errorf("result round %d attempted/count mismatch for %s", round, txnType)
+		}
+		if window.ExpectedRollback[txnType] != expectedRollback {
+			return fmt.Errorf("result round %d expected rollback/count mismatch for %s", round, txnType)
+		}
+		if window.Abandoned[txnType] != outcomes["abandoned"] {
+			return fmt.Errorf("result round %d abandoned/count mismatch for %s", round, txnType)
+		}
+		expectedCompletion := 0.0
+		if attempted > 0 {
+			expectedCompletion = float64(outcomes["commit"]+expectedRollback) / float64(attempted)
+		}
+		if math.Abs(window.Completion[txnType]-expectedCompletion) > 1e-9 {
+			return fmt.Errorf("result round %d completion mismatch for %s", round, txnType)
 		}
 	}
-	if commits+nonCommits > 0 {
-		expectedAbortRate := float64(nonCommits) / float64(commits+nonCommits)
+	if attemptedTotal > 0 {
+		expectedAbortRate := float64(serverAborts) / float64(attemptedTotal)
 		if math.Abs(window.AbortRate-expectedAbortRate) > 1e-9 {
 			return fmt.Errorf("result round %d abort rate mismatch", round)
 		}
@@ -2679,7 +2895,7 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 				return fmt.Errorf("result round %d has no committed %s transaction", round, txnType)
 			}
 		}
-		completed := commits + measureCounts["new_order"]["invalid-item-rollback"]
+		completed := committedTotal + measureCounts["new_order"]["invalid-item-rollback"]
 		if window.Coverage.Completed != completed {
 			return fmt.Errorf("result round %d coverage completed=%d, want %d from commits + business rollbacks",
 				round, window.Coverage.Completed, completed)
@@ -3285,6 +3501,18 @@ func main() {
 		probe.close()
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	if *mode == "official-equivalent" {
+		preparedProbe, preparedErr := factory()
+		if preparedErr == nil {
+			preparedErr = verifyPreparedInvalidItemRollback(preparedProbe, p)
+			preparedProbe.close()
+		}
+		if preparedErr != nil {
+			probe.close()
+			fmt.Fprintln(os.Stderr, preparedErr)
+			os.Exit(1)
+		}
 	}
 	ordersText, err := probe.exec("select count(*) from orders;")
 	if err != nil {

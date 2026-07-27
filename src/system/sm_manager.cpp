@@ -1040,9 +1040,12 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
         }
         std::memset(record.data(), 0, record_size);
         for (const auto& cs : col_src) {
-            // 空字段记为 SQL NULL：数据字节保持全零，只置 NULL 位。
             const char* raw = fields[cs.csv_idx];
-            if (*raw == '\0') {
+            // finalv3 uses an empty string (not SQL NULL) for undelivered CHAR
+            // timestamps. Preserve the existing NULL interpretation for empty
+            // numeric CSV fields, while letting empty text flow through as a
+            // non-NULL, zero-length string.
+            if (*raw == '\0' && cs.type != TYPE_STRING && cs.type != TYPE_DATETIME) {
                 set_null_at(record.data(), cs.null_byte, cs.null_mask);
                 continue;
             }

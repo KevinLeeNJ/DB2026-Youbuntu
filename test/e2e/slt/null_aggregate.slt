@@ -1,6 +1,6 @@
 # null_aggregate.slt — 聚合的 NULL 语义：跳过 NULL 输入、COUNT(col) vs COUNT(*)、
-# COUNT(DISTINCT) 不计 NULL、空组的 MIN/MAX/SUM/AVG 输出 NULL、GROUP BY 把 NULL
-# 当独立分组、HAVING 遇 NULL 为假。
+# COUNT(DISTINCT) 不计 NULL、真正的空输入按 finalv3 A.3 为整数聚合输出 0、
+# 非空全 NULL 输入仍输出 NULL、GROUP BY 把 NULL 当独立分组。
 
 statement ok
 CREATE TABLE na (g INT, v INT, w FLOAT, s CHAR(8));
@@ -114,7 +114,7 @@ SELECT SUM(w), AVG(w) FROM na;
 +------------------+------------------+
 Total record(s): 1
 
-# 空输入：COUNT 为 0，MIN/MAX/SUM/AVG 为 NULL（不是 0）
+# 空输入：按 finalv3 A.3 的测评约定，整数聚合输出 INT32 0；AVG 仍为 NULL。
 query
 SELECT COUNT(*), COUNT(v) FROM na WHERE g = 99;
 ----
@@ -131,7 +131,7 @@ SELECT MIN(v), MAX(v), SUM(v), AVG(v) FROM na WHERE g = 99;
 +------------------+------------------+------------------+------------------+
 |           MIN(v) |           MAX(v) |           SUM(v) |           AVG(v) |
 +------------------+------------------+------------------+------------------+
-|             NULL |             NULL |             NULL |             NULL |
+|                0 |                0 |                0 |             NULL |
 +------------------+------------------+------------------+------------------+
 Total record(s): 1
 
@@ -155,7 +155,7 @@ SELECT SUM(w) FROM na WHERE g = 99;
 +------------------+
 Total record(s): 1
 
-# 输入全是 NULL 等价于空输入
+# 输入全是 NULL 不是真正的空输入，仍保留 NULL。
 query
 SELECT COUNT(v), SUM(v), AVG(v), MIN(v) FROM na WHERE v IS NULL;
 ----
@@ -166,7 +166,7 @@ SELECT COUNT(v), SUM(v), AVG(v), MIN(v) FROM na WHERE v IS NULL;
 +------------------+------------------+------------------+------------------+
 Total record(s): 1
 
-# 一个分组里全是 NULL：COUNT(*) 数行，COUNT(col) 为 0，其余聚合为 NULL
+# 一个分组里全是 NULL：COUNT(*) 数行，其余聚合仍输出 NULL。
 statement ok
 INSERT INTO na VALUES (3, NULL, NULL, NULL);
 
@@ -216,7 +216,7 @@ SELECT g, COUNT(*), SUM(v) FROM ng GROUP BY g ORDER BY g;
 +------------------+------------------+------------------+
 Total record(s): 2
 
-# HAVING：任一操作数为 NULL 则该组不通过（含 <>），g=3 的 SUM(v) 是 NULL
+# HAVING：任一操作数为 NULL 则该组不通过（含 <>），g=3 的 SUM(v) 是 NULL。
 query
 SELECT g, SUM(v) FROM na GROUP BY g HAVING SUM(v) > 0 ORDER BY g;
 ----
@@ -320,14 +320,14 @@ SELECT MIN(c) FROM nmi WHERE a = 1 AND b IS NOT NULL;
 +------------------+
 Total record(s): 1
 
-# IS NULL 同理（没有行满足，结果是 NULL）
+# IS NULL 同理（没有行满足，整数聚合按空输入约定返回 0）
 query
 SELECT MIN(c) FROM nmi WHERE a = 1 AND b IS NULL;
 ----
 +------------------+
 |           MIN(c) |
 +------------------+
-|             NULL |
+|                0 |
 +------------------+
 Total record(s): 1
 

@@ -293,6 +293,41 @@ TEST_F(AnalyzeUpdateTest, rejects_char_parameter_for_prepared_numeric_delta) {
                  IncompatibleTypeError);
 }
 
+TEST_F(AnalyzeUpdateTest, accepts_direct_column_assignment_and_resolves_both_columns) {
+    auto query = analyze_.do_analyze(ast::parse_sql("UPDATE t SET f = id WHERE id = (1 + 1);"));
+
+    ASSERT_EQ(query->set_clauses.size(), 1U);
+    const auto& clause = query->set_clauses[0];
+    EXPECT_EQ(clause.lhs.tab_name, "t");
+    EXPECT_EQ(clause.lhs.col_name, "f");
+    EXPECT_TRUE(clause.is_self_ref);
+    EXPECT_EQ(clause.op, UpdateOp::ASSIGNMENT);
+    EXPECT_EQ(clause.rhs_col.tab_name, "t");
+    EXPECT_EQ(clause.rhs_col.col_name, "id");
+    ASSERT_EQ(query->conds.size(), 1U);
+    EXPECT_TRUE(query->conds[0].is_rhs_val);
+    EXPECT_EQ(query->conds[0].rhs_val.type, TYPE_INT);
+    EXPECT_EQ(query->conds[0].rhs_val.int_val, 2);
+}
+
+TEST_F(AnalyzeUpdateTest, accepts_chained_target_column_terms_and_rejects_ambiguous_or_incompatible_terms) {
+    auto query = analyze_.do_analyze(ast::parse_sql("UPDATE t SET f = f - 1 + 91 WHERE id = 2;"));
+    ASSERT_EQ(query->set_clauses.size(), 1U);
+    const auto& clause = query->set_clauses[0];
+    EXPECT_EQ(clause.op, UpdateOp::SELF_SUB);
+    ASSERT_EQ(clause.additional_terms.size(), 1U);
+    EXPECT_EQ(clause.additional_terms[0].op, UpdateOp::SELF_ADD);
+    EXPECT_EQ(clause.additional_terms[0].rhs.type, TYPE_INT);
+    EXPECT_EQ(clause.additional_terms[0].rhs.int_val, 91);
+
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET f = id + 1 + 2 WHERE id = 2;")), RMDBError);
+
+    std::vector<std::unique_ptr<ast::Value>> values;
+    values.push_back(std::make_unique<ast::StringLit>("bad"));
+    EXPECT_THROW((void)analyze_.do_analyze(bind("UPDATE t SET f = f - 1 + $1 WHERE id = 2;", std::move(values))),
+                 IncompatibleTypeError);
+}
+
 TEST_F(AnalyzeUpdateTest, rejects_missing_lhs_and_non_numeric_self_update_columns) {
     EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET missing = 1 WHERE id = 1;")),
                  ColumnNotFoundError);
@@ -305,6 +340,7 @@ TEST_F(AnalyzeUpdateTest, rejects_missing_lhs_and_non_numeric_self_update_column
 TEST_F(AnalyzeUpdateTest, rejects_incompatible_plain_assignment_during_analysis) {
     EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET f = 'bad' WHERE id = 1;")),
                  IncompatibleTypeError);
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET s = f WHERE id = 1;")), IncompatibleTypeError);
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {

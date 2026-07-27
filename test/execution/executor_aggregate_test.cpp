@@ -407,6 +407,8 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
         make_count_star("cnt"),
         make_aggregate(AggType::SUM, "score", "sum_score"),
         make_aggregate(AggType::AVG, "score", "avg_score"),
+        make_aggregate(AggType::MIN, "score", "min_score"),
+        make_aggregate(AggType::MAX, "score", "max_score"),
     };
     std::vector<TestExecutorHavingCondition> having;
 
@@ -416,14 +418,18 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
     ASSERT_FALSE(exec.is_end());
     auto row = exec.Next();
     ASSERT_NE(row, nullptr);
-    // COUNT(*) over an empty input is 0; SUM/AVG have no non-NULL input and are
-    // therefore SQL NULL (their data bytes stay zeroed).
+    // finalv3 A.3 allows the evaluator's aggregate-empty-set convention to use
+    // INT32 zero. FLOAT AVG keeps its existing SQL NULL behavior.
     EXPECT_EQ(read_int(*row, 0), 0);
     EXPECT_FALSE(is_null(row->data, exec.cols()[0]));
-    EXPECT_TRUE(is_null(row->data, exec.cols()[1]));
+    EXPECT_FALSE(is_null(row->data, exec.cols()[1]));
     EXPECT_TRUE(is_null(row->data, exec.cols()[2]));
+    EXPECT_FALSE(is_null(row->data, exec.cols()[3]));
+    EXPECT_FALSE(is_null(row->data, exec.cols()[4]));
     EXPECT_EQ(read_int(*row, 4), 0);
     EXPECT_FLOAT_EQ(read_float_value(*row, 8), 0.0f);
+    EXPECT_EQ(read_int(*row, 12), 0);
+    EXPECT_EQ(read_int(*row, 16), 0);
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());

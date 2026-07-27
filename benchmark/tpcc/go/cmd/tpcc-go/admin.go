@@ -391,7 +391,7 @@ func generateData(warehouses int, dataDir string, seed int64, overwrite bool) er
 					} else {
 						last = surname(rng.Intn(1000))
 					}
-					if err := w.Write([]string{fmt.Sprint(cID), fmt.Sprint(dID), fmt.Sprint(wID), randomString(rng, 16), "OE", last, randomString(rng, 20), randomString(rng, 20), randomString(rng, 20), randomString(rng, 2), randomString(rng, 9), randomDigits(rng, 16), fixedTimestamp, map[bool]string{true: "BC", false: "GC"}[cID%10 == 0], "50000.0", decimal(rng.Float64()*0.5, 4), "-10.0", "10.0", "1", "0", randomString(rng, 40)}); err != nil {
+					if err := w.Write([]string{fmt.Sprint(cID), fmt.Sprint(dID), fmt.Sprint(wID), randomString(rng, 16), "OE", last, randomString(rng, 20), randomString(rng, 20), randomString(rng, 20), randomString(rng, 2), randomString(rng, 9), randomDigits(rng, 16), fixedTimestamp, map[bool]string{true: "BC", false: "GC"}[cID%10 == 0], "50000", decimal(rng.Float64()*0.5, 4), "-10.0", "10.0", "1", "0", randomString(rng, 40)}); err != nil {
 						return err
 					}
 				}
@@ -603,7 +603,7 @@ func verifyLoadIntegrity(c sqlExecutor, manifest datasetManifest) error {
 		{"orders with o_carrier_id = 0 equals the generated count",
 			"select count(o_id) from orders where o_carrier_id = 0;", generatedCarrierZeroRows},
 		{"order_line rows with an empty delivery time equals the generated count",
-			"select count(*) from order_line where ol_delivery_d is null;", generatedDeliveryNulls},
+			"select count(*) from order_line where ol_delivery_d = '';", generatedDeliveryNulls},
 		{"stock.s_ytd is initially zero",
 			"select count(*) from stock where s_ytd <> 0.0;", 0},
 		{"stock.s_order_cnt is initially zero",

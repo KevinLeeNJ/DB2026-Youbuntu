@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -327,37 +328,36 @@ func TestOfficialWorkerReportAttributesByCompletionTime(t *testing.T) {
 	}
 }
 
-func TestOfficialTPCCTargetIndexesAreDeclared(t *testing.T) {
-	want := []struct {
-		rmdbStatement   string
-		sqliteStatement string
-	}{
-		{
-			rmdbStatement:   "create index customer_last on customer(c_w_id, c_d_id, c_last, c_id);",
-			sqliteStatement: "create index idx_customer_last on customer(c_w_id, c_d_id, c_last, c_id);",
-		},
-		{
-			rmdbStatement:   "create index orders_customer on orders(o_w_id, o_d_id, o_c_id, o_id);",
-			sqliteStatement: "create index idx_orders_customer on orders(o_w_id, o_d_id, o_c_id, o_id);",
-		},
-	}
-	for _, schemaName := range []string{"rmdb_indexes.sql", "sqlite_indexes.sql"} {
-		data, err := os.ReadFile(tpccSchemaPath(schemaName))
+func TestOfficialTPCCSchemaAndIndexesMatchFinalV3(t *testing.T) {
+	const wantSchema = `create table warehouse (w_id int, w_name char(10), w_street_1 char(20), w_street_2 char(20), w_city char(20), w_state char(2), w_zip char(9), w_tax float, w_ytd float);
+create table district (d_id int, d_w_id int, d_name char(10), d_street_1 char(20), d_street_2 char(20), d_city char(20), d_state char(2), d_zip char(9), d_tax float, d_ytd float, d_next_o_id int);
+create table customer (c_id int, c_d_id int, c_w_id int, c_first char(16), c_middle char(2), c_last char(16), c_street_1 char(20), c_street_2 char(20), c_city char(20), c_state char(2), c_zip char(9), c_phone char(16), c_since char(30), c_credit char(2), c_credit_lim int, c_discount float, c_balance float, c_ytd_payment float, c_payment_cnt int, c_delivery_cnt int, c_data char(50));
+create table history (h_c_id int, h_c_d_id int, h_c_w_id int, h_d_id int, h_w_id int, h_date char(30), h_amount float, h_data char(24));
+create table new_orders (no_o_id int, no_d_id int, no_w_id int);
+create table orders (o_id int, o_d_id int, o_w_id int, o_c_id int, o_entry_d char(30), o_carrier_id int, o_ol_cnt int, o_all_local int);
+create table order_line (ol_o_id int, ol_d_id int, ol_w_id int, ol_number int, ol_i_id int, ol_supply_w_id int, ol_delivery_d char(30), ol_quantity int, ol_amount float, ol_dist_info char(24));
+create table item (i_id int, i_im_id int, i_name char(24), i_price float, i_data char(50));
+create table stock (s_i_id int, s_w_id int, s_quantity int, s_dist_01 char(24), s_dist_02 char(24), s_dist_03 char(24), s_dist_04 char(24), s_dist_05 char(24), s_dist_06 char(24), s_dist_07 char(24), s_dist_08 char(24), s_dist_09 char(24), s_dist_10 char(24), s_ytd float, s_order_cnt int, s_remote_cnt int, s_data char(50));`
+	const wantIndexes = `create index warehouse(w_id);
+create index district(d_w_id, d_id);
+create index customer(c_w_id, c_d_id, c_id);
+create index customer(c_w_id, c_d_id, c_last, c_id);
+create index new_orders(no_w_id, no_d_id, no_o_id);
+create index orders(o_w_id, o_d_id, o_id);
+create index orders(o_w_id, o_d_id, o_c_id, o_id);
+create index order_line(ol_w_id, ol_d_id, ol_o_id, ol_number);
+create index item(i_id);
+create index stock(s_w_id, s_i_id);`
+	for file, want := range map[string]string{
+		"rmdb_schema.sql":  wantSchema,
+		"rmdb_indexes.sql": wantIndexes,
+	} {
+		data, err := os.ReadFile(tpccSchemaPath(file))
 		if err != nil {
 			t.Fatal(err)
 		}
-		text := strings.ToLower(string(data))
-		for _, index := range want {
-			statement := index.sqliteStatement
-			if schemaName == "rmdb_indexes.sql" {
-				statement = index.rmdbStatement
-			}
-			if !strings.Contains(text, statement) {
-				t.Errorf("%s does not declare %q", schemaName, statement)
-			}
-		}
-		if strings.Contains(text, "distinct") || strings.Contains(text, "exec_batch") || strings.Contains(text, "prepare_set") {
-			t.Errorf("%s contains out-of-scope protocol or DISTINCT changes", schemaName)
+		if got := strings.TrimSpace(string(data)); got != want {
+			t.Errorf("%s differs from the finalv3 contract\n--- got ---\n%s\n--- want ---\n%s", file, got, want)
 		}
 	}
 }
@@ -373,6 +373,13 @@ func TestOfficialTPCCTargetIndexesExecuteAndSupportQueries(t *testing.T) {
 	}
 	if err := backend.execFile(tpccSchemaPath("sqlite_indexes.sql")); err != nil {
 		t.Fatal(err)
+	}
+	customerInfo, err := backend.exec("pragma table_info(customer);")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToUpper(customerInfo), "|C_CREDIT_LIM|INTEGER|") {
+		t.Fatalf("SQLite c_credit_lim does not use INTEGER affinity:\n%s", customerInfo)
 	}
 
 	checks := []struct {
@@ -471,6 +478,52 @@ func TestResultFinalizeIncludesPerTransactionTPM(t *testing.T) {
 	}
 }
 
+func TestResultFinalizeReportsLogicalAttemptOutcomes(t *testing.T) {
+	result := newResult(60)
+	result.record("measure", "new_order", "commit", 1, "")
+	result.record("measure", "new_order", "invalid-item-rollback", 1, errInvalidItem.Error())
+	result.record("measure", "new_order", "abandoned", 1, "deadline")
+	result.record("measure", "payment", "commit", 1, "")
+	result.finalize()
+
+	if result.Attempted["new_order"] != 3 || result.Committed["new_order"] != 1 ||
+		result.ExpectedRollback["new_order"] != 1 || result.Abandoned["new_order"] != 1 {
+		t.Fatalf("NewOrder report = attempted:%d committed:%d expected:%d abandoned:%d",
+			result.Attempted["new_order"], result.Committed["new_order"],
+			result.ExpectedRollback["new_order"], result.Abandoned["new_order"])
+	}
+	if got, want := result.Completion["new_order"], 2.0/3.0; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("NewOrder completion = %v, want %v", got, want)
+	}
+	if result.NewOrderPerMin != 1 {
+		t.Fatalf("NewOrder/min = %v, want committed-only numerator 1", result.NewOrderPerMin)
+	}
+	if result.AbortRate != 0 {
+		t.Fatalf("abort rate = %v, expected rollback and abandonment are not server aborts", result.AbortRate)
+	}
+}
+
+func TestResultValidationDerivesAbortRateFromServerAbortsOnly(t *testing.T) {
+	result := newResult(60)
+	result.record("measure", "new_order", "commit", 1, "")
+	result.record("measure", "new_order", "server-abort", 1, "conflict")
+	result.record("measure", "new_order", "invalid-item-rollback", 1, errInvalidItem.Error())
+	result.record("measure", "new_order", "abandoned", 1, "deadline")
+	result.finalize()
+
+	if result.AbortRate != 0.25 {
+		t.Fatalf("abort rate = %v, want 1 server abort / 4 attempted", result.AbortRate)
+	}
+	if err := validateResultWindow(result, 60, "sqlite-reference", 1); err != nil {
+		t.Fatal(err)
+	}
+	result.AbortRate = 0.75
+	if err := validateResultWindow(result, 60, "sqlite-reference", 1); err == nil ||
+		!strings.Contains(err.Error(), "abort rate mismatch") {
+		t.Fatalf("validation error = %v, want abort rate mismatch", err)
+	}
+}
+
 func TestWorkerSeedIsStableAndSeparatesStreams(t *testing.T) {
 	const seed int64 = 8675309
 	first := workerSeed(seed, 1, 0)
@@ -522,6 +575,38 @@ func TestResultMetricsExcludeWarmupButKeepWarmupCounts(t *testing.T) {
 	}
 	if _, ok := result.LatencyMS["payment"]; ok {
 		t.Fatalf("abort latency unexpectedly summarized: %#v", result.LatencyMS["payment"])
+	}
+}
+
+func TestLiveStatsCountsOnlyServerAbortInAbortRate(t *testing.T) {
+	stats := &liveStats{}
+	stats.record("measure", "new_order", "commit")
+	stats.record("measure", "new_order", "invalid-item-rollback")
+	stats.record("measure", "new_order", "abandoned")
+	stats.record("measure", "payment", "backend-error")
+	stats.record("measure", "payment", "server-abort")
+
+	index := phaseIndex("measure")
+	if got := stats.attempted[index].Load(); got != 5 {
+		t.Fatalf("attempted = %d, want 5", got)
+	}
+	if got := stats.commits[index].Load(); got != 1 {
+		t.Fatalf("commits = %d, want 1", got)
+	}
+	if got := stats.serverAborts[index].Load(); got != 1 {
+		t.Fatalf("server aborts = %d, want 1", got)
+	}
+	if got := stats.newOrderAttempted[index].Load(); got != 3 {
+		t.Fatalf("NewOrder attempted = %d, want 3", got)
+	}
+	if got := stats.newOrderCommits[index].Load(); got != 1 {
+		t.Fatalf("NewOrder commits = %d, want 1", got)
+	}
+	if got := stats.newOrderServerAborts[index].Load(); got != 0 {
+		t.Fatalf("NewOrder server aborts = %d, want 0", got)
+	}
+	if got := liveAbortRatePercent(stats.attempted[index].Load(), stats.serverAborts[index].Load()); got != 20 {
+		t.Fatalf("live abort rate = %v%%, want 20%%", got)
 	}
 }
 
@@ -662,6 +747,20 @@ func (b *lifecycleBackend) commit() error { return nil }
 func (b *lifecycleBackend) rollback()     {}
 func (b *lifecycleBackend) close()        { b.closeCount++ }
 
+type alwaysAbortBackend struct {
+	attempts   int
+	closeCount int
+}
+
+func (b *alwaysAbortBackend) exec(string) (string, error) { return "", nil }
+func (b *alwaysAbortBackend) begin() error {
+	b.attempts++
+	return errAbort
+}
+func (b *alwaysAbortBackend) commit() error { return nil }
+func (b *alwaysAbortBackend) rollback()     {}
+func (b *alwaysAbortBackend) close()        { b.closeCount++ }
+
 func resultTransactionCount(result *result, phase string) int {
 	total := 0
 	for _, outcomes := range result.Counts[phase] {
@@ -698,6 +797,38 @@ func TestOfficialWorkerRetainsBackendAcrossAllPhases(t *testing.T) {
 		if got := resultTransactionCount(result, "measure"); got == 0 {
 			t.Fatalf("measurement window %d received no transactions", window+1)
 		}
+	}
+}
+
+func TestOfficialWorkerCountsRetriedTransactionOnceWhenDeadlineAbandonsIt(t *testing.T) {
+	backend := &alwaysAbortBackend{}
+	stats := []*liveStats{{}, {}}
+	output := make(chan officialWorkerReport, 1)
+	warmupEnd := time.Now()
+	p := profile{warehouses: 50, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 25}
+	plan, err := newOfficialRoutingPlan(1, p, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go runOfficialWorker(0, 1, 1,
+		p, plan, warmupEnd, 20*time.Millisecond, 1, 0, stats, make(chan struct{}), output, backend)
+	report := <-output
+	if report.err != nil {
+		t.Fatal(report.err)
+	}
+	window := report.windows[0]
+	window.finalize()
+	if backend.attempts < 2 {
+		t.Fatalf("backend attempts = %d, want retries before deadline", backend.attempts)
+	}
+	attempted, abandoned := 0, 0
+	for txnType, count := range window.Attempted {
+		attempted += count
+		abandoned += window.Abandoned[txnType]
+	}
+	if attempted != 1 || abandoned != 1 || window.Coverage.Completed != 0 {
+		t.Fatalf("report = attempted:%d abandoned:%d coverage:%d, want 1/1/0",
+			attempted, abandoned, window.Coverage.Completed)
 	}
 }
 
@@ -776,6 +907,85 @@ func TestStockLevelCountQueryUsesServerDistinct(t *testing.T) {
 	}
 }
 
+type preparedRollbackProbe struct {
+	*fakeRankingBatcher
+	statements []string
+	leaveDirty bool
+	dirty      bool
+}
+
+func newPreparedRollbackProbe(t *testing.T, leaveDirty bool) *preparedRollbackProbe {
+	t.Helper()
+	return &preparedRollbackProbe{fakeRankingBatcher: newFakeRankingBatcher(t), leaveDirty: leaveDirty}
+}
+
+func (p *preparedRollbackProbe) batchOperation(sql string) (batchOperation, error) {
+	p.statements = append(p.statements, sql)
+	return p.fakeRankingBatcher.batchOperation(sql)
+}
+
+func (p *preparedRollbackProbe) execBatch(operations []batchOperation) (batchResult, error) {
+	result, err := p.fakeRankingBatcher.execBatch(operations)
+	if err == nil {
+		for _, operation := range operations {
+			if operation.sql == "abort;" {
+				p.dirty = p.leaveDirty
+			}
+		}
+	}
+	return result, err
+}
+
+func (p *preparedRollbackProbe) exec(sql string) (string, error) {
+	switch {
+	case strings.HasPrefix(sql, "select d_next_o_id"):
+		if p.dirty {
+			return "3002", nil
+		}
+		return "3001", nil
+	case strings.HasPrefix(sql, "select count(*)"):
+		if p.dirty {
+			return "1", nil
+		}
+		return "0", nil
+	case strings.HasPrefix(sql, "select s_quantity, s_ytd"):
+		return "15|0.0|0|0", nil
+	default:
+		return "", fmt.Errorf("unexpected prepared rollback probe SQL: %s", sql)
+	}
+}
+
+func (p *preparedRollbackProbe) begin() error  { return nil }
+func (p *preparedRollbackProbe) commit() error { return nil }
+func (p *preparedRollbackProbe) rollback()     {}
+func (p *preparedRollbackProbe) close()        {}
+
+func TestVerifyPreparedInvalidItemRollbackUsesPreparedWritesAndDetectsResidue(t *testing.T) {
+	ctx := rankingTestContext()
+	probe := newPreparedRollbackProbe(t, false)
+	if err := verifyPreparedInvalidItemRollback(probe, ctx.profile); err != nil {
+		t.Fatal(err)
+	}
+	validWrites, abortIndex := 0, -1
+	for i, statement := range probe.statements {
+		if strings.HasPrefix(statement, "insert into order_line") {
+			validWrites++
+		}
+		if statement == "abort;" {
+			abortIndex = i
+		}
+	}
+	if validWrites == 0 || abortIndex < 0 {
+		t.Fatalf("prepared probe emitted %d valid order_line writes, abort index %d", validWrites, abortIndex)
+	}
+
+	dirty := newPreparedRollbackProbe(t, true)
+	err := verifyPreparedInvalidItemRollback(dirty, ctx.profile)
+	if err == nil || !strings.Contains(err.Error(), "changed snapshot") {
+		t.Fatalf("dirty rollback error = %v, want changed snapshot", err)
+	}
+}
+
 func TestVerifyBenchmarkFeaturesUsesFormalDistinctAndRollback(t *testing.T) {
 	backend, err := newSQLiteBackend(filepath.Join(t.TempDir(), "tpcc.sqlite"))
 	if err != nil {
@@ -846,17 +1056,17 @@ func integrityManifest() datasetManifest {
 
 func passingIntegrityAnswers(manifest datasetManifest) map[string]int64 {
 	return map[string]int64{
-		"select sum(o_ol_cnt) from orders;":                            manifest.Files["order_line"].Rows,
-		"select count(*) from stock where s_quantity < 10;":            0,
-		"select count(*) from stock where s_quantity > 100;":           0,
-		"select count(*) from orders where o_ol_cnt < 5;":              0,
-		"select count(*) from orders where o_ol_cnt > 15;":             0,
-		"select count(*) from orders where o_carrier_id = 0;":          manifest.Files["new_orders"].Rows,
-		"select count(o_id) from orders where o_carrier_id = 0;":       int64(manifest.Aggregates[aggOrdersCarrierZeroRows]),
-		"select count(*) from order_line where ol_delivery_d is null;": int64(manifest.Aggregates[aggOrderLineDeliveryNulls]),
-		"select count(*) from stock where s_ytd <> 0.0;":               0,
-		"select count(*) from stock where s_order_cnt <> 0;":           0,
-		"select count(*) from stock where s_remote_cnt <> 0;":          0,
+		"select sum(o_ol_cnt) from orders;":                         manifest.Files["order_line"].Rows,
+		"select count(*) from stock where s_quantity < 10;":         0,
+		"select count(*) from stock where s_quantity > 100;":        0,
+		"select count(*) from orders where o_ol_cnt < 5;":           0,
+		"select count(*) from orders where o_ol_cnt > 15;":          0,
+		"select count(*) from orders where o_carrier_id = 0;":       manifest.Files["new_orders"].Rows,
+		"select count(o_id) from orders where o_carrier_id = 0;":    int64(manifest.Aggregates[aggOrdersCarrierZeroRows]),
+		"select count(*) from order_line where ol_delivery_d = '';": int64(manifest.Aggregates[aggOrderLineDeliveryNulls]),
+		"select count(*) from stock where s_ytd <> 0.0;":            0,
+		"select count(*) from stock where s_order_cnt <> 0;":        0,
+		"select count(*) from stock where s_remote_cnt <> 0;":       0,
 	}
 }
 
@@ -883,17 +1093,17 @@ func TestVerifyLoadIntegrityChecksThePublishedSemantics(t *testing.T) {
 func TestVerifyLoadIntegrityRejectsEveryViolation(t *testing.T) {
 	manifest := integrityManifest()
 	violations := map[string]int64{
-		"select sum(o_ol_cnt) from orders;":                            manifest.Files["order_line"].Rows - 1,
-		"select count(*) from stock where s_quantity < 10;":            1,
-		"select count(*) from stock where s_quantity > 100;":           1,
-		"select count(*) from orders where o_ol_cnt < 5;":              1,
-		"select count(*) from orders where o_ol_cnt > 15;":             1,
-		"select count(*) from orders where o_carrier_id = 0;":          manifest.Files["new_orders"].Rows + 1,
-		"select count(o_id) from orders where o_carrier_id = 0;":       int64(manifest.Aggregates[aggOrdersCarrierZeroRows]) - 1,
-		"select count(*) from order_line where ol_delivery_d is null;": 0,
-		"select count(*) from stock where s_ytd <> 0.0;":               1,
-		"select count(*) from stock where s_order_cnt <> 0;":           1,
-		"select count(*) from stock where s_remote_cnt <> 0;":          1,
+		"select sum(o_ol_cnt) from orders;":                         manifest.Files["order_line"].Rows - 1,
+		"select count(*) from stock where s_quantity < 10;":         1,
+		"select count(*) from stock where s_quantity > 100;":        1,
+		"select count(*) from orders where o_ol_cnt < 5;":           1,
+		"select count(*) from orders where o_ol_cnt > 15;":          1,
+		"select count(*) from orders where o_carrier_id = 0;":       manifest.Files["new_orders"].Rows + 1,
+		"select count(o_id) from orders where o_carrier_id = 0;":    int64(manifest.Aggregates[aggOrdersCarrierZeroRows]) - 1,
+		"select count(*) from order_line where ol_delivery_d = '';": 0,
+		"select count(*) from stock where s_ytd <> 0.0;":            1,
+		"select count(*) from stock where s_order_cnt <> 0;":        1,
+		"select count(*) from stock where s_remote_cnt <> 0;":       1,
 	}
 	for sql, wrong := range violations {
 		answers := passingIntegrityAnswers(manifest)

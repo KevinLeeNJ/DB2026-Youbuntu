@@ -74,8 +74,10 @@ private:
         int64_t count = 0;
         double sum = 0.0;
         double float_sum = 0.0; // FLOAT inputs accumulate in double to avoid binary32 drift
-        // 是否有非 NULL 输入参与过：MIN/MAX 用它保存最优值，SUM 用它区分
-        // "总和为 0" 和 "没有任何输入"（后者按 SQL 语义输出 NULL）。
+        // 区分 WHERE 后真正的空输入与“有行但该列全为 NULL”。finalv3 A.3
+        // 允许前者按测评约定返回整数 0，后者仍保留 SQL NULL 语义。
+        bool saw_row = false;
+        // 是否有非 NULL 输入参与过：MIN/MAX 用它保存最优值。
         bool has_value = false;
         CellValue value;
         std::unordered_set<CellValue, CellValueHash> distinct_values;
@@ -378,6 +380,7 @@ private:
     }
 
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, TupleView tuple) const {
+        state.saw_row = true;
         // SQL 聚合忽略 NULL 输入：COUNT(col) 不计 NULL、COUNT(DISTINCT col) 不把
         // NULL 当成一个取值、MIN/MAX/SUM/AVG 完全跳过。只有 COUNT(*) 例外。
         if (!spec.is_star && is_null_at(tuple.data, spec.input_null_byte, spec.input_null_mask)) {
@@ -445,8 +448,7 @@ private:
         case LocalAggType::SUM: {
             CellValue value;
             value.type = spec.input_type;
-            // 没有任何非 NULL 输入时 SUM 为 NULL，而不是 0
-            if (!state.has_value) {
+            if (!state.has_value && (spec.input_type != TYPE_INT || state.saw_row)) {
                 value.is_null = true;
                 return value;
             }
@@ -481,7 +483,9 @@ private:
             }
             {
                 CellValue value = zero_value(spec.input_type);
-                value.is_null = true;
+                if (spec.input_type != TYPE_INT || state.saw_row) {
+                    value.is_null = true;
+                }
                 return value;
             }
         }

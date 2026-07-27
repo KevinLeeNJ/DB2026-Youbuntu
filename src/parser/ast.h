@@ -268,20 +268,29 @@ struct SelectItem : public TreeNode {
         : TreeNode(AstType::SelectItem), expr(std::move(expr_)), alias(std::move(alias_)) {}
 };
 
+struct UpdateTerm {
+    std::unique_ptr<Value> val;
+    SetOp op;
+
+    UpdateTerm(std::unique_ptr<Value> val_, SetOp op_) : val(std::move(val_)), op(op_) {}
+};
+
 struct SetClause : public TreeNode {
     std::string col_name;
     std::unique_ptr<Value> val;
     std::unique_ptr<Col> rhs_col;
     bool is_self_ref;
     SetOp op;
+    std::vector<UpdateTerm> additional_terms;
 
     SetClause(std::string col_name_, std::unique_ptr<Value> val_)
         : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)), is_self_ref(false),
           op(SetOp::ASSIGNMENT) {}
 
-    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_, SetOp op_)
+    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_, SetOp op_,
+              std::vector<UpdateTerm> additional_terms_ = {})
         : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)),
-          rhs_col(std::move(rhs_col_)), is_self_ref(true), op(op_) {}
+          rhs_col(std::move(rhs_col_)), is_self_ref(true), op(op_), additional_terms(std::move(additional_terms_)) {}
 };
 
 struct BinaryExpr : public TreeNode {
@@ -587,9 +596,14 @@ struct LoadStmt : public TreeNode {
 };
 
 inline std::unique_ptr<SetClause> clone_set_bound(const SetClause& x, const std::vector<std::unique_ptr<Value>>& b) {
+    std::vector<UpdateTerm> additional_terms;
+    additional_terms.reserve(x.additional_terms.size());
+    for (const auto& term : x.additional_terms) {
+        additional_terms.emplace_back(clone_bound_value(*term.val, b), term.op);
+    }
     return std::make_unique<SetClause>(
         x.col_name, x.rhs_col ? std::make_unique<Col>(x.rhs_col->tab_name, x.rhs_col->col_name) : nullptr,
-        x.val ? clone_bound_value(*x.val, b) : nullptr, x.op);
+        x.val ? clone_bound_value(*x.val, b) : nullptr, x.op, std::move(additional_terms));
 }
 
 inline std::unique_ptr<JoinExpr> clone_join_bound(const JoinExpr& x, const std::vector<std::unique_ptr<Value>>& b) {
@@ -658,11 +672,16 @@ inline std::unique_ptr<TreeNode> clone_bound_tree(const TreeNode& root, const st
         const auto& x = static_cast<const UpdateStmt&>(root);
         std::vector<std::unique_ptr<SetClause>> sets, conds_dummy;
         for (const auto& s : x.set_clauses) {
+            std::vector<UpdateTerm> additional_terms;
+            additional_terms.reserve(s->additional_terms.size());
+            for (const auto& term : s->additional_terms) {
+                additional_terms.emplace_back(clone_bound_value(*term.val, b), term.op);
+            }
             std::unique_ptr<SetClause> copy;
             if (s->is_self_ref)
-                copy = std::make_unique<SetClause>(s->col_name,
-                                                   std::make_unique<Col>(s->rhs_col->tab_name, s->rhs_col->col_name),
-                                                   s->val ? clone_bound_value(*s->val, b) : nullptr, s->op);
+                copy = std::make_unique<SetClause>(
+                    s->col_name, std::make_unique<Col>(s->rhs_col->tab_name, s->rhs_col->col_name),
+                    s->val ? clone_bound_value(*s->val, b) : nullptr, s->op, std::move(additional_terms));
             else
                 copy = std::make_unique<SetClause>(s->col_name, s->val ? clone_bound_value(*s->val, b) : nullptr);
             sets.push_back(std::move(copy));

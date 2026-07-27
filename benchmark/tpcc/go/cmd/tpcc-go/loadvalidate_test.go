@@ -36,6 +36,16 @@ func TestDatasetManifestRecordsAggregatesMatchingTheCSV(t *testing.T) {
 	if err := generateData(sampleTestWarehouses, dir, 13, true); err != nil {
 		t.Fatal(err)
 	}
+	creditLimitColumn, customerRows := csvColumn(t, filepath.Join(dir, "customer.csv"), "c_credit_lim")
+	for row, values := range customerRows {
+		creditLimit, err := strconv.ParseInt(values[creditLimitColumn], 10, 32)
+		if err != nil || creditLimit != 50000 {
+			t.Fatalf("customer.csv row %d c_credit_lim = %q, want INT 50000", row+1, values[creditLimitColumn])
+		}
+	}
+	if _, floatTyped := float32Columns["c_credit_lim"]; floatTyped {
+		t.Fatal("c_credit_lim is classified as FLOAT32, want INT")
+	}
 	manifest, err := readDatasetManifest(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -255,11 +265,7 @@ func (e *sampleSQLExecutor) answerContent(sql string) (string, bool) {
 			}
 			values := make([]string, len(spec.values))
 			for i, column := range spec.values {
-				if sample[column] == "" {
-					values[i] = "NULL"
-				} else {
-					values[i] = sample[column]
-				}
+				values[i] = sample[column]
 			}
 			return rowAnswer(values), true
 		}
@@ -383,10 +389,9 @@ func TestVerifyLoadContentSamplesRejectsAWrongOrderLineCount(t *testing.T) {
 	}
 }
 
-func TestVerifyLoadContentSamplesRejectsANonNullDeliveryTime(t *testing.T) {
+func TestVerifyLoadContentSamplesRejectsANonEmptyDeliveryTime(t *testing.T) {
 	// order_line.ol_delivery_d is the only sampled column the generator can leave
-	// empty, so it is the one that proves the loader turned an empty CSV field into
-	// SQL NULL rather than into an empty string.
+	// empty, so it proves the loader preserved the non-NULL empty CHAR sentinel.
 	manifest := sampleTestManifest(t)
 	spec, _ := datasetSampleSpecFor("order_line")
 	injected := false
@@ -409,8 +414,8 @@ func TestVerifyLoadContentSamplesRejectsANonNullDeliveryTime(t *testing.T) {
 		}
 		executor := &sampleSQLExecutor{manifest: manifest, overrides: map[string]string{sql: rowAnswer(values)}}
 		if err := verifyLoadContentSamples(executor, manifest); err == nil ||
-			!strings.Contains(err.Error(), "want NULL") {
-			t.Errorf("a non-NULL delivery time reported %v, want a NULL mismatch", err)
+			!strings.Contains(err.Error(), "want empty CHAR") {
+			t.Errorf("a non-empty delivery time reported %v, want an empty CHAR mismatch", err)
 		}
 		injected = true
 		break
@@ -427,12 +432,14 @@ func TestCompareSampledValueHandlesEveryColumnShape(t *testing.T) {
 	}{
 		{"c_credit", "BC", "BC", true},
 		{"c_credit", "BC", "GC", false},
+		{"c_credit_lim", "50000", "50000", true},
+		{"c_credit_lim", "50000", "50000.0", false},
 		{"w_ytd", "300000.0", "300000", true},
 		{"d_tax", "0.1234", "0.12340001", false},
 		{"d_tax", "0.1234", "0.1234000027179718", true},
 		{"d_tax", "0.1234", "0.1244", false},
-		{"ol_delivery_d", "", "NULL", true},
-		{"ol_delivery_d", "", "", false},
+		{"ol_delivery_d", "", "", true},
+		{"ol_delivery_d", "", "NULL", false},
 		{"ol_delivery_d", fixedTimestamp, "NULL", false},
 		{"c_last", "BARBARBAR", "BARBARBAR ", true},
 	}

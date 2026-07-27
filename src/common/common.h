@@ -196,10 +196,19 @@ inline NullEval eval_condition_nulls(const Condition& cond, const char* tuple, i
 
 enum class UpdateOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
 
+struct UpdateTerm {
+    Value rhs;
+    UpdateOp op = UpdateOp::SELF_ADD;
+};
+
 struct SetClause {
     TabCol lhs;
     Value rhs;
     bool is_self_ref = false;
     TabCol rhs_col;
     UpdateOp op = UpdateOp::ASSIGNMENT;
+    // Ordered scalar +/- terms after the legacy first operation. Keeping the
+    // first term in the existing fields preserves prepared/cache compatibility
+    // for the ranking-critical single-operation UPDATE shape.
+    std::vector<UpdateTerm> additional_terms;
 };

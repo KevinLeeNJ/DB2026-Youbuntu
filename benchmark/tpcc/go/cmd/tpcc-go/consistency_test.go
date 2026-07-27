@@ -98,9 +98,9 @@ func passingIntAnswers(m consistencyModel, rules []intRule) map[string]float64 {
 	// The derived rules compare two aggregates of the recovered database; scripting
 	// them as an agreeing pair is what "the rule holds" means.
 	answers["select sum(o_ol_cnt) from orders where o_carrier_id = 0;"] = testUndeliveredLines
-	answers["select count(*) from order_line where ol_delivery_d is null;"] = testUndeliveredLines
+	answers["select count(*) from order_line where ol_delivery_d = '';"] = testUndeliveredLines
 	answers["select sum(o_ol_cnt) from orders where o_carrier_id <> 0;"] = testDeliveredLines
-	answers["select count(*) from order_line where ol_delivery_d is not null;"] = testDeliveredLines
+	answers["select count(*) from order_line where ol_delivery_d <> '';"] = testDeliveredLines
 	answers["select count(o_id) from orders where o_w_id = 1 and o_d_id = 1;"] = testPartitionOrders
 	answers["select d_next_o_id from district where d_w_id = 1 and d_id = 1;"] = testPartitionDNext
 	answers["select count(ol_o_id) from order_line where ol_w_id = 1 and ol_d_id = 1;"] = testPartitionLines
@@ -147,18 +147,18 @@ func partitionAnswers(answers map[string]float64, m consistencyModel) map[string
 func onePartitionAnswers(wID, dID int) map[string]float64 {
 	const orders, lines, pending, pendingLines = 3100, 31000, 900, 9000
 	return map[string]float64{
-		fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", wID, dID):                              orders + 1,
-		fmt.Sprintf("select max(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                                orders,
-		fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                              orders,
-		fmt.Sprintf("select min(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                                1,
-		fmt.Sprintf("select count(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID):                     pending,
-		fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID):                       orders - pending + 1,
-		fmt.Sprintf("select max(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID):                       orders,
-		fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID):         pending,
-		fmt.Sprintf("select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                            lines,
-		fmt.Sprintf("select count(ol_o_id) from order_line where ol_w_id = %d and ol_d_id = %d;", wID, dID):                     lines,
-		fmt.Sprintf("select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID):       pendingLines,
-		fmt.Sprintf("select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_delivery_d is null;", wID, dID): pendingLines,
+		fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", wID, dID):                           orders + 1,
+		fmt.Sprintf("select max(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                             orders,
+		fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                           orders,
+		fmt.Sprintf("select min(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                             1,
+		fmt.Sprintf("select count(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID):                  pending,
+		fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID):                    orders - pending + 1,
+		fmt.Sprintf("select max(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID):                    orders,
+		fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID):      pending,
+		fmt.Sprintf("select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d;", wID, dID):                         lines,
+		fmt.Sprintf("select count(ol_o_id) from order_line where ol_w_id = %d and ol_d_id = %d;", wID, dID):                  lines,
+		fmt.Sprintf("select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID):    pendingLines,
+		fmt.Sprintf("select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_delivery_d = '';", wID, dID): pendingLines,
 	}
 }
 
@@ -391,7 +391,7 @@ func TestPartitionCheckRejectsEveryPartitionViolation(t *testing.T) {
 // final.md:345 names and the previous implementation lacked.
 func TestPartitionCheckCoversEmptyDeliveryTime(t *testing.T) {
 	base := onePartitionAnswers(2, 4)
-	const sql = "select count(*) from order_line where ol_w_id = 2 and ol_d_id = 4 and ol_delivery_d is null;"
+	const sql = "select count(*) from order_line where ol_w_id = 2 and ol_d_id = 4 and ol_delivery_d = '';"
 	if _, ok := base[sql]; !ok {
 		t.Fatalf("the partition check does not count rows with an empty delivery time")
 	}
@@ -415,7 +415,7 @@ func TestPartitionCheckAcceptsAnEmptyNewOrderQueue(t *testing.T) {
 	answers["select count(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;"] = 0
 	answers["select count(o_id) from orders where o_w_id = 1 and o_d_id = 1 and o_carrier_id = 0;"] = 0
 	answers["select sum(o_ol_cnt) from orders where o_w_id = 1 and o_d_id = 1 and o_carrier_id = 0;"] = 0
-	answers["select count(*) from order_line where ol_w_id = 1 and ol_d_id = 1 and ol_delivery_d is null;"] = 0
+	answers["select count(*) from order_line where ol_w_id = 1 and ol_d_id = 1 and ol_delivery_d = '';"] = 0
 	executor := &nullableAggregateExecutor{scriptedAggregateExecutor{answers: answers}, map[string]bool{
 		"select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;": true,
 		"select max(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;": true,

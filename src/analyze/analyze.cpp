@@ -162,9 +162,26 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                     if (!is_numeric_type(lhs_meta->type) || !is_numeric_type(rhs_meta->type)) {
                         throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(rhs_meta->type));
                     }
-                    if (set_clause->val == nullptr || clause.rhs.is_null || !is_numeric_type(clause.rhs.type)) {
+                    if (set_clause->val == nullptr || (!clause.rhs.is_null && !is_numeric_type(clause.rhs.type))) {
                         throw IncompatibleTypeError(coltype2str(rhs_meta->type), coltype2str(clause.rhs.type));
                     }
+                }
+                if (!set_clause->additional_terms.empty() && (clause.rhs_col.tab_name != clause.lhs.tab_name ||
+                                                              clause.rhs_col.col_name != clause.lhs.col_name)) {
+                    throw RMDBError("chained UPDATE arithmetic must use the target column as its base");
+                }
+                clause.additional_terms.reserve(set_clause->additional_terms.size());
+                for (const auto& ast_term : set_clause->additional_terms) {
+                    UpdateTerm term;
+                    term.op = convert_update_op(ast_term.op);
+                    if (term.op != UpdateOp::SELF_ADD && term.op != UpdateOp::SELF_SUB) {
+                        throw InternalError("Unexpected chained UPDATE operator");
+                    }
+                    term.rhs = convert_sv_value(ast_term.val.get());
+                    if (!term.rhs.is_null && !is_numeric_type(term.rhs.type)) {
+                        throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(term.rhs.type));
+                    }
+                    clause.additional_terms.push_back(std::move(term));
                 }
             } else if (!clause.rhs.is_null && !can_cast(lhs_meta->type, clause.rhs.type)) {
                 throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(clause.rhs.type));

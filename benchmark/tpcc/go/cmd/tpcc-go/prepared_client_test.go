@@ -77,6 +77,22 @@ func TestRankingTemplatesDeclareSchemasAndFitProtocolBounds(t *testing.T) {
 	}
 }
 
+func TestPaymentCreditLimitPreparedSchemaIsInt32(t *testing.T) {
+	matches := 0
+	for _, template := range rankingTemplates() {
+		if !strings.Contains(template.sql, "c_credit_lim") {
+			continue
+		}
+		matches++
+		if len(template.columns) != 14 || template.columns[10] != wireTypeInt32 {
+			t.Fatalf("Payment customer schema = %#v, want c_credit_lim INT32 at column 11", template.columns)
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("found %d ranking templates projecting c_credit_lim, want 1", matches)
+	}
+}
+
 // prepareOKBody encodes a PREPARE_OK response whose per-statement column types
 // are supplied by the caller, so the decoder can be driven with both correct and
 // deliberately wrong schemas.

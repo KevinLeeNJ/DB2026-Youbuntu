@@ -133,7 +133,7 @@ var baselineQueries = []baselineQuery{
 		[]string{baseOrdersCarrierZeroRows}},
 	{"select count(*), sum(ol_amount), sum(ol_quantity) from order_line;",
 		[]string{baseOrderLineRows, baseOrderLineAmount, baseOrderLineQuantity}},
-	{"select count(*) from order_line where ol_delivery_d is null;",
+	{"select count(*) from order_line where ol_delivery_d = '';",
 		[]string{baseOrderLineDeliveryNulls}},
 	{"select count(*) from item;",
 		[]string{baseItemRows}},
@@ -747,10 +747,10 @@ func postRecoveryIntRules(m consistencyModel) []intRule {
 		{name: "orders with o_carrier_id = 0", sql: "select count(o_id) from orders where o_carrier_id = 0;",
 			want: m.b(baseOrdersCarrierZeroRows) + m.l(ledgerNewOrderCommits) - m.l(ledgerDeliveryOrders)},
 		{name: "order_line rows without a delivery time equal SUM(o_ol_cnt) of undelivered orders",
-			sql:     "select count(*) from order_line where ol_delivery_d is null;",
+			sql:     "select count(*) from order_line where ol_delivery_d = '';",
 			wantSQL: "select sum(o_ol_cnt) from orders where o_carrier_id = 0;"},
 		{name: "order_line rows with a delivery time equal SUM(o_ol_cnt) of delivered orders",
-			sql:     "select count(*) from order_line where ol_delivery_d is not null;",
+			sql:     "select count(*) from order_line where ol_delivery_d <> '';",
 			wantSQL: "select sum(o_ol_cnt) from orders where o_carrier_id <> 0;"},
 
 		// (3) final.md:323 — warehouse, district, customer, order line, item and
@@ -1066,10 +1066,10 @@ func checkPartition(runner *ruleRunner, wID, dID int) {
 	// names ("空配送时间行数") and that the previous implementation was missing.
 	pendingLines, okPending := query(fmt.Sprintf(
 		"select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID))
-	nullLines, okNull := query(fmt.Sprintf(
-		"select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_delivery_d is null;", wID, dID))
-	if okPending && okNull && pendingLines != nullLines {
-		runner.fail("empty delivery time mismatch w=%d d=%d: undelivered_o_ol_cnt=%d, null_delivery_rows=%d",
-			wID, dID, pendingLines, nullLines)
+	emptyLines, okEmpty := query(fmt.Sprintf(
+		"select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_delivery_d = '';", wID, dID))
+	if okPending && okEmpty && pendingLines != emptyLines {
+		runner.fail("empty delivery time mismatch w=%d d=%d: undelivered_o_ol_cnt=%d, empty_delivery_rows=%d",
+			wID, dID, pendingLines, emptyLines)
 	}
 }

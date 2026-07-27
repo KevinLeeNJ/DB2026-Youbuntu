@@ -606,6 +606,22 @@ private:
         return clauses;
     }
 
+    std::unique_ptr<SetClause> parse_column_arithmetic_set_clause(std::string column, std::unique_ptr<Col> rhs_col,
+                                                                  TokenType first_token, SetOp first_op) {
+        auto first_value = parse_numeric_delta_after(first_token);
+        std::vector<UpdateTerm> additional_terms;
+        if (first_token == TokenType::PLUS || first_token == TokenType::MINUS) {
+            while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
+                const TokenType token = current_.type;
+                advance();
+                additional_terms.emplace_back(parse_numeric_delta_after(token),
+                                              token == TokenType::PLUS ? SetOp::SELF_ADD : SetOp::SELF_SUB);
+            }
+        }
+        return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), std::move(first_value), first_op,
+                                           std::move(additional_terms));
+    }
+
     std::unique_ptr<SetClause> parse_set_clause() {
         std::string column = parse_identifier();
 
@@ -628,23 +644,20 @@ private:
         if (check(TokenType::IDENTIFIER)) {
             auto rhs_col = parse_col();
             if (match(TokenType::PLUS)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::PLUS,
+                                                          SetOp::SELF_ADD);
             }
             if (match(TokenType::MINUS)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::MINUS), SetOp::SELF_SUB);
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::MINUS,
+                                                          SetOp::SELF_SUB);
             }
             if (match(TokenType::STAR)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::STAR), SetOp::SELF_MUL);
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::STAR,
+                                                          SetOp::SELF_MUL);
             }
             if (match(TokenType::SLASH)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::SLASH), SetOp::SELF_DIV);
-            }
-            if (rhs_col->col_name != column) {
-                error("expected arithmetic operator after different column reference in SET clause");
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::SLASH,
+                                                          SetOp::SELF_DIV);
             }
             return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), nullptr, SetOp::ASSIGNMENT);
         }

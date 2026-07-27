@@ -701,7 +701,7 @@ TEST_F(E2ETest, LoadCsvMatchesFileContents) {
 
     // warehouse.csv columns: w_id,w_name,w_street_1,w_street_2,w_city,w_state,w_zip,w_tax,w_ytd
     ASSERT_NO_THROW(
-        db_->exec_sql("create table warehouse (w_id int, w_name char(20), w_street_1 char(40), w_street_2 char(40), "
+        db_->exec_sql("create table warehouse (w_id int, w_name char(10), w_street_1 char(20), w_street_2 char(20), "
                       "w_city char(20), w_state char(2), w_zip char(9), w_tax float, w_ytd float);"));
     // Load via "./<name>" — the "./" prefix is recognized as VALUE_PATH by the lexer,
     // and since cwd is the db directory, the copied CSV is found by relative path.
@@ -819,7 +819,7 @@ TEST_F(LoadCsvFixture, ShuffledHeaderCsvMapsByName) {
     EXPECT_NE(output.find("beta"), std::string::npos) << output;
 }
 
-TEST_F(LoadCsvFixture, EmptyFieldsBecomeNullForEveryColumnType) {
+TEST_F(LoadCsvFixture, EmptyNumericFieldsBecomeNullAndEmptyTextRemainsEmpty) {
     // 每种列类型各留一个空字段：INT / FLOAT / CHAR / DATETIME。
     const std::string path = write_csv("load_nulls.csv", "id,i,f,c,d\n"
                                                          "1,10,1.5,aa,2026-01-01 00:00:00\n"
@@ -831,8 +831,8 @@ TEST_F(LoadCsvFixture, EmptyFieldsBecomeNullForEveryColumnType) {
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ln;"); });
     EXPECT_NE(output.find("2"), std::string::npos) << output;
 
-    // 装载完整性校验第 7 条就是这种 "空配送时间行数" 计数。
-    for (const char* column : {"i", "f", "c", "d"}) {
+    // 保留空数值字段的既有 NULL 解释。
+    for (const char* column : {"i", "f"}) {
         ASSERT_NO_THROW(
             { output = db_->exec_sql(std::string("select count(*) from ln where ") + column + " is null;"); });
         EXPECT_NE(output.find("1"), std::string::npos) << column << ": " << output;
@@ -840,9 +840,21 @@ TEST_F(LoadCsvFixture, EmptyFieldsBecomeNullForEveryColumnType) {
             { output = db_->exec_sql(std::string("select count(*) from ln where ") + column + " is not null;"); });
         EXPECT_NE(output.find("1"), std::string::npos) << column << ": " << output;
     }
-    // 空字段必须存成 NULL 而不是空串 / 0。
+
+    // finalv3 要求未配送 CHAR 时间戳使用空字符串，而不是 SQL NULL。
+    for (const char* column : {"c", "d"}) {
+        ASSERT_NO_THROW({ output = db_->exec_sql(std::string("select id from ln where ") + column + " is null;"); });
+        EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << column << ": " << output;
+        ASSERT_NO_THROW({ output = db_->exec_sql(std::string("select id from ln where ") + column + " = '';"); });
+        EXPECT_NE(output.find("2"), std::string::npos) << column << ": " << output;
+        EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << column << ": " << output;
+    }
+    ASSERT_NO_THROW({ output = db_->exec_sql("select c from ln where id = 2;"); });
+    EXPECT_EQ(output.find("NULL"), std::string::npos) << output;
+
     ASSERT_NO_THROW({ output = db_->exec_sql("select id from ln where c = '';"); });
-    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select id from ln where i = 0;"); });
     EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select id from ln where i is null;"); });
@@ -865,9 +877,12 @@ TEST_F(LoadCsvFixture, QuotedFieldsAreUnescapedInsteadOfRejected) {
     EXPECT_NE(output.find("x,y"), std::string::npos) << output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select name from lq where id = 2;"); });
     EXPECT_NE(output.find("a\"b"), std::string::npos) << output;
-    // 引号里的空字段同样按 NULL 处理（空字段一律是 NULL）。
-    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lq where name is null;"); });
+    // RFC 4180 quoted empty text is the same non-NULL empty string.
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lq where name = '';"); });
     EXPECT_NE(output.find("3"), std::string::npos) << output;
+    EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lq where name is null;"); });
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
 }
 
 TEST_F(LoadCsvFixture, ExtraTrailingFieldsAreIgnored) {
@@ -899,15 +914,18 @@ TEST_F(LoadCsvFixture, FewerFieldsThanColumnsIsRejected) {
     EXPECT_NE(err.find("fewer fields"), std::string::npos) << err;
     EXPECT_NE(err.find("row 3"), std::string::npos) << err;
 
-    // 空字段仍然是合法的 NULL，只有"字段个数不够"才报错。
+    // 空文本字段仍然合法，只有"字段个数不够"才报错。
     const std::string ok_path = write_csv("load_short_ok.csv", "id,val,name\n"
                                                                "1,10,alpha\n"
                                                                "2,20,\n");
     ASSERT_NO_THROW(db_->exec_sql("create table lsf_ok (id int, val int, name char(8));"));
     ASSERT_NO_THROW(db_->exec_sql("load " + ok_path + " into lsf_ok;"));
     std::string output;
-    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lsf_ok where name is null;"); });
-    EXPECT_NE(output.find("1"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lsf_ok where name = '';"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lsf_ok where name is null;"); });
+    EXPECT_NE(output.find("Total record(s): 0"), std::string::npos) << output;
 }
 
 TEST_F(LoadCsvFixture, TrailingCommaOnEveryLineStillLoads) {
@@ -968,26 +986,24 @@ TEST_F(LoadCsvFixture, DuplicateHeaderNamesAreTreatedAsData) {
     EXPECT_NE(output.find("2"), std::string::npos) << output;
 }
 
-// 标准 TPC-C 的 customer.c_data 是 char(500)，整条记录 749 字节。RM_MAX_RECORD_SIZE
-// 只有 512 时 CREATE TABLE 第一步就抛 InvalidRecordSizeError，900 秒装载预算一秒
-// 都用不上。final.md 没有公开列宽，所以这条形状必须能建、能装、能查。
-TEST_F(LoadCsvFixture, CustomerShapedTableWithChar500LoadsAndQueries) {
+// 以 finalv3 customer 的精确列型为基形，仅将 c_data 从 char(50) 放大到
+// char(500)，覆盖超过 512 字节的记录能建、能装、能查。
+TEST_F(LoadCsvFixture, FinalV3CustomerShapeWithChar500LoadsAndQueries) {
     const std::string c_data(500, 'z');
-    // 与 benchmark/tpcc/schema/rmdb_schema.sql 的 customer 完全同形，只把 c_data
-    // 从 char(100) 换成标准 TPC-C 的 char(500)：整条记录 749 字节。
+    // finalv3 基形的记录是 242 字节；c_data 增加 450 字节后是 692 字节。
     ASSERT_NO_THROW(db_->exec_sql("create table customer500 ("
-                                  "c_id int, c_d_id int, c_w_id int, c_first char(20), c_middle char(2), "
-                                  "c_last char(40), c_street_1 char(40), c_street_2 char(40), c_city char(20), "
-                                  "c_state char(2), c_zip char(9), c_phone char(16), c_since char(19), "
-                                  "c_credit char(2), c_credit_lim float, c_discount float, c_balance float, "
+                                  "c_id int, c_d_id int, c_w_id int, c_first char(16), c_middle char(2), "
+                                  "c_last char(16), c_street_1 char(20), c_street_2 char(20), c_city char(20), "
+                                  "c_state char(2), c_zip char(9), c_phone char(16), c_since char(30), "
+                                  "c_credit char(2), c_credit_lim int, c_discount float, c_balance float, "
                                   "c_ytd_payment float, c_payment_cnt int, c_delivery_cnt int, c_data char(500));"));
-    EXPECT_EQ(db_->file_header("customer500").record_size, 749);
+    EXPECT_EQ(db_->file_header("customer500").record_size, 692);
     ASSERT_NO_THROW(db_->exec_sql("create index customer500(c_w_id, c_d_id, c_id);"));
 
     auto row = [&](int c_id, const std::string& last, const std::string& data) {
         return std::to_string(c_id) + ",1,1,First,OE," + last +
                ",street1,street2,city,CA,123456789,1234567890123456,2026-01-01 "
-               "00:00:00,GC,50000.0,0.5,-10.0,10.0,1,0," +
+               "00:00:00,GC,50000,0.5,-10.0,10.0,1,0," +
                data + "\n";
     };
     const std::string path =
@@ -998,16 +1014,19 @@ TEST_F(LoadCsvFixture, CustomerShapedTableWithChar500LoadsAndQueries) {
     std::string output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from customer500;"); });
     EXPECT_NE(output.find("3"), std::string::npos) << output;
-    // 索引点查（复合键的尾列是 c_id，和 final.md 的 10 个索引同形）
+    // 索引点查（复合键的尾列是 c_id，和 finalv3 的 10 个索引同形）
     ASSERT_NO_THROW(
         { output = db_->exec_sql("select c_last from customer500 where c_w_id = 1 and c_d_id = 1 and c_id = 2;"); });
     EXPECT_NE(output.find("OUGHTOUGHT"), std::string::npos) << output;
     // 500 字节的定长列必须完整往返（比较按 strnlen 裁掉右侧零填充）
     ASSERT_NO_THROW({ output = db_->exec_sql("select c_id from customer500 where c_data = '" + c_data + "';"); });
     EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << output;
-    // 空的 c_data 字段仍然是 NULL
+    // 空的 c_data 字段是非 NULL 空字符串。
+    ASSERT_NO_THROW({ output = db_->exec_sql("select c_id from customer500 where c_data = '';"); });
+    EXPECT_NE(output.find("3"), std::string::npos) << output;
+    EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from customer500 where c_data is null;"); });
-    EXPECT_NE(output.find("1"), std::string::npos) << output;
+    EXPECT_NE(output.find("0"), std::string::npos) << output;
     // UPDATE 也要走通（Payment 事务会往 c_data 前面拼 500 字节的历史）
     ASSERT_NO_THROW(db_->exec_sql("update customer500 set c_data = '" + std::string(500, 'w') +
                                   "' where c_w_id = 1 and c_d_id = 1 and c_id = 3;"));
@@ -1031,32 +1050,32 @@ TEST_F(E2ETest, TpccPageDensityMatchesCompactTupleMeta) {
         int num_records_per_page;   // 32 字节 TupleMeta 下的每页元组数
         int records_per_page_at_40; // 旧的 40 字节 TupleMeta 下的每页元组数
     };
-    // DDL 与 benchmark/tpcc/schema/rmdb_schema.sql 一致。
+    // DDL 与 finalv3、benchmark/tpcc/schema/rmdb_schema.sql 一致。
     const std::vector<Shape> shapes = {
-        {"create table warehouse (w_id int, w_name char(20), w_street_1 char(40), w_street_2 char(40), "
+        {"create table warehouse (w_id int, w_name char(10), w_street_1 char(20), w_street_2 char(20), "
          "w_city char(20), w_state char(2), w_zip char(9), w_tax float, w_ytd float);",
-         "warehouse", 145, 23, 22},
-        {"create table district (d_id int, d_w_id int, d_name char(20), d_street_1 char(40), d_street_2 char(40), "
+         "warehouse", 95, 32, 30},
+        {"create table district (d_id int, d_w_id int, d_name char(10), d_street_1 char(20), d_street_2 char(20), "
          "d_city char(20), d_state char(2), d_zip char(9), d_tax float, d_ytd float, d_next_o_id int);",
-         "district", 153, 22, 21},
-        {"create table customer (c_id int, c_d_id int, c_w_id int, c_first char(20), c_middle char(2), "
-         "c_last char(40), c_street_1 char(40), c_street_2 char(40), c_city char(20), c_state char(2), "
-         "c_zip char(9), c_phone char(16), c_since char(19), c_credit char(2), c_credit_lim float, "
+         "district", 103, 30, 28},
+        {"create table customer (c_id int, c_d_id int, c_w_id int, c_first char(16), c_middle char(2), "
+         "c_last char(16), c_street_1 char(20), c_street_2 char(20), c_city char(20), c_state char(2), "
+         "c_zip char(9), c_phone char(16), c_since char(30), c_credit char(2), c_credit_lim int, "
          "c_discount float, c_balance float, c_ytd_payment float, c_payment_cnt int, c_delivery_cnt int, "
-         "c_data char(100));",
-         "customer", 349, 10, 10},
+         "c_data char(50));",
+         "customer", 242, 14, 14},
         {"create table history (h_c_id int, h_c_d_id int, h_c_w_id int, h_d_id int, h_w_id int, "
-         "h_date char(19), h_amount float, h_data char(24));",
-         "history", 68, 40, 37},
+         "h_date char(30), h_amount float, h_data char(24));",
+         "history", 79, 36, 34},
         {"create table new_orders (no_o_id int, no_d_id int, no_w_id int);", "new_orders", 13, 90, 76},
-        {"create table orders (o_id int, o_d_id int, o_w_id int, o_c_id int, o_entry_d char(19), "
+        {"create table orders (o_id int, o_d_id int, o_w_id int, o_c_id int, o_entry_d char(30), "
          "o_carrier_id int, o_ol_cnt int, o_all_local int);",
-         "orders", 48, 50, 46},
+         "orders", 59, 44, 41},
         {"create table order_line (ol_o_id int, ol_d_id int, ol_w_id int, ol_number int, ol_i_id int, "
-         "ol_supply_w_id int, ol_delivery_d char(19), ol_quantity int, ol_amount float, ol_dist_info char(24));",
-         "order_line", 77, 37, 34},
-        {"create table item (i_id int, i_im_id int, i_name char(40), i_price float, i_data char(50));", "item", 103, 30,
-         28},
+         "ol_supply_w_id int, ol_delivery_d char(30), ol_quantity int, ol_amount float, ol_dist_info char(24));",
+         "order_line", 88, 33, 31},
+        {"create table item (i_id int, i_im_id int, i_name char(24), i_price float, i_data char(50));", "item", 87, 34,
+         32},
         {"create table stock (s_i_id int, s_w_id int, s_quantity int, s_dist_01 char(24), s_dist_02 char(24), "
          "s_dist_03 char(24), s_dist_04 char(24), s_dist_05 char(24), s_dist_06 char(24), s_dist_07 char(24), "
          "s_dist_08 char(24), s_dist_09 char(24), s_dist_10 char(24), s_ytd float, s_order_cnt int, "
@@ -1149,8 +1168,8 @@ TEST_F(E2ETest, RecordSizeBoundaryAcceptsChar512AndRejectsOversized) {
     EXPECT_NE(err.find("record size"), std::string::npos) << err;
 }
 
-TEST_F(LoadCsvFixture, LoadedNullsSurviveIndexesAndUpdate) {
-    // Delivery 事务的形状：装载出 NULL 的配送时间，之后 UPDATE 成非 NULL。
+TEST_F(LoadCsvFixture, LoadedEmptyTextSurvivesIndexesAndUpdate) {
+    // Delivery 事务的形状：装载出空字符串配送时间，之后 UPDATE 成非空值。
     const std::string path = write_csv("load_null_update.csv", "k,v,dts\n"
                                                                "1,10,\n"
                                                                "2,20,2026-02-02 00:00:00\n");
@@ -1159,10 +1178,12 @@ TEST_F(LoadCsvFixture, LoadedNullsSurviveIndexesAndUpdate) {
     ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lnu;"));
 
     std::string output;
-    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts is null;"); });
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts = '';"); });
     EXPECT_NE(output.find("1"), std::string::npos) << output;
-    ASSERT_NO_THROW(db_->exec_sql("update lnu set dts = '2026-03-03 00:00:00' where k = 1;"));
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts is null;"); });
+    EXPECT_NE(output.find("0"), std::string::npos) << output;
+    ASSERT_NO_THROW(db_->exec_sql("update lnu set dts = '2026-03-03 00:00:00' where k = 1;"));
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts = '';"); });
     EXPECT_NE(output.find("0"), std::string::npos) << output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lnu where dts is not null;"); });
     EXPECT_NE(output.find("2"), std::string::npos) << output;
@@ -1363,7 +1384,7 @@ TEST(LoadCrashRecoveryTest, LoadedDataSurvivesRestart) {
 
         // item.csv columns: i_id,i_im_id,i_name,i_price,i_data
         ASSERT_NO_THROW(
-            db.exec_sql("create table item (i_id int, i_im_id int, i_name char(40), i_price float, i_data char(50));"));
+            db.exec_sql("create table item (i_id int, i_im_id int, i_name char(24), i_price float, i_data char(50));"));
         ASSERT_NO_THROW(db.exec_sql("load ./item_crash_test.csv into item;"));
 
         // Verify the load worked before the "crash".

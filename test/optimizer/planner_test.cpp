@@ -140,6 +140,25 @@ std::unique_ptr<Query> make_point_update_query(int id, int value) {
     return query;
 }
 
+std::unique_ptr<Query> make_point_chained_update_query(int id, int first, int second, UpdateOp second_op) {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::UpdateStmt>("point_program", std::vector<std::unique_ptr<ast::SetClause>>{},
+                                                     std::vector<std::unique_ptr<ast::BinaryExpr>>{});
+    query->conds = {value_cond("point_program", "id", OP_EQ, id)};
+    SetClause set_clause;
+    set_clause.lhs = {.tab_name = "point_program", .col_name = "value"};
+    set_clause.is_self_ref = true;
+    set_clause.rhs_col = {.tab_name = "point_program", .col_name = "value"};
+    set_clause.op = UpdateOp::SELF_SUB;
+    set_clause.rhs.set_int(first);
+    UpdateTerm term;
+    term.op = second_op;
+    term.rhs.set_int(second);
+    set_clause.additional_terms.push_back(term);
+    query->set_clauses = {set_clause};
+    return query;
+}
+
 std::unique_ptr<Query> make_point_delete_query(int id) {
     auto query = std::make_unique<Query>();
     query->parse = std::make_unique<ast::DeleteStmt>("point_program", std::vector<std::unique_ptr<ast::BinaryExpr>>{});
@@ -498,6 +517,25 @@ TEST_F(PlannerAggregateTest, compiled_point_program_hits_for_update_and_delete_s
     EXPECT_EQ(second_delete_dml->compiled_point_program_->kind, PointProgramKind::Delete);
     EXPECT_EQ(second_delete_dml->subplan_, nullptr);
     EXPECT_EQ(planner_.point_program_cache_hits_.load(), 2U);
+}
+
+TEST_F(PlannerAggregateTest, compiled_point_program_keys_include_chained_update_shape_but_not_values) {
+    planner_.enable_compiled_point_program_cache_ = true;
+    sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
+
+    auto first = planner_.do_planner(make_point_chained_update_query(1, 1, 91, UpdateOp::SELF_ADD), nullptr);
+    EXPECT_EQ(static_cast<DMLPlan*>(first.get())->compiled_point_program_, nullptr);
+
+    auto same_shape = planner_.do_planner(make_point_chained_update_query(2, 7, 13, UpdateOp::SELF_ADD), nullptr);
+    auto* same_shape_dml = static_cast<DMLPlan*>(same_shape.get());
+    ASSERT_NE(same_shape_dml->compiled_point_program_, nullptr);
+    ASSERT_EQ(same_shape_dml->compiled_point_program_->set_ops.size(), 1U);
+    ASSERT_EQ(same_shape_dml->compiled_point_program_->set_ops[0].additional_terms.size(), 1U);
+    EXPECT_EQ(same_shape_dml->compiled_point_program_->set_ops[0].additional_terms[0].first, UpdateOp::SELF_ADD);
+
+    auto different_operator =
+        planner_.do_planner(make_point_chained_update_query(3, 7, 13, UpdateOp::SELF_SUB), nullptr);
+    EXPECT_EQ(static_cast<DMLPlan*>(different_operator.get())->compiled_point_program_, nullptr);
 }
 
 TEST_F(PlannerAggregateTest, compiled_point_program_is_invalidated_by_catalog_generation) {

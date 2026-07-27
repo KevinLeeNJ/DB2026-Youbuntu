@@ -8,6 +8,7 @@ You can use this software according to the terms and conditions of the Mulan PSL
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/common.h"
@@ -30,6 +31,7 @@ struct CompiledSetOp {
     TabCol rhs_col;
     UpdateOp op = UpdateOp::ASSIGNMENT;
     ColType rhs_type = TYPE_INT;
+    std::vector<std::pair<UpdateOp, ColType>> additional_terms;
 };
 
 // Immutable, schema-generation-scoped metadata for a point DML program.
