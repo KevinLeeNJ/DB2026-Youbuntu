@@ -1471,7 +1471,16 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	stage3 := make([]string, 0, len(plans)*3+1)
 	deliveredOrders, deliveredCustomers, deliveredAmount := 0, 0, 0.0
 	for _, plan := range plans {
-		if rankingScalar(result, plan.confirmOp, "") == "" {
+		// The claim confirmation is `SELECT MIN(no_o_id) ... WHERE no_o_id = X`.
+		// When another Delivery already took the row, that is not an empty
+		// result: SQL returns exactly one row holding NULL, which the wire
+		// protocol sends as present=0 (final.md:763) and decodeRow renders as
+		// the literal string "NULL". Testing for "" therefore never fired and
+		// every lost claim was treated as won — the driver then deleted a queue
+		// entry it had not claimed and credited the customer a second time.
+		// Compare against the order id we asked for, the way the non-ranking
+		// delivery() path already does.
+		if rankingScalar(result, plan.confirmOp, "") != strconv.Itoa(plan.oID) {
 			continue
 		}
 		customerID, _ := strconv.Atoi(rankingScalar(result, plan.customerOp, "0"))

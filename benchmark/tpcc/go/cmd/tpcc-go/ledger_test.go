@@ -249,8 +249,11 @@ type deliveryFakeBatcher struct {
 	oID     int
 	cID     int
 	amount  float64
-	// claimed reports the confirmation query as empty, modelling a row a
-	// concurrent Delivery already removed.
+	// claimLost models a row a concurrent Delivery already removed. The engine
+	// answers `SELECT MIN(no_o_id) ... WHERE no_o_id = X` with exactly one row
+	// holding NULL in that case — never with zero rows — so the fixture has to
+	// reproduce that shape or it cannot detect a confirmation check that only
+	// tests for an empty result.
 	claimLost bool
 }
 
@@ -277,7 +280,11 @@ func (d *deliveryFakeBatcher) execBatch(operations []batchOperation) (batchResul
 		rows := make([][]string, 0, 1)
 		switch {
 		case strings.Contains(sql, "select min(no_o_id)") && strings.Contains(sql, "and no_o_id ="):
-			if !d.claimLost {
+			// Aggregate over an empty group: one row, NULL. decodeRow renders a
+			// present=0 cell (final.md:763) as the literal string "NULL".
+			if d.claimLost {
+				rows = append(rows, []string{"NULL"})
+			} else {
 				rows = append(rows, []string{strconv.Itoa(d.oID)})
 			}
 		case strings.Contains(sql, "select min(no_o_id)"):
@@ -344,9 +351,19 @@ func TestDeliveryReadsTheRightOperationIndices(t *testing.T) {
 }
 
 // TestDeliverySkipsAnOrderItDidNotClaim proves the confirmation read really is
-// the "did my claim stick" query: when it comes back empty the order must not be
+// the "did my claim stick" query: when the row is gone the order must not be
 // delivered, which is what stops two concurrent Delivery transactions from both
 // counting the same new_orders row.
+//
+// The subtlety this pins down: a lost claim is *one row holding NULL*, not an
+// empty result. Testing the confirmation with `== ""` therefore never fired, so
+// every lost claim was treated as won — the driver deleted a queue entry it had
+// not claimed and credited the customer twice. Measured at 0.99% of claims with
+// two clients on one home warehouse, which surfaced as `new_orders row count`
+// and `orders with o_carrier_id = 0` both overshooting the ledger by the same
+// amount. The engine is not at fault: after the lock hand-off the loser's
+// READ COMMITTED statement snapshot does contain the winner's committed DELETE
+// (see test/transaction/delivery_claim_test.cpp).
 func TestDeliverySkipsAnOrderItDidNotClaim(t *testing.T) {
 	batcher := newDeliveryFakeBatcher(t)
 	batcher.claimLost = true
