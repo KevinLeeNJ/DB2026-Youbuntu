@@ -247,12 +247,19 @@ private:
     std::atomic<uint64_t> topology_epoch_{0};
     mutable Page* cached_root_page_{nullptr};
     mutable page_id_t cached_root_page_no_{IX_NO_PAGE};
-    mutable std::mutex append_hint_latch_;
-    struct LeafHint {
-        page_id_t page_no = IX_NO_PAGE;
-        uint64_t topology_epoch = 0;
-    };
-    mutable std::unordered_map<std::string, LeafHint> append_hints_;
+
+    // Right-edge append hint. try_append_hint() can only ever accept the single
+    // rightmost leaf, so one slot carries the whole benefit; packing the page
+    // number together with the topology epoch into one word keeps the hottest
+    // insert path free of both a mutex and a per-row key allocation. A stale
+    // slot is harmless: try_append_hint() re-validates the leaf it names.
+    static constexpr uint64_t kNoAppendHint = ~uint64_t{0};
+    mutable std::atomic<uint64_t> append_hint_{kNoAppendHint};
+
+    static uint64_t pack_append_hint(page_id_t page_no, uint64_t topology_epoch) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(topology_epoch)) << 32) |
+               static_cast<uint64_t>(static_cast<uint32_t>(page_no));
+    }
 
 public:
     using SharedIndexLatch = std::shared_lock<std::shared_mutex>;
@@ -337,12 +344,12 @@ public:
     // than one RID. The rid is valid only for the Unique result.
     UniqueLookupResult lookup_unique(const char* key) const;
 
-    // last_leaf_ is an append hint that reaches disk only when a checkpoint
-    // publishes the header. After a crash it can therefore name a leaf that has
-    // since been split, which makes the leaf chain look broken and makes
-    // delete_entry stop scanning early. Recompute it by descending the right
-    // edge of the tree: one page read per level. Returns false when even that
-    // spine is unusable, which means the index has to be rebuilt.
+    // first_leaf_/last_leaf_ reach disk only when a checkpoint publishes the
+    // header. After a crash they can therefore name leaves that have since been
+    // split or merged away, which makes the leaf chain look broken and makes
+    // delete_entry stop scanning early. Recompute both by descending the left and
+    // right edges of the tree: one page read per level. Returns false when even
+    // that spine is unusable, which means the index has to be rebuilt.
     bool refresh_leaf_chain_endpoint();
 
     // Validate persisted parent/child relationships, key ordering, and the
@@ -374,16 +381,12 @@ public:
     Iid leaf_begin() const;
 
 private:
-    std::string append_hint_key(const char* key) const {
-        if (file_hdr_->col_num_ == 0) {
-            return {};
-        }
-        const int prefix_len = file_hdr_->col_tot_len_ - file_hdr_->col_lens_.back();
-        return std::string(key, static_cast<size_t>(std::max(prefix_len, 0)));
-    }
-
     bool try_append_hint(const char* key, IxNodeHandle& leaf) const;
-    void remember_append_hint(const char* key, page_id_t page_no) const;
+    void remember_append_hint(page_id_t page_no) const;
+
+    // Follows the leftmost (rightmost=false) or rightmost child pointer down to a
+    // leaf, rejecting page numbers that leave the file.
+    bool descend_leaf_chain_edge(bool rightmost, page_id_t* leaf_page_no) const;
 
     // Root pages are shared by every lookup and are cheap to retain. Keep the
     // historical internal-cache default for explicit refreshes; startup uses
@@ -408,20 +411,37 @@ private:
     void release_root_page_cache() const;
     void register_internal_pages();
     void mark_internal_page_resident(page_id_t page_no, Page* page);
+    void cache_internal_page(page_id_t page_no, Page* page);
+    void drop_cached_internal_page(page_id_t page_no) const;
     void unregister_internal_pages() const;
+
+    // A cached raw Page* is only usable while its frame still holds the page we
+    // asked for. The frame is meant to stay put - the cache pins it and the
+    // buffer pool keeps it out of the replacer - but a single hole anywhere in
+    // that bookkeeping (BufferPoolManager::clear_residency() downgrades a frame
+    // without telling its holder) would otherwise make the index parse an
+    // unrelated page as a B+ tree node. So re-check the identity on every hit,
+    // the way InnoDB re-checks a block's page id: two int compares, no lock and
+    // no hash lookup on the hottest path in the index.
+    bool frame_holds(const Page* page, page_id_t page_no) const {
+        return page != nullptr && page->get_page_id() == PageId{fd_, page_no};
+    }
 
     Page* cached_page(page_id_t page_no) const {
         if (page_no == IX_NO_PAGE) {
             return nullptr;
         }
-        if (root_cache_enabled() && cached_root_page_ != nullptr && cached_root_page_no_ == page_no) {
+        if (root_cache_enabled() && cached_root_page_no_ == page_no && frame_holds(cached_root_page_, page_no)) {
             return cached_root_page_;
         }
         if (!internal_page_cache_enabled()) {
             return nullptr;
         }
         auto it = cached_internal_pages_.find(page_no);
-        return it == cached_internal_pages_.end() ? nullptr : it->second;
+        if (it == cached_internal_pages_.end() || !frame_holds(it->second, page_no)) {
+            return nullptr;
+        }
+        return it->second;
     }
 
     void unpin_if_not_cached(PageId page_id, bool is_dirty = false) const {
@@ -437,8 +457,10 @@ private:
     }
 
     void fetch_root_node_into(IxNodeHandle& out) const {
-        if (root_cache_enabled() && cached_root_page_ != nullptr && cached_root_page_no_ == file_hdr_->root_page_) {
-            out = IxNodeHandle(file_hdr_.get(), cached_root_page_);
+        // Same predicate as unpin_if_not_cached(), so a page taken from the cache
+        // is never unpinned and a page taken from the buffer pool always is.
+        if (Page* page = cached_page(file_hdr_->root_page_); page != nullptr) {
+            out = IxNodeHandle(file_hdr_.get(), page);
             return;
         }
         fetch_node_into(file_hdr_->root_page_, out);

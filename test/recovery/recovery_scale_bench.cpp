@@ -61,7 +61,14 @@ constexpr int kHashLen = 48;
 constexpr int kDataLen = 150;
 // s_i_id, s_w_id, s_quantity, s_ytd, s_order_cnt, s_remote_cnt, s_hash, s_data
 constexpr int kHashOffset = 6 * static_cast<int>(sizeof(int));
-constexpr int kRowSize = kHashOffset + kHashLen + kDataLen;
+// Data area only. A table's record is one byte longer: create_table appends a
+// trailing NULL bitmap (TabMeta::record_len). Sizing the WAL images at the data
+// length made every record image one byte shorter than the table's record_size,
+// so RmFileHandle::insert_record and apply_tuple_update -- which always copy
+// record_size bytes -- read one byte past the end of the source buffer, and the
+// recovery image-length guard now rejects such a WAL outright.
+constexpr int kDataSize = kHashOffset + kHashLen + kDataLen;
+constexpr int kRowSize = kDataSize + 1; // null_bitmap_bytes(8) == 1
 
 int64_t EnvInt(const char* name, int64_t fallback) {
     const char* value = std::getenv(name);
@@ -128,6 +135,7 @@ void EncodeHash(uint64_t seed, char* out) {
 }
 
 void EncodeRow(const Row& row, char* out) {
+    memset(out, 0, kRowSize);
     int offset = 0;
     for (const int value : {row.i_id, row.w_id, row.quantity, row.ytd, row.order_cnt, row.remote_cnt}) {
         memcpy(out + offset, &value, sizeof(int));
@@ -137,6 +145,7 @@ void EncodeRow(const Row& row, char* out) {
     memset(out + kHashOffset + kHashLen, 'x', kDataLen);
     // Keep some payload variation so the digest is sensitive to row content.
     snprintf(out + kHashOffset + kHashLen, kDataLen, "stock-%d-%d", row.i_id, row.w_id);
+    out[kDataSize] = 0; // no column is NULL
 }
 
 // FNV-1a over the recovered state, so two recoveries can be compared exactly.
@@ -227,6 +236,9 @@ void BuildDatabase(const std::string& db_name, int64_t rows, size_t bpm_pages) {
     db.sm_mgr_.create_index(kTableName, SecondaryIndexCols(), nullptr);
 
     auto* table = db.table();
+    // Every image this harness writes has to be exactly the table's record size,
+    // or the WAL it produces is not a WAL the server could have written.
+    ASSERT_EQ(table->get_file_hdr().record_size, kRowSize);
     const auto& tab_meta = db.sm_mgr_.db_.get_table(kTableName);
     std::vector<char> row_bytes(kRowSize);
     for (int64_t i = 0; i < rows; ++i) {
@@ -476,10 +488,15 @@ struct RecoveryTiming {
     double undo_ms{0};
     double total_ms{0};
     uint64_t scanned_records{0};
+    uint64_t dml_records{0};
     uint64_t redo_applied{0};
+    uint64_t redo_skipped{0};
     uint64_t undo_applied{0};
     uint64_t index_probes{0};
     uint64_t index_mutations{0};
+    uint64_t index_unchanged_keys{0};
+    uint64_t index_duplicate_entries{0};
+    uint64_t index_rebuilds{0};
     uint64_t analyze_page_reads{0};
     uint64_t redo_page_reads{0};
     uint64_t undo_page_reads{0};
@@ -560,10 +577,15 @@ RecoveryTiming RecoverAndMeasure(const std::string& db_name, size_t bpm_pages, u
     timing.total_ms = ElapsedMs(total_begin);
 
     timing.scanned_records = recovery.get_scanned_record_count();
+    timing.dml_records = recovery.get_dml_record_count();
     timing.redo_applied = recovery.get_redo_applied_count();
+    timing.redo_skipped = recovery.get_redo_skipped_count();
     timing.undo_applied = recovery.get_undo_applied_count();
     timing.index_probes = recovery.get_index_probe_count();
     timing.index_mutations = recovery.get_index_mutation_count();
+    timing.index_unchanged_keys = recovery.get_index_unchanged_key_count();
+    timing.index_duplicate_entries = recovery.get_index_duplicate_entry_count();
+    timing.index_rebuilds = recovery.get_index_rebuild_count();
     timing.page_reads = db.disk_.get_page_read_count();
     timing.page_writes = db.disk_.get_page_write_count();
     timing.wal_reads = db.disk_.get_log_read_count();
@@ -585,14 +607,37 @@ void PrintTiming(const char* label, const RecoveryTiming& timing) {
               << " page reads)\n"
               << "         total            : " << timing.total_ms << " ms\n"
               << "         records scanned  : " << timing.scanned_records << "\n"
+              << "         dml records      : " << timing.dml_records << "\n"
               << "         redo applied     : " << timing.redo_applied << "\n"
+              << "         redo skipped     : " << timing.redo_skipped << "\n"
               << "         undo applied     : " << timing.undo_applied << "\n"
               << "         index probes     : " << timing.index_probes << "\n"
               << "         index mutations  : " << timing.index_mutations << "\n"
+              << "         index unchanged  : " << timing.index_unchanged_keys << "\n"
+              << "         index duplicates : " << timing.index_duplicate_entries << "\n"
+              << "         index rebuilds   : " << timing.index_rebuilds << "\n"
               << "         page reads       : " << timing.page_reads << "\n"
               << "         page writes      : " << timing.page_writes << "\n"
               << "         wal preads       : " << timing.wal_reads << " (" << timing.wal_read_bytes << " bytes)\n";
+    if (timing.index_rebuilds > 0) {
+        // Made loud on purpose. The previous round's numbers were read as
+        // evidence about the key-level index repair when in fact both indexes
+        // had failed the structure gate and been rebuilt wholesale, so the
+        // repair had never executed a single line. That must never again be
+        // something a reader has to infer from a log line.
+        std::cout << "[scale] *** " << timing.index_rebuilds
+                  << " INDEX(ES) WERE REBUILT FROM THE HEAP: the structure gate rejected them, so the key-level\n"
+                     "[scale] *** repair did NOT run and its counters above say nothing about it. Recovery time here\n"
+                     "[scale] *** is proportional to the table, not to the WAL.\n";
+    }
     std::cout.flush();
+}
+
+// applied + skipped has to account for every DML record in the WAL, or one of
+// the two counters is losing records and the report cannot be trusted.
+void CheckCounters(const char* label, const RecoveryTiming& timing) {
+    EXPECT_EQ(timing.redo_applied + timing.redo_skipped, timing.dml_records)
+        << label << ": redo counters do not add up";
 }
 
 } // namespace
@@ -614,6 +659,7 @@ TEST(RecoveryScaleBench, MeasurePhasesAndIdempotency) {
         uint64_t entries = 0;
         const auto timing = RecoverAndMeasure(recover_only, bpm_pages, &digest, &rows, &entries);
         PrintTiming("recovery (replay of existing crash state)", timing);
+        CheckCounters("replay", timing);
         std::cout << "[scale] digest=" << digest << " rows=" << rows << " index_entries=" << entries << "\n";
         return;
     }
@@ -659,6 +705,7 @@ TEST(RecoveryScaleBench, MeasurePhasesAndIdempotency) {
     uint64_t first_entries = 0;
     const auto first = RecoverAndMeasure(db_name, bpm_pages, &first_digest, &first_rows, &first_entries);
     PrintTiming("recovery pass 1 (cold cache)", first);
+    CheckCounters("pass 1", first);
     std::cout << "[scale] digest=" << first_digest << " rows=" << first_rows << " index_entries=" << first_entries
               << "\n";
 
@@ -668,6 +715,7 @@ TEST(RecoveryScaleBench, MeasurePhasesAndIdempotency) {
     uint64_t second_entries = 0;
     const auto second = RecoverAndMeasure(db_name, bpm_pages, &second_digest, &second_rows, &second_entries);
     PrintTiming("recovery pass 2 (over the already recovered database)", second);
+    CheckCounters("pass 2", second);
     std::cout << "[scale] digest=" << second_digest << " rows=" << second_rows << " index_entries=" << second_entries
               << "\n";
     EXPECT_EQ(first_digest, second_digest) << "recovery is not idempotent";
@@ -681,6 +729,7 @@ TEST(RecoveryScaleBench, MeasurePhasesAndIdempotency) {
     uint64_t replay_entries = 0;
     const auto replay = RecoverAndMeasure(snapshot, bpm_pages, &replay_digest, &replay_rows, &replay_entries);
     PrintTiming("recovery of the pristine crash state (repeatability)", replay);
+    CheckCounters("repeatability", replay);
     std::cout << "[scale] digest=" << replay_digest << " rows=" << replay_rows << " index_entries=" << replay_entries
               << "\n";
     EXPECT_EQ(first_digest, replay_digest) << "recovery is not repeatable from the same WAL";

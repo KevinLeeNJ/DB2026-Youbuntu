@@ -242,6 +242,25 @@ TEST_F(BufferPoolManagerTest, PageTableReserveAndLoadFactorAvoidPoolSizedRehash)
     EXPECT_EQ(bpm->page_table_.bucket_count(), initial_bucket_count);
 }
 
+// Two owners can hold the same page - the index root cache pins the root and
+// hands the very same raw page to a writer - so the owner that releases second
+// finds pin_count_ already at zero. Losing its dirty mark there would silently
+// drop a committed page modification.
+TEST_F(BufferPoolManagerTest, UnpinMarksDirtyEvenWhenThePinWasAlreadyReleased) {
+    auto bpm = std::make_unique<BufferPoolManager>(4, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    Page* page = bpm->new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+
+    // First owner releases the only pin without reporting a modification.
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    ASSERT_FALSE(page->is_dirty());
+
+    // Second owner reports its modification after the pin is already gone.
+    EXPECT_FALSE(bpm->unpin_page(page_id, true));
+    EXPECT_TRUE(page->is_dirty());
+}
+
 TEST_F(BufferPoolManagerTest, ResidentClassificationSurvivesVictimPressureAndUnmark) {
     auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
     PageId resident_id{fd_, INVALID_PAGE_ID};

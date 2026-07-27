@@ -217,3 +217,46 @@ SELECT * FROM (SELECT v FROM so WHERE v IS NULL UNION SELECT v FROM so WHERE id 
 +------------------+
 Total record(s): 2
 
+
+# ---------------------------------------------------------------------------
+# CHAR 列在记录里是右侧零填充的定长字段。NLJ 的字符串比较必须按 strnlen 裁掉
+# 填充，否则 char(5) 的 'abc' 与 char(10) 的 'abc' 会判不相等（其余四份条件求值
+# 实现都是按 strnlen 裁的）。
+
+statement ok
+CREATE TABLE jw1 (id INT, s CHAR(5));
+
+statement ok
+CREATE TABLE jw2 (id INT, s CHAR(10));
+
+statement ok
+INSERT INTO jw1 VALUES (1, 'abc');
+
+statement ok
+INSERT INTO jw1 VALUES (2, 'zz');
+
+statement ok
+INSERT INTO jw2 VALUES (7, 'abc');
+
+statement ok
+INSERT INTO jw2 VALUES (8, 'qqq');
+
+query
+SELECT jw1.id, jw2.id FROM jw1, jw2 WHERE jw1.s = jw2.s;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
+|                1 |                7 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT jw1.id, jw2.id FROM jw1, jw2 WHERE jw1.s < jw2.s;
+----
++------------------+------------------+
+|               id |               id |
++------------------+------------------+
+|                1 |                8 |
++------------------+------------------+
+Total record(s): 1

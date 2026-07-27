@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cerrno>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <sys/wait.h>
 #include <string>
@@ -69,7 +70,7 @@ std::vector<char> MakeIntKey(int value) {
     return key;
 }
 
-void CreateRecoveryTestDb(const std::string& db_name) {
+void CreateRecoveryTestDb(const std::string& db_name, const std::vector<std::string>& table_names = {"t"}) {
     DiskManager disk;
     BufferPoolManager bpm(64, &disk);
     RmManager rm_mgr(&disk, &bpm);
@@ -78,8 +79,10 @@ void CreateRecoveryTestDb(const std::string& db_name) {
 
     sm_mgr.create_db(db_name);
     sm_mgr.open_db(db_name);
-    sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
-    sm_mgr.create_index("t", {"id"}, nullptr);
+    for (const auto& table_name : table_names) {
+        sm_mgr.create_table(table_name, {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
+        sm_mgr.create_index(table_name, {"id"}, nullptr);
+    }
     sm_mgr.close_db();
 }
 
@@ -111,9 +114,10 @@ lsn_t AppendBegin(LogManager& log_mgr, txn_id_t txn_id) {
     return log_mgr.add_log_to_buffer(&begin);
 }
 
-lsn_t AppendInsert(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const Rid& rid, RmRecord& rec) {
+lsn_t AppendInsert(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const Rid& rid, RmRecord& rec,
+                   const std::string& table_name = "t") {
     Rid log_rid = rid;
-    InsertLogRecord insert(txn_id, rec, log_rid, "t");
+    InsertLogRecord insert(txn_id, rec, log_rid, table_name);
     insert.prev_lsn_ = prev_lsn;
     return log_mgr.add_log_to_buffer(&insert);
 }
@@ -149,6 +153,11 @@ void FlushLogs(LogManager& log_mgr) {
     log_mgr.flush_log_to_disk();
 }
 
+// Mirrors what rmdb.cpp does at startup. Note that production calls
+// LogManager::initialize_from_existing_log() first, which truncates the WAL to
+// its intact prefix; RecoveryManager documents that as a precondition. Every WAL
+// these tests build is complete, so analyze()'s "the file ends where the scan
+// ended" check holds either way.
 void RunRecovery(const std::string& db_name) {
     OpenRecoveryDb db(db_name);
     auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
@@ -199,9 +208,9 @@ int RunRecoveryAfterInjectedProcessDeath(const std::string& db_name, const char*
 #endif
 }
 
-bool RecordExists(SmManager& sm_mgr, const Rid& rid) {
+bool RecordExists(SmManager& sm_mgr, const Rid& rid, const std::string& table_name = "t") {
     try {
-        auto* fh = sm_mgr.fhs_.at("t").get();
+        auto* fh = sm_mgr.fhs_.at(table_name).get();
         if (rid.page_no < 0 || rid.page_no >= fh->get_file_hdr().num_pages) {
             return false;
         }
@@ -211,20 +220,56 @@ bool RecordExists(SmManager& sm_mgr, const Rid& rid) {
     }
 }
 
-int RecordValue(SmManager& sm_mgr, const Rid& rid) {
-    auto record = sm_mgr.fhs_.at("t")->get_record(rid, nullptr);
+int RecordValue(SmManager& sm_mgr, const Rid& rid, const std::string& table_name = "t") {
+    auto record = sm_mgr.fhs_.at(table_name)->get_record(rid, nullptr);
     int value = 0;
     memcpy(&value, record->data + sizeof(int), sizeof(int));
     return value;
 }
 
-bool IndexPointsTo(SmManager& sm_mgr, int key, const Rid& rid) {
-    auto* index = sm_mgr.ihs_.at(sm_mgr.get_ix_manager()->get_index_name("t", {"id"})).get();
+std::vector<Rid> IndexEntriesFor(SmManager& sm_mgr, int key, const std::string& table_name = "t") {
+    auto* index = sm_mgr.ihs_.at(sm_mgr.get_ix_manager()->get_index_name(table_name, {"id"})).get();
     std::vector<Rid> result;
-    if (!index->get_value(MakeIntKey(key).data(), &result, nullptr)) {
-        return false;
-    }
+    index->get_value(MakeIntKey(key).data(), &result, nullptr);
+    return result;
+}
+
+bool IndexPointsTo(SmManager& sm_mgr, int key, const Rid& rid, const std::string& table_name = "t") {
+    const auto result = IndexEntriesFor(sm_mgr, key, table_name);
     return result.size() == 1 && result[0] == rid;
+}
+
+// Walks the WAL by its length prefixes and returns the file offsets of the
+// records whose type matches, so a test can corrupt one specific record.
+std::vector<int64_t> WalRecordOffsets(DiskManager& disk, LogType wanted) {
+    std::vector<int64_t> offsets;
+    const int64_t file_size = disk.get_file_size(LOG_FILE_NAME);
+    std::vector<char> header(LOG_HEADER_SIZE);
+    int64_t offset = 0;
+    while (offset + LOG_HEADER_SIZE <= file_size) {
+        if (disk.read_log_chunk(header.data(), LOG_HEADER_SIZE, offset) != LOG_HEADER_SIZE) {
+            break;
+        }
+        const auto total_len = read_unaligned<uint32_t>(header.data() + OFFSET_LOG_TOT_LEN);
+        if (total_len < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
+            offset + static_cast<int64_t>(total_len) > file_size) {
+            break;
+        }
+        if (read_unaligned<LogType>(header.data() + OFFSET_LOG_TYPE) == wanted) {
+            offsets.push_back(offset);
+        }
+        offset += total_len;
+    }
+    return offsets;
+}
+
+void PatchWalBytes(const std::string& log_path, int64_t offset, const void* bytes, size_t size) {
+    std::fstream file(log_path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(file.is_open());
+    file.seekp(static_cast<std::streamoff>(offset));
+    file.write(static_cast<const char*>(bytes), static_cast<std::streamsize>(size));
+    file.flush();
+    ASSERT_TRUE(static_cast<bool>(file));
 }
 
 } // namespace
@@ -896,6 +941,253 @@ TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
     ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+// redo() must resolve every record's table from that record's own table name.
+// A previous version looked the table up by the record's *position* in the redo
+// pass, keeping the RID from the record but the table identity from analyze's
+// parallel array. That is only correct while redo's record filter stays
+// byte-for-byte identical to analyze's, and nothing enforces it: any divergence
+// writes a valid RID into the wrong table's file, with no exception and nothing
+// in the log. The divergence is injected here by retyping one DML record as a
+// CHECKPOINT record after analyze() has already counted it, so redo sees one DML
+// record fewer and positional lookup shifts by one.
+TEST(RecoveryManagerTest, RedoRoutesEachRecordToTheTableItNames) {
+    ScopedTestDir test_dir("recovery_redo_table_identity_root");
+    const std::string db_name = "recovery_redo_table_identity_db";
+    CreateRecoveryTestDb(db_name, {"t", "u"});
+    const Rid rid{1, 0};
+    auto t_rec = MakeTuple(1, 10);
+    auto u_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, t_rec, "t");
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, u_rec, "u");
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    {
+        OpenRecoveryDb db(db_name);
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+
+        const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+        ASSERT_EQ(dml_offsets.size(), 2u);
+        const LogType retyped = LogType::CHECKPOINT;
+        PatchWalBytes(LOG_FILE_NAME, dml_offsets[0] + OFFSET_LOG_TYPE, &retyped, sizeof(LogType));
+
+        recovery.redo();
+
+        // The one surviving DML record names "u", so it must land in u and
+        // nowhere else.
+        EXPECT_TRUE(RecordExists(db.sm_mgr_, rid, "u"));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid, "u"), 20);
+        EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "t"));
+    }
+}
+
+// A DML payload that does not parse cannot be a torn tail: the record header
+// already proved every payload byte is inside the file. Recovery used to treat
+// it as the end of the log, silently discarding this committed insert and
+// anything after it. It has to fail and keep the WAL instead.
+TEST(RecoveryManagerTest, CorruptDmlPayloadFailsRecoveryInsteadOfEndingTheScan) {
+    ScopedTestDir test_dir("recovery_corrupt_payload_root");
+    const std::string db_name = "recovery_corrupt_payload_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+    int64_t wal_size = 0;
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+
+        // Only the payload's own image-length prefix is made impossible; the
+        // header keeps its correct total_len and type.
+        const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+        ASSERT_EQ(dml_offsets.size(), 1u);
+        const int impossible_image_size = 1 << 28;
+        PatchWalBytes(LOG_FILE_NAME, dml_offsets[0] + OFFSET_LOG_DATA, &impossible_image_size, sizeof(int));
+        wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
+
+    OpenRecoveryDb db(db_name);
+    // Retained in full, so the next process retries from the same input rather
+    // than starting up on a database missing a committed row.
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+}
+
+// A loser whose prev_lsn chain reaches back before the scan's start offset must
+// fail recovery. Walking off the end of the offset index used to just stop
+// following that chain, leaving the transaction's earlier writes rolled forward
+// -- a partially visible uncommitted transaction, which `final.md:342` clause 2
+// forbids, and which leaves no trace at all. Unreachable while
+// write_restart_offset() always writes 0; reachable the day fuzzy checkpointing
+// publishes a restart offset that is not below every live transaction's first
+// LSN, which is exactly what is constructed here.
+TEST(RecoveryManagerTest, LoserChainReachingBeforeTheRestartOffsetFailsRecovery) {
+    ScopedTestDir test_dir("recovery_restart_offset_chain_root");
+    const std::string db_name = "recovery_restart_offset_chain_db";
+    CreateRecoveryTestDb(db_name);
+    auto loser_rec = MakeTuple(1, 10);
+    auto committed_rec = MakeTuple(2, 20);
+    int64_t wal_size = 0;
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto loser_lsn = AppendBegin(*db.log_mgr_, 100);
+        loser_lsn = AppendInsert(*db.log_mgr_, 100, loser_lsn, Rid{1, 0}, loser_rec);
+        FlushLogs(*db.log_mgr_);
+        const int64_t checkpoint_offset = db.disk_.get_file_size(LOG_FILE_NAME);
+
+        // A checkpoint naming the loser as still active, as a fuzzy checkpoint
+        // would, published as the restart offset.
+        CheckpointLogRecord checkpoint(std::unordered_map<txn_id_t, lsn_t>{{100, loser_lsn}});
+        db.log_mgr_->add_log_to_buffer(&checkpoint);
+
+        // Work after the checkpoint, so undo() runs at all.
+        auto lsn = AppendBegin(*db.log_mgr_, 200);
+        lsn = AppendInsert(*db.log_mgr_, 200, lsn, Rid{1, 1}, committed_rec);
+        AppendCommit(*db.log_mgr_, 200, lsn);
+        FlushLogs(*db.log_mgr_);
+        db.log_mgr_->write_restart_offset(checkpoint_offset);
+        wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+}
+
+// The index probe returns a multiset, not a set: lookup_equal() pushes back
+// every matching slot, insert_entry(allow_duplicate=true) really stores the same
+// pair twice, and delete_entry() removes one copy per call. Treating it as a set
+// made E = {r, r}, C = {r}, R = {r} look already correct, so the duplicate
+// survived every recovery and made an index scan return the same heap row twice
+// -- inflating the per-partition counts `final.md:345` cross-checks.
+TEST(RecoveryManagerTest, DuplicateEntryForAStillLiveKeyIsDrainedToOne) {
+    ScopedTestDir test_dir("recovery_duplicate_live_key_root");
+    const std::string db_name = "recovery_duplicate_live_key_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(1, 20); // the indexed column does not move
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
+        index->insert_entry(MakeIntKey(1).data(), rid, nullptr, true);
+        ASSERT_EQ(IndexEntriesFor(db.sm_mgr_, 1).size(), 2u);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendUpdate(*db.log_mgr_, 100, lsn, rid, old_rec, new_rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+    const auto entries = IndexEntriesFor(db.sm_mgr_, 1);
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_EQ(entries[0], rid);
+}
+
+// A well formed WAL record can still carry an image shorter than the table's
+// record size, because nothing cross-checks the two. Both the fast and the
+// fallback replay path copy exactly record_size bytes out of the image, so
+// installing it would read past the end of the image inside the WAL buffer.
+TEST(RecoveryManagerTest, WalImageShorterThanTheRecordSizeFailsRecovery) {
+    ScopedTestDir test_dir("recovery_short_image_root");
+    const std::string db_name = "recovery_short_image_db";
+    CreateRecoveryTestDb(db_name);
+
+    {
+        OpenRecoveryDb db(db_name);
+        RmRecord short_rec(4);
+        memset(short_rec.data, 0, 4);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{1, 0}, short_rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
+}
+
+// RmFileHandle::insert_record() sets the bitmap bit for rid.slot_no and memcpys
+// into get_slot(rid.slot_no) with no bounds check at all, so an out-of-range
+// slot number from the WAL writes outside the page. The WAL carries no checksum,
+// so the RID is unvalidated external input and recovery has to bound it itself.
+TEST(RecoveryManagerTest, WalRidWithAnOutOfRangeSlotFailsRecovery) {
+    ScopedTestDir test_dir("recovery_bad_slot_root");
+    const std::string db_name = "recovery_bad_slot_db";
+    CreateRecoveryTestDb(db_name);
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{1, 100000}, rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
+}
+
+// Same input class, the other field: insert_record() extends the file until
+// num_pages passes rid.page_no, so an absurd page number turns into hundreds of
+// millions of page allocations. The number of DML records in the WAL bounds how
+// many unpersisted pages there can legitimately be.
+TEST(RecoveryManagerTest, WalRidWithAnImpossiblePageFailsRecovery) {
+    ScopedTestDir test_dir("recovery_bad_page_root");
+    const std::string db_name = "recovery_bad_page_db";
+    CreateRecoveryTestDb(db_name);
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{1 << 26, 0}, rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
+}
+
+// Page 0 is the file header, never a record.
+TEST(RecoveryManagerTest, WalRidNamingTheHeaderPageFailsRecovery) {
+    ScopedTestDir test_dir("recovery_header_page_rid_root");
+    const std::string db_name = "recovery_header_page_rid_db";
+    CreateRecoveryTestDb(db_name);
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{0, 0}, rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
 }
 
 TEST(RecoveryFaultInjectionTest, RedoProcessDeathIsRecoverable) {

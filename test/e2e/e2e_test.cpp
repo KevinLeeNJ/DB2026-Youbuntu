@@ -174,6 +174,10 @@ public:
         std::remove("output.txt");
     }
 
+    RmFileHdr file_header(const std::string& table_name) {
+        return sm_manager_->fhs_.at(table_name)->get_file_hdr();
+    }
+
     TupleMeta first_tuple_meta(const std::string& table_name) {
         auto* fh = sm_manager_->fhs_.at(table_name).get();
         RmScan scan(fh);
@@ -861,23 +865,77 @@ TEST_F(LoadCsvFixture, QuotedFieldsAreUnescapedInsteadOfRejected) {
     EXPECT_NE(output.find("3"), std::string::npos) << output;
 }
 
-TEST_F(LoadCsvFixture, MissingAndExtraFieldsAreToleratedNotRejected) {
-    // 第 2 行字段不足 -> 缺的列按 NULL；第 3 行字段超出 -> 多的字段忽略。
-    const std::string path = write_csv("load_ragged.csv", "id,val,name\n"
-                                                          "1,10,alpha\n"
-                                                          "2,20\n"
-                                                          "3,30,gamma,999,extra\n");
-    ASSERT_NO_THROW(db_->exec_sql("create table lr (id int, val int, name char(8));"));
-    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lr;"));
+TEST_F(LoadCsvFixture, ExtraTrailingFieldsAreIgnored) {
+    // 字段数超出 DDL 列数 -> 多出来的尾部字段忽略（表头/无表头都按列序取前 n 个）。
+    const std::string path = write_csv("load_extra.csv", "id,val,name\n"
+                                                         "1,10,alpha\n"
+                                                         "3,30,gamma,999,extra\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lx (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into lx;"));
 
     std::string output;
-    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lr;"); });
-    EXPECT_NE(output.find("3"), std::string::npos) << output;
-    ASSERT_NO_THROW({ output = db_->exec_sql("select id from lr where name is null;"); });
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lx;"); });
     EXPECT_NE(output.find("2"), std::string::npos) << output;
-    ASSERT_NO_THROW({ output = db_->exec_sql("select val, name from lr where id = 3;"); });
+    ASSERT_NO_THROW({ output = db_->exec_sql("select val, name from lx where id = 3;"); });
     EXPECT_NE(output.find("30"), std::string::npos) << output;
     EXPECT_NE(output.find("gamma"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, FewerFieldsThanColumnsIsRejected) {
+    // 字段数不足是硬错误：截断/错列的 CSV 不能静默装成一片 NULL，否则 9 张表的
+    // COUNT(*) 校验照样通过，病因要等到完整性校验才暴露。
+    const std::string path = write_csv("load_short.csv", "id,val,name\n"
+                                                         "1,10,alpha\n"
+                                                         "2,20\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lsf (id int, val int, name char(8));"));
+
+    std::string err;
+    ASSERT_NO_THROW({ err = db_->exec_sql_expect_error("load " + path + " into lsf;"); });
+    EXPECT_NE(err.find("fewer fields"), std::string::npos) << err;
+    EXPECT_NE(err.find("row 3"), std::string::npos) << err;
+
+    // 空字段仍然是合法的 NULL，只有"字段个数不够"才报错。
+    const std::string ok_path = write_csv("load_short_ok.csv", "id,val,name\n"
+                                                               "1,10,alpha\n"
+                                                               "2,20,\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table lsf_ok (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + ok_path + " into lsf_ok;"));
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from lsf_ok where name is null;"); });
+    EXPECT_NE(output.find("1"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, TrailingCommaOnEveryLineStillLoads) {
+    // 行尾逗号按 RFC 4180 多切出一个空字段。表头行一多一个字段就会让表头嗅探
+    // 失败，进而把表头当数据行去 strtol，整个装载失败。
+    const std::string path = write_csv("load_trailing_comma.csv", "id,val,name,\n"
+                                                                  "1,10,alpha,\n"
+                                                                  "2,20,beta,\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table ltc (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into ltc;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ltc;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select val, name from ltc where id = 2;"); });
+    EXPECT_NE(output.find("20"), std::string::npos) << output;
+    EXPECT_NE(output.find("beta"), std::string::npos) << output;
+    // 表头被正确识别，不能有第 3 行数据，也不能出现 name 为 NULL 的行。
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ltc where name is null;"); });
+    EXPECT_NE(output.find("0"), std::string::npos) << output;
+}
+
+TEST_F(LoadCsvFixture, TrailingCommaWithoutHeaderStillLoads) {
+    const std::string path = write_csv("load_trailing_comma_nh.csv", "1,10,alpha,\n"
+                                                                     "2,20,beta,\n");
+    ASSERT_NO_THROW(db_->exec_sql("create table ltcn (id int, val int, name char(8));"));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into ltcn;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ltcn;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select name from ltcn where id = 1;"); });
+    EXPECT_NE(output.find("alpha"), std::string::npos) << output;
 }
 
 TEST_F(LoadCsvFixture, FirstRowThatOnlyPartlyMatchesColumnNamesIsData) {
@@ -903,6 +961,187 @@ TEST_F(LoadCsvFixture, DuplicateHeaderNamesAreTreatedAsData) {
     std::string output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from ldh;"); });
     EXPECT_NE(output.find("2"), std::string::npos) << output;
+}
+
+// 标准 TPC-C 的 customer.c_data 是 char(500)，整条记录 749 字节。RM_MAX_RECORD_SIZE
+// 只有 512 时 CREATE TABLE 第一步就抛 InvalidRecordSizeError，900 秒装载预算一秒
+// 都用不上。final.md 没有公开列宽，所以这条形状必须能建、能装、能查。
+TEST_F(LoadCsvFixture, CustomerShapedTableWithChar500LoadsAndQueries) {
+    const std::string c_data(500, 'z');
+    // 与 benchmark/tpcc/schema/rmdb_schema.sql 的 customer 完全同形，只把 c_data
+    // 从 char(100) 换成标准 TPC-C 的 char(500)：整条记录 749 字节。
+    ASSERT_NO_THROW(db_->exec_sql("create table customer500 ("
+                                  "c_id int, c_d_id int, c_w_id int, c_first char(20), c_middle char(2), "
+                                  "c_last char(40), c_street_1 char(40), c_street_2 char(40), c_city char(20), "
+                                  "c_state char(2), c_zip char(9), c_phone char(16), c_since char(19), "
+                                  "c_credit char(2), c_credit_lim float, c_discount float, c_balance float, "
+                                  "c_ytd_payment float, c_payment_cnt int, c_delivery_cnt int, c_data char(500));"));
+    EXPECT_EQ(db_->file_header("customer500").record_size, 749);
+    ASSERT_NO_THROW(db_->exec_sql("create index customer500(c_w_id, c_d_id, c_id);"));
+
+    auto row = [&](int c_id, const std::string& last, const std::string& data) {
+        return std::to_string(c_id) + ",1,1,First,OE," + last +
+               ",street1,street2,city,CA,123456789,1234567890123456,2026-01-01 "
+               "00:00:00,GC,50000.0,0.5,-10.0,10.0,1,0," +
+               data + "\n";
+    };
+    const std::string path =
+        write_csv("load_customer500.csv",
+                  row(1, "BARBARBAR", c_data) + row(2, "OUGHTOUGHT", std::string(500, 'y')) + row(3, "ABLEABLE", ""));
+    ASSERT_NO_THROW(db_->exec_sql("load " + path + " into customer500;"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from customer500;"); });
+    EXPECT_NE(output.find("3"), std::string::npos) << output;
+    // 索引点查（复合键的尾列是 c_id，和 final.md 的 10 个索引同形）
+    ASSERT_NO_THROW(
+        { output = db_->exec_sql("select c_last from customer500 where c_w_id = 1 and c_d_id = 1 and c_id = 2;"); });
+    EXPECT_NE(output.find("OUGHTOUGHT"), std::string::npos) << output;
+    // 500 字节的定长列必须完整往返（比较按 strnlen 裁掉右侧零填充）
+    ASSERT_NO_THROW({ output = db_->exec_sql("select c_id from customer500 where c_data = '" + c_data + "';"); });
+    EXPECT_NE(output.find("Total record(s): 1"), std::string::npos) << output;
+    // 空的 c_data 字段仍然是 NULL
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from customer500 where c_data is null;"); });
+    EXPECT_NE(output.find("1"), std::string::npos) << output;
+    // UPDATE 也要走通（Payment 事务会往 c_data 前面拼 500 字节的历史）
+    ASSERT_NO_THROW(db_->exec_sql("update customer500 set c_data = '" + std::string(500, 'w') +
+                                  "' where c_w_id = 1 and c_d_id = 1 and c_id = 3;"));
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from customer500 where c_data is null;"); });
+    EXPECT_NE(output.find("0"), std::string::npos) << output;
+}
+
+// RM_MAX_RECORD_SIZE 的边界：null bitmap 也算在记录长度里，所以 char(512) 的单列
+// 表是 513 字节。旧的 512 上限会把它拒掉。
+// 页密度回归：TupleMeta 是每个 slot 的固定开销，窄表上它就是主要开销
+// （new_orders 的记录只有 13 字节）。这里从真实的文件头读 record_size /
+// num_records_per_page，把 9 张 TPC-C 表的每页元组数钉住，任何 TupleMeta 布局
+// 回退（例如 padding 又长回来）都会在这里立刻失败。
+TEST_F(E2ETest, TpccPageDensityMatchesCompactTupleMeta) {
+    ASSERT_EQ(TUPLE_META_SIZE, 32) << "TupleMeta 变大会直接吃掉每页的元组数";
+
+    struct Shape {
+        const char* ddl;
+        const char* table;
+        int record_size;            // 数据区 + 尾部 null bitmap
+        int num_records_per_page;   // 32 字节 TupleMeta 下的每页元组数
+        int records_per_page_at_40; // 旧的 40 字节 TupleMeta 下的每页元组数
+    };
+    // DDL 与 benchmark/tpcc/schema/rmdb_schema.sql 一致。
+    const std::vector<Shape> shapes = {
+        {"create table warehouse (w_id int, w_name char(20), w_street_1 char(40), w_street_2 char(40), "
+         "w_city char(20), w_state char(2), w_zip char(9), w_tax float, w_ytd float);",
+         "warehouse", 145, 23, 22},
+        {"create table district (d_id int, d_w_id int, d_name char(20), d_street_1 char(40), d_street_2 char(40), "
+         "d_city char(20), d_state char(2), d_zip char(9), d_tax float, d_ytd float, d_next_o_id int);",
+         "district", 153, 22, 21},
+        {"create table customer (c_id int, c_d_id int, c_w_id int, c_first char(20), c_middle char(2), "
+         "c_last char(40), c_street_1 char(40), c_street_2 char(40), c_city char(20), c_state char(2), "
+         "c_zip char(9), c_phone char(16), c_since char(19), c_credit char(2), c_credit_lim float, "
+         "c_discount float, c_balance float, c_ytd_payment float, c_payment_cnt int, c_delivery_cnt int, "
+         "c_data char(100));",
+         "customer", 349, 10, 10},
+        {"create table history (h_c_id int, h_c_d_id int, h_c_w_id int, h_d_id int, h_w_id int, "
+         "h_date char(19), h_amount float, h_data char(24));",
+         "history", 68, 40, 37},
+        {"create table new_orders (no_o_id int, no_d_id int, no_w_id int);", "new_orders", 13, 90, 76},
+        {"create table orders (o_id int, o_d_id int, o_w_id int, o_c_id int, o_entry_d char(19), "
+         "o_carrier_id int, o_ol_cnt int, o_all_local int);",
+         "orders", 48, 50, 46},
+        {"create table order_line (ol_o_id int, ol_d_id int, ol_w_id int, ol_number int, ol_i_id int, "
+         "ol_supply_w_id int, ol_delivery_d char(19), ol_quantity int, ol_amount float, ol_dist_info char(24));",
+         "order_line", 77, 37, 34},
+        {"create table item (i_id int, i_im_id int, i_name char(40), i_price float, i_data char(50));", "item", 103, 30,
+         28},
+        {"create table stock (s_i_id int, s_w_id int, s_quantity int, s_dist_01 char(24), s_dist_02 char(24), "
+         "s_dist_03 char(24), s_dist_04 char(24), s_dist_05 char(24), s_dist_06 char(24), s_dist_07 char(24), "
+         "s_dist_08 char(24), s_dist_09 char(24), s_dist_10 char(24), s_ytd float, s_order_cnt int, "
+         "s_remote_cnt int, s_data char(50));",
+         "stock", 317, 11, 11},
+    };
+
+    for (const auto& shape : shapes) {
+        ASSERT_NO_THROW(db_->exec_sql(shape.ddl)) << shape.table;
+        const RmFileHdr hdr = db_->file_header(shape.table);
+        EXPECT_EQ(hdr.record_size, shape.record_size) << shape.table;
+        EXPECT_EQ(hdr.num_records_per_page, shape.num_records_per_page) << shape.table;
+        EXPECT_EQ(rm_num_records_per_page(shape.record_size), shape.num_records_per_page) << shape.table;
+        EXPECT_GE(shape.num_records_per_page, shape.records_per_page_at_40) << shape.table;
+        // 布局必须真的放得进一个页面
+        EXPECT_LE(RM_PAGE_META_OFFSET + hdr.num_records_per_page * (hdr.record_size + TUPLE_META_SIZE) +
+                      hdr.bitmap_size,
+                  PAGE_SIZE)
+            << shape.table;
+        std::cout << "[page-density] " << shape.table << ": record_size=" << hdr.record_size
+                  << " num_records_per_page=" << hdr.num_records_per_page << " (was " << shape.records_per_page_at_40
+                  << " at TUPLE_META_SIZE=40)" << std::endl;
+    }
+}
+
+// append_to_context 以前是无边界的 memcpy 到固定 BUFFER_LENGTH 的 data_send_ 上。
+// 宽表 join 的计划树轻松超过 8 KB，那就是一次缓冲区越界写：连接线程静默死亡、
+// 日志里什么都没有。现在必须像 RecordPrinter 一样截断。ASan 下跑这个用例才是完整
+// 验证（修复前是 stack-buffer-overflow）。
+TEST_F(E2ETest, WideExplainAnalyzeOutputIsTruncatedNotOverflowing) {
+    constexpr int kTables = 4;
+    constexpr int kCols = 40;
+    auto col_name = [](int t, int c) {
+        return "explain_overflow_regression_wide_column_name_t" + std::to_string(t) + "_c" + std::to_string(c) +
+               "_padding";
+    };
+
+    for (int t = 0; t < kTables; ++t) {
+        std::string ddl = "create table wide_explain_t" + std::to_string(t) + " (";
+        for (int c = 0; c < kCols; ++c) {
+            ddl += (c == 0 ? "" : ", ") + col_name(t, c) + " int";
+        }
+        ddl += ");";
+        ASSERT_NO_THROW(db_->exec_sql(ddl));
+        std::string ins = "insert into wide_explain_t" + std::to_string(t) + " values (";
+        for (int c = 0; c < kCols; ++c) {
+            ins += (c == 0 ? "" : ", ") + std::string("1");
+        }
+        ins += ");";
+        ASSERT_NO_THROW(db_->exec_sql(ins));
+    }
+
+    std::string select_list;
+    std::string from_list;
+    std::string where_list;
+    for (int t = 0; t < kTables; ++t) {
+        const std::string tab = "wide_explain_t" + std::to_string(t);
+        from_list += (t == 0 ? "" : ", ") + tab;
+        for (int c = 0; c < kCols; ++c) {
+            select_list += (select_list.empty() ? "" : ", ") + tab + "." + col_name(t, c);
+        }
+        if (t > 0) {
+            where_list += (where_list.empty() ? "" : " and ") + std::string("wide_explain_t0.") + col_name(0, 0) +
+                          " = " + tab + "." + col_name(t, 0);
+        }
+    }
+    const std::string sql =
+        "explain analyze select " + select_list + " from " + from_list + " where " + where_list + ";";
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql(sql); });
+    // 计划树的完整文本远超 8 KB：确认这个用例真的把缓冲写满了……
+    EXPECT_GT(sql.size(), static_cast<size_t>(BUFFER_LENGTH));
+    // ……而输出被截断在缓冲区内，且给尾部的 "Total record(s)" 行留了位置。
+    EXPECT_LE(output.size(), static_cast<size_t>(BUFFER_LENGTH) - RECORD_COUNT_LENGTH);
+    EXPECT_GT(output.size(), static_cast<size_t>(BUFFER_LENGTH) / 2);
+    db_->clean_output_txt();
+}
+
+TEST_F(E2ETest, RecordSizeBoundaryAcceptsChar512AndRejectsOversized) {
+    ASSERT_NO_THROW(db_->exec_sql("create table rs512 (x char(512));"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into rs512 values ('abc');"));
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from rs512;"); });
+    EXPECT_NE(output.find("1"), std::string::npos) << output;
+
+    // 超过上限仍然必须明确报错（而不是静默截断或越界写）
+    std::string err;
+    ASSERT_NO_THROW({ err = db_->exec_sql_expect_error("create table rs_huge (x char(2048), y char(2048));"); });
+    EXPECT_NE(err.find("record size"), std::string::npos) << err;
 }
 
 TEST_F(LoadCsvFixture, LoadedNullsSurviveIndexesAndUpdate) {
@@ -946,6 +1185,34 @@ TEST_F(E2ETest, LoadCsvAllowsDuplicateSecondaryIndexKeys) {
     std::string output;
     ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from load_dup_idx where a = 10;"); });
     EXPECT_NE(output.find("2"), std::string::npos) << output;
+
+    std::remove(dest_csv.c_str());
+}
+
+// `CREATE INDEX` builds an access path, not a uniqueness constraint
+// (final.md:168), so it must not reject data that LOAD already accepted.
+TEST_F(E2ETest, CreateIndexOnLoadedDuplicateSecondaryKeysSucceeds) {
+    char cwd_buf[1024];
+    getcwd(cwd_buf, sizeof(cwd_buf));
+    std::string dest_csv = std::string(cwd_buf) + "/create_index_duplicate_test.csv";
+    {
+        std::ofstream out(dest_csv);
+        out << "id,a\n";
+        out << "1,10\n";
+        out << "2,10\n";
+        out << "3,20\n";
+    }
+
+    ASSERT_NO_THROW(db_->exec_sql("create table create_dup_idx (id int, a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("load ./create_index_duplicate_test.csv into create_dup_idx;"));
+    // Index built after the duplicates are already in the heap.
+    ASSERT_NO_THROW(db_->exec_sql("create index create_dup_idx(a);"));
+
+    std::string output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from create_dup_idx where a = 10;"); });
+    EXPECT_NE(output.find("2"), std::string::npos) << output;
+    ASSERT_NO_THROW({ output = db_->exec_sql("select count(*) from create_dup_idx where a = 20;"); });
+    EXPECT_NE(output.find("1"), std::string::npos) << output;
 
     std::remove(dest_csv.c_str());
 }

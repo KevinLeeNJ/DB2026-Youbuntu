@@ -77,10 +77,6 @@ public:
 
     void write_log(char* log_data, int size);
 
-    // Ask the kernel to start reading pages recovery is about to fetch. Purely
-    // advisory: failures are ignored and the caller's behaviour is unchanged.
-    void prefetch_page(int fd, page_id_t page_no);
-
     void fsync_log();
 
     // Flush a data or metadata file so a checkpoint can establish a durable

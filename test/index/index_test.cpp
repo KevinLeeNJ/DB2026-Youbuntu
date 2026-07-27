@@ -1322,16 +1322,37 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "qweruiop")}, {"name"}), std::vector<int>({10}));
 }
 
-TEST_F(IndexScanFeatureTest, CreateIndexRejectsDuplicateExistingKeysAndDoesNotLeaveCatalogEntry) {
+// `CREATE INDEX` builds an access path, not a uniqueness constraint: final.md:168
+// says the schema declares no PRIMARY KEY / FOREIGN KEY / other constraint beyond
+// the CREATE INDEX statements themselves. It must therefore not be stricter than
+// the paths that already put those rows in the heap — LOAD and the recovery-time
+// index rebuild both pass allow_duplicate=true, so rejecting duplicates here made
+// a legitimately loaded table impossible to index.
+//
+// INSERT/UPDATE keep enforcing uniqueness on purpose: it is the loud failure
+// signal for concurrent order-number races (final.md:444), and TPC-C's composite
+// index keys are unique by construction thanks to their trailing column
+// (final.md:171), so it never misfires on the real workload.
+TEST_F(IndexScanFeatureTest, CreateIndexOverDuplicateExistingKeysSucceeds) {
     create_two_int_table("dups");
     insert_two_ints("dups", 1, 10);
     insert_two_ints("dups", 1, 20);
 
-    EXPECT_THROW(sm_manager->create_index("dups", {"a"}, nullptr), IndexEntryExistsError);
-    EXPECT_FALSE(sm_manager->db_.get_table("dups").is_index({"a"}));
-    EXPECT_TRUE(sm_manager->ihs_.find(sm_manager->get_ix_manager()->get_index_name(
-                    "dups", std::vector<std::string>{"a"})) == sm_manager->ihs_.end());
+    ASSERT_NO_THROW(sm_manager->create_index("dups", {"a"}, nullptr));
+    EXPECT_TRUE(sm_manager->db_.get_table("dups").is_index({"a"}));
+
+    // Both heap rows must be reachable through the new index.
+    const std::string index_name =
+        sm_manager->get_ix_manager()->get_index_name("dups", std::vector<std::string>{"a"});
+    auto handle = sm_manager->ihs_.find(index_name);
+    ASSERT_NE(handle, sm_manager->ihs_.end());
+    int key = 1;
+    std::vector<Rid> rids;
+    handle->second->get_value(reinterpret_cast<char*>(&key), &rids, nullptr);
+    EXPECT_EQ(rids.size(), 2u) << "索引应能找到两行重复键";
 }
+// (INSERT 侧保留的唯一性检查由本文件上方的
+//  RejectsDuplicateKeyOnIndexedColumn 系列用例覆盖，此处不重复。)
 
 } // namespace
 

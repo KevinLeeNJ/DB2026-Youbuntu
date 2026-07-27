@@ -69,28 +69,40 @@ bool VerifyHeap(const std::string& name, RmFileHandle* fh, BufferPoolManager* bp
         bpm->unpin_page(page.page->get_page_id(), false);
     }
 
-    std::set<page_id_t> actual_free;
-    page_id_t current = hdr.first_free_page_no;
-    while (current != RM_NO_PAGE) {
-        if (!actual_free.insert(current).second) {
-            return Fail(name + ": cycle in record free list");
+    // Free-space bookkeeping: check what the design actually guarantees.
+    //
+    // This used to walk first_free_page_no -> next_free_page_no and require the
+    // chain to equal `expected_free` exactly. That invariant only holds for the
+    // instant after RmFileHandle::open_file(), which rebuilds both the chain and
+    // the in-memory candidate vector by rescanning every bitmap. At run time the
+    // source of truth is free_page_candidates_; add/remove_free_page_candidate()
+    // maintain that vector and first_free_page_no but deliberately never rewrite
+    // next_free_page_no, because doing so would dirty an extra page on every page
+    // fill along the hot insert path. The on-disk chain therefore decays as soon
+    // as any page fills or frees — by design, and harmlessly, since open_file()
+    // never trusts it.
+    //
+    // The old check consequently failed on every healthy database (reporting
+    // "full page appears in record free list", or "cycle" once the head started
+    // tracking the candidate vector), which made this verifier useless as the
+    // crash-recovery safety net it is supposed to be. What is worth asserting is
+    // that the persisted head is not actively misleading: it must either be
+    // absent or name a page that really has room.
+    const page_id_t head = hdr.first_free_page_no;
+    if (head != RM_NO_PAGE) {
+        if (head < RM_FIRST_RECORD_PAGE || head >= hdr.num_pages) {
+            return Fail(name + ": free-list head " + std::to_string(head) + " is not a valid record page");
         }
-        RmPageHandle page;
-        try {
-            page = fh->fetch_page_handle(current);
-        } catch (const std::exception& e) {
-            return Fail(name + ": cannot fetch free-list page: " + std::string(e.what()));
+        if (expected_free.find(head) == expected_free.end()) {
+            return Fail(name + ": free-list head page " + std::to_string(head) + " has no free slot");
         }
-        if (page.page == nullptr || page.page_hdr->num_records >= hdr.num_records_per_page) {
-            if (page.page != nullptr)
-                bpm->unpin_page(page.page->get_page_id(), false);
-            return Fail(name + ": full page appears in record free list");
-        }
-        current = page.page_hdr->next_free_page_no;
-        bpm->unpin_page(page.page->get_page_id(), false);
-    }
-    if (actual_free != expected_free) {
-        return Fail(name + ": record free list does not match page occupancy");
+    } else if (!expected_free.empty()) {
+        // Not an error: pages freed after the head was last published are found
+        // again by open_file()'s rescan. Report it so a real leak is still
+        // visible in the log.
+        std::cerr << "[verify] note: " << name << " has " << expected_free.size()
+                  << " page(s) with free space but no published free-list head"
+                     " (open_file rescans, so this is recoverable)\n";
     }
     return true;
 }

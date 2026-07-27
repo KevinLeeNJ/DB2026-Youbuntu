@@ -15,7 +15,9 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <queue>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -24,12 +26,9 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
-// Number of DML records whose pages are handed to the kernel as one readahead
-// batch. Recovery stays serial; this only lifts the queue depth above one.
-constexpr size_t kPrefetchBatchRecords = 1024;
-
-// A stale index entry that keeps reappearing would otherwise loop forever.
-// A key can legitimately hold only a handful of duplicates.
+// Caps how many copies of one (key, rid) pair the repair will remove. The probe
+// result says how many there are, so this only bounds the work if that result is
+// itself absurd. A key can legitimately hold only a handful of duplicates.
 constexpr int kMaxDuplicateDrain = 16;
 
 // Number of repaired keys re-probed afterwards. A repair that did not take
@@ -79,6 +78,9 @@ uint16_t RecoveryManager::intern_table(std::string_view table_name) {
     auto file_it = sm_manager_->fhs_.find(table.name);
     if (file_it != sm_manager_->fhs_.end()) {
         table.file_handle = file_it->second.get();
+        const RmFileHdr file_hdr = table.file_handle->get_file_hdr();
+        table.records_per_page = file_hdr.num_records_per_page;
+        table.record_size = file_hdr.record_size;
     }
     if (sm_manager_->db_.is_table(table.name)) {
         table.meta = &sm_manager_->db_.get_table(table.name);
@@ -107,8 +109,97 @@ void RecoveryManager::build_touched_index() {
     touched_sorted_.erase(std::unique(touched_sorted_.begin(), touched_sorted_.end()), touched_sorted_.end());
 }
 
+void RecoveryManager::validate_dml_rid(const RecoveryTable& table, const WalRecordView& record, const Rid& rid) const {
+    // Page 0 holds the file header, never a record.
+    if (rid.page_no < RM_FIRST_RECORD_PAGE) {
+        throw InternalError("recovery found a WAL record naming page " + std::to_string(rid.page_no) + " of table " +
+                            table.name + " at LSN " + std::to_string(record.lsn) + "; WAL retained");
+    }
+    // A table that is not open cannot supply its slot count. Such records are
+    // skipped by every later phase, so the only thing still needed is that the
+    // slot number survives being packed into TouchedTuple.
+    const int slot_limit = table.records_per_page > 0 ? table.records_per_page : static_cast<int>(INT16_MAX) + 1;
+    if (rid.slot_no < 0 || rid.slot_no >= slot_limit) {
+        throw InternalError("recovery found a WAL record naming slot " + std::to_string(rid.slot_no) + " of table " +
+                            table.name + ", which holds " + std::to_string(slot_limit) + " slots per page, at LSN " +
+                            std::to_string(record.lsn) + "; WAL retained");
+    }
+}
+
+void RecoveryManager::validate_touched_page_bounds() {
+    // Every table's page numbers get an upper bound before any of them reaches
+    // the record layer. A committed insert may legitimately name a page that
+    // never made it to disk, so the file length alone is not the bound; but
+    // each DML record can account for at most one such page, so the number of
+    // DML records is. Without this, a corrupt page_no of 2^30 would send
+    // RmFileHandle::insert_record into a billion create_new_page_handle calls.
+    for (auto& table : tables_) {
+        if (table.file_handle == nullptr) {
+            continue;
+        }
+        const int64_t file_bytes =
+            disk_manager_->get_file_size(disk_manager_->get_file_name(table.file_handle->GetFd()));
+        const int64_t disk_pages = file_bytes > 0 ? file_bytes / PAGE_SIZE : 0;
+        const int64_t header_pages = table.file_handle->get_file_hdr().num_pages;
+        table.page_no_limit = static_cast<int32_t>(
+            std::min<int64_t>(std::max(disk_pages, header_pages) + static_cast<int64_t>(touched_.size()) + 1,
+                              std::numeric_limits<int32_t>::max()));
+    }
+    for (const auto& touched : touched_sorted_) {
+        const RecoveryTable& table = tables_[touched.table_id];
+        if (table.file_handle == nullptr) {
+            continue;
+        }
+        if (touched.page_no >= table.page_no_limit) {
+            throw InternalError("recovery found a WAL record naming page " + std::to_string(touched.page_no) +
+                                " of table " + table.name + ", beyond the " + std::to_string(table.page_no_limit) +
+                                " pages the WAL can account for; WAL retained");
+        }
+    }
+}
+
+void RecoveryManager::validate_installable_image(const RecoveryTable& table, const WalRecordView& record,
+                                                 int image_size) const {
+    if (image_size != table.record_size) {
+        throw InternalError("recovery found a WAL image of " + std::to_string(image_size) + " bytes for table " +
+                            table.name + ", whose records are " + std::to_string(table.record_size) +
+                            " bytes, at LSN " + std::to_string(record.lsn) + "; WAL retained");
+    }
+}
+
 /**
  * @description: analyze阶段，需要获得脏页表（DPT）和未完成的事务列表（ATT）
+ *
+ * Why this phase can tell a torn tail apart from real corruption, with no CRC
+ * in the WAL at all:
+ *
+ *  1. DiskManager::write_log() is a single pwrite plus a short-write retry
+ *     loop, always appending the log buffer's bytes in order. A pwrite that is
+ *     cut short by process death has written a *prefix* of what was handed to
+ *     it, never a hole and never bytes out of order. So the WAL file on disk is
+ *     always a prefix of the byte stream the writer intended.
+ *  2. Under the prefix property the only possible record-boundary anomaly is
+ *     the very last record being cut short, and WalReader::next() catches
+ *     exactly that with `next_offset + total_len > end_offset`.
+ *  3. Therefore, if a record header passed the length and type checks, every
+ *     byte of its payload is inside the file. A payload that then fails to
+ *     parse is *not* a torn tail: it is real corruption. Treating it as a tail
+ *     -- which is what this code used to do -- silently discards every
+ *     committed record after it.
+ *  4. LogManager::initialize_from_existing_log() already ran the identical
+ *     header-level scan and truncated the file to the intact prefix, so when
+ *     this phase starts, file_size is the end of a header-validated prefix. A
+ *     second run of the same parser disagreeing with the first means
+ *     corruption or a bug, never a tail.
+ *
+ * A CRC would buy nothing here. `final.md:349` fixes the crash model at SIGKILL
+ * with a same-machine restart, not at whole-machine power loss, so the kernel
+ * still owns every acknowledged byte and media-level rot is out of scope. The
+ * prefix property already covers the only tearing that model produces, and a
+ * CRC would cost a WAL header layout change plus every test that builds a WAL
+ * by hand. If the crash model ever widens to power loss or to a WAL written
+ * through O_DIRECT, points 1-3 above stop holding and a per-record checksum
+ * becomes the right answer.
  */
 void RecoveryManager::analyze() {
     active_txn_last_lsn_.clear();
@@ -128,10 +219,13 @@ void RecoveryManager::analyze() {
     scanned_record_count_ = 0;
     redo_applied_count_ = 0;
     redo_skipped_count_ = 0;
+    redo_missing_table_count_ = 0;
     undo_applied_count_ = 0;
     index_probe_count_ = 0;
     index_mutation_count_ = 0;
     index_unchanged_key_count_ = 0;
+    index_duplicate_entry_count_ = 0;
+    index_rebuild_count_ = 0;
 
     const int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
@@ -163,8 +257,7 @@ void RecoveryManager::analyze() {
     WalRecordView record;
     WalDmlView dml;
     lsn_t previous_lsn = INVALID_LSN;
-    bool torn_payload = false;
-    while (!torn_payload && reader.next(&record)) {
+    while (reader.next(&record)) {
         ++scanned_record_count_;
         switch (record.log_type) {
         case LogType::BEGIN:
@@ -174,17 +267,22 @@ void RecoveryManager::analyze() {
         case LogType::DELETE:
         case LogType::UPDATE: {
             if (!ParseWalDml(record, &dml)) {
-                // A payload that does not parse cannot be replayed; the WAL
-                // ends here, exactly as a short header would end it.
-                scan_end_offset_ = record.offset;
-                torn_payload = true;
-                --scanned_record_count_;
-                break;
+                // Point 3 of the comment on this function: the header already
+                // proved the whole payload is inside the file, so this is
+                // corruption, not the end of the log. Stopping here would drop
+                // every committed record that follows.
+                throw InternalError("recovery found a corrupt DML payload at WAL offset " +
+                                    std::to_string(record.offset) + " (LSN " + std::to_string(record.lsn) +
+                                    "); WAL retained");
             }
             active_txn_last_lsn_[record.txn_id] = record.lsn;
             has_dml_records_ = true;
             const uint16_t table_id = intern_table(dml.table_name);
-            touched_tables_.insert(tables_[table_id].name);
+            const RecoveryTable& table = tables_[table_id];
+            // Before the narrowing cast below and before any later phase can
+            // hand this RID to the record layer.
+            validate_dml_rid(table, record, dml.rid);
+            touched_tables_.insert(table.name);
             TouchedTuple touched;
             touched.table_id = table_id;
             touched.page_no = dml.rid.page_no;
@@ -204,9 +302,6 @@ void RecoveryManager::analyze() {
         case LogType::CHECKPOINT:
             break;
         }
-        if (torn_payload) {
-            break;
-        }
 
         record_locations_.push_back(WalRecordLocation{record.lsn, record.offset});
         if (record.lsn != INVALID_LSN && previous_lsn != INVALID_LSN && record.lsn <= previous_lsn) {
@@ -217,9 +312,18 @@ void RecoveryManager::analyze() {
             max_lsn_ = record.lsn;
         }
     }
-    if (!torn_payload) {
-        scan_end_offset_ = std::min(scan_end_offset_, reader.next_offset());
+    if (reader.next_offset() != file_size) {
+        // Point 4 of the comment on this function: the startup scan already
+        // truncated the file to the end of the intact prefix using this exact
+        // parser, so the two runs must agree. They do not, so either the file
+        // was corrupted between the two scans or one of the two scans is buggy.
+        // Either way, replaying only up to here would silently drop whatever
+        // committed records lie beyond it.
+        throw InternalError("recovery stopped at WAL offset " + std::to_string(reader.next_offset()) +
+                            " but the file is " + std::to_string(file_size) +
+                            " bytes; the startup scan should have truncated it to a record boundary; WAL retained");
     }
+    scan_end_offset_ = file_size;
 
     if (!record_locations_sorted_) {
         // LSNs are handed out under the append latch, so the file is normally
@@ -228,6 +332,7 @@ void RecoveryManager::analyze() {
                   [](const WalRecordLocation& left, const WalRecordLocation& right) { return left.lsn < right.lsn; });
     }
     build_touched_index();
+    validate_touched_page_bounds();
 
     LOG_INFO("recovery analyze: %llu records, %llu dml, %zu distinct rids, %llu wal preads, loser txns %zu",
              static_cast<unsigned long long>(scanned_record_count_), static_cast<unsigned long long>(touched_.size()),
@@ -241,46 +346,78 @@ void RecoveryManager::analyze() {
     }
 }
 
-void RecoveryManager::prefetch_redo_batch(size_t from_index) {
-    if (from_index >= touched_.size()) {
-        return;
-    }
-    const size_t end_index = std::min(from_index + kPrefetchBatchRecords, touched_.size());
-    prefetch_scratch_.assign(touched_.begin() + static_cast<std::ptrdiff_t>(from_index),
-                             touched_.begin() + static_cast<std::ptrdiff_t>(end_index));
-    std::sort(prefetch_scratch_.begin(), prefetch_scratch_.end());
-    uint16_t previous_table = 0;
-    int32_t previous_page = -1;
-    for (const auto& touched : prefetch_scratch_) {
-        if (touched.page_no == previous_page && touched.table_id == previous_table && previous_page >= 0) {
-            continue;
-        }
-        previous_table = touched.table_id;
-        previous_page = touched.page_no;
-        RmFileHandle* file_handle = tables_[touched.table_id].file_handle;
-        if (file_handle != nullptr) {
-            disk_manager_->prefetch_page(file_handle->GetFd(), touched.page_no);
-        }
-    }
-}
-
 /**
  * @description: 重做所有未落盘的操作
+ *
+ * No readahead is issued here, deliberately. A previous version handed the
+ * pages of the next batch of records to posix_fadvise(WILLNEED) to lift the
+ * queue depth above one. Measurement showed it could not help and did not: two
+ * runs of the identical crash state issued the identical 421,528 page reads in
+ * 2,852 ms and 15,445 ms, i.e. 6.8 and 36.6 microseconds per page read. A cold
+ * NVMe random 4 KiB read at QD=1 costs 80-120 microseconds, so neither figure
+ * can contain a real device round trip, and a 5.4x wall-clock spread at a fixed
+ * read count says the phase is bound by CPU and memory bandwidth, not by queue
+ * depth. The reason is that the buffer pool opens data files with a plain
+ * open(O_RDWR): every read_page is a copy out of the page cache, and the
+ * benchmark's POSIX_FADV_DONTNEED is advisory, so on a 30 GB machine an 820 MB
+ * working set is simply never evicted.
+ *
+ * This is not just a benchmark artefact. `final.md:349` fixes the crash model at
+ * SIGKILL with a same-machine restart, and SIGKILL does not drop the page cache.
+ * After a 450-second workload, killing and restarting the server leaves the
+ * whole hot working set in the kernel's cache, so recovery's page reads are
+ * mostly cache hits on the graded machine too. The 80-100 microseconds/page
+ * cold-cache figure in PLAN.md's budget model therefore probably overestimates
+ * this phase by two orders of magnitude. Anything aimed at recovery's page reads
+ * should be aimed at *how many* there are, not at their latency -- which is what
+ * the next paragraph is about.
+ *
+ * NEXT STEP, NOT DONE HERE: replay page by page instead of record by record.
+ * This pass visits records in WAL order, so it re-reads the same table page many
+ * times: 463,212 distinct RIDs spread over roughly 101,000 pages cost 420,232
+ * page reads and about 700,000 page writes, a 4.2x re-read amplification caused
+ * by a 397 MB table against a 75 MB pool -- each page is fetched, evicted and
+ * written back over and over. Merging by page would take both counts to about
+ * 101,000 and is the single largest remaining lever in recovery.
+ *
+ * Why it is safe in principle: records on the same (page, slot) must be applied
+ * in write order, but there is no dependency *across* pages. redo_existing_slot
+ * only touches the slot it is given; file extension, free-list maintenance and
+ * TupleMeta normalization all happen in separate serial phases
+ * (repair_touched_file_headers, reset_touched_tuple_meta).
+ *
+ * Sketch:
+ *  - analyze() also records, per DML record, {wal_offset, page_no, table_id}
+ *    (16 bytes, ~9 MB for a 256 MB WAL). File-offset order is write order, by
+ *    the prefix property, so no LSN field is needed for ordering.
+ *  - redo() sorts that array by (table_id, page_no, wal_offset) -- a total
+ *    order, so replay stays deterministic -- and mmaps the WAL read-only
+ *    (<= 256 MB) so per-record random access costs a page-cache-warm fault
+ *    instead of the two preads ReadWalRecordAt would issue.
+ *  - Per (table, page) group: one fetch_page_handle and one exclusive page
+ *    latch, then apply every record of the group whose slot bit is already set,
+ *    taking max() of their LSNs for the page LSN. Records whose slot bit is not
+ *    set are collected and, *after* the latch is dropped, replayed through
+ *    today's redo_insert/redo_delete/redo_update -- insert_record takes the same
+ *    page latch itself, so calling it under the latch would deadlock.
+ *  - Keep verifying the record's own table name against the group's table_id, so
+ *    the grouping key can never silently disagree with the record (the failure
+ *    mode fixed in this round).
+ *
+ * Deferred deliberately: it is ~120 lines in the hottest recovery phase, it
+ * reaches into the buffer pool's pin/latch protocol, and recovery already
+ * finishes in about 30 s against a 90 s budget, so it is not on the critical
+ * path. The thing that does threaten the budget is a whole-index rebuild (see
+ * rebuild_indexes), which is a different fix.
  */
 void RecoveryManager::redo() {
-    if (!has_dml_records_ && scanned_record_count_ == 0) {
+    if (!has_dml_records_) {
         return;
     }
-
-    // The pages the whole pass will touch are already known, so the kernel can
-    // be reading the next batch while this one is applied.
-    prefetch_redo_batch(0);
-    prefetch_redo_batch(kPrefetchBatchRecords);
 
     WalReader reader(disk_manager_, scan_begin_offset_, scan_end_offset_);
     WalRecordView record;
     WalDmlView dml;
-    size_t dml_index = 0;
     while (reader.next(&record)) {
         switch (record.log_type) {
         case LogType::INSERT:
@@ -291,18 +428,27 @@ void RecoveryManager::redo() {
             continue;
         }
         if (!ParseWalDml(record, &dml)) {
-            break;
-        }
-        const size_t current_index = dml_index++;
-        if (current_index % kPrefetchBatchRecords == 0 && current_index > 0) {
-            prefetch_redo_batch(current_index + 2 * kPrefetchBatchRecords);
+            // analyze() parsed the same bytes with the same parser and threw if
+            // any of them failed, so reaching this is a bug, not bad input.
+            throw InternalError("recovery failed to re-parse the DML payload at WAL offset " +
+                                std::to_string(record.offset) + " that analyze accepted; WAL retained");
         }
         if (committed_txns_.count(record.txn_id) == 0) {
-            ++redo_skipped_count_;
+            ++redo_skipped_count_; // a loser: undo() rolls it back instead
             continue;
         }
-        RecoveryTable* table = current_index < touched_.size() ? table_at(touched_[current_index].table_id) : nullptr;
-        if (table == nullptr || table->file_handle == nullptr) {
+        // Resolved from the record's own table name. An earlier version indexed
+        // touched_ by the record's position in this pass, which only worked as
+        // long as this loop's filter stayed byte-for-byte identical to
+        // analyze()'s. Any divergence would have written a correct RID into the
+        // wrong table's file, with no exception and nothing in the log. It
+        // bought one hash lookup per record, about 1% of this phase.
+        RecoveryTable* table = table_at(intern_table(dml.table_name));
+        if (table->file_handle == nullptr) {
+            // The table is no longer open, so there is nothing to replay into.
+            // Counted so that applied + skipped covers every DML record.
+            ++redo_skipped_count_;
+            ++redo_missing_table_count_;
             continue;
         }
         ++redo_applied_count_;
@@ -323,9 +469,10 @@ void RecoveryManager::redo() {
             break;
         }
     }
-    LOG_INFO("recovery redo: applied %llu, skipped %llu, wal preads %llu",
+    LOG_INFO("recovery redo: applied %llu, skipped %llu (%llu with no open table), %llu dml records, wal preads %llu",
              static_cast<unsigned long long>(redo_applied_count_), static_cast<unsigned long long>(redo_skipped_count_),
-             static_cast<unsigned long long>(reader.read_count()));
+             static_cast<unsigned long long>(redo_missing_table_count_),
+             static_cast<unsigned long long>(touched_.size()), static_cast<unsigned long long>(reader.read_count()));
 }
 
 /**
@@ -341,6 +488,15 @@ void RecoveryManager::undo() {
     // the exact reverse of the order the records were written. Undoing whole
     // transactions one after another would let an older transaction's rollback
     // run before a newer transaction's write on the same slot is undone.
+    //
+    // Every record on a chain is fetched with its own ReadWalRecordAt, i.e. two
+    // preads (header, then body). That is affordable only because the number of
+    // loser records is bounded: at most one open transaction per connection, so
+    // 50, times the longest transaction's record count, 132 for Delivery, which
+    // is under 13,200 syscalls. The bound depends on no transaction spanning a
+    // checkpoint -- LOAD is the only shape that could, and it cannot run
+    // concurrently with the measured workload. If that ever changes, this turns
+    // into a streaming backward pass instead.
     std::priority_queue<lsn_t> pending;
     for (const auto& [txn_id, last_lsn] : active_txn_last_lsn_) {
         (void)txn_id;
@@ -358,9 +514,26 @@ void RecoveryManager::undo() {
             pending.pop();
         }
 
+        // Each of the three failures below used to `continue`, which broke that
+        // loser's whole prev_lsn chain and left the rest of its writes rolled
+        // forward, with no exception and nothing in the log. None of them is
+        // reachable today: write_restart_offset() always writes 0, so
+        // scan_begin_offset_ is always 0 and record_locations_ holds every LSN
+        // in the file. They become reachable the day fuzzy checkpointing lands,
+        // because a restart offset that is not <= the first LSN of every live
+        // transaction turns a missing lookup into a partially rolled-back
+        // transaction -- a direct violation of `final.md:342` clause 2, and one
+        // that leaves no trace. Failing the recovery instead makes the next
+        // process retry from the complete WAL.
         const int64_t offset = offset_of_lsn(current_lsn);
-        if (offset < 0 || !ReadWalRecordAt(disk_manager_, offset, scan_end_offset_, &scratch, &record)) {
-            continue;
+        if (offset < 0) {
+            throw InternalError("recovery could not locate WAL LSN " + std::to_string(current_lsn) +
+                                " on a loser's prev_lsn chain; the scan started at offset " +
+                                std::to_string(scan_begin_offset_) + "; WAL retained");
+        }
+        if (!ReadWalRecordAt(disk_manager_, offset, scan_end_offset_, &scratch, &record)) {
+            throw InternalError("recovery could not re-read the WAL record for LSN " + std::to_string(current_lsn) +
+                                " at offset " + std::to_string(offset) + "; WAL retained");
         }
         if (record.log_type == LogType::BEGIN) {
             continue;
@@ -368,7 +541,8 @@ void RecoveryManager::undo() {
         if (record.log_type == LogType::INSERT || record.log_type == LogType::DELETE ||
             record.log_type == LogType::UPDATE) {
             if (!ParseWalDml(record, &dml)) {
-                continue;
+                throw InternalError("recovery failed to re-parse the DML payload for LSN " +
+                                    std::to_string(current_lsn) + " that analyze accepted; WAL retained");
             }
             const uint16_t table_id = intern_table(dml.table_name);
             RecoveryTable& table = tables_[table_id];
@@ -396,8 +570,12 @@ void RecoveryManager::undo() {
     }
     LOG_INFO("recovery undo: %llu records", static_cast<unsigned long long>(undo_applied_count_));
 
-    reset_touched_tuple_meta();
+    // Headers first: reset_touched_tuple_meta() skips any page at or beyond
+    // num_pages, so a touched page still outside the header's page count would
+    // keep a loser's writer_txn_id_ and is_committed_=false on disk forever.
+    // The window is not constructible today, but the order costs nothing.
     repair_touched_file_headers();
+    reset_touched_tuple_meta();
     // Repair only keys named by the WAL. Rebuilding every index from every heap
     // row makes recovery proportional to the whole database even when the
     // crash affected a handful of records. The repair is idempotent and
@@ -498,7 +676,7 @@ void RecoveryManager::reset_touched_tuple_meta() {
     }
 }
 
-void RecoveryManager::collect_wal_index_keys(std::map<std::string, IndexRepairPlan>* plans) {
+void RecoveryManager::collect_wal_index_keys() {
     // Every image the WAL mentions is a candidate stale entry: without index
     // page LSNs recovery cannot tell whether the matching index write reached
     // disk, so each one has to be reconciled against the tree.
@@ -515,33 +693,29 @@ void RecoveryManager::collect_wal_index_keys(std::map<std::string, IndexRepairPl
             continue;
         }
         if (!ParseWalDml(record, &dml)) {
-            break;
+            throw InternalError("recovery failed to re-parse the DML payload at WAL offset " +
+                                std::to_string(record.offset) + " that analyze accepted; WAL retained");
         }
-        RecoveryTable& table = tables_[intern_table(dml.table_name)];
-        if (table.meta == nullptr) {
-            continue;
-        }
-        for (const auto& index_meta : table.meta->indexes) {
-            const auto index_name = sm_manager_->get_ix_manager()->get_index_name(table.name, index_meta.cols);
-            auto plan_it = plans->find(index_name);
-            if (plan_it == plans->end()) {
-                continue;
-            }
-            IndexRepairPlan& plan = plan_it->second;
+        // index_plans was resolved once per table; this loop runs once per WAL
+        // record, and rebuilding the index name here used to cost a string
+        // concatenation plus a map lookup per record per index.
+        const RecoveryTable& table = tables_[intern_table(dml.table_name)];
+        for (IndexRepairPlan* plan : table.index_plans) {
             for (const char* image : {dml.before_image, dml.after_image}) {
                 if (image == nullptr) {
                     continue;
                 }
-                const auto key_slot = static_cast<uint32_t>(plan.key_arena.size() / plan.key_len);
-                plan.key_arena.resize(plan.key_arena.size() + static_cast<size_t>(plan.key_len));
-                BuildIndexKey(index_meta, image, plan.key_arena.data() + static_cast<size_t>(key_slot) * plan.key_len);
-                plan.entries.push_back(IndexRepairEntry{key_slot, dml.rid, false});
+                const auto key_slot = static_cast<uint32_t>(plan->key_arena.size() / plan->key_len);
+                plan->key_arena.resize(plan->key_arena.size() + static_cast<size_t>(plan->key_len));
+                BuildIndexKey(*plan->index_meta, image,
+                              plan->key_arena.data() + static_cast<size_t>(key_slot) * plan->key_len);
+                plan->entries.push_back(IndexRepairEntry{key_slot, dml.rid, false});
             }
         }
     }
 }
 
-void RecoveryManager::collect_heap_index_keys(std::map<std::string, IndexRepairPlan>* plans) {
+void RecoveryManager::collect_heap_index_keys() {
     // Read the final tuple of every touched RID one page at a time. The RIDs
     // are already ordered by page, so this is a sequential sweep and the keys
     // of every index on the table come out of the same page pin.
@@ -552,24 +726,11 @@ void RecoveryManager::collect_heap_index_keys(std::map<std::string, IndexRepairP
             ++end;
         }
         RecoveryTable& table = tables_[table_id];
-        if (table.file_handle == nullptr || table.meta == nullptr) {
+        if (table.file_handle == nullptr || table.index_plans.empty()) {
             begin = end;
             continue;
         }
-
-        // Resolve each index's plan once per table instead of once per row.
-        std::vector<std::pair<const IndexMeta*, IndexRepairPlan*>> table_plans;
-        for (const auto& index_meta : table.meta->indexes) {
-            const auto index_name = sm_manager_->get_ix_manager()->get_index_name(table.name, index_meta.cols);
-            auto plan_it = plans->find(index_name);
-            if (plan_it != plans->end()) {
-                table_plans.emplace_back(&index_meta, &plan_it->second);
-            }
-        }
-        if (table_plans.empty()) {
-            begin = end;
-            continue;
-        }
+        const auto& table_plans = table.index_plans;
 
         const int num_pages = table.file_handle->get_file_hdr().num_pages;
         for (size_t i = begin; i < end;) {
@@ -596,10 +757,10 @@ void RecoveryManager::collect_heap_index_keys(std::map<std::string, IndexRepairP
                     }
                     const char* row = page_handle.get_slot(slot_no);
                     const Rid rid{page_no, slot_no};
-                    for (const auto& [index_meta, plan] : table_plans) {
+                    for (IndexRepairPlan* plan : table_plans) {
                         const auto key_slot = static_cast<uint32_t>(plan->key_arena.size() / plan->key_len);
                         plan->key_arena.resize(plan->key_arena.size() + static_cast<size_t>(plan->key_len));
-                        BuildIndexKey(*index_meta, row,
+                        BuildIndexKey(*plan->index_meta, row,
                                       plan->key_arena.data() + static_cast<size_t>(key_slot) * plan->key_len);
                         plan->entries.push_back(IndexRepairEntry{key_slot, rid, true});
                     }
@@ -614,20 +775,43 @@ void RecoveryManager::collect_heap_index_keys(std::map<std::string, IndexRepairP
 
 void RecoveryManager::plan_touched_indexes(std::map<std::string, IndexRepairPlan>* plans) {
     // One plan per index that a touched table owns and that is actually open.
-    for (const auto& touched : touched_sorted_) {
-        RecoveryTable& table = tables_[touched.table_id];
+    // Every entry of tables_ was interned from a DML record, so iterating it
+    // visits each touched table exactly once; the previous version iterated
+    // touched_sorted_ instead and rebuilt every index name once per touched RID.
+    for (const auto& table : tables_) {
         if (table.meta == nullptr) {
             continue;
         }
         for (const auto& index_meta : table.meta->indexes) {
-            const auto index_name = sm_manager_->get_ix_manager()->get_index_name(table.name, index_meta.cols);
-            if (plans->count(index_name) != 0 || sm_manager_->ihs_.count(index_name) == 0) {
+            auto index_name = sm_manager_->get_ix_manager()->get_index_name(table.name, index_meta.cols);
+            auto handle_it = sm_manager_->ihs_.find(index_name);
+            if (handle_it == sm_manager_->ihs_.end() || plans->count(index_name) != 0) {
                 continue;
             }
             IndexRepairPlan plan;
             plan.index_name = index_name;
+            plan.index_meta = &index_meta;
+            plan.index = handle_it->second.get();
             plan.key_len = index_meta.col_tot_len;
-            plans->emplace(index_name, std::move(plan));
+            plans->emplace(std::move(index_name), std::move(plan));
+        }
+    }
+}
+
+void RecoveryManager::bind_index_plans(std::map<std::string, IndexRepairPlan>* plans) {
+    // Once per table per index, so the two collectors below can walk pointers.
+    // plans is not mutated after this, so the addresses stay valid; the plans are
+    // unbound again before anything can invalidate them.
+    for (auto& table : tables_) {
+        table.index_plans.clear();
+        if (table.meta == nullptr) {
+            continue;
+        }
+        for (const auto& index_meta : table.meta->indexes) {
+            auto plan_it = plans->find(sm_manager_->get_ix_manager()->get_index_name(table.name, index_meta.cols));
+            if (plan_it != plans->end()) {
+                table.index_plans.push_back(&plan_it->second);
+            }
         }
     }
 }
@@ -636,12 +820,13 @@ void RecoveryManager::collect_index_repair_keys(std::map<std::string, IndexRepai
     if (plans->empty()) {
         return;
     }
-    collect_wal_index_keys(plans);
-    collect_heap_index_keys(plans);
+    bind_index_plans(plans);
+    collect_wal_index_keys();
+    collect_heap_index_keys();
 }
 
-bool RecoveryManager::apply_index_repair_plan(IxIndexHandle* index, const IndexMeta& index_meta,
-                                              IndexRepairPlan* plan) {
+bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
+    IxIndexHandle* index = plan->index;
     const int key_len = plan->key_len;
     const char* arena = plan->key_arena.data();
     const auto key_of = [arena, key_len](const IndexRepairEntry& entry) {
@@ -690,16 +875,37 @@ bool RecoveryManager::apply_index_repair_plan(IxIndexHandle* index, const IndexM
         ++index_probe_count_;
         index->get_value(key, &existing, nullptr);
 
-        // Deleting every WAL image and then reinstalling the live keys leaves
-        // this key holding exactly `required`. When the tree already holds
-        // exactly that, the sequence is a no-op and the traversals, page
-        // dirtying and node merges it would cause are all pure waste.
+        // `existing` is a multiset, not a set: lookup_equal() pushes back every
+        // matching slot, insert_entry(..., allow_duplicate=true) will store the
+        // same (key, rid) twice, and delete_entry() removes one copy per call.
+        // Treating it as a set is what let E = {r, r}, C = {r}, R = {r} pass the
+        // skip test below and leave a duplicated entry in the tree forever --
+        // which makes an index scan return the same heap row twice and inflates
+        // the per-partition row counts `final.md:345` cross-checks.
         const auto contains = [](const std::vector<Rid>& haystack, const Rid& needle) {
             return std::find(haystack.begin(), haystack.end(), needle) != haystack.end();
         };
+        const auto multiplicity = [](const std::vector<Rid>& haystack, const Rid& needle) {
+            return static_cast<int>(std::count(haystack.begin(), haystack.end(), needle));
+        };
+        for (size_t i = 0; i < existing.size(); ++i) {
+            // Count each duplicated RID once, at its first occurrence. This is
+            // the only measurement of how often a real crash leaves a duplicate;
+            // the skip predicate used to hide them from every counter.
+            if (multiplicity(existing, existing[i]) > 1 &&
+                std::find(existing.begin(), existing.begin() + static_cast<std::ptrdiff_t>(i), existing[i]) ==
+                    existing.begin() + static_cast<std::ptrdiff_t>(i)) {
+                ++index_duplicate_entry_count_;
+            }
+        }
+
+        // Draining every WAL image and then reinstalling the live keys leaves
+        // this key holding exactly `required`, once each. When the tree already
+        // holds exactly that, the sequence is a no-op and the traversals, page
+        // dirtying and node merges it would cause are all pure waste.
         bool already_correct = true;
         for (const Rid& rid : required) {
-            if (!contains(existing, rid)) {
+            if (multiplicity(existing, rid) != 1) {
                 already_correct = false;
                 break;
             }
@@ -718,26 +924,33 @@ bool RecoveryManager::apply_index_repair_plan(IxIndexHandle* index, const IndexM
             continue;
         }
 
-        for (const Rid& rid : candidates) {
-            if (!contains(existing, rid)) {
-                continue;
-            }
-            // Drain duplicates: an interrupted index write can leave the same
-            // pair more than once, and the old repair removed one copy per WAL
-            // record that mentioned it.
-            for (int attempt = 0; attempt < kMaxDuplicateDrain; ++attempt) {
+        // An interrupted index write can leave the same pair more than once, so
+        // every removal drains rather than deleting a single copy.
+        const auto drain = [&](const Rid& rid, int keep) {
+            const int surplus = std::min(multiplicity(existing, rid) - keep, kMaxDuplicateDrain);
+            for (int removed = 0; removed < surplus; ++removed) {
                 if (!index->delete_entry(key, rid, nullptr)) {
                     break;
                 }
                 ++index_mutation_count_;
             }
+        };
+        for (const Rid& rid : candidates) {
+            drain(rid, 0);
         }
         for (const Rid& rid : required) {
-            if (contains(existing, rid) && !contains(candidates, rid)) {
-                continue; // still installed and never deleted above
+            if (contains(candidates, rid)) {
+                // Drained to zero above, so exactly one copy has to go back.
+                index->insert_entry(key, rid, nullptr, true);
+                ++index_mutation_count_;
+            } else if (multiplicity(existing, rid) == 0) {
+                index->insert_entry(key, rid, nullptr, true);
+                ++index_mutation_count_;
+            } else {
+                // Present and never deleted; only the surplus copies have to go.
+                drain(rid, 1);
+                continue;
             }
-            index->insert_entry(key, rid, nullptr, true);
-            ++index_mutation_count_;
             if (spot_check_keys.size() < kRepairSpotCheckLimit) {
                 spot_check_keys.push_back(key);
                 spot_check_rids.push_back(rid);
@@ -755,7 +968,6 @@ bool RecoveryManager::apply_index_repair_plan(IxIndexHandle* index, const IndexM
             return false;
         }
     }
-    (void)index_meta;
     return true;
 }
 
@@ -781,28 +993,21 @@ void RecoveryManager::repair_touched_indexes() {
     //    nothing ever called the checker, which is why a stale root pointer on
     //    a self-consistent tree raised no exception at all.
     const auto validate_begin = std::chrono::steady_clock::now();
-    size_t validated_indexes = 0;
     size_t repaired_endpoints = 0;
     for (const auto& [index_name, plan] : plans) {
-        (void)plan;
-        auto index_it = sm_manager_->ihs_.find(index_name);
-        if (index_it == sm_manager_->ihs_.end()) {
-            continue;
-        }
-        ++validated_indexes;
-        if (!index_it->second->refresh_leaf_chain_endpoint()) {
-            LOG_WARN("recovery could not follow the leaf chain of index %s", index_name.c_str());
+        if (!plan.index->refresh_leaf_chain_endpoint()) {
+            LOG_ERROR("recovery could not follow the leaf chain of index %s", index_name.c_str());
             indexes_to_rebuild.insert(index_name);
             continue;
         }
         ++repaired_endpoints;
-        if (!index_it->second->validate_structure()) {
-            LOG_WARN("recovery found structurally invalid index %s", index_name.c_str());
+        if (!plan.index->validate_structure()) {
+            LOG_ERROR("recovery found structurally invalid index %s", index_name.c_str());
             indexes_to_rebuild.insert(index_name);
         }
     }
     LOG_INFO("recovery index structure gate: %zu indexes, %zu leaf endpoints refreshed, %zu to rebuild, %lld ms",
-             validated_indexes, repaired_endpoints, indexes_to_rebuild.size(),
+             plans.size(), repaired_endpoints, indexes_to_rebuild.size(),
              static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::steady_clock::now() - validate_begin)
                                         .count()));
@@ -815,45 +1020,50 @@ void RecoveryManager::repair_touched_indexes() {
     collect_index_repair_keys(&plans);
 
     for (auto& [index_name, plan] : plans) {
-        auto index_it = sm_manager_->ihs_.find(index_name);
-        if (index_it == sm_manager_->ihs_.end()) {
-            continue;
-        }
-        const IndexMeta* index_meta = nullptr;
-        for (auto& table : tables_) {
-            if (table.meta == nullptr) {
-                continue;
-            }
-            for (const auto& candidate : table.meta->indexes) {
-                if (sm_manager_->get_ix_manager()->get_index_name(table.name, candidate.cols) == index_name) {
-                    index_meta = &candidate;
-                    break;
-                }
-            }
-            if (index_meta != nullptr) {
-                break;
-            }
-        }
-        if (index_meta == nullptr) {
-            continue;
-        }
         try {
-            if (!apply_index_repair_plan(index_it->second.get(), *index_meta, &plan)) {
+            if (!apply_index_repair_plan(&plan)) {
                 indexes_to_rebuild.insert(index_name);
             }
         } catch (const std::exception& error) {
-            LOG_WARN("recovery found structurally inconsistent index %s: %s", index_name.c_str(), error.what());
+            LOG_ERROR("recovery found structurally inconsistent index %s: %s", index_name.c_str(), error.what());
             indexes_to_rebuild.insert(index_name);
         }
     }
 
-    LOG_INFO("recovery index repair: %llu probes, %llu mutations, %llu keys already correct",
+    LOG_INFO("recovery index repair: %llu probes, %llu mutations, %llu keys already correct, %llu duplicated entries",
              static_cast<unsigned long long>(index_probe_count_),
              static_cast<unsigned long long>(index_mutation_count_),
-             static_cast<unsigned long long>(index_unchanged_key_count_));
+             static_cast<unsigned long long>(index_unchanged_key_count_),
+             static_cast<unsigned long long>(index_duplicate_entry_count_));
 
-    if (!indexes_to_rebuild.empty()) {
-        sm_manager_->rebuild_indexes(indexes_to_rebuild);
+    // index_plans points into `plans`, which dies with this function.
+    for (auto& table : tables_) {
+        table.index_plans.clear();
+    }
+    rebuild_indexes(indexes_to_rebuild);
+}
+
+void RecoveryManager::rebuild_indexes(const std::unordered_set<std::string>& index_names) {
+    if (index_names.empty()) {
+        return;
+    }
+    // Logged at ERROR, not INFO. A rebuild reads the whole heap once per index,
+    // so recovery time stops being proportional to the WAL and starts being
+    // proportional to the table -- at ten million rows no rebuild fits the 90 s
+    // readiness budget at all. It is a correctness backstop, not a normal
+    // outcome, and the default log level is WARN, so anything quieter than this
+    // would be invisible outside the recovery window.
+    LOG_ERROR("recovery must rebuild %zu index(es) from the heap; this is NOT the normal recovery path and makes "
+              "recovery time proportional to the table rather than to the WAL",
+              index_names.size());
+    for (const auto& index_name : index_names) {
+        const auto begin = std::chrono::steady_clock::now();
+        sm_manager_->rebuild_indexes({index_name});
+        ++index_rebuild_count_;
+        LOG_ERROR("recovery rebuilt index %s in %lld ms", index_name.c_str(),
+                  static_cast<long long>(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
+                          .count()));
     }
 }
 
@@ -934,7 +1144,18 @@ bool RecoveryManager::redo_existing_slot(RecoveryTable& table, const Rid& rid, c
     return applied;
 }
 
+// The three redo functions below all validate the image length before the fast
+// path, not just before the fallback. redo_existing_slot() checks it itself and
+// declines the record, but declining hands the same unchecked bytes to
+// RmFileHandle::insert_record(), which copies exactly record_size bytes out of
+// the pointer regardless of how long the WAL says the image is, sets the bitmap
+// bit for the slot without bounds-checking it, and extends the file until
+// num_pages exceeds page_no. The RID and the image length are unvalidated
+// external input, so both have to be settled before either path runs.
+// analyze() already bounded the RID; only the length is left.
+
 void RecoveryManager::redo_insert(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    validate_installable_image(table, record, dml.after_size);
     // The committed metadata is installed even when the tuple body was already
     // present: a page LSN can be ahead because the same page also holds a loser
     // operation, so it must not be used to skip this redo.
@@ -949,6 +1170,7 @@ void RecoveryManager::redo_insert(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::redo_delete(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    validate_installable_image(table, record, dml.before_size);
     TupleMeta meta = MakeCommittedMeta(record.txn_id);
     meta.is_deleted_ = true;
     if (redo_existing_slot(table, dml.rid, dml.before_image, dml.before_size, meta, record.lsn)) {
@@ -961,6 +1183,7 @@ void RecoveryManager::redo_delete(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::redo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    validate_installable_image(table, record, dml.after_size);
     const TupleMeta meta = MakeCommittedMeta(record.txn_id);
     if (redo_existing_slot(table, dml.rid, dml.after_image, dml.after_size, meta, record.lsn)) {
         return;
@@ -987,6 +1210,9 @@ void RecoveryManager::undo_insert(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::undo_delete(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    // Both paths below copy record_size bytes out of before_image; see the note
+    // above redo_insert().
+    validate_installable_image(table, record, dml.before_size);
     // 幂等守卫：仅当该 slot 当前为空，或仍是本 loser 写下的 MVCC tombstone 时才恢复。
     // 若 slot 已被后续 committed 事务重新写入为 live tuple，跳过，避免覆盖 committed 数据。
     const TupleMeta restored_meta = MakeLoserMeta(record.txn_id);
@@ -1002,6 +1228,9 @@ void RecoveryManager::undo_delete(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::undo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    // apply_tuple_update() copies record_size bytes out of before_image; see the
+    // note above redo_insert().
+    validate_installable_image(table, record, dml.before_size);
     // 幂等守卫：仅当该 rid 仍持有本 loser 事务写入的 new_value 时才回滚到 old_value。
     // 若 rid 已被后续 committed 事务覆盖为其他值，跳过，避免覆盖 committed 数据。
     if (!record_exists(table, dml.rid)) {

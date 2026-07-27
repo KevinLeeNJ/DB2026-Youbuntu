@@ -328,6 +328,43 @@ TEST(LogManagerTest, ConcurrentDurableFlushesShareAGroup) {
     EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kWaiterCount));
 }
 
+// Under a continuously refilled queue the leader keeps extending the batch, so
+// waiters are released across many flushes. Each one must be released only once
+// its own target is covered by durable_lsn_ — never early, and never left
+// behind, however the batches happen to line up.
+TEST(LogManagerTest, SaturatedGroupCommitReleasesEveryWaiterOnlyWhenDurable) {
+    ScopedTestDir test_dir("log_manager_group_commit_saturated_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    constexpr int kThreads = 8;
+    constexpr int kCommitsPerThread = 40;
+    std::atomic<int> completed{0};
+    std::vector<std::thread> committers;
+    committers.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        committers.emplace_back([&, i] {
+            for (int n = 0; n < kCommitsPerThread; ++n) {
+                CommitLogRecord commit(300 + i);
+                const lsn_t lsn = log_mgr.add_log_to_buffer(&commit);
+                log_mgr.flush_log_to_disk_up_to(lsn);
+                // Returning from the flush must mean this record is durable.
+                ASSERT_GE(log_mgr.get_durable_lsn(), lsn);
+                completed.fetch_add(1, std::memory_order_acq_rel);
+            }
+        });
+    }
+    for (auto& committer : committers) {
+        committer.join();
+    }
+
+    EXPECT_EQ(completed.load(), kThreads * kCommitsPerThread);
+    EXPECT_GE(log_mgr.get_group_commit_leader_count(), 1u);
+    // Coalescing must still happen: far fewer fdatasync calls than commits.
+    EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kThreads * kCommitsPerThread));
+}
+
 TEST(LogManagerTest, RestartOffsetRoundTrip) {
     ScopedTestDir test_dir("log_manager_restart_test_db");
     DiskManager disk;

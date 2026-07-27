@@ -233,6 +233,14 @@ public:
         return tabs_.find(tab_name) != tabs_.end();
     }
 
+    /**
+     * @brief 直接注入一张表的元数据。仅供单元测试搭建内存中的 schema 使用。
+     *
+     * ⚠️ 它绕过了 create_table / load_meta 里的 TabMeta::bind_null_positions()，
+     * 因此注入的 ColMeta 必须自带正确的 null_byte / null_mask（要么调用方先自己
+     * 调 bind_null_positions，要么按 defs.h 的布局手填），否则 NULL 位读写会落到
+     * 错误的字节上。生产路径请一律走 SmManager。
+     */
     void SetTabMeta(const std::string& tab_name, const TabMeta& meta) {
         tabs_[tab_name] = meta;
     }

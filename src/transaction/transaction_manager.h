@@ -107,6 +107,9 @@ public:
         if (txn_id == INVALID_TXN_ID)
             return nullptr;
 
+        // Counts only the lookups that reach the global txn_map mutex, which is
+        // the cost a session avoids by caching the transaction it is running.
+        txn_map_lookup_count_.fetch_add(1, std::memory_order_relaxed);
         std::unique_lock<std::mutex> lock(latch_);
         auto it = TransactionManager::txn_map.find(txn_id);
         if (it == TransactionManager::txn_map.end())
@@ -216,6 +219,10 @@ public:
     size_t DebugActivePredicateTableCount();
     size_t DebugTxnMapSize();
 
+    uint64_t DebugTxnMapLookupCount() const {
+        return txn_map_lookup_count_.load(std::memory_order_relaxed);
+    }
+
     // GC observability: the backlog is the current txn-map population waiting
     // for bounded background collection (including entries not yet eligible).
     size_t DebugGcBacklog() const {
@@ -266,6 +273,7 @@ private:
     uint64_t commits_since_gc_{0};
     bool gc_running_{false};
     bool gc_requested_{false};
+    std::atomic<uint64_t> txn_map_lookup_count_{0};
     std::atomic<size_t> gc_backlog_{0};
     std::atomic<size_t> gc_last_batch_size_{0};
 

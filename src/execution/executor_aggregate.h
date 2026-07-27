@@ -630,11 +630,16 @@ private:
                     continue;
                 }
                 update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], tuple);
-                // MIN 忽略 NULL。NULL 的索引键是全零字节，因此排在最前面：跳过
-                // 这些前导 NULL 行，第一个非 NULL 行才是最小值。
+                // MIN 忽略 NULL：update_aggregate_state 不会把 NULL 计入，所以
+                // has_value 仍为假就说明到这里为止扫到的都是 NULL，继续往后走。
+                // 注意不要假设 NULL 行一定排在最前面——NULL 的索引键是全零字节，
+                // 在负值列上它排在负数之后。这段代码不依赖 NULL 行的位置，只依赖
+                // 非 NULL 行之间按 col 升序，所以两种情况都对。
                 if (!global_state.aggregate_states[0].has_value) {
                     continue;
                 }
+                // 这里没有 passes_having：can_use_min_index_shortcut() 已经要求
+                // having_conds_ 为空，HAVING 存在时根本不会走进这条捷径。
                 groups_.push_back(std::move(global_state));
                 return;
             }

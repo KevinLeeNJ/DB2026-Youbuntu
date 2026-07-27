@@ -215,8 +215,8 @@ void IxIndexHandle::refresh_root_page_cache() {
         if (old_root != nullptr && old_root_id.page_no != IX_NO_PAGE) {
             if (resident_internal_pages_.erase(old_root_id.page_no) != 0) {
                 buffer_pool_manager_->unmark_resident(old_root_id);
-                cached_internal_pages_.erase(old_root_id.page_no);
             }
+            drop_cached_internal_page(old_root_id.page_no);
             buffer_pool_manager_->unpin_page(old_root_id, false);
         }
     }
@@ -235,9 +235,43 @@ void IxIndexHandle::mark_internal_page_resident(page_id_t page_no, Page* page) {
     if (resident_internal_pages_.insert(page_no).second) {
         buffer_pool_manager_->mark_resident(PageId{fd_, page_no}, ResidencyClass::IndexInternal);
     }
-    if (internal_page_cache_enabled() && page_no != file_hdr_->root_page_) {
-        cached_internal_pages_[page_no] = page;
+    cache_internal_page(page_no, page);
+}
+
+/**
+ * @brief Remember a raw Page* for an internal page and take the buffer-pool pin
+ * that keeps it valid.
+ *
+ * Keeping the frame out of the replacer is a placement policy, not ownership: it
+ * says "prefer not to evict this" and BufferPoolManager::clear_residency() may
+ * revoke it without telling us. A real pin is the ownership primitive - the same
+ * split InnoDB draws between its LRU policy and a block's fix count - so every
+ * entry in cached_internal_pages_ holds exactly one pin, released by
+ * drop_cached_internal_page().
+ */
+void IxIndexHandle::cache_internal_page(page_id_t page_no, Page* page) {
+    if (!internal_page_cache_enabled() || page_no == file_hdr_->root_page_ || page_no == IX_NO_PAGE) {
+        return;
     }
+    auto [it, inserted] = cached_internal_pages_.try_emplace(page_no, page);
+    if (!inserted) {
+        // The pin for this page is already held; only the frame may have moved.
+        it->second = page;
+        return;
+    }
+    Page* pinned = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
+    if (pinned == nullptr) {
+        cached_internal_pages_.erase(it);
+        return;
+    }
+    it->second = pinned;
+}
+
+void IxIndexHandle::drop_cached_internal_page(page_id_t page_no) const {
+    if (cached_internal_pages_.erase(page_no) == 0) {
+        return;
+    }
+    buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, false);
 }
 
 void IxIndexHandle::release_root_page_cache() const {
@@ -284,9 +318,7 @@ void IxIndexHandle::register_internal_pages() {
                 reachable.insert(page_no);
                 resident_internal_pages_.insert(page_no);
                 buffer_pool_manager_->mark_resident(PageId{fd_, page_no}, ResidencyClass::IndexInternal);
-                if (internal_page_cache_enabled() && page_no != file_hdr_->root_page_) {
-                    cached_internal_pages_[page_no] = page;
-                }
+                cache_internal_page(page_no, page);
                 for (int child_idx = 0; child_idx < node.get_size(); ++child_idx) {
                     pending.push_back(node.value_at(child_idx));
                 }
@@ -308,6 +340,11 @@ void IxIndexHandle::unregister_internal_pages() const {
         buffer_pool_manager_->unmark_resident(PageId{fd_, page_no});
     }
     resident_internal_pages_.clear();
+    // Release the pin every cache entry owns before dropping the pointers.
+    for (const auto& [page_no, page] : cached_internal_pages_) {
+        (void)page;
+        buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, false);
+    }
     cached_internal_pages_.clear();
 }
 
@@ -358,21 +395,17 @@ bool IxIndexHandle::get_value(const char* key, std::vector<Rid>* result, Transac
  * 注意：本函数执行完毕后，原node和new node都需要在函数外面进行unpin
  */
 bool IxIndexHandle::try_append_hint(const char* key, IxNodeHandle& leaf) const {
-    const std::string hint_key = append_hint_key(key);
-    LeafHint hint;
-    {
-        std::lock_guard<std::mutex> guard(append_hint_latch_);
-        auto it = append_hints_.find(hint_key);
-        if (it == append_hints_.end() || it->second.topology_epoch != topology_epoch_.load(std::memory_order_relaxed)) {
-            return false;
-        }
-        hint = it->second;
+    const uint64_t hint = append_hint_.load(std::memory_order_relaxed);
+    if (hint != pack_append_hint(static_cast<page_id_t>(static_cast<int32_t>(hint & 0xFFFFFFFFU)),
+                                 topology_epoch_.load(std::memory_order_relaxed))) {
+        return false;
     }
-    if (hint.page_no == IX_NO_PAGE || hint.page_no == IX_LEAF_HEADER_PAGE || hint.page_no == file_hdr_->root_page_) {
+    const auto hint_page_no = static_cast<page_id_t>(static_cast<int32_t>(hint & 0xFFFFFFFFU));
+    if (hint_page_no == IX_NO_PAGE || hint_page_no == IX_LEAF_HEADER_PAGE || hint_page_no == file_hdr_->root_page_) {
         return false;
     }
 
-    fetch_node_into(hint.page_no, leaf);
+    fetch_node_into(hint_page_no, leaf);
     const bool valid =
         leaf.is_leaf_page() && leaf.get_size() > 0 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE &&
         ix_compare(key, leaf.get_key(leaf.get_size() - 1), file_hdr_->col_types_, file_hdr_->col_lens_) > 0;
@@ -383,12 +416,9 @@ bool IxIndexHandle::try_append_hint(const char* key, IxNodeHandle& leaf) const {
     return true;
 }
 
-void IxIndexHandle::remember_append_hint(const char* key, page_id_t page_no) const {
-    std::lock_guard<std::mutex> guard(append_hint_latch_);
-    if (append_hints_.size() > 4096) {
-        append_hints_.clear();
-    }
-    append_hints_[append_hint_key(key)] = LeafHint{page_no, topology_epoch_.load(std::memory_order_relaxed)};
+void IxIndexHandle::remember_append_hint(page_id_t page_no) const {
+    append_hint_.store(pack_append_hint(page_no, topology_epoch_.load(std::memory_order_relaxed)),
+                       std::memory_order_relaxed);
 }
 
 IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
@@ -525,7 +555,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
             const page_id_t inserted_page_no = leaf.get_page_no();
             leaf.insert_pair(pos, key, value);
             if (pos == leaf.get_size() - 1 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE) {
-                remember_append_hint(key, inserted_page_no);
+                remember_append_hint(inserted_page_no);
             }
             leaf_guard.unlock();
             unpin_if_not_cached(leaf.get_page_id(), true);
@@ -578,14 +608,14 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
         }
         insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, transaction);
         if (right_edge_append) {
-            remember_append_hint(key, new_leaf->get_page_no());
+            remember_append_hint(new_leaf->get_page_no());
         }
         buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
         delete new_leaf;
     }
 
     if (right_edge_append && !did_split) {
-        remember_append_hint(key, leaf.get_page_no());
+        remember_append_hint(leaf.get_page_no());
     }
 
     if (pos == 0) {
@@ -620,14 +650,23 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         bool before_leaf = cmp_first < 0;
         bool after_leaf = cmp_last > 0 && leaf.get_page_no() != ih->file_hdr_->last_leaf_;
         if (before_leaf || after_leaf) {
-            // Key out of range — rewalk.
-            ih->unpin_if_not_cached(leaf.get_page_id());
+            // Key out of range — rewalk. The leaf being released already holds
+            // the entries earlier insert() calls put there, and nothing else
+            // marks it dirty, so releasing it clean would let the buffer pool
+            // drop every one of them. Non-ascending bulk loads - TPC-C's
+            // customer(..., c_last, c_id) and orders(..., o_c_id, o_id) - take
+            // this branch constantly.
+            // While the walk is in flight `leaf` names a page this object no
+            // longer owns, so a throwing fetch must not reach the destructor.
+            active = false;
+            ih->unpin_if_not_cached(leaf.get_page_id(), true);
             ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
             while (!leaf.is_leaf_page()) {
                 page_id_t child_page_no = leaf.internal_lookup(key);
                 ih->unpin_if_not_cached(leaf.get_page_id());
                 ih->fetch_node_into(child_page_no, leaf);
             }
+            active = true;
         }
     }
 
@@ -654,16 +693,18 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         ih->insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, txn);
         page_id_t new_leaf_page_no = new_leaf->get_page_no();
         if (right_edge_append) {
-            ih->remember_append_hint(key, new_leaf_page_no);
+            ih->remember_append_hint(new_leaf_page_no);
         }
         ih->buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
         delete new_leaf;
 
         // Reposition to the right leaf after split.
+        active = false;
         ih->unpin_if_not_cached(leaf.get_page_id(), true);
         ih->fetch_node_into(new_leaf_page_no, leaf);
+        active = true;
     } else if (right_edge_append) {
-        ih->remember_append_hint(key, leaf.get_page_no());
+        ih->remember_append_hint(leaf.get_page_no());
     }
 
     if (pos == 0) {
@@ -781,7 +822,12 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
             const page_id_t next_leaf = leaf.get_next_leaf();
             leaf_guard.unlock();
             unpin_if_not_cached(leaf.get_page_id());
-            if (found_target || stop_at_leaf || at_last_leaf) {
+            // last_leaf_ only reaches disk at a checkpoint, so after a crash it
+            // can name a leaf that has since been split. The end of the chain is
+            // the authoritative stop condition - without it a stale last_leaf_
+            // makes this walk parse the leaf header page as a node. Same guard
+            // as lookup_equal().
+            if (found_target || stop_at_leaf || at_last_leaf || next_leaf == IX_LEAF_HEADER_PAGE) {
                 break;
             }
             fetch_node_into(next_leaf, leaf);
@@ -1181,11 +1227,27 @@ bool IxIndexHandle::refresh_leaf_chain_endpoint() {
         return false;
     }
 
-    // The last leaf is the rightmost one, so descend the right edge of the tree
-    // instead of walking the leaf chain. That costs one page read per level
-    // rather than one per leaf, and it still works when the chain itself has a
-    // hole - which is what makes validate_structure's endpoint check usable as
-    // a gate rather than a guaranteed failure after every crash.
+    // The endpoints are the leftmost and the rightmost leaf, so descend the two
+    // edges of the tree instead of walking the leaf chain. That costs one page
+    // read per level rather than one per leaf, and it still works when the chain
+    // itself has a hole - which is what makes validate_structure's endpoint
+    // check usable as a gate rather than a guaranteed failure after every crash.
+    //
+    // first_leaf_ is documented as immutable after index creation, but that only
+    // holds while the leftmost leaf is never merged away; coalesce() can delete
+    // it. Recomputing both endpoints costs one extra descent and removes the
+    // difference between "the header is stale" and "the index must be rebuilt".
+    page_id_t first_leaf = IX_NO_PAGE;
+    page_id_t last_leaf = IX_NO_PAGE;
+    if (!descend_leaf_chain_edge(false, &first_leaf) || !descend_leaf_chain_edge(true, &last_leaf)) {
+        return false;
+    }
+    file_hdr_->first_leaf_ = first_leaf;
+    file_hdr_->last_leaf_ = last_leaf;
+    return true;
+}
+
+bool IxIndexHandle::descend_leaf_chain_edge(bool rightmost, page_id_t* leaf_page_no) const {
     page_id_t current = file_hdr_->root_page_;
     for (page_id_t level = 0; level <= file_hdr_->num_pages_; ++level) {
         IxNodeHandle node;
@@ -1196,7 +1258,7 @@ bool IxIndexHandle::refresh_leaf_chain_endpoint() {
         }
         if (node.is_leaf_page()) {
             unpin_if_not_cached(node.get_page_id());
-            file_hdr_->last_leaf_ = current;
+            *leaf_page_no = current;
             return true;
         }
         const int size = node.get_size();
@@ -1204,7 +1266,7 @@ bool IxIndexHandle::refresh_leaf_chain_endpoint() {
             unpin_if_not_cached(node.get_page_id());
             return false;
         }
-        const page_id_t child = node.value_at(size - 1);
+        const page_id_t child = node.value_at(rightmost ? size - 1 : 0);
         unpin_if_not_cached(node.get_page_id());
         if (child < IX_INIT_ROOT_PAGE || child >= file_hdr_->num_pages_) {
             return false;
@@ -1474,7 +1536,7 @@ void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
  */
 void IxIndexHandle::release_node_handle(IxNodeHandle& node) {
     if (!node.is_leaf_page()) {
-        cached_internal_pages_.erase(node.get_page_no());
+        drop_cached_internal_page(node.get_page_no());
         buffer_pool_manager_->unmark_resident(node.get_page_id());
         resident_internal_pages_.erase(node.get_page_no());
         // Cached pages normally have no BPM pin. This also releases the

@@ -587,8 +587,15 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
                 std::memcpy(key.data() + offset, record->data + col.offset, col.len);
                 offset += col.len;
             }
-            // 插入索引
-            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_);
+            // 插入索引。允许重复键：`CREATE INDEX` 只是建立访问路径，不是唯一约束
+            // （final.md:168 明确数据模式除 CREATE INDEX 外不声明任何约束）。它也不能比
+            // 已经把这些行放进表里的路径更严格 —— LOAD（:54）和恢复期索引重建（:812）
+            // 都传 allow_duplicate=true，若此处仍拒重复，一张 LOAD 出来的合法表就可能
+            // 建不出索引。INSERT/UPDATE 路径保留唯一性检查不变：它是并发取号冲突
+            // （重复 d_next_o_id 等，final.md:444）的响亮失败信号，而 TPC-C 的复合索引
+            // 靠尾列天然唯一（final.md:171），正常负载下不会误拒。
+            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_,
+                                       /*allow_duplicate=*/true);
         }
         // Index creation is complete, so it is now safe to build the optional
         // root cache and upper-level residency state.
@@ -985,6 +992,14 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     strip_cr(line);
     split_csv_line(line, fields);
 
+    // 行尾逗号（"a,b,c,"）按 RFC 4180 会多切出一个空字段。数据行多出来的尾部字段
+    // 无害（下面按列序取前 cols.size() 个），但表头行一多一个字段就会让下面的
+    // 嗅探判定失败，把表头当数据行去 strtol，整个装载失败。这里只吃掉刚好多出来
+    // 的那一个空字段。
+    if (fields.size() == cols.size() + 1 && *fields.back() == '\0') {
+        fields.pop_back();
+    }
+
     std::unordered_map<std::string, size_t> col_index;
     bool has_header = fields.size() == cols.size();
     if (has_header) {
@@ -1043,12 +1058,18 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
 
     // 把当前 fields 组装成一条记录并写入表和索引。
     auto emit_row = [&](size_t line_no) {
+        // 字段数不足是硬错误，不能当成"这些列都是 NULL"：一个被截断或错列的 CSV
+        // 会静默装成一片 NULL，而 COUNT(*) 校验照样通过，报错点离病因非常远。
+        // 字段数多于列数则只忽略尾部（见上面的行尾逗号说明）。
+        if (fields.size() < cols.size()) {
+            throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected: got " +
+                            std::to_string(fields.size()) + ", need " + std::to_string(cols.size()));
+        }
         std::memset(record.data(), 0, record_size);
         for (const auto& cs : col_src) {
-            // 缺失字段和空字段都记为 SQL NULL：数据字节保持全零，只置 NULL 位。
-            // 字段数超出 DDL 列数时多出来的字段被忽略。
-            const char* raw = cs.csv_idx < fields.size() ? fields[cs.csv_idx] : nullptr;
-            if (raw == nullptr || *raw == '\0') {
+            // 空字段记为 SQL NULL：数据字节保持全零，只置 NULL 位。
+            const char* raw = fields[cs.csv_idx];
+            if (*raw == '\0') {
                 set_null_at(record.data(), cs.null_byte, cs.null_mask);
                 continue;
             }

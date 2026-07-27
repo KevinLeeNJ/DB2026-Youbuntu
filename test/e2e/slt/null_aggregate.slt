@@ -290,3 +290,65 @@ Total record(s): 1
 statement error
 INSERT INTO nm VALUES (5, NULL);
 
+
+# ---------------------------------------------------------------------------
+# min(col) 的索引序捷径：只有当 col 之前的每个索引列都被"普通字面量等值"钉死
+# 时，索引序才在 col 上单调。`b IS NOT NULL` 被 get_clause 编码成
+# op = OP_EQ / is_rhs_val = true / rhs_val.is_null，它不钉死 b，因此不能算作
+# 前缀等值约束——否则捷径会把索引序的第一行当成最小值。
+
+statement ok
+CREATE TABLE nmi (a INT, b INT, c INT);
+
+statement ok
+CREATE INDEX nmi(a, b, c);
+
+statement ok
+INSERT INTO nmi VALUES (1, 5, 9);
+
+statement ok
+INSERT INTO nmi VALUES (1, 7, 1);
+
+# a 被等值钉死，b 只是 IS NOT NULL：MIN(c) 必须扫完整个 a = 1 的范围
+query
+SELECT MIN(c) FROM nmi WHERE a = 1 AND b IS NOT NULL;
+----
++------------------+
+|           MIN(c) |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+# IS NULL 同理（没有行满足，结果是 NULL）
+query
+SELECT MIN(c) FROM nmi WHERE a = 1 AND b IS NULL;
+----
++------------------+
+|           MIN(c) |
++------------------+
+|             NULL |
++------------------+
+Total record(s): 1
+
+# 只有 a 的等值约束时 c 不是索引序的下一列，同样必须扫完
+query
+SELECT MIN(c) FROM nmi WHERE a = 1;
+----
++------------------+
+|           MIN(c) |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+# a、b 都被字面量等值钉死时捷径成立：索引序在 c 上单调
+query
+SELECT MIN(c) FROM nmi WHERE a = 1 AND b = 5;
+----
++------------------+
+|           MIN(c) |
++------------------+
+|                9 |
++------------------+
+Total record(s): 1

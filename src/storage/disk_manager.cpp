@@ -336,15 +336,6 @@ int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
     return bytes_read;
 }
 
-void DiskManager::prefetch_page(int fd, page_id_t page_no) {
-    if (fd < 0 || page_no < 0) {
-        return;
-    }
-    // Advisory only: recovery stays single threaded and deterministic, this
-    // just lets the kernel keep more than one read in flight.
-    (void)posix_fadvise(fd, static_cast<off_t>(page_no) * PAGE_SIZE, PAGE_SIZE, POSIX_FADV_WILLNEED);
-}
-
 /**
  * @description: 写日志内容
  * @param {char} *log_data 要写入的日志内容

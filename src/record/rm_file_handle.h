@@ -276,13 +276,15 @@ public:
         Rid insert(const char* buf) {
             int slot_no = Bitmap::first_bit(false, page.bitmap, fh->file_hdr_.num_records_per_page);
             if (slot_no == fh->file_hdr_.num_records_per_page) {
-                // Page full → advance to next free page
+                // Page full → hand it back and take a fresh one. Go through
+                // create_page_handle(): it is the only routine that guarantees
+                // a page with a free slot. Following first_free_page_no
+                // directly (as this code used to) can land on an already-full
+                // page, and the recomputed slot_no was then not re-checked —
+                // writing at get_slot(num_records_per_page), i.e. past the end
+                // of the page.
                 fh->buffer_pool_manager_->unpin_page(page.page->get_page_id(), true);
-                if (fh->file_hdr_.first_free_page_no == -1) {
-                    page = fh->create_new_page_handle();
-                } else {
-                    page = fh->fetch_page_handle(fh->file_hdr_.first_free_page_no);
-                }
+                page = fh->create_page_handle();
                 slot_no = Bitmap::first_bit(false, page.bitmap, fh->file_hdr_.num_records_per_page);
             }
             memcpy(page.get_slot(slot_no), buf, fh->file_hdr_.record_size);
@@ -295,7 +297,12 @@ public:
             Bitmap::set(page.bitmap, slot_no);
             page.page_hdr->num_records++;
             if (page.page_hdr->num_records >= fh->file_hdr_.num_records_per_page) {
-                fh->file_hdr_.first_free_page_no = page.page_hdr->next_free_page_no;
+                // Same stale-link hazard as insert_record(): publishing this
+                // page's own next pointer as the new list head is only correct
+                // when the page happens to be the head. Route through the
+                // candidate bookkeeping, which never publishes a stale link and
+                // also drops the page from free_page_candidates_.
+                fh->remove_free_page_candidate(page.page->get_page_id().page_no, page.page_hdr->next_free_page_no);
             }
             return Rid{page.page->get_page_id().page_no, slot_no};
         }

@@ -688,7 +688,12 @@ public:
             const std::string& before_name = index_meta_.cols[i].name;
             bool has_eq = false;
             for (const auto& cond : fed_conds_) {
-                if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == before_name &&
+                // 必须是普通字面量等值：`IS [NOT] NULL` 被 get_clause 编码成
+                // op = OP_EQ / is_rhs_val = true / rhs_val.is_null，它不把该列钉死
+                // 在一个索引键值上，因此不能算作前缀等值约束（否则索引序在 col
+                // 上不再单调，min(col) 捷径会取到错误的行）。与 planner 的
+                // has_equality_constraint 保持同一判据。
+                if (is_indexable_value_condition(cond) && cond.op == OP_EQ && cond.lhs_col.col_name == before_name &&
                     (cond.lhs_col.tab_name.empty() || cond.lhs_col.tab_name == tab_name_)) {
                     has_eq = true;
                     break;

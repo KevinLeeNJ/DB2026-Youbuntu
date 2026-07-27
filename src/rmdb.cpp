@@ -69,6 +69,38 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 
+// SIGUSR1 asks the server to publish its WAL/group-commit counters once. A
+// signal handler may not format or log, and `final.md:416` forbids per-
+// transaction logging on a measured run, so the handler only raises this flag
+// and the periodic checkpoint thread emits a single line for it.
+static std::atomic<bool> wal_statistics_requested{false};
+
+void sigusr1_handler(int signo) {
+    (void)signo;
+    wal_statistics_requested.store(true, std::memory_order_release);
+}
+
+// Counters are monotonic since startup: take one line before and one after a
+// measurement window and subtract to get rates for that window alone.
+void log_wal_statistics() {
+    LOG_WARN("walstats t_ms=%lld commits=%llu fsyncs=%llu leaders=%llu batches=%llu waiters=%llu wait_ns=%llu "
+             "pwrites=%llu pwrite_bytes=%llu write_ns=%llu fsync_ns=%llu txnmap_lookups=%llu",
+             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count()),
+             static_cast<unsigned long long>(log_manager->get_commit_count()),
+             static_cast<unsigned long long>(log_manager->get_fsync_count()),
+             static_cast<unsigned long long>(log_manager->get_group_commit_leader_count()),
+             static_cast<unsigned long long>(log_manager->get_group_commit_count()),
+             static_cast<unsigned long long>(log_manager->get_group_commit_waiter_count()),
+             static_cast<unsigned long long>(log_manager->get_group_commit_wait_ns()),
+             static_cast<unsigned long long>(log_manager->get_pwrite_count()),
+             static_cast<unsigned long long>(log_manager->get_pwrite_bytes()),
+             static_cast<unsigned long long>(log_manager->get_wal_write_ns()),
+             static_cast<unsigned long long>(log_manager->get_wal_fsync_ns()),
+             static_cast<unsigned long long>(txn_manager->DebugTxnMapLookupCount()));
+}
+
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
     (void)signo;
@@ -76,19 +108,6 @@ void sigint_handler(int signo) {
     log_manager->flush_log_to_disk_with_sync();
     LOG_INFO("the server received Ctrl+C and will close");
     longjmp(jmpbuf, 1);
-}
-
-// 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(txn_id_t* txn_id, Context* context) {
-    context->txn_ = txn_manager->get_transaction(*txn_id);
-    if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
-        context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
-        *txn_id = context->txn_->get_transaction_id();
-        context->txn_->set_txn_mode(false);
-        context->txn_->set_isolation_level(context->isolation_level_);
-    }
-    txn_manager->BeginStatement(context->txn_);
 }
 
 namespace {
@@ -179,7 +198,62 @@ struct SessionState {
     txn_id_t txn_id = INVALID_TXN_ID;
     IsolationLevel isolation = DEFAULT_ISOLATION_LEVEL;
     bool output_file_enabled = false;
+
+    // Every operation used to resolve txn_id through TransactionManager's global
+    // txn_map under a single process-wide mutex; at 50 connections and 57
+    // operations per NewOrder that lookup cost 41.3 us per operation, four times
+    // the entire compile pipeline. A session executes its operations one at a
+    // time, so it can simply remember the transaction it is running.
+    //
+    // Lifetime rule, and the only reason this is safe: a Transaction object may
+    // be freed by RetireTransactionIfSafe/GC the moment it reaches COMMITTED or
+    // ABORTED, so a cached pointer must never outlive its running transaction.
+    // The cache is therefore keyed by the id it was taken for and is only ever
+    // consulted through running_transaction(), which drops it as soon as txn_id
+    // changes — which is what ending a transaction does, whether this file ends
+    // it (execute_tree/abort_session) or COMMIT/ROLLBACK/ABORT ends it through
+    // the txn_id pointer handed to portal->run(). Nothing else can retire a
+    // transaction this session is still running.
+    Transaction* running_txn = nullptr;
+    txn_id_t running_txn_id = INVALID_TXN_ID;
+
+    Transaction* running_transaction() {
+        if (running_txn == nullptr || running_txn_id != txn_id) {
+            forget_running_transaction();
+            return nullptr;
+        }
+        return running_txn;
+    }
+
+    // `txn` must not have reached COMMITTED or ABORTED yet.
+    void remember_running_transaction(Transaction* txn) {
+        running_txn = txn;
+        running_txn_id = txn->get_transaction_id();
+    }
+
+    void forget_running_transaction() {
+        running_txn = nullptr;
+        running_txn_id = INVALID_TXN_ID;
+    }
 };
+
+// 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
+void SetTransaction(SessionState& session, Context* context) {
+    Transaction* txn = session.running_transaction();
+    if (txn == nullptr) {
+        txn = txn_manager->get_transaction(session.txn_id);
+        if (txn == nullptr || txn->get_state() == TransactionState::COMMITTED ||
+            txn->get_state() == TransactionState::ABORTED) {
+            txn = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
+            session.txn_id = txn->get_transaction_id();
+            txn->set_txn_mode(false);
+            txn->set_isolation_level(context->isolation_level_);
+        }
+        session.remember_running_transaction(txn);
+    }
+    context->txn_ = txn;
+    txn_manager->BeginStatement(txn);
+}
 
 struct PreparedStatement {
     std::uint16_t id = 0;
@@ -241,9 +315,14 @@ bool is_valid_utf8(const std::string& text) {
 
 void abort_session(SessionState& session, Context* context) {
     Transaction* txn = context == nullptr ? nullptr : context->txn_;
+    if (txn == nullptr) {
+        txn = session.running_transaction();
+    }
     if (txn == nullptr && session.txn_id != INVALID_TXN_ID) {
         txn = txn_manager->get_transaction(session.txn_id);
     }
+    // The transaction is over either way, and abort may already have freed it.
+    session.forget_running_transaction();
     if (txn != nullptr && txn->get_state() != TransactionState::ABORTED &&
         txn->get_state() != TransactionState::COMMITTED) {
         txn_manager->abort(txn, log_manager.get());
@@ -273,7 +352,7 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
     const bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
     const bool is_load = parsed_type == ast::AstType::LoadStmt;
     if (!is_checkpoint && !is_load) {
-        SetTransaction(&session.txn_id, &context);
+        SetTransaction(session, &context);
     }
     try {
         std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
@@ -289,6 +368,8 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
             context.txn_->get_state() != TransactionState::COMMITTED &&
             context.txn_->get_state() != TransactionState::ABORTED) {
             txn_manager->commit(context.txn_, context.log_mgr_);
+            // commit may already have freed the transaction object.
+            session.forget_running_transaction();
             session.txn_id = INVALID_TXN_ID;
         }
         context.txn_ = nullptr;
@@ -811,6 +892,7 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGUSR1, sigusr1_handler);
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
@@ -936,12 +1018,26 @@ int main(int argc, char** argv) {
                 if (has_checkpoint_override) {
                     checkpoint_mgr.SetOptions(checkpoint_options);
                 }
+                // This is the only periodic tick in the server, so it also
+                // services the SIGUSR1 statistics request. Poll faster than the
+                // checkpoint interval so the published counters bracket a
+                // measurement window closely, and keep the checkpoint cadence
+                // itself unchanged.
+                constexpr auto checkpoint_interval = std::chrono::seconds(2);
+                constexpr auto signal_poll_interval = std::chrono::milliseconds(100);
+                auto next_checkpoint = std::chrono::steady_clock::now() + checkpoint_interval;
                 while (!checkpoint_thread_stop.load()) {
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    std::this_thread::sleep_for(signal_poll_interval);
                     if (checkpoint_thread_stop.load()) {
                         break;
                     }
-                    checkpoint_mgr.RunIfNeeded();
+                    if (wal_statistics_requested.exchange(false, std::memory_order_acq_rel)) {
+                        log_wal_statistics();
+                    }
+                    if (std::chrono::steady_clock::now() >= next_checkpoint) {
+                        checkpoint_mgr.RunIfNeeded();
+                        next_checkpoint = std::chrono::steady_clock::now() + checkpoint_interval;
+                    }
                 }
             });
 

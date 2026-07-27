@@ -32,10 +32,6 @@ See the Mulan PSL v2 for more details. */
 struct UndoLog {
     /* 此日志是否为删除标记 */
     bool is_deleted_;
-    /* 此撤销日志修改的字段 */
-    std::vector<bool> modified_fields_;
-    /* 修改后的字段 */
-    std::vector<Value> tuple_;
     RmRecord* tuple_test_;
     /* 此撤销日志的时间戳 */
     timestamp_t ts_{INVALID_TS};
@@ -260,6 +256,13 @@ public:
     }
     inline auto GetUndoLog(size_t log_id) -> UndoLog {
         std::scoped_lock<std::mutex> lck(latch_);
+        if (log_id >= undo_logs_.size()) {
+            // A stale or corrupted UndoLink must not index past the buffer.
+            // Unchecked, this read whatever followed the vector and built an
+            // UndoLog out of it, which crashed the server instead of failing
+            // the one statement that followed the bad link.
+            throw InternalError("GetUndoLog: undo log index out of range");
+        }
         return undo_logs_[log_id];
     }
 

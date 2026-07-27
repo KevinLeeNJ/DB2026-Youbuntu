@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstring>
 #include <string_view>
 
 #include "execution_defs.h"
@@ -43,6 +44,8 @@ private:
 
     struct CompiledCondition {
         CompOp op = OP_EQ;
+        // `IS [NOT] NULL` 只看 lhs 的 NULL 位，不参与下面的类型检查与数值比较。
+        NullTest null_test = NullTest::NONE;
         CompiledOperand lhs;
         CompiledOperand rhs;
     };
@@ -155,6 +158,7 @@ private:
         for (const auto& cond : fed_conds_) {
             CompiledCondition compiled;
             compiled.op = cond.op;
+            compiled.null_test = cond.null_test;
             compiled.lhs = compile_column_operand(cond.lhs_col);
             if (cond.is_rhs_val) {
                 compiled.rhs.source = OperandSource::Literal;
@@ -198,15 +202,29 @@ private:
             return operand.literal.str_val;
         }
 
+        // CHAR 列在记录里是右侧零填充的定长字段，必须按 strnlen 裁掉填充再比较，
+        // 否则 char(5) 的 'abc' 与 char(10) 的 'abc'（或与字面量 'abc'）会判不相等。
+        // 与 AbstractExecutor::compare / row_mutation 的 CompareCondition 一致。
         const char* data = get_operand_data(operand, left_tuple, right_tuple);
-        return std::string_view(data, operand.len);
+        return std::string_view(data, strnlen(data, static_cast<size_t>(operand.len)));
     }
 
     bool is_condition(const TupleView& left_tuple, const TupleView& right_tuple) const {
         for (const auto& cond : compiled_conds_) {
-            // 任一操作数为 NULL 时条件为假（含 `<>`），且不读数据字节
-            if (is_operand_null(cond.lhs, left_tuple, right_tuple) ||
-                is_operand_null(cond.rhs, left_tuple, right_tuple)) {
+            // 三值逻辑与 AbstractExecutor::compare / eval_condition_nulls 一致：
+            // `IS [NOT] NULL` 由 lhs 的 NULL 位定值；否则任一操作数为 NULL 时条件
+            // 为假（含 `<>`），且都不读数据字节。
+            // 目前 planner 只把列-列条件下推到 join，带 null_test 的值条件全落在
+            // 表扫描上；这里照样实现，是为了以后真把值谓词推进 join 时不会静默
+            // 把 `IS NULL` 和 `IS NOT NULL` 一起判成 false。
+            const bool lhs_null = is_operand_null(cond.lhs, left_tuple, right_tuple);
+            if (cond.null_test != NullTest::NONE) {
+                if (lhs_null != (cond.null_test == NullTest::IS_NULL)) {
+                    return false;
+                }
+                continue;
+            }
+            if (lhs_null || is_operand_null(cond.rhs, left_tuple, right_tuple)) {
                 return false;
             }
             const auto lhs_type = cond.lhs.type;

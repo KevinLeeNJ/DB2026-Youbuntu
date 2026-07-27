@@ -182,20 +182,41 @@ void RmFileHandle::abort_prepared_insert(RmPinnedInsert& insert) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
+    // This overload takes the slot from the caller, and its callers include redo
+    // and undo, where the Rid comes straight out of a WAL record — i.e. from
+    // unvalidated bytes on disk.  Recovery validates on its side, but fail loudly
+    // here as well so *every* caller gets the check: an out-of-range slot_no used
+    // to reach Bitmap::set() and memcpy(get_slot(...)) and write past the end of
+    // the page, and an absurd page_no turned the extension loop below into an
+    // attempt to allocate billions of pages.
+    if (rid.slot_no < 0 || rid.slot_no >= file_hdr_.num_records_per_page) {
+        throw InternalError("insert_record: slot_no " + std::to_string(rid.slot_no) + " is out of range for table fd " +
+                            std::to_string(fd_));
+    }
+    if (rid.page_no < RM_FIRST_RECORD_PAGE) {
+        throw InternalError("insert_record: page_no " + std::to_string(rid.page_no) + " is not a record page");
+    }
+    // Extending the file one page at a time is fine for the small gaps redo can
+    // legitimately produce, but bound it so a corrupt page_no cannot spin here.
+    constexpr int kMaxExtensionPages = 1 << 20;
+    if (rid.page_no - file_hdr_.num_pages > kMaxExtensionPages) {
+        throw InternalError("insert_record: page_no " + std::to_string(rid.page_no) + " is implausibly far past " +
+                            std::to_string(file_hdr_.num_pages) + " pages");
+    }
     while (rid.page_no >= file_hdr_.num_pages) {
         auto new_page = create_new_page_handle();
         buffer_pool_manager_->unpin_page(new_page.page->get_page_id(), true);
     }
     RmPageHandle pageHandle = fetch_page_handle(rid.page_no);
+    bool occupied_a_free_slot = false;
+    bool page_became_full = false;
     {
         std::unique_lock<std::shared_mutex> page_lock(pageHandle.page->latch());
-        bool was_free = !Bitmap::is_set(pageHandle.bitmap, rid.slot_no);
-        if (was_free) {
+        occupied_a_free_slot = !Bitmap::is_set(pageHandle.bitmap, rid.slot_no);
+        if (occupied_a_free_slot) {
             Bitmap::set(pageHandle.bitmap, rid.slot_no);
             pageHandle.page_hdr->num_records++;
-            if (pageHandle.page_hdr->num_records == file_hdr_.num_records_per_page) {
-                file_hdr_.first_free_page_no = pageHandle.page_hdr->next_free_page_no;
-            }
+            page_became_full = pageHandle.page_hdr->num_records >= file_hdr_.num_records_per_page;
         }
 
         char* slot = pageHandle.get_slot(rid.slot_no);
@@ -210,6 +231,23 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
         if (page_lsn != INVALID_LSN && pageHandle.page->get_page_lsn() < page_lsn) {
             pageHandle.page->set_page_lsn(page_lsn);
         }
+    }
+
+    // Keep the free-space bookkeeping consistent.  This path is reached by redo
+    // *and* by transaction rollback (transaction_manager.cpp re-inserts the old
+    // image when undoing a delete), so it runs concurrently under normal load.
+    // Publishing this page's own `next_free_page_no` into the file header — as
+    // this code used to do — is wrong whenever the page is not the current list
+    // head: it drops genuinely free pages and can splice a full page into the
+    // chain, which `rmdb_verify` reports as "full page appears in record free
+    // list".  remove_free_page_candidate() treats the candidate vector as the
+    // serialized source of truth and never publishes a stale link, so route
+    // through it instead.  Called after releasing the page latch to match the
+    // ordering used by create_page_handle().
+    if (page_became_full) {
+        remove_free_page_candidate(rid.page_no, pageHandle.page_hdr->next_free_page_no);
+    } else if (occupied_a_free_slot) {
+        add_free_page_candidate(rid.page_no);
     }
 
     buffer_pool_manager_->unpin_page(pageHandle.page->get_page_id(), true);
@@ -268,6 +306,11 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context, ls
 }
 
 void RmFileHandle::apply_tuple_update(const Rid& rid, const char* buf, const TupleMeta& meta, lsn_t page_lsn) {
+    // Also reachable from redo/undo with a WAL-supplied Rid — see insert_record().
+    if (rid.slot_no < 0 || rid.slot_no >= file_hdr_.num_records_per_page) {
+        throw InternalError("apply_tuple_update: slot_no " + std::to_string(rid.slot_no) +
+                            " is out of range for table fd " + std::to_string(fd_));
+    }
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     {
         std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
@@ -340,21 +383,37 @@ RmPageHandle RmFileHandle::create_new_page_handle_unlocked() {
  * @return RmPageHandle 返回生成的空闲page handle
  * @note pin the page, remember to unpin it outside!
  */
+/**
+ * @description: 取一个**确定有空闲槽位**的数据页（返回时已 pin）。
+ *
+ * 唯一调用方是批量装载的 PinnedInserter；逐条插入走 prepare_insert_record()。
+ *
+ * 不能直接信任 file_hdr_.first_free_page_no —— 那个链接可能是陈旧的并指向一个
+ * 已满的页，调用方随后会在 get_slot(num_records_per_page) 处越界写出页外。所以
+ * 复用 prepare_insert_record() 的候选机制，并在候选已满时把它剔除后重试。
+ */
 RmPageHandle RmFileHandle::create_page_handle() {
-    // Todo:
-    // 1. 判断file_hdr_中是否还有空闲页
-    //     1.1 没有空闲页：使用缓冲池来创建一个新page；可直接调用create_new_page_handle()
-    //     1.2 有空闲页：直接获取第一个空闲页
-    // 2. 生成page handle并返回给上层
-    page_id_t first_free_page_no;
-    {
-        std::lock_guard<std::mutex> header_lock(file_header_latch_);
-        first_free_page_no = file_hdr_.first_free_page_no;
+    for (;;) {
+        RmPageHandle page_handle;
+        auto candidate = select_free_page_candidate();
+        if (candidate.has_value()) {
+            page_handle = fetch_page_handle(*candidate);
+        } else {
+            // Serialize only the extension decision, then re-check so that
+            // waiters reuse the page created by the first inserter.
+            std::lock_guard<std::mutex> extension_lock(extension_latch_);
+            candidate = select_free_page_candidate();
+            page_handle = candidate.has_value() ? fetch_page_handle(*candidate) : create_new_page_handle_unlocked();
+        }
+        if (Bitmap::first_bit(false, page_handle.bitmap, file_hdr_.num_records_per_page) !=
+            file_hdr_.num_records_per_page) {
+            return page_handle;
+        }
+        const page_id_t page_no = page_handle.page->get_page_id().page_no;
+        const page_id_t next_free_page_no = page_handle.page_hdr->next_free_page_no;
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        remove_free_page_candidate(page_no, next_free_page_no);
     }
-    if (first_free_page_no == -1) {
-        return create_new_page_handle();
-    }
-    return fetch_page_handle(first_free_page_no);
 }
 
 /**

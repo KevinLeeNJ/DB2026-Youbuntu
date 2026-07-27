@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <unordered_set>
 
+#include "minilog.h"
 #include "recovery/log_manager.h"
 
 namespace {
@@ -42,10 +43,17 @@ void BufferPoolManager::recycle_frame(frame_id_t frame_id) {
     recycled_frames_.push_back(frame_id);
 }
 
+// Reaching this with a non-Normal class means a frame was reused while its
+// owner still classified it, i.e. the owner's pin bookkeeping has a hole. The
+// class cannot survive the reuse, so drop it - but say so, because the holder
+// may also be keeping a raw Page* for the page that just left this frame.
 void BufferPoolManager::clear_residency(frame_id_t frame_id) {
-    if (residency_classes_[frame_id] == ResidencyClass::IndexInternal) {
-        residency_classes_[frame_id] = ResidencyClass::Normal;
+    if (residency_classes_[frame_id] == ResidencyClass::Normal) {
+        return;
     }
+    LOG_WARN("buffer pool reused frame %d while it was still classified as resident (page %s)",
+             static_cast<int>(frame_id), pages_[frame_id].id_.toString().c_str());
+    residency_classes_[frame_id] = ResidencyClass::Normal;
 }
 
 void BufferPoolManager::flush_log_before_page_write(lsn_t page_lsn) {
@@ -291,6 +299,16 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     }
 
     std::scoped_lock pin_lock{targetPage->pin_latch_};
+    // 3 根据参数is_dirty，更改P的is_dirty_
+    // Marking a modified page dirty is independent of releasing a pin (compare
+    // PostgreSQL's MarkBufferDirty vs ReleaseBuffer). Doing it before the
+    // pin-count check matters: two owners can hold the same page - the index
+    // root cache pins the root and hands the same raw page to a writer - and
+    // whoever releases second must not lose the modification just because the
+    // pin is already gone.
+    if (is_dirty == true) {
+        mark_dirty(targetPage);
+    }
     // 2.1 若pin_count_已经等于0,则返回false
     if (targetPage->pin_count_ == 0)
         return false;
@@ -301,10 +319,6 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     if (targetPage->pin_count_ == 0 && state == FrameState::VALID &&
         residency_classes_[fid] == ResidencyClass::Normal) {
         replacer_->unpin(fid);
-    }
-    // 3 根据参数is_dirty，更改P的is_dirty_
-    if (is_dirty == true) {
-        mark_dirty(targetPage);
     }
 
     return true;

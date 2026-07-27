@@ -81,7 +81,6 @@ public:
         conds_ = std::move(conds);
         TabMeta& tab = sm_manager->db_.get_table(tab_name_);
         cols_ = tab.cols;
-        len_ = tab.record_len(); // 数据区 + 尾部 null bitmap，与 Scan 执行器一致
         fed_conds_ = conds_;
         index_col_names_ = index_col_names;
     }
@@ -90,7 +89,8 @@ public:
     std::string tab_name_;
     std::vector<ColMeta> cols_;
     std::vector<Condition> conds_;
-    size_t len_;
+    // 这里刻意不缓存记录长度：Scan 执行器一律从数据文件头的 record_size 取，
+    // 计划里再存一份就是第二个真值来源（曾经有过 len_ 字段，全仓无读者）。
     std::vector<Condition> fed_conds_;
     std::vector<std::string> index_col_names_;
     bool scan_backward_ = false;

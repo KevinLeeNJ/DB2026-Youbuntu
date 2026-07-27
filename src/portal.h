@@ -48,6 +48,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution_sort.h"
 #include "common/common.h"
 #include "optimizer/plan.h"
+#include "record_printer.h" // BUFFER_LENGTH 截断语义与 RecordPrinter 共用
 
 typedef enum portalTag {
     PORTAL_Invalid_Query = 0,
@@ -671,12 +672,27 @@ private:
         }
     }
 
+    // data_send_ 是固定 BUFFER_LENGTH 字节的发送缓冲，写满必须截断。语义与
+    // RecordPrinter 完全一致：尾部保留 RECORD_COUNT_LENGTH 给后续的
+    // "Total record(s)" 行，写不下时置 ellipsis_ 让客户端看到 "... ..." 标记。
+    // （宽表的 EXPLAIN ANALYZE 计划树可以轻松超过 8 KB，这里少一个长度判断就是
+    //   一次堆越界写：连接线程静默死亡、服务端日志无任何记录。）
     static void append_to_context(const std::string& text, Context* context) {
         if (context == nullptr || context->data_send_ == nullptr || context->offset_ == nullptr) {
             return;
         }
-        memcpy(context->data_send_ + *(context->offset_), text.c_str(), text.size());
-        *(context->offset_) += static_cast<int>(text.size());
+        const int offset = *(context->offset_);
+        const int remaining = static_cast<int>(BUFFER_LENGTH) - RECORD_COUNT_LENGTH - offset;
+        if (remaining <= 0) {
+            context->ellipsis_ = true;
+            return;
+        }
+        const int written = std::min(static_cast<int>(text.size()), remaining);
+        memcpy(context->data_send_ + offset, text.c_str(), static_cast<size_t>(written));
+        *(context->offset_) = offset + written;
+        if (written < static_cast<int>(text.size())) {
+            context->ellipsis_ = true;
+        }
     }
 
     void write_explain_output(const std::string& text, Context* context) {
