@@ -328,6 +328,70 @@ func TestOfficialWorkerReportAttributesByCompletionTime(t *testing.T) {
 	}
 }
 
+func TestConflictRetryDefaultRetriesUntilSuccess(t *testing.T) {
+	now := time.Unix(100, 0)
+	attempts := 0
+	err, outcome := runTxnWithConflictRetries(now.Add(time.Second), defaultMaxConflictRetries,
+		make(chan struct{}), func() time.Time { return now }, func() error {
+			attempts++
+			if attempts < 3 {
+				return errAbort
+			}
+			return nil
+		})
+	if err != nil || outcome != conflictRetryCompleted || attempts != 3 {
+		t.Fatalf("retry result = (%v, %v), attempts = %d, want success after 3 attempts", err, outcome, attempts)
+	}
+}
+
+func TestConflictRetryFiniteBudgetAllowsNRetries(t *testing.T) {
+	now := time.Unix(100, 0)
+	for _, test := range []struct {
+		name        string
+		succeedLast bool
+		wantErr     bool
+	}{
+		{name: "final retry succeeds", succeedLast: true},
+		{name: "final retry aborts", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			err, outcome := runTxnWithConflictRetries(now.Add(time.Second), 2,
+				make(chan struct{}), func() time.Time { return now }, func() error {
+					attempts++
+					if test.succeedLast && attempts == 3 {
+						return nil
+					}
+					return errAbort
+				})
+			if outcome != conflictRetryCompleted || attempts != 3 || errors.Is(err, errAbort) != test.wantErr {
+				t.Fatalf("retry result = (%v, %v), attempts = %d", err, outcome, attempts)
+			}
+		})
+	}
+}
+
+func TestConflictRetryStopsAtPhaseDeadline(t *testing.T) {
+	start := time.Unix(100, 0)
+	deadline := start.Add(time.Second)
+	times := []time.Time{start, deadline}
+	clockCalls := 0
+	attempts := 0
+	err, outcome := runTxnWithConflictRetries(deadline, defaultMaxConflictRetries,
+		make(chan struct{}), func() time.Time {
+			now := times[clockCalls]
+			clockCalls++
+			return now
+		}, func() error {
+			attempts++
+			return errAbort
+		})
+	if err != nil || outcome != conflictRetryDeadline || attempts != 1 {
+		t.Fatalf("retry result = (%v, %v), attempts = %d, want phase deadline after one abort",
+			err, outcome, attempts)
+	}
+}
+
 func TestOfficialTPCCSchemaAndIndexesMatchFinalV3(t *testing.T) {
 	const wantSchema = `create table warehouse (w_id int, w_name char(10), w_street_1 char(20), w_street_2 char(20), w_city char(20), w_state char(2), w_zip char(9), w_tax float, w_ytd float);
 create table district (d_id int, d_w_id int, d_name char(10), d_street_1 char(20), d_street_2 char(20), d_city char(20), d_state char(2), d_zip char(9), d_tax float, d_ytd float, d_next_o_id int);
@@ -630,6 +694,16 @@ func completeResult(measure int) *result {
 	return result
 }
 
+func TestConfigJSONIncludesMaxConflictRetries(t *testing.T) {
+	encoded, err := json.Marshal(config{MaxConflictRetries: defaultMaxConflictRetries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"max_conflict_retries":-1`) {
+		t.Fatalf("config JSON = %s, want max_conflict_retries=-1", encoded)
+	}
+}
+
 func TestMergeResultFilesRejectsDifferentSeed(t *testing.T) {
 	dir := t.TempDir()
 	firstPath := filepath.Join(dir, "round-1.json")
@@ -701,7 +775,10 @@ func (b *beginErrorBackend) close()                      {}
 
 func shortRound(factory backendFactory) (*result, error) {
 	end := time.Now().Add(5 * time.Millisecond)
-	return runRound(1, 1, 1, profile{warehouses: 1, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1}, "terminal-home", time.Now(), end, 1, 0, false, &liveStats{}, factory, newTxnLedger())
+	return runRound(1, 1, 1,
+		profile{warehouses: 1, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
+		"terminal-home", time.Now(), end, 1, 0, false, defaultMaxConflictRetries, &liveStats{}, factory,
+		newTxnLedger())
 }
 
 func TestRunRoundRejectsInitialConnectFailure(t *testing.T) {
@@ -750,11 +827,15 @@ func (b *lifecycleBackend) close()        { b.closeCount++ }
 type alwaysAbortBackend struct {
 	attempts   int
 	closeCount int
+	onAttempt  func()
 }
 
 func (b *alwaysAbortBackend) exec(string) (string, error) { return "", nil }
 func (b *alwaysAbortBackend) begin() error {
 	b.attempts++
+	if b.onAttempt != nil {
+		b.onAttempt()
+	}
 	return errAbort
 }
 func (b *alwaysAbortBackend) commit() error { return nil }
@@ -771,6 +852,57 @@ func resultTransactionCount(result *result, phase string) int {
 	return total
 }
 
+func TestRunWorkerZeroConflictRetriesRecordsOneServerAbort(t *testing.T) {
+	stop := make(chan struct{})
+	backend := &alwaysAbortBackend{onAttempt: func() { close(stop) }}
+	output := make(chan workerReport, 1)
+	now := time.Now()
+	runWorker(0, 1, 1,
+		profile{warehouses: 1, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
+		"terminal-home", now, now.Add(time.Second), 1, 0, false, 0, &liveStats{}, stop, output,
+		func() (txnBackend, error) { return backend, nil })
+	report := <-output
+	if report.err != nil {
+		t.Fatal(report.err)
+	}
+	serverAborts, abandoned := 0, 0
+	for txnType, outcomes := range report.result.Counts["measure"] {
+		serverAborts += outcomes["server-abort"]
+		abandoned += report.result.Abandoned[txnType]
+	}
+	if backend.attempts != 1 || serverAborts != 1 || abandoned != 0 {
+		t.Fatalf("attempts/server-aborts/abandoned = %d/%d/%d, want 1/1/0",
+			backend.attempts, serverAborts, abandoned)
+	}
+}
+
+func TestOfficialWorkerZeroConflictRetriesRecordsOneServerAbort(t *testing.T) {
+	stop := make(chan struct{})
+	backend := &alwaysAbortBackend{onAttempt: func() { close(stop) }}
+	stats := []*liveStats{{}, {}}
+	output := make(chan officialWorkerReport, 1)
+	warmupEnd := time.Now()
+	p := profile{warehouses: 50, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 25}
+	plan, err := newOfficialRoutingPlan(1, p, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOfficialWorker(0, 1, 1, p, plan, warmupEnd, time.Second, 1, 0, 0, stats, stop, output, backend)
+	report := <-output
+	if report.err != nil {
+		t.Fatal(report.err)
+	}
+	serverAborts, abandoned := 0, 0
+	for txnType, outcomes := range report.windows[0].Counts["measure"] {
+		serverAborts += outcomes["server-abort"]
+		abandoned += report.windows[0].Abandoned[txnType]
+	}
+	if backend.attempts != 1 || serverAborts != 1 || abandoned != 0 {
+		t.Fatalf("attempts/server-aborts/abandoned = %d/%d/%d, want 1/1/0",
+			backend.attempts, serverAborts, abandoned)
+	}
+}
+
 func TestOfficialWorkerRetainsBackendAcrossAllPhases(t *testing.T) {
 	backend := &lifecycleBackend{abortOnce: true}
 	stats := []*liveStats{{}, {}, {}}
@@ -782,7 +914,8 @@ func TestOfficialWorkerRetainsBackendAcrossAllPhases(t *testing.T) {
 		t.Fatal(err)
 	}
 	go runOfficialWorker(0, 1, 1,
-		p, plan, warmupEnd, 20*time.Millisecond, 2, 0, stats, make(chan struct{}), output, backend)
+		p, plan, warmupEnd, 20*time.Millisecond, 2, 0, defaultMaxConflictRetries, stats,
+		make(chan struct{}), output, backend)
 	report := <-output
 	if report.err != nil {
 		t.Fatal(report.err)
@@ -811,7 +944,8 @@ func TestOfficialWorkerCountsRetriedTransactionOnceWhenDeadlineAbandonsIt(t *tes
 		t.Fatal(err)
 	}
 	go runOfficialWorker(0, 1, 1,
-		p, plan, warmupEnd, 20*time.Millisecond, 1, 0, stats, make(chan struct{}), output, backend)
+		p, plan, warmupEnd, 20*time.Millisecond, 1, 0, defaultMaxConflictRetries, stats,
+		make(chan struct{}), output, backend)
 	report := <-output
 	if report.err != nil {
 		t.Fatal(report.err)
@@ -836,7 +970,7 @@ func TestOfficialWindowsRejectsReconnectEachTxnBeforeConnecting(t *testing.T) {
 	factoryCalls := 0
 	_, err := runOfficialWindows(1, 1, 1,
 		profile{warehouses: 25, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
-		0, 1, 0, 0, true, 0, func() (txnBackend, error) {
+		0, 1, 0, 0, defaultMaxConflictRetries, true, 0, func() (txnBackend, error) {
 			factoryCalls++
 			return &lifecycleBackend{}, nil
 		}, newTxnLedger())
