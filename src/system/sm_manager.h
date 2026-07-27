@@ -232,6 +232,35 @@ public:
         return result;
     }
 
+    /** @brief Historical (key, rid) candidates inside a key range, in index-key
+     *  order. The bucket is a std::map ordered by ix_compare, so the natural
+     *  iteration order is the index order the caller needs in order to merge
+     *  these candidates into an index range scan without destroying the scan's
+     *  ordering (which min(col) pushdown depends on).
+     *  Returning the key alongside the rid is what makes that merge possible;
+     *  get_historical_index_rids_in_range() throws the key away. */
+    void collect_historical_index_entries_in_range(const std::string& tab_name, const std::string& index_name,
+                                                   const std::vector<char>& lower, const std::vector<char>& upper,
+                                                   bool lower_exclusive, bool upper_inclusive,
+                                                   std::vector<std::pair<std::string, Rid>>& out) const {
+        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
+        if (it == historical_index_keys_.end()) {
+            return;
+        }
+        const auto lower_key = std::string(lower.data(), lower.size());
+        const auto upper_key = std::string(upper.data(), upper.size());
+        auto begin =
+            lower_exclusive ? it->second.entries.upper_bound(lower_key) : it->second.entries.lower_bound(lower_key);
+        auto end =
+            upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
+        for (auto entry = begin; entry != end; ++entry) {
+            for (const Rid& rid : entry->second) {
+                out.emplace_back(entry->first, rid);
+            }
+        }
+    }
+
     bool has_historical_index_keys(const std::string& tab_name, const std::string& index_name) const {
         std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));

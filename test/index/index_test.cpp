@@ -212,6 +212,118 @@ TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
     close_index(ih);
 }
 
+// The coupled cursor drops the structure latch between batches and resumes by
+// re-descending on the last emitted key, skipping leaves that hold nothing. An
+// end bound expressed as (page, slot) can be skipped exactly like that: an
+// upper_bound landing on slot_no == size normalises to the next leaf's slot 0,
+// and delete_entry never coalesces, so that next leaf may be empty. When the
+// resume walk steps over it, no page number ever matches the end bound again and
+// the scan runs to the physical end of the leaf chain.
+//
+// This case (a range spanning exactly kMaxBatchLeaves, with the leaf the end
+// bound normalises onto emptied first) holds in both directions and is kept as
+// an invariant: an empty end leaf must still terminate the scan. The variant
+// below is the one that actually fails without the key bound.
+// On 50-warehouse TPC-C the live symptom was a one-district new_orders range of
+// ~900 entries walking 290,732 (and in another sample 412,063) entries.
+TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundWhenEndLeafIsEmpty) {
+    auto ih = open_index();
+    constexpr int kKeyCount = 8000;
+    for (int value = 0; value < kKeyCount; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+    }
+
+    auto leaves = leaf_snapshots(ih.get());
+    // leaves[1..8] is the scanned range, leaves[9] is emptied and becomes the
+    // end bound, and leaves[10] onwards is what an unbounded scan would spill
+    // into.
+    ASSERT_GE(leaves.size(), 11U);
+    const int range_lo = leaves[1].keys.front();
+    const int range_hi = leaves[8].keys.back();
+    ASSERT_FALSE(leaves[9].keys.empty());
+
+    auto lower_key = key(range_lo);
+    auto upper_key = key(range_hi);
+    const Iid lower = ih->lower_bound(lower_key.data());
+    const Iid upper = ih->upper_bound(upper_key.data());
+    ASSERT_NE(lower.page_no, upper.page_no);
+    ASSERT_EQ(upper.page_no, leaves[9].page_no);
+    ASSERT_EQ(upper.slot_no, 0);
+
+    for (int value : leaves[9].keys) {
+        auto k = key(value);
+        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, nullptr));
+    }
+
+    std::vector<int> scanned;
+    for (IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get()); !scan.is_end(); scan.next()) {
+        scanned.push_back(scan.rid().slot_no);
+    }
+
+    std::vector<int> expected;
+    for (int value = range_lo; value <= range_hi; ++value) {
+        expected.push_back(value);
+    }
+    EXPECT_EQ(scanned, expected);
+
+    close_index(ih);
+}
+
+// Same failure mode reached the other way: the end position keeps a slot index
+// into a leaf that then shrinks below it, so "this is the end leaf and we have
+// passed its end slot" can never become true again. Before the fix the scan ran
+// past the end leaf into the rest of the chain.
+TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundAfterEndLeafShrinksBelowEndSlot) {
+    auto ih = open_index();
+    constexpr int kKeyCount = 8000;
+    for (int value = 0; value < kKeyCount; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+    }
+
+    auto leaves = leaf_snapshots(ih.get());
+    ASSERT_GE(leaves.size(), 4U);
+    const auto& end_leaf = leaves[2];
+    ASSERT_GE(end_leaf.keys.size(), 8U);
+    const int range_lo = leaves[1].keys.front();
+    // Mid-leaf upper bound, so end_.slot_no is a real slot index inside the leaf.
+    const int range_hi = end_leaf.keys[end_leaf.keys.size() / 2];
+
+    auto lower_key = key(range_lo);
+    auto upper_key = key(range_hi);
+    const Iid lower = ih->lower_bound(lower_key.data());
+    const Iid upper = ih->upper_bound(upper_key.data());
+    ASSERT_EQ(upper.page_no, end_leaf.page_no);
+    ASSERT_GT(upper.slot_no, 0);
+    ASSERT_NE(lower.page_no, upper.page_no);
+
+    // Shrink the end leaf below the recorded end slot, which is what a
+    // concurrent split (half the entries move away) or a run of deletes does.
+    std::vector<int> surviving{end_leaf.keys.front()};
+    for (int value : end_leaf.keys) {
+        if (value == surviving.front()) {
+            continue;
+        }
+        auto k = key(value);
+        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, nullptr));
+    }
+
+    std::vector<int> scanned;
+    for (IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get()); !scan.is_end(); scan.next()) {
+        scanned.push_back(scan.rid().slot_no);
+    }
+
+    std::vector<int> expected;
+    for (int value = range_lo; value < end_leaf.keys.front(); ++value) {
+        expected.push_back(value);
+    }
+    expected.push_back(surviving.front());
+    EXPECT_EQ(scanned, expected);
+
+    close_index(ih);
+}
+
 TEST_F(IndexHandleTest, FloatKeysUseBinary32Ordering) {
     const auto int_index_name = ix_manager->get_index_name(table_name, cols);
     disk_manager->destroy_file(int_index_name);

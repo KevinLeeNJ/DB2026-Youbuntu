@@ -115,6 +115,7 @@ protected:
     ScanDirection direction_{ScanDirection::Forward};
     std::vector<Rid> rid_scan_rids_;
     std::vector<Rid> historical_rids_;
+    std::vector<std::pair<std::string, Rid>> historical_entries_;
     std::unordered_set<uint64_t> seen_rids_;
 
     Rid rid_;
@@ -128,6 +129,10 @@ protected:
     bool predicate_recorded_{false};
     bool use_historical_index_candidates_{false};
     bool historical_candidates_merged_{false};
+    // True when the merged rid sequence is still ascending in index-key order,
+    // i.e. when min(col) pushdown remains valid. Only the keyed merge below can
+    // guarantee it; an unordered append cannot.
+    bool merged_key_ordered_{false};
     RmRecordViewWithMeta buffered_tuple_;
 
     SmManager* sm_manager_;
@@ -399,8 +404,10 @@ public:
         rid_vector_cursor_.reset();
         rid_scan_rids_.clear();
         historical_rids_.clear();
+        historical_entries_.clear();
         seen_rids_.clear();
         historical_candidates_merged_ = false;
+        merged_key_ordered_ = false;
         record_predicate_read();
 
         std::optional<IxIndexHandle::SharedIndexLatch> index_latch_guard;
@@ -466,12 +473,6 @@ public:
         }
 
         const bool exact_key_lookup = !lower_exclusive && upper_inclusive && lower_key_ == upper_key_;
-        Iid lower, upper;
-        if (!exact_key_lookup) {
-            index_latch_guard.emplace(ih_->lock_shared());
-            lower = lower_exclusive ? ih_->upper_bound(lower_key_.data()) : ih_->lower_bound(lower_key_.data());
-            upper = upper_inclusive ? ih_->upper_bound(upper_key_.data()) : ih_->lower_bound(upper_key_.data());
-        }
         // READ COMMITTED normally reads only the current index. A writer can
         // nevertheless remove an exact key before publishing its replacement
         // tuple meta, leaving a reader unable to reach the writer's undo
@@ -479,13 +480,42 @@ public:
         // historical-index scan on the RC hot path.
         bool use_rc_exact_historical_key = false;
         if (historical_candidates_available && context_ != nullptr && context_->txn_ != nullptr &&
-            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && !lower_exclusive &&
-            upper_inclusive && lower_key_ == upper_key_) {
+            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && exact_key_lookup) {
             historical_rids_ = sm_manager_->get_historical_index_key_rids(tab_name_, index_name_, lower_key_);
             use_rc_exact_historical_key = !historical_rids_.empty();
             // Exact RC probes only need history for the requested key. Range,
             // prefix and skip-scan paths retain the broad candidate set.
             use_historical_index_candidates_ = false;
+        }
+        // Collect the broad candidate set *before* deciding how to scan, and
+        // before taking the index latch (remember_historical_index_key() runs
+        // without one, so this keeps the two latches unordered with respect to
+        // each other).
+        //
+        // has_historical_index_keys() is per index, so a single committed delete
+        // anywhere in the table used to force every range scan on that index
+        // onto the eager materialise-then-merge path - which in turn disables
+        // min(col) pushdown. Measured on 50-warehouse TPC-C: 0.38 historical
+        // rids per new_orders range scan, i.e. the range is empty over 99% of
+        // the time, while the eager path was materialising ~920 rids and
+        // visiting ~890 tuples per scan. Checking the range first keeps the lazy
+        // cursor whenever the range really has no history, which is exact (the
+        // merge of an empty set is the identity), not an approximation.
+        historical_entries_.clear();
+        if (use_historical_index_candidates_) {
+            sm_manager_->collect_historical_index_entries_in_range(tab_name_, index_name_, lower_key_, upper_key_,
+                                                                   lower_exclusive, upper_inclusive,
+                                                                   historical_entries_);
+            if (historical_entries_.empty()) {
+                use_historical_index_candidates_ = false;
+            }
+        }
+
+        Iid lower, upper;
+        if (!exact_key_lookup) {
+            index_latch_guard.emplace(ih_->lock_shared());
+            lower = lower_exclusive ? ih_->upper_bound(lower_key_.data()) : ih_->lower_bound(lower_key_.data());
+            upper = upper_inclusive ? ih_->upper_bound(upper_key_.data()) : ih_->lower_bound(upper_key_.data());
         }
 
         const bool use_single_rid_lookup =
@@ -506,31 +536,60 @@ public:
             }
         } else if (exact_key_lookup || use_historical_index_candidates_ || use_rc_exact_historical_key) {
             historical_candidates_merged_ = use_historical_index_candidates_ || use_rc_exact_historical_key;
+            // Every merge below preserves ascending index-key order, so min(col)
+            // pushdown stays valid: exact-key merges only ever hold one key, and
+            // the range merge below is an ordered two-way merge.
+            merged_key_ordered_ = true;
+            const auto rid_hash = [](const Rid& rid) {
+                return (static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
+                       static_cast<uint32_t>(rid.slot_no);
+            };
             if (exact_key_lookup) {
                 ih_->lookup_equal(lower_key_.data(), rid_scan_rids_);
-            } else {
-                for (IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm(), std::move(*index_latch_guard));
-                     !index_scan.is_end(); index_scan.next()) {
-                    rid_scan_rids_.push_back(index_scan.rid());
-                }
-            }
-
-            if (use_historical_index_candidates_) {
-                historical_rids_ = sm_manager_->get_historical_index_rids_in_range(
-                    tab_name_, index_name_, lower_key_, upper_key_, lower_exclusive, upper_inclusive);
-            }
-            if (!historical_rids_.empty()) {
-                seen_rids_.reserve(rid_scan_rids_.size() + historical_rids_.size());
-                for (const Rid& rid : rid_scan_rids_) {
-                    seen_rids_.insert((static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
-                                      static_cast<uint32_t>(rid.slot_no));
-                }
-                for (const Rid& historical_rid : historical_rids_) {
-                    uint64_t rid_key = (static_cast<uint64_t>(static_cast<uint32_t>(historical_rid.page_no)) << 32) |
-                                       static_cast<uint32_t>(historical_rid.slot_no);
-                    if (seen_rids_.insert(rid_key).second) {
-                        rid_scan_rids_.push_back(historical_rid);
+                if (use_historical_index_candidates_) {
+                    historical_rids_.clear();
+                    historical_rids_.reserve(historical_entries_.size());
+                    for (const auto& entry : historical_entries_) {
+                        historical_rids_.push_back(entry.second);
                     }
+                }
+                if (!historical_rids_.empty()) {
+                    seen_rids_.reserve(rid_scan_rids_.size() + historical_rids_.size());
+                    for (const Rid& rid : rid_scan_rids_) {
+                        seen_rids_.insert(rid_hash(rid));
+                    }
+                    for (const Rid& historical_rid : historical_rids_) {
+                        if (seen_rids_.insert(rid_hash(historical_rid)).second) {
+                            rid_scan_rids_.push_back(historical_rid);
+                        }
+                    }
+                }
+            } else {
+                // Ordered two-way merge of the live index range with the
+                // historical candidates, both ascending in index-key order.
+                // Appending the historical rids after the range (the previous
+                // shape) is what forced provides_min_order() to give up.
+                const auto& col_types = ih_->get_col_types();
+                const auto& col_lens = ih_->get_col_lens();
+                size_t hist_pos = 0;
+                seen_rids_.reserve(historical_entries_.size() * 2);
+                const auto push_unique = [&](const Rid& rid) {
+                    if (seen_rids_.insert(rid_hash(rid)).second) {
+                        rid_scan_rids_.push_back(rid);
+                    }
+                };
+                for (IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm(), std::move(*index_latch_guard), true);
+                     !index_scan.is_end(); index_scan.next()) {
+                    const char* base_key = index_scan.key();
+                    while (hist_pos < historical_entries_.size() &&
+                           ix_compare(historical_entries_[hist_pos].first.data(), base_key, col_types, col_lens) < 0) {
+                        push_unique(historical_entries_[hist_pos].second);
+                        ++hist_pos;
+                    }
+                    push_unique(index_scan.rid());
+                }
+                for (; hist_pos < historical_entries_.size(); ++hist_pos) {
+                    push_unique(historical_entries_[hist_pos].second);
                 }
             }
             rid_vector_cursor_.emplace(&rid_scan_rids_);
@@ -665,7 +724,9 @@ public:
     // it is constrained to a single equality value (so the remaining order is
     // monotonic in `col`).
     bool provides_min_order(const TabCol& col) const override {
-        if (historical_candidates_merged_) {
+        // A merged candidate set is only usable when the merge kept index-key
+        // order; beginTuple() guarantees that for every merge shape it builds.
+        if (historical_candidates_merged_ && !merged_key_ordered_) {
             return false;
         }
         if (!col.tab_name.empty() && col.tab_name != tab_name_) {

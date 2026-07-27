@@ -236,22 +236,65 @@ private:
         }
     }
 
+    // Turn the (page, slot) end position into a *key* bound.
+    //
+    // The coupled cursor releases the structure latch between batches, so the
+    // end position is only meaningful for as long as the end leaf keeps the
+    // shape it had when upper_bound() computed it. A key bound survives
+    // concurrent inserts, splits and deletes; a slot index does not.
+    //
+    // The case that matters is end_.slot_no == end_leaf.get_size(), which is
+    // what upper_bound() returns whenever the range's last entry happens to be
+    // the last entry of its leaf. Recording no key at all there used to leave
+    // the batch loop with only "stop when the leaf whose page_no equals
+    // end_.page_no is reached and stop >= end_.slot_no". Any concurrent shrink
+    // of that leaf (a split moves half its entries away; a delete removes one)
+    // makes get_size() < end_.slot_no, the condition never holds, and the scan
+    // runs on to the physical end of the leaf chain.
+    // Measured on 50-warehouse TPC-C before this fix: a
+    // `where no_w_id = 18 and no_d_id = 10` range on new_orders - one district,
+    // ~900 entries - walked 290,732 entries, and another 412,063, i.e. very
+    // nearly the whole index. Results stayed correct because the executor
+    // re-checks every predicate, so this was silent.
+    //
+    // The first entry strictly greater than the range's last entry is the first
+    // entry of the next non-empty leaf (empty leaves are a legal steady state
+    // here: delete_entry never coalesces). Using that as an exclusive key bound
+    // is exactly upper_bound()'s own definition.
     void capture_end_bound() {
         if (iid_ == end_) {
             coupled_end_ = true;
             return;
         }
-        Page* page = fetch_scan_page(end_.page_no);
-        std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
-        IxNodeHandle end_leaf(ih_->file_hdr_.get(), page);
-        if (end_.slot_no < end_leaf.get_size()) {
-            end_key_.assign(end_leaf.get_key(end_.slot_no),
-                            end_leaf.get_key(end_.slot_no) + ih_->file_hdr_->col_tot_len_);
-        } else {
-            unbounded_end_ = end_.page_no == ih_->file_hdr_->last_leaf_;
+        page_id_t page_no = end_.page_no;
+        int slot_no = end_.slot_no;
+        while (page_no != IX_LEAF_HEADER_PAGE && page_no != IX_NO_PAGE) {
+            Page* page = fetch_scan_page(page_no);
+            page_id_t next_leaf = IX_LEAF_HEADER_PAGE;
+            bool captured = false;
+            {
+                std::shared_lock<std::shared_mutex> leaf_lock(page->latch());
+                IxNodeHandle end_leaf(ih_->file_hdr_.get(), page);
+                if (slot_no < end_leaf.get_size()) {
+                    end_key_.assign(end_leaf.get_key(slot_no),
+                                    end_leaf.get_key(slot_no) + ih_->file_hdr_->col_tot_len_);
+                    captured = true;
+                } else if (end_leaf.get_page_no() != ih_->file_hdr_->last_leaf_) {
+                    next_leaf = end_leaf.get_next_leaf();
+                }
+            }
+            unpin_scan_page(page);
+            if (captured) {
+                return;
+            }
+            if (next_leaf == IX_LEAF_HEADER_PAGE || next_leaf == IX_NO_PAGE) {
+                break;
+            }
+            page_no = next_leaf;
+            slot_no = 0;
         }
-        leaf_lock.unlock();
-        unpin_scan_page(page);
+        // No entry after the range: the scan may run to the end of the chain.
+        unbounded_end_ = true;
     }
 
     // Locate the lower bound while holding the coupled structure latch and
