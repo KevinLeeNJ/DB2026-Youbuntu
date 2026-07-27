@@ -26,8 +26,6 @@ See the Mulan PSL v2 for more details. */
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
 
 struct LockObservabilitySnapshot {
-    uint64_t fast{0};
-    uint64_t reentrant{0};
     uint64_t immediate_conflict{0};
     uint64_t wait_enqueued{0};
     uint64_t wait_granted{0};
@@ -142,8 +140,6 @@ private:
     std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
     std::atomic<uint64_t> wait_topology_epoch_{0};
     std::atomic<uint64_t> wait_cycle_abort_count_{0};
-    std::atomic<uint64_t> record_fast_{0};
-    std::atomic<uint64_t> record_reentrant_{0};
     std::atomic<uint64_t> record_immediate_conflict_{0};
     std::atomic<uint64_t> record_wait_enqueued_{0};
     std::atomic<uint64_t> record_wait_granted_{0};
@@ -163,8 +159,6 @@ private:
         std::unordered_map<std::string, std::shared_ptr<UniqueKeyQueue>> queues;
     };
     std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
-    std::atomic<uint64_t> unique_fast_{0};
-    std::atomic<uint64_t> unique_reentrant_{0};
     std::atomic<uint64_t> unique_immediate_conflict_{0};
     std::atomic<uint64_t> unique_wait_enqueued_{0};
     std::atomic<uint64_t> unique_wait_granted_{0};

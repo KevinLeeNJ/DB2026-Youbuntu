@@ -610,28 +610,108 @@ def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
         verifier.close()
 
 
-def test_sigusr1_observability(server):
-    os.kill(server.process.pid, signal.SIGUSR1)
-    log_path = os.path.join(server.root, "rmdb.log")
+OBSERVABILITY_FIELDS = {
+    "obs_abort": {"t_ms", "seq", "shrinking", "upgrade", "deadlock", "ww", "ssi", "unique"},
+    "obs_lock": {"t_ms", "seq", "kind", "immediate_conflict", "wait_enqueued", "wait_granted",
+                 "wait_cancelled", "wait_ns", "queue_depth_max", "cycle_checks", "cycle_victims"},
+    "obs_ckpt": {"t_ms", "seq", "attempt", "preflush", "success", "drain_timeout", "deadline",
+                 "final_data_fail", "initial_ns", "preblock_ns", "block_ns", "drain_ns", "final_wal_ns",
+                 "final_data_ns", "meta_ns", "manifest_ns", "truncate_ns", "begin_blocked", "begin_wait_ns"},
+    "obs_bpm": {"t_ms", "seq", "fetch_miss", "inflight_wait", "inflight_wait_ns", "no_victim",
+                "eviction_clean", "eviction_dirty", "page_reads", "page_writes"},
+}
+
+
+def read_observability_snapshots(log_path):
+    try:
+        with open(log_path, "r", encoding="utf-8") as log_file:
+            lines = log_file.read().splitlines()
+    except FileNotFoundError:
+        return {}
+
+    snapshots = {}
+    for line in lines:
+        match = re.search(r"\b(obs_abort|obs_lock|obs_ckpt|obs_bpm) (.*)$", line)
+        if not match:
+            continue
+        line_kind, payload = match.groups()
+        values = {}
+        for token in payload.split():
+            key, separator, value = token.partition("=")
+            require(separator and key and value, "malformed " + line_kind + " observability field")
+            values[key] = value
+        require(set(values) == OBSERVABILITY_FIELDS[line_kind], line_kind + " omitted or added observability fields")
+        for key, value in values.items():
+            if key != "kind":
+                require(value.isdigit(), line_kind + " field " + key + " is not an unsigned integer")
+        sequence = int(values["seq"])
+        snapshot = snapshots.setdefault(sequence, {"obs_lock": {}})
+        if line_kind == "obs_lock":
+            require(values["kind"] in ("record", "unique"), "obs_lock emitted an unknown kind")
+            snapshot["obs_lock"][values["kind"]] = values
+        else:
+            snapshot[line_kind] = values
+    return snapshots
+
+
+def wait_for_observability_snapshot(log_path, after_sequence):
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        try:
-            with open(log_path, "r", encoding="utf-8") as log_file:
-                lines = log_file.read().splitlines()
-        except FileNotFoundError:
-            lines = []
-        observed = {}
-        for line in lines:
-            match = re.search(r"\b(obs_abort|obs_lock|obs_ckpt|obs_bpm) t_ms=(\d+) seq=(\d+)", line)
-            if match:
-                observed.setdefault(match.group(1), []).append(match.group(3))
-        if (len(observed.get("obs_abort", [])) >= 1 and len(observed.get("obs_lock", [])) >= 2 and
-                len(observed.get("obs_ckpt", [])) >= 1 and len(observed.get("obs_bpm", [])) >= 1):
-            latest = {kind: values[-1] for kind, values in observed.items()}
-            require(len(set(latest.values())) == 1, "SIGUSR1 observability lines did not share one sequence")
-            return
+        snapshots = read_observability_snapshots(log_path)
+        for sequence in sorted(snapshots):
+            snapshot = snapshots[sequence]
+            if sequence <= after_sequence:
+                continue
+            if ("obs_abort" in snapshot and "obs_ckpt" in snapshot and "obs_bpm" in snapshot and
+                    set(snapshot["obs_lock"]) == {"record", "unique"}):
+                for line_kind, values in snapshot.items():
+                    if line_kind == "obs_lock":
+                        for lock_values in values.values():
+                            require(int(lock_values["seq"]) == sequence,
+                                    "SIGUSR1 observability lines did not share one sequence")
+                    else:
+                        require(int(values["seq"]) == sequence,
+                                "SIGUSR1 observability lines did not share one sequence")
+                return sequence, snapshot
         time.sleep(0.05)
     raise ProtocolFailure("SIGUSR1 did not publish complete observability lines")
+
+
+def force_snapshot_write_conflict(port):
+    setup = WireClient(port)
+    setup.command("CREATE TABLE obs_si_probe (id INT, value INT);")
+    setup.command("INSERT INTO obs_si_probe VALUES (1, 10);")
+    setup.close()
+
+    winner = WireClient(port)
+    victim = WireClient(port)
+    try:
+        winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        winner.command("BEGIN;")
+        victim.command("BEGIN;")
+        winner.command("UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;")
+        winner.command("COMMIT;")
+        tag, diagnostic = victim.stream_raw("UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;")
+        require(tag == TRANSACTION_ABORT and diagnostic,
+                "observability probe did not create a SNAPSHOT ISOLATION write conflict")
+    finally:
+        winner.close()
+        victim.close()
+
+
+def test_sigusr1_observability(server):
+    log_path = os.path.join(server.root, "rmdb.log")
+    os.kill(server.process.pid, signal.SIGUSR1)
+    first_sequence, first = wait_for_observability_snapshot(log_path, 0)
+
+    force_snapshot_write_conflict(server.port)
+    os.kill(server.process.pid, signal.SIGUSR1)
+    second_sequence, second = wait_for_observability_snapshot(log_path, first_sequence)
+
+    require(second_sequence > first_sequence, "consecutive SIGUSR1 requests did not produce increasing sequences")
+    require(int(second["obs_abort"]["ww"]) == int(first["obs_abort"]["ww"]) + 1,
+            "one EXEC_STREAM SNAPSHOT ISOLATION write conflict must increment ww exactly once")
 
 
 def main():

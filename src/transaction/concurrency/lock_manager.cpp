@@ -29,9 +29,7 @@ void LockManager::observe_queue_depth(std::atomic<uint64_t>& maximum, size_t dep
 }
 
 LockObservabilitySnapshot LockManager::record_lock_observability() const {
-    return {record_fast_.load(std::memory_order_relaxed),
-            record_reentrant_.load(std::memory_order_relaxed),
-            record_immediate_conflict_.load(std::memory_order_relaxed),
+    return {record_immediate_conflict_.load(std::memory_order_relaxed),
             record_wait_enqueued_.load(std::memory_order_relaxed),
             record_wait_granted_.load(std::memory_order_relaxed),
             record_wait_cancelled_.load(std::memory_order_relaxed),
@@ -42,9 +40,7 @@ LockObservabilitySnapshot LockManager::record_lock_observability() const {
 }
 
 LockObservabilitySnapshot LockManager::unique_key_lock_observability() const {
-    return {unique_fast_.load(std::memory_order_relaxed),
-            unique_reentrant_.load(std::memory_order_relaxed),
-            unique_immediate_conflict_.load(std::memory_order_relaxed),
+    return {unique_immediate_conflict_.load(std::memory_order_relaxed),
             unique_wait_enqueued_.load(std::memory_order_relaxed),
             unique_wait_granted_.load(std::memory_order_relaxed),
             unique_wait_cancelled_.load(std::memory_order_relaxed),
@@ -336,7 +332,6 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     std::unique_lock<std::mutex> lock(request_queue->latch_);
 
     if (request_queue->owner_txn_id_ == INVALID_TXN_ID) {
-        record_fast_.fetch_add(1, std::memory_order_relaxed);
         request_queue->owner_txn_id_ = txn->get_transaction_id();
         request_queue->group_lock_mode_ = GroupLockMode::X;
         note_wait_topology_change();
@@ -347,7 +342,6 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     }
 
     if (request_queue->owner_txn_id_ == txn->get_transaction_id()) {
-        record_reentrant_.fetch_add(1, std::memory_order_relaxed);
         txn->get_lock_set()->insert(lock_data_id);
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
@@ -435,12 +429,10 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
     }
     const txn_id_t txn_id = txn->get_transaction_id();
     if (queue->owner == txn_id) {
-        unique_reentrant_.fetch_add(1, std::memory_order_relaxed);
         txn->get_unique_key_lock_set()->insert(lock_id);
         return true;
     }
     if (queue->owner == INVALID_TXN_ID && queue->waiters.empty()) {
-        unique_fast_.fetch_add(1, std::memory_order_relaxed);
         queue->owner = txn_id;
         note_wait_topology_change();
         txn->get_unique_key_lock_set()->insert(lock_id);

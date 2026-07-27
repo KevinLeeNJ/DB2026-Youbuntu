@@ -138,7 +138,6 @@ TEST(SnapshotIsolationConcurrencyTest, ExplicitReadCommittedWriterWaitsForRecord
     EXPECT_EQ(waiter.get_lock_set()->count(LockDataId(42, rid, LockDataType::RECORD)), 1u);
     EXPECT_TRUE(lock_manager.unlock(&waiter, LockDataId(42, rid, LockDataType::RECORD)));
     const auto stats = lock_manager.record_lock_observability();
-    EXPECT_GE(stats.fast, 1u);
     EXPECT_EQ(stats.wait_enqueued, 1u);
     EXPECT_EQ(stats.wait_granted, 1u);
     EXPECT_EQ(stats.wait_cancelled, 0u);
