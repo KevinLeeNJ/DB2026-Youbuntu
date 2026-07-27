@@ -1,7 +1,5 @@
 #include <netdb.h>
 #include <netinet/in.h>
-#include <readline/history.h>
-#include <readline/readline.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -116,16 +114,14 @@ int main(int argc, char* argv[]) {
     char recv_buf[MAX_MEM_BUFFER_SIZE];
 
     while (1) {
-        char* line_read = readline("Rucbase> ");
-        if (line_read == nullptr) {
+        std::cout << "Rucbase> " << std::flush;
+        std::string command;
+        if (!std::getline(std::cin, command)) {
             // EOF encountered
             break;
         }
-        std::string command = line_read;
-        free(line_read);
 
         if (!command.empty()) {
-            add_history(command.c_str());
             if (is_exit_command(command)) {
                 printf("The client will be closed.\n");
                 break;
