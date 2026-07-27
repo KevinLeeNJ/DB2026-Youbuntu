@@ -269,7 +269,9 @@ lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
-    log_manager->flush_log_to_disk();
+    // ABORT has no durability acknowledgement contract. If a rollback dirties
+    // a page, its abort_lsn page LSN makes the buffer pool force this WAL
+    // prefix before that page can be written or evicted.
     return lsn;
 }
 
