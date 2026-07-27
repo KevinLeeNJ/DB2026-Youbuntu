@@ -605,48 +605,60 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
         return true;
     }
 
+    const std::unordered_set<int> fd_set(fds.begin(), fds.end());
+    std::vector<PageId> candidates;
+    {
+        std::shared_lock lock{latch_};
+        candidates.reserve(page_table_.size());
+        for (const auto& [page_id, frame_id] : page_table_) {
+            if (fd_set.find(page_id.fd) == fd_set.end()) {
+                continue;
+            }
+            Page* page = &pages_[frame_id];
+            if (page->state_.load(std::memory_order_acquire) == FrameState::VALID && page->is_dirty_) {
+                candidates.push_back(page_id);
+            }
+        }
+    }
+    return flush_pages(candidates, wal_preflushed).success;
+}
+
+BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<PageId>& page_ids, bool wal_preflushed) {
+    FlushBatchResult result;
+    if (page_ids.empty()) {
+        return result;
+    }
+
     constexpr size_t kClaimPages = 64;
-    struct CandidatePage {
-        PageId page_id;
-    };
     struct ClaimedPage {
         PageId page_id;
         frame_id_t frame_id;
         uint64_t dirty_epoch;
     };
 
-    const std::unordered_set<int> fd_set(fds.begin(), fds.end());
-    std::vector<CandidatePage> candidates;
-    {
-        std::shared_lock lock{latch_};
-        candidates.reserve(page_table_.size());
-        for (const auto& [page_id, frame_id] : page_table_) {
-            (void)frame_id;
-            if (fd_set.find(page_id.fd) == fd_set.end()) {
-                continue;
-            }
-            Page* page = &pages_[frame_id];
-            if (page->state_.load(std::memory_order_acquire) == FrameState::VALID && page->is_dirty_) {
-                candidates.push_back(CandidatePage{page_id});
-            }
+    // Sorted so that runs of adjacent page numbers become single pwrites.
+    std::sort(page_ids.begin(), page_ids.end(), [](const PageId& lhs, const PageId& rhs) {
+        if (lhs.fd != rhs.fd) {
+            return lhs.fd < rhs.fd;
         }
-    }
-
-    std::sort(candidates.begin(), candidates.end(), [](const CandidatePage& lhs, const CandidatePage& rhs) {
-        if (lhs.page_id.fd != rhs.page_id.fd) {
-            return lhs.page_id.fd < rhs.page_id.fd;
-        }
-        return lhs.page_id.page_no < rhs.page_id.page_no;
+        return lhs.page_no < rhs.page_no;
     });
 
+    const std::vector<PageId>& candidates = page_ids;
+    // Grown, never shrunk, and never larger than the batch actually claimed. A
+    // checkpoint reaches the full kClaimPages once and keeps it; an index
+    // structure change publishes a handful of pages and must not pay for
+    // zero-filling 256 KiB it will not use.
+    std::vector<char> image;
+    std::vector<ClaimedPage> claimed;
+    claimed.reserve(kClaimPages);
     bool success = true;
     for (size_t candidate_begin = 0; candidate_begin < candidates.size();) {
-        std::vector<ClaimedPage> claimed;
-        claimed.reserve(kClaimPages);
+        claimed.clear();
         {
             std::unique_lock lock{latch_};
             while (candidate_begin < candidates.size() && claimed.size() < kClaimPages) {
-                const PageId page_id = candidates[candidate_begin++].page_id;
+                const PageId page_id = candidates[candidate_begin++];
                 auto hit = page_table_.find(page_id);
                 if (hit == page_table_.end()) {
                     continue;
@@ -664,7 +676,9 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
         }
 
         size_t claimed_begin = 0;
-        std::vector<char> image(kClaimPages * PAGE_SIZE);
+        if (image.size() < claimed.size() * PAGE_SIZE) {
+            image.resize(claimed.size() * PAGE_SIZE);
+        }
         while (claimed_begin < claimed.size()) {
             size_t claimed_end = claimed_begin + 1;
             while (claimed_end < claimed.size() &&
@@ -699,6 +713,9 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
                 }
             }
             success = copied && success;
+            if (copied) {
+                result.pages_written += page_count;
+            }
 
             {
                 std::unique_lock lock{latch_};
@@ -727,10 +744,71 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
             claimed_begin = claimed_end;
         }
     }
-    return success;
+    result.success = success;
+    return result;
+}
+
+void BufferPoolManager::log_pool_stats() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RMDB_LOG_BPM_STATS");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    if (!enabled) {
+        return;
+    }
+    // The preflush loop calls in bursts; one line per second is what makes the
+    // resident/pinned counts readable as a time series.
+    static std::atomic<int64_t> next_log_ns{0};
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    int64_t expected_ns = next_log_ns.load(std::memory_order_relaxed);
+    if (now_ns < expected_ns ||
+        !next_log_ns.compare_exchange_strong(expected_ns, now_ns + 1'000'000'000, std::memory_order_relaxed)) {
+        return;
+    }
+
+    size_t resident_pages = 0;
+    size_t index_internal_frames = 0;
+    size_t pinned_frames = 0;
+    size_t dirty_frames = 0;
+    {
+        std::shared_lock lock{latch_};
+        resident_pages = page_table_.size();
+        for (size_t frame_id = 0; frame_id < pool_size_; ++frame_id) {
+            if (residency_classes_[frame_id] == ResidencyClass::IndexInternal) {
+                ++index_internal_frames;
+            }
+            const Page& page = pages_[frame_id];
+            if (page.state_.load(std::memory_order_acquire) != FrameState::VALID) {
+                continue;
+            }
+            // pin_count_ is read without its latch: this is a diagnostic, and a
+            // torn read costs one unit of accuracy in a number that is only ever
+            // compared by order of magnitude.
+            if (page.pin_count_ > 0) {
+                ++pinned_frames;
+            }
+            if (page.is_dirty_.load(std::memory_order_acquire)) {
+                ++dirty_frames;
+            }
+        }
+    }
+    // WARN, not INFO: the server runs at WARN outside recovery (rmdb.cpp sets the
+    // level), so an INFO line here would be silently discarded. The env gate is
+    // what keeps this quiet by default.
+    LOG_WARN("bpm stats: %zu/%zu frames resident, %zu evictable, %zu pinned, %zu index-internal, %zu dirty, "
+             "%lu page reads, %lu page writes",
+             resident_pages, pool_size_, replacer_->Size(), pinned_frames, index_internal_frames, dirty_frames,
+             static_cast<unsigned long>(disk_manager_->get_page_read_count()),
+             static_cast<unsigned long>(disk_manager_->get_page_write_count()));
+    // A benchmark run ends in SIGKILL, which throws away the logger's 1 MiB
+    // buffer. Without this the whole time series is lost.
+    minilog::Logger::get().flush();
 }
 
 size_t BufferPoolManager::flush_dirty_pages(size_t max_pages) {
+    log_pool_stats();
     if (max_pages == 0) {
         return 0;
     }

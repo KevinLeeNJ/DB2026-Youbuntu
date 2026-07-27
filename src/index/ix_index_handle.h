@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
@@ -310,6 +311,62 @@ public:
         void insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate = false);
     };
 
+    // A structure-modification operation (SMO) - a split, a new root, or a
+    // separator-key update - dirties several pages at once, but the buffer pool
+    // evicts each of them independently and at a moment of its own choosing. A
+    // crash between two such evictions leaves a tree on disk in which, say, a
+    // parent already names a child page that was never written; recovery then
+    // has to rebuild the whole index, which blows the 90 s readiness budget on
+    // a multi-GB index. Index pages carry no page LSN (IxPageHdr occupies
+    // Page::OFFSET_LSN), so WAL redo cannot repair them either.
+    //
+    // SmoScope closes that gap: while it is alive it records every page this
+    // operation touched, and on destruction - still under the caller's
+    // structure-exclusive latch - it writes the dirty ones plus the index header
+    // page out together. See publish_smo_pages() for what that does and does not
+    // guarantee.
+    class SmoScope {
+    public:
+        explicit SmoScope(const IxIndexHandle* index_handle) : index_handle_(index_handle) {
+            // SMOs never nest: the three entry points that open a scope
+            // (insert_entry_unlocked, PinnedInserter::insert,
+            // delete_entry_unlocked) never call each other.
+            assert(!index_handle_->smo_active_);
+            index_handle_->smo_pages_.clear();
+            index_handle_->smo_structural_ = false;
+            index_handle_->smo_active_ = true;
+        }
+
+        ~SmoScope() {
+            index_handle_->smo_active_ = false;
+            index_handle_->publish_smo_pages();
+        }
+
+        SmoScope(const SmoScope&) = delete;
+        SmoScope& operator=(const SmoScope&) = delete;
+
+    private:
+        const IxIndexHandle* index_handle_;
+    };
+
+    // Observability for the SMO write-out. "SMOs" counts published operations,
+    // "pages" the page images those operations wrote, so pages/SMO is directly
+    // comparable against the "leaf + sibling + next leaf + one parent per level"
+    // expectation - a collection hole would show up as a suspiciously low ratio.
+    static uint64_t smo_publish_count();
+    static uint64_t smo_pages_written();
+
+    // Switchable so the cost of the SMO write-out can be measured against the
+    // same binary (ENABLE_INDEX_SMO_FLUSH=0), and so one test process can show
+    // both sides of the switch - a crash test that passes is only evidence if
+    // the same construction demonstrably fails without the mechanism.
+    static bool smo_flush_enabled() {
+        return smo_flush_enabled_.load(std::memory_order_relaxed);
+    }
+    static void set_smo_flush_enabled(bool enabled) {
+        smo_flush_enabled_.store(enabled, std::memory_order_relaxed);
+    }
+
     IxNodeHandle* split(IxNodeHandle* node, bool right_edge_append = false);
 
     void insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node, Transaction* transaction);
@@ -407,6 +464,39 @@ private:
         return enabled;
     }
 
+    // Defaults from ENABLE_INDEX_SMO_FLUSH; see set_smo_flush_enabled().
+    static std::atomic<bool> smo_flush_enabled_;
+
+    // The single funnel through which a page becomes part of the current SMO's
+    // page set. Called from fetch_node_into(), fetch_node() and create_node(),
+    // which together are the *only* ways index code can obtain a page - so a
+    // page cannot be modified without being collected. Collecting on acquisition
+    // rather than on modification is deliberate: over-collection costs one hash
+    // lookup in flush_pages(), which skips pages that turned out to be clean,
+    // whereas under-collection silently reintroduces the torn-SMO bug.
+    void note_smo_page(page_id_t page_no) const {
+        if (smo_active_) {
+            smo_pages_.push_back(page_no);
+        }
+    }
+
+    // Records that this operation changed tree linkage or a separator key, i.e.
+    // that it is an SMO and not just an in-place update of one leaf's payload.
+    // Without this every bulk-load row would publish its leaf.
+    void note_structure_change() const {
+        smo_structural_ = true;
+    }
+
+#ifndef NDEBUG
+    bool smo_collected(page_id_t page_no) const {
+        return std::find(smo_pages_.begin(), smo_pages_.end(), page_no) != smo_pages_.end();
+    }
+#endif
+
+    void publish_smo_pages() const noexcept;
+    void publish_smo_pages_impl() const;
+    void write_index_header_page() const;
+
     void refresh_root_page_cache();
     void release_root_page_cache() const;
     void register_internal_pages();
@@ -445,6 +535,12 @@ private:
     }
 
     void unpin_if_not_cached(PageId page_id, bool is_dirty = false) const {
+        // Every page an in-flight SMO dirties has to be in the set that
+        // publish_smo_pages() writes out. note_smo_page() sits on the acquisition
+        // paths, so this can only trip if a new code path obtains an index page
+        // some other way - which is exactly the mistake that would silently
+        // restore the old behaviour.
+        assert(!is_dirty || !smo_active_ || page_id.fd != fd_ || smo_collected(page_id.page_no));
         if (page_id.fd == fd_) {
             if (Page* page = cached_page(page_id.page_no); page != nullptr) {
                 if (is_dirty) {
@@ -454,6 +550,14 @@ private:
             }
         }
         buffer_pool_manager_->unpin_page(page_id, is_dirty);
+    }
+
+    // Releases the allocation pin create_node() left on a fresh page. This
+    // cannot go through unpin_if_not_cached(): a new internal page is registered
+    // in the internal-page cache while it still holds that pin, and skipping the
+    // unpin because the page is "cached" would leak it.
+    void unpin_created_page(PageId page_id) const {
+        buffer_pool_manager_->unpin_page(page_id, true);
     }
 
     void fetch_root_node_into(IxNodeHandle& out) const {
@@ -500,4 +604,17 @@ private:
 
     mutable std::unordered_set<page_id_t> resident_internal_pages_;
     mutable std::unordered_map<page_id_t, Page*> cached_internal_pages_;
+
+    // SMO bookkeeping, deliberately non-atomic. index_latch_ already orders it:
+    // smo_active_ is only ever assigned by the holder of the structure-exclusive
+    // latch, and every read of it (note_smo_page(), reached from fetch_node_into()
+    // and create_node()) happens under at least the shared latch - every index
+    // page acquisition in the codebase is latched, including the executors'
+    // lower_bound()/upper_bound() calls. Storage is reused across operations so a
+    // split costs no allocation once the vectors have grown.
+    mutable bool smo_active_{false};
+    mutable bool smo_structural_{false};
+    mutable std::vector<page_id_t> smo_pages_;
+    mutable std::vector<PageId> smo_flush_batch_;
+    mutable std::vector<char> header_image_;
 };

@@ -112,6 +112,25 @@ public:
     // durable. Adjacent pages in one file may be written with one pwrite.
     bool flush_all_pages(const std::vector<int>& fds, bool wal_preflushed);
 
+    struct FlushBatchResult {
+        // Pages whose image actually reached the file. A named page that is no
+        // longer resident, or resident but clean, contributes nothing: both mean
+        // its current image is already on disk.
+        size_t pages_written = 0;
+        bool success = true;
+    };
+
+    // Write the current image of every named page that is still resident and
+    // dirty, coalescing runs of adjacent page numbers in one file into single
+    // pwrites. page_ids is sorted in place.
+    //
+    // wal_preflushed declares that the caller has already satisfied WAL-before-
+    // page ordering for this batch. Index pages set it because they carry no
+    // page LSN at all - byte 0 of an index page is IxPageHdr, not Page::OFFSET_LSN
+    // - so there is no WAL record to wait for and treating those bytes as an LSN
+    // would make a split block on the log.
+    FlushBatchResult flush_pages(std::vector<PageId>& page_ids, bool wal_preflushed);
+
     // Write at most max_pages dirty resident pages without requiring a
     // checkpoint barrier. The page dirty epoch prevents a concurrent update
     // from being lost when the write completes.
@@ -124,6 +143,14 @@ public:
     }
 
 private:
+    // Env-gated (RMDB_LOG_BPM_STATS=1) snapshot of how much of the pool is
+    // actually available for replacement. Emitted from the background preflush
+    // tick - the only periodic call the buffer pool receives - so nothing is
+    // added to any request path. Written to answer a specific question: whether
+    // the index's resident/pinned internal pages measurably shrink the effective
+    // pool.
+    void log_pool_stats();
+
     frame_id_t take_free_frame();
     void recycle_frame(frame_id_t frame_id);
     void clear_residency(frame_id_t frame_id);

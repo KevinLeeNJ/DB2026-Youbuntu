@@ -17,6 +17,128 @@ See the Mulan PSL v2 for more details. */
 #include "ix_scan.h"
 #include "minilog.h"
 
+namespace {
+
+std::atomic<uint64_t> g_smo_publish_count{0};
+std::atomic<uint64_t> g_smo_pages_written{0};
+
+// One line roughly every few seconds of TPC-C, so the SMO rate and the pages
+// per SMO can be read straight out of the server log after a benchmark run
+// without adding anything to the per-row path.
+constexpr uint64_t kSmoLogInterval = 4096;
+
+// Opt-in, and emitted at WARN because the server runs at WARN outside recovery
+// (rmdb.cpp sets the level) - an INFO line here is simply discarded.
+bool SmoStatsLoggingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RMDB_LOG_INDEX_SMO_STATS");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    return enabled;
+}
+
+} // namespace
+
+std::atomic<bool> IxIndexHandle::smo_flush_enabled_{[] {
+    const char* value = std::getenv("ENABLE_INDEX_SMO_FLUSH");
+    return value == nullptr || std::string(value) != "0";
+}()};
+
+uint64_t IxIndexHandle::smo_publish_count() {
+    return g_smo_publish_count.load(std::memory_order_relaxed);
+}
+
+uint64_t IxIndexHandle::smo_pages_written() {
+    return g_smo_pages_written.load(std::memory_order_relaxed);
+}
+
+/**
+ * @brief Publish one structure-modification operation's pages to the index file.
+ *
+ * Called by ~SmoScope, i.e. still under the structure-exclusive latch, so no
+ * other index thread can read a half-published tree and nothing else can dirty
+ * these pages while they are being written.
+ *
+ * The index header page goes out last and unconditionally. It is what carries
+ * root_page_, num_pages_, first_leaf_ and last_leaf_, none of which live in a
+ * tree page, and without it a root split would publish a new root that no
+ * persisted header names. Writing it last is the better of two imperfect
+ * orders: if the header is lost, the file still describes the previous tree
+ * shape, whereas a header written first can name a page that was never written
+ * at all - i.e. a hole that reads back as zeros.
+ *
+ * These are plain pwrites with no fsync, which is sound for the crash model the
+ * finals specify (SIGKILL plus a restart of the same machine, final.md:349):
+ * SIGKILL does not discard the kernel page cache. The durability audit only
+ * scores objects in the WAL namespace (final.md:332-335), so index page writes
+ * are neither counted nor penalised.
+ *
+ * What this does NOT give: atomicity *between* the pwrites. A SIGKILL landing
+ * between two of them still leaves part of the set on disk. The exposure shrinks
+ * from "however long the buffer pool takes to evict the rest", i.e. seconds to
+ * minutes, to the handful of microseconds a few write syscalls take - six to
+ * seven orders of magnitude - but that is a reduction, not a proof. Closing it
+ * from construction requires making the SMO physically idempotent through the
+ * log (an IX_SMO full-page-image record, which is what InnoDB does) at a cost
+ * of roughly +36% WAL volume.
+ */
+void IxIndexHandle::publish_smo_pages() const noexcept {
+    if (!smo_structural_ || smo_pages_.empty() || !smo_flush_enabled()) {
+        return;
+    }
+
+    // ~SmoScope may run while an exception (IndexEntryExistsError, for one) is
+    // already propagating, so nothing here may escape. Failing to publish is a
+    // degradation, not damage: the pages stay dirty in the buffer pool and reach
+    // disk the old way, on eviction.
+    try {
+        publish_smo_pages_impl();
+    } catch (const std::exception& error) {
+        LOG_WARN("index %s could not publish its structure change: %s", disk_manager_->get_file_name(fd_).c_str(),
+                 error.what());
+    } catch (...) {
+        LOG_WARN("index %s could not publish its structure change", disk_manager_->get_file_name(fd_).c_str());
+    }
+}
+
+void IxIndexHandle::publish_smo_pages_impl() const {
+    std::sort(smo_pages_.begin(), smo_pages_.end());
+    smo_pages_.erase(std::unique(smo_pages_.begin(), smo_pages_.end()), smo_pages_.end());
+
+    smo_flush_batch_.clear();
+    smo_flush_batch_.reserve(smo_pages_.size());
+    for (const page_id_t page_no : smo_pages_) {
+        if (page_no != IX_NO_PAGE) {
+            smo_flush_batch_.push_back(PageId{fd_, page_no});
+        }
+    }
+
+    // wal_preflushed: index pages have no page LSN, so there is no log record to
+    // wait for - see BufferPoolManager::flush_pages().
+    const auto flushed = buffer_pool_manager_->flush_pages(smo_flush_batch_, /*wal_preflushed=*/true);
+    write_index_header_page();
+
+    const uint64_t published = g_smo_publish_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_smo_pages_written.fetch_add(flushed.pages_written, std::memory_order_relaxed);
+    if (published % kSmoLogInterval == 0 && SmoStatsLoggingEnabled()) {
+        LOG_WARN("index SMO write-out stats: %lu operations, %lu page images", static_cast<unsigned long>(published),
+                 static_cast<unsigned long>(smo_pages_written()));
+        // The logger buffers 1 MiB and a benchmark run ends in SIGKILL, so a line
+        // that is not flushed is a line that never existed. One fflush per
+        // kSmoLogInterval operations - tens of seconds apart - is what makes this
+        // counter readable at all.
+        minilog::Logger::get().flush();
+    }
+}
+
+void IxIndexHandle::write_index_header_page() const {
+    if (header_image_.size() != static_cast<size_t>(file_hdr_->tot_len_)) {
+        header_image_.assign(static_cast<size_t>(file_hdr_->tot_len_), 0);
+    }
+    file_hdr_->serialize(header_image_.data());
+    disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, header_image_.data(), file_hdr_->tot_len_);
+}
+
 /**
  * @brief 在当前node中查找第一个>=target的key_idx
  *
@@ -423,6 +545,7 @@ void IxIndexHandle::remember_append_hint(page_id_t page_no) const {
 
 IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
     topology_epoch_.fetch_add(1, std::memory_order_relaxed);
+    note_structure_change();
     IxNodeHandle* new_node = create_node();
     memcpy(new_node->page_hdr, node->page_hdr, sizeof(IxPageHdr));
     new_node->set_parent_page_no(node->get_parent_page_no());
@@ -478,6 +601,7 @@ IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
  */
 void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node,
                                        Transaction* transaction) {
+    note_structure_change();
     if (old_node->is_root_page()) {
         IxNodeHandle* new_root = create_node();
         new_root->page_hdr->is_leaf = false;
@@ -490,7 +614,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
         new_node->set_parent_page_no(new_root->get_page_no());
         update_root_page_no(new_root->get_page_no());
         refresh_root_page_cache();
-        buffer_pool_manager_->unpin_page(new_root->get_page_id(), true);
+        unpin_created_page(new_root->get_page_id());
         delete new_root;
         return;
     }
@@ -504,7 +628,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
     if (parent.get_size() >= parent.get_max_size()) {
         IxNodeHandle* new_parent = split(&parent);
         insert_into_parent(&parent, new_parent->get_key(0), new_parent, transaction);
-        buffer_pool_manager_->unpin_page(new_parent->get_page_id(), true);
+        unpin_created_page(new_parent->get_page_id());
         delete new_parent;
     }
     unpin_if_not_cached(parent.get_page_id(), true);
@@ -572,6 +696,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
 
 page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value, Transaction* transaction,
                                                bool allow_duplicate) {
+    SmoScope smo(this);
     IxNodeHandle leaf;
     if (!try_append_hint(key, leaf)) {
         fetch_node_into(file_hdr_->root_page_, leaf);
@@ -610,7 +735,7 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
         if (right_edge_append) {
             remember_append_hint(new_leaf->get_page_no());
         }
-        buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
+        unpin_created_page(new_leaf->get_page_id());
         delete new_leaf;
     }
 
@@ -642,6 +767,13 @@ IxIndexHandle::PinnedInserter::~PinnedInserter() {
 }
 
 void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate) {
+    SmoScope smo(ih);
+    // This object holds the leaf pinned across rows, so unlike the other two
+    // entry points it does not necessarily re-fetch it inside the scope. Record
+    // it explicitly - it is the one page note_smo_page()'s acquisition funnel
+    // cannot see.
+    ih->note_smo_page(leaf.get_page_no());
+
     // Skip root→leaf walk if key belongs in the pinned leaf (ascending bulk load).
     if (leaf.get_size() > 0) {
         int cmp_first = ix_compare(key, leaf.get_key(0), ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_);
@@ -695,7 +827,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
         if (right_edge_append) {
             ih->remember_append_hint(new_leaf_page_no);
         }
-        ih->buffer_pool_manager_->unpin_page(new_leaf->get_page_id(), true);
+        ih->unpin_created_page(new_leaf->get_page_id());
         delete new_leaf;
 
         // Reposition to the right leaf after split.
@@ -754,6 +886,7 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 }
 
 bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transaction) {
+    SmoScope smo(this);
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
@@ -843,6 +976,7 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
 
 bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction) {
     (void)transaction;
+    SmoScope smo(this);
     Iid lower = lower_bound(key);
     Iid upper = upper_bound(key);
     IxScan scan(this, lower, upper, buffer_pool_manager_, false);
@@ -914,6 +1048,7 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
 bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
     if (!old_root_node->is_leaf_page() && old_root_node->get_size() == 1) {
         topology_epoch_.fetch_add(1, std::memory_order_relaxed);
+        note_structure_change();
         page_id_t child_page_no = old_root_node->value_at(0);
         IxNodeHandle child;
         fetch_node_into(child_page_no, child);
@@ -945,6 +1080,7 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
  */
 void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node, IxNodeHandle* parent, int index) {
     (void)parent;
+    note_structure_change();
     if (index == 0) {
         node->insert_pair(node->get_size(), neighbor_node->get_key(0), *neighbor_node->get_rid(0));
         neighbor_node->erase_pair(0);
@@ -975,6 +1111,7 @@ void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node
  */
 bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, IxNodeHandle** parent, int index,
                              Transaction* transaction, bool* root_is_latched) {
+    note_structure_change();
     if (index == 0) {
         std::swap(*neighbor_node, *node);
         index = 1;
@@ -1320,7 +1457,17 @@ bool IxIndexHandle::validate_structure() const {
         };
 
         const int size = node.get_size();
-        if (size <= 0 || size > node.get_max_size()) {
+        // An empty leaf is a legal steady state, not damage. delete_entry only
+        // erases the key - coalesce_or_redistribute() is unreachable from the
+        // delete path - so a leaf that has had all of its keys removed stays in
+        // the tree and in the leaf chain. TPC-C reaches this on every index over
+        // new_orders, whose leftmost leaf is emptied by Delivery taking
+        // MIN(no_o_id), and rejecting it here used to send those indexes into a
+        // full rebuild after every crash. Descent, lookup_equal() and the scans
+        // all step past a zero-key leaf via its next_leaf link. An internal node
+        // with no children is genuinely unusable and still rejected.
+        const int min_size = node.is_leaf_page() ? 0 : 1;
+        if (size < min_size || size > node.get_max_size()) {
             return finish(reject("node key count out of range", page_no));
         }
         if (node.get_parent_page_no() != expected_parent) {
@@ -1436,6 +1583,7 @@ Iid IxIndexHandle::leaf_begin() const {
  * @note pin the page, remember to unpin it outside!
  */
 IxNodeHandle* IxIndexHandle::fetch_node(int page_no) const {
+    note_smo_page(page_no);
     Page* page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
     IxNodeHandle* node = new IxNodeHandle(file_hdr_.get(), page);
 
@@ -1443,6 +1591,7 @@ IxNodeHandle* IxIndexHandle::fetch_node(int page_no) const {
 }
 
 void IxIndexHandle::fetch_node_into(int page_no, IxNodeHandle& out) const {
+    note_smo_page(page_no);
     Page* page = cached_page(page_no);
     if (page == nullptr) {
         page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
@@ -1474,6 +1623,10 @@ IxNodeHandle* IxIndexHandle::create_node() {
     PageId new_page_id = {.fd = fd_, .page_no = INVALID_PAGE_ID};
     // 从3开始分配page_no，第一次分配之后，new_page_id.page_no=3，file_hdr_.num_pages=4
     Page* page = buffer_pool_manager_->new_page(&new_page_id);
+    // A page that has only been allocated occupies no bytes in the file yet, so
+    // it reads back as a hole full of zeros. Publishing it with the rest of the
+    // SMO is the only thing that stops a parent from pointing at one.
+    note_smo_page(new_page_id.page_no);
     node = new IxNodeHandle(file_hdr_.get(), page);
     return node;
 }
@@ -1503,7 +1656,12 @@ void IxIndexHandle::maintain_parent(IxNodeHandle* node) {
             unpin_if_not_cached(next->get_page_id(), true);
             break;
         }
+        // A separator key is as much a part of the tree's shape as a child
+        // pointer: if the new separator reaches disk without the leaf that
+        // justifies it (or the other way round), a range of keys stops being
+        // reachable by descent even though every page still validates.
         topology_epoch_.fetch_add(1, std::memory_order_relaxed);
+        note_structure_change();
         memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_);
         unpin_if_not_cached(next->get_page_id(), true);
         std::swap(curr, next);
@@ -1517,6 +1675,7 @@ void IxIndexHandle::maintain_parent(IxNodeHandle* node) {
  */
 void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
     assert(leaf->is_leaf_page());
+    note_structure_change();
 
     IxNodeHandle prev;
     fetch_node_into(leaf->get_prev_leaf(), prev);
@@ -1552,6 +1711,10 @@ void IxIndexHandle::release_node_handle(IxNodeHandle& node) {
  */
 void IxIndexHandle::maintain_child(IxNodeHandle* node, int child_idx) {
     if (!node->is_leaf_page()) {
+        // An internal split re-parents up to fanout/2 children this way, which is
+        // why an SMO's dirty set is much larger than {leaf, sibling, parent} and
+        // why it has to be collected rather than enumerated by hand.
+        note_structure_change();
         //  Current node is inner node, load its child and set its parent to current node
         int child_page_no = node->value_at(child_idx);
         IxNodeHandle child;
