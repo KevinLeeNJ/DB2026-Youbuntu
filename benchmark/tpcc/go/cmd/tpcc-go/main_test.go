@@ -685,6 +685,34 @@ func writeResultDocument(t *testing.T, path string, doc document) {
 	}
 }
 
+func writeLegacyResultDocument(t *testing.T, path string, doc document) {
+	t.Helper()
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	var configFields map[string]json.RawMessage
+	if err := json.Unmarshal(fields["config"], &configFields); err != nil {
+		t.Fatal(err)
+	}
+	delete(configFields, "max_conflict_retries")
+	fields["config"], err = json.Marshal(configFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func completeResult(measure int) *result {
 	result := newResult(measure)
 	for _, txnType := range []string{"new_order", "payment", "order_status", "delivery", "stock_level"} {
@@ -701,6 +729,91 @@ func TestConfigJSONIncludesMaxConflictRetries(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), `"max_conflict_retries":-1`) {
 		t.Fatalf("config JSON = %s, want max_conflict_retries=-1", encoded)
+	}
+}
+
+func TestConfigJSONDefaultsMissingMaxConflictRetriesToUnlimited(t *testing.T) {
+	var legacy config
+	if err := json.Unmarshal([]byte(`{"rounds":1}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.MaxConflictRetries != defaultMaxConflictRetries {
+		t.Fatalf("legacy max conflict retries = %d, want %d",
+			legacy.MaxConflictRetries, defaultMaxConflictRetries)
+	}
+
+	var explicitZero config
+	if err := json.Unmarshal([]byte(`{"max_conflict_retries":0}`), &explicitZero); err != nil {
+		t.Fatal(err)
+	}
+	if explicitZero.MaxConflictRetries != 0 {
+		t.Fatalf("explicit max conflict retries = %d, want 0", explicitZero.MaxConflictRetries)
+	}
+}
+
+func TestMergeResultFilesTreatsLegacyRetryModeAsUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "legacy.json")
+	unlimitedPath := filepath.Join(dir, "unlimited.json")
+	outputPath := filepath.Join(dir, "merged.json")
+	baseConfig := config{Backend: "rmdb", Isolation: "snapshot-isolation", Warehouses: 1, Workers: 4,
+		Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, MaxConflictRetries: defaultMaxConflictRetries,
+		WarehousePolicy: "terminal-home"}
+	doc := document{Config: baseConfig, Rounds: []*result{completeResult(60)}}
+	writeLegacyResultDocument(t, legacyPath, doc)
+	writeResultDocument(t, unlimitedPath, doc)
+
+	if err := mergeResultFiles(outputPath, legacyPath+","+unlimitedPath); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged document
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatal(err)
+	}
+	if merged.Config.MaxConflictRetries != defaultMaxConflictRetries {
+		t.Fatalf("merged max conflict retries = %d, want %d",
+			merged.Config.MaxConflictRetries, defaultMaxConflictRetries)
+	}
+}
+
+func TestMergeResultFilesRejectsLegacyAndExplicitZeroRetryModes(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "legacy.json")
+	zeroPath := filepath.Join(dir, "zero.json")
+	outputPath := filepath.Join(dir, "merged.json")
+	baseConfig := config{Backend: "rmdb", Isolation: "snapshot-isolation", Warehouses: 1, Workers: 4,
+		Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, MaxConflictRetries: defaultMaxConflictRetries,
+		WarehousePolicy: "terminal-home"}
+	writeLegacyResultDocument(t, legacyPath,
+		document{Config: baseConfig, Rounds: []*result{completeResult(60)}})
+	baseConfig.MaxConflictRetries = 0
+	writeResultDocument(t, zeroPath,
+		document{Config: baseConfig, Rounds: []*result{completeResult(60)}})
+
+	err := mergeResultFiles(outputPath, legacyPath+","+zeroPath)
+	if err == nil || !strings.Contains(err.Error(), "materially different") {
+		t.Fatalf("merge error = %v, want retry-mode config mismatch", err)
+	}
+}
+
+func TestResultAndMergeRejectInvalidMaxConflictRetries(t *testing.T) {
+	badConfig := config{Measure: 60, Rounds: 1, MaxConflictRetries: -2}
+	doc := document{Config: badConfig, Rounds: []*result{completeResult(60)}}
+	if err := validateResultDocument(doc); err == nil || !strings.Contains(err.Error(), "max_conflict_retries") {
+		t.Fatalf("result validation error = %v, want invalid retry limit", err)
+	}
+
+	dir := t.TempDir()
+	inputPath := filepath.Join(dir, "invalid.json")
+	outputPath := filepath.Join(dir, "merged.json")
+	writeResultDocument(t, inputPath, doc)
+	if err := mergeResultFiles(outputPath, inputPath); err == nil ||
+		!strings.Contains(err.Error(), "max_conflict_retries") {
+		t.Fatalf("merge error = %v, want invalid retry limit", err)
 	}
 }
 

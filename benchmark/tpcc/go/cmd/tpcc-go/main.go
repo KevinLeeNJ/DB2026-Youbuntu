@@ -2774,6 +2774,16 @@ type config struct {
 	BaselineOrdersTotal    int    `json:"baseline_orders_total"`
 }
 
+func (value *config) UnmarshalJSON(data []byte) error {
+	type configJSON config
+	decoded := configJSON{MaxConflictRetries: defaultMaxConflictRetries}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*value = config(decoded)
+	return nil
+}
+
 type document struct {
 	Config config `json:"config"`
 	// Baselines is the aggregate snapshot of the freshly loaded database, taken
@@ -2796,7 +2806,17 @@ type document struct {
 	Rounds          []*result         `json:"rounds"`
 }
 
+func validateMaxConflictRetries(value int) error {
+	if value < defaultMaxConflictRetries {
+		return fmt.Errorf("max_conflict_retries must be -1 or greater, got %d", value)
+	}
+	return nil
+}
+
 func validateResultDocument(doc document) error {
+	if err := validateMaxConflictRetries(doc.Config.MaxConflictRetries); err != nil {
+		return fmt.Errorf("result config: %w", err)
+	}
 	if doc.Config.Rounds < 1 || len(doc.Rounds) != doc.Config.Rounds {
 		return fmt.Errorf("result has %d rounds, want %d", len(doc.Rounds), doc.Config.Rounds)
 	}
@@ -3223,8 +3243,8 @@ func main() {
 		os.Exit(2)
 	}
 	if *command == "run" {
-		if *maxConflictRetries < defaultMaxConflictRetries {
-			fmt.Fprintln(os.Stderr, "--max-conflict-retries must be -1 or greater")
+		if err := validateMaxConflictRetries(*maxConflictRetries); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 		if err := validateBenchmarkMode(*mode, *workers, *warmup, *measure, *rounds, *think, *allowNonOfficialTiming); err != nil {

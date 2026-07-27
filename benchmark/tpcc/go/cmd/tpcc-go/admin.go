@@ -765,6 +765,9 @@ func mergeResultFiles(outputPath, inputs string) error {
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return err
 		}
+		if err := validateMaxConflictRetries(doc.Config.MaxConflictRetries); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
 		if len(doc.Rounds) != 1 {
 			return fmt.Errorf("%s has %d rounds, want exactly 1", path, len(doc.Rounds))
 		}
