@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <queue>
@@ -854,7 +855,7 @@ void RecoveryManager::collect_index_repair_keys(std::map<std::string, IndexRepai
     collect_heap_index_keys();
 }
 
-bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
+void RecoveryManager::sort_index_repair_entries(IndexRepairPlan* plan) {
     IxIndexHandle* index = plan->index;
     const int key_len = plan->key_len;
     const char* arena = plan->key_arena.data();
@@ -863,7 +864,10 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
     };
 
     // Group by key in B+tree order so the leaves are visited left to right and
-    // the internal nodes stay hot, then let each group make one decision.
+    // the internal nodes stay hot, then let each group make one decision. Both
+    // the structure gate and the repair below consume this order, and the gate
+    // depends on it for its "the previous descent already covers this key" skip,
+    // so it is established once, here, before either of them runs.
     std::sort(
         plan->entries.begin(), plan->entries.end(), [&](const IndexRepairEntry& left, const IndexRepairEntry& right) {
             const int cmp = ix_compare(key_of(left), key_of(right), index->get_col_types(), index->get_col_lens());
@@ -876,6 +880,70 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
             }
             return static_cast<int>(left.from_heap) < static_cast<int>(right.from_heap);
         });
+}
+
+bool RecoveryManager::gate_index_change_set(IndexRepairPlan* plan, RecoveryIndexGate::Stats* totals) {
+    IxIndexHandle* index = plan->index;
+    const int key_len = plan->key_len;
+    const char* arena = plan->key_arena.data();
+
+    bool valid = true;
+    bool gate_declined = false;
+    {
+        // Recovery is single threaded and runs before the listener opens, so the
+        // latch is documentation rather than mutual exclusion - but the gate does
+        // write to index pages, and taking the same latch every writer takes keeps
+        // that from becoming an exception to the rule. It is released before
+        // validate_structure() runs below: index_latch_ is a plain shared_mutex,
+        // so re-entering it for a shared hold would deadlock.
+        auto structure_guard = index->lock_exclusive();
+
+        RecoveryIndexGate gate(disk_manager_, buffer_pool_manager_, index, plan->index_name);
+        const char* previous_key = nullptr;
+        for (const IndexRepairEntry& entry : plan->entries) {
+            const char* key = arena + static_cast<size_t>(entry.key_slot) * key_len;
+            // plan->entries holds one element per (key, rid, source); the gate
+            // only cares about distinct keys, and they arrive grouped by sort
+            // order.
+            if (previous_key != nullptr &&
+                ix_compare(previous_key, key, index->get_col_types(), index->get_col_lens()) == 0) {
+                continue;
+            }
+            previous_key = key;
+            if (!gate.check_key(key)) {
+                valid = false;
+                break;
+            }
+        }
+
+        const RecoveryIndexGate::Stats& stats = gate.stats();
+        totals->descents += stats.descents;
+        totals->keys_covered += stats.keys_covered;
+        totals->pages_validated += stats.pages_validated;
+        totals->page_fetches += stats.page_fetches;
+        totals->parent_pointers_repaired += stats.parent_pointers_repaired;
+        totals->chain_bounds_unknown += stats.chain_bounds_unknown;
+        index_parent_pointer_repair_count_ += stats.parent_pointers_repaired;
+        // Unusable is not a verdict on the tree: the gate is saying it cannot
+        // trust its own inputs (an unreadable or outdated page 0). Rebuilding on
+        // that would turn a gate limitation into a table-sized recovery.
+        gate_declined = gate.setup() == RecoveryIndexGate::Setup::Unusable;
+    }
+    if (gate_declined) {
+        LOG_WARN("recovery index gate %s declined; falling back to whole-tree structure validation",
+                 plan->index_name.c_str());
+        return index->validate_structure();
+    }
+    return valid;
+}
+
+bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
+    IxIndexHandle* index = plan->index;
+    const int key_len = plan->key_len;
+    const char* arena = plan->key_arena.data();
+    const auto key_of = [arena, key_len](const IndexRepairEntry& entry) {
+        return arena + static_cast<size_t>(entry.key_slot) * key_len;
+    };
 
     std::vector<Rid> existing;
     std::vector<Rid> required;   // must be present when the group is done
@@ -1003,26 +1071,37 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
 void RecoveryManager::repair_touched_indexes() {
     std::map<std::string, IndexRepairPlan> plans;
     // Only names and key widths at this point. Collecting the keys costs a WAL
-    // pass and a heap sweep, so it waits until the gate has decided which
-    // indexes are actually going to be repaired in place.
+    // pass and a heap sweep, so it waits until the spine check below has dropped
+    // the indexes that cannot be repaired in place at all.
     plan_touched_indexes(&plans);
     if (plans.empty()) {
         return;
     }
+    const size_t total_indexes = plans.size();
 
     std::unordered_set<std::string> indexes_to_rebuild;
-    // Structure gate. Two things happen here, in this order:
-    //
-    // 1. last_leaf_ is repaired. It is an append hint that reaches disk only
-    //    when a checkpoint publishes the header, so after a crash it routinely
-    //    names a leaf that has since been split. That alone makes the leaf
-    //    chain look broken and makes delete_entry stop scanning early.
-    // 2. The tree is validated. A tree that fails its own invariants cannot be
-    //    fixed key by key, so it goes to the rebuild set instead. Until now
-    //    nothing ever called the checker, which is why a stale root pointer on
-    //    a self-consistent tree raised no exception at all.
-    const auto validate_begin = std::chrono::steady_clock::now();
+
+    // Stage 1: the spine. last_leaf_/first_leaf_ are append hints that reach disk
+    // only when a checkpoint publishes the header, so after a crash they
+    // routinely name leaves that have since been split - which alone makes the
+    // leaf chain look broken and makes delete_entry stop scanning early.
+    // refresh_leaf_chain_endpoint() recomputes both by descending the left and
+    // right edges, one page read per level, and fails only when even that spine
+    // is unusable.
+    const auto spine_begin = std::chrono::steady_clock::now();
+    const uint64_t spine_reads_begin = disk_manager_->get_page_read_count();
     size_t repaired_endpoints = 0;
+    // The whole-tree checker is the reference oracle for the descent-path gate
+    // in stage 2, not a second line of defence: it reads every page of every
+    // index (leaves twice) and holds two page-number sets sized by the tree, so
+    // its cost is O(database) while the crash it is looking for is O(WAL). Keep
+    // it one environment variable away for A/B runs, bug reports and the
+    // whole-tree assertions in test/index/. Read per recovery rather than cached
+    // in a function-local static, so one test process can demonstrate both sides
+    // of the switch - a gate that passes is only evidence if the same corruption
+    // demonstrably costs a rebuild without it.
+    const char* full_validation_env = std::getenv("RMDB_RECOVERY_FULL_INDEX_VALIDATION");
+    const bool full_validation = full_validation_env != nullptr && std::string(full_validation_env) == "1";
     for (const auto& [index_name, plan] : plans) {
         if (!plan.index->refresh_leaf_chain_endpoint()) {
             LOG_ERROR("recovery could not follow the leaf chain of index %s", index_name.c_str());
@@ -1030,16 +1109,17 @@ void RecoveryManager::repair_touched_indexes() {
             continue;
         }
         ++repaired_endpoints;
-        if (!plan.index->validate_structure()) {
-            LOG_ERROR("recovery found structurally invalid index %s", index_name.c_str());
+        if (full_validation && !plan.index->validate_structure()) {
+            LOG_ERROR("recovery found structurally invalid index %s (full validation)", index_name.c_str());
             indexes_to_rebuild.insert(index_name);
         }
     }
-    LOG_INFO("recovery index structure gate: %zu indexes, %zu leaf endpoints refreshed, %zu to rebuild, %lld ms",
-             plans.size(), repaired_endpoints, indexes_to_rebuild.size(),
-             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now() - validate_begin)
-                                        .count()));
+    const auto spine_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - spine_begin).count();
+    // Reported separately from the gate's own numbers so an A/B run against
+    // RMDB_RECOVERY_FULL_INDEX_VALIDATION=1 reads the whole-tree checker's cost
+    // off the same log line as the gate's.
+    const uint64_t spine_reads = disk_manager_->get_page_read_count() - spine_reads_begin;
 
     // Drop the plans for indexes that are going to be rebuilt anyway, then pay
     // for the key collection only for the rest.
@@ -1047,6 +1127,48 @@ void RecoveryManager::repair_touched_indexes() {
         it = indexes_to_rebuild.count(it->first) != 0 ? plans.erase(it) : std::next(it);
     }
     collect_index_repair_keys(&plans);
+
+    // Stage 2: the structure gate proper, over the change set rather than over
+    // the tree. See src/recovery/index_structure_gate.h for why the distinct
+    // repair keys are a sufficient cover for everything an interrupted SMO can
+    // damage. It runs before any mutation, so a tree the repair cannot fix key
+    // by key never gets written to.
+    const auto gate_begin = std::chrono::steady_clock::now();
+    const uint64_t gate_reads_begin = disk_manager_->get_page_read_count();
+    RecoveryIndexGate::Stats gate_totals;
+    for (auto& [index_name, plan] : plans) {
+        sort_index_repair_entries(&plan);
+        try {
+            if (!gate_index_change_set(&plan, &gate_totals)) {
+                LOG_ERROR("recovery found structurally invalid index %s", index_name.c_str());
+                indexes_to_rebuild.insert(index_name);
+            }
+        } catch (const std::exception& error) {
+            LOG_ERROR("recovery could not validate the structure of index %s: %s", index_name.c_str(), error.what());
+            indexes_to_rebuild.insert(index_name);
+        }
+    }
+    LOG_INFO("recovery index structure gate: %zu indexes, spine: %zu leaf endpoints refreshed, %lld ms, "
+             "%llu disk page reads%s; change set: %llu descents, "
+             "%llu keys covered, %llu pages validated, %llu page fetches, %llu disk page reads, "
+             "%llu parent pointers repaired, %llu leaves with an empty successor, %zu to rebuild, %lld ms",
+             total_indexes, repaired_endpoints, static_cast<long long>(spine_ms),
+             static_cast<unsigned long long>(spine_reads),
+             full_validation ? " (INCLUDES whole-tree validate_structure)" : "",
+             static_cast<unsigned long long>(gate_totals.descents),
+             static_cast<unsigned long long>(gate_totals.keys_covered),
+             static_cast<unsigned long long>(gate_totals.pages_validated),
+             static_cast<unsigned long long>(gate_totals.page_fetches),
+             static_cast<unsigned long long>(disk_manager_->get_page_read_count() - gate_reads_begin),
+             static_cast<unsigned long long>(gate_totals.parent_pointers_repaired),
+             static_cast<unsigned long long>(gate_totals.chain_bounds_unknown), indexes_to_rebuild.size(),
+             static_cast<long long>(
+                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - gate_begin)
+                     .count()));
+
+    for (auto it = plans.begin(); it != plans.end();) {
+        it = indexes_to_rebuild.count(it->first) != 0 ? plans.erase(it) : std::next(it);
+    }
 
     for (auto& [index_name, plan] : plans) {
         try {

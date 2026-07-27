@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "index_structure_gate.h"
 #include "log_manager.h"
 #include "wal_reader.h"
 #include "storage/disk_manager.h"
@@ -112,6 +113,13 @@ public:
     // path: it makes recovery time proportional to the table, not to the WAL.
     uint64_t get_index_rebuild_count() const {
         return index_rebuild_count_;
+    }
+    // How many child pages the structure gate found naming the wrong parent and
+    // repaired in place (A-1). This is the invariant a real SIGKILL was measured
+    // to break; before the in-place repair every occurrence cost a full rebuild
+    // of the whole index.
+    uint64_t get_index_parent_pointer_repair_count() const {
+        return index_parent_pointer_repair_count_;
     }
 
     /**
@@ -291,7 +299,16 @@ private:
     void collect_index_repair_keys(std::map<std::string, IndexRepairPlan>* plans);
     void collect_wal_index_keys();
     void collect_heap_index_keys();
+    // Puts one plan's entries into B+tree key order. Both the structure gate and
+    // the repair consume that order, so it is established exactly once.
+    void sort_index_repair_entries(IndexRepairPlan* plan);
+    // Structure gate for one index, priced against the change set: validates the
+    // root->leaf descent path of every distinct repair key, repairing parent back
+    // pointers in place. Returns false when the index must be rebuilt from the
+    // heap. Requires sort_index_repair_entries() to have run on the plan.
+    bool gate_index_change_set(IndexRepairPlan* plan, RecoveryIndexGate::Stats* totals);
     // Applies one index's plan; returns false when the index must be rebuilt.
+    // Requires sort_index_repair_entries() to have run on the plan.
     bool apply_index_repair_plan(IndexRepairPlan* plan);
     void rebuild_indexes(const std::unordered_set<std::string>& index_names);
     void reset_wal_if_needed();
@@ -324,6 +341,7 @@ private:
     uint64_t index_unchanged_key_count_{0};
     uint64_t index_duplicate_entry_count_{0};
     uint64_t index_rebuild_count_{0};
+    uint64_t index_parent_pointer_repair_count_{0};
 
     // 计数器恢复的两个来源，见 get_recovered_next_timestamp()。
     timestamp_t persisted_next_timestamp_{0};
