@@ -166,7 +166,7 @@ protected:
         if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
             return;
         }
-        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_start_ts();
+        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_read_ts();
         if (invisible && txn_mgr->CheckInvisibleWriteEdge(reader_id, meta.writer_txn_id_)) {
             throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER);
         }
@@ -503,9 +503,8 @@ public:
         // merge of an empty set is the identity), not an approximation.
         historical_entries_.clear();
         if (use_historical_index_candidates_) {
-            sm_manager_->collect_historical_index_entries_in_range(tab_name_, index_name_, lower_key_, upper_key_,
-                                                                   lower_exclusive, upper_inclusive,
-                                                                   historical_entries_);
+            sm_manager_->collect_historical_index_entries_in_range(
+                tab_name_, index_name_, lower_key_, upper_key_, lower_exclusive, upper_inclusive, historical_entries_);
             if (historical_entries_.empty()) {
                 use_historical_index_candidates_ = false;
             }

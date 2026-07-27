@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -62,9 +63,9 @@ RmRecord make_filter_record(int lhs, int rhs) {
 class CountingExecutor : public AbstractExecutor {
 public:
     CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records,
-                     int* external_next_record_calls = nullptr)
-        : cols_(std::move(cols)), records_(std::move(records)),
-          external_next_record_calls_(external_next_record_calls) {
+                     int* external_next_record_calls = nullptr, bool* tracking_enabled_on_begin = nullptr)
+        : cols_(std::move(cols)), records_(std::move(records)), external_next_record_calls_(external_next_record_calls),
+          tracking_enabled_on_begin_(tracking_enabled_on_begin) {
         len_ = 0;
         for (const auto& col : cols_) {
             len_ = std::max(len_, static_cast<size_t>(col.offset + col.len));
@@ -73,6 +74,9 @@ public:
 
     void beginTuple() override {
         ++begin_calls_;
+        if (tracking_enabled_on_begin_ != nullptr) {
+            *tracking_enabled_on_begin_ = context_ != nullptr && context_->enable_ssi_read_tracking_;
+        }
         if (throw_on_begin_) {
             throw std::runtime_error("test child begin failure");
         }
@@ -145,8 +149,27 @@ private:
     std::vector<ColMeta> cols_;
     std::vector<RmRecord> records_;
     int* external_next_record_calls_ = nullptr;
+    bool* tracking_enabled_on_begin_ = nullptr;
     size_t len_ = 0;
     size_t cursor_ = 0;
+};
+
+class CountingResultSink : public QueryResultSink {
+public:
+    void begin_query(const std::vector<ColMeta>& columns, const std::vector<std::string>& names) override {
+        ++begin_calls;
+        column_count = columns.size();
+        captions = names;
+    }
+
+    void append_row(const std::vector<ColMeta>&, const char*, std::size_t) override {
+        ++row_count;
+    }
+
+    int begin_calls = 0;
+    int row_count = 0;
+    std::size_t column_count = 0;
+    std::vector<std::string> captions;
 };
 
 class BareExecutor : public AbstractExecutor {
@@ -889,6 +912,40 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     EXPECT_TRUE(after_delete.is_end());
 }
 
+TEST_F(ExecutorTest, update_rejects_non_finite_float_result_without_writing_row) {
+    setup_db();
+    sm_manager_->create_table("finite_update", {{"amount", TYPE_FLOAT, 4}}, nullptr);
+
+    Value maximum;
+    maximum.set_float(std::numeric_limits<float>::max());
+    char buf[4096] = {};
+    int offset = 0;
+    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    InsertExecutor insert(sm_manager_.get(), "finite_update", {maximum}, &ctx);
+    insert.Next();
+
+    Rid rid;
+    {
+        SeqScanExecutor scan(sm_manager_.get(), "finite_update", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    SetClause add;
+    add.lhs = {"finite_update", "amount"};
+    add.rhs = maximum;
+    add.is_self_ref = true;
+    add.rhs_col = {"finite_update", "amount"};
+    add.op = UpdateOp::SELF_ADD;
+    UpdateExecutor update(sm_manager_.get(), "finite_update", {add}, {}, {rid}, &ctx);
+
+    EXPECT_THROW((void)update.Next(), RMDBError);
+    auto record = sm_manager_->fhs_.at("finite_update")->get_record(rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_FLOAT_EQ(read_float(record->data), std::numeric_limits<float>::max());
+}
+
 TEST_F(ExecutorTest, read_committed_update_rechecks_latest_version) {
     setup_db();
     auto cols = make_int_cols({"id", "next_id"});
@@ -1009,6 +1066,86 @@ TEST_F(ExecutorTest, select_from_prefers_current_view_over_next_record) {
                                               "|               20 |\n"
                                               "+------------------+\n"
                                               "Total record(s): 2\n");
+}
+
+TEST_F(ExecutorTest, select_from_result_sink_enables_and_restores_ssi_read_tracking) {
+    bool tracking_enabled_on_begin = false;
+    auto executor = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(10)}, nullptr, &tracking_enabled_on_begin);
+
+    char data_send[64] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    CountingResultSink sink;
+    context.result_sink_ = &sink;
+    executor->context_ = &context;
+    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
+
+    ql_manager.select_from(std::move(executor), {"id"}, &context);
+
+    EXPECT_TRUE(tracking_enabled_on_begin);
+    EXPECT_FALSE(context.enable_ssi_read_tracking_);
+    EXPECT_EQ(sink.begin_calls, 1);
+    EXPECT_EQ(sink.row_count, 1);
+    EXPECT_EQ(sink.column_count, 1U);
+    EXPECT_EQ(sink.captions, std::vector<std::string>({"id"}));
+}
+
+TEST_F(ExecutorTest, select_from_result_sink_restores_ssi_tracking_when_executor_throws) {
+    bool tracking_enabled_on_begin = false;
+    auto executor =
+        std::make_unique<CountingExecutor>(std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+                                           std::vector<RmRecord>{}, nullptr, &tracking_enabled_on_begin);
+    executor->throw_on_begin_ = true;
+
+    char data_send[64] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    CountingResultSink sink;
+    context.result_sink_ = &sink;
+    executor->context_ = &context;
+    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
+
+    EXPECT_THROW(ql_manager.select_from(std::move(executor), {"id"}, &context), std::runtime_error);
+    EXPECT_TRUE(tracking_enabled_on_begin);
+    EXPECT_FALSE(context.enable_ssi_read_tracking_);
+}
+
+TEST_F(ExecutorTest, select_from_result_sink_records_serializable_nonempty_and_empty_predicates) {
+    setup_db();
+    sm_manager_->create_table("sink_ssi", make_int_cols({"id"}), nullptr);
+    insert_test_rows("sink_ssi", {1});
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    QlManager ql_manager(sm_manager_.get(), &txn_manager, nullptr);
+
+    for (int key : {1, 2}) {
+        Transaction* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::SERIALIZABLE);
+        char data_send[64] = {};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, data_send, &offset, &txn_manager);
+        CountingResultSink sink;
+        context.result_sink_ = &sink;
+
+        Condition condition;
+        condition.lhs_col = {"sink_ssi", "id"};
+        condition.op = OP_EQ;
+        condition.is_rhs_val = true;
+        condition.rhs_val.set_int(key);
+        auto executor = std::make_unique<SeqScanExecutor>(sm_manager_.get(), "sink_ssi",
+                                                          std::vector<Condition>{condition}, &context);
+
+        ql_manager.select_from(std::move(executor), {"id"}, &context);
+
+        ASSERT_EQ(txn->predicate_reads_.size(), 1U);
+        EXPECT_EQ(txn->predicate_reads_[0].tab_name_, "sink_ssi");
+        EXPECT_EQ(sink.row_count, key == 1 ? 1 : 0);
+        EXPECT_EQ(txn->read_rids_.empty(), key != 1);
+        EXPECT_FALSE(context.enable_ssi_read_tracking_);
+        txn_manager.abort(txn, nullptr);
+    }
 }
 
 TEST_F(ExecutorTest, update_multiple_fields) {

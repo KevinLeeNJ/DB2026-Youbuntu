@@ -35,6 +35,9 @@ type rankingStatement struct {
 type batchOperation struct {
 	statement rankingStatement
 	args      []preparedArgument
+	// sql is retained locally for deterministic test backends. The wire encoder
+	// uses only statement and args.
+	sql string
 }
 
 type batchOperationResult struct {
@@ -453,7 +456,7 @@ func (c *rankingClient) batchOperation(sql string) (batchOperation, error) {
 			return batchOperation{}, fmt.Errorf("ranking SQL parameter %d type mismatch for %q", i+1, template)
 		}
 	}
-	return batchOperation{statement: statement, args: args}, nil
+	return batchOperation{statement: statement, args: args, sql: sql}, nil
 }
 
 func (c *rankingClient) begin() error {
@@ -763,8 +766,11 @@ func rankingTemplates() []rankingTemplate {
 		{sql: "select i_price, i_name, i_data from item where i_id = 1;",
 			columns: []byte{f, c, c}},
 		{sql: "update stock set s_ytd = s_ytd + 1, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 0 where s_i_id = 1 and s_w_id = 1;"},
+		{sql: "update stock set s_ytd = s_ytd where s_w_id = 1 and s_i_id = 1;"},
 		{sql: "select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = 1 and s_w_id = 1;",
 			columns: []byte{i, c, c, c, c, c, c, c, c, c, c, c}},
+		{sql: "select s_ytd from stock where s_i_id = 1 and s_w_id = 1;",
+			columns: []byte{f}},
 		{sql: "update stock set s_quantity = s_quantity + 1 where s_i_id = 1 and s_w_id = 1;"},
 		{sql: "update stock set s_quantity = s_quantity - 1 where s_i_id = 1 and s_w_id = 1;"},
 		{sql: "insert into order_line values (1, 1, 1, 1, 1, 1, NULL, 1, 1.00, 'dist');"},
@@ -772,12 +778,18 @@ func rankingTemplates() []rankingTemplate {
 		{sql: "select c_id, c_first from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
 			columns: []byte{i, c}},
 		{sql: "update warehouse set w_ytd = w_ytd + 1.00 where w_id = 1;"},
+		{sql: "select w_ytd from warehouse where w_id = 1;",
+			columns: []byte{f}},
 		{sql: "select w_street_1, w_street_2, w_city, w_state, w_zip, w_name from warehouse where w_id = 1;",
 			columns: []byte{c, c, c, c, c, c}},
 		{sql: "update district set d_ytd = d_ytd + 1.00 where d_w_id = 1 and d_id = 1;"},
+		{sql: "select d_ytd from district where d_w_id = 1 and d_id = 1;",
+			columns: []byte{f}},
 		{sql: "select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where d_w_id = 1 and d_id = 1;",
 			columns: []byte{c, c, c, c, c, c}},
 		{sql: "update customer set c_balance = c_balance - 1.00, c_ytd_payment = c_ytd_payment + 1.00, c_payment_cnt = c_payment_cnt + 1 where c_w_id = 1 and c_d_id = 1 and c_id = 1;"},
+		{sql: "select c_balance, c_ytd_payment from customer where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
+			columns: []byte{f, f}},
 		{sql: "select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
 			columns: []byte{c, c, c, c, c, c, c, c, c, c, f, f, f, c}},
 		{sql: "insert into history values (1, 1, 1, 1, 1, '2026-01-01 00:00:00', 1.00, 'payment');"},
@@ -804,6 +816,8 @@ func rankingTemplates() []rankingTemplate {
 		{sql: "select sum(ol_amount) from order_line where ol_o_id = 1 and ol_d_id = 1 and ol_w_id = 1;",
 			columns: []byte{f}},
 		{sql: "update customer set c_balance = c_balance + 1.00, c_delivery_cnt = c_delivery_cnt + 1 where c_id = 1 and c_d_id = 1 and c_w_id = 1;"},
+		{sql: "select c_balance from customer where c_id = 1 and c_d_id = 1 and c_w_id = 1;",
+			columns: []byte{f}},
 		{sql: "select d_next_o_id from district where d_id = 1 and d_w_id = 1;",
 			columns: []byte{i}},
 		{sql: "select count(distinct ol_i_id) from order_line, stock where ol_w_id = 1 and ol_d_id = 1 and ol_o_id >= 1 and ol_o_id < 2 and s_w_id = 1 and s_i_id = ol_i_id and s_quantity < 10;",

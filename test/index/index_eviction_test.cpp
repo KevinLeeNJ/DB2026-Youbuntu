@@ -282,13 +282,13 @@ TEST_F(IndexEvictionTest, CachedRootPageIsNotUsedAfterItsFrameIsReused) {
 // Measurement harness for the structure gate that crash recovery runs before it
 // trusts an index. Disabled by default because it deliberately builds a large
 // index; run it with
-//   index_test --gtest_also_run_disabled_tests \
+//   index_test --gtest_also_run_disabled_tests
 //              --gtest_filter='*ValidateStructureCost*'
 //
 // Runs the same structure gate over the .idx files of a real database, which
 // rmdb_verify cannot reach once a record file reports a problem first (it stops
 // at the first failure). Point it at a database directory with
-//   RMDB_VERIFY_INDEX_DIR=tpcc_w1_db index_test --gtest_also_run_disabled_tests \
+//   RMDB_VERIFY_INDEX_DIR=tpcc_w1_db index_test --gtest_also_run_disabled_tests
 //              --gtest_filter='*ValidatesEveryIndexInDirectory*'
 TEST(IndexValidateStructureCost, DISABLED_ValidatesEveryIndexInDirectory) {
     const char* dir = std::getenv("RMDB_VERIFY_INDEX_DIR");

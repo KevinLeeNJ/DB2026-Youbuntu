@@ -337,7 +337,7 @@ TEST_F(IndexHandleTest, FloatKeysUseBinary32Ordering) {
     ix_manager->create_index(table_name, cols);
 
     auto ih = open_index();
-    for (const auto [value, slot] :
+    for (const auto& [value, slot] :
          std::vector<std::pair<float, int>>{{1.5F, 115}, {300000.01F, 3000100}, {-2.0F, 80}}) {
         auto k = float_key(value);
         ih->insert_entry(k.data(), Rid{1, slot}, nullptr);
@@ -1468,8 +1468,7 @@ TEST_F(IndexScanFeatureTest, CreateIndexOverDuplicateExistingKeysSucceeds) {
     EXPECT_TRUE(sm_manager->db_.get_table("dups").is_index({"a"}));
 
     // Both heap rows must be reachable through the new index.
-    const std::string index_name =
-        sm_manager->get_ix_manager()->get_index_name("dups", std::vector<std::string>{"a"});
+    const std::string index_name = sm_manager->get_ix_manager()->get_index_name("dups", std::vector<std::string>{"a"});
     auto handle = sm_manager->ihs_.find(index_name);
     ASSERT_NE(handle, sm_manager->ihs_.end());
     int key = 1;

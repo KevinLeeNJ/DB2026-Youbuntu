@@ -224,6 +224,24 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     }
 
+    struct SsiReadTrackingGuard {
+        Context* context_;
+        bool old_value_;
+
+        explicit SsiReadTrackingGuard(Context* context) : context_(context), old_value_(false) {
+            if (context_ != nullptr) {
+                old_value_ = context_->enable_ssi_read_tracking_;
+                context_->enable_ssi_read_tracking_ = true;
+            }
+        }
+
+        ~SsiReadTrackingGuard() {
+            if (context_ != nullptr) {
+                context_->enable_ssi_read_tracking_ = old_value_;
+            }
+        }
+    } ssi_read_tracking_guard(context);
+
     if (context != nullptr && context->result_sink_ != nullptr) {
         context->result_sink_->begin_query(result_cols, captions);
         for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
@@ -246,24 +264,6 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     // Print records
     size_t num_rec = 0;
     const int output_start = *context->offset_;
-
-    struct SsiReadTrackingGuard {
-        Context* context_;
-        bool old_value_;
-
-        explicit SsiReadTrackingGuard(Context* context) : context_(context), old_value_(false) {
-            if (context_ != nullptr) {
-                old_value_ = context_->enable_ssi_read_tracking_;
-                context_->enable_ssi_read_tracking_ = true;
-            }
-        }
-
-        ~SsiReadTrackingGuard() {
-            if (context_ != nullptr) {
-                context_->enable_ssi_read_tracking_ = old_value_;
-            }
-        }
-    } ssi_read_tracking_guard(context);
 
     // Format the result directly into the request response buffer. If execution
     // aborts, client_handler replaces the buffer with the error response.

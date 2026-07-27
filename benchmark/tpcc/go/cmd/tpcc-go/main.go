@@ -25,14 +25,15 @@ const (
 	districtsPerWarehouse = 10
 	initialOrdersPerDist  = 3000
 
-	// Official ranking load shape (final.md:45-47): exactly one 30 second
-	// warmup, three continuous 150 second measurement windows, 50 clients with
-	// no think time, and two clients per terminal home for 25 distinct homes.
+	// Official ranking load shape (finalv2.md:69-74): exactly one 30 second
+	// warmup, three continuous 150 second measurement windows and 32 clients.
 	officialWarmupSeconds  = 30
 	officialMeasureSeconds = 150
 	officialWindows        = 3
-	officialWorkers        = 50
-	officialTerminalHomes  = 25
+	officialWorkers        = 32
+	// Retained for the legacy diagnostic warehouse policy only. Official ranking
+	// uses the deterministic wheel in routing.go.
+	officialTerminalHomes = 25
 	// officialWarehouses is the size of the official data set (final.md:47).
 	// final.md:226 scores a run with the wrong data scale as zero, so an
 	// official-equivalent run must refuse anything else rather than publish a
@@ -40,7 +41,7 @@ const (
 	// the floor for explicitly non-official smoke runs, which still need enough
 	// warehouses for the 25 distinct terminal homes.
 	officialWarehouses    = 50
-	officialMinWarehouses = officialTerminalHomes
+	officialMinWarehouses = 1
 
 	wireTagMeta             = 0x01
 	wireTagRow              = 0x02
@@ -486,9 +487,10 @@ type profile struct {
 }
 
 type txnContext struct {
-	wID      int
-	dID      int
-	official bool
+	wID        int
+	dID        int
+	official   bool
+	hotItemIDs []int
 	// ledger receives the row and amount effects of this attempt. The worker
 	// resets it before every attempt and folds it into its running total only
 	// once the transaction's outcome is known, so a retried or aborted attempt
@@ -503,7 +505,17 @@ type txnContext struct {
 // the published result JSON alone, without any in-memory state surviving the
 // crash.
 type txnLedger struct {
-	values map[string]float64
+	values       map[string]float64
+	paymentEdges []paymentFloatEdge
+}
+
+type paymentFloatEdge struct {
+	Kind       string `json:"kind"`
+	Warehouse  int    `json:"warehouse_id"`
+	District   int    `json:"district_id,omitempty"`
+	BeforeBits uint32 `json:"before_bits"`
+	AmountBits uint32 `json:"amount_bits"`
+	AfterBits  uint32 `json:"after_bits"`
 }
 
 func newTxnLedger() *txnLedger {
@@ -528,6 +540,7 @@ func (l *txnLedger) reset() {
 	for key := range l.values {
 		l.values[key] = 0
 	}
+	l.paymentEdges = l.paymentEdges[:0]
 }
 
 func (l *txnLedger) merge(other *txnLedger) {
@@ -537,6 +550,20 @@ func (l *txnLedger) merge(other *txnLedger) {
 	for key, value := range other.values {
 		l.values[key] += value
 	}
+	l.paymentEdges = append(l.paymentEdges, other.paymentEdges...)
+}
+
+func (l *txnLedger) addPaymentEdge(edge paymentFloatEdge) {
+	if l != nil {
+		l.paymentEdges = append(l.paymentEdges, edge)
+	}
+}
+
+func (l *txnLedger) paymentEdgeSnapshot() []paymentFloatEdge {
+	if l == nil {
+		return nil
+	}
+	return append([]paymentFloatEdge(nil), l.paymentEdges...)
 }
 
 func (l *txnLedger) snapshot() map[string]float64 {
@@ -560,7 +587,20 @@ type result struct {
 	Counts         map[string]map[string]map[string]int `json:"counts"`
 	LatencyMS      map[string]latencySummary            `json:"latency_ms"`
 	Errors         map[string]map[string]map[string]int `json:"errors"`
+	Coverage       coverageSummary                      `json:"coverage"`
 	latencies      map[string][]float64
+	covered        map[int]struct{}
+}
+
+type coverageSummary struct {
+	Completed              int   `json:"completed"`
+	Warehouses             []int `json:"warehouses"`
+	WarehouseCount         int   `json:"warehouse_count"`
+	RequiredWarehouseCount int   `json:"required_warehouse_count"`
+	HotWarehouses          []int `json:"hot_warehouses"`
+	HotWarehouseCount      int   `json:"hot_warehouse_count"`
+	RequireAllHot          bool  `json:"require_all_hot"`
+	DeliveryProcessed      int   `json:"delivery_processed_orders"`
 }
 
 type latencySummary struct {
@@ -646,7 +686,14 @@ func newResult(measureSeconds int) *result {
 		LatencyMS:      make(map[string]latencySummary),
 		Errors:         make(map[string]map[string]map[string]int),
 		latencies:      make(map[string][]float64),
+		covered:        make(map[int]struct{}),
 	}
+}
+
+func (r *result) recordCompletion(wID int, deliveryProcessed int) {
+	r.Coverage.Completed++
+	r.Coverage.DeliveryProcessed += deliveryProcessed
+	r.covered[wID] = struct{}{}
 }
 
 func (r *result) record(phase, txnType, outcome string, latency float64, detail string) {
@@ -706,6 +753,11 @@ func (r *result) merge(other *result) {
 			}
 		}
 	}
+	r.Coverage.Completed += other.Coverage.Completed
+	r.Coverage.DeliveryProcessed += other.Coverage.DeliveryProcessed
+	for wID := range other.covered {
+		r.covered[wID] = struct{}{}
+	}
 }
 
 func (r *result) finalize() {
@@ -739,6 +791,12 @@ func (r *result) finalize() {
 			P50: percentile(values, 50), P95: percentile(values, 95), P99: percentile(values, 99), Max: values[len(values)-1],
 		}
 	}
+	r.Coverage.Warehouses = r.Coverage.Warehouses[:0]
+	for wID := range r.covered {
+		r.Coverage.Warehouses = append(r.Coverage.Warehouses, wID)
+	}
+	sort.Ints(r.Coverage.Warehouses)
+	r.Coverage.WarehouseCount = len(r.Coverage.Warehouses)
 }
 
 func (r *result) hasBackendError() bool {
@@ -867,6 +925,17 @@ func nowText() string { return time.Now().Format("2006-01-02 15:04:05") }
 func surname(number int) string {
 	sy := []string{"BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION", "EING"}
 	return sy[number/100] + sy[(number/10)%10] + sy[number%10]
+}
+
+// float32SQL is the shortest decimal spelling that round-trips to the same
+// binary32 value. A decimal point is kept for integral values so PREPARE_SET
+// declares the marker as FLOAT32 rather than INT32.
+func float32SQL(value float32) string {
+	text := strconv.FormatFloat(float64(value), 'g', -1, 32)
+	if !strings.ContainsAny(text, ".eE") {
+		text += ".0"
+	}
+	return text
 }
 
 func newOrder(c txnBackend, ctx txnContext, rng *rand.Rand) error {
@@ -1201,6 +1270,41 @@ func rankingScalar(result batchResult, index int, fallback string) string {
 	return rows[0][0]
 }
 
+func rankingFloat32(result batchResult, index int, label string) (float32, error) {
+	raw := rankingScalar(result, index, "")
+	value, err := strconv.ParseFloat(raw, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%s returned invalid FLOAT32 %q", label, raw)
+	}
+	parsed := float32(value)
+	if math.IsNaN(float64(parsed)) || math.IsInf(float64(parsed), 0) {
+		return 0, fmt.Errorf("%s returned non-finite FLOAT32 %q", label, raw)
+	}
+	return parsed, nil
+}
+
+func verifyRankingFloat32Update(result batchResult, beforeOp, afterOp int, delta float32, subtract bool,
+	label string) error {
+	before, err := rankingFloat32(result, beforeOp, label+" before")
+	if err != nil {
+		return err
+	}
+	after, err := rankingFloat32(result, afterOp, label+" after")
+	if err != nil {
+		return err
+	}
+	want := before + delta
+	if subtract {
+		want = before - delta
+	}
+	gotBits, wantBits := math.Float32bits(after), math.Float32bits(want)
+	if !equalFloat32Bits(gotBits, wantBits) {
+		return fmt.Errorf("%s update evidence mismatch: before=0x%08x delta=0x%08x after=0x%08x want=0x%08x (0 ULP required)",
+			label, math.Float32bits(before), math.Float32bits(delta), gotBits, wantBits)
+	}
+	return nil
+}
+
 func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	cID, lineCount := rng.Intn(ctx.customersPerDistrict)+1, rng.Intn(11)+5
 	itemIDs := make([]int, lineCount)
@@ -1209,13 +1313,22 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	invalid := rng.Intn(100) == 0
 	allLocal := true
 	for i := range itemIDs {
-		itemIDs[i] = rng.Intn(ctx.itemCount) + 1
+		if len(ctx.hotItemIDs) > 0 && rng.Intn(100) < 25 {
+			itemIDs[i] = ctx.hotItemIDs[rng.Intn(len(ctx.hotItemIDs))]
+		} else {
+			for {
+				itemIDs[i] = rng.Intn(ctx.itemCount) + 1
+				if !containsInt(ctx.hotItemIDs, itemIDs[i]) {
+					break
+				}
+			}
+		}
 		if invalid && i == lineCount-1 {
 			itemIDs[i] = ctx.itemCount + 1
 		}
 		quantities[i] = rng.Intn(10) + 1
 		supplyWIDs[i] = ctx.wID
-		if ctx.warehouses > 1 && rng.Intn(100) == 0 {
+		if ctx.warehouses > 1 && rng.Intn(100) < 8 {
 			for supplyWIDs[i] == ctx.wID {
 				supplyWIDs[i] = rng.Intn(ctx.warehouses) + 1
 			}
@@ -1232,8 +1345,35 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	for _, itemID := range itemIDs {
 		stage1 = append(stage1, fmt.Sprintf("select i_price, i_name, i_data from item where i_id = %d;", itemID))
 	}
+	type stockKey struct {
+		wID, iID int
+	}
+	lockKeys := make([]stockKey, len(itemIDs))
+	for i := range itemIDs {
+		lockKeys[i] = stockKey{wID: supplyWIDs[i], iID: itemIDs[i]}
+	}
+	sort.Slice(lockKeys, func(i, j int) bool {
+		if lockKeys[i].wID != lockKeys[j].wID {
+			return lockKeys[i].wID < lockKeys[j].wID
+		}
+		return lockKeys[i].iID < lockKeys[j].iID
+	})
+	uniqueLocks := lockKeys[:0]
+	for _, key := range lockKeys {
+		if len(uniqueLocks) == 0 || uniqueLocks[len(uniqueLocks)-1] != key {
+			uniqueLocks = append(uniqueLocks, key)
+		}
+	}
+	for _, key := range uniqueLocks {
+		stage1 = append(stage1, fmt.Sprintf(
+			"update stock set s_ytd = s_ytd where s_w_id = %d and s_i_id = %d;", key.wID, key.iID))
+	}
 	for i, itemID := range itemIDs {
 		stage1 = append(stage1, fmt.Sprintf("select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = %d and s_w_id = %d;", itemID, supplyWIDs[i]))
+	}
+	for i, itemID := range itemIDs {
+		stage1 = append(stage1,
+			fmt.Sprintf("select s_ytd from stock where s_i_id = %d and s_w_id = %d;", itemID, supplyWIDs[i]))
 	}
 	result, err := rankingBatch(c, stage1...)
 	if err != nil {
@@ -1245,20 +1385,27 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	}
 	dNext--
 
-	prices := make([]float64, lineCount)
+	prices := make([]float32, lineCount)
 	stockQtys := make([]int, lineCount)
+	stockYTDBefore := make([]float32, lineCount)
 	for i := 0; i < lineCount; i++ {
 		itemRows := rankingResult(result, 4+i)
 		if len(itemRows) == 0 {
 			invalid = true
 			continue
 		}
-		prices[i], _ = strconv.ParseFloat(itemRows[0][0], 64)
-		stockRows := rankingResult(result, 4+lineCount+i)
+		price, _ := strconv.ParseFloat(itemRows[0][0], 32)
+		prices[i] = float32(price)
+		stockRows := rankingResult(result, 4+lineCount+len(uniqueLocks)+i)
 		if len(stockRows) == 0 {
 			stockQtys[i] = 10
 		} else {
 			stockQtys[i], _ = strconv.Atoi(stockRows[0][0])
+		}
+		beforeOp := 4 + lineCount + len(uniqueLocks) + lineCount + i
+		stockYTDBefore[i], err = rankingFloat32(result, beforeOp, "NewOrder stock.s_ytd before")
+		if err != nil {
+			return err
 		}
 	}
 
@@ -1270,6 +1417,7 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	// s_quantity. The update is relative, so the applied delta is exact even when
 	// the s_quantity that decided between "subtract" and "restock" was stale.
 	stockQuantityDeltas := make([]int, lineCount)
+	stockAfterOps := make([]int, lineCount)
 	for i, itemID := range itemIDs {
 		if invalid && i == lineCount-1 {
 			continue
@@ -1281,6 +1429,9 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		stage2 = append(stage2,
 			fmt.Sprintf("update stock set s_ytd = s_ytd + %d, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + %d where s_i_id = %d and s_w_id = %d;", quantities[i], remote, itemID, supplyWIDs[i]),
 		)
+		stockAfterOps[i] = len(stage2)
+		stage2 = append(stage2,
+			fmt.Sprintf("select s_ytd from stock where s_i_id = %d and s_w_id = %d;", itemID, supplyWIDs[i]))
 		delta := -quantities[i]
 		op := "+"
 		if stockQtys[i]-quantities[i] < 10 {
@@ -1290,9 +1441,10 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		if delta < 0 {
 			op, delta = "-", -delta
 		}
+		amount := float32(float64(prices[i]) * float64(quantities[i]))
 		stage2 = append(stage2,
 			fmt.Sprintf("update stock set s_quantity = s_quantity %s %d where s_i_id = %d and s_w_id = %d;", op, delta, itemID, supplyWIDs[i]),
-			fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, NULL, %d, %.2f, 'dist');", dNext, ctx.dID, ctx.wID, i+1, itemID, supplyWIDs[i], quantities[i], math.Round(prices[i]*float64(quantities[i])*100)/100),
+			fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, NULL, %d, %s, 'dist');", dNext, ctx.dID, ctx.wID, i+1, itemID, supplyWIDs[i], quantities[i], float32SQL(amount)),
 		)
 	}
 	if !allLocal {
@@ -1304,7 +1456,8 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		stage2 = append(stage2, "commit;")
 	}
 
-	if _, err = rankingBatch(c, stage2...); err != nil {
+	result, err = rankingBatch(c, stage2...)
+	if err != nil {
 		return err
 	}
 	if invalid {
@@ -1315,12 +1468,30 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		ctx.ledger.add(ledgerNewOrderRollbacks, 1)
 		return errInvalidItem
 	}
+	currentYTD := make(map[stockKey]float32, lineCount)
+	for i, itemID := range itemIDs {
+		key := stockKey{wID: supplyWIDs[i], iID: itemID}
+		before, ok := currentYTD[key]
+		if !ok {
+			before = stockYTDBefore[i]
+		}
+		after, err := rankingFloat32(result, stockAfterOps[i], "NewOrder stock.s_ytd after")
+		if err != nil {
+			return err
+		}
+		want := before + float32(quantities[i])
+		if !equalFloat32Bits(math.Float32bits(after), math.Float32bits(want)) {
+			return fmt.Errorf("NewOrder stock.s_ytd update evidence mismatch w=%d i=%d: before=0x%08x quantity=%d after=0x%08x want=0x%08x (0 ULP required)",
+				key.wID, key.iID, math.Float32bits(before), quantities[i], math.Float32bits(after), math.Float32bits(want))
+		}
+		currentYTD[key] = after
+	}
 	ctx.ledger.add(ledgerNewOrderCommits, 1)
 	ctx.ledger.add(ledgerNewOrderLines, float64(lineCount))
 	for i := range itemIDs {
 		ctx.ledger.add(ledgerNewOrderQuantity, float64(quantities[i]))
 		ctx.ledger.add(ledgerNewOrderStockDelta, float64(stockQuantityDeltas[i]))
-		ctx.ledger.add(ledgerNewOrderAmount, math.Round(prices[i]*float64(quantities[i])*100)/100)
+		ctx.ledger.add(ledgerNewOrderAmount, float64(float32(float64(prices[i])*float64(quantities[i]))))
 		if supplyWIDs[i] != ctx.wID {
 			ctx.ledger.add(ledgerNewOrderRemote, 1)
 		}
@@ -1328,17 +1499,28 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	return nil
 }
 
+func containsInt(values []int, target int) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func rankingPayment(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	cID := rng.Intn(ctx.customersPerDistrict) + 1
 	cWID, cDID := ctx.wID, ctx.dID
-	if ctx.official && ctx.warehouses > 1 && rng.Intn(100) < 15 {
+	if ctx.official && ctx.warehouses > 1 && rng.Intn(100) < 30 {
 		cWID = rng.Intn(ctx.warehouses-1) + 1
 		if cWID >= ctx.wID {
 			cWID++
 		}
 		cDID = rng.Intn(ctx.districtsPerWarehouse) + 1
 	}
-	amount := math.Round((rng.Float64()*4999+1)*100) / 100
+	amountCents := rng.Intn(499900) + 100
+	amount := float32(float64(amountCents) / 100)
+	amountSQL := float32SQL(amount)
 
 	stage1 := []string{"begin;"}
 	search := false
@@ -1346,16 +1528,34 @@ func rankingPayment(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		search = true
 		stage1 = append(stage1, fmt.Sprintf("select c_id, c_first from customer where c_w_id = %d and c_d_id = %d and c_last = '%s' order by c_first, c_id;", cWID, cDID, surname(rng.Intn(1000))))
 	}
+	wBeforeOp := len(stage1)
 	stage1 = append(stage1,
-		fmt.Sprintf("update warehouse set w_ytd = w_ytd + %.2f where w_id = %d;", amount, ctx.wID),
+		fmt.Sprintf("select w_ytd from warehouse where w_id = %d;", ctx.wID),
+		fmt.Sprintf("update warehouse set w_ytd = w_ytd + %s where w_id = %d;", amountSQL, ctx.wID),
+		fmt.Sprintf("select w_ytd from warehouse where w_id = %d;", ctx.wID),
 		fmt.Sprintf("select w_street_1, w_street_2, w_city, w_state, w_zip, w_name from warehouse where w_id = %d;", ctx.wID),
-		fmt.Sprintf("update district set d_ytd = d_ytd + %.2f where d_w_id = %d and d_id = %d;", amount, ctx.wID, ctx.dID),
+	)
+	dBeforeOp := len(stage1)
+	stage1 = append(stage1,
+		fmt.Sprintf("select d_ytd from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
+		fmt.Sprintf("update district set d_ytd = d_ytd + %s where d_w_id = %d and d_id = %d;", amountSQL, ctx.wID, ctx.dID),
+		fmt.Sprintf("select d_ytd from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
 		fmt.Sprintf("select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
 	)
 	result, err := rankingBatch(c, stage1...)
 	if err != nil {
 		return err
 	}
+	if err := verifyRankingFloat32Update(result, wBeforeOp, wBeforeOp+2, amount, false, "Payment w_ytd"); err != nil {
+		return err
+	}
+	if err := verifyRankingFloat32Update(result, dBeforeOp, dBeforeOp+2, amount, false, "Payment d_ytd"); err != nil {
+		return err
+	}
+	wBefore, _ := rankingFloat32(result, wBeforeOp, "Payment w_ytd before")
+	wAfter, _ := rankingFloat32(result, wBeforeOp+2, "Payment w_ytd after")
+	dBefore, _ := rankingFloat32(result, dBeforeOp, "Payment d_ytd before")
+	dAfter, _ := rankingFloat32(result, dBeforeOp+2, "Payment d_ytd after")
 	if search {
 		rows := rankingResult(result, 1)
 		if len(rows) > 0 {
@@ -1363,16 +1563,41 @@ func rankingPayment(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		}
 	}
 	stage2 := []string{
-		fmt.Sprintf("update customer set c_balance = c_balance - %.2f, c_ytd_payment = c_ytd_payment + %.2f, c_payment_cnt = c_payment_cnt + 1 where c_w_id = %d and c_d_id = %d and c_id = %d;", amount, amount, cWID, cDID, cID),
+		fmt.Sprintf("select c_balance, c_ytd_payment from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", cWID, cDID, cID),
+		fmt.Sprintf("update customer set c_balance = c_balance - %s, c_ytd_payment = c_ytd_payment + %s, c_payment_cnt = c_payment_cnt + 1 where c_w_id = %d and c_d_id = %d and c_id = %d;", amountSQL, amountSQL, cWID, cDID, cID),
+		fmt.Sprintf("select c_balance, c_ytd_payment from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", cWID, cDID, cID),
 		fmt.Sprintf("select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", cWID, cDID, cID),
-		fmt.Sprintf("insert into history values (%d, %d, %d, %d, %d, '%s', %.2f, 'payment');", cID, cDID, cWID, ctx.dID, ctx.wID, nowText(), amount),
+		fmt.Sprintf("insert into history values (%d, %d, %d, %d, %d, '%s', %s, 'payment');", cID, cDID, cWID, ctx.dID, ctx.wID, nowText(), amountSQL),
 		"commit;",
 	}
-	if _, err = rankingBatch(c, stage2...); err != nil {
+	result, err = rankingBatch(c, stage2...)
+	if err != nil {
+		return err
+	}
+	if err := verifyRankingFloat32Update(result, 0, 2, amount, true, "Payment c_balance"); err != nil {
+		return err
+	}
+	beforeRows, afterRows := rankingResult(result, 0), rankingResult(result, 2)
+	if len(beforeRows) != 1 || len(beforeRows[0]) != 2 || len(afterRows) != 1 || len(afterRows[0]) != 2 {
+		return errors.New("Payment c_ytd_payment evidence did not return one two-column row before and after")
+	}
+	ytdEvidence := batchResult{results: []batchOperationResult{
+		{operationIndex: 0, rows: [][]string{{beforeRows[0][1]}}},
+		{operationIndex: 2, rows: [][]string{{afterRows[0][1]}}},
+	}}
+	if err := verifyRankingFloat32Update(ytdEvidence, 0, 2, amount, false, "Payment c_ytd_payment"); err != nil {
 		return err
 	}
 	ctx.ledger.add(ledgerPaymentCommits, 1)
-	ctx.ledger.add(ledgerPaymentAmount, amount)
+	ctx.ledger.add(ledgerPaymentAmount, float64(amount))
+	ctx.ledger.addPaymentEdge(paymentFloatEdge{
+		Kind: "warehouse", Warehouse: ctx.wID, BeforeBits: math.Float32bits(wBefore),
+		AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(wAfter),
+	})
+	ctx.ledger.addPaymentEdge(paymentFloatEdge{
+		Kind: "district", Warehouse: ctx.wID, District: ctx.dID, BeforeBits: math.Float32bits(dBefore),
+		AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(dAfter),
+	})
 	// w_ytd and d_ytd of the terminal home take one binary32 accumulation step per
 	// committed Payment. The post-crash tolerance is derived from these counts.
 	ctx.ledger.add(ledgerPaymentWarehousePrefix+strconv.Itoa(ctx.wID), 1)
@@ -1468,7 +1693,15 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	if err != nil {
 		return err
 	}
-	stage3 := make([]string, 0, len(plans)*3+1)
+	stage3 := make([]string, 0, len(plans)*6+1)
+	type deliveryBalanceEvidence struct {
+		beforeOp int
+		afterOp  int
+		amount   float32
+		dID      int
+		cID      int
+	}
+	evidence := make([]deliveryBalanceEvidence, 0, len(plans))
 	deliveredOrders, deliveredCustomers, deliveredAmount := 0, 0, 0.0
 	for _, plan := range plans {
 		// The claim confirmation is `SELECT MIN(no_o_id) ... WHERE no_o_id = X`.
@@ -1484,7 +1717,8 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 			continue
 		}
 		customerID, _ := strconv.Atoi(rankingScalar(result, plan.customerOp, "0"))
-		amount, _ := strconv.ParseFloat(rankingScalar(result, plan.amountOp, "0"), 64)
+		amount64, _ := strconv.ParseFloat(rankingScalar(result, plan.amountOp, "0"), 32)
+		amount := float32(amount64)
 		stage3 = append(stage3,
 			fmt.Sprintf("delete from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;", ctx.wID, plan.dID, plan.oID),
 			fmt.Sprintf("update orders set o_carrier_id = %d where o_id = %d and o_d_id = %d and o_w_id = %d;", carrierID, plan.oID, plan.dID, ctx.wID),
@@ -1492,18 +1726,31 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		)
 		deliveredOrders++
 		if customerID > 0 {
-			// The SQL literal is the %.2f rendering of the amount that was read
-			// back, so the ledger must record exactly that value and not the raw
-			// parsed float.
-			credited, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", amount), 64)
-			stage3 = append(stage3, fmt.Sprintf("update customer set c_balance = c_balance + %.2f, c_delivery_cnt = c_delivery_cnt + 1 where c_id = %d and c_d_id = %d and c_w_id = %d;", amount, customerID, plan.dID, ctx.wID))
+			// Bind the exact binary32 SUM returned by the server. Re-formatting
+			// through cents would change valid order totals.
+			beforeOp := len(stage3)
+			stage3 = append(stage3,
+				fmt.Sprintf("select c_balance from customer where c_id = %d and c_d_id = %d and c_w_id = %d;", customerID, plan.dID, ctx.wID),
+				fmt.Sprintf("update customer set c_balance = c_balance + %s, c_delivery_cnt = c_delivery_cnt + 1 where c_id = %d and c_d_id = %d and c_w_id = %d;", float32SQL(amount), customerID, plan.dID, ctx.wID),
+				fmt.Sprintf("select c_balance from customer where c_id = %d and c_d_id = %d and c_w_id = %d;", customerID, plan.dID, ctx.wID),
+			)
+			evidence = append(evidence, deliveryBalanceEvidence{
+				beforeOp: beforeOp, afterOp: beforeOp + 2, amount: amount, dID: plan.dID, cID: customerID,
+			})
 			deliveredCustomers++
-			deliveredAmount += credited
+			deliveredAmount += float64(amount)
 		}
 	}
 	stage3 = append(stage3, "commit;")
-	if _, err = rankingBatch(c, stage3...); err != nil {
+	result, err = rankingBatch(c, stage3...)
+	if err != nil {
 		return err
+	}
+	for _, update := range evidence {
+		label := fmt.Sprintf("Delivery c_balance w=%d d=%d c=%d", ctx.wID, update.dID, update.cID)
+		if err := verifyRankingFloat32Update(result, update.beforeOp, update.afterOp, update.amount, false, label); err != nil {
+			return err
+		}
 	}
 	ctx.ledger.add(ledgerDeliveryOrders, float64(deliveredOrders))
 	ctx.ledger.add(ledgerDeliveryCustomers, float64(deliveredCustomers))
@@ -1675,9 +1922,6 @@ func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int, th
 		}
 		if think != 0 {
 			return fmt.Errorf("official-equivalent is a saturated load and requires think=0, got %s (use --allow-nonofficial-timing for smoke runs)", think)
-		}
-		if homes := officialTerminalHomeCount(workers); homes != officialTerminalHomes {
-			return fmt.Errorf("official-equivalent requires %d distinct terminal home warehouses, got %d", officialTerminalHomes, homes)
 		}
 		return nil
 	default:
@@ -2043,9 +2287,11 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 	return combined, nil
 }
 
-func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd time.Time, measure time.Duration,
-	windows int, think time.Duration, stats []*liveStats, stop <-chan struct{}, output chan<- officialWorkerReport, c txnBackend) {
+func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officialRoutingPlan, warmupEnd time.Time,
+	measure time.Duration, windows int, think time.Duration, stats []*liveStats, stop <-chan struct{},
+	output chan<- officialWorkerReport, c txnBackend) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
+	router := newOfficialRouter(plan, workerID)
 	report := officialWorkerReport{warmup: newResult(0), windows: make([]*result, windows), ledger: newTxnLedger()}
 	attempt := newTxnLedger()
 	for window := range report.windows {
@@ -2068,7 +2314,11 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 		}
 
 		txnType := chooseTxn(rng)
-		ctx := chooseContext(p, workerID, "official-terminal-home", rng)
+		routingPhase := 0
+		if !now.Before(warmupEnd) {
+			routingPhase = int(now.Sub(warmupEnd)/measure) + 1
+		}
+		ctx := router.next(routingPhase)
 		ctx.ledger = attempt
 		attemptSeed := rng.Int63()
 		phaseEnd := measureEnd
@@ -2115,9 +2365,11 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 
 		if err == nil {
 			local.record(phase, txnType, "commit", latency, "")
+			local.recordCompletion(ctx.wID, int(attempt.values[ledgerDeliveryOrders]))
 			phaseStats.record(phase, txnType, "commit")
 		} else if errors.Is(err, errInvalidItem) {
 			local.record(phase, txnType, "invalid-item-rollback", latency, err.Error())
+			local.recordCompletion(ctx.wID, 0)
 			phaseStats.record(phase, txnType, "invalid-item-rollback")
 		} else if errors.Is(err, errAbort) {
 			local.record(phase, txnType, "server-abort", latency, err.Error())
@@ -2173,6 +2425,10 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 		return nil, errors.New("official-equivalent does not allow reconnect-each-txn")
 	}
 	backends := make([]txnBackend, 0, workers)
+	plan, err := newOfficialRoutingPlan(seed, p, rounds+1)
+	if err != nil {
+		return nil, err
+	}
 	for workerID := 0; workerID < workers; workerID++ {
 		backend, err := factory()
 		if err != nil {
@@ -2198,7 +2454,7 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	printProgress(0, rounds, "warmup", 0, warmup, stats[0])
 	go monitorOfficialProgress(rounds, warmup, measure, progress, start, stats, monitorStop, monitorDone)
 	for workerID, backend := range backends {
-		go runOfficialWorker(workerID, roundOffset+1, seed, p, warmupEnd, measureDuration, rounds, think, stats, stop, partials, backend)
+		go runOfficialWorker(workerID, roundOffset+1, seed, p, plan, warmupEnd, measureDuration, rounds, think, stats, stop, partials, backend)
 	}
 
 	warmupResult := newResult(0)
@@ -2237,6 +2493,20 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 				return nil, fmt.Errorf("official measurement window %d has no committed %s transaction", round+1, txnType)
 			}
 		}
+		if window.Coverage.DeliveryProcessed < 1 {
+			return nil, fmt.Errorf("official measurement window %d has no Delivery that processed a queued order", round+1)
+		}
+		if err := applyCoverageGate(window, plan.hotWarehouses, false); err != nil {
+			return nil, fmt.Errorf("official measurement window %d: %w", round+1, err)
+		}
+	}
+	combinedCoverage := newResult(measure * rounds)
+	for _, window := range windows {
+		combinedCoverage.merge(window)
+	}
+	combinedCoverage.finalize()
+	if err := applyCoverageGate(combinedCoverage, plan.hotWarehouses, true); err != nil {
+		return nil, fmt.Errorf("official combined windows: %w", err)
 	}
 	for round, window := range windows {
 		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f abort_rate=%.2f%%\n", round+1, rounds, window.NewOrderPerMin,
@@ -2290,10 +2560,18 @@ type document struct {
 	// that finished after the last measurement window. Together they let the
 	// post-crash validation reconcile the recovered database without any state
 	// surviving the crash (final.md:322).
-	Baselines  map[string]float64 `json:"baselines,omitempty"`
-	Ledger     map[string]float64 `json:"ledger,omitempty"`
-	MedianTPMC float64            `json:"median_tpmc"`
-	Rounds     []*result          `json:"rounds"`
+	Baselines map[string]float64 `json:"baselines,omitempty"`
+	Ledger    map[string]float64 `json:"ledger,omitempty"`
+	// PaymentEdges is the committed per-key binary32 update graph. Online
+	// consistency links it from the public initial value without assuming client
+	// completion order, catching gaps, forks and lost updates.
+	PaymentEdges        []paymentFloatEdge `json:"payment_float_edges,omitempty"`
+	PaymentTerminalBits map[string]uint32  `json:"payment_terminal_bits,omitempty"`
+	// OnlineFloatBits captures the seven pre-crash aggregate cells as raw
+	// binary32 so recovery validation never passes through decimal tolerance.
+	OnlineFloatBits map[string]uint32 `json:"online_float_bits,omitempty"`
+	MedianTPMC      float64           `json:"median_tpmc"`
+	Rounds          []*result         `json:"rounds"`
 }
 
 func validateResultDocument(doc document) error {
@@ -2306,6 +2584,30 @@ func validateResultDocument(doc document) error {
 	for round, window := range doc.Rounds {
 		if err := validateResultWindow(window, doc.Config.Measure, doc.Config.Mode, round+1); err != nil {
 			return err
+		}
+	}
+	if doc.Config.Mode == "official-equivalent" {
+		combined := newResult(doc.Config.Measure * doc.Config.Rounds)
+		hot := make(map[int]struct{}, officialHotWarehouseCount)
+		for _, window := range doc.Rounds {
+			combined.Coverage.Completed += window.Coverage.Completed
+			for _, wID := range window.Coverage.Warehouses {
+				combined.covered[wID] = struct{}{}
+			}
+			for _, wID := range window.Coverage.HotWarehouses {
+				hot[wID] = struct{}{}
+			}
+		}
+		combined.finalize()
+		hotIDs := make([]int, 0, len(hot))
+		for wID := range hot {
+			hotIDs = append(hotIDs, wID)
+		}
+		if err := applyCoverageGate(combined, hotIDs, true); err != nil {
+			return fmt.Errorf("combined coverage: %w", err)
+		}
+		if combined.Coverage.Completed >= 400 && len(hot) != officialHotWarehouseCount {
+			return fmt.Errorf("combined coverage includes %d/%d hot warehouses", len(hot), officialHotWarehouseCount)
 		}
 	}
 	if math.IsNaN(doc.MedianTPMC) || math.IsInf(doc.MedianTPMC, 0) || doc.MedianTPMC < 0 {
@@ -2376,6 +2678,32 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 			if window.Committed[txnType] < 1 {
 				return fmt.Errorf("result round %d has no committed %s transaction", round, txnType)
 			}
+		}
+		completed := commits + measureCounts["new_order"]["invalid-item-rollback"]
+		if window.Coverage.Completed != completed {
+			return fmt.Errorf("result round %d coverage completed=%d, want %d from commits + business rollbacks",
+				round, window.Coverage.Completed, completed)
+		}
+		if window.Coverage.DeliveryProcessed < 1 {
+			return fmt.Errorf("result round %d has no Delivery that processed a queued order", round)
+		}
+		seen := make(map[int]struct{}, len(window.Coverage.Warehouses))
+		for _, wID := range window.Coverage.Warehouses {
+			seen[wID] = struct{}{}
+		}
+		if len(seen) != window.Coverage.WarehouseCount {
+			return fmt.Errorf("result round %d warehouse coverage count mismatch", round)
+		}
+		required := int(math.Ceil(float64(45*completed) / 400))
+		if required > 45 {
+			required = 45
+		}
+		if window.Coverage.RequiredWarehouseCount != required || len(seen) < required {
+			return fmt.Errorf("result round %d covers %d warehouses, want at least %d", round, len(seen), required)
+		}
+		if completed >= 400 && window.Coverage.HotWarehouseCount != officialHotWarehouseCount {
+			return fmt.Errorf("result round %d covers %d/%d hot warehouses", round,
+				window.Coverage.HotWarehouseCount, officialHotWarehouseCount)
 		}
 	}
 	return nil
@@ -2613,12 +2941,12 @@ func main() {
 	host := flag.String("host", "127.0.0.1", "RMDB host")
 	port := flag.Int("port", 8765, "RMDB port")
 	warehouses := flag.Int("warehouses", 1, "warehouses for data generation")
-	workers := flag.Int("workers", 16, "concurrent workers")
-	warmup := flag.Int("warmup", 30, "warmup seconds")
-	measure := flag.Int("measure", 360, "measurement seconds")
-	rounds := flag.Int("rounds", 1, "benchmark rounds")
+	workers := flag.Int("workers", officialWorkers, "concurrent workers")
+	warmup := flag.Int("warmup", officialWarmupSeconds, "warmup seconds")
+	measure := flag.Int("measure", officialMeasureSeconds, "measurement seconds")
+	rounds := flag.Int("rounds", officialWindows, "benchmark rounds")
 	roundOffset := flag.Int("round-offset", 0, "zero-based round offset used for deterministic workload streams")
-	isolation := flag.String("isolation", "read-committed", "read-committed or snapshot-isolation")
+	isolation := flag.String("isolation", "snapshot-isolation", "read-committed or snapshot-isolation")
 	policy := flag.String("warehouse-policy", "terminal-home", "terminal-home or random-per-txn")
 	timeout := flag.Duration("timeout", 30*time.Second, "RMDB connection timeout")
 	jsonOut := flag.String("json-out", "benchmark/tpcc/result.json", "result JSON path")
@@ -2660,6 +2988,10 @@ func main() {
 		}
 		if *mode == "official-equivalent" && *reconnectEachTxn {
 			fmt.Fprintln(os.Stderr, "official-equivalent does not allow --reconnect-each-txn")
+			os.Exit(2)
+		}
+		if *mode == "official-equivalent" && *isolation != "snapshot-isolation" {
+			fmt.Fprintln(os.Stderr, "official-equivalent requires --isolation snapshot-isolation")
 			os.Exit(2)
 		}
 		if *mode == "official-equivalent" && *allowNonOfficialTiming {
@@ -2974,6 +3306,14 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("[baseline] aggregate snapshot took %s\n", time.Since(snapshotStart).Round(time.Millisecond))
+		manifest, manifestErr := readDatasetManifest(*dataDir)
+		if manifestErr != nil {
+			probe.close()
+			fmt.Fprintf(os.Stderr, "read exact FLOAT32 dataset baselines: %v\n", manifestErr)
+			os.Exit(1)
+		}
+		baselines[baseHistoryAmount] = manifest.Aggregates[aggHistoryAmountSum]
+		baselines[baseOrderLineAmount] = manifest.Aggregates[aggOrderLineAmountSum]
 	}
 	probe.close()
 	if *mode == "official-equivalent" {
@@ -3016,6 +3356,7 @@ func main() {
 	}
 	doc.MedianTPMC = median(values)
 	doc.Ledger = ledger.snapshot()
+	doc.PaymentEdges = ledger.paymentEdgeSnapshot()
 	encoded, err := publishResultDocument(*jsonOut, doc)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

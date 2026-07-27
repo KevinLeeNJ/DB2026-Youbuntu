@@ -110,7 +110,11 @@ func passingIntAnswers(m consistencyModel, rules []intRule) map[string]float64 {
 
 func passingAmountAnswers(answers map[string]float64, rules []amountRule) map[string]float64 {
 	for _, rule := range rules {
-		answers[rule.sql] = rule.want
+		if rule.useWantBits {
+			answers[rule.sql] = float64(math.Float32frombits(rule.wantBits))
+		} else {
+			answers[rule.sql] = rule.want
+		}
 	}
 	return answers
 }
@@ -213,40 +217,14 @@ func TestConsistencyRuleNamesAndQueriesAreUnique(t *testing.T) {
 	}
 }
 
-func TestOnlineRulesAvoidFullLargeTableScans(t *testing.T) {
-	// final.md:326 forbids a full large-table scan or row-by-row relation audit
-	// before the forced termination, so every online query must either target a
-	// small table or carry an index-key predicate.
-	smallTables := map[string]bool{"warehouse": true, "district": true}
+func TestOnlineRulesCaptureSevenDistinctFloatAggregates(t *testing.T) {
 	m := testConsistencyModel()
-	queries := make([]string, 0, onlineIntRuleCount*2+onlineAmountRuleCount)
-	for _, rule := range onlineIntRules(m) {
-		queries = append(queries, rule.sql)
-		if rule.wantSQL != "" {
-			queries = append(queries, rule.wantSQL)
-		}
-	}
+	queries := make(map[string]struct{}, onlineAmountRuleCount)
 	for _, rule := range onlineAmountRules(m) {
-		queries = append(queries, rule.sql)
+		queries[rule.sql] = struct{}{}
 	}
-	for _, sql := range queries {
-		fields := strings.Fields(sql)
-		table := ""
-		for i, field := range fields {
-			if field == "from" && i+1 < len(fields) {
-				table = strings.TrimSuffix(fields[i+1], ";")
-			}
-		}
-		if table == "" {
-			t.Errorf("online query %q has no FROM table", sql)
-			continue
-		}
-		if smallTables[table] {
-			continue
-		}
-		if !strings.Contains(sql, " where ") {
-			t.Errorf("online query %q scans the large table %s without an index-key predicate", sql, table)
-		}
+	if len(queries) != onlineAmountRuleCount {
+		t.Fatalf("online FLOAT rules use %d distinct queries, want %d", len(queries), onlineAmountRuleCount)
 	}
 }
 
@@ -326,6 +304,9 @@ func TestOnlineConsistencyRejectsEveryViolation(t *testing.T) {
 		}
 	}
 	for _, rule := range onlineAmountRules(m) {
+		if rule.captureOnly {
+			continue
+		}
 		answers := make(map[string]float64, len(base))
 		for key, value := range base {
 			answers[key] = value
@@ -705,29 +686,25 @@ func TestWarehouseYTDReconciliationSeparatesDriftFromALostPayment(t *testing.T) 
 	}
 }
 
-// TestOnlyAccumulatedAggregatesCarryADriftAllowance keeps the widening confined
-// to the two read-modify-write accumulators. history and order_line amounts are
-// built by INSERT, so they must be held to the tight relative tolerance.
-func TestOnlyAccumulatedAggregatesCarryADriftAllowance(t *testing.T) {
+func TestRecoveryFloatRulesUseFinalV2ULPClasses(t *testing.T) {
 	m := officialScalePaymentModel()
-	accumulated := map[string]bool{
+	strict := map[string]bool{
 		"select sum(w_ytd) from warehouse;": true,
 		"select sum(d_ytd) from district;":  true,
+		"select sum(s_ytd) from stock;":     true,
 	}
 	for _, rule := range postRecoveryAmountRules(m) {
-		if accumulated[rule.sql] {
-			if rule.drift <= 0 {
-				t.Errorf("%s carries no drift allowance", rule.name)
-			}
-			continue
+		want := uint32(1)
+		if strict[rule.sql] {
+			want = 0
 		}
-		if rule.drift != 0 {
-			t.Errorf("%s carries a drift allowance of %v but is built by INSERT", rule.name, rule.drift)
+		if !rule.useWantBits || rule.maxULP != want {
+			t.Errorf("%s uses wantBits=%v maxULP=%d, want %d", rule.name, rule.useWantBits, rule.maxULP, want)
 		}
 	}
 	for _, rule := range onlineAmountRules(m) {
-		if rule.drift <= 0 {
-			t.Errorf("online rule %s carries no drift allowance", rule.name)
+		if !rule.captureOnly && rule.boundaryAddends == 0 && rule.sql != "select sum(s_ytd) from stock;" {
+			t.Errorf("online rule %s has no finalv2 exact comparison", rule.name)
 		}
 	}
 }
@@ -740,5 +717,67 @@ func TestAmountToleranceWithDriftNeverShrinksTheWindow(t *testing.T) {
 	}
 	if got := amountToleranceWithDrift(value, value, base); got < base {
 		t.Errorf("a drift allowance shrank the tolerance to %v", got)
+	}
+}
+
+func TestFinalV2FloatULPAndBoundaryRules(t *testing.T) {
+	if distance := float32ULPDistance(math.Float32bits(0), math.Float32bits(float32(math.Copysign(0, -1)))); distance != 0 {
+		t.Fatalf("+0/-0 distance = %d", distance)
+	}
+	low := float32(1)
+	high := math.Nextafter32(low, float32(math.Inf(1)))
+	midpoint := (float64(low) + float64(high)) / 2
+	if !boundaryAwareFloat32Match(math.Float32bits(low), midpoint, 1) {
+		t.Fatal("lower rounding candidate at a binary32 midpoint was rejected")
+	}
+	if !boundaryAwareFloat32Match(math.Float32bits(high), midpoint, 1) {
+		t.Fatal("upper rounding candidate at a binary32 midpoint was rejected")
+	}
+	beyond := math.Nextafter32(high, float32(math.Inf(1)))
+	if boundaryAwareFloat32Match(math.Float32bits(beyond), midpoint, 1) {
+		t.Fatal("a value beyond the two boundary candidates was accepted")
+	}
+}
+
+func TestPaymentFloatChainsLinkWithoutClientCompletionOrder(t *testing.T) {
+	start := float32(300000)
+	a1, a2 := float32(10.25), float32(20.5)
+	middle, end := start+a1, start+a1+a2
+	doc := document{
+		Ledger: map[string]float64{ledgerPaymentCommits: 2},
+		PaymentEdges: []paymentFloatEdge{
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(middle),
+				AmountBits: math.Float32bits(a2), AfterBits: math.Float32bits(end)},
+			{Kind: "district", Warehouse: 1, District: 1, BeforeBits: math.Float32bits(float32(30000)),
+				AmountBits: math.Float32bits(a1), AfterBits: math.Float32bits(float32(30000) + a1)},
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start),
+				AmountBits: math.Float32bits(a1), AfterBits: math.Float32bits(middle)},
+			{Kind: "district", Warehouse: 2, District: 3, BeforeBits: math.Float32bits(float32(30000)),
+				AmountBits: math.Float32bits(a2), AfterBits: math.Float32bits(float32(30000) + a2)},
+		},
+	}
+	terminals, err := validatePaymentFloatChains(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := terminals["warehouse:1"]; got != math.Float32bits(end) {
+		t.Fatalf("warehouse terminal = 0x%08x, want 0x%08x", got, math.Float32bits(end))
+	}
+}
+
+func TestPaymentFloatChainsRejectALostUpdateFork(t *testing.T) {
+	start := float32(300000)
+	amount := float32(10)
+	doc := document{
+		Ledger: map[string]float64{ledgerPaymentCommits: 1},
+		PaymentEdges: []paymentFloatEdge{
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start),
+				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(start + amount)},
+			{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start),
+				AmountBits: math.Float32bits(amount), AfterBits: math.Float32bits(start + amount)},
+		},
+	}
+	if _, err := validatePaymentFloatChains(doc); err == nil || !strings.Contains(err.Error(), "forks") {
+		t.Fatalf("lost-update fork reported %v", err)
 	}
 }

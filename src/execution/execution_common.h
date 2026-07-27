@@ -43,8 +43,7 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
 
     auto* txn = context->txn_;
     auto* txn_mgr = context->txn_mgr_;
-    const timestamp_t read_ts =
-        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
+    const timestamp_t read_ts = txn->get_read_ts();
     const txn_id_t self_id = txn->get_transaction_id();
 
     constexpr int MAX_DEPTH = 100;
@@ -122,8 +121,7 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
 
     auto* txn = context->txn_;
     auto* txn_mgr = context->txn_mgr_;
-    const timestamp_t read_ts =
-        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED ? txn->get_read_ts() : txn->get_start_ts();
+    const timestamp_t read_ts = txn->get_read_ts();
     const txn_id_t self_id = txn->get_transaction_id();
 
     constexpr int MAX_DEPTH = 100;
@@ -241,7 +239,7 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
             continue;
         }
 
-        bool concurrent_delete = !meta.is_committed_ || meta.commit_ts_ > txn->get_start_ts();
+        bool concurrent_delete = !meta.is_committed_ || meta.commit_ts_ > txn->get_read_ts();
         if (!concurrent_delete) {
             continue;
         }
@@ -273,7 +271,7 @@ inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid,
         if (current_key_matches) {
             return true;
         }
-    } else if (meta.commit_ts_ <= txn->get_start_ts()) {
+    } else if (meta.commit_ts_ <= txn->get_read_ts()) {
         return !meta.is_deleted_ && current_key_matches;
     } else if (current_key_matches) {
         return true;
@@ -295,7 +293,7 @@ inline bool HistoricalIndexKeyConflictsWithTxn(RmFileHandle* fh, const Rid& rid,
             continue;
         }
 
-        if (old_meta.commit_ts_ <= txn->get_start_ts()) {
+        if (old_meta.commit_ts_ <= txn->get_read_ts()) {
             return old_key_matches;
         }
 

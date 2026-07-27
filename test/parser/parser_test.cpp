@@ -118,6 +118,53 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     EXPECT_DOUBLE_EQ(bonus_delta->val, 0.5);
 }
 
+TEST(ParserTest, BindsPreparedSelfReferentialUpdateAndWhereParameters) {
+    auto parsed = parse_ok("update stock set s_ytd = s_ytd + $3 where s_w_id = $1 and s_i_id = $2;");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    ASSERT_NE(update->set_clauses[0]->val, nullptr);
+    const auto* delta = dynamic_cast<const ast::Parameter*>(update->set_clauses[0]->val.get());
+    ASSERT_NE(delta, nullptr);
+    EXPECT_EQ(delta->ordinal, 3U);
+    ASSERT_EQ(update->conds.size(), 2U);
+    ASSERT_NE(dynamic_cast<const ast::Parameter*>(update->conds[0]->rhs.get()), nullptr);
+    ASSERT_NE(dynamic_cast<const ast::Parameter*>(update->conds[1]->rhs.get()), nullptr);
+
+    std::vector<std::unique_ptr<ast::Value>> bindings;
+    bindings.push_back(std::make_unique<ast::IntLit>(7));
+    bindings.push_back(std::make_unique<ast::IntLit>(19));
+    bindings.push_back(std::make_unique<ast::FloatLit>(2.5F));
+    auto bound = ast::clone_bound_tree(*parsed, bindings);
+    const auto* bound_update = as_node<ast::UpdateStmt>(bound);
+    ASSERT_NE(bound_update, nullptr);
+    const auto* bound_delta = dynamic_cast<const ast::FloatLit*>(bound_update->set_clauses[0]->val.get());
+    ASSERT_NE(bound_delta, nullptr);
+    EXPECT_FLOAT_EQ(bound_delta->val, 2.5F);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->conds[0]->rhs.get())->val, 7);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->conds[1]->rhs.get())->val, 19);
+}
+
+TEST(ParserTest, BindsPreparedBareSelfAssignmentWithParameterizedWhere) {
+    auto parsed = parse_ok("update stock set s_ytd = s_ytd where s_w_id = $1 and s_i_id = $2;");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    EXPECT_TRUE(update->set_clauses[0]->is_self_ref);
+    EXPECT_EQ(update->set_clauses[0]->op, ast::SetOp::ASSIGNMENT);
+    EXPECT_EQ(update->set_clauses[0]->val, nullptr);
+
+    std::vector<std::unique_ptr<ast::Value>> bindings;
+    bindings.push_back(std::make_unique<ast::IntLit>(7));
+    bindings.push_back(std::make_unique<ast::IntLit>(19));
+    auto bound = ast::clone_bound_tree(*parsed, bindings);
+    const auto* bound_update = as_node<ast::UpdateStmt>(bound);
+    ASSERT_NE(bound_update, nullptr);
+    ASSERT_EQ(bound_update->set_clauses.size(), 1U);
+    EXPECT_TRUE(bound_update->set_clauses[0]->is_self_ref);
+    EXPECT_EQ(bound_update->set_clauses[0]->val, nullptr);
+}
+
 TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
     // col += num / col -= num 在解析期脱糖为 col = col ± num 的自引用节点
     auto parsed = parse_ok("update score_tab set score += 5, bonus -= 0.5 where id < 3;");

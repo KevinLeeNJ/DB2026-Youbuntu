@@ -13,7 +13,7 @@ TPCC_SQLITE_PATH ?= benchmark/tpcc/tpcc.sqlite
 TPCC_SQLITE_RESULT ?= benchmark/tpcc/result-sqlite.json
 TPCC_SQLITE_BEGIN ?= immediate
 TPCC_WAREHOUSES ?= 50
-TPCC_WORKERS ?= 50
+TPCC_WORKERS ?= 32
 TPCC_WARMUP ?= 10
 TPCC_MEASURE ?= 60
 TPCC_ROUNDS ?= 2
@@ -23,7 +23,7 @@ TPCC_PORT ?= 8765
 TPCC_RESTART_TIMEOUT ?= 90
 TPCC_THINK_MS ?= 0
 TPCC_RECONNECT_EACH_TXN ?= 0
-TPCC_ISOLATION ?= read-committed
+TPCC_ISOLATION ?= snapshot-isolation
 TPCC_GO_BINARY := $(BUILD_DIR)/bin/tpcc-go
 TPCC_RANDOM_DB ?= tpcc_random_kill_db
 TPCC_RANDOM_WORKERS ?= 16
@@ -47,7 +47,7 @@ help:
 	@echo "  make format          - Format code with clang-format"
 	@echo "  make client          - Build rmdb_client"
 	@echo "  make client-debug    - Build rmdb_client with debug flags"
-	@echo "  make benchmark       - Run the official-equivalent rmdb TPC-C benchmark"
+	@echo "  make benchmark       - Run the local 32-client SI TPC-C smoke benchmark (10s + 2x60s)"
 	@echo "  make benchmark-sqlite - Run SQLite TPC-C benchmark"
 	@echo "  make benchmark-random-kill - Run TPC-C random kill-9 recovery consistency test"
 	@echo "  make benchmark-clean - Remove benchmark runtime data, keep CSV files"

@@ -14,15 +14,12 @@ import (
 // sampled rows. Both sets of expected values come from the dataset manifest, so
 // they stay correct when PLAN.md item 1.10 makes the generator truly random.
 
-const (
-	// sampledValueAbsoluteTolerance is the floor for FLOAT comparisons. RMDB
-	// stores FLOAT as binary32, so a decimal such as 0.1234 cannot round-trip
-	// exactly through the CSV.
-	sampledValueAbsoluteTolerance = 1e-6
-	// sampledValueRelativeTolerance covers binary32 representation error with
-	// roughly an order of magnitude of headroom over FLT_EPSILON (1.19e-7).
-	sampledValueRelativeTolerance = 1e-6
-)
+var float32Columns = map[string]struct{}{
+	"w_tax": {}, "w_ytd": {},
+	"d_tax": {}, "d_ytd": {},
+	"c_credit_lim": {}, "c_discount": {}, "c_balance": {}, "c_ytd_payment": {},
+	"h_amount": {}, "ol_amount": {}, "i_price": {}, "s_ytd": {},
+}
 
 // contentSampleTables are the tables whose sampled rows are compared value by
 // value. final.md:295 names item prices, stock quantities, warehouse and
@@ -199,6 +196,62 @@ func verifyLoadContentSamples(c sqlExecutor, manifest datasetManifest) error {
 			failures = append(failures, fmt.Sprintf("orders line count [%s]: got %d order_line row(s), want o_ol_cnt=%d", predicate, got, want))
 		}
 	}
+	for _, check := range manifest.OrderLineChecks {
+		predicate := fmt.Sprintf("ol_w_id = %d and ol_d_id = %d and ol_o_id = %d",
+			check.WarehouseID, check.DistrictID, check.OrderID)
+		text, err := c.exec(fmt.Sprintf(
+			"select ol_number, ol_amount from order_line where %s order by ol_number;", predicate))
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("fixed order_line [%s]: %v", predicate, err))
+			continue
+		}
+		rows := parseRows(text)
+		if len(rows) != len(check.AmountBits) {
+			failures = append(failures, fmt.Sprintf("fixed order_line [%s]: got %d rows, want %d",
+				predicate, len(rows), len(check.AmountBits)))
+			continue
+		}
+		bins := exactFloat32Bins{}
+		for index, row := range rows {
+			checks++
+			if len(row) != 2 || row[0] != strconv.Itoa(index+1) {
+				failures = append(failures, fmt.Sprintf("fixed order_line [%s]: invalid line %d", predicate, index+1))
+				continue
+			}
+			value, err := strconv.ParseFloat(row[1], 32)
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("fixed order_line [%s]: invalid FLOAT32 %q", predicate, row[1]))
+				continue
+			}
+			gotBits := math.Float32bits(float32(value))
+			if !equalFloat32Bits(gotBits, check.AmountBits[index]) {
+				failures = append(failures, fmt.Sprintf(
+					"fixed order_line [%s] line %d: got 0x%08x, want 0x%08x, tolerance 0 ULP",
+					predicate, index+1, gotBits, check.AmountBits[index]))
+			}
+			if err := bins.add(math.Float32frombits(check.AmountBits[index])); err != nil {
+				failures = append(failures, fmt.Sprintf("fixed order_line [%s]: %v", predicate, err))
+			}
+		}
+		checks++
+		sumText, err := c.exec(fmt.Sprintf("select sum(ol_amount) from order_line where %s;", predicate))
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("fixed order_line SUM [%s]: %v", predicate, err))
+			continue
+		}
+		sumValue, err := scalarFloatStrict(sumText)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("fixed order_line SUM [%s]: %v", predicate, err))
+			continue
+		}
+		gotBits := math.Float32bits(float32(sumValue))
+		wantBits := math.Float32bits(float32(bins.float64()))
+		if !equalFloat32Bits(gotBits, wantBits) {
+			failures = append(failures, fmt.Sprintf(
+				"fixed order_line SUM [%s]: got 0x%08x, want 0x%08x, tolerance 0 ULP",
+				predicate, gotBits, wantBits))
+		}
+	}
 	if len(failures) > 0 {
 		return fmt.Errorf("LOAD content mismatch: cross-partition content sampling failed %d of %d comparison(s)\n%s",
 			len(failures), checks, strings.Join(failures, "\n"))
@@ -233,12 +286,20 @@ func compareSampledValue(column, want, got string) error {
 	if got == "NULL" {
 		return fmt.Errorf("%s: got NULL, want %q", column, want)
 	}
-	wantNumber, wantErr := strconv.ParseFloat(want, 64)
-	gotNumber, gotErr := strconv.ParseFloat(got, 64)
-	if wantErr == nil && gotErr == nil {
-		tolerance := math.Max(sampledValueAbsoluteTolerance, sampledValueRelativeTolerance*math.Abs(wantNumber))
-		if math.Abs(wantNumber-gotNumber) > tolerance {
-			return fmt.Errorf("%s: got %s, want %s (tolerance %g)", column, got, want, tolerance)
+	if _, isFloat32 := float32Columns[column]; isFloat32 {
+		wantNumber, wantErr := strconv.ParseFloat(want, 32)
+		gotNumber, gotErr := strconv.ParseFloat(got, 32)
+		if wantErr != nil || gotErr != nil {
+			return fmt.Errorf("%s: invalid FLOAT32 got=%q want=%q", column, got, want)
+		}
+		if math.IsNaN(wantNumber) || math.IsInf(wantNumber, 0) ||
+			math.IsNaN(gotNumber) || math.IsInf(gotNumber, 0) {
+			return fmt.Errorf("%s: non-finite FLOAT32 got=%q want=%q", column, got, want)
+		}
+		wantBits, gotBits := math.Float32bits(float32(wantNumber)), math.Float32bits(float32(gotNumber))
+		if !equalFloat32Bits(wantBits, gotBits) {
+			return fmt.Errorf("%s: got %s (0x%08x), want %s (0x%08x), tolerance 0 ULP",
+				column, got, gotBits, want, wantBits)
 		}
 		return nil
 	}

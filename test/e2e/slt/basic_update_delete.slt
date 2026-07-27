@@ -153,3 +153,28 @@ SELECT score, ratio, note FROM update_math WHERE id = 1;
 |               15 |         2.000000 |             keep |
 +------------------+------------------+------------------+
 Total record(s): 1
+
+statement ok
+CREATE TABLE stock_update (s_w_id INT, s_i_id INT, s_ytd FLOAT);
+
+statement ok
+INSERT INTO stock_update VALUES (7, 19, 10.5);
+
+statement ok
+UPDATE stock_update SET s_ytd = s_ytd WHERE s_w_id = 7 AND s_i_id = 19;
+
+statement ok
+UPDATE stock_update SET s_ytd = s_ytd + 2.5 WHERE s_w_id = 7 AND s_i_id = 19;
+
+statement ok
+UPDATE stock_update SET s_ytd = s_ytd - 1.0 WHERE s_w_id = 7 AND s_i_id = 19;
+
+query
+SELECT s_ytd FROM stock_update WHERE s_w_id = 7 AND s_i_id = 19;
+----
++------------------+
+|            s_ytd |
++------------------+
+|        12.000000 |
++------------------+
+Total record(s): 1

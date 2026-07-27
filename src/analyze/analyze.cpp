@@ -137,10 +137,13 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     switch (root->type) {
     case ast::AstType::UpdateStmt: {
         auto x = static_cast<const ast::UpdateStmt*>(root);
+        std::vector<ColMeta> all_cols;
+        get_all_cols({x->tab_name}, all_cols);
         query->set_clauses.reserve(x->set_clauses.size());
         for (const auto& set_clause : x->set_clauses) {
             SetClause clause;
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
+            const ColMeta* lhs_meta = resolve_column_meta(all_cols, clause.lhs);
             clause.op = convert_update_op(set_clause->op);
             if (set_clause->val != nullptr) {
                 clause.rhs = convert_sv_value(set_clause->val.get());
@@ -150,9 +153,21 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                 clause.rhs_col = {.tab_name = set_clause->rhs_col->tab_name.empty() ? x->tab_name
                                                                                     : set_clause->rhs_col->tab_name,
                                   .col_name = set_clause->rhs_col->col_name};
-                std::vector<ColMeta> all_cols;
-                get_all_cols({x->tab_name}, all_cols);
-                clause.rhs_col = check_column(all_cols, clause.rhs_col);
+                const ColMeta* rhs_meta = resolve_column_meta(all_cols, clause.rhs_col);
+                if (clause.op == UpdateOp::ASSIGNMENT) {
+                    if (!can_cast(lhs_meta->type, rhs_meta->type)) {
+                        throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(rhs_meta->type));
+                    }
+                } else {
+                    if (!is_numeric_type(lhs_meta->type) || !is_numeric_type(rhs_meta->type)) {
+                        throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(rhs_meta->type));
+                    }
+                    if (set_clause->val == nullptr || clause.rhs.is_null || !is_numeric_type(clause.rhs.type)) {
+                        throw IncompatibleTypeError(coltype2str(rhs_meta->type), coltype2str(clause.rhs.type));
+                    }
+                }
+            } else if (!clause.rhs.is_null && !can_cast(lhs_meta->type, clause.rhs.type)) {
+                throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(clause.rhs.type));
             }
             query->set_clauses.push_back(clause);
         }

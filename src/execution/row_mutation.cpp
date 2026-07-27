@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details.
 #include "row_mutation.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -154,7 +155,7 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
     const bool snapshot_conflict_check = level == IsolationLevel::SNAPSHOT_ISOLATION ||
                                          level == IsolationLevel::REPEATABLE_READ ||
                                          level == IsolationLevel::SERIALIZABLE;
-    if (snapshot_conflict_check && meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
+    if (snapshot_conflict_check && meta.is_committed_ && meta.commit_ts_ > txn->get_read_ts() &&
         meta.writer_txn_id_ != txn->get_transaction_id()) {
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
     }
@@ -247,13 +248,21 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
                 result = base;
                 break;
             }
+            if (!std::isfinite(result)) {
+                throw RMDBError("FLOAT arithmetic result must be finite");
+            }
             switch (bound.lhs.type) {
             case TYPE_INT:
                 write_unaligned(data, static_cast<int>(result));
                 break;
-            case TYPE_FLOAT:
-                write_float(data, static_cast<float>(result));
+            case TYPE_FLOAT: {
+                const float float_result = static_cast<float>(result);
+                if (!std::isfinite(float_result)) {
+                    throw RMDBError("FLOAT arithmetic result must be finite");
+                }
+                write_float(data, float_result);
                 break;
+            }
             case TYPE_STRING:
             case TYPE_DATETIME:
                 throw IncompatibleTypeError(coltype2str(bound.lhs.type), coltype2str(bound.rhs.type));

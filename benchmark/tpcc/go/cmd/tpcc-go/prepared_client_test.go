@@ -257,6 +257,11 @@ type fakeRankingBatcher struct {
 	statements   map[string]rankingStatement
 	batches      int
 	emptyResults bool
+	warehouseYTD float32
+	districtYTD  float32
+	balance      float32
+	customerYTD  float32
+	stockYTD     map[string]float32
 }
 
 func newFakeRankingBatcher(t *testing.T) *fakeRankingBatcher {
@@ -274,7 +279,10 @@ func newFakeRankingBatcher(t *testing.T) *fakeRankingBatcher {
 		statements[statement.template] = rankingStatement{id: statement.id, query: statement.query,
 			parameterTypes: argumentTypes(statement.args), columns: columns}
 	}
-	return &fakeRankingBatcher{statements: statements}
+	return &fakeRankingBatcher{
+		statements: statements, warehouseYTD: 1, districtYTD: 1, balance: 1, customerYTD: 1,
+		stockYTD: make(map[string]float32),
+	}
 }
 
 func (f *fakeRankingBatcher) batchOperation(sql string) (batchOperation, error) {
@@ -294,24 +302,53 @@ func (f *fakeRankingBatcher) batchOperation(sql string) (batchOperation, error) 
 			return batchOperation{}, fmt.Errorf("ranking SQL parameter %d type mismatch for %q", index+1, template)
 		}
 	}
-	return batchOperation{statement: statement, args: args}, nil
+	return batchOperation{statement: statement, args: args, sql: sql}, nil
 }
 
 func (f *fakeRankingBatcher) execBatch(operations []batchOperation) (batchResult, error) {
 	f.batches++
 	result := batchResult{executedOperations: uint16(len(operations)), failedOperation: 0xffff}
 	for index, operation := range operations {
+		switch {
+		case strings.HasPrefix(operation.sql, "update warehouse set w_ytd"):
+			f.warehouseYTD += fakeFloatArgument(operation.args[0])
+		case strings.HasPrefix(operation.sql, "update district set d_ytd"):
+			f.districtYTD += fakeFloatArgument(operation.args[0])
+		case strings.HasPrefix(operation.sql, "update customer set c_balance = c_balance -"):
+			f.balance -= fakeFloatArgument(operation.args[0])
+			f.customerYTD += fakeFloatArgument(operation.args[1])
+		case strings.HasPrefix(operation.sql, "update customer set c_balance = c_balance +"):
+			f.balance += fakeFloatArgument(operation.args[0])
+		case strings.HasPrefix(operation.sql, "update stock set s_ytd = s_ytd +"):
+			key := fakeStockKey(operation.args[3], operation.args[4])
+			f.stockYTD[key] = f.fakeStockYTD(key) + fakeFloatArgument(operation.args[0])
+		}
 		if !operation.statement.query {
 			continue
 		}
 		rows := make([][]string, 0, 1)
 		if !f.emptyResults {
-			row := make([]string, 0, len(operation.statement.columns))
-			for _, column := range operation.statement.columns {
-				if column.sqlType == wireTypeChar {
-					row = append(row, "x")
-				} else {
-					row = append(row, "1")
+			var row []string
+			switch {
+			case strings.HasPrefix(operation.sql, "select w_ytd from warehouse"):
+				row = []string{float32SQL(f.warehouseYTD)}
+			case strings.HasPrefix(operation.sql, "select d_ytd from district"):
+				row = []string{float32SQL(f.districtYTD)}
+			case strings.HasPrefix(operation.sql, "select c_balance, c_ytd_payment from customer"):
+				row = []string{float32SQL(f.balance), float32SQL(f.customerYTD)}
+			case strings.HasPrefix(operation.sql, "select c_balance from customer where c_id"):
+				row = []string{float32SQL(f.balance)}
+			case strings.HasPrefix(operation.sql, "select s_ytd from stock"):
+				key := fakeStockKey(operation.args[0], operation.args[1])
+				row = []string{float32SQL(f.fakeStockYTD(key))}
+			default:
+				row = make([]string, 0, len(operation.statement.columns))
+				for _, column := range operation.statement.columns {
+					if column.sqlType == wireTypeChar {
+						row = append(row, "x")
+					} else {
+						row = append(row, "1")
+					}
 				}
 			}
 			rows = append(rows, row)
@@ -319,6 +356,24 @@ func (f *fakeRankingBatcher) execBatch(operations []batchOperation) (batchResult
 		result.results = append(result.results, batchOperationResult{operationIndex: uint16(index), rows: rows})
 	}
 	return result, nil
+}
+
+func fakeFloatArgument(argument preparedArgument) float32 {
+	if argument.typ == wireTypeFloat32 {
+		return math.Float32frombits(argument.floatBits)
+	}
+	return float32(argument.int32)
+}
+
+func fakeStockKey(item, warehouse preparedArgument) string {
+	return fmt.Sprintf("%d/%d", item.int32, warehouse.int32)
+}
+
+func (f *fakeRankingBatcher) fakeStockYTD(key string) float32 {
+	if value, ok := f.stockYTD[key]; ok {
+		return value
+	}
+	return 1
 }
 
 func rankingTestContext() txnContext {

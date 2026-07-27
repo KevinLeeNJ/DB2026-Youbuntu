@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -57,8 +58,51 @@ func TestDatasetManifestRecordsAggregatesMatchingTheCSV(t *testing.T) {
 	}
 	// The generator formula and the recorded aggregate must agree today; once
 	// PLAN.md item 1.10 makes the generator random only the manifest survives.
-	if want := float64(expectedUndeliveredOrderLines(sampleTestWarehouses)); deliveryNulls != want {
+	if want := float64(expectedUndeliveredOrderLines(sampleTestWarehouses, 13)); deliveryNulls != want {
 		t.Errorf("CSV has %v rows without a delivery time, generator formula says %v", deliveryNulls, want)
+	}
+}
+
+func TestExactFloat32BinsIsOrderIndependentAndKeepsLongChainLowBits(t *testing.T) {
+	large := float32(math.Ldexp(1, 60))
+	values := make([]float32, 1025)
+	values[0] = large
+	for i := 1; i < len(values); i++ {
+		values[i] = 2
+	}
+
+	var forward, reverse exactFloat32Bins
+	ordinary := float64(0)
+	for _, value := range values {
+		if err := forward.add(value); err != nil {
+			t.Fatal(err)
+		}
+		ordinary += float64(value)
+	}
+	for i := len(values) - 1; i >= 0; i-- {
+		if err := reverse.add(values[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := math.Ldexp(1, 60) + 2048
+	if got := forward.float64(); got != want {
+		t.Fatalf("exact forward sum = %.0f, want %.0f", got, want)
+	}
+	if got := reverse.float64(); got != want {
+		t.Fatalf("exact reverse sum = %.0f, want %.0f", got, want)
+	}
+	if ordinary == want {
+		t.Fatalf("ordinary float64 chain unexpectedly retained the low-order terms")
+	}
+}
+
+func TestExactFloat32BinsRejectsNegativeAndNonFiniteInputs(t *testing.T) {
+	for _, value := range []float32{-1, float32(math.Inf(1)), float32(math.NaN())} {
+		var bins exactFloat32Bins
+		if err := bins.add(value); err == nil {
+			t.Errorf("add(%v) succeeded, want rejection", value)
+		}
 	}
 }
 
@@ -136,6 +180,9 @@ func (e *sampleSQLExecutor) exec(sql string) (string, error) {
 	if answer, ok := e.answerContent(sql); ok {
 		return answer, nil
 	}
+	if answer, ok := e.answerFixedOrderLine(sql); ok {
+		return answer, nil
+	}
 	return "", fmt.Errorf("unexpected SQL %q", sql)
 }
 
@@ -149,6 +196,16 @@ func rowAnswer(values []string) string {
 		header[i] = fmt.Sprintf("c%d", i+1)
 	}
 	return fmt.Sprintf("| %s |\n| %s |\nTotal record(s): 1\n", strings.Join(header, " | "), strings.Join(values, " | "))
+}
+
+func rowsAnswer(rows [][]string) string {
+	var builder strings.Builder
+	builder.WriteString("| c1 | c2 |\n")
+	for _, row := range rows {
+		fmt.Fprintf(&builder, "| %s |\n", strings.Join(row, " | "))
+	}
+	fmt.Fprintf(&builder, "Total record(s): %d\n", len(rows))
+	return builder.String()
 }
 
 func (e *sampleSQLExecutor) answerRelation(sql string) (string, bool) {
@@ -210,6 +267,30 @@ func (e *sampleSQLExecutor) answerContent(sql string) (string, bool) {
 	return "", false
 }
 
+func (e *sampleSQLExecutor) answerFixedOrderLine(sql string) (string, bool) {
+	for _, check := range e.manifest.OrderLineChecks {
+		predicate := fmt.Sprintf("ol_w_id = %d and ol_d_id = %d and ol_o_id = %d",
+			check.WarehouseID, check.DistrictID, check.OrderID)
+		if want := fmt.Sprintf("select ol_number, ol_amount from order_line where %s order by ol_number;", predicate); want == sql {
+			rows := make([][]string, len(check.AmountBits))
+			for i, bits := range check.AmountBits {
+				rows[i] = []string{strconv.Itoa(i + 1), float32SQL(math.Float32frombits(bits))}
+			}
+			return rowsAnswer(rows), true
+		}
+		if want := fmt.Sprintf("select sum(ol_amount) from order_line where %s;", predicate); want == sql {
+			bins := exactFloat32Bins{}
+			for _, bits := range check.AmountBits {
+				if err := bins.add(math.Float32frombits(bits)); err != nil {
+					return "", false
+				}
+			}
+			return scalarAnswer(float32SQL(float32(bins.float64()))), true
+		}
+	}
+	return "", false
+}
+
 func TestVerifyLoadSamplingAcceptsACorrectlyLoadedDatabase(t *testing.T) {
 	manifest := sampleTestManifest(t)
 	executor := &sampleSQLExecutor{manifest: manifest}
@@ -227,12 +308,13 @@ func TestVerifyLoadSamplingAcceptsACorrectlyLoadedDatabase(t *testing.T) {
 	if err := verifyLoadContentSamples(executor, manifest); err != nil {
 		t.Fatal(err)
 	}
-	// One keyed row read per sampled row per content table, plus the order line
-	// count of every sampled order.
+	// One keyed row read per sampled row per content table, the order line count
+	// of every sampled order, and a full row+SUM read per fixed order.
 	want = len(manifest.Samples["orders"])
 	for _, table := range contentSampleTables {
 		want += len(manifest.Samples[table])
 	}
+	want += 2 * len(manifest.OrderLineChecks)
 	if got := len(executor.statements); got != want {
 		t.Errorf("content sampling issued %d queries, want %d", got, want)
 	}
@@ -346,7 +428,8 @@ func TestCompareSampledValueHandlesEveryColumnShape(t *testing.T) {
 		{"c_credit", "BC", "BC", true},
 		{"c_credit", "BC", "GC", false},
 		{"w_ytd", "300000.0", "300000", true},
-		{"d_tax", "0.1234", "0.12340001", true},
+		{"d_tax", "0.1234", "0.12340001", false},
+		{"d_tax", "0.1234", "0.1234000027179718", true},
 		{"d_tax", "0.1234", "0.1244", false},
 		{"ol_delivery_d", "", "NULL", true},
 		{"ol_delivery_d", "", "", false},

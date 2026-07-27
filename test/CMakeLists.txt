@@ -28,3 +28,9 @@ foreach(DIR ${SUBDIRS})
         endif()
     endif()
 endforeach()
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME protocol_live_wire_test
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol/live_wire_protocol_test.py
+                 $<TARGET_FILE:rmdb>)
+set_tests_properties(protocol_live_wire_test PROPERTIES TIMEOUT 90)

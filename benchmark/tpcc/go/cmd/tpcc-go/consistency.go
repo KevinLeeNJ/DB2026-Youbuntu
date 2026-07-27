@@ -13,10 +13,9 @@ import (
 
 // Consistency validation.
 //
-// final.md:319 splits the work in two. Before the forced termination the
-// evaluator runs a fixed "6 integer + 2 amount" quick check made of small-table
-// or index-key queries; final.md:326 forbids a full large-table scan or a
-// row-by-row relation audit at that point. After the restart it runs 37 integer
+// finalv2.md:382 splits the work in two. Before the forced termination the
+// evaluator runs a fixed "6 integer + 7 FLOAT32" quick check and captures the
+// seven aggregate bit patterns. After the restart it runs 37 integer
 // aggregate checks and 7 amount aggregate checks (final.md:321-324) plus a
 // per-partition reconciliation over all warehouse/district partitions
 // (final.md:345).
@@ -26,7 +25,7 @@ import (
 
 const (
 	onlineIntRuleCount        = 6
-	onlineAmountRuleCount     = 2
+	onlineAmountRuleCount     = 7
 	postRecoveryIntRuleCount  = 37
 	postRecoveryAmountRuleCnt = 7
 
@@ -289,6 +288,14 @@ type amountRule struct {
 	name string
 	sql  string
 	want float64
+	// captureOnly records the online bit pattern without comparing it to a
+	// ledger. maxULP applies when useWantBits is set. boundaryAddends enables the
+	// finalv2 boundary-aware exact-sum test for ranking-scale non-negative sums.
+	captureOnly     bool
+	useWantBits     bool
+	wantBits        uint32
+	maxULP          uint32
+	boundaryAddends int64
 	// drift is one standard deviation of the binary32 accumulation error the
 	// aggregate is expected to carry, derived from the ledger's step counts. Zero
 	// means the aggregate is built by inserts rather than by read-modify-write
@@ -302,6 +309,7 @@ type ruleRunner struct {
 	failures    []string
 	intRules    int
 	amountRules int
+	floatBits   map[string]uint32
 }
 
 func (r *ruleRunner) fail(format string, args ...any) {
@@ -362,6 +370,9 @@ func (r *ruleRunner) runIntRules(rules []intRule) {
 }
 
 func (r *ruleRunner) runAmountRules(rules []amountRule) {
+	if r.floatBits == nil {
+		r.floatBits = make(map[string]uint32, len(rules))
+	}
 	for _, rule := range rules {
 		r.amountRules++
 		got, err := r.scalar(rule.sql)
@@ -369,20 +380,182 @@ func (r *ruleRunner) runAmountRules(rules []amountRule) {
 			r.fail("%s: %v [%s]", rule.name, err, rule.sql)
 			continue
 		}
-		tolerance := amountToleranceWithDrift(rule.want, got, rule.drift)
-		if math.Abs(got-rule.want) > tolerance {
-			// The binary32 ULP at this magnitude is reported so a reviewer can tell a
-			// real accounting error from accumulated FLOAT rounding at a glance: a
-			// delta of a few ULPs per contributing update is arithmetic, a delta the
-			// size of a transaction amount is a lost or duplicated update.
-			message := fmt.Sprintf("%s: got %.2f, want %.2f (delta %.2f, tolerance %.2f, binary32 ulp %.4g) [%s]",
-				rule.name, got, rule.want, got-rule.want, tolerance, binary32ULP(rule.want), rule.sql)
+		got32 := float32(got)
+		if math.IsNaN(float64(got32)) || math.IsInf(float64(got32), 0) {
+			r.fail("%s: got non-finite FLOAT32 [%s]", rule.name, rule.sql)
+			continue
+		}
+		gotBits := math.Float32bits(got32)
+		r.floatBits[rule.name] = gotBits
+		if rule.captureOnly {
+			continue
+		}
+		matches := false
+		toleranceText := "0 ULP"
+		wantBits := math.Float32bits(float32(rule.want))
+		if rule.useWantBits {
+			wantBits = rule.wantBits
+			matches = float32ULPDistance(gotBits, wantBits) <= rule.maxULP
+			toleranceText = fmt.Sprintf("<=%d ULP", rule.maxULP)
+		} else if rule.boundaryAddends > 0 {
+			matches = boundaryAwareFloat32Match(gotBits, rule.want, rule.boundaryAddends)
+			toleranceText = "boundary-aware"
+		} else {
+			matches = equalFloat32Bits(gotBits, wantBits)
+		}
+		if !matches {
+			message := fmt.Sprintf("%s: got %.9g (0x%08x), want %.9g (0x%08x), tolerance %s [%s]",
+				rule.name, got32, gotBits, math.Float32frombits(wantBits), wantBits, toleranceText, rule.sql)
 			if rule.hint != "" {
 				message += "\n    hint: " + rule.hint
 			}
 			r.fail("%s", message)
 		}
 	}
+}
+
+func equalFloat32Bits(left, right uint32) bool {
+	if left<<1 == 0 && right<<1 == 0 {
+		return true
+	}
+	return left == right
+}
+
+func orderedFloat32Bits(bits uint32) uint32 {
+	if bits&0x80000000 != 0 {
+		return ^bits
+	}
+	return bits | 0x80000000
+}
+
+func float32ULPDistance(left, right uint32) uint32 {
+	if equalFloat32Bits(left, right) {
+		return 0
+	}
+	a, b := orderedFloat32Bits(left), orderedFloat32Bits(right)
+	if a < b {
+		return b - a
+	}
+	return a - b
+}
+
+func boundaryAwareFloat32Match(gotBits uint32, exactSum float64, addends int64) bool {
+	if addends < 0 || exactSum < 0 || math.IsNaN(exactSum) || math.IsInf(exactSum, 0) {
+		return false
+	}
+	// Dataset sums are accumulated exactly in exponent bins before one float64
+	// rounding, whose error is at most 2^-53*S. Runtime ledger additions add at
+	// most the same relative error per term, so n*2^-53*S safely encloses the
+	// exact real sum before testing the adjacent binary32 boundary candidates.
+	epsilon := float64(addends) * math.Ldexp(1, -53) * exactSum
+	for _, candidate := range []float64{exactSum - epsilon, exactSum, exactSum + epsilon} {
+		if equalFloat32Bits(gotBits, math.Float32bits(float32(candidate))) {
+			return true
+		}
+	}
+	return false
+}
+
+func paymentEdgeKey(edge paymentFloatEdge) (string, uint32, error) {
+	switch edge.Kind {
+	case "warehouse":
+		if edge.Warehouse < 1 || edge.District != 0 {
+			return "", 0, fmt.Errorf("invalid warehouse Payment edge key w=%d d=%d", edge.Warehouse, edge.District)
+		}
+		return fmt.Sprintf("warehouse:%d", edge.Warehouse), math.Float32bits(float32(300000)), nil
+	case "district":
+		if edge.Warehouse < 1 || edge.District < 1 {
+			return "", 0, fmt.Errorf("invalid district Payment edge key w=%d d=%d", edge.Warehouse, edge.District)
+		}
+		return fmt.Sprintf("district:%d:%d", edge.Warehouse, edge.District), math.Float32bits(float32(30000)), nil
+	default:
+		return "", 0, fmt.Errorf("invalid Payment edge kind %q", edge.Kind)
+	}
+}
+
+// validatePaymentFloatChains treats committed updates as a per-key multiset of
+// before->after edges. Linking by raw bits, rather than client completion order,
+// accepts every serial interleaving while rejecting a missing edge or the fork
+// produced when two committed transactions both update the same old value.
+func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
+	commits := int(math.Round(doc.Ledger[ledgerPaymentCommits]))
+	if len(doc.PaymentEdges) != commits*2 {
+		return nil, fmt.Errorf("Payment FLOAT32 evidence has %d edges, want two for each of %d commit(s)",
+			len(doc.PaymentEdges), commits)
+	}
+	grouped := make(map[string][]paymentFloatEdge)
+	initial := make(map[string]uint32)
+	for _, edge := range doc.PaymentEdges {
+		key, start, err := paymentEdgeKey(edge)
+		if err != nil {
+			return nil, err
+		}
+		amount := math.Float32frombits(edge.AmountBits)
+		before := math.Float32frombits(edge.BeforeBits)
+		if amount <= 0 || math.IsNaN(float64(amount)) || math.IsInf(float64(amount), 0) {
+			return nil, fmt.Errorf("Payment FLOAT32 edge %s has invalid amount 0x%08x", key, edge.AmountBits)
+		}
+		want := math.Float32bits(before + amount)
+		if !equalFloat32Bits(edge.AfterBits, want) {
+			return nil, fmt.Errorf("Payment FLOAT32 edge %s is not 0 ULP: before=0x%08x amount=0x%08x after=0x%08x want=0x%08x",
+				key, edge.BeforeBits, edge.AmountBits, edge.AfterBits, want)
+		}
+		grouped[key] = append(grouped[key], edge)
+		initial[key] = start
+	}
+	terminals := make(map[string]uint32, len(grouped))
+	for key, edges := range grouped {
+		current := initial[key]
+		for len(edges) > 0 {
+			match := -1
+			for i, edge := range edges {
+				if equalFloat32Bits(edge.BeforeBits, current) {
+					if match >= 0 {
+						return nil, fmt.Errorf("Payment FLOAT32 chain %s forks at 0x%08x", key, current)
+					}
+					match = i
+				}
+			}
+			if match < 0 {
+				return nil, fmt.Errorf("Payment FLOAT32 chain %s has a gap after 0x%08x (%d edge(s) remain)",
+					key, current, len(edges))
+			}
+			current = edges[match].AfterBits
+			edges[match] = edges[len(edges)-1]
+			edges = edges[:len(edges)-1]
+		}
+		terminals[key] = current
+	}
+	return terminals, nil
+}
+
+func checkPaymentTerminalBits(c sqlExecutor, terminals map[string]uint32, stage string) error {
+	for key, want := range terminals {
+		parts := strings.Split(key, ":")
+		var sql string
+		switch parts[0] {
+		case "warehouse":
+			sql = fmt.Sprintf("select w_ytd from warehouse where w_id = %s;", parts[1])
+		case "district":
+			sql = fmt.Sprintf("select d_ytd from district where d_w_id = %s and d_id = %s;", parts[1], parts[2])
+		default:
+			return fmt.Errorf("[%s] invalid Payment terminal key %q", stage, key)
+		}
+		text, err := c.exec(sql)
+		if err != nil {
+			return fmt.Errorf("[%s] Payment terminal %s: %w", stage, key, err)
+		}
+		value, err := scalarFloatStrict(text)
+		if err != nil {
+			return fmt.Errorf("[%s] Payment terminal %s: %w", stage, key, err)
+		}
+		got := math.Float32bits(float32(value))
+		if !equalFloat32Bits(got, want) {
+			return fmt.Errorf("[%s] Payment terminal %s got 0x%08x, want 0x%08x (0 ULP)",
+				stage, key, got, want)
+		}
+	}
+	return nil
 }
 
 // consistencyModel carries the dataset shape, the pre-workload aggregate
@@ -394,14 +567,16 @@ type consistencyModel struct {
 	itemCount             int
 	baseline              map[string]float64
 	ledger                map[string]float64
+	onlineFloatBits       map[string]uint32
 }
 
 func newConsistencyModel(prior document) (consistencyModel, error) {
 	model := consistencyModel{
-		warehouses: prior.Config.BaselineWarehouseTotal,
-		itemCount:  prior.Config.BaselineItemTotal,
-		baseline:   prior.Baselines,
-		ledger:     prior.Ledger,
+		warehouses:      prior.Config.BaselineWarehouseTotal,
+		itemCount:       prior.Config.BaselineItemTotal,
+		baseline:        prior.Baselines,
+		ledger:          prior.Ledger,
+		onlineFloatBits: prior.OnlineFloatBits,
 	}
 	if model.warehouses < 1 || prior.Config.BaselineDistrictTotal < 1 || prior.Config.BaselineCustomerTotal < 1 || model.itemCount < 1 {
 		return consistencyModel{}, errors.New("result file has no dataset profile; rerun the benchmark to produce one")
@@ -604,22 +779,21 @@ func postRecoveryIntRules(m consistencyModel) []intRule {
 // postRecoveryAmountRules returns the 7 amount aggregate checks of
 // final.md:324: the amounts Payment, Delivery and NewOrder move.
 func postRecoveryAmountRules(m consistencyModel) []amountRule {
-	payment := m.a(ledgerPaymentAmount)
 	return []amountRule{
 		{name: "warehouse SUM(w_ytd) matches the Payment ledger", sql: "select sum(w_ytd) from warehouse;",
-			want: m.f(baseWarehouseYTD) + payment, drift: m.totalWarehouseYTDDrift()},
+			wantBits: m.onlineFloatBits["warehouse SUM(w_ytd) matches the Payment ledger"], useWantBits: true, maxULP: 0},
 		{name: "district SUM(d_ytd) matches the Payment ledger", sql: "select sum(d_ytd) from district;",
-			want: m.f(baseDistrictYTD) + payment, drift: m.totalDistrictYTDDrift()},
+			wantBits: m.onlineFloatBits["district SUM(d_ytd) matches the Payment ledger"], useWantBits: true, maxULP: 0},
 		{name: "customer SUM(c_ytd_payment) matches the Payment ledger", sql: "select sum(c_ytd_payment) from customer;",
-			want: m.f(baseCustomerYTDPayment) + payment},
+			wantBits: m.onlineFloatBits["customer SUM(c_ytd_payment) matches the Payment ledger"], useWantBits: true, maxULP: 1},
 		{name: "history SUM(h_amount) matches the Payment ledger", sql: "select sum(h_amount) from history;",
-			want: m.f(baseHistoryAmount) + payment},
+			wantBits: m.onlineFloatBits["history SUM(h_amount) matches the Payment ledger"], useWantBits: true, maxULP: 1},
 		{name: "customer SUM(c_balance) matches the Payment and Delivery ledger", sql: "select sum(c_balance) from customer;",
-			want: m.f(baseCustomerBalance) - payment + m.a(ledgerDeliveryAmount)},
+			wantBits: m.onlineFloatBits["customer SUM(c_balance) matches the Payment and Delivery ledger"], useWantBits: true, maxULP: 1},
 		{name: "order_line SUM(ol_amount) matches the NewOrder ledger", sql: "select sum(ol_amount) from order_line;",
-			want: m.f(baseOrderLineAmount) + m.a(ledgerNewOrderAmount)},
+			wantBits: m.onlineFloatBits["order_line SUM(ol_amount) matches the NewOrder ledger"], useWantBits: true, maxULP: 1},
 		{name: "stock SUM(s_ytd) matches the NewOrder ledger", sql: "select sum(s_ytd) from stock;",
-			want: m.f(baseStockYTD) + float64(m.l(ledgerNewOrderQuantity))},
+			wantBits: m.onlineFloatBits["stock SUM(s_ytd) matches the NewOrder ledger"], useWantBits: true, maxULP: 0},
 	}
 }
 
@@ -650,16 +824,28 @@ func onlineIntRules(m consistencyModel) []intRule {
 	}
 }
 
-// onlineAmountRules returns the 2 amount quick checks of final.md:319. Both read
-// a small table in full and tie it to the Payment ledger, which together also
-// imply w_ytd == SUM(d_ytd) globally.
+// onlineAmountRules captures all seven pre-crash FLOAT32 aggregates. The three
+// non-negative sums whose exact inputs are in the ledger are also checked now;
+// the other four are captured for the post-recovery 0/1-ULP comparison.
 func onlineAmountRules(m consistencyModel) []amountRule {
 	payment := m.a(ledgerPaymentAmount)
 	return []amountRule{
 		{name: "warehouse SUM(w_ytd) matches the Payment ledger", sql: "select sum(w_ytd) from warehouse;",
-			want: m.f(baseWarehouseYTD) + payment, drift: m.totalWarehouseYTDDrift()},
+			captureOnly: true},
 		{name: "district SUM(d_ytd) matches the Payment ledger", sql: "select sum(d_ytd) from district;",
-			want: m.f(baseDistrictYTD) + payment, drift: m.totalDistrictYTDDrift()},
+			captureOnly: true},
+		{name: "customer SUM(c_ytd_payment) matches the Payment ledger", sql: "select sum(c_ytd_payment) from customer;",
+			captureOnly: true},
+		{name: "history SUM(h_amount) matches the Payment ledger", sql: "select sum(h_amount) from history;",
+			want:            m.f(baseHistoryAmount) + payment,
+			boundaryAddends: m.b(baseHistoryRows) + m.l(ledgerPaymentCommits)},
+		{name: "customer SUM(c_balance) matches the Payment and Delivery ledger", sql: "select sum(c_balance) from customer;",
+			captureOnly: true},
+		{name: "order_line SUM(ol_amount) matches the NewOrder ledger", sql: "select sum(ol_amount) from order_line;",
+			want:            m.f(baseOrderLineAmount) + m.a(ledgerNewOrderAmount),
+			boundaryAddends: m.b(baseOrderLineRows) + m.l(ledgerNewOrderLines)},
+		{name: "stock SUM(s_ytd) matches the NewOrder ledger", sql: "select sum(s_ytd) from stock;",
+			want: m.f(baseStockYTD) + float64(m.l(ledgerNewOrderQuantity))},
 	}
 }
 
@@ -696,27 +882,68 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 	}
 	defer c.close()
 	if strings.HasPrefix(stage, "online-") {
-		return checkOnlineConsistency(c, model, stage)
+		terminals, err := validatePaymentFloatChains(prior)
+		if err != nil {
+			return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
+		}
+		if err := checkPaymentTerminalBits(c, terminals, stage); err != nil {
+			return err
+		}
+		bits, err := checkOnlineConsistencyWithBits(c, model, stage)
+		if err != nil {
+			return err
+		}
+		prior.OnlineFloatBits = bits
+		prior.PaymentTerminalBits = terminals
+		if _, err := publishResultDocument(resultPath, prior); err != nil {
+			return fmt.Errorf("[%s] persist online FLOAT32 evidence: %w", stage, err)
+		}
+		return nil
+	}
+	if len(prior.OnlineFloatBits) != postRecoveryAmountRuleCnt {
+		return fmt.Errorf("[%s] result carries %d online FLOAT32 baselines, want %d; run online consistency before crash",
+			stage, len(prior.OnlineFloatBits), postRecoveryAmountRuleCnt)
+	}
+	terminals, err := validatePaymentFloatChains(prior)
+	if err != nil {
+		return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
+	}
+	if len(prior.PaymentTerminalBits) != len(terminals) {
+		return fmt.Errorf("[%s] result carries %d Payment terminal bits, want %d; run online consistency before crash",
+			stage, len(prior.PaymentTerminalBits), len(terminals))
+	}
+	for key, want := range terminals {
+		if got, ok := prior.PaymentTerminalBits[key]; !ok || !equalFloat32Bits(got, want) {
+			return fmt.Errorf("[%s] persisted Payment terminal %s does not match the committed edge chain", stage, key)
+		}
+	}
+	if err := checkPaymentTerminalBits(c, terminals, stage); err != nil {
+		return err
 	}
 	return checkPostRecoveryConsistency(c, model, stage)
 }
 
 func checkOnlineConsistency(c sqlExecutor, model consistencyModel, stage string) error {
+	_, err := checkOnlineConsistencyWithBits(c, model, stage)
+	return err
+}
+
+func checkOnlineConsistencyWithBits(c sqlExecutor, model consistencyModel, stage string) (map[string]uint32, error) {
 	runner := &ruleRunner{exec: c}
 	start := time.Now()
 	runner.runIntRules(onlineIntRules(model))
 	runner.runAmountRules(onlineAmountRules(model))
 	if runner.intRules != onlineIntRuleCount || runner.amountRules != onlineAmountRuleCount {
-		return fmt.Errorf("[%s] online consistency ran %d integer + %d amount rules, want %d + %d",
+		return nil, fmt.Errorf("[%s] online consistency ran %d integer + %d amount rules, want %d + %d",
 			stage, runner.intRules, runner.amountRules, onlineIntRuleCount, onlineAmountRuleCount)
 	}
 	if len(runner.failures) > 0 {
-		return fmt.Errorf("[%s] online consistency validation failed (%d of %d rule(s))\n%s",
+		return nil, fmt.Errorf("[%s] online consistency validation failed (%d of %d rule(s))\n%s",
 			stage, len(runner.failures), runner.intRules+runner.amountRules, strings.Join(runner.failures, "\n"))
 	}
 	fmt.Printf("consistency ok: stage=%s rules=%d integer + %d amount (%s)\n",
 		stage, runner.intRules, runner.amountRules, time.Since(start).Round(time.Millisecond))
-	return nil
+	return runner.floatBits, nil
 }
 
 func checkPostRecoveryConsistency(c sqlExecutor, model consistencyModel, stage string) error {

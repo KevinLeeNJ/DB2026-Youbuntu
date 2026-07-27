@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -453,6 +454,9 @@ private:
                 value.int_val = static_cast<int>(state.sum);
             } else {
                 value.float_val = static_cast<float>(state.float_sum);
+                if (!std::isfinite(value.float_val)) {
+                    throw RMDBError("FLOAT aggregate result must be finite");
+                }
             }
             return value;
         }
@@ -465,6 +469,9 @@ private:
             }
             value.float_val = static_cast<float>((spec.input_type == TYPE_FLOAT ? state.float_sum : state.sum) /
                                                  static_cast<double>(state.count));
+            if (!std::isfinite(value.float_val)) {
+                throw RMDBError("FLOAT aggregate result must be finite");
+            }
             return value;
         }
         case LocalAggType::MAX:

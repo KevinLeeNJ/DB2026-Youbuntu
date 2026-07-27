@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"math"
+	"math/big"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -13,13 +15,10 @@ import (
 //
 // IMPORTANT (dependency on PLAN.md item 1.10): every expected value used by the
 // post-load integrity, relation and content validation must come from here, not
-// from a generator formula. The generator is deterministic today
-// (`initialOrderLineCount` is `5+(oID+dID+wID)%11`, the ORIGINAL marker is
-// `iID%10==0`), so a formula would work — but item 1.10 replaces those formulas
-// with true randomness precisely because the fixed shape hides bugs. Once that
-// lands the generator can no longer be inverted, and only manifest-recorded
-// facts survive. `expectedUndeliveredOrderLines` is therefore kept only as a
-// cross-check of the recorded aggregate inside the unit tests.
+// from a generator formula. The generator is reproducible for a seed, but each
+// order derives its 5..15 line count independently. Only manifest-recorded facts
+// are used as the load oracle; expectedUndeliveredOrderLines remains a unit-test
+// cross-check.
 const (
 	// datasetSampleCount is how many rows per table the manifest keeps for the
 	// index-key relation sampling and the content sampling of final.md:258-259.
@@ -48,19 +47,24 @@ const (
 	aggOrdersOlCntSum         = "orders.o_ol_cnt.sum"
 	aggOrdersCarrierZeroRows  = "orders.o_carrier_id.zeros"
 	aggOrderLineDeliveryNulls = "order_line.ol_delivery_d.nulls"
+	aggHistoryAmountSum       = "history.h_amount.exact_sum"
+	aggOrderLineAmountSum     = "order_line.ol_amount.exact_sum"
 )
 
 type manifestAggregateSpec struct {
-	key    string
-	table  string
-	column string
-	kind   aggregateKind
+	key          string
+	table        string
+	column       string
+	kind         aggregateKind
+	float32Input bool
 }
 
 var datasetAggregateSpecs = []manifestAggregateSpec{
-	{aggOrdersOlCntSum, "orders", "o_ol_cnt", aggregateSum},
-	{aggOrdersCarrierZeroRows, "orders", "o_carrier_id", aggregateZeros},
-	{aggOrderLineDeliveryNulls, "order_line", "ol_delivery_d", aggregateNulls},
+	{key: aggOrdersOlCntSum, table: "orders", column: "o_ol_cnt", kind: aggregateSum},
+	{key: aggOrdersCarrierZeroRows, table: "orders", column: "o_carrier_id", kind: aggregateZeros},
+	{key: aggOrderLineDeliveryNulls, table: "order_line", column: "ol_delivery_d", kind: aggregateNulls},
+	{key: aggHistoryAmountSum, table: "history", column: "h_amount", kind: aggregateSum, float32Input: true},
+	{key: aggOrderLineAmountSum, table: "order_line", column: "ol_amount", kind: aggregateSum, float32Input: true},
 }
 
 // partitionScale says how many partitions a table has, which bounds how many
@@ -133,9 +137,55 @@ func datasetSampleSpecFor(table string) (datasetSampleSpec, bool) {
 
 // csvScan holds everything a single streaming pass over one CSV file produces.
 type csvScan struct {
-	record     fileRecord
-	aggregates map[string]float64
-	samples    []map[string]string
+	record          fileRecord
+	aggregates      map[string]float64
+	samples         []map[string]string
+	orderLineChecks []orderLineCheck
+}
+
+// exactFloat32Bins sums non-negative binary32 inputs exactly. A normal value is
+// mantissa*2^(exp_field-1)*2^-149; a subnormal uses exp_field 0. At ranking
+// scale each bin stays far below uint64 overflow, and only the final 255-bin
+// reduction uses big.Int.
+type exactFloat32Bins [255]uint64
+
+func (bins *exactFloat32Bins) add(value float32) error {
+	bits := math.Float32bits(value)
+	if bits&0x80000000 != 0 && bits<<1 != 0 {
+		return fmt.Errorf("exact FLOAT32 sum requires non-negative inputs")
+	}
+	exponent := int((bits >> 23) & 0xff)
+	fraction := uint64(bits & 0x7fffff)
+	if exponent == 0xff {
+		return fmt.Errorf("exact FLOAT32 sum requires finite inputs")
+	}
+	mantissa := fraction
+	if exponent != 0 {
+		mantissa |= 1 << 23
+	}
+	if ^uint64(0)-bins[exponent] < mantissa {
+		return fmt.Errorf("exact FLOAT32 exponent bin overflow")
+	}
+	bins[exponent] += mantissa
+	return nil
+}
+
+func (bins *exactFloat32Bins) float64() float64 {
+	sum := new(big.Int)
+	for exponent, mantissa := range bins {
+		if mantissa == 0 {
+			continue
+		}
+		term := new(big.Int).SetUint64(mantissa)
+		if exponent > 0 {
+			term.Lsh(term, uint(exponent-1))
+		}
+		sum.Add(sum, term)
+	}
+	numerator := new(big.Float).SetPrec(256).SetInt(sum)
+	denominator := new(big.Float).SetPrec(256).SetInt(new(big.Int).Lsh(big.NewInt(1), 149))
+	value, _ := new(big.Float).SetPrec(256).Quo(numerator, denominator).Float64()
+	return value
 }
 
 // sampleStreamSeed derives a per-table reservoir stream from the dataset seed so
@@ -184,8 +234,13 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 		reservoir        []map[string]string
 		rng              *rand.Rand
 		seen             int64
+		exactSums        map[string]*exactFloat32Bins
+		orderColumns     [5]int
+		orderCheck       *orderLineCheck
+		orderCheckDone   bool
 	)
 	onHeader := func(header []string) error {
+		exactSums = make(map[string]*exactFloat32Bins)
 		aggregateColumns = make([]int, len(aggregates))
 		for i, agg := range aggregates {
 			index, err := columnIndex(header, agg.column)
@@ -193,6 +248,9 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 				return err
 			}
 			aggregateColumns[i] = index
+			if agg.float32Input {
+				exactSums[agg.key] = &exactFloat32Bins{}
+			}
 		}
 		if wantSamples {
 			sampleColumns = append(append([]string{}, spec.keys...), spec.values...)
@@ -207,6 +265,15 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 			reservoir = make([]map[string]string, 0, datasetSampleCount)
 			rng = rand.New(rand.NewSource(sampleStreamSeed(seed, table)))
 		}
+		if table == "order_line" {
+			for i, name := range []string{"ol_w_id", "ol_d_id", "ol_o_id", "ol_delivery_d", "ol_amount"} {
+				index, err := columnIndex(header, name)
+				if err != nil {
+					return err
+				}
+				orderColumns[i] = index
+			}
+		}
 		return nil
 	}
 	onRow := func(row []string) error {
@@ -214,9 +281,23 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 			raw := row[aggregateColumns[i]]
 			switch agg.kind {
 			case aggregateSum:
-				value, err := strconv.ParseFloat(raw, 64)
+				bitSize := 64
+				if agg.float32Input {
+					bitSize = 32
+				}
+				value, err := strconv.ParseFloat(raw, bitSize)
 				if err != nil {
 					return fmt.Errorf("column %s holds a non-numeric value %q: %w", agg.column, raw, err)
+				}
+				if math.IsNaN(value) || math.IsInf(value, 0) {
+					return fmt.Errorf("column %s holds a non-finite value %q", agg.column, raw)
+				}
+				if agg.float32Input {
+					value = float64(float32(value))
+					if err := exactSums[agg.key].add(float32(value)); err != nil {
+						return fmt.Errorf("column %s value %q: %w", agg.column, raw, err)
+					}
+					continue
 				}
 				scan.aggregates[agg.key] += value
 			case aggregateZeros:
@@ -241,6 +322,25 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 			} else if slot := rng.Int63n(seen + 1); slot < int64(datasetSampleCount) {
 				reservoir[slot] = sampleRow(row, sampleColumns, sampleIndexes)
 			}
+			if table == "order_line" && !orderCheckDone {
+				wID, _ := strconv.Atoi(row[orderColumns[0]])
+				dID, _ := strconv.Atoi(row[orderColumns[1]])
+				oID, _ := strconv.Atoi(row[orderColumns[2]])
+				if orderCheck == nil && row[orderColumns[3]] == "" {
+					orderCheck = &orderLineCheck{WarehouseID: wID, DistrictID: dID, OrderID: oID}
+				}
+				if orderCheck != nil {
+					if orderCheck.WarehouseID != wID || orderCheck.DistrictID != dID || orderCheck.OrderID != oID {
+						orderCheckDone = true
+					} else {
+						value, err := strconv.ParseFloat(row[orderColumns[4]], 32)
+						if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+							return fmt.Errorf("invalid fixed order_line FLOAT32 amount %q", row[orderColumns[4]])
+						}
+						orderCheck.AmountBits = append(orderCheck.AmountBits, math.Float32bits(float32(value)))
+					}
+				}
+			}
 		}
 		seen++
 		return nil
@@ -251,6 +351,10 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 	}
 	scan.record = record
 	for _, agg := range aggregates {
+		if agg.float32Input {
+			scan.aggregates[agg.key] = exactSums[agg.key].float64()
+			continue
+		}
 		if _, ok := scan.aggregates[agg.key]; !ok {
 			scan.aggregates[agg.key] = 0
 		}
@@ -258,6 +362,9 @@ func scanCSVFile(path, table string, seed int64) (csvScan, error) {
 	if wantSamples {
 		sortSamples(reservoir, spec.keys)
 		scan.samples = reservoir
+	}
+	if orderCheck != nil {
+		scan.orderLineChecks = []orderLineCheck{*orderCheck}
 	}
 	return scan, nil
 }

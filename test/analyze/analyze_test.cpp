@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <memory>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,6 +48,14 @@ TEST(AnalyzeConvertTest, convert_float_lit) {
     Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_FLOAT);
     EXPECT_FLOAT_EQ(val.float_val, 3.14f);
+}
+
+TEST(AnalyzeConvertTest, rejects_non_finite_float_values) {
+    Analyze analyze(nullptr);
+    auto infinity = std::make_unique<ast::FloatLit>(std::numeric_limits<float>::infinity());
+    auto nan = std::make_unique<ast::FloatLit>(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_THROW((void)analyze.convert_sv_value(infinity.get()), RMDBError);
+    EXPECT_THROW((void)analyze.convert_sv_value(nan.get()), RMDBError);
 }
 
 TEST(AnalyzeConvertTest, convert_string_lit) {
@@ -175,6 +184,17 @@ TabMeta make_grade_tab() {
     return tab;
 }
 
+TabMeta make_update_tab() {
+    TabMeta tab;
+    tab.name = "t";
+    tab.cols = {
+        {.tab_name = "t", .name = "id", .type = TYPE_INT, .len = 4, .offset = 0, .index = false},
+        {.tab_name = "t", .name = "f", .type = TYPE_FLOAT, .len = 4, .offset = 4, .index = false},
+        {.tab_name = "t", .name = "s", .type = TYPE_STRING, .len = 8, .offset = 8, .index = false},
+    };
+    return tab;
+}
+
 std::unique_ptr<ast::AggExpr> make_ast_agg(ast::AggFuncType func, const std::string& col_name) {
     return std::make_unique<ast::AggExpr>(func, false, std::make_unique<ast::Col>("", col_name));
 }
@@ -232,6 +252,60 @@ protected:
         sm_manager_.db_.SetTabMeta("grade", make_grade_tab());
     }
 };
+
+class AnalyzeUpdateTest : public ::testing::Test {
+protected:
+    SmManager sm_manager_{nullptr, nullptr, nullptr, nullptr};
+    Analyze analyze_{&sm_manager_};
+
+    void SetUp() override {
+        sm_manager_.db_.SetTabMeta("t", make_update_tab());
+    }
+
+    std::unique_ptr<ast::TreeNode> bind(const std::string& sql, std::vector<std::unique_ptr<ast::Value>> values) {
+        auto template_tree = ast::parse_sql(sql);
+        return ast::clone_bound_tree(*template_tree, values);
+    }
+};
+
+TEST_F(AnalyzeUpdateTest, accepts_numeric_prepared_self_update_and_resolves_columns) {
+    std::vector<std::unique_ptr<ast::Value>> values;
+    values.push_back(std::make_unique<ast::FloatLit>(0.0F));
+    values.push_back(std::make_unique<ast::IntLit>(0));
+
+    auto query = analyze_.do_analyze(bind("UPDATE t SET f = f + $1 WHERE id = $2;", std::move(values)));
+
+    ASSERT_EQ(query->set_clauses.size(), 1U);
+    EXPECT_EQ(query->set_clauses[0].lhs.tab_name, "t");
+    EXPECT_EQ(query->set_clauses[0].lhs.col_name, "f");
+    EXPECT_EQ(query->set_clauses[0].rhs_col.tab_name, "t");
+    EXPECT_EQ(query->set_clauses[0].rhs_col.col_name, "f");
+    EXPECT_EQ(query->set_clauses[0].rhs.type, TYPE_FLOAT);
+    EXPECT_EQ(query->conds.size(), 1U);
+}
+
+TEST_F(AnalyzeUpdateTest, rejects_char_parameter_for_prepared_numeric_delta) {
+    std::vector<std::unique_ptr<ast::Value>> values;
+    values.push_back(std::make_unique<ast::StringLit>(""));
+    values.push_back(std::make_unique<ast::IntLit>(0));
+
+    EXPECT_THROW((void)analyze_.do_analyze(bind("UPDATE t SET f = f + $1 WHERE id = $2;", std::move(values))),
+                 IncompatibleTypeError);
+}
+
+TEST_F(AnalyzeUpdateTest, rejects_missing_lhs_and_non_numeric_self_update_columns) {
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET missing = 1 WHERE id = 1;")),
+                 ColumnNotFoundError);
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET s = s + 1 WHERE id = 1;")),
+                 IncompatibleTypeError);
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET f = s + 1 WHERE id = 1;")),
+                 IncompatibleTypeError);
+}
+
+TEST_F(AnalyzeUpdateTest, rejects_incompatible_plain_assignment_during_analysis) {
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("UPDATE t SET f = 'bad' WHERE id = 1;")),
+                 IncompatibleTypeError);
+}
 
 TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
     auto stmt = make_select_stmt(

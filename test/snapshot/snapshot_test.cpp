@@ -28,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 #include <future>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -586,6 +587,10 @@ public:
         } catch (TransactionAbortException&) {
             return false;
         }
+    }
+
+    Transaction* current_transaction() {
+        return txn_id_ == INVALID_TXN_ID ? nullptr : db_->txn()->get_transaction(txn_id_);
     }
 
     /// Strip trailing newlines for comparison
@@ -2363,6 +2368,49 @@ TEST_F(SnapshotTest, SI_NonRepeatableRead_LostUpdate) {
                                  "+------------------+------------------+\n"
                                  "Total record(s): 1";
     EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
+
+TEST_F(SnapshotTest, SI_AllocatedCommitTimestampOutsidePublishedSnapshotStaysInvisible) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table snapshot_frontier (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index snapshot_frontier (id);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into snapshot_frontier values (1, 100);"));
+
+    auto writer = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    auto reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    auto verifier = create_session();
+
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update snapshot_frontier set val = 200 where id = 1;"));
+    Transaction* writer_txn = writer->current_transaction();
+    ASSERT_NE(writer_txn, nullptr);
+
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+    Transaction* reader_txn = reader->current_transaction();
+    ASSERT_NE(reader_txn, nullptr);
+    const timestamp_t snapshot_ts = reader_txn->get_read_ts();
+
+    // Deterministically model the production window in which the writer has
+    // reserved a commit timestamp but has not advanced the published frontier:
+    // the reader's allocation timestamp is newer, while its snapshot timestamp
+    // still points at the old published frontier.
+    reader_txn->set_start_ts(std::numeric_limits<timestamp_t>::max() - 1);
+    const std::string before = reader->exec_sql("select val from snapshot_frontier where id = 1;");
+
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+    ASSERT_GT(writer_txn->get_commit_ts(), snapshot_ts);
+    ASSERT_LT(writer_txn->get_commit_ts(), reader_txn->get_start_ts());
+
+    const std::string after = reader->exec_sql("select val from snapshot_frontier where id = 1;");
+    EXPECT_EQ(TestSession::trim_output(before), TestSession::trim_output(after))
+        << "a commit outside the published snapshot must not appear between two SI reads";
+    EXPECT_EQ(TestSession::trim_output(
+                  reader->exec_sql_expect_abort("update snapshot_frontier set val = val + 1 where id = 1;")),
+              "abort")
+        << "a writer committed after read_ts must cause an SI stale-write abort";
+
+    const std::string final_state = verifier->exec_sql("select val from snapshot_frontier where id = 1;");
+    EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
 }
 
 // =============================================================================

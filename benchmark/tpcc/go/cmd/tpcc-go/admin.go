@@ -32,8 +32,16 @@ type datasetManifest struct {
 	// Aggregates and Samples are the exact facts of this CSV set. See dataset.go
 	// for why every expected value has to be recorded here rather than recomputed
 	// from a generator formula.
-	Aggregates map[string]float64             `json:"aggregates"`
-	Samples    map[string][]map[string]string `json:"samples"`
+	Aggregates      map[string]float64             `json:"aggregates"`
+	Samples         map[string][]map[string]string `json:"samples"`
+	OrderLineChecks []orderLineCheck               `json:"order_line_checks"`
+}
+
+type orderLineCheck struct {
+	WarehouseID int      `json:"warehouse_id"`
+	DistrictID  int      `json:"district_id"`
+	OrderID     int      `json:"order_id"`
+	AmountBits  []uint32 `json:"amount_bits"`
 }
 
 type fileRecord struct {
@@ -91,7 +99,7 @@ func inspectCSVFile(path string) (fileRecord, error) {
 	return streamCSVFile(path, nil, nil)
 }
 
-func expectedCSVRows(warehouses int, table string) int64 {
+func expectedCSVRows(warehouses int, table string, seed int64) int64 {
 	w := int64(warehouses)
 	districts := w * districtsPerWarehouse
 	customers := districts * customersPerDistrict
@@ -113,7 +121,7 @@ func expectedCSVRows(warehouses int, table string) int64 {
 		for wID := 1; wID <= warehouses; wID++ {
 			for dID := 1; dID <= districtsPerWarehouse; dID++ {
 				for oID := 1; oID <= initialOrdersPerDist; oID++ {
-					rows += int64(initialOrderLineCount(wID, dID, oID))
+					rows += int64(initialOrderLineCount(seed, wID, dID, oID))
 				}
 			}
 		}
@@ -137,14 +145,15 @@ func writeDatasetManifest(dataDir string, warehouses int, seed int64) error {
 	files := make(map[string]fileRecord, len(tpccTables))
 	aggregates := make(map[string]float64, len(datasetAggregateSpecs))
 	samples := make(map[string][]map[string]string, len(datasetSampleSpecs))
+	var orderLineChecks []orderLineCheck
 	for _, table := range tpccTables {
 		path := filepath.Join(dataDir, table+".csv")
 		scan, err := scanCSVFile(path, table, seed)
 		if err != nil {
 			return fmt.Errorf("inspect generated dataset file %s: %w", path, err)
 		}
-		if scan.record.Rows != expectedCSVRows(warehouses, table) {
-			return fmt.Errorf("generated dataset file %s has %d rows, want %d", path, scan.record.Rows, expectedCSVRows(warehouses, table))
+		if scan.record.Rows != expectedCSVRows(warehouses, table, seed) {
+			return fmt.Errorf("generated dataset file %s has %d rows, want %d", path, scan.record.Rows, expectedCSVRows(warehouses, table, seed))
 		}
 		files[table] = scan.record
 		for key, value := range scan.aggregates {
@@ -153,8 +162,12 @@ func writeDatasetManifest(dataDir string, warehouses int, seed int64) error {
 		if len(scan.samples) > 0 {
 			samples[table] = scan.samples
 		}
+		if table == "order_line" {
+			orderLineChecks = scan.orderLineChecks
+		}
 	}
-	manifest := datasetManifest{Warehouses: warehouses, Seed: seed, Files: files, Aggregates: aggregates, Samples: samples}
+	manifest := datasetManifest{Warehouses: warehouses, Seed: seed, Files: files, Aggregates: aggregates,
+		Samples: samples, OrderLineChecks: orderLineChecks}
 	if err := validateManifestFacts(manifest); err != nil {
 		return err
 	}
@@ -190,6 +203,15 @@ func validateManifestFacts(manifest datasetManifest) error {
 		}
 		if err := validateSampleCoverage(spec.table, spec, samples, manifest.Warehouses); err != nil {
 			return err
+		}
+	}
+	if len(manifest.OrderLineChecks) == 0 {
+		return fmt.Errorf("dataset manifest is missing fixed undelivered order_line checks")
+	}
+	for _, check := range manifest.OrderLineChecks {
+		if check.WarehouseID < 1 || check.DistrictID < 1 || check.OrderID < 1 ||
+			len(check.AmountBits) < minOrderLineCount || len(check.AmountBits) > maxOrderLineCount {
+			return fmt.Errorf("dataset manifest has an invalid fixed order_line check")
 		}
 	}
 	// The recorded aggregates must already satisfy the invariants the loaded
@@ -267,8 +289,8 @@ func validateDataset(dataDir string, warehouses int, seed int64) error {
 		if info.Size != record.Size || info.Rows != record.Rows || info.Header != record.Header {
 			return fmt.Errorf("dataset file %s changed since manifest", table)
 		}
-		if info.Rows != expectedCSVRows(warehouses, table) {
-			return fmt.Errorf("dataset file %s has %d rows, want %d", table, info.Rows, expectedCSVRows(warehouses, table))
+		if info.Rows != expectedCSVRows(warehouses, table, seed) {
+			return fmt.Errorf("dataset file %s has %d rows, want %d", table, info.Rows, expectedCSVRows(warehouses, table, seed))
 		}
 	}
 	return nil
@@ -297,7 +319,14 @@ func decimal(value float64, digits int) string {
 	return fmt.Sprintf("%.*f", digits, value)
 }
 
-func initialOrderLineCount(wID, dID, oID int) int { return 5 + (oID+dID+wID)%11 }
+func initialOrderLineCount(seed int64, wID, dID, oID int) int {
+	value := uint64(seed) ^ uint64(wID)*0x9e3779b97f4a7c15 ^ uint64(dID)*0xbf58476d1ce4e5b9 ^
+		uint64(oID)*0x94d049bb133111eb
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
+	value ^= value >> 31
+	return 5 + int(value%11)
+}
 
 func writeCSV(path string, header []string, write func(*csv.Writer) error) error {
 	file, err := os.Create(path)
@@ -434,7 +463,7 @@ func generateData(warehouses int, dataDir string, seed int64, overwrite bool) er
 					if oID < 2100 {
 						carrier = rng.Intn(10) + 1
 					}
-					if err := w.Write([]string{fmt.Sprint(oID + 1), fmt.Sprint(dID), fmt.Sprint(wID), fmt.Sprint(cID), fixedTimestamp, fmt.Sprint(carrier), fmt.Sprint(initialOrderLineCount(wID, dID, oID+1)), "1"}); err != nil {
+					if err := w.Write([]string{fmt.Sprint(oID + 1), fmt.Sprint(dID), fmt.Sprint(wID), fmt.Sprint(cID), fixedTimestamp, fmt.Sprint(carrier), fmt.Sprint(initialOrderLineCount(seed, wID, dID, oID+1)), "1"}); err != nil {
 						return err
 					}
 				}
@@ -463,11 +492,12 @@ func generateData(warehouses int, dataDir string, seed int64, overwrite bool) er
 		for wID := 1; wID <= warehouses; wID++ {
 			for dID := 1; dID <= districtsPerWarehouse; dID++ {
 				for oID := 1; oID <= initialOrdersPerDist; oID++ {
-					for number := 1; number <= initialOrderLineCount(wID, dID, oID); number++ {
+					for number := 1; number <= initialOrderLineCount(seed, wID, dID, oID); number++ {
 						deliveryDate, amount := fixedTimestamp, "0.0"
 						if oID > 2100 {
 							deliveryDate = ""
-							amount = decimal(0.01+rng.Float64()*999.98, 2)
+							amountCents := rng.Intn(999999) + 1
+							amount = float32SQL(float32(float64(amountCents) / 100))
 						}
 						if err := w.Write([]string{fmt.Sprint(oID), fmt.Sprint(dID), fmt.Sprint(wID), fmt.Sprint(number), fmt.Sprint((oID*17+number)%itemCount + 1), fmt.Sprint(wID), deliveryDate, "5", amount, randomString(rng, 24)}); err != nil {
 							return err
@@ -525,13 +555,17 @@ func loadPath(dataDir, dbDir, table string) (string, error) {
 // no delivery time. generateData leaves the delivery time unset for the last
 // initialNewOrdersPerDistrict orders of every district, which are exactly the
 // orders still queued in new_orders.
-func expectedUndeliveredOrderLines(warehouses int) int64 {
+func expectedUndeliveredOrderLines(warehouses int, seed ...int64) int64 {
+	datasetSeed := int64(1)
+	if len(seed) > 0 {
+		datasetSeed = seed[0]
+	}
 	firstUndelivered := initialOrdersPerDist - initialNewOrdersPerDistrict + 1
 	rows := int64(0)
 	for wID := 1; wID <= warehouses; wID++ {
 		for dID := 1; dID <= districtsPerWarehouse; dID++ {
 			for oID := firstUndelivered; oID <= initialOrdersPerDist; oID++ {
-				rows += int64(initialOrderLineCount(wID, dID, oID))
+				rows += int64(initialOrderLineCount(datasetSeed, wID, dID, oID))
 			}
 		}
 	}

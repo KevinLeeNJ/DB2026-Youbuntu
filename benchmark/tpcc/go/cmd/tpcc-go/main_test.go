@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -163,13 +163,28 @@ func TestTPCCTxnMixMatchesOfficialWeights(t *testing.T) {
 	}
 }
 
-func TestOfficialTerminalHomePairsWorkers(t *testing.T) {
+func TestOfficialWheelCoversAllSlotsInFiveWaves(t *testing.T) {
 	p := profile{warehouses: 50, districtsPerWarehouse: 10, customersPerDistrict: 3000, itemCount: 100000}
-	first := chooseContext(p, 0, "official-terminal-home", rand.New(rand.NewSource(1)))
-	second := chooseContext(p, 1, "official-terminal-home", rand.New(rand.NewSource(1)))
-	twentyFifth := chooseContext(p, 48, "official-terminal-home", rand.New(rand.NewSource(1)))
-	if first.wID != 1 || second.wID != 1 || twentyFifth.wID != 25 {
-		t.Fatalf("terminal homes = %d, %d, %d; want 1, 1, 25", first.wID, second.wID, twentyFifth.wID)
+	plan, err := newOfficialRoutingPlan(1, p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[int]int{}
+	for txnNo := uint64(0); txnNo < 5; txnNo++ {
+		for clientID := 0; clientID < officialWorkers; clientID++ {
+			counts[officialSlotIndex(clientID, txnNo)]++
+		}
+	}
+	if len(counts) != officialSlotCount {
+		t.Fatalf("five waves covered %d slots, want %d", len(counts), officialSlotCount)
+	}
+	for slot, count := range counts {
+		if count != 1 {
+			t.Fatalf("slot %d appeared %d times", slot, count)
+		}
+	}
+	if len(plan.hotWarehouses) != officialHotWarehouseCount {
+		t.Fatalf("hot warehouse count = %d", len(plan.hotWarehouses))
 	}
 }
 
@@ -207,9 +222,35 @@ func TestOfficialModeValidation(t *testing.T) {
 	}
 }
 
-func TestOfficialTerminalHomeCountMatchesOfficialShape(t *testing.T) {
-	if got := officialTerminalHomeCount(officialWorkers); got != officialTerminalHomes {
-		t.Fatalf("terminal homes for %d clients = %d, want %d", officialWorkers, got, officialTerminalHomes)
+func TestOfficialWheelHasFinalV2Distribution(t *testing.T) {
+	p := profile{warehouses: 50, districtsPerWarehouse: 10, customersPerDistrict: 3000, itemCount: 100000}
+	plan, err := newOfficialRoutingPlan(11, p, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for phase, wheel := range plan.slots {
+		counts := map[int]int{}
+		for _, wID := range wheel {
+			counts[wID]++
+		}
+		if len(counts) != officialWarehouses {
+			t.Fatalf("phase %d covers %d warehouses", phase, len(counts))
+		}
+		extraCold := 0
+		for wID, count := range counts {
+			if _, hot := plan.hotWarehouse[wID]; hot {
+				if count != officialHotWarehouseSlots {
+					t.Fatalf("phase %d hot warehouse %d has %d slots", phase, wID, count)
+				}
+			} else if count == 2 {
+				extraCold++
+			} else if count != 1 {
+				t.Fatalf("phase %d cold warehouse %d has %d slots", phase, wID, count)
+			}
+		}
+		if extraCold != officialExtraColdSlots {
+			t.Fatalf("phase %d has %d extra cold warehouses", phase, extraCold)
+		}
 	}
 }
 
@@ -636,9 +677,13 @@ func TestOfficialWorkerRetainsBackendAcrossAllPhases(t *testing.T) {
 	stats := []*liveStats{{}, {}, {}}
 	output := make(chan officialWorkerReport, 1)
 	warmupEnd := time.Now().Add(20 * time.Millisecond)
+	p := profile{warehouses: 50, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 25}
+	plan, err := newOfficialRoutingPlan(1, p, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go runOfficialWorker(0, 1, 1,
-		profile{warehouses: 25, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
-		warmupEnd, 20*time.Millisecond, 2, 0, stats, make(chan struct{}), output, backend)
+		p, plan, warmupEnd, 20*time.Millisecond, 2, 0, stats, make(chan struct{}), output, backend)
 	report := <-output
 	if report.err != nil {
 		t.Fatal(report.err)
@@ -875,14 +920,17 @@ func TestExpectedUndeliveredOrderLinesMatchesGeneratedCSV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	column := -1
+	deliveryColumn, amountColumn := -1, -1
 	for index, name := range header {
 		if name == "ol_delivery_d" {
-			column = index
+			deliveryColumn = index
+		}
+		if name == "ol_amount" {
+			amountColumn = index
 		}
 	}
-	if column < 0 {
-		t.Fatal("order_line.csv has no ol_delivery_d column")
+	if deliveryColumn < 0 || amountColumn < 0 {
+		t.Fatal("order_line.csv is missing delivery or amount column")
 	}
 	empty := int64(0)
 	for {
@@ -893,11 +941,19 @@ func TestExpectedUndeliveredOrderLinesMatchesGeneratedCSV(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if row[column] == "" {
+		if row[deliveryColumn] == "" {
 			empty++
+			value, err := strconv.ParseFloat(row[amountColumn], 32)
+			if err != nil || value < float64(float32(0.01)) || value > float64(float32(9999.99)) {
+				t.Fatalf("invalid initial undelivered FLOAT32 amount %q", row[amountColumn])
+			}
+			if got := float32SQL(float32(value)); got != row[amountColumn] {
+				t.Fatalf("amount %q does not round-trip through one binary32 conversion (canonical %q)",
+					row[amountColumn], got)
+			}
 		}
 	}
-	if want := expectedUndeliveredOrderLines(1); empty != want {
+	if want := expectedUndeliveredOrderLines(1, 7); empty != want {
 		t.Fatalf("generated %d order_line rows without a delivery time, expected %d", empty, want)
 	}
 }

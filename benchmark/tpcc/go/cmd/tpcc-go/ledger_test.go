@@ -123,6 +123,39 @@ func TestNewOrderLedgerMatchesTheEmittedSQL(t *testing.T) {
 	}
 }
 
+func TestNewOrderLocksSortedUniqueStockKeysBeforeReading(t *testing.T) {
+	batcher := newSQLRecordingBatcher(t)
+	ctx := ledgerContext(newTxnLedger())
+	ctx.hotItemIDs = []int{1, 2, 3, 4}
+	if err := rankingNewOrder(batcher, ctx, rand.New(rand.NewSource(9))); err != nil && !errors.Is(err, errInvalidItem) {
+		t.Fatal(err)
+	}
+	lockPattern := regexp.MustCompile(`update stock set s_ytd = s_ytd where s_w_id = (\d+) and s_i_id = (\d+);`)
+	type key struct{ wID, iID int }
+	locks := make([]key, 0)
+	firstRead, lastLock := len(batcher.sqls), -1
+	for index, sql := range batcher.sqls {
+		if strings.HasPrefix(sql, "select s_quantity") && firstRead == len(batcher.sqls) {
+			firstRead = index
+		}
+		if match := lockPattern.FindStringSubmatch(sql); match != nil {
+			wID, _ := strconv.Atoi(match[1])
+			iID, _ := strconv.Atoi(match[2])
+			locks = append(locks, key{wID, iID})
+			lastLock = index
+		}
+	}
+	if len(locks) == 0 || lastLock >= firstRead {
+		t.Fatalf("stock locks=%v lastLock=%d firstRead=%d", locks, lastLock, firstRead)
+	}
+	for i := 1; i < len(locks); i++ {
+		if locks[i-1].wID > locks[i].wID ||
+			locks[i-1].wID == locks[i].wID && locks[i-1].iID >= locks[i].iID {
+			t.Fatalf("stock locks are not strictly sorted and unique: %v", locks)
+		}
+	}
+}
+
 func TestPaymentLedgerMatchesTheEmittedSQL(t *testing.T) {
 	for seed := int64(1); seed <= 25; seed++ {
 		batcher := newSQLRecordingBatcher(t)
@@ -144,11 +177,11 @@ func TestPaymentLedgerMatchesTheEmittedSQL(t *testing.T) {
 			`c_ytd_payment = c_ytd_payment \+ ([0-9.]+)`,
 			`insert into history values \([^)]*, ([0-9]+\.[0-9]+), 'payment'\)`,
 		} {
-			if got := batcher.sum(pattern); !closeEnough(got, amount) {
+			if got := batcher.sum(pattern); !closeEnough(float64(float32(got)), amount) {
 				t.Fatalf("seed %d: %s applied %v, ledger recorded %v", seed, pattern, got, amount)
 			}
 		}
-		if got := batcher.sum(`c_balance = c_balance - ([0-9.]+)`); !closeEnough(got, amount) {
+		if got := batcher.sum(`c_balance = c_balance - ([0-9.]+)`); !closeEnough(float64(float32(got)), amount) {
 			t.Fatalf("seed %d: c_balance was reduced by %v, ledger recorded %v", seed, got, amount)
 		}
 	}
@@ -249,6 +282,7 @@ type deliveryFakeBatcher struct {
 	oID     int
 	cID     int
 	amount  float64
+	balance float32
 	// claimLost models a row a concurrent Delivery already removed. The engine
 	// answers `SELECT MIN(no_o_id) ... WHERE no_o_id = X` with exactly one row
 	// holding NULL in that case — never with zero rows — so the fixture has to
@@ -259,7 +293,9 @@ type deliveryFakeBatcher struct {
 
 func newDeliveryFakeBatcher(t *testing.T) *deliveryFakeBatcher {
 	t.Helper()
-	return &deliveryFakeBatcher{fakeRankingBatcher: newFakeRankingBatcher(t), oID: 2718, cID: 1234, amount: 3456.78}
+	return &deliveryFakeBatcher{
+		fakeRankingBatcher: newFakeRankingBatcher(t), oID: 2718, cID: 1234, amount: 3456.78, balance: 1,
+	}
 }
 
 func (d *deliveryFakeBatcher) batchOperation(sql string) (batchOperation, error) {
@@ -273,6 +309,9 @@ func (d *deliveryFakeBatcher) execBatch(operations []batchOperation) (batchResul
 	d.all = append(d.all, sqls...)
 	result := batchResult{executedOperations: uint16(len(operations)), failedOperation: 0xffff}
 	for index, operation := range operations {
+		if strings.HasPrefix(sqls[index], "update customer set c_balance = c_balance +") {
+			d.balance += fakeFloatArgument(operation.args[0])
+		}
 		if !operation.statement.query {
 			continue
 		}
@@ -293,6 +332,8 @@ func (d *deliveryFakeBatcher) execBatch(operations []batchOperation) (batchResul
 			rows = append(rows, []string{strconv.Itoa(d.cID)})
 		case strings.Contains(sql, "select sum(ol_amount)"):
 			rows = append(rows, []string{strconv.FormatFloat(d.amount, 'f', 2, 64)})
+		case strings.HasPrefix(sql, "select c_balance from customer"):
+			rows = append(rows, []string{float32SQL(d.balance)})
 		default:
 			row := make([]string, 0, len(operation.statement.columns))
 			for _, column := range operation.statement.columns {
@@ -333,14 +374,15 @@ func TestDeliveryReadsTheRightOperationIndices(t *testing.T) {
 	if got := batcher.emitted("delete from new_orders"); got != districts {
 		t.Fatalf("Delivery removed %d new_orders rows, want one per district (%d)", got, districts)
 	}
-	want := fmt.Sprintf("update customer set c_balance = c_balance + %.2f, c_delivery_cnt = c_delivery_cnt + 1 where c_id = %d",
-		batcher.amount, batcher.cID)
+	want := fmt.Sprintf("update customer set c_balance = c_balance + %s, c_delivery_cnt = c_delivery_cnt + 1 where c_id = %d",
+		float32SQL(float32(batcher.amount)), batcher.cID)
 	if got := batcher.emitted(want); got != districts {
 		t.Fatalf("Delivery credited the customer %d times with %q, want %d\nemitted: %v",
 			got, want, districts, batcher.all)
 	}
-	if got := ledger.values[ledgerDeliveryAmount]; !closeEnough(got, batcher.amount*float64(districts)) {
-		t.Fatalf("ledger recorded %v credited, want %v", got, batcher.amount*float64(districts))
+	expectedAmount := float64(float32(batcher.amount)) * float64(districts)
+	if got := ledger.values[ledgerDeliveryAmount]; !closeEnough(got, expectedAmount) {
+		t.Fatalf("ledger recorded %v credited, want %v", got, expectedAmount)
 	}
 	if got := ledger.values[ledgerDeliveryOrders]; got != float64(districts) {
 		t.Fatalf("ledger recorded %v delivered orders, want %v", got, districts)

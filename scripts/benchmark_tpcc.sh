@@ -17,10 +17,10 @@ BINARY="$ROOT_DIR/build/bin/rmdb"
 DB_DIR="tpcc_benchmark_db"
 PORT=8765
 WAREHOUSES=50
-WORKERS=50
-WARMUP=30
-MEASURE=150
-ROUNDS=3
+WORKERS=32
+WARMUP=10
+MEASURE=60
+ROUNDS=2
 PROGRESS_INTERVAL=5
 DATA_DIR="$ROOT_DIR/benchmark/tpcc/data"
 JSON_OUT="$ROOT_DIR/benchmark/tpcc/result.json"
@@ -29,7 +29,7 @@ RESTART_TIMEOUT=90
 REGENERATE_DATA=0
 THINK_MS=0
 RECONNECT_EACH_TXN=0
-ISOLATION="read-committed"
+ISOLATION="snapshot-isolation"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
 # final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
 # COUNT, integrity, index-key relation sampling and cross-partition content
@@ -44,10 +44,10 @@ Usage: $0 [options]
   --db-dir PATH            database directory (default: tpcc_benchmark_db)
   --port N                 server port (default: 8765)
   --warehouses N           TPC-C warehouses (default: 50)
-  --workers N              concurrent workers (default: 50)
-  --warmup N               warmup seconds (default: 30)
-  --measure N              measure seconds (default: 150)
-  --rounds N               benchmark rounds (default: 3)
+  --workers N              concurrent workers (default: 32)
+  --warmup N               warmup seconds (default: 10; official: 30)
+  --measure N              measure seconds (default: 60; official: 150)
+  --rounds N               benchmark rounds (default: 2; official: 3)
   --progress-interval N    progress print interval seconds (default: 5)
   --data-dir PATH          CSV data directory
   --json-out PATH          result.json path
@@ -55,7 +55,7 @@ Usage: $0 [options]
   --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 90)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
-  --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
+  --isolation LEVEL        read-committed or snapshot-isolation (default: snapshot-isolation)
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate
@@ -214,20 +214,24 @@ if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
     GO_RECONNECT_ARGS=(--reconnect-each-txn)
 fi
 
-# The official ranking shape is 50 workers, one 30s warmup and 3 continuous 150s
-# windows (final.md:45-47).  Shorter local runs are useful as smoke tests, but
+# The finalv2 ranking shape is 32 workers, one 30s warmup and 3 continuous 150s
+# windows. Shorter local runs are useful as smoke tests, but
 # their NewOrder/min must never be mistaken for a ranking figure, so make the
 # deviation loud instead of letting tpcc-go reject the run outright.
 GO_TIMING_ARGS=()
-if [[ "$WORKERS" != "50" || "$WARMUP" != "30" || "$MEASURE" != "150" || "$ROUNDS" != "3" || "$THINK_MS" != "0" ]]; then
+if [[ "$WORKERS" != "32" || "$WARMUP" != "30" || "$MEASURE" != "150" || "$ROUNDS" != "3" || "$THINK_MS" != "0" ]]; then
     echo "[benchmark] WARNING: ${WORKERS} workers / ${WARMUP}s warmup / ${ROUNDS}x${MEASURE}s windows / think=${THINK_MS}ms" >&2
-    echo "[benchmark]          deviates from the official 50 / 30s / 3x150s / 0ms shape." >&2
+    echo "[benchmark]          deviates from the official 32 / 30s / 3x150s / 0ms shape." >&2
     echo "[benchmark]          This is a SMOKE RUN; its NewOrder/min does not predict the official ranking." >&2
     GO_TIMING_ARGS=(--allow-nonofficial-timing)
 fi
 
 rm -rf "$DB_DIR"
-echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
+if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
+    echo "[benchmark] smoke/non-ranking: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
+else
+    echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
+fi
 RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port 30
@@ -245,11 +249,16 @@ fi
 "$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
-    --think "${THINK_MS}ms" --json-out "$JSON_OUT" "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
+    --think "${THINK_MS}ms" --data-dir "$DATA_DIR" --json-out "$JSON_OUT" \
+    "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
 "$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --consistency-stage online-official-equivalent --result-json "$JSON_OUT"
-echo "[benchmark] official-equivalent: SIGKILL and recovery check"
+if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
+    echo "[benchmark] smoke/non-ranking: SIGKILL and recovery check"
+else
+    echo "[benchmark] official-equivalent: SIGKILL and recovery check"
+fi
 kill -KILL "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
@@ -258,4 +267,8 @@ SERVER_PID=$!
 wait_port "$RESTART_TIMEOUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --consistency-stage post-recovery-official-equivalent --result-json "$JSON_OUT"
-echo "[benchmark] official-equivalent complete: result=$JSON_OUT"
+if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
+    echo "[benchmark] smoke/non-ranking complete: result=$JSON_OUT (not an official ranking result)"
+else
+    echo "[benchmark] official-equivalent complete: result=$JSON_OUT"
+fi

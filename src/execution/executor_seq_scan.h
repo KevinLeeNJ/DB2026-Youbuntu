@@ -65,7 +65,7 @@ private:
         if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
             return;
         }
-        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_start_ts();
+        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_read_ts();
         if (invisible && txn_mgr->CheckInvisibleWriteEdge(reader_id, meta.writer_txn_id_)) {
             throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER);
         }

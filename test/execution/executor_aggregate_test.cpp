@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -302,6 +303,16 @@ TEST(AggregateExecutorTest, GroupsRowsAndComputesCountStarAndSum) {
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
+}
+
+TEST(AggregateExecutorTest, RejectsNonFiniteFloatSum) {
+    std::vector<ColMeta> cols = {make_col("t", "amount", TYPE_FLOAT, 4, 0)};
+    const float maximum = std::numeric_limits<float>::max();
+    auto child = make_child_executor(cols, {{make_float_value(maximum)}, {make_float_value(maximum)}});
+    std::vector<AggExpr> aggs = {make_aggregate(AggType::SUM, "amount", "total")};
+
+    AggregateExecutor exec(std::move(child), std::vector<TabCol>{}, aggs, std::vector<TestExecutorHavingCondition>{});
+    EXPECT_THROW(exec.beginTuple(), RMDBError);
 }
 
 TEST(AggregateExecutorTest, CountDistinctUsesIndependentPerGroupStatesAndSemanticFloatEquality) {

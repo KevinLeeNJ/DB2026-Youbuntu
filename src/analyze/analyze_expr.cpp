@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze_expr_internal.h"
 
+#include <cmath>
+
 namespace analyze_internal {
 
 Value convert_ast_value_node(const ast::Value* sv_val) {
@@ -22,6 +24,9 @@ Value convert_ast_value_node(const ast::Value* sv_val) {
     }
     case ast::AstType::FloatLit: {
         auto float_lit = static_cast<const ast::FloatLit*>(sv_val);
+        if (!std::isfinite(float_lit->val)) {
+            throw RMDBError("FLOAT value must be finite");
+        }
         val.set_float(float_lit->val);
         break;
     }

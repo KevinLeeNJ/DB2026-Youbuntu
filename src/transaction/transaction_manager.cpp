@@ -228,7 +228,7 @@ bool SsiTxnCanConflictWithWriter(Transaction* reader_txn, Transaction* writer_tx
         return false;
     }
     timestamp_t reader_commit_ts = reader_txn->get_commit_ts();
-    return reader_commit_ts != INVALID_TS && reader_commit_ts > writer_txn->get_start_ts();
+    return reader_commit_ts != INVALID_TS && reader_commit_ts > writer_txn->get_read_ts();
 }
 
 void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
@@ -394,6 +394,9 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     txn->set_state(TransactionState::GROWING);
     txn->set_start_ts(next_timestamp_.fetch_add(1));
     txn->set_read_ts(last_commit_ts_.load());
+    // start_ts orders transaction lifecycle events, but a committer may already
+    // have reserved a smaller commit_ts without publishing it. read_ts is the
+    // published snapshot frontier and therefore drives visibility and SSI.
     // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
     // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
     txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
@@ -1269,7 +1272,7 @@ bool TransactionManager::TransactionsOverlap(Transaction* lhs, Transaction* rhs)
     if (rhs->get_state() != TransactionState::COMMITTED) {
         rhs_end = std::numeric_limits<timestamp_t>::max();
     }
-    return lhs->get_start_ts() < rhs_end && rhs->get_start_ts() < lhs_end;
+    return lhs->get_read_ts() < rhs_end && rhs->get_read_ts() < lhs_end;
 }
 
 bool TransactionManager::CommittedBefore(txn_id_t lhs, txn_id_t rhs) {
@@ -1449,7 +1452,7 @@ bool TransactionManager::RecordPredicateRead(Transaction* txn, const std::string
             if (writer_state == TransactionState::ABORTED) {
                 continue;
             }
-            bool invisible = writer_state != TransactionState::COMMITTED || writer_commit_ts > txn->get_start_ts();
+            bool invisible = writer_state != TransactionState::COMMITTED || writer_commit_ts > txn->get_read_ts();
             if (!invisible) {
                 continue;
             }
@@ -1617,7 +1620,7 @@ bool TransactionManager::CheckInvisibleWrites(txn_id_t reader, Rid rid, const st
 
         bool invisible_to_reader =
             txn->get_state() == TransactionState::GROWING ||
-            (txn->get_state() == TransactionState::COMMITTED && txn->get_commit_ts() > reader_txn->get_start_ts());
+            (txn->get_state() == TransactionState::COMMITTED && txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)
             continue;
 
@@ -1694,7 +1697,7 @@ bool TransactionManager::CheckPredicateInvisibleWrites(txn_id_t reader, const st
 
         bool invisible_to_reader = writer_txn->get_state() == TransactionState::GROWING ||
                                    (writer_txn->get_state() == TransactionState::COMMITTED &&
-                                    writer_txn->get_commit_ts() > reader_txn->get_start_ts());
+                                    writer_txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)
             continue;
 
