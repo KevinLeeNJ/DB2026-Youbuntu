@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -111,6 +112,60 @@ public:
     // path: it makes recovery time proportional to the table, not to the WAL.
     uint64_t get_index_rebuild_count() const {
         return index_rebuild_count_;
+    }
+
+    /**
+     * 重启后 TransactionManager::next_timestamp_ 必须取的值。analyze() 之后可用。
+     *
+     * 为什么必须有这个函数（这是看代码看不出来、却决定正确性的知识）：
+     * TupleMeta.commit_ts_ 持久化在数据页里，而计数器只活在内存里。若计数器每次
+     * 启动都从 0 开始，上一世以高 commit_ts_ 提交的行会被 GetVisibleRecord 判成
+     * “来自未来”，而版本链随进程消失后无从回退 ⇒ 已提交的行不可见，直接违反
+     * final.md:342 第 1 条。
+     *
+     * 取值 = max(db.restart 里的计数器快照, 保留 WAL 中 COMMIT 记录的最大 commit_ts + 1)。
+     * 为什么这两项取 max 就覆盖了**所有**已持久化的 commit_ts_ —— 令 C 为最后一次
+     * 成功完成的 clean checkpoint，N_C 为它写进 db.restart 的计数器快照。对磁盘上
+     * 任意一个 commit_ts_ = T：
+     *   (a) T 是在 C 取快照之前分发的 ⇒ T <= N_C - 1（commit_ts 来自
+     *       next_timestamp_.fetch_add(1)，已分发值严格小于计数器），被第一项覆盖；
+     *   (b) T 是在 C 之后分发的 ⇒ 分发它的事务在 C 之后提交，其 COMMIT 记录写在
+     *       C 的截断点之后，而 C 是最后一次 checkpoint，所以那条记录仍在保留的 WAL
+     *       里；又 T 只可能由 mark_slots_committed() 写进页面，而它排在
+     *       WriteCommitLog() 的 flush_log_to_disk_up_to() 之后，所以“页上出现 T”
+     *       蕴含“带 T 的 COMMIT 记录已 durable” ⇒ 被第二项覆盖。
+     * 注意分类依据是 T 的**分发时刻**而不是页面的写盘时刻，因此“回滚把一个更老的
+     * committed 版本（带更老的 T）重新写回页面、该页在 C 之后才落盘”这类情况也落在
+     * (a) 里。mark_slots_committed() 是 src/ 里唯一给页面写非零 commit_ts_ 的地方
+     * （其余路径一律写 0），这一点是上述论证的前提。
+     *
+     * 缺省值为什么安全：全新库没有 db.restart，第一项为 0；此时 WAL 从未被截断过，
+     * 所以每一个已持久化的 commit_ts_ 都有 COMMIT 记录留在 WAL 里，第二项本身就是
+     * 精确上界。旧版本写的 db.restart 只有裸偏移、没有计数器字段，同样退化为 0——
+     * 只有“旧版本已经完成过 checkpoint 并截断了 WAL”的库会因此欠抬（见报告的残留风险）。
+     */
+    timestamp_t get_recovered_next_timestamp() const {
+        const timestamp_t from_wal = max_wal_commit_ts_ == INVALID_TS ? 0 : max_wal_commit_ts_ + 1;
+        return std::max(persisted_next_timestamp_, from_wal);
+    }
+
+    /**
+     * 重启后 TransactionManager::next_txn_id_ 必须取的值：max(db.restart 快照,
+     * 保留 WAL 中最大 txn_id + 1)。
+     *
+     * writer_txn_id_ 同样持久化在页里，而 GetVisibleRecord 有一条
+     * `!is_committed_ && writer_txn_id_ == self_id` 的“这是我自己的未提交写”分支。
+     * 今天磁盘上不会残留 is_committed_ == false 的 meta（reset_touched_tuple_meta
+     * 会把保留 WAL 触及页上的存活槽全部归一化，而未提交的写必然被 WAL 记录覆盖），
+     * 所以那条分支不会被误判。这里仍然把计数器抬高，是为了让“页上的 writer_txn_id_
+     * 与新事务 ID 不会撞车”成为一条不依赖归一化范围的独立性质：一旦归一化被收窄
+     * （PLAN.md 的 fuzzy checkpoint / 索引修复窗口化都会动它），重用 ID 就会让上面
+     * 那条分支把别人上一世的未提交残留当成自己的写而返回。同时它也避免新事务在
+     * 未被截断的 WAL 上重用旧 ID，让 analyze() 的 committed/loser 集合失真。
+     */
+    txn_id_t get_recovered_next_txn_id() const {
+        const txn_id_t from_wal = max_wal_txn_id_ == INVALID_TXN_ID ? 0 : max_wal_txn_id_ + 1;
+        return std::max(persisted_next_txn_id_, from_wal);
     }
 
 private:
@@ -269,6 +324,12 @@ private:
     uint64_t index_unchanged_key_count_{0};
     uint64_t index_duplicate_entry_count_{0};
     uint64_t index_rebuild_count_{0};
+
+    // 计数器恢复的两个来源，见 get_recovered_next_timestamp()。
+    timestamp_t persisted_next_timestamp_{0};
+    txn_id_t persisted_next_txn_id_{0};
+    timestamp_t max_wal_commit_ts_{INVALID_TS};
+    txn_id_t max_wal_txn_id_{INVALID_TXN_ID};
 
     DiskManager* disk_manager_;              // 用来读写文件
     BufferPoolManager* buffer_pool_manager_; // 对页面进行读写

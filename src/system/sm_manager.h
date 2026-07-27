@@ -286,8 +286,6 @@ public:
 
     void refresh_index_residency();
 
-    void reset_all_tuple_meta_after_recovery();
-
     // Validate and freeze the publication set before a COMMIT record is made
     // durable. Publication must not discover a missing table or invalid RID
     // after durable COMMIT has already been written.

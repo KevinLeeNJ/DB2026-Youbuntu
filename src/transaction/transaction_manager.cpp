@@ -240,11 +240,17 @@ void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
     txn->set_prev_lsn(lsn);
 }
 
-void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
+void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
     if (txn == nullptr || log_manager == nullptr) {
         return;
     }
-    CommitLogRecord record(txn->get_transaction_id());
+    // commit_ts 进 WAL：它是恢复期重建时间戳计数器的第二个来源。两次 checkpoint
+    // 之间被驱逐的数据页可能带着比 db.restart 里的快照更高的 commit_ts_，而这条
+    // 记录在那次页写之前就已经 durable（下面的 flush_log_to_disk_up_to 保证），
+    // 所以“db.restart 快照”与“保留 WAL 里 COMMIT 的最大 commit_ts”取 max 覆盖
+    // 一切已持久化的 commit_ts_。完整论证见
+    // RecoveryManager::get_recovered_next_timestamp()。
+    CommitLogRecord record(txn->get_transaction_id(), commit_ts);
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     FaultInjector::Point("after_commit_log_append");
@@ -446,12 +452,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 
     FaultInjector::Point("before_commit_wal");
     try {
-        // Once COMMITTING is visible, neither a WAL failure nor a publication
-        // failure may fall back to ordinary abort: the COMMIT record may
-        // already be present in the WAL prefix recovered after restart.
-        WriteCommitLog(txn, log_manager);
-        FaultInjector::Point("after_commit_wal_sync");
-
         timestamp_t commit_csn;
         timestamp_t commit_ts;
         {
@@ -463,6 +463,17 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             commit_ts = next_timestamp_.fetch_add(1);
             txn->commit_ts_ = commit_ts;
         }
+
+        // 时间戳分配移到 WAL 之前，只为让 COMMIT 记录能带上 commit_ts；它不发布
+        // 任何东西，因此不改变可见性顺序。分配后若 WriteCommitLog 抛出，catch 分支
+        // 直接 fail-stop 整个进程，不会留下一个占用了 CSN 却永不完成、卡住发布
+        // 前沿的事务。
+        //
+        // Once COMMITTING is visible, neither a WAL failure nor a publication
+        // failure may fall back to ordinary abort: the COMMIT record may
+        // already be present in the WAL prefix recovered after restart.
+        WriteCommitLog(txn, log_manager, commit_ts);
+        FaultInjector::Point("after_commit_wal_sync");
 
         // Publish every modified slot outside the frontier mutex. A new RC
         // statement still cannot observe this commit until its CSN is part of
@@ -608,6 +619,29 @@ std::unordered_map<txn_id_t, lsn_t> TransactionManager::get_active_txn_lsn_snaps
         }
     }
     return snapshot;
+}
+
+void TransactionManager::seed_counters_after_recovery(timestamp_t next_timestamp, txn_id_t next_txn_id) {
+    // 单调抬高，绝不回退：本进程里可能已经跑过事务（测试里就会），把计数器往回拧
+    // 会让新事务重用已经写进数据页的 commit_ts_。
+    if (next_timestamp > next_timestamp_.load()) {
+        next_timestamp_.store(next_timestamp);
+    }
+    if (next_txn_id > next_txn_id_.load()) {
+        next_txn_id_.store(next_txn_id);
+    }
+
+    // read_ts 必须 >= 任何已持久化的 commit_ts_，而后者都 <= next_timestamp - 1
+    // （commit_ts 由 next_timestamp_.fetch_add(1) 分发，故已分发值都严格小于计数器）。
+    // 取到恰好 next_timestamp - 1 而不是 next_timestamp：否则本进程第一个提交拿到的
+    // commit_ts 会等于早先开始的事务的 read_ts，让读者看见自己快照之后的提交。
+    const timestamp_t seed_read_ts = next_timestamp_.load() - 1;
+    if (seed_read_ts > last_commit_ts_.load(std::memory_order_acquire)) {
+        last_commit_ts_.store(seed_read_ts, std::memory_order_release);
+        // 水位线也一起抬高，否则在本进程第一次提交之前 GC 会以 0 为水位线，
+        // 保守到什么都回收不了。
+        running_txns_.UpdateCommitTs(seed_read_ts);
+    }
 }
 
 UndoLog TransactionManager::GetUndoLog(UndoLink link) {

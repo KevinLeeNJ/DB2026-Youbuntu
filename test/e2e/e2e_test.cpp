@@ -91,6 +91,11 @@ public:
         recovery_->analyze();
         recovery_->redo();
         recovery_->undo();
+        // 与 rmdb.cpp 的启动顺序保持一致：commit_ts_ 持久化在数据页里，计数器必须在任何
+        // 事务开始之前抬到高于任何已持久化的 commit_ts_，否则上一世提交的行会被判成
+        // “来自未来”而不可见。缺了这一步，本 harness 就不再是生产启动路径的镜像。
+        txn_manager_->seed_counters_after_recovery(recovery_->get_recovered_next_timestamp(),
+                                                   recovery_->get_recovered_next_txn_id());
     }
 
     ~EmbeddedDB() {

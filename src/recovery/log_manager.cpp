@@ -470,13 +470,16 @@ void LogManager::reset_log(lsn_t next_lsn) {
     durable_lsn_.store(next_lsn == 0 ? INVALID_LSN : next_lsn - 1, std::memory_order_release);
 }
 
-void LogManager::write_restart_offset(int64_t checkpoint_offset) {
+void LogManager::write_restart_manifest(const RestartManifest& manifest) {
     const std::string temp_name = std::string(RESTART_FILE_NAME) + ".tmp";
     std::ofstream restart_file(temp_name, std::ios::trunc);
     if (!restart_file.is_open()) {
         throw UnixError();
     }
-    restart_file << checkpoint_offset;
+    // 第一行保持裸偏移，只为让旧读者（`>> offset`）继续可读。
+    restart_file << manifest.checkpoint_offset << '\n'
+                 << "next_timestamp=" << manifest.next_timestamp << '\n'
+                 << "next_txn_id=" << manifest.next_txn_id << '\n';
     restart_file.flush();
     if (!restart_file) {
         throw UnixError();
@@ -492,16 +495,54 @@ void LogManager::write_restart_offset(int64_t checkpoint_offset) {
     disk_manager_->sync_directory(".");
 }
 
-int64_t LogManager::read_restart_offset() const {
+RestartManifest LogManager::read_restart_manifest() const {
+    RestartManifest manifest;
     std::ifstream restart_file(RESTART_FILE_NAME);
     if (!restart_file.is_open()) {
-        return 0;
+        return manifest;
     }
 
     int64_t checkpoint_offset = 0;
-    restart_file >> checkpoint_offset;
-    if (!restart_file || checkpoint_offset < 0) {
-        return 0;
+    if (!(restart_file >> checkpoint_offset) || checkpoint_offset < 0) {
+        // 无法解析出偏移的清单整体不可信：偏移错了会让恢复从错误的位置开始扫描，
+        // 所以此时连计数器也不采纳，全部退回“字段缺失”的安全默认值。
+        return manifest;
     }
-    return checkpoint_offset;
+    manifest.checkpoint_offset = checkpoint_offset;
+
+    // 每一项都独立解析：将来新增的键不会让旧字段读不出来，无法识别的键被忽略。
+    // 负值一律当作缺失——计数器只可能单调增长，负数只能来自损坏的文件。
+    std::string entry;
+    while (restart_file >> entry) {
+        const size_t separator = entry.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string key = entry.substr(0, separator);
+        int64_t value = 0;
+        try {
+            value = std::stoll(entry.substr(separator + 1));
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (value < 0) {
+            continue;
+        }
+        if (key == "next_timestamp") {
+            manifest.next_timestamp = static_cast<timestamp_t>(value);
+        } else if (key == "next_txn_id") {
+            manifest.next_txn_id = static_cast<txn_id_t>(value);
+        }
+    }
+    return manifest;
+}
+
+void LogManager::write_restart_offset(int64_t checkpoint_offset) {
+    RestartManifest manifest;
+    manifest.checkpoint_offset = checkpoint_offset;
+    write_restart_manifest(manifest);
+}
+
+int64_t LogManager::read_restart_offset() const {
+    return read_restart_manifest().checkpoint_offset;
 }

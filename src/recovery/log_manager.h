@@ -125,25 +125,44 @@ public:
 
 /**
  * commit操作的日志记录
+ *
+ * 载荷只有 8 字节：本事务的 MVCC 提交时间戳。它是恢复期重建时间戳计数器的两个
+ * 来源之一（另一个是 checkpoint 写进 db.restart 的计数器快照），详见
+ * RecoveryManager::get_recovered_next_timestamp() 上的论证。
+ *
+ * 向后兼容：旧 WAL 里的 COMMIT 记录只有日志头（log_tot_len_ == LOG_HEADER_SIZE）。
+ * deserialize 用长度判断载荷是否存在，缺失时留 INVALID_TS，analyze 会跳过它。
  */
 class CommitLogRecord : public LogRecord {
 public:
+    timestamp_t commit_ts_{INVALID_TS};
+
     CommitLogRecord() {
         log_type_ = LogType::COMMIT;
         lsn_ = INVALID_LSN;
-        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tot_len_ = LOG_HEADER_SIZE + sizeof(timestamp_t);
         log_tid_ = INVALID_TXN_ID;
         prev_lsn_ = INVALID_LSN;
     }
     explicit CommitLogRecord(txn_id_t txn_id) : CommitLogRecord() {
         log_tid_ = txn_id;
     }
+    CommitLogRecord(txn_id_t txn_id, timestamp_t commit_ts) : CommitLogRecord(txn_id) {
+        commit_ts_ = commit_ts;
+    }
 
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
+        memcpy(dest + OFFSET_LOG_DATA, &commit_ts_, sizeof(timestamp_t));
     }
     void deserialize(const char* src) override {
         LogRecord::deserialize(src);
+        commit_ts_ = HasCommitTs(log_tot_len_) ? read_unaligned<timestamp_t>(src + OFFSET_LOG_DATA) : INVALID_TS;
+    }
+
+    /** 该长度的 COMMIT 记录是否带提交时间戳载荷。恢复期直接按字节解析，不构造对象。 */
+    static bool HasCommitTs(uint32_t total_len) {
+        return total_len >= static_cast<uint32_t>(LOG_HEADER_SIZE) + sizeof(timestamp_t);
     }
 };
 
@@ -445,6 +464,25 @@ public:
 /* 日志管理器，负责把日志写入日志缓冲区，以及把日志缓冲区中的内容写入磁盘中 */
 enum class DurabilityMode { PROCESS_CRASH, STRICT };
 
+/**
+ * db.restart：重启清单。它承担 PostgreSQL 里 pg_control 的角色——记录“下一次恢复
+ * 需要知道、但无法从数据页便宜地重算”的少量标量。
+ *
+ * 磁盘格式（文本，空白分隔）：第一行仍是裸的 checkpoint 偏移，后面跟若干
+ * `key=value` 行。这样两个方向都兼容：旧读者 `>> offset` 照旧工作并忽略其余内容；
+ * 新读者遇到没有 key 的旧文件时，把缺失字段留在“安全默认值”上。
+ */
+struct RestartManifest {
+    // 恢复扫描的起点（今天恒为 0：clean checkpoint 会把 WAL 截为空）。
+    int64_t checkpoint_offset{0};
+    // checkpoint 那一刻 TransactionManager::next_timestamp_ 的快照。
+    // 0 表示“文件里没有这个字段”，与“计数器确实是 0”同义，因此可以安全合并：
+    // 两种情况下有效下界都由保留 WAL 里 COMMIT 记录的最大 commit_ts 补齐。
+    timestamp_t next_timestamp{0};
+    // 同上，但针对 next_txn_id_。
+    txn_id_t next_txn_id{0};
+};
+
 class LogManager {
 public:
     static constexpr const char* RESTART_FILE_NAME = "db.restart";
@@ -532,6 +570,13 @@ public:
         return durability_mode_;
     }
 
+    // 原子发布重启清单：tmp 文件 + fdatasync + rename + 目录 fsync。
+    // checkpoint 必须在截断 WAL *之前* 调用它，见 CheckpointManager::RunCleanCheckpoint()。
+    void write_restart_manifest(const RestartManifest& manifest);
+    RestartManifest read_restart_manifest() const;
+
+    // 只关心扫描起点的调用方（以及旧测试）的薄封装。写入时计数器字段留默认值 0，
+    // 语义等同于“本次发布不提供计数器”。
     void write_restart_offset(int64_t checkpoint_offset);
     int64_t read_restart_offset() const;
 

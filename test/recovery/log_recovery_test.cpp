@@ -8,6 +8,8 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
+#include "common/context.h"
+#include "execution/execution_common.h"
 #include "index/ix.h"
 #include "record/rm.h"
 #include "recovery/checkpoint_manager.h"
@@ -139,6 +141,13 @@ lsn_t AppendUpdate(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const R
 
 void AppendCommit(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn) {
     CommitLogRecord commit(txn_id);
+    commit.prev_lsn_ = prev_lsn;
+    log_mgr.add_log_to_buffer(&commit);
+}
+
+// 带 MVCC 提交时间戳的 COMMIT 记录，就是生产提交路径写下的形状。
+void AppendCommitWithTs(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, timestamp_t commit_ts) {
+    CommitLogRecord commit(txn_id, commit_ts);
     commit.prev_lsn_ = prev_lsn;
     log_mgr.add_log_to_buffer(&commit);
 }
@@ -1295,4 +1304,148 @@ TEST(RecoveryFaultInjectionTest, IndexRepairIsIdempotentAcrossRepeatedRecovery) 
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+// ---------------------------------------------------------------------------
+// 重启后时间戳计数器的恢复。
+//
+// TupleMeta.commit_ts_ 持久化在数据页里，而 next_timestamp_/last_commit_ts_ 只活在
+// 内存里。计数器每次启动都从 0 开始时，上一世以高 commit_ts_ 提交的行会被
+// GetVisibleRecord 判成“来自未来”，而版本链已随进程消失、无从回退，于是**已提交的行
+// 变得不可见**——违反 final.md:342 第 1 条。50 仓实测：恢复后 customer 只剩
+// 1,488,859/1,500,000 可见，而磁盘上一行不缺。
+// ---------------------------------------------------------------------------
+
+// 只被 checkpoint 覆盖、不再出现在任何保留 WAL 里的已提交行：它的 commit_ts_ 不会被
+// reset_touched_tuple_meta 归一化，所以可见性完全取决于计数器有没有被抬回去。
+// 修复前这个测试在 GetVisibleRecord 处返回 nullptr。
+TEST(RecoveryTimestampTest, CleanCheckpointPersistsTheTimestampCounterSoOldCommitsStayVisible) {
+    ScopedTestDir test_dir("recovery_ts_counter_root");
+    const std::string db_name = "recovery_ts_counter_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+    timestamp_t persisted_commit_ts = 0;
+
+    {
+        OpenRecoveryDb db(db_name);
+        LockManager lock_mgr;
+        TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+        CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, db.log_mgr_.get());
+
+        // 把时间戳计数器推到高位。真实负载 60 秒就能推到几十万，这里 8 个事务足够让
+        // commit_ts 明显大于一个从 0 重启的 read_ts。
+        for (int i = 0; i < 8; ++i) {
+            Transaction* txn = txn_mgr.begin(nullptr, db.log_mgr_.get(), IsolationLevel::READ_COMMITTED);
+            txn_mgr.commit(txn, db.log_mgr_.get());
+        }
+        persisted_commit_ts = txn_mgr.get_last_commit_ts();
+        ASSERT_GT(persisted_commit_ts, 0);
+
+        // 一行已提交数据，元组头带着那个高位 commit_ts_——这正是 mark_slots_committed()
+        // 在提交时写进页面、并随脏页落盘的东西。
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        TupleMeta committed_in_the_past;
+        committed_in_the_past.commit_ts_ = persisted_commit_ts;
+        committed_in_the_past.writer_txn_id_ = INVALID_TXN_ID;
+        committed_in_the_past.is_committed_ = true;
+        committed_in_the_past.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, committed_in_the_past);
+
+        // clean checkpoint：脏页落盘 → 发布重启清单 → 截断 WAL。此后磁盘上没有任何日志
+        // 提到这一行，恢复的归一化扫描也就不会碰它所在的页。
+        ASSERT_TRUE(checkpoint_mgr.RunCleanCheckpoint());
+        ASSERT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+    }
+
+    // 重启：新的 TransactionManager，计数器从 0 开始，除非恢复把它抬回去。
+    OpenRecoveryDb db(db_name);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.redo();
+    recovery.undo();
+    EXPECT_GT(recovery.get_recovered_next_timestamp(), persisted_commit_ts);
+
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    txn_mgr.seed_counters_after_recovery(recovery.get_recovered_next_timestamp(), recovery.get_recovered_next_txn_id());
+    EXPECT_GE(txn_mgr.get_last_commit_ts(), persisted_commit_ts);
+
+    Transaction* txn = txn_mgr.begin(nullptr, db.log_mgr_.get(), IsolationLevel::READ_COMMITTED);
+    int send_offset = 0;
+    Context context(&lock_mgr, db.log_mgr_.get(), txn, nullptr, &send_offset, &txn_mgr);
+    auto visible = GetVisibleRecord(db.sm_mgr_.fhs_.at("t").get(), rid, &context);
+    ASSERT_NE(visible, nullptr) << "已提交的行在重启后必须仍然可见";
+    int value = 0;
+    memcpy(&value, visible->data + sizeof(int), sizeof(int));
+    EXPECT_EQ(value, 10);
+    txn_mgr.commit(txn, db.log_mgr_.get());
+}
+
+// 两次 checkpoint 之间被驱逐的页可能带着比清单快照更高的 commit_ts_。补齐它的是
+// COMMIT 记录里的 8 字节载荷：analyze 取所有 COMMIT 的最大 commit_ts。
+TEST(RecoveryTimestampTest, CommitRecordCommitTsRaisesTheCounterWithoutAnyCheckpoint) {
+    ScopedTestDir test_dir("recovery_ts_wal_root");
+    const std::string db_name = "recovery_ts_wal_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+    constexpr timestamp_t kCommitTs = 4242;
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, rec);
+        AppendCommitWithTs(*db.log_mgr_, 100, lsn, kCommitTs);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    // 没有任何 checkpoint，所以 db.restart 里没有计数器；下界只能来自 WAL。
+    ASSERT_FALSE(std::filesystem::exists(std::filesystem::path(db_name) / LogManager::RESTART_FILE_NAME));
+    {
+        OpenRecoveryDb db(db_name);
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        EXPECT_EQ(recovery.get_recovered_next_timestamp(), kCommitTs + 1);
+        // txn_id 同样不能重用：页上的 writer_txn_id_ 也是持久化的。
+        EXPECT_EQ(recovery.get_recovered_next_txn_id(), 101);
+        recovery.redo();
+        recovery.undo();
+    }
+
+    // 恢复会截断 WAL，所以它必须把算出的下界发布到 db.restart，否则下一轮恢复
+    // 既没有 WAL 也没有清单，计数器又回到 0。同一个崩溃状态恢复两次必须同值。
+    {
+        OpenRecoveryDb db(db_name);
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        EXPECT_EQ(recovery.get_recovered_next_timestamp(), kCommitTs + 1);
+        EXPECT_EQ(recovery.get_recovered_next_txn_id(), 101);
+        recovery.redo();
+        recovery.undo();
+    }
+}
+
+// 旧 WAL 的 COMMIT 记录没有时间戳载荷（log_tot_len_ == LOG_HEADER_SIZE），也可能是
+// 手写日志的测试。此时下界退化为 0，而不是把 INVALID_TS(-1) 当成时间戳算进去。
+TEST(RecoveryTimestampTest, CommitRecordWithoutCommitTsLeavesTheCounterAtZero) {
+    ScopedTestDir test_dir("recovery_ts_legacy_root");
+    const std::string db_name = "recovery_ts_legacy_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 7);
+        lsn = AppendInsert(*db.log_mgr_, 7, lsn, rid, rec);
+        AppendCommit(*db.log_mgr_, 7, lsn); // 不带 commit_ts
+        FlushLogs(*db.log_mgr_);
+    }
+
+    OpenRecoveryDb db(db_name);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    EXPECT_EQ(recovery.get_recovered_next_timestamp(), 0);
+    EXPECT_EQ(recovery.get_recovered_next_txn_id(), 8);
 }

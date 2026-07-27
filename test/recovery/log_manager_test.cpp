@@ -375,6 +375,58 @@ TEST(LogManagerTest, RestartOffsetRoundTrip) {
     EXPECT_EQ(log_mgr.read_restart_offset(), 128);
 }
 
+TEST(LogManagerTest, RestartManifestRoundTrip) {
+    ScopedTestDir test_dir("log_manager_restart_manifest_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    RestartManifest written;
+    written.checkpoint_offset = 4096;
+    written.next_timestamp = 123456;
+    written.next_txn_id = 789;
+    log_mgr.write_restart_manifest(written);
+
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_EQ(read.checkpoint_offset, 4096);
+    EXPECT_EQ(read.next_timestamp, 123456);
+    EXPECT_EQ(read.next_txn_id, 789);
+    // 旧读者只读第一个 token，必须继续拿到偏移。
+    EXPECT_EQ(log_mgr.read_restart_offset(), 4096);
+}
+
+// 旧版本写的 db.restart 只有裸偏移。缺失的计数器字段必须退回 0，而不是让整个清单
+// 读失败——0 的语义是“本文件不提供计数器”，恢复会改用保留 WAL 里的 COMMIT 时间戳。
+TEST(LogManagerTest, LegacyRestartFileWithoutCountersReadsAsZero) {
+    ScopedTestDir test_dir("log_manager_legacy_restart_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    {
+        std::ofstream restart(LogManager::RESTART_FILE_NAME, std::ios::trunc);
+        restart << 512;
+    }
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_EQ(read.checkpoint_offset, 512);
+    EXPECT_EQ(read.next_timestamp, 0);
+    EXPECT_EQ(read.next_txn_id, 0);
+}
+
+// 认不出的键被忽略，认得出的键照旧生效：清单可以继续加字段而不破坏旧字段。
+TEST(LogManagerTest, RestartManifestIgnoresUnknownAndMalformedEntries) {
+    ScopedTestDir test_dir("log_manager_restart_unknown_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    {
+        std::ofstream restart(LogManager::RESTART_FILE_NAME, std::ios::trunc);
+        restart << "0\nfuture_key=1\nnext_timestamp=99\nnext_txn_id=not-a-number\n";
+    }
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_EQ(read.checkpoint_offset, 0);
+    EXPECT_EQ(read.next_timestamp, 99);
+    EXPECT_EQ(read.next_txn_id, 0);
+}
+
 TEST(LogManagerTest, DiskManagerReportsFileSizePastTwoGb) {
     ScopedTestDir test_dir("log_manager_large_file_size_test_db");
     DiskManager disk;

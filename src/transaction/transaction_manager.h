@@ -86,6 +86,35 @@ public:
 
     std::unordered_map<txn_id_t, lsn_t> get_active_txn_lsn_snapshot();
 
+    /**
+     * @brief 重启后把时间戳/事务 ID 计数器抬到持久化状态之上。恢复结束、任何事务开始
+     * 之前调用一次。
+     *
+     * 为什么必须做：TupleMeta.commit_ts_ 是**持久化**在数据页里的，而 RC 的 read_ts
+     * 取自 last_commit_ts_。如果计数器每次进程启动都从 0 开始，上一世以
+     * commit_ts_ = 50000 提交的行，面对一个从 0 开始的 read_ts 会被判成“来自未来”；
+     * 此时版本链（只存在于内存里）已经随进程消失，GetVisibleRecord 无从回退，
+     * 于是**已提交的行变得不可见**——违反 final.md:342。PostgreSQL 把 nextXid 记在
+     * pg_control、InnoDB 把 max trx id 记在系统表空间，都是同一件事。
+     *
+     * next_timestamp 由 RecoveryManager::get_recovered_next_timestamp() 计算，
+     * 那里有“为什么这个值一定大于任何已持久化的 commit_ts_”的完整论证。
+     */
+    void seed_counters_after_recovery(timestamp_t next_timestamp, txn_id_t next_txn_id);
+
+    /** @brief 当前计数器快照。checkpoint 用它写 db.restart；见 seed_counters_after_recovery。 */
+    timestamp_t peek_next_timestamp() const {
+        return next_timestamp_.load();
+    }
+
+    txn_id_t peek_next_txn_id() const {
+        return next_txn_id_.load();
+    }
+
+    timestamp_t get_last_commit_ts() const {
+        return last_commit_ts_.load(std::memory_order_acquire);
+    }
+
     ConcurrencyMode get_concurrency_mode() {
         return concurrency_mode_;
     }

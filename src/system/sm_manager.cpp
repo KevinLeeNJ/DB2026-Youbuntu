@@ -881,38 +881,11 @@ void SmManager::refresh_index_residency() {
     }
 }
 
-void SmManager::reset_all_tuple_meta_after_recovery() {
-    TupleMeta clean_meta;
-    clean_meta.commit_ts_ = 0;
-    clean_meta.writer_txn_id_ = INVALID_TXN_ID;
-    clean_meta.is_committed_ = true;
-    clean_meta.is_deleted_ = false;
-    clean_meta.version_chain_head_ = UndoLink{};
-
-    for (const auto& [_, fh] : fhs_) {
-        std::vector<Rid> tombstones;
-        std::vector<Rid> live_records;
-        for (RmScan scan(fh.get()); !scan.is_end(); scan.next()) {
-            Rid rid = scan.rid();
-            TupleMeta meta = fh->get_tuple_meta(rid);
-            if (meta.is_deleted_) {
-                tombstones.push_back(rid);
-            } else {
-                live_records.push_back(rid);
-            }
-        }
-        for (const auto& rid : tombstones) {
-            fh->delete_record(rid, nullptr);
-        }
-        for (const auto& rid : live_records) {
-            if (fh->is_record(rid)) {
-                fh->set_tuple_meta(rid, clean_meta);
-            }
-        }
-        fh->rebuild_file_header_from_pages();
-    }
-}
-
+// 这里曾有一个 reset_all_tuple_meta_after_recovery()：恢复后全表扫描，把每个存活槽的
+// TupleMeta 归一化成 commit_ts_ = 0。它从来没有调用者，也不该有——那是“重启后已提交行
+// 不可见”的错误解法：代价与整库大小成正比（评测规模 5 GB），必然击穿 final.md:53 的
+// 90 秒就绪预算。正解是让时间戳计数器在重启后恢复到高于任何已持久化的 commit_ts_，
+// 见 RecoveryManager::get_recovered_next_timestamp()，代价 O(1)。
 void SmManager::load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context) {
     (void)context;
     std::ifstream infile(file_path);

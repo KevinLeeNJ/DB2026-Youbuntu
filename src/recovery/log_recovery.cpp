@@ -226,6 +226,18 @@ void RecoveryManager::analyze() {
     index_unchanged_key_count_ = 0;
     index_duplicate_entry_count_ = 0;
     index_rebuild_count_ = 0;
+    persisted_next_timestamp_ = 0;
+    persisted_next_txn_id_ = 0;
+    max_wal_commit_ts_ = INVALID_TS;
+    max_wal_txn_id_ = INVALID_TXN_ID;
+
+    // 重启清单先读：它是计数器恢复的第一个来源，而且必须在“WAL 为空所以无事可做”
+    // 的提前返回之前读到——恰恰是刚做过 clean checkpoint（WAL 被截为空）的库最需要
+    // 它。见 get_recovered_next_timestamp()。
+    const RestartManifest manifest =
+        log_manager_ != nullptr ? log_manager_->read_restart_manifest() : RestartManifest{};
+    persisted_next_timestamp_ = manifest.next_timestamp;
+    persisted_next_txn_id_ = manifest.next_txn_id;
 
     const int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
@@ -238,7 +250,7 @@ void RecoveryManager::analyze() {
     {
         std::vector<char> scratch;
         WalRecordView checkpoint;
-        const int64_t restart_offset = log_manager_ != nullptr ? log_manager_->read_restart_offset() : 0;
+        const int64_t restart_offset = manifest.checkpoint_offset;
         if (restart_offset > 0 && ReadWalRecordAt(disk_manager_, restart_offset, file_size, &scratch, &checkpoint) &&
             checkpoint.log_type == LogType::CHECKPOINT) {
             auto record = DeserializeLogRecord(checkpoint.bytes, static_cast<int>(checkpoint.total_len));
@@ -290,10 +302,18 @@ void RecoveryManager::analyze() {
             touched_.push_back(touched);
             break;
         }
-        case LogType::COMMIT:
+        case LogType::COMMIT: {
             committed_txns_.insert(record.txn_id);
             active_txn_last_lsn_.erase(record.txn_id);
+            // 8 字节载荷；旧 WAL 的 COMMIT 记录没有它，此时保持 INVALID_TS 并跳过。
+            if (CommitLogRecord::HasCommitTs(record.total_len)) {
+                const timestamp_t commit_ts = read_unaligned<timestamp_t>(record.bytes + OFFSET_LOG_DATA);
+                if (commit_ts != INVALID_TS && (max_wal_commit_ts_ == INVALID_TS || commit_ts > max_wal_commit_ts_)) {
+                    max_wal_commit_ts_ = commit_ts;
+                }
+            }
             break;
+        }
         case LogType::ABORT:
             // ABORT only records that rollback was requested. This system does not write CLRs,
             // so recovery must still idempotently undo the transaction's original DML records.
@@ -303,6 +323,9 @@ void RecoveryManager::analyze() {
             break;
         }
 
+        if (record.txn_id != INVALID_TXN_ID && (max_wal_txn_id_ == INVALID_TXN_ID || record.txn_id > max_wal_txn_id_)) {
+            max_wal_txn_id_ = record.txn_id;
+        }
         record_locations_.push_back(WalRecordLocation{record.lsn, record.offset});
         if (record.lsn != INVALID_LSN && previous_lsn != INVALID_LSN && record.lsn <= previous_lsn) {
             record_locations_sorted_ = false;
@@ -337,6 +360,12 @@ void RecoveryManager::analyze() {
     LOG_INFO("recovery analyze: %llu records, %llu dml, %zu distinct rids, %llu wal preads, loser txns %zu",
              static_cast<unsigned long long>(scanned_record_count_), static_cast<unsigned long long>(touched_.size()),
              touched_sorted_.size(), static_cast<unsigned long long>(reader.read_count()), active_txn_last_lsn_.size());
+    // 这三个数一起解释了计数器为什么落在这个位置，否则“已提交的行为什么可见”只能靠猜。
+    LOG_INFO("recovery timestamps: persisted next_timestamp %lld, max wal commit_ts %lld, seeding next_timestamp %lld, "
+             "next_txn_id %lld",
+             static_cast<long long>(persisted_next_timestamp_), static_cast<long long>(max_wal_commit_ts_),
+             static_cast<long long>(get_recovered_next_timestamp()),
+             static_cast<long long>(get_recovered_next_txn_id()));
 
     if (has_dml_records_) {
         // A crash may persist newly allocated record pages before the short
@@ -1068,7 +1097,26 @@ void RecoveryManager::rebuild_indexes(const std::unordered_set<std::string>& ind
 }
 
 void RecoveryManager::reset_wal_if_needed() {
-    if (log_manager_ == nullptr || max_lsn_ == INVALID_LSN) {
+    if (log_manager_ == nullptr) {
+        return;
+    }
+
+    // 截断 WAL 会连带丢掉 COMMIT 记录里的 commit_ts，因此在截断**之前**必须把本轮算出的
+    // 计数器下界发布到 db.restart：恢复在这一刻接过了 checkpoint 的同一份责任。
+    // 不发布的后果很具体：本轮恢复之后、下一次 checkpoint 之前再崩一次，第二轮恢复既
+    // 没有 WAL 也没有清单，计数器又回到 0，那些没被 reset_touched_tuple_meta 归一化过
+    // 的页上的已提交行会再次变成不可见。它同时给出重复恢复的幂等性：同一个崩溃状态恢复
+    // 两次得到同一个计数器下界。
+    // write_restart_manifest 自带 tmp + fdatasync + rename + 目录 fsync，所以它在
+    // reset_log 之前就已经 durable。
+    const bool truncating = max_lsn_ != INVALID_LSN;
+    RestartManifest manifest;
+    // 截断之后扫描只能从文件头开始；不截断时保持 analyze 本轮用过的起点。
+    manifest.checkpoint_offset = truncating ? 0 : checkpoint_offset_;
+    manifest.next_timestamp = get_recovered_next_timestamp();
+    manifest.next_txn_id = get_recovered_next_txn_id();
+    log_manager_->write_restart_manifest(manifest);
+    if (!truncating) {
         return;
     }
     const lsn_t next_lsn = max_lsn_ + 1;

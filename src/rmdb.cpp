@@ -964,6 +964,16 @@ int main(int argc, char** argv) {
             LOG_INFO("recovery undo: %lld ms, page reads: %llu", static_cast<long long>(phase_elapsed_ms(phase_begin)),
                      static_cast<unsigned long long>(disk_manager->get_page_read_count() - undo_page_reads_before));
 
+            // 必须在任何事务开始之前、恢复读完 WAL 与重启清单之后做：commit_ts_ 持久化
+            // 在数据页里，而计数器只活在内存里。计数器从 0 重启会让上一世提交的行被
+            // 判成“来自未来”而不可见（final.md:342 第 1 条）。取值的完整论证见
+            // RecoveryManager::get_recovered_next_timestamp()。
+            txn_manager->seed_counters_after_recovery(recovery->get_recovered_next_timestamp(),
+                                                      recovery->get_recovered_next_txn_id());
+            LOG_INFO("recovery seeded counters: next_timestamp %lld, next_txn_id %lld",
+                     static_cast<long long>(recovery->get_recovered_next_timestamp()),
+                     static_cast<long long>(recovery->get_recovered_next_txn_id()));
+
             phase_begin = std::chrono::steady_clock::now();
             sm_manager->refresh_index_residency();
             LOG_INFO("recovery index residency refresh: %lld ms",

@@ -423,6 +423,20 @@ TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
 // Trusting it would make the next create_node() hand out page numbers that
 // live nodes already occupy, and recovery would overwrite a live subtree.
 TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
+    // This test is about what the IxIndexHandle constructor does when the
+    // persisted num_pages_ is behind the real file length. Splits now publish
+    // the index header themselves, so that condition has to be created on
+    // purpose instead of assumed - which is the whole point of the SMO
+    // write-out, but it means the precondition below would otherwise never hold.
+    struct SmoFlushOff {
+        SmoFlushOff() {
+            IxIndexHandle::set_smo_flush_enabled(false);
+        }
+        ~SmoFlushOff() {
+            IxIndexHandle::set_smo_flush_enabled(true);
+        }
+    } smo_flush_off;
+
     constexpr int kCheckpointedKeys = 1000;
     constexpr int kKeysAfterCheckpoint = 1400;
     const auto index_name = ix_manager->get_index_name(table_name, cols);

@@ -126,7 +126,17 @@ bool CheckpointManager::RunCleanCheckpoint() {
     sm_mgr_->flush_meta();
     // Publish the restart manifest before truncating WAL. If anything after
     // this point fails, the complete WAL is still available for recovery.
-    log_mgr_->write_restart_offset(0);
+    //
+    // 计数器快照必须在这里取，而这里恰好是唯一能取到可靠快照的地方：所有脏页刚刚
+    // 落盘、且没有活跃事务，所以**每一个已持久化的 commit_ts_ 都小于此刻的
+    // next_timestamp_**。截断 WAL 会连带丢掉那些页的 COMMIT 记录，因此这份快照就是
+    // 恢复期唯一能覆盖“早于本次 checkpoint”的那部分行的信息来源。
+    // 读的顺序（先取快照，再截断）由本函数的语句顺序保证。
+    RestartManifest manifest;
+    manifest.checkpoint_offset = 0;
+    manifest.next_timestamp = txn_mgr_->peek_next_timestamp();
+    manifest.next_txn_id = txn_mgr_->peek_next_txn_id();
+    log_mgr_->write_restart_manifest(manifest);
     FaultInjector::Point("before_wal_truncate");
     log_mgr_->reset_log(log_mgr_->get_global_lsn());
     return true;
