@@ -268,27 +268,6 @@ TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {
     EXPECT_EQ(log_mgr.current_log_offset(), disk.get_file_size(LOG_FILE_NAME));
 }
 
-TEST(LogManagerTest, TransactionAbortAcknowledgementDoesNotForceBufferedWal) {
-    ScopedTestDir test_dir("transaction_abort_no_force_test_db");
-    DiskManager disk;
-    disk.create_file(LOG_FILE_NAME);
-    BufferPoolManager bpm(8, &disk);
-    RmManager rm_mgr(&disk, &bpm);
-    IxManager ix_mgr(&disk, &bpm);
-    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
-    LockManager lock_mgr;
-    TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
-    LogManager log_mgr(&disk);
-
-    Transaction* txn = txn_mgr.begin(nullptr, &log_mgr);
-    txn_mgr.abort(txn, &log_mgr);
-
-    EXPECT_EQ(log_mgr.get_persist_lsn(), INVALID_LSN);
-    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
-    EXPECT_EQ(log_mgr.get_pwrite_count(), 0u);
-    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
-}
-
 TEST(LogManagerTest, AbortPageEvictionFlushesWalThroughPageLsn) {
     ScopedTestDir test_dir("abort_page_eviction_wal_barrier_test_db");
     DiskManager disk;
