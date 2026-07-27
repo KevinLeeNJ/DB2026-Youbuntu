@@ -4,9 +4,9 @@
 # Flow: start rmdb -> load + run -> kill -9 -> restart rmdb (wait for WAL
 # recovery) -> run consistency check against the recovered database.
 #
-# The consistency phase reads baseline counts and the committed new_order total
-# from the result.json written by the run phase, so it does not depend on any
-# in-memory state across the crash/restart.
+# The consistency phase reads the pre-workload aggregate snapshot and the ledger
+# of committed transaction effects from the result.json written by the run phase,
+# so it does not depend on any in-memory state across the crash/restart.
 
 set -Eeuo pipefail
 
@@ -32,8 +32,9 @@ RECONNECT_EACH_TXN=0
 ISOLATION="read-committed"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
 # final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
-# COUNT, integrity and content validation) must fit in one 900 second SQL
-# budget measured from a successful connection.
+# COUNT, integrity, index-key relation sampling and cross-partition content
+# sampling) must fit in one 900 second SQL budget measured from a successful
+# connection.
 LOAD_SQL_BUDGET_SECONDS=900
 
 usage() {
@@ -236,7 +237,7 @@ load_start=$SECONDS
     --data-dir "$DATA_DIR" --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
     --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
 load_elapsed=$((SECONDS - load_start))
-echo "[benchmark] load stage (create table + create index + LOAD + COUNT + integrity) took ${load_elapsed}s"
+echo "[benchmark] load stage (create table + create index + LOAD + COUNT + integrity + relation/content sampling) took ${load_elapsed}s"
 if (( load_elapsed > LOAD_SQL_BUDGET_SECONDS )); then
     echo "[benchmark] load stage exceeded the official ${LOAD_SQL_BUDGET_SECONDS}s SQL budget: ${load_elapsed}s" >&2
     exit 1

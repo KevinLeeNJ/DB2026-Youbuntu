@@ -33,6 +33,14 @@ const (
 	officialWindows        = 3
 	officialWorkers        = 50
 	officialTerminalHomes  = 25
+	// officialWarehouses is the size of the official data set (final.md:47).
+	// final.md:226 scores a run with the wrong data scale as zero, so an
+	// official-equivalent run must refuse anything else rather than publish a
+	// number produced against a smaller database. officialMinWarehouses is only
+	// the floor for explicitly non-official smoke runs, which still need enough
+	// warehouses for the 25 distinct terminal homes.
+	officialWarehouses    = 50
+	officialMinWarehouses = officialTerminalHomes
 
 	wireTagMeta             = 0x01
 	wireTagRow              = 0x02
@@ -481,7 +489,65 @@ type txnContext struct {
 	wID      int
 	dID      int
 	official bool
+	// ledger receives the row and amount effects of this attempt. The worker
+	// resets it before every attempt and folds it into its running total only
+	// once the transaction's outcome is known, so a retried or aborted attempt
+	// never contributes. May be nil for callers that do not reconcile.
+	ledger *txnLedger
 	profile
+}
+
+// txnLedger accumulates the effects committed transactions had on the database.
+// The post-crash consistency validation reconciles the recovered database
+// against baseline + ledger (final.md:322), and it must be able to do so from
+// the published result JSON alone, without any in-memory state surviving the
+// crash.
+type txnLedger struct {
+	values map[string]float64
+}
+
+func newTxnLedger() *txnLedger {
+	values := make(map[string]float64, len(ledgerKeys))
+	for _, key := range ledgerKeys {
+		values[key] = 0
+	}
+	return &txnLedger{values: values}
+}
+
+func (l *txnLedger) add(key string, delta float64) {
+	if l == nil {
+		return
+	}
+	l.values[key] += delta
+}
+
+func (l *txnLedger) reset() {
+	if l == nil {
+		return
+	}
+	for key := range l.values {
+		l.values[key] = 0
+	}
+}
+
+func (l *txnLedger) merge(other *txnLedger) {
+	if l == nil || other == nil {
+		return
+	}
+	for key, value := range other.values {
+		l.values[key] += value
+	}
+}
+
+func (l *txnLedger) snapshot() map[string]float64 {
+	if l == nil {
+		return nil
+	}
+	copied := make(map[string]float64, len(l.values))
+	for key, value := range l.values {
+		copied[key] = value
+	}
+	return copied
 }
 
 type result struct {
@@ -1200,6 +1266,10 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		fmt.Sprintf("insert into orders values (%d, %d, %d, %d, '%s', 0, %d, 1);", dNext, ctx.dID, ctx.wID, cID, nowText(), lineCount),
 		fmt.Sprintf("insert into new_orders values (%d, %d, %d);", dNext, ctx.dID, ctx.wID),
 	}
+	// stockQuantityDeltas records the signed change each line applies to
+	// s_quantity. The update is relative, so the applied delta is exact even when
+	// the s_quantity that decided between "subtract" and "restock" was stale.
+	stockQuantityDeltas := make([]int, lineCount)
 	for i, itemID := range itemIDs {
 		if invalid && i == lineCount-1 {
 			continue
@@ -1216,6 +1286,7 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		if stockQtys[i]-quantities[i] < 10 {
 			delta = 91 - quantities[i]
 		}
+		stockQuantityDeltas[i] = delta
 		if delta < 0 {
 			op, delta = "-", -delta
 		}
@@ -1237,7 +1308,22 @@ func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		return err
 	}
 	if invalid {
+		// The order number increment lives in the same transaction that just
+		// aborted, so a correct engine undoes it; the count is recorded anyway
+		// because the official ledger formula for d_next_o_id is "committed +
+		// expected rollback" and the diagnostic needs both numbers.
+		ctx.ledger.add(ledgerNewOrderRollbacks, 1)
 		return errInvalidItem
+	}
+	ctx.ledger.add(ledgerNewOrderCommits, 1)
+	ctx.ledger.add(ledgerNewOrderLines, float64(lineCount))
+	for i := range itemIDs {
+		ctx.ledger.add(ledgerNewOrderQuantity, float64(quantities[i]))
+		ctx.ledger.add(ledgerNewOrderStockDelta, float64(stockQuantityDeltas[i]))
+		ctx.ledger.add(ledgerNewOrderAmount, math.Round(prices[i]*float64(quantities[i])*100)/100)
+		if supplyWIDs[i] != ctx.wID {
+			ctx.ledger.add(ledgerNewOrderRemote, 1)
+		}
 	}
 	return nil
 }
@@ -1282,8 +1368,15 @@ func rankingPayment(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		fmt.Sprintf("insert into history values (%d, %d, %d, %d, %d, '%s', %.2f, 'payment');", cID, cDID, cWID, ctx.dID, ctx.wID, nowText(), amount),
 		"commit;",
 	}
-	_, err = rankingBatch(c, stage2...)
-	return err
+	if _, err = rankingBatch(c, stage2...); err != nil {
+		return err
+	}
+	ctx.ledger.add(ledgerPaymentCommits, 1)
+	ctx.ledger.add(ledgerPaymentAmount, amount)
+	// w_ytd and d_ytd of the terminal home take one binary32 accumulation step per
+	// committed Payment. The post-crash tolerance is derived from these counts.
+	ctx.ledger.add(ledgerPaymentWarehousePrefix+strconv.Itoa(ctx.wID), 1)
+	return nil
 }
 
 func rankingOrderStatus(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
@@ -1340,7 +1433,15 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	}
 	plans := make([]deliveryPlan, 0, ctx.districtsPerWarehouse)
 	stage2 := make([]string, 0, ctx.districtsPerWarehouse*5)
-	opIndex := 1
+	// Operation indices are zero-based inside the batch. Unlike stage 1, stage 2
+	// has no leading `begin;`, so the first statement of the first plan is at
+	// index 0. Starting the cursor at 1 shifted every read by one: the "claim
+	// confirmed" test read o_c_id (never empty, so every claim looked confirmed
+	// even when the row had already been delivered by a concurrent Delivery), the
+	// customer id read SUM(ol_amount) (which fails to parse as an integer, so the
+	// customer was almost never credited) and the amount read a non-query
+	// operation and fell back to zero.
+	opIndex := 0
 	for dID := 1; dID <= ctx.districtsPerWarehouse; dID++ {
 		oID, _ := strconv.Atoi(rankingScalar(result, dID, "0"))
 		if oID == 0 {
@@ -1368,6 +1469,7 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		return err
 	}
 	stage3 := make([]string, 0, len(plans)*3+1)
+	deliveredOrders, deliveredCustomers, deliveredAmount := 0, 0, 0.0
 	for _, plan := range plans {
 		if rankingScalar(result, plan.confirmOp, "") == "" {
 			continue
@@ -1379,13 +1481,25 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 			fmt.Sprintf("update orders set o_carrier_id = %d where o_id = %d and o_d_id = %d and o_w_id = %d;", carrierID, plan.oID, plan.dID, ctx.wID),
 			fmt.Sprintf("update order_line set ol_delivery_d = '%s' where ol_o_id = %d and ol_d_id = %d and ol_w_id = %d;", nowText(), plan.oID, plan.dID, ctx.wID),
 		)
+		deliveredOrders++
 		if customerID > 0 {
+			// The SQL literal is the %.2f rendering of the amount that was read
+			// back, so the ledger must record exactly that value and not the raw
+			// parsed float.
+			credited, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", amount), 64)
 			stage3 = append(stage3, fmt.Sprintf("update customer set c_balance = c_balance + %.2f, c_delivery_cnt = c_delivery_cnt + 1 where c_id = %d and c_d_id = %d and c_w_id = %d;", amount, customerID, plan.dID, ctx.wID))
+			deliveredCustomers++
+			deliveredAmount += credited
 		}
 	}
 	stage3 = append(stage3, "commit;")
-	_, err = rankingBatch(c, stage3...)
-	return err
+	if _, err = rankingBatch(c, stage3...); err != nil {
+		return err
+	}
+	ctx.ledger.add(ledgerDeliveryOrders, float64(deliveredOrders))
+	ctx.ledger.add(ledgerDeliveryCustomers, float64(deliveredCustomers))
+	ctx.ledger.add(ledgerDeliveryAmount, deliveredAmount)
+	return nil
 }
 
 func rankingStockLevel(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
@@ -1562,6 +1676,29 @@ func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int, th
 	}
 }
 
+// validateOfficialWarehouses enforces the official data scale. The previous
+// check only required 25 warehouses, which is looser than the evaluator: the
+// official data set has 50 (final.md:47) and a wrong data scale scores zero
+// (final.md:226).
+func validateOfficialWarehouses(warehouses int, allowNonOfficialTiming bool) error {
+	if allowNonOfficialTiming {
+		if warehouses < officialMinWarehouses {
+			return fmt.Errorf("official-equivalent requires at least %d warehouses even for a smoke run, got %d",
+				officialMinWarehouses, warehouses)
+		}
+		if warehouses != officialWarehouses {
+			fmt.Fprintf(os.Stderr, "[warning] official-equivalent against %d warehouses instead of the official %d; the official evaluator scores a wrong data scale as zero\n",
+				warehouses, officialWarehouses)
+		}
+		return nil
+	}
+	if warehouses != officialWarehouses {
+		return fmt.Errorf("official-equivalent requires exactly %d warehouses, got %d (use --allow-nonofficial-timing for smoke runs)",
+			officialWarehouses, warehouses)
+	}
+	return nil
+}
+
 func runTxn(c txnBackend, txnType string, ctx txnContext, rng *rand.Rand) error {
 	switch rmdbClient := c.(type) {
 	case *client:
@@ -1730,13 +1867,19 @@ func workerSeed(seed int64, round, workerID int) int64 {
 
 type workerReport struct {
 	result *result
+	ledger *txnLedger
 	err    error
 }
 
 type officialWorkerReport struct {
 	warmup  *result
 	windows []*result
-	err     error
+	// ledger covers every transaction this worker committed, including the warmup
+	// and the ones that finished after the last measurement window. Row counts in
+	// the recovered database reflect those too, so the reconciliation must see
+	// them even though no measurement bucket owns them.
+	ledger *txnLedger
+	err    error
 }
 
 // attribute maps a transaction completion instant onto the bucket that owns it.
@@ -1758,8 +1901,9 @@ func (r *officialWorkerReport) attribute(finish, warmupEnd time.Time, measure ti
 func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	local := newResult(measureSeconds)
+	total, attempt := newTxnLedger(), newTxnLedger()
 	report := func(err error) {
-		output <- workerReport{result: local, err: err}
+		output <- workerReport{result: local, ledger: total, err: err}
 	}
 	c, err := factory()
 	if err != nil {
@@ -1786,6 +1930,7 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 		}
 		txnType := chooseTxn(rng)
 		ctx := chooseContext(p, workerID, policy, rng)
+		ctx.ledger = attempt
 		attemptSeed := rng.Int63()
 		phaseEnd := measureEnd
 		if phase == "warmup" {
@@ -1801,6 +1946,7 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 				return
 			default:
 			}
+			attempt.reset()
 			err = runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
 			if !errors.Is(err, errAbort) {
 				completed = true
@@ -1811,6 +1957,9 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			continue
 		}
 		latency := float64(time.Since(start).Microseconds()) / 1000.0
+		if err == nil || errors.Is(err, errInvalidItem) {
+			total.merge(attempt)
+		}
 
 		if err == nil {
 			local.record(phase, txnType, "commit", latency, "")
@@ -1849,7 +1998,7 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 	report(nil)
 }
 
-func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, factory backendFactory) (*result, error) {
+func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, factory backendFactory, ledger *txnLedger) (*result, error) {
 	partials := make(chan workerReport, workers)
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -1869,6 +2018,7 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 	var roundErr error
 	for partial := range partials {
 		combined.merge(partial.result)
+		ledger.merge(partial.ledger)
 		if partial.err != nil && roundErr == nil {
 			roundErr = partial.err
 			stopOnce.Do(func() { close(stop) })
@@ -1887,7 +2037,8 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd time.Time, measure time.Duration,
 	windows int, think time.Duration, stats []*liveStats, stop <-chan struct{}, output chan<- officialWorkerReport, c txnBackend) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
-	report := officialWorkerReport{warmup: newResult(0), windows: make([]*result, windows)}
+	report := officialWorkerReport{warmup: newResult(0), windows: make([]*result, windows), ledger: newTxnLedger()}
+	attempt := newTxnLedger()
 	for window := range report.windows {
 		report.windows[window] = newResult(int(measure / time.Second))
 	}
@@ -1909,6 +2060,7 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 
 		txnType := chooseTxn(rng)
 		ctx := chooseContext(p, workerID, "official-terminal-home", rng)
+		ctx.ledger = attempt
 		attemptSeed := rng.Int63()
 		phaseEnd := measureEnd
 		if now.Before(warmupEnd) {
@@ -1923,6 +2075,7 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 				return
 			default:
 			}
+			attempt.reset()
 			err = runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
 			if !errors.Is(err, errAbort) {
 				completed = true
@@ -1934,6 +2087,11 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 		}
 		finish := time.Now()
 		latency := float64(finish.Sub(start).Microseconds()) / 1000.0
+		// The ledger is folded in before attribution: the database was changed
+		// regardless of which measurement bucket, if any, owns the completion.
+		if err == nil || errors.Is(err, errInvalidItem) {
+			report.ledger.merge(attempt)
+		}
 		phase, local, window := report.attribute(finish, warmupEnd, measure)
 		if local == nil {
 			// Completed after the final window: it belongs to no measurement
@@ -2001,7 +2159,7 @@ func monitorOfficialProgress(rounds, warmup, measure, interval int, start time.T
 }
 
 func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
-	reconnectEachTxn bool, roundOffset int, factory backendFactory) ([]*result, error) {
+	reconnectEachTxn bool, roundOffset int, factory backendFactory, ledger *txnLedger) ([]*result, error) {
 	if reconnectEachTxn {
 		return nil, errors.New("official-equivalent does not allow reconnect-each-txn")
 	}
@@ -2043,6 +2201,7 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	for workerID := 0; workerID < workers; workerID++ {
 		partial := <-partials
 		warmupResult.merge(partial.warmup)
+		ledger.merge(partial.ledger)
 		for round := range windows {
 			windows[round].merge(partial.windows[round])
 		}
@@ -2115,9 +2274,17 @@ type config struct {
 }
 
 type document struct {
-	Config     config    `json:"config"`
-	MedianTPMC float64   `json:"median_tpmc"`
-	Rounds     []*result `json:"rounds"`
+	Config config `json:"config"`
+	// Baselines is the aggregate snapshot of the freshly loaded database, taken
+	// before the first warmup transaction. Ledger is the total effect of every
+	// transaction this run committed, including the warmup and the transactions
+	// that finished after the last measurement window. Together they let the
+	// post-crash validation reconcile the recovered database without any state
+	// surviving the crash (final.md:322).
+	Baselines  map[string]float64 `json:"baselines,omitempty"`
+	Ledger     map[string]float64 `json:"ledger,omitempty"`
+	MedianTPMC float64            `json:"median_tpmc"`
+	Rounds     []*result          `json:"rounds"`
 }
 
 func validateResultDocument(doc document) error {
@@ -2766,10 +2933,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if *mode == "official-equivalent" && p.warehouses < 25 {
-		probe.close()
-		fmt.Fprintf(os.Stderr, "official-equivalent mode requires at least 25 warehouses, got %d\n", p.warehouses)
-		os.Exit(2)
+	if *mode == "official-equivalent" {
+		if err := validateOfficialWarehouses(p.warehouses, *allowNonOfficialTiming); err != nil {
+			probe.close()
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 	}
 	if err := verifyBenchmarkFeatures(probe, p); err != nil {
 		probe.close()
@@ -2777,19 +2946,35 @@ func main() {
 		os.Exit(1)
 	}
 	ordersText, err := probe.exec("select count(*) from orders;")
-	probe.close()
 	if err != nil {
+		probe.close()
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	baseOrders := scalarInt(ordersText, 0)
+	// The pre-workload aggregate snapshot is the reference the post-crash
+	// reconciliation compares against, so it has to be taken here, while the
+	// database is still quiescent, and published with the result.
+	var baselines map[string]float64
+	if *backend == "rmdb" {
+		snapshotStart := time.Now()
+		baselines, err = captureBaselines(probe)
+		if err != nil {
+			probe.close()
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("[baseline] aggregate snapshot took %s\n", time.Since(snapshotStart).Round(time.Millisecond))
+	}
+	probe.close()
 	if *mode == "official-equivalent" {
 		*policy = "official-terminal-home"
 	}
-	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
+	ledger := newTxnLedger()
+	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}, Baselines: baselines}
 	if *mode == "official-equivalent" {
 		windows, runErr := runOfficialWindows(*rounds, *workers, *seed, p, *warmup, *measure, *progress, *think,
-			*reconnectEachTxn, *roundOffset, factory)
+			*reconnectEachTxn, *roundOffset, factory, ledger)
 		if runErr != nil {
 			fmt.Fprintln(os.Stderr, runErr)
 			os.Exit(1)
@@ -2804,7 +2989,7 @@ func main() {
 			monitorStop := make(chan struct{})
 			monitorDone := make(chan struct{})
 			go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
-			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory)
+			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory, ledger)
 			close(monitorStop)
 			<-monitorDone
 			if roundErr != nil {
@@ -2821,6 +3006,7 @@ func main() {
 		values[i] = round.TPMC
 	}
 	doc.MedianTPMC = median(values)
+	doc.Ledger = ledger.snapshot()
 	encoded, err := publishResultDocument(*jsonOut, doc)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

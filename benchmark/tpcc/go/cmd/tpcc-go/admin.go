@@ -29,6 +29,11 @@ type datasetManifest struct {
 	Warehouses int                   `json:"warehouses"`
 	Seed       int64                 `json:"seed"`
 	Files      map[string]fileRecord `json:"files"`
+	// Aggregates and Samples are the exact facts of this CSV set. See dataset.go
+	// for why every expected value has to be recorded here rather than recomputed
+	// from a generator formula.
+	Aggregates map[string]float64             `json:"aggregates"`
+	Samples    map[string][]map[string]string `json:"samples"`
 }
 
 type fileRecord struct {
@@ -37,7 +42,9 @@ type fileRecord struct {
 	Header string `json:"header"`
 }
 
-func inspectCSVFile(path string) (fileRecord, error) {
+// streamCSVFile reads one CSV file exactly once, handing the header and every
+// data row to the supplied callbacks, and returns the measured file record.
+func streamCSVFile(path string, onHeader func([]string) error, onRow func([]string) error) (fileRecord, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fileRecord{}, err
@@ -51,20 +58,37 @@ func inspectCSVFile(path string) (fileRecord, error) {
 	}
 	defer file.Close()
 	reader := csv.NewReader(file)
+	reader.ReuseRecord = true
 	header, err := reader.Read()
 	if err != nil {
 		return fileRecord{}, fmt.Errorf("read dataset header %s: %w", path, err)
 	}
+	headerCopy := append([]string{}, header...)
+	if onHeader != nil {
+		if err := onHeader(headerCopy); err != nil {
+			return fileRecord{}, fmt.Errorf("dataset %s: %w", path, err)
+		}
+	}
 	rows := int64(0)
 	for {
-		if _, err := reader.Read(); errors.Is(err, io.EOF) {
+		row, err := reader.Read()
+		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
 			return fileRecord{}, fmt.Errorf("read dataset %s: %w", path, err)
 		}
+		if onRow != nil {
+			if err := onRow(row); err != nil {
+				return fileRecord{}, fmt.Errorf("dataset %s row %d: %w", path, rows+1, err)
+			}
+		}
 		rows++
 	}
-	return fileRecord{Size: info.Size(), Rows: rows, Header: strings.Join(header, ",")}, nil
+	return fileRecord{Size: info.Size(), Rows: rows, Header: strings.Join(headerCopy, ",")}, nil
+}
+
+func inspectCSVFile(path string) (fileRecord, error) {
+	return streamCSVFile(path, nil, nil)
 }
 
 func expectedCSVRows(warehouses int, table string) int64 {
@@ -111,22 +135,77 @@ func completeCSVSet(dataDir string) bool {
 
 func writeDatasetManifest(dataDir string, warehouses int, seed int64) error {
 	files := make(map[string]fileRecord, len(tpccTables))
+	aggregates := make(map[string]float64, len(datasetAggregateSpecs))
+	samples := make(map[string][]map[string]string, len(datasetSampleSpecs))
 	for _, table := range tpccTables {
 		path := filepath.Join(dataDir, table+".csv")
-		record, err := inspectCSVFile(path)
+		scan, err := scanCSVFile(path, table, seed)
 		if err != nil {
 			return fmt.Errorf("inspect generated dataset file %s: %w", path, err)
 		}
-		if record.Rows != expectedCSVRows(warehouses, table) {
-			return fmt.Errorf("generated dataset file %s has %d rows, want %d", path, record.Rows, expectedCSVRows(warehouses, table))
+		if scan.record.Rows != expectedCSVRows(warehouses, table) {
+			return fmt.Errorf("generated dataset file %s has %d rows, want %d", path, scan.record.Rows, expectedCSVRows(warehouses, table))
 		}
-		files[table] = record
+		files[table] = scan.record
+		for key, value := range scan.aggregates {
+			aggregates[key] = value
+		}
+		if len(scan.samples) > 0 {
+			samples[table] = scan.samples
+		}
 	}
-	data, err := json.MarshalIndent(datasetManifest{Warehouses: warehouses, Seed: seed, Files: files}, "", "  ")
+	manifest := datasetManifest{Warehouses: warehouses, Seed: seed, Files: files, Aggregates: aggregates, Samples: samples}
+	if err := validateManifestFacts(manifest); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dataDir, datasetManifestName), append(data, '\n'), 0644)
+}
+
+// validateManifestFacts refuses to publish or accept a manifest that does not
+// carry every derived fact the load-phase validation needs. A silently missing
+// aggregate or sample would turn a required check into a skipped one, which is
+// exactly the "looser than the official evaluator" failure mode this work exists
+// to remove.
+func validateManifestFacts(manifest datasetManifest) error {
+	for _, spec := range datasetAggregateSpecs {
+		if _, ok := manifest.Aggregates[spec.key]; !ok {
+			return fmt.Errorf("dataset manifest is missing the aggregate %s", spec.key)
+		}
+	}
+	for _, spec := range datasetSampleSpecs {
+		samples := manifest.Samples[spec.table]
+		if len(samples) == 0 {
+			return fmt.Errorf("dataset manifest is missing row samples for %s", spec.table)
+		}
+		for _, sample := range samples {
+			for _, column := range append(append([]string{}, spec.keys...), spec.values...) {
+				if _, ok := sample[column]; !ok {
+					return fmt.Errorf("dataset manifest sample of %s is missing column %s", spec.table, column)
+				}
+			}
+		}
+		if err := validateSampleCoverage(spec.table, spec, samples, manifest.Warehouses); err != nil {
+			return err
+		}
+	}
+	// The recorded aggregates must already satisfy the invariants the loaded
+	// database is asked to satisfy; otherwise a mismatch could be blamed on the
+	// database when the manifest itself is wrong.
+	if rows, ok := manifest.Files["order_line"]; ok {
+		if got := int64(manifest.Aggregates[aggOrdersOlCntSum]); got != rows.Rows {
+			return fmt.Errorf("dataset manifest records SUM(o_ol_cnt)=%d but %d order_line rows", got, rows.Rows)
+		}
+	}
+	if rows, ok := manifest.Files["new_orders"]; ok {
+		if got := int64(manifest.Aggregates[aggOrdersCarrierZeroRows]); got != rows.Rows {
+			return fmt.Errorf("dataset manifest records %d orders with o_carrier_id=0 but %d new_orders rows", got, rows.Rows)
+		}
+	}
+	return nil
 }
 
 // readDatasetManifest returns the row counts recorded when the CSV set was
@@ -151,6 +230,9 @@ func readDatasetManifest(dataDir string) (datasetManifest, error) {
 		if !ok || record.Rows < 1 {
 			return datasetManifest{}, fmt.Errorf("dataset manifest %s is missing the row count for %s", path, table)
 		}
+	}
+	if err := validateManifestFacts(manifest); err != nil {
+		return datasetManifest{}, fmt.Errorf("dataset manifest %s: %w (regenerate it with --command refresh-manifest)", path, err)
 	}
 	return manifest, nil
 }
@@ -463,6 +545,10 @@ func expectedUndeliveredOrderLines(warehouses int) int64 {
 func verifyLoadIntegrity(c sqlExecutor, manifest datasetManifest) error {
 	orderLineRows := manifest.Files["order_line"].Rows
 	newOrderRows := manifest.Files["new_orders"].Rows
+	// The manifest records the real aggregates of this CSV set; see dataset.go for
+	// why these must not be recomputed from a generator formula.
+	generatedCarrierZeroRows := int64(manifest.Aggregates[aggOrdersCarrierZeroRows])
+	generatedDeliveryNulls := int64(manifest.Aggregates[aggOrderLineDeliveryNulls])
 	checks := []struct {
 		label string
 		sql   string
@@ -480,8 +566,10 @@ func verifyLoadIntegrity(c sqlExecutor, manifest datasetManifest) error {
 			"select count(*) from orders where o_ol_cnt > 15;", 0},
 		{"orders with o_carrier_id = 0 equals the new_orders row count",
 			"select count(*) from orders where o_carrier_id = 0;", newOrderRows},
+		{"orders with o_carrier_id = 0 equals the generated count",
+			"select count(o_id) from orders where o_carrier_id = 0;", generatedCarrierZeroRows},
 		{"order_line rows with an empty delivery time equals the generated count",
-			"select count(*) from order_line where ol_delivery_d is null;", expectedUndeliveredOrderLines(manifest.Warehouses)},
+			"select count(*) from order_line where ol_delivery_d is null;", generatedDeliveryNulls},
 		{"stock.s_ytd is initially zero",
 			"select count(*) from stock where s_ytd <> 0.0;", 0},
 		{"stock.s_order_cnt is initially zero",
@@ -573,7 +661,15 @@ func loadData(address string, timeout time.Duration, isolation, dataDir, schemaD
 	if err := verifyLoadIntegrity(c, manifest); err != nil {
 		return err
 	}
+	if err := verifyLoadRelationSamples(c, manifest); err != nil {
+		return err
+	}
 	phase("integrity validation", integrityStart)
+	contentStart := time.Now()
+	if err := verifyLoadContentSamples(c, manifest); err != nil {
+		return err
+	}
+	phase("content validation", contentStart)
 	return nil
 }
 
@@ -608,196 +704,6 @@ func waitForReady(address string, timeout time.Duration) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("server did not become SQL-ready on %s within %s: %v", address, timeout, lastErr)
-}
-
-func checkConsistency(address string, timeout time.Duration, isolation, resultPath, stage string) error {
-	if resultPath == "" {
-		return errors.New("--result-json is required for consistency")
-	}
-	data, err := os.ReadFile(resultPath)
-	if err != nil {
-		return err
-	}
-	var prior document
-	if err := json.Unmarshal(data, &prior); err != nil {
-		return err
-	}
-	if err := validateResultDocument(prior); err != nil {
-		return fmt.Errorf("invalid benchmark result: %w", err)
-	}
-	c, err := newClient(address, timeout, isolation)
-	if err != nil {
-		return err
-	}
-	defer c.close()
-	if strings.HasPrefix(stage, "online-") {
-		return checkOnlineConsistency(c, prior, stage)
-	}
-	failures := make([]string, 0)
-	queryInt := func(sql string, fallback int) int {
-		text, err := c.exec(sql)
-		if err != nil {
-			failures = append(failures, err.Error())
-			return fallback
-		}
-		return scalarInt(text, fallback)
-	}
-	warehouseTotal, districtTotal := prior.Config.BaselineWarehouseTotal, prior.Config.BaselineDistrictTotal
-	if actual := queryInt("select count(*) from warehouse;", -1); actual != warehouseTotal {
-		failures = append(failures, fmt.Sprintf("warehouse count: expected %d, got %d", warehouseTotal, actual))
-	}
-	if actual := queryInt("select count(*) from district;", -1); actual != districtTotal {
-		failures = append(failures, fmt.Sprintf("district count: expected %d, got %d", districtTotal, actual))
-	}
-	staticCounts := []struct {
-		table    string
-		expected int
-		label    string
-	}{
-		{"customer", prior.Config.BaselineCustomerTotal, "customer"},
-		{"item", prior.Config.BaselineItemTotal, "item"},
-		{"stock", prior.Config.BaselineStockTotal, "stock"},
-	}
-	for _, check := range staticCounts {
-		if check.expected <= 0 {
-			continue // Backward-compatible with result files written before these fields existed.
-		}
-		if actual := queryInt(fmt.Sprintf("select count(*) from %s;", check.table), -1); actual != check.expected {
-			failures = append(failures, fmt.Sprintf("%s count: expected %d, got %d", check.label, check.expected, actual))
-		}
-	}
-	for wID := 1; wID <= warehouseTotal; wID++ {
-		warehouseText, err := c.exec(fmt.Sprintf("select w_ytd from warehouse where w_id = %d;", wID))
-		if err != nil {
-			failures = append(failures, err.Error())
-			continue
-		}
-		districtText, err := c.exec(fmt.Sprintf("select sum(d_ytd) from district where d_w_id = %d;", wID))
-		if err != nil {
-			failures = append(failures, err.Error())
-			continue
-		}
-		warehouseYTD, districtYTD := scalarFloat(warehouseText, 0), scalarFloat(districtText, 0)
-		// RMDB stores FLOAT values as binary32. Warehouse and district totals
-		// are accumulated independently, so their rounded sums need a scale-
-		// aware tolerance after a high-volume run.
-		tolerance := math.Max(0.05, 2e-6*math.Max(math.Abs(warehouseYTD), math.Abs(districtYTD)))
-		if math.Abs(warehouseYTD-districtYTD) > tolerance {
-			failures = append(failures, fmt.Sprintf("warehouse/district YTD mismatch w=%d: warehouse=%.2f, districts=%.2f", wID, warehouseYTD, districtYTD))
-		}
-	}
-	for wID := 1; wID <= warehouseTotal; wID++ {
-		for dID := 1; dID <= districtsPerWarehouse; dID++ {
-			checkDistrict(c, wID, dID, &failures)
-		}
-	}
-	if len(failures) > 0 {
-		return fmt.Errorf("[%s] consistency validation failed (%d rule(s))\n%s", stage, len(failures), strings.Join(failures, "\n"))
-	}
-	fmt.Printf("consistency ok: stage=%s\n", stage)
-	return nil
-}
-
-func checkOnlineConsistency(c *client, prior document, stage string) error {
-	failures := make([]string, 0)
-	queryInt := func(sql string, fallback int) int {
-		text, err := c.exec(sql)
-		if err != nil {
-			failures = append(failures, err.Error())
-			return fallback
-		}
-		return scalarInt(text, fallback)
-	}
-	queryFloat := func(sql string, fallback float64) float64 {
-		text, err := c.exec(sql)
-		if err != nil {
-			failures = append(failures, err.Error())
-			return fallback
-		}
-		return scalarFloat(text, fallback)
-	}
-
-	warehouseTotal := prior.Config.BaselineWarehouseTotal
-	districtTotal := prior.Config.BaselineDistrictTotal
-	if actual := queryInt("select count(*) from warehouse;", -1); actual != warehouseTotal {
-		failures = append(failures, fmt.Sprintf("warehouse count: expected %d, got %d", warehouseTotal, actual))
-	}
-	if actual := queryInt("select count(*) from district;", -1); actual != districtTotal {
-		failures = append(failures, fmt.Sprintf("district count: expected %d, got %d", districtTotal, actual))
-	}
-	if actual := queryInt("select count(w_id) from warehouse where w_id = 1;", -1); actual != 1 {
-		failures = append(failures, fmt.Sprintf("warehouse key lookup: expected 1, got %d", actual))
-	}
-	if actual := queryInt("select count(d_id) from district where d_w_id = 1 and d_id = 1;", -1); actual != 1 {
-		failures = append(failures, fmt.Sprintf("district key lookup: expected 1, got %d", actual))
-	}
-	dNext := queryInt("select d_next_o_id from district where d_w_id = 1 and d_id = 1;", -1)
-	if dNext < initialOrdersPerDist+1 {
-		failures = append(failures, fmt.Sprintf("district next order id is out of range: %d", dNext))
-	}
-	maxOrder := queryInt("select max(o_id) from orders where o_w_id = 1 and o_d_id = 1;", -1)
-	if maxOrder != dNext-1 {
-		failures = append(failures, fmt.Sprintf("district order id mismatch: d_next=%d max_order=%d", dNext, maxOrder))
-	}
-
-	warehouseYTD := queryFloat("select w_ytd from warehouse where w_id = 1;", -1)
-	districtYTD := queryFloat("select sum(d_ytd) from district where d_w_id = 1;", -1)
-	if warehouseYTD < 300000 {
-		failures = append(failures, fmt.Sprintf("warehouse YTD is out of range: %.2f", warehouseYTD))
-	}
-	if districtYTD < 300000 {
-		failures = append(failures, fmt.Sprintf("district YTD is out of range: %.2f", districtYTD))
-	}
-	tolerance := math.Max(0.05, 2e-6*math.Max(math.Abs(warehouseYTD), math.Abs(districtYTD)))
-	if math.Abs(warehouseYTD-districtYTD) > tolerance {
-		failures = append(failures,
-			fmt.Sprintf("warehouse/district YTD mismatch: warehouse=%.2f districts=%.2f", warehouseYTD, districtYTD))
-	}
-	if len(failures) > 0 {
-		return fmt.Errorf("[%s] online consistency validation failed (%d rule(s))\n%s",
-			stage, len(failures), strings.Join(failures, "\n"))
-	}
-	fmt.Printf("consistency ok: stage=%s\n", stage)
-	return nil
-}
-
-func checkDistrict(c *client, wID, dID int, failures *[]string) {
-	query := func(sql string, fallback int) int {
-		text, err := c.exec(sql)
-		if err != nil {
-			*failures = append(*failures, err.Error())
-			return fallback
-		}
-		return scalarInt(text, fallback)
-	}
-	dNext := query(fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", wID, dID), -1)
-	maxOrder := query(fmt.Sprintf("select max(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID), -1)
-	maxNew := query(fmt.Sprintf("select max(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID), -1)
-	if dNext-1 != maxOrder {
-		*failures = append(*failures, fmt.Sprintf("district order id mismatch w=%d d=%d: d_next=%d, max_order=%d", wID, dID, dNext, maxOrder))
-	}
-	countOrder := query(fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID), 0)
-	minOrder := query(fmt.Sprintf("select min(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID), -1)
-	if countOrder > 0 && countOrder != maxOrder-minOrder+1 {
-		*failures = append(*failures, fmt.Sprintf("orders gap w=%d d=%d: count=%d, min=%d, max=%d", wID, dID, countOrder, minOrder, maxOrder))
-	}
-	countNew := query(fmt.Sprintf("select count(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID), 0)
-	minNew := query(fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID), -1)
-	if countNew > 0 && countNew != maxNew-minNew+1 {
-		*failures = append(*failures, fmt.Sprintf("new_orders gap w=%d d=%d: count=%d, min=%d, max=%d", wID, dID, countNew, minNew, maxNew))
-	}
-	if countNew > 0 && maxNew != maxOrder {
-		*failures = append(*failures, fmt.Sprintf("new_orders tail mismatch w=%d d=%d: max_new_order=%d, max_order=%d", wID, dID, maxNew, maxOrder))
-	}
-	carrierZero := query(fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID), 0)
-	if carrierZero != countNew {
-		*failures = append(*failures, fmt.Sprintf("pending order mismatch w=%d d=%d: carrier_zero=%d, new_orders=%d", wID, dID, carrierZero, countNew))
-	}
-	sumLines := query(fmt.Sprintf("select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d;", wID, dID), 0)
-	countLines := query(fmt.Sprintf("select count(ol_o_id) from order_line where ol_w_id = %d and ol_d_id = %d;", wID, dID), 0)
-	if sumLines != countLines {
-		*failures = append(*failures, fmt.Sprintf("order_line count mismatch w=%d d=%d: sum_o_ol_cnt=%d, count_ol_o_id=%d", wID, dID, sumLines, countLines))
-	}
 }
 
 func mergeComparableConfig(value config) config {

@@ -575,7 +575,7 @@ func (b *beginErrorBackend) close()                      {}
 
 func shortRound(factory backendFactory) (*result, error) {
 	end := time.Now().Add(5 * time.Millisecond)
-	return runRound(1, 1, 1, profile{warehouses: 1, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1}, "terminal-home", time.Now(), end, 1, 0, false, &liveStats{}, factory)
+	return runRound(1, 1, 1, profile{warehouses: 1, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1}, "terminal-home", time.Now(), end, 1, 0, false, &liveStats{}, factory, newTxnLedger())
 }
 
 func TestRunRoundRejectsInitialConnectFailure(t *testing.T) {
@@ -663,7 +663,7 @@ func TestOfficialWindowsRejectsReconnectEachTxnBeforeConnecting(t *testing.T) {
 		0, 1, 0, 0, true, 0, func() (txnBackend, error) {
 			factoryCalls++
 			return &lifecycleBackend{}, nil
-		})
+		}, newTxnLedger())
 	if err == nil || !strings.Contains(err.Error(), "does not allow reconnect-each-txn") {
 		t.Fatalf("runOfficialWindows() error = %v, want reconnect rejection", err)
 	}
@@ -792,6 +792,10 @@ func integrityManifest() datasetManifest {
 	return datasetManifest{Warehouses: 1, Files: map[string]fileRecord{
 		"order_line": {Rows: 300000, Size: 1},
 		"new_orders": {Rows: districtsPerWarehouse * initialNewOrdersPerDistrict, Size: 1},
+	}, Aggregates: map[string]float64{
+		aggOrdersOlCntSum:         300000,
+		aggOrdersCarrierZeroRows:  districtsPerWarehouse * initialNewOrdersPerDistrict,
+		aggOrderLineDeliveryNulls: float64(expectedUndeliveredOrderLines(1)),
 	}}
 }
 
@@ -803,7 +807,8 @@ func passingIntegrityAnswers(manifest datasetManifest) map[string]int64 {
 		"select count(*) from orders where o_ol_cnt < 5;":              0,
 		"select count(*) from orders where o_ol_cnt > 15;":             0,
 		"select count(*) from orders where o_carrier_id = 0;":          manifest.Files["new_orders"].Rows,
-		"select count(*) from order_line where ol_delivery_d is null;": expectedUndeliveredOrderLines(manifest.Warehouses),
+		"select count(o_id) from orders where o_carrier_id = 0;":       int64(manifest.Aggregates[aggOrdersCarrierZeroRows]),
+		"select count(*) from order_line where ol_delivery_d is null;": int64(manifest.Aggregates[aggOrderLineDeliveryNulls]),
 		"select count(*) from stock where s_ytd <> 0.0;":               0,
 		"select count(*) from stock where s_order_cnt <> 0;":           0,
 		"select count(*) from stock where s_remote_cnt <> 0;":          0,
@@ -839,6 +844,7 @@ func TestVerifyLoadIntegrityRejectsEveryViolation(t *testing.T) {
 		"select count(*) from orders where o_ol_cnt < 5;":              1,
 		"select count(*) from orders where o_ol_cnt > 15;":             1,
 		"select count(*) from orders where o_carrier_id = 0;":          manifest.Files["new_orders"].Rows + 1,
+		"select count(o_id) from orders where o_carrier_id = 0;":       int64(manifest.Aggregates[aggOrdersCarrierZeroRows]) - 1,
 		"select count(*) from order_line where ol_delivery_d is null;": 0,
 		"select count(*) from stock where s_ytd <> 0.0;":               1,
 		"select count(*) from stock where s_order_cnt <> 0;":           1,
