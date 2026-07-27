@@ -476,6 +476,95 @@ void RmFileHandle::rebuild_file_header_from_pages() {
     }
 }
 
+void RmFileHandle::repair_file_header_for_pages(const std::vector<page_id_t>& page_nos) {
+    if (page_nos.empty()) {
+        return;
+    }
+
+    std::vector<page_id_t> pages = page_nos;
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    if (pages.front() < RM_FIRST_RECORD_PAGE) {
+        throw InternalError("recovery referenced an invalid record page");
+    }
+
+    const std::string& path = disk_manager_->get_file_name(fd_);
+    const int64_t file_size = disk_manager_->get_file_size(path);
+    if (file_size < static_cast<int64_t>(sizeof(RmFileHdr)) || (file_size > PAGE_SIZE && file_size % PAGE_SIZE != 0)) {
+        throw InternalError("record file has an incomplete page during recovery");
+    }
+    const int disk_page_count = file_size <= PAGE_SIZE ? 1 : static_cast<int>(file_size / PAGE_SIZE);
+
+    // A newly allocated page may only exist in the buffer pool when the
+    // process crashed. Pages that are in neither place are intentionally left
+    // for redo/undo's existing exact-RID allocation path; this is the normal
+    // case for a committed insert whose page was never created before the
+    // crash.
+    std::vector<page_id_t> existing_pages;
+    existing_pages.reserve(pages.size());
+    for (const page_id_t page_no : pages) {
+        const PageId page_id{fd_, page_no};
+        if (page_no < disk_page_count || buffer_pool_manager_->is_page_resident(page_id)) {
+            existing_pages.push_back(page_no);
+        }
+    }
+
+    if (!existing_pages.empty()) {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        file_hdr_.num_pages = std::max(file_hdr_.num_pages, existing_pages.back() + 1);
+        disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
+    }
+
+    // The bitmap is authoritative for a touched page. Repair its count and
+    // update only the in-memory/persisted free-page chain entry for that page.
+    // Untouched pages retain the existing chain, so the cost is proportional to
+    // the pages named by the WAL rather than to the table size.
+    for (const page_id_t page_no : existing_pages) {
+        auto page_handle = fetch_page_handle(page_no);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            int num_records = 0;
+            for (int slot_no = 0; slot_no < file_hdr_.num_records_per_page; ++slot_no) {
+                if (Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                    ++num_records;
+                }
+            }
+            page_handle.page_hdr->num_records = num_records;
+
+            std::scoped_lock metadata_lock(free_space_latch_, file_header_latch_);
+            const bool page_is_full = num_records >= file_hdr_.num_records_per_page;
+            if (page_is_full) {
+                const bool was_candidate = free_page_candidate_set_.erase(page_no) != 0;
+                if (was_candidate) {
+                    free_page_candidates_.erase(
+                        std::remove(free_page_candidates_.begin(), free_page_candidates_.end(), page_no),
+                        free_page_candidates_.end());
+                    if (free_page_cursor_ >= free_page_candidates_.size()) {
+                        free_page_cursor_ = 0;
+                    }
+                }
+                if (file_hdr_.first_free_page_no == page_no) {
+                    file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+                }
+                page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
+                if (file_hdr_.first_free_page_no == page_no) {
+                    file_hdr_.first_free_page_no = RM_NO_PAGE;
+                }
+            } else if (free_page_candidate_set_.insert(page_no).second) {
+                free_page_candidates_.push_back(page_no);
+                page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+                file_hdr_.first_free_page_no = page_no;
+            } else if (file_hdr_.first_free_page_no == RM_NO_PAGE) {
+                // The candidate cache can be populated before the header is
+                // repaired (for example after reopening a database).
+                page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
+                file_hdr_.first_free_page_no = page_no;
+            }
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    }
+}
+
 TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
     auto page_handle = fetch_page_handle(rid.page_no);
     TupleMeta meta;

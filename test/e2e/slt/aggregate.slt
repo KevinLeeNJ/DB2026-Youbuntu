@@ -56,7 +56,7 @@ SELECT AVG(score) AS avg_score FROM grade WHERE course = 'DataStructure';
 +------------------+
 |        avg_score |
 +------------------+
-|        94.333333 |
+|        94.333336 |
 +------------------+
 Total record(s): 1
 

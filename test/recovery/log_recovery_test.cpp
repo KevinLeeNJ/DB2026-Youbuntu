@@ -20,9 +20,12 @@ See the Mulan PSL v2 for more details. */
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <filesystem>
 #include <memory>
+#include <sys/wait.h>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -144,10 +147,52 @@ void FlushLogs(LogManager& log_mgr) {
 
 void RunRecovery(const std::string& db_name) {
     OpenRecoveryDb db(db_name);
-    auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.sm_mgr_);
+    auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
     recovery->analyze();
     recovery->redo();
     recovery->undo();
+}
+
+int RunRecoveryAfterInjectedProcessDeath(const std::string& db_name, const char* point) {
+#ifndef RMDB_ENABLE_FAULT_INJECTION
+    (void)db_name;
+    (void)point;
+    return -1;
+#else
+    // _exit(137) is the FaultInjector's deterministic crash action. Using it
+    // avoids racing a SIGKILL against the block action, which has no
+    // ready-at-point notification. The child still disappears without running
+    // recovery cleanup, so the following process exercises the same replay.
+    if (setenv("RMDB_FAULT_POINT", point, 1) != 0 || setenv("RMDB_FAULT_ACTION", "_exit", 1) != 0 ||
+        unsetenv("RMDB_FAULT_SKIP") != 0) {
+        return -1;
+    }
+
+    const pid_t child = fork();
+    if (child == -1) {
+        unsetenv("RMDB_FAULT_POINT");
+        unsetenv("RMDB_FAULT_ACTION");
+        return -1;
+    }
+    if (child == 0) {
+        RunRecovery(db_name);
+        _exit(0);
+    }
+
+    int status = 0;
+    pid_t waited = 0;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+
+    unsetenv("RMDB_FAULT_POINT");
+    unsetenv("RMDB_FAULT_ACTION");
+    unsetenv("RMDB_FAULT_SKIP");
+    if (waited != child) {
+        return -1;
+    }
+    return status;
+#endif
 }
 
 bool RecordExists(SmManager& sm_mgr, const Rid& rid) {
@@ -610,4 +655,110 @@ TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
     ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryFaultInjectionTest, RedoProcessDeathIsRecoverable) {
+    ScopedTestDir test_dir("recovery_fault_redo_root");
+    const std::string db_name = "recovery_fault_redo_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto insert_lsn = AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);
+        AppendCommit(*db.log_mgr_, 100, insert_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    const int status = RunRecoveryAfterInjectedProcessDeath(db_name, "mid_recovery_redo");
+#ifdef RMDB_ENABLE_FAULT_INJECTION
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 137);
+#else
+    (void)status;
+#endif
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryFaultInjectionTest, UndoProcessDeathIsRecoverable) {
+    ScopedTestDir test_dir("recovery_fault_undo_root");
+    const std::string db_name = "recovery_fault_undo_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        AppendInsert(*db.log_mgr_, 100, begin_lsn, rid, rec);
+        FlushLogs(*db.log_mgr_);
+
+        db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    const int status = RunRecoveryAfterInjectedProcessDeath(db_name, "mid_recovery_undo");
+#ifdef RMDB_ENABLE_FAULT_INJECTION
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 137);
+#else
+    (void)status;
+#endif
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryFaultInjectionTest, IndexRepairIsIdempotentAcrossRepeatedRecovery) {
+    ScopedTestDir test_dir("recovery_fault_index_reentry_root");
+    const std::string db_name = "recovery_fault_index_reentry_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
+        AppendCommit(*db.log_mgr_, 100, update_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    // This point is after redo/undo, incremental index repair and page flush,
+    // but before WAL truncation. The next process must safely re-enter recovery.
+    const int status = RunRecoveryAfterInjectedProcessDeath(db_name, "before_recovery_wal_reset");
+#ifdef RMDB_ENABLE_FAULT_INJECTION
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 137);
+#else
+    (void)status;
+#endif
+
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
 }

@@ -71,6 +71,24 @@ TEST(ParserTest, ParsesDdlAndDmlStatements) {
               ast::AstType::UpdateStmt);
 }
 
+TEST(ParserTest, ParsesNamedCreateIndexOnTableSyntax) {
+    auto parsed = parse_ok("create index customer_last on customer(c_w_id, c_d_id, c_last, c_first, c_id);");
+    auto* index = dynamic_cast<ast::CreateIndex*>(parsed.get());
+    ASSERT_NE(index, nullptr);
+    EXPECT_EQ(index->tab_name, "customer");
+    EXPECT_EQ(index->col_names, std::vector<std::string>({"c_w_id", "c_d_id", "c_last", "c_first", "c_id"}));
+}
+
+TEST(ParserTest, FloatColumnsUseBinary32Width) {
+    auto parsed = parse_ok("create table tb (value float);");
+    const auto* create = as_node<ast::CreateTable>(parsed);
+    ASSERT_EQ(create->fields.size(), 1U);
+    const auto* column = dynamic_cast<const ast::ColDef*>(create->fields[0].get());
+    ASSERT_NE(column, nullptr);
+    EXPECT_EQ(column->type_len->type, ast::SV_TYPE_FLOAT);
+    EXPECT_EQ(column->type_len->len, static_cast<int>(sizeof(float)));
+}
+
 TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     auto parsed = parse_ok("update score_tab set score = score + 5, bonus = score_tab.bonus - 0.5 where id < 3;");
     auto update = as_node<ast::UpdateStmt>(parsed);

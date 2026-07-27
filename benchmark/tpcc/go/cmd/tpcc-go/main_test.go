@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +92,151 @@ func TestSurnameAcceptsTPCCTokenRange(t *testing.T) {
 	}
 }
 
+func TestTPCCTxnMixMatchesOfficialWeights(t *testing.T) {
+	counts := make(map[string]int)
+	for bucket := 0; bucket < 100; bucket++ {
+		counts[txnTypeForBucket(bucket)]++
+	}
+	want := map[string]int{"new_order": 45, "payment": 43, "order_status": 4, "delivery": 4, "stock_level": 4}
+	if fmt.Sprint(counts) != fmt.Sprint(want) {
+		t.Fatalf("transaction mix = %#v, want %#v", counts, want)
+	}
+}
+
+func TestOfficialTerminalHomePairsWorkers(t *testing.T) {
+	p := profile{warehouses: 50, districtsPerWarehouse: 10, customersPerDistrict: 3000, itemCount: 100000}
+	first := chooseContext(p, 0, "official-terminal-home", rand.New(rand.NewSource(1)))
+	second := chooseContext(p, 1, "official-terminal-home", rand.New(rand.NewSource(1)))
+	twentyFifth := chooseContext(p, 48, "official-terminal-home", rand.New(rand.NewSource(1)))
+	if first.wID != 1 || second.wID != 1 || twentyFifth.wID != 25 {
+		t.Fatalf("terminal homes = %d, %d, %d; want 1, 1, 25", first.wID, second.wID, twentyFifth.wID)
+	}
+}
+
+func TestOfficialModeValidation(t *testing.T) {
+	if err := validateBenchmarkMode("official-equivalent", 50, 10, 60, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBenchmarkMode("official-equivalent", 16, 10, 60, 1); err == nil {
+		t.Fatal("non-official worker count unexpectedly accepted")
+	}
+	if err := validateBenchmarkMode("sqlite-reference", 16, 30, 360, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBenchmarkMode("local", 16, 30, 360, 1); err == nil {
+		t.Fatal("legacy local benchmark mode unexpectedly accepted")
+	}
+}
+
+func TestOfficialTPCCTargetIndexesAreDeclared(t *testing.T) {
+	want := []struct {
+		rmdbStatement   string
+		sqliteStatement string
+	}{
+		{
+			rmdbStatement:   "create index customer_last on customer(c_w_id, c_d_id, c_last, c_first, c_id);",
+			sqliteStatement: "create index idx_customer_last on customer(c_w_id, c_d_id, c_last, c_first, c_id);",
+		},
+		{
+			rmdbStatement:   "create index orders_customer on orders(o_w_id, o_d_id, o_c_id, o_id);",
+			sqliteStatement: "create index idx_orders_customer on orders(o_w_id, o_d_id, o_c_id, o_id);",
+		},
+	}
+	for _, schemaName := range []string{"rmdb_indexes.sql", "sqlite_indexes.sql"} {
+		data, err := os.ReadFile(tpccSchemaPath(schemaName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := strings.ToLower(string(data))
+		for _, index := range want {
+			statement := index.sqliteStatement
+			if schemaName == "rmdb_indexes.sql" {
+				statement = index.rmdbStatement
+			}
+			if !strings.Contains(text, statement) {
+				t.Errorf("%s does not declare %q", schemaName, statement)
+			}
+		}
+		if strings.Contains(text, "distinct") || strings.Contains(text, "exec_batch") || strings.Contains(text, "prepare_set") {
+			t.Errorf("%s contains out-of-scope protocol or DISTINCT changes", schemaName)
+		}
+	}
+}
+
+func TestOfficialTPCCTargetIndexesExecuteAndSupportQueries(t *testing.T) {
+	backend, err := newSQLiteBackend(filepath.Join(t.TempDir(), "tpcc.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.close()
+	if err := backend.execFile(tpccSchemaPath("sqlite_schema.sql")); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.execFile(tpccSchemaPath("sqlite_indexes.sql")); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := []struct {
+		name    string
+		columns []string
+		query   string
+	}{
+		{
+			name:    "idx_customer_last",
+			columns: []string{"c_w_id", "c_d_id", "c_last", "c_first", "c_id"},
+			query:   "select c_id from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
+		},
+		{
+			name:    "idx_orders_customer",
+			columns: []string{"o_w_id", "o_d_id", "o_c_id", "o_id"},
+			query:   "select o_id from orders where o_w_id = 1 and o_d_id = 1 and o_c_id = 1 order by o_id desc limit 1;",
+		},
+	}
+	for _, check := range checks {
+		info, err := backend.exec("pragma index_info(" + check.name + ");")
+		if err != nil {
+			t.Fatalf("PRAGMA index_info(%s): %v", check.name, err)
+		}
+		if strings.TrimSpace(info) == "" {
+			t.Fatalf("index %s was not created", check.name)
+		}
+		var gotColumns []string
+		for _, line := range strings.Split(strings.TrimSpace(info), "\n") {
+			fields := strings.Split(line, "|")
+			if len(fields) != 3 {
+				t.Fatalf("PRAGMA index_info(%s) returned malformed row %q", check.name, line)
+			}
+			gotColumns = append(gotColumns, fields[2])
+		}
+		if strings.Join(gotColumns, ",") != strings.Join(check.columns, ",") {
+			t.Fatalf("index %s columns = %v, want %v", check.name, gotColumns, check.columns)
+		}
+		plan, err := backend.exec("explain query plan " + check.query)
+		if err != nil {
+			t.Fatalf("EXPLAIN for %s: %v", check.name, err)
+		}
+		if !strings.Contains(plan, check.name) {
+			t.Fatalf("query plan does not use %s: %q", check.name, plan)
+		}
+	}
+}
+
+func tpccSchemaPath(name string) string {
+	_, file, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(file), "..", "..", "..", "schema", name)
+}
+
+func TestWaitForReadyExecutesShowTables(t *testing.T) {
+	received := make(chan []byte, 1)
+	address := runTestServer(t, []byte("Total record(s): 0\n\x00"), received)
+	if err := waitForReady(address, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(<-received); got != "show tables;\x00" {
+		t.Fatalf("readiness request = %q", got)
+	}
+}
+
 func TestResultMergePreservesCountsAndLatencies(t *testing.T) {
 	combined := newResult(60)
 	first := newResult(60)
@@ -119,6 +266,9 @@ func TestResultFinalizeIncludesPerTransactionTPM(t *testing.T) {
 	result.finalize()
 	if result.TxnTPM["new_order"] != 2 || result.TxnTPM["delivery"] != 1 {
 		t.Fatalf("txn_tpm = %#v", result.TxnTPM)
+	}
+	if result.Committed["new_order"] != 2 || result.NewOrderPerMin != 2 {
+		t.Fatalf("committed = %#v, NewOrder/min = %v", result.Committed, result.NewOrderPerMin)
 	}
 }
 

@@ -66,6 +66,7 @@ private:
     struct AggregateState {
         int64_t count = 0;
         double sum = 0.0;
+        float float_sum = 0.0f;
         bool has_value = false;
         CellValue value;
     };
@@ -149,7 +150,7 @@ private:
             value.int_val = read_unaligned<int>(data);
             break;
         case TYPE_FLOAT:
-            value.float_val = read_unaligned<double>(data);
+            value.float_val = read_float(data);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -202,7 +203,7 @@ private:
             write_unaligned(dest + col.offset, value.int_val);
             break;
         case TYPE_FLOAT:
-            write_unaligned(dest + col.offset, value.float_val);
+            write_float(dest + col.offset, value.float_val);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -352,12 +353,18 @@ private:
             ++state.count;
             break;
         case LocalAggType::SUM:
-            state.sum += (current_value.type == TYPE_INT) ? static_cast<double>(current_value.int_val)
-                                                          : static_cast<double>(current_value.float_val);
+            if (spec.input_type == TYPE_FLOAT) {
+                state.float_sum += current_value.float_val;
+            } else {
+                state.sum += static_cast<double>(current_value.int_val);
+            }
             break;
         case LocalAggType::AVG:
-            state.sum += (current_value.type == TYPE_INT) ? static_cast<double>(current_value.int_val)
-                                                          : static_cast<double>(current_value.float_val);
+            if (spec.input_type == TYPE_FLOAT) {
+                state.float_sum += current_value.float_val;
+            } else {
+                state.sum += static_cast<double>(current_value.int_val);
+            }
             ++state.count;
             break;
         case LocalAggType::MAX:
@@ -398,14 +405,18 @@ private:
             if (spec.input_type == TYPE_INT) {
                 value.int_val = static_cast<int>(state.sum);
             } else {
-                value.float_val = state.sum;
+                value.float_val = state.float_sum;
             }
             return value;
         }
         case LocalAggType::AVG: {
             CellValue value;
             value.type = TYPE_FLOAT;
-            value.float_val = state.count == 0 ? 0.0 : state.sum / static_cast<double>(state.count);
+            value.float_val = state.count == 0
+                                  ? 0.0f
+                                  : (spec.input_type == TYPE_FLOAT
+                                         ? state.float_sum / static_cast<float>(state.count)
+                                         : static_cast<float>(state.sum / static_cast<double>(state.count)));
             return value;
         }
         case LocalAggType::MAX:
@@ -632,7 +643,7 @@ private:
                 break;
             case LocalAggType::AVG:
                 output_col.type = TYPE_FLOAT;
-                output_col.len = static_cast<int>(sizeof(double));
+                output_col.len = static_cast<int>(sizeof(float));
                 break;
             case LocalAggType::MAX:
             case LocalAggType::MIN:

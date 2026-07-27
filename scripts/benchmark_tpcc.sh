@@ -16,16 +16,16 @@ SERVER_LOG="$ROOT_DIR/benchmark/tpcc/rmdb-server.log"
 BINARY="$ROOT_DIR/build/bin/rmdb"
 DB_DIR="tpcc_benchmark_db"
 PORT=8765
-WAREHOUSES=1
-WORKERS=16
+WAREHOUSES=50
+WORKERS=50
 WARMUP=30
-MEASURE=360
+MEASURE=150
 ROUNDS=3
 PROGRESS_INTERVAL=5
 DATA_DIR="$ROOT_DIR/benchmark/tpcc/data"
 JSON_OUT="$ROOT_DIR/benchmark/tpcc/result.json"
 RMDB_DB_DIR=""
-RESTART_TIMEOUT=120
+RESTART_TIMEOUT=600
 REGENERATE_DATA=0
 THINK_MS=0
 RECONNECT_EACH_TXN=0
@@ -38,16 +38,16 @@ Usage: $0 [options]
   --binary PATH            rmdb binary (default: build/bin/rmdb)
   --db-dir PATH            database directory (default: tpcc_benchmark_db)
   --port N                 server port (default: 8765)
-  --warehouses N           TPC-C warehouses (default: 1)
-  --workers N              concurrent workers (default: 16)
+  --warehouses N           TPC-C warehouses (default: 50)
+  --workers N              concurrent workers (default: 50)
   --warmup N               warmup seconds (default: 30)
-  --measure N              measure seconds (default: 360)
+  --measure N              measure seconds (default: 150)
   --rounds N               benchmark rounds (default: 3)
   --progress-interval N    progress print interval seconds (default: 5)
   --data-dir PATH          CSV data directory
   --json-out PATH          result.json path
   --rmdb-db-dir PATH       RMDB directory used to resolve CSV load paths
-  --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 120)
+  --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 600)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
   --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
@@ -112,7 +112,7 @@ fi
 
 # Auto-detect whether the CSV test data set is present. The Go runner owns
 # generation as well as the high-concurrency workload.
-if ! "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR"; then
+if ! "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1; then
     echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
     "$GO_BINARY" --command datagen --warehouses "$WAREHOUSES" --data-dir "$DATA_DIR" --seed 1 --overwrite-data-dir
 fi
@@ -137,68 +137,34 @@ trap cleanup EXIT INT TERM
 
 wait_port() {
     local timeout="$1"
-    "$GO_BINARY" --command wait-port --port "$PORT" --wait-timeout "${timeout}s"
+    "$GO_BINARY" --command wait-ready --port "$PORT" --wait-timeout "${timeout}s"
 }
 
-ROUND_RESULTS=()
-for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
-    ROUND_JSON="${JSON_OUT}.round-${ROUND_NO}.tmp"
-    ROUND_RESULTS+=("$ROUND_JSON")
-    rm -rf "$DB_DIR" "$ROUND_JSON"
+GO_RECONNECT_ARGS=()
+if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
+    GO_RECONNECT_ARGS=(--reconnect-each-txn)
+fi
 
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: 启动全新 rmdb server (db=$DB_DIR)"
-    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
-    wait_port 30
-
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: load run runner=go isolation=$ISOLATION warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
-    "$GO_BINARY" --command load \
-        --port "$PORT" \
-        --isolation "$ISOLATION" \
-        --data-dir "$DATA_DIR" \
-        --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
-        --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
-    GO_RECONNECT_ARGS=()
-    if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
-        GO_RECONNECT_ARGS=(--reconnect-each-txn)
-    fi
-    "$GO_BINARY" \
-        --port "$PORT" \
-        --isolation "$ISOLATION" \
-        --workers "$WORKERS" \
-        --warmup "$WARMUP" \
-        --measure "$MEASURE" \
-        --rounds 1 \
-        --progress-interval "$PROGRESS_INTERVAL" \
-        --warehouse-policy terminal-home \
-        --think "${THINK_MS}ms" \
-        --json-out "$ROUND_JSON" \
-        "${GO_RECONNECT_ARGS[@]}"
-
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: kill -9 rmdb server (pid=$SERVER_PID) 触发崩溃恢复"
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: 重启 rmdb server，等待恢复就绪 (最长 ${RESTART_TIMEOUT}s)"
-    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
-    wait_port "$RESTART_TIMEOUT"
-
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: 恢复后一致性检查"
-    "$GO_BINARY" --command consistency \
-        --port "$PORT" \
-        --isolation "$ISOLATION" \
-        --consistency-stage "post-recovery-round-$ROUND_NO" \
-        --result-json "$ROUND_JSON"
-
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-done
-
-RESULT_INPUTS=$(IFS=,; echo "${ROUND_RESULTS[*]}")
-"$GO_BINARY" --command merge-results --json-out "$JSON_OUT" --result-inputs "$RESULT_INPUTS"
-rm -f "${ROUND_RESULTS[@]}"
-
-echo "[benchmark] all $ROUNDS independent round(s) complete: result=$JSON_OUT"
+rm -rf "$DB_DIR" "$JSON_OUT"
+echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
+"$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_port 30
+"$GO_BINARY" --command load \
+    --port "$PORT" --isolation "$ISOLATION" \
+    --data-dir "$DATA_DIR" --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
+    --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
+"$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
+    --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
+    --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
+    --think "${THINK_MS}ms" --json-out "$JSON_OUT" "${GO_RECONNECT_ARGS[@]}"
+echo "[benchmark] official-equivalent: SIGKILL and recovery check"
+kill -KILL "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+"$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_port "$RESTART_TIMEOUT"
+"$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
+    --consistency-stage post-recovery-official-equivalent --result-json "$JSON_OUT"
+echo "[benchmark] official-equivalent complete: result=$JSON_OUT"

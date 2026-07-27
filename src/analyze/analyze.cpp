@@ -220,7 +220,7 @@ std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query) {
         ColType type = infer_expr_type(item.expr, all_cols);
         int len = sizeof(int);
         if (type == TYPE_FLOAT) {
-            len = sizeof(double);
+            len = sizeof(float);
         } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
             if (item.expr.type != QueryExprType::COLUMN) {
                 throw RMDBError("UNION only supports string output from columns");
@@ -256,7 +256,7 @@ ColMeta Analyze::make_union_col_meta(const ColMeta& current, const ColMeta& next
     if ((current.type == TYPE_INT && next.type == TYPE_FLOAT) ||
         (current.type == TYPE_FLOAT && next.type == TYPE_INT)) {
         result.type = TYPE_FLOAT;
-        result.len = sizeof(double);
+        result.len = sizeof(float);
         return result;
     }
 
@@ -399,7 +399,7 @@ Value Analyze::convert_sv_value(const ast::Value* sv_val) {
 
 void Analyze::cast_value(Value& val, ColType to) {
     if (to == TYPE_FLOAT && val.type == TYPE_INT) {
-        val.set_float(static_cast<double>(val.int_val));
+        val.set_float(static_cast<float>(val.int_val));
         return;
     }
     if (to == TYPE_INT && val.type == TYPE_FLOAT) {

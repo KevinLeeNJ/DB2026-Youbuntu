@@ -145,7 +145,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 wait_port() {
-    "$GO_BINARY" --command wait-port --port "$PORT" --wait-timeout "${1}s"
+    "$GO_BINARY" --command wait-ready --port "$PORT" --wait-timeout "${1}s"
 }
 
 start_server() {

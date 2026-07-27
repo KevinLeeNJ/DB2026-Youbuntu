@@ -148,7 +148,7 @@ struct Token {
     // 对于数值类型，直接存储解析后的值
     union {
         int64_t int_value;
-        double float_value;
+        float float_value;
         bool bool_value;
     };
 
@@ -199,7 +199,7 @@ private:
 
     // 数字解析
     int64_t parse_integer(std::string_view text);
-    double parse_float(std::string_view text);
+    float parse_float(std::string_view text);
 };
 
 } // namespace parser

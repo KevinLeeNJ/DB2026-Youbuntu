@@ -358,11 +358,11 @@ int64_t Lexer::parse_integer(std::string_view text) {
     return value;
 }
 
-double Lexer::parse_float(std::string_view text) {
+float Lexer::parse_float(std::string_view text) {
     std::string owned(text);
     char* end = nullptr;
     errno = 0;
-    double value = std::strtod(owned.c_str(), &end);
+    float value = std::strtof(owned.c_str(), &end);
     if (errno == ERANGE || end != owned.c_str() + owned.size()) {
         throw LexerError("Lexer Error: float literal out of range or malformed");
     }

@@ -33,7 +33,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 
 #define SOCK_PORT 8765
-#define MAX_CONN_LIMIT 8
+#define MAX_CONN_LIMIT 128
 
 static bool should_exit = false;
 
@@ -49,11 +49,10 @@ auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_m
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
 auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
-auto log_manager = std::make_unique<LogManager>(disk_manager.get(),
-                                                std::getenv("RMDB_DURABILITY_MODE") != nullptr &&
-                                                        std::string(std::getenv("RMDB_DURABILITY_MODE")) == "strict"
-                                                    ? DurabilityMode::STRICT
-                                                    : DurabilityMode::PROCESS_CRASH);
+// The server must not acknowledge a commit before the WAL is durable.  Keep
+// PROCESS_CRASH available to focused LogManager tests, but never let an
+// omitted or misspelled environment variable weaken the production path.
+auto log_manager = std::make_unique<LogManager>(disk_manager.get(), DurabilityMode::STRICT);
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get(),
                                                   log_manager.get());
 

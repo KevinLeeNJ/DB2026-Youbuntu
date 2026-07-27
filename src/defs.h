@@ -29,6 +29,14 @@ template <typename T> inline void write_unaligned(void* data, const T& value) {
     std::memcpy(data, &value, sizeof(T));
 }
 
+inline float read_float(const void* data) {
+    return read_unaligned<float>(data);
+}
+
+inline void write_float(void* data, float value) {
+    write_unaligned(data, value);
+}
+
 // 此处重载了<<操作符，在ColMeta中进行了调用
 template <typename T, typename = typename std::enable_if<std::is_enum<T>::value, T>::type>
 std::ostream& operator<<(std::ostream& os, const T& enum_val) {

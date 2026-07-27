@@ -91,8 +91,8 @@ private:
             break;
         }
         case TYPE_FLOAT: {
-            const double converted = value.type == TYPE_INT ? static_cast<double>(value.int_val) : value.float_val;
-            memcpy(dest, &converted, col.len);
+            const float converted = value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+            write_float(dest, converted);
             break;
         }
         case TYPE_STRING:

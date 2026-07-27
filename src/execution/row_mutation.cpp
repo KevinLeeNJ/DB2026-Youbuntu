@@ -53,12 +53,12 @@ bool CompareCondition(const Condition& condition, const BoundMutationCondition& 
 
     if (bound.lhs.type == TYPE_INT || bound.lhs.type == TYPE_FLOAT) {
         const double lhs_value = bound.lhs.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
-                                                            : read_unaligned<double>(lhs_data);
+                                                            : static_cast<double>(read_float(lhs_data));
         const double rhs_value =
             condition.is_rhs_val
                 ? (rhs_type == TYPE_INT ? static_cast<double>(condition.rhs_val.int_val) : condition.rhs_val.float_val)
                 : (rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
-                                        : read_unaligned<double>(rhs_data));
+                                        : static_cast<double>(read_float(rhs_data)));
         switch (condition.op) {
         case OP_EQ:
             return lhs_value == rhs_value;
@@ -171,9 +171,9 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
         if (set_clause.is_self_ref) {
             if (set_clause.op == UpdateOp::ASSIGNMENT) {
                 if (bound.lhs.type == TYPE_INT && bound.rhs.type == TYPE_FLOAT) {
-                    write_unaligned(data, static_cast<int>(read_unaligned<double>(old_record.data + bound.rhs.offset)));
+                    write_unaligned(data, static_cast<int>(read_float(old_record.data + bound.rhs.offset)));
                 } else if (bound.lhs.type == TYPE_FLOAT && bound.rhs.type == TYPE_INT) {
-                    write_unaligned(data, static_cast<double>(read_unaligned<int>(old_record.data + bound.rhs.offset)));
+                    write_float(data, static_cast<float>(read_unaligned<int>(old_record.data + bound.rhs.offset)));
                 } else if (bound.lhs.type == TYPE_STRING || bound.lhs.type == TYPE_DATETIME) {
                     if (bound.rhs.type != TYPE_STRING && bound.rhs.type != TYPE_DATETIME) {
                         throw IncompatibleTypeError(coltype2str(bound.lhs.type), coltype2str(bound.rhs.type));
@@ -189,7 +189,7 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
                     if (bound.rhs.type != TYPE_FLOAT) {
                         throw IncompatibleTypeError(coltype2str(bound.lhs.type), coltype2str(bound.rhs.type));
                     }
-                    write_unaligned(data, read_unaligned<double>(old_record.data + bound.rhs.offset));
+                    write_float(data, read_float(old_record.data + bound.rhs.offset));
                 }
                 continue;
             }
@@ -200,7 +200,7 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
             }
             const double base = bound.rhs.type == TYPE_INT
                                     ? static_cast<double>(read_unaligned<int>(old_record.data + bound.rhs.offset))
-                                    : read_unaligned<double>(old_record.data + bound.rhs.offset);
+                                    : static_cast<double>(read_float(old_record.data + bound.rhs.offset));
             const double delta = set_clause.rhs.type == TYPE_INT ? static_cast<double>(set_clause.rhs.int_val)
                                                                  : set_clause.rhs.float_val;
             double result = base;
@@ -229,7 +229,7 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
                 write_unaligned(data, static_cast<int>(result));
                 break;
             case TYPE_FLOAT:
-                write_unaligned(data, result);
+                write_float(data, static_cast<float>(result));
                 break;
             case TYPE_STRING:
             case TYPE_DATETIME:
@@ -247,8 +247,8 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
                                                                   : static_cast<int>(set_clause.rhs.float_val));
             break;
         case TYPE_FLOAT:
-            write_unaligned(data, set_clause.rhs.type == TYPE_FLOAT ? set_clause.rhs.float_val
-                                                                    : static_cast<double>(set_clause.rhs.int_val));
+            write_float(data, set_clause.rhs.type == TYPE_FLOAT ? set_clause.rhs.float_val
+                                                                : static_cast<float>(set_clause.rhs.int_val));
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:

@@ -60,11 +60,18 @@ private:
     void undo_delete(const DeleteLogRecord& log);
     void undo_update(const UpdateLogRecord& log);
     void rebuild_indexes();
+    void repair_touched_file_headers();
+    void reset_touched_tuple_meta();
+    void repair_touched_indexes();
+    void reset_wal_if_needed();
 
     std::unordered_map<txn_id_t, lsn_t> active_txn_last_lsn_;
     std::unordered_set<txn_id_t> committed_txns_;
     std::unordered_map<lsn_t, std::unique_ptr<LogRecord>> log_records_;
     std::vector<lsn_t> log_order_;
+    std::unordered_map<std::string, std::vector<Rid>> touched_rids_;
+    std::unordered_set<std::string> touched_tables_;
+    bool has_dml_records_{false};
     lsn_t max_lsn_{INVALID_LSN}; // analyze 扫描到的最大 lsn，用于 recovery 后推进 global_lsn
     int64_t checkpoint_offset_{0};
 

@@ -47,7 +47,7 @@ inline std::string trim_string(const char* data, int len) {
 struct CellValue {
     ColType type = TYPE_INT;
     int int_val = 0;
-    double float_val = 0.0;
+    float float_val = 0.0f;
     std::string str_val;
 
     bool operator==(const CellValue& other) const;

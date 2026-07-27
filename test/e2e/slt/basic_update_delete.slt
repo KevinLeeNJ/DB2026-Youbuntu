@@ -41,7 +41,7 @@ SELECT amount FROM float64_update WHERE id = 1;
 +------------------+
 |           amount |
 +------------------+
-|    300000.010000 |
+|    300000.000000 |
 +------------------+
 Total record(s): 1
 

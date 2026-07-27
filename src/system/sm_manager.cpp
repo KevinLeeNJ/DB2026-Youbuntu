@@ -706,6 +706,26 @@ bool SmManager::flush_dirty_data_pages(bool wal_preflushed) {
     return buffer_pool_manager_->flush_all_pages(fds, wal_preflushed);
 }
 
+bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& table_names) {
+    std::vector<int> fds;
+    for (const auto& tab_name : table_names) {
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it == fhs_.end()) {
+            continue;
+        }
+        fds.push_back(fh_it->second->GetFd());
+        const auto& tab = db_.get_table(tab_name);
+        for (const auto& index : tab.indexes) {
+            const auto index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            auto ih_it = ihs_.find(index_name);
+            if (ih_it != ihs_.end()) {
+                fds.push_back(ih_it->second->GetFd());
+            }
+        }
+    }
+    return buffer_pool_manager_->flush_all_pages(fds);
+}
+
 size_t SmManager::flush_dirty_pages(size_t max_pages) {
     return buffer_pool_manager_->flush_dirty_pages(max_pages);
 }
@@ -948,11 +968,11 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
             } else if (cs.type == TYPE_FLOAT) {
                 errno = 0;
                 char* end = nullptr;
-                double v = std::strtod(raw, &end);
+                float v = std::strtof(raw, &end);
                 if (errno != 0 || end == raw || *end != '\0') {
                     throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
                 }
-                std::memcpy(record.data() + cs.offset, &v, cs.len);
+                write_float(record.data() + cs.offset, v);
             } else if (cs.type == TYPE_STRING || cs.type == TYPE_DATETIME) {
                 size_t raw_len = std::strlen(raw);
                 if (static_cast<int>(raw_len) > cs.len) {

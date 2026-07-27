@@ -234,7 +234,7 @@ TEST_F(SmManagerTest, create_table_multiple_types) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"val", TYPE_FLOAT, 8},
+        {"val", TYPE_FLOAT, 4},
         {"name", TYPE_STRING, 32},
     };
     sm_manager_->create_table("multi_types", cols, nullptr);

@@ -249,8 +249,17 @@ private:
                 return std::make_unique<CreateTable>(std::move(table), std::move(fields));
             }
             if (match(TokenType::INDEX)) {
+                // Accept both the historical RMDB form
+                //   CREATE INDEX table(columns)
+                // and the SQL form
+                //   CREATE INDEX name ON table(columns)
+                // The catalog keeps its canonical table/column-derived index
+                // filename, so the optional SQL name is syntax-only for now.
                 std::string table = parse_identifier();
-                expect(TokenType::LPAREN, "expected '(' after table name");
+                if (match(TokenType::ON)) {
+                    table = parse_identifier();
+                }
+                expect(TokenType::LPAREN, "expected '(' after index table name");
                 auto columns = parse_col_name_list();
                 expect(TokenType::RPAREN, "expected ')' after column list");
                 return std::make_unique<CreateIndex>(std::move(table), std::move(columns));
@@ -387,7 +396,7 @@ private:
             return std::make_unique<TypeLen>(SV_TYPE_INT, sizeof(int));
         }
         if (match(TokenType::FLOAT)) {
-            return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(double));
+            return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
         }
         if (match(TokenType::DATETIME)) {
             return std::make_unique<TypeLen>(SV_TYPE_DATETIME, 19);
@@ -477,7 +486,7 @@ private:
 
     std::unique_ptr<FloatLit> parse_float_literal(bool is_negative = false) {
         Token token = expect(TokenType::VALUE_FLOAT, "expected float");
-        double val = token.float_value;
+        float val = token.float_value;
         std::string display = token_text(token);
         if (is_negative) {
             val = -val;
@@ -787,11 +796,11 @@ private:
             }
             return std::make_unique<IntLit>(static_cast<int>(res), "");
         }
-        double l = is_float(lhs.get()) ? static_cast<const FloatLit*>(lhs.get())->val
-                                       : static_cast<const IntLit*>(lhs.get())->val;
-        double r = is_float(rhs.get()) ? static_cast<const FloatLit*>(rhs.get())->val
-                                       : static_cast<const IntLit*>(rhs.get())->val;
-        double res = 0;
+        float l = is_float(lhs.get()) ? static_cast<const FloatLit*>(lhs.get())->val
+                                      : static_cast<const IntLit*>(lhs.get())->val;
+        float r = is_float(rhs.get()) ? static_cast<const FloatLit*>(rhs.get())->val
+                                      : static_cast<const IntLit*>(rhs.get())->val;
+        float res = 0;
         switch (op) {
         case TokenType::PLUS:
             res = l + r;

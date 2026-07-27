@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 
 #include "common/context.h"
@@ -275,6 +276,7 @@ public:
     void prune_version_history(timestamp_t watermark);
 
     bool flush_all_table_and_index_pages(bool wal_preflushed = false);
+    bool flush_recovery_pages(const std::unordered_set<std::string>& table_names);
     bool flush_dirty_data_pages(bool wal_preflushed = false);
 
     size_t flush_dirty_pages(size_t max_pages);

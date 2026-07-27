@@ -36,12 +36,11 @@ private:
 
     static void copy_cell(char* dst, const ColMeta& dst_col, const char* src, const ColMeta& src_col) {
         if (dst_col.type == TYPE_FLOAT) {
-            double value =
-                src_col.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(src)) : read_unaligned<double>(src);
+            float value = src_col.type == TYPE_INT ? static_cast<float>(read_unaligned<int>(src)) : read_float(src);
             if (value == 0.0) {
                 value = 0.0;
             }
-            std::memcpy(dst, &value, sizeof(double));
+            write_float(dst, value);
             return;
         }
 

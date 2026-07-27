@@ -172,7 +172,8 @@ private:
         }
 
         const char* data = get_operand_data(operand, left_tuple, right_tuple);
-        return operand.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(data)) : read_unaligned<double>(data);
+        return operand.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(data))
+                                        : static_cast<double>(read_float(data));
     }
 
     static std::string_view read_string_operand(const CompiledOperand& operand, const TupleView& left_tuple,
@@ -261,7 +262,7 @@ private:
             val.set_int(read_unaligned<int>(data));
             break;
         case TYPE_FLOAT:
-            val.set_float(read_unaligned<double>(data));
+            val.set_float(read_float(data));
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:

@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/config.h"
@@ -91,6 +92,12 @@ public:
     static std::vector<char> key(int value) {
         std::vector<char> buf(sizeof(int));
         std::memcpy(buf.data(), &value, sizeof(int));
+        return buf;
+    }
+
+    static std::vector<char> float_key(float value) {
+        std::vector<char> buf(sizeof(float));
+        std::memcpy(buf.data(), &value, sizeof(float));
         return buf;
     }
 
@@ -202,6 +209,43 @@ TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
 
     EXPECT_EQ(slots, std::vector<int>({123, 124, 125, 126, 127, 128, 129, 130}));
 
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, FloatKeysUseBinary32Ordering) {
+    const auto int_index_name = ix_manager->get_index_name(table_name, cols);
+    disk_manager->destroy_file(int_index_name);
+    ASSERT_FALSE(disk_manager->is_file(int_index_name));
+    cols = {ColMeta{.tab_name = table_name,
+                    .name = "value",
+                    .type = TYPE_FLOAT,
+                    .len = static_cast<int>(sizeof(float)),
+                    .offset = 0,
+                    .index = true}};
+    ix_manager->create_index(table_name, cols);
+
+    auto ih = open_index();
+    for (const auto [value, slot] :
+         std::vector<std::pair<float, int>>{{1.5F, 115}, {300000.01F, 3000100}, {-2.0F, 80}}) {
+        auto k = float_key(value);
+        ih->insert_entry(k.data(), Rid{1, slot}, nullptr);
+    }
+
+    auto target = float_key(300000.01F);
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(target.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1);
+    EXPECT_EQ(result.front().slot_no, 3000100);
+
+    auto lower = float_key(-3.0F);
+    auto upper = float_key(2.0F);
+    IxScan scan(ih.get(), ih->lower_bound(lower.data()), ih->upper_bound(upper.data()), buffer_pool_manager.get());
+    std::vector<int> slots;
+    while (!scan.is_end()) {
+        slots.push_back(scan.rid().slot_no);
+        scan.next();
+    }
+    EXPECT_EQ(slots, std::vector<int>({80, 115}));
     close_index(ih);
 }
 
@@ -782,7 +826,7 @@ public:
     }
 
     void create_scores() {
-        std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 8}};
+        std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4}};
         sm_manager->create_table("scores", cols, nullptr);
     }
 
@@ -824,7 +868,7 @@ public:
         executor.Next();
     }
 
-    void insert_score(int sid, int cid, double score) {
+    void insert_score(int sid, int cid, float score) {
         Value sid_val;
         sid_val.set_int(sid);
         Value cid_val;
@@ -1094,9 +1138,9 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
 
     create_scores();
     for (int sid = 10; sid <= 15; ++sid) {
-        insert_score(sid, 101, static_cast<double>(sid));
-        insert_score(sid, 102, static_cast<double>(sid) + 0.5);
-        insert_score(sid, 103, static_cast<double>(sid) + 1.0);
+        insert_score(sid, 101, static_cast<float>(sid));
+        insert_score(sid, 102, static_cast<float>(sid) + 0.5f);
+        insert_score(sid, 103, static_cast<float>(sid) + 1.0f);
     }
     sm_manager->create_index("scores", {"sid", "cid"}, nullptr);
 

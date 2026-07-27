@@ -279,7 +279,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             if (col.type == TYPE_INT) {
                 col_str = std::to_string(read_unaligned<int>(rec_buf));
             } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(read_unaligned<double>(rec_buf));
+                col_str = std::to_string(read_float(rec_buf));
             } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
                 col_str.assign(rec_buf, strnlen(rec_buf, col.len));
             }

@@ -324,9 +324,6 @@ func loadData(address string, timeout time.Duration, isolation, dataDir, schemaD
 	if err := executeSQLFile(c, filepath.Join(schemaDir, "rmdb_schema.sql")); err != nil {
 		return err
 	}
-	if err := executeSQLFile(c, filepath.Join(schemaDir, "rmdb_indexes.sql")); err != nil {
-		return err
-	}
 	for _, table := range tpccTables {
 		path, err := loadPath(dataDir, dbDir, table)
 		if err != nil {
@@ -335,6 +332,9 @@ func loadData(address string, timeout time.Duration, isolation, dataDir, schemaD
 		if _, err := c.exec(fmt.Sprintf("load %s into %s;", path, table)); err != nil {
 			return err
 		}
+	}
+	if err := executeSQLFile(c, filepath.Join(schemaDir, "rmdb_indexes.sql")); err != nil {
+		return err
 	}
 	_, err = c.exec("set output_file off")
 	return err
@@ -353,6 +353,24 @@ func waitForPort(address string, timeout time.Duration) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("server did not become ready on %s within %s: %v", address, timeout, lastErr)
+}
+
+func waitForReady(address string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		client, err := newClient(address, 500*time.Millisecond, "read-committed")
+		if err == nil {
+			_, err = client.exec("show tables;")
+			client.close()
+			if err == nil {
+				return nil
+			}
+		}
+		lastErr = err
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("server did not become SQL-ready on %s within %s: %v", address, timeout, lastErr)
 }
 
 func checkConsistency(address string, timeout time.Duration, isolation, resultPath, stage string) error {
@@ -417,7 +435,11 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 			continue
 		}
 		warehouseYTD, districtYTD := scalarFloat(warehouseText, 0), scalarFloat(districtText, 0)
-		if math.Abs(warehouseYTD-districtYTD) > 0.01 {
+		// RMDB stores FLOAT values as binary32. Warehouse and district totals
+		// are accumulated independently, so their rounded sums need a scale-
+		// aware tolerance after a high-volume run.
+		tolerance := math.Max(0.05, 2e-6*math.Max(math.Abs(warehouseYTD), math.Abs(districtYTD)))
+		if math.Abs(warehouseYTD-districtYTD) > tolerance {
 			failures = append(failures, fmt.Sprintf("warehouse/district YTD mismatch w=%d: warehouse=%.2f, districts=%.2f", wID, warehouseYTD, districtYTD))
 		}
 	}

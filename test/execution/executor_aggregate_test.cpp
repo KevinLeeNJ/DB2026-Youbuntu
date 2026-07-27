@@ -162,7 +162,7 @@ Value make_int_value(int value) {
     return v;
 }
 
-Value make_float_value(double value) {
+Value make_float_value(float value) {
     Value v;
     v.set_float(value);
     return v;
@@ -191,7 +191,7 @@ RmRecord make_record(const std::vector<ColMeta>& cols, const std::vector<Value>&
             write_unaligned(dest, value.int_val);
             break;
         case TYPE_FLOAT:
-            write_unaligned(dest, value.float_val);
+            write_float(dest, value.float_val);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -250,8 +250,8 @@ int read_int(const RmRecord& rec, int offset) {
     return read_unaligned<int>(rec.data + offset);
 }
 
-double read_float(const RmRecord& rec, int offset) {
-    return read_unaligned<double>(rec.data + offset);
+float read_float_value(const RmRecord& rec, int offset) {
+    return read_float(rec.data + offset);
 }
 
 std::string read_string(const RmRecord& rec, int offset, int len) {
@@ -325,7 +325,7 @@ TEST(AggregateExecutorTest, HavingCanFilterOnAggregateResultAgainstIntegerLitera
     auto row = exec.Next();
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_string(*row, 0, 8), "eng");
-    EXPECT_DOUBLE_EQ(read_float(*row, 8), 15.0);
+    EXPECT_FLOAT_EQ(read_float_value(*row, 8), 15.0f);
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
@@ -353,7 +353,7 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_int(*row, 0), 0);
     EXPECT_EQ(read_int(*row, 4), 0);
-    EXPECT_DOUBLE_EQ(read_float(*row, 8), 0.0);
+    EXPECT_FLOAT_EQ(read_float_value(*row, 8), 0.0f);
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
@@ -418,7 +418,7 @@ TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {
     std::vector<ColMeta> cols = {
         make_col("t", "dept", TYPE_STRING, 8, 0),
         make_col("t", "score", TYPE_INT, 4, 8),
-        make_col("t", "bonus", TYPE_FLOAT, 8, 12),
+        make_col("t", "bonus", TYPE_FLOAT, 4, 12),
     };
 
     auto child = make_child_executor(cols, {
@@ -433,7 +433,7 @@ TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {
 
     AggregateExecutor exec(std::move(child), group_by, aggs, having);
 
-    ASSERT_EQ(exec.tupleLen(), 20);
+    ASSERT_EQ(exec.tupleLen(), 16);
     ASSERT_EQ(exec.cols().size(), 3);
 
     EXPECT_EQ(exec.cols()[0].tab_name, "t");

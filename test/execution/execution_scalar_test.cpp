@@ -14,6 +14,10 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_aggregate.h"
 #undef private
 
+#include <cstdint>
+#include <cstring>
+
+#include "common/common.h"
 #include "gtest/gtest.h"
 
 namespace {
@@ -45,6 +49,35 @@ CellValue make_string_cell(std::string value) {
 }
 
 } // namespace
+
+TEST(ValueFloatTest, RawStorageKeepsBinary32BitPattern) {
+    constexpr float input = 300000.01F;
+    Value value;
+    value.set_float(input);
+    value.init_raw(sizeof(float));
+
+    uint32_t expected_bits = 0;
+    uint32_t actual_bits = 0;
+    std::memcpy(&expected_bits, &input, sizeof(expected_bits));
+    std::memcpy(&actual_bits, value.raw->data, sizeof(actual_bits));
+    EXPECT_EQ(actual_bits, expected_bits);
+    EXPECT_EQ(value.raw->size, static_cast<int>(sizeof(float)));
+}
+
+TEST(ValueFloatTest, RepeatedWritesRoundAtBinary32Precision) {
+    float expected = 0.0F;
+    constexpr float delta = 0.01F;
+    for (int i = 0; i < 1000; ++i) {
+        expected = static_cast<float>(expected + delta);
+    }
+
+    Value value;
+    value.set_float(0.0F);
+    for (int i = 0; i < 1000; ++i) {
+        value.set_float(static_cast<float>(value.float_val + delta));
+    }
+    EXPECT_EQ(value.float_val, expected);
+}
 
 TEST(ExecutionScalarTest, CompareCellsNormalizesMixedNumericEquality) {
     EXPECT_EQ(AggregateExecutor::compare_cells(make_int_cell(7), make_float_cell(7.0f)), 0);

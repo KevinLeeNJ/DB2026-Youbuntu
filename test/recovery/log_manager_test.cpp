@@ -97,6 +97,12 @@ private:
 
 } // namespace
 
+TEST(LogManagerTest, DefaultsToStrictDurability) {
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+    EXPECT_EQ(log_mgr.durability_mode(), DurabilityMode::STRICT);
+}
+
 TEST(LogRecordTest, InsertRoundTripKeepsPayload) {
     auto rec = MakeRecord("abc123");
     Rid rid{3, 7};

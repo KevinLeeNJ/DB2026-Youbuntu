@@ -43,10 +43,10 @@ TEST(AnalyzeConvertTest, convert_int_lit) {
 
 TEST(AnalyzeConvertTest, convert_float_lit) {
     Analyze analyze(nullptr);
-    auto sv_val = std::make_unique<ast::FloatLit>(3.14);
+    auto sv_val = std::make_unique<ast::FloatLit>(3.14f);
     Value val = analyze.convert_sv_value(sv_val.get());
     EXPECT_EQ(val.type, TYPE_FLOAT);
-    EXPECT_DOUBLE_EQ(val.float_val, 3.14);
+    EXPECT_FLOAT_EQ(val.float_val, 3.14f);
 }
 
 TEST(AnalyzeConvertTest, convert_string_lit) {
@@ -82,7 +82,7 @@ protected:
     std::vector<ColMeta> make_cols() {
         return {
             {.tab_name = "t1", .name = "a", .type = TYPE_INT, .len = 4, .offset = 0, .index = false},
-            {.tab_name = "t1", .name = "b", .type = TYPE_FLOAT, .len = 8, .offset = 4, .index = false},
+            {.tab_name = "t1", .name = "b", .type = TYPE_FLOAT, .len = 4, .offset = 4, .index = false},
             {.tab_name = "t2", .name = "a", .type = TYPE_INT, .len = 4, .offset = 0, .index = false},
         };
     }

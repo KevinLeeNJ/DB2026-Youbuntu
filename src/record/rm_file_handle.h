@@ -236,6 +236,12 @@ public:
     // the file header itself may have been stale when the process crashed.
     void rebuild_file_header_from_pages();
 
+    // Recovery repair for a bounded set of pages. Unlike
+    // rebuild_file_header_from_pages(), this only inspects the supplied pages
+    // and advances the allocation boundary when a touched RID references a
+    // page that was allocated before its file-header update reached disk.
+    void repair_file_header_for_pages(const std::vector<page_id_t>& page_nos);
+
     // MVCC: get TupleMeta for a slot
     TupleMeta get_tuple_meta(const Rid& rid) const;
 

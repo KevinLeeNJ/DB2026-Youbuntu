@@ -763,7 +763,7 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},         {"source", TYPE_INT, 4},  {"assigned", TYPE_INT, 4},
-        {"arithmetic", TYPE_INT, 4}, {"score", TYPE_FLOAT, 8},
+        {"arithmetic", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4},
     };
     sm_manager_->create_table("mutation_bind", cols, nullptr);
 
@@ -799,7 +799,7 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     auto bound_conditions = BindMutationConditions(tab, conditions);
     ASSERT_EQ(bound_conditions.size(), 2U);
     EXPECT_EQ(bound_conditions[0].lhs.offset, 16U);
-    EXPECT_EQ(bound_conditions[0].lhs.len, 8U);
+    EXPECT_EQ(bound_conditions[0].lhs.len, 4U);
     EXPECT_EQ(bound_conditions[0].lhs.type, TYPE_FLOAT);
     EXPECT_EQ(bound_conditions[0].rhs.offset, 0U);
     EXPECT_EQ(bound_conditions[0].rhs.len, 0U);
@@ -830,7 +830,7 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     auto bound_set_clauses = BindMutationSetClauses(tab, set_clauses);
     ASSERT_EQ(bound_set_clauses.size(), 3U);
     EXPECT_EQ(bound_set_clauses[0].lhs.offset, 16U);
-    EXPECT_EQ(bound_set_clauses[0].lhs.len, 8U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.len, 4U);
     EXPECT_EQ(bound_set_clauses[0].lhs.type, TYPE_FLOAT);
     EXPECT_EQ(bound_set_clauses[0].rhs.offset, 0U);
     EXPECT_EQ(bound_set_clauses[0].rhs.len, 0U);
@@ -862,7 +862,7 @@ TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
     ASSERT_NE(record, nullptr);
     EXPECT_EQ(*reinterpret_cast<int*>(record->data + 8), 7);
     EXPECT_EQ(*reinterpret_cast<int*>(record->data + 12), 12);
-    EXPECT_DOUBLE_EQ(*reinterpret_cast<double*>(record->data + 16), 42.0);
+    EXPECT_FLOAT_EQ(read_float(record->data + 16), 42.0f);
 
     Condition delete_literal;
     delete_literal.lhs_col = {"mutation_bind", "id"};
@@ -1191,7 +1191,7 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"score", TYPE_FLOAT, 8},
+        {"score", TYPE_FLOAT, 4},
     };
     sm_manager_->create_table("upd_promo", cols, nullptr);
     {
@@ -1235,15 +1235,15 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     SeqScanExecutor scan(sm_manager_.get(), "upd_promo", {}, &ctx);
     scan.beginTuple();
     auto rec = scan.Next();
-    double score = *reinterpret_cast<double*>(rec->data + 4);
-    EXPECT_DOUBLE_EQ(score, 90.0);
+    float score = read_float(rec->data + 4);
+    EXPECT_FLOAT_EQ(score, 90.0f);
 }
 
 TEST_F(ExecutorTest, update_float_to_int_truncation) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"score", TYPE_FLOAT, 8},
+        {"score", TYPE_FLOAT, 4},
     };
     sm_manager_->create_table("upd_trunc", cols, nullptr);
     {

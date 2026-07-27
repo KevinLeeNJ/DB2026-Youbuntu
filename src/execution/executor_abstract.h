@@ -211,13 +211,13 @@ protected:
         case TYPE_INT:
         case TYPE_FLOAT: {
             const double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
-                                                        : read_unaligned<double>(lhs_data);
+                                                        : static_cast<double>(read_float(lhs_data));
             double rhs_val;
             if (cond.is_rhs_val) {
                 rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
             } else {
                 rhs_val = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
-                                               : read_unaligned<double>(rhs_data);
+                                               : static_cast<double>(read_float(rhs_data));
             }
             switch (cond.op) {
             case OP_EQ:

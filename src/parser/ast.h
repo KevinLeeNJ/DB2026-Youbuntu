@@ -201,9 +201,9 @@ struct IntLit : public Value {
 };
 
 struct FloatLit : public Value {
-    double val;
+    float val;
 
-    FloatLit(double val_, std::string display_text_ = "")
+    FloatLit(float val_, std::string display_text_ = "")
         : Value(AstType::FloatLit, std::move(display_text_)), val(val_) {}
 };
 

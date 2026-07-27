@@ -193,15 +193,18 @@ type profile struct {
 }
 
 type txnContext struct {
-	wID int
-	dID int
+	wID      int
+	dID      int
+	official bool
 	profile
 }
 
 type result struct {
 	MeasureSeconds int                                  `json:"measure_seconds"`
 	TPMC           float64                              `json:"tpmc"`
+	NewOrderPerMin float64                              `json:"NewOrder/min"`
 	TxnTPM         map[string]float64                   `json:"txn_tpm"`
+	Committed      map[string]int                       `json:"committed"`
 	AbortRate      float64                              `json:"abort_rate"`
 	Counts         map[string]map[string]map[string]int `json:"counts"`
 	LatencyMS      map[string]latencySummary            `json:"latency_ms"`
@@ -291,6 +294,7 @@ func newResult(measureSeconds int) *result {
 	return &result{
 		MeasureSeconds: measureSeconds,
 		TxnTPM:         make(map[string]float64),
+		Committed:      make(map[string]int),
 		Counts:         make(map[string]map[string]map[string]int),
 		LatencyMS:      make(map[string]latencySummary),
 		Errors:         make(map[string]map[string]map[string]int),
@@ -370,7 +374,9 @@ func (r *result) finalize() {
 	}
 	if r.MeasureSeconds > 0 {
 		r.TPMC = float64(newOrderCommitted) / (float64(r.MeasureSeconds) / 60.0)
+		r.NewOrderPerMin = r.TPMC
 		for txnType, outcomes := range r.Counts["measure"] {
+			r.Committed[txnType] = outcomes["commit"]
 			r.TxnTPM[txnType] = float64(outcomes["commit"]) / (float64(r.MeasureSeconds) / 60.0)
 		}
 	}
@@ -583,6 +589,14 @@ func newOrder(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 
 func payment(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	cID := rng.Intn(ctx.customersPerDistrict) + 1
+	cWID, cDID := ctx.wID, ctx.dID
+	if ctx.official && ctx.warehouses > 1 && rng.Intn(100) < 15 {
+		cWID = rng.Intn(ctx.warehouses-1) + 1
+		if cWID >= ctx.wID {
+			cWID++
+		}
+		cDID = rng.Intn(ctx.districtsPerWarehouse) + 1
+	}
 	amount := math.Round((rng.Float64()*4999+1)*100) / 100
 	if err := c.begin(); err != nil {
 		return err
@@ -593,14 +607,25 @@ func payment(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 			c.rollback()
 		}
 	}()
+	if ctx.official && rng.Intn(100) < 60 {
+		last := surname(rng.Intn(1000))
+		customerText, err := c.exec(fmt.Sprintf("select c_id, c_first from customer where c_w_id = %d and c_d_id = %d and c_last = '%s' order by c_first, c_id;", cWID, cDID, last))
+		if err != nil {
+			return err
+		}
+		rows := parseRows(customerText)
+		if len(rows) > 0 {
+			cID = scalarInt(rows[(len(rows)-1)/2][0], cID)
+		}
+	}
 	queries := []string{
 		fmt.Sprintf("update warehouse set w_ytd = w_ytd + %.2f where w_id = %d;", amount, ctx.wID),
 		fmt.Sprintf("select w_street_1, w_street_2, w_city, w_state, w_zip, w_name from warehouse where w_id = %d;", ctx.wID),
 		fmt.Sprintf("update district set d_ytd = d_ytd + %.2f where d_w_id = %d and d_id = %d;", amount, ctx.wID, ctx.dID),
 		fmt.Sprintf("select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
-		fmt.Sprintf("update customer set c_balance = c_balance - %.2f, c_ytd_payment = c_ytd_payment + %.2f, c_payment_cnt = c_payment_cnt + 1 where c_w_id = %d and c_d_id = %d and c_id = %d;", amount, amount, ctx.wID, ctx.dID, cID),
-		fmt.Sprintf("select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", ctx.wID, ctx.dID, cID),
-		fmt.Sprintf("insert into history values (%d, %d, %d, %d, %d, '%s', %.2f, 'payment');", cID, ctx.dID, ctx.wID, ctx.dID, ctx.wID, nowText(), amount),
+		fmt.Sprintf("update customer set c_balance = c_balance - %.2f, c_ytd_payment = c_ytd_payment + %.2f, c_payment_cnt = c_payment_cnt + 1 where c_w_id = %d and c_d_id = %d and c_id = %d;", amount, amount, cWID, cDID, cID),
+		fmt.Sprintf("select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", cWID, cDID, cID),
+		fmt.Sprintf("insert into history values (%d, %d, %d, %d, %d, '%s', %.2f, 'payment');", cID, cDID, cWID, ctx.dID, ctx.wID, nowText(), amount),
 	}
 	for _, query := range queries {
 		if _, err := c.exec(query); err != nil {
@@ -625,21 +650,31 @@ func orderStatus(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	cID := rng.Intn(ctx.customersPerDistrict) + 1
 	if rng.Intn(100) < 60 {
 		last := surname(rng.Intn(1000))
-		if _, err := c.exec(fmt.Sprintf("select count(c_id) as count_c_id from customer where c_w_id = %d and c_d_id = %d and c_last = '%s';", ctx.wID, ctx.dID, last)); err != nil {
+		customerText, err := c.exec(fmt.Sprintf("select c_id, c_balance, c_first, c_middle, c_last from customer where c_w_id = %d and c_d_id = %d and c_last = '%s' order by c_first, c_id;", ctx.wID, ctx.dID, last))
+		if err != nil {
 			return err
 		}
-		if _, err := c.exec(fmt.Sprintf("select c_balance, c_first, c_middle, c_last from customer where c_w_id = %d and c_d_id = %d and c_last = '%s' order by c_first;", ctx.wID, ctx.dID, last)); err != nil {
-			return err
+		rows := parseRows(customerText)
+		if len(rows) > 0 {
+			cID = scalarInt(rows[(len(rows)-1)/2][0], cID)
 		}
 	} else if _, err := c.exec(fmt.Sprintf("select c_balance, c_first, c_middle, c_last from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", ctx.wID, ctx.dID, cID)); err != nil {
 		return err
 	}
 	oID := rng.Intn(initialOrdersPerDist) + 1
-	if _, err := c.exec(fmt.Sprintf("select o_id, o_entry_d, o_carrier_id from orders where o_w_id = %d and o_d_id = %d and o_c_id = %d and o_id = %d;", ctx.wID, ctx.dID, cID, oID)); err != nil {
+	if ctx.official {
+		orderText, err := c.exec(fmt.Sprintf("select o_id, o_entry_d, o_carrier_id from orders where o_w_id = %d and o_d_id = %d and o_c_id = %d order by o_id desc limit 1;", ctx.wID, ctx.dID, cID))
+		if err != nil {
+			return err
+		}
+		oID = scalarInt(orderText, 0)
+	} else if _, err := c.exec(fmt.Sprintf("select o_id, o_entry_d, o_carrier_id from orders where o_w_id = %d and o_d_id = %d and o_c_id = %d and o_id = %d;", ctx.wID, ctx.dID, cID, oID)); err != nil {
 		return err
 	}
-	if _, err := c.exec(fmt.Sprintf("select ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id = %d;", ctx.wID, ctx.dID, oID)); err != nil {
-		return err
+	if oID > 0 {
+		if _, err := c.exec(fmt.Sprintf("select ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id = %d;", ctx.wID, ctx.dID, oID)); err != nil {
+			return err
+		}
 	}
 	err := c.commit()
 	rollback = err != nil
@@ -658,14 +693,31 @@ func delivery(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	}()
 	carrierID := rng.Intn(10) + 1
 	for dID := 1; dID <= ctx.districtsPerWarehouse; dID++ {
-		if _, err := c.exec(fmt.Sprintf("update district set d_next_o_id = d_next_o_id + 0 where d_w_id = %d and d_id = %d;", ctx.wID, dID)); err != nil {
-			return err
+		oID := 0
+		for {
+			oIDText, err := c.exec(fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", ctx.wID, dID))
+			if err != nil {
+				return err
+			}
+			candidate := scalarInt(oIDText, 0)
+			if candidate == 0 {
+				break
+			}
+			// Claim the candidate while holding its row lock. A concurrent
+			// delivery either waits for this update or observes that the
+			// candidate disappeared and retries the minimum lookup.
+			if _, err := c.exec(fmt.Sprintf("update new_orders set no_o_id = no_o_id where no_w_id = %d and no_d_id = %d and no_o_id = %d;", ctx.wID, dID, candidate)); err != nil {
+				return err
+			}
+			claimedText, err := c.exec(fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;", ctx.wID, dID, candidate))
+			if err != nil {
+				return err
+			}
+			if scalarInt(claimedText, 0) == candidate {
+				oID = candidate
+				break
+			}
 		}
-		oIDText, err := c.exec(fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", ctx.wID, dID))
-		if err != nil {
-			return err
-		}
-		oID := scalarInt(oIDText, 0)
 		if oID == 0 {
 			continue
 		}
@@ -717,22 +769,31 @@ func stockLevel(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 		return err
 	}
 	dNext := scalarInt(dNextText, 0)
-	itemsText, err := c.exec(fmt.Sprintf("select ol_i_id from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id < %d and ol_o_id >= %d;", ctx.wID, ctx.dID, dNext, max(1, dNext-20)))
+	orderLineText, err := c.exec(fmt.Sprintf("select ol_i_id from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id >= %d and ol_o_id < %d;", ctx.wID, ctx.dID, max(1, dNext-20), dNext))
 	if err != nil {
 		return err
 	}
-	for _, row := range parseRows(itemsText) {
+	stockText, err := c.exec(fmt.Sprintf("select s_i_id from stock where s_w_id = %d and s_quantity < %d;", ctx.wID, threshold))
+	if err != nil {
+		return err
+	}
+	lowStock := make(map[int]struct{})
+	for _, row := range parseRows(stockText) {
+		if len(row) > 0 {
+			lowStock[scalarInt(row[0], -1)] = struct{}{}
+		}
+	}
+	seen := make(map[int]struct{})
+	for _, row := range parseRows(orderLineText) {
 		if len(row) == 0 {
 			continue
 		}
-		itemID := scalarInt(row[0], 0)
-		if itemID <= 0 {
-			continue
-		}
-		if _, err := c.exec(fmt.Sprintf("select count(*) as count_stock from stock where s_w_id = %d and s_i_id = %d and s_quantity < %d;", ctx.wID, itemID, threshold)); err != nil {
-			return err
+		itemID := scalarInt(row[0], -1)
+		if _, ok := lowStock[itemID]; ok {
+			seen[itemID] = struct{}{}
 		}
 	}
+	_ = len(seen)
 	err = c.commit()
 	rollback = err != nil
 	return err
@@ -745,29 +806,54 @@ func max(a, b int) int {
 	return b
 }
 
-func chooseTxn(rng *rand.Rand) string {
-	n := rng.Intn(100)
-	if n < 45 {
+func txnTypeForBucket(bucket int) string {
+	bucket %= 100
+	if bucket < 45 {
 		return "new_order"
 	}
-	if n < 88 {
+	if bucket < 88 {
 		return "payment"
 	}
-	if n < 92 {
+	if bucket < 92 {
 		return "order_status"
 	}
-	if n < 96 {
+	if bucket < 96 {
 		return "delivery"
 	}
 	return "stock_level"
+}
+
+func chooseTxn(rng *rand.Rand) string {
+	return txnTypeForBucket(rng.Intn(100))
 }
 
 func chooseContext(p profile, workerID int, policy string, rng *rand.Rand) txnContext {
 	wID := workerID%p.warehouses + 1
 	if policy == "random-per-txn" {
 		wID = rng.Intn(p.warehouses) + 1
+	} else if policy == "official-terminal-home" {
+		// The official shape has two clients per terminal home and 25 homes.
+		// The caller validates that this mode has enough warehouses.
+		wID = (workerID/2)%25 + 1
 	}
-	return txnContext{wID: wID, dID: rng.Intn(p.districtsPerWarehouse) + 1, profile: p}
+	return txnContext{wID: wID, dID: rng.Intn(p.districtsPerWarehouse) + 1, official: policy == "official-terminal-home", profile: p}
+}
+
+func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int) error {
+	switch mode {
+	case "sqlite-reference":
+		return nil
+	case "official-equivalent":
+		if workers != 50 {
+			return errors.New("official-equivalent requires workers=50; warmup, measure, and rounds may be overridden for smoke runs")
+		}
+		if warmup < 0 || measure < 1 || rounds < 1 {
+			return errors.New("official-equivalent requires non-negative warmup, positive measure, and positive rounds")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported benchmark mode: %s", mode)
+	}
 }
 
 func runTxn(c txnBackend, txnType string, ctx txnContext, rng *rand.Rand) error {
@@ -1029,6 +1115,49 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 	return combined, nil
 }
 
+func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
+	reconnectEachTxn bool, roundOffset int, factory backendFactory) ([]*result, error) {
+	const policy = "official-terminal-home"
+	warmupStats := &liveStats{}
+	warmupEnd := time.Now().Add(time.Duration(warmup) * time.Second)
+	warmupStop := make(chan struct{})
+	warmupDone := make(chan struct{})
+	printProgress(0, rounds, "warmup", 0, warmup, warmupStats)
+	go monitorProgress(0, rounds, warmup, 0, progress, warmupEnd, warmupEnd, warmupStats, warmupStop, warmupDone)
+	_, err := runRound(0, workers, seed, p, policy, warmupEnd, warmupEnd, 0, think, reconnectEachTxn, warmupStats, factory)
+	close(warmupStop)
+	<-warmupDone
+	if err != nil {
+		return nil, fmt.Errorf("official warmup invalid: %w", err)
+	}
+
+	windows := make([]*result, 0, rounds)
+	for round := 1; round <= rounds; round++ {
+		stats := &liveStats{}
+		windowStart := time.Now()
+		windowEnd := windowStart.Add(time.Duration(measure) * time.Second)
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go monitorProgress(round, rounds, 0, measure, progress, windowStart, windowEnd, stats, stop, done)
+		window, runErr := runRound(roundOffset+round, workers, seed, p, policy, windowStart, windowEnd, measure, think,
+			reconnectEachTxn, stats, factory)
+		close(stop)
+		<-done
+		if runErr != nil {
+			return nil, fmt.Errorf("official measurement window %d invalid: %w", round, runErr)
+		}
+		for _, txnType := range []string{"new_order", "payment", "order_status", "delivery", "stock_level"} {
+			if window.Committed[txnType] < 1 {
+				return nil, fmt.Errorf("official measurement window %d has no committed %s transaction", round, txnType)
+			}
+		}
+		windows = append(windows, window)
+		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f abort_rate=%.2f%%\n", round, rounds, window.NewOrderPerMin,
+			window.AbortRate*100)
+	}
+	return windows, nil
+}
+
 func inspectProfile(c txnBackend) (profile, error) {
 	queries := []string{"select count(*) from warehouse;", "select max(d_id) from district;", "select max(c_id) from customer;", "select max(i_id) from item;"}
 	values := make([]int, len(queries))
@@ -1043,6 +1172,7 @@ func inspectProfile(c txnBackend) (profile, error) {
 }
 
 type config struct {
+	Mode                   string `json:"mode"`
 	Backend                string `json:"backend"`
 	Isolation              string `json:"isolation"`
 	SQLitePath             string `json:"sqlite_path,omitempty"`
@@ -1265,7 +1395,8 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 }
 
 func main() {
-	command := flag.String("command", "run", "run, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, or merge-results")
+	command := flag.String("command", "run", "run, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
+	mode := flag.String("mode", "official-equivalent", "official-equivalent for rmdb or sqlite-reference for SQLite")
 	backend := flag.String("backend", "rmdb", "rmdb or sqlite")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
 	port := flag.Int("port", 8765, "RMDB port")
@@ -1304,6 +1435,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--backend must be rmdb or sqlite")
 		os.Exit(2)
 	}
+	if *command == "run" {
+		if err := validateBenchmarkMode(*mode, *workers, *warmup, *measure, *rounds); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}
+	if *mode == "official-equivalent" && *backend != "rmdb" {
+		fmt.Fprintln(os.Stderr, "official-equivalent mode requires the rmdb backend")
+		os.Exit(2)
+	}
+	if *mode == "sqlite-reference" && *backend != "sqlite" {
+		fmt.Fprintln(os.Stderr, "sqlite-reference mode requires the sqlite backend")
+		os.Exit(2)
+	}
 	if *sqliteBegin != "immediate" && *sqliteBegin != "deferred" {
 		fmt.Fprintln(os.Stderr, "--sqlite-begin must be immediate or deferred")
 		os.Exit(2)
@@ -1335,6 +1480,13 @@ func main() {
 		}
 		return
 	}
+	if *command == "wait-ready" {
+		if err := waitForReady(net.JoinHostPort(*host, strconv.Itoa(*port)), *waitTimeout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *command == "merge-results" {
 		if err := mergeResultFiles(*jsonOut, *resultInputs); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -1346,7 +1498,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "workers must be positive, warmup and round-offset non-negative, measure and rounds positive")
 		os.Exit(2)
 	}
-	if *policy != "terminal-home" && *policy != "random-per-txn" {
+	if *policy != "terminal-home" && *policy != "random-per-txn" && *policy != "official-terminal-home" {
 		fmt.Fprintln(os.Stderr, "unsupported warehouse policy")
 		os.Exit(2)
 	}
@@ -1506,6 +1658,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if *mode == "official-equivalent" && p.warehouses < 25 {
+		probe.close()
+		fmt.Fprintf(os.Stderr, "official-equivalent mode requires at least 25 warehouses, got %d\n", p.warehouses)
+		os.Exit(2)
+	}
 	ordersText, err := probe.exec("select count(*) from orders;")
 	probe.close()
 	if err != nil {
@@ -1513,24 +1670,37 @@ func main() {
 		os.Exit(1)
 	}
 	baseOrders := scalarInt(ordersText, 0)
-	doc := document{Config: config{Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
-	for round := 1; round <= *rounds; round++ {
-		warmupEnd := time.Now().Add(time.Duration(*warmup) * time.Second)
-		measureEnd := warmupEnd.Add(time.Duration(*measure) * time.Second)
-		stats := &liveStats{}
-		printProgress(round, *rounds, "warmup", 0, *warmup, stats)
-		monitorStop := make(chan struct{})
-		monitorDone := make(chan struct{})
-		go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
-		combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory)
-		close(monitorStop)
-		<-monitorDone
-		if roundErr != nil {
-			fmt.Fprintf(os.Stderr, "round %d invalid: %v\n", round, roundErr)
+	if *mode == "official-equivalent" {
+		*policy = "official-terminal-home"
+	}
+	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}}
+	if *mode == "official-equivalent" {
+		windows, runErr := runOfficialWindows(*rounds, *workers, *seed, p, *warmup, *measure, *progress, *think,
+			*reconnectEachTxn, *roundOffset, factory)
+		if runErr != nil {
+			fmt.Fprintln(os.Stderr, runErr)
 			os.Exit(1)
 		}
-		doc.Rounds = append(doc.Rounds, combined)
-		fmt.Printf("[round %d/%d] tpmC=%.2f abort_rate=%.2f%%\n", round, *rounds, combined.TPMC, combined.AbortRate*100)
+		doc.Rounds = windows
+	} else {
+		for round := 1; round <= *rounds; round++ {
+			warmupEnd := time.Now().Add(time.Duration(*warmup) * time.Second)
+			measureEnd := warmupEnd.Add(time.Duration(*measure) * time.Second)
+			stats := &liveStats{}
+			printProgress(round, *rounds, "warmup", 0, *warmup, stats)
+			monitorStop := make(chan struct{})
+			monitorDone := make(chan struct{})
+			go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
+			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd, *measure, *think, *reconnectEachTxn, stats, factory)
+			close(monitorStop)
+			<-monitorDone
+			if roundErr != nil {
+				fmt.Fprintf(os.Stderr, "round %d invalid: %v\n", round, roundErr)
+				os.Exit(1)
+			}
+			doc.Rounds = append(doc.Rounds, combined)
+			fmt.Printf("[round %d/%d] tpmC=%.2f abort_rate=%.2f%%\n", round, *rounds, combined.TPMC, combined.AbortRate*100)
+		}
 	}
 	values := make([]float64, len(doc.Rounds))
 	for i, round := range doc.Rounds {

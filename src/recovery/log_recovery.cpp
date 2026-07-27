@@ -14,7 +14,53 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <fstream>
+#include <cstring>
+#include <unordered_set>
 #include <vector>
+
+namespace {
+
+std::vector<char> MakeRecoveryIndexKey(const IndexMeta& index, const char* record_data) {
+    std::vector<char> key(index.col_tot_len);
+    int offset = 0;
+    for (const auto& col : index.cols) {
+        std::memcpy(key.data() + offset, record_data + col.offset, col.len);
+        offset += col.len;
+    }
+    return key;
+}
+
+void DeleteRecoveryIndexEntry(SmManager* sm_manager, const std::string& table_name, const IndexMeta& index,
+                              const RmRecord& record, const Rid& rid) {
+    const auto index_name = sm_manager->get_ix_manager()->get_index_name(table_name, index.cols);
+    auto index_it = sm_manager->ihs_.find(index_name);
+    if (index_it == sm_manager->ihs_.end()) {
+        return;
+    }
+    auto key = MakeRecoveryIndexKey(index, record.data);
+    index_it->second->delete_entry(key.data(), rid, nullptr);
+}
+
+void InsertRecoveryIndexEntry(SmManager* sm_manager, const std::string& table_name, const IndexMeta& index,
+                              const RmRecord& record, const Rid& rid) {
+    const auto index_name = sm_manager->get_ix_manager()->get_index_name(table_name, index.cols);
+    auto index_it = sm_manager->ihs_.find(index_name);
+    if (index_it == sm_manager->ihs_.end()) {
+        return;
+    }
+    auto key = MakeRecoveryIndexKey(index, record.data);
+    std::vector<Rid> existing;
+    if (index_it->second->get_value(key.data(), &existing, nullptr)) {
+        for (const auto& existing_rid : existing) {
+            if (existing_rid == rid) {
+                return;
+            }
+        }
+    }
+    index_it->second->insert_entry(key.data(), rid, nullptr, true);
+}
+
+} // namespace
 
 /**
  * @description: analyze阶段，需要获得脏页表（DPT）和未完成的事务列表（ATT）
@@ -24,6 +70,9 @@ void RecoveryManager::analyze() {
     committed_txns_.clear();
     log_records_.clear();
     log_order_.clear();
+    touched_rids_.clear();
+    touched_tables_.clear();
+    has_dml_records_ = false;
     max_lsn_ = INVALID_LSN;
     checkpoint_offset_ = 0;
 
@@ -97,6 +146,17 @@ void RecoveryManager::analyze() {
         case LogType::DELETE:
         case LogType::UPDATE:
             active_txn_last_lsn_[txn_id] = lsn;
+            has_dml_records_ = true;
+            if (const auto* insert = dynamic_cast<const InsertLogRecord*>(record.get())) {
+                touched_rids_[insert->table_name_].push_back(insert->rid_);
+                touched_tables_.insert(insert->table_name_);
+            } else if (const auto* del = dynamic_cast<const DeleteLogRecord*>(record.get())) {
+                touched_rids_[del->table_name_].push_back(del->rid_);
+                touched_tables_.insert(del->table_name_);
+            } else if (const auto* update = dynamic_cast<const UpdateLogRecord*>(record.get())) {
+                touched_rids_[update->table_name_].push_back(update->rid_);
+                touched_tables_.insert(update->table_name_);
+            }
             break;
         case LogType::COMMIT:
             committed_txns_.insert(txn_id);
@@ -119,11 +179,11 @@ void RecoveryManager::analyze() {
         offset += static_cast<int64_t>(header.log_tot_len_);
     }
 
-    // A crash may persist newly allocated record pages before the short file
-    // header update reaches disk. Reconcile the in-memory allocation metadata
-    // with the physical file size before redo/undo can fetch those RIDs.
-    for (const auto& [_, file_handle] : sm_manager_->fhs_) {
-        file_handle->rebuild_file_header_from_pages();
+    if (has_dml_records_) {
+        // A crash may persist newly allocated record pages before the short
+        // file header update reaches disk. Reconcile only pages named by WAL
+        // before redo/undo fetches their RIDs.
+        repair_touched_file_headers();
     }
 }
 
@@ -160,6 +220,11 @@ void RecoveryManager::redo() {
  * @description: 回滚未完成的事务
  */
 void RecoveryManager::undo() {
+    if (!has_dml_records_) {
+        reset_wal_if_needed();
+        return;
+    }
+
     for (const auto& [txn_id, last_lsn] : active_txn_last_lsn_) {
         (void)txn_id;
         lsn_t current_lsn = last_lsn;
@@ -192,9 +257,17 @@ void RecoveryManager::undo() {
             current_lsn = record->prev_lsn_;
         }
     }
-    sm_manager_->reset_all_tuple_meta_after_recovery();
-    rebuild_indexes();
-    if (!sm_manager_->flush_all_table_and_index_pages()) {
+    reset_touched_tuple_meta();
+    repair_touched_file_headers();
+    // Concurrent benchmark DML can leave an index tree structurally unusable
+    // even though the table records are recoverable. Incremental repair would
+    // traverse that tree and may assert before its exception fallback runs.
+    // Rebuild every touched index from the recovered tables instead; the no-DML
+    // path above remains incremental-free and fast.
+    if (!touched_rids_.empty()) {
+        rebuild_indexes();
+    }
+    if (!sm_manager_->flush_recovery_pages(touched_tables_)) {
         // Recovery results are not durable. Keep the complete WAL and refuse
         // normal startup so the next process can retry recovery.
         throw InternalError("recovery page flush failed; WAL retained");
@@ -202,11 +275,138 @@ void RecoveryManager::undo() {
     // 表页与索引页已落盘后，截断日志文件并推进 global_lsn。
     // 这样已 undo 完毕的 loser 日志不再残留，避免下一次重启跨轮重复 undo
     // 同 RID 上的数据（尤其是 RID 复用且内容相同时，仅靠 undo 内容守卫无法区分）。
-    if (log_manager_ != nullptr) {
-        lsn_t next_lsn = (max_lsn_ == INVALID_LSN) ? 0 : max_lsn_ + 1;
-        FaultInjector::Point("before_recovery_wal_reset");
-        log_manager_->reset_log(next_lsn);
+    reset_wal_if_needed();
+}
+
+void RecoveryManager::repair_touched_file_headers() {
+    for (const auto& [table_name, rids] : touched_rids_) {
+        auto file_it = sm_manager_->fhs_.find(table_name);
+        if (file_it == sm_manager_->fhs_.end()) {
+            continue;
+        }
+        std::vector<page_id_t> touched_pages;
+        touched_pages.reserve(rids.size());
+        for (const auto& rid : rids) {
+            touched_pages.push_back(rid.page_no);
+        }
+        file_it->second->repair_file_header_for_pages(touched_pages);
     }
+}
+
+void RecoveryManager::reset_touched_tuple_meta() {
+    for (const auto& [table_name, rids] : touched_rids_) {
+        auto table_it = sm_manager_->fhs_.find(table_name);
+        if (table_it == sm_manager_->fhs_.end()) {
+            continue;
+        }
+        std::unordered_set<int> touched_pages;
+        for (const auto& rid : rids) {
+            touched_pages.insert(rid.page_no);
+        }
+        for (const int page_no : touched_pages) {
+            auto page_handle = table_it->second->fetch_page_handle(page_no);
+            std::vector<int> live_slots;
+            std::vector<int> deleted_slots;
+            {
+                std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+                for (int slot_no = 0; slot_no < page_handle.file_hdr->num_records_per_page; ++slot_no) {
+                    if (!Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                        continue;
+                    }
+                    if (page_handle.get_meta(slot_no).is_deleted_) {
+                        deleted_slots.push_back(slot_no);
+                    } else {
+                        live_slots.push_back(slot_no);
+                    }
+                }
+            }
+            sm_manager_->get_bpm()->unpin_page(page_handle.page->get_page_id(), false);
+            for (const int slot_no : deleted_slots) {
+                table_it->second->delete_record(Rid{page_no, slot_no}, nullptr);
+            }
+            for (const int slot_no : live_slots) {
+                reset_tuple_meta(table_name, Rid{page_no, slot_no});
+            }
+        }
+    }
+}
+
+void RecoveryManager::repair_touched_indexes() {
+    // Remove every old/new key mentioned by recovered DML for the affected
+    // RID, then install exactly the final live tuple key. This is idempotent
+    // and repairs both a missing index write and a stale index entry.
+    for (const auto lsn : log_order_) {
+        auto it = log_records_.find(lsn);
+        if (it == log_records_.end()) {
+            continue;
+        }
+        const auto* record = it->second.get();
+        switch (record->log_type_) {
+        case LogType::INSERT: {
+            const auto& log = *static_cast<const InsertLogRecord*>(record);
+            if (sm_manager_->db_.is_table(log.table_name_)) {
+                const auto& tab = sm_manager_->db_.get_table(log.table_name_);
+                for (const auto& index : tab.indexes) {
+                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.insert_value_, log.rid_);
+                }
+            }
+            break;
+        }
+        case LogType::DELETE: {
+            const auto& log = *static_cast<const DeleteLogRecord*>(record);
+            if (sm_manager_->db_.is_table(log.table_name_)) {
+                const auto& tab = sm_manager_->db_.get_table(log.table_name_);
+                for (const auto& index : tab.indexes) {
+                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.delete_value_, log.rid_);
+                }
+            }
+            break;
+        }
+        case LogType::UPDATE: {
+            const auto& log = *static_cast<const UpdateLogRecord*>(record);
+            if (sm_manager_->db_.is_table(log.table_name_)) {
+                const auto& tab = sm_manager_->db_.get_table(log.table_name_);
+                for (const auto& index : tab.indexes) {
+                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.old_value_, log.rid_);
+                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.new_value_, log.rid_);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    for (const auto& [table_name, rids] : touched_rids_) {
+        auto file_it = sm_manager_->fhs_.find(table_name);
+        if (!sm_manager_->db_.is_table(table_name) || file_it == sm_manager_->fhs_.end()) {
+            continue;
+        }
+        const auto& table = sm_manager_->db_.get_table(table_name);
+        for (const auto& rid : rids) {
+            if (!record_exists(table_name, rid)) {
+                continue;
+            }
+            const auto meta = file_it->second->get_tuple_meta(rid);
+            if (meta.is_deleted_) {
+                continue;
+            }
+            auto record = file_it->second->get_record(rid, nullptr);
+            for (const auto& index : table.indexes) {
+                InsertRecoveryIndexEntry(sm_manager_, table_name, index, *record, rid);
+            }
+        }
+    }
+}
+
+void RecoveryManager::reset_wal_if_needed() {
+    if (log_manager_ == nullptr || max_lsn_ == INVALID_LSN) {
+        return;
+    }
+    const lsn_t next_lsn = max_lsn_ + 1;
+    FaultInjector::Point("before_recovery_wal_reset");
+    log_manager_->reset_log(next_lsn);
 }
 
 bool RecoveryManager::record_exists(const std::string& table_name, const Rid& rid) const {
