@@ -258,6 +258,13 @@ class Server:
     def start(self):
         env = os.environ.copy()
         env["RMDB_PORT"] = str(self.port)
+        # Live protocol tests exercise normal server behavior.  Do not inherit
+        # diagnostic checkpoint knobs from the caller: a tiny threshold could
+        # checkpoint the buffered ABORT before this suite deliberately kills
+        # the process.
+        env.pop("RMDB_AUTO_CHECKPOINT_BYTES", None)
+        env.pop("RMDB_CHECKPOINT_PREFLUSH_BYTES", None)
+        env.pop("RMDB_CHECKPOINT_PREFLUSH_PAGES", None)
         self.process = subprocess.Popen([self.binary, "db"], cwd=self.root, env=env, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = time.monotonic() + 20
@@ -546,6 +553,62 @@ def test_crash_recovery_smoke(server):
     client.close()
 
 
+def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
+    client = WireClient(server.port)
+    try:
+        client.command("CREATE TABLE abort_crash_wire (id INT, key_col INT, value INT);")
+        client.command("CREATE INDEX abort_crash_wire(key_col);")
+        client.command("INSERT INTO abort_crash_wire VALUES (1, 10, 100);")
+        client.command("INSERT INTO abort_crash_wire VALUES (2, 20, 200);")
+
+        client.command("BEGIN;")
+        client.command("INSERT INTO abort_crash_wire VALUES (3, 30, 300);")
+        client.command("UPDATE abort_crash_wire SET key_col = 11 WHERE id = 1;")
+        client.command("DELETE FROM abort_crash_wire WHERE id = 2;")
+
+        # A separate committed transaction advances the WAL durable frontier
+        # past this transaction's DML records without flushing its later ABORT
+        # record.  Thus recovery must undo durable loser changes after kill -9,
+        # rather than passing merely because none of the aborted work reached
+        # the WAL file.
+        flusher = WireClient(server.port)
+        try:
+            flusher.command("INSERT INTO abort_crash_wire VALUES (4, 40, 400);")
+        finally:
+            flusher.close()
+
+        # COMMAND_OK is the ABORT acknowledgement.  Kill the process only
+        # after it has been received, so any unflushed abort record is left to
+        # crash recovery rather than a graceful shutdown.
+        client.command("ABORT;")
+    finally:
+        client.close()
+
+    server.stop(crash=True)
+    server.start()
+
+    verifier = WireClient(server.port)
+    try:
+        # The complete table result proves the heap is back at its pre-ABORT
+        # state; the equality predicates exercise the secondary index's old
+        # and new keys after recovery.
+        _, rows = verifier.query("SELECT id, key_col, value FROM abort_crash_wire ORDER BY id;")
+        require(rows == [[1, 10, 100], [2, 20, 200], [4, 40, 400]],
+                "SIGKILL after ABORT acknowledgement left heap rows behind or changed")
+        _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 10;")
+        require(rows == [[1]], "recovery lost the pre-ABORT secondary-index entry")
+        _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 20;")
+        require(rows == [[2]], "recovery did not restore the deleted row's secondary-index entry")
+        _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 11;")
+        require(rows == [], "recovery retained the aborted UPDATE secondary-index entry")
+        _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 30;")
+        require(rows == [], "recovery retained the aborted INSERT secondary-index entry")
+        _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 40;")
+        require(rows == [[4]], "recovery lost the WAL-stabilizing committed row")
+    finally:
+        verifier.close()
+
+
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
     server = Server(sys.argv[1])
@@ -558,6 +621,7 @@ def main():
         test_direct_column_update(server.port)
         test_chained_update(server.port)
         test_crash_recovery_smoke(server)
+        test_abort_ack_then_sigkill_recovers_indexed_undo(server)
         print("live Wire v3 server baseline: PASS")
         return 0
     finally:

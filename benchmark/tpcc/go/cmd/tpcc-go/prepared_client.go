@@ -740,6 +740,29 @@ type rankingTemplate struct {
 	columns []byte
 }
 
+func rankingDistrictNextOrderSQL(wID, dID int) string {
+	return fmt.Sprintf("select d_next_o_id from district where d_id = %d and d_w_id = %d;", dID, wID)
+}
+
+func rankingOrderCountSQL(wID, dID, oID int) string {
+	return fmt.Sprintf("select count(*) from orders where o_w_id = %d and o_d_id = %d and o_id = %d;", wID, dID, oID)
+}
+
+func rankingNewOrderCountSQL(wID, dID, oID int) string {
+	return fmt.Sprintf("select count(*) from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;",
+		wID, dID, oID)
+}
+
+func rankingOrderLineCountSQL(wID, dID, oID int) string {
+	return fmt.Sprintf("select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id = %d;",
+		wID, dID, oID)
+}
+
+func rankingStockSnapshotSQL(wID, iID int) string {
+	return fmt.Sprintf("select s_quantity, s_ytd, s_order_cnt, s_remote_cnt from stock where s_w_id = %d and s_i_id = %d;",
+		wID, iID)
+}
+
 // rankingTemplates lists every statement the ranking transactions execute plus
 // the projection schema each query must report. The expected types follow the
 // benchmark DDL in benchmark/tpcc/schema/rmdb_schema.sql: COUNT yields INT32,
@@ -818,8 +841,16 @@ func rankingTemplates() []rankingTemplate {
 		{sql: "update customer set c_balance = c_balance + 1.00, c_delivery_cnt = c_delivery_cnt + 1 where c_id = 1 and c_d_id = 1 and c_w_id = 1;"},
 		{sql: "select c_balance from customer where c_id = 1 and c_d_id = 1 and c_w_id = 1;",
 			columns: []byte{f}},
-		{sql: "select d_next_o_id from district where d_id = 1 and d_w_id = 1;",
+		{sql: rankingDistrictNextOrderSQL(1, 1),
 			columns: []byte{i}},
+		{sql: rankingOrderCountSQL(1, 1, 1),
+			columns: []byte{i}},
+		{sql: rankingNewOrderCountSQL(1, 1, 1),
+			columns: []byte{i}},
+		{sql: rankingOrderLineCountSQL(1, 1, 1),
+			columns: []byte{i}},
+		{sql: rankingStockSnapshotSQL(1, 1),
+			columns: []byte{i, f, i, i}},
 		{sql: "select count(distinct ol_i_id) from order_line, stock where ol_w_id = 1 and ol_d_id = 1 and ol_o_id >= 1 and ol_o_id < 2 and s_w_id = 1 and s_i_id = ol_i_id and s_quantity < 10;",
 			columns: []byte{i}},
 	}

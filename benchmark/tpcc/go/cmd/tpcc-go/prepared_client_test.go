@@ -280,7 +280,7 @@ type fakeRankingBatcher struct {
 	stockYTD     map[string]float32
 }
 
-func newFakeRankingBatcher(t *testing.T) *fakeRankingBatcher {
+func testRankingStatementDictionary(t *testing.T) map[string]rankingStatement {
 	t.Helper()
 	pending, err := pendingRankingStatements()
 	if err != nil {
@@ -295,9 +295,29 @@ func newFakeRankingBatcher(t *testing.T) *fakeRankingBatcher {
 		statements[statement.template] = rankingStatement{id: statement.id, query: statement.query,
 			parameterTypes: argumentTypes(statement.args), columns: columns}
 	}
+	return statements
+}
+
+func newFakeRankingBatcher(t *testing.T) *fakeRankingBatcher {
+	t.Helper()
 	return &fakeRankingBatcher{
-		statements: statements, warehouseYTD: 1, districtYTD: 1, balance: 1, customerYTD: 1,
+		statements: testRankingStatementDictionary(t), warehouseYTD: 1, districtYTD: 1, balance: 1, customerYTD: 1,
 		stockYTD: make(map[string]float32),
+	}
+}
+
+func TestPreparedInvalidItemSnapshotQueriesUsePreparedTemplates(t *testing.T) {
+	ranking := &rankingClient{statements: testRankingStatementDictionary(t)}
+	ctx := txnContext{wID: 17, dID: 3}
+	input := rankingNewOrderInput{itemIDs: []int{7, 8}, supplyWIDs: []int{17, 18}}
+	for _, query := range preparedInvalidItemSnapshotQueries(ctx, input, 3001) {
+		if _, err := ranking.batchOperation(query); err != nil {
+			t.Fatalf("registered invalid-item snapshot query %q was rejected: %v", query, err)
+		}
+	}
+	if _, err := ranking.batchOperation("select d_next_o_id from district where d_w_id = 17 and d_id = 3;"); err == nil ||
+		!strings.Contains(err.Error(), "was not prepared") {
+		t.Fatalf("unknown district lookup error = %v, want unprepared-template rejection", err)
 	}
 }
 

@@ -268,6 +268,36 @@ TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {
     EXPECT_EQ(log_mgr.current_log_offset(), disk.get_file_size(LOG_FILE_NAME));
 }
 
+TEST(LogManagerTest, AbortPageEvictionFlushesWalThroughPageLsn) {
+    ScopedTestDir test_dir("abort_page_eviction_wal_barrier_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    disk.create_file("pages");
+    const int page_fd = disk.open_file("pages");
+    LogManager log_mgr(&disk);
+
+    AbortLogRecord abort_record(104);
+    const lsn_t abort_lsn = log_mgr.add_log_to_buffer(&abort_record);
+    {
+        BufferPoolManager bpm(1, &disk);
+        bpm.set_log_manager(&log_mgr);
+
+        PageId aborted_page{page_fd, INVALID_PAGE_ID};
+        Page* page = bpm.new_page(&aborted_page);
+        ASSERT_NE(page, nullptr);
+        page->set_page_lsn(abort_lsn);
+        ASSERT_TRUE(bpm.unpin_page(aborted_page, true));
+
+        PageId replacement_page{page_fd, INVALID_PAGE_ID};
+        ASSERT_NE(bpm.new_page(&replacement_page), nullptr);
+        EXPECT_GE(log_mgr.get_durable_lsn(), abort_lsn);
+        EXPECT_GE(log_mgr.get_persist_lsn(), abort_lsn);
+        EXPECT_GT(disk.get_file_size(LOG_FILE_NAME), 0);
+        EXPECT_TRUE(bpm.unpin_page(replacement_page, false));
+    }
+    disk.close_file(page_fd);
+}
+
 TEST(LogManagerTest, ProcessCrashCommitWaitsForPwriteWithoutFsync) {
     ScopedTestDir test_dir("log_manager_process_crash_test_db");
     DiskManager disk;
