@@ -111,14 +111,13 @@ public:
 
     /// Execute a single SQL statement (must include trailing ';').
     /// Returns the captured text output. Throws RMDBError on failure.
-    std::string exec_sql(const std::string& sql) {
+    std::string exec_sql(const std::string& sql, bool* output_file_enabled = nullptr) {
         char data_send[BUFFER_LENGTH];
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
         Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
-        // output_file toggle is now a database-global on SmManager; no per-session
-        // mirror needed here.
+        context.output_file_enabled_ = output_file_enabled;
 
         // Parse
         std::unique_ptr<ast::TreeNode> parse_tree;
@@ -906,6 +905,33 @@ TEST(LoadCrashRecoveryTest, LoadedDataSurvivesRestart) {
 
 // Verify show tables/index respect the output_file toggle: after "set output_file off",
 // these commands must NOT append to output.txt.
+
+TEST_F(E2ETest, SessionOutputFilePolicyIsIsolated) {
+    ASSERT_NO_THROW(db_->exec_sql("create table t_session_output (a int);"));
+    ASSERT_NO_THROW(db_->exec_sql("insert into t_session_output values (1);"));
+    db_->clean_output_txt();
+
+    bool wire_session_output = false;
+    bool other_wire_session_output = false;
+    ASSERT_NO_THROW(db_->exec_sql("select * from t_session_output;", &wire_session_output));
+    EXPECT_FALSE(std::ifstream("output.txt").good());
+
+    ASSERT_NO_THROW(db_->exec_sql("set output_file on", &wire_session_output));
+    EXPECT_TRUE(wire_session_output);
+    EXPECT_FALSE(other_wire_session_output);
+    ASSERT_NO_THROW(db_->exec_sql("select * from t_session_output;", &wire_session_output));
+
+    std::ifstream enabled_output("output.txt");
+    std::string enabled_content((std::istreambuf_iterator<char>(enabled_output)), std::istreambuf_iterator<char>());
+    EXPECT_NE(enabled_content.find("1"), std::string::npos);
+
+    db_->clean_output_txt();
+    ASSERT_NO_THROW(db_->exec_sql("select * from t_session_output;", &other_wire_session_output));
+    EXPECT_FALSE(std::ifstream("output.txt").good());
+
+    ASSERT_NO_THROW(db_->exec_sql("select * from t_session_output;"));
+    EXPECT_TRUE(std::ifstream("output.txt").good());
+}
 
 TEST_F(E2ETest, ShowCommandsRespectOutputFileOff) {
     ASSERT_NO_THROW(db_->exec_sql("create table t_show (a int, b char(4));"));

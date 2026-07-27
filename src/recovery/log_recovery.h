@@ -59,9 +59,7 @@ private:
     void undo_insert(const InsertLogRecord& log);
     void undo_delete(const DeleteLogRecord& log);
     void undo_update(const UpdateLogRecord& log);
-    void rebuild_indexes();
     void repair_touched_file_headers();
-    void rebuild_touched_file_headers();
     void reset_touched_tuple_meta();
     void repair_touched_indexes();
     void reset_wal_if_needed();

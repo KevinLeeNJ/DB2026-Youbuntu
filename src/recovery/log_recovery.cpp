@@ -261,21 +261,14 @@ void RecoveryManager::undo() {
     }
     reset_touched_tuple_meta();
     repair_touched_file_headers();
-    rebuild_touched_file_headers();
     // Repair only keys named by the WAL. Rebuilding every index from every heap
     // row makes recovery proportional to the whole database even when the
-    // crash affected a handful of records (the official 50-warehouse data set
-    // is several GiB). The repair is idempotent and preserves the existing
-    // B+tree topology; a structural failure still falls back to the expensive
-    // full rebuild path.
+    // crash affected a handful of records. The repair is idempotent and
+    // preserves the existing B+tree topology. A failure rebuilds only the
+    // affected index; if that also fails, recovery stops with WAL retained.
     if (!touched_rids_.empty()) {
         FaultInjector::Point("mid_index_rebuild");
-        try {
-            repair_touched_indexes();
-        } catch (const std::exception& error) {
-            LOG_WARN("incremental recovery index repair failed; rebuilding indexes: %s", error.what());
-            rebuild_indexes();
-        }
+        repair_touched_indexes();
     }
     if (!sm_manager_->flush_recovery_pages(touched_tables_)) {
         // Recovery results are not durable. Keep the complete WAL and refuse
@@ -300,15 +293,6 @@ void RecoveryManager::repair_touched_file_headers() {
             touched_pages.push_back(rid.page_no);
         }
         file_it->second->repair_file_header_for_pages(touched_pages);
-    }
-}
-
-void RecoveryManager::rebuild_touched_file_headers() {
-    for (const auto& table_name : touched_tables_) {
-        auto file_it = sm_manager_->fhs_.find(table_name);
-        if (file_it != sm_manager_->fhs_.end()) {
-            file_it->second->rebuild_file_header_from_pages();
-        }
     }
 }
 
@@ -355,12 +339,6 @@ void RecoveryManager::repair_touched_indexes() {
     // RID, then install exactly the final live tuple key. This is idempotent
     // and repairs both a missing index write and a stale index entry.
     std::unordered_set<std::string> indexes_to_rebuild;
-    for (const auto& [index_name, handle] : sm_manager_->ihs_) {
-        if (!handle->validate_structure()) {
-            LOG_WARN("recovery found structurally inconsistent index %s", index_name.c_str());
-            indexes_to_rebuild.insert(index_name);
-        }
-    }
 
     auto repair_index = [&](const std::string& table_name, const IndexMeta& index, const auto& repair) {
         const auto index_name = sm_manager_->get_ix_manager()->get_index_name(table_name, index.cols);
@@ -572,6 +550,9 @@ void RecoveryManager::redo_update(const UpdateLogRecord& log) {
     meta.version_chain_head_ = UndoLink{};
     if (current == nullptr) {
         table_it->second->insert_record(log.rid_, log.new_value_.data, log.lsn_);
+        if (table_it->second->is_record(log.rid_)) {
+            table_it->second->set_tuple_meta(log.rid_, meta, log.lsn_);
+        }
     } else {
         table_it->second->apply_tuple_update(log.rid_, log.new_value_.data, meta, log.lsn_);
     }
@@ -644,8 +625,4 @@ void RecoveryManager::undo_update(const UpdateLogRecord& log) {
     restored_meta.is_deleted_ = false;
     restored_meta.version_chain_head_ = UndoLink{};
     table_it->second->apply_tuple_update(log.rid_, log.old_value_.data, restored_meta, log.lsn_);
-}
-
-void RecoveryManager::rebuild_indexes() {
-    sm_manager_->rebuild_all_indexes();
 }

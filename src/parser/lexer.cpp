@@ -176,6 +176,16 @@ Token Lexer::next_token() {
     }
 
     // Operator or punctuation
+    if (c == '$' && std::isdigit(static_cast<unsigned char>(peek_char()))) {
+        int start_line = line_;
+        int start_col = column_;
+        size_t start_pos = pos_;
+        advance();
+        while (std::isdigit(static_cast<unsigned char>(current_char()))) {
+            advance();
+        }
+        return Token(TokenType::PARAMETER, input_.substr(start_pos, pos_ - start_pos), start_line, start_col);
+    }
     return scan_operator();
 }
 

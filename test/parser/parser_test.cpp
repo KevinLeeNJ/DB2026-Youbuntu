@@ -327,6 +327,11 @@ TEST(ParserTest, ParsesKnobsAndTransactionStatements) {
     EXPECT_EQ(parse_ok("create static_checkpoint;")->type, ast::AstType::StaticCheckpoint);
 }
 
+TEST(ParserTest, RejectsParameterOrdinalOverflow) {
+    expect_parse_error("select $184467440737095516160 from tb;");
+    expect_parse_error("select * from tb limit $184467440737095516160;");
+}
+
 TEST(ParserTest, RejectsMalformedStatements) {
     expect_parse_error("select * from tb");
     expect_parse_error("select from tb;");
@@ -418,6 +423,21 @@ TEST(ParserTest, ParsesOptionalWhereAndNegativeLiterals) {
     EXPECT_DOUBLE_EQ(float_lit->val, -2.5);
 }
 
+TEST(ParserTest, ParsesPreparedMarkersAndQuotedDollarText) {
+    auto insert_node = parse_ok("insert into tb values ($2, '$1', $1);");
+    auto insert = as_node<ast::InsertStmt>(insert_node);
+    ASSERT_NE(insert, nullptr);
+    ASSERT_EQ(insert->vals.size(), 3);
+    EXPECT_EQ(insert->vals[0]->type, ast::AstType::Parameter);
+    EXPECT_EQ(static_cast<const ast::Parameter*>(insert->vals[0].get())->ordinal, 2u);
+    EXPECT_EQ(insert->vals[1]->type, ast::AstType::StringLit);
+    EXPECT_EQ(insert->vals[2]->type, ast::AstType::Parameter);
+    auto select_node = parse_ok("select a from tb where a=$1 limit $2;");
+    auto select = as_node<ast::SelectStmt>(select_node);
+    ASSERT_NE(select, nullptr);
+    EXPECT_TRUE(select->limit_is_parameter);
+    EXPECT_EQ(select->limit_parameter, 2u);
+}
 TEST(ParserTest, RejectsUnterminatedBlockComment) {
     expect_parse_error("select * from tb /* missing close ;");
 }

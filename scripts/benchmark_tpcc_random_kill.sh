@@ -181,7 +181,7 @@ start_server 30
 # The consistency checker needs only the initial profile/counts. Generate it
 # before crash cycles; the random-kill workload itself may not reach its normal
 # JSON write because its clients lose their connections when the server dies.
-"$GO_BINARY" \
+"$GO_BINARY" --mode rmdb-diagnostic \
     --port "$PORT" \
     --isolation "$ISOLATION" \
     --workers 1 \
@@ -230,7 +230,7 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     done
 
     rm -f "$RUN_JSON"
-    "$GO_BINARY" \
+    "$GO_BINARY" --mode rmdb-diagnostic \
         --port "$PORT" \
         --isolation "$ISOLATION" \
         --workers "$WORKERS" \

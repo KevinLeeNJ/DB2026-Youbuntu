@@ -53,4 +53,6 @@ public:
     IsolationLevel isolation_level_;
     bool enable_ssi_read_tracking_{false};
     QueryResultSink* result_sink_{nullptr};
+    // When set, overrides the legacy database-wide output.txt policy for this session.
+    bool* output_file_enabled_{nullptr};
 };

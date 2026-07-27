@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -25,8 +26,77 @@ const (
 var tpccTables = []string{"warehouse", "district", "customer", "history", "new_orders", "orders", "order_line", "item", "stock"}
 
 type datasetManifest struct {
-	Warehouses int   `json:"warehouses"`
-	Seed       int64 `json:"seed"`
+	Warehouses int                   `json:"warehouses"`
+	Seed       int64                 `json:"seed"`
+	Files      map[string]fileRecord `json:"files"`
+}
+
+type fileRecord struct {
+	Size   int64  `json:"size"`
+	Rows   int64  `json:"rows"`
+	Header string `json:"header"`
+}
+
+func inspectCSVFile(path string) (fileRecord, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileRecord{}, err
+	}
+	if info.Size() <= 0 {
+		return fileRecord{}, fmt.Errorf("dataset file %s is empty", path)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fileRecord{}, err
+	}
+	defer file.Close()
+	reader := csv.NewReader(file)
+	header, err := reader.Read()
+	if err != nil {
+		return fileRecord{}, fmt.Errorf("read dataset header %s: %w", path, err)
+	}
+	rows := int64(0)
+	for {
+		if _, err := reader.Read(); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return fileRecord{}, fmt.Errorf("read dataset %s: %w", path, err)
+		}
+		rows++
+	}
+	return fileRecord{Size: info.Size(), Rows: rows, Header: strings.Join(header, ",")}, nil
+}
+
+func expectedCSVRows(warehouses int, table string) int64 {
+	w := int64(warehouses)
+	districts := w * districtsPerWarehouse
+	customers := districts * customersPerDistrict
+	switch table {
+	case "warehouse":
+		return w
+	case "district":
+		return districts
+	case "customer", "history", "orders":
+		return customers
+	case "item":
+		return itemCount
+	case "stock":
+		return w * itemCount
+	case "new_orders":
+		return districts * initialNewOrdersPerDistrict
+	case "order_line":
+		rows := int64(0)
+		for wID := 1; wID <= warehouses; wID++ {
+			for dID := 1; dID <= districtsPerWarehouse; dID++ {
+				for oID := 1; oID <= initialOrdersPerDist; oID++ {
+					rows += int64(initialOrderLineCount(wID, dID, oID))
+				}
+			}
+		}
+		return rows
+	default:
+		return 0
+	}
 }
 
 func completeCSVSet(dataDir string) bool {
@@ -40,7 +110,19 @@ func completeCSVSet(dataDir string) bool {
 }
 
 func writeDatasetManifest(dataDir string, warehouses int, seed int64) error {
-	data, err := json.MarshalIndent(datasetManifest{Warehouses: warehouses, Seed: seed}, "", "  ")
+	files := make(map[string]fileRecord, len(tpccTables))
+	for _, table := range tpccTables {
+		path := filepath.Join(dataDir, table+".csv")
+		record, err := inspectCSVFile(path)
+		if err != nil {
+			return fmt.Errorf("inspect generated dataset file %s: %w", path, err)
+		}
+		if record.Rows != expectedCSVRows(warehouses, table) {
+			return fmt.Errorf("generated dataset file %s has %d rows, want %d", path, record.Rows, expectedCSVRows(warehouses, table))
+		}
+		files[table] = record
+	}
+	data, err := json.MarshalIndent(datasetManifest{Warehouses: warehouses, Seed: seed, Files: files}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -66,7 +148,27 @@ func validateDataset(dataDir string, warehouses int, seed int64) error {
 	if manifest.Seed != seed {
 		return fmt.Errorf("dataset seed mismatch: manifest has %d, requested %d", manifest.Seed, seed)
 	}
+	if len(manifest.Files) != len(tpccTables) {
+		return fmt.Errorf("dataset manifest %s has incomplete file records", path)
+	}
+	for _, table := range tpccTables {
+		record, ok := manifest.Files[table]
+		if !ok || record.Size <= 0 {
+			return fmt.Errorf("dataset manifest %s is missing file record for %s", path, table)
+		}
+		info, err := inspectCSVFile(filepath.Join(dataDir, table+".csv"))
+		if err != nil {
+			return fmt.Errorf("inspect dataset file %s: %w", table, err)
+		}
+		if info.Size != record.Size || info.Rows != record.Rows || info.Header != record.Header {
+			return fmt.Errorf("dataset file %s changed since manifest", table)
+		}
+		if info.Rows != expectedCSVRows(warehouses, table) {
+			return fmt.Errorf("dataset file %s has %d rows, want %d", table, info.Rows, expectedCSVRows(warehouses, table))
+		}
+	}
 	return nil
+
 }
 
 func randomString(rng *rand.Rand, length int) string {
@@ -336,8 +438,7 @@ func loadData(address string, timeout time.Duration, isolation, dataDir, schemaD
 	if err := executeSQLFile(c, filepath.Join(schemaDir, "rmdb_indexes.sql")); err != nil {
 		return err
 	}
-	_, err = c.exec("set output_file off")
-	return err
+	return nil
 }
 
 func waitForPort(address string, timeout time.Duration) error {
@@ -384,6 +485,9 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 	var prior document
 	if err := json.Unmarshal(data, &prior); err != nil {
 		return err
+	}
+	if err := validateResultDocument(prior); err != nil {
+		return fmt.Errorf("invalid benchmark result: %w", err)
 	}
 	c, err := newClient(address, timeout, isolation)
 	if err != nil {
@@ -588,8 +692,8 @@ func mergeResultFiles(outputPath, inputs string) error {
 		if len(doc.Rounds) != 1 {
 			return fmt.Errorf("%s has %d rounds, want exactly 1", path, len(doc.Rounds))
 		}
-		if doc.Rounds[0].hasBackendError() {
-			return fmt.Errorf("%s contains a backend-error round", path)
+		if err := validateResultWindow(doc.Rounds[0], doc.Config.Measure, doc.Config.Mode, 1); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
 		}
 		if len(documents) > 0 && mergeComparableConfig(documents[0].Config) != mergeComparableConfig(doc.Config) {
 			return fmt.Errorf("%s has a materially different benchmark config", path)
@@ -605,11 +709,8 @@ func mergeResultFiles(outputPath, inputs string) error {
 		values = append(values, doc.Rounds[0].TPMC)
 	}
 	merged.MedianTPMC = median(values)
-	encoded, err := json.MarshalIndent(merged, "", "  ")
+	encoded, err := publishResultDocument(outputPath, merged)
 	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(outputPath, encoded, 0644); err != nil {
 		return err
 	}
 	fmt.Println(string(encoded))

@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -496,12 +497,8 @@ func printProgress(round, rounds int, phase string, elapsed, total int, stats *l
 	if totalTransactions > 0 {
 		abortRate = float64(aborts) / float64(totalTransactions) * 100
 	}
-	tpmc := 0.0
-	if phase == "measure" && elapsed > 0 {
-		tpmc = float64(newOrderCommits) / (float64(elapsed) / 60.0)
-	}
-	fmt.Printf("[round %d/%d %s %d/%ds] commits=%d aborts=%d new_order_commit=%d new_order_abort=%d tpmC=%.2f abort_rate=%.2f%%\n",
-		round, rounds, phase, elapsed, total, commits, aborts, newOrderCommits, newOrderAborts, tpmc, abortRate)
+	fmt.Printf("[round %d/%d %s %d/%ds] commits=%d aborts=%d new_order_commit=%d new_order_abort=%d tpmC=deferred abort_rate=%.2f%%\n",
+		round, rounds, phase, elapsed, total, commits, aborts, newOrderCommits, newOrderAborts, abortRate)
 }
 
 func monitorProgress(round, rounds, warmupSeconds, measureSeconds, interval int, warmupEnd, measureEnd time.Time, stats *liveStats, stop <-chan struct{}, done chan<- struct{}) {
@@ -1057,6 +1054,302 @@ func stockLevelCountQuery(wID, dID, dNext, threshold int, parenthesized bool) st
 	return fmt.Sprintf("select count(distinct %s) from order_line, stock where ol_w_id = %d and ol_d_id = %d and ol_o_id >= %d and ol_o_id < %d and s_w_id = %d and s_i_id = ol_i_id and s_quantity < %d;", column, wID, dID, max(1, dNext-20), dNext, wID, threshold)
 }
 
+type rankingBatcher interface {
+	batchOperation(string) (batchOperation, error)
+	execBatch([]batchOperation) (batchResult, error)
+}
+
+func rankingBatch(c rankingBatcher, sqls ...string) (batchResult, error) {
+	operations := make([]batchOperation, len(sqls))
+	for i, sql := range sqls {
+		operation, err := c.batchOperation(sql)
+		if err != nil {
+			return batchResult{}, err
+		}
+		operations[i] = operation
+	}
+	return c.execBatch(operations)
+}
+
+func rankingResult(result batchResult, index int) [][]string {
+	for _, query := range result.results {
+		if int(query.operationIndex) == index {
+			return query.rows
+		}
+	}
+	return nil
+}
+
+func rankingScalar(result batchResult, index int, fallback string) string {
+	rows := rankingResult(result, index)
+	if len(rows) == 0 || len(rows[0]) == 0 {
+		return fallback
+	}
+	return rows[0][0]
+}
+
+func rankingNewOrder(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+	cID, lineCount := rng.Intn(ctx.customersPerDistrict)+1, rng.Intn(11)+5
+	itemIDs := make([]int, lineCount)
+	quantities := make([]int, lineCount)
+	supplyWIDs := make([]int, lineCount)
+	invalid := rng.Intn(100) == 0
+	allLocal := true
+	for i := range itemIDs {
+		itemIDs[i] = rng.Intn(ctx.itemCount) + 1
+		if invalid && i == lineCount-1 {
+			itemIDs[i] = ctx.itemCount + 1
+		}
+		quantities[i] = rng.Intn(10) + 1
+		supplyWIDs[i] = ctx.wID
+		if ctx.warehouses > 1 && rng.Intn(100) == 0 {
+			for supplyWIDs[i] == ctx.wID {
+				supplyWIDs[i] = rng.Intn(ctx.warehouses) + 1
+			}
+			allLocal = false
+		}
+	}
+
+	stage1 := []string{
+		"begin;",
+		fmt.Sprintf("select c_discount, c_last, c_credit, w_tax from customer, warehouse where w_id = %d and c_w_id = w_id and c_d_id = %d and c_id = %d;", ctx.wID, ctx.dID, cID),
+		fmt.Sprintf("update district set d_next_o_id = d_next_o_id + 1 where d_id = %d and d_w_id = %d;", ctx.dID, ctx.wID),
+		fmt.Sprintf("select d_next_o_id, d_tax from district where d_id = %d and d_w_id = %d;", ctx.dID, ctx.wID),
+	}
+	for _, itemID := range itemIDs {
+		stage1 = append(stage1, fmt.Sprintf("select i_price, i_name, i_data from item where i_id = %d;", itemID))
+	}
+	for i, itemID := range itemIDs {
+		stage1 = append(stage1, fmt.Sprintf("select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = %d and s_w_id = %d;", itemID, supplyWIDs[i]))
+	}
+	result, err := rankingBatch(c, stage1...)
+	if err != nil {
+		return err
+	}
+	dNext, err := strconv.Atoi(rankingScalar(result, 3, "0"))
+	if err != nil || dNext < 1 {
+		return errors.New("district next order id not found")
+	}
+	dNext--
+
+	prices := make([]float64, lineCount)
+	stockQtys := make([]int, lineCount)
+	for i := 0; i < lineCount; i++ {
+		itemRows := rankingResult(result, 4+i)
+		if len(itemRows) == 0 {
+			invalid = true
+			continue
+		}
+		prices[i], _ = strconv.ParseFloat(itemRows[0][0], 64)
+		stockRows := rankingResult(result, 4+lineCount+i)
+		if len(stockRows) == 0 {
+			stockQtys[i] = 10
+		} else {
+			stockQtys[i], _ = strconv.Atoi(stockRows[0][0])
+		}
+	}
+
+	stage2 := []string{
+		fmt.Sprintf("insert into orders values (%d, %d, %d, %d, '%s', 0, %d, 1);", dNext, ctx.dID, ctx.wID, cID, nowText(), lineCount),
+		fmt.Sprintf("insert into new_orders values (%d, %d, %d);", dNext, ctx.dID, ctx.wID),
+	}
+	for i, itemID := range itemIDs {
+		if invalid && i == lineCount-1 {
+			continue
+		}
+		remote := 0
+		if supplyWIDs[i] != ctx.wID {
+			remote = 1
+		}
+		stage2 = append(stage2,
+			fmt.Sprintf("update stock set s_ytd = s_ytd + %d, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + %d where s_i_id = %d and s_w_id = %d;", quantities[i], remote, itemID, supplyWIDs[i]),
+		)
+		delta := -quantities[i]
+		op := "+"
+		if stockQtys[i]-quantities[i] < 10 {
+			delta = 91 - quantities[i]
+		}
+		if delta < 0 {
+			op, delta = "-", -delta
+		}
+		stage2 = append(stage2,
+			fmt.Sprintf("update stock set s_quantity = s_quantity %s %d where s_i_id = %d and s_w_id = %d;", op, delta, itemID, supplyWIDs[i]),
+			fmt.Sprintf("insert into order_line values (%d, %d, %d, %d, %d, %d, NULL, %d, %.2f, 'dist');", dNext, ctx.dID, ctx.wID, i+1, itemID, supplyWIDs[i], quantities[i], math.Round(prices[i]*float64(quantities[i])*100)/100),
+		)
+	}
+	if !allLocal {
+		stage2 = append(stage2, fmt.Sprintf("update orders set o_all_local = 0 where o_id = %d and o_d_id = %d and o_w_id = %d;", dNext, ctx.dID, ctx.wID))
+	}
+	if invalid {
+		stage2 = append(stage2, "abort;")
+	} else {
+		stage2 = append(stage2, "commit;")
+	}
+
+	if _, err = rankingBatch(c, stage2...); err != nil {
+		return err
+	}
+	if invalid {
+		return errInvalidItem
+	}
+	return nil
+}
+
+func rankingPayment(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+	cID := rng.Intn(ctx.customersPerDistrict) + 1
+	cWID, cDID := ctx.wID, ctx.dID
+	if ctx.official && ctx.warehouses > 1 && rng.Intn(100) < 15 {
+		cWID = rng.Intn(ctx.warehouses-1) + 1
+		if cWID >= ctx.wID {
+			cWID++
+		}
+		cDID = rng.Intn(ctx.districtsPerWarehouse) + 1
+	}
+	amount := math.Round((rng.Float64()*4999+1)*100) / 100
+
+	stage1 := []string{"begin;"}
+	search := false
+	if ctx.official && rng.Intn(100) < 60 {
+		search = true
+		stage1 = append(stage1, fmt.Sprintf("select c_id, c_first from customer where c_w_id = %d and c_d_id = %d and c_last = '%s' order by c_first, c_id;", cWID, cDID, surname(rng.Intn(1000))))
+	}
+	stage1 = append(stage1,
+		fmt.Sprintf("update warehouse set w_ytd = w_ytd + %.2f where w_id = %d;", amount, ctx.wID),
+		fmt.Sprintf("select w_street_1, w_street_2, w_city, w_state, w_zip, w_name from warehouse where w_id = %d;", ctx.wID),
+		fmt.Sprintf("update district set d_ytd = d_ytd + %.2f where d_w_id = %d and d_id = %d;", amount, ctx.wID, ctx.dID),
+		fmt.Sprintf("select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
+	)
+	result, err := rankingBatch(c, stage1...)
+	if err != nil {
+		return err
+	}
+	if search {
+		rows := rankingResult(result, 1)
+		if len(rows) > 0 {
+			cID, _ = strconv.Atoi(rows[(len(rows)-1)/2][0])
+		}
+	}
+	stage2 := []string{
+		fmt.Sprintf("update customer set c_balance = c_balance - %.2f, c_ytd_payment = c_ytd_payment + %.2f, c_payment_cnt = c_payment_cnt + 1 where c_w_id = %d and c_d_id = %d and c_id = %d;", amount, amount, cWID, cDID, cID),
+		fmt.Sprintf("select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", cWID, cDID, cID),
+		fmt.Sprintf("insert into history values (%d, %d, %d, %d, %d, '%s', %.2f, 'payment');", cID, cDID, cWID, ctx.dID, ctx.wID, nowText(), amount),
+		"commit;",
+	}
+	_, err = rankingBatch(c, stage2...)
+	return err
+}
+
+func rankingOrderStatus(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+	cID := rng.Intn(ctx.customersPerDistrict) + 1
+	stage1 := []string{"begin;"}
+	search := rng.Intn(100) < 60
+	if search {
+		stage1 = append(stage1, fmt.Sprintf("select c_id, c_balance, c_first, c_middle, c_last from customer where c_w_id = %d and c_d_id = %d and c_last = '%s' order by c_first, c_id;", ctx.wID, ctx.dID, surname(rng.Intn(1000))))
+	} else {
+		stage1 = append(stage1, fmt.Sprintf("select c_balance, c_first, c_middle, c_last from customer where c_w_id = %d and c_d_id = %d and c_id = %d;", ctx.wID, ctx.dID, cID))
+	}
+	result, err := rankingBatch(c, stage1...)
+	if err != nil {
+		return err
+	}
+	if search {
+		rows := rankingResult(result, 1)
+		if len(rows) > 0 {
+			cID, _ = strconv.Atoi(rows[(len(rows)-1)/2][0])
+		}
+	}
+	stage2 := []string{fmt.Sprintf("select o_id, o_entry_d, o_carrier_id from orders where o_w_id = %d and o_d_id = %d and o_c_id = %d order by o_id desc limit 1;", ctx.wID, ctx.dID, cID)}
+	result, err = rankingBatch(c, stage2...)
+	if err != nil {
+		return err
+	}
+	oID, _ := strconv.Atoi(rankingScalar(result, 0, "0"))
+	stage3 := []string{}
+	if oID > 0 {
+		stage3 = append(stage3, fmt.Sprintf("select ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id = %d;", ctx.wID, ctx.dID, oID))
+	}
+	stage3 = append(stage3, "commit;")
+	_, err = rankingBatch(c, stage3...)
+	return err
+}
+
+type deliveryPlan struct {
+	dID        int
+	oID        int
+	confirmOp  int
+	customerOp int
+	amountOp   int
+}
+
+func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+	carrierID := rng.Intn(10) + 1
+	stage1 := []string{"begin;"}
+	for dID := 1; dID <= ctx.districtsPerWarehouse; dID++ {
+		stage1 = append(stage1, fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", ctx.wID, dID))
+	}
+	result, err := rankingBatch(c, stage1...)
+	if err != nil {
+		return err
+	}
+	plans := make([]deliveryPlan, 0, ctx.districtsPerWarehouse)
+	stage2 := make([]string, 0, ctx.districtsPerWarehouse*5)
+	opIndex := 1
+	for dID := 1; dID <= ctx.districtsPerWarehouse; dID++ {
+		oID, _ := strconv.Atoi(rankingScalar(result, dID, "0"))
+		if oID == 0 {
+			continue
+		}
+		plans = append(plans, deliveryPlan{dID: dID, oID: oID, confirmOp: opIndex + 1, customerOp: opIndex + 2, amountOp: opIndex + 3})
+		stage2 = append(stage2,
+			fmt.Sprintf("update new_orders set no_o_id = no_o_id where no_w_id = %d and no_d_id = %d and no_o_id = %d;", ctx.wID, dID, oID),
+			fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;", ctx.wID, dID, oID),
+			fmt.Sprintf("select o_c_id from orders where o_id = %d and o_d_id = %d and o_w_id = %d;", oID, dID, ctx.wID),
+			fmt.Sprintf("select sum(ol_amount) from order_line where ol_o_id = %d and ol_d_id = %d and ol_w_id = %d;", oID, dID, ctx.wID),
+		)
+		opIndex += 4
+	}
+	if len(stage2) == 0 {
+		stage2 = append(stage2, "select 0;")
+	}
+	result, err = rankingBatch(c, stage2...)
+	if err != nil {
+		return err
+	}
+	stage3 := make([]string, 0, len(plans)*3+1)
+	for _, plan := range plans {
+		if rankingScalar(result, plan.confirmOp, "") == "" {
+			continue
+		}
+		customerID, _ := strconv.Atoi(rankingScalar(result, plan.customerOp, "0"))
+		amount, _ := strconv.ParseFloat(rankingScalar(result, plan.amountOp, "0"), 64)
+		stage3 = append(stage3,
+			fmt.Sprintf("delete from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;", ctx.wID, plan.dID, plan.oID),
+			fmt.Sprintf("update orders set o_carrier_id = %d where o_id = %d and o_d_id = %d and o_w_id = %d;", carrierID, plan.oID, plan.dID, ctx.wID),
+			fmt.Sprintf("update order_line set ol_delivery_d = '%s' where ol_o_id = %d and ol_d_id = %d and ol_w_id = %d;", nowText(), plan.oID, plan.dID, ctx.wID),
+		)
+		if customerID > 0 {
+			stage3 = append(stage3, fmt.Sprintf("update customer set c_balance = c_balance + %.2f, c_delivery_cnt = c_delivery_cnt + 1 where c_id = %d and c_d_id = %d and c_w_id = %d;", amount, customerID, plan.dID, ctx.wID))
+		}
+	}
+	stage3 = append(stage3, "commit;")
+	_, err = rankingBatch(c, stage3...)
+	return err
+}
+
+func rankingStockLevel(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
+	threshold := rng.Intn(11) + 10
+	result, err := rankingBatch(c, "begin;", fmt.Sprintf("select d_next_o_id from district where d_id = %d and d_w_id = %d;", ctx.dID, ctx.wID))
+	if err != nil {
+		return err
+	}
+	dNext, err := strconv.Atoi(rankingScalar(result, 1, "0"))
+	if err != nil {
+		return err
+	}
+	_, err = rankingBatch(c, stockLevelCountQuery(ctx.wID, ctx.dID, dNext, threshold, false), "commit;")
+	return err
+}
+
 func verifyBenchmarkFeatures(c txnBackend, p profile) error {
 	if p.warehouses < 1 {
 		return errors.New("feature check requires at least one warehouse")
@@ -1172,7 +1465,7 @@ func chooseContext(p profile, workerID int, policy string, rng *rand.Rand) txnCo
 
 func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int) error {
 	switch mode {
-	case "sqlite-reference":
+	case "sqlite-reference", "rmdb-diagnostic":
 		return nil
 	case "official-equivalent":
 		if workers != 50 {
@@ -1196,14 +1489,29 @@ func runTxn(c txnBackend, txnType string, ctx txnContext, rng *rand.Rand) error 
 	}
 	switch txnType {
 	case "new_order":
+		if ranking, ok := c.(*rankingClient); ok {
+			return rankingNewOrder(ranking, ctx, rng)
+		}
 		return newOrder(c, ctx, rng)
 	case "payment":
+		if ranking, ok := c.(*rankingClient); ok {
+			return rankingPayment(ranking, ctx, rng)
+		}
 		return payment(c, ctx, rng)
 	case "order_status":
+		if ranking, ok := c.(*rankingClient); ok {
+			return rankingOrderStatus(ranking, ctx, rng)
+		}
 		return orderStatus(c, ctx, rng)
 	case "delivery":
+		if ranking, ok := c.(*rankingClient); ok {
+			return rankingDelivery(ranking, ctx, rng)
+		}
 		return delivery(c, ctx, rng)
 	default:
+		if ranking, ok := c.(*rankingClient); ok {
+			return rankingStockLevel(ranking, ctx, rng)
+		}
 		return stockLevel(c, ctx, rng)
 	}
 }
@@ -1343,6 +1651,12 @@ type workerReport struct {
 	err    error
 }
 
+type officialWorkerReport struct {
+	warmup  *result
+	windows []*result
+	err     error
+}
+
 func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	local := newResult(measureSeconds)
@@ -1373,9 +1687,33 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			break
 		}
 		txnType := chooseTxn(rng)
+		ctx := chooseContext(p, workerID, policy, rng)
+		attemptSeed := rng.Int63()
+		phaseEnd := measureEnd
+		if phase == "warmup" {
+			phaseEnd = warmupEnd
+		}
 		start := time.Now()
-		err := runTxn(c, txnType, chooseContext(p, workerID, policy, rng), rng)
+		var err error
+		completed := false
+		for time.Now().Before(phaseEnd) {
+			select {
+			case <-stop:
+				report(nil)
+				return
+			default:
+			}
+			err = runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
+			if !errors.Is(err, errAbort) {
+				completed = true
+				break
+			}
+		}
+		if !completed {
+			continue
+		}
 		latency := float64(time.Since(start).Microseconds()) / 1000.0
+
 		if err == nil {
 			local.record(phase, txnType, "commit", latency, "")
 			stats.record(phase, txnType, "commit")
@@ -1383,7 +1721,6 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			local.record(phase, txnType, "invalid-item-rollback", latency, err.Error())
 			stats.record(phase, txnType, "invalid-item-rollback")
 		} else if errors.Is(err, errAbort) {
-			c.rollback()
 			local.record(phase, txnType, "server-abort", latency, err.Error())
 			stats.record(phase, txnType, "server-abort")
 		} else {
@@ -1449,44 +1786,191 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 	return combined, nil
 }
 
-func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
-	reconnectEachTxn bool, roundOffset int, factory backendFactory) ([]*result, error) {
-	const policy = "official-terminal-home"
-	warmupStats := &liveStats{}
-	warmupEnd := time.Now().Add(time.Duration(warmup) * time.Second)
-	warmupStop := make(chan struct{})
-	warmupDone := make(chan struct{})
-	printProgress(0, rounds, "warmup", 0, warmup, warmupStats)
-	go monitorProgress(0, rounds, warmup, 0, progress, warmupEnd, warmupEnd, warmupStats, warmupStop, warmupDone)
-	_, err := runRound(0, workers, seed, p, policy, warmupEnd, warmupEnd, 0, think, reconnectEachTxn, warmupStats, factory)
-	close(warmupStop)
-	<-warmupDone
-	if err != nil {
-		return nil, fmt.Errorf("official warmup invalid: %w", err)
+func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd time.Time, measure time.Duration,
+	windows int, think time.Duration, stats []*liveStats, stop <-chan struct{}, output chan<- officialWorkerReport, c txnBackend) {
+	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
+	report := officialWorkerReport{warmup: newResult(0), windows: make([]*result, windows)}
+	for window := range report.windows {
+		report.windows[window] = newResult(int(measure / time.Second))
 	}
-
-	windows := make([]*result, 0, rounds)
-	for round := 1; round <= rounds; round++ {
-		stats := &liveStats{}
-		windowStart := time.Now()
-		windowEnd := windowStart.Add(time.Duration(measure) * time.Second)
-		stop := make(chan struct{})
-		done := make(chan struct{})
-		go monitorProgress(round, rounds, 0, measure, progress, windowStart, windowEnd, stats, stop, done)
-		window, runErr := runRound(roundOffset+round, workers, seed, p, policy, windowStart, windowEnd, measure, think,
-			reconnectEachTxn, stats, factory)
-		close(stop)
-		<-done
-		if runErr != nil {
-			return nil, fmt.Errorf("official measurement window %d invalid: %w", round, runErr)
+	defer func() {
+		c.close()
+		output <- report
+	}()
+	measureEnd := warmupEnd.Add(time.Duration(windows) * measure)
+	for {
+		select {
+		case <-stop:
+			return
+		default:
 		}
-		for _, txnType := range []string{"new_order", "payment", "order_status", "delivery", "stock_level"} {
-			if window.Committed[txnType] < 1 {
-				return nil, fmt.Errorf("official measurement window %d has no committed %s transaction", round, txnType)
+		now := time.Now()
+		phase := "warmup"
+		local := report.warmup
+		phaseStats := stats[0]
+		if !now.Before(warmupEnd) {
+			if !now.Before(measureEnd) {
+				return
+			}
+			phase = "measure"
+			window := int(now.Sub(warmupEnd) / measure)
+			local = report.windows[window]
+			phaseStats = stats[window+1]
+		}
+
+		txnType := chooseTxn(rng)
+		ctx := chooseContext(p, workerID, "official-terminal-home", rng)
+		attemptSeed := rng.Int63()
+		phaseEnd := measureEnd
+		if phase == "warmup" {
+			phaseEnd = warmupEnd
+		}
+		start := time.Now()
+		var err error
+		completed := false
+		for time.Now().Before(phaseEnd) {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			err = runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
+			if !errors.Is(err, errAbort) {
+				completed = true
+				break
 			}
 		}
-		windows = append(windows, window)
-		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f abort_rate=%.2f%%\n", round, rounds, window.NewOrderPerMin,
+		if !completed {
+			continue
+		}
+		latency := float64(time.Since(start).Microseconds()) / 1000.0
+
+		if err == nil {
+			local.record(phase, txnType, "commit", latency, "")
+			phaseStats.record(phase, txnType, "commit")
+		} else if errors.Is(err, errInvalidItem) {
+			local.record(phase, txnType, "invalid-item-rollback", latency, err.Error())
+			phaseStats.record(phase, txnType, "invalid-item-rollback")
+		} else if errors.Is(err, errAbort) {
+			local.record(phase, txnType, "server-abort", latency, err.Error())
+			phaseStats.record(phase, txnType, "server-abort")
+		} else {
+			c.rollback()
+			local.record(phase, txnType, "backend-error", latency, err.Error())
+			phaseStats.record(phase, txnType, "backend-error")
+			report.err = fmt.Errorf("worker %d %s transaction: %w", workerID, txnType, err)
+			return
+		}
+		if think > 0 {
+			select {
+			case <-stop:
+				return
+			case <-time.After(think):
+			}
+		}
+	}
+}
+
+func monitorOfficialProgress(rounds, warmup, measure, interval int, start time.Time, stats []*liveStats, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+	warmupEnd := start.Add(time.Duration(warmup) * time.Second)
+	measureDuration := time.Duration(measure) * time.Second
+	finalEnd := warmupEnd.Add(time.Duration(rounds) * measureDuration)
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-ticker.C:
+			if now.Before(warmupEnd) {
+				printProgress(0, rounds, "warmup", int(now.Sub(start).Seconds()), warmup, stats[0])
+			} else if now.Before(finalEnd) {
+				round := int(now.Sub(warmupEnd)/measureDuration) + 1
+				windowStart := warmupEnd.Add(time.Duration(round-1) * measureDuration)
+				printProgress(round, rounds, "measure", int(now.Sub(windowStart).Seconds()), measure, stats[round])
+			} else {
+				return
+			}
+		}
+	}
+}
+
+func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
+	reconnectEachTxn bool, roundOffset int, factory backendFactory) ([]*result, error) {
+	if reconnectEachTxn {
+		return nil, errors.New("official-equivalent does not allow reconnect-each-txn")
+	}
+	backends := make([]txnBackend, 0, workers)
+	for workerID := 0; workerID < workers; workerID++ {
+		backend, err := factory()
+		if err != nil {
+			for _, connected := range backends {
+				connected.close()
+			}
+			return nil, fmt.Errorf("official worker %d initial connect: %w", workerID, err)
+		}
+		backends = append(backends, backend)
+	}
+
+	stats := make([]*liveStats, rounds+1)
+	for i := range stats {
+		stats[i] = &liveStats{}
+	}
+	start := time.Now()
+	warmupEnd := start.Add(time.Duration(warmup) * time.Second)
+	measureDuration := time.Duration(measure) * time.Second
+	stop := make(chan struct{})
+	partials := make(chan officialWorkerReport, workers)
+	monitorStop := make(chan struct{})
+	monitorDone := make(chan struct{})
+	printProgress(0, rounds, "warmup", 0, warmup, stats[0])
+	go monitorOfficialProgress(rounds, warmup, measure, progress, start, stats, monitorStop, monitorDone)
+	for workerID, backend := range backends {
+		go runOfficialWorker(workerID, roundOffset+1, seed, p, warmupEnd, measureDuration, rounds, think, stats, stop, partials, backend)
+	}
+
+	warmupResult := newResult(0)
+	windows := make([]*result, rounds)
+	for round := range windows {
+		windows[round] = newResult(measure)
+	}
+	var runErr error
+	for workerID := 0; workerID < workers; workerID++ {
+		partial := <-partials
+		warmupResult.merge(partial.warmup)
+		for round := range windows {
+			windows[round].merge(partial.windows[round])
+		}
+		if partial.err != nil && runErr == nil {
+			runErr = partial.err
+			close(stop)
+		}
+	}
+	close(monitorStop)
+	<-monitorDone
+	if runErr != nil || warmupResult.hasBackendError() {
+		if runErr == nil {
+			runErr = errors.New("warmup contains a backend error")
+		}
+		return nil, fmt.Errorf("official run invalid: %w", runErr)
+	}
+	for round, window := range windows {
+		if window.hasBackendError() {
+			return nil, fmt.Errorf("official measurement window %d contains a backend error", round+1)
+		}
+		window.finalize()
+		for _, txnType := range []string{"new_order", "payment", "order_status", "delivery", "stock_level"} {
+			if window.Committed[txnType] < 1 {
+				return nil, fmt.Errorf("official measurement window %d has no committed %s transaction", round+1, txnType)
+			}
+		}
+	}
+	for round, window := range windows {
+		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f abort_rate=%.2f%%\n", round+1, rounds, window.NewOrderPerMin,
 			window.AbortRate*100)
 	}
 	return windows, nil
@@ -1535,8 +2019,125 @@ type document struct {
 	Rounds     []*result `json:"rounds"`
 }
 
+func validateResultDocument(doc document) error {
+	if doc.Config.Rounds < 1 || len(doc.Rounds) != doc.Config.Rounds {
+		return fmt.Errorf("result has %d rounds, want %d", len(doc.Rounds), doc.Config.Rounds)
+	}
+	if doc.Config.Measure < 1 {
+		return errors.New("result has non-positive measurement duration")
+	}
+	for round, window := range doc.Rounds {
+		if err := validateResultWindow(window, doc.Config.Measure, doc.Config.Mode, round+1); err != nil {
+			return err
+		}
+	}
+	if math.IsNaN(doc.MedianTPMC) || math.IsInf(doc.MedianTPMC, 0) || doc.MedianTPMC < 0 {
+		return fmt.Errorf("result has invalid median tpmC %.6g", doc.MedianTPMC)
+	}
+	return nil
+}
+
+func validateResultWindow(window *result, measure int, mode string, round int) error {
+	if window == nil {
+		return fmt.Errorf("result round %d is nil", round)
+	}
+	if window.MeasureSeconds != measure {
+		return fmt.Errorf("result round %d measures %d seconds, want %d", round, window.MeasureSeconds, measure)
+	}
+	if window.hasBackendError() {
+		return fmt.Errorf("result round %d contains a backend error", round)
+	}
+	if math.IsNaN(window.TPMC) || math.IsInf(window.TPMC, 0) || window.TPMC < 0 {
+		return fmt.Errorf("result round %d has invalid tpmC %.6g", round, window.TPMC)
+	}
+	if window.MeasureSeconds <= 0 {
+		return fmt.Errorf("result round %d has non-positive measurement duration", round)
+	}
+	measureSeconds := float64(window.MeasureSeconds)
+	for txnType, committed := range window.Committed {
+		if committed < 0 {
+			return fmt.Errorf("result round %d has negative committed count for %s", round, txnType)
+		}
+		if window.Counts["measure"][txnType]["commit"] != committed {
+			return fmt.Errorf("result round %d committed/count mismatch for %s", round, txnType)
+		}
+		expectedTPM := float64(committed) / measureSeconds * 60
+		if math.Abs(window.TxnTPM[txnType]-expectedTPM) > 1e-9 {
+			return fmt.Errorf("result round %d txn_tpm mismatch for %s", round, txnType)
+		}
+	}
+	newOrders := window.Committed["new_order"]
+	expectedTPMC := float64(newOrders) / measureSeconds * 60
+	if math.Abs(window.TPMC-expectedTPMC) > 1e-9 || math.Abs(window.NewOrderPerMin-expectedTPMC) > 1e-9 {
+		return fmt.Errorf("result round %d new_order throughput mismatch", round)
+	}
+	measureCounts := window.Counts["measure"]
+	commits, nonCommits := 0, 0
+	for txnType, outcomes := range measureCounts {
+		for outcome, count := range outcomes {
+			if count < 0 {
+				return fmt.Errorf("result round %d has negative count for %s/%s", round, txnType, outcome)
+			}
+			if outcome == "commit" {
+				commits += count
+			} else {
+				nonCommits += count
+			}
+		}
+	}
+	if commits+nonCommits > 0 {
+		expectedAbortRate := float64(nonCommits) / float64(commits+nonCommits)
+		if math.Abs(window.AbortRate-expectedAbortRate) > 1e-9 {
+			return fmt.Errorf("result round %d abort rate mismatch", round)
+		}
+	}
+	if newOrders < 1 {
+		return fmt.Errorf("result round %d has no committed new_order transaction", round)
+	}
+	if mode == "official-equivalent" {
+		for _, txnType := range []string{"payment", "order_status", "delivery", "stock_level"} {
+			if window.Committed[txnType] < 1 {
+				return fmt.Errorf("result round %d has no committed %s transaction", round, txnType)
+			}
+		}
+	}
+	return nil
+}
+
+func publishResultDocument(path string, doc document) ([]byte, error) {
+	if err := validateResultDocument(doc); err != nil {
+		return nil, err
+	}
+	encoded, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tpcc-result-*.tmp")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(encoded); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
 func verifyCrashOracle(address string, timeout time.Duration, isolation, ackPath string) error {
 	data, err := os.ReadFile(ackPath)
+
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -1729,7 +2330,7 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 }
 
 func main() {
-	command := flag.String("command", "run", "run, feature-check, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
+	command := flag.String("command", "run", "run, feature-check, mixed-sql, data-ready, refresh-manifest, datagen, load, consistency, validate-result, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
 	mode := flag.String("mode", "official-equivalent", "official-equivalent for rmdb or sqlite-reference for SQLite")
 	backend := flag.String("backend", "rmdb", "rmdb or sqlite")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
@@ -1774,6 +2375,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
+		if *mode == "official-equivalent" && *reconnectEachTxn {
+			fmt.Fprintln(os.Stderr, "official-equivalent does not allow --reconnect-each-txn")
+			os.Exit(2)
+		}
 	}
 	if *mode == "official-equivalent" && *backend != "rmdb" {
 		fmt.Fprintln(os.Stderr, "official-equivalent mode requires the rmdb backend")
@@ -1792,6 +2397,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		return
+	}
+	if *command == "refresh-manifest" {
+		if err := writeDatasetManifest(*dataDir, *warehouses, *seed); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("[tpcc] refreshed dataset manifest in %s\n", *dataDir)
 		return
 	}
 	if *command == "datagen" {
@@ -1847,9 +2460,6 @@ func main() {
 		}
 		if featureErr == nil {
 			defer featureBackend.close()
-			if *backend == "rmdb" {
-				_, featureErr = featureBackend.exec("set output_file off")
-			}
 		}
 		if featureErr == nil {
 			profile, profileErr := inspectProfile(featureBackend)
@@ -1975,6 +2585,23 @@ func main() {
 		}
 		return
 	}
+	if *command == "validate-result" {
+		data, err := os.ReadFile(*resultJSON)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		var doc document
+		if err := json.Unmarshal(data, &doc); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := validateResultDocument(doc); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *command != "run" {
 		fmt.Fprintf(os.Stderr, "unsupported command: %s\n", *command)
 		os.Exit(2)
@@ -2012,13 +2639,6 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
-	}
-	if *backend == "rmdb" {
-		if _, err := probe.exec("set output_file off"); err != nil {
-			probe.close()
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
 	}
 	p, err := inspectProfile(probe)
 	if err != nil {
@@ -2072,7 +2692,8 @@ func main() {
 				os.Exit(1)
 			}
 			doc.Rounds = append(doc.Rounds, combined)
-			fmt.Printf("[round %d/%d] tpmC=%.2f abort_rate=%.2f%%\n", round, *rounds, combined.TPMC, combined.AbortRate*100)
+			fmt.Printf("[round %d/%d] tpmC=deferred abort_rate=%.2f%%\n", round, *rounds, combined.AbortRate*100)
+
 		}
 	}
 	values := make([]float64, len(doc.Rounds))
@@ -2080,12 +2701,8 @@ func main() {
 		values[i] = round.TPMC
 	}
 	doc.MedianTPMC = median(values)
-	encoded, err := json.MarshalIndent(doc, "", "  ")
+	encoded, err := publishResultDocument(*jsonOut, doc)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(*jsonOut, encoded, 0644); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

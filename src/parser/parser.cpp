@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace ast {
@@ -358,10 +359,10 @@ private:
         auto group_by = parse_opt_group_clause();
         auto having = parse_opt_having_clause();
         auto order = parse_opt_order_clause();
-        auto [has_limit, limit_value] = parse_opt_limit_clause();
+        auto [has_limit, limit_value, limit_parameter] = parse_opt_limit_clause();
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
                                             std::move(having), std::move(order), has_limit, limit_value, has_star,
-                                            std::move(from->jointree));
+                                            std::move(from->jointree), limit_parameter != 0, limit_parameter);
     }
 
     std::unique_ptr<UnionStmt> parse_union_query() {
@@ -426,6 +427,22 @@ private:
     }
 
     std::unique_ptr<Value> parse_value() {
+        if (check(TokenType::PARAMETER)) {
+            Token token = expect(TokenType::PARAMETER, "expected parameter");
+            const auto text = token_text(token);
+            std::size_t ordinal = 0;
+            for (std::size_t i = 1; i < text.size(); ++i) {
+                const auto digit = static_cast<std::size_t>(text[i] - '0');
+                if (ordinal > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+                    error("parameter ordinal is too large");
+                }
+                ordinal = ordinal * 10 + digit;
+            }
+            if (ordinal == 0) {
+                error("parameter ordinal must be positive");
+            }
+            return std::make_unique<Parameter>(ordinal);
+        }
         bool is_negative = match(TokenType::MINUS);
 
         if (check(TokenType::VALUE_INT)) {
@@ -449,7 +466,8 @@ private:
     std::unique_ptr<Value> parse_numeric_delta_after(TokenType op) {
         auto delta = parse_value();
         if (op == TokenType::PLUS || op == TokenType::MINUS || op == TokenType::STAR || op == TokenType::SLASH) {
-            if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit) {
+            if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit &&
+                delta->type != AstType::Parameter) {
                 error("expected numeric value after arithmetic operator");
             }
             return delta;
@@ -906,12 +924,27 @@ private:
         return std::make_unique<OrderByItem>(std::move(expr), dir);
     }
 
-    std::pair<bool, int> parse_opt_limit_clause() {
+    std::tuple<bool, int, std::size_t> parse_opt_limit_clause() {
         if (!match(TokenType::LIMIT)) {
-            return {false, 0};
+            return {false, 0, 0};
+        }
+        if (check(TokenType::PARAMETER)) {
+            Token token = expect(TokenType::PARAMETER, "expected limit");
+            std::size_t ordinal = 0;
+            for (std::size_t i = 1; i < token.text.size(); ++i) {
+                const auto digit = static_cast<std::size_t>(token.text[i] - '0');
+                if (ordinal > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+                    error("parameter ordinal is too large");
+                }
+                ordinal = ordinal * 10 + digit;
+            }
+            if (ordinal == 0) {
+                error("parameter ordinal must be positive");
+            }
+            return {true, 0, ordinal};
         }
         auto lit = parse_int_literal();
-        return {true, lit->val};
+        return {true, lit->val, 0};
     }
 
     std::string parse_identifier() {

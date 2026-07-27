@@ -110,11 +110,19 @@ if [[ "$REGENERATE_DATA" -eq 1 ]]; then
     rm -rf "$DATA_DIR"
 fi
 
-# Auto-detect whether the CSV test data set is present. The Go runner owns
-# generation as well as the high-concurrency workload.
+# Never leave a previous result available when preparation or execution fails.
+rm -f "$JSON_OUT"
+
+# Auto-detect whether the CSV test data set is present. Refresh an old manifest
+# before falling back to the expensive CSV generator.
 if ! "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1; then
-    echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
-    "$GO_BINARY" --command datagen --warehouses "$WAREHOUSES" --data-dir "$DATA_DIR" --seed 1 --overwrite-data-dir
+    if "$GO_BINARY" --command refresh-manifest --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1; then
+        "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1
+    else
+        echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
+        "$GO_BINARY" --command datagen --warehouses "$WAREHOUSES" --data-dir "$DATA_DIR" --seed 1 --overwrite-data-dir
+        "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1
+    fi
 fi
 
 if [[ ! -x "$BINARY" ]]; then
@@ -123,7 +131,7 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-rm -rf "$DB_DIR" "$JSON_OUT" "$SERVER_LOG"
+rm -rf "$DB_DIR" "$SERVER_LOG"
 
 SERVER_PID=""
 
@@ -145,7 +153,7 @@ if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
     GO_RECONNECT_ARGS=(--reconnect-each-txn)
 fi
 
-rm -rf "$DB_DIR" "$JSON_OUT"
+rm -rf "$DB_DIR"
 echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
 RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -158,6 +166,7 @@ wait_port 30
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
     --think "${THINK_MS}ms" --json-out "$JSON_OUT" "${GO_RECONNECT_ARGS[@]}"
+"$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --consistency-stage online-official-equivalent --result-json "$JSON_OUT"
 echo "[benchmark] official-equivalent: SIGKILL and recovery check"

@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <exception>
+#include <algorithm>
 #include <thread>
 #include <gtest/gtest.h>
 
@@ -161,6 +162,38 @@ TEST(WireProtocolTest, FrameRoundTripHandlesSocketStreams) {
     close_pair(sockets);
 }
 
+TEST(WireProtocolTest, WriteFrameHandlesPartialVectoredWrites) {
+    int sockets[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    int send_buffer = 1024;
+    ASSERT_EQ(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)), 0);
+
+    const std::vector<std::uint8_t> payload(wire_protocol::kMaxPayload, 0xa5);
+    std::exception_ptr writer_error;
+    std::thread writer([&] {
+        try {
+            wire_protocol::write_frame(sockets[0], wire_protocol::Tag::ROW, payload);
+        } catch (...) {
+            writer_error = std::current_exception();
+        }
+    });
+
+    const auto expected_header =
+        raw_frame(static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(wire_protocol::Tag::ROW));
+    std::vector<std::uint8_t> received(expected_header.size() + payload.size());
+    std::size_t offset = 0;
+    while (offset < received.size()) {
+        const auto result = ::read(sockets[1], received.data() + offset, received.size() - offset);
+        ASSERT_GT(result, 0);
+        offset += static_cast<std::size_t>(result);
+    }
+    writer.join();
+
+    ASSERT_EQ(writer_error, nullptr);
+    EXPECT_TRUE(std::equal(expected_header.begin(), expected_header.end(), received.begin()));
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), received.begin() + expected_header.size()));
+    close_pair(sockets);
+}
 TEST(WireProtocolTest, HandshakeEchoesTheEstablishedVersion) {
     int sockets[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);

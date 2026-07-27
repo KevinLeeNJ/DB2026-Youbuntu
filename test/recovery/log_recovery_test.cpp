@@ -416,6 +416,37 @@ TEST(RecoveryManagerTest, CommittedUpdateSurvivesRecovery) {
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
 }
 
+TEST(RecoveryManagerTest, RedoUpdateMissingRidInstallsCommittedTupleMeta) {
+    ScopedTestDir test_dir("recovery_redo_update_missing_rid_root");
+    const std::string db_name = "recovery_redo_update_missing_rid_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeTuple(1, 10);
+    auto new_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
+        AppendCommit(*db.log_mgr_, 100, update_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery->analyze();
+        recovery->redo();
+
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+        const TupleMeta meta = db.sm_mgr_.fhs_.at("t")->get_tuple_meta(rid);
+        EXPECT_EQ(meta.writer_txn_id_, 100);
+        EXPECT_TRUE(meta.is_committed_);
+        EXPECT_FALSE(meta.is_deleted_);
+    }
+}
+
 TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
     ScopedTestDir test_dir("recovery_uncommitted_update_root");
     const std::string db_name = "recovery_uncommitted_update_db";
@@ -744,9 +775,10 @@ TEST(RecoveryFaultInjectionTest, IndexRepairIsIdempotentAcrossRepeatedRecovery) 
         FlushLogs(*db.log_mgr_);
     }
 
-    // This point is after redo/undo, incremental index repair and page flush,
-    // but before WAL truncation. The next process must safely re-enter recovery.
-    const int status = RunRecoveryAfterInjectedProcessDeath(db_name, "before_recovery_wal_reset");
+    // This point is after redo/undo, incremental index repair, header writes,
+    // and fdatasync of every affected data file, but before WAL truncation.
+    // The next process must safely re-enter recovery.
+    const int status = RunRecoveryAfterInjectedProcessDeath(db_name, "after_recovery_data_sync");
 #ifdef RMDB_ENABLE_FAULT_INJECTION
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 137);

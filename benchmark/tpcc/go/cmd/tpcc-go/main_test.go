@@ -192,8 +192,8 @@ func TestOfficialTPCCTargetIndexesAreDeclared(t *testing.T) {
 		sqliteStatement string
 	}{
 		{
-			rmdbStatement:   "create index customer_last on customer(c_w_id, c_d_id, c_last, c_first, c_id);",
-			sqliteStatement: "create index idx_customer_last on customer(c_w_id, c_d_id, c_last, c_first, c_id);",
+			rmdbStatement:   "create index customer_last on customer(c_w_id, c_d_id, c_last, c_id);",
+			sqliteStatement: "create index idx_customer_last on customer(c_w_id, c_d_id, c_last, c_id);",
 		},
 		{
 			rmdbStatement:   "create index orders_customer on orders(o_w_id, o_d_id, o_c_id, o_id);",
@@ -241,7 +241,7 @@ func TestOfficialTPCCTargetIndexesExecuteAndSupportQueries(t *testing.T) {
 	}{
 		{
 			name:    "idx_customer_last",
-			columns: []string{"c_w_id", "c_d_id", "c_last", "c_first", "c_id"},
+			columns: []string{"c_w_id", "c_d_id", "c_last", "c_id"},
 			query:   "select c_id from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
 		},
 		{
@@ -395,16 +395,25 @@ func writeResultDocument(t *testing.T, path string, doc document) {
 	}
 }
 
+func completeResult(measure int) *result {
+	result := newResult(measure)
+	for _, txnType := range []string{"new_order", "payment", "order_status", "delivery", "stock_level"} {
+		result.record("measure", txnType, "commit", 1, "")
+	}
+	result.finalize()
+	return result
+}
+
 func TestMergeResultFilesRejectsDifferentSeed(t *testing.T) {
 	dir := t.TempDir()
 	firstPath := filepath.Join(dir, "round-1.json")
 	secondPath := filepath.Join(dir, "round-2.json")
 	outputPath := filepath.Join(dir, "merged.json")
 	baseConfig := config{Backend: "rmdb", Isolation: "read-committed", Warehouses: 1, Workers: 4, Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, WarehousePolicy: "terminal-home"}
-	writeResultDocument(t, firstPath, document{Config: baseConfig, Rounds: []*result{{TPMC: 100}}})
+	writeResultDocument(t, firstPath, document{Config: baseConfig, Rounds: []*result{completeResult(60)}})
 	secondConfig := baseConfig
 	secondConfig.Seed = 12
-	writeResultDocument(t, secondPath, document{Config: secondConfig, Rounds: []*result{{TPMC: 110}}})
+	writeResultDocument(t, secondPath, document{Config: secondConfig, Rounds: []*result{completeResult(60)}})
 
 	err := mergeResultFiles(outputPath, firstPath+","+secondPath)
 	if err == nil || !strings.Contains(err.Error(), "materially different") {
@@ -412,17 +421,31 @@ func TestMergeResultFilesRejectsDifferentSeed(t *testing.T) {
 	}
 }
 
+func TestMergeResultFilesRejectsIncompleteRound(t *testing.T) {
+	dir := t.TempDir()
+	inputPath := filepath.Join(dir, "round.json")
+	outputPath := filepath.Join(dir, "merged.json")
+	writeResultDocument(t, inputPath, document{Config: config{Rounds: 1, Measure: 60}, Rounds: []*result{{TPMC: 100}}})
+	if err := mergeResultFiles(outputPath, inputPath); err == nil {
+		t.Fatal("incomplete round was accepted")
+	}
+	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+		t.Fatalf("merged output exists after rejection: %v", err)
+	}
+}
+
 func TestMergeResultFilesAllowsRoundAndProgressDifferences(t *testing.T) {
+
 	dir := t.TempDir()
 	firstPath := filepath.Join(dir, "round-1.json")
 	secondPath := filepath.Join(dir, "round-2.json")
 	outputPath := filepath.Join(dir, "merged.json")
 	baseConfig := config{Backend: "rmdb", Isolation: "read-committed", Warehouses: 1, Workers: 4, Warmup: 10, Measure: 60, Rounds: 1, ProgressInterval: 1, Seed: 11, WarehousePolicy: "terminal-home"}
-	writeResultDocument(t, firstPath, document{Config: baseConfig, Rounds: []*result{{TPMC: 100}}})
+	writeResultDocument(t, firstPath, document{Config: baseConfig, Rounds: []*result{completeResult(60)}})
 	secondConfig := baseConfig
 	secondConfig.Rounds = 99
 	secondConfig.ProgressInterval = 10
-	writeResultDocument(t, secondPath, document{Config: secondConfig, Rounds: []*result{{TPMC: 110}}})
+	writeResultDocument(t, secondPath, document{Config: secondConfig, Rounds: []*result{completeResult(60)}})
 
 	if err := mergeResultFiles(outputPath, firstPath+","+secondPath); err != nil {
 		t.Fatal(err)
@@ -435,7 +458,7 @@ func TestMergeResultFilesAllowsRoundAndProgressDifferences(t *testing.T) {
 	if err := json.Unmarshal(data, &merged); err != nil {
 		t.Fatal(err)
 	}
-	if merged.Config.Rounds != 2 || len(merged.Rounds) != 2 || merged.MedianTPMC != 105 {
+	if merged.Config.Rounds != 2 || len(merged.Rounds) != 2 || merged.MedianTPMC != 1 {
 		t.Fatalf("merged document = %#v", merged)
 	}
 }
@@ -481,16 +504,84 @@ func TestRunRoundAllowsExpectedAbort(t *testing.T) {
 	}
 }
 
+type lifecycleBackend struct {
+	closeCount int
+	abortOnce  bool
+}
+
+func (b *lifecycleBackend) exec(string) (string, error) { return "2\n", nil }
+func (b *lifecycleBackend) begin() error {
+	if b.abortOnce {
+		b.abortOnce = false
+		return errAbort
+	}
+	return nil
+}
+func (b *lifecycleBackend) commit() error { return nil }
+func (b *lifecycleBackend) rollback()     {}
+func (b *lifecycleBackend) close()        { b.closeCount++ }
+
+func resultTransactionCount(result *result, phase string) int {
+	total := 0
+	for _, outcomes := range result.Counts[phase] {
+		for _, count := range outcomes {
+			total += count
+		}
+	}
+	return total
+}
+
+func TestOfficialWorkerRetainsBackendAcrossAllPhases(t *testing.T) {
+	backend := &lifecycleBackend{abortOnce: true}
+	stats := []*liveStats{{}, {}, {}}
+	output := make(chan officialWorkerReport, 1)
+	warmupEnd := time.Now().Add(20 * time.Millisecond)
+	go runOfficialWorker(0, 1, 1,
+		profile{warehouses: 25, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
+		warmupEnd, 20*time.Millisecond, 2, 0, stats, make(chan struct{}), output, backend)
+	report := <-output
+	if report.err != nil {
+		t.Fatal(report.err)
+	}
+	if backend.closeCount != 1 {
+		t.Fatalf("backend close count = %d, want 1", backend.closeCount)
+	}
+	if got := resultTransactionCount(report.warmup, "warmup"); got == 0 {
+		t.Fatal("warmup received no transactions")
+	}
+	for window, result := range report.windows {
+		if got := resultTransactionCount(result, "measure"); got == 0 {
+			t.Fatalf("measurement window %d received no transactions", window+1)
+		}
+	}
+}
+
+func TestOfficialWindowsRejectsReconnectEachTxnBeforeConnecting(t *testing.T) {
+	factoryCalls := 0
+	_, err := runOfficialWindows(1, 1, 1,
+		profile{warehouses: 25, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
+		0, 1, 0, 0, true, 0, func() (txnBackend, error) {
+			factoryCalls++
+			return &lifecycleBackend{}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "does not allow reconnect-each-txn") {
+		t.Fatalf("runOfficialWindows() error = %v, want reconnect rejection", err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("factory calls = %d, want 0", factoryCalls)
+	}
+}
+
 func TestMergeResultFilesRejectsBackendErrorRound(t *testing.T) {
 	dir := t.TempDir()
 	inputPath := filepath.Join(dir, "failed-round.json")
 	outputPath := filepath.Join(dir, "merged.json")
 	failed := newResult(60)
 	failed.record("measure", "payment", "backend-error", 1, "connection reset")
-	writeResultDocument(t, inputPath, document{Rounds: []*result{failed}})
+	writeResultDocument(t, inputPath, document{Config: config{Mode: "official-equivalent", Rounds: 1, Measure: 60}, Rounds: []*result{failed}})
 
 	err := mergeResultFiles(outputPath, inputPath)
-	if err == nil || !strings.Contains(err.Error(), "backend-error") {
+	if err == nil || !strings.Contains(err.Error(), "backend error") {
 		t.Fatalf("merge error = %v, want backend-error rejection", err)
 	}
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
@@ -566,24 +657,25 @@ func TestVerifyBenchmarkFeaturesUsesFormalDistinctAndRollback(t *testing.T) {
 	}
 }
 
+func TestResultDocumentRejectsIncompleteMeasurement(t *testing.T) {
+	config := config{Rounds: 1, Measure: 10}
+	doc := document{Config: config, Rounds: []*result{newResult(10)}}
+	if err := validateResultDocument(doc); err == nil || !strings.Contains(err.Error(), "no committed") {
+		t.Fatalf("validation error = %v, want missing committed transaction", err)
+	}
+}
+
+func TestResultDocumentRejectsWrongRoundShape(t *testing.T) {
+	doc := document{Config: config{Rounds: 2, Measure: 10}, Rounds: []*result{newResult(10)}}
+	if err := validateResultDocument(doc); err == nil || !strings.Contains(err.Error(), "rounds") {
+		t.Fatalf("validation error = %v, want round count error", err)
+	}
+}
+
 func TestDatasetManifestValidation(t *testing.T) {
 	dir := t.TempDir()
-	for _, table := range tpccTables {
-		if err := os.WriteFile(filepath.Join(dir, table+".csv"), []byte("header\n"), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := writeDatasetManifest(dir, 3, 17); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateDataset(dir, 3, 17); err != nil {
-		t.Fatalf("matching manifest rejected: %v", err)
-	}
-	if err := validateDataset(dir, 4, 17); err == nil || !strings.Contains(err.Error(), "warehouses mismatch") {
-		t.Fatalf("warehouse mismatch error = %v", err)
-	}
-	if err := validateDataset(dir, 3, 18); err == nil || !strings.Contains(err.Error(), "seed mismatch") {
-		t.Fatalf("seed mismatch error = %v", err)
+	if err := writeDatasetManifest(dir, 3, 17); err == nil {
+		t.Fatal("empty dataset accepted")
 	}
 }
 

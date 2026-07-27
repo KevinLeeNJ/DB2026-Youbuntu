@@ -380,8 +380,11 @@ void SmManager::prune_version_history(timestamp_t watermark) {
  * @param {Context*} context
  */
 void SmManager::show_tables(Context* context) {
+    const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
+                                         ? *context->output_file_enabled_
+                                         : output_file_enabled_;
     std::fstream outfile;
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
         outfile << "| Tables |\n";
     }
@@ -392,12 +395,12 @@ void SmManager::show_tables(Context* context) {
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
         printer.print_record({tab.name}, context);
-        if (output_file_enabled_) {
+        if (output_file_enabled) {
             outfile << "| " << tab.name << " |\n";
         }
     }
     printer.print_separator(context);
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.close();
     }
 }
@@ -411,35 +414,38 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
     printer.print_record(captions, context);
     printer.print_separator(context);
 
+    const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
+                                         ? *context->output_file_enabled_
+                                         : output_file_enabled_;
     std::fstream outfile;
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
     }
     for (const auto& index : tab.indexes) {
         std::string cols = "(";
-        if (output_file_enabled_) {
+        if (output_file_enabled) {
             outfile << "| " << tab_name << " | unique | (";
         }
         for (int i = 0; i < index.col_num; ++i) {
             if (i != 0) {
                 cols += ",";
-                if (output_file_enabled_) {
+                if (output_file_enabled) {
                     outfile << ",";
                 }
             }
             cols += index.cols[i].name;
-            if (output_file_enabled_) {
+            if (output_file_enabled) {
                 outfile << index.cols[i].name;
             }
         }
         cols += ")";
-        if (output_file_enabled_) {
+        if (output_file_enabled) {
             outfile << ") |\n";
         }
 
         printer.print_record({tab_name, "unique", cols}, context);
     }
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.close();
     }
 
@@ -708,6 +714,7 @@ bool SmManager::flush_dirty_data_pages(bool wal_preflushed) {
 
 bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& table_names) {
     std::vector<int> fds;
+    fds.reserve(table_names.size());
     for (const auto& tab_name : table_names) {
         auto fh_it = fhs_.find(tab_name);
         if (fh_it == fhs_.end()) {
@@ -723,18 +730,32 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
             }
         }
     }
+    std::sort(fds.begin(), fds.end());
+    fds.erase(std::unique(fds.begin(), fds.end()), fds.end());
     if (!buffer_pool_manager_->flush_all_pages(fds)) {
         return false;
     }
-    // The record header is written outside the buffer pool. Persist it only
-    // after the repaired data pages so WAL is never truncated while the
-    // on-disk free-page chain still points at its pre-recovery state.
+    // Headers are written outside the buffer pool. Write them only after the
+    // repaired pages, then sync every affected file before WAL can be reset.
     for (const auto& tab_name : table_names) {
         auto fh_it = fhs_.find(tab_name);
-        if (fh_it != fhs_.end()) {
-            rm_manager_->flush_file_header(fh_it->second.get());
+        if (fh_it == fhs_.end()) {
+            continue;
+        }
+        rm_manager_->flush_file_header(fh_it->second.get());
+        const auto& tab = db_.get_table(tab_name);
+        for (const auto& index : tab.indexes) {
+            const auto index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            auto ih_it = ihs_.find(index_name);
+            if (ih_it != ihs_.end()) {
+                ix_manager_->flush_index_header(ih_it->second.get());
+            }
         }
     }
+    for (const int fd : fds) {
+        disk_manager_->sync_file(fd);
+    }
+    FaultInjector::Point("after_recovery_data_sync");
     return true;
 }
 

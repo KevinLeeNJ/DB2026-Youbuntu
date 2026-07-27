@@ -181,9 +181,11 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     }
     case T_SetOutputFile: {
         auto* x = static_cast<SetOutputFilePlan*>(plan);
-        // output_file is a database-global toggle shared across all connections;
-        // store it on SmManager so it persists across connection lifetimes.
-        sm_manager_->output_file_enabled_ = x->enable_;
+        if (context != nullptr && context->output_file_enabled_ != nullptr) {
+            *context->output_file_enabled_ = x->enable_;
+        } else {
+            sm_manager_->output_file_enabled_ = x->enable_;
+        }
         break;
     }
     case T_LoadData: {
@@ -270,8 +272,10 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
 
+    const bool output_file_enabled =
+        context->output_file_enabled_ != nullptr ? *context->output_file_enabled_ : sm_manager_->output_file_enabled_;
     std::ostringstream out_file_stream;
-    if (sm_manager_->output_file_enabled_) {
+    if (output_file_enabled) {
         out_file_stream << "|";
         for (const auto& cap : captions) {
             out_file_stream << " " << cap << " |";
@@ -307,7 +311,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         // print record into client buffer
         rec_printer.print_record(columns, context);
         // print record into output.txt (compact borderless)
-        if (sm_manager_->output_file_enabled_) {
+        if (output_file_enabled) {
             out_file_stream << "|";
             for (const auto& col_str : columns) {
                 out_file_stream << " " << col_str << " |";
@@ -321,7 +325,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     // Print record count into client buffer
     RecordPrinter::print_record_count(num_rec, context);
 
-    if (sm_manager_->output_file_enabled_ && *context->offset_ > output_start) {
+    if (output_file_enabled && *context->offset_ > output_start) {
         std::fstream outfile;
         outfile.open("output.txt", std::ios::out | std::ios::app);
         outfile << out_file_stream.str();

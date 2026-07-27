@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdint>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <optional>
@@ -170,12 +171,13 @@ struct ProtocolCollector : QueryResultSink {
 struct SessionState {
     txn_id_t txn_id = INVALID_TXN_ID;
     IsolationLevel isolation = DEFAULT_ISOLATION_LEVEL;
+    bool output_file_enabled = false;
 };
 
 struct PreparedStatement {
     std::uint16_t id = 0;
     bool query = false;
-    std::string sql;
+    std::unique_ptr<ast::TreeNode> template_tree;
     std::vector<Type> parameters;
     std::vector<std::string> names;
     std::vector<Type> result_types;
@@ -245,109 +247,21 @@ void abort_session(SessionState& session, Context* context) {
     }
 }
 
-std::string sql_literal(const Value& value) {
-    if (!value.present) {
-        throw wire_protocol::ProtocolError("SQL NULL parameters are not supported by this storage engine");
-    }
-    if (value.type == Type::INT32) {
-        return std::to_string(value.int32);
-    }
-    if (value.type == Type::FLOAT32) {
-        float number;
-        std::memcpy(&number, &value.float_bits, sizeof(number));
-        std::ostringstream output;
-        output << std::setprecision(9) << number;
-        return output.str();
-    }
-    std::string escaped = "'";
-    for (char c : value.text) {
-        escaped += c;
-        if (c == '\'') {
-            escaped += '\'';
-        }
-    }
-    escaped += '\'';
-    return escaped;
-}
-
-std::string substitute_parameters(const std::string& sql, const std::vector<Value>* values, std::size_t parameter_count,
-                                  const std::vector<Type>* parameter_types = nullptr) {
-    std::string output;
-    output.reserve(sql.size() + parameter_count * 4);
-    std::vector<bool> seen(parameter_count, false);
-    for (std::size_t i = 0; i < sql.size();) {
-        if (sql[i] == '\'') {
-            output += sql[i++];
-            while (i < sql.size()) {
-                const char quoted = sql[i++];
-                output += quoted;
-                if (quoted != '\'') {
-                    continue;
-                }
-                if (i < sql.size() && sql[i] == '\'') {
-                    output += sql[i++];
-                    continue;
-                }
-                break;
-            }
-            continue;
-        }
-        if (sql[i] != '$') {
-            output += sql[i++];
-            continue;
-        }
-        ++i;
-        if (i == sql.size() || !std::isdigit(static_cast<unsigned char>(sql[i]))) {
-            throw wire_protocol::ProtocolError("invalid parameter marker");
-        }
-        std::size_t number = 0;
-        while (i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i]))) {
-            number = number * 10 + static_cast<std::size_t>(sql[i++] - '0');
-            if (number > parameter_count) {
-                throw wire_protocol::ProtocolError("parameter marker is out of range");
-            }
-        }
-        if (number == 0 || number > parameter_count) {
-            throw wire_protocol::ProtocolError("parameter marker is out of range");
-        }
-        seen[number - 1] = true;
-        if (values != nullptr) {
-            if (parameter_types != nullptr && values->at(number - 1).type != parameter_types->at(number - 1)) {
-                throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
-            }
-            output += sql_literal(values->at(number - 1));
-        } else if (parameter_types != nullptr && parameter_types->at(number - 1) == Type::CHAR) {
-            output += "''";
-        } else if (parameter_types != nullptr && parameter_types->at(number - 1) == Type::FLOAT32) {
-            output += "0.0";
-        } else {
-            output += "0";
-        }
-    }
-    for (bool marker_seen : seen) {
-        if (!marker_seen) {
-            throw wire_protocol::ProtocolError("parameter markers must be dense");
-        }
-    }
-    return output;
-}
-
 struct ExecutionOutcome {
     bool query = false;
     bool catalog_changed = false;
 };
 
-ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, QueryResultSink* result_sink) {
+ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
+                              QueryResultSink* result_sink) {
     std::vector<char> response(BUFFER_LENGTH, 0);
     int offset = 0;
     Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
     context.isolation_level_ = session.isolation;
     context.result_sink_ = result_sink;
-
-    std::unique_ptr<ast::TreeNode> parse_tree = ast::parse_sql(sql);
-    if (parse_tree == nullptr) {
+    context.output_file_enabled_ = &session.output_file_enabled;
+    if (parse_tree == nullptr)
         return {};
-    }
     const auto parsed_type = parse_tree->type;
     const bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
     const bool is_load = parsed_type == ast::AstType::LoadStmt;
@@ -381,25 +295,36 @@ ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, Quer
     }
 }
 
-PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Type> parameters, std::string sql) {
+ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, QueryResultSink* result_sink) {
+    auto parse_tree = ast::parse_sql(sql);
+    return execute_tree(std::move(parse_tree), session, result_sink);
+}
+
+PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Type> parameters,
+                                   std::unique_ptr<ast::TreeNode> template_tree) {
     std::vector<char> response(BUFFER_LENGTH, 0);
     int offset = 0;
     Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
-    std::unique_ptr<ast::TreeNode> parse_tree = ast::parse_sql(sql);
-    if (parse_tree == nullptr) {
-        throw wire_protocol::ProtocolError("empty prepared SQL");
+    std::vector<std::unique_ptr<ast::Value>> zero_values;
+    for (Type type : parameters) {
+        if (type == Type::INT32)
+            zero_values.push_back(std::make_unique<ast::IntLit>(0));
+        else if (type == Type::FLOAT32)
+            zero_values.push_back(std::make_unique<ast::FloatLit>(0.0f));
+        else
+            zero_values.push_back(std::make_unique<ast::StringLit>(""));
     }
-    std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(parse_tree));
+    auto bound = ast::clone_bound_tree(*template_tree, zero_values);
+    std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(bound));
     std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query_tree), &context);
     std::unique_ptr<PortalStmt> statement = portal->start(std::move(plan), &context);
     const bool actual_query = statement->tag == PORTAL_ONE_SELECT;
-    if (actual_query != query) {
+    if (actual_query != query)
         throw wire_protocol::ProtocolError("prepared result kind does not match SQL");
-    }
     PreparedStatement result;
     result.id = id;
     result.query = query;
-    result.sql = std::move(sql);
+    result.template_tree = std::move(template_tree);
     result.parameters = std::move(parameters);
     result.catalog_generation = catalog_generation.load(std::memory_order_acquire);
     if (actual_query) {
@@ -560,10 +485,84 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             if (template_sql.empty() || template_sql.find('\0') != std::string::npos || !is_valid_utf8(template_sql)) {
                 throw wire_protocol::ProtocolError("prepared SQL must be non-empty UTF-8 without NUL");
             }
-            const std::string inspect_sql =
-                substitute_parameters(template_sql, nullptr, statement.parameters.size(), &statement.parameters);
-            statement = inspect_prepared(statement.id, statement.query, std::move(statement.parameters), inspect_sql);
-            statement.sql = template_sql;
+            auto template_tree = ast::parse_sql(template_sql);
+            if (template_tree == nullptr)
+                throw wire_protocol::ProtocolError("empty prepared SQL");
+            std::vector<bool> seen(statement.parameters.size(), false);
+            std::function<void(const ast::TreeNode&)> collect = [&](const ast::TreeNode& node) {
+                if (node.type == ast::AstType::Parameter) {
+                    auto ordinal = static_cast<const ast::Parameter&>(node).ordinal;
+                    if (ordinal == 0 || ordinal > statement.parameters.size())
+                        throw wire_protocol::ProtocolError("parameter marker is out of range");
+                    seen[ordinal - 1] = true;
+                }
+                if (node.type == ast::AstType::SelectStmt) {
+                    const auto& select = static_cast<const ast::SelectStmt&>(node);
+                    if (select.limit_is_parameter) {
+                        if (select.limit_parameter == 0 || select.limit_parameter > statement.parameters.size())
+                            throw wire_protocol::ProtocolError("parameter marker is out of range");
+                        seen[select.limit_parameter - 1] = true;
+                    }
+                }
+            };
+            std::function<void(const ast::Expr&)> visit_expr = [&](const ast::Expr& expr) {
+                if (expr.type == ast::AstType::Parameter) {
+                    auto ordinal = static_cast<const ast::Parameter&>(expr).ordinal;
+                    if (ordinal == 0 || ordinal > statement.parameters.size())
+                        throw wire_protocol::ProtocolError("parameter marker is out of range");
+                    seen[ordinal - 1] = true;
+                }
+            };
+            std::function<void(const ast::TreeNode&)> walk = [&](const ast::TreeNode& node) {
+                collect(node);
+                switch (node.type) {
+                case ast::AstType::InsertStmt:
+                    for (const auto& v : static_cast<const ast::InsertStmt&>(node).vals)
+                        visit_expr(*v);
+                    break;
+                case ast::AstType::DeleteStmt:
+                    for (const auto& c : static_cast<const ast::DeleteStmt&>(node).conds) {
+                        visit_expr(*c->lhs);
+                        visit_expr(*c->rhs);
+                    }
+                    break;
+                case ast::AstType::UpdateStmt: {
+                    const auto& x = static_cast<const ast::UpdateStmt&>(node);
+                    for (const auto& s : x.set_clauses)
+                        if (s->val)
+                            visit_expr(*s->val);
+                    for (const auto& c : x.conds) {
+                        visit_expr(*c->lhs);
+                        visit_expr(*c->rhs);
+                    }
+                    break;
+                }
+                case ast::AstType::SelectStmt: {
+                    const auto& x = static_cast<const ast::SelectStmt&>(node);
+                    for (const auto& i : x.select_items)
+                        visit_expr(*i->expr);
+                    for (const auto& c : x.conds) {
+                        visit_expr(*c->lhs);
+                        visit_expr(*c->rhs);
+                    }
+                    for (const auto& h : x.having_conds) {
+                        visit_expr(*h->lhs);
+                        visit_expr(*h->rhs);
+                    }
+                    for (const auto& o : x.order_by_items)
+                        visit_expr(*o->expr);
+                    break;
+                }
+                default:
+                    break;
+                }
+            };
+            walk(*template_tree);
+            for (bool marker_seen : seen)
+                if (!marker_seen)
+                    throw wire_protocol::ProtocolError("parameter markers must be dense");
+            statement = inspect_prepared(statement.id, statement.query, std::move(statement.parameters),
+                                         std::move(template_tree));
             pending.push_back(std::move(statement));
         }
         reader.require_end();
@@ -624,10 +623,27 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             ProtocolCollector result;
             result.encoded_bytes = &encoded_result_bytes;
             result.encoded_limit = result_budget;
-            const auto sql =
-                substitute_parameters(operations[i].statement->sql, &operations[i].values,
-                                      operations[i].statement->parameters.size(), &operations[i].statement->parameters);
-            const auto outcome = execute_sql(sql, session, &result);
+            auto bound_tree = ast::clone_bound_tree(*operations[i].statement->template_tree, [&]() {
+                std::vector<std::unique_ptr<ast::Value>> values;
+                values.reserve(operations[i].values.size());
+                for (const auto& value : operations[i].values) {
+                    if (!value.present)
+                        throw wire_protocol::ProtocolError(
+                            "SQL NULL parameters are not supported by this storage engine");
+                    if (value.type != operations[i].statement->parameters[values.size()])
+                        throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
+                    if (value.type == Type::INT32)
+                        values.push_back(std::make_unique<ast::IntLit>(value.int32));
+                    else if (value.type == Type::FLOAT32) {
+                        float number;
+                        std::memcpy(&number, &value.float_bits, sizeof(number));
+                        values.push_back(std::make_unique<ast::FloatLit>(number));
+                    } else
+                        values.push_back(std::make_unique<ast::StringLit>(value.text));
+                }
+                return values;
+            }());
+            const auto outcome = execute_tree(std::move(bound_tree), session, &result);
             if (outcome.query) {
                 results.emplace_back(i, std::move(result));
             }

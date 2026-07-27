@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <unordered_set>
@@ -312,9 +313,38 @@ void write_frame(int fd, Tag tag, const std::vector<std::uint8_t>& payload, std:
                               flags,
                               0,
                               0};
-    write_all(fd, header, sizeof(header));
-    if (!payload.empty()) {
-        write_all(fd, payload.data(), payload.size());
+    iovec vectors[2] = {
+        {header, sizeof(header)},
+        {const_cast<std::uint8_t*>(payload.data()), payload.size()},
+    };
+    std::size_t current = 0;
+    const std::size_t vector_count = payload.empty() ? 1 : 2;
+    while (current < vector_count) {
+        msghdr message{};
+        message.msg_iov = vectors + current;
+        message.msg_iovlen = vector_count - current;
+        const ssize_t result = ::sendmsg(fd, &message, MSG_NOSIGNAL);
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw ProtocolError(std::string("socket write failed: ") + std::strerror(errno));
+        }
+        if (result == 0) {
+            throw ProtocolError("socket write returned zero");
+        }
+
+        std::size_t written = static_cast<std::size_t>(result);
+        while (written >= vectors[current].iov_len) {
+            written -= vectors[current].iov_len;
+            if (++current == vector_count) {
+                break;
+            }
+        }
+        if (current < vector_count && written != 0) {
+            vectors[current].iov_base = static_cast<std::uint8_t*>(vectors[current].iov_base) + written;
+            vectors[current].iov_len -= written;
+        }
     }
 }
 

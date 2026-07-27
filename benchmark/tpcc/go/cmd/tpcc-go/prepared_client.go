@@ -32,6 +32,24 @@ type rankingStatement struct {
 	columns        []wireColumn
 }
 
+type batchOperation struct {
+	statement rankingStatement
+	args      []preparedArgument
+}
+
+type batchOperationResult struct {
+	operationIndex uint16
+	rows           [][]string
+}
+
+type batchResult struct {
+	executedOperations uint16
+	status             byte
+	failedOperation    uint16
+	diagnostic         string
+	results            []batchOperationResult
+}
+
 type pendingStatement struct {
 	id       uint16
 	query    bool
@@ -136,13 +154,11 @@ func (c *rankingClient) writeRequest(tag, flags byte, payload []byte) error {
 	if err := c.conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
 		return err
 	}
-	header := make([]byte, 8)
-	binary.BigEndian.PutUint32(header[:4], uint32(len(payload)))
-	header[4], header[5] = tag, flags
-	if err := writeAll(c.conn, header); err != nil {
-		return err
-	}
-	return writeAll(c.conn, payload)
+	frame := make([]byte, 8, 8+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	frame[4], frame[5] = tag, flags
+	frame = append(frame, payload...)
+	return writeAll(c.conn, frame)
 }
 
 func parameterizeSQL(sql string) (string, []preparedArgument, error) {
@@ -358,30 +374,38 @@ func decodeColumn(body []byte, offset int) (wireColumn, int, error) {
 }
 
 func (c *rankingClient) exec(sql string) (string, error) {
-	template, args, err := parameterizeSQL(sql)
+	operation, err := c.batchOperation(sql)
 	if err != nil {
 		return "", err
+	}
+	result, err := c.execBatch([]batchOperation{operation})
+	if err != nil {
+		return "", err
+	}
+	if !operation.statement.query {
+		return "", nil
+	}
+	return formatWireRows(operation.statement.columns, result.results[0].rows), nil
+}
+
+func (c *rankingClient) batchOperation(sql string) (batchOperation, error) {
+	template, args, err := parameterizeSQL(sql)
+	if err != nil {
+		return batchOperation{}, err
 	}
 	statement, ok := c.statements[template]
 	if !ok {
-		return "", fmt.Errorf("ranking SQL template was not prepared: %q", template)
+		return batchOperation{}, fmt.Errorf("ranking SQL template was not prepared: %q", template)
 	}
 	if len(args) != len(statement.parameterTypes) {
-		return "", fmt.Errorf("ranking SQL parameter count mismatch for %q", template)
+		return batchOperation{}, fmt.Errorf("ranking SQL parameter count mismatch for %q", template)
 	}
 	for i := range args {
 		if args[i].typ != statement.parameterTypes[i] {
-			return "", fmt.Errorf("ranking SQL parameter %d type mismatch for %q", i+1, template)
+			return batchOperation{}, fmt.Errorf("ranking SQL parameter %d type mismatch for %q", i+1, template)
 		}
 	}
-	rows, err := c.execBatch(statement, args)
-	if err != nil {
-		return "", err
-	}
-	if !statement.query {
-		return "", nil
-	}
-	return formatWireRows(statement.columns, rows), nil
+	return batchOperation{statement: statement, args: args}, nil
 }
 
 func (c *rankingClient) begin() error {
@@ -464,135 +488,182 @@ func (r *batchReader) u32() (uint32, error) {
 
 func (r *batchReader) remaining() int { return len(r.body) - r.offset }
 
-func (c *rankingClient) execBatch(statement rankingStatement, args []preparedArgument) ([][]string, error) {
-	payload := make([]byte, 4)
-	binary.BigEndian.PutUint16(payload[:2], 1)
-	binary.BigEndian.PutUint16(payload[2:4], statement.id)
-	for i, arg := range args {
-		if arg.typ != statement.parameterTypes[i] {
-			return nil, errors.New("typed EXEC_BATCH argument does not match prepared type")
+func encodeBatchOperations(operations []batchOperation) ([]byte, error) {
+	if len(operations) == 0 || len(operations) > 256 {
+		return nil, errors.New("EXEC_BATCH operation count must be between 1 and 256")
+	}
+	payload := make([]byte, 2)
+	binary.BigEndian.PutUint16(payload, uint16(len(operations)))
+	for _, operation := range operations {
+		statement, args := operation.statement, operation.args
+		if statement.id == 0 {
+			return nil, errors.New("EXEC_BATCH statement id must be nonzero")
 		}
-		if arg.present {
-			payload = append(payload, 1)
-		} else {
-			payload = append(payload, 0)
+		if len(args) != len(statement.parameterTypes) {
+			return nil, errors.New("EXEC_BATCH argument count does not match prepared statement")
 		}
-		if !arg.present {
-			continue
-		}
-		switch arg.typ {
-		case wireTypeInt32:
-			var value [4]byte
-			binary.BigEndian.PutUint32(value[:], uint32(arg.int32))
-			payload = append(payload, value[:]...)
-		case wireTypeFloat32:
-			var value [4]byte
-			binary.BigEndian.PutUint32(value[:], arg.floatBits)
-			payload = append(payload, value[:]...)
-		case wireTypeChar:
-			if len(arg.text) > math.MaxUint32 {
-				return nil, errors.New("typed CHAR parameter exceeds protocol limit")
+		var id [2]byte
+		binary.BigEndian.PutUint16(id[:], statement.id)
+		payload = append(payload, id[:]...)
+		for i, arg := range args {
+			if arg.typ != statement.parameterTypes[i] {
+				return nil, errors.New("typed EXEC_BATCH argument does not match prepared type")
 			}
-			var length [4]byte
-			binary.BigEndian.PutUint32(length[:], uint32(len(arg.text)))
-			payload = append(payload, length[:]...)
-			payload = append(payload, arg.text...)
-		default:
-			return nil, errors.New("unknown typed EXEC_BATCH argument")
+			if arg.present {
+				payload = append(payload, 1)
+			} else {
+				payload = append(payload, 0)
+			}
+			if !arg.present {
+				continue
+			}
+			switch arg.typ {
+			case wireTypeInt32:
+				var value [4]byte
+				binary.BigEndian.PutUint32(value[:], uint32(arg.int32))
+				payload = append(payload, value[:]...)
+			case wireTypeFloat32:
+				var value [4]byte
+				binary.BigEndian.PutUint32(value[:], arg.floatBits)
+				payload = append(payload, value[:]...)
+			case wireTypeChar:
+				if len(arg.text) > math.MaxUint32 {
+					return nil, errors.New("typed CHAR parameter exceeds protocol limit")
+				}
+				var length [4]byte
+				binary.BigEndian.PutUint32(length[:], uint32(len(arg.text)))
+				payload = append(payload, length[:]...)
+				payload = append(payload, arg.text...)
+			default:
+				return nil, errors.New("unknown typed EXEC_BATCH argument")
+			}
 		}
+	}
+	if len(payload) > maxWirePayload {
+		return nil, errors.New("EXEC_BATCH payload exceeds 1 MiB")
+	}
+	return payload, nil
+}
+
+func (c *rankingClient) execBatch(operations []batchOperation) (batchResult, error) {
+	payload, err := encodeBatchOperations(operations)
+	if err != nil {
+		return batchResult{}, err
 	}
 	if err := c.writeRequest(wireTagExecBatch, 1, payload); err != nil {
 		c.close()
-		return nil, err
+		return batchResult{}, err
 	}
 	tag, body, err := c.readFrame()
 	if err != nil {
 		c.close()
-		return nil, err
+		return batchResult{}, err
 	}
 	if tag == wireTagError {
 		c.autoAborted = true
-		return nil, errors.New(string(body))
+		return batchResult{}, errors.New(string(body))
 	}
 	if tag != wireTagBatchResult {
-		return nil, fmt.Errorf("EXEC_BATCH returned unexpected tag 0x%02x", tag)
+		return batchResult{}, fmt.Errorf("EXEC_BATCH returned unexpected tag 0x%02x", tag)
 	}
+	result, err := decodeBatchResult(body, operations)
+	if err != nil {
+		return batchResult{}, err
+	}
+	if result.status != 0 {
+		c.autoAborted = true
+		if result.status == 1 {
+			return result, errAbort
+		}
+		return result, errors.New(result.diagnostic)
+	}
+	return result, nil
+}
+
+func decodeBatchResult(body []byte, operations []batchOperation) (batchResult, error) {
 	reader := batchReader{body: body}
 	executed, err := reader.u16()
 	if err != nil {
-		return nil, err
+		return batchResult{}, err
 	}
 	status, err := reader.u8()
 	if err != nil {
-		return nil, err
+		return batchResult{}, err
 	}
 	failed, err := reader.u16()
 	if err != nil {
-		return nil, err
+		return batchResult{}, err
 	}
 	diagnosticLength, err := reader.u32()
 	if err != nil {
-		return nil, err
+		return batchResult{}, err
 	}
 	diagnostic, err := reader.take(int(diagnosticLength))
 	if err != nil || diagnosticLength > 64<<10 {
-		return nil, errors.New("invalid BATCH_RESULT diagnostic")
+		return batchResult{}, errors.New("invalid BATCH_RESULT diagnostic")
 	}
 	resultCount, err := reader.u16()
 	if err != nil {
-		return nil, err
+		return batchResult{}, err
+	}
+	result := batchResult{
+		executedOperations: executed,
+		status:             status,
+		failedOperation:    failed,
+		diagnostic:         string(diagnostic),
+		results:            make([]batchOperationResult, 0, resultCount),
 	}
 	if status != 0 {
-		if executed >= 1 || failed != executed || resultCount != 0 || reader.remaining() != 0 {
-			return nil, errors.New("invalid failed BATCH_RESULT counters")
+		if (status != 1 && status != 2) || executed >= uint16(len(operations)) || failed != executed || resultCount != 0 || reader.remaining() != 0 {
+			return batchResult{}, errors.New("invalid failed BATCH_RESULT")
 		}
-		c.autoAborted = true
-		if status == 1 {
-			return nil, errAbort
-		}
-		return nil, errors.New(string(diagnostic))
+		return result, nil
 	}
-	if executed != 1 || failed != 0xffff {
-		return nil, errors.New("invalid successful BATCH_RESULT counters")
+	if executed != uint16(len(operations)) || failed != 0xffff || len(diagnostic) != 0 {
+		return batchResult{}, errors.New("invalid successful BATCH_RESULT counters")
 	}
-	var rows [][]string
 	lastIndex := -1
 	for i := 0; i < int(resultCount); i++ {
 		operationIndex, err := reader.u16()
 		if err != nil {
-			return nil, err
+			return batchResult{}, err
 		}
-		if int(operationIndex) <= lastIndex || operationIndex != 0 || !statement.query {
-			return nil, errors.New("invalid BATCH_RESULT operation index")
+		if int(operationIndex) <= lastIndex || int(operationIndex) >= len(operations) || !operations[operationIndex].statement.query {
+			return batchResult{}, errors.New("invalid BATCH_RESULT operation index")
 		}
 		lastIndex = int(operationIndex)
 		rowCount, err := reader.u32()
 		if err != nil {
-			return nil, err
+			return batchResult{}, err
 		}
-		rows = make([][]string, 0, rowCount)
+		rows := make([][]string, 0, rowCount)
 		for row := uint32(0); row < rowCount; row++ {
-			values := make([]string, 0, len(statement.columns))
-			for _, column := range statement.columns {
+			columns := operations[operationIndex].statement.columns
+			values := make([]string, 0, len(columns))
+			for _, column := range columns {
 				value, valueErr := decodeBatchCell(&reader, column.sqlType)
 				if valueErr != nil {
-					return nil, valueErr
+					return batchResult{}, valueErr
 				}
 				values = append(values, value)
 			}
 			rows = append(rows, values)
 		}
+		result.results = append(result.results, batchOperationResult{operationIndex: operationIndex, rows: rows})
 	}
-	if statement.query && resultCount != 1 {
-		return nil, errors.New("successful query BATCH_RESULT must contain one result")
+	queryCount := 0
+	for _, operation := range operations {
+		if operation.statement.query {
+			queryCount++
+		}
 	}
-	if !statement.query && resultCount != 0 {
-		return nil, errors.New("successful command BATCH_RESULT contains a result")
+	if int(resultCount) != queryCount {
+		return batchResult{}, errors.New("successful BATCH_RESULT does not contain one result per query")
 	}
 	if reader.remaining() != 0 {
-		return nil, errors.New("BATCH_RESULT contains trailing bytes")
+		return batchResult{}, errors.New("BATCH_RESULT contains trailing bytes")
 	}
-	return rows, nil
+	return result, nil
 }
 
 func decodeBatchCell(reader *batchReader, typ byte) (string, error) {
@@ -627,7 +698,7 @@ func decodeBatchCell(reader *batchReader, typ byte) (string, error) {
 
 func rankingTemplateSamples() []string {
 	return []string{
-		"begin;", "commit;", "rollback;",
+		"begin;", "commit;", "rollback;", "abort;",
 		"select c_discount, c_last, c_credit, w_tax from customer, warehouse where w_id = 1 and c_w_id = w_id and c_d_id = 1 and c_id = 1;",
 		"update district set d_next_o_id = d_next_o_id + 1 where d_id = 1 and d_w_id = 1;",
 		"select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;",
@@ -638,7 +709,7 @@ func rankingTemplateSamples() []string {
 		"select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = 1 and s_w_id = 1;",
 		"update stock set s_quantity = s_quantity + 1 where s_i_id = 1 and s_w_id = 1;",
 		"update stock set s_quantity = s_quantity - 1 where s_i_id = 1 and s_w_id = 1;",
-		"insert into order_line values (1, 1, 1, 1, 1, 1, '2026-01-01 00:00:00', 1, 1.00, 'dist');",
+		"insert into order_line values (1, 1, 1, 1, 1, 1, NULL, 1, 1.00, 'dist');",
 		"update orders set o_all_local = 0 where o_id = 1 and o_d_id = 1 and o_w_id = 1;",
 		"select c_id, c_first from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
 		"update warehouse set w_ytd = w_ytd + 1.00 where w_id = 1;",

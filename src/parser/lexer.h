@@ -134,6 +134,7 @@ enum class TokenType {
     VALUE_FLOAT,
     VALUE_STRING,
     VALUE_BOOL,
+    PARAMETER,
 
     // Special
     T_EOF,

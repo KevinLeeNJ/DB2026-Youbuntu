@@ -681,7 +681,10 @@ private:
 
     void write_explain_output(const std::string& text, Context* context) {
         append_to_context(text, context);
-        if (sm_manager_->output_file_enabled_) {
+        const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
+                                             ? *context->output_file_enabled_
+                                             : sm_manager_->output_file_enabled_;
+        if (output_file_enabled) {
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << text;
