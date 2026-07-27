@@ -7,6 +7,7 @@ server's network/result-sink path are observable by CTest.
 """
 
 import os
+import re
 import shutil
 import signal
 import socket
@@ -609,6 +610,30 @@ def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
         verifier.close()
 
 
+def test_sigusr1_observability(server):
+    os.kill(server.process.pid, signal.SIGUSR1)
+    log_path = os.path.join(server.root, "rmdb.log")
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            with open(log_path, "r", encoding="utf-8") as log_file:
+                lines = log_file.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        observed = {}
+        for line in lines:
+            match = re.search(r"\b(obs_abort|obs_lock|obs_ckpt|obs_bpm) t_ms=(\d+) seq=(\d+)", line)
+            if match:
+                observed.setdefault(match.group(1), []).append(match.group(3))
+        if (len(observed.get("obs_abort", [])) >= 1 and len(observed.get("obs_lock", [])) >= 2 and
+                len(observed.get("obs_ckpt", [])) >= 1 and len(observed.get("obs_bpm", [])) >= 1):
+            latest = {kind: values[-1] for kind, values in observed.items()}
+            require(len(set(latest.values())) == 1, "SIGUSR1 observability lines did not share one sequence")
+            return
+        time.sleep(0.05)
+    raise ProtocolFailure("SIGUSR1 did not publish complete observability lines")
+
+
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
     server = Server(sys.argv[1])
@@ -622,6 +647,7 @@ def main():
         test_chained_update(server.port)
         test_crash_recovery_smoke(server)
         test_abort_ack_then_sigkill_recovers_indexed_undo(server)
+        test_sigusr1_observability(server)
         print("live Wire v3 server baseline: PASS")
         return 0
     finally:

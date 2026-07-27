@@ -386,7 +386,19 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
 
     {
         std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
-        checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
+        const bool blocked = checkpoint_blocking_new_txns_;
+        if (blocked) {
+            const auto wait_begin = std::chrono::steady_clock::now();
+            checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
+            checkpoint_begin_blocked_.fetch_add(1, std::memory_order_relaxed);
+            checkpoint_begin_wait_ns_.fetch_add(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
+                        .count()),
+                std::memory_order_relaxed);
+        } else {
+            checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
+        }
         active_txn_ids_.insert(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
     }
@@ -410,6 +422,118 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         active_serializable_txns_.insert(txn->get_transaction_id());
     }
     return txn;
+}
+
+void TransactionManager::record_client_abort(AbortReason reason) {
+    switch (reason) {
+    case AbortReason::LOCK_ON_SHIRINKING:
+        abort_lock_on_shrinking_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case AbortReason::UPGRADE_CONFLICT:
+        abort_upgrade_conflict_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case AbortReason::DEADLOCK_PREVENTION:
+        abort_deadlock_prevention_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case AbortReason::WW_CONFLICT:
+        abort_ww_conflict_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case AbortReason::SSI_DANGER:
+        abort_ssi_danger_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case AbortReason::UNIQUE_KEY_CONFLICT:
+        abort_unique_key_conflict_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+}
+
+AbortObservabilitySnapshot TransactionManager::abort_observability() const {
+    return {abort_lock_on_shrinking_.load(std::memory_order_relaxed),
+            abort_upgrade_conflict_.load(std::memory_order_relaxed),
+            abort_deadlock_prevention_.load(std::memory_order_relaxed),
+            abort_ww_conflict_.load(std::memory_order_relaxed),
+            abort_ssi_danger_.load(std::memory_order_relaxed),
+            abort_unique_key_conflict_.load(std::memory_order_relaxed)};
+}
+
+CheckpointObservabilitySnapshot TransactionManager::checkpoint_observability() const {
+    return {checkpoint_attempt_.load(std::memory_order_relaxed),
+            checkpoint_preflush_.load(std::memory_order_relaxed),
+            checkpoint_success_.load(std::memory_order_relaxed),
+            checkpoint_drain_timeout_.load(std::memory_order_relaxed),
+            checkpoint_deadline_.load(std::memory_order_relaxed),
+            checkpoint_final_data_fail_.load(std::memory_order_relaxed),
+            checkpoint_initial_ns_.load(std::memory_order_relaxed),
+            checkpoint_preblock_ns_.load(std::memory_order_relaxed),
+            checkpoint_block_ns_.load(std::memory_order_relaxed),
+            checkpoint_drain_ns_.load(std::memory_order_relaxed),
+            checkpoint_final_wal_ns_.load(std::memory_order_relaxed),
+            checkpoint_final_data_ns_.load(std::memory_order_relaxed),
+            checkpoint_meta_ns_.load(std::memory_order_relaxed),
+            checkpoint_manifest_ns_.load(std::memory_order_relaxed),
+            checkpoint_truncate_ns_.load(std::memory_order_relaxed),
+            checkpoint_begin_blocked_.load(std::memory_order_relaxed),
+            checkpoint_begin_wait_ns_.load(std::memory_order_relaxed)};
+}
+
+void TransactionManager::observe_checkpoint_attempt() {
+    checkpoint_attempt_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_preflush() {
+    checkpoint_preflush_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_success() {
+    checkpoint_success_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_drain_timeout() {
+    checkpoint_drain_timeout_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_deadline() {
+    checkpoint_deadline_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_final_data_fail() {
+    checkpoint_final_data_fail_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_initial_ns(uint64_t elapsed_ns) {
+    checkpoint_initial_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_preblock_ns(uint64_t elapsed_ns) {
+    checkpoint_preblock_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_block_ns(uint64_t elapsed_ns) {
+    checkpoint_block_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_drain_ns(uint64_t elapsed_ns) {
+    checkpoint_drain_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_final_wal_ns(uint64_t elapsed_ns) {
+    checkpoint_final_wal_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_final_data_ns(uint64_t elapsed_ns) {
+    checkpoint_final_data_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_meta_ns(uint64_t elapsed_ns) {
+    checkpoint_meta_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_manifest_ns(uint64_t elapsed_ns) {
+    checkpoint_manifest_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
+}
+
+void TransactionManager::observe_checkpoint_truncate_ns(uint64_t elapsed_ns) {
+    checkpoint_truncate_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
 }
 
 void TransactionManager::BeginStatement(Transaction* txn) {

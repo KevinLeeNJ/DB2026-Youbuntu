@@ -74,6 +74,7 @@ auto analyze = std::make_unique<Analyze>(sm_manager.get());
 // transaction logging on a measured run, so the handler only raises this flag
 // and the periodic checkpoint thread emits a single line for it.
 static std::atomic<bool> wal_statistics_requested{false};
+static std::atomic<uint64_t> observability_sequence{0};
 
 void sigusr1_handler(int signo) {
     (void)signo;
@@ -99,6 +100,65 @@ void log_wal_statistics() {
              static_cast<unsigned long long>(log_manager->get_wal_write_ns()),
              static_cast<unsigned long long>(log_manager->get_wal_fsync_ns()),
              static_cast<unsigned long long>(txn_manager->DebugTxnMapLookupCount()));
+}
+
+void log_observability_statistics() {
+    const uint64_t sequence = observability_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto now_ms = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const auto aborts = txn_manager->abort_observability();
+    const auto record_locks = lock_manager->record_lock_observability();
+    const auto unique_locks = lock_manager->unique_key_lock_observability();
+    const auto checkpoint = txn_manager->checkpoint_observability();
+    const auto bpm = buffer_pool_manager->observability_snapshot();
+
+    LOG_WARN("obs_abort t_ms=%lld seq=%llu shrinking=%llu upgrade=%llu deadlock=%llu ww=%llu ssi=%llu unique=%llu",
+             now_ms, static_cast<unsigned long long>(sequence),
+             static_cast<unsigned long long>(aborts.lock_on_shrinking),
+             static_cast<unsigned long long>(aborts.upgrade_conflict),
+             static_cast<unsigned long long>(aborts.deadlock_prevention),
+             static_cast<unsigned long long>(aborts.ww_conflict), static_cast<unsigned long long>(aborts.ssi_danger),
+             static_cast<unsigned long long>(aborts.unique_key_conflict));
+    const auto log_lock = [now_ms, sequence](const char* kind, const LockObservabilitySnapshot& stats) {
+        LOG_WARN(
+            "obs_lock t_ms=%lld seq=%llu kind=%s fast=%llu reentrant=%llu immediate_conflict=%llu "
+            "wait_enqueued=%llu wait_granted=%llu wait_cancelled=%llu wait_ns=%llu queue_depth_max=%llu "
+            "cycle_checks=%llu cycle_victims=%llu",
+            now_ms, static_cast<unsigned long long>(sequence), kind, static_cast<unsigned long long>(stats.fast),
+            static_cast<unsigned long long>(stats.reentrant), static_cast<unsigned long long>(stats.immediate_conflict),
+            static_cast<unsigned long long>(stats.wait_enqueued), static_cast<unsigned long long>(stats.wait_granted),
+            static_cast<unsigned long long>(stats.wait_cancelled), static_cast<unsigned long long>(stats.wait_ns),
+            static_cast<unsigned long long>(stats.queue_depth_max), static_cast<unsigned long long>(stats.cycle_checks),
+            static_cast<unsigned long long>(stats.cycle_victims));
+    };
+    log_lock("record", record_locks);
+    log_lock("unique", unique_locks);
+    LOG_WARN(
+        "obs_ckpt t_ms=%lld seq=%llu attempt=%llu preflush=%llu success=%llu drain_timeout=%llu deadline=%llu "
+        "final_data_fail=%llu initial_ns=%llu preblock_ns=%llu block_ns=%llu drain_ns=%llu final_wal_ns=%llu "
+        "final_data_ns=%llu meta_ns=%llu manifest_ns=%llu truncate_ns=%llu begin_blocked=%llu begin_wait_ns=%llu",
+        now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(checkpoint.attempt),
+        static_cast<unsigned long long>(checkpoint.preflush), static_cast<unsigned long long>(checkpoint.success),
+        static_cast<unsigned long long>(checkpoint.drain_timeout), static_cast<unsigned long long>(checkpoint.deadline),
+        static_cast<unsigned long long>(checkpoint.final_data_fail),
+        static_cast<unsigned long long>(checkpoint.initial_ns), static_cast<unsigned long long>(checkpoint.preblock_ns),
+        static_cast<unsigned long long>(checkpoint.block_ns), static_cast<unsigned long long>(checkpoint.drain_ns),
+        static_cast<unsigned long long>(checkpoint.final_wal_ns),
+        static_cast<unsigned long long>(checkpoint.final_data_ns), static_cast<unsigned long long>(checkpoint.meta_ns),
+        static_cast<unsigned long long>(checkpoint.manifest_ns),
+        static_cast<unsigned long long>(checkpoint.truncate_ns),
+        static_cast<unsigned long long>(checkpoint.begin_blocked),
+        static_cast<unsigned long long>(checkpoint.begin_wait_ns));
+    LOG_WARN("obs_bpm t_ms=%lld seq=%llu fetch_miss=%llu inflight_wait=%llu inflight_wait_ns=%llu no_victim=%llu "
+             "eviction_clean=%llu eviction_dirty=%llu page_reads=%llu page_writes=%llu",
+             now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(bpm.fetch_miss),
+             static_cast<unsigned long long>(bpm.inflight_wait), static_cast<unsigned long long>(bpm.inflight_wait_ns),
+             static_cast<unsigned long long>(bpm.no_victim), static_cast<unsigned long long>(bpm.eviction_clean),
+             static_cast<unsigned long long>(bpm.eviction_dirty),
+             static_cast<unsigned long long>(disk_manager->get_page_read_count()),
+             static_cast<unsigned long long>(disk_manager->get_page_write_count()));
+    minilog::Logger::get().flush();
 }
 
 static jmp_buf jmpbuf;
@@ -377,6 +437,10 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
             catalog_generation.fetch_add(1, std::memory_order_acq_rel);
         }
         return {is_query, catalog_changed};
+    } catch (TransactionAbortException& exception) {
+        txn_manager->record_client_abort(exception.GetAbortReason());
+        abort_session(session, &context);
+        throw;
     } catch (...) {
         abort_session(session, &context);
         throw;
@@ -1046,6 +1110,7 @@ int main(int argc, char** argv) {
                     }
                     if (wal_statistics_requested.exchange(false, std::memory_order_acq_rel)) {
                         log_wal_statistics();
+                        log_observability_statistics();
                     }
                     if (std::chrono::steady_clock::now() >= next_checkpoint) {
                         checkpoint_mgr.RunIfNeeded();

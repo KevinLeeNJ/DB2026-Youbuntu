@@ -27,6 +27,12 @@ bool IsValidPageId(const PageId& page_id) {
 
 } // namespace
 
+BufferPoolObservabilitySnapshot BufferPoolManager::observability_snapshot() const {
+    return {fetch_miss_.load(std::memory_order_relaxed),       inflight_wait_.load(std::memory_order_relaxed),
+            inflight_wait_ns_.load(std::memory_order_relaxed), no_victim_.load(std::memory_order_relaxed),
+            eviction_clean_.load(std::memory_order_relaxed),   eviction_dirty_.load(std::memory_order_relaxed)};
+}
+
 frame_id_t BufferPoolManager::take_free_frame() {
     if (!recycled_frames_.empty()) {
         const frame_id_t frame_id = recycled_frames_.back();
@@ -97,11 +103,17 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
 
         if (wait_page != nullptr) {
+            const auto wait_begin = std::chrono::steady_clock::now();
+            inflight_wait_.fetch_add(1, std::memory_order_relaxed);
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
+            inflight_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                  std::chrono::steady_clock::now() - wait_begin)
+                                                                  .count()),
+                                        std::memory_order_relaxed);
             continue;
         }
 
@@ -121,9 +133,18 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                     return target_page;
                 }
             } else {
+                fetch_miss_.fetch_add(1, std::memory_order_relaxed);
                 fid = take_free_frame();
-                if (fid == INVALID_FRAME_ID && !replacer_->victim(&fid)) {
-                    return nullptr;
+                if (fid == INVALID_FRAME_ID) {
+                    if (!replacer_->victim(&fid)) {
+                        no_victim_.fetch_add(1, std::memory_order_relaxed);
+                        return nullptr;
+                    }
+                    if (pages_[fid].is_dirty_.load(std::memory_order_acquire)) {
+                        eviction_dirty_.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        eviction_clean_.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
 
                 target_page = &pages_[fid];
@@ -144,11 +165,17 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         }
 
         if (wait_page != nullptr) {
+            const auto wait_begin = std::chrono::steady_clock::now();
+            inflight_wait_.fetch_add(1, std::memory_order_relaxed);
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
+            inflight_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                  std::chrono::steady_clock::now() - wait_begin)
+                                                                  .count()),
+                                        std::memory_order_relaxed);
             continue;
         }
 
@@ -419,8 +446,16 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     {
         std::scoped_lock lock{latch_};
         fid = take_free_frame();
-        if (fid == INVALID_FRAME_ID && !replacer_->victim(&fid)) {
-            return nullptr;
+        if (fid == INVALID_FRAME_ID) {
+            if (!replacer_->victim(&fid)) {
+                no_victim_.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
+            }
+            if (pages_[fid].is_dirty_.load(std::memory_order_acquire)) {
+                eviction_dirty_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                eviction_clean_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         page_id->page_no = disk_manager_->allocate_page(page_id->fd);

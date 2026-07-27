@@ -101,6 +101,11 @@ TEST(CheckpointDrainTest, IdleTransactionDoesNotStallNewTransactionsForever) {
     ASSERT_EQ(checkpoint_result.wait_for(std::chrono::seconds(15)), std::future_status::ready)
         << "RunCleanCheckpoint never returned";
     EXPECT_FALSE(checkpoint_result.get()) << "checkpoint should abandon the round when the drain times out";
+    const auto stats = txn_mgr.checkpoint_observability();
+    EXPECT_EQ(stats.attempt, 1u);
+    EXPECT_EQ(stats.drain_timeout, 1u);
+    EXPECT_GT(stats.drain_ns, 0u);
+    EXPECT_GT(stats.block_ns, 0u);
 
     txn_mgr.abort(probe_txn, &db.log_mgr_);
     txn_mgr.abort(idle_txn, &db.log_mgr_);
@@ -124,4 +129,10 @@ TEST(CheckpointDrainTest, CheckpointSucceedsAfterBlockedRoundIsAbandoned) {
     // not be gated by the automatic retry backoff.
     EXPECT_TRUE(checkpoint_mgr.RunCleanCheckpoint());
     EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+    const auto stats = txn_mgr.checkpoint_observability();
+    EXPECT_EQ(stats.attempt, 2u);
+    EXPECT_EQ(stats.drain_timeout, 1u);
+    EXPECT_EQ(stats.success, 1u);
+    EXPECT_GT(stats.final_wal_ns, 0u);
+    EXPECT_GT(stats.final_data_ns, 0u);
 }

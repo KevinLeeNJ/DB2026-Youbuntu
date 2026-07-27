@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +32,35 @@ See the Mulan PSL v2 for more details. */
 
 /* 系统采用的并发控制算法，当前题目中要求两阶段封锁并发控制算法 */
 enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
+
+struct AbortObservabilitySnapshot {
+    uint64_t lock_on_shrinking{0};
+    uint64_t upgrade_conflict{0};
+    uint64_t deadlock_prevention{0};
+    uint64_t ww_conflict{0};
+    uint64_t ssi_danger{0};
+    uint64_t unique_key_conflict{0};
+};
+
+struct CheckpointObservabilitySnapshot {
+    uint64_t attempt{0};
+    uint64_t preflush{0};
+    uint64_t success{0};
+    uint64_t drain_timeout{0};
+    uint64_t deadline{0};
+    uint64_t final_data_fail{0};
+    uint64_t initial_ns{0};
+    uint64_t preblock_ns{0};
+    uint64_t block_ns{0};
+    uint64_t drain_ns{0};
+    uint64_t final_wal_ns{0};
+    uint64_t final_data_ns{0};
+    uint64_t meta_ns{0};
+    uint64_t manifest_ns{0};
+    uint64_t truncate_ns{0};
+    uint64_t begin_blocked{0};
+    uint64_t begin_wait_ns{0};
+};
 
 /// 版本链中的第一个撤销链接，将表堆元组链接到撤销日志。
 struct VersionUndoLink {
@@ -74,6 +104,25 @@ public:
     void commit(Transaction* txn, LogManager* log_manager);
 
     void abort(Transaction* txn, LogManager* log_manager);
+
+    void record_client_abort(AbortReason reason);
+    AbortObservabilitySnapshot abort_observability() const;
+    CheckpointObservabilitySnapshot checkpoint_observability() const;
+    void observe_checkpoint_attempt();
+    void observe_checkpoint_preflush();
+    void observe_checkpoint_success();
+    void observe_checkpoint_drain_timeout();
+    void observe_checkpoint_deadline();
+    void observe_checkpoint_final_data_fail();
+    void observe_checkpoint_initial_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_preblock_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_block_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_drain_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_final_wal_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_final_data_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_meta_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_manifest_ns(uint64_t elapsed_ns);
+    void observe_checkpoint_truncate_ns(uint64_t elapsed_ns);
 
     void block_new_transactions_for_checkpoint();
 
@@ -317,6 +366,30 @@ private:
     bool checkpoint_blocking_new_txns_{false};
     int active_txn_count_{0};
     std::unordered_set<txn_id_t> active_txn_ids_;
+
+    std::atomic<uint64_t> abort_lock_on_shrinking_{0};
+    std::atomic<uint64_t> abort_upgrade_conflict_{0};
+    std::atomic<uint64_t> abort_deadlock_prevention_{0};
+    std::atomic<uint64_t> abort_ww_conflict_{0};
+    std::atomic<uint64_t> abort_ssi_danger_{0};
+    std::atomic<uint64_t> abort_unique_key_conflict_{0};
+    std::atomic<uint64_t> checkpoint_attempt_{0};
+    std::atomic<uint64_t> checkpoint_preflush_{0};
+    std::atomic<uint64_t> checkpoint_success_{0};
+    std::atomic<uint64_t> checkpoint_drain_timeout_{0};
+    std::atomic<uint64_t> checkpoint_deadline_{0};
+    std::atomic<uint64_t> checkpoint_final_data_fail_{0};
+    std::atomic<uint64_t> checkpoint_initial_ns_{0};
+    std::atomic<uint64_t> checkpoint_preblock_ns_{0};
+    std::atomic<uint64_t> checkpoint_block_ns_{0};
+    std::atomic<uint64_t> checkpoint_drain_ns_{0};
+    std::atomic<uint64_t> checkpoint_final_wal_ns_{0};
+    std::atomic<uint64_t> checkpoint_final_data_ns_{0};
+    std::atomic<uint64_t> checkpoint_meta_ns_{0};
+    std::atomic<uint64_t> checkpoint_manifest_ns_{0};
+    std::atomic<uint64_t> checkpoint_truncate_ns_{0};
+    std::atomic<uint64_t> checkpoint_begin_blocked_{0};
+    std::atomic<uint64_t> checkpoint_begin_wait_ns_{0};
 
     std::condition_variable gc_cv_;
     std::thread gc_thread_;
