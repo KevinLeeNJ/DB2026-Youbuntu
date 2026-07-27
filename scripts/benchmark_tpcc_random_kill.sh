@@ -202,8 +202,11 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     rm -f "$RUN_JSON" "$SQL_READY" "$SQL_ACK" "$SQL_ISSUED"
 
     echo "[random-kill] cycle $cycle/$CYCLES: execute at least $SQL_OPS mixed SQL operations"
+    # Only the mixed-SQL workload can feed the ACK oracle: the TPC-C ranking
+    # transactions submit `commit;` inside their final EXEC_BATCH, so there is no
+    # client-side commit ACK to record (the Go runner rejects --oracle-ack-file
+    # for that backend rather than silently recording nothing).
     SQL_PREFIX=$((cycle * 2))
-    TPCC_PREFIX=$((cycle * 2 - 1))
     "$GO_BINARY" --command mixed-sql \
         --port "$PORT" \
         --isolation "$ISOLATION" \
@@ -239,8 +242,6 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
         --rounds 1 \
         --progress-interval 0 \
         --warehouse-policy terminal-home \
-        --oracle-ack-file "$ACK_FILE" \
-        --oracle-id-prefix "$TPCC_PREFIX" \
         --json-out "$RUN_JSON" \
         >"$WORK_DIR/run-$cycle.out" 2>"$WORK_DIR/run-$cycle.err" &
     WORKLOAD_PID=$!

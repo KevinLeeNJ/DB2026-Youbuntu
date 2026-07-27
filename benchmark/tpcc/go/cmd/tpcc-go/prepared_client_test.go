@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"strings"
 	"testing"
@@ -52,58 +54,103 @@ func TestParameterizeSQLDoesNotRewriteDigitsInIdentifiers(t *testing.T) {
 	}
 }
 
-func TestRankingTemplateSamplesAreBoundedAndUnique(t *testing.T) {
-	seen := make(map[string]struct{})
-	for _, sample := range rankingTemplateSamples() {
-		template, args, err := parameterizeSQL(sample)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(template) > maxWirePayload || len(args) > 256 {
-			t.Fatalf("template exceeds protocol bounds: %q", sample)
-		}
-		if _, duplicate := seen[template]; duplicate {
-			continue
-		}
-		seen[template] = struct{}{}
+func TestRankingTemplatesDeclareSchemasAndFitProtocolBounds(t *testing.T) {
+	pending, err := pendingRankingStatements()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(seen) < 30 {
-		t.Fatalf("prepared ranking template set has only %d statements", len(seen))
+	if len(pending) < 30 {
+		t.Fatalf("prepared ranking template set has only %d statements", len(pending))
+	}
+	for _, statement := range pending {
+		if len(statement.template) > maxWirePayload || len(statement.args) > 256 {
+			t.Fatalf("template exceeds protocol bounds: %q", statement.template)
+		}
+		if statement.query != (len(statement.wantColumns) > 0) {
+			t.Fatalf("template %q declares %d expected columns", statement.template, len(statement.wantColumns))
+		}
+		for index, sqlType := range statement.wantColumns {
+			if sqlType != wireTypeInt32 && sqlType != wireTypeFloat32 && sqlType != wireTypeChar {
+				t.Fatalf("template %q column %d declares unknown SQL type 0x%02x", statement.template, index+1, sqlType)
+			}
+		}
 	}
 }
 
-func TestDecodePrepareOKSupportsFinalAndCurrentServerSchemas(t *testing.T) {
-	pending := []pendingStatement{
-		{id: 1, query: false},
-		{id: 2, query: true, args: []preparedArgument{{typ: wireTypeInt32}}},
-	}
-	columnName := "value"
-	makeBody := func(legacy bool) []byte {
-		body := appendU16(nil, 2)
-		body = appendU16(body, 1)
+// prepareOKBody encodes a PREPARE_OK response whose per-statement column types
+// are supplied by the caller, so the decoder can be driven with both correct and
+// deliberately wrong schemas.
+func prepareOKBody(t *testing.T, pending []pendingStatement, columns [][]byte, legacy bool) []byte {
+	t.Helper()
+	body := appendU16(nil, uint16(len(pending)))
+	for index, statement := range pending {
+		body = appendU16(body, statement.id)
 		if legacy {
-			body = appendU16(body, 0)
+			body = appendU16(body, uint16(len(statement.args)))
+			for _, arg := range statement.args {
+				body = append(body, arg.typ)
+			}
 		}
-		body = appendU16(body, 0)
-		body = appendU16(body, 2)
-		if legacy {
-			body = appendU16(body, 1)
-			body = append(body, wireTypeInt32)
+		body = appendU16(body, uint16(len(columns[index])))
+		for position, sqlType := range columns[index] {
+			name := fmt.Sprintf("c%d", position+1)
+			body = appendU16(body, uint16(len(name)))
+			body = append(body, name...)
+			body = append(body, sqlType)
 		}
-		body = appendU16(body, 1)
-		body = appendU16(body, uint16(len(columnName)))
-		body = append(body, columnName...)
-		body = append(body, wireTypeInt32)
-		return body
 	}
-	for _, legacy := range []bool{false, true} {
-		decoded, err := decodePrepareOK(makeBody(legacy), pending)
-		if err != nil {
-			t.Fatalf("legacy=%v: %v", legacy, err)
+	return body
+}
+
+func prepareOKFixture() []pendingStatement {
+	return []pendingStatement{
+		{id: 1, query: false, template: "commit;"},
+		{id: 2, query: true, template: "select a, b from t where c = $1;",
+			args: []preparedArgument{{typ: wireTypeInt32}}, wantColumns: []byte{wireTypeInt32, wireTypeFloat32}},
+	}
+}
+
+func TestDecodePrepareOKVerifiesEveryColumnType(t *testing.T) {
+	pending := prepareOKFixture()
+	decoded, err := decodePrepareOK(prepareOKBody(t, pending, [][]byte{nil, {wireTypeInt32, wireTypeFloat32}}, false), pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded[1].columns) != 0 || len(decoded[2].columns) != 2 ||
+		decoded[2].columns[0].sqlType != wireTypeInt32 || decoded[2].columns[1].sqlType != wireTypeFloat32 {
+		t.Fatalf("decoded schema = %#v", decoded)
+	}
+
+	// final.md:680 rejects a placeholder column, a missing projection column, a
+	// numeric column disguised as CHAR, and a command that reports columns.
+	rejected := map[string][][]byte{
+		"single placeholder column": {nil, {wireTypeInt32}},
+		"numeric column as CHAR":    {nil, {wireTypeInt32, wireTypeChar}},
+		"swapped column order":      {nil, {wireTypeFloat32, wireTypeInt32}},
+		"extra column":              {nil, {wireTypeInt32, wireTypeFloat32, wireTypeInt32}},
+		"command reports a column":  {{wireTypeInt32}, {wireTypeInt32, wireTypeFloat32}},
+	}
+	for name, columns := range rejected {
+		if _, err := decodePrepareOK(prepareOKBody(t, pending, columns, false), pending); err == nil {
+			t.Errorf("%s was accepted", name)
 		}
-		if decoded[2].columns[0].name != columnName || decoded[2].columns[0].sqlType != wireTypeInt32 {
-			t.Fatalf("legacy=%v: decoded schema = %#v", legacy, decoded[2])
-		}
+	}
+}
+
+func TestDecodePrepareOKRejectsLegacyLayoutUnlessAllowed(t *testing.T) {
+	pending := prepareOKFixture()
+	body := prepareOKBody(t, pending, [][]byte{nil, {wireTypeInt32, wireTypeFloat32}}, true)
+	if _, err := decodePrepareOK(body, pending); err == nil || !strings.Contains(err.Error(), "legacy layout") {
+		t.Fatalf("legacy PREPARE_OK error = %v, want an explicit legacy layout rejection", err)
+	}
+	allowLegacyPrepare = true
+	defer func() { allowLegacyPrepare = false }()
+	decoded, err := decodePrepareOK(body, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded[2].columns) != 2 {
+		t.Fatalf("decoded legacy schema = %#v", decoded[2])
 	}
 }
 
@@ -199,6 +246,127 @@ func TestDecodeBatchResultPreservesFailureProgress(t *testing.T) {
 	}
 	if result.executedOperations != 2 || result.status != 2 || result.failedOperation != 2 || result.diagnostic != "boom" || len(result.results) != 0 {
 		t.Fatalf("batch failure = %#v", result)
+	}
+}
+
+// fakeRankingBatcher mirrors the connection-level prepared dictionary: it only
+// accepts statements whose parameterized template appears in rankingTemplates(),
+// so a ranking transaction that emits an unprepared statement fails here exactly
+// as it would against the server.
+type fakeRankingBatcher struct {
+	statements   map[string]rankingStatement
+	batches      int
+	emptyResults bool
+}
+
+func newFakeRankingBatcher(t *testing.T) *fakeRankingBatcher {
+	t.Helper()
+	pending, err := pendingRankingStatements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := make(map[string]rankingStatement, len(pending))
+	for _, statement := range pending {
+		columns := make([]wireColumn, 0, len(statement.wantColumns))
+		for index, sqlType := range statement.wantColumns {
+			columns = append(columns, wireColumn{name: fmt.Sprintf("c%d", index+1), sqlType: sqlType})
+		}
+		statements[statement.template] = rankingStatement{id: statement.id, query: statement.query,
+			parameterTypes: argumentTypes(statement.args), columns: columns}
+	}
+	return &fakeRankingBatcher{statements: statements}
+}
+
+func (f *fakeRankingBatcher) batchOperation(sql string) (batchOperation, error) {
+	template, args, err := parameterizeSQL(sql)
+	if err != nil {
+		return batchOperation{}, err
+	}
+	statement, ok := f.statements[template]
+	if !ok {
+		return batchOperation{}, fmt.Errorf("ranking SQL template was not prepared: %q", template)
+	}
+	if len(args) != len(statement.parameterTypes) {
+		return batchOperation{}, fmt.Errorf("ranking SQL parameter count mismatch for %q", template)
+	}
+	for index := range args {
+		if args[index].typ != statement.parameterTypes[index] {
+			return batchOperation{}, fmt.Errorf("ranking SQL parameter %d type mismatch for %q", index+1, template)
+		}
+	}
+	return batchOperation{statement: statement, args: args}, nil
+}
+
+func (f *fakeRankingBatcher) execBatch(operations []batchOperation) (batchResult, error) {
+	f.batches++
+	result := batchResult{executedOperations: uint16(len(operations)), failedOperation: 0xffff}
+	for index, operation := range operations {
+		if !operation.statement.query {
+			continue
+		}
+		rows := make([][]string, 0, 1)
+		if !f.emptyResults {
+			row := make([]string, 0, len(operation.statement.columns))
+			for _, column := range operation.statement.columns {
+				if column.sqlType == wireTypeChar {
+					row = append(row, "x")
+				} else {
+					row = append(row, "1")
+				}
+			}
+			rows = append(rows, row)
+		}
+		result.results = append(result.results, batchOperationResult{operationIndex: uint16(index), rows: rows})
+	}
+	return result, nil
+}
+
+func rankingTestContext() txnContext {
+	return txnContext{wID: 1, dID: 1, official: true, profile: profile{
+		warehouses: officialTerminalHomes, districtsPerWarehouse: districtsPerWarehouse,
+		customersPerDistrict: 3000, itemCount: 100000}}
+}
+
+func TestRankingTransactionsUseOfficialBatchBoundaries(t *testing.T) {
+	// final.md:741-749 fixes the dependent-stage round trips at 2/2/3/3/2. Every
+	// statement they emit must also be part of the prepared dictionary, otherwise
+	// the batch fails and the whole measurement window is void.
+	cases := []struct {
+		name    string
+		batches int
+		run     func(rankingBatcher, txnContext, *rand.Rand) error
+	}{
+		{"new_order", 2, rankingNewOrder},
+		{"payment", 2, rankingPayment},
+		{"order_status", 3, rankingOrderStatus},
+		{"delivery", 3, rankingDelivery},
+		{"stock_level", 2, rankingStockLevel},
+	}
+	for _, test := range cases {
+		for seed := int64(1); seed <= 25; seed++ {
+			batcher := newFakeRankingBatcher(t)
+			if err := test.run(batcher, rankingTestContext(), rand.New(rand.NewSource(seed))); err != nil &&
+				!errors.Is(err, errInvalidItem) {
+				t.Fatalf("%s seed %d: %v", test.name, seed, err)
+			}
+			if batcher.batches != test.batches {
+				t.Fatalf("%s seed %d used %d batches, want %d", test.name, seed, batcher.batches, test.batches)
+			}
+		}
+	}
+}
+
+func TestRankingDeliveryKeepsPreparedStatementsWhenEveryQueueIsEmpty(t *testing.T) {
+	// Regression guard for the unprepared `select 0;` placeholder: when all ten
+	// districts have an empty new_orders queue the second stage must still send a
+	// prepared statement and Delivery must keep its three batch boundaries.
+	batcher := newFakeRankingBatcher(t)
+	batcher.emptyResults = true
+	if err := rankingDelivery(batcher, rankingTestContext(), rand.New(rand.NewSource(1))); err != nil {
+		t.Fatal(err)
+	}
+	if batcher.batches != 3 {
+		t.Fatalf("delivery used %d batches on an empty warehouse, want 3", batcher.batches)
 	}
 }
 

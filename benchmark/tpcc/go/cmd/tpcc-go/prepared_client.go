@@ -51,11 +51,18 @@ type batchResult struct {
 }
 
 type pendingStatement struct {
-	id       uint16
-	query    bool
-	template string
-	args     []preparedArgument
+	id          uint16
+	query       bool
+	template    string
+	args        []preparedArgument
+	wantColumns []byte
 }
+
+// allowLegacyPrepare opts back into the pre-final PREPARE_OK layout that echoed
+// parameter types before the column count. The official evaluator only decodes
+// the final layout (final.md:669-680), so the strict layout is the default and a
+// legacy response is reported as a protocol contract failure.
+var allowLegacyPrepare bool
 
 type rankingClient struct {
 	*client
@@ -75,27 +82,47 @@ func newRankingClient(address string, timeout time.Duration, isolation string) (
 	return ranking, nil
 }
 
-func (c *rankingClient) prepare() error {
-	pending := make([]pendingStatement, 0, len(rankingTemplateSamples()))
-	seen := make(map[string]struct{})
-	for _, sample := range rankingTemplateSamples() {
-		template, args, err := parameterizeSQL(sample)
-		if err != nil {
-			return fmt.Errorf("parameterize ranking SQL %q: %w", sample, err)
+// pendingRankingStatements turns the ranking template table into the statement
+// dictionary sent by PREPARE_SET, keeping the expected query schema of every
+// template so PREPARE_OK can be verified column by column.
+func pendingRankingStatements() ([]pendingStatement, error) {
+	templates := rankingTemplates()
+	pending := make([]pendingStatement, 0, len(templates))
+	seen := make(map[string]int, len(templates))
+	for _, sample := range templates {
+		query := statementResultKind(sample.sql) == resultKindQuery
+		if query != (len(sample.columns) > 0) {
+			return nil, fmt.Errorf("ranking template %q declares %d expected columns", sample.sql, len(sample.columns))
 		}
-		if _, ok := seen[template]; ok {
+		template, args, err := parameterizeSQL(sample.sql)
+		if err != nil {
+			return nil, fmt.Errorf("parameterize ranking SQL %q: %w", sample.sql, err)
+		}
+		if index, ok := seen[template]; ok {
+			if string(pending[index].wantColumns) != string(sample.columns) {
+				return nil, fmt.Errorf("ranking template %q duplicates %q with a different schema", sample.sql, template)
+			}
 			continue
 		}
-		seen[template] = struct{}{}
 		if len(pending) >= 256 {
-			return errors.New("ranking prepared statement set exceeds protocol limit")
+			return nil, errors.New("ranking prepared statement set exceeds protocol limit")
 		}
+		seen[template] = len(pending)
 		pending = append(pending, pendingStatement{
-			id:       uint16(len(pending) + 1),
-			query:    strings.HasPrefix(strings.TrimSpace(strings.ToLower(template)), "select "),
-			template: template,
-			args:     args,
+			id:          uint16(len(pending) + 1),
+			query:       query,
+			template:    template,
+			args:        args,
+			wantColumns: sample.columns,
 		})
+	}
+	return pending, nil
+}
+
+func (c *rankingClient) prepare() error {
+	pending, err := pendingRankingStatements()
+	if err != nil {
+		return err
 	}
 
 	payload := make([]byte, 2)
@@ -269,10 +296,11 @@ func numericArgument(literal string) (preparedArgument, error) {
 
 // rankingPrepareItem is the wire-independent shape used by the decoder.
 type rankingPrepareItem struct {
-	id       uint16
-	query    bool
-	template string
-	args     []preparedArgument
+	id          uint16
+	query       bool
+	template    string
+	args        []preparedArgument
+	wantColumns []byte
 }
 
 func decodePrepareCandidate(body []byte, pending []rankingPrepareItem, legacy bool) (map[uint16]rankingStatement, error) {
@@ -315,17 +343,27 @@ func decodePrepareCandidate(body []byte, pending []rankingPrepareItem, legacy bo
 		if !pending[i].query && columnCount != 0 {
 			return nil, fmt.Errorf("command statement %d returned columns", id)
 		}
+		// final.md:137,680: the column count, order and SQL type of every query
+		// must match its real projection schema. A placeholder column, a missing
+		// projection column or a numeric column reported as CHAR is a protocol
+		// contract failure, so compare the whole declared schema position by
+		// position instead of only accepting "some column of a known type".
+		if columnCount != len(pending[i].wantColumns) {
+			return nil, fmt.Errorf("PREPARE_OK statement %d reported %d columns, want %d for %q",
+				id, columnCount, len(pending[i].wantColumns), pending[i].template)
+		}
 		columns := make([]wireColumn, 0, columnCount)
 		for j := 0; j < columnCount; j++ {
 			column, next, err := decodeColumn(body, offset)
 			if err != nil {
 				return nil, err
 			}
+			if column.sqlType != pending[i].wantColumns[j] {
+				return nil, fmt.Errorf("PREPARE_OK statement %d column %d has SQL type 0x%02x, want 0x%02x for %q",
+					id, j+1, column.sqlType, pending[i].wantColumns[j], pending[i].template)
+			}
 			columns = append(columns, column)
 			offset = next
-		}
-		if pending[i].query && len(columns) == 0 {
-			return nil, fmt.Errorf("query statement %d returned no columns", id)
 		}
 		decoded[id] = rankingStatement{id: id, query: pending[i].query, parameterTypes: argumentTypes(pending[i].args), columns: columns}
 	}
@@ -338,15 +376,25 @@ func decodePrepareCandidate(body []byte, pending []rankingPrepareItem, legacy bo
 func decodePrepareOK(body []byte, pending []pendingStatement) (map[uint16]rankingStatement, error) {
 	items := make([]rankingPrepareItem, len(pending))
 	for i, item := range pending {
-		items[i] = rankingPrepareItem{id: item.id, query: item.query, template: item.template, args: item.args}
+		items[i] = rankingPrepareItem{id: item.id, query: item.query, template: item.template,
+			args: item.args, wantColumns: item.wantColumns}
 	}
-	if decoded, err := decodePrepareCandidate(body, items, false); err == nil {
+	if allowLegacyPrepare {
+		return decodePrepareCandidate(body, items, true)
+	}
+	decoded, err := decodePrepareCandidate(body, items, false)
+	if err == nil {
 		return decoded, nil
 	}
-	if decoded, err := decodePrepareCandidate(body, items, true); err == nil {
-		return decoded, nil
+	// Never fall back silently: a server that still speaks the legacy layout
+	// would make every local run pass while the official evaluator reports a
+	// protocol contract failure.
+	if _, legacyErr := decodePrepareCandidate(body, items, true); legacyErr == nil {
+		return nil, fmt.Errorf("PREPARE_OK uses the legacy layout that echoes parameter types; "+
+			"the final protocol sends statement id, column count and column definitions only "+
+			"(rerun with --allow-legacy-prepare to accept it locally): %w", err)
 	}
-	return nil, errors.New("PREPARE_OK does not match final or legacy RMDB schema")
+	return nil, err
 }
 
 func argumentTypes(args []preparedArgument) []byte {
@@ -414,30 +462,15 @@ func (c *rankingClient) begin() error {
 	return err
 }
 
+// commit exists to satisfy txnBackend. The ranking transactions never call it:
+// they carry `commit;` as the last operation of their final EXEC_BATCH so the
+// official batch round-trip counts stay at 2/2/3/3/2 (final.md:741-749). It
+// therefore also carries no crash-oracle bookkeeping — main rejects
+// --oracle-ack-file for the ranking backend instead of silently recording
+// nothing.
 func (c *rankingClient) commit() error {
-	if oracleAckFile != "" {
-		oracleID := c.oracleID
-		if oracleID == 0 {
-			seq := oracleSeq.Add(1)
-			if seq >= 1_000_000 {
-				return errors.New("crash oracle transaction sequence exhausted")
-			}
-			oracleID = oracleIDPrefix*1_000_000 + int(seq)
-		}
-		payloadHash := c.oraclePayloadHash
-		if payloadHash == 0 {
-			for _, ch := range c.txnType {
-				payloadHash = (payloadHash*131 + int(ch)) & 0x7fffffff
-			}
-		}
-		if _, err := c.exec(fmt.Sprintf("insert into crash_txn_log values (%d, '%s', %d);", oracleID, c.txnType, payloadHash)); err != nil {
-			return err
-		}
-	}
-	if _, err := c.exec("commit;"); err != nil {
-		return err
-	}
-	return nil
+	_, err := c.exec("commit;")
+	return err
 }
 
 func (c *rankingClient) rollback() {
@@ -696,44 +729,84 @@ func decodeBatchCell(reader *batchReader, typ byte) (string, error) {
 	}
 }
 
-func rankingTemplateSamples() []string {
-	return []string{
-		"begin;", "commit;", "rollback;", "abort;",
-		"select c_discount, c_last, c_credit, w_tax from customer, warehouse where w_id = 1 and c_w_id = w_id and c_d_id = 1 and c_id = 1;",
-		"update district set d_next_o_id = d_next_o_id + 1 where d_id = 1 and d_w_id = 1;",
-		"select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;",
-		"insert into orders values (1, 1, 1, 1, '2026-01-01 00:00:00', 0, 5, 1);",
-		"insert into new_orders values (1, 1, 1);",
-		"select i_price, i_name, i_data from item where i_id = 1;",
-		"update stock set s_ytd = s_ytd + 1, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 0 where s_i_id = 1 and s_w_id = 1;",
-		"select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = 1 and s_w_id = 1;",
-		"update stock set s_quantity = s_quantity + 1 where s_i_id = 1 and s_w_id = 1;",
-		"update stock set s_quantity = s_quantity - 1 where s_i_id = 1 and s_w_id = 1;",
-		"insert into order_line values (1, 1, 1, 1, 1, 1, NULL, 1, 1.00, 'dist');",
-		"update orders set o_all_local = 0 where o_id = 1 and o_d_id = 1 and o_w_id = 1;",
-		"select c_id, c_first from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
-		"update warehouse set w_ytd = w_ytd + 1.00 where w_id = 1;",
-		"select w_street_1, w_street_2, w_city, w_state, w_zip, w_name from warehouse where w_id = 1;",
-		"update district set d_ytd = d_ytd + 1.00 where d_w_id = 1 and d_id = 1;",
-		"select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where d_w_id = 1 and d_id = 1;",
-		"update customer set c_balance = c_balance - 1.00, c_ytd_payment = c_ytd_payment + 1.00, c_payment_cnt = c_payment_cnt + 1 where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
-		"select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
-		"insert into history values (1, 1, 1, 1, 1, '2026-01-01 00:00:00', 1.00, 'payment');",
-		"select c_id, c_balance, c_first, c_middle, c_last from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
-		"select c_balance, c_first, c_middle, c_last from customer where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
-		"select o_id, o_entry_d, o_carrier_id from orders where o_w_id = 1 and o_d_id = 1 and o_c_id = 1 order by o_id desc limit 1;",
-		"select o_id, o_entry_d, o_carrier_id from orders where o_w_id = 1 and o_d_id = 1 and o_c_id = 1 and o_id = 1;",
-		"select ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d from order_line where ol_w_id = 1 and ol_d_id = 1 and ol_o_id = 1;",
-		"select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;",
-		"update new_orders set no_o_id = no_o_id where no_w_id = 1 and no_d_id = 1 and no_o_id = 1;",
-		"select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1 and no_o_id = 1;",
-		"delete from new_orders where no_w_id = 1 and no_d_id = 1 and no_o_id = 1;",
-		"select o_c_id from orders where o_id = 1 and o_d_id = 1 and o_w_id = 1;",
-		"update orders set o_carrier_id = 1 where o_id = 1 and o_d_id = 1 and o_w_id = 1;",
-		"update order_line set ol_delivery_d = '2026-01-01 00:00:00' where ol_o_id = 1 and ol_d_id = 1 and ol_w_id = 1;",
-		"select sum(ol_amount) from order_line where ol_o_id = 1 and ol_d_id = 1 and ol_w_id = 1;",
-		"update customer set c_balance = c_balance + 1.00, c_delivery_cnt = c_delivery_cnt + 1 where c_id = 1 and c_d_id = 1 and c_w_id = 1;",
-		"select d_next_o_id from district where d_id = 1 and d_w_id = 1;",
-		"select count(distinct ol_i_id) from order_line, stock where ol_w_id = 1 and ol_d_id = 1 and ol_o_id >= 1 and ol_o_id < 2 and s_w_id = 1 and s_i_id = ol_i_id and s_quantity < 10;",
+// rankingTemplate pairs a ranking SQL sample with the exact PREPARE_OK query
+// schema its projection must report. columns is nil for commands, whose
+// column_count must be 0.
+type rankingTemplate struct {
+	sql     string
+	columns []byte
+}
+
+// rankingTemplates lists every statement the ranking transactions execute plus
+// the projection schema each query must report. The expected types follow the
+// benchmark DDL in benchmark/tpcc/schema/rmdb_schema.sql: COUNT yields INT32,
+// MIN/SUM keep their input column type, and CHAR(n) columns (including the
+// timestamp columns) are reported as CHAR.
+func rankingTemplates() []rankingTemplate {
+	const (
+		i = wireTypeInt32
+		f = wireTypeFloat32
+		c = wireTypeChar
+	)
+	return []rankingTemplate{
+		{sql: "begin;"},
+		{sql: "commit;"},
+		{sql: "rollback;"},
+		{sql: "abort;"},
+		{sql: "select c_discount, c_last, c_credit, w_tax from customer, warehouse where w_id = 1 and c_w_id = w_id and c_d_id = 1 and c_id = 1;",
+			columns: []byte{f, c, c, f}},
+		{sql: "update district set d_next_o_id = d_next_o_id + 1 where d_id = 1 and d_w_id = 1;"},
+		{sql: "select d_next_o_id, d_tax from district where d_id = 1 and d_w_id = 1;",
+			columns: []byte{i, f}},
+		{sql: "insert into orders values (1, 1, 1, 1, '2026-01-01 00:00:00', 0, 5, 1);"},
+		{sql: "insert into new_orders values (1, 1, 1);"},
+		{sql: "select i_price, i_name, i_data from item where i_id = 1;",
+			columns: []byte{f, c, c}},
+		{sql: "update stock set s_ytd = s_ytd + 1, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 0 where s_i_id = 1 and s_w_id = 1;"},
+		{sql: "select s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 from stock where s_i_id = 1 and s_w_id = 1;",
+			columns: []byte{i, c, c, c, c, c, c, c, c, c, c, c}},
+		{sql: "update stock set s_quantity = s_quantity + 1 where s_i_id = 1 and s_w_id = 1;"},
+		{sql: "update stock set s_quantity = s_quantity - 1 where s_i_id = 1 and s_w_id = 1;"},
+		{sql: "insert into order_line values (1, 1, 1, 1, 1, 1, NULL, 1, 1.00, 'dist');"},
+		{sql: "update orders set o_all_local = 0 where o_id = 1 and o_d_id = 1 and o_w_id = 1;"},
+		{sql: "select c_id, c_first from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
+			columns: []byte{i, c}},
+		{sql: "update warehouse set w_ytd = w_ytd + 1.00 where w_id = 1;"},
+		{sql: "select w_street_1, w_street_2, w_city, w_state, w_zip, w_name from warehouse where w_id = 1;",
+			columns: []byte{c, c, c, c, c, c}},
+		{sql: "update district set d_ytd = d_ytd + 1.00 where d_w_id = 1 and d_id = 1;"},
+		{sql: "select d_street_1, d_street_2, d_city, d_state, d_zip, d_name from district where d_w_id = 1 and d_id = 1;",
+			columns: []byte{c, c, c, c, c, c}},
+		{sql: "update customer set c_balance = c_balance - 1.00, c_ytd_payment = c_ytd_payment + 1.00, c_payment_cnt = c_payment_cnt + 1 where c_w_id = 1 and c_d_id = 1 and c_id = 1;"},
+		{sql: "select c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since from customer where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
+			columns: []byte{c, c, c, c, c, c, c, c, c, c, f, f, f, c}},
+		{sql: "insert into history values (1, 1, 1, 1, 1, '2026-01-01 00:00:00', 1.00, 'payment');"},
+		{sql: "select c_id, c_balance, c_first, c_middle, c_last from customer where c_w_id = 1 and c_d_id = 1 and c_last = 'BARBARBAR' order by c_first, c_id;",
+			columns: []byte{i, f, c, c, c}},
+		{sql: "select c_balance, c_first, c_middle, c_last from customer where c_w_id = 1 and c_d_id = 1 and c_id = 1;",
+			columns: []byte{f, c, c, c}},
+		{sql: "select o_id, o_entry_d, o_carrier_id from orders where o_w_id = 1 and o_d_id = 1 and o_c_id = 1 order by o_id desc limit 1;",
+			columns: []byte{i, c, i}},
+		{sql: "select o_id, o_entry_d, o_carrier_id from orders where o_w_id = 1 and o_d_id = 1 and o_c_id = 1 and o_id = 1;",
+			columns: []byte{i, c, i}},
+		{sql: "select ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d from order_line where ol_w_id = 1 and ol_d_id = 1 and ol_o_id = 1;",
+			columns: []byte{i, i, i, f, c}},
+		{sql: "select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1;",
+			columns: []byte{i}},
+		{sql: "update new_orders set no_o_id = no_o_id where no_w_id = 1 and no_d_id = 1 and no_o_id = 1;"},
+		{sql: "select min(no_o_id) from new_orders where no_w_id = 1 and no_d_id = 1 and no_o_id = 1;",
+			columns: []byte{i}},
+		{sql: "delete from new_orders where no_w_id = 1 and no_d_id = 1 and no_o_id = 1;"},
+		{sql: "select o_c_id from orders where o_id = 1 and o_d_id = 1 and o_w_id = 1;",
+			columns: []byte{i}},
+		{sql: "update orders set o_carrier_id = 1 where o_id = 1 and o_d_id = 1 and o_w_id = 1;"},
+		{sql: "update order_line set ol_delivery_d = '2026-01-01 00:00:00' where ol_o_id = 1 and ol_d_id = 1 and ol_w_id = 1;"},
+		{sql: "select sum(ol_amount) from order_line where ol_o_id = 1 and ol_d_id = 1 and ol_w_id = 1;",
+			columns: []byte{f}},
+		{sql: "update customer set c_balance = c_balance + 1.00, c_delivery_cnt = c_delivery_cnt + 1 where c_id = 1 and c_d_id = 1 and c_w_id = 1;"},
+		{sql: "select d_next_o_id from district where d_id = 1 and d_w_id = 1;",
+			columns: []byte{i}},
+		{sql: "select count(distinct ol_i_id) from order_line, stock where ol_w_id = 1 and ol_d_id = 1 and ol_o_id >= 1 and ol_o_id < 2 and s_w_id = 1 and s_i_id = ol_i_id and s_quantity < 10;",
+			columns: []byte{i}},
 	}
 }

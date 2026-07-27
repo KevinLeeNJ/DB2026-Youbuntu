@@ -31,6 +31,10 @@ THINK_MS=0
 RECONNECT_EACH_TXN=0
 ISOLATION="read-committed"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
+# final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
+# COUNT, integrity and content validation) must fit in one 900 second SQL
+# budget measured from a successful connection.
+LOAD_SQL_BUDGET_SECONDS=900
 
 usage() {
     cat <<EOF
@@ -143,9 +147,65 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# final.md:33,52 require the service port to be owned by the expected rmdb
+# process tree; a successful TCP connect (or a stale listener left behind by
+# another run) is not readiness. `ss` is not guaranteed to be installed, so
+# resolve the listening socket inode through /proc and match it against the file
+# descriptors of the process tree rooted at the server pid.
+listening_socket_inodes() {
+    local hex_port
+    hex_port="$(printf '%04X' "$PORT")"
+    awk -v suffix=":$hex_port" '$4 == "0A" && $2 ~ suffix"$" { print $10 }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u
+}
+
+process_tree_pids() {
+    local root="$1" path pid ppid changed=1
+    local -A tree=()
+    tree[$root]=1
+    while (( changed )); do
+        changed=0
+        for path in /proc/[0-9]*; do
+            pid="${path#/proc/}"
+            [[ -n "${tree[$pid]:-}" ]] && continue
+            ppid="$(sed -e 's/^[0-9]* (.*) //' "$path/stat" 2>/dev/null | cut -d' ' -f2)" || continue
+            if [[ -n "$ppid" && -n "${tree[$ppid]:-}" ]]; then
+                tree[$pid]=1
+                changed=1
+            fi
+        done
+    done
+    printf '%s\n' "${!tree[@]}"
+}
+
+assert_port_owned_by_server() {
+    local root="$1" inodes inode pids pid owner
+    inodes="$(listening_socket_inodes)"
+    if [[ -z "$inodes" ]]; then
+        echo "[benchmark] no process is listening on port $PORT" >&2
+        return 1
+    fi
+    pids="$(process_tree_pids "$root")"
+    for inode in $inodes; do
+        owner=""
+        for pid in $pids; do
+            if readlink /proc/"$pid"/fd/* 2>/dev/null | grep -qx "socket:\[$inode\]"; then
+                owner="$pid"
+                break
+            fi
+        done
+        if [[ -z "$owner" ]]; then
+            echo "[benchmark] port $PORT listening socket (inode $inode) is not owned by the rmdb process tree rooted at pid $root" >&2
+            return 1
+        fi
+    done
+    echo "[benchmark] port $PORT is listened by the rmdb process tree (pid $root)"
+}
+
 wait_port() {
     local timeout="$1"
     "$GO_BINARY" --command wait-ready --port "$PORT" --wait-timeout "${timeout}s"
+    assert_port_owned_by_server "$SERVER_PID"
 }
 
 GO_RECONNECT_ARGS=()
@@ -158,10 +218,17 @@ echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuou
 RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port 30
+load_start=$SECONDS
 "$GO_BINARY" --command load \
     --port "$PORT" --isolation "$ISOLATION" \
     --data-dir "$DATA_DIR" --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
     --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
+load_elapsed=$((SECONDS - load_start))
+echo "[benchmark] load stage (create table + create index + LOAD + COUNT + integrity) took ${load_elapsed}s"
+if (( load_elapsed > LOAD_SQL_BUDGET_SECONDS )); then
+    echo "[benchmark] load stage exceeded the official ${LOAD_SQL_BUDGET_SECONDS}s SQL budget: ${load_elapsed}s" >&2
+    exit 1
+fi
 "$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \

@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -172,17 +174,115 @@ func TestOfficialTerminalHomePairsWorkers(t *testing.T) {
 }
 
 func TestOfficialModeValidation(t *testing.T) {
-	if err := validateBenchmarkMode("official-equivalent", 50, 10, 60, 1); err != nil {
+	official := func(workers, warmup, measure, rounds int, think time.Duration, allow bool) error {
+		return validateBenchmarkMode("official-equivalent", workers, warmup, measure, rounds, think, allow)
+	}
+	if err := official(officialWorkers, officialWarmupSeconds, officialMeasureSeconds, officialWindows, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateBenchmarkMode("official-equivalent", 16, 10, 60, 1); err == nil {
-		t.Fatal("non-official worker count unexpectedly accepted")
+	rejected := map[string]error{
+		"workers": official(16, officialWarmupSeconds, officialMeasureSeconds, officialWindows, 0, false),
+		"warmup":  official(officialWorkers, 10, officialMeasureSeconds, officialWindows, 0, false),
+		"measure": official(officialWorkers, officialWarmupSeconds, 60, officialWindows, 0, false),
+		"rounds":  official(officialWorkers, officialWarmupSeconds, officialMeasureSeconds, 1, 0, false),
+		"think":   official(officialWorkers, officialWarmupSeconds, officialMeasureSeconds, officialWindows, time.Millisecond, false),
 	}
-	if err := validateBenchmarkMode("sqlite-reference", 16, 30, 360, 1); err != nil {
+	for name, err := range rejected {
+		if err == nil {
+			t.Fatalf("non-official %s unexpectedly accepted", name)
+		}
+	}
+	// The escape hatch must be explicit, and it must still reject nonsense.
+	if err := official(16, 10, 60, 1, time.Millisecond, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateBenchmarkMode("local", 16, 30, 360, 1); err == nil {
+	if err := official(16, 10, 0, 1, 0, true); err == nil {
+		t.Fatal("zero measurement window accepted under --allow-nonofficial-timing")
+	}
+	if err := validateBenchmarkMode("sqlite-reference", 16, 30, 360, 1, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBenchmarkMode("local", 16, 30, 360, 1, 0, false); err == nil {
 		t.Fatal("legacy local benchmark mode unexpectedly accepted")
+	}
+}
+
+func TestOfficialTerminalHomeCountMatchesOfficialShape(t *testing.T) {
+	if got := officialTerminalHomeCount(officialWorkers); got != officialTerminalHomes {
+		t.Fatalf("terminal homes for %d clients = %d, want %d", officialWorkers, got, officialTerminalHomes)
+	}
+}
+
+func TestStatementResultKindSeparatesQueriesFromCommands(t *testing.T) {
+	cases := map[string]resultKind{
+		"select count(*) from stock;": resultKindQuery,
+		"  SELECT 1;":                 resultKindQuery,
+		"insert into t values (1);":   resultKindCommand,
+		"update t set a = 1;":         resultKindCommand,
+		"delete from t where a = 1;":  resultKindCommand,
+		"create index t(a);":          resultKindCommand,
+		"load ./t.csv into t;":        resultKindCommand,
+		"commit;":                     resultKindCommand,
+		// final.md:33 lets `show tables;` answer with either terminator.
+		"show tables;": resultKindEither,
+	}
+	for sql, want := range cases {
+		if got := statementResultKind(sql); got != want {
+			t.Errorf("statementResultKind(%q) = %d, want %d", sql, got, want)
+		}
+	}
+}
+
+func TestClientExecRejectsInterchangedResultTerminators(t *testing.T) {
+	// final.md:645: a query may only succeed with RESULT_END and a non-query only
+	// with COMMAND_OK; treating COMMAND_OK as an empty result set would hide a
+	// protocol contract failure.
+	received := make(chan []byte, 1)
+	address := runTestServer(t, testWireFrame(wireTagCommandOK, nil), received)
+	queryClient, err := newClient(address, time.Second, "read-committed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queryClient.close()
+	if _, err := queryClient.exec("select count(*) from stock;"); err == nil ||
+		!strings.Contains(err.Error(), "COMMAND_OK") {
+		t.Fatalf("query answered with COMMAND_OK: error = %v", err)
+	}
+	<-received
+
+	meta := []byte{0, 1, 0, 5, 'v', 'a', 'l', 'u', 'e', 1}
+	response := testWireFrame(wireTagMeta, meta)
+	response = append(response, testWireFrame(wireTagResultEnd, []byte{0, 0, 0, 0, 0, 0, 0, 0})...)
+	commandAddress := runTestServer(t, response, make(chan []byte, 1))
+	commandClient, err := newClient(commandAddress, time.Second, "read-committed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer commandClient.close()
+	if _, err := commandClient.exec("update t set a = 1;"); err == nil ||
+		!strings.Contains(err.Error(), "META") {
+		t.Fatalf("non-query answered with META: error = %v", err)
+	}
+}
+
+func TestOfficialWorkerReportAttributesByCompletionTime(t *testing.T) {
+	// final.md:214 counts the transactions that committed inside the window, so a
+	// transaction that starts in one window and commits in the next belongs to
+	// the later window.
+	report := &officialWorkerReport{warmup: newResult(0), windows: []*result{newResult(150), newResult(150)}}
+	warmupEnd := time.Now()
+	measure := 150 * time.Second
+	if phase, local, window := report.attribute(warmupEnd.Add(-time.Second), warmupEnd, measure); phase != "warmup" || local != report.warmup || window != -1 {
+		t.Fatalf("warmup attribution = (%q, %p, %d)", phase, local, window)
+	}
+	if phase, local, window := report.attribute(warmupEnd.Add(measure-time.Millisecond), warmupEnd, measure); phase != "measure" || local != report.windows[0] || window != 0 {
+		t.Fatalf("first window attribution = (%q, %p, %d)", phase, local, window)
+	}
+	if phase, local, window := report.attribute(warmupEnd.Add(measure), warmupEnd, measure); phase != "measure" || local != report.windows[1] || window != 1 {
+		t.Fatalf("second window attribution = (%q, %p, %d)", phase, local, window)
+	}
+	if _, local, _ := report.attribute(warmupEnd.Add(2*measure), warmupEnd, measure); local != nil {
+		t.Fatal("a completion after the final window was attributed to a window")
 	}
 }
 
@@ -669,6 +769,130 @@ func TestResultDocumentRejectsWrongRoundShape(t *testing.T) {
 	doc := document{Config: config{Rounds: 2, Measure: 10}, Rounds: []*result{newResult(10)}}
 	if err := validateResultDocument(doc); err == nil || !strings.Contains(err.Error(), "rounds") {
 		t.Fatalf("validation error = %v, want round count error", err)
+	}
+}
+
+// scriptedExecutor answers each query with a canned scalar and records the SQL
+// it was asked to run.
+type scriptedExecutor struct {
+	answers    map[string]int64
+	statements []string
+}
+
+func (e *scriptedExecutor) exec(sql string) (string, error) {
+	e.statements = append(e.statements, sql)
+	value, ok := e.answers[sql]
+	if !ok {
+		return "", fmt.Errorf("unexpected SQL %q", sql)
+	}
+	return fmt.Sprintf("+---+\n| n |\n+---+\n| %d |\n+---+\nTotal record(s): 1\n", value), nil
+}
+
+func integrityManifest() datasetManifest {
+	return datasetManifest{Warehouses: 1, Files: map[string]fileRecord{
+		"order_line": {Rows: 300000, Size: 1},
+		"new_orders": {Rows: districtsPerWarehouse * initialNewOrdersPerDistrict, Size: 1},
+	}}
+}
+
+func passingIntegrityAnswers(manifest datasetManifest) map[string]int64 {
+	return map[string]int64{
+		"select sum(o_ol_cnt) from orders;":                            manifest.Files["order_line"].Rows,
+		"select count(*) from stock where s_quantity < 10;":            0,
+		"select count(*) from stock where s_quantity > 100;":           0,
+		"select count(*) from orders where o_ol_cnt < 5;":              0,
+		"select count(*) from orders where o_ol_cnt > 15;":             0,
+		"select count(*) from orders where o_carrier_id = 0;":          manifest.Files["new_orders"].Rows,
+		"select count(*) from order_line where ol_delivery_d is null;": expectedUndeliveredOrderLines(manifest.Warehouses),
+		"select count(*) from stock where s_ytd <> 0.0;":               0,
+		"select count(*) from stock where s_order_cnt <> 0;":           0,
+		"select count(*) from stock where s_remote_cnt <> 0;":          0,
+	}
+}
+
+func TestVerifyLoadIntegrityChecksThePublishedSemantics(t *testing.T) {
+	// final.md:285-292 lists the publicly defined post-load invariants; each must
+	// be issued as its own SQL statement and compared against the exact generated
+	// numbers.
+	manifest := integrityManifest()
+	answers := passingIntegrityAnswers(manifest)
+	executor := &scriptedExecutor{answers: answers}
+	if err := verifyLoadIntegrity(executor, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(executor.statements) != len(answers) {
+		t.Fatalf("integrity validation issued %d statements, want %d", len(executor.statements), len(answers))
+	}
+	for _, sql := range executor.statements {
+		if _, ok := answers[sql]; !ok {
+			t.Errorf("unexpected integrity statement %q", sql)
+		}
+	}
+}
+
+func TestVerifyLoadIntegrityRejectsEveryViolation(t *testing.T) {
+	manifest := integrityManifest()
+	violations := map[string]int64{
+		"select sum(o_ol_cnt) from orders;":                            manifest.Files["order_line"].Rows - 1,
+		"select count(*) from stock where s_quantity < 10;":            1,
+		"select count(*) from stock where s_quantity > 100;":           1,
+		"select count(*) from orders where o_ol_cnt < 5;":              1,
+		"select count(*) from orders where o_ol_cnt > 15;":             1,
+		"select count(*) from orders where o_carrier_id = 0;":          manifest.Files["new_orders"].Rows + 1,
+		"select count(*) from order_line where ol_delivery_d is null;": 0,
+		"select count(*) from stock where s_ytd <> 0.0;":               1,
+		"select count(*) from stock where s_order_cnt <> 0;":           1,
+		"select count(*) from stock where s_remote_cnt <> 0;":          1,
+	}
+	for sql, wrong := range violations {
+		answers := passingIntegrityAnswers(manifest)
+		answers[sql] = wrong
+		err := verifyLoadIntegrity(&scriptedExecutor{answers: answers}, manifest)
+		if err == nil || !strings.Contains(err.Error(), "LOAD integrity mismatch") {
+			t.Errorf("violating %q produced error %v", sql, err)
+		}
+	}
+}
+
+func TestExpectedUndeliveredOrderLinesMatchesGeneratedCSV(t *testing.T) {
+	dir := t.TempDir()
+	if err := generateData(1, dir, 7, true); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(filepath.Join(dir, "order_line.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader := csv.NewReader(file)
+	header, err := reader.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	column := -1
+	for index, name := range header {
+		if name == "ol_delivery_d" {
+			column = index
+		}
+	}
+	if column < 0 {
+		t.Fatal("order_line.csv has no ol_delivery_d column")
+	}
+	empty := int64(0)
+	for {
+		row, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row[column] == "" {
+			empty++
+		}
+	}
+	if want := expectedUndeliveredOrderLines(1); empty != want {
+		t.Fatalf("generated %d order_line rows without a delivery time, expected %d", empty, want)
 	}
 }
 

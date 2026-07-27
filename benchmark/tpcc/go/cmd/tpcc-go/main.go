@@ -25,6 +25,15 @@ const (
 	districtsPerWarehouse = 10
 	initialOrdersPerDist  = 3000
 
+	// Official ranking load shape (final.md:45-47): exactly one 30 second
+	// warmup, three continuous 150 second measurement windows, 50 clients with
+	// no think time, and two clients per terminal home for 25 distinct homes.
+	officialWarmupSeconds  = 30
+	officialMeasureSeconds = 150
+	officialWindows        = 3
+	officialWorkers        = 50
+	officialTerminalHomes  = 25
+
 	wireTagMeta             = 0x01
 	wireTagRow              = 0x02
 	wireTagCommandOK        = 0x10
@@ -136,10 +145,39 @@ func (c *client) connectWithIsolation(isolation string) error {
 	return nil
 }
 
+type resultKind int
+
+const (
+	// resultKindCommand statements may only succeed with an empty COMMAND_OK.
+	resultKindCommand resultKind = iota
+	// resultKindQuery statements may only succeed with META -> ROW* -> RESULT_END.
+	resultKindQuery
+	// resultKindEither covers `show tables;`, which final.md:33 explicitly allows
+	// to answer with COMMAND_OK or with META ... RESULT_END.
+	resultKindEither
+)
+
+// statementResultKind reports which EXEC_STREAM terminator a statement is
+// allowed to use. final.md:645 makes the two terminators non-interchangeable:
+// answering a SELECT with COMMAND_OK (or a DML with META) is a protocol
+// contract failure, not an empty result.
+func statementResultKind(sql string) resultKind {
+	trimmed := strings.ToLower(strings.TrimSpace(sql))
+	switch {
+	case strings.HasPrefix(trimmed, "select"):
+		return resultKindQuery
+	case strings.HasPrefix(trimmed, "show"), strings.HasPrefix(trimmed, "desc"):
+		return resultKindEither
+	default:
+		return resultKindCommand
+	}
+}
+
 func (c *client) exec(sql string) (string, error) {
 	if c.conn == nil {
 		return "", errors.New("rmdb connection is closed")
 	}
+	kind := statementResultKind(sql)
 	deadline := time.Now().Add(c.timeout)
 	if err := c.conn.SetDeadline(deadline); err != nil {
 		return "", err
@@ -159,7 +197,12 @@ func (c *client) exec(sql string) (string, error) {
 	}
 	if tag == wireTagCommandOK {
 		if len(body) != 0 {
+			c.close()
 			return "", errors.New("COMMAND_OK contains a payload")
+		}
+		if kind == resultKindQuery {
+			c.close()
+			return "", fmt.Errorf("query answered with COMMAND_OK instead of META ... RESULT_END: %s", sql)
 		}
 		return "", nil
 	}
@@ -173,6 +216,10 @@ func (c *client) exec(sql string) (string, error) {
 	}
 	if tag != wireTagMeta {
 		return "", errors.New("unexpected RMDB wire response")
+	}
+	if kind == resultKindCommand {
+		c.close()
+		return "", fmt.Errorf("non-query answered with META instead of COMMAND_OK: %s", sql)
 	}
 	columns, err := decodeMeta(body)
 	if err != nil {
@@ -1309,7 +1356,12 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 		opIndex += 4
 	}
 	if len(stage2) == 0 {
-		stage2 = append(stage2, "select 0;")
+		// Every district of this warehouse had an empty new_orders queue. Re-read
+		// one prepared MIN instead of an unprepared placeholder such as
+		// `select 0;`: an unprepared template fails the whole batch and
+		// invalidates the measurement window, while this keeps Delivery on its
+		// official three batch boundaries (final.md:746).
+		stage2 = append(stage2, fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = 1;", ctx.wID))
 	}
 	result, err = rankingBatch(c, stage2...)
 	if err != nil {
@@ -1451,28 +1503,58 @@ func chooseTxn(rng *rand.Rand) string {
 	return txnTypeForBucket(rng.Intn(100))
 }
 
+// officialTerminalHome maps a client index onto its terminal home warehouse:
+// two clients per home over officialTerminalHomes homes (final.md:47).
+func officialTerminalHome(workerID int) int { return (workerID/2)%officialTerminalHomes + 1 }
+
+// officialTerminalHomeCount reports how many distinct terminal homes a client
+// count actually uses under the official pairing policy.
+func officialTerminalHomeCount(workers int) int {
+	homes := make(map[int]struct{}, workers)
+	for workerID := 0; workerID < workers; workerID++ {
+		homes[officialTerminalHome(workerID)] = struct{}{}
+	}
+	return len(homes)
+}
+
 func chooseContext(p profile, workerID int, policy string, rng *rand.Rand) txnContext {
 	wID := workerID%p.warehouses + 1
 	if policy == "random-per-txn" {
 		wID = rng.Intn(p.warehouses) + 1
 	} else if policy == "official-terminal-home" {
-		// The official shape has two clients per terminal home and 25 homes.
 		// The caller validates that this mode has enough warehouses.
-		wID = (workerID/2)%25 + 1
+		wID = officialTerminalHome(workerID)
 	}
 	return txnContext{wID: wID, dID: rng.Intn(p.districtsPerWarehouse) + 1, official: policy == "official-terminal-home", profile: p}
 }
 
-func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int) error {
+func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int, think time.Duration, allowNonOfficialTiming bool) error {
 	switch mode {
 	case "sqlite-reference", "rmdb-diagnostic":
 		return nil
 	case "official-equivalent":
-		if workers != 50 {
-			return errors.New("official-equivalent requires workers=50; warmup, measure, and rounds may be overridden for smoke runs")
+		if allowNonOfficialTiming {
+			if workers < 1 || warmup < 0 || measure < 1 || rounds < 1 || think < 0 {
+				return errors.New("official-equivalent requires positive workers/measure/rounds and non-negative warmup/think")
+			}
+			return nil
 		}
-		if warmup < 0 || measure < 1 || rounds < 1 {
-			return errors.New("official-equivalent requires non-negative warmup, positive measure, and positive rounds")
+		// The ranking metric is only comparable to the official one when the load
+		// shape is identical, so refuse to start instead of publishing a number
+		// produced by a different shape. --allow-nonofficial-timing opts out.
+		if workers != officialWorkers {
+			return fmt.Errorf("official-equivalent requires workers=%d, got %d (use --allow-nonofficial-timing for smoke runs)",
+				officialWorkers, workers)
+		}
+		if warmup != officialWarmupSeconds || measure != officialMeasureSeconds || rounds != officialWindows {
+			return fmt.Errorf("official-equivalent requires warmup=%d, measure=%d, rounds=%d, got %d/%d/%d (use --allow-nonofficial-timing for smoke runs)",
+				officialWarmupSeconds, officialMeasureSeconds, officialWindows, warmup, measure, rounds)
+		}
+		if think != 0 {
+			return fmt.Errorf("official-equivalent is a saturated load and requires think=0, got %s (use --allow-nonofficial-timing for smoke runs)", think)
+		}
+		if homes := officialTerminalHomeCount(workers); homes != officialTerminalHomes {
+			return fmt.Errorf("official-equivalent requires %d distinct terminal home warehouses, got %d", officialTerminalHomes, homes)
 		}
 		return nil
 	default:
@@ -1657,6 +1739,22 @@ type officialWorkerReport struct {
 	err     error
 }
 
+// attribute maps a transaction completion instant onto the bucket that owns it.
+// The official rate counts the NewOrder transactions whose COMMIT succeeded
+// inside the window (final.md:214), so attribution follows the completion time
+// and not the time the transaction started. A transaction that finishes after
+// the last window belongs to no bucket and returns a nil result.
+func (r *officialWorkerReport) attribute(finish, warmupEnd time.Time, measure time.Duration) (string, *result, int) {
+	if finish.Before(warmupEnd) {
+		return "warmup", r.warmup, -1
+	}
+	window := int(finish.Sub(warmupEnd) / measure)
+	if window >= len(r.windows) {
+		return "", nil, window
+	}
+	return "measure", r.windows[window], window
+}
+
 func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time, measureSeconds int, think time.Duration, reconnectEachTxn bool, stats *liveStats, stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	local := newResult(measureSeconds)
@@ -1805,24 +1903,15 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 		default:
 		}
 		now := time.Now()
-		phase := "warmup"
-		local := report.warmup
-		phaseStats := stats[0]
-		if !now.Before(warmupEnd) {
-			if !now.Before(measureEnd) {
-				return
-			}
-			phase = "measure"
-			window := int(now.Sub(warmupEnd) / measure)
-			local = report.windows[window]
-			phaseStats = stats[window+1]
+		if !now.Before(measureEnd) {
+			return
 		}
 
 		txnType := chooseTxn(rng)
 		ctx := chooseContext(p, workerID, "official-terminal-home", rng)
 		attemptSeed := rng.Int63()
 		phaseEnd := measureEnd
-		if phase == "warmup" {
+		if now.Before(warmupEnd) {
 			phaseEnd = warmupEnd
 		}
 		start := time.Now()
@@ -1843,7 +1932,19 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, warmupEnd tim
 		if !completed {
 			continue
 		}
-		latency := float64(time.Since(start).Microseconds()) / 1000.0
+		finish := time.Now()
+		latency := float64(finish.Sub(start).Microseconds()) / 1000.0
+		phase, local, window := report.attribute(finish, warmupEnd, measure)
+		if local == nil {
+			// Completed after the final window: it belongs to no measurement
+			// interval. A backend error still invalidates the run.
+			if err != nil && !errors.Is(err, errInvalidItem) && !errors.Is(err, errAbort) {
+				c.rollback()
+				report.err = fmt.Errorf("worker %d %s transaction: %w", workerID, txnType, err)
+			}
+			return
+		}
+		phaseStats := stats[window+1]
 
 		if err == nil {
 			local.record(phase, txnType, "commit", latency, "")
@@ -2365,18 +2466,37 @@ func main() {
 	oraclePrefix := flag.Int("oracle-id-prefix", 0, "positive per-run crash oracle ID prefix")
 	sqlOps := flag.Int("sql-ops", 100, "minimum mixed-sql operations before publishing readiness")
 	sqlReadyFile := flag.String("sql-ready-file", "", "readiness file for mixed-sql crash workloads")
+	allowNonOfficialTiming := flag.Bool("allow-nonofficial-timing", false,
+		fmt.Sprintf("allow official-equivalent runs that deviate from workers=%d, warmup=%d, measure=%d, rounds=%d, think=0; results are not comparable to the official ranking",
+			officialWorkers, officialWarmupSeconds, officialMeasureSeconds, officialWindows))
+	allowLegacyPrepareFlag := flag.Bool("allow-legacy-prepare", false,
+		"accept the legacy PREPARE_OK layout that echoes parameter types; the official evaluator does not")
 	flag.Parse()
+	allowLegacyPrepare = *allowLegacyPrepareFlag
 	if *backend != "rmdb" && *backend != "sqlite" {
 		fmt.Fprintln(os.Stderr, "--backend must be rmdb or sqlite")
 		os.Exit(2)
 	}
 	if *command == "run" {
-		if err := validateBenchmarkMode(*mode, *workers, *warmup, *measure, *rounds); err != nil {
+		if err := validateBenchmarkMode(*mode, *workers, *warmup, *measure, *rounds, *think, *allowNonOfficialTiming); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 		if *mode == "official-equivalent" && *reconnectEachTxn {
 			fmt.Fprintln(os.Stderr, "official-equivalent does not allow --reconnect-each-txn")
+			os.Exit(2)
+		}
+		if *mode == "official-equivalent" && *allowNonOfficialTiming {
+			fmt.Fprintf(os.Stderr, "[warning] --allow-nonofficial-timing: workers=%d warmup=%d measure=%d rounds=%d think=%s deviate from the official %d/%d/%d/%d/0 shape; this result does not predict the official ranking\n",
+				*workers, *warmup, *measure, *rounds, *think, officialWorkers, officialWarmupSeconds, officialMeasureSeconds, officialWindows)
+		}
+		if *backend == "rmdb" && *oracleAck != "" {
+			// Every rmdb `run` uses the prepared ranking client, whose transactions
+			// submit `commit;` inside their final EXEC_BATCH and never route
+			// through a client-side commit hook, so nothing would ever be
+			// appended to the ACK file. Fail instead of pretending the crash
+			// oracle covers the TPC-C load.
+			fmt.Fprintln(os.Stderr, "--oracle-ack-file is not supported by the ranking backend: ranking transactions commit inside EXEC_BATCH, so no ACK can be recorded; use --command mixed-sql for crash oracle coverage")
 			os.Exit(2)
 		}
 	}
