@@ -213,6 +213,18 @@ if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
     GO_RECONNECT_ARGS=(--reconnect-each-txn)
 fi
 
+# The official ranking shape is 50 workers, one 30s warmup and 3 continuous 150s
+# windows (final.md:45-47).  Shorter local runs are useful as smoke tests, but
+# their NewOrder/min must never be mistaken for a ranking figure, so make the
+# deviation loud instead of letting tpcc-go reject the run outright.
+GO_TIMING_ARGS=()
+if [[ "$WORKERS" != "50" || "$WARMUP" != "30" || "$MEASURE" != "150" || "$ROUNDS" != "3" || "$THINK_MS" != "0" ]]; then
+    echo "[benchmark] WARNING: ${WORKERS} workers / ${WARMUP}s warmup / ${ROUNDS}x${MEASURE}s windows / think=${THINK_MS}ms" >&2
+    echo "[benchmark]          deviates from the official 50 / 30s / 3x150s / 0ms shape." >&2
+    echo "[benchmark]          This is a SMOKE RUN; its NewOrder/min does not predict the official ranking." >&2
+    GO_TIMING_ARGS=(--allow-nonofficial-timing)
+fi
+
 rm -rf "$DB_DIR"
 echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
 RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
@@ -232,7 +244,7 @@ fi
 "$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
-    --think "${THINK_MS}ms" --json-out "$JSON_OUT" "${GO_RECONNECT_ARGS[@]}"
+    --think "${THINK_MS}ms" --json-out "$JSON_OUT" "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
 "$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --consistency-stage online-official-equivalent --result-json "$JSON_OUT"
