@@ -25,7 +25,7 @@ PROGRESS_INTERVAL=5
 DATA_DIR="$ROOT_DIR/benchmark/tpcc/data"
 JSON_OUT="$ROOT_DIR/benchmark/tpcc/result.json"
 RMDB_DB_DIR=""
-RESTART_TIMEOUT=600
+RESTART_TIMEOUT=90
 REGENERATE_DATA=0
 THINK_MS=0
 RECONNECT_EACH_TXN=0
@@ -47,7 +47,7 @@ Usage: $0 [options]
   --data-dir PATH          CSV data directory
   --json-out PATH          result.json path
   --rmdb-db-dir PATH       RMDB directory used to resolve CSV load paths
-  --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 600)
+  --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 90)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
   --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
@@ -147,7 +147,7 @@ fi
 
 rm -rf "$DB_DIR" "$JSON_OUT"
 echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
-"$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port 30
 "$GO_BINARY" --command load \
@@ -158,11 +158,13 @@ wait_port 30
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
     --think "${THINK_MS}ms" --json-out "$JSON_OUT" "${GO_RECONNECT_ARGS[@]}"
+"$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
+    --consistency-stage online-official-equivalent --result-json "$JSON_OUT"
 echo "[benchmark] official-equivalent: SIGKILL and recovery check"
 kill -KILL "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
-"$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port "$RESTART_TIMEOUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \

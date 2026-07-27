@@ -352,6 +352,28 @@ TEST(ParserTest, SelectStmtUsesSelectItemsAsSingleProjectionContract) {
     EXPECT_EQ(select->limit, 5);
 }
 
+TEST(ParserTest, ParsesCountDistinctColumnAndParenthesizedColumn) {
+    for (const auto& sql : {"select count(distinct id) from tb;", "select count(distinct (tb.id)) from tb;"}) {
+        auto parsed = parse_ok(sql);
+        const auto* select = as_node<ast::SelectStmt>(parsed);
+        ASSERT_EQ(select->select_items.size(), 1);
+        const auto* aggregate = dynamic_cast<const ast::AggExpr*>(select->select_items[0]->expr.get());
+        ASSERT_NE(aggregate, nullptr);
+        EXPECT_EQ(aggregate->func, ast::AGG_COUNT);
+        EXPECT_FALSE(aggregate->is_star);
+        EXPECT_TRUE(aggregate->is_distinct);
+        ASSERT_NE(aggregate->col, nullptr);
+        EXPECT_EQ(aggregate->col->tab_name, std::string(sql).find("tb.id") == std::string::npos ? "" : "tb");
+        EXPECT_EQ(aggregate->col->col_name, "id");
+    }
+}
+
+TEST(ParserTest, RejectsUnsupportedDistinctAggregateForms) {
+    expect_parse_error("select count(distinct *) from tb;");
+    expect_parse_error("select count(distinct id, score) from tb;");
+    expect_parse_error("select sum(distinct score) from tb;");
+}
+
 TEST(ParserTest, UsesBinaryExprForWhereAndHavingExprForHavingConditions) {
     auto where_parsed = parse_ok("select * from tb where a = 1 and b = c;");
     auto where_select = as_node<ast::SelectStmt>(where_parsed);

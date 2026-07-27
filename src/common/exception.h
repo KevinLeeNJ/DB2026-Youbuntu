@@ -1,4 +1,5 @@
 /* Copyright (c) 2023 Renmin University of China
+   Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -44,7 +45,7 @@ enum class ExceptionType {
     EXECUTION = 12,
 };
 
-extern std::atomic<bool> global_disable_execution_exception_print;
+inline std::atomic<bool> global_disable_execution_exception_print{false};
 
 class Exception : public std::runtime_error {
 public:

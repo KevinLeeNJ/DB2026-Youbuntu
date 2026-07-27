@@ -99,6 +99,7 @@ inline CompOp swap_comp_op(CompOp op) {
 struct AggExpr {
     AggType type = AggType::COUNT;
     bool is_star = false;
+    bool is_distinct = false;
     TabCol col;
     std::string display_name;
 };

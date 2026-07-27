@@ -40,11 +40,13 @@ QueryExpr make_col_expr(const std::string& col_name) {
     return expr;
 }
 
-QueryExpr make_agg_expr(AggType type, const std::string& col_name, const std::string& display_name) {
+QueryExpr make_agg_expr(AggType type, const std::string& col_name, const std::string& display_name,
+                        bool is_distinct = false) {
     QueryExpr expr;
     expr.type = QueryExprType::AGGREGATE;
     expr.agg.type = type;
     expr.agg.is_star = false;
+    expr.agg.is_distinct = is_distinct;
     expr.agg.col = {.tab_name = "grade", .col_name = col_name};
     expr.agg.display_name = display_name;
     expr.display_name = display_name;
@@ -288,6 +290,47 @@ TEST_F(PlannerAggregateTest, generate_select_plan_builds_aggregate_projection_sh
     ASSERT_EQ(aggregate->agg_exprs_.size(), 2);
     EXPECT_EQ(aggregate->agg_exprs_[0].display_name, "MAX(score)");
     EXPECT_EQ(aggregate->agg_exprs_[1].display_name, "COUNT(*)");
+}
+
+TEST_F(PlannerAggregateTest, countAndCountDistinctUseSeparateAggregateStatesAndCacheShapes) {
+    auto query = make_aggregate_query(false, false);
+    query->group_by_cols.clear();
+    query->having_conds.clear();
+    query->select_items.clear();
+    query->output_names.clear();
+
+    SelectItem count_item;
+    count_item.expr = make_agg_expr(AggType::COUNT, "score", "COUNT(score)");
+    count_item.output_name = "COUNT(score)";
+    query->select_items.push_back(count_item);
+    query->output_names.push_back(count_item.output_name);
+
+    SelectItem distinct_item;
+    distinct_item.expr = make_agg_expr(AggType::COUNT, "score", "COUNT(DISTINCT score)", true);
+    distinct_item.output_name = "COUNT(DISTINCT score)";
+    query->select_items.push_back(distinct_item);
+    query->output_names.push_back(distinct_item.output_name);
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+    ASSERT_NE(plan, nullptr);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
+    ASSERT_EQ(aggregate->agg_exprs_.size(), 2);
+    EXPECT_FALSE(aggregate->agg_exprs_[0].is_distinct);
+    EXPECT_TRUE(aggregate->agg_exprs_[1].is_distinct);
+
+    auto normal_shape = make_aggregate_query(false, false);
+    normal_shape->group_by_cols.clear();
+    normal_shape->having_conds.clear();
+    normal_shape->select_items.clear();
+    normal_shape->select_items.push_back(count_item);
+    auto distinct_shape = make_aggregate_query(false, false);
+    distinct_shape->group_by_cols.clear();
+    distinct_shape->having_conds.clear();
+    distinct_shape->select_items.clear();
+    distinct_shape->select_items.push_back(distinct_item);
+    EXPECT_NE(planner_.make_physical_plan_cache_key(*normal_shape, 0),
+              planner_.make_physical_plan_cache_key(*distinct_shape, 0));
 }
 
 TEST_F(PlannerAggregateTest, generate_select_plan_pushes_limit_into_sort_over_projection_and_aggregate) {

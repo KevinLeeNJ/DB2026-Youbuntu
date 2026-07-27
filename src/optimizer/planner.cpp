@@ -74,8 +74,8 @@ std::optional<PointAccessPath> find_point_access_path(SmManager* sm_manager, con
 }
 
 bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
-    return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.display_name == rhs.display_name &&
-           (lhs.is_star || same_tab_col(lhs.col, rhs.col));
+    return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.is_distinct == rhs.is_distinct &&
+           lhs.display_name == rhs.display_name && (lhs.is_star || same_tab_col(lhs.col, rhs.col));
 }
 
 ScanPlan* find_order_preserving_scan(Plan* plan) {
@@ -145,6 +145,7 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return false;
     case QueryExprType::AGGREGATE:
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
+               lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
     }
     return false;
@@ -238,6 +239,7 @@ void append_query_expr_shape(std::string& key, const QueryExpr& expr) {
     case QueryExprType::AGGREGATE:
         append_cache_key_part(key, static_cast<int>(expr.agg.type));
         append_cache_key_part(key, expr.agg.is_star);
+        append_cache_key_part(key, expr.agg.is_distinct);
         if (!expr.agg.is_star) {
             append_tab_col_shape(key, expr.agg.col);
         }

@@ -52,6 +52,7 @@ const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::ke
     {"HAVING", TokenType::HAVING},
     {"UNION", TokenType::UNION},
     {"COUNT", TokenType::COUNT},
+    {"DISTINCT", TokenType::DISTINCT},
     {"SUM", TokenType::SUM},
     {"AVG", TokenType::AVG},
     {"MIN", TokenType::MIN},

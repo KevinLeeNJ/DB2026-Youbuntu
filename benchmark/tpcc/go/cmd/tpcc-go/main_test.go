@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -26,19 +28,41 @@ func runTestServer(t *testing.T, response []byte, received chan<- []byte) string
 			return
 		}
 		defer conn.Close()
-		buffer := make([]byte, 4096)
-		n, err := conn.Read(buffer)
-		if err == nil {
-			received <- buffer[:n]
+		handshake := make([]byte, 8)
+		if _, err := io.ReadFull(conn, handshake); err != nil {
+			return
 		}
+		_, _ = conn.Write(handshake)
+		header := make([]byte, 8)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return
+		}
+		length := binary.BigEndian.Uint32(header[:4])
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return
+		}
+		received <- payload
 		_, _ = conn.Write(response)
 	}()
 	return listener.Addr().String()
 }
 
-func TestClientExecUsesNulProtocol(t *testing.T) {
+func testWireFrame(tag byte, payload []byte) []byte {
+	frame := make([]byte, 8, 8+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	frame[4] = tag
+	return append(frame, payload...)
+}
+
+func TestClientExecUsesWireProtocol(t *testing.T) {
 	received := make(chan []byte, 1)
-	address := runTestServer(t, []byte("OK\n\x00"), received)
+	meta := []byte{0, 1, 0, 5, 'v', 'a', 'l', 'u', 'e', 1}
+	row := []byte{1, 0, 0, 0, 42}
+	response := testWireFrame(0x01, meta)
+	response = append(response, testWireFrame(0x02, row)...)
+	response = append(response, testWireFrame(0x11, []byte{0, 0, 0, 0, 0, 0, 0, 1})...)
+	address := runTestServer(t, response, received)
 	client, err := newClient(address, time.Second, "read-committed")
 	if err != nil {
 		t.Fatal(err)
@@ -48,17 +72,18 @@ func TestClientExecUsesNulProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text != "OK" {
-		t.Fatalf("response = %q, want OK", text)
+	if !strings.Contains(text, "42") {
+		t.Fatalf("response = %q, want row 42", text)
 	}
-	if got := string(<-received); got != "select 1;\x00" {
+	if got := string(<-received); got != "select 1;" {
 		t.Fatalf("request = %q", got)
 	}
 }
 
 func TestClientExecClassifiesAbort(t *testing.T) {
 	received := make(chan []byte, 1)
-	address := runTestServer(t, []byte("abort\n\x00"), received)
+	response := testWireFrame(0x12, []byte("abort"))
+	address := runTestServer(t, response, received)
 	client, err := newClient(address, time.Second, "read-committed")
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +91,39 @@ func TestClientExecClassifiesAbort(t *testing.T) {
 	defer client.close()
 	if _, err := client.exec("commit;"); err != errAbort {
 		t.Fatalf("error = %v, want errAbort", err)
+	}
+}
+
+func TestClientRejectsUnknownWireResponseTag(t *testing.T) {
+	received := make(chan []byte, 1)
+	address := runTestServer(t, testWireFrame(0x7f, nil), received)
+	client, err := newClient(address, time.Second, "read-committed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.close()
+	if _, err := client.exec("select 1;"); err == nil || !strings.Contains(err.Error(), "invalid RMDB wire frame") {
+		t.Fatalf("error = %v, want invalid frame error", err)
+	}
+}
+
+func TestClientDoesNotSendRollbackAfterServerAutoAbort(t *testing.T) {
+	received := make(chan []byte, 1)
+	address := runTestServer(t, testWireFrame(wireTagError, []byte("statement failed")), received)
+	client, err := newClient(address, time.Second, "read-committed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.close()
+	if _, err := client.exec("update t set value = 1;"); err == nil {
+		t.Fatal("exec unexpectedly succeeded")
+	}
+	if !client.autoAborted {
+		t.Fatal("client did not record server-side AUTO_ABORT")
+	}
+	client.rollback()
+	if client.autoAborted {
+		t.Fatal("rollback did not clear AUTO_ABORT state")
 	}
 }
 
@@ -228,11 +286,11 @@ func tpccSchemaPath(name string) string {
 
 func TestWaitForReadyExecutesShowTables(t *testing.T) {
 	received := make(chan []byte, 1)
-	address := runTestServer(t, []byte("Total record(s): 0\n\x00"), received)
+	address := runTestServer(t, testWireFrame(0x10, nil), received)
 	if err := waitForReady(address, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(<-received); got != "show tables;\x00" {
+	if got := string(<-received); got != "show tables;" {
 		t.Fatalf("readiness request = %q", got)
 	}
 }
@@ -465,6 +523,46 @@ func TestSQLiteBackendRoundTrip(t *testing.T) {
 	}
 	if text != "7|ok\n" {
 		t.Fatalf("SQLite result = %q, want %q", text, "7|ok\n")
+	}
+}
+
+func TestStockLevelCountQueryUsesServerDistinct(t *testing.T) {
+	query := stockLevelCountQuery(2, 3, 100, 17, false)
+	if !strings.Contains(strings.ToLower(query), "count(distinct ol_i_id)") {
+		t.Fatalf("query = %q, want SQL COUNT(DISTINCT)", query)
+	}
+	if strings.Contains(strings.ToLower(query), "select ol_i_id") {
+		t.Fatalf("query = %q, unexpectedly selects rows for client-side deduplication", query)
+	}
+	parenthesized := stockLevelCountQuery(2, 3, 100, 17, true)
+	if !strings.Contains(strings.ToLower(parenthesized), "count(distinct (ol_i_id))") {
+		t.Fatalf("parenthesized query = %q, want COUNT(DISTINCT (col))", parenthesized)
+	}
+}
+
+func TestVerifyBenchmarkFeaturesUsesFormalDistinctAndRollback(t *testing.T) {
+	backend, err := newSQLiteBackend(filepath.Join(t.TempDir(), "tpcc.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.close()
+	if err := backend.execFile(tpccSchemaPath("sqlite_schema.sql")); err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		"insert into warehouse values (1, 'w', 's1', 's2', 'c', 'ST', '000000001', 0.1, 100.0);",
+		"insert into district values (1, 1, 'd', 's1', 's2', 'c', 'ST', '000000001', 0.1, 100.0, 10);",
+		"insert into order_line values (1, 1, 1, 1, 7, 1, '2026-01-01 00:00:00', 1, 1.0, 'dist');",
+		"insert into order_line values (2, 1, 1, 1, 7, 1, '2026-01-01 00:00:00', 1, 1.0, 'dist');",
+		"insert into stock values (7, 1, 5, 'd', 'd', 'd', 'd', 'd', 'd', 'd', 'd', 'd', 'd', 0.0, 0, 0, 'data');",
+	}
+	for _, statement := range statements {
+		if _, err := backend.exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := verifyBenchmarkFeatures(backend, profile{warehouses: 1}); err != nil {
+		t.Fatal(err)
 	}
 }
 

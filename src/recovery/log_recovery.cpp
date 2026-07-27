@@ -18,6 +18,8 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_set>
 #include <vector>
 
+#include "minilog.h"
+
 namespace {
 
 std::vector<char> MakeRecoveryIndexKey(const IndexMeta& index, const char* record_data) {
@@ -259,13 +261,21 @@ void RecoveryManager::undo() {
     }
     reset_touched_tuple_meta();
     repair_touched_file_headers();
-    // Concurrent benchmark DML can leave an index tree structurally unusable
-    // even though the table records are recoverable. Incremental repair would
-    // traverse that tree and may assert before its exception fallback runs.
-    // Rebuild every touched index from the recovered tables instead; the no-DML
-    // path above remains incremental-free and fast.
+    rebuild_touched_file_headers();
+    // Repair only keys named by the WAL. Rebuilding every index from every heap
+    // row makes recovery proportional to the whole database even when the
+    // crash affected a handful of records (the official 50-warehouse data set
+    // is several GiB). The repair is idempotent and preserves the existing
+    // B+tree topology; a structural failure still falls back to the expensive
+    // full rebuild path.
     if (!touched_rids_.empty()) {
-        rebuild_indexes();
+        FaultInjector::Point("mid_index_rebuild");
+        try {
+            repair_touched_indexes();
+        } catch (const std::exception& error) {
+            LOG_WARN("incremental recovery index repair failed; rebuilding indexes: %s", error.what());
+            rebuild_indexes();
+        }
     }
     if (!sm_manager_->flush_recovery_pages(touched_tables_)) {
         // Recovery results are not durable. Keep the complete WAL and refuse
@@ -290,6 +300,15 @@ void RecoveryManager::repair_touched_file_headers() {
             touched_pages.push_back(rid.page_no);
         }
         file_it->second->repair_file_header_for_pages(touched_pages);
+    }
+}
+
+void RecoveryManager::rebuild_touched_file_headers() {
+    for (const auto& table_name : touched_tables_) {
+        auto file_it = sm_manager_->fhs_.find(table_name);
+        if (file_it != sm_manager_->fhs_.end()) {
+            file_it->second->rebuild_file_header_from_pages();
+        }
     }
 }
 
@@ -335,6 +354,27 @@ void RecoveryManager::repair_touched_indexes() {
     // Remove every old/new key mentioned by recovered DML for the affected
     // RID, then install exactly the final live tuple key. This is idempotent
     // and repairs both a missing index write and a stale index entry.
+    std::unordered_set<std::string> indexes_to_rebuild;
+    for (const auto& [index_name, handle] : sm_manager_->ihs_) {
+        if (!handle->validate_structure()) {
+            LOG_WARN("recovery found structurally inconsistent index %s", index_name.c_str());
+            indexes_to_rebuild.insert(index_name);
+        }
+    }
+
+    auto repair_index = [&](const std::string& table_name, const IndexMeta& index, const auto& repair) {
+        const auto index_name = sm_manager_->get_ix_manager()->get_index_name(table_name, index.cols);
+        if (indexes_to_rebuild.count(index_name) != 0) {
+            return;
+        }
+        try {
+            repair();
+        } catch (const std::exception& error) {
+            LOG_WARN("recovery found structurally inconsistent index %s: %s", index_name.c_str(), error.what());
+            indexes_to_rebuild.insert(index_name);
+        }
+    };
+
     for (const auto lsn : log_order_) {
         auto it = log_records_.find(lsn);
         if (it == log_records_.end()) {
@@ -347,7 +387,9 @@ void RecoveryManager::repair_touched_indexes() {
             if (sm_manager_->db_.is_table(log.table_name_)) {
                 const auto& tab = sm_manager_->db_.get_table(log.table_name_);
                 for (const auto& index : tab.indexes) {
-                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.insert_value_, log.rid_);
+                    repair_index(log.table_name_, index, [&] {
+                        DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.insert_value_, log.rid_);
+                    });
                 }
             }
             break;
@@ -357,7 +399,9 @@ void RecoveryManager::repair_touched_indexes() {
             if (sm_manager_->db_.is_table(log.table_name_)) {
                 const auto& tab = sm_manager_->db_.get_table(log.table_name_);
                 for (const auto& index : tab.indexes) {
-                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.delete_value_, log.rid_);
+                    repair_index(log.table_name_, index, [&] {
+                        DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.delete_value_, log.rid_);
+                    });
                 }
             }
             break;
@@ -367,8 +411,10 @@ void RecoveryManager::repair_touched_indexes() {
             if (sm_manager_->db_.is_table(log.table_name_)) {
                 const auto& tab = sm_manager_->db_.get_table(log.table_name_);
                 for (const auto& index : tab.indexes) {
-                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.old_value_, log.rid_);
-                    DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.new_value_, log.rid_);
+                    repair_index(log.table_name_, index, [&] {
+                        DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.old_value_, log.rid_);
+                        DeleteRecoveryIndexEntry(sm_manager_, log.table_name_, index, log.new_value_, log.rid_);
+                    });
                 }
             }
             break;
@@ -394,9 +440,14 @@ void RecoveryManager::repair_touched_indexes() {
             }
             auto record = file_it->second->get_record(rid, nullptr);
             for (const auto& index : table.indexes) {
-                InsertRecoveryIndexEntry(sm_manager_, table_name, index, *record, rid);
+                repair_index(table_name, index,
+                             [&] { InsertRecoveryIndexEntry(sm_manager_, table_name, index, *record, rid); });
             }
         }
+    }
+
+    if (!indexes_to_rebuild.empty()) {
+        sm_manager_->rebuild_indexes(indexes_to_rebuild);
     }
 }
 

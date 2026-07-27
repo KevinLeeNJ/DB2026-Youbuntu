@@ -225,7 +225,9 @@ public:
                 break;
             }
         }
-        assert(rid_idx < page_hdr->num_key);
+        if (rid_idx >= page_hdr->num_key) {
+            throw InternalError("index parent does not reference child");
+        }
         return rid_idx;
     }
 };
@@ -335,9 +337,16 @@ public:
     // than one RID. The rid is valid only for the Unique result.
     UniqueLookupResult lookup_unique(const char* key) const;
 
+    // Validate persisted parent/child relationships, key ordering, and the
+    // complete leaf chain before crash recovery attempts incremental repair.
+    bool validate_structure() const;
+
     // Rebuild the root cache and upper-level residency after recovery has
     // repaired or rebuilt the on-disk index structure.
-    void refresh_page_residency();
+    // Refresh the root cache and, by default, the optional internal-page
+    // residency cache. Database startup can request root-only refresh to
+    // avoid walking every leaf of a large index.
+    void refresh_page_residency(bool include_internal = true);
 
     Iid leaf_end() const;
 
@@ -356,8 +365,8 @@ private:
     void remember_append_hint(const char* key, page_id_t page_no) const;
 
     // Root pages are shared by every lookup and are cheap to retain. Keep the
-    // cache enabled by default, while allowing deployments with many open
-    // indexes to opt out explicitly.
+    // historical internal-cache default for explicit refreshes; startup uses
+    // refresh_page_residency(false) when it only needs root pages.
     static bool root_cache_enabled() {
         static const bool enabled = [] {
             const char* value = std::getenv("ENABLE_INDEX_ROOT_CACHE");

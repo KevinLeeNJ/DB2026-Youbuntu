@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <unordered_set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -56,6 +57,7 @@ private:
     struct AggregateSpec {
         LocalAggType type = LocalAggType::COUNT;
         bool is_star = false;
+        bool is_distinct = false;
         TabCol col;
         std::string output_name;
         ColType input_type = TYPE_INT;
@@ -69,6 +71,7 @@ private:
         float float_sum = 0.0f;
         bool has_value = false;
         CellValue value;
+        std::unordered_set<CellValue, CellValueHash> distinct_values;
     };
 
     struct GroupState {
@@ -239,9 +242,10 @@ private:
         AggregateSpec spec;
         spec.type = normalize_agg_type(static_cast<int>(agg_expr.type));
         spec.is_star = agg_expr.is_star;
+        spec.is_distinct = agg_expr.is_distinct;
         spec.col = agg_expr.col;
         spec.output_name = agg_expr.display_name;
-        if (spec.type == LocalAggType::COUNT) {
+        if (spec.type == LocalAggType::COUNT && !spec.is_distinct) {
             spec.input_type = TYPE_INT;
             spec.input_len = static_cast<int>(sizeof(int));
         } else {
@@ -301,8 +305,8 @@ private:
                 operand.index = i;
                 return operand;
             }
-            if (agg.is_star == expr.agg.is_star && agg.col.tab_name == expr.agg.col.tab_name &&
-                agg.col.col_name == expr.agg.col.col_name &&
+            if (agg.is_star == expr.agg.is_star && agg.is_distinct == expr.agg.is_distinct &&
+                agg.col.tab_name == expr.agg.col.tab_name && agg.col.col_name == expr.agg.col.col_name &&
                 static_cast<int>(agg.type) == static_cast<int>(normalize_agg_type(static_cast<int>(expr.agg.type)))) {
                 operand.kind = OperandKind::AGG_RESULT;
                 operand.index = i;
@@ -344,13 +348,15 @@ private:
 
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, TupleView tuple) const {
         CellValue current_value;
-        if (!spec.is_star && spec.type != LocalAggType::COUNT) {
+        if (!spec.is_star && (spec.type != LocalAggType::COUNT || spec.is_distinct)) {
             current_value = read_cell(tuple, spec.input_col);
         }
 
         switch (spec.type) {
         case LocalAggType::COUNT:
-            ++state.count;
+            if (!spec.is_distinct || state.distinct_values.insert(current_value).second) {
+                ++state.count;
+            }
             break;
         case LocalAggType::SUM:
             if (spec.input_type == TYPE_FLOAT) {

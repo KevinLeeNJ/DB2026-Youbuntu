@@ -723,7 +723,19 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
             }
         }
     }
-    return buffer_pool_manager_->flush_all_pages(fds);
+    if (!buffer_pool_manager_->flush_all_pages(fds)) {
+        return false;
+    }
+    // The record header is written outside the buffer pool. Persist it only
+    // after the repaired data pages so WAL is never truncated while the
+    // on-disk free-page chain still points at its pre-recovery state.
+    for (const auto& tab_name : table_names) {
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it != fhs_.end()) {
+            rm_manager_->flush_file_header(fh_it->second.get());
+        }
+    }
+    return true;
 }
 
 size_t SmManager::flush_dirty_pages(size_t max_pages) {
@@ -731,6 +743,10 @@ size_t SmManager::flush_dirty_pages(size_t max_pages) {
 }
 
 void SmManager::rebuild_all_indexes() {
+    rebuild_indexes({});
+}
+
+void SmManager::rebuild_indexes(const std::unordered_set<std::string>& index_names) {
     std::vector<std::pair<std::string, std::vector<IndexMeta>>> indexes_by_table;
     indexes_by_table.reserve(db_.tabs_.size());
     for (const auto& [tab_name, tab] : db_.tabs_) {
@@ -747,6 +763,9 @@ void SmManager::rebuild_all_indexes() {
                 col_names.emplace_back(col.name);
             }
             const std::string index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            if (!index_names.empty() && index_names.count(index_name) == 0) {
+                continue;
+            }
             const std::string backup_name = index_name + ".rebuild.bak";
             const std::string temp_base = index_name + ".rebuild.tmp";
             const std::string temp_name = ix_manager_->get_index_name(temp_base, index.cols);
@@ -816,7 +835,10 @@ void SmManager::rebuild_all_indexes() {
 
 void SmManager::refresh_index_residency() {
     for (auto& [_, index_handle] : ihs_) {
-        index_handle->refresh_page_residency();
+        // Reopening a large benchmark must not walk every index leaf merely
+        // to warm optional residency state. Individual index creation and
+        // tests retain the explicit full-refresh default.
+        index_handle->refresh_page_residency(false);
     }
 }
 

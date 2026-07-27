@@ -235,10 +235,14 @@ inline std::unique_ptr<Col> clone_col(const Col& col) {
 struct AggExpr : public Expr {
     AggFuncType func;
     bool is_star;
+    bool is_distinct;
     std::unique_ptr<Col> col;
 
+    AggExpr(AggFuncType func_, bool is_star_, bool is_distinct_, std::unique_ptr<Col> col_)
+        : Expr(AstType::AggExpr), func(func_), is_star(is_star_), is_distinct(is_distinct_), col(std::move(col_)) {}
+
     AggExpr(AggFuncType func_, bool is_star_, std::unique_ptr<Col> col_)
-        : Expr(AstType::AggExpr), func(func_), is_star(is_star_), col(std::move(col_)) {}
+        : AggExpr(func_, is_star_, false, std::move(col_)) {}
 };
 
 struct SelectItem : public TreeNode {
@@ -316,7 +320,8 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
     }
     case AstType::AggExpr: {
         auto& agg = static_cast<const AggExpr&>(expr);
-        return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.col == nullptr ? nullptr : clone_col(*agg.col));
+        return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.is_distinct,
+                                         agg.col == nullptr ? nullptr : clone_col(*agg.col));
     }
     case AstType::IntLit: {
         auto& lit = static_cast<const IntLit&>(expr);

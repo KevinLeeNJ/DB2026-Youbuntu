@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "ix_index_handle.h"
 
 #include <algorithm>
+#include <functional>
 
 #include "ix_scan.h"
 
@@ -176,9 +177,12 @@ IxIndexHandle::~IxIndexHandle() {
     release_root_page_cache();
 }
 
-void IxIndexHandle::refresh_page_residency() {
+void IxIndexHandle::refresh_page_residency(bool include_internal) {
     auto structure_guard = lock_exclusive();
     refresh_root_page_cache();
+    if (include_internal && internal_page_cache_enabled()) {
+        register_internal_pages();
+    }
 }
 void IxIndexHandle::refresh_root_page_cache() {
     if (root_cache_enabled() && (cached_root_page_ == nullptr || cached_root_page_no_ != file_hdr_->root_page_)) {
@@ -191,10 +195,22 @@ void IxIndexHandle::refresh_root_page_cache() {
         cached_root_page_ = new_root;
         cached_root_page_no_ = file_hdr_->root_page_;
         if (old_root != nullptr && old_root_id.page_no != IX_NO_PAGE) {
+            if (resident_internal_pages_.erase(old_root_id.page_no) != 0) {
+                buffer_pool_manager_->unmark_resident(old_root_id);
+                cached_internal_pages_.erase(old_root_id.page_no);
+            }
             buffer_pool_manager_->unpin_page(old_root_id, false);
         }
     }
-    register_internal_pages();
+    if (cached_root_page_ != nullptr) {
+        IxNodeHandle root(file_hdr_.get(), cached_root_page_);
+        if (!root.is_leaf_page()) {
+            // Keep the root classified as an internal page without walking
+            // the entire tree. Full internal residency is still established
+            // by an explicit refresh_page_residency(true).
+            mark_internal_page_resident(file_hdr_->root_page_, cached_root_page_);
+        }
+    }
 }
 
 void IxIndexHandle::mark_internal_page_resident(page_id_t page_no, Page* page) {
@@ -1136,6 +1152,103 @@ UniqueLookupResult IxIndexHandle::lookup_unique(const char* key) const {
     }
     unpin_if_not_cached_root(leaf.get_page_id());
     return result;
+}
+
+bool IxIndexHandle::validate_structure() const {
+    auto structure_guard = lock_shared();
+    if (file_hdr_->num_pages_ < IX_INIT_NUM_PAGES) {
+        return false;
+    }
+    if (file_hdr_->root_page_ == IX_NO_PAGE) {
+        return true;
+    }
+    if (file_hdr_->root_page_ < IX_INIT_ROOT_PAGE || file_hdr_->root_page_ >= file_hdr_->num_pages_) {
+        return false;
+    }
+
+    std::unordered_set<page_id_t> visited;
+    std::unordered_set<page_id_t> leaves;
+    std::function<bool(page_id_t, page_id_t)> visit = [&](page_id_t page_no, page_id_t expected_parent) {
+        if (page_no < IX_INIT_ROOT_PAGE || page_no >= file_hdr_->num_pages_ || !visited.insert(page_no).second) {
+            return false;
+        }
+
+        IxNodeHandle node;
+        try {
+            fetch_node_into(page_no, node);
+        } catch (...) {
+            return false;
+        }
+        auto finish = [&](bool valid) {
+            unpin_if_not_cached(node.get_page_id());
+            return valid;
+        };
+
+        const int size = node.get_size();
+        if (size <= 0 || size > node.get_max_size() || node.get_parent_page_no() != expected_parent) {
+            return finish(false);
+        }
+        for (int i = 1; i < size; ++i) {
+            if (ix_compare(node.get_key(i - 1), node.get_key(i), file_hdr_->col_types_, file_hdr_->col_lens_) > 0) {
+                return finish(false);
+            }
+        }
+
+        if (node.is_leaf_page()) {
+            leaves.insert(page_no);
+            const page_id_t previous = node.get_prev_leaf();
+            const page_id_t next = node.get_next_leaf();
+            const bool previous_valid =
+                previous == IX_LEAF_HEADER_PAGE || (previous >= IX_INIT_ROOT_PAGE && previous < file_hdr_->num_pages_);
+            const bool next_valid =
+                next == IX_LEAF_HEADER_PAGE || (next >= IX_INIT_ROOT_PAGE && next < file_hdr_->num_pages_);
+            return finish(previous_valid && next_valid);
+        }
+
+        std::vector<page_id_t> children;
+        children.reserve(static_cast<std::size_t>(size));
+        for (int i = 0; i < size; ++i) {
+            children.push_back(node.value_at(i));
+        }
+        finish(true);
+        for (const page_id_t child : children) {
+            if (!visit(child, page_no)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    try {
+        if (!visit(file_hdr_->root_page_, IX_NO_PAGE)) {
+            return false;
+        }
+        if (file_hdr_->first_leaf_ == IX_NO_PAGE || file_hdr_->last_leaf_ == IX_NO_PAGE) {
+            return false;
+        }
+
+        std::unordered_set<page_id_t> chain;
+        page_id_t previous = IX_LEAF_HEADER_PAGE;
+        page_id_t current = file_hdr_->first_leaf_;
+        while (current != IX_LEAF_HEADER_PAGE) {
+            if (current < IX_INIT_ROOT_PAGE || current >= file_hdr_->num_pages_ || !leaves.count(current) ||
+                !chain.insert(current).second) {
+                return false;
+            }
+            IxNodeHandle leaf;
+            fetch_node_into(current, leaf);
+            if (!leaf.is_leaf_page() || leaf.get_prev_leaf() != previous) {
+                unpin_if_not_cached(leaf.get_page_id());
+                return false;
+            }
+            previous = current;
+            current = leaf.get_next_leaf();
+            unpin_if_not_cached(leaf.get_page_id());
+        }
+        return chain == leaves && previous == file_hdr_->last_leaf_;
+    } catch (...) {
+        return false;
+    }
 }
 
 /**

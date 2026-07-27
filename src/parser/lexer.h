@@ -99,6 +99,7 @@ enum class TokenType {
     JOIN,
     ON,
     COUNT,
+    DISTINCT,
     MAX,
     MIN,
     SUM,

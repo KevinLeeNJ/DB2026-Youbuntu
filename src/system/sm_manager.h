@@ -282,6 +282,7 @@ public:
     size_t flush_dirty_pages(size_t max_pages);
 
     void rebuild_all_indexes();
+    void rebuild_indexes(const std::unordered_set<std::string>& index_names);
 
     void refresh_index_residency();
 

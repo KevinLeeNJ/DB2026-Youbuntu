@@ -71,6 +71,26 @@ SELECT COUNT(course) AS course_num FROM grade;
 Total record(s): 1
 
 query
+SELECT COUNT(DISTINCT id) FROM grade;
+----
++------------------+
+| COUNT(DISTINC... |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(DISTINCT (id)) FROM grade WHERE course = 'C++';
+----
++------------------+
+| COUNT(DISTINC... |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+query
 SELECT COUNT(*) AS row_num FROM grade WHERE score < 60;
 ----
 +------------------+

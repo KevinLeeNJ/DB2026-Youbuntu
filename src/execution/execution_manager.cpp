@@ -222,6 +222,25 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     }
 
+    if (context != nullptr && context->result_sink_ != nullptr) {
+        context->result_sink_->begin_query(result_cols, captions);
+        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+            TupleView tuple = executorTreeRoot->current();
+            std::unique_ptr<RmRecord> fallback;
+            if (!tuple) {
+                fallback = executorTreeRoot->Next();
+                if (fallback) {
+                    tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                }
+            }
+            if (!tuple) {
+                throw ExecutionException("executor returned an empty tuple");
+            }
+            context->result_sink_->append_row(result_cols, tuple.data, tuple.size);
+        }
+        return;
+    }
+
     // Print records
     size_t num_rec = 0;
     const int output_start = *context->offset_;

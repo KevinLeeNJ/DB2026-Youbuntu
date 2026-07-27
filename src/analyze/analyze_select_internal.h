@@ -91,6 +91,7 @@ QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& 
         expr.type = QueryExprType::AGGREGATE;
         expr.agg.type = convert_ast_agg_type(agg->func);
         expr.agg.is_star = agg->is_star;
+        expr.agg.is_distinct = agg->is_distinct;
         if (!agg->is_star) {
             if (agg->col == nullptr) {
                 throw InternalError("Unexpected null aggregate argument");

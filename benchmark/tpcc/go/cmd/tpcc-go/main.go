@@ -1,11 +1,12 @@
 package main
 
 import (
-	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -22,6 +23,18 @@ import (
 const (
 	districtsPerWarehouse = 10
 	initialOrdersPerDist  = 3000
+
+	wireTagMeta             = 0x01
+	wireTagRow              = 0x02
+	wireTagCommandOK        = 0x10
+	wireTagResultEnd        = 0x11
+	wireTagTransactionAbort = 0x12
+	wireTagError            = 0x13
+	wireTagExecStream       = 0x20
+	wireTypeInt32           = 0x01
+	wireTypeFloat32         = 0x02
+	wireTypeChar            = 0x03
+	maxWirePayload          = 1 << 20
 )
 
 var (
@@ -36,11 +49,25 @@ var (
 	oracleIDPrefix   int
 )
 
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		written, err := conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return errors.New("RMDB wire write returned zero")
+		}
+		data = data[written:]
+	}
+	return nil
+}
+
 type client struct {
 	address           string
 	timeout           time.Duration
 	conn              net.Conn
-	reader            *bufio.Reader
+	autoAborted       bool
 	txnType           string
 	oracleID          int
 	oraclePayloadHash int
@@ -75,7 +102,20 @@ func (c *client) connect() error {
 		}
 	}
 	c.conn = conn
-	c.reader = bufio.NewReaderSize(conn, 64*1024)
+	handshake := []byte{'R', 'M', 'D', 'B', 0, 3, 0, 0}
+	if err := writeAll(conn, handshake); err != nil {
+		conn.Close()
+		return err
+	}
+	response := make([]byte, len(handshake))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		conn.Close()
+		return err
+	}
+	if string(response) != string(handshake) {
+		conn.Close()
+		return errors.New("invalid RMDB wire protocol handshake")
+	}
 	return nil
 }
 
@@ -103,34 +143,227 @@ func (c *client) exec(sql string) (string, error) {
 	if err := c.conn.SetDeadline(deadline); err != nil {
 		return "", err
 	}
-	if _, err := c.conn.Write(append([]byte(sql), 0)); err != nil {
+	payload := []byte(sql)
+	header := make([]byte, 8)
+	binary.BigEndian.PutUint32(header[:4], uint32(len(payload)))
+	header[4] = wireTagExecStream
+	if err := writeAll(c.conn, append(header, payload...)); err != nil {
 		c.close()
 		return "", err
 	}
-	response, err := c.reader.ReadBytes(0)
+	tag, body, err := c.readFrame()
 	if err != nil {
 		c.close()
 		return "", err
 	}
-	text := strings.TrimRight(string(response[:len(response)-1]), "\n")
-	if text == "abort" {
+	if tag == wireTagCommandOK {
+		if len(body) != 0 {
+			return "", errors.New("COMMAND_OK contains a payload")
+		}
+		return "", nil
+	}
+	if tag == wireTagTransactionAbort {
+		c.autoAborted = true
 		return "", errAbort
 	}
-	if strings.HasPrefix(text, "Error:") || strings.HasPrefix(text, "Parser Error") {
-		return "", errors.New(text)
+	if tag == wireTagError {
+		c.autoAborted = true
+		return "", errors.New(string(body))
 	}
-	return text, nil
+	if tag != wireTagMeta {
+		return "", errors.New("unexpected RMDB wire response")
+	}
+	columns, err := decodeMeta(body)
+	if err != nil {
+		return "", err
+	}
+	rows := make([][]string, 0)
+	for {
+		tag, body, err = c.readFrame()
+		if err != nil {
+			return "", err
+		}
+		if tag == wireTagRow {
+			row, rowErr := decodeRow(body, columns)
+			if rowErr != nil {
+				return "", rowErr
+			}
+			rows = append(rows, row)
+			continue
+		}
+		if tag != wireTagResultEnd || len(body) != 8 || binary.BigEndian.Uint64(body) != uint64(len(rows)) {
+			return "", errors.New("invalid EXEC_STREAM result sequence")
+		}
+		return formatWireRows(columns, rows), nil
+	}
+}
+
+type wireColumn struct {
+	name    string
+	sqlType byte
+}
+
+func (c *client) readFrame() (byte, []byte, error) {
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(c.conn, header); err != nil {
+		return 0, nil, err
+	}
+	length := binary.BigEndian.Uint32(header[:4])
+	if length > maxWirePayload || header[5] != 0 || header[6] != 0 || header[7] != 0 || !knownWireTag(header[4]) {
+		return 0, nil, errors.New("invalid RMDB wire frame")
+	}
+	body := make([]byte, length)
+	if _, err := io.ReadFull(c.conn, body); err != nil {
+		return 0, nil, err
+	}
+	return header[4], body, nil
+}
+
+func knownWireTag(tag byte) bool {
+	switch tag {
+	case wireTagMeta, wireTagRow, wireTagCommandOK, wireTagResultEnd, wireTagTransactionAbort, wireTagError:
+		return true
+	case wireTagPrepareOK, wireTagBatchResult:
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeMeta(body []byte) ([]wireColumn, error) {
+	if len(body) < 2 {
+		return nil, errors.New("truncated META")
+	}
+	count := int(binary.BigEndian.Uint16(body[:2]))
+	if count == 0 {
+		return nil, errors.New("empty META")
+	}
+	offset := 2
+	columns := make([]wireColumn, 0, count)
+	for i := 0; i < count; i++ {
+		if offset+2 > len(body) {
+			return nil, errors.New("truncated column definition")
+		}
+		nameLen := int(binary.BigEndian.Uint16(body[offset : offset+2]))
+		offset += 2
+		if nameLen == 0 || offset+nameLen+1 > len(body) {
+			return nil, errors.New("invalid column definition")
+		}
+		columns = append(columns, wireColumn{name: string(body[offset : offset+nameLen]), sqlType: body[offset+nameLen]})
+		offset += nameLen + 1
+	}
+	if offset != len(body) {
+		return nil, errors.New("META contains trailing bytes")
+	}
+	return columns, nil
+}
+
+func decodeRow(body []byte, columns []wireColumn) ([]string, error) {
+	offset := 0
+	row := make([]string, 0, len(columns))
+	for _, column := range columns {
+		if offset >= len(body) {
+			return nil, errors.New("truncated ROW")
+		}
+		present := body[offset]
+		offset++
+		if present == 0 {
+			row = append(row, "NULL")
+			continue
+		}
+		if present != 1 {
+			return nil, errors.New("invalid ROW present flag")
+		}
+		switch column.sqlType {
+		case wireTypeInt32:
+			if offset+4 > len(body) {
+				return nil, errors.New("truncated INT32")
+			}
+			row = append(row, strconv.FormatInt(int64(int32(binary.BigEndian.Uint32(body[offset:offset+4]))), 10))
+			offset += 4
+		case wireTypeFloat32:
+			if offset+4 > len(body) {
+				return nil, errors.New("truncated FLOAT32")
+			}
+			row = append(row, strconv.FormatFloat(float64(math.Float32frombits(binary.BigEndian.Uint32(body[offset:offset+4]))), 'f', -1, 32))
+			offset += 4
+		case wireTypeChar:
+			if offset+4 > len(body) {
+				return nil, errors.New("truncated CHAR length")
+			}
+			length := int(binary.BigEndian.Uint32(body[offset : offset+4]))
+			offset += 4
+			if offset+length > len(body) {
+				return nil, errors.New("truncated CHAR")
+			}
+			row = append(row, string(body[offset:offset+length]))
+			offset += length
+		default:
+			return nil, errors.New("unknown wire type")
+		}
+	}
+	if offset != len(body) {
+		return nil, errors.New("ROW contains trailing bytes")
+	}
+	return row, nil
+}
+
+func formatWireRows(columns []wireColumn, rows [][]string) string {
+	widths := make([]int, len(columns))
+	for i, column := range columns {
+		widths[i] = len(column.name)
+	}
+	for _, row := range rows {
+		for i, value := range row {
+			if len(value) > widths[i] {
+				widths[i] = len(value)
+			}
+		}
+	}
+	separator := func() string {
+		var builder strings.Builder
+		for _, width := range widths {
+			builder.WriteByte('+')
+			builder.WriteString(strings.Repeat("-", width+2))
+		}
+		builder.WriteString("+\n")
+		return builder.String()
+	}
+	var builder strings.Builder
+	builder.WriteString(separator())
+	writeRow := func(row []string) {
+		builder.WriteByte('|')
+		for i, value := range row {
+			builder.WriteByte(' ')
+			builder.WriteString(value)
+			builder.WriteString(strings.Repeat(" ", widths[i]-len(value)+1))
+			builder.WriteByte('|')
+		}
+		builder.WriteByte('\n')
+	}
+	headers := make([]string, len(columns))
+	for i, column := range columns {
+		headers[i] = column.name
+	}
+	writeRow(headers)
+	builder.WriteString(separator())
+	for _, row := range rows {
+		writeRow(row)
+	}
+	builder.WriteString(separator())
+	fmt.Fprintf(&builder, "Total record(s): %d\n", len(rows))
+	return builder.String()
 }
 
 func (c *client) close() {
 	if c.conn != nil {
 		_ = c.conn.Close()
 		c.conn = nil
-		c.reader = nil
 	}
 }
 
 func (c *client) begin() error {
+	c.autoAborted = false
 	_, err := c.exec("begin;")
 	return err
 }
@@ -182,6 +415,10 @@ func (c *client) commit() error {
 }
 
 func (c *client) rollback() {
+	if c.autoAborted {
+		c.autoAborted = false
+		return
+	}
 	_, _ = c.exec("rollback;")
 }
 
@@ -491,6 +728,30 @@ func scalarFloat(text string, fallback float64) float64 {
 	return value
 }
 
+func scalarIntStrict(text string) (int, error) {
+	value := strings.TrimSpace(scalarText(text, ""))
+	if value == "" {
+		return 0, errors.New("query returned no scalar value")
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer scalar %q: %w", value, err)
+	}
+	return parsed, nil
+}
+
+func scalarFloatStrict(text string) (float64, error) {
+	value := strings.TrimSpace(scalarText(text, ""))
+	if value == "" {
+		return 0, errors.New("query returned no scalar value")
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid float scalar %q: %w", value, err)
+	}
+	return parsed, nil
+}
+
 func nowText() string { return time.Now().Format("2006-01-02 15:04:05") }
 
 func surname(number int) string {
@@ -768,35 +1029,105 @@ func stockLevel(c txnBackend, ctx txnContext, rng *rand.Rand) error {
 	if err != nil {
 		return err
 	}
-	dNext := scalarInt(dNextText, 0)
-	orderLineText, err := c.exec(fmt.Sprintf("select ol_i_id from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id >= %d and ol_o_id < %d;", ctx.wID, ctx.dID, max(1, dNext-20), dNext))
+	dNext, err := scalarIntStrict(dNextText)
+	if err != nil {
+		return fmt.Errorf("stock level district boundary: %w", err)
+	}
+	countText, err := c.exec(stockLevelCountQuery(ctx.wID, ctx.dID, dNext, threshold, false))
 	if err != nil {
 		return err
 	}
-	stockText, err := c.exec(fmt.Sprintf("select s_i_id from stock where s_w_id = %d and s_quantity < %d;", ctx.wID, threshold))
+	count, err := scalarIntStrict(countText)
 	if err != nil {
-		return err
+		return fmt.Errorf("stock level COUNT(DISTINCT) result: %w", err)
 	}
-	lowStock := make(map[int]struct{})
-	for _, row := range parseRows(stockText) {
-		if len(row) > 0 {
-			lowStock[scalarInt(row[0], -1)] = struct{}{}
-		}
+	if count < 0 {
+		return fmt.Errorf("stock level COUNT(DISTINCT) returned negative count %d", count)
 	}
-	seen := make(map[int]struct{})
-	for _, row := range parseRows(orderLineText) {
-		if len(row) == 0 {
-			continue
-		}
-		itemID := scalarInt(row[0], -1)
-		if _, ok := lowStock[itemID]; ok {
-			seen[itemID] = struct{}{}
-		}
-	}
-	_ = len(seen)
 	err = c.commit()
 	rollback = err != nil
 	return err
+}
+
+func stockLevelCountQuery(wID, dID, dNext, threshold int, parenthesized bool) string {
+	column := "ol_i_id"
+	if parenthesized {
+		column = "(ol_i_id)"
+	}
+	return fmt.Sprintf("select count(distinct %s) from order_line, stock where ol_w_id = %d and ol_d_id = %d and ol_o_id >= %d and ol_o_id < %d and s_w_id = %d and s_i_id = ol_i_id and s_quantity < %d;", column, wID, dID, max(1, dNext-20), dNext, wID, threshold)
+}
+
+func verifyBenchmarkFeatures(c txnBackend, p profile) error {
+	if p.warehouses < 1 {
+		return errors.New("feature check requires at least one warehouse")
+	}
+	const wID, dID, threshold = 1, 1, 20
+	dNextText, err := c.exec("select d_next_o_id from district where d_w_id = 1 and d_id = 1;")
+	if err != nil {
+		return fmt.Errorf("feature check district lookup: %w", err)
+	}
+	dNext, err := scalarIntStrict(dNextText)
+	if err != nil || dNext < 1 {
+		if err != nil {
+			return fmt.Errorf("feature check district boundary: %w", err)
+		}
+		return fmt.Errorf("feature check district boundary is invalid: %d", dNext)
+	}
+	counts := make([]int, 2)
+	for i, parenthesized := range []bool{false, true} {
+		text, queryErr := c.exec(stockLevelCountQuery(wID, dID, dNext, threshold, parenthesized))
+		if queryErr != nil {
+			return fmt.Errorf("feature check COUNT(DISTINCT) syntax %d: %w", i+1, queryErr)
+		}
+		counts[i], err = scalarIntStrict(text)
+		if err != nil {
+			return fmt.Errorf("feature check COUNT(DISTINCT) syntax %d result: %w", i+1, err)
+		}
+		if counts[i] < 0 {
+			return fmt.Errorf("feature check COUNT(DISTINCT) syntax %d returned negative count %d", i+1, counts[i])
+		}
+	}
+	if counts[0] != counts[1] {
+		return fmt.Errorf("COUNT(DISTINCT col)=%d differs from COUNT(DISTINCT (col))=%d", counts[0], counts[1])
+	}
+
+	beforeText, err := c.exec("select w_ytd from warehouse where w_id = 1;")
+	if err != nil {
+		return fmt.Errorf("feature check transaction read: %w", err)
+	}
+	before, err := scalarFloatStrict(beforeText)
+	if err != nil {
+		return fmt.Errorf("feature check transaction value: %w", err)
+	}
+	if err := c.begin(); err != nil {
+		return fmt.Errorf("feature check BEGIN: %w", err)
+	}
+	rollbackNeeded := true
+	defer func() {
+		if rollbackNeeded {
+			c.rollback()
+		}
+	}()
+	if _, err := c.exec("update warehouse set w_ytd = w_ytd + 1.0 where w_id = 1;"); err != nil {
+		return fmt.Errorf("feature check transactional UPDATE: %w", err)
+	}
+	if _, err := c.exec("rollback;"); err != nil {
+		return fmt.Errorf("feature check ROLLBACK: %w", err)
+	}
+	rollbackNeeded = false
+	afterText, err := c.exec("select w_ytd from warehouse where w_id = 1;")
+	if err != nil {
+		return fmt.Errorf("feature check post-rollback read: %w", err)
+	}
+	after, err := scalarFloatStrict(afterText)
+	if err != nil {
+		return fmt.Errorf("feature check post-rollback value: %w", err)
+	}
+	if math.Abs(after-before) > 1e-5 {
+		return fmt.Errorf("transaction rollback changed warehouse w_ytd from %v to %v", before, after)
+	}
+	fmt.Printf("[feature-check] COUNT(DISTINCT)=%d; explicit transaction rollback preserved w_ytd=%.6g\n", counts[0], after)
+	return nil
 }
 
 func max(a, b int) int {
@@ -857,7 +1188,10 @@ func validateBenchmarkMode(mode string, workers, warmup, measure, rounds int) er
 }
 
 func runTxn(c txnBackend, txnType string, ctx txnContext, rng *rand.Rand) error {
-	if rmdbClient, ok := c.(*client); ok {
+	switch rmdbClient := c.(type) {
+	case *client:
+		rmdbClient.txnType = txnType
+	case *rankingClient:
 		rmdbClient.txnType = txnType
 	}
 	switch txnType {
@@ -1395,7 +1729,7 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 }
 
 func main() {
-	command := flag.String("command", "run", "run, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
+	command := flag.String("command", "run", "run, feature-check, mixed-sql, data-ready, datagen, load, consistency, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
 	mode := flag.String("mode", "official-equivalent", "official-equivalent for rmdb or sqlite-reference for SQLite")
 	backend := flag.String("backend", "rmdb", "rmdb or sqlite")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
@@ -1503,6 +1837,34 @@ func main() {
 		os.Exit(2)
 	}
 	address := net.JoinHostPort(*host, strconv.Itoa(*port))
+	if *command == "feature-check" {
+		var featureBackend txnBackend
+		var featureErr error
+		if *backend == "sqlite" {
+			featureBackend, featureErr = newSQLiteBackendWithBegin(*sqlitePath, *sqliteBegin)
+		} else {
+			featureBackend, featureErr = newClient(address, *timeout, *isolation)
+		}
+		if featureErr == nil {
+			defer featureBackend.close()
+			if *backend == "rmdb" {
+				_, featureErr = featureBackend.exec("set output_file off")
+			}
+		}
+		if featureErr == nil {
+			profile, profileErr := inspectProfile(featureBackend)
+			if profileErr != nil {
+				featureErr = profileErr
+			} else {
+				featureErr = verifyBenchmarkFeatures(featureBackend, profile)
+			}
+		}
+		if featureErr != nil {
+			fmt.Fprintln(os.Stderr, featureErr)
+			os.Exit(1)
+		}
+		return
+	}
 	if *command == "oracle-init" {
 		c, err := newClient(address, *timeout, *isolation)
 		if err == nil {
@@ -1637,10 +1999,16 @@ func main() {
 		}
 	} else {
 		factory = func() (txnBackend, error) {
-			return newClient(address, *timeout, *isolation)
+			return newRankingClient(address, *timeout, *isolation)
 		}
 	}
-	probe, err := factory()
+	var probe txnBackend
+	var err error
+	if *backend == "sqlite" {
+		probe, err = newSQLiteBackendWithBegin(*sqlitePath, *sqliteBegin)
+	} else {
+		probe, err = newClient(address, *timeout, *isolation)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -1662,6 +2030,11 @@ func main() {
 		probe.close()
 		fmt.Fprintf(os.Stderr, "official-equivalent mode requires at least 25 warehouses, got %d\n", p.warehouses)
 		os.Exit(2)
+	}
+	if err := verifyBenchmarkFeatures(probe, p); err != nil {
+		probe.close()
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 	ordersText, err := probe.exec("select count(*) from orders;")
 	probe.close()

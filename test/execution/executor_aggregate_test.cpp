@@ -228,6 +228,12 @@ AggExpr make_aggregate(AggType type, std::string col_name, std::string display_n
     return agg;
 }
 
+AggExpr make_count_distinct(std::string col_name, std::string display_name) {
+    AggExpr agg = make_aggregate(AggType::COUNT, std::move(col_name), std::move(display_name));
+    agg.is_distinct = true;
+    return agg;
+}
+
 TestExecutorQueryExpr make_agg_expr(const AggExpr& agg) {
     TestExecutorQueryExpr expr;
     expr.type = QueryExprType::AGGREGATE;
@@ -293,6 +299,54 @@ TEST(AggregateExecutorTest, GroupsRowsAndComputesCountStarAndSum) {
     EXPECT_EQ(read_string(*second, 0, 8), "ops");
     EXPECT_EQ(read_int(*second, 8), 1);
     EXPECT_EQ(read_int(*second, 12), 7);
+
+    exec.nextTuple();
+    EXPECT_TRUE(exec.is_end());
+}
+
+TEST(AggregateExecutorTest, CountDistinctUsesIndependentPerGroupStatesAndSemanticFloatEquality) {
+    std::vector<ColMeta> cols = {
+        make_col("t", "dept", TYPE_STRING, 8, 0),
+        make_col("t", "id", TYPE_INT, 4, 8),
+        make_col("t", "ratio", TYPE_FLOAT, 4, 12),
+        make_col("t", "label", TYPE_STRING, 8, 16),
+    };
+
+    auto child = make_child_executor(
+        cols, {
+                  {make_string_value("eng"), make_int_value(1), make_float_value(-0.0f), make_string_value("alpha")},
+                  {make_string_value("eng"), make_int_value(1), make_float_value(0.0f), make_string_value("alpha")},
+                  {make_string_value("eng"), make_int_value(2), make_float_value(1.5f), make_string_value("beta")},
+                  {make_string_value("ops"), make_int_value(1), make_float_value(0.0f), make_string_value("alpha")},
+                  {make_string_value("ops"), make_int_value(1), make_float_value(2.5f), make_string_value("alpha")},
+              });
+
+    std::vector<TabCol> group_by = {{"t", "dept"}};
+    std::vector<AggExpr> aggs = {
+        make_count_distinct("id", "COUNT(DISTINCT id)"),
+        make_count_distinct("ratio", "COUNT(DISTINCT ratio)"),
+        make_count_distinct("label", "COUNT(DISTINCT label)"),
+    };
+
+    AggregateExecutor exec(std::move(child), group_by, aggs, std::vector<TestExecutorHavingCondition>());
+
+    exec.beginTuple();
+    ASSERT_FALSE(exec.is_end());
+    auto first = exec.Next();
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(read_string(*first, 0, 8), "eng");
+    EXPECT_EQ(read_int(*first, 8), 2);
+    EXPECT_EQ(read_int(*first, 12), 2);
+    EXPECT_EQ(read_int(*first, 16), 2);
+
+    exec.nextTuple();
+    ASSERT_FALSE(exec.is_end());
+    auto second = exec.Next();
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(read_string(*second, 0, 8), "ops");
+    EXPECT_EQ(read_int(*second, 8), 1);
+    EXPECT_EQ(read_int(*second, 12), 2);
+    EXPECT_EQ(read_int(*second, 16), 1);
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());

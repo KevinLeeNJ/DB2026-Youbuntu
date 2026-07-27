@@ -19,7 +19,7 @@ foreach(DIR ${SUBDIRS})
 
                 target_link_libraries(${TEST_TARGET}
                         "-Wl,--start-group"
-                        analyze parser system storage lru_replacer record index transaction planner execution recovery
+                        analyze parser system storage lru_replacer record index transaction planner execution recovery wire_protocol
                         "-Wl,--end-group"
                         gtest_main pthread)
                 target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_SRC_DIR="${CMAKE_SOURCE_DIR}")

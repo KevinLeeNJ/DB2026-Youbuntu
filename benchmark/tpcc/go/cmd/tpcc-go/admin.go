@@ -390,6 +390,9 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 		return err
 	}
 	defer c.close()
+	if strings.HasPrefix(stage, "online-") {
+		return checkOnlineConsistency(c, prior, stage)
+	}
 	failures := make([]string, 0)
 	queryInt := func(sql string, fallback int) int {
 		text, err := c.exec(sql)
@@ -450,6 +453,69 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 	}
 	if len(failures) > 0 {
 		return fmt.Errorf("[%s] consistency validation failed (%d rule(s))\n%s", stage, len(failures), strings.Join(failures, "\n"))
+	}
+	fmt.Printf("consistency ok: stage=%s\n", stage)
+	return nil
+}
+
+func checkOnlineConsistency(c *client, prior document, stage string) error {
+	failures := make([]string, 0)
+	queryInt := func(sql string, fallback int) int {
+		text, err := c.exec(sql)
+		if err != nil {
+			failures = append(failures, err.Error())
+			return fallback
+		}
+		return scalarInt(text, fallback)
+	}
+	queryFloat := func(sql string, fallback float64) float64 {
+		text, err := c.exec(sql)
+		if err != nil {
+			failures = append(failures, err.Error())
+			return fallback
+		}
+		return scalarFloat(text, fallback)
+	}
+
+	warehouseTotal := prior.Config.BaselineWarehouseTotal
+	districtTotal := prior.Config.BaselineDistrictTotal
+	if actual := queryInt("select count(*) from warehouse;", -1); actual != warehouseTotal {
+		failures = append(failures, fmt.Sprintf("warehouse count: expected %d, got %d", warehouseTotal, actual))
+	}
+	if actual := queryInt("select count(*) from district;", -1); actual != districtTotal {
+		failures = append(failures, fmt.Sprintf("district count: expected %d, got %d", districtTotal, actual))
+	}
+	if actual := queryInt("select count(w_id) from warehouse where w_id = 1;", -1); actual != 1 {
+		failures = append(failures, fmt.Sprintf("warehouse key lookup: expected 1, got %d", actual))
+	}
+	if actual := queryInt("select count(d_id) from district where d_w_id = 1 and d_id = 1;", -1); actual != 1 {
+		failures = append(failures, fmt.Sprintf("district key lookup: expected 1, got %d", actual))
+	}
+	dNext := queryInt("select d_next_o_id from district where d_w_id = 1 and d_id = 1;", -1)
+	if dNext < initialOrdersPerDist+1 {
+		failures = append(failures, fmt.Sprintf("district next order id is out of range: %d", dNext))
+	}
+	maxOrder := queryInt("select max(o_id) from orders where o_w_id = 1 and o_d_id = 1;", -1)
+	if maxOrder != dNext-1 {
+		failures = append(failures, fmt.Sprintf("district order id mismatch: d_next=%d max_order=%d", dNext, maxOrder))
+	}
+
+	warehouseYTD := queryFloat("select w_ytd from warehouse where w_id = 1;", -1)
+	districtYTD := queryFloat("select sum(d_ytd) from district where d_w_id = 1;", -1)
+	if warehouseYTD < 300000 {
+		failures = append(failures, fmt.Sprintf("warehouse YTD is out of range: %.2f", warehouseYTD))
+	}
+	if districtYTD < 300000 {
+		failures = append(failures, fmt.Sprintf("district YTD is out of range: %.2f", districtYTD))
+	}
+	tolerance := math.Max(0.05, 2e-6*math.Max(math.Abs(warehouseYTD), math.Abs(districtYTD)))
+	if math.Abs(warehouseYTD-districtYTD) > tolerance {
+		failures = append(failures,
+			fmt.Sprintf("warehouse/district YTD mismatch: warehouse=%.2f districts=%.2f", warehouseYTD, districtYTD))
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("[%s] online consistency validation failed (%d rule(s))\n%s",
+			stage, len(failures), strings.Join(failures, "\n"))
 	}
 	fmt.Printf("consistency ok: stage=%s\n", stage)
 	return nil

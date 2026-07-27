@@ -670,11 +670,18 @@ private:
         expect(TokenType::LPAREN, "expected '(' after aggregate function");
         if (func == AGG_COUNT && match(TokenType::STAR)) {
             expect(TokenType::RPAREN, "expected ')' after COUNT(*)");
-            return std::make_unique<AggExpr>(func, true, nullptr);
+            return std::make_unique<AggExpr>(func, true, false, nullptr);
+        }
+        bool is_distinct = func == AGG_COUNT && match(TokenType::DISTINCT);
+        if (is_distinct && match(TokenType::LPAREN)) {
+            auto column = parse_col();
+            expect(TokenType::RPAREN, "expected ')' after DISTINCT aggregate argument");
+            expect(TokenType::RPAREN, "expected ')' after aggregate argument");
+            return std::make_unique<AggExpr>(func, false, true, std::move(column));
         }
         auto column = parse_col();
         expect(TokenType::RPAREN, "expected ')' after aggregate argument");
-        return std::make_unique<AggExpr>(func, false, std::move(column));
+        return std::make_unique<AggExpr>(func, false, is_distinct, std::move(column));
     }
 
     std::vector<std::unique_ptr<Col>> parse_opt_group_clause() {

@@ -183,6 +183,10 @@ std::unique_ptr<ast::AggExpr> make_ast_count_star() {
     return std::make_unique<ast::AggExpr>(ast::AGG_COUNT, true, nullptr);
 }
 
+std::unique_ptr<ast::AggExpr> make_ast_count_distinct(const std::string& col_name) {
+    return std::make_unique<ast::AggExpr>(ast::AGG_COUNT, false, true, std::make_unique<ast::Col>("", col_name));
+}
+
 template <typename... Items> std::vector<std::unique_ptr<ast::SelectItem>> select_items(Items&&... items) {
     std::vector<std::unique_ptr<ast::SelectItem>> result;
     (result.push_back(std::forward<Items>(items)), ...);
@@ -244,6 +248,21 @@ TEST_F(AnalyzeAggregateTest, do_analyze_group_by_having_success) {
     EXPECT_EQ(query->having_conds[0].lhs.type, QueryExprType::AGGREGATE);
     EXPECT_EQ(query->having_conds[0].lhs.agg.display_name, "COUNT(*)");
     EXPECT_EQ(query->output_names, (std::vector<std::string>{"id", "max_score"}));
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_preserves_count_distinct_and_resolves_column) {
+    auto stmt = make_select_stmt(select_items(std::make_unique<ast::SelectItem>(make_ast_count_distinct("id"), "")));
+
+    auto query = analyze_.do_analyze(std::move(stmt));
+
+    ASSERT_EQ(query->select_items.size(), 1);
+    const auto& aggregate = query->select_items[0].expr.agg;
+    EXPECT_EQ(aggregate.type, AggType::COUNT);
+    EXPECT_TRUE(aggregate.is_distinct);
+    EXPECT_FALSE(aggregate.is_star);
+    EXPECT_EQ(aggregate.col.tab_name, "grade");
+    EXPECT_EQ(aggregate.display_name, "COUNT(DISTINCT id)");
+    EXPECT_EQ(query->output_names, (std::vector<std::string>{"COUNT(DISTINCT id)"}));
 }
 
 TEST_F(AnalyzeAggregateTest, do_analyze_rejects_select_column_not_in_group_by) {
