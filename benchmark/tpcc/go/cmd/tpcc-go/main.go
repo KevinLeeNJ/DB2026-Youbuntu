@@ -1859,7 +1859,7 @@ func rankingDelivery(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 
 func rankingStockLevel(c rankingBatcher, ctx txnContext, rng *rand.Rand) error {
 	threshold := rng.Intn(11) + 10
-	result, err := rankingBatch(c, "begin;", fmt.Sprintf("select d_next_o_id from district where d_id = %d and d_w_id = %d;", ctx.dID, ctx.wID))
+	result, err := rankingBatch(c, "begin;", rankingDistrictNextOrderSQL(ctx.wID, ctx.dID))
 	if err != nil {
 		return err
 	}
@@ -1946,13 +1946,10 @@ func verifyBenchmarkFeatures(c txnBackend, p profile) error {
 
 func preparedInvalidItemSnapshotQueries(ctx txnContext, input rankingNewOrderInput, orderID int) []string {
 	queries := []string{
-		fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", ctx.wID, ctx.dID),
-		fmt.Sprintf("select count(*) from orders where o_w_id = %d and o_d_id = %d and o_id = %d;",
-			ctx.wID, ctx.dID, orderID),
-		fmt.Sprintf("select count(*) from new_orders where no_w_id = %d and no_d_id = %d and no_o_id = %d;",
-			ctx.wID, ctx.dID, orderID),
-		fmt.Sprintf("select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_o_id = %d;",
-			ctx.wID, ctx.dID, orderID),
+		rankingDistrictNextOrderSQL(ctx.wID, ctx.dID),
+		rankingOrderCountSQL(ctx.wID, ctx.dID, orderID),
+		rankingNewOrderCountSQL(ctx.wID, ctx.dID, orderID),
+		rankingOrderLineCountSQL(ctx.wID, ctx.dID, orderID),
 	}
 	keys := make([]stockKey, 0, len(input.itemIDs))
 	for i, itemID := range input.itemIDs {
@@ -1971,9 +1968,7 @@ func preparedInvalidItemSnapshotQueries(ctx txnContext, input rankingNewOrderInp
 		if i > 0 && keys[i-1] == key {
 			continue
 		}
-		queries = append(queries, fmt.Sprintf(
-			"select s_quantity, s_ytd, s_order_cnt, s_remote_cnt from stock where s_w_id = %d and s_i_id = %d;",
-			key.wID, key.iID))
+		queries = append(queries, rankingStockSnapshotSQL(key.wID, key.iID))
 	}
 	return queries
 }
@@ -2000,7 +1995,7 @@ func verifyPreparedInvalidItemRollback(c txnBackend, p profile) error {
 	if len(input.itemIDs) < 2 || !input.invalid || input.itemIDs[len(input.itemIDs)-1] != p.itemCount+1 {
 		return errors.New("prepared invalid-item check did not generate valid writes followed by an invalid item")
 	}
-	nextText, err := c.exec("select d_next_o_id from district where d_w_id = 1 and d_id = 1;")
+	nextText, err := c.exec(rankingDistrictNextOrderSQL(1, 1))
 	if err != nil {
 		return fmt.Errorf("prepared invalid-item check district lookup: %w", err)
 	}
