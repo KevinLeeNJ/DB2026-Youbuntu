@@ -1,185 +1,137 @@
 # Repository Guide
 
-## Project Structure and Module Organization
+## Scope and Source of Truth
 
-This is a C++17 RMDB database system. The core server code is in `src/`, and the server entry point is
-`src/rmdb.cpp`; the standalone client is in `rmdb_client/`. Third-party dependencies, including GoogleTest, are
-vendored under `deps/`. Build artifacts should be placed in `build/` and `rmdb_client/build/`.
+This is a C++17 RMDB database system. Server code is under `src/`, with entry point `src/rmdb.cpp`; the standalone
+client is under `rmdb_client/`. Build artifacts belong in `build/` and `rmdb_client/build/`.
 
-The main module responsibilities are as follows:
+`finalv2.md` is the normative specification for the 2026 national final. It overrides this guide, historical behavior,
+local benchmark clients, and incomplete tests. Before changing protocol, transactions, FLOAT, TPC-C, loading,
+persistence, recovery, or performance-critical behavior, read the relevant section and Appendix A. The conversion notice
+lists four quoted blocks missing from the source PDF; do not invent their exact contents.
 
-- `src/parser`: handwritten lexer and recursive descent parser, AST definitions, and conversion from SQL text to
-  syntax trees; the current `parser` target only compiles `parser.cpp` and `lexer.cpp`.
-- `src/analyze`: semantic analysis, responsible for validation of table names, column names, types, expressions,
-  aggregation, grouping, ordering, LIMIT, UNION, and generation of the `Query` structure.
-- `src/optimizer`: query plan generation and basic optimization, constructing `Plan` nodes for scan, filter, join,
-  projection, aggregation, sort, LIMIT, UNION, DML, DDL, transaction control, and so on.
-- `src/execution`: executor framework and concrete executors, covering sequential scan, index scan, filter,
-  projection, nested loop join, aggregation, sort, LIMIT, UNION, insert, delete, update, and execution management.
-- `src/system`: system management and metadata management, responsible for creating, dropping, opening, and closing
-  databases/tables/indexes, metadata persistence, DDL execution, and management of table files and index handles.
-- `src/storage`: disk management, page abstraction, and buffer pool management, responsible for page allocation,
-  reading, writeback, flushing, and WAL write-before constraints.
-- `src/record`: record file management, in-page slot/bitmap/TupleMeta layout, record insert/delete/update/scan, and
-  MVCC metadata access.
-- `src/index`: B+ tree index management, composite key comparison, index node operations, insert/delete/search, and
-  range scan.
-- `src/transaction`: transaction lifecycle, commit/rollback, concurrency control modes, MVCC undo/version chains,
-  watermark, and SSI dependency tracking.
-- `src/transaction/concurrency`: lock manager, responsible for table-level and record-level shared locks, exclusive
-  locks, intention locks, SIX locks, and unlocking.
-- `src/recovery`: WAL logging, log management, checkpoint, crash recovery analyze/redo/undo, and post-recovery log
-  truncation.
-- `src/replacer`: buffer pool page replacement strategy, currently implementing the LRU replacer.
-- `src/common`: cross-module common configuration, context, exceptions, and basic definitions.
-- `src/test` and `src/test/performance_test`: test/performance-test helper targets inside the source tree, not part of
-  the main server execution path.
+## Project Layout
 
-Tests are organized by subsystem under `test/`, including directories such as `analyze`, `execution`, `index`, `nest`,
-`optimizer`, `parser`, `portal`, `record`, `recovery`, `replacer`, `snapshot`, `storage`, and `system`. End-to-end
-SQLLogicTest-style cases are in `test/e2e/slt/`, and `test/e2e/` also contains Python helper scripts for crash recovery
-and related scenarios.
+- `src/parser`, `src/analyze`, `src/optimizer`: SQL parsing, semantic analysis, and planning.
+- `src/execution`: scans, joins, aggregation, sorting, DML, and execution management.
+- `src/protocol`: Wire Protocol v3 framing, typed encoding, validation, and socket I/O.
+- `src/system`: database/table/index metadata, DDL, and file-handle management.
+- `src/storage`, `src/record`, `src/index`, `src/replacer`: pages, buffer pool, records/MVCC metadata, B+ trees, and
+  LRU.
+- `src/transaction`: transaction lifecycle, MVCC, SI/SSI, watermark, and locking.
+- `src/recovery`: WAL, checkpoint, crash analysis/redo/undo, and log truncation.
+- `src/common`: shared configuration, context, exceptions, and definitions.
+- `test/<subsystem>`: GoogleTest suites; `test/e2e/slt/`: SQLLogicTest cases; `test/e2e/`: live recovery helpers.
 
-## Build, Test, and Development Commands
+The main parser is handwritten; edit `src/parser/parser.cpp`, `src/parser/lexer.cpp`, and related headers instead of
+regenerating Flex/Bison sources.
 
-- `make build`: configure a Debug CMake build if needed and compile all targets.
-- `make test`: build first, then run `ctest --output-on-failure` inside `build/`.
+## Common Commands
+
+- `make build`: configure a Debug build if needed and compile all targets.
+- `make test`: build, then run CTest with failure output.
 - `make run`: build and start `build/bin/rmdb testdb`.
-- `make debug` / `make release`: clean first, then rebuild with Debug or Release parameters respectively.
-- `make client`: build `rmdb_client` in Release mode.
-- `make client-debug`: rebuild `rmdb_client` in Debug mode.
-- `make run-client`: build and run the interactive client.
-- `make benchmark`: server runtime logs are written to the repository-root `rmdb.log`; use this file for benchmark
-  diagnostics instead of the former `benchmark/tpcc/rmdb-server.log` location.
-- `make parser`: historical Flex/Bison generation entry point; the current main parser is handwritten, so when changing
-  parsing logic, prefer editing `src/parser/parser.cpp`, `src/parser/lexer.cpp`, and related headers.
-- `make format`: apply `clang-format-18` to C++ source code under `src/` and `test/`.
+- `make debug` / `make release`: clean and rebuild in the selected mode.
+- `make client` / `make client-debug` / `make run-client`: build or run the standalone client.
+- `make format`: apply `clang-format-18` to C++ under `src/` and `test/`.
+- `make benchmark`: local 32-client SI smoke test, defaulting to 10-second warmup and two 60-second rounds. It is not
+  the official 30-second warmup plus three 150-second ranking run. Diagnose it with repository-root `rmdb.log`.
 
-## Coding Style and Naming Conventions
+## Final Competition Constraints
 
-Follow `.clang-format`: LLVM-based style, 4-space indentation, no tabs, left braces do not move to a separate line,
-120-column limit, left-aligned pointers, and no include sorting. Prefer the naming patterns already used in the current
-module. Files and most functions use `snake_case`, classes and GoogleTest fixtures use `PascalCase`, and test files use
-the `_test.cpp` suffix. When feasible, use `std::unique_ptr` or references to make ownership explicit.
+### Generality and Integrity
 
-## Behavioral Guidelines
+- The evaluator runs `rmdb` as a non-privileged user and owns all generated SQL, data, answers, and hidden checks. Never
+  inspect, modify, or depend on evaluator assets or internals.
+- Names, file names, build/load/check order, data, parameters, connection schedules, and crash points may vary. Never
+  identify requests or substitute execution using names, SQL hashes, fixed `statement_id`, row counts, phases, timing,
+  client IDs, or precomputed answers.
+- Caches and fast paths must use current parameters and visible database state, maintain correct invalidation, and fall
+  back to a general implementation. The official 50-warehouse/32-client setup is not a correctness assumption.
+- Readiness requires the expected process tree to own the port and complete exact SQL `show tables;` through the Wire
+  Protocol; accepting TCP alone is insufficient.
 
-The following guidelines are intended to reduce common LLM coding errors. By default, they favor caution over speed; for
-very simple tasks, use judgment based on the actual situation.
+### Wire Protocol and Output
 
-### 1. Think Before Coding
+- Appendix A is byte-exact and incompatible with the historical NUL protocol: use the 8-byte v3 handshake, big-endian
+  fields, 8-byte frame headers, 1 MiB payload limit, bounded allocation, and exact loops for short reads/writes.
+- `EXEC_STREAM` returns exactly `META -> ROW* -> RESULT_END` for queries or `COMMAND_OK` for non-queries.
+  `PREPARE_SET` atomically installs a connection-local typed statement/schema dictionary. `EXEC_BATCH` runs operations
+  in order and returns one `BATCH_RESULT`.
+- Every ranking batch uses `AUTO_ABORT`. On failure, roll back and end the active transaction before responding, return
+  no partial results, and follow Appendix A's status/count rules. `TRANSACTION_ABORT` means rollback is already
+  complete.
+- Wire values are typed: `INT32`, raw IEEE-754 `FLOAT32`, and unpadded, non-NUL-terminated `CHAR`.
+- The official evaluator neither reads `output.txt` nor sends `SET OUTPUT_FILE OFF/ON`. `output.txt` is only a legacy
+  local-client/SLT surface; preserve its whitespace-sensitive format unless a task explicitly changes local behavior.
 
-Do not make assumptions, do not conceal confusion, and actively surface tradeoffs.
+### SQL, Transactions, and FLOAT
 
-- Before starting an implementation, explicitly state your assumptions; if uncertain, ask the user.
-- If there are multiple possible interpretations, list them instead of silently choosing one.
-- If there is a simpler approach, state it; push back when necessary.
-- If the requirement is unclear, stop, point out the specific confusion, and ask a question.
+- SNAPSHOT ISOLATION and SERIALIZABLE settings persist per connection for later transactions. Ranking sets SI before
+  `PREPARE_SET`. SERIALIZABLE must satisfy the specified SSI histories; a statement creating a specified dangerous
+  rw-dependency must immediately return `TRANSACTION_ABORT`, roll back the current transaction, and not defer victim
+  choice to `COMMIT`.
+- Support native server-side `COUNT(DISTINCT ...)` over joins/filters, including both
+  `COUNT(DISTINCT col)` and `COUNT(DISTINCT (col))`. StockLevel has no client deduplication fallback.
+- Preserve all five TPC-C transactions, including invalid-item NewOrder rollback, concurrent relative stock updates,
+  earliest-order Delivery, newest-order OrderStatus, and median customer-by-name selection.
+- Records, indexes, counters, visibility, and related writes must commit or roll back atomically on every execution
+  path. Performance work must not weaken conflict detection, rollback, WAL, index maintenance, or ACID.
+- FLOAT storage/literals/binds are binary32 with round-to-nearest, ties-to-even. Relative updates round once per
+  binary32 operation; stale SI updates abort. `SUM(FLOAT)` accumulates exact binary32 inputs in binary64 and rounds once
+  to binary32. Use `finalv2.md` for the precise ULP rules.
 
-### 2. Prefer Simplicity
+### Durability and Official Gates
 
-Use the smallest amount of code that solves the problem, and do not write speculative content.
+- Before a successful `COMMIT` response, new WAL bytes and the commit record must be covered by an accepted
+  stabilization operation on an auditable WAL object under the current database directory. Follow `finalv2.md` for
+  allowed WAL names, sync mechanisms, `syncfs` boundaries, and parent-directory fsync requirements.
+- Enforce WAL-before-data ordering. After SIGKILL, redo committed work, remove incomplete work, and restore consistent
+  tables, indexes, metadata, and FLOAT results. Ranking restart budget is 90 seconds; earlier crash cases use 60
+  seconds.
+- The official database has dynamic `order_line` cardinality; total rows are `10,050,550 + order_line`. Loading and SQL
+  validation share 900 seconds. Do not hard-code generated counts.
+- Correctness, COMMIT durability, crash recovery, loading, online consistency, and post-restart consistency are
+  mandatory gates. Ranking is the median NewOrder successful commits/min over three 150-second windows; diagnostics do
+  not score.
 
-- Do not implement features the user did not request.
-- Do not add abstractions for one-off code.
-- Do not add unrequested "flexibility" or "configurability".
-- Do not add error handling for scenarios that cannot occur.
-- If you wrote 200 lines but 50 lines would solve it, rewrite and simplify.
+## Development Rules
 
-Self-check question: would a senior engineer consider this overcomplicated? If yes, simplify it.
+- State assumptions and a short validation plan before non-trivial implementation. If requirements are genuinely
+  ambiguous and a choice would materially change behavior, ask before coding.
+- Make the smallest change that satisfies the request. Avoid speculative features, one-off abstractions, adjacent
+  refactors, and unrelated cleanup.
+- Preserve user changes in a dirty worktree. Remove only unused code introduced by your own change.
+- Every changed line should trace to the requested outcome. Prefer explicit ownership with references or
+  `std::unique_ptr`, following existing local patterns.
+- Define success with reproducible checks: add a regression test for a bug, test invalid input for validation work, and
+  compare behavior before/after a refactor.
 
-### 3. Surgical Changes
+Follow `.clang-format`: LLVM style, 4 spaces, no tabs, attached braces, 120-column limit, left-aligned pointers, and no
+include sorting. Use existing naming conventions: mostly `snake_case`, `PascalCase` classes/fixtures, and `_test.cpp`.
 
-Change only what must be changed, and clean up only problems caused by your own changes.
+## Testing
 
-- Do not casually "improve" adjacent code, comments, or formatting.
-- Do not refactor code that is not broken.
-- Match the existing style, even if you would write it differently.
-- If you find unrelated dead code, you may mention it, but do not delete it.
-- Remove unused imports, variables, or functions caused by this change.
-- Do not delete dead code that already existed before the change unless the user explicitly asks for it.
+Direct `test/` subdirectories containing C++ produce `build/bin/test/<subsystem>_test`; CTest also runs the live Python
+Wire Protocol test.
 
-Acceptance criterion: every changed line should be directly traceable to the user's request.
+- Parser/AST: `test/parser/parser_test.cpp`.
+- Analyzer/planner/executor: `test/analyze/`, `test/optimizer/`, `test/execution/`.
+- Protocol: `test/protocol/wire_protocol_test.cpp` and `test/protocol/live_wire_protocol_test.py`.
+- SI/SSI and transaction concurrency: `test/snapshot/` and `test/transaction/`.
+- Storage, record, index, recovery, system, and replacer: matching subsystem directories.
+- Complete SQL behavior: `.slt` cases under `test/e2e/slt/`; preserve exact expected table text.
+- Live crash flows: `test/e2e/live_crash_recovery_matrix.py`, `crash_repro_strong.py`, and
+  `live_crash_checkpoint.sh`.
 
-### 4. Goal-Driven Execution
+Run `make test` before submission. During diagnosis, build and run the smallest relevant binary with
+`--gtest_filter=Suite.Test`; for final-facing changes, add the relevant live protocol, concurrent transaction,
+forced-crash, or local TPC-C smoke check. `make benchmark` supplements rather than replaces correctness tests.
 
-Define success criteria and iterate until validation passes.
+Tests must be deterministic. Use unique temporary database directories and clean them in teardown; do not depend on or
+pollute persistent local databases.
 
-- Turn "add validation" into "write a test for invalid input, then make the test pass".
-- Turn "fix a bug" into "write a test that reproduces the bug, then make the test pass".
-- Turn "refactor X" into "ensure tests pass both before and after the refactor".
-- For multi-step tasks, first provide a short plan and write the validation method for each step.
+## Commits and Pull Requests
 
-Example:
-
-```text
-1. [Step] -> Validation: [check item]
-2. [Step] -> Validation: [check item]
-3. [Step] -> Validation: [check item]
-```
-
-Strong success criteria can support independent iterative progress; weak criteria, such as "make it work", usually
-require continued clarification.
-
-When these guidelines take effect, the result should be fewer unnecessary changes in the diff, less rework caused by
-overcomplexity, and clarification questions happening before implementation rather than after things go wrong.
-
-## `output.txt` Compatibility Rules
-
-Cloud evaluation depends on the exact contents and format of `output.txt`.
-
-- Never modify the output format of `output.txt`.
-- Unless the user explicitly asks for it, do not add, delete, reorder, or rename fields, columns, headers, separators,
-  prompts, status text, blank lines, or ending text in `output.txt`.
-- Any change involving the output format of `output.txt` must receive user confirmation first; when requesting
-  confirmation, state what you plan to modify and show an example of what the modified `output.txt` format would look
-  like.
-- Do not modify whitespace-sensitive formatting in `output.txt`, including spaces, tabs, newlines, alignment, and final
-  newline.
-- Do not localize or translate text written to `output.txt`.
-- When modifying query execution, printing logic, logs, client output, or test framework behavior, confirm that
-  `output.txt` remains byte-for-byte compatible unless the task explicitly requires changing the output.
-
-## Testing Guide
-
-Tests use GoogleTest and are automatically discovered by CMake from the direct subdirectories of `test/`: each directory
-that contains `.cpp` files generates a `<directory_name>_test` target and outputs it to `build/bin/test/`. The current
-main targets include `parser_test`, `analyze_test`, `optimizer_test`, `execution_test`, `storage_test`, `record_test`,
-`index_test`, `recovery_test`, `system_test`, `snapshot_test`, `portal_test`, `nest_test`, `replacer_test`, and
-`e2e_test`.
-
-Choose the test location based on the scope of the change:
-
-- Parser grammar, token, and AST structure changes go in `test/parser/parser_test.cpp`, directly asserting the node types
-  and fields from `ast::parse_sql`; there is no need to start the database.
-- Semantic analysis, plan generation, and executor internal logic go in `test/analyze/`, `test/optimizer/`, and
-  `test/execution/` respectively.
-- Low-level behavior for storage, records, indexes, buffer pool replacement, system management, recovery, and similar
-  areas goes in the corresponding subdirectory, for example `test/recovery/log_recovery_test.cpp`.
-- Changes involving complete SQL behavior, output tables, error paths, aggregation, UNION, JOIN, transactions, index
-  selection, or checkpoint should add or update `.slt` cases under `test/e2e/slt/` and ensure `e2e_test` passes.
-- For crash recovery or long real server-level flow validation, refer to `test/e2e/live_crash_recovery_matrix.py`,
-  `test/e2e/crash_repro_strong.py`, and `test/e2e/live_crash_checkpoint.sh`; these scripts depend on `build/bin/rmdb`
-  and local port 8765.
-
-`.slt` files use the three directives currently supported by the runner: `statement ok` means the SQL should succeed,
-`statement error` means an `RMDBError` should be thrown, and `query` is followed by SQL, `----`, and the expected output
-block. Expected output must match the actual `data_send`/`output.txt` table text; except for trailing extra newlines that
-the runner already uniformly ignores, do not casually change column widths, separator lines, spaces, headers,
-`Total record(s): N`, or similar content.
-
-When running tests, execute `make test` by default before submission. While diagnosing issues, you may build first and
-then run a single target, for example `./build/bin/test/parser_test`, `./build/bin/test/recovery_test`, or
-`./build/bin/test/e2e_test`. To filter cases, use GoogleTest's `--gtest_filter=SuiteName.TestName`.
-
-Tests should remain deterministic. Tests that need database directories must use unique directory names and clean them up
-in teardown; the existing e2e fixture creates an isolated database by test name and cleans up `output.txt` after each
-case. New tests should follow this isolation pattern to avoid depending on or polluting persistent local database
-directories.
-
-## Commit and Pull Request Guidelines
-
-Recent history uses Conventional Commit prefixes such as `fix:`, `feat:`, `test(...)`, and `perf:`; keep this style and
-use a short imperative summary, in either English or Chinese. Pull Requests should describe behavior changes, affected
-modules, test commands that were run, and known limitations. Link related issues if any; attach logs or screenshots only
-when user-visible client or CLI behavior is involved.
+Use the repository's Conventional Commit style (`fix:`, `feat:`, `test(...)`, `perf:`) with a short imperative summary.
+PRs should state behavior changes, affected modules, tests run, and known limitations.

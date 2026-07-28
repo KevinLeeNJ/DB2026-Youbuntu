@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 class LogManager;
@@ -19,6 +21,10 @@ class TransactionManager;
 
 struct CheckpointOptions {
     int64_t auto_checkpoint_bytes = 256LL * 1024 * 1024;
+    int64_t preflush_trigger_bytes = 64LL * 1024 * 1024;
+    // Keep the preflush pass bounded so checkpoint I/O does not monopolize
+    // the storage device while foreground transactions are still running.
+    size_t preflush_batch_pages = 4096;
 };
 
 class CheckpointManager {
@@ -35,4 +41,9 @@ private:
     LogManager* log_mgr_;
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};
+    // Backoff state for automatic checkpoints after a drain failure. Retrying
+    // every scheduler tick would make the whole process flap between blocked
+    // and unblocked while a stuck transaction stays open.
+    std::chrono::steady_clock::time_point drain_retry_time_{};
+    int64_t drain_retry_log_offset_{0};
 };

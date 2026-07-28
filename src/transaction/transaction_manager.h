@@ -12,12 +12,15 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
 #include <functional>
 #include <shared_mutex>
+#include <thread>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -58,9 +61,10 @@ public:
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
+        gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
 
-    ~TransactionManager() = default;
+    ~TransactionManager();
 
     Transaction* begin(Transaction* txn, LogManager* log_manager,
                        IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL);
@@ -75,9 +79,41 @@ public:
 
     void unblock_new_transactions_after_checkpoint();
 
-    std::unordered_map<txn_id_t, lsn_t> wait_active_transactions_drained_for_checkpoint();
+    // Wait until no transaction is active. Returns false when the timeout
+    // expires with transactions still running, so the caller can abandon the
+    // checkpoint instead of holding the "block new transactions" window open.
+    bool wait_active_transactions_drained_for_checkpoint(std::chrono::milliseconds timeout);
 
     std::unordered_map<txn_id_t, lsn_t> get_active_txn_lsn_snapshot();
+
+    /**
+     * @brief 重启后把时间戳/事务 ID 计数器抬到持久化状态之上。恢复结束、任何事务开始
+     * 之前调用一次。
+     *
+     * 为什么必须做：TupleMeta.commit_ts_ 是**持久化**在数据页里的，而 RC 的 read_ts
+     * 取自 last_commit_ts_。如果计数器每次进程启动都从 0 开始，上一世以
+     * commit_ts_ = 50000 提交的行，面对一个从 0 开始的 read_ts 会被判成“来自未来”；
+     * 此时版本链（只存在于内存里）已经随进程消失，GetVisibleRecord 无从回退，
+     * 于是**已提交的行变得不可见**——违反 final.md:342。PostgreSQL 把 nextXid 记在
+     * pg_control、InnoDB 把 max trx id 记在系统表空间，都是同一件事。
+     *
+     * next_timestamp 由 RecoveryManager::get_recovered_next_timestamp() 计算，
+     * 那里有“为什么这个值一定大于任何已持久化的 commit_ts_”的完整论证。
+     */
+    void seed_counters_after_recovery(timestamp_t next_timestamp, txn_id_t next_txn_id);
+
+    /** @brief 当前计数器快照。checkpoint 用它写 db.restart；见 seed_counters_after_recovery。 */
+    timestamp_t peek_next_timestamp() const {
+        return next_timestamp_.load();
+    }
+
+    txn_id_t peek_next_txn_id() const {
+        return next_txn_id_.load();
+    }
+
+    timestamp_t get_last_commit_ts() const {
+        return last_commit_ts_.load(std::memory_order_acquire);
+    }
 
     ConcurrencyMode get_concurrency_mode() {
         return concurrency_mode_;
@@ -100,6 +136,9 @@ public:
         if (txn_id == INVALID_TXN_ID)
             return nullptr;
 
+        // Counts only the lookups that reach the global txn_map mutex, which is
+        // the cost a session avoids by caching the transaction it is running.
+        txn_map_lookup_count_.fetch_add(1, std::memory_order_relaxed);
         std::unique_lock<std::mutex> lock(latch_);
         auto it = TransactionManager::txn_map.find(txn_id);
         if (it == TransactionManager::txn_map.end())
@@ -209,6 +248,20 @@ public:
     size_t DebugActivePredicateTableCount();
     size_t DebugTxnMapSize();
 
+    uint64_t DebugTxnMapLookupCount() const {
+        return txn_map_lookup_count_.load(std::memory_order_relaxed);
+    }
+
+    // GC observability: the backlog is the current txn-map population waiting
+    // for bounded background collection (including entries not yet eligible).
+    size_t DebugGcBacklog() const {
+        return gc_backlog_.load(std::memory_order_acquire);
+    }
+
+    size_t DebugGcLastBatchSize() const {
+        return gc_last_batch_size_.load(std::memory_order_acquire);
+    }
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
@@ -230,6 +283,15 @@ private:
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
     std::mutex latch_;                           // 用于txn_map的并发
+    // Commit publication is ordered by a small completion frontier rather
+    // than by holding one mutex while touching every tuple page. A commit may
+    // publish outside this mutex; readers advance only through contiguous
+    // completed CSNs, so an out-of-order publisher remains invisible.
+    std::mutex commit_frontier_latch_;
+    std::condition_variable commit_frontier_cv_;
+    timestamp_t next_commit_csn_{0};
+    timestamp_t published_commit_csn_{0};
+    std::map<timestamp_t, timestamp_t> completed_commits_;
     SmManager* sm_manager_;
     LockManager* lock_manager_;
 
@@ -240,15 +302,25 @@ private:
     uint64_t commits_since_gc_{0};
     bool gc_running_{false};
     bool gc_requested_{false};
+    std::atomic<uint64_t> txn_map_lookup_count_{0};
+    std::atomic<size_t> gc_backlog_{0};
+    std::atomic<size_t> gc_last_batch_size_{0};
 
     /** 节流式触发垃圾回收：按提交计数或 txn_map 规模决定是否真正执行。 */
     void MaybeRunGarbageCollection();
+
+    void GarbageCollectionLoop();
+    bool GarbageCollectionBatch();
 
     std::mutex checkpoint_latch_;
     std::condition_variable checkpoint_cv_;
     bool checkpoint_blocking_new_txns_{false};
     int active_txn_count_{0};
     std::unordered_set<txn_id_t> active_txn_ids_;
+
+    std::condition_variable gc_cv_;
+    std::thread gc_thread_;
+    std::atomic<bool> gc_stop_{false};
 
     // ---- SSI State (centralized) — protected by latch_ ----
     struct SsiRecordKey {

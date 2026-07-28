@@ -66,6 +66,7 @@ enum class TokenType {
     GROUP,
     HAVING,
     LIMIT,
+    OFFSET,
     AS,
     UNION,
     BEGIN_KW,
@@ -96,9 +97,13 @@ enum class TokenType {
     DATETIME,
     INDEX,
     AND,
+    IS,
+    NOT,
+    NULL_KW,
     JOIN,
     ON,
     COUNT,
+    DISTINCT,
     MAX,
     MIN,
     SUM,
@@ -133,6 +138,7 @@ enum class TokenType {
     VALUE_FLOAT,
     VALUE_STRING,
     VALUE_BOOL,
+    PARAMETER,
 
     // Special
     T_EOF,
@@ -148,7 +154,7 @@ struct Token {
     // 对于数值类型，直接存储解析后的值
     union {
         int64_t int_value;
-        double float_value;
+        float float_value;
         bool bool_value;
     };
 
@@ -199,7 +205,7 @@ private:
 
     // 数字解析
     int64_t parse_integer(std::string_view text);
-    double parse_float(std::string_view text);
+    float parse_float(std::string_view text);
 };
 
 } // namespace parser

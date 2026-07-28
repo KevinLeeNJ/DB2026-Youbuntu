@@ -43,6 +43,10 @@ template <typename T, typename = void> struct has_limit_member : std::false_type
 
 template <typename T> struct has_limit_member<T, std::void_t<decltype(std::declval<T>().limit)>> : std::true_type {};
 
+template <typename T, typename = void> struct has_offset_member : std::false_type {};
+
+template <typename T> struct has_offset_member<T, std::void_t<decltype(std::declval<T>().offset)>> : std::true_type {};
+
 template <typename T, typename = void> struct has_has_select_star_member : std::false_type {};
 
 template <typename T>
@@ -91,6 +95,7 @@ QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& 
         expr.type = QueryExprType::AGGREGATE;
         expr.agg.type = convert_ast_agg_type(agg->func);
         expr.agg.is_star = agg->is_star;
+        expr.agg.is_distinct = agg->is_distinct;
         if (!agg->is_star) {
             if (agg->col == nullptr) {
                 throw InternalError("Unexpected null aggregate argument");
@@ -169,6 +174,10 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
             case ast::SV_OP_GE:
                 cond.op = OP_GE;
                 break;
+            case ast::SV_OP_IS_NULL:
+            case ast::SV_OP_IS_NOT_NULL:
+                // `IS [NOT] NULL` 只在 WHERE 支持，parse_having_condition 不会产生它
+                throw RMDBError("HAVING does not support IS [NOT] NULL");
             }
             if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
                 cond.is_rhs_val = true;
@@ -205,9 +214,13 @@ template <typename SelectStmtT> void populate_order_by_from_ast(Query& query, co
 template <typename SelectStmtT> void populate_limit_from_ast(Query& query, const SelectStmtT& stmt) {
     query.has_limit = false;
     query.limit = 0;
+    query.offset = 0;
     if constexpr (has_has_limit_member<SelectStmtT>::value && has_limit_member<SelectStmtT>::value) {
         query.has_limit = stmt.has_limit;
         query.limit = stmt.limit;
+    }
+    if constexpr (has_offset_member<SelectStmtT>::value) {
+        query.offset = stmt.offset;
     }
 }
 

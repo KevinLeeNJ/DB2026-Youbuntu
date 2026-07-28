@@ -19,9 +19,12 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/config.h"
@@ -92,6 +95,12 @@ public:
         return buf;
     }
 
+    static std::vector<char> float_key(float value) {
+        std::vector<char> buf(sizeof(float));
+        std::memcpy(buf.data(), &value, sizeof(float));
+        return buf;
+    }
+
     struct LeafSnapshot {
         page_id_t page_no;
         std::vector<int> keys;
@@ -140,6 +149,35 @@ TEST_F(IndexHandleTest, InsertsUniqueKeysAndFindsValues) {
     close_index(ih);
 }
 
+TEST_F(IndexHandleTest, UniqueLookupFindsSingleKey) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{7, value}, nullptr);
+    }
+
+    auto found = ih->lookup_unique(key(137).data());
+    ASSERT_EQ(found.status, UniqueLookupStatus::Unique);
+    EXPECT_EQ(found.rid.page_no, 7);
+    EXPECT_EQ(found.rid.slot_no, 137);
+
+    const auto missing = ih->lookup_unique(key(9999).data());
+    EXPECT_EQ(missing.status, UniqueLookupStatus::NotFound);
+
+    std::vector<page_id_t> resident_pages(ih->resident_internal_pages_.begin(), ih->resident_internal_pages_.end());
+    ASSERT_FALSE(resident_pages.empty());
+    for (page_id_t page_no : resident_pages) {
+        EXPECT_TRUE(buffer_pool_manager->is_page_resident(PageId{ih->fd_, page_no}));
+        ASSERT_EQ(buffer_pool_manager->get_residency_class(PageId{ih->fd_, page_no}), ResidencyClass::IndexInternal);
+    }
+
+    const int index_fd = ih->fd_;
+    close_index(ih);
+    for (page_id_t page_no : resident_pages) {
+        EXPECT_FALSE(buffer_pool_manager->is_page_resident(PageId{index_fd, page_no}));
+    }
+}
+
 TEST_F(IndexHandleTest, RejectsDuplicateKeys) {
     auto ih = open_index();
     auto k10 = key(10);
@@ -171,6 +209,225 @@ TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
 
     EXPECT_EQ(slots, std::vector<int>({123, 124, 125, 126, 127, 128, 129, 130}));
 
+    close_index(ih);
+}
+
+// The coupled cursor drops the structure latch between batches and resumes by
+// re-descending on the last emitted key, skipping leaves that hold nothing. An
+// end bound expressed as (page, slot) can be skipped exactly like that: an
+// upper_bound landing on slot_no == size normalises to the next leaf's slot 0,
+// and delete_entry never coalesces, so that next leaf may be empty. When the
+// resume walk steps over it, no page number ever matches the end bound again and
+// the scan runs to the physical end of the leaf chain.
+//
+// This case (a range spanning exactly kMaxBatchLeaves, with the leaf the end
+// bound normalises onto emptied first) holds in both directions and is kept as
+// an invariant: an empty end leaf must still terminate the scan. The variant
+// below is the one that actually fails without the key bound.
+// On 50-warehouse TPC-C the live symptom was a one-district new_orders range of
+// ~900 entries walking 290,732 (and in another sample 412,063) entries.
+TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundWhenEndLeafIsEmpty) {
+    auto ih = open_index();
+    constexpr int kKeyCount = 8000;
+    for (int value = 0; value < kKeyCount; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+    }
+
+    auto leaves = leaf_snapshots(ih.get());
+    // leaves[1..8] is the scanned range, leaves[9] is emptied and becomes the
+    // end bound, and leaves[10] onwards is what an unbounded scan would spill
+    // into.
+    ASSERT_GE(leaves.size(), 11U);
+    const int range_lo = leaves[1].keys.front();
+    const int range_hi = leaves[8].keys.back();
+    ASSERT_FALSE(leaves[9].keys.empty());
+
+    auto lower_key = key(range_lo);
+    auto upper_key = key(range_hi);
+    const Iid lower = ih->lower_bound(lower_key.data());
+    const Iid upper = ih->upper_bound(upper_key.data());
+    ASSERT_NE(lower.page_no, upper.page_no);
+    ASSERT_EQ(upper.page_no, leaves[9].page_no);
+    ASSERT_EQ(upper.slot_no, 0);
+
+    for (int value : leaves[9].keys) {
+        auto k = key(value);
+        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, nullptr));
+    }
+
+    std::vector<int> scanned;
+    for (IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get()); !scan.is_end(); scan.next()) {
+        scanned.push_back(scan.rid().slot_no);
+    }
+
+    std::vector<int> expected;
+    for (int value = range_lo; value <= range_hi; ++value) {
+        expected.push_back(value);
+    }
+    EXPECT_EQ(scanned, expected);
+
+    close_index(ih);
+}
+
+// Same failure mode reached the other way: the end position keeps a slot index
+// into a leaf that then shrinks below it, so "this is the end leaf and we have
+// passed its end slot" can never become true again. Before the fix the scan ran
+// past the end leaf into the rest of the chain.
+TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundAfterEndLeafShrinksBelowEndSlot) {
+    auto ih = open_index();
+    constexpr int kKeyCount = 8000;
+    for (int value = 0; value < kKeyCount; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+    }
+
+    auto leaves = leaf_snapshots(ih.get());
+    ASSERT_GE(leaves.size(), 4U);
+    const auto& end_leaf = leaves[2];
+    ASSERT_GE(end_leaf.keys.size(), 8U);
+    const int range_lo = leaves[1].keys.front();
+    // Mid-leaf upper bound, so end_.slot_no is a real slot index inside the leaf.
+    const int range_hi = end_leaf.keys[end_leaf.keys.size() / 2];
+
+    auto lower_key = key(range_lo);
+    auto upper_key = key(range_hi);
+    const Iid lower = ih->lower_bound(lower_key.data());
+    const Iid upper = ih->upper_bound(upper_key.data());
+    ASSERT_EQ(upper.page_no, end_leaf.page_no);
+    ASSERT_GT(upper.slot_no, 0);
+    ASSERT_NE(lower.page_no, upper.page_no);
+
+    // Shrink the end leaf below the recorded end slot, which is what a
+    // concurrent split (half the entries move away) or a run of deletes does.
+    std::vector<int> surviving{end_leaf.keys.front()};
+    for (int value : end_leaf.keys) {
+        if (value == surviving.front()) {
+            continue;
+        }
+        auto k = key(value);
+        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, nullptr));
+    }
+
+    std::vector<int> scanned;
+    for (IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get()); !scan.is_end(); scan.next()) {
+        scanned.push_back(scan.rid().slot_no);
+    }
+
+    std::vector<int> expected;
+    for (int value = range_lo; value < end_leaf.keys.front(); ++value) {
+        expected.push_back(value);
+    }
+    expected.push_back(surviving.front());
+    EXPECT_EQ(scanned, expected);
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, FloatKeysUseBinary32Ordering) {
+    const auto int_index_name = ix_manager->get_index_name(table_name, cols);
+    disk_manager->destroy_file(int_index_name);
+    ASSERT_FALSE(disk_manager->is_file(int_index_name));
+    cols = {ColMeta{.tab_name = table_name,
+                    .name = "value",
+                    .type = TYPE_FLOAT,
+                    .len = static_cast<int>(sizeof(float)),
+                    .offset = 0,
+                    .index = true}};
+    ix_manager->create_index(table_name, cols);
+
+    auto ih = open_index();
+    for (const auto& [value, slot] :
+         std::vector<std::pair<float, int>>{{1.5F, 115}, {300000.01F, 3000100}, {-2.0F, 80}}) {
+        auto k = float_key(value);
+        ih->insert_entry(k.data(), Rid{1, slot}, nullptr);
+    }
+
+    auto target = float_key(300000.01F);
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(target.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1);
+    EXPECT_EQ(result.front().slot_no, 3000100);
+
+    auto lower = float_key(-3.0F);
+    auto upper = float_key(2.0F);
+    IxScan scan(ih.get(), ih->lower_bound(lower.data()), ih->upper_bound(upper.data()), buffer_pool_manager.get());
+    std::vector<int> slots;
+    while (!scan.is_end()) {
+        slots.push_back(scan.rid().slot_no);
+        scan.next();
+    }
+    EXPECT_EQ(slots, std::vector<int>({80, 115}));
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, ReverseScanWalksLeafLinksWithoutReSeek) {
+    auto ih = open_index();
+    for (int value = 0; value < 200; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    std::vector<int> values;
+    {
+        IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get(), true, false,
+                    ScanDirection::Backward);
+        while (!scan.is_end()) {
+            values.push_back(scan.rid().slot_no);
+            scan.next();
+        }
+    }
+
+    ASSERT_EQ(values.size(), 200u);
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(values[i], 199 - static_cast<int>(i));
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, AppendSplitsPreserveOrder) {
+    auto ih = open_index();
+    for (int value = 0; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    std::vector<int> values;
+    IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
+    while (!scan.is_end()) {
+        values.push_back(scan.rid().slot_no);
+        scan.next();
+    }
+    ASSERT_EQ(values.size(), 2000u);
+    for (size_t i = 0; i < values.size(); ++i) {
+        EXPECT_EQ(values[i], static_cast<int>(i));
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, HybridUsesPinnedCursorForSingleLeafRange) {
+    auto ih = open_index();
+    for (int value : {10, 20, 30}) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    auto lower_key = key(10);
+    auto upper_key = key(20);
+    Iid lower = ih->lower_bound(lower_key.data());
+    Iid upper = ih->upper_bound(upper_key.data());
+    ASSERT_EQ(lower.page_no, upper.page_no);
+
+    IxScan scan(ih.get(), lower, upper, buffer_pool_manager.get(), true, true);
+    std::vector<int> values;
+    while (!scan.is_end()) {
+        int value = 0;
+        std::memcpy(&value, scan.key(), sizeof(value));
+        values.push_back(value);
+        scan.next();
+    }
+
+    EXPECT_EQ(values, std::vector<int>({10, 20}));
     close_index(ih);
 }
 
@@ -242,6 +499,198 @@ TEST_F(IndexHandleTest, EqualRangeMatchesLowerBoundPlusUpperBound) {
     close_index(ih);
 }
 
+TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
+    auto ih = open_index();
+    for (int value = 0; value < 1000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    close_index(ih);
+
+    // Simulate a new server process: fd2pageno_ is process-local and must be
+    // reconstructed from the persisted index header when the index is opened.
+    ix_manager.reset();
+    buffer_pool_manager.reset();
+    disk_manager.reset();
+    disk_manager = std::make_unique<DiskManager>();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    ih = open_index();
+
+    for (int value = 1000; value < 2000; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    auto k = key(1500);
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result.front(), (Rid{1, 1500}));
+    close_index(ih);
+}
+
+// num_pages_ only ever reaches disk through the checkpoint path, so a crash
+// leaves the persisted header naming fewer pages than the file actually holds.
+// Trusting it would make the next create_node() hand out page numbers that
+// live nodes already occupy, and recovery would overwrite a live subtree.
+TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
+    // This test is about what the IxIndexHandle constructor does when the
+    // persisted num_pages_ is behind the real file length. Splits now publish
+    // the index header themselves, so that condition has to be created on
+    // purpose instead of assumed - which is the whole point of the SMO
+    // write-out, but it means the precondition below would otherwise never hold.
+    struct SmoFlushOff {
+        SmoFlushOff() {
+            IxIndexHandle::set_smo_flush_enabled(false);
+        }
+        ~SmoFlushOff() {
+            IxIndexHandle::set_smo_flush_enabled(true);
+        }
+    } smo_flush_off;
+
+    constexpr int kCheckpointedKeys = 1000;
+    constexpr int kKeysAfterCheckpoint = 1400;
+    const auto index_name = ix_manager->get_index_name(table_name, cols);
+
+    // A checkpoint publishes a fully consistent header.
+    auto ih = open_index();
+    for (int value = 0; value < kCheckpointedKeys; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    close_index(ih);
+
+    // More leaf splits allocate pages after that header was published. The
+    // root does not move, so only num_pages_ goes stale - which is the case
+    // the fix has to survive. A stale root_page_ needs its own WAL record and
+    // is out of scope here.
+    ih = open_index();
+    const page_id_t root_before = ih->file_hdr_->root_page_;
+    const page_id_t pages_at_checkpoint = ih->file_hdr_->num_pages_;
+    for (int value = kCheckpointedKeys; value < kKeysAfterCheckpoint; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    ASSERT_EQ(ih->file_hdr_->root_page_, root_before) << "test needs a workload that does not move the root";
+    ASSERT_GT(ih->file_hdr_->num_pages_, pages_at_checkpoint);
+
+    // Persist the node pages but not the header, which is exactly what kill -9
+    // leaves behind: close_index()/flush_index_header() never ran.
+    const int fd = ih->GetFd();
+    ASSERT_TRUE(buffer_pool_manager->flush_all_pages(fd));
+    ih->release_root_page_cache();
+    buffer_pool_manager->delete_all_pages(fd);
+    disk_manager->close_file(fd);
+    ih.reset();
+
+    // The precondition the fix exists for: the persisted page count is behind
+    // the real file length.
+    const int64_t file_size = disk_manager->get_file_size(index_name);
+    ASSERT_GT(file_size, 0);
+    {
+        std::vector<char> header_bytes(PAGE_SIZE, 0);
+        const int header_fd = disk_manager->open_file(index_name);
+        disk_manager->read_page(header_fd, IX_FILE_HDR_PAGE, header_bytes.data(), PAGE_SIZE);
+        IxFileHdr persisted;
+        persisted.deserialize(header_bytes.data());
+        disk_manager->close_file(header_fd);
+        EXPECT_LT(static_cast<int64_t>(persisted.num_pages_) * PAGE_SIZE, file_size)
+            << "test no longer reproduces the stale-header case";
+    }
+
+    // Simulate the restarted process.
+    ix_manager.reset();
+    buffer_pool_manager.reset();
+    disk_manager.reset();
+    disk_manager = std::make_unique<DiskManager>();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    ih = open_index();
+
+    // The allocation cursor must start past every page the file already holds.
+    const page_id_t pages_on_disk = static_cast<page_id_t>((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
+    EXPECT_GE(disk_manager->get_fd2pageno(ih->GetFd()), pages_on_disk);
+
+    // Inserting more keys now calls create_node(); with a stale cursor those
+    // new nodes would land on top of the leaves holding the old keys.
+    constexpr int kKeysAfterRestart = 2400;
+    for (int value = kKeysAfterCheckpoint; value < kKeysAfterRestart; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+    for (int value = 0; value < kKeysAfterRestart; ++value) {
+        auto k = key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << "lost key " << value;
+        ASSERT_EQ(result.size(), 1u) << "key " << value;
+        EXPECT_EQ(result.front(), (Rid{1, value}));
+    }
+    // last_leaf_ went stale together with num_pages_, so the structure gate
+    // has to recompute it before it can trust the leaf chain.
+    EXPECT_FALSE(ih->validate_structure());
+    ASSERT_TRUE(ih->refresh_leaf_chain_endpoint());
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, CachesMultiLevelInternalPagesAcrossReopen) {
+    cleanup();
+    cols = {ColMeta{.tab_name = table_name, .name = "id", .type = TYPE_STRING, .len = 128, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+
+    const auto wide_key = [](int value) {
+        std::vector<char> buf(128, 0);
+        const std::string encoded = std::to_string(value);
+        std::memcpy(buf.data(), encoded.data(), encoded.size());
+        return buf;
+    };
+    for (int value = 0; value < 4000; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    ih->refresh_page_residency();
+    ASSERT_GT(ih->cached_internal_pages_.size(), 1u);
+
+    const auto cached = *ih->cached_internal_pages_.begin();
+    ASSERT_NE(cached.second, nullptr);
+    const int pin_count_before = cached.second->pin_count_;
+    {
+        auto structure_guard = ih->lock_shared();
+        IxNodeHandle node;
+        ih->fetch_node_into(cached.first, node);
+        EXPECT_EQ(node.page, cached.second);
+        EXPECT_EQ(cached.second->pin_count_, pin_count_before);
+        ih->unpin_if_not_cached(node.get_page_id());
+        EXPECT_EQ(cached.second->pin_count_, pin_count_before);
+    }
+
+    const int index_fd = ih->fd_;
+    close_index(ih);
+    for (page_id_t page_no : {cached.first}) {
+        EXPECT_FALSE(buffer_pool_manager->is_page_resident(PageId{index_fd, page_no}));
+    }
+
+    ix_manager.reset();
+    buffer_pool_manager.reset();
+    disk_manager.reset();
+    disk_manager = std::make_unique<DiskManager>();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    ih = open_index();
+    ih->refresh_page_residency();
+    ASSERT_GT(ih->cached_internal_pages_.size(), 1u);
+
+    auto lookup_key = wide_key(1379);
+    std::vector<Rid> result;
+    ASSERT_TRUE(ih->get_value(lookup_key.data(), &result, nullptr));
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result.front(), (Rid{1, 1379}));
+    close_index(ih);
+}
+
 TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     auto ih = open_index();
     auto duplicate_key = key(777);
@@ -257,6 +706,13 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
     ASSERT_EQ(result.size(), inserted.size());
 
+    std::vector<Rid> fast_result;
+    ih->lookup_equal(duplicate_key.data(), fast_result);
+    EXPECT_EQ(fast_result, inserted);
+
+    const auto duplicate_lookup = ih->lookup_unique(duplicate_key.data());
+    EXPECT_EQ(duplicate_lookup.status, UniqueLookupStatus::Duplicate);
+
     Rid target = inserted[inserted.size() / 2];
     EXPECT_TRUE(ih->delete_entry(duplicate_key.data(), target, nullptr));
 
@@ -264,6 +720,36 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
     EXPECT_EQ(result.size(), inserted.size() - 1);
     EXPECT_TRUE(std::none_of(result.begin(), result.end(), [&](const Rid& rid) { return rid == target; }));
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleTest, LeafLocalMutationDoesNotInvalidateTopologyEpoch) {
+    auto ih = open_index();
+    for (int value = 0; value < 200; ++value) {
+        auto k = key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+    }
+
+    const auto leaves = leaf_snapshots(ih.get());
+    const int max_size = ih->file_hdr_->btree_order_ + 1;
+    bool tested = false;
+    for (const auto& snapshot : leaves) {
+        if (snapshot.keys.size() < 2 || static_cast<int>(snapshot.keys.size()) + 1 >= max_size) {
+            continue;
+        }
+
+        auto duplicate_key = key(snapshot.keys[1]);
+        const Rid duplicate_rid{9001, snapshot.keys[1]};
+        const auto epoch_before = ih->topology_epoch_.load(std::memory_order_relaxed);
+        ih->insert_entry(duplicate_key.data(), duplicate_rid, nullptr, true);
+        EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
+        ASSERT_TRUE(ih->delete_entry(duplicate_key.data(), duplicate_rid, nullptr));
+        EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
+        tested = true;
+        break;
+    }
+    EXPECT_TRUE(tested);
 
     close_index(ih);
 }
@@ -312,7 +798,7 @@ TEST_F(IndexHandleTest, ConcurrentInsertDeleteByRidDoesNotCorruptTree) {
     close_index(ih);
 }
 
-TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
+TEST_F(IndexHandleTest, LongScanAllowsStructuralChangesWithoutMissingOrDuplicatingEntries) {
     auto ih = open_index();
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
@@ -320,18 +806,23 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
     }
 
     auto inserted_key = key(5000);
-    auto deleted_key = key(1000);
+    auto deleted_key = key(1500); // non-first entry in its leaf: optimistic delete path
     std::atomic<bool> scan_ready{false};
     std::atomic<bool> release_scan{false};
     std::atomic<bool> insert_done{false};
     std::atomic<bool> delete_done{false};
     std::atomic<bool> delete_result{false};
+    std::vector<int> scanned_slots;
 
     std::thread reader([&] {
         IxScan scan(ih.get(), ih->leaf_begin(), ih->leaf_end(), buffer_pool_manager.get());
         scan_ready.store(true, std::memory_order_release);
         while (!release_scan.load(std::memory_order_acquire)) {
             std::this_thread::yield();
+        }
+        while (!scan.is_end()) {
+            scanned_slots.push_back(scan.rid().slot_no);
+            scan.next();
         }
     });
 
@@ -357,9 +848,15 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
     }
     ASSERT_TRUE(scan_ready.load(std::memory_order_acquire));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_FALSE(insert_done.load(std::memory_order_acquire));
-    EXPECT_FALSE(delete_done.load(std::memory_order_acquire));
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while ((!insert_done.load(std::memory_order_acquire) || !delete_done.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    // A scan object may outlive a leaf batch, but it must not retain the
+    // structure latch while its consumer is processing that batch.
+    EXPECT_TRUE(insert_done.load(std::memory_order_acquire));
+    EXPECT_TRUE(delete_done.load(std::memory_order_acquire));
 
     release_scan.store(true, std::memory_order_release);
     reader.join();
@@ -369,6 +866,10 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
     EXPECT_TRUE(insert_done.load(std::memory_order_acquire));
     EXPECT_TRUE(delete_done.load(std::memory_order_acquire));
     EXPECT_TRUE(delete_result.load(std::memory_order_acquire));
+    ASSERT_EQ(scanned_slots.size(), 2000u);
+    EXPECT_TRUE(std::is_sorted(scanned_slots.begin(), scanned_slots.end()));
+    EXPECT_EQ(std::count(scanned_slots.begin(), scanned_slots.end(), 1500), 0);
+    EXPECT_EQ(std::count(scanned_slots.begin(), scanned_slots.end(), 5000), 1);
 
     std::vector<Rid> result;
     EXPECT_TRUE(ih->get_value(inserted_key.data(), &result, nullptr));
@@ -388,7 +889,7 @@ TEST_F(IndexHandleTest, ScanBlocksConcurrentWritersUntilDestroyed) {
 
     ASSERT_EQ(slots.size(), 2000u);
     EXPECT_TRUE(std::is_sorted(slots.begin(), slots.end()));
-    EXPECT_EQ(std::count(slots.begin(), slots.end(), 1000), 0);
+    EXPECT_EQ(std::count(slots.begin(), slots.end(), 1500), 0);
     EXPECT_EQ(std::count(slots.begin(), slots.end(), 5000), 1);
 
     close_index(ih);
@@ -469,6 +970,23 @@ TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
 
 namespace {
 
+class ObservableIndexScanExecutor : public IndexScanExecutor {
+public:
+    using IndexScanExecutor::IndexScanExecutor;
+
+    bool uses_single_rid_cursor() const {
+        return single_rid_cursor_.has_value();
+    }
+
+    bool uses_empty_single_rid_cursor() const {
+        return uses_single_rid_cursor() && single_rid_cursor_->is_end();
+    }
+
+    bool uses_rid_vector_cursor() const {
+        return rid_vector_cursor_.has_value();
+    }
+};
+
 class IndexScanFeatureTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager;
@@ -524,7 +1042,7 @@ public:
     }
 
     void create_scores() {
-        std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 8}};
+        std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4}};
         sm_manager->create_table("scores", cols, nullptr);
     }
 
@@ -566,7 +1084,7 @@ public:
         executor.Next();
     }
 
-    void insert_score(int sid, int cid, double score) {
+    void insert_score(int sid, int cid, float score) {
         Value sid_val;
         sid_val.set_int(sid);
         Value cid_val;
@@ -686,6 +1204,113 @@ TEST_F(IndexScanFeatureTest, UsesSingleColumnIndexForPointAndRangeScans) {
     EXPECT_EQ(scan_ids({int_cond(OP_LT, 534), int_cond(OP_GT, 100)}, {"w_id"}), std::vector<int>({500}));
 }
 
+TEST_F(IndexScanFeatureTest, ReusesCompiledConstraintsAcrossInjectedLookups) {
+    create_two_int_table("lookup_rows");
+    insert_two_ints("lookup_rows", 10, 1);
+    insert_two_ints("lookup_rows", 20, 2);
+    insert_two_ints("lookup_rows", 30, 3);
+    sm_manager->create_index("lookup_rows", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    IndexScanExecutor executor(sm_manager.get(), "lookup_rows", {}, {"b"}, &context);
+
+    auto scan_for_b = [&](int value) {
+        executor.set_key_conditions({table_int_cond("lookup_rows", "b", OP_EQ, value)});
+        std::vector<int> result;
+        for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+            auto rec = executor.Next();
+            result.push_back(*reinterpret_cast<int*>(rec->data));
+        }
+        return result;
+    };
+
+    EXPECT_EQ(scan_for_b(2), std::vector<int>({20}));
+    EXPECT_EQ(scan_for_b(1), std::vector<int>({10}));
+    EXPECT_EQ(scan_for_b(3), std::vector<int>({30}));
+}
+
+TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
+    create_two_int_table("lookup_direct");
+    insert_two_ints("lookup_direct", 10, 7);
+    insert_two_ints("lookup_direct", 20, 8);
+    sm_manager->create_index("lookup_direct", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_direct", {}, {"b"}, &context);
+    int lookup_value = 7;
+    executor.set_lookup_key(TabCol{"lookup_direct", "b"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    executor.beginTuple();
+    EXPECT_TRUE(executor.uses_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_empty_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_rid_vector_cursor());
+
+    std::vector<int> result;
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto rec = executor.Next();
+        ASSERT_NE(rec, nullptr);
+        result.push_back(*reinterpret_cast<int*>(rec->data));
+    }
+    EXPECT_EQ(result, std::vector<int>({10}));
+}
+
+TEST_F(IndexScanFeatureTest, ExactLookupMissUsesEmptySingleRidCursor) {
+    create_two_int_table("lookup_miss");
+    insert_two_ints("lookup_miss", 10, 7);
+    sm_manager->create_index("lookup_miss", {"b"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_miss", {}, {"b"}, &context);
+    int lookup_value = 8;
+    executor.set_lookup_key(TabCol{"lookup_miss", "b"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    executor.beginTuple();
+
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_TRUE(executor.uses_empty_single_rid_cursor());
+    EXPECT_FALSE(executor.uses_rid_vector_cursor());
+}
+
+TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
+    create_two_int_table("lookup_duplicates");
+    sm_manager->create_index("lookup_duplicates", {"b"}, nullptr);
+
+    const std::string csv_path = db_name + "_duplicate_lookup.csv";
+    {
+        std::ofstream out(csv_path);
+        ASSERT_TRUE(out.is_open());
+        out << "a,b\n10,7\n20,7\n";
+    }
+    sm_manager->load_csv_data(csv_path, "lookup_duplicates", nullptr);
+    std::remove(csv_path.c_str());
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_duplicates", {}, {"b"}, &context);
+    int lookup_value = 7;
+    executor.set_lookup_key(TabCol{"lookup_duplicates", "b"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    std::vector<int> result;
+    for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+        auto rec = executor.Next();
+        ASSERT_NE(rec, nullptr);
+        result.push_back(*reinterpret_cast<int*>(rec->data));
+    }
+    EXPECT_EQ(result, std::vector<int>({10, 20}));
+    EXPECT_FALSE(executor.uses_single_rid_cursor());
+    EXPECT_TRUE(executor.uses_rid_vector_cursor());
+}
+
 TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRange) {
     create_warehouse();
     sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);
@@ -729,9 +1354,9 @@ TEST_F(IndexScanFeatureTest, DroppedTableRecordPagesDoNotPolluteLaterIndexBuilds
 
     create_scores();
     for (int sid = 10; sid <= 15; ++sid) {
-        insert_score(sid, 101, static_cast<double>(sid));
-        insert_score(sid, 102, static_cast<double>(sid) + 0.5);
-        insert_score(sid, 103, static_cast<double>(sid) + 1.0);
+        insert_score(sid, 101, static_cast<float>(sid));
+        insert_score(sid, 102, static_cast<float>(sid) + 0.5f);
+        insert_score(sid, 103, static_cast<float>(sid) + 1.0f);
     }
     sm_manager->create_index("scores", {"sid", "cid"}, nullptr);
 
@@ -823,16 +1448,36 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "qweruiop")}, {"name"}), std::vector<int>({10}));
 }
 
-TEST_F(IndexScanFeatureTest, CreateIndexRejectsDuplicateExistingKeysAndDoesNotLeaveCatalogEntry) {
+// `CREATE INDEX` builds an access path, not a uniqueness constraint: final.md:168
+// says the schema declares no PRIMARY KEY / FOREIGN KEY / other constraint beyond
+// the CREATE INDEX statements themselves. It must therefore not be stricter than
+// the paths that already put those rows in the heap — LOAD and the recovery-time
+// index rebuild both pass allow_duplicate=true, so rejecting duplicates here made
+// a legitimately loaded table impossible to index.
+//
+// INSERT/UPDATE keep enforcing uniqueness on purpose: it is the loud failure
+// signal for concurrent order-number races (final.md:444), and TPC-C's composite
+// index keys are unique by construction thanks to their trailing column
+// (final.md:171), so it never misfires on the real workload.
+TEST_F(IndexScanFeatureTest, CreateIndexOverDuplicateExistingKeysSucceeds) {
     create_two_int_table("dups");
     insert_two_ints("dups", 1, 10);
     insert_two_ints("dups", 1, 20);
 
-    EXPECT_THROW(sm_manager->create_index("dups", {"a"}, nullptr), IndexEntryExistsError);
-    EXPECT_FALSE(sm_manager->db_.get_table("dups").is_index({"a"}));
-    EXPECT_TRUE(sm_manager->ihs_.find(sm_manager->get_ix_manager()->get_index_name(
-                    "dups", std::vector<std::string>{"a"})) == sm_manager->ihs_.end());
+    ASSERT_NO_THROW(sm_manager->create_index("dups", {"a"}, nullptr));
+    EXPECT_TRUE(sm_manager->db_.get_table("dups").is_index({"a"}));
+
+    // Both heap rows must be reachable through the new index.
+    const std::string index_name = sm_manager->get_ix_manager()->get_index_name("dups", std::vector<std::string>{"a"});
+    auto handle = sm_manager->ihs_.find(index_name);
+    ASSERT_NE(handle, sm_manager->ihs_.end());
+    int key = 1;
+    std::vector<Rid> rids;
+    handle->second->get_value(reinterpret_cast<char*>(&key), &rids, nullptr);
+    EXPECT_EQ(rids.size(), 2u) << "索引应能找到两行重复键";
 }
+// (INSERT 侧保留的唯一性检查由本文件上方的
+//  RejectsDuplicateKeyOnIndexedColumn 系列用例覆盖，此处不重复。)
 
 } // namespace
 

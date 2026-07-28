@@ -11,9 +11,12 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -29,10 +32,6 @@ See the Mulan PSL v2 for more details. */
 struct UndoLog {
     /* 此日志是否为删除标记 */
     bool is_deleted_;
-    /* 此撤销日志修改的字段 */
-    std::vector<bool> modified_fields_;
-    /* 修改后的字段 */
-    std::vector<Value> tuple_;
     RmRecord* tuple_test_;
     /* 此撤销日志的时间戳 */
     timestamp_t ts_{INVALID_TS};
@@ -45,12 +44,42 @@ struct UndoLog {
 };
 
 class Transaction {
+private:
+    struct UpdateWriteKey {
+        std::string tab_name_;
+        Rid rid_;
+    };
+
+    struct UpdateUndoEntry {
+        UpdateWriteKey key_;
+        UndoLink undo_link_;
+    };
+
+    struct ModifiedSlotKey {
+        std::string tab_name_;
+        Rid rid_;
+
+        bool operator==(const ModifiedSlotKey& other) const {
+            return tab_name_ == other.tab_name_ && rid_ == other.rid_;
+        }
+    };
+
+    struct ModifiedSlotKeyHash {
+        size_t operator()(const ModifiedSlotKey& key) const {
+            size_t hash = std::hash<std::string>{}(key.tab_name_);
+            hash ^= std::hash<int>{}(key.rid_.page_no) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+            hash ^= std::hash<int>{}(key.rid_.slot_no) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+            return hash;
+        }
+    };
+
+    std::optional<UpdateWriteKey> pending_update_key_;
+    std::optional<UndoLink> pending_update_undo_link_;
+    std::vector<UpdateUndoEntry> update_undo_entries_;
+
 public:
     explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {
-        lock_set_ = std::make_unique<std::unordered_set<LockDataId>>();
-        index_latch_page_set_ = std::make_unique<std::deque<Page*>>();
-        index_deleted_page_set_ = std::make_unique<std::deque<Page*>>();
         prev_lsn_ = INVALID_LSN;
         thread_id_ = std::this_thread::get_id();
     }
@@ -92,6 +121,17 @@ public:
     inline void set_state(TransactionState state) {
         state_.store(state, std::memory_order_release);
     }
+    inline bool compare_exchange_state(TransactionState& expected, TransactionState desired) {
+        return state_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    inline void mark_lock_cancellation_requested() {
+        lock_cancellation_requested_.store(true, std::memory_order_release);
+    }
+
+    inline bool is_lock_cancellation_requested() const {
+        return lock_cancellation_requested_.load(std::memory_order_acquire);
+    }
 
     inline lsn_t get_prev_lsn() {
         return prev_lsn_;
@@ -104,25 +144,54 @@ public:
         return write_set_;
     }
     inline void append_write_record(std::unique_ptr<WriteRecord> write_record) {
+        pending_update_key_.reset();
+        pending_update_undo_link_.reset();
+
+        if (write_record != nullptr && write_record->GetWriteType() == WType::UPDATE_TUPLE) {
+            UpdateWriteKey key{write_record->GetTableName(), write_record->GetRid()};
+            for (const auto& entry : update_undo_entries_) {
+                if (entry.key_.tab_name_ == key.tab_name_ && entry.key_.rid_ == key.rid_) {
+                    // Keep the first WriteRecord and its original undo link. The
+                    // executor still applies each later update to the current tuple.
+                    pending_update_undo_link_ = entry.undo_link_;
+                    return;
+                }
+            }
+            pending_update_key_ = std::move(key);
+        } else if (write_record != nullptr) {
+            // An INSERT/DELETE on the same RID starts a different write lifecycle.
+            const std::string& tab_name = write_record->GetTableName();
+            const Rid& rid = write_record->GetRid();
+            update_undo_entries_.erase(std::remove_if(update_undo_entries_.begin(), update_undo_entries_.end(),
+                                                      [&](const auto& entry) {
+                                                          return entry.key_.tab_name_ == tab_name &&
+                                                                 entry.key_.rid_ == rid;
+                                                      }),
+                                       update_undo_entries_.end());
+        }
         write_set_.push_back(std::move(write_record));
     }
 
     inline std::deque<Page*>* get_index_deleted_page_set() {
-        return index_deleted_page_set_.get();
+        return &index_deleted_page_set_;
     }
     inline void append_index_deleted_page(Page* page) {
-        index_deleted_page_set_->push_back(page);
+        index_deleted_page_set_.push_back(page);
     }
 
     inline std::deque<Page*>* get_index_latch_page_set() {
-        return index_latch_page_set_.get();
+        return &index_latch_page_set_;
     }
     inline void append_index_latch_page_set(Page* page) {
-        index_latch_page_set_->push_back(page);
+        index_latch_page_set_.push_back(page);
     }
 
     inline std::unordered_set<LockDataId>* get_lock_set() {
-        return lock_set_.get();
+        return &lock_set_;
+    }
+
+    inline std::unordered_set<std::string>* get_unique_key_lock_set() {
+        return &unique_key_lock_set_;
     }
 
     inline timestamp_t get_read_ts() const {
@@ -130,6 +199,12 @@ public:
     }
     inline void set_read_ts(timestamp_t ts) {
         read_ts_ = ts;
+    }
+    inline size_t get_watermark_slot() const {
+        return watermark_slot_;
+    }
+    inline void set_watermark_slot(size_t slot) {
+        watermark_slot_ = slot;
     }
     inline timestamp_t get_commit_ts() const {
         return commit_ts_;
@@ -143,11 +218,15 @@ public:
         return modified_slots_;
     }
     inline void append_modified_slot(const std::string& tab_name, const Rid& rid) {
-        if (!modified_slots_.empty() && modified_slots_.back().first == tab_name &&
-            modified_slots_.back().second == rid) {
+        if (!modified_slot_set_.emplace(ModifiedSlotKey{tab_name, rid}).second) {
             return;
         }
         modified_slots_.emplace_back(tab_name, rid);
+    }
+
+    inline void clear_modified_slots() {
+        modified_slots_.clear();
+        modified_slot_set_.clear();
     }
 
     /** 修改现有的撤销日志 */
@@ -159,13 +238,31 @@ public:
     /** @return an UndoLink pointing to the appended undo log.
      *  Uses the undo log index as the slot offset for in-memory undo storage. */
     inline auto AppendUndoLog(UndoLog log) -> UndoLink {
+        if (pending_update_undo_link_.has_value()) {
+            UndoLink undo_link = *pending_update_undo_link_;
+            pending_update_undo_link_.reset();
+            return undo_link;
+        }
+
         std::scoped_lock<std::mutex> lck(latch_);
         int idx = static_cast<int>(undo_logs_.size());
         undo_logs_.emplace_back(std::move(log));
-        return UndoLink{0, idx, txn_id_}; // in-memory: page=0, slot=idx, txn=self
+        UndoLink undo_link{0, idx, txn_id_}; // in-memory: page=0, slot=idx, txn=self
+        if (pending_update_key_.has_value()) {
+            update_undo_entries_.push_back(UpdateUndoEntry{std::move(*pending_update_key_), undo_link});
+            pending_update_key_.reset();
+        }
+        return undo_link;
     }
     inline auto GetUndoLog(size_t log_id) -> UndoLog {
         std::scoped_lock<std::mutex> lck(latch_);
+        if (log_id >= undo_logs_.size()) {
+            // A stale or corrupted UndoLink must not index past the buffer.
+            // Unchecked, this read whatever followed the vector and built an
+            // UndoLog out of it, which crashed the server instead of failing
+            // the one statement that followed the bad link.
+            throw InternalError("GetUndoLog: undo log index out of range");
+        }
         return undo_logs_[log_id];
     }
 
@@ -177,6 +274,7 @@ public:
 
     // MVCC: slots modified by this txn (tab_name, rid) — for commit-time TupleMeta update
     std::vector<std::pair<std::string, Rid>> modified_slots_;
+    std::unordered_set<ModifiedSlotKey, ModifiedSlotKeyHash> modified_slot_set_;
 
     // SSI dependency tracking (SER only)
     struct PredicateRead {
@@ -195,18 +293,21 @@ public:
 private:
     bool txn_mode_{false};                // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     std::atomic<TransactionState> state_; // 事务状态；GC/SSI may inspect it from another thread
-    IsolationLevel isolation_level_;      // 事务的隔离级别
-    std::thread::id thread_id_;           // 当前事务对应的线程id
-    lsn_t prev_lsn_;       // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
-    txn_id_t txn_id_;      // 事务的ID，唯一标识符
-    timestamp_t start_ts_; // 事务的开始时间戳
+    std::atomic<bool> lock_cancellation_requested_{false};
+    IsolationLevel isolation_level_; // 事务的隔离级别
+    std::thread::id thread_id_;      // 当前事务对应的线程id
+    lsn_t prev_lsn_;                 // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
+    txn_id_t txn_id_;                // 事务的ID，唯一标识符
+    timestamp_t start_ts_;           // 事务的开始时间戳
 
-    std::deque<std::unique_ptr<WriteRecord>> write_set_;        // 事务包含的所有写操作
-    std::unique_ptr<std::unordered_set<LockDataId>> lock_set_;  // 事务申请的所有锁
-    std::unique_ptr<std::deque<Page*>> index_latch_page_set_;   // 维护事务执行过程中加锁的索引页面
-    std::unique_ptr<std::deque<Page*>> index_deleted_page_set_; // 维护事务执行过程中删除的索引页面
+    std::deque<std::unique_ptr<WriteRecord>> write_set_;  // 事务包含的所有写操作
+    std::unordered_set<LockDataId> lock_set_;             // 事务申请的所有锁
+    std::unordered_set<std::string> unique_key_lock_set_; // 事务持有的逻辑唯一键 reservation
+    std::deque<Page*> index_latch_page_set_;              // 维护事务执行过程中加锁的索引页面
+    std::deque<Page*> index_deleted_page_set_;            // 维护事务执行过程中删除的索引页面
 
     std::atomic<timestamp_t> read_ts_{0};
+    size_t watermark_slot_{std::numeric_limits<size_t>::max()};
     /**
      * @brief 存储撤销日志。
      * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。

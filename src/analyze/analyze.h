@@ -37,6 +37,7 @@ public:
     std::vector<OrderByItem> order_by_items;
     bool has_limit = false;
     int limit = 0;
+    int offset = 0;
     bool has_aggregate = false;
     bool has_select_star = false;
     std::vector<std::string> output_names;

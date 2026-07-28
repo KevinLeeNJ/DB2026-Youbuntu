@@ -17,14 +17,19 @@ class LimitExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
     size_t limit_ = 0;
+    size_t offset_ = 0;
     size_t returned_ = 0;
 
 public:
-    LimitExecutor(std::unique_ptr<AbstractExecutor> prev, size_t limit) : prev_(std::move(prev)), limit_(limit) {}
+    LimitExecutor(std::unique_ptr<AbstractExecutor> prev, size_t limit, size_t offset = 0)
+        : prev_(std::move(prev)), limit_(limit), offset_(offset) {}
 
     void beginTuple() override {
         returned_ = 0;
         prev_->beginTuple();
+        for (size_t skipped = 0; skipped < offset_ && !prev_->is_end(); ++skipped) {
+            prev_->nextTuple();
+        }
     }
 
     void nextTuple() override {
@@ -40,6 +45,13 @@ public:
             return nullptr;
         }
         return prev_->Next();
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return prev_->current();
     }
 
     bool is_end() const override {

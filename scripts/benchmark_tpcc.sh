@@ -4,9 +4,9 @@
 # Flow: start rmdb -> load + run -> kill -9 -> restart rmdb (wait for WAL
 # recovery) -> run consistency check against the recovered database.
 #
-# The consistency phase reads baseline counts and the committed new_order total
-# from the result.json written by the run phase, so it does not depend on any
-# in-memory state across the crash/restart.
+# The consistency phase reads the pre-workload aggregate snapshot and the ledger
+# of committed transaction effects from the result.json written by the run phase,
+# so it does not depend on any in-memory state across the crash/restart.
 
 set -Eeuo pipefail
 
@@ -16,21 +16,26 @@ SERVER_LOG="$ROOT_DIR/benchmark/tpcc/rmdb-server.log"
 BINARY="$ROOT_DIR/build/bin/rmdb"
 DB_DIR="tpcc_benchmark_db"
 PORT=8765
-WAREHOUSES=1
-WORKERS=16
-WARMUP=30
-MEASURE=360
-ROUNDS=3
+WAREHOUSES=50
+WORKERS=32
+WARMUP=10
+MEASURE=60
+ROUNDS=2
 PROGRESS_INTERVAL=5
 DATA_DIR="$ROOT_DIR/benchmark/tpcc/data"
 JSON_OUT="$ROOT_DIR/benchmark/tpcc/result.json"
 RMDB_DB_DIR=""
-RESTART_TIMEOUT=120
+RESTART_TIMEOUT=90
 REGENERATE_DATA=0
 THINK_MS=0
 RECONNECT_EACH_TXN=0
-ISOLATION="read-committed"
+ISOLATION="snapshot-isolation"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
+# final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
+# COUNT, integrity, index-key relation sampling and cross-partition content
+# sampling) must fit in one 900 second SQL budget measured from a successful
+# connection.
+LOAD_SQL_BUDGET_SECONDS=900
 
 usage() {
     cat <<EOF
@@ -38,19 +43,19 @@ Usage: $0 [options]
   --binary PATH            rmdb binary (default: build/bin/rmdb)
   --db-dir PATH            database directory (default: tpcc_benchmark_db)
   --port N                 server port (default: 8765)
-  --warehouses N           TPC-C warehouses (default: 1)
-  --workers N              concurrent workers (default: 16)
-  --warmup N               warmup seconds (default: 30)
-  --measure N              measure seconds (default: 360)
-  --rounds N               benchmark rounds (default: 3)
+  --warehouses N           TPC-C warehouses (default: 50)
+  --workers N              concurrent workers (default: 32)
+  --warmup N               warmup seconds (default: 10; official: 30)
+  --measure N              measure seconds (default: 60; official: 150)
+  --rounds N               benchmark rounds (default: 2; official: 3)
   --progress-interval N    progress print interval seconds (default: 5)
   --data-dir PATH          CSV data directory
   --json-out PATH          result.json path
   --rmdb-db-dir PATH       RMDB directory used to resolve CSV load paths
-  --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 120)
+  --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 90)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
-  --isolation LEVEL        read-committed or snapshot-isolation (default: read-committed)
+  --isolation LEVEL        read-committed or snapshot-isolation (default: snapshot-isolation)
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate
@@ -110,11 +115,19 @@ if [[ "$REGENERATE_DATA" -eq 1 ]]; then
     rm -rf "$DATA_DIR"
 fi
 
-# Auto-detect whether the CSV test data set is present. The Go runner owns
-# generation as well as the high-concurrency workload.
-if ! "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR"; then
-    echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
-    "$GO_BINARY" --command datagen --warehouses "$WAREHOUSES" --data-dir "$DATA_DIR" --seed 1 --overwrite-data-dir
+# Never leave a previous result available when preparation or execution fails.
+rm -f "$JSON_OUT"
+
+# Auto-detect whether the CSV test data set is present. Refresh an old manifest
+# before falling back to the expensive CSV generator.
+if ! "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1; then
+    if "$GO_BINARY" --command refresh-manifest --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1; then
+        "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1
+    else
+        echo "[benchmark] $DATA_DIR 缺少或不完整的 CSV 测试数据，自动生成"
+        "$GO_BINARY" --command datagen --warehouses "$WAREHOUSES" --data-dir "$DATA_DIR" --seed 1 --overwrite-data-dir
+        "$GO_BINARY" --command data-ready --data-dir "$DATA_DIR" --warehouses "$WAREHOUSES" --seed 1
+    fi
 fi
 
 if [[ ! -x "$BINARY" ]]; then
@@ -123,7 +136,7 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-rm -rf "$DB_DIR" "$JSON_OUT" "$SERVER_LOG"
+rm -rf "$DB_DIR" "$SERVER_LOG"
 
 SERVER_PID=""
 
@@ -135,70 +148,127 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-wait_port() {
-    local timeout="$1"
-    "$GO_BINARY" --command wait-port --port "$PORT" --wait-timeout "${timeout}s"
+# final.md:33,52 require the service port to be owned by the expected rmdb
+# process tree; a successful TCP connect (or a stale listener left behind by
+# another run) is not readiness. `ss` is not guaranteed to be installed, so
+# resolve the listening socket inode through /proc and match it against the file
+# descriptors of the process tree rooted at the server pid.
+listening_socket_inodes() {
+    local hex_port
+    hex_port="$(printf '%04X' "$PORT")"
+    awk -v suffix=":$hex_port" '$4 == "0A" && $2 ~ suffix"$" { print $10 }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u
 }
 
-ROUND_RESULTS=()
-for ((ROUND_NO = 1; ROUND_NO <= ROUNDS; ROUND_NO++)); do
-    ROUND_JSON="${JSON_OUT}.round-${ROUND_NO}.tmp"
-    ROUND_RESULTS+=("$ROUND_JSON")
-    rm -rf "$DB_DIR" "$ROUND_JSON"
+process_tree_pids() {
+    local root="$1" path pid ppid changed=1
+    local -A tree=()
+    tree[$root]=1
+    while (( changed )); do
+        changed=0
+        for path in /proc/[0-9]*; do
+            pid="${path#/proc/}"
+            [[ -n "${tree[$pid]:-}" ]] && continue
+            ppid="$(sed -e 's/^[0-9]* (.*) //' "$path/stat" 2>/dev/null | cut -d' ' -f2)" || continue
+            if [[ -n "$ppid" && -n "${tree[$ppid]:-}" ]]; then
+                tree[$pid]=1
+                changed=1
+            fi
+        done
+    done
+    printf '%s\n' "${!tree[@]}"
+}
 
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: 启动全新 rmdb server (db=$DB_DIR)"
-    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
-    wait_port 30
-
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: load run runner=go isolation=$ISOLATION warehouses=$WAREHOUSES workers=$WORKERS warmup=${WARMUP}s measure=${MEASURE}s"
-    "$GO_BINARY" --command load \
-        --port "$PORT" \
-        --isolation "$ISOLATION" \
-        --data-dir "$DATA_DIR" \
-        --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
-        --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
-    GO_RECONNECT_ARGS=()
-    if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
-        GO_RECONNECT_ARGS=(--reconnect-each-txn)
+assert_port_owned_by_server() {
+    local root="$1" inodes inode pids pid owner
+    inodes="$(listening_socket_inodes)"
+    if [[ -z "$inodes" ]]; then
+        echo "[benchmark] no process is listening on port $PORT" >&2
+        return 1
     fi
-    "$GO_BINARY" \
-        --port "$PORT" \
-        --isolation "$ISOLATION" \
-        --workers "$WORKERS" \
-        --warmup "$WARMUP" \
-        --measure "$MEASURE" \
-        --rounds 1 \
-        --progress-interval "$PROGRESS_INTERVAL" \
-        --warehouse-policy terminal-home \
-        --think "${THINK_MS}ms" \
-        --json-out "$ROUND_JSON" \
-        "${GO_RECONNECT_ARGS[@]}"
+    pids="$(process_tree_pids "$root")"
+    for inode in $inodes; do
+        owner=""
+        for pid in $pids; do
+            if readlink /proc/"$pid"/fd/* 2>/dev/null | grep -qx "socket:\[$inode\]"; then
+                owner="$pid"
+                break
+            fi
+        done
+        if [[ -z "$owner" ]]; then
+            echo "[benchmark] port $PORT listening socket (inode $inode) is not owned by the rmdb process tree rooted at pid $root" >&2
+            return 1
+        fi
+    done
+    echo "[benchmark] port $PORT is listened by the rmdb process tree (pid $root)"
+}
 
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: kill -9 rmdb server (pid=$SERVER_PID) 触发崩溃恢复"
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
+wait_port() {
+    local timeout="$1"
+    "$GO_BINARY" --command wait-ready --port "$PORT" --wait-timeout "${timeout}s"
+    assert_port_owned_by_server "$SERVER_PID"
+}
 
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: 重启 rmdb server，等待恢复就绪 (最长 ${RESTART_TIMEOUT}s)"
-    "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
-    wait_port "$RESTART_TIMEOUT"
+GO_RECONNECT_ARGS=()
+if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
+    GO_RECONNECT_ARGS=(--reconnect-each-txn)
+fi
 
-    echo "[benchmark] round $ROUND_NO/$ROUNDS: 恢复后一致性检查"
-    "$GO_BINARY" --command consistency \
-        --port "$PORT" \
-        --isolation "$ISOLATION" \
-        --consistency-stage "post-recovery-round-$ROUND_NO" \
-        --result-json "$ROUND_JSON"
+# The finalv2 ranking shape is 32 workers, one 30s warmup and 3 continuous 150s
+# windows. Shorter local runs are useful as smoke tests, but
+# their NewOrder/min must never be mistaken for a ranking figure, so make the
+# deviation loud instead of letting tpcc-go reject the run outright.
+GO_TIMING_ARGS=()
+if [[ "$WORKERS" != "32" || "$WARMUP" != "30" || "$MEASURE" != "150" || "$ROUNDS" != "3" || "$THINK_MS" != "0" ]]; then
+    echo "[benchmark] WARNING: ${WORKERS} workers / ${WARMUP}s warmup / ${ROUNDS}x${MEASURE}s windows / think=${THINK_MS}ms" >&2
+    echo "[benchmark]          deviates from the official 32 / 30s / 3x150s / 0ms shape." >&2
+    echo "[benchmark]          This is a SMOKE RUN; its NewOrder/min does not predict the official ranking." >&2
+    GO_TIMING_ARGS=(--allow-nonofficial-timing)
+fi
 
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-done
-
-RESULT_INPUTS=$(IFS=,; echo "${ROUND_RESULTS[*]}")
-"$GO_BINARY" --command merge-results --json-out "$JSON_OUT" --result-inputs "$RESULT_INPUTS"
-rm -f "${ROUND_RESULTS[@]}"
-
-echo "[benchmark] all $ROUNDS independent round(s) complete: result=$JSON_OUT"
+rm -rf "$DB_DIR"
+if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
+    echo "[benchmark] smoke/non-ranking: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
+else
+    echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
+fi
+RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_port 30
+load_start=$SECONDS
+"$GO_BINARY" --command load \
+    --port "$PORT" --isolation "$ISOLATION" \
+    --data-dir "$DATA_DIR" --schema-dir "$ROOT_DIR/benchmark/tpcc/schema" \
+    --rmdb-db-dir "${RMDB_DB_DIR:-$DB_DIR}"
+load_elapsed=$((SECONDS - load_start))
+echo "[benchmark] load stage (create table + create index + LOAD + COUNT + integrity + relation/content sampling) took ${load_elapsed}s"
+if (( load_elapsed > LOAD_SQL_BUDGET_SECONDS )); then
+    echo "[benchmark] load stage exceeded the official ${LOAD_SQL_BUDGET_SECONDS}s SQL budget: ${load_elapsed}s" >&2
+    exit 1
+fi
+"$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
+    --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
+    --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
+    --think "${THINK_MS}ms" --data-dir "$DATA_DIR" --json-out "$JSON_OUT" \
+    "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
+"$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
+"$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
+    --consistency-stage online-official-equivalent --result-json "$JSON_OUT"
+if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
+    echo "[benchmark] smoke/non-ranking: SIGKILL and recovery check"
+else
+    echo "[benchmark] official-equivalent: SIGKILL and recovery check"
+fi
+kill -KILL "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+wait_port "$RESTART_TIMEOUT"
+"$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
+    --consistency-stage post-recovery-official-equivalent --result-json "$JSON_OUT"
+if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
+    echo "[benchmark] smoke/non-ranking complete: result=$JSON_OUT (not an official ranking result)"
+else
+    echo "[benchmark] official-equivalent complete: result=$JSON_OUT"
+fi

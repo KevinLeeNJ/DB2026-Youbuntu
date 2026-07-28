@@ -22,8 +22,40 @@ class ProjectionExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_; // 投影节点的儿子节点
     std::vector<ColMeta> cols_;              // 需要投影的字段
-    size_t len_;                             // 字段总长度
+    size_t len_;                             // 输出元组总长度（数据区 + null bitmap）
+    size_t data_len_ = 0;                    // 输出元组数据区长度，即 null bitmap 的起始偏移
     std::vector<size_t> sel_idxs_;
+    std::unique_ptr<RmRecord> current_output_;
+    std::unique_ptr<RmRecord> fallback_input_;
+    TupleView current_view_;
+
+    // 投影会重新打包元组，所以输出的 null bitmap 也要重排：输出列 i 的 NULL 位
+    // 在 data_len_ + i/8 处，与输入侧的位置无关。
+    bool materialize_view(TupleView input) {
+        if (!input) {
+            return false;
+        }
+        if (current_output_ == nullptr || current_output_->size != static_cast<int>(len_)) {
+            current_output_ = std::make_unique<RmRecord>(static_cast<int>(len_));
+        }
+        char* out = current_output_->data;
+        std::memset(out + data_len_, 0, static_cast<size_t>(len_) - data_len_);
+        const auto& prev_cols = prev_->cols();
+        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
+            const auto& col = cols_[i];
+            const auto& src_col = prev_cols[sel_idxs_[i]];
+            std::memcpy(out + col.offset, input.data + src_col.offset, col.len);
+            if (is_null(input.data, src_col)) {
+                set_null(out, col);
+            }
+        }
+        current_view_ = TupleView{out, static_cast<uint32_t>(current_output_->size)};
+        return true;
+    }
+
+    bool materialize_current() {
+        return materialize_view(prev_->current());
+    }
 
     void append_projection_col(size_t prev_idx, const std::string& output_name = "") {
         auto col = prev_->cols()[prev_idx];
@@ -35,6 +67,13 @@ private:
         len_ += col.len;
         cols_.push_back(col);
         sel_idxs_.push_back(prev_idx);
+    }
+
+    // 所有输出列就位后才能确定 bitmap 的起始偏移，因此布局在构造末尾一次算定。
+    void finalize_layout() {
+        data_len_ = len_;
+        bind_null_positions(cols_, static_cast<int>(data_len_));
+        len_ = data_len_ + static_cast<size_t>(null_bitmap_bytes(cols_.size()));
     }
 
     static std::vector<ColMeta>::const_iterator find_col_by_name(const std::vector<ColMeta>& cols,
@@ -100,6 +139,7 @@ public:
             auto pos = get_col(prev_cols, sel_col);
             append_projection_col(static_cast<size_t>(pos - prev_cols.begin()));
         }
+        finalize_layout();
     }
 
     template <typename SelectItemT, typename = std::enable_if_t<!std::is_same_v<SelectItemT, TabCol>>>
@@ -107,36 +147,39 @@ public:
         prev_ = std::move(prev);
         len_ = 0;
         build_from_select_items(select_items);
+        finalize_layout();
     }
 
     void beginTuple() override {
         prev_->beginTuple();          // 调用儿子节点的beginTuple方法，准备开始遍历记录
         _abstract_rid = prev_->rid(); // 初始化抽象记录号
+        current_view_ = {};
+        materialize_current();
     }
 
     void nextTuple() override {
         prev_->nextTuple();           // 调用儿子节点的nextTuple方法，获取下一条记录
         _abstract_rid = prev_->rid(); // 更新抽象记录号
+        current_view_ = {};
+        materialize_current();
     }
 
     std::unique_ptr<RmRecord> Next() override {
         if (prev_->is_end()) {
             return nullptr; // 如果儿子节点已经结束，则返回nullptr
         }
-        auto rec = prev_->Next();
-        if (!rec) {
-            return nullptr; // 如果儿子节点没有记录，则返回nullptr
+        if (!current_view_) {
+            fallback_input_ = prev_->Next();
+            if (!fallback_input_) {
+                return nullptr;
+            }
+            if (!materialize_view(TupleView{fallback_input_->data, static_cast<uint32_t>(fallback_input_->size)})) {
+                return nullptr;
+            }
         }
-
-        // 创建一个新的记录，用于存储投影后的结果
-        auto new_rec = std::make_unique<RmRecord>(len_);
-        // 将投影的字段从儿子节点的记录中复制到新的记录中
-        for (size_t i = 0; i < sel_idxs_.size(); ++i) {
-            auto& col = cols_[i];
-            auto& src_col = prev_->cols()[sel_idxs_[i]];
-            std::memcpy(new_rec->data + col.offset, rec->data + src_col.offset, col.len);
-        }
-        return new_rec;
+        auto copy = std::make_unique<RmRecord>(static_cast<int>(current_view_.size));
+        std::memcpy(copy->data, current_view_.data, current_view_.size);
+        return copy;
     }
 
     Rid& rid() override {
@@ -145,6 +188,13 @@ public:
 
     bool is_end() const override {
         return prev_->is_end(); // 判断儿子节点是否结束
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return current_view_;
     }
     std::string getType() override {
         return "ProjectionExecutor"; // 返回执行器的名称
@@ -176,11 +226,23 @@ public:
         prev_->set_key_conditions(std::move(key_conds));
     }
 
+    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+        prev_->set_lookup_key(target, key, len);
+    }
+
     std::string scan_table_name() const override {
         return prev_->scan_table_name();
     }
 
+    std::string_view scan_table_name_view() const override {
+        return prev_->scan_table_name_view();
+    }
+
     std::vector<Condition> scan_conditions() const override {
         return prev_->scan_conditions();
+    }
+
+    const std::vector<Condition>& scan_conditions_ref() const override {
+        return prev_->scan_conditions_ref();
     }
 };

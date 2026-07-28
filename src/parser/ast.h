@@ -21,7 +21,9 @@ namespace ast {
 
 enum SvType { SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL, SV_TYPE_DATETIME };
 
-enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE };
+// SV_OP_IS_NULL / SV_OP_IS_NOT_NULL 不是二元比较，rhs 恒为 NullLit 占位。
+// 它们与 `col = NULL`（恒假）语义不同，因此不能复用 SV_OP_EQ / SV_OP_NE。
+enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE, SV_OP_IS_NULL, SV_OP_IS_NOT_NULL };
 
 enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 
@@ -52,6 +54,8 @@ enum class AstType {
     FloatLit,
     StringLit,
     BoolLit,
+    NullLit,
+    Parameter,
     Col,
     AggExpr,
     SelectItem,
@@ -201,9 +205,9 @@ struct IntLit : public Value {
 };
 
 struct FloatLit : public Value {
-    double val;
+    float val;
 
-    FloatLit(double val_, std::string display_text_ = "")
+    FloatLit(float val_, std::string display_text_ = "")
         : Value(AstType::FloatLit, std::move(display_text_)), val(val_) {}
 };
 
@@ -218,6 +222,17 @@ struct BoolLit : public Value {
     bool val;
 
     BoolLit(bool val_, std::string display_text_ = "") : Value(AstType::BoolLit, std::move(display_text_)), val(val_) {}
+};
+
+/* SQL NULL 字面量。没有值，只有类型标记；display_text 固定为 "NULL"。 */
+struct NullLit : public Value {
+    NullLit() : Value(AstType::NullLit, "NULL") {}
+};
+
+struct Parameter : public Value {
+    std::size_t ordinal;
+
+    explicit Parameter(std::size_t ordinal_) : Value(AstType::Parameter), ordinal(ordinal_) {}
 };
 
 struct Col : public Expr {
@@ -235,10 +250,14 @@ inline std::unique_ptr<Col> clone_col(const Col& col) {
 struct AggExpr : public Expr {
     AggFuncType func;
     bool is_star;
+    bool is_distinct;
     std::unique_ptr<Col> col;
 
+    AggExpr(AggFuncType func_, bool is_star_, bool is_distinct_, std::unique_ptr<Col> col_)
+        : Expr(AstType::AggExpr), func(func_), is_star(is_star_), is_distinct(is_distinct_), col(std::move(col_)) {}
+
     AggExpr(AggFuncType func_, bool is_star_, std::unique_ptr<Col> col_)
-        : Expr(AstType::AggExpr), func(func_), is_star(is_star_), col(std::move(col_)) {}
+        : AggExpr(func_, is_star_, false, std::move(col_)) {}
 };
 
 struct SelectItem : public TreeNode {
@@ -249,20 +268,29 @@ struct SelectItem : public TreeNode {
         : TreeNode(AstType::SelectItem), expr(std::move(expr_)), alias(std::move(alias_)) {}
 };
 
+struct UpdateTerm {
+    std::unique_ptr<Value> val;
+    SetOp op;
+
+    UpdateTerm(std::unique_ptr<Value> val_, SetOp op_) : val(std::move(val_)), op(op_) {}
+};
+
 struct SetClause : public TreeNode {
     std::string col_name;
     std::unique_ptr<Value> val;
     std::unique_ptr<Col> rhs_col;
     bool is_self_ref;
     SetOp op;
+    std::vector<UpdateTerm> additional_terms;
 
     SetClause(std::string col_name_, std::unique_ptr<Value> val_)
         : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)), is_self_ref(false),
           op(SetOp::ASSIGNMENT) {}
 
-    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_, SetOp op_)
+    SetClause(std::string col_name_, std::unique_ptr<Col> rhs_col_, std::unique_ptr<Value> val_, SetOp op_,
+              std::vector<UpdateTerm> additional_terms_ = {})
         : TreeNode(AstType::SetClause), col_name(std::move(col_name_)), val(std::move(val_)),
-          rhs_col(std::move(rhs_col_)), is_self_ref(true), op(op_) {}
+          rhs_col(std::move(rhs_col_)), is_self_ref(true), op(op_), additional_terms(std::move(additional_terms_)) {}
 };
 
 struct BinaryExpr : public TreeNode {
@@ -316,7 +344,8 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
     }
     case AstType::AggExpr: {
         auto& agg = static_cast<const AggExpr&>(expr);
-        return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.col == nullptr ? nullptr : clone_col(*agg.col));
+        return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.is_distinct,
+                                         agg.col == nullptr ? nullptr : clone_col(*agg.col));
     }
     case AstType::IntLit: {
         auto& lit = static_cast<const IntLit&>(expr);
@@ -334,10 +363,87 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
         auto& lit = static_cast<const BoolLit&>(expr);
         return std::make_unique<BoolLit>(lit.val, lit.display_text);
     }
+    case AstType::NullLit:
+        return std::make_unique<NullLit>();
+    case AstType::Parameter: {
+        auto& parameter = static_cast<const Parameter&>(expr);
+        return std::make_unique<Parameter>(parameter.ordinal);
+    }
     default:
         throw std::logic_error("unsupported expression type for AST clone");
     }
 }
+
+inline std::unique_ptr<Value> clone_value(const Value& value) {
+    switch (value.type) {
+    case AstType::IntLit: {
+        const auto& x = static_cast<const IntLit&>(value);
+        return std::make_unique<IntLit>(x.val, x.display_text);
+    }
+    case AstType::FloatLit: {
+        const auto& x = static_cast<const FloatLit&>(value);
+        return std::make_unique<FloatLit>(x.val, x.display_text);
+    }
+    case AstType::StringLit: {
+        const auto& x = static_cast<const StringLit&>(value);
+        return std::make_unique<StringLit>(x.val, x.display_text);
+    }
+    case AstType::BoolLit: {
+        const auto& x = static_cast<const BoolLit&>(value);
+        return std::make_unique<BoolLit>(x.val, x.display_text);
+    }
+    case AstType::NullLit:
+        return std::make_unique<NullLit>();
+    case AstType::Parameter: {
+        const auto& x = static_cast<const Parameter&>(value);
+        return std::make_unique<Parameter>(x.ordinal);
+    }
+    default:
+        throw std::logic_error("unsupported value type for AST clone");
+    }
+}
+
+inline std::unique_ptr<Value> clone_bound_value(const Value& value,
+                                                const std::vector<std::unique_ptr<Value>>& bindings) {
+    if (value.type != AstType::Parameter)
+        return clone_value(value);
+    const auto& parameter = static_cast<const Parameter&>(value);
+    if (parameter.ordinal == 0 || parameter.ordinal > bindings.size() || bindings[parameter.ordinal - 1] == nullptr) {
+        throw std::logic_error("unbound AST parameter");
+    }
+    return clone_value(*bindings[parameter.ordinal - 1]);
+}
+
+inline std::unique_ptr<Expr> clone_expr_bound(const Expr& expr, const std::vector<std::unique_ptr<Value>>& bindings) {
+    if (expr.type == AstType::Parameter || expr.type == AstType::IntLit || expr.type == AstType::FloatLit ||
+        expr.type == AstType::StringLit || expr.type == AstType::BoolLit || expr.type == AstType::NullLit) {
+        return clone_bound_value(static_cast<const Value&>(expr), bindings);
+    }
+    if (expr.type == AstType::Col)
+        return clone_col(static_cast<const Col&>(expr));
+    if (expr.type == AstType::AggExpr) {
+        const auto& x = static_cast<const AggExpr&>(expr);
+        return std::make_unique<AggExpr>(x.func, x.is_star, x.is_distinct, x.col ? clone_col(*x.col) : nullptr);
+    }
+    throw std::logic_error("unsupported expression for AST bind");
+}
+
+inline std::unique_ptr<BinaryExpr> clone_binary_bound(const BinaryExpr& x,
+                                                      const std::vector<std::unique_ptr<Value>>& b) {
+    return std::make_unique<BinaryExpr>(clone_expr_bound(*x.lhs, b), x.op, clone_expr_bound(*x.rhs, b));
+}
+
+inline std::unique_ptr<HavingExpr> clone_having_bound(const HavingExpr& x,
+                                                      const std::vector<std::unique_ptr<Value>>& b) {
+    return std::make_unique<HavingExpr>(clone_expr_bound(*x.lhs, b), x.op, clone_expr_bound(*x.rhs, b));
+}
+
+inline std::unique_ptr<OrderByItem> clone_order_bound(const OrderByItem& x,
+                                                      const std::vector<std::unique_ptr<Value>>& b) {
+    return std::make_unique<OrderByItem>(clone_expr_bound(*x.expr, b), x.orderby_dir);
+}
+
+inline std::unique_ptr<TreeNode> clone_bound_tree(const TreeNode& root, const std::vector<std::unique_ptr<Value>>& b);
 
 struct InsertStmt : public TreeNode {
     std::string tab_name;
@@ -391,17 +497,25 @@ struct SelectStmt : public TreeNode {
     std::vector<std::unique_ptr<OrderByItem>> order_by_items;
     bool has_limit;
     int limit;
+    bool limit_is_parameter;
+    std::size_t limit_parameter;
+    int offset;
+    bool offset_is_parameter;
+    std::size_t offset_parameter;
 
     SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
                std::vector<std::unique_ptr<HavingExpr>> having_conds_,
                std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
-               bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {})
+               bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {},
+               bool limit_is_parameter_ = false, std::size_t limit_parameter_ = 0, int offset_ = 0,
+               bool offset_is_parameter_ = false, std::size_t offset_parameter_ = 0)
         : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
           conds(std::move(conds_)), jointree(std::move(jointree_)), has_select_star(has_select_star_),
           group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
           has_sort(!order_by_items_.empty()), order_by_items(std::move(order_by_items_)), has_limit(has_limit_),
-          limit(limit_) {
+          limit(limit_), limit_is_parameter(limit_is_parameter_), limit_parameter(limit_parameter_), offset(offset_),
+          offset_is_parameter(offset_is_parameter_), offset_parameter(offset_parameter_) {
         if (!order_by_items.empty()) {
             std::vector<std::unique_ptr<OrderByItem>> order_items;
             order_items.reserve(order_by_items.size());
@@ -480,5 +594,116 @@ struct LoadStmt : public TreeNode {
     LoadStmt(std::string file_name, std::string tab_name)
         : TreeNode(AstType::LoadStmt), file_name_(std::move(file_name)), tab_name_(std::move(tab_name)) {}
 };
+
+inline std::unique_ptr<SetClause> clone_set_bound(const SetClause& x, const std::vector<std::unique_ptr<Value>>& b) {
+    std::vector<UpdateTerm> additional_terms;
+    additional_terms.reserve(x.additional_terms.size());
+    for (const auto& term : x.additional_terms) {
+        additional_terms.emplace_back(clone_bound_value(*term.val, b), term.op);
+    }
+    return std::make_unique<SetClause>(
+        x.col_name, x.rhs_col ? std::make_unique<Col>(x.rhs_col->tab_name, x.rhs_col->col_name) : nullptr,
+        x.val ? clone_bound_value(*x.val, b) : nullptr, x.op, std::move(additional_terms));
+}
+
+inline std::unique_ptr<JoinExpr> clone_join_bound(const JoinExpr& x, const std::vector<std::unique_ptr<Value>>& b) {
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
+    for (const auto& cond : x.conds)
+        conds.push_back(clone_binary_bound(*cond, b));
+    return std::make_unique<JoinExpr>(x.left, x.right, std::move(conds), x.join_type);
+}
+
+inline std::unique_ptr<SelectStmt> clone_select_bound(const SelectStmt& x,
+                                                      const std::vector<std::unique_ptr<Value>>& b) {
+    std::vector<std::unique_ptr<SelectItem>> items;
+    for (const auto& item : x.select_items)
+        items.push_back(std::make_unique<SelectItem>(clone_expr_bound(*item->expr, b), item->alias));
+    std::vector<std::unique_ptr<BinaryExpr>> conds;
+    for (const auto& cond : x.conds)
+        conds.push_back(clone_binary_bound(*cond, b));
+    std::vector<std::unique_ptr<Col>> groups;
+    for (const auto& col : x.group_by_cols)
+        groups.push_back(clone_col(*col));
+    std::vector<std::unique_ptr<HavingExpr>> having;
+    for (const auto& cond : x.having_conds)
+        having.push_back(clone_having_bound(*cond, b));
+    std::vector<std::unique_ptr<OrderByItem>> order;
+    for (const auto& item : x.order_by_items)
+        order.push_back(clone_order_bound(*item, b));
+    std::vector<std::unique_ptr<JoinExpr>> joins;
+    for (const auto& join : x.jointree)
+        joins.push_back(clone_join_bound(*join, b));
+    int limit = x.limit;
+    if (x.limit_is_parameter) {
+        if (x.limit_parameter == 0 || x.limit_parameter > b.size() || b[x.limit_parameter - 1] == nullptr ||
+            b[x.limit_parameter - 1]->type != AstType::IntLit)
+            throw std::logic_error("LIMIT parameter must be INT32");
+        limit = static_cast<const IntLit*>(b[x.limit_parameter - 1].get())->val;
+    }
+    int offset = x.offset;
+    if (x.offset_is_parameter) {
+        if (x.offset_parameter == 0 || x.offset_parameter > b.size() || b[x.offset_parameter - 1] == nullptr ||
+            b[x.offset_parameter - 1]->type != AstType::IntLit)
+            throw std::logic_error("OFFSET parameter must be INT32");
+        offset = static_cast<const IntLit*>(b[x.offset_parameter - 1].get())->val;
+    }
+    return std::make_unique<SelectStmt>(std::move(items), x.tabs, std::move(conds), std::move(groups),
+                                        std::move(having), std::move(order), x.has_limit, limit, x.has_select_star,
+                                        std::move(joins), false, 0, offset);
+}
+
+inline std::unique_ptr<TreeNode> clone_bound_tree(const TreeNode& root, const std::vector<std::unique_ptr<Value>>& b) {
+    switch (root.type) {
+    case AstType::InsertStmt: {
+        const auto& x = static_cast<const InsertStmt&>(root);
+        std::vector<std::unique_ptr<Value>> vals;
+        for (const auto& v : x.vals)
+            vals.push_back(clone_bound_value(*v, b));
+        return std::make_unique<InsertStmt>(x.tab_name, std::move(vals));
+    }
+    case AstType::DeleteStmt: {
+        const auto& x = static_cast<const DeleteStmt&>(root);
+        std::vector<std::unique_ptr<BinaryExpr>> conds;
+        for (const auto& c : x.conds)
+            conds.push_back(clone_binary_bound(*c, b));
+        return std::make_unique<DeleteStmt>(x.tab_name, std::move(conds));
+    }
+    case AstType::UpdateStmt: {
+        const auto& x = static_cast<const UpdateStmt&>(root);
+        std::vector<std::unique_ptr<SetClause>> sets, conds_dummy;
+        for (const auto& s : x.set_clauses) {
+            std::vector<UpdateTerm> additional_terms;
+            additional_terms.reserve(s->additional_terms.size());
+            for (const auto& term : s->additional_terms) {
+                additional_terms.emplace_back(clone_bound_value(*term.val, b), term.op);
+            }
+            std::unique_ptr<SetClause> copy;
+            if (s->is_self_ref)
+                copy = std::make_unique<SetClause>(
+                    s->col_name, std::make_unique<Col>(s->rhs_col->tab_name, s->rhs_col->col_name),
+                    s->val ? clone_bound_value(*s->val, b) : nullptr, s->op, std::move(additional_terms));
+            else
+                copy = std::make_unique<SetClause>(s->col_name, s->val ? clone_bound_value(*s->val, b) : nullptr);
+            sets.push_back(std::move(copy));
+        }
+        std::vector<std::unique_ptr<BinaryExpr>> conds;
+        for (const auto& c : x.conds)
+            conds.push_back(clone_binary_bound(*c, b));
+        return std::make_unique<UpdateStmt>(x.tab_name, std::move(sets), std::move(conds));
+    }
+    case AstType::SelectStmt:
+        return clone_select_bound(static_cast<const SelectStmt&>(root), b);
+    case AstType::TxnBegin:
+        return std::make_unique<TxnBegin>();
+    case AstType::TxnCommit:
+        return std::make_unique<TxnCommit>();
+    case AstType::TxnAbort:
+        return std::make_unique<TxnAbort>();
+    case AstType::TxnRollback:
+        return std::make_unique<TxnRollback>();
+    default:
+        throw std::logic_error("prepared statement type is not supported");
+    }
+}
 
 } // namespace ast

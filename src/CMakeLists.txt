@@ -12,13 +12,18 @@ add_subdirectory(common)
 add_subdirectory(replacer)
 add_subdirectory(transaction)
 add_subdirectory(recovery)
+add_subdirectory(protocol)
 add_subdirectory(test)
 
 
 target_link_libraries(parser execution pthread)
 
 add_executable(rmdb rmdb.cpp)
-target_link_libraries(rmdb parser execution readline pthread planner analyze)
+target_link_libraries(rmdb parser execution pthread planner analyze wire_protocol)
+
+# Offline post-recovery structural verifier used by crash-consistency tests.
+add_executable(rmdb_verify rmdb_verify.cpp)
+target_link_libraries(rmdb_verify parser execution pthread planner analyze storage recovery)
 
 # unit_test
 add_executable(unit_test unit_test.cpp)

@@ -41,7 +41,7 @@ SELECT amount FROM float64_update WHERE id = 1;
 +------------------+
 |           amount |
 +------------------+
-|    300000.010000 |
+|    300000.000000 |
 +------------------+
 Total record(s): 1
 
@@ -152,4 +152,119 @@ SELECT score, ratio, note FROM update_math WHERE id = 1;
 +------------------+------------------+------------------+
 |               15 |         2.000000 |             keep |
 +------------------+------------------+------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE stock_update (s_w_id INT, s_i_id INT, s_ytd FLOAT);
+
+statement ok
+INSERT INTO stock_update VALUES (7, 19, 10.5);
+
+statement ok
+UPDATE stock_update SET s_ytd = s_ytd WHERE s_w_id = 7 AND s_i_id = 19;
+
+statement ok
+UPDATE stock_update SET s_ytd = s_ytd + 2.5 WHERE s_w_id = 7 AND s_i_id = 19;
+
+statement ok
+UPDATE stock_update SET s_ytd = s_ytd - 1.0 WHERE s_w_id = 7 AND s_i_id = 19;
+
+query
+SELECT s_ytd FROM stock_update WHERE s_w_id = 7 AND s_i_id = 19;
+----
++------------------+
+|            s_ytd |
++------------------+
+|        12.000000 |
++------------------+
+Total record(s): 1
+
+# Direct column assignment supports every storage type, propagates NULL, and
+# evaluates every SET clause against the same old row.
+statement ok
+CREATE TABLE update_copy (id INT, i_src INT, i_dst INT, f_src FLOAT, f_dst FLOAT, c_src CHAR(8), c_dst CHAR(8), n_src INT, n_dst INT);
+
+statement ok
+INSERT INTO update_copy VALUES (2, 7, 3, 1.5, 9.5, 'source', 'dest', NULL, 8);
+
+statement ok
+UPDATE update_copy SET i_src = i_dst, i_dst = i_src, f_dst = f_src, c_dst = c_src, n_dst = n_src WHERE id = (1 + 1);
+
+query
+SELECT i_src, i_dst, f_dst, c_dst, n_dst FROM update_copy WHERE id = 2;
+----
++------------------+------------------+------------------+------------------+------------------+
+|            i_src |            i_dst |            f_dst |            c_dst |            n_dst |
++------------------+------------------+------------------+------------------+------------------+
+|                3 |                7 |         1.500000 |           source |             NULL |
++------------------+------------------+------------------+------------------+------------------+
+Total record(s): 1
+
+statement error
+UPDATE update_copy SET i_dst = c_src WHERE id = 2;
+
+# Chained UPDATE arithmetic is an ordered sequence of scalar +/- operations.
+statement ok
+CREATE TABLE chained_update (id INT, a INT, b INT, c INT, d INT, f FLOAT, n INT);
+
+statement ok
+INSERT INTO chained_update VALUES (2, 10, 20, 30, 40, 16777216.0, NULL);
+
+statement ok
+UPDATE chained_update SET a = a - 1 + 91, b = b + 3, c = c + 4, d = d + 5 WHERE id = (1 + 1);
+
+statement ok
+UPDATE chained_update SET f = f + 1 - 1, n = n - 1 + 91 WHERE id = 2;
+
+query
+SELECT a, b, c, d, f, n FROM chained_update WHERE id = 2;
+----
++------------------+------------------+------------------+------------------+------------------+------------------+
+|                a |                b |                c |                d |                f |                n |
++------------------+------------------+------------------+------------------+------------------+------------------+
+|              100 |               23 |               34 |               45 |  16777215.000000 |             NULL |
++------------------+------------------+------------------+------------------+------------------+------------------+
+Total record(s): 1
+
+statement error
+UPDATE chained_update SET a = b + 1 + 2 WHERE id = 2;
+
+statement error
+UPDATE chained_update SET a = a + 1 + 'bad' WHERE id = 2;
+
+# A failure while maintaining an indexed target rolls back earlier rows and
+# every other assignment in the same statement.
+statement ok
+CREATE TABLE chained_atomic (id INT, a INT, source INT, b INT);
+
+statement ok
+CREATE INDEX chained_atomic(a);
+
+statement ok
+INSERT INTO chained_atomic VALUES (1, 1, 5, 10);
+
+statement ok
+INSERT INTO chained_atomic VALUES (2, 2, 5, 20);
+
+statement error
+UPDATE chained_atomic SET a = source, b = b + 1 + 1 WHERE id >= 1;
+
+query
+SELECT a, b FROM chained_atomic WHERE id = 1;
+----
++------------------+------------------+
+|                a |                b |
++------------------+------------------+
+|                1 |               10 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT a, b FROM chained_atomic WHERE id = 2;
+----
++------------------+------------------+
+|                a |                b |
++------------------+------------------+
+|                2 |               20 |
++------------------+------------------+
 Total record(s): 1

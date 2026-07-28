@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "row_mutation.h"
 #include "system/sm.h"
 #include <algorithm>
 
@@ -24,19 +25,16 @@ private:
     std::vector<Condition> conds_;
     RmFileHandle* fh_;
     std::vector<Rid> rids_;
+    std::optional<Rid> point_rid_;
+    bool point_lookup_{false};
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager* sm_manager_;
 
-    static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
-        std::vector<char> key(index.col_tot_len);
-        int offset = 0;
-        for (int i = 0; i < index.col_num; ++i) {
-            std::memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
-            offset += index.cols[i].len;
-        }
-        return key;
-    }
+    std::vector<bool> affected_index_bitmap_;
+    std::vector<RowMutationIndex> cached_indexes_;
+    std::vector<BoundMutationCondition> bound_conditions_;
+    std::vector<BoundMutationSetClause> bound_set_clauses_;
 
 public:
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
@@ -49,187 +47,55 @@ public:
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        bound_conditions_ = BindMutationConditions(tab_, conds_);
+        bound_set_clauses_ = BindMutationSetClauses(tab_, set_clauses_);
+
+        affected_index_bitmap_.assign(tab_.indexes.size(), false);
+        cached_indexes_.reserve(tab_.indexes.size());
+        for (size_t index_idx = 0; index_idx < tab_.indexes.size(); ++index_idx) {
+            const auto& index = tab_.indexes[index_idx];
+            std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
+            cached_indexes_.push_back(
+                RowMutationIndex{&index, sm_manager_->ihs_.at(index_name).get(), std::move(index_name)});
+
+            for (const auto& set_clause : set_clauses_) {
+                if (std::any_of(index.cols.begin(), index.cols.end(),
+                                [&](const ColMeta& index_col) { return index_col.name == set_clause.lhs.col_name; })) {
+                    affected_index_bitmap_[index_idx] = true;
+                    break;
+                }
+            }
+        }
+    }
+    UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
+                   std::vector<Condition> conds, PointMutationTarget target, Context* context, bool point_path)
+        : UpdateExecutor(sm_manager, tab_name, std::move(set_clauses), std::move(conds), std::vector<Rid>{}, context) {
+        point_rid_ = target.rid;
+        point_lookup_ = point_path;
     }
     std::unique_ptr<RmRecord> Next() override {
-        bool has_non_self_ref_set = std::any_of(set_clauses_.begin(), set_clauses_.end(),
-                                                [](const SetClause& clause) { return !clause.is_self_ref; });
-        for (Rid& rid : rids_) {
+        const size_t rid_count = point_lookup_ ? (point_rid_.has_value() ? 1 : 0) : rids_.size();
+        for (size_t rid_index = 0; rid_index < rid_count; ++rid_index) {
+            Rid& rid = point_lookup_ ? *point_rid_ : rids_[rid_index];
             std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
-                if (context_ != nullptr && context_->txn_ != nullptr) {
+                if (context_ != nullptr && context_->txn_ != nullptr &&
+                    context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
                 }
                 continue;
             }
-            bool match = true;
-            for (auto cond : conds_) // 判断是否匹配
-            {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                // MVCC Write-Write conflict detection
-                if (context_ != nullptr && context_->txn_ != nullptr) {
-                    auto txn = context_->txn_;
-                    timestamp_t statement_read_ts = txn->get_read_ts();
-                    if (context_->lock_mgr_ != nullptr &&
-                        !context_->lock_mgr_->lock_exclusive_on_record(txn, rid, fh_->GetFd())) {
-                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                    }
-                    if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context_->txn_mgr_ != nullptr) {
-                        auto current_record = GetCurrentRecordForRcWrite(fh_, rid, txn, context_);
-                        if (!current_record.has_value()) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                        }
-                        rec = std::move(current_record->record);
-                        bool latest_match = true;
-                        for (const auto& cond : conds_) {
-                            if (!compare(cond, *rec)) {
-                                latest_match = false;
-                                break;
-                            }
-                        }
-                        if (!latest_match) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                        }
-                        const TupleMeta& latest_meta = current_record->meta;
-                        if (has_non_self_ref_set && latest_meta.is_committed_ &&
-                            latest_meta.writer_txn_id_ != txn->get_transaction_id() &&
-                            latest_meta.commit_ts_ > statement_read_ts) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                        }
-                    }
-                    TupleMeta meta = fh_->get_tuple_meta(rid);
-                    if (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id()) {
-                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                    }
-                    IsolationLevel level = txn->get_isolation_level();
-                    bool snapshot_conflict_check = level == IsolationLevel::SNAPSHOT_ISOLATION ||
-                                                   level == IsolationLevel::REPEATABLE_READ ||
-                                                   level == IsolationLevel::SERIALIZABLE;
-                    if (snapshot_conflict_check && meta.is_committed_ && meta.commit_ts_ > txn->get_start_ts() &&
-                        meta.writer_txn_id_ != txn->get_transaction_id()) {
-                        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                    }
-                }
-
-                auto new_rec = std::make_unique<RmRecord>(*rec); // 对原记录进行拷贝
-                update_record(new_rec.get(), *rec);              // 对记录更新
-
-                // SSI: Consolidated atomic check for both old and new records.
-                // Per spec: UPDATE must check both old (pre-update) and new (post-update) records.
-                // Both are checked atomically under a single lock; the write is stored
-                // as one ssi_writes_ entry only if no danger is found.
-                if (context_ != nullptr && context_->txn_ != nullptr &&
-                    context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE &&
-                    context_->txn_mgr_ != nullptr) {
-                    auto* txn_mgr = context_->txn_mgr_;
-                    txn_id_t writer_id = context_->txn_->get_transaction_id();
-                    bool danger =
-                        txn_mgr->CheckWriteAgainstReaders(writer_id, rid, tab_name_, std::optional<RmRecord>(*rec),
-                                                          std::optional<RmRecord>(*new_rec), tab_.cols);
-                    if (danger) {
-                        throw TransactionAbortException(writer_id, AbortReason::SSI_DANGER);
-                    }
-                }
-
-                struct IndexUpdate {
-                    const IndexMeta* index;
-                    std::vector<char> old_key;
-                    std::vector<char> new_key;
-                };
-                std::vector<IndexUpdate> index_updates;
-                auto txn = context_ == nullptr ? nullptr : context_->txn_;
-
-                for (const auto& index : tab_.indexes) {
-                    auto old_key = make_index_key(index, rec->data);
-                    auto new_key = make_index_key(index, new_rec->data);
-                    if (old_key == new_key) {
-                        continue;
-                    }
-                    sm_manager_->remember_historical_index_key(
-                        tab_name_, sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols), old_key, rid);
-                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols))
-                                  .get();
-                    std::vector<Rid> result;
-                    if (ih->get_value(new_key.data(), &result, txn) &&
-                        std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
-                        throw IndexEntryExistsError();
-                    }
-                    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-                    auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, new_key);
-                    for (const auto& candidate_rid : candidate_rids) {
-                        if (candidate_rid != rid &&
-                            HistoricalIndexKeyConflictsWithTxn(fh_, candidate_rid, index, new_key, context_)) {
-                            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
-                        }
-                    }
-                    index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
-                }
-                if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
-                    UpdateLogRecord log_record(context_->txn_->get_transaction_id(), *rec, *new_rec, rid, tab_name_);
-                    log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
-                    lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
-                    context_->txn_->set_prev_lsn(lsn);
-                }
-                if (context_ != nullptr && context_->txn_ != nullptr) {
-                    context_->txn_->append_write_record(
-                        std::make_unique<WriteRecord>(WType::UPDATE_TUPLE, tab_name_, rid, *rec));
-
-                    // Save old version as undo log for MVCC version chain
-                    UndoLog undo;
-                    undo.is_deleted_ = false;
-                    undo.old_meta_ = fh_->get_tuple_meta(rid);
-                    undo.old_tuple_data_.assign(rec->data, rec->data + rec->size);
-                    undo.prev_version_ = undo.old_meta_.version_chain_head_;
-                    UndoLink undo_link = context_->txn_->AppendUndoLog(undo);
-
-                    // Track modified slot for MVCC commit
-                    context_->txn_->append_modified_slot(tab_name_, rid);
-                    // Update TupleMeta: mark as uncommitted, owned by this txn, chain to old version
-                    TupleMeta meta;
-                    meta.writer_txn_id_ = context_->txn_->get_transaction_id();
-                    meta.is_committed_ = false;
-                    meta.is_deleted_ = false;
-                    meta.version_chain_head_ = undo_link;
-                    fh_->set_tuple_meta(rid, meta);
-                }
-
-                std::vector<size_t> deleted_indexes;
-                std::vector<size_t> inserted_indexes;
-                try {
-                    for (size_t i = 0; i < index_updates.size(); ++i) {
-                        const auto& update = index_updates[i];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        ih->delete_entry(update.old_key.data(), rid, txn); // 删除旧索引
-                        deleted_indexes.push_back(i);
-                        ih->insert_entry(update.new_key.data(), rid, txn); // 插入新索引
-                        inserted_indexes.push_back(i);
-                    }
-                } catch (...) // 失败时回滚已经修改过的索引
-                {
-                    for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
-                        const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        ih->delete_entry(update.new_key.data(), rid, txn); // 删除新索引
-                    }
-                    for (auto it = deleted_indexes.rbegin(); it != deleted_indexes.rend(); ++it) {
-                        const auto& update = index_updates[*it];
-                        auto ih = sm_manager_->ihs_
-                                      .at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, update.index->cols))
-                                      .get();
-                        ih->insert_entry(update.old_key.data(), rid, txn, true); // 恢复旧索引
-                    }
-                    throw; // 仍然抛出错误
-                }
-                fh_->update_record(rid, new_rec->data, context_);
-            }
+            UpdateRuntimeInfo info{sm_manager_,
+                                   &tab_name_,
+                                   &tab_,
+                                   fh_,
+                                   &conds_,
+                                   &bound_conditions_,
+                                   &cached_indexes_,
+                                   &set_clauses_,
+                                   &bound_set_clauses_,
+                                   &affected_index_bitmap_};
+            RowMutationEngine::UpdateOne(rid, *rec, info, context_);
         }
         return nullptr;
     }
@@ -239,119 +105,6 @@ public:
     }
     std::string getType() override {
         return "UpdateExecutor"; // 返回执行器的名称
-    }
-    /**
-     * @brief 更新记录
-     * @param rec 需要更新的记录
-     */
-    void update_record(RmRecord* rec, const RmRecord& old_rec) {
-        for (const auto& set_clause : set_clauses_) {
-            auto col_meta = get_col_offset(set_clause.lhs);
-            char* data = rec->data + col_meta.offset;
-            if (set_clause.is_self_ref) {
-                auto rhs_col_meta = get_col_offset(set_clause.rhs_col);
-                if (set_clause.op == UpdateOp::ASSIGNMENT) {
-                    if (col_meta.type == TYPE_INT && rhs_col_meta.type == TYPE_FLOAT) {
-                        *reinterpret_cast<int*>(data) =
-                            static_cast<int>(*reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset));
-                    } else if (col_meta.type == TYPE_FLOAT && rhs_col_meta.type == TYPE_INT) {
-                        *reinterpret_cast<double*>(data) =
-                            static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset));
-                    } else if (col_meta.type == TYPE_STRING || col_meta.type == TYPE_DATETIME) {
-                        if (rhs_col_meta.type != TYPE_STRING && rhs_col_meta.type != TYPE_DATETIME) {
-                            throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
-                        }
-                        std::memset(data, 0, col_meta.len);
-                        std::memcpy(data, old_rec.data + rhs_col_meta.offset, std::min(col_meta.len, rhs_col_meta.len));
-                    } else if (col_meta.type == TYPE_INT) {
-                        if (rhs_col_meta.type != TYPE_INT) {
-                            throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
-                        }
-                        *reinterpret_cast<int*>(data) = *reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset);
-                    } else if (col_meta.type == TYPE_FLOAT) {
-                        if (rhs_col_meta.type != TYPE_FLOAT) {
-                            throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
-                        }
-                        *reinterpret_cast<double*>(data) =
-                            *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
-                    }
-                    continue;
-                }
-
-                if ((rhs_col_meta.type != TYPE_INT && rhs_col_meta.type != TYPE_FLOAT) ||
-                    (set_clause.rhs.type != TYPE_INT && set_clause.rhs.type != TYPE_FLOAT)) {
-                    throw IncompatibleTypeError(coltype2str(rhs_col_meta.type), coltype2str(set_clause.rhs.type));
-                }
-
-                double base = rhs_col_meta.type == TYPE_INT
-                                  ? static_cast<double>(*reinterpret_cast<int*>(old_rec.data + rhs_col_meta.offset))
-                                  : *reinterpret_cast<double*>(old_rec.data + rhs_col_meta.offset);
-                double delta = set_clause.rhs.type == TYPE_INT ? static_cast<double>(set_clause.rhs.int_val)
-                                                               : set_clause.rhs.float_val;
-                double result = base;
-                switch (set_clause.op) {
-                case UpdateOp::SELF_ADD:
-                    result = base + delta;
-                    break;
-                case UpdateOp::SELF_SUB:
-                    result = base - delta;
-                    break;
-                case UpdateOp::SELF_MUL:
-                    result = base * delta;
-                    break;
-                case UpdateOp::SELF_DIV:
-                    if (delta == 0.0F) {
-                        throw InternalError("division by zero in UPDATE");
-                    }
-                    result = base / delta;
-                    break;
-                case UpdateOp::ASSIGNMENT:
-                    result = base;
-                    break;
-                }
-
-                switch (col_meta.type) {
-                case TYPE_INT:
-                    *reinterpret_cast<int*>(data) = static_cast<int>(result);
-                    break;
-                case TYPE_FLOAT:
-                    *reinterpret_cast<double*>(data) = result;
-                    break;
-                case TYPE_STRING:
-                case TYPE_DATETIME:
-                    throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(rhs_col_meta.type));
-                }
-                continue;
-            }
-            if (can_cast(col_meta.type, set_clause.rhs.type) == false) {
-                throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(set_clause.rhs.type));
-            }
-            switch (col_meta.type) {
-            case TYPE_INT: {
-                if (set_clause.rhs.type == TYPE_INT) {
-                    *(int*)data = set_clause.rhs.int_val;
-                } else {
-                    *(int*)data = (int)set_clause.rhs.float_val;
-                }
-                break;
-            }
-            case TYPE_FLOAT: {
-                if (set_clause.rhs.type == TYPE_FLOAT) {
-                    *(double*)data = set_clause.rhs.float_val;
-                } else {
-                    *(double*)data = static_cast<double>(set_clause.rhs.int_val);
-                }
-                break;
-            }
-            case TYPE_STRING:
-            case TYPE_DATETIME: {
-                int len = get_col_offset(set_clause.lhs).len;
-                std::memset(data, 0, len);
-                std::memcpy(data, set_clause.rhs.str_val.c_str(), std::min(len, (int)set_clause.rhs.str_val.size()));
-                break;
-            }
-            }
-        }
     }
     ColMeta get_col_offset(const TabCol& target) override {
         for (const auto& col : tab_.cols) {

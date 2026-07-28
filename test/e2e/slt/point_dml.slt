@@ -1,0 +1,122 @@
+statement ok
+CREATE TABLE point_dml (id INT, value INT, note CHAR(8));
+
+statement ok
+CREATE INDEX point_dml (id);
+
+statement ok
+INSERT INTO point_dml VALUES (1, 10, 'one');
+
+statement ok
+INSERT INTO point_dml VALUES (2, 20, 'two');
+
+statement ok
+INSERT INTO point_dml VALUES (3, 30, 'three');
+
+statement ok
+INSERT INTO point_dml VALUES (4, 40, 'four');
+
+statement ok
+UPDATE point_dml SET value = 11 WHERE id = 1;
+
+statement ok
+UPDATE point_dml SET value = 31 WHERE id = 3;
+
+statement ok
+UPDATE point_dml SET value = 41 WHERE id = 4;
+
+query
+SELECT id, value FROM point_dml ORDER BY id;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |               11 |
+|                2 |               20 |
+|                3 |               31 |
+|                4 |               41 |
++------------------+------------------+
+Total record(s): 4
+
+query
+SELECT id, value FROM point_dml WHERE id = 1;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |               11 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+UPDATE point_dml SET value = 99 WHERE id = 1 AND value = 20;
+
+query
+SELECT id, value FROM point_dml WHERE id = 1;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |               11 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+DELETE FROM point_dml WHERE id = 2;
+
+statement ok
+DELETE FROM point_dml WHERE id = 3;
+
+query
+SELECT id FROM point_dml WHERE id = 2;
+----
++------------------+
+|               id |
++------------------+
++------------------+
+Total record(s): 0
+
+query
+SELECT id, value FROM point_dml ORDER BY id;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |               11 |
+|                4 |               41 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE point_dml_composite (a INT, b INT, value INT);
+
+statement ok
+CREATE INDEX point_dml_composite (a, b);
+
+statement ok
+INSERT INTO point_dml_composite VALUES (1, 2, 20);
+
+statement ok
+UPDATE point_dml_composite SET value = 21 WHERE b = 2 AND a = 1;
+
+query
+SELECT a, b, value FROM point_dml_composite WHERE a = 1 AND b = 2;
+----
++------------------+------------------+------------------+
+|                a |                b |            value |
++------------------+------------------+------------------+
+|                1 |                2 |               21 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+statement ok
+DELETE FROM point_dml_composite WHERE a = 1 AND b = 2;
+
+query
+SELECT a, b, value FROM point_dml_composite WHERE a = 1 AND b = 2;
+----
++------------------+------------------+------------------+
+|                a |                b |            value |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+Total record(s): 0

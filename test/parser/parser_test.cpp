@@ -71,6 +71,24 @@ TEST(ParserTest, ParsesDdlAndDmlStatements) {
               ast::AstType::UpdateStmt);
 }
 
+TEST(ParserTest, ParsesNamedCreateIndexOnTableSyntax) {
+    auto parsed = parse_ok("create index customer_last on customer(c_w_id, c_d_id, c_last, c_first, c_id);");
+    auto* index = dynamic_cast<ast::CreateIndex*>(parsed.get());
+    ASSERT_NE(index, nullptr);
+    EXPECT_EQ(index->tab_name, "customer");
+    EXPECT_EQ(index->col_names, std::vector<std::string>({"c_w_id", "c_d_id", "c_last", "c_first", "c_id"}));
+}
+
+TEST(ParserTest, FloatColumnsUseBinary32Width) {
+    auto parsed = parse_ok("create table tb (value float);");
+    const auto* create = as_node<ast::CreateTable>(parsed);
+    ASSERT_EQ(create->fields.size(), 1U);
+    const auto* column = dynamic_cast<const ast::ColDef*>(create->fields[0].get());
+    ASSERT_NE(column, nullptr);
+    EXPECT_EQ(column->type_len->type, ast::SV_TYPE_FLOAT);
+    EXPECT_EQ(column->type_len->len, static_cast<int>(sizeof(float)));
+}
+
 TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     auto parsed = parse_ok("update score_tab set score = score + 5, bonus = score_tab.bonus - 0.5 where id < 3;");
     auto update = as_node<ast::UpdateStmt>(parsed);
@@ -98,6 +116,107 @@ TEST(ParserTest, ParsesSelfReferentialUpdateSetClauses) {
     auto bonus_delta = dynamic_cast<const ast::FloatLit*>(bonus_clause->val.get());
     ASSERT_NE(bonus_delta, nullptr);
     EXPECT_DOUBLE_EQ(bonus_delta->val, 0.5);
+}
+
+TEST(ParserTest, ParsesAndClonesDirectColumnAssignmentWithConstantWhereExpression) {
+    auto parsed = parse_ok("update tb set a = b where id = (1 + 1);");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    const auto* clause = update->set_clauses[0].get();
+    EXPECT_TRUE(clause->is_self_ref);
+    EXPECT_EQ(clause->op, ast::SetOp::ASSIGNMENT);
+    EXPECT_EQ(clause->col_name, "a");
+    ASSERT_NE(clause->rhs_col, nullptr);
+    EXPECT_EQ(clause->rhs_col->tab_name, "");
+    EXPECT_EQ(clause->rhs_col->col_name, "b");
+    EXPECT_EQ(clause->val, nullptr);
+    ASSERT_EQ(update->conds.size(), 1U);
+    const auto* where_value = dynamic_cast<const ast::IntLit*>(update->conds[0]->rhs.get());
+    ASSERT_NE(where_value, nullptr);
+    EXPECT_EQ(where_value->val, 2);
+
+    const std::vector<std::unique_ptr<ast::Value>> no_bindings;
+    auto cloned = ast::clone_bound_tree(*parsed, no_bindings);
+    const auto* cloned_update = as_node<ast::UpdateStmt>(cloned);
+    ASSERT_NE(cloned_update, nullptr);
+    ASSERT_EQ(cloned_update->set_clauses.size(), 1U);
+    ASSERT_NE(cloned_update->set_clauses[0]->rhs_col, nullptr);
+    EXPECT_EQ(cloned_update->set_clauses[0]->rhs_col->col_name, "b");
+}
+
+TEST(ParserTest, ParsesAndBindsOrderedChainedUpdateTerms) {
+    auto parsed = parse_ok("update chain_tab set a = a - 1 + 91 - 3, b = b + $1 - $2 where id = $3;");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 2U);
+
+    const auto* a_clause = update->set_clauses[0].get();
+    EXPECT_EQ(a_clause->op, ast::SetOp::SELF_SUB);
+    ASSERT_EQ(a_clause->additional_terms.size(), 2U);
+    EXPECT_EQ(a_clause->additional_terms[0].op, ast::SetOp::SELF_ADD);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(a_clause->additional_terms[0].val.get())->val, 91);
+    EXPECT_EQ(a_clause->additional_terms[1].op, ast::SetOp::SELF_SUB);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(a_clause->additional_terms[1].val.get())->val, 3);
+
+    std::vector<std::unique_ptr<ast::Value>> bindings;
+    bindings.push_back(std::make_unique<ast::IntLit>(5));
+    bindings.push_back(std::make_unique<ast::IntLit>(2));
+    bindings.push_back(std::make_unique<ast::IntLit>(7));
+    auto bound = ast::clone_bound_tree(*parsed, bindings);
+    const auto* bound_update = as_node<ast::UpdateStmt>(bound);
+    ASSERT_NE(bound_update, nullptr);
+    ASSERT_EQ(bound_update->set_clauses[1]->additional_terms.size(), 1U);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->set_clauses[1]->val.get())->val, 5);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->set_clauses[1]->additional_terms[0].val.get())->val, 2);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->conds[0]->rhs.get())->val, 7);
+}
+
+TEST(ParserTest, BindsPreparedSelfReferentialUpdateAndWhereParameters) {
+    auto parsed = parse_ok("update stock set s_ytd = s_ytd + $3 where s_w_id = $1 and s_i_id = $2;");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    ASSERT_NE(update->set_clauses[0]->val, nullptr);
+    const auto* delta = dynamic_cast<const ast::Parameter*>(update->set_clauses[0]->val.get());
+    ASSERT_NE(delta, nullptr);
+    EXPECT_EQ(delta->ordinal, 3U);
+    ASSERT_EQ(update->conds.size(), 2U);
+    ASSERT_NE(dynamic_cast<const ast::Parameter*>(update->conds[0]->rhs.get()), nullptr);
+    ASSERT_NE(dynamic_cast<const ast::Parameter*>(update->conds[1]->rhs.get()), nullptr);
+
+    std::vector<std::unique_ptr<ast::Value>> bindings;
+    bindings.push_back(std::make_unique<ast::IntLit>(7));
+    bindings.push_back(std::make_unique<ast::IntLit>(19));
+    bindings.push_back(std::make_unique<ast::FloatLit>(2.5F));
+    auto bound = ast::clone_bound_tree(*parsed, bindings);
+    const auto* bound_update = as_node<ast::UpdateStmt>(bound);
+    ASSERT_NE(bound_update, nullptr);
+    const auto* bound_delta = dynamic_cast<const ast::FloatLit*>(bound_update->set_clauses[0]->val.get());
+    ASSERT_NE(bound_delta, nullptr);
+    EXPECT_FLOAT_EQ(bound_delta->val, 2.5F);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->conds[0]->rhs.get())->val, 7);
+    EXPECT_EQ(dynamic_cast<const ast::IntLit*>(bound_update->conds[1]->rhs.get())->val, 19);
+}
+
+TEST(ParserTest, BindsPreparedBareSelfAssignmentWithParameterizedWhere) {
+    auto parsed = parse_ok("update stock set s_ytd = s_ytd where s_w_id = $1 and s_i_id = $2;");
+    const auto* update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    EXPECT_TRUE(update->set_clauses[0]->is_self_ref);
+    EXPECT_EQ(update->set_clauses[0]->op, ast::SetOp::ASSIGNMENT);
+    EXPECT_EQ(update->set_clauses[0]->val, nullptr);
+
+    std::vector<std::unique_ptr<ast::Value>> bindings;
+    bindings.push_back(std::make_unique<ast::IntLit>(7));
+    bindings.push_back(std::make_unique<ast::IntLit>(19));
+    auto bound = ast::clone_bound_tree(*parsed, bindings);
+    const auto* bound_update = as_node<ast::UpdateStmt>(bound);
+    ASSERT_NE(bound_update, nullptr);
+    ASSERT_EQ(bound_update->set_clauses.size(), 1U);
+    EXPECT_TRUE(bound_update->set_clauses[0]->is_self_ref);
+    EXPECT_EQ(bound_update->set_clauses[0]->val, nullptr);
 }
 
 TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
@@ -309,12 +428,17 @@ TEST(ParserTest, ParsesKnobsAndTransactionStatements) {
     EXPECT_EQ(parse_ok("create static_checkpoint;")->type, ast::AstType::StaticCheckpoint);
 }
 
+TEST(ParserTest, RejectsParameterOrdinalOverflow) {
+    expect_parse_error("select $184467440737095516160 from tb;");
+    expect_parse_error("select * from tb limit $184467440737095516160;");
+}
+
 TEST(ParserTest, RejectsMalformedStatements) {
     expect_parse_error("select * from tb");
     expect_parse_error("select from tb;");
     expect_parse_error("insert into tb values (1, );");
     expect_parse_error("set enable_nestloop = maybe;");
-    expect_parse_error("update tb set a = b where x = 1;");
+    EXPECT_EQ(parse_ok("update tb set a = b where x = 1;")->type, ast::AstType::UpdateStmt);
     EXPECT_EQ(parse_ok("update tb set a = a where x = 1;")->type, ast::AstType::UpdateStmt);
     expect_parse_error("update tb set a = b * 'bad' where x = 1;");
 }
@@ -332,6 +456,28 @@ TEST(ParserTest, SelectStmtUsesSelectItemsAsSingleProjectionContract) {
     EXPECT_EQ(select->order_by_items.size(), 1);
     EXPECT_TRUE(select->has_limit);
     EXPECT_EQ(select->limit, 5);
+}
+
+TEST(ParserTest, ParsesCountDistinctColumnAndParenthesizedColumn) {
+    for (const auto& sql : {"select count(distinct id) from tb;", "select count(distinct (tb.id)) from tb;"}) {
+        auto parsed = parse_ok(sql);
+        const auto* select = as_node<ast::SelectStmt>(parsed);
+        ASSERT_EQ(select->select_items.size(), 1);
+        const auto* aggregate = dynamic_cast<const ast::AggExpr*>(select->select_items[0]->expr.get());
+        ASSERT_NE(aggregate, nullptr);
+        EXPECT_EQ(aggregate->func, ast::AGG_COUNT);
+        EXPECT_FALSE(aggregate->is_star);
+        EXPECT_TRUE(aggregate->is_distinct);
+        ASSERT_NE(aggregate->col, nullptr);
+        EXPECT_EQ(aggregate->col->tab_name, std::string(sql).find("tb.id") == std::string::npos ? "" : "tb");
+        EXPECT_EQ(aggregate->col->col_name, "id");
+    }
+}
+
+TEST(ParserTest, RejectsUnsupportedDistinctAggregateForms) {
+    expect_parse_error("select count(distinct *) from tb;");
+    expect_parse_error("select count(distinct id, score) from tb;");
+    expect_parse_error("select sum(distinct score) from tb;");
 }
 
 TEST(ParserTest, UsesBinaryExprForWhereAndHavingExprForHavingConditions) {
@@ -378,6 +524,44 @@ TEST(ParserTest, ParsesOptionalWhereAndNegativeLiterals) {
     EXPECT_DOUBLE_EQ(float_lit->val, -2.5);
 }
 
+TEST(ParserTest, ParsesPreparedMarkersAndQuotedDollarText) {
+    auto insert_node = parse_ok("insert into tb values ($2, '$1', $1);");
+    auto insert = as_node<ast::InsertStmt>(insert_node);
+    ASSERT_NE(insert, nullptr);
+    ASSERT_EQ(insert->vals.size(), 3);
+    EXPECT_EQ(insert->vals[0]->type, ast::AstType::Parameter);
+    EXPECT_EQ(static_cast<const ast::Parameter*>(insert->vals[0].get())->ordinal, 2u);
+    EXPECT_EQ(insert->vals[1]->type, ast::AstType::StringLit);
+    EXPECT_EQ(insert->vals[2]->type, ast::AstType::Parameter);
+    auto select_node = parse_ok("select a from tb where a=$1 limit $2;");
+    auto select = as_node<ast::SelectStmt>(select_node);
+    ASSERT_NE(select, nullptr);
+    EXPECT_TRUE(select->limit_is_parameter);
+    EXPECT_EQ(select->limit_parameter, 2u);
+}
+
+TEST(ParserTest, ParsesLimitOffsetClause) {
+    auto literal_node = parse_ok("select a from tb limit 3 offset 7;");
+    auto literal_select = as_node<ast::SelectStmt>(literal_node);
+    ASSERT_NE(literal_select, nullptr);
+    EXPECT_TRUE(literal_select->has_limit);
+    EXPECT_EQ(literal_select->limit, 3);
+    EXPECT_EQ(literal_select->offset, 7);
+    EXPECT_FALSE(literal_select->offset_is_parameter);
+
+    auto plain_node = parse_ok("select a from tb limit 3;");
+    EXPECT_EQ(as_node<ast::SelectStmt>(plain_node)->offset, 0);
+
+    auto param_node = parse_ok("select a from tb order by a limit 1 offset $2;");
+    auto param_select = as_node<ast::SelectStmt>(param_node);
+    ASSERT_NE(param_select, nullptr);
+    EXPECT_EQ(param_select->limit, 1);
+    EXPECT_TRUE(param_select->offset_is_parameter);
+    EXPECT_EQ(param_select->offset_parameter, 2u);
+
+    expect_parse_error("select a from tb offset 2;");
+    expect_parse_error("select a from tb limit 2 offset;");
+}
 TEST(ParserTest, RejectsUnterminatedBlockComment) {
     expect_parse_error("select * from tb /* missing close ;");
 }
@@ -429,4 +613,74 @@ TEST(ParserTest, ParsesLoadStmt) {
     ASSERT_NE(load2, nullptr);
     EXPECT_EQ(load2->file_name_, "./x.csv");
     EXPECT_EQ(load2->tab_name_, "t");
+}
+
+TEST(ParserTest, ParsesNullLiteral) {
+    auto node = parse_ok("insert into tb values (1, NULL, 'x');");
+    auto insert = as_node<ast::InsertStmt>(node);
+    ASSERT_NE(insert, nullptr);
+    ASSERT_EQ(insert->vals.size(), 3U);
+    EXPECT_EQ(insert->vals[0]->type, ast::AstType::IntLit);
+    EXPECT_EQ(insert->vals[1]->type, ast::AstType::NullLit);
+    EXPECT_EQ(insert->vals[2]->type, ast::AstType::StringLit);
+    EXPECT_EQ(insert->vals[1]->display_text, "NULL");
+
+    // 大小写不敏感，和其他关键字一致
+    auto lower = parse_ok("insert into tb values (null);");
+    auto lower_insert = as_node<ast::InsertStmt>(lower);
+    ASSERT_NE(lower_insert, nullptr);
+    ASSERT_EQ(lower_insert->vals.size(), 1U);
+    EXPECT_EQ(lower_insert->vals[0]->type, ast::AstType::NullLit);
+
+    // NULL 不能参与常量算术
+    expect_parse_error("insert into tb values (NULL + 1);");
+    expect_parse_error("insert into tb values (-NULL);");
+}
+
+TEST(ParserTest, ParsesSetColumnToNull) {
+    auto node = parse_ok("update tb set a = NULL where id = 1;");
+    auto update = as_node<ast::UpdateStmt>(node);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 1U);
+    EXPECT_EQ(update->set_clauses[0]->col_name, "a");
+    ASSERT_NE(update->set_clauses[0]->val, nullptr);
+    EXPECT_EQ(update->set_clauses[0]->val->type, ast::AstType::NullLit);
+    EXPECT_FALSE(update->set_clauses[0]->is_self_ref);
+}
+
+TEST(ParserTest, ParsesIsNullPredicates) {
+    // `IS [NOT] NULL` 有专门的比较算子，不能退化成 `= NULL` / `<> NULL`
+    auto is_null = parse_ok("select a from tb where a is null;");
+    auto select = as_node<ast::SelectStmt>(is_null);
+    ASSERT_NE(select, nullptr);
+    ASSERT_EQ(select->conds.size(), 1U);
+    EXPECT_EQ(select->conds[0]->op, ast::SV_OP_IS_NULL);
+    EXPECT_EQ(select->conds[0]->lhs->type, ast::AstType::Col);
+    EXPECT_EQ(select->conds[0]->rhs->type, ast::AstType::NullLit);
+
+    auto is_not_null = parse_ok("select a from tb where tb.a IS NOT NULL;");
+    auto select2 = as_node<ast::SelectStmt>(is_not_null);
+    ASSERT_NE(select2, nullptr);
+    ASSERT_EQ(select2->conds.size(), 1U);
+    EXPECT_EQ(select2->conds[0]->op, ast::SV_OP_IS_NOT_NULL);
+
+    // `= NULL` 仍然是普通的相等比较（语义上恒假，但语法上不是 IS NULL）
+    auto eq_null = parse_ok("select a from tb where a = NULL;");
+    auto select3 = as_node<ast::SelectStmt>(eq_null);
+    ASSERT_NE(select3, nullptr);
+    ASSERT_EQ(select3->conds.size(), 1U);
+    EXPECT_EQ(select3->conds[0]->op, ast::SV_OP_EQ);
+    EXPECT_EQ(select3->conds[0]->rhs->type, ast::AstType::NullLit);
+
+    // 多个 IS NULL 用 AND 连接
+    auto both = parse_ok("delete from tb where a is null and b is not null;");
+    auto del = as_node<ast::DeleteStmt>(both);
+    ASSERT_NE(del, nullptr);
+    ASSERT_EQ(del->conds.size(), 2U);
+    EXPECT_EQ(del->conds[0]->op, ast::SV_OP_IS_NULL);
+    EXPECT_EQ(del->conds[1]->op, ast::SV_OP_IS_NOT_NULL);
+
+    expect_parse_error("select a from tb where a is;");
+    expect_parse_error("select a from tb where a is not;");
+    expect_parse_error("select a from tb where a is not 1;");
 }

@@ -131,7 +131,7 @@ public:
             disk_manager_->write_page(fd, IX_INIT_ROOT_PAGE, page_buf, PAGE_SIZE);
         }
 
-        disk_manager_->set_fd2pageno(fd, IX_INIT_NUM_PAGES - 1); // DEBUG
+        disk_manager_->set_fd2pageno(fd, IX_INIT_NUM_PAGES);
 
         // Close index file
         disk_manager_->close_file(fd);
@@ -166,6 +166,7 @@ public:
         disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data.data(), ih->file_hdr_->tot_len_);
         // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
         buffer_pool_manager_->flush_all_pages(ih->fd_);
+        ih->release_root_page_cache();
         buffer_pool_manager_->delete_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
     }

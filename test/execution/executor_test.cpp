@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #define private public
 #include "execution/executor_insert.h"
 #include "execution/executor_seq_scan.h"
+#include "execution/executor_filter.h"
 #include "execution/executor_projection.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_delete.h"
@@ -23,7 +24,9 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include "gtest/gtest.h"
@@ -50,10 +53,19 @@ RmRecord make_join_record(int value) {
     return rec;
 }
 
+RmRecord make_filter_record(int lhs, int rhs) {
+    RmRecord rec(sizeof(int) * 2);
+    std::memcpy(rec.data, &lhs, sizeof(int));
+    std::memcpy(rec.data + sizeof(int), &rhs, sizeof(int));
+    return rec;
+}
+
 class CountingExecutor : public AbstractExecutor {
 public:
-    CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records)
-        : cols_(std::move(cols)), records_(std::move(records)) {
+    CountingExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> records,
+                     int* external_next_record_calls = nullptr, bool* tracking_enabled_on_begin = nullptr)
+        : cols_(std::move(cols)), records_(std::move(records)), external_next_record_calls_(external_next_record_calls),
+          tracking_enabled_on_begin_(tracking_enabled_on_begin) {
         len_ = 0;
         for (const auto& col : cols_) {
             len_ = std::max(len_, static_cast<size_t>(col.offset + col.len));
@@ -62,6 +74,12 @@ public:
 
     void beginTuple() override {
         ++begin_calls_;
+        if (tracking_enabled_on_begin_ != nullptr) {
+            *tracking_enabled_on_begin_ = context_ != nullptr && context_->enable_ssi_read_tracking_;
+        }
+        if (throw_on_begin_) {
+            throw std::runtime_error("test child begin failure");
+        }
         cursor_ = 0;
     }
 
@@ -74,10 +92,21 @@ public:
 
     std::unique_ptr<RmRecord> Next() override {
         ++next_record_calls_;
+        if (external_next_record_calls_ != nullptr) {
+            ++*external_next_record_calls_;
+        }
         if (is_end()) {
             return nullptr;
         }
         return std::make_unique<RmRecord>(records_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        const auto& record = records_[cursor_];
+        return TupleView{record.data, static_cast<uint32_t>(record.size)};
     }
 
     Rid& rid() override {
@@ -89,6 +118,7 @@ public:
     }
 
     const std::vector<ColMeta>& cols() const override {
+        ++cols_calls_;
         return cols_;
     }
 
@@ -108,12 +138,49 @@ public:
     int begin_calls_ = 0;
     int next_calls_ = 0;
     int next_record_calls_ = 0;
+    mutable int cols_calls_ = 0;
+    bool throw_on_begin_ = false;
+
+    std::string scan_table_name() const override {
+        return "t";
+    }
 
 private:
     std::vector<ColMeta> cols_;
     std::vector<RmRecord> records_;
+    int* external_next_record_calls_ = nullptr;
+    bool* tracking_enabled_on_begin_ = nullptr;
     size_t len_ = 0;
     size_t cursor_ = 0;
+};
+
+class CountingResultSink : public QueryResultSink {
+public:
+    void begin_query(const std::vector<ColMeta>& columns, const std::vector<std::string>& names) override {
+        ++begin_calls;
+        column_count = columns.size();
+        captions = names;
+    }
+
+    void append_row(const std::vector<ColMeta>&, const char*, std::size_t) override {
+        ++row_count;
+    }
+
+    int begin_calls = 0;
+    int row_count = 0;
+    std::size_t column_count = 0;
+    std::vector<std::string> captions;
+};
+
+class BareExecutor : public AbstractExecutor {
+public:
+    std::unique_ptr<RmRecord> Next() override {
+        return nullptr;
+    }
+
+    Rid& rid() override {
+        return _abstract_rid;
+    }
 };
 
 } // namespace
@@ -177,6 +244,62 @@ public:
         }
     }
 };
+
+TEST(AbstractExecutorFocusedTest, DefaultColsIsSafe) {
+    BareExecutor executor;
+    EXPECT_TRUE(executor.cols().empty());
+}
+
+TEST(FilterExecutorFocusedTest, CachesConditionAddressesAndReusesChildSchema) {
+    const std::vector<ColMeta> cols{make_test_col("t", "id", TYPE_INT, sizeof(int), 0),
+                                    make_test_col("t", "threshold", TYPE_INT, sizeof(int), sizeof(int))};
+    auto child = std::make_unique<CountingExecutor>(
+        cols, std::vector<RmRecord>{make_filter_record(5, 4), make_filter_record(2, 4)});
+    const auto* child_schema = &child->cols();
+    auto* child_ptr = child.get();
+
+    Condition condition;
+    condition.lhs_col = {"t", "id"};
+    condition.op = OP_GT;
+    condition.is_rhs_val = false;
+    condition.rhs_col = {"t", "threshold"};
+
+    FilterExecutor executor(std::move(child), {condition});
+
+    EXPECT_EQ(child_ptr->cols_calls_, 3);
+    EXPECT_EQ(&executor.cols(), child_schema);
+    EXPECT_EQ(child_ptr->cols_calls_, 4);
+
+    executor.beginTuple();
+    ASSERT_FALSE(executor.is_end());
+    auto record = executor.Next();
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(*reinterpret_cast<const int*>(record->data), 5);
+    executor.nextTuple();
+    EXPECT_TRUE(executor.is_end());
+    EXPECT_EQ(child_ptr->cols_calls_, 4);
+    EXPECT_EQ(child_ptr->next_record_calls_, 0);
+}
+
+TEST(FilterExecutorFocusedTest, RestoresContextTrackingWhenChildThrows) {
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, nullptr);
+    Transaction txn(1, IsolationLevel::SERIALIZABLE);
+    char data_send[64] = {};
+    int offset = 0;
+    Context context(&lock_manager, nullptr, &txn, data_send, &offset, &txn_manager);
+    context.enable_ssi_read_tracking_ = true;
+
+    auto child =
+        std::make_unique<CountingExecutor>(std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+                                           std::vector<RmRecord>{make_join_record(1)});
+    child->context_ = &context;
+    child->throw_on_begin_ = true;
+    FilterExecutor executor(std::move(child), {});
+
+    EXPECT_THROW(executor.beginTuple(), std::runtime_error);
+    EXPECT_TRUE(context.enable_ssi_read_tracking_);
+}
 
 TEST_F(ExecutorTest, seq_scan_empty_table) {
     setup_db();
@@ -359,8 +482,8 @@ TEST_F(ExecutorTest, projection_subset_columns) {
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
     auto rec = exec.Next();
-    // Should have 2 columns: id(4 bytes) + score(4 bytes) = 8 bytes
-    EXPECT_EQ(exec.tupleLen(), 8);
+    // 2 columns: id(4) + score(4) + 1 byte trailing NULL bitmap
+    EXPECT_EQ(exec.tupleLen(), 8 + 1);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 42);     // id at offset 0
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data + 4), 99); // score at offset 4
 }
@@ -396,7 +519,8 @@ TEST_F(ExecutorTest, projection_all_columns) {
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
     auto rec = exec.Next();
-    EXPECT_EQ(exec.tupleLen(), 8);
+    // a(4) + b(4) + 1 byte trailing NULL bitmap
+    EXPECT_EQ(exec.tupleLen(), 8 + 1);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 10);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data + 4), 20);
 }
@@ -481,11 +605,15 @@ TEST_F(ExecutorTest, nljoin_cross_product) {
     auto right = std::make_unique<SeqScanExecutor>(sm_manager_.get(), "jr", std::vector<Condition>{}, &ctx);
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {});
 
+    // The joined tuple concatenates both child tuples, each with its own
+    // trailing NULL bitmap, so column offsets must come from cols().
+    const int l_off = exec.cols()[0].offset;
+    const int r_off = exec.cols()[1].offset;
     std::vector<std::pair<int, int>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
         auto rec = exec.Next();
-        int l_val = *reinterpret_cast<int*>(rec->data);
-        int r_val = *reinterpret_cast<int*>(rec->data + 4);
+        int l_val = read_unaligned<int>(rec->data + l_off);
+        int r_val = read_unaligned<int>(rec->data + r_off);
         results.push_back({l_val, r_val});
     }
     ASSERT_EQ(results.size(), 6); // 2 x 3
@@ -528,11 +656,13 @@ TEST_F(ExecutorTest, nljoin_with_condition) {
 
     NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond});
 
+    const int l_off = exec.cols()[0].offset;
+    const int r_off = exec.cols()[1].offset;
     std::vector<std::pair<int, int>> results;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
         auto rec = exec.Next();
-        int l_val = *reinterpret_cast<int*>(rec->data);
-        int r_val = *reinterpret_cast<int*>(rec->data + 4);
+        int l_val = read_unaligned<int>(rec->data + l_off);
+        int r_val = read_unaligned<int>(rec->data + r_off);
         results.push_back({l_val, r_val});
     }
     ASSERT_EQ(results.size(), 2);
@@ -659,7 +789,171 @@ TEST_F(ExecutorTest, update_single_field) {
     }
 }
 
-TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_commit) {
+TEST_F(ExecutorTest, row_mutation_binding_offsets_types_and_execution) {
+    setup_db();
+    std::vector<ColDef> cols = {
+        {"id", TYPE_INT, 4},         {"source", TYPE_INT, 4},  {"assigned", TYPE_INT, 4},
+        {"arithmetic", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4},
+    };
+    sm_manager_->create_table("mutation_bind", cols, nullptr);
+
+    Value id;
+    id.set_int(1);
+    Value source;
+    source.set_int(7);
+    Value assigned;
+    assigned.set_int(3);
+    Value arithmetic;
+    arithmetic.set_int(4);
+    Value score;
+    score.set_float(1.5);
+    char buf[4096] = {};
+    int offset = 0;
+    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    InsertExecutor insert(sm_manager_.get(), "mutation_bind", {id, source, assigned, arithmetic, score}, &ctx);
+    insert.Next();
+
+    Condition literal_condition;
+    literal_condition.lhs_col = {"mutation_bind", "score"};
+    literal_condition.op = OP_GT;
+    literal_condition.is_rhs_val = true;
+    literal_condition.rhs_val.set_int(1);
+    Condition column_condition;
+    column_condition.lhs_col = {"mutation_bind", "source"};
+    column_condition.op = OP_GT;
+    column_condition.is_rhs_val = false;
+    column_condition.rhs_col = {"mutation_bind", "assigned"};
+    std::vector<Condition> conditions{literal_condition, column_condition};
+
+    const auto& tab = sm_manager_->db_.get_table("mutation_bind");
+    auto bound_conditions = BindMutationConditions(tab, conditions);
+    ASSERT_EQ(bound_conditions.size(), 2U);
+    EXPECT_EQ(bound_conditions[0].lhs.offset, 16U);
+    EXPECT_EQ(bound_conditions[0].lhs.len, 4U);
+    EXPECT_EQ(bound_conditions[0].lhs.type, TYPE_FLOAT);
+    EXPECT_EQ(bound_conditions[0].rhs.offset, 0U);
+    EXPECT_EQ(bound_conditions[0].rhs.len, 0U);
+    EXPECT_EQ(bound_conditions[0].rhs.type, TYPE_INT);
+    EXPECT_EQ(bound_conditions[1].lhs.offset, 4U);
+    EXPECT_EQ(bound_conditions[1].lhs.len, 4U);
+    EXPECT_EQ(bound_conditions[1].lhs.type, TYPE_INT);
+    EXPECT_EQ(bound_conditions[1].rhs.offset, 8U);
+    EXPECT_EQ(bound_conditions[1].rhs.len, 4U);
+    EXPECT_EQ(bound_conditions[1].rhs.type, TYPE_INT);
+
+    SetClause literal_set;
+    literal_set.lhs = {"mutation_bind", "score"};
+    literal_set.rhs.set_int(42);
+    SetClause column_set;
+    column_set.lhs = {"mutation_bind", "assigned"};
+    column_set.is_self_ref = true;
+    column_set.rhs_col = {"mutation_bind", "source"};
+    column_set.op = UpdateOp::ASSIGNMENT;
+    SetClause arithmetic_set;
+    arithmetic_set.lhs = {"mutation_bind", "arithmetic"};
+    arithmetic_set.rhs.set_int(5);
+    arithmetic_set.is_self_ref = true;
+    arithmetic_set.rhs_col = {"mutation_bind", "source"};
+    arithmetic_set.op = UpdateOp::SELF_ADD;
+    UpdateTerm subtract_term;
+    subtract_term.op = UpdateOp::SELF_SUB;
+    subtract_term.rhs.set_int(2);
+    UpdateTerm add_term;
+    add_term.op = UpdateOp::SELF_ADD;
+    add_term.rhs.set_int(3);
+    arithmetic_set.additional_terms = {subtract_term, add_term};
+    std::vector<SetClause> set_clauses{literal_set, column_set, arithmetic_set};
+
+    auto bound_set_clauses = BindMutationSetClauses(tab, set_clauses);
+    ASSERT_EQ(bound_set_clauses.size(), 3U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.offset, 16U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[0].lhs.type, TYPE_FLOAT);
+    EXPECT_EQ(bound_set_clauses[0].rhs.offset, 0U);
+    EXPECT_EQ(bound_set_clauses[0].rhs.len, 0U);
+    EXPECT_EQ(bound_set_clauses[0].rhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[1].lhs.offset, 8U);
+    EXPECT_EQ(bound_set_clauses[1].lhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[1].lhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[1].rhs.offset, 4U);
+    EXPECT_EQ(bound_set_clauses[1].rhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[1].rhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[2].lhs.offset, 12U);
+    EXPECT_EQ(bound_set_clauses[2].lhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[2].lhs.type, TYPE_INT);
+    EXPECT_EQ(bound_set_clauses[2].rhs.offset, 4U);
+    EXPECT_EQ(bound_set_clauses[2].rhs.len, 4U);
+    EXPECT_EQ(bound_set_clauses[2].rhs.type, TYPE_INT);
+
+    Rid rid;
+    {
+        SeqScanExecutor scan(sm_manager_.get(), "mutation_bind", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    UpdateExecutor update(sm_manager_.get(), "mutation_bind", set_clauses, conditions, {rid}, &ctx);
+    update.Next();
+    auto record = sm_manager_->fhs_.at("mutation_bind")->get_record(rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(record->data + 8), 7);
+    EXPECT_EQ(*reinterpret_cast<int*>(record->data + 12), 13);
+    EXPECT_FLOAT_EQ(read_float(record->data + 16), 42.0f);
+
+    Condition delete_literal;
+    delete_literal.lhs_col = {"mutation_bind", "id"};
+    delete_literal.op = OP_EQ;
+    delete_literal.is_rhs_val = true;
+    delete_literal.rhs_val.set_int(1);
+    Condition delete_column;
+    delete_column.lhs_col = {"mutation_bind", "assigned"};
+    delete_column.op = OP_EQ;
+    delete_column.is_rhs_val = false;
+    delete_column.rhs_col = {"mutation_bind", "source"};
+    DeleteExecutor delete_exec(sm_manager_.get(), "mutation_bind", {delete_literal, delete_column}, {rid}, &ctx);
+    delete_exec.Next();
+
+    SeqScanExecutor after_delete(sm_manager_.get(), "mutation_bind", {}, &ctx);
+    after_delete.beginTuple();
+    EXPECT_TRUE(after_delete.is_end());
+}
+
+TEST_F(ExecutorTest, update_rejects_non_finite_float_result_without_writing_row) {
+    setup_db();
+    sm_manager_->create_table("finite_update", {{"amount", TYPE_FLOAT, 4}}, nullptr);
+
+    Value maximum;
+    maximum.set_float(std::numeric_limits<float>::max());
+    char buf[4096] = {};
+    int offset = 0;
+    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
+    InsertExecutor insert(sm_manager_.get(), "finite_update", {maximum}, &ctx);
+    insert.Next();
+
+    Rid rid;
+    {
+        SeqScanExecutor scan(sm_manager_.get(), "finite_update", {}, &ctx);
+        scan.beginTuple();
+        ASSERT_FALSE(scan.is_end());
+        rid = scan.rid();
+    }
+
+    SetClause add;
+    add.lhs = {"finite_update", "amount"};
+    add.rhs = maximum;
+    add.is_self_ref = true;
+    add.rhs_col = {"finite_update", "amount"};
+    add.op = UpdateOp::SELF_ADD;
+    UpdateExecutor update(sm_manager_.get(), "finite_update", {add}, {}, {rid}, &ctx);
+
+    EXPECT_THROW((void)update.Next(), RMDBError);
+    auto record = sm_manager_->fhs_.at("finite_update")->get_record(rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_FLOAT_EQ(read_float(record->data), std::numeric_limits<float>::max());
+}
+
+TEST_F(ExecutorTest, read_committed_update_rechecks_latest_version) {
     setup_db();
     auto cols = make_int_cols({"id", "next_id"});
     sm_manager_->create_table("rc_lost_update", cols, nullptr);
@@ -718,19 +1012,22 @@ TEST_F(ExecutorTest, read_committed_constant_update_aborts_after_concurrent_comm
     ASSERT_NO_THROW(txn1_update.Next());
     txn_manager.commit(txn1, nullptr);
 
-    bool txn2_aborted = false;
-    try {
-        UpdateExecutor txn2_update(sm_manager_.get(), "rc_lost_update", {set_next_to_3021}, {}, {rid}, &ctx2);
+    SetClause set_next_to_3022;
+    set_next_to_3022.lhs = {"rc_lost_update", "next_id"};
+    Value next_3022;
+    next_3022.set_int(3022);
+    set_next_to_3022.rhs = next_3022;
+    ASSERT_NO_THROW({
+        UpdateExecutor txn2_update(sm_manager_.get(), "rc_lost_update", {set_next_to_3022}, {}, {rid}, &ctx2);
         txn2_update.Next();
-    } catch (const TransactionAbortException&) {
-        txn2_aborted = true;
-    }
-    txn_manager.abort(txn2, nullptr);
+    });
+    txn_manager.commit(txn2, nullptr);
 
-    EXPECT_TRUE(txn2_aborted) << "RC constant UPDATE must not overwrite a row committed after the statement read_ts";
+    EXPECT_FALSE(txn2->get_state() == TransactionState::ABORTED)
+        << "RC UPDATE should re-read the latest committed row after waiting for its writer";
     auto final_rec = fh->get_record(rid, nullptr);
     ASSERT_NE(final_rec, nullptr);
-    EXPECT_EQ(*reinterpret_cast<int*>(final_rec->data + 4), 3021);
+    EXPECT_EQ(*reinterpret_cast<int*>(final_rec->data + 4), 3022);
 }
 
 TEST_F(ExecutorTest, transaction_end_commands_clear_session_transaction_id) {
@@ -751,6 +1048,110 @@ TEST_F(ExecutorTest, transaction_end_commands_clear_session_transaction_id) {
 
         EXPECT_EQ(txn_id, INVALID_TXN_ID);
         EXPECT_EQ(context.txn_, nullptr);
+    }
+}
+
+TEST_F(ExecutorTest, select_from_prefers_current_view_over_next_record) {
+    sm_manager_->output_file_enabled_ = false;
+    int next_record_calls = 0;
+    auto executor = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(10), make_join_record(20)}, &next_record_calls);
+
+    char data_send[4096] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
+
+    ql_manager.select_from(std::move(executor), {"id"}, &context);
+
+    EXPECT_EQ(next_record_calls, 0);
+    EXPECT_EQ(std::string(data_send, offset), "+------------------+\n"
+                                              "|               id |\n"
+                                              "+------------------+\n"
+                                              "|               10 |\n"
+                                              "|               20 |\n"
+                                              "+------------------+\n"
+                                              "Total record(s): 2\n");
+}
+
+TEST_F(ExecutorTest, select_from_result_sink_enables_and_restores_ssi_read_tracking) {
+    bool tracking_enabled_on_begin = false;
+    auto executor = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(10)}, nullptr, &tracking_enabled_on_begin);
+
+    char data_send[64] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    CountingResultSink sink;
+    context.result_sink_ = &sink;
+    executor->context_ = &context;
+    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
+
+    ql_manager.select_from(std::move(executor), {"id"}, &context);
+
+    EXPECT_TRUE(tracking_enabled_on_begin);
+    EXPECT_FALSE(context.enable_ssi_read_tracking_);
+    EXPECT_EQ(sink.begin_calls, 1);
+    EXPECT_EQ(sink.row_count, 1);
+    EXPECT_EQ(sink.column_count, 1U);
+    EXPECT_EQ(sink.captions, std::vector<std::string>({"id"}));
+}
+
+TEST_F(ExecutorTest, select_from_result_sink_restores_ssi_tracking_when_executor_throws) {
+    bool tracking_enabled_on_begin = false;
+    auto executor =
+        std::make_unique<CountingExecutor>(std::vector<ColMeta>{make_test_col("t", "id", TYPE_INT, sizeof(int), 0)},
+                                           std::vector<RmRecord>{}, nullptr, &tracking_enabled_on_begin);
+    executor->throw_on_begin_ = true;
+
+    char data_send[64] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    CountingResultSink sink;
+    context.result_sink_ = &sink;
+    executor->context_ = &context;
+    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
+
+    EXPECT_THROW(ql_manager.select_from(std::move(executor), {"id"}, &context), std::runtime_error);
+    EXPECT_TRUE(tracking_enabled_on_begin);
+    EXPECT_FALSE(context.enable_ssi_read_tracking_);
+}
+
+TEST_F(ExecutorTest, select_from_result_sink_records_serializable_nonempty_and_empty_predicates) {
+    setup_db();
+    sm_manager_->create_table("sink_ssi", make_int_cols({"id"}), nullptr);
+    insert_test_rows("sink_ssi", {1});
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    QlManager ql_manager(sm_manager_.get(), &txn_manager, nullptr);
+
+    for (int key : {1, 2}) {
+        Transaction* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::SERIALIZABLE);
+        char data_send[64] = {};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, data_send, &offset, &txn_manager);
+        CountingResultSink sink;
+        context.result_sink_ = &sink;
+
+        Condition condition;
+        condition.lhs_col = {"sink_ssi", "id"};
+        condition.op = OP_EQ;
+        condition.is_rhs_val = true;
+        condition.rhs_val.set_int(key);
+        auto executor = std::make_unique<SeqScanExecutor>(sm_manager_.get(), "sink_ssi",
+                                                          std::vector<Condition>{condition}, &context);
+
+        ql_manager.select_from(std::move(executor), {"id"}, &context);
+
+        ASSERT_EQ(txn->predicate_reads_.size(), 1U);
+        EXPECT_EQ(txn->predicate_reads_[0].tab_name_, "sink_ssi");
+        EXPECT_EQ(sink.row_count, key == 1 ? 1 : 0);
+        EXPECT_EQ(txn->read_rids_.empty(), key != 1);
+        EXPECT_FALSE(context.enable_ssi_read_tracking_);
+        txn_manager.abort(txn, nullptr);
     }
 }
 
@@ -941,7 +1342,7 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"score", TYPE_FLOAT, 8},
+        {"score", TYPE_FLOAT, 4},
     };
     sm_manager_->create_table("upd_promo", cols, nullptr);
     {
@@ -985,15 +1386,15 @@ TEST_F(ExecutorTest, update_int_to_float_promotion) {
     SeqScanExecutor scan(sm_manager_.get(), "upd_promo", {}, &ctx);
     scan.beginTuple();
     auto rec = scan.Next();
-    double score = *reinterpret_cast<double*>(rec->data + 4);
-    EXPECT_DOUBLE_EQ(score, 90.0);
+    float score = read_float(rec->data + 4);
+    EXPECT_FLOAT_EQ(score, 90.0f);
 }
 
 TEST_F(ExecutorTest, update_float_to_int_truncation) {
     setup_db();
     std::vector<ColDef> cols = {
         {"id", TYPE_INT, 4},
-        {"score", TYPE_FLOAT, 8},
+        {"score", TYPE_FLOAT, 4},
     };
     sm_manager_->create_table("upd_trunc", cols, nullptr);
     {
@@ -1084,9 +1485,10 @@ TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches)
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    ASSERT_NE(exec.current_left_rec_, nullptr);
+    ASSERT_TRUE(exec.current_left_view_);
+    EXPECT_EQ(exec.current_left_owned_, nullptr);
     ASSERT_NE(exec._buffered_record, nullptr);
-    const RmRecord* first_left_ptr = exec.current_left_rec_.get();
+    const char* first_left_ptr = exec.current_left_view_.data;
 
     auto first = exec.Next();
     ASSERT_NE(first, nullptr);
@@ -1095,8 +1497,9 @@ TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches)
 
     exec.nextTuple();
     ASSERT_FALSE(exec.is_end());
-    ASSERT_NE(exec.current_left_rec_, nullptr);
-    EXPECT_EQ(exec.current_left_rec_.get(), first_left_ptr);
+    ASSERT_TRUE(exec.current_left_view_);
+    EXPECT_EQ(exec.current_left_owned_, nullptr);
+    EXPECT_EQ(exec.current_left_view_.data, first_left_ptr);
     ASSERT_NE(exec._buffered_record, nullptr);
 
     auto second = exec.Next();
@@ -1106,7 +1509,7 @@ TEST(ExecutorJoinFocusedTest, ReusesCurrentLeftRecordAcrossMultipleRightMatches)
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
-    EXPECT_EQ(exec.current_left_rec_, nullptr);
+    EXPECT_FALSE(exec.current_left_view_);
 }
 
 TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
@@ -1136,10 +1539,13 @@ TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
 
     EXPECT_EQ(produced, 3);
     EXPECT_EQ(left_ptr->begin_calls_, 1);
-    EXPECT_EQ(left_ptr->next_record_calls_, 3);
+    EXPECT_EQ(left_ptr->next_record_calls_, 0);
     EXPECT_EQ(left_ptr->next_calls_, 2);
     EXPECT_EQ(right_ptr->begin_calls_, 3);
-    EXPECT_EQ(right_ptr->next_record_calls_, 8);
+    // The join consumes the right child's borrowed current view; only
+    // executors without current() support should use the compatibility Next()
+    // path.
+    EXPECT_EQ(right_ptr->next_record_calls_, 0);
     EXPECT_EQ(right_ptr->next_calls_, 6);
 }
 

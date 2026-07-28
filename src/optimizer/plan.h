@@ -14,12 +14,14 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include "parser/ast.h"
 
 #include "parser/parser.h"
+#include "compiled_point_program.h"
 
 typedef enum PlanTag {
     T_Invalid = 1,
@@ -63,6 +65,9 @@ class Plan {
 public:
     PlanTag tag;
     size_t runtime_rows_ = 0;
+    // Set when an index-backed child is configured to produce the requested
+    // ORDER BY directly, so LIMIT can be pushed below the projection chain.
+    bool order_satisfied_ = false;
     std::unordered_map<std::string, std::string> table_name_to_display_;
     virtual ~Plan() = default;
 };
@@ -76,7 +81,6 @@ public:
         conds_ = std::move(conds);
         TabMeta& tab = sm_manager->db_.get_table(tab_name_);
         cols_ = tab.cols;
-        len_ = cols_.back().offset + cols_.back().len;
         fed_conds_ = conds_;
         index_col_names_ = index_col_names;
     }
@@ -85,9 +89,11 @@ public:
     std::string tab_name_;
     std::vector<ColMeta> cols_;
     std::vector<Condition> conds_;
-    size_t len_;
+    // 这里刻意不缓存记录长度：Scan 执行器一律从数据文件头的 record_size 取，
+    // 计划里再存一份就是第二个真值来源（曾经有过 len_ 字段，全仓无读者）。
     std::vector<Condition> fed_conds_;
     std::vector<std::string> index_col_names_;
+    bool scan_backward_ = false;
 };
 
 class JoinPlan : public Plan {
@@ -179,14 +185,16 @@ public:
 
 class LimitPlan : public Plan {
 public:
-    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit) {
+    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit, int offset = 0) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         limit_ = limit;
+        offset_ = offset;
     }
     ~LimitPlan() {}
     std::unique_ptr<Plan> subplan_;
     int limit_;
+    int offset_ = 0;
 };
 
 class UnionPlan : public Plan {
@@ -202,6 +210,11 @@ public:
     std::vector<std::unique_ptr<Plan>> branches_;
     std::vector<ColMeta> cols_;
     std::vector<std::string> output_names_;
+};
+
+struct PointAccessPath {
+    std::vector<std::string> index_cols;
+    std::vector<size_t> condition_positions;
 };
 
 // dml语句，包括insert; delete; update; select语句　
@@ -222,6 +235,8 @@ public:
     std::vector<Value> values_;
     std::vector<Condition> conds_;
     std::vector<SetClause> set_clauses_;
+    std::optional<PointAccessPath> point_access_;
+    CompiledPointProgramPtr compiled_point_program_;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;

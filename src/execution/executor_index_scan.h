@@ -13,9 +13,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <limits>
-#include <map>
 #include <optional>
-#include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -31,42 +30,110 @@ class IndexScanExecutor : public AbstractExecutor {
 protected:
     class RidVectorScan : public RecScan {
     public:
-        explicit RidVectorScan(std::vector<Rid> rids) : rids_(std::move(rids)) {}
+        explicit RidVectorScan(const std::vector<Rid>* rids) : rids_(rids) {}
 
         void next() override {
             ++position_;
         }
 
         bool is_end() const override {
-            return position_ >= rids_.size();
+            return position_ >= rids_->size();
         }
 
         Rid rid() const override {
-            return rids_[position_];
+            return (*rids_)[position_];
         }
 
     private:
-        std::vector<Rid> rids_;
+        const std::vector<Rid>* rids_;
         size_t position_{0};
     };
 
-    std::string tab_name_;              // 表名称
-    TabMeta tab_;                       // 表的元数据
-    std::vector<Condition> conds_;      // 扫描条件
-    RmFileHandle* fh_;                  // 表的数据文件句柄
-    std::vector<ColMeta> cols_;         // 需要读取的字段
-    size_t len_;                        // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_;  // 扫描条件，和conds_字段相同
+    class SingleRidScan : public RecScan {
+    public:
+        explicit SingleRidScan(std::optional<Rid> rid) : rid_(rid) {}
+
+        void next() override {
+            consumed_ = true;
+        }
+
+        bool is_end() const override {
+            return consumed_ || !rid_.has_value();
+        }
+
+        Rid rid() const override {
+            return *rid_;
+        }
+
+    private:
+        std::optional<Rid> rid_;
+        bool consumed_{false};
+    };
+
+    std::string tab_name_;             // 表名称
+    TabMeta tab_;                      // 表的元数据
+    std::vector<Condition> conds_;     // 扫描条件
+    RmFileHandle* fh_;                 // 表的数据文件句柄
+    std::vector<ColMeta> cols_;        // 需要读取的字段
+    size_t len_;                       // 选取出来的一条记录的长度
+    std::vector<Condition> fed_conds_; // 扫描条件，和conds_字段相同
+    std::vector<ConditionAddress> condition_addresses_;
     std::vector<Condition> base_conds_; // original conditions from construction, for INLJ key injection
 
     std::vector<std::string> index_col_names_; // index scan涉及到的索引包含的字段
     IndexMeta index_meta_;                     // index scan涉及到的索引元数据
 
+    struct CompiledIndexCondition {
+        size_t index_col_ordinal;
+        CompOp op;
+        Value literal;
+    };
+
+    struct BoundValue {
+        std::vector<char> data;
+        bool present = false;
+        bool inclusive = true;
+    };
+
+    struct ColumnConstraint {
+        std::vector<char> eq;
+        bool eq_present = false;
+        BoundValue lower;
+        BoundValue upper;
+    };
+
+    std::vector<CompiledIndexCondition> compiled_index_conditions_;
+    std::vector<ColumnConstraint> constraints_;
+    std::string index_name_;
+    IxIndexHandle* ih_ = nullptr;
+    std::vector<char> lower_key_;
+    std::vector<char> upper_key_;
+    std::vector<char> value_key_scratch_;
+    std::vector<char> lookup_key_;
+    size_t lookup_key_ordinal_{std::numeric_limits<size_t>::max()};
+    bool lookup_key_valid_{false};
+    ScanDirection direction_{ScanDirection::Forward};
+    std::vector<Rid> rid_scan_rids_;
+    std::vector<Rid> historical_rids_;
+    std::vector<std::pair<std::string, Rid>> historical_entries_;
+    std::unordered_set<uint64_t> seen_rids_;
+
     Rid rid_;
-    std::unique_ptr<RecScan> scan_;
+    // Cursor storage belongs to the executor. Exact lookups and range scans
+    // are reconstructed in place for each beginTuple() instead of allocating
+    // a new polymorphic cursor on every lookup.
+    std::optional<RidVectorScan> rid_vector_cursor_;
+    std::optional<SingleRidScan> single_rid_cursor_;
+    std::optional<IxScan> index_scan_cursor_;
+    RecScan* scan_ = nullptr;
     bool predicate_recorded_{false};
     bool use_historical_index_candidates_{false};
-    std::unique_ptr<RmRecord> buffered_record_;
+    bool historical_candidates_merged_{false};
+    // True when the merged rid sequence is still ascending in index-key order,
+    // i.e. when min(col) pushdown remains valid. Only the keyed merge below can
+    // guarantee it; an unordered append cannot.
+    bool merged_key_ordered_{false};
+    RmRecordViewWithMeta buffered_tuple_;
 
     SmManager* sm_manager_;
 
@@ -99,22 +166,11 @@ protected:
         if (meta.writer_txn_id_ == reader_id || meta.writer_txn_id_ == INVALID_TXN_ID) {
             return;
         }
-        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_start_ts();
+        bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_read_ts();
         if (invisible && txn_mgr->CheckInvisibleWriteEdge(reader_id, meta.writer_txn_id_)) {
             throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER);
         }
     }
-
-    struct BoundValue {
-        std::vector<char> data;
-        bool inclusive = true;
-    };
-
-    struct ColumnConstraint {
-        std::optional<std::vector<char>> eq;
-        std::optional<BoundValue> lower;
-        std::optional<BoundValue> upper;
-    };
 
     static void write_min(char* dest, const ColMeta& col) {
         switch (col.type) {
@@ -124,7 +180,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            double value = std::numeric_limits<double>::lowest();
+            float value = std::numeric_limits<float>::lowest();
             memcpy(dest, &value, col.len);
             break;
         }
@@ -143,7 +199,7 @@ protected:
             break;
         }
         case TYPE_FLOAT: {
-            double value = std::numeric_limits<double>::max();
+            float value = std::numeric_limits<float>::max();
             memcpy(dest, &value, col.len);
             break;
         }
@@ -154,68 +210,119 @@ protected:
         }
     }
 
-    static std::vector<char> value_to_key_part(const Value& value, const ColMeta& col) {
-        std::vector<char> data(col.len, 0);
+    static void write_value_to_key_part(char* dest, const Value& value, const ColMeta& col) {
+        memset(dest, 0, col.len);
         switch (col.type) {
         case TYPE_INT: {
             int converted = value.type == TYPE_FLOAT ? static_cast<int>(value.float_val) : value.int_val;
-            memcpy(data.data(), &converted, col.len);
+            memcpy(dest, &converted, col.len);
             break;
         }
         case TYPE_FLOAT: {
-            double converted = value.type == TYPE_INT ? static_cast<double>(value.int_val) : value.float_val;
-            memcpy(data.data(), &converted, col.len);
+            float converted = value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+            memcpy(dest, &converted, col.len);
             break;
         }
         case TYPE_STRING:
         case TYPE_DATETIME:
-            memcpy(data.data(), value.str_val.c_str(), std::min(static_cast<int>(value.str_val.size()), col.len));
+            memcpy(dest, value.str_val.c_str(), std::min(static_cast<int>(value.str_val.size()), col.len));
             break;
         }
-        return data;
     }
 
-    static int compare_key_part(const std::vector<char>& lhs, const std::vector<char>& rhs, const ColMeta& col) {
-        return ix_compare(lhs.data(), rhs.data(), col.type, col.len);
+    static int compare_key_part(const char* lhs, const char* rhs, const ColMeta& col) {
+        return ix_compare(lhs, rhs, col.type, col.len);
     }
 
-    std::map<std::string, ColumnConstraint> build_constraints() const {
-        std::map<std::string, ColMeta> col_meta;
+    size_t find_index_col_ordinal(const std::string& col_name) const {
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            if (index_meta_.cols[i].name == col_name) {
+                return i;
+            }
+        }
+        return index_meta_.cols.size();
+    }
+
+    void initialize_constraint_storage() {
+        constraints_.resize(index_meta_.cols.size());
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            auto& constraint = constraints_[i];
+            constraint.eq.resize(index_meta_.cols[i].len);
+            constraint.lower.data.resize(index_meta_.cols[i].len);
+            constraint.upper.data.resize(index_meta_.cols[i].len);
+        }
+        lower_key_.resize(index_meta_.col_tot_len);
+        upper_key_.resize(index_meta_.col_tot_len);
+        size_t max_col_len = 0;
         for (const auto& col : index_meta_.cols) {
-            col_meta[col.name] = col;
+            max_col_len = std::max(max_col_len, static_cast<size_t>(col.len));
+        }
+        value_key_scratch_.resize(max_col_len);
+        lookup_key_.resize(max_col_len);
+    }
+
+    void compile_index_conditions() {
+        compiled_index_conditions_.clear();
+        compiled_index_conditions_.reserve(conds_.size());
+        for (const auto& cond : conds_) {
+            // NULL 不进索引键：`IS [NOT] NULL` 与 `col = NULL` 留给 fed_conds_ 过滤
+            if (!is_indexable_value_condition(cond) || cond.lhs_col.tab_name != tab_name_ || cond.op == OP_NE) {
+                continue;
+            }
+            size_t ordinal = find_index_col_ordinal(cond.lhs_col.col_name);
+            if (ordinal == index_meta_.cols.size()) {
+                continue;
+            }
+            compiled_index_conditions_.push_back(CompiledIndexCondition{ordinal, cond.op, cond.rhs_val});
+        }
+    }
+
+    void rebuild_constraints() {
+        for (auto& constraint : constraints_) {
+            constraint.eq_present = false;
+            constraint.lower.present = false;
+            constraint.upper.present = false;
+            constraint.lower.inclusive = true;
+            constraint.upper.inclusive = true;
         }
 
-        std::map<std::string, ColumnConstraint> constraints;
-        for (const auto& cond : conds_) {
-            if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_) {
-                continue;
-            }
-            auto meta_it = col_meta.find(cond.lhs_col.col_name);
-            if (meta_it == col_meta.end() || cond.op == OP_NE) {
-                continue;
-            }
-            const auto& col = meta_it->second;
-            auto value = value_to_key_part(cond.rhs_val, col);
-            auto& constraint = constraints[col.name];
-            switch (cond.op) {
+        for (const auto& compiled : compiled_index_conditions_) {
+            const auto& col = index_meta_.cols[compiled.index_col_ordinal];
+            auto& constraint = constraints_[compiled.index_col_ordinal];
+            switch (compiled.op) {
             case OP_EQ:
-                constraint.eq = value;
+                write_value_to_key_part(constraint.eq.data(), compiled.literal, col);
+                constraint.eq_present = true;
                 break;
             case OP_GT:
             case OP_GE: {
-                bool inclusive = cond.op == OP_GE;
-                if (!constraint.lower || compare_key_part(value, constraint.lower->data, col) > 0 ||
-                    (compare_key_part(value, constraint.lower->data, col) == 0 && !inclusive)) {
-                    constraint.lower = BoundValue{value, inclusive};
+                bool inclusive = compiled.op == OP_GE;
+                write_value_to_key_part(value_key_scratch_.data(), compiled.literal, col);
+                bool replace = !constraint.lower.present;
+                if (!replace) {
+                    int cmp = compare_key_part(value_key_scratch_.data(), constraint.lower.data.data(), col);
+                    replace = cmp > 0 || (cmp == 0 && !inclusive);
+                }
+                if (replace) {
+                    memcpy(constraint.lower.data.data(), value_key_scratch_.data(), col.len);
+                    constraint.lower.present = true;
+                    constraint.lower.inclusive = inclusive;
                 }
                 break;
             }
             case OP_LT:
             case OP_LE: {
-                bool inclusive = cond.op == OP_LE;
-                if (!constraint.upper || compare_key_part(value, constraint.upper->data, col) < 0 ||
-                    (compare_key_part(value, constraint.upper->data, col) == 0 && !inclusive)) {
-                    constraint.upper = BoundValue{value, inclusive};
+                bool inclusive = compiled.op == OP_LE;
+                write_value_to_key_part(value_key_scratch_.data(), compiled.literal, col);
+                bool replace = !constraint.upper.present;
+                if (!replace) {
+                    int cmp = compare_key_part(value_key_scratch_.data(), constraint.upper.data.data(), col);
+                    replace = cmp < 0 || (cmp == 0 && !inclusive);
+                }
+                if (replace) {
+                    memcpy(constraint.upper.data.data(), value_key_scratch_.data(), col.len);
+                    constraint.upper.present = true;
+                    constraint.upper.inclusive = inclusive;
                 }
                 break;
             }
@@ -223,7 +330,15 @@ protected:
                 break;
             }
         }
-        return constraints;
+    }
+
+    void reset_key_bounds() {
+        int offset = 0;
+        for (const auto& col : index_meta_.cols) {
+            write_min(lower_key_.data() + offset, col);
+            write_max(upper_key_.data() + offset, col);
+            offset += col.len;
+        }
     }
 
     bool needs_historical_index_candidates() const {
@@ -231,7 +346,8 @@ protected:
             return false;
         }
         IsolationLevel level = context_->txn_->get_isolation_level();
-        if (level != IsolationLevel::SNAPSHOT_ISOLATION && level != IsolationLevel::REPEATABLE_READ &&
+        if (level != IsolationLevel::READ_COMMITTED && level != IsolationLevel::SNAPSHOT_ISOLATION &&
+            level != IsolationLevel::REPEATABLE_READ &&
             !(level == IsolationLevel::SERIALIZABLE && context_->txn_->get_txn_mode())) {
             return false;
         }
@@ -240,15 +356,16 @@ protected:
         // after its indexed key was changed or deleted. Those old keys are
         // tracked by SmManager; non-index updates and post-snapshot inserts are
         // handled by GetVisibleRecord.
-        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
-        return sm_manager_->has_historical_index_keys(tab_name_, index_name);
+        return sm_manager_->has_historical_index_keys(tab_name_, index_name_);
     }
 
 public:
     IndexScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
-                      std::vector<std::string> index_col_names, Context* context) {
+                      std::vector<std::string> index_col_names, Context* context,
+                      ScanDirection direction = ScanDirection::Forward) {
         sm_manager_ = sm_manager;
         context_ = context;
+        direction_ = direction;
         tab_name_ = std::move(tab_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
@@ -257,7 +374,8 @@ public:
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
-        len_ = cols_.back().offset + cols_.back().len;
+        // 同 SeqScanExecutor：包含尾部 null bitmap
+        len_ = static_cast<size_t>(fh_->get_file_hdr().record_size);
 
         for (auto& cond : conds_) {
             if (cond.lhs_col.tab_name != tab_name_) {
@@ -269,66 +387,84 @@ public:
             }
         }
         fed_conds_ = conds_;
+        condition_addresses_ = cache_condition_addresses(fed_conds_);
         base_conds_ = conds_; // save original conditions before any key injection
+        index_name_ = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
+        ih_ = sm_manager_->ihs_.at(index_name_).get();
+        initialize_constraint_storage();
+        rid_scan_rids_.reserve(1);
+        compile_index_conditions();
+        rebuild_constraints();
     }
 
     void beginTuple() override {
+        scan_ = nullptr;
+        index_scan_cursor_.reset();
+        single_rid_cursor_.reset();
+        rid_vector_cursor_.reset();
+        rid_scan_rids_.clear();
+        historical_rids_.clear();
+        historical_entries_.clear();
+        seen_rids_.clear();
+        historical_candidates_merged_ = false;
+        merged_key_ordered_ = false;
         record_predicate_read();
 
-        use_historical_index_candidates_ = needs_historical_index_candidates();
+        std::optional<IxIndexHandle::SharedIndexLatch> index_latch_guard;
+        const bool historical_candidates_available = needs_historical_index_candidates();
+        use_historical_index_candidates_ = historical_candidates_available;
+        reset_key_bounds();
 
-        auto ih =
-            sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
-        auto index_latch_guard = ih->lock_shared();
-        auto constraints = build_constraints();
-
-        std::vector<char> lower_key(index_meta_.col_tot_len);
-        std::vector<char> upper_key(index_meta_.col_tot_len);
-        int offset = 0;
-        for (const auto& col : index_meta_.cols) {
-            write_min(lower_key.data() + offset, col);
-            write_max(upper_key.data() + offset, col);
-            offset += col.len;
+        if (lookup_key_valid_) {
+            auto& lookup_constraint = constraints_[lookup_key_ordinal_];
+            const auto& lookup_col = index_meta_.cols[lookup_key_ordinal_];
+            memcpy(lookup_constraint.eq.data(), lookup_key_.data(), lookup_col.len);
+            lookup_constraint.eq_present = true;
+            lookup_constraint.lower.present = false;
+            lookup_constraint.upper.present = false;
         }
 
         bool lower_exclusive = false;
         bool upper_inclusive = true;
         bool saw_range = false;
-        offset = 0;
-        for (const auto& col : index_meta_.cols) {
-            auto constraint_it = constraints.find(col.name);
-            if (constraint_it == constraints.end() || saw_range) {
+        int offset = 0;
+        for (size_t ordinal = 0; ordinal < index_meta_.cols.size(); ++ordinal) {
+            const auto& col = index_meta_.cols[ordinal];
+            if (saw_range) {
                 break;
             }
 
-            const auto& constraint = constraint_it->second;
-            if (constraint.eq.has_value()) {
-                memcpy(lower_key.data() + offset, constraint.eq->data(), col.len);
-                memcpy(upper_key.data() + offset, constraint.eq->data(), col.len);
+            const auto& constraint = constraints_[ordinal];
+            if (!constraint.eq_present && !constraint.lower.present && !constraint.upper.present) {
+                break;
+            }
+            if (constraint.eq_present) {
+                memcpy(lower_key_.data() + offset, constraint.eq.data(), col.len);
+                memcpy(upper_key_.data() + offset, constraint.eq.data(), col.len);
                 offset += col.len;
                 continue;
             }
 
-            if (constraint.lower.has_value()) {
-                memcpy(lower_key.data() + offset, constraint.lower->data.data(), col.len);
-                lower_exclusive = !constraint.lower->inclusive;
+            if (constraint.lower.present) {
+                memcpy(lower_key_.data() + offset, constraint.lower.data.data(), col.len);
+                lower_exclusive = !constraint.lower.inclusive;
             }
-            if (constraint.upper.has_value()) {
-                memcpy(upper_key.data() + offset, constraint.upper->data.data(), col.len);
-                upper_inclusive = constraint.upper->inclusive;
+            if (constraint.upper.present) {
+                memcpy(upper_key_.data() + offset, constraint.upper.data.data(), col.len);
+                upper_inclusive = constraint.upper.inclusive;
             }
 
             int suffix_offset = offset + col.len;
-            if (constraint.lower.has_value() && lower_exclusive) {
-                for (size_t i = (&col - index_meta_.cols.data()) + 1; i < index_meta_.cols.size(); ++i) {
-                    write_max(lower_key.data() + suffix_offset, index_meta_.cols[i]);
+            if (constraint.lower.present && lower_exclusive) {
+                for (size_t i = ordinal + 1; i < index_meta_.cols.size(); ++i) {
+                    write_max(lower_key_.data() + suffix_offset, index_meta_.cols[i]);
                     suffix_offset += index_meta_.cols[i].len;
                 }
             }
             suffix_offset = offset + col.len;
-            if (constraint.upper.has_value() && !upper_inclusive) {
-                for (size_t i = (&col - index_meta_.cols.data()) + 1; i < index_meta_.cols.size(); ++i) {
-                    write_min(upper_key.data() + suffix_offset, index_meta_.cols[i]);
+            if (constraint.upper.present && !upper_inclusive) {
+                for (size_t i = ordinal + 1; i < index_meta_.cols.size(); ++i) {
+                    write_min(upper_key_.data() + suffix_offset, index_meta_.cols[i]);
                     suffix_offset += index_meta_.cols[i].len;
                 }
             }
@@ -336,51 +472,131 @@ public:
             break;
         }
 
-        Iid lower, upper;
-        if (!lower_exclusive && upper_inclusive && lower_key == upper_key) {
-            auto [lo, hi] = ih->equal_range(lower_key.data());
-            lower = lo;
-            upper = hi;
-        } else {
-            lower = lower_exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
-            upper = upper_inclusive ? ih->upper_bound(upper_key.data()) : ih->lower_bound(upper_key.data());
-        }
+        const bool exact_key_lookup = !lower_exclusive && upper_inclusive && lower_key_ == upper_key_;
         // READ COMMITTED normally reads only the current index. A writer can
         // nevertheless remove an exact key before publishing its replacement
         // tuple meta, leaving a reader unable to reach the writer's undo
         // version. Probe that one historical key without adopting SI's broad
         // historical-index scan on the RC hot path.
         bool use_rc_exact_historical_key = false;
-        std::vector<Rid> rc_exact_historical_rids;
-        if (!use_historical_index_candidates_ && context_ != nullptr && context_->txn_ != nullptr &&
-            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && !lower_exclusive &&
-            upper_inclusive && lower_key == upper_key) {
-            const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
-            rc_exact_historical_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, lower_key);
-            use_rc_exact_historical_key = !rc_exact_historical_rids.empty();
+        if (historical_candidates_available && context_ != nullptr && context_->txn_ != nullptr &&
+            context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && exact_key_lookup) {
+            historical_rids_ = sm_manager_->get_historical_index_key_rids(tab_name_, index_name_, lower_key_);
+            use_rc_exact_historical_key = !historical_rids_.empty();
+            // Exact RC probes only need history for the requested key. Range,
+            // prefix and skip-scan paths retain the broad candidate set.
+            use_historical_index_candidates_ = false;
+        }
+        // Collect the broad candidate set *before* deciding how to scan, and
+        // before taking the index latch (remember_historical_index_key() runs
+        // without one, so this keeps the two latches unordered with respect to
+        // each other).
+        //
+        // has_historical_index_keys() is per index, so a single committed delete
+        // anywhere in the table used to force every range scan on that index
+        // onto the eager materialise-then-merge path - which in turn disables
+        // min(col) pushdown. Measured on 50-warehouse TPC-C: 0.38 historical
+        // rids per new_orders range scan, i.e. the range is empty over 99% of
+        // the time, while the eager path was materialising ~920 rids and
+        // visiting ~890 tuples per scan. Checking the range first keeps the lazy
+        // cursor whenever the range really has no history, which is exact (the
+        // merge of an empty set is the identity), not an approximation.
+        historical_entries_.clear();
+        if (use_historical_index_candidates_) {
+            sm_manager_->collect_historical_index_entries_in_range(
+                tab_name_, index_name_, lower_key_, upper_key_, lower_exclusive, upper_inclusive, historical_entries_);
+            if (historical_entries_.empty()) {
+                use_historical_index_candidates_ = false;
+            }
         }
 
-        if (use_historical_index_candidates_ || use_rc_exact_historical_key) {
-            std::vector<Rid> rids;
-            for (IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
-                 !index_scan.is_end(); index_scan.next()) {
-                rids.push_back(index_scan.rid());
-            }
+        Iid lower, upper;
+        if (!exact_key_lookup) {
+            index_latch_guard.emplace(ih_->lock_shared());
+            lower = lower_exclusive ? ih_->upper_bound(lower_key_.data()) : ih_->lower_bound(lower_key_.data());
+            upper = upper_inclusive ? ih_->upper_bound(upper_key_.data()) : ih_->lower_bound(upper_key_.data());
+        }
 
-            std::vector<Rid> historical_rids = std::move(rc_exact_historical_rids);
-            if (use_historical_index_candidates_) {
-                const std::string index_name =
-                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols);
-                historical_rids = sm_manager_->get_historical_index_rids(tab_name_, index_name);
+        const bool use_single_rid_lookup =
+            exact_key_lookup && !use_historical_index_candidates_ && !use_rc_exact_historical_key;
+        if (use_single_rid_lookup) {
+            const auto lookup = ih_->lookup_unique(lower_key_.data());
+            if (lookup.status == UniqueLookupStatus::Unique) {
+                single_rid_cursor_.emplace(lookup.rid);
+                scan_ = &*single_rid_cursor_;
+            } else if (lookup.status == UniqueLookupStatus::NotFound) {
+                single_rid_cursor_.emplace(std::nullopt);
+                scan_ = &*single_rid_cursor_;
+            } else {
+                // LOAD may intentionally append duplicate keys to an index.
+                ih_->lookup_equal(lower_key_.data(), rid_scan_rids_);
+                rid_vector_cursor_.emplace(&rid_scan_rids_);
+                scan_ = &*rid_vector_cursor_;
             }
-            for (const Rid& historical_rid : historical_rids) {
-                if (std::find(rids.begin(), rids.end(), historical_rid) == rids.end()) {
-                    rids.push_back(historical_rid);
+        } else if (exact_key_lookup || use_historical_index_candidates_ || use_rc_exact_historical_key) {
+            historical_candidates_merged_ = use_historical_index_candidates_ || use_rc_exact_historical_key;
+            // Every merge below preserves ascending index-key order, so min(col)
+            // pushdown stays valid: exact-key merges only ever hold one key, and
+            // the range merge below is an ordered two-way merge.
+            merged_key_ordered_ = true;
+            const auto rid_hash = [](const Rid& rid) {
+                return (static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
+                       static_cast<uint32_t>(rid.slot_no);
+            };
+            if (exact_key_lookup) {
+                ih_->lookup_equal(lower_key_.data(), rid_scan_rids_);
+                if (use_historical_index_candidates_) {
+                    historical_rids_.clear();
+                    historical_rids_.reserve(historical_entries_.size());
+                    for (const auto& entry : historical_entries_) {
+                        historical_rids_.push_back(entry.second);
+                    }
+                }
+                if (!historical_rids_.empty()) {
+                    seen_rids_.reserve(rid_scan_rids_.size() + historical_rids_.size());
+                    for (const Rid& rid : rid_scan_rids_) {
+                        seen_rids_.insert(rid_hash(rid));
+                    }
+                    for (const Rid& historical_rid : historical_rids_) {
+                        if (seen_rids_.insert(rid_hash(historical_rid)).second) {
+                            rid_scan_rids_.push_back(historical_rid);
+                        }
+                    }
+                }
+            } else {
+                // Ordered two-way merge of the live index range with the
+                // historical candidates, both ascending in index-key order.
+                // Appending the historical rids after the range (the previous
+                // shape) is what forced provides_min_order() to give up.
+                const auto& col_types = ih_->get_col_types();
+                const auto& col_lens = ih_->get_col_lens();
+                size_t hist_pos = 0;
+                seen_rids_.reserve(historical_entries_.size() * 2);
+                const auto push_unique = [&](const Rid& rid) {
+                    if (seen_rids_.insert(rid_hash(rid)).second) {
+                        rid_scan_rids_.push_back(rid);
+                    }
+                };
+                for (IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm(), std::move(*index_latch_guard), true);
+                     !index_scan.is_end(); index_scan.next()) {
+                    const char* base_key = index_scan.key();
+                    while (hist_pos < historical_entries_.size() &&
+                           ix_compare(historical_entries_[hist_pos].first.data(), base_key, col_types, col_lens) < 0) {
+                        push_unique(historical_entries_[hist_pos].second);
+                        ++hist_pos;
+                    }
+                    push_unique(index_scan.rid());
+                }
+                for (; hist_pos < historical_entries_.size(); ++hist_pos) {
+                    push_unique(historical_entries_[hist_pos].second);
                 }
             }
-            scan_ = std::make_unique<RidVectorScan>(std::move(rids));
+            rid_vector_cursor_.emplace(&rid_scan_rids_);
+            scan_ = &*rid_vector_cursor_;
         } else {
-            scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm(), std::move(index_latch_guard));
+            index_scan_cursor_.emplace(ih_, lower, upper, sm_manager_->get_bpm(), std::move(*index_latch_guard), false,
+                                       direction_);
+            scan_ = &*index_scan_cursor_;
         }
         advance_to_match();
     }
@@ -391,24 +607,19 @@ public:
     }
 
     void advance_to_match() {
-        buffered_record_.reset();
+        buffered_tuple_ = {};
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto rec = GetVisibleRecord(fh_, rid_, context_);
-            if (rec == nullptr) {
+            auto tuple = GetVisibleTuple(fh_, rid_, context_);
+            if (tuple.view.data == nullptr) {
                 scan_->next();
                 continue;
             }
-            bool match = true;
-            for (const auto& cond : fed_conds_) {
-                if (!compare(cond, *rec)) {
-                    match = false;
-                    break;
-                }
-            }
+            const TupleView view{tuple.view.data, tuple.view.size};
+            const bool match = conditions_match(fed_conds_, condition_addresses_, view);
             if (match) {
                 record_tuple_read(rid_);
-                buffered_record_ = std::move(rec);
+                buffered_tuple_ = std::move(tuple);
                 break;
             }
             scan_->next();
@@ -416,10 +627,19 @@ public:
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || buffered_record_ == nullptr) {
+        if (is_end() || buffered_tuple_.view.data == nullptr) {
             return nullptr;
         }
-        return std::make_unique<RmRecord>(*buffered_record_);
+        auto result = std::make_unique<RmRecord>(static_cast<int>(buffered_tuple_.view.size));
+        memcpy(result->data, buffered_tuple_.view.data, buffered_tuple_.view.size);
+        return result;
+    }
+
+    TupleView current() const override {
+        if (is_end() || buffered_tuple_.view.data == nullptr) {
+            return {};
+        }
+        return TupleView{buffered_tuple_.view.data, buffered_tuple_.view.size};
     }
 
     Rid& rid() override {
@@ -458,13 +678,37 @@ public:
             conds_.push_back(std::move(kc));
         }
         fed_conds_ = conds_;
+        condition_addresses_ = cache_condition_addresses(fed_conds_);
+        compile_index_conditions();
+        rebuild_constraints();
+        lookup_key_valid_ = false;
+    }
+
+    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+        const size_t ordinal = find_index_col_ordinal(target.col_name);
+        if (ordinal == index_meta_.cols.size()) {
+            throw ColumnNotFoundError(target.col_name);
+        }
+        const auto& col = index_meta_.cols[ordinal];
+        if (len != static_cast<size_t>(col.len)) {
+            throw InternalError("INLJ lookup key length does not match index column");
+        }
+        memcpy(lookup_key_.data(), key, len);
+        lookup_key_ordinal_ = ordinal;
+        lookup_key_valid_ = true;
     }
 
     std::string scan_table_name() const override {
         return tab_name_;
     }
+    std::string_view scan_table_name_view() const override {
+        return tab_name_;
+    }
 
     std::vector<Condition> scan_conditions() const override {
+        return fed_conds_;
+    }
+    const std::vector<Condition>& scan_conditions_ref() const override {
         return fed_conds_;
     }
     void record_current_read_for_ssi() override {
@@ -479,7 +723,9 @@ public:
     // it is constrained to a single equality value (so the remaining order is
     // monotonic in `col`).
     bool provides_min_order(const TabCol& col) const override {
-        if (use_historical_index_candidates_) {
+        // A merged candidate set is only usable when the merge kept index-key
+        // order; beginTuple() guarantees that for every merge shape it builds.
+        if (historical_candidates_merged_ && !merged_key_ordered_) {
             return false;
         }
         if (!col.tab_name.empty() && col.tab_name != tab_name_) {
@@ -502,7 +748,12 @@ public:
             const std::string& before_name = index_meta_.cols[i].name;
             bool has_eq = false;
             for (const auto& cond : fed_conds_) {
-                if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == before_name &&
+                // 必须是普通字面量等值：`IS [NOT] NULL` 被 get_clause 编码成
+                // op = OP_EQ / is_rhs_val = true / rhs_val.is_null，它不把该列钉死
+                // 在一个索引键值上，因此不能算作前缀等值约束（否则索引序在 col
+                // 上不再单调，min(col) 捷径会取到错误的行）。与 planner 的
+                // has_equality_constraint 保持同一判据。
+                if (is_indexable_value_condition(cond) && cond.op == OP_EQ && cond.lhs_col.col_name == before_name &&
                     (cond.lhs_col.tab_name.empty() || cond.lhs_col.tab_name == tab_name_)) {
                     has_eq = true;
                     break;

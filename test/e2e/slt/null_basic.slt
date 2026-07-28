@@ -1,0 +1,384 @@
+# null_basic.slt — SQL NULL 全链路：字面量、记录层尾部 bitmap、IS [NOT] NULL、
+# WHERE 三值逻辑（含 <>）、UPDATE 双向切换、DELETE。
+
+statement ok
+CREATE TABLE nb (id INT, i INT, f FLOAT, c CHAR(8), d DATETIME);
+
+# NULL 与列类型无关：INT / FLOAT / CHAR / DATETIME 四种列都能存 NULL
+statement ok
+INSERT INTO nb VALUES (1, 10, 1.5, 'aa', '2026-01-01 00:00:00');
+
+statement ok
+INSERT INTO nb VALUES (2, NULL, NULL, NULL, NULL);
+
+statement ok
+INSERT INTO nb VALUES (3, 30, 3.5, 'cc', '2026-03-03 00:00:00');
+
+# SELECT 回显：NULL 打印成 NULL，不是空白（final.md:761 NULL 不得编码为空字符串）
+query
+SELECT id, i, f, c FROM nb;
+----
++------------------+------------------+------------------+------------------+
+|               id |                i |                f |                c |
++------------------+------------------+------------------+------------------+
+|                1 |               10 |         1.500000 |               aa |
+|                2 |             NULL |             NULL |             NULL |
+|                3 |               30 |         3.500000 |               cc |
++------------------+------------------+------------------+------------------+
+Total record(s): 3
+
+# DATETIME 列宽 19 > 16，表格输出会截断成 '...'，NULL 则原样显示
+query
+SELECT id, d FROM nb;
+----
++------------------+------------------+
+|               id |                d |
++------------------+------------------+
+|                1 | 2026-01-01 00... |
+|                2 |             NULL |
+|                3 | 2026-03-03 00... |
++------------------+------------------+
+Total record(s): 3
+
+# IS NULL / IS NOT NULL，四种列类型各测一遍
+query
+SELECT id FROM nb WHERE i IS NULL;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE i IS NOT NULL;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT id FROM nb WHERE f IS NULL;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE c IS NULL;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE d IS NULL;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE d IS NOT NULL;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                3 |
++------------------+
+Total record(s): 2
+
+# 大小写不敏感 + 多条件 AND
+query
+SELECT id FROM nb where i is null and f is null;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE id = 2 AND c IS NULL;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+# 三值逻辑：任一操作数为 NULL 时比较为假。<> 也必须为假 —— NULL <> x 在 SQL 里
+# 是 UNKNOWN 而不是 TRUE，这是三值逻辑与二值逻辑最常见的分歧点。
+query
+SELECT id FROM nb WHERE i <> 10;
+----
++------------------+
+|               id |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE i = 10;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE i > 5;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT id FROM nb WHERE i < 100;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT id FROM nb WHERE i >= 10;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT id FROM nb WHERE c <> 'aa';
+----
++------------------+
+|               id |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE c = 'aa';
+----
++------------------+
+|               id |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM nb WHERE f <> 1.5;
+----
++------------------+
+|               id |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+# col = NULL 恒假，与 IS NULL 不是一回事
+query
+SELECT id FROM nb WHERE i = NULL;
+----
++------------------+
+|               id |
++------------------+
++------------------+
+Total record(s): 0
+
+query
+SELECT id FROM nb WHERE i <> NULL;
+----
++------------------+
+|               id |
++------------------+
++------------------+
+Total record(s): 0
+
+# UPDATE：非 NULL -> NULL
+statement ok
+UPDATE nb SET i = NULL WHERE id = 1;
+
+query
+SELECT id, i FROM nb WHERE i IS NULL;
+----
++------------------+------------------+
+|               id |                i |
++------------------+------------------+
+|                1 |             NULL |
+|                2 |             NULL |
++------------------+------------------+
+Total record(s): 2
+
+# UPDATE：NULL -> 非 NULL（Delivery 事务就是这个形状）
+statement ok
+UPDATE nb SET d = '2026-02-02 00:00:00' WHERE id = 2;
+
+query
+SELECT id FROM nb WHERE d IS NOT NULL;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
+|                3 |
++------------------+
+Total record(s): 3
+
+query
+SELECT id FROM nb WHERE d IS NULL;
+----
++------------------+
+|               id |
++------------------+
++------------------+
+Total record(s): 0
+
+# 同一条 UPDATE 里一列置 NULL、另一列置非 NULL
+statement ok
+UPDATE nb SET c = NULL, f = 9.5 WHERE id = 3;
+
+query
+SELECT id, c, f FROM nb WHERE id = 3;
+----
++------------------+------------------+------------------+
+|               id |                c |                f |
++------------------+------------------+------------------+
+|                3 |             NULL |         9.500000 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+# 把 NULL 列改成非 NULL 之后旧的 IS NULL 谓词不再命中
+statement ok
+UPDATE nb SET i = 77 WHERE id = 2;
+
+query
+SELECT id, i FROM nb WHERE i IS NOT NULL;
+----
++------------------+------------------+
+|               id |                i |
++------------------+------------------+
+|                2 |               77 |
+|                3 |               30 |
++------------------+------------------+
+Total record(s): 2
+
+# DELETE WHERE ... IS NULL
+statement ok
+DELETE FROM nb WHERE i IS NULL;
+
+query
+SELECT id, i FROM nb;
+----
++------------------+------------------+
+|               id |                i |
++------------------+------------------+
+|                2 |               77 |
+|                3 |               30 |
++------------------+------------------+
+Total record(s): 2
+
+# id=2 和 id=3 的 c 都是 NULL（id=2 插入时就是 NULL，id=3 是被 UPDATE 置的）
+statement ok
+DELETE FROM nb WHERE c IS NULL;
+
+query
+SELECT id, i FROM nb;
+----
++------------------+------------------+
+|               id |                i |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0
+
+# 索引表：IS NULL 不走索引（NULL 不进索引键），但索引点查仍然正常
+statement ok
+CREATE TABLE nbi (k INT, v INT);
+
+statement ok
+CREATE INDEX nbi(k);
+
+statement ok
+INSERT INTO nbi VALUES (1, NULL);
+
+statement ok
+INSERT INTO nbi VALUES (2, 20);
+
+statement ok
+INSERT INTO nbi VALUES (3, NULL);
+
+query
+SELECT k FROM nbi WHERE v IS NULL;
+----
++------------------+
+|                k |
++------------------+
+|                1 |
+|                3 |
++------------------+
+Total record(s): 2
+
+query
+SELECT v FROM nbi WHERE k = 2;
+----
++------------------+
+|                v |
++------------------+
+|               20 |
++------------------+
+Total record(s): 1
+
+query
+SELECT k FROM nbi WHERE v <> 20;
+----
++------------------+
+|                k |
++------------------+
++------------------+
+Total record(s): 0
+
+query
+SELECT k, v FROM nbi WHERE k >= 2;
+----
++------------------+------------------+
+|                k |                v |
++------------------+------------------+
+|                2 |               20 |
+|                3 |             NULL |
++------------------+------------------+
+Total record(s): 2
+

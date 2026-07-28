@@ -20,10 +20,12 @@ See the Mulan PSL v2 for more details. */
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -94,6 +96,12 @@ private:
 };
 
 } // namespace
+
+TEST(LogManagerTest, DefaultsToStrictDurability) {
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+    EXPECT_EQ(log_mgr.durability_mode(), DurabilityMode::STRICT);
+}
 
 TEST(LogRecordTest, InsertRoundTripKeepsPayload) {
     auto rec = MakeRecord("abc123");
@@ -215,6 +223,10 @@ TEST(LogManagerTest, AppendFlushAndReadBack) {
     EXPECT_EQ(commit_lsn, 1);
     EXPECT_EQ(log_mgr.get_persist_lsn(), commit_lsn);
     EXPECT_GE(disk.get_file_size(LOG_FILE_NAME), LOG_HEADER_SIZE * 2);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+
+    log_mgr.flush_log_to_disk_with_sync();
+    EXPECT_EQ(log_mgr.get_durable_lsn(), commit_lsn);
 
     std::vector<char> first(LOG_HEADER_SIZE);
     ASSERT_EQ(disk.read_log(first.data(), static_cast<int>(first.size()), 0), LOG_HEADER_SIZE);
@@ -222,6 +234,135 @@ TEST(LogManagerTest, AppendFlushAndReadBack) {
     ASSERT_NE(decoded, nullptr);
     EXPECT_EQ(decoded->log_type_, LogType::BEGIN);
     EXPECT_EQ(decoded->lsn_, begin_lsn);
+}
+
+TEST(LogManagerTest, FlushDurableUpToHonorsPageLsnTarget) {
+    ScopedTestDir test_dir("log_manager_flush_up_to_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    BeginLogRecord begin(101);
+    lsn_t begin_lsn = log_mgr.add_log_to_buffer(&begin);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+
+    log_mgr.flush_log_to_disk_up_to(begin_lsn);
+
+    EXPECT_EQ(log_mgr.get_durable_lsn(), begin_lsn);
+    EXPECT_GE(log_mgr.get_persist_lsn(), begin_lsn);
+}
+
+TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {
+    ScopedTestDir test_dir("log_manager_buffered_offset_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    BeginLogRecord begin(103);
+    log_mgr.add_log_to_buffer(&begin);
+
+    EXPECT_GE(log_mgr.current_log_offset(), static_cast<int64_t>(begin.log_tot_len_));
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
+
+    log_mgr.flush_log_to_disk();
+    EXPECT_EQ(log_mgr.current_log_offset(), disk.get_file_size(LOG_FILE_NAME));
+}
+
+TEST(LogManagerTest, ProcessCrashCommitWaitsForPwriteWithoutFsync) {
+    ScopedTestDir test_dir("log_manager_process_crash_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk, DurabilityMode::PROCESS_CRASH);
+
+    CommitLogRecord commit(102);
+    lsn_t commit_lsn = log_mgr.add_log_to_buffer(&commit);
+    log_mgr.flush_log_to_disk_up_to(commit_lsn);
+
+    EXPECT_EQ(log_mgr.get_persist_lsn(), commit_lsn);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+    EXPECT_EQ(log_mgr.get_commit_count(), 1u);
+    EXPECT_EQ(log_mgr.get_pwrite_count(), 1u);
+    EXPECT_GT(log_mgr.get_pwrite_bytes(), 0u);
+
+    log_mgr.flush_log_to_disk_with_sync();
+    EXPECT_EQ(log_mgr.get_durable_lsn(), commit_lsn);
+}
+
+TEST(LogManagerTest, ConcurrentDurableFlushesShareAGroup) {
+    ScopedTestDir test_dir("log_manager_group_commit_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    constexpr int kWaiterCount = 16;
+    lsn_t target_lsn = INVALID_LSN;
+    for (int i = 0; i < kWaiterCount; ++i) {
+        BeginLogRecord begin(200 + i);
+        target_lsn = log_mgr.add_log_to_buffer(&begin);
+    }
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> waiters;
+    waiters.reserve(kWaiterCount);
+    for (int i = 0; i < kWaiterCount; ++i) {
+        waiters.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            log_mgr.flush_log_to_disk_up_to(target_lsn);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kWaiterCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& waiter : waiters) {
+        waiter.join();
+    }
+
+    EXPECT_EQ(log_mgr.get_durable_lsn(), target_lsn);
+    EXPECT_GE(log_mgr.get_group_commit_count(), 1u);
+    EXPECT_GE(log_mgr.get_group_commit_waiter_count(), 1u);
+    EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kWaiterCount));
+}
+
+// Under a continuously refilled queue the leader keeps extending the batch, so
+// waiters are released across many flushes. Each one must be released only once
+// its own target is covered by durable_lsn_ — never early, and never left
+// behind, however the batches happen to line up.
+TEST(LogManagerTest, SaturatedGroupCommitReleasesEveryWaiterOnlyWhenDurable) {
+    ScopedTestDir test_dir("log_manager_group_commit_saturated_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    constexpr int kThreads = 8;
+    constexpr int kCommitsPerThread = 40;
+    std::atomic<int> completed{0};
+    std::vector<std::thread> committers;
+    committers.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        committers.emplace_back([&, i] {
+            for (int n = 0; n < kCommitsPerThread; ++n) {
+                CommitLogRecord commit(300 + i);
+                const lsn_t lsn = log_mgr.add_log_to_buffer(&commit);
+                log_mgr.flush_log_to_disk_up_to(lsn);
+                // Returning from the flush must mean this record is durable.
+                ASSERT_GE(log_mgr.get_durable_lsn(), lsn);
+                completed.fetch_add(1, std::memory_order_acq_rel);
+            }
+        });
+    }
+    for (auto& committer : committers) {
+        committer.join();
+    }
+
+    EXPECT_EQ(completed.load(), kThreads * kCommitsPerThread);
+    EXPECT_GE(log_mgr.get_group_commit_leader_count(), 1u);
+    // Coalescing must still happen: far fewer fdatasync calls than commits.
+    EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kThreads * kCommitsPerThread));
 }
 
 TEST(LogManagerTest, RestartOffsetRoundTrip) {
@@ -232,6 +373,58 @@ TEST(LogManagerTest, RestartOffsetRoundTrip) {
     EXPECT_EQ(log_mgr.read_restart_offset(), 0);
     log_mgr.write_restart_offset(128);
     EXPECT_EQ(log_mgr.read_restart_offset(), 128);
+}
+
+TEST(LogManagerTest, RestartManifestRoundTrip) {
+    ScopedTestDir test_dir("log_manager_restart_manifest_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    RestartManifest written;
+    written.checkpoint_offset = 4096;
+    written.next_timestamp = 123456;
+    written.next_txn_id = 789;
+    log_mgr.write_restart_manifest(written);
+
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_EQ(read.checkpoint_offset, 4096);
+    EXPECT_EQ(read.next_timestamp, 123456);
+    EXPECT_EQ(read.next_txn_id, 789);
+    // 旧读者只读第一个 token，必须继续拿到偏移。
+    EXPECT_EQ(log_mgr.read_restart_offset(), 4096);
+}
+
+// 旧版本写的 db.restart 只有裸偏移。缺失的计数器字段必须退回 0，而不是让整个清单
+// 读失败——0 的语义是“本文件不提供计数器”，恢复会改用保留 WAL 里的 COMMIT 时间戳。
+TEST(LogManagerTest, LegacyRestartFileWithoutCountersReadsAsZero) {
+    ScopedTestDir test_dir("log_manager_legacy_restart_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    {
+        std::ofstream restart(LogManager::RESTART_FILE_NAME, std::ios::trunc);
+        restart << 512;
+    }
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_EQ(read.checkpoint_offset, 512);
+    EXPECT_EQ(read.next_timestamp, 0);
+    EXPECT_EQ(read.next_txn_id, 0);
+}
+
+// 认不出的键被忽略，认得出的键照旧生效：清单可以继续加字段而不破坏旧字段。
+TEST(LogManagerTest, RestartManifestIgnoresUnknownAndMalformedEntries) {
+    ScopedTestDir test_dir("log_manager_restart_unknown_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+
+    {
+        std::ofstream restart(LogManager::RESTART_FILE_NAME, std::ios::trunc);
+        restart << "0\nfuture_key=1\nnext_timestamp=99\nnext_txn_id=not-a-number\n";
+    }
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_EQ(read.checkpoint_offset, 0);
+    EXPECT_EQ(read.next_timestamp, 99);
+    EXPECT_EQ(read.next_txn_id, 0);
 }
 
 TEST(LogManagerTest, DiskManagerReportsFileSizePastTwoGb) {
@@ -340,7 +533,7 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
 
     Value new_v;
     new_v.set_int(20);
-    SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT};
+    SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT, {}};
     UpdateExecutor update_executor(&sm_mgr, "t", {set_clause}, {}, {rid}, &context);
     update_executor.Next();
 

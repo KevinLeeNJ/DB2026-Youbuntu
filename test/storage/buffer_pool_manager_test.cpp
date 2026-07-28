@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -35,6 +36,7 @@ class BufferPoolManagerTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager_;
     int fd_ = -1; // 此文件描述符为disk_manager_->open_file的返回值
+    bool fd_closed_{false};
 
 public:
     // This function is called before every test.
@@ -65,7 +67,9 @@ public:
 
     // This function is called after every test.
     void TearDown() override {
-        disk_manager_->close_file(fd_);
+        if (!fd_closed_) {
+            disk_manager_->close_file(fd_);
+        }
         // disk_manager_->destroy_file(TEST_FILE_NAME);  // you can choose to delete the file
 
         // 返回上一层目录
@@ -75,6 +79,29 @@ public:
         assert(disk_manager_->is_dir(TEST_DB_NAME));
     }
 };
+
+TEST_F(BufferPoolManagerTest, FailedDirtyEvictionRetainsOriginalPage) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId old_page_id{fd_, INVALID_PAGE_ID};
+    Page* old_page = bpm->new_page(&old_page_id);
+    ASSERT_NE(old_page, nullptr);
+    std::memcpy(old_page->get_data(), "dirty-page", 11);
+    ASSERT_TRUE(bpm->unpin_page(old_page_id, true));
+
+    // Closing the file makes the victim write fail deterministically while the
+    // frame still contains the only copy of the dirty page.
+    disk_manager_->close_file(fd_);
+    fd_closed_ = true;
+
+    PageId missing_page{fd_, 99};
+    EXPECT_EQ(bpm->fetch_page(missing_page), nullptr);
+    EXPECT_TRUE(bpm->is_page_resident(old_page_id));
+
+    Page* retained_page = bpm->fetch_page(old_page_id);
+    ASSERT_NE(retained_page, nullptr);
+    EXPECT_EQ(std::memcmp(retained_page->get_data(), "dirty-page", 11), 0);
+    EXPECT_TRUE(bpm->unpin_page(old_page_id, true));
+}
 
 TEST_F(BufferPoolManagerTest, SampleTest) {
     // create BufferPoolManager
@@ -149,6 +176,123 @@ TEST_F(BufferPoolManagerTest, NewPageFromFreshFrameHasOnlyValidPageTableEntry) {
     EXPECT_EQ(0, bpm->page_table_.count(PageId{0, INVALID_PAGE_ID}));
 }
 
+TEST_F(BufferPoolManagerTest, FreeFrameCounterAndRecycleVectorPreserveAllocationPaths) {
+    auto bpm = std::make_unique<BufferPoolManager>(3, disk_manager_.get());
+    EXPECT_EQ(bpm->next_unused_frame_, 0);
+    EXPECT_TRUE(bpm->recycled_frames_.empty());
+
+    PageId first_page{fd_, INVALID_PAGE_ID};
+    PageId second_page{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&first_page), nullptr);
+    ASSERT_NE(bpm->new_page(&second_page), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(first_page, false));
+    ASSERT_TRUE(bpm->unpin_page(second_page, false));
+    EXPECT_EQ(bpm->next_unused_frame_, 2);
+
+    ASSERT_TRUE(bpm->delete_page(first_page));
+    ASSERT_EQ(bpm->recycled_frames_.size(), 1u);
+    EXPECT_EQ(bpm->recycled_frames_.back(), 0);
+
+    PageId recycled_page{fd_, INVALID_PAGE_ID};
+    Page* recycled_frame = bpm->new_page(&recycled_page);
+    ASSERT_NE(recycled_frame, nullptr);
+    EXPECT_EQ(recycled_frame, &bpm->pages_[0]);
+    EXPECT_TRUE(bpm->recycled_frames_.empty());
+
+    PageId fresh_page{fd_, INVALID_PAGE_ID};
+    Page* fresh_frame = bpm->new_page(&fresh_page);
+    ASSERT_NE(fresh_frame, nullptr);
+    EXPECT_EQ(fresh_frame, &bpm->pages_[2]);
+    EXPECT_EQ(bpm->next_unused_frame_, 3);
+}
+
+TEST_F(BufferPoolManagerTest, ReplacerFallbackAndExhaustionRemainUnchanged) {
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
+    PageId first_page{fd_, INVALID_PAGE_ID};
+    PageId second_page{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&first_page), nullptr);
+    ASSERT_NE(bpm->new_page(&second_page), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(first_page, false));
+    ASSERT_TRUE(bpm->recycled_frames_.empty());
+
+    PageId replacement_page{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&replacement_page), nullptr);
+    EXPECT_FALSE(bpm->is_page_resident(first_page));
+
+    PageId exhausted_page{fd_, INVALID_PAGE_ID};
+    EXPECT_EQ(bpm->new_page(&exhausted_page), nullptr);
+    EXPECT_EQ(bpm->fetch_page(first_page), nullptr);
+}
+
+TEST_F(BufferPoolManagerTest, PageTableReserveAndLoadFactorAvoidPoolSizedRehash) {
+    constexpr size_t buffer_pool_size = 10;
+    auto bpm = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get());
+    const size_t initial_bucket_count = bpm->page_table_.bucket_count();
+    const size_t expected_reserved_pages = buffer_pool_size + (buffer_pool_size + 4) / 5;
+
+    EXPECT_FLOAT_EQ(bpm->page_table_.max_load_factor(), 0.7F);
+    EXPECT_GE(initial_bucket_count, expected_reserved_pages);
+
+    for (size_t i = 0; i < buffer_pool_size; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm->new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    }
+    EXPECT_EQ(bpm->page_table_.size(), buffer_pool_size);
+    EXPECT_EQ(bpm->page_table_.bucket_count(), initial_bucket_count);
+}
+
+// Two owners can hold the same page - the index root cache pins the root and
+// hands the very same raw page to a writer - so the owner that releases second
+// finds pin_count_ already at zero. Losing its dirty mark there would silently
+// drop a committed page modification.
+TEST_F(BufferPoolManagerTest, UnpinMarksDirtyEvenWhenThePinWasAlreadyReleased) {
+    auto bpm = std::make_unique<BufferPoolManager>(4, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    Page* page = bpm->new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+
+    // First owner releases the only pin without reporting a modification.
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    ASSERT_FALSE(page->is_dirty());
+
+    // Second owner reports its modification after the pin is already gone.
+    EXPECT_FALSE(bpm->unpin_page(page_id, true));
+    EXPECT_TRUE(page->is_dirty());
+}
+
+TEST_F(BufferPoolManagerTest, ResidentClassificationSurvivesVictimPressureAndUnmark) {
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
+    PageId resident_id{fd_, INVALID_PAGE_ID};
+    PageId ordinary_id{fd_, INVALID_PAGE_ID};
+    PageId replacement_id{fd_, INVALID_PAGE_ID};
+
+    ASSERT_NE(nullptr, bpm->new_page(&resident_id));
+    ASSERT_TRUE(bpm->unpin_page(resident_id, false));
+    ASSERT_NE(nullptr, bpm->new_page(&ordinary_id));
+    ASSERT_TRUE(bpm->unpin_page(ordinary_id, false));
+
+    bpm->mark_resident(resident_id, ResidencyClass::IndexInternal);
+    ASSERT_EQ(bpm->get_residency_class(resident_id), ResidencyClass::IndexInternal);
+
+    // The ordinary page is the first victim; keep the replacement page pinned
+    // so the resident page is the only possible victim after it is explicitly
+    // made evictable again.
+    ASSERT_NE(nullptr, bpm->new_page(&replacement_id));
+    EXPECT_TRUE(bpm->is_page_resident(resident_id));
+    ASSERT_EQ(bpm->get_residency_class(resident_id), ResidencyClass::IndexInternal);
+
+    bpm->unmark_resident(resident_id);
+    ASSERT_EQ(bpm->get_residency_class(resident_id), ResidencyClass::Normal);
+
+    PageId final_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(nullptr, bpm->new_page(&final_id));
+    EXPECT_FALSE(bpm->is_page_resident(resident_id));
+    EXPECT_FALSE(bpm->get_residency_class(resident_id).has_value());
+    ASSERT_TRUE(bpm->unpin_page(replacement_id, false));
+    ASSERT_TRUE(bpm->unpin_page(final_id, false));
+}
+
 TEST_F(BufferPoolManagerTest, FlushPageFlushesWalBeforePageWrite) {
     auto disk_manager = BufferPoolManagerTest::disk_manager_.get();
     if (disk_manager->is_file(LOG_FILE_NAME)) {
@@ -196,6 +340,115 @@ TEST_F(BufferPoolManagerTest, FlushAllPagesSkipsCleanPages) {
     ASSERT_NE(nullptr, reopened_page);
     EXPECT_STREQ("persisted", reopened_page->get_data());
     ASSERT_TRUE(reopened_bpm.unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, FlushDirtyPagesHonorsPageBudget) {
+    auto bpm = std::make_unique<BufferPoolManager>(3, disk_manager_.get());
+    std::vector<PageId> page_ids;
+    for (int i = 0; i < 3; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        Page* page = bpm->new_page(&page_id);
+        ASSERT_NE(page, nullptr);
+        std::strcpy(page->get_data(), "preflush");
+        ASSERT_TRUE(bpm->unpin_page(page_id, true));
+        page_ids.push_back(page_id);
+    }
+
+    EXPECT_EQ(bpm->flush_dirty_pages(1), 1u);
+    size_t dirty_pages = 0;
+    for (const PageId& page_id : page_ids) {
+        Page* page = bpm->fetch_page(page_id);
+        ASSERT_NE(page, nullptr);
+        dirty_pages += page->is_dirty() ? 1u : 0u;
+        ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    }
+    EXPECT_EQ(dirty_pages, 2u);
+
+    EXPECT_EQ(bpm->flush_dirty_pages(3), 2u);
+    for (const PageId& page_id : page_ids) {
+        Page* page = bpm->fetch_page(page_id);
+        ASSERT_NE(page, nullptr);
+        EXPECT_STREQ(page->get_data(), "preflush");
+        ASSERT_TRUE(bpm->unpin_page(page_id, false));
+    }
+}
+
+TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfReplacer) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&page_id), nullptr);
+
+    for (int iteration = 0; iteration < 1000; ++iteration) {
+        std::atomic<int> ready{0};
+        std::atomic<bool> start{false};
+        Page* fetched = nullptr;
+        std::thread fetcher([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            fetched = bpm->fetch_page(page_id);
+        });
+        std::thread unpinner([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            EXPECT_TRUE(bpm->unpin_page(page_id, false));
+        });
+        while (ready.load(std::memory_order_acquire) != 2) {
+            std::this_thread::yield();
+        }
+        start.store(true, std::memory_order_release);
+        fetcher.join();
+        unpinner.join();
+
+        ASSERT_NE(fetched, nullptr);
+        EXPECT_EQ(bpm->pages_[0].pin_count_, 1);
+        EXPECT_EQ(bpm->replacer_->Size(), 0);
+    }
+
+    EXPECT_TRUE(bpm->unpin_page(page_id, false));
+}
+
+TEST_F(BufferPoolManagerTest, FlushDoesNotClearDirtyFromConcurrentWriter) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    Page* page = bpm->new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+    std::strcpy(page->get_data(), "before-flush");
+    ASSERT_TRUE(bpm->unpin_page(page_id, true));
+
+    Page* writer_page = bpm->fetch_page(page_id);
+    ASSERT_NE(writer_page, nullptr);
+    std::unique_lock<std::shared_mutex> block_flush(writer_page->latch());
+    std::atomic<bool> writer_started{false};
+    std::thread flusher([&] { EXPECT_TRUE(bpm->flush_page(page_id)); });
+    while (writer_page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
+        std::this_thread::yield();
+    }
+    std::thread writer([&] {
+        writer_started.store(true, std::memory_order_release);
+        std::unique_lock<std::shared_mutex> page_lock(writer_page->latch());
+        std::strcpy(writer_page->get_data(), "after-flush-started");
+        page_lock.unlock();
+        EXPECT_TRUE(bpm->unpin_page(page_id, true));
+    });
+    while (!writer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    block_flush.unlock();
+    flusher.join();
+    writer.join();
+
+    EXPECT_TRUE(writer_page->is_dirty());
+    ASSERT_TRUE(bpm->flush_page(page_id));
+
+    BufferPoolManager reopened_bpm(1, disk_manager_.get());
+    Page* reopened_page = reopened_bpm.fetch_page(page_id);
+    ASSERT_NE(reopened_page, nullptr);
+    EXPECT_STREQ("after-flush-started", reopened_page->get_data());
+    EXPECT_TRUE(reopened_bpm.unpin_page(page_id, false));
 }
 
 class BufferPoolManagerConcurrencyTest : public ::testing::Test {

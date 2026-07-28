@@ -24,7 +24,8 @@ class UnionExecutor : public AbstractExecutor {
 private:
     std::vector<std::unique_ptr<AbstractExecutor>> branches_;
     std::vector<ColMeta> cols_;
-    size_t len_ = 0;
+    size_t len_ = 0;      // 输出元组总长度（数据区 + null bitmap）
+    size_t data_len_ = 0; // 数据区长度，即 null bitmap 的起始偏移
     std::vector<RmRecord> tuples_;
     std::unordered_set<std::string> seen_;
     size_t cursor_ = 0;
@@ -36,12 +37,11 @@ private:
 
     static void copy_cell(char* dst, const ColMeta& dst_col, const char* src, const ColMeta& src_col) {
         if (dst_col.type == TYPE_FLOAT) {
-            double value = src_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(src))
-                                                    : *reinterpret_cast<const double*>(src);
+            float value = src_col.type == TYPE_INT ? static_cast<float>(read_unaligned<int>(src)) : read_float(src);
             if (value == 0.0) {
                 value = 0.0;
             }
-            std::memcpy(dst, &value, sizeof(double));
+            write_float(dst, value);
             return;
         }
 
@@ -57,11 +57,23 @@ private:
     }
 
     RmRecord convert_record(const RmRecord& src_rec, const std::vector<ColMeta>& src_cols) const {
+        return convert_view(TupleView{src_rec.data, static_cast<uint32_t>(src_rec.size)}, src_cols);
+    }
+
+    // UNION 重新打包元组，因此按输出列顺序重建尾部 null bitmap。NULL 单元的数据
+    // 字节置零，使去重用的 seen_ 键对同一个 NULL 稳定。
+    RmRecord convert_view(TupleView src_view, const std::vector<ColMeta>& src_cols) const {
         RmRecord dst_rec(static_cast<int>(len_));
+        std::memset(dst_rec.data + data_len_, 0, static_cast<size_t>(len_) - data_len_);
         for (size_t i = 0; i < cols_.size(); ++i) {
             const auto& dst_col = cols_[i];
             const auto& src_col = src_cols[i];
-            copy_cell(dst_rec.data + dst_col.offset, dst_col, src_rec.data + src_col.offset, src_col);
+            if (is_null(src_view.data, src_col)) {
+                std::memset(dst_rec.data + dst_col.offset, 0, static_cast<size_t>(dst_col.len));
+                set_null(dst_rec.data, dst_col);
+                continue;
+            }
+            copy_cell(dst_rec.data + dst_col.offset, dst_col, src_view.data + src_col.offset, src_col);
         }
         return dst_rec;
     }
@@ -72,11 +84,18 @@ private:
         for (auto& branch : branches_) {
             const auto& branch_cols = branch->cols();
             for (branch->beginTuple(); !branch->is_end(); branch->nextTuple()) {
-                auto rec = branch->Next();
-                if (rec == nullptr) {
+                TupleView view = branch->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!view) {
+                    fallback = branch->Next();
+                    if (fallback != nullptr) {
+                        view = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (!view) {
                     continue;
                 }
-                RmRecord converted = convert_record(*rec, branch_cols);
+                RmRecord converted = convert_view(view, branch_cols);
                 std::string key(converted.data, static_cast<size_t>(converted.size));
                 if (seen_.insert(key).second) {
                     tuples_.push_back(converted);
@@ -90,8 +109,10 @@ public:
     UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches, std::vector<ColMeta> cols)
         : branches_(std::move(branches)), cols_(std::move(cols)) {
         if (!cols_.empty()) {
-            len_ = static_cast<size_t>(cols_.back().offset + cols_.back().len);
+            data_len_ = static_cast<size_t>(cols_.back().offset + cols_.back().len);
         }
+        bind_null_positions(cols_, static_cast<int>(data_len_));
+        len_ = data_len_ + static_cast<size_t>(null_bitmap_bytes(cols_.size()));
     }
 
     void beginTuple() override {
@@ -116,6 +137,13 @@ public:
             return nullptr;
         }
         return std::make_unique<RmRecord>(tuples_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return TupleView{tuples_[cursor_].data, static_cast<uint32_t>(tuples_[cursor_].size)};
     }
 
     Rid& rid() override {

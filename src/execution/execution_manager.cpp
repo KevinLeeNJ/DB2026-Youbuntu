@@ -181,9 +181,11 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
     }
     case T_SetOutputFile: {
         auto* x = static_cast<SetOutputFilePlan*>(plan);
-        // output_file is a database-global toggle shared across all connections;
-        // store it on SmManager so it persists across connection lifetimes.
-        sm_manager_->output_file_enabled_ = x->enable_;
+        if (context != nullptr && context->output_file_enabled_ != nullptr) {
+            *context->output_file_enabled_ = x->enable_;
+        } else {
+            sm_manager_->output_file_enabled_ = x->enable_;
+        }
         break;
     }
     case T_LoadData: {
@@ -222,14 +224,6 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     }
 
-    // Print records
-    size_t num_rec = 0;
-    std::vector<char> local_send(BUFFER_LENGTH, 0);
-    int local_offset = 0;
-    Context print_context(context->lock_mgr_, context->log_mgr_, context->txn_, local_send.data(), &local_offset,
-                          context->txn_mgr_);
-    print_context.isolation_level_ = context->isolation_level_;
-
     struct SsiReadTrackingGuard {
         Context* context_;
         bool old_value_;
@@ -248,63 +242,98 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
     } ssi_read_tracking_guard(context);
 
-    // Print header into a statement-local buffer. It is copied to the client
-    // and output.txt only after the SELECT completes without aborting.
-    RecordPrinter rec_printer(captions.size());
-    rec_printer.print_separator(&print_context);
-    rec_printer.print_record(captions, &print_context);
-    rec_printer.print_separator(&print_context);
-
-    std::ostringstream out_file_stream;
-    out_file_stream << "|";
-    for (const auto& cap : captions) {
-        out_file_stream << " " << cap << " |";
+    if (context != nullptr && context->result_sink_ != nullptr) {
+        context->result_sink_->begin_query(result_cols, captions);
+        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+            TupleView tuple = executorTreeRoot->current();
+            std::unique_ptr<RmRecord> fallback;
+            if (!tuple) {
+                fallback = executorTreeRoot->Next();
+                if (fallback) {
+                    tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                }
+            }
+            if (!tuple) {
+                throw ExecutionException("executor returned an empty tuple");
+            }
+            context->result_sink_->append_row(result_cols, tuple.data, tuple.size);
+        }
+        return;
     }
-    out_file_stream << "\n";
+
+    // Print records
+    size_t num_rec = 0;
+    const int output_start = *context->offset_;
+
+    // Format the result directly into the request response buffer. If execution
+    // aborts, client_handler replaces the buffer with the error response.
+    RecordPrinter rec_printer(captions.size());
+    rec_printer.print_separator(context);
+    rec_printer.print_record(captions, context);
+    rec_printer.print_separator(context);
+
+    const bool output_file_enabled =
+        context->output_file_enabled_ != nullptr ? *context->output_file_enabled_ : sm_manager_->output_file_enabled_;
+    std::ostringstream out_file_stream;
+    if (output_file_enabled) {
+        out_file_stream << "|";
+        for (const auto& cap : captions) {
+            out_file_stream << " " << cap << " |";
+        }
+        out_file_stream << "\n";
+    }
 
     // 执行query_plan
+    std::vector<std::string> columns;
+    columns.reserve(result_cols.size());
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-        auto Tuple = executorTreeRoot->Next();
-        std::vector<std::string> columns;
-        columns.reserve(result_cols.size());
+        TupleView tuple = executorTreeRoot->current();
+        std::unique_ptr<RmRecord> fallback;
+        if (!tuple) {
+            fallback = executorTreeRoot->Next();
+            if (fallback) {
+                tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+            }
+        }
+        columns.clear();
         for (auto& col : result_cols) {
             std::string col_str;
-            char* rec_buf = Tuple->data + col.offset;
-            if (col.type == TYPE_INT) {
-                col_str = std::to_string(*(int*)rec_buf);
+            const char* rec_buf = tuple.data + col.offset;
+            if (is_null(tuple.data, col)) {
+                // NULL 是新增的值形态，此前不可能出现，因此不影响 output.txt
+                // 既有格式；不能写成空串（final.md:761）。
+                col_str = NULL_DISPLAY_TEXT;
+            } else if (col.type == TYPE_INT) {
+                col_str = std::to_string(read_unaligned<int>(rec_buf));
             } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(*(double*)rec_buf);
+                col_str = std::to_string(read_float(rec_buf));
             } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
-                col_str = std::string((char*)rec_buf, col.len);
-                col_str.resize(strlen(col_str.c_str()));
+                col_str.assign(rec_buf, strnlen(rec_buf, col.len));
             }
             columns.push_back(col_str);
         }
         // print record into client buffer
-        rec_printer.print_record(columns, &print_context);
+        rec_printer.print_record(columns, context);
         // print record into output.txt (compact borderless)
-        out_file_stream << "|";
-        for (const auto& col_str : columns) {
-            out_file_stream << " " << col_str << " |";
+        if (output_file_enabled) {
+            out_file_stream << "|";
+            for (const auto& col_str : columns) {
+                out_file_stream << " " << col_str << " |";
+            }
+            out_file_stream << "\n";
         }
-        out_file_stream << "\n";
         num_rec++;
     }
     // Print footer into client buffer
-    rec_printer.print_separator(&print_context);
+    rec_printer.print_separator(context);
     // Print record count into client buffer
-    RecordPrinter::print_record_count(num_rec, &print_context);
+    RecordPrinter::print_record_count(num_rec, context);
 
-    if (local_offset > 0) {
-        memcpy(context->data_send_ + *(context->offset_), local_send.data(), local_offset);
-        *(context->offset_) += local_offset;
-
-        if (sm_manager_->output_file_enabled_) {
-            std::fstream outfile;
-            outfile.open("output.txt", std::ios::out | std::ios::app);
-            outfile << out_file_stream.str();
-            outfile.close();
-        }
+    if (output_file_enabled && *context->offset_ > output_start) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << out_file_stream.str();
+        outfile.close();
     }
 }
 

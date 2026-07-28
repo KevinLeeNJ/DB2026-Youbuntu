@@ -14,7 +14,9 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -93,17 +95,32 @@ void SmManager::create_db(const std::string& db_name) {
 
     // 注意，此处ofstream会在当前目录创建(如果没有此文件先创建)和打开一个名为DB_META_NAME的文件
     std::ofstream ofs(DB_META_NAME);
+    if (!ofs.is_open()) {
+        throw UnixError();
+    }
 
     // 将new_db中的信息，按照定义好的operator<<操作符，写入到ofs打开的DB_META_NAME文件中
     ofs << new_db; // 注意：此处重载了操作符<<
 
+    ofs.flush();
+    if (!ofs) {
+        throw UnixError();
+    }
+    ofs.close();
+    disk_manager_->sync_path(DB_META_NAME);
+
     // 创建日志文件
     disk_manager_->create_file(LOG_FILE_NAME);
+    // The new WAL segment's directory entry must be durable before the segment
+    // can be used to cover a COMMIT.
+    disk_manager_->sync_directory(".");
 
     // 回到根目录
     if (chdir("..") < 0) {
         throw UnixError();
     }
+    // Make the database directory entry itself durable as well.
+    disk_manager_->sync_directory(".");
 }
 
 /**
@@ -145,6 +162,7 @@ void SmManager::open_db(const std::string& db_name) {
     {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
+        historical_retire_queue_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
@@ -165,16 +183,42 @@ void SmManager::open_db(const std::string& db_name) {
         //  打开所有表的记录文件
         for (auto& entry : db_.tabs_) {
             auto& tab_meta = entry.second;
-            fhs_.emplace(tab_meta.name, rm_manager_->open_file(tab_meta.name));
+            auto file_handle = rm_manager_->open_file(tab_meta.name);
+            // NULL 位地址不进磁盘元数据，每次打开库时按数据文件的 record_size 推导。
+            tab_meta.bind_null_positions(file_handle->get_file_hdr().record_size);
+            fhs_.emplace(tab_meta.name, std::move(file_handle));
             for (auto& index : tab_meta.indexes) {
                 // 打开索引文件
-                ihs_.emplace(ix_manager_->get_index_name(tab_meta.name, index.cols),
-                             ix_manager_->open_index(index.tab_name, index.cols));
+                const std::string index_name = ix_manager_->get_index_name(tab_meta.name, index.cols);
+                const std::string backup_name = index_name + ".rebuild.bak";
+                const std::string temp_base = index_name + ".rebuild.tmp";
+                const std::string temp_name = ix_manager_->get_index_name(temp_base, index.cols);
+                // A crash between the two rename operations must leave a
+                // complete old or new index that can be opened on restart.
+                if (!disk_manager_->is_file(index_name) && disk_manager_->is_file(backup_name)) {
+                    if (rename(backup_name.c_str(), index_name.c_str()) != 0) {
+                        throw UnixError();
+                    }
+                    disk_manager_->sync_directory(".");
+                }
+                if (disk_manager_->is_file(index_name) && disk_manager_->is_file(backup_name)) {
+                    if (std::remove(backup_name.c_str()) != 0) {
+                        throw UnixError();
+                    }
+                    disk_manager_->sync_directory(".");
+                }
+                if (disk_manager_->is_file(temp_name)) {
+                    if (std::remove(temp_name.c_str()) != 0) {
+                        throw UnixError();
+                    }
+                }
+                ihs_.emplace(index_name, ix_manager_->open_index(index.tab_name, index.cols));
             }
         }
         // Reset the database-global output_file toggle: opening a (possibly
         // different) database should not inherit the previous database's toggle.
         output_file_enabled_ = true;
+        bump_catalog_generation();
     } catch (...) {
         fhs_.clear();
         ihs_.clear();
@@ -188,9 +232,22 @@ void SmManager::open_db(const std::string& db_name) {
  * @description: 把数据库相关的元数据刷入磁盘中
  */
 void SmManager::flush_meta() {
-    // 默认清空文件
-    std::ofstream ofs(DB_META_NAME);
+    const std::string temp_meta = std::string(DB_META_NAME) + ".tmp";
+    std::ofstream ofs(temp_meta, std::ios::trunc);
+    if (!ofs.is_open()) {
+        throw UnixError();
+    }
     ofs << db_;
+    ofs.flush();
+    if (!ofs) {
+        throw UnixError();
+    }
+    ofs.close();
+    disk_manager_->sync_path(temp_meta);
+    if (rename(temp_meta.c_str(), DB_META_NAME.c_str()) != 0) {
+        throw UnixError();
+    }
+    disk_manager_->sync_directory(".");
 }
 
 /**
@@ -200,6 +257,7 @@ void SmManager::close_db() {
     if (db_.name_.empty()) {
         throw DatabaseNotFoundError("No database is currently open.");
     }
+    bump_catalog_generation();
     flush_meta();
     // 关闭所有表的记录文件
     for (auto& entry : fhs_) {
@@ -216,6 +274,7 @@ void SmManager::close_db() {
     {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
+        historical_retire_queue_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
@@ -227,53 +286,61 @@ void SmManager::close_db() {
 }
 
 void SmManager::prune_version_history(timestamp_t watermark) {
-    // 回收 historical_index_keys_：键编码为 tab_name + '\0' + index_name + '\0' + key
-    // 对每个 RID，若其当前 tuple 版本已提交且 commit_ts < watermark，则任何活跃事务
-    // （read_ts >= watermark）都不会回溯其版本链，该历史键不再被冲突检测访问。
-    // 先在锁内快照待检查的 (key, RID) 列表，再在锁外读 meta，最后回锁内删除，避免
-    // 持锁访问缓冲池造成长时间持锁/死锁。
-    std::vector<std::pair<std::string, Rid>> hist_snapshot;
+    constexpr size_t kHistoryPruneBatch = 512;
+    // Historical entries are placed on a retire queue when created. Each GC
+    // pass examines only a bounded queue prefix; entries that are still
+    // visible to an active snapshot are requeued for a later watermark.
+    std::vector<HistoricalRetireCandidate> hist_snapshot;
     {
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        hist_snapshot.reserve(historical_index_keys_.size() * 2);
-        for (const auto& [combined_key, rids] : historical_index_keys_) {
-            for (const Rid& rid : rids) {
-                hist_snapshot.emplace_back(combined_key, rid);
-            }
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        const size_t count = std::min(kHistoryPruneBatch, historical_retire_queue_.size());
+        hist_snapshot.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            hist_snapshot.push_back(std::move(historical_retire_queue_.front()));
+            historical_retire_queue_.pop_front();
         }
     }
-    std::vector<std::pair<std::string, Rid>> hist_to_remove;
-    for (auto& [combined_key, rid] : hist_snapshot) {
-        // 解析 tab_name（第一个 '\0' 之前的部分）
-        size_t nul = combined_key.find('\0');
-        std::string tab_name = (nul != std::string::npos) ? combined_key.substr(0, nul) : std::string{};
+    std::vector<bool> hist_requeue(hist_snapshot.size(), false);
+    for (size_t i = 0; i < hist_snapshot.size(); ++i) {
+        const auto& candidate = hist_snapshot[i];
+        size_t nul = candidate.bucket_key.find('\0');
+        std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
         auto fh_it = fhs_.find(tab_name);
         if (fh_it == fhs_.end()) {
-            // 表已不存在，整组历史键失效，直接标记删除
-            hist_to_remove.emplace_back(std::move(combined_key), rid);
             continue;
         }
         RmFileHandle* fh = fh_it->second.get();
-        if (!fh->is_record(rid)) {
-            hist_to_remove.emplace_back(std::move(combined_key), rid);
+        if (!fh->is_record(candidate.rid)) {
             continue;
         }
-        TupleMeta meta = fh->get_tuple_meta(rid);
-        if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
-            hist_to_remove.emplace_back(std::move(combined_key), rid);
+        TupleMeta meta = fh->get_tuple_meta(candidate.rid);
+        if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
+            hist_requeue[i] = true;
         }
     }
-    if (!hist_to_remove.empty()) {
+    if (!hist_snapshot.empty()) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (auto& [combined_key, rid] : hist_to_remove) {
-            auto it = historical_index_keys_.find(combined_key);
+        for (size_t i = 0; i < hist_snapshot.size(); ++i) {
+            const auto& candidate = hist_snapshot[i];
+            auto it = historical_index_keys_.find(candidate.bucket_key);
             if (it == historical_index_keys_.end()) {
                 continue;
             }
-            auto& rids = it->second;
-            rids.erase(std::remove(rids.begin(), rids.end(), rid), rids.end());
-            if (rids.empty()) {
-                historical_index_keys_.erase(it);
+            auto key_it = it->second.entries.find(candidate.encoded_key);
+            if (key_it == it->second.entries.end()) {
+                continue;
+            }
+            auto& rids = key_it->second;
+            if (!hist_requeue[i]) {
+                rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
+                if (rids.empty()) {
+                    it->second.entries.erase(key_it);
+                }
+                if (it->second.entries.empty()) {
+                    historical_index_keys_.erase(it);
+                }
+            } else {
+                historical_retire_queue_.push_back(candidate);
             }
         }
     }
@@ -286,7 +353,11 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         for (const auto& [tab_name, rids] : deleted_tuple_candidates_) {
             for (const Rid& rid : rids) {
                 del_snapshot.emplace_back(tab_name, rid);
+                if (del_snapshot.size() >= kHistoryPruneBatch)
+                    break;
             }
+            if (del_snapshot.size() >= kHistoryPruneBatch)
+                break;
         }
     }
     std::vector<std::pair<std::string, Rid>> del_to_remove;
@@ -318,8 +389,11 @@ void SmManager::prune_version_history(timestamp_t watermark) {
  * @param {Context*} context
  */
 void SmManager::show_tables(Context* context) {
+    const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
+                                         ? *context->output_file_enabled_
+                                         : output_file_enabled_;
     std::fstream outfile;
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
         outfile << "| Tables |\n";
     }
@@ -330,12 +404,12 @@ void SmManager::show_tables(Context* context) {
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
         printer.print_record({tab.name}, context);
-        if (output_file_enabled_) {
+        if (output_file_enabled) {
             outfile << "| " << tab.name << " |\n";
         }
     }
     printer.print_separator(context);
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.close();
     }
 }
@@ -349,35 +423,38 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
     printer.print_record(captions, context);
     printer.print_separator(context);
 
+    const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
+                                         ? *context->output_file_enabled_
+                                         : output_file_enabled_;
     std::fstream outfile;
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
     }
     for (const auto& index : tab.indexes) {
         std::string cols = "(";
-        if (output_file_enabled_) {
+        if (output_file_enabled) {
             outfile << "| " << tab_name << " | unique | (";
         }
         for (int i = 0; i < index.col_num; ++i) {
             if (i != 0) {
                 cols += ",";
-                if (output_file_enabled_) {
+                if (output_file_enabled) {
                     outfile << ",";
                 }
             }
             cols += index.cols[i].name;
-            if (output_file_enabled_) {
+            if (output_file_enabled) {
                 outfile << index.cols[i].name;
             }
         }
         cols += ")";
-        if (output_file_enabled_) {
+        if (output_file_enabled) {
             outfile << ") |\n";
         }
 
         printer.print_record({tab_name, "unique", cols}, context);
     }
-    if (output_file_enabled_) {
+    if (output_file_enabled) {
         outfile.close();
     }
 
@@ -434,13 +511,16 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
         tab.cols.emplace_back(col);
     }
     // Create & open record file
-    int record_size = curr_offset; // record_size就是col meta所占的大小（表的元数据也是以记录的形式进行存储的）
+    // record_size = 数据区 + 尾部 null bitmap（每列 1 bit），列偏移量不受影响。
+    int record_size = tab.record_len();
+    tab.bind_null_positions(record_size);
     rm_manager_->create_file(tab_name, record_size);
     db_.tabs_[tab_name] = tab;
     // fhs_[tab_name] = rm_manager_->open_file(tab_name);
     fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
 
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -460,6 +540,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     db_.tabs_.erase(tab_name);           // 删除对应键值对
     fhs_.erase(tab_name);
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -506,9 +587,19 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
                 std::memcpy(key.data() + offset, record->data + col.offset, col.len);
                 offset += col.len;
             }
-            // 插入索引
-            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_);
+            // 插入索引。允许重复键：`CREATE INDEX` 只是建立访问路径，不是唯一约束
+            // （final.md:168 明确数据模式除 CREATE INDEX 外不声明任何约束）。它也不能比
+            // 已经把这些行放进表里的路径更严格 —— LOAD（:54）和恢复期索引重建（:812）
+            // 都传 allow_duplicate=true，若此处仍拒重复，一张 LOAD 出来的合法表就可能
+            // 建不出索引。INSERT/UPDATE 路径保留唯一性检查不变：它是并发取号冲突
+            // （重复 d_next_o_id 等，final.md:444）的响亮失败信号，而 TPC-C 的复合索引
+            // 靠尾列天然唯一（final.md:171），正常负载下不会误拒。
+            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_,
+                                       /*allow_duplicate=*/true);
         }
+        // Index creation is complete, so it is now safe to build the optional
+        // root cache and upper-level residency state.
+        index_handle->refresh_page_residency();
     } catch (...) {
         ix_manager_->close_index(index_handle.get());
         ix_manager_->destroy_index(tab_name, cols);
@@ -518,6 +609,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     tab.indexes.emplace_back(index_meta);
     ihs_.emplace(index_name, std::move(index_handle));
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -540,6 +632,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     ix_manager_->destroy_index(tab_name, col_names);
     ihs_.erase(index_name);
     flush_meta();
+    bump_catalog_generation();
 }
 
 /**
@@ -564,6 +657,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
     ix_manager_->destroy_index(tab_name, col_names);
     ihs_.erase(index_name);
     flush_meta();
+    bump_catalog_generation();
 }
 
 void SmManager::insert_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& rec) {
@@ -605,18 +699,93 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
     }
 }
 
-void SmManager::flush_all_table_and_index_pages() {
+bool SmManager::flush_all_table_and_index_pages(bool wal_preflushed) {
+    bool success = true;
+    std::vector<int> fds;
+    fds.reserve(fhs_.size() + ihs_.size());
     for (const auto& [_, fh] : fhs_) {
         rm_manager_->flush_file_header(fh.get());
-        buffer_pool_manager_->flush_all_pages(fh->GetFd());
+        fds.push_back(fh->GetFd());
     }
     for (const auto& [_, ih] : ihs_) {
         ix_manager_->flush_index_header(ih.get());
-        buffer_pool_manager_->flush_all_pages(ih->GetFd());
+        fds.push_back(ih->GetFd());
     }
+    success = buffer_pool_manager_->flush_all_pages(fds, wal_preflushed) && success;
+    for (int fd : fds) {
+        disk_manager_->sync_file(fd);
+    }
+    return success;
+}
+
+bool SmManager::flush_dirty_data_pages(bool wal_preflushed) {
+    std::vector<int> fds;
+    fds.reserve(fhs_.size() + ihs_.size());
+    for (const auto& [_, fh] : fhs_) {
+        fds.push_back(fh->GetFd());
+    }
+    for (const auto& [_, ih] : ihs_) {
+        fds.push_back(ih->GetFd());
+    }
+    return buffer_pool_manager_->flush_all_pages(fds, wal_preflushed);
+}
+
+bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& table_names) {
+    std::vector<int> fds;
+    fds.reserve(table_names.size());
+    for (const auto& tab_name : table_names) {
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it == fhs_.end()) {
+            continue;
+        }
+        fds.push_back(fh_it->second->GetFd());
+        const auto& tab = db_.get_table(tab_name);
+        for (const auto& index : tab.indexes) {
+            const auto index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            auto ih_it = ihs_.find(index_name);
+            if (ih_it != ihs_.end()) {
+                fds.push_back(ih_it->second->GetFd());
+            }
+        }
+    }
+    std::sort(fds.begin(), fds.end());
+    fds.erase(std::unique(fds.begin(), fds.end()), fds.end());
+    if (!buffer_pool_manager_->flush_all_pages(fds)) {
+        return false;
+    }
+    // Headers are written outside the buffer pool. Write them only after the
+    // repaired pages, then sync every affected file before WAL can be reset.
+    for (const auto& tab_name : table_names) {
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it == fhs_.end()) {
+            continue;
+        }
+        rm_manager_->flush_file_header(fh_it->second.get());
+        const auto& tab = db_.get_table(tab_name);
+        for (const auto& index : tab.indexes) {
+            const auto index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            auto ih_it = ihs_.find(index_name);
+            if (ih_it != ihs_.end()) {
+                ix_manager_->flush_index_header(ih_it->second.get());
+            }
+        }
+    }
+    for (const int fd : fds) {
+        disk_manager_->sync_file(fd);
+    }
+    FaultInjector::Point("after_recovery_data_sync");
+    return true;
+}
+
+size_t SmManager::flush_dirty_pages(size_t max_pages) {
+    return buffer_pool_manager_->flush_dirty_pages(max_pages);
 }
 
 void SmManager::rebuild_all_indexes() {
+    rebuild_indexes({});
+}
+
+void SmManager::rebuild_indexes(const std::unordered_set<std::string>& index_names) {
     std::vector<std::pair<std::string, std::vector<IndexMeta>>> indexes_by_table;
     indexes_by_table.reserve(db_.tabs_.size());
     for (const auto& [tab_name, tab] : db_.tabs_) {
@@ -632,43 +801,91 @@ void SmManager::rebuild_all_indexes() {
             for (const auto& col : index.cols) {
                 col_names.emplace_back(col.name);
             }
-            drop_index(tab_name, index.cols, nullptr);
-            create_index(tab_name, col_names, nullptr);
+            const std::string index_name = ix_manager_->get_index_name(tab_name, index.cols);
+            if (!index_names.empty() && index_names.count(index_name) == 0) {
+                continue;
+            }
+            const std::string backup_name = index_name + ".rebuild.bak";
+            const std::string temp_base = index_name + ".rebuild.tmp";
+            const std::string temp_name = ix_manager_->get_index_name(temp_base, index.cols);
+
+            ix_manager_->create_index(temp_base, index.cols);
+            auto temp_handle = ix_manager_->open_index(temp_base, index.cols);
+            try {
+                auto file_handle = fhs_.at(tab_name).get();
+                for (RmScan scan(file_handle); !scan.is_end(); scan.next()) {
+                    auto record = file_handle->get_record(scan.rid(), nullptr);
+                    auto key = MakeIndexKey(index, record->data);
+                    temp_handle->insert_entry(key.data(), scan.rid(), nullptr, true);
+                }
+                ix_manager_->close_index(temp_handle.get());
+                temp_handle.reset();
+                FaultInjector::Point("mid_index_rebuild");
+                disk_manager_->sync_path(temp_name);
+            } catch (...) {
+                if (temp_handle != nullptr) {
+                    ix_manager_->close_index(temp_handle.get());
+                }
+                if (disk_manager_->is_file(temp_name)) {
+                    ix_manager_->destroy_index(temp_base, index.cols);
+                }
+                throw;
+            }
+
+            auto old_it = ihs_.find(index_name);
+            if (old_it == ihs_.end()) {
+                throw InternalError("missing index handle during recovery rebuild");
+            }
+            ix_manager_->close_index(old_it->second.get());
+            old_it->second.reset();
+            ihs_.erase(old_it);
+
+            if (rename(index_name.c_str(), backup_name.c_str()) != 0) {
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+                throw UnixError();
+            }
+            if (rename(temp_name.c_str(), index_name.c_str()) != 0) {
+                if (rename(backup_name.c_str(), index_name.c_str()) != 0) {
+                    throw UnixError();
+                }
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+                throw UnixError();
+            }
+            disk_manager_->sync_directory(".");
+
+            try {
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+            } catch (...) {
+                std::remove(index_name.c_str());
+                if (rename(backup_name.c_str(), index_name.c_str()) != 0) {
+                    throw UnixError();
+                }
+                ihs_.emplace(index_name, ix_manager_->open_index(tab_name, index.cols));
+                disk_manager_->sync_directory(".");
+                throw;
+            }
+            if (std::remove(backup_name.c_str()) != 0) {
+                throw UnixError();
+            }
+            disk_manager_->sync_directory(".");
         }
     }
 }
 
-void SmManager::reset_all_tuple_meta_after_recovery() {
-    TupleMeta clean_meta;
-    clean_meta.commit_ts_ = 0;
-    clean_meta.writer_txn_id_ = INVALID_TXN_ID;
-    clean_meta.is_committed_ = true;
-    clean_meta.is_deleted_ = false;
-    clean_meta.version_chain_head_ = UndoLink{};
-
-    for (const auto& [_, fh] : fhs_) {
-        std::vector<Rid> tombstones;
-        std::vector<Rid> live_records;
-        for (RmScan scan(fh.get()); !scan.is_end(); scan.next()) {
-            Rid rid = scan.rid();
-            TupleMeta meta = fh->get_tuple_meta(rid);
-            if (meta.is_deleted_) {
-                tombstones.push_back(rid);
-            } else {
-                live_records.push_back(rid);
-            }
-        }
-        for (const auto& rid : tombstones) {
-            fh->delete_record(rid, nullptr);
-        }
-        for (const auto& rid : live_records) {
-            if (fh->is_record(rid)) {
-                fh->set_tuple_meta(rid, clean_meta);
-            }
-        }
+void SmManager::refresh_index_residency() {
+    for (auto& [_, index_handle] : ihs_) {
+        // Reopening a large benchmark must not walk every index leaf merely
+        // to warm optional residency state. Individual index creation and
+        // tests retain the explicit full-refresh default.
+        index_handle->refresh_page_residency(false);
     }
 }
 
+// 这里曾有一个 reset_all_tuple_meta_after_recovery()：恢复后全表扫描，把每个存活槽的
+// TupleMeta 归一化成 commit_ts_ = 0。它从来没有调用者，也不该有——那是“重启后已提交行
+// 不可见”的错误解法：代价与整库大小成正比（评测规模 5 GB），必然击穿 final.md:53 的
+// 90 秒就绪预算。正解是让时间戳计数器在重启后恢复到高于任何已持久化的 commit_ts_，
+// 见 RecoveryManager::get_recovered_next_timestamp()，代价 O(1)。
 void SmManager::load_csv_data(const std::string& file_path, const std::string& tab_name, Context* context) {
     (void)context;
     std::ifstream infile(file_path);
@@ -688,27 +905,94 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
         }
     };
 
-    // Build column-name -> CSV-field-index map from the header row.
-    std::string header_line;
-    if (!std::getline(infile, header_line)) {
+    // 就地按 RFC 4180 切分一行，结果是指向 line 内部的 NUL 结尾字段。
+    // 解引号只会删字符，所以写指针永不超过读指针，可以原地改写；末尾多留的
+    // 一个字节用于给最后一个字段写 NUL。不支持引号内换行（TPC-C 数据不含换行，
+    // Go 的 encoding/csv 也只在字段含 , " \n 时才加引号）。
+    auto split_csv_line = [](std::string& s, std::vector<const char*>& out) {
+        out.clear();
+        s.push_back('\0');
+        char* write = s.data();
+        const char* read = s.data();
+        const char* end = s.data() + s.size() - 1;
+        while (true) {
+            char* field_begin = write;
+            if (read < end && *read == '"') {
+                ++read; // 起始引号
+                while (read < end) {
+                    if (*read != '"') {
+                        *write++ = *read++;
+                        continue;
+                    }
+                    if (read + 1 < end && read[1] == '"') {
+                        *write++ = '"'; // "" 还原成一个 "
+                        read += 2;
+                        continue;
+                    }
+                    ++read; // 结束引号
+                    break;
+                }
+                while (read < end && *read != ',') {
+                    ++read; // 容忍结束引号与逗号之间的多余字符
+                }
+            } else {
+                while (read < end && *read != ',') {
+                    *write++ = *read++;
+                }
+            }
+            *write++ = '\0';
+            out.push_back(field_begin);
+            if (read >= end) {
+                break;
+            }
+            ++read; // 跳过字段分隔符
+        }
+        s.pop_back();
+    };
+
+    // 复用的字段指针数组：提到循环外，省掉每行一次 malloc/free。
+    std::vector<const char*> fields;
+    fields.reserve(cols.size() * 2);
+
+    // 表头嗅探：只有"字段数 == DDL 列数 ∧ 每个字段（trim 后）都命中列名 ∧ 互不
+    // 重复"才认定为表头，否则按 DDL 列序做位置映射并把这一行也当数据行。
+    // final.md 全文对表头未作规定，因此必须同时支持有/无表头两种 CSV。
+    // TPC-C 列名是标识符，数据行是数字/时间戳/随机串，不可能凑巧全部命中。
+    std::string line;
+    if (!std::getline(infile, line)) {
         throw RMDBError("load file is empty: " + file_path);
     }
-    strip_cr(header_line);
-    std::vector<std::string> header_fields;
-    {
-        std::stringstream ss(header_line);
-        std::string field;
-        while (std::getline(ss, field, ',')) {
-            header_fields.push_back(field);
-        }
+    strip_cr(line);
+    split_csv_line(line, fields);
+
+    // 行尾逗号（"a,b,c,"）按 RFC 4180 会多切出一个空字段。数据行多出来的尾部字段
+    // 无害（下面按列序取前 cols.size() 个），但表头行一多一个字段就会让下面的
+    // 嗅探判定失败，把表头当数据行去 strtol，整个装载失败。这里只吃掉刚好多出来
+    // 的那一个空字段。
+    if (fields.size() == cols.size() + 1 && *fields.back() == '\0') {
+        fields.pop_back();
     }
+
     std::unordered_map<std::string, size_t> col_index;
-    for (size_t i = 0; i < header_fields.size(); ++i) {
-        col_index[header_fields[i]] = i;
-    }
-    for (const auto& col : cols) {
-        if (col_index.find(col.name) == col_index.end()) {
-            throw RMDBError("load file missing column: " + col.name);
+    bool has_header = fields.size() == cols.size();
+    if (has_header) {
+        auto trim = [](const char* text) {
+            const char* begin = text;
+            const char* stop = text + std::strlen(text);
+            while (begin < stop && std::isspace(static_cast<unsigned char>(*begin))) {
+                ++begin;
+            }
+            while (stop > begin && std::isspace(static_cast<unsigned char>(stop[-1]))) {
+                --stop;
+            }
+            return std::string(begin, static_cast<size_t>(stop - begin));
+        };
+        for (size_t i = 0; i < fields.size() && has_header; ++i) {
+            std::string name = trim(fields[i]);
+            has_header = tab.is_col(name) && col_index.emplace(std::move(name), i).second;
+        }
+        if (!has_header) {
+            col_index.clear();
         }
     }
 
@@ -718,11 +1002,15 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
         ColType type;
         int len;
         int offset;
+        int null_byte;
+        uint8_t null_mask;
     };
     std::vector<ColSrc> col_src;
     col_src.reserve(cols.size());
-    for (const auto& col : cols) {
-        col_src.push_back({col_index[col.name], col.type, col.len, col.offset});
+    for (size_t i = 0; i < cols.size(); ++i) {
+        const auto& col = cols[i];
+        const size_t csv_idx = has_header ? col_index.at(col.name) : i;
+        col_src.push_back({csv_idx, col.type, col.len, col.offset, col.null_byte, col.null_mask});
     }
 
     struct LoadIndexTarget {
@@ -741,37 +1029,25 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     RmFileHandle::PinnedInserter rm_inserter(fh);
     std::vector<char> record(record_size, 0);
 
-    std::string line;
-    size_t line_no = 1; // header was line 1
-    while (std::getline(infile, line)) {
-        ++line_no;
-        strip_cr(line);
-        if (line.empty()) {
-            continue; // skip trailing blank lines
+    // 把当前 fields 组装成一条记录并写入表和索引。
+    auto emit_row = [&](size_t line_no) {
+        // 字段数不足是硬错误，不能当成"这些列都是 NULL"：一个被截断或错列的 CSV
+        // 会静默装成一片 NULL，而 COUNT(*) 校验照样通过，报错点离病因非常远。
+        // 字段数多于列数则只忽略尾部（见上面的行尾逗号说明）。
+        if (fields.size() < cols.size()) {
+            throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected: got " +
+                            std::to_string(fields.size()) + ", need " + std::to_string(cols.size()));
         }
-
-        std::vector<const char*> fields;
-        fields.reserve(col_src.size() * 2);
-        {
-            const char* field_start = line.data();
-            for (char* p = line.data(); *p != '\0'; ++p) {
-                if (*p == ',') {
-                    *p = '\0';
-                    fields.push_back(field_start);
-                    field_start = p + 1;
-                }
-            }
-            fields.push_back(field_start);
-        }
-
         std::memset(record.data(), 0, record_size);
         for (const auto& cs : col_src) {
-            if (cs.csv_idx >= fields.size()) {
-                throw RMDBError("load file row " + std::to_string(line_no) + " has fewer fields than expected");
-            }
             const char* raw = fields[cs.csv_idx];
-            if (std::strchr(raw, '"') != nullptr) {
-                throw RMDBError("load file row " + std::to_string(line_no) + " contains an unexpected quote character");
+            // finalv3 uses an empty string (not SQL NULL) for undelivered CHAR
+            // timestamps. Preserve the existing NULL interpretation for empty
+            // numeric CSV fields, while letting empty text flow through as a
+            // non-NULL, zero-length string.
+            if (*raw == '\0' && cs.type != TYPE_STRING && cs.type != TYPE_DATETIME) {
+                set_null_at(record.data(), cs.null_byte, cs.null_mask);
+                continue;
             }
             if (cs.type == TYPE_INT) {
                 errno = 0;
@@ -785,11 +1061,11 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
             } else if (cs.type == TYPE_FLOAT) {
                 errno = 0;
                 char* end = nullptr;
-                double v = std::strtod(raw, &end);
+                float v = std::strtof(raw, &end);
                 if (errno != 0 || end == raw || *end != '\0') {
                     throw RMDBError("load file row " + std::to_string(line_no) + " invalid float for column");
                 }
-                std::memcpy(record.data() + cs.offset, &v, cs.len);
+                write_float(record.data() + cs.offset, v);
             } else if (cs.type == TYPE_STRING || cs.type == TYPE_DATETIME) {
                 size_t raw_len = std::strlen(raw);
                 if (static_cast<int>(raw_len) > cs.len) {
@@ -811,6 +1087,20 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
             }
             target.inserter->insert(target.key.data(), rid, nullptr, true);
         }
+    };
+
+    size_t line_no = 1;
+    if (!has_header && !line.empty()) {
+        emit_row(line_no); // 第一行不是表头，它已经切分好了
+    }
+    while (std::getline(infile, line)) {
+        ++line_no;
+        strip_cr(line);
+        if (line.empty()) {
+            continue; // skip trailing blank lines
+        }
+        split_csv_line(line, fields);
+        emit_row(line_no);
     }
 
     idx_inserters.clear();

@@ -13,10 +13,13 @@ See the Mulan PSL v2 for more details. */
 
 #include <array>
 #include <condition_variable>
-#include <list>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
+#include <string>
+#include <atomic>
 #include "transaction/transaction.h"
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
@@ -43,10 +46,11 @@ class LockManager {
     /* 数据项上的加锁队列 */
     class LockRequestQueue {
     public:
-        std::list<std::shared_ptr<LockRequest>> request_queue_; // 加锁队列
+        txn_id_t owner_txn_id_{INVALID_TXN_ID};
+        std::deque<std::shared_ptr<LockRequest>> waiters_;
         std::mutex latch_;
-        GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK; // 加锁队列的锁模式
-        size_t active_users_ = 0;                                 // 在分片锁外持有并访问该队列的线程数
+        GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;
+        size_t active_users_ = 0; // 在分片锁外持有并访问该队列的线程数
     };
 
     class LockTableShard {
@@ -64,6 +68,12 @@ public:
 
     bool lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
+    // Reserve a logical unique-index key for the lifetime of txn. This is
+    // separate from the B+ tree structural latch because history/current-index
+    // validation must be protected across the whole write protocol.
+    bool lock_exclusive_on_unique_key(Transaction* txn, int index_fd, const std::vector<char>& key);
+    bool unlock_unique_key(Transaction* txn, const std::string& lock_id);
+
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
 
     bool lock_exclusive_on_table(Transaction* txn, int tab_fd);
@@ -77,14 +87,52 @@ public:
     // Cancel pending lock requests owned by txn. Granted locks are released by the transaction manager.
     void cancel_transaction(Transaction* txn);
 
+    uint64_t wait_cycle_abort_count() const {
+        return wait_cycle_abort_count_.load(std::memory_order_acquire);
+    }
+
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
+
+    struct PendingLock {
+        LockDataId lock_data_id;
+        std::shared_ptr<LockRequestQueue> queue;
+        std::shared_ptr<LockRequest> request;
+    };
 
     LockTableShard& get_shard(const LockDataId& lock_data_id);
     std::shared_ptr<LockRequestQueue> get_or_create_queue(const LockDataId& lock_data_id);
     std::shared_ptr<LockRequestQueue> get_queue(const LockDataId& lock_data_id);
     void release_queue_user(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
     void try_remove_empty_queue(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
+    bool register_pending_lock(Transaction* txn, const LockDataId& lock_data_id,
+                               const std::shared_ptr<LockRequestQueue>& request_queue,
+                               const std::shared_ptr<LockRequest>& request);
+    void unregister_pending_lock(txn_id_t txn_id, const LockDataId& lock_data_id,
+                                 const std::shared_ptr<LockRequest>& request);
+    using WaitForGraph = std::unordered_map<txn_id_t, std::vector<txn_id_t>>;
+    WaitForGraph build_wait_for_graph_snapshot();
+    txn_id_t find_youngest_cycle_victim(txn_id_t requester);
+    void note_wait_topology_change();
+    void register_waiting_txn(Transaction* txn);
+    void unregister_waiting_txn(txn_id_t txn_id);
+    void cancel_waiting_transaction(txn_id_t txn_id);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
+    std::mutex pending_latch_;
+    std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
+    std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
+    std::atomic<uint64_t> wait_topology_epoch_{0};
+    std::atomic<uint64_t> wait_cycle_abort_count_{0};
+    static constexpr size_t UNIQUE_KEY_SHARD_COUNT = 64;
+    struct UniqueKeyQueue {
+        txn_id_t owner{INVALID_TXN_ID};
+        std::deque<txn_id_t> waiters;
+        std::condition_variable cv;
+    };
+    struct UniqueKeyShard {
+        std::mutex latch;
+        std::unordered_map<std::string, std::shared_ptr<UniqueKeyQueue>> queues;
+    };
+    std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
 };

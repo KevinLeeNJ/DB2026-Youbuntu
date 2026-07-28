@@ -46,11 +46,20 @@ private:
     bool materialized_ = false;
     int limit_ = -1;
 
+    static std::unique_ptr<RmRecord> copy_view(TupleView view) {
+        if (!view) {
+            return nullptr;
+        }
+        auto record = std::make_unique<RmRecord>(static_cast<int>(view.size));
+        std::memcpy(record->data, view.data, view.size);
+        return record;
+    }
+
     static int compare_int_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
-        int lhs_val = *reinterpret_cast<const int*>(lhs_data);
-        int rhs_val = *reinterpret_cast<const int*>(rhs_data);
+        int lhs_val = read_unaligned<int>(lhs_data);
+        int rhs_val = read_unaligned<int>(rhs_data);
         if (lhs_val < rhs_val) {
             return -1;
         }
@@ -63,8 +72,8 @@ private:
     static int compare_float_cell(const RmRecord& lhs, const RmRecord& rhs, const ColMeta& col) {
         const char* lhs_data = lhs.data + col.offset;
         const char* rhs_data = rhs.data + col.offset;
-        double lhs_val = *reinterpret_cast<const double*>(lhs_data);
-        double rhs_val = *reinterpret_cast<const double*>(rhs_data);
+        float lhs_val = read_float(lhs_data);
+        float rhs_val = read_float(rhs_data);
         if (lhs_val < rhs_val) {
             return -1;
         }
@@ -129,9 +138,21 @@ private:
         sort_keys_.push_back({col, is_desc, bind_compare_fn(col.type)});
     }
 
+    // NULL 排在所有非 NULL 之后（即视为最大值），两个 NULL 相等。这个约定使
+    // ASC 时 NULLS LAST、DESC 时 NULLS FIRST，与 PostgreSQL 的默认行为一致；
+    // 引擎不提供显式的 NULLS FIRST/LAST 语法。
+    static int compare_sort_key(const SortKey& key, const RmRecord& lhs, const RmRecord& rhs) {
+        const bool lhs_null = is_null(lhs.data, key.col);
+        const bool rhs_null = is_null(rhs.data, key.col);
+        if (lhs_null || rhs_null) {
+            return lhs_null == rhs_null ? 0 : (lhs_null ? 1 : -1);
+        }
+        return key.compare_fn(lhs, rhs, key.col);
+    }
+
     int compare_records(const RmRecord& lhs, const RmRecord& rhs) const {
         for (const auto& key : sort_keys_) {
-            int cmp = key.compare_fn(lhs, rhs, key.col);
+            int cmp = compare_sort_key(key, lhs, rhs);
             if (cmp != 0) {
                 return key.is_desc ? -cmp : cmp;
             }
@@ -160,7 +181,10 @@ private:
     void materialize_all() {
         tuples_.clear();
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            auto rec = prev_->Next();
+            auto rec = copy_view(prev_->current());
+            if (rec == nullptr) {
+                rec = prev_->Next();
+            }
             if (rec != nullptr) {
                 tuples_.emplace_back(*rec);
             }
@@ -184,7 +208,10 @@ private:
         std::priority_queue<MaterializedTuple, std::vector<MaterializedTuple>, HeapCompare> heap(HeapCompare{this});
         size_t ordinal = 0;
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            auto rec = prev_->Next();
+            auto rec = copy_view(prev_->current());
+            if (rec == nullptr) {
+                rec = prev_->Next();
+            }
             if (rec == nullptr) {
                 continue;
             }
@@ -222,7 +249,7 @@ private:
         }
         std::stable_sort(tuples_.begin(), tuples_.end(), [&](const RmRecord& lhs, const RmRecord& rhs) {
             for (const auto& key : sort_keys_) {
-                int cmp = key.compare_fn(lhs, rhs, key.col);
+                int cmp = compare_sort_key(key, lhs, rhs);
                 if (cmp == 0) {
                     continue;
                 }
@@ -308,6 +335,13 @@ public:
             return nullptr;
         }
         return std::make_unique<RmRecord>(tuples_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return TupleView{tuples_[cursor_].data, static_cast<uint32_t>(tuples_[cursor_].size)};
     }
 
     Rid& rid() override {

@@ -47,8 +47,11 @@ inline std::string trim_string(const char* data, int len) {
 struct CellValue {
     ColType type = TYPE_INT;
     int int_val = 0;
-    double float_val = 0.0;
+    float float_val = 0.0f;
     std::string str_val;
+    // SQL NULL：其余字段无意义。GROUP BY 把 NULL 当成一个独立分组，因此两个
+    // NULL 在相等性和哈希上必须一致。
+    bool is_null = false;
 
     bool operator==(const CellValue& other) const;
 };
@@ -91,6 +94,9 @@ inline int compare_cells(const CellValue& lhs, const CellValue& rhs) {
 }
 
 inline bool CellValue::operator==(const CellValue& other) const {
+    if (is_null || other.is_null) {
+        return is_null == other.is_null;
+    }
     try {
         return compare_cells(*this, other) == 0;
     } catch (const IncompatibleTypeError&) {
@@ -116,6 +122,10 @@ inline std::size_t hash_numeric_value(const CellValue& value) {
 
 struct CellValueHash {
     std::size_t operator()(const CellValue& value) const {
+        if (value.is_null) {
+            // 与任何具体值的哈希都不同，且与列类型无关
+            return 0x9e3779b97f4a7c15ULL;
+        }
         if (is_numeric_type(value.type)) {
             return hash_numeric_value(value);
         }

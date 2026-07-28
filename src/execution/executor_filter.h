@@ -17,16 +17,18 @@ class FilterExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
     std::vector<Condition> conds_;
-    std::vector<ColMeta> cols_;
+    std::vector<ConditionAddress> condition_addresses_;
     size_t len_;
-    std::unique_ptr<RmRecord> buffered_record_;
+    std::unique_ptr<RmRecord> fallback_record_;
+    TupleView current_view_;
+    mutable std::vector<Condition> scan_conditions_cache_;
     bool isend_ = true;
     bool predicate_recorded_ = false;
 
     bool should_track_ssi_reads() const {
         return context_ != nullptr && context_->enable_ssi_read_tracking_ && context_->txn_ != nullptr &&
                context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE && context_->txn_mgr_ != nullptr &&
-               !scan_table_name().empty();
+               !scan_table_name_view().empty();
     }
 
     void record_predicate_read() {
@@ -34,26 +36,38 @@ private:
             return;
         }
         predicate_recorded_ = true;
-        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, scan_table_name(), scan_conditions())) {
+        if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, std::string(scan_table_name_view()),
+                                                    scan_conditions_ref())) {
             throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
         }
     }
 
-    bool matches(const RmRecord& rec) {
-        for (const auto& cond : conds_) {
-            if (!compare(cond, rec)) {
-                return false;
-            }
+    bool matches(const TupleView& tuple) {
+        return conditions_match(conds_, condition_addresses_, tuple);
+    }
+
+    template <typename Callback> void with_child_tracking_suppressed(Callback&& callback) {
+        if (!should_track_ssi_reads()) {
+            callback();
+            return;
         }
-        return true;
+        ScopedValueOverride<bool> tracking_override(context_->enable_ssi_read_tracking_, false);
+        callback();
     }
 
     void advance_to_match() {
-        buffered_record_ = nullptr;
+        fallback_record_.reset();
+        current_view_ = {};
         while (!prev_->is_end()) {
-            auto rec = prev_->Next();
-            if (rec != nullptr && matches(*rec)) {
-                buffered_record_ = std::move(rec);
+            TupleView tuple = prev_->current();
+            if (!tuple) {
+                fallback_record_ = prev_->Next();
+                if (fallback_record_ != nullptr) {
+                    tuple = TupleView{fallback_record_->data, static_cast<uint32_t>(fallback_record_->size)};
+                }
+            }
+            if (tuple && matches(tuple)) {
+                current_view_ = tuple;
                 _abstract_rid = prev_->rid();
                 prev_->record_current_read_for_ssi();
                 isend_ = false;
@@ -69,44 +83,32 @@ public:
         prev_ = std::move(prev);
         context_ = prev_->context_;
         conds_ = std::move(conds);
-        cols_ = prev_->cols();
+        condition_addresses_ = cache_condition_addresses(conds_);
         len_ = prev_->tupleLen();
     }
 
     void beginTuple() override {
         record_predicate_read();
-        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking_ : false;
-        bool suppress_child_tracking = should_track_ssi_reads();
-        if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = false;
-        }
-        prev_->beginTuple();
-        if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = old_tracking;
-        }
+        with_child_tracking_suppressed([this] { prev_->beginTuple(); });
         advance_to_match();
     }
 
     void nextTuple() override {
-        bool old_tracking = context_ != nullptr ? context_->enable_ssi_read_tracking_ : false;
-        bool suppress_child_tracking = should_track_ssi_reads();
-        if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = false;
-        }
-        if (!prev_->is_end()) {
-            prev_->nextTuple();
-        }
-        if (context_ != nullptr && suppress_child_tracking) {
-            context_->enable_ssi_read_tracking_ = old_tracking;
-        }
+        with_child_tracking_suppressed([this] {
+            if (!prev_->is_end()) {
+                prev_->nextTuple();
+            }
+        });
         advance_to_match();
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || buffered_record_ == nullptr) {
+        if (is_end() || !current_view_) {
             return nullptr;
         }
-        return std::make_unique<RmRecord>(*buffered_record_);
+        auto copy = std::make_unique<RmRecord>(static_cast<int>(current_view_.size));
+        memcpy(copy->data, current_view_.data, current_view_.size);
+        return copy;
     }
 
     Rid& rid() override {
@@ -117,12 +119,19 @@ public:
         return isend_;
     }
 
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        return current_view_;
+    }
+
     std::string getType() override {
         return "FilterExecutor";
     }
 
     const std::vector<ColMeta>& cols() const override {
-        return cols_;
+        return prev_->cols();
     }
 
     size_t tupleLen() const override {
@@ -130,7 +139,7 @@ public:
     }
 
     ColMeta get_col_offset(const TabCol& target) override {
-        auto pos = get_col(cols_, target);
+        auto pos = get_col(prev_->cols(), target);
         return *pos;
     }
 
@@ -142,13 +151,25 @@ public:
         prev_->set_key_conditions(std::move(key_conds));
     }
 
+    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+        prev_->set_lookup_key(target, key, len);
+    }
+
     std::string scan_table_name() const override {
         return prev_->scan_table_name();
+    }
+    std::string_view scan_table_name_view() const override {
+        return prev_->scan_table_name_view();
     }
 
     std::vector<Condition> scan_conditions() const override {
         auto conds = prev_->scan_conditions();
         conds.insert(conds.end(), conds_.begin(), conds_.end());
         return conds;
+    }
+    const std::vector<Condition>& scan_conditions_ref() const override {
+        scan_conditions_cache_ = prev_->scan_conditions_ref();
+        scan_conditions_cache_.insert(scan_conditions_cache_.end(), conds_.begin(), conds_.end());
+        return scan_conditions_cache_;
     }
 };

@@ -78,5 +78,6 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
  * @description: 获取当前replacer中可以被淘汰的页面数量
  */
 size_t LRUReplacer::Size() {
+    std::scoped_lock lock{latch_};
     return LRUlist_.size();
 }

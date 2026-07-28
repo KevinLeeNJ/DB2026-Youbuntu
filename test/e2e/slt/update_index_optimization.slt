@@ -1,0 +1,50 @@
+# update_index_optimization.slt — UPDATE paths with and without indexed-column changes
+
+statement ok
+CREATE TABLE update_index_opt (id INT, payload INT, note CHAR(20));
+
+statement ok
+INSERT INTO update_index_opt VALUES (1, 10, 'first');
+
+statement ok
+INSERT INTO update_index_opt VALUES (2, 20, 'second');
+
+statement ok
+CREATE INDEX update_index_opt (id);
+
+# Updating only a non-indexed column must preserve the indexed lookup path.
+statement ok
+UPDATE update_index_opt SET payload = 15 WHERE id = 1;
+
+query
+SELECT id, payload, note FROM update_index_opt WHERE id = 1;
+----
++------------------+------------------+------------------+
+|               id |          payload |             note |
++------------------+------------------+------------------+
+|                1 |               15 |            first |
++------------------+------------------+------------------+
+Total record(s): 1
+
+# Updating the indexed column must move the index entry to the new key.
+statement ok
+UPDATE update_index_opt SET id = 10 WHERE id = 1;
+
+query
+SELECT id, payload, note FROM update_index_opt WHERE id = 10;
+----
++------------------+------------------+------------------+
+|               id |          payload |             note |
++------------------+------------------+------------------+
+|               10 |               15 |            first |
++------------------+------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, payload, note FROM update_index_opt WHERE id = 1;
+----
++------------------+------------------+------------------+
+|               id |          payload |             note |
++------------------+------------------+------------------+
++------------------+------------------+------------------+
+Total record(s): 0

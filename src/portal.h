@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <set>
@@ -47,6 +48,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution_sort.h"
 #include "common/common.h"
 #include "optimizer/plan.h"
+#include "record_printer.h" // BUFFER_LENGTH 截断语义与 RecordPrinter 共用
 
 typedef enum portalTag {
     PORTAL_Invalid_Query = 0,
@@ -72,6 +74,95 @@ struct PortalStmt {
 class Portal {
 private:
     SmManager* sm_manager_;
+
+    static bool point_dml_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ENABLE_POINT_DML");
+            return value == nullptr || std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
+    static void write_point_key_part(char* dest, const Value& value, const ColMeta& col) {
+        memset(dest, 0, col.len);
+        switch (col.type) {
+        case TYPE_INT: {
+            const int converted = value.type == TYPE_FLOAT ? static_cast<int>(value.float_val) : value.int_val;
+            memcpy(dest, &converted, col.len);
+            break;
+        }
+        case TYPE_FLOAT: {
+            const float converted = value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+            write_float(dest, converted);
+            break;
+        }
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            memcpy(dest, value.str_val.data(), std::min(static_cast<size_t>(col.len), value.str_val.size()));
+            break;
+        }
+    }
+
+    // nullopt means the point path is not safe and the caller must build the
+    // original scan executor. A value with no RID is a proven no-match result.
+    std::optional<std::optional<Rid>> resolve_point_rid(const DMLPlan& plan, Context* context) const {
+        if (!point_dml_enabled() || !plan.point_access_.has_value()) {
+            return std::nullopt;
+        }
+        if (context != nullptr && context->txn_ != nullptr &&
+            context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
+            return std::nullopt;
+        }
+
+        const auto& path = *plan.point_access_;
+        auto& tab = sm_manager_->db_.get_table(plan.tab_name_);
+        auto index_it = tab.get_index_meta(path.index_cols);
+        if (index_it == tab.indexes.end()) {
+            return std::nullopt;
+        }
+        const IndexMeta& index = *index_it;
+        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(plan.tab_name_, index.cols);
+        auto ih_it = sm_manager_->ihs_.find(index_name);
+        if (ih_it == sm_manager_->ihs_.end()) {
+            return std::nullopt;
+        }
+
+        std::vector<char> key(index.col_tot_len);
+        int key_offset = 0;
+        for (size_t i = 0; i < index.cols.size(); ++i) {
+            const auto& condition = plan.conds_[path.condition_positions[i]];
+            write_point_key_part(key.data() + key_offset, condition.rhs_val, index.cols[i]);
+            key_offset += index.cols[i].len;
+        }
+
+        const auto lookup = ih_it->second->lookup_unique(key.data());
+        if (lookup.status == UniqueLookupStatus::Duplicate) {
+            return std::nullopt;
+        }
+        std::optional<Rid> point_rid;
+        if (lookup.status == UniqueLookupStatus::Unique) {
+            point_rid = lookup.rid;
+        }
+        if (context != nullptr && context->txn_ != nullptr && context->txn_mgr_ != nullptr &&
+            sm_manager_->has_historical_index_keys(plan.tab_name_, index_name)) {
+            std::optional<Rid> historical_rid;
+            for (const Rid& candidate_rid :
+                 sm_manager_->get_historical_index_key_rids(plan.tab_name_, index_name, key)) {
+                if (!historical_rid.has_value()) {
+                    historical_rid = candidate_rid;
+                } else if (*historical_rid != candidate_rid) {
+                    return std::nullopt;
+                }
+            }
+            if (historical_rid.has_value()) {
+                if (point_rid.has_value() && *point_rid != *historical_rid) {
+                    return std::nullopt;
+                }
+                point_rid = historical_rid;
+            }
+        }
+        return point_rid;
+    }
 
     struct ExecutorQueryExpr {
         QueryExprType type = QueryExprType::COLUMN;
@@ -103,6 +194,16 @@ private:
         std::unique_ptr<AbstractExecutor> inner_;
         Plan* plan_;
         bool counting_enabled_ = true;
+        bool current_counted_ = false;
+
+        void count_current_if_available() {
+            current_counted_ = false;
+            if (!counting_enabled_ || inner_->is_end() || !inner_->current()) {
+                return;
+            }
+            ++plan_->runtime_rows_;
+            current_counted_ = true;
+        }
 
     public:
         CountingExecutor(std::unique_ptr<AbstractExecutor> inner, Plan* plan) {
@@ -125,10 +226,12 @@ private:
 
         void beginTuple() override {
             inner_->beginTuple();
+            count_current_if_available();
         }
 
         void nextTuple() override {
             inner_->nextTuple();
+            count_current_if_available();
         }
 
         bool is_end() const override {
@@ -141,10 +244,15 @@ private:
 
         std::unique_ptr<RmRecord> Next() override {
             auto rec = inner_->Next();
-            if (rec != nullptr && counting_enabled_) {
+            if (rec != nullptr && counting_enabled_ && !current_counted_) {
                 ++plan_->runtime_rows_;
             }
+            current_counted_ = false;
             return rec;
+        }
+
+        TupleView current() const override {
+            return inner_->current();
         }
 
         ColMeta get_col_offset(const TabCol& target) override {
@@ -160,12 +268,24 @@ private:
             inner_->set_key_conditions(std::move(key_conds));
         }
 
+        void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+            inner_->set_lookup_key(target, key, len);
+        }
+
         std::string scan_table_name() const override {
             return inner_->scan_table_name();
         }
 
+        std::string_view scan_table_name_view() const override {
+            return inner_->scan_table_name_view();
+        }
+
         std::vector<Condition> scan_conditions() const override {
             return inner_->scan_conditions();
+        }
+
+        const std::vector<Condition>& scan_conditions_ref() const override {
+            return inner_->scan_conditions_ref();
         }
 
         void record_current_read_for_ssi() override {
@@ -552,17 +672,35 @@ private:
         }
     }
 
+    // data_send_ 是固定 BUFFER_LENGTH 字节的发送缓冲，写满必须截断。语义与
+    // RecordPrinter 完全一致：尾部保留 RECORD_COUNT_LENGTH 给后续的
+    // "Total record(s)" 行，写不下时置 ellipsis_ 让客户端看到 "... ..." 标记。
+    // （宽表的 EXPLAIN ANALYZE 计划树可以轻松超过 8 KB，这里少一个长度判断就是
+    //   一次堆越界写：连接线程静默死亡、服务端日志无任何记录。）
     static void append_to_context(const std::string& text, Context* context) {
         if (context == nullptr || context->data_send_ == nullptr || context->offset_ == nullptr) {
             return;
         }
-        memcpy(context->data_send_ + *(context->offset_), text.c_str(), text.size());
-        *(context->offset_) += static_cast<int>(text.size());
+        const int offset = *(context->offset_);
+        const int remaining = static_cast<int>(BUFFER_LENGTH) - RECORD_COUNT_LENGTH - offset;
+        if (remaining <= 0) {
+            context->ellipsis_ = true;
+            return;
+        }
+        const int written = std::min(static_cast<int>(text.size()), remaining);
+        memcpy(context->data_send_ + offset, text.c_str(), static_cast<size_t>(written));
+        *(context->offset_) = offset + written;
+        if (written < static_cast<int>(text.size())) {
+            context->ellipsis_ = true;
+        }
     }
 
     void write_explain_output(const std::string& text, Context* context) {
         append_to_context(text, context);
-        if (sm_manager_->output_file_enabled_) {
+        const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
+                                             ? *context->output_file_enabled_
+                                             : sm_manager_->output_file_enabled_;
+        if (output_file_enabled) {
             std::fstream outfile;
             outfile.open("output.txt", std::ios::out | std::ios::app);
             outfile << text;
@@ -630,8 +768,26 @@ public:
             }
 
             case T_Update: {
-                std::unique_ptr<AbstractExecutor> scan = convert_plan_executor(x->subplan_.get(), context);
                 std::vector<Rid> rids;
+                const bool compiled_program = x->compiled_point_program_ != nullptr;
+                auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
+                if (point_rid.has_value()) {
+                    std::unique_ptr<AbstractExecutor> root =
+                        std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_,
+                                                         PointMutationTarget{*point_rid}, context, true);
+                    return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                        std::move(root), std::move(plan));
+                }
+                std::unique_ptr<AbstractExecutor> scan;
+                if (compiled_program) {
+                    // Duplicate/non-unique lookup or a visibility ambiguity
+                    // falls back to the original scan semantics.
+                    auto fallback_plan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
+                                                                    x->compiled_point_program_->index_col_names);
+                    scan = convert_plan_executor(fallback_plan.get(), context);
+                } else {
+                    scan = convert_plan_executor(x->subplan_.get(), context);
+                }
                 for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                     rids.push_back(scan->rid());
                 }
@@ -641,8 +797,23 @@ public:
                                                     std::move(root), std::move(plan));
             }
             case T_Delete: {
-                std::unique_ptr<AbstractExecutor> scan = convert_plan_executor(x->subplan_.get(), context);
                 std::vector<Rid> rids;
+                const bool compiled_program = x->compiled_point_program_ != nullptr;
+                auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
+                if (point_rid.has_value()) {
+                    std::unique_ptr<AbstractExecutor> root = std::make_unique<DeleteExecutor>(
+                        sm_manager_, x->tab_name_, x->conds_, PointMutationTarget{*point_rid}, context, true);
+                    return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
+                                                        std::move(root), std::move(plan));
+                }
+                std::unique_ptr<AbstractExecutor> scan;
+                if (compiled_program) {
+                    auto fallback_plan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
+                                                                    x->compiled_point_program_->index_col_names);
+                    scan = convert_plan_executor(fallback_plan.get(), context);
+                } else {
+                    scan = convert_plan_executor(x->subplan_.get(), context);
+                }
                 for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                     rids.push_back(scan->rid());
                 }
@@ -757,8 +928,9 @@ public:
                 executor = std::make_unique<IndexSkipScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
                                                                    x->index_col_names_, context);
             } else {
-                executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_,
-                                                               x->index_col_names_, context);
+                executor = std::make_unique<IndexScanExecutor>(
+                    sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context,
+                    x->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
             }
             return maybe_count(std::move(executor), plan, count_rows);
         }
@@ -780,8 +952,9 @@ public:
         }
         case T_Limit: {
             auto x = static_cast<LimitPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> executor = std::make_unique<LimitExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), static_cast<size_t>(x->limit_));
+            std::unique_ptr<AbstractExecutor> executor =
+                std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
+                                                static_cast<size_t>(x->limit_), static_cast<size_t>(x->offset_));
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Union: {

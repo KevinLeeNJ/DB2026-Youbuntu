@@ -17,10 +17,20 @@ foreach(DIR ${SUBDIRS})
 
                 set_target_properties(${TEST_TARGET} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/test")
 
-                target_link_libraries(${TEST_TARGET} analyze parser system storage lru_replacer record index transaction planner execution recovery gtest_main pthread)
+                target_link_libraries(${TEST_TARGET}
+                        "-Wl,--start-group"
+                        analyze parser system storage lru_replacer record index transaction planner execution recovery wire_protocol
+                        "-Wl,--end-group"
+                        gtest_main pthread)
                 target_compile_definitions(${TEST_TARGET} PRIVATE RMDB_SRC_DIR="${CMAKE_SOURCE_DIR}")
                 gtest_discover_tests(${TEST_TARGET})
             endif()
         endif()
     endif()
 endforeach()
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME protocol_live_wire_test
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol/live_wire_protocol_test.py
+                 $<TARGET_FILE:rmdb>)
+set_tests_properties(protocol_live_wire_test PROPERTIES TIMEOUT 90)

@@ -102,8 +102,8 @@ do_record() {
     log "目标 PID=${pid}，采样 ${DURATION}s（CPU 采样，频率 99Hz）"
     log "输出：${perf_data}"
 
-    # -g 启用调用栈；--call-graph dwarf 更可靠地展开 C++ 用户态栈
-    local perf_cmd=(perf record -F 99 -p "${pid}" -g --call-graph dwarf -o "${perf_data}")
+    # -g 启用调用栈；--call-graph fp 更可靠地展开 C++ 用户态栈
+    local perf_cmd=(perf record -F 99 -p "${pid}" -g --call-graph fp -o "${perf_data}")
     ( set -x; sudo "${perf_cmd[@]}" -- sleep "${DURATION}" ) || {
         err "perf record 失败（退出码 $?）"
         err "可能原因：1) 进程已退出 2) perf_event_paranoid 限制 3) 磁盘空间不足"

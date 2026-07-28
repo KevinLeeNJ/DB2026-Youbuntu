@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace ast {
@@ -249,8 +250,17 @@ private:
                 return std::make_unique<CreateTable>(std::move(table), std::move(fields));
             }
             if (match(TokenType::INDEX)) {
+                // Accept both the historical RMDB form
+                //   CREATE INDEX table(columns)
+                // and the SQL form
+                //   CREATE INDEX name ON table(columns)
+                // The catalog keeps its canonical table/column-derived index
+                // filename, so the optional SQL name is syntax-only for now.
                 std::string table = parse_identifier();
-                expect(TokenType::LPAREN, "expected '(' after table name");
+                if (match(TokenType::ON)) {
+                    table = parse_identifier();
+                }
+                expect(TokenType::LPAREN, "expected '(' after index table name");
                 auto columns = parse_col_name_list();
                 expect(TokenType::RPAREN, "expected ')' after column list");
                 return std::make_unique<CreateIndex>(std::move(table), std::move(columns));
@@ -349,10 +359,11 @@ private:
         auto group_by = parse_opt_group_clause();
         auto having = parse_opt_having_clause();
         auto order = parse_opt_order_clause();
-        auto [has_limit, limit_value] = parse_opt_limit_clause();
+        auto [has_limit, limit_value, limit_parameter, offset_value, offset_parameter] = parse_opt_limit_clause();
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
                                             std::move(having), std::move(order), has_limit, limit_value, has_star,
-                                            std::move(from->jointree));
+                                            std::move(from->jointree), limit_parameter != 0, limit_parameter,
+                                            offset_value, offset_parameter != 0, offset_parameter);
     }
 
     std::unique_ptr<UnionStmt> parse_union_query() {
@@ -387,7 +398,7 @@ private:
             return std::make_unique<TypeLen>(SV_TYPE_INT, sizeof(int));
         }
         if (match(TokenType::FLOAT)) {
-            return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(double));
+            return std::make_unique<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
         }
         if (match(TokenType::DATETIME)) {
             return std::make_unique<TypeLen>(SV_TYPE_DATETIME, 19);
@@ -417,6 +428,22 @@ private:
     }
 
     std::unique_ptr<Value> parse_value() {
+        if (check(TokenType::PARAMETER)) {
+            Token token = expect(TokenType::PARAMETER, "expected parameter");
+            const auto text = token_text(token);
+            std::size_t ordinal = 0;
+            for (std::size_t i = 1; i < text.size(); ++i) {
+                const auto digit = static_cast<std::size_t>(text[i] - '0');
+                if (ordinal > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+                    error("parameter ordinal is too large");
+                }
+                ordinal = ordinal * 10 + digit;
+            }
+            if (ordinal == 0) {
+                error("parameter ordinal must be positive");
+            }
+            return std::make_unique<Parameter>(ordinal);
+        }
         bool is_negative = match(TokenType::MINUS);
 
         if (check(TokenType::VALUE_INT)) {
@@ -434,13 +461,17 @@ private:
         if (check(TokenType::VALUE_BOOL)) {
             return parse_bool_literal();
         }
+        if (match(TokenType::NULL_KW)) {
+            return std::make_unique<NullLit>();
+        }
         error("expected value");
     }
 
     std::unique_ptr<Value> parse_numeric_delta_after(TokenType op) {
         auto delta = parse_value();
         if (op == TokenType::PLUS || op == TokenType::MINUS || op == TokenType::STAR || op == TokenType::SLASH) {
-            if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit) {
+            if (delta->type != AstType::IntLit && delta->type != AstType::FloatLit &&
+                delta->type != AstType::Parameter) {
                 error("expected numeric value after arithmetic operator");
             }
             return delta;
@@ -477,7 +508,7 @@ private:
 
     std::unique_ptr<FloatLit> parse_float_literal(bool is_negative = false) {
         Token token = expect(TokenType::VALUE_FLOAT, "expected float");
-        double val = token.float_value;
+        float val = token.float_value;
         std::string display = token_text(token);
         if (is_negative) {
             val = -val;
@@ -510,6 +541,12 @@ private:
 
     std::unique_ptr<BinaryExpr> parse_condition() {
         auto lhs = parse_col();
+        if (match(TokenType::IS)) {
+            const bool negated = match(TokenType::NOT);
+            expect(TokenType::NULL_KW, "expected NULL after IS");
+            return std::make_unique<BinaryExpr>(std::move(lhs), negated ? SV_OP_IS_NOT_NULL : SV_OP_IS_NULL,
+                                                std::make_unique<NullLit>());
+        }
         auto op = parse_op();
         auto rhs = parse_general_expr();
         return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
@@ -569,6 +606,22 @@ private:
         return clauses;
     }
 
+    std::unique_ptr<SetClause> parse_column_arithmetic_set_clause(std::string column, std::unique_ptr<Col> rhs_col,
+                                                                  TokenType first_token, SetOp first_op) {
+        auto first_value = parse_numeric_delta_after(first_token);
+        std::vector<UpdateTerm> additional_terms;
+        if (first_token == TokenType::PLUS || first_token == TokenType::MINUS) {
+            while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
+                const TokenType token = current_.type;
+                advance();
+                additional_terms.emplace_back(parse_numeric_delta_after(token),
+                                              token == TokenType::PLUS ? SetOp::SELF_ADD : SetOp::SELF_SUB);
+            }
+        }
+        return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), std::move(first_value), first_op,
+                                           std::move(additional_terms));
+    }
+
     std::unique_ptr<SetClause> parse_set_clause() {
         std::string column = parse_identifier();
 
@@ -591,23 +644,20 @@ private:
         if (check(TokenType::IDENTIFIER)) {
             auto rhs_col = parse_col();
             if (match(TokenType::PLUS)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::PLUS,
+                                                          SetOp::SELF_ADD);
             }
             if (match(TokenType::MINUS)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::MINUS), SetOp::SELF_SUB);
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::MINUS,
+                                                          SetOp::SELF_SUB);
             }
             if (match(TokenType::STAR)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::STAR), SetOp::SELF_MUL);
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::STAR,
+                                                          SetOp::SELF_MUL);
             }
             if (match(TokenType::SLASH)) {
-                return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
-                                                   parse_numeric_delta_after(TokenType::SLASH), SetOp::SELF_DIV);
-            }
-            if (rhs_col->col_name != column) {
-                error("expected arithmetic operator after different column reference in SET clause");
+                return parse_column_arithmetic_set_clause(std::move(column), std::move(rhs_col), TokenType::SLASH,
+                                                          SetOp::SELF_DIV);
             }
             return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), nullptr, SetOp::ASSIGNMENT);
         }
@@ -661,11 +711,18 @@ private:
         expect(TokenType::LPAREN, "expected '(' after aggregate function");
         if (func == AGG_COUNT && match(TokenType::STAR)) {
             expect(TokenType::RPAREN, "expected ')' after COUNT(*)");
-            return std::make_unique<AggExpr>(func, true, nullptr);
+            return std::make_unique<AggExpr>(func, true, false, nullptr);
+        }
+        bool is_distinct = func == AGG_COUNT && match(TokenType::DISTINCT);
+        if (is_distinct && match(TokenType::LPAREN)) {
+            auto column = parse_col();
+            expect(TokenType::RPAREN, "expected ')' after DISTINCT aggregate argument");
+            expect(TokenType::RPAREN, "expected ')' after aggregate argument");
+            return std::make_unique<AggExpr>(func, false, true, std::move(column));
         }
         auto column = parse_col();
         expect(TokenType::RPAREN, "expected ')' after aggregate argument");
-        return std::make_unique<AggExpr>(func, false, std::move(column));
+        return std::make_unique<AggExpr>(func, false, is_distinct, std::move(column));
     }
 
     std::vector<std::unique_ptr<Col>> parse_opt_group_clause() {
@@ -787,11 +844,11 @@ private:
             }
             return std::make_unique<IntLit>(static_cast<int>(res), "");
         }
-        double l = is_float(lhs.get()) ? static_cast<const FloatLit*>(lhs.get())->val
-                                       : static_cast<const IntLit*>(lhs.get())->val;
-        double r = is_float(rhs.get()) ? static_cast<const FloatLit*>(rhs.get())->val
-                                       : static_cast<const IntLit*>(rhs.get())->val;
-        double res = 0;
+        float l = is_float(lhs.get()) ? static_cast<const FloatLit*>(lhs.get())->val
+                                      : static_cast<const IntLit*>(lhs.get())->val;
+        float r = is_float(rhs.get()) ? static_cast<const FloatLit*>(rhs.get())->val
+                                      : static_cast<const IntLit*>(rhs.get())->val;
+        float res = 0;
         switch (op) {
         case TokenType::PLUS:
             res = l + r;
@@ -890,12 +947,44 @@ private:
         return std::make_unique<OrderByItem>(std::move(expr), dir);
     }
 
-    std::pair<bool, int> parse_opt_limit_clause() {
-        if (!match(TokenType::LIMIT)) {
-            return {false, 0};
+    std::size_t parse_row_count_parameter(const char* message) {
+        Token token = expect(TokenType::PARAMETER, message);
+        std::size_t ordinal = 0;
+        for (std::size_t i = 1; i < token.text.size(); ++i) {
+            const auto digit = static_cast<std::size_t>(token.text[i] - '0');
+            if (ordinal > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+                error("parameter ordinal is too large");
+            }
+            ordinal = ordinal * 10 + digit;
         }
-        auto lit = parse_int_literal();
-        return {true, lit->val};
+        if (ordinal == 0) {
+            error("parameter ordinal must be positive");
+        }
+        return ordinal;
+    }
+
+    // returns {has_limit, limit, limit_parameter, offset, offset_parameter}
+    std::tuple<bool, int, std::size_t, int, std::size_t> parse_opt_limit_clause() {
+        if (!match(TokenType::LIMIT)) {
+            return {false, 0, 0, 0, 0};
+        }
+        int limit_value = 0;
+        std::size_t limit_parameter = 0;
+        if (check(TokenType::PARAMETER)) {
+            limit_parameter = parse_row_count_parameter("expected limit");
+        } else {
+            limit_value = parse_int_literal()->val;
+        }
+        int offset_value = 0;
+        std::size_t offset_parameter = 0;
+        if (match(TokenType::OFFSET)) {
+            if (check(TokenType::PARAMETER)) {
+                offset_parameter = parse_row_count_parameter("expected offset");
+            } else {
+                offset_value = parse_int_literal()->val;
+            }
+        }
+        return {true, limit_value, limit_parameter, offset_value, offset_parameter};
     }
 
     std::string parse_identifier() {
@@ -905,7 +994,7 @@ private:
 
 } // namespace
 
-std::unique_ptr<TreeNode> parse_sql(const std::string& sql) {
+std::unique_ptr<TreeNode> parse_sql(std::string_view sql) {
     try {
         SqlParser parser(sql);
         return parser.parse();

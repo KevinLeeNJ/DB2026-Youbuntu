@@ -30,12 +30,16 @@ struct TabCol {
 };
 
 struct Value {
-    ColType type; // type of value
+    ColType type = TYPE_INT; // type of value
     union {
-        int int_val;      // int value
-        double float_val; // SQL FLOAT value
+        int int_val = 0; // int value
+        float float_val; // SQL FLOAT value
     };
     std::string str_val; // string value
+
+    // SQL NULL 与列类型无关：is_null 为真时 type 只表示"被赋给哪种列"，
+    // int_val/float_val/str_val 均无意义，原始字节按全零处理。
+    bool is_null = false;
 
     std::shared_ptr<RmRecord> raw; // raw record buffer
 
@@ -44,7 +48,7 @@ struct Value {
         int_val = int_val_;
     }
 
-    void set_float(double float_val_) {
+    void set_float(float float_val_) {
         type = TYPE_FLOAT;
         float_val = float_val_;
     }
@@ -54,15 +58,21 @@ struct Value {
         str_val = std::move(str_val_);
     }
 
+    void set_null() {
+        is_null = true;
+    }
+
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
-        if (type == TYPE_INT) {
+        if (is_null) {
+            memset(raw->data, 0, len);
+        } else if (type == TYPE_INT) {
             assert(len == sizeof(int));
-            *(int*)(raw->data) = int_val;
+            write_unaligned(raw->data, int_val);
         } else if (type == TYPE_FLOAT) {
-            assert(len == sizeof(double));
-            *(double*)(raw->data) = float_val;
+            assert(len == sizeof(float));
+            write_float(raw->data, float_val);
         } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
             if (len < (int)str_val.size()) {
                 throw StringOverflowError();
@@ -99,6 +109,7 @@ inline CompOp swap_comp_op(CompOp op) {
 struct AggExpr {
     AggType type = AggType::COUNT;
     bool is_star = false;
+    bool is_distinct = false;
     TabCol col;
     std::string display_name;
 };
@@ -131,6 +142,9 @@ struct HavingCondition {
     Value rhs_val;
 };
 
+/* `IS NULL` / `IS NOT NULL`：不读数据字节，只看 lhs 列的 NULL 位 */
+enum class NullTest { NONE, IS_NULL, IS_NOT_NULL };
+
 struct Condition {
     TabCol lhs_col;  // left-hand side column
     CompOp op;       // comparison operator
@@ -138,9 +152,54 @@ struct Condition {
     TabCol rhs_col;  // right-hand side column
     Value rhs_val;   // right-hand side value
     std::string rhs_display;
+    NullTest null_test = NullTest::NONE;
 };
 
+/**
+ * @brief 条件的右值是否是可用于索引键 / 点查的普通字面量。
+ *
+ * NULL 不进索引键，所以 `IS [NOT] NULL` 和 `col = NULL` 都必须留给执行器按
+ * 三值逻辑过滤，不能参与索引前缀匹配或点查键的构造。
+ */
+inline bool is_indexable_value_condition(const Condition& cond) {
+    return cond.is_rhs_val && cond.null_test == NullTest::NONE && !cond.rhs_val.is_null;
+}
+
+/* eval_condition_nulls 的结果：条件已被 NULL 语义定死，或需要按原有二值语义
+   继续比较数据字节。 */
+enum class NullEval { DECIDED_TRUE, DECIDED_FALSE, COMPARE };
+
+/**
+ * @brief 比较前的 NULL 短路，四个条件求值器（执行器 compare、row_mutation、
+ *        以及 SSI 的两处）共用同一份三值逻辑。
+ *
+ * 语义：`IS [NOT] NULL` 直接由 lhs 的 NULL 位定值；否则任一操作数为 NULL 时
+ * 整个比较为假——包括 `<>`，SQL 里 `NULL <> x` 是 UNKNOWN 而不是 TRUE。
+ *
+ * 各 null 地址由调用方从自己缓存的列地址里取（见 defs.h 的布局说明），
+ * null_byte < 0 的列（旧格式文件）会被 is_null_at 直接短路掉。
+ */
+inline NullEval eval_condition_nulls(const Condition& cond, const char* tuple, int lhs_null_byte, uint8_t lhs_null_mask,
+                                     int rhs_null_byte, uint8_t rhs_null_mask) {
+    const bool lhs_null = is_null_at(tuple, lhs_null_byte, lhs_null_mask);
+    if (cond.null_test != NullTest::NONE) {
+        return lhs_null == (cond.null_test == NullTest::IS_NULL) ? NullEval::DECIDED_TRUE : NullEval::DECIDED_FALSE;
+    }
+    if (lhs_null || (cond.is_rhs_val && cond.rhs_val.is_null)) {
+        return NullEval::DECIDED_FALSE;
+    }
+    if (!cond.is_rhs_val && is_null_at(tuple, rhs_null_byte, rhs_null_mask)) {
+        return NullEval::DECIDED_FALSE;
+    }
+    return NullEval::COMPARE;
+}
+
 enum class UpdateOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
+
+struct UpdateTerm {
+    Value rhs;
+    UpdateOp op = UpdateOp::SELF_ADD;
+};
 
 struct SetClause {
     TabCol lhs;
@@ -148,4 +207,8 @@ struct SetClause {
     bool is_self_ref = false;
     TabCol rhs_col;
     UpdateOp op = UpdateOp::ASSIGNMENT;
+    // Ordered scalar +/- terms after the legacy first operation. Keeping the
+    // first term in the existing fields preserves prepared/cache compatibility
+    // for the ranking-critical single-operation UPDATE shape.
+    std::vector<UpdateTerm> additional_terms;
 };

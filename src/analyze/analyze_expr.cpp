@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze_expr_internal.h"
 
+#include <cmath>
+
 namespace analyze_internal {
 
 Value convert_ast_value_node(const ast::Value* sv_val) {
@@ -22,6 +24,9 @@ Value convert_ast_value_node(const ast::Value* sv_val) {
     }
     case ast::AstType::FloatLit: {
         auto float_lit = static_cast<const ast::FloatLit*>(sv_val);
+        if (!std::isfinite(float_lit->val)) {
+            throw RMDBError("FLOAT value must be finite");
+        }
         val.set_float(float_lit->val);
         break;
     }
@@ -30,6 +35,9 @@ Value convert_ast_value_node(const ast::Value* sv_val) {
         val.set_str(str_lit->val);
         break;
     }
+    case ast::AstType::NullLit:
+        val.set_null();
+        break;
     case ast::AstType::BoolLit:
     default:
         throw InternalError("Unexpected sv value type");
@@ -144,6 +152,9 @@ std::string build_agg_display_name(const AggExpr& agg) {
     if (agg.is_star) {
         name += "*";
     } else {
+        if (agg.is_distinct) {
+            name += "DISTINCT ";
+        }
         name += agg.col.col_name;
     }
     name += ")";
@@ -152,6 +163,9 @@ std::string build_agg_display_name(const AggExpr& agg) {
 
 void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols) {
     if (agg.is_star) {
+        if (agg.is_distinct) {
+            throw RMDBError("COUNT(DISTINCT *) is not supported");
+        }
         if (agg.type != AggType::COUNT) {
             throw RMDBError("Only COUNT(*) is supported for '*' aggregate arguments");
         }
@@ -162,6 +176,10 @@ void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols) {
     TabCol resolved_col = agg.col;
     const ColMeta* col_meta = resolve_column_meta(all_cols, resolved_col);
     agg.col = resolved_col;
+
+    if (agg.is_distinct && agg.type != AggType::COUNT) {
+        throw RMDBError("DISTINCT is only supported for COUNT");
+    }
 
     switch (agg.type) {
     case AggType::COUNT:
@@ -248,6 +266,7 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return false;
     case QueryExprType::AGGREGATE:
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
+               lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
     }
     return false;

@@ -1,0 +1,243 @@
+# aggregate_join.slt — aggregates and GROUP BY over a join (StockLevel shape)
+
+statement ok
+CREATE TABLE ol (w INT, o INT, i INT, amt FLOAT);
+
+statement ok
+CREATE TABLE st (w INT, i INT, q INT, nm CHAR(8));
+
+statement ok
+INSERT INTO ol VALUES (1, 100, 10, 5.5);
+
+statement ok
+INSERT INTO ol VALUES (1, 100, 20, 7.25);
+
+statement ok
+INSERT INTO ol VALUES (1, 101, 10, 1.5);
+
+statement ok
+INSERT INTO ol VALUES (1, 101, 30, 2.0);
+
+statement ok
+INSERT INTO ol VALUES (2, 200, 10, 100.0);
+
+statement ok
+INSERT INTO ol VALUES (2, 200, 40, 50.25);
+
+statement ok
+INSERT INTO st VALUES (1, 10, 5, 'apple');
+
+statement ok
+INSERT INTO st VALUES (1, 20, 50, 'banana');
+
+statement ok
+INSERT INTO st VALUES (1, 30, 3, 'cherry');
+
+statement ok
+INSERT INTO st VALUES (2, 10, 7, 'durian');
+
+statement ok
+INSERT INTO st VALUES (2, 40, 99, 'elder');
+
+# --- The join itself (6 matching pairs) ---
+query
+SELECT * FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+------------------+------------------+------------------+------------------+------------------+------------------+------------------+
+|                w |                o |                i |              amt |                w |                i |                q |               nm |
++------------------+------------------+------------------+------------------+------------------+------------------+------------------+------------------+
+|                1 |              100 |               10 |         5.500000 |                1 |               10 |                5 |            apple |
+|                1 |              100 |               20 |         7.250000 |                1 |               20 |               50 |           banana |
+|                1 |              101 |               10 |         1.500000 |                1 |               10 |                5 |            apple |
+|                1 |              101 |               30 |         2.000000 |                1 |               30 |                3 |           cherry |
+|                2 |              200 |               10 |       100.000000 |                2 |               10 |                7 |           durian |
+|                2 |              200 |               40 |        50.250000 |                2 |               40 |               99 |            elder |
++------------------+------------------+------------------+------------------+------------------+------------------+------------------+------------------+
+Total record(s): 6
+
+# --- Aggregate on a right-table column (non-zero offset in the joined tuple) ---
+query
+SELECT MAX(st.q) AS max_q FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|            max_q |
++------------------+
+|               99 |
++------------------+
+Total record(s): 1
+
+query
+SELECT MIN(st.q) AS min_q FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|            min_q |
++------------------+
+|                3 |
++------------------+
+Total record(s): 1
+
+# --- CHAR aggregate over the join (non-int path) ---
+query
+SELECT MIN(st.nm) AS min_nm FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|           min_nm |
++------------------+
+|            apple |
++------------------+
+Total record(s): 1
+
+query
+SELECT MAX(st.nm) AS max_nm FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|           max_nm |
++------------------+
+|            elder |
++------------------+
+Total record(s): 1
+
+# --- Unqualified column name in the aggregate ---
+query
+SELECT MAX(amt) AS max_amt FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|          max_amt |
++------------------+
+|       100.000000 |
++------------------+
+Total record(s): 1
+
+query
+SELECT SUM(amt) AS sum_amt FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|          sum_amt |
++------------------+
+|       166.500000 |
++------------------+
+Total record(s): 1
+
+query
+SELECT AVG(st.q) AS avg_q FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+
+|            avg_q |
++------------------+
+|        28.166666 |
++------------------+
+Total record(s): 1
+
+query
+SELECT COUNT(*) AS n_all, COUNT(ol.i) AS n_i FROM ol, st WHERE ol.i = st.i AND ol.w = st.w;
+----
++------------------+------------------+
+|            n_all |              n_i |
++------------------+------------------+
+|                6 |                6 |
++------------------+------------------+
+Total record(s): 1
+
+# --- GROUP BY over the join ---
+query
+SELECT ol.w, COUNT(*) AS n, MAX(st.q) AS max_q, SUM(amt) AS sum_amt FROM ol, st WHERE ol.i = st.i AND ol.w = st.w GROUP BY ol.w ORDER BY ol.w;
+----
++------------------+------------------+------------------+------------------+
+|                w |                n |            max_q |          sum_amt |
++------------------+------------------+------------------+------------------+
+|                1 |                4 |               50 |        16.250000 |
+|                2 |                2 |               99 |       150.250000 |
++------------------+------------------+------------------+------------------+
+Total record(s): 2
+
+# --- StockLevel shape: COUNT(DISTINCT) + join + warehouse filter + threshold ---
+query
+SELECT COUNT(DISTINCT ol.i) AS low_stock FROM ol, st WHERE ol.w = 1 AND st.w = 1 AND ol.i = st.i AND st.q < 10;
+----
++------------------+
+|        low_stock |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+# Threshold uses strict <: q = 5 must not be counted when threshold is 5
+query
+SELECT COUNT(DISTINCT ol.i) AS low_stock FROM ol, st WHERE ol.w = 1 AND st.w = 1 AND ol.i = st.i AND st.q < 5;
+----
++------------------+
+|        low_stock |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+# COUNT(DISTINCT (col)) — extra parentheses, same semantics
+query
+SELECT COUNT(DISTINCT (ol.i)) AS low_stock FROM ol, st WHERE ol.w = 1 AND st.w = 1 AND ol.i = st.i AND st.q < 10;
+----
++------------------+
+|        low_stock |
++------------------+
+|                2 |
++------------------+
+Total record(s): 1
+
+# Warehouse isolation: only warehouse 2 rows
+query
+SELECT COUNT(DISTINCT (ol.i)) AS low_stock FROM ol, st WHERE ol.w = 2 AND st.w = 2 AND ol.i = st.i AND st.q < 10;
+----
++------------------+
+|        low_stock |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+statement ok
+DROP TABLE ol;
+
+statement ok
+DROP TABLE st;
+
+# --- SUM/AVG over FLOAT must accumulate in double, not binary32 ---
+statement ok
+CREATE TABLE amt_t (v FLOAT);
+
+statement ok
+INSERT INTO amt_t VALUES (16777216.0);
+
+statement ok
+INSERT INTO amt_t VALUES (1.0);
+
+statement ok
+INSERT INTO amt_t VALUES (1.0);
+
+statement ok
+INSERT INTO amt_t VALUES (1.0);
+
+statement ok
+INSERT INTO amt_t VALUES (1.0);
+
+query
+SELECT SUM(v) AS sum_v FROM amt_t;
+----
++------------------+
+|            sum_v |
++------------------+
+|  16777220.000000 |
++------------------+
+Total record(s): 1
+
+query
+SELECT AVG(v) AS avg_v FROM amt_t;
+----
++------------------+
+|            avg_v |
++------------------+
+|   3355444.000000 |
++------------------+
+Total record(s): 1
+
+statement ok
+DROP TABLE amt_t;

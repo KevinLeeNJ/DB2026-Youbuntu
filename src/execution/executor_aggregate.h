@@ -11,10 +11,12 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <unordered_set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -56,18 +58,29 @@ private:
     struct AggregateSpec {
         LocalAggType type = LocalAggType::COUNT;
         bool is_star = false;
+        bool is_distinct = false;
         TabCol col;
         std::string output_name;
         ColType input_type = TYPE_INT;
         int input_len = static_cast<int>(sizeof(int));
         ColMeta input_col;
+        // 输入列的 NULL 位地址。非 COUNT(*) 的聚合都要用它跳过 NULL 输入，
+        // 因此对 COUNT(col) 也要绑定（它并不读 input_col 的数据字节）。
+        int input_null_byte = -1;
+        uint8_t input_null_mask = 0;
     };
 
     struct AggregateState {
         int64_t count = 0;
         double sum = 0.0;
+        double float_sum = 0.0; // FLOAT inputs accumulate in double to avoid binary32 drift
+        // 区分 WHERE 后真正的空输入与“有行但该列全为 NULL”。finalv3 A.3
+        // 允许前者按测评约定返回整数 0，后者仍保留 SQL NULL 语义。
+        bool saw_row = false;
+        // 是否有非 NULL 输入参与过：MIN/MAX 用它保存最优值。
         bool has_value = false;
         CellValue value;
+        std::unordered_set<CellValue, CellValueHash> distinct_values;
     };
 
     struct GroupState {
@@ -105,7 +118,8 @@ private:
     std::unique_ptr<AbstractExecutor> prev_;
     Context* context_ = nullptr;
     std::vector<ColMeta> cols_;
-    size_t len_ = 0;
+    size_t len_ = 0;      // 输出元组总长度（数据区 + null bitmap）
+    size_t data_len_ = 0; // 数据区长度，即 null bitmap 的起始偏移
     std::vector<ColMeta> group_cols_;
     std::vector<AggregateSpec> aggregates_;
     std::vector<HavingSpec> having_conds_;
@@ -113,6 +127,7 @@ private:
     size_t cursor_ = 0;
     bool materialized_ = false;
     bool has_group_by_ = false;
+    mutable std::unique_ptr<RmRecord> current_output_;
 
     static std::string trim_string(const char* data, int len) {
         return execution_scalar::trim_string(data, len);
@@ -136,15 +151,23 @@ private:
     }
 
     CellValue read_cell(const RmRecord& rec, const ColMeta& col) const {
+        return read_cell(TupleView{rec.data, static_cast<uint32_t>(rec.size)}, col);
+    }
+
+    CellValue read_cell(TupleView tuple, const ColMeta& col) const {
         CellValue value;
         value.type = col.type;
-        const char* data = rec.data + col.offset;
+        if (is_null(tuple.data, col)) {
+            value.is_null = true;
+            return value;
+        }
+        const char* data = tuple.data + col.offset;
         switch (col.type) {
         case TYPE_INT:
-            value.int_val = *reinterpret_cast<const int*>(data);
+            value.int_val = read_unaligned<int>(data);
             break;
         case TYPE_FLOAT:
-            value.float_val = *reinterpret_cast<const double*>(data);
+            value.float_val = read_float(data);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -192,12 +215,17 @@ private:
     }
 
     void write_cell(char* dest, const ColMeta& col, const CellValue& value) const {
+        // 输出元组已整体清零，NULL 单元只需置位、数据字节留零
+        if (value.is_null) {
+            set_null(dest, col);
+            return;
+        }
         switch (col.type) {
         case TYPE_INT:
-            *reinterpret_cast<int*>(dest + col.offset) = value.int_val;
+            write_unaligned(dest + col.offset, value.int_val);
             break;
         case TYPE_FLOAT:
-            *reinterpret_cast<double*>(dest + col.offset) = value.float_val;
+            write_float(dest + col.offset, value.float_val);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -212,13 +240,19 @@ private:
     }
 
     void append_output_col(ColMeta col, const std::string& output_name) {
-        col.offset = static_cast<int>(len_);
+        col.offset = static_cast<int>(data_len_);
         if (!output_name.empty()) {
             col.name = output_name;
             col.tab_name.clear();
         }
-        len_ += static_cast<size_t>(col.len);
+        data_len_ += static_cast<size_t>(col.len);
         cols_.push_back(col);
+    }
+
+    // 所有输出列就位后才能确定 bitmap 的起始偏移，因此布局在构造末尾一次算定。
+    void finalize_layout() {
+        bind_null_positions(cols_, static_cast<int>(data_len_));
+        len_ = data_len_ + static_cast<size_t>(null_bitmap_bytes(cols_.size()));
     }
 
     template <typename GroupByT> static const TabCol& extract_group_col(const GroupByT& item) {
@@ -233,15 +267,24 @@ private:
         AggregateSpec spec;
         spec.type = normalize_agg_type(static_cast<int>(agg_expr.type));
         spec.is_star = agg_expr.is_star;
+        spec.is_distinct = agg_expr.is_distinct;
         spec.col = agg_expr.col;
         spec.output_name = agg_expr.display_name;
-        if (spec.type == LocalAggType::COUNT) {
+        if (spec.type == LocalAggType::COUNT && !spec.is_distinct) {
             spec.input_type = TYPE_INT;
             spec.input_len = static_cast<int>(sizeof(int));
+            // COUNT(col) 不读数据字节，但要跳过 NULL；COUNT(*) 没有输入列
+            if (!spec.is_star) {
+                const ColMeta input_col = find_input_col(spec.col);
+                spec.input_null_byte = input_col.null_byte;
+                spec.input_null_mask = input_col.null_mask;
+            }
         } else {
             spec.input_col = find_input_col(spec.col);
             spec.input_type = spec.input_col.type;
             spec.input_len = spec.input_col.len;
+            spec.input_null_byte = spec.input_col.null_byte;
+            spec.input_null_mask = spec.input_col.null_mask;
         }
         return spec;
     }
@@ -295,8 +338,8 @@ private:
                 operand.index = i;
                 return operand;
             }
-            if (agg.is_star == expr.agg.is_star && agg.col.tab_name == expr.agg.col.tab_name &&
-                agg.col.col_name == expr.agg.col.col_name &&
+            if (agg.is_star == expr.agg.is_star && agg.is_distinct == expr.agg.is_distinct &&
+                agg.col.tab_name == expr.agg.col.tab_name && agg.col.col_name == expr.agg.col.col_name &&
                 static_cast<int>(agg.type) == static_cast<int>(normalize_agg_type(static_cast<int>(expr.agg.type)))) {
                 operand.kind = OperandKind::AGG_RESULT;
                 operand.index = i;
@@ -333,22 +376,41 @@ private:
     }
 
     void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec) const {
+        update_aggregate_state(state, spec, TupleView{rec.data, static_cast<uint32_t>(rec.size)});
+    }
+
+    void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, TupleView tuple) const {
+        state.saw_row = true;
+        // SQL 聚合忽略 NULL 输入：COUNT(col) 不计 NULL、COUNT(DISTINCT col) 不把
+        // NULL 当成一个取值、MIN/MAX/SUM/AVG 完全跳过。只有 COUNT(*) 例外。
+        if (!spec.is_star && is_null_at(tuple.data, spec.input_null_byte, spec.input_null_mask)) {
+            return;
+        }
         CellValue current_value;
-        if (!spec.is_star && spec.type != LocalAggType::COUNT) {
-            current_value = read_cell(rec, spec.input_col);
+        if (!spec.is_star && (spec.type != LocalAggType::COUNT || spec.is_distinct)) {
+            current_value = read_cell(tuple, spec.input_col);
         }
 
         switch (spec.type) {
         case LocalAggType::COUNT:
-            ++state.count;
+            if (!spec.is_distinct || state.distinct_values.insert(current_value).second) {
+                ++state.count;
+            }
             break;
         case LocalAggType::SUM:
-            state.sum += (current_value.type == TYPE_INT) ? static_cast<double>(current_value.int_val)
-                                                          : static_cast<double>(current_value.float_val);
+            if (spec.input_type == TYPE_FLOAT) {
+                state.float_sum += current_value.float_val;
+            } else {
+                state.sum += static_cast<double>(current_value.int_val);
+            }
+            state.has_value = true;
             break;
         case LocalAggType::AVG:
-            state.sum += (current_value.type == TYPE_INT) ? static_cast<double>(current_value.int_val)
-                                                          : static_cast<double>(current_value.float_val);
+            if (spec.input_type == TYPE_FLOAT) {
+                state.float_sum += current_value.float_val;
+            } else {
+                state.sum += static_cast<double>(current_value.int_val);
+            }
             ++state.count;
             break;
         case LocalAggType::MAX:
@@ -386,17 +448,32 @@ private:
         case LocalAggType::SUM: {
             CellValue value;
             value.type = spec.input_type;
+            if (!state.has_value && (spec.input_type != TYPE_INT || state.saw_row)) {
+                value.is_null = true;
+                return value;
+            }
             if (spec.input_type == TYPE_INT) {
                 value.int_val = static_cast<int>(state.sum);
             } else {
-                value.float_val = state.sum;
+                value.float_val = static_cast<float>(state.float_sum);
+                if (!std::isfinite(value.float_val)) {
+                    throw RMDBError("FLOAT aggregate result must be finite");
+                }
             }
             return value;
         }
         case LocalAggType::AVG: {
             CellValue value;
             value.type = TYPE_FLOAT;
-            value.float_val = state.count == 0 ? 0.0 : state.sum / static_cast<double>(state.count);
+            if (state.count == 0) {
+                value.is_null = true;
+                return value;
+            }
+            value.float_val = static_cast<float>((spec.input_type == TYPE_FLOAT ? state.float_sum : state.sum) /
+                                                 static_cast<double>(state.count));
+            if (!std::isfinite(value.float_val)) {
+                throw RMDBError("FLOAT aggregate result must be finite");
+            }
             return value;
         }
         case LocalAggType::MAX:
@@ -404,7 +481,13 @@ private:
             if (state.has_value) {
                 return state.value;
             }
-            return zero_value(spec.input_type);
+            {
+                CellValue value = zero_value(spec.input_type);
+                if (spec.input_type != TYPE_INT || state.saw_row) {
+                    value.is_null = true;
+                }
+                return value;
+            }
         }
         throw InternalError("Unexpected aggregate type");
     }
@@ -427,6 +510,10 @@ private:
         for (const auto& cond : having_conds_) {
             CellValue lhs = resolve_having_operand(cond.lhs, group_values, aggregate_values);
             CellValue rhs = resolve_having_operand(cond.rhs, group_values, aggregate_values);
+            // 任一操作数为 NULL 则条件为假（含 `<>`），与 WHERE 一致
+            if (lhs.is_null || rhs.is_null) {
+                return false;
+            }
             if (!compare_with_op(cond.op, compare_cells(lhs, rhs))) {
                 return false;
             }
@@ -486,15 +573,22 @@ private:
         if (has_group_by_) {
             std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-                auto rec = prev_->Next();
-                if (rec == nullptr) {
+                TupleView tuple = prev_->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!tuple) {
+                    fallback = prev_->Next();
+                    if (fallback != nullptr) {
+                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (!tuple) {
                     continue;
                 }
 
                 GroupKey key;
                 key.values.reserve(group_cols_.size());
                 for (const auto& col : group_cols_) {
-                    key.values.push_back(read_cell(*rec, col));
+                    key.values.push_back(read_cell(tuple, col));
                 }
 
                 auto [it, inserted] = group_indexes.emplace(key, groups_.size());
@@ -502,7 +596,7 @@ private:
                     groups_.push_back(make_group_state(key.values));
                 }
                 for (size_t i = 0; i < aggregates_.size(); ++i) {
-                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec);
+                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], tuple);
                 }
             }
 
@@ -535,11 +629,28 @@ private:
         // stop after consuming it instead of scanning the whole range.
         if (can_use_min_index_shortcut()) {
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-                auto rec = prev_->Next();
-                if (rec == nullptr) {
+                TupleView tuple = prev_->current();
+                std::unique_ptr<RmRecord> fallback;
+                if (!tuple) {
+                    fallback = prev_->Next();
+                    if (fallback != nullptr) {
+                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                    }
+                }
+                if (!tuple) {
                     continue;
                 }
-                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], *rec);
+                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], tuple);
+                // MIN 忽略 NULL：update_aggregate_state 不会把 NULL 计入，所以
+                // has_value 仍为假就说明到这里为止扫到的都是 NULL，继续往后走。
+                // 注意不要假设 NULL 行一定排在最前面——NULL 的索引键是全零字节，
+                // 在负值列上它排在负数之后。这段代码不依赖 NULL 行的位置，只依赖
+                // 非 NULL 行之间按 col 升序，所以两种情况都对。
+                if (!global_state.aggregate_states[0].has_value) {
+                    continue;
+                }
+                // 这里没有 passes_having：can_use_min_index_shortcut() 已经要求
+                // having_conds_ 为空，HAVING 存在时根本不会走进这条捷径。
                 groups_.push_back(std::move(global_state));
                 return;
             }
@@ -551,12 +662,19 @@ private:
         }
 
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
-            auto rec = prev_->Next();
-            if (rec == nullptr) {
+            TupleView tuple = prev_->current();
+            std::unique_ptr<RmRecord> fallback;
+            if (!tuple) {
+                fallback = prev_->Next();
+                if (fallback != nullptr) {
+                    tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
+                }
+            }
+            if (!tuple) {
                 continue;
             }
             for (size_t i = 0; i < aggregates_.size(); ++i) {
-                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], *rec);
+                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], tuple);
             }
         }
 
@@ -602,7 +720,7 @@ private:
                 break;
             case LocalAggType::AVG:
                 output_col.type = TYPE_FLOAT;
-                output_col.len = static_cast<int>(sizeof(double));
+                output_col.len = static_cast<int>(sizeof(float));
                 break;
             case LocalAggType::MAX:
             case LocalAggType::MIN:
@@ -629,6 +747,7 @@ public:
         : prev_(std::move(prev)), context_(context) {
         init_group_cols(group_by_cols);
         init_aggregate_cols(aggregate_exprs);
+        finalize_layout();
         init_having_conds(having_conds);
     }
 
@@ -651,6 +770,20 @@ public:
             return nullptr;
         }
         return materialize_group_result(groups_[cursor_]);
+    }
+
+    TupleView current() const override {
+        if (is_end()) {
+            return {};
+        }
+        // Aggregate results are materialized per call; current() keeps a
+        // reusable compatibility buffer so downstream executors can borrow it.
+        if (current_output_ == nullptr || current_output_->size != static_cast<int>(len_)) {
+            current_output_ = std::make_unique<RmRecord>(static_cast<int>(len_));
+        }
+        auto result = materialize_group_result(groups_[cursor_]);
+        memcpy(current_output_->data, result->data, len_);
+        return TupleView{current_output_->data, static_cast<uint32_t>(len_)};
     }
 
     bool is_end() const override {

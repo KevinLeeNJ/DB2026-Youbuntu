@@ -11,8 +11,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <map>
+#include <algorithm>
+#include <limits>
 #include <mutex>
+#include <vector>
 
 #include "transaction/transaction.h"
 
@@ -25,9 +27,17 @@ See the Mulan PSL v2 for more details. */
  */
 class Watermark {
 public:
-    explicit Watermark(timestamp_t commit_ts) : commit_ts_(commit_ts), watermark_(commit_ts) {}
+    explicit Watermark(timestamp_t commit_ts, size_t initial_slots = 64)
+        : commit_ts_(commit_ts), watermark_(commit_ts),
+          active_read_ts_(std::max<size_t>(initial_slots, 1), inactive_read_ts()) {}
 
     void AddTxn(timestamp_t read_ts);
+
+    // Stable slot APIs let a transaction update/remove its own reader entry
+    // without searching by timestamp (which is ambiguous for equal snapshots).
+    size_t AddTxnSlot(timestamp_t read_ts);
+    void RemoveTxnSlot(size_t slot);
+    void UpdateTxnReadTsSlot(size_t slot, timestamp_t new_read_ts);
 
     void RemoveTxn(timestamp_t read_ts);
 
@@ -49,8 +59,17 @@ public:
 
     timestamp_t watermark_;
 
-    std::map<timestamp_t, int> current_reads_;
-
 private:
+    static constexpr timestamp_t inactive_read_ts() {
+        return std::numeric_limits<timestamp_t>::max();
+    }
+
+    void recompute_watermark_locked();
+
+    // Transactions normally fit in this preallocated slot array. If an
+    // unusually large burst exceeds the hint, the vector grows under the
+    // same latch so correctness is preserved without reintroducing a map node
+    // allocation for every transaction.
+    std::vector<timestamp_t> active_read_ts_;
     std::mutex latch_;
 };

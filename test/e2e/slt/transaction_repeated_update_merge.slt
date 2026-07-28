@@ -1,0 +1,77 @@
+# Repeated UPDATEs on one tuple retain the first undo/write entry while each
+# statement continues from the tuple's current uncommitted value.
+
+statement ok
+CREATE TABLE repeated_update_merge (id INT, value INT);
+
+statement ok
+INSERT INTO repeated_update_merge VALUES (1, 10);
+
+statement ok
+CREATE INDEX repeated_update_merge (id);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE repeated_update_merge SET id = id + 1, value = value + 1 WHERE id = 1;
+
+statement ok
+UPDATE repeated_update_merge SET id = id + 1, value = value + 1 WHERE id = 2;
+
+statement ok
+UPDATE repeated_update_merge SET id = id + 1, value = value + 1 WHERE id = 3;
+
+query
+SELECT id, value FROM repeated_update_merge WHERE id = 4;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                4 |               13 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+COMMIT;
+
+query
+SELECT id, value FROM repeated_update_merge WHERE id = 4;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                4 |               13 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE repeated_update_merge SET id = id + 1, value = value + 1 WHERE id = 4;
+
+statement ok
+UPDATE repeated_update_merge SET id = id + 1, value = value + 1 WHERE id = 5;
+
+statement ok
+ABORT;
+
+query
+SELECT id, value FROM repeated_update_merge WHERE id = 4;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                4 |               13 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, value FROM repeated_update_merge WHERE id = 6;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
++------------------+------------------+
+Total record(s): 0

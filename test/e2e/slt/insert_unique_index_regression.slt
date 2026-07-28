@@ -1,0 +1,44 @@
+# insert_unique_index_regression.slt — INSERT unique-index duplicate detection
+
+statement ok
+CREATE TABLE insert_unique_reg (id INT, email CHAR(20), payload INT);
+
+statement ok
+CREATE INDEX insert_unique_reg (id);
+
+statement ok
+CREATE INDEX insert_unique_reg (email);
+
+# Normal inserts populate both unique indexes.
+statement ok
+INSERT INTO insert_unique_reg VALUES (1, 'one', 10);
+
+statement ok
+INSERT INTO insert_unique_reg VALUES (2, 'two', 20);
+
+query
+SELECT id, email, payload FROM insert_unique_reg ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |            email |          payload |
++------------------+------------------+------------------+
+|                1 |              one |               10 |
+|                2 |              two |               20 |
++------------------+------------------+------------------+
+Total record(s): 2
+
+# The second unique index rejects the row after the first index was updated.
+statement error
+INSERT INTO insert_unique_reg VALUES (3, 'one', 30);
+
+# The failed insert leaves neither a heap row nor a partial first-index entry.
+query
+SELECT id, email, payload FROM insert_unique_reg ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |            email |          payload |
++------------------+------------------+------------------+
+|                1 |              one |               10 |
+|                2 |              two |               20 |
++------------------+------------------+------------------+
+Total record(s): 2

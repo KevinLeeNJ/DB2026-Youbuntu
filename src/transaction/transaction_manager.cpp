@@ -10,15 +10,29 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
+#include "common/fault_injection.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
 
 std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> TransactionManager::txn_map = {};
+
+TransactionManager::~TransactionManager() {
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        gc_stop_ = true;
+    }
+    gc_cv_.notify_all();
+    if (gc_thread_.joinable()) {
+        gc_thread_.join();
+    }
+}
 
 namespace {
 
@@ -29,6 +43,14 @@ constexpr size_t SSI_EDGE_PRUNE_THRESHOLD = 8192;
 // 垃圾回收节流：避免每次 commit 都全表扫描 txn_map
 constexpr uint64_t GC_COMMIT_INTERVAL = 256;  // 每 N 次提交尝试一次 GC
 constexpr size_t GC_TXN_MAP_THRESHOLD = 1024; // 或 txn_map 超过该阈值立即 GC
+constexpr size_t GC_BATCH_SIZE = 128;
+constexpr size_t GC_SCAN_LIMIT = 512;
+
+[[noreturn]] void FailStopAfterCommitMayBePersistent() {
+    std::fprintf(stderr, "FATAL: COMMIT WAL/publication failed; stopping for recovery\n");
+    std::fflush(stderr);
+    std::_Exit(134);
+}
 
 void ClearWriteSet(Transaction* txn) {
     if (txn == nullptr) {
@@ -47,6 +69,12 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
         lock_manager->unlock(txn, lock_id);
     }
     lock_set->clear();
+
+    auto unique_key_locks = *txn->get_unique_key_lock_set();
+    for (const auto& lock_id : unique_key_locks) {
+        lock_manager->unlock_unique_key(txn, lock_id);
+    }
+    txn->get_unique_key_lock_set()->clear();
 }
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
@@ -102,6 +130,18 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         rhs_type = rhs_col_meta->type;
     }
 
+    // SSI 的谓词匹配必须与执行器 compare() 用同一份三值逻辑，否则会漏判/误判冲突
+    switch (eval_condition_nulls(cond, rec.data, lhs_col_meta.null_byte, lhs_col_meta.null_mask,
+                                 rhs_col_meta == nullptr ? -1 : rhs_col_meta->null_byte,
+                                 rhs_col_meta == nullptr ? 0 : rhs_col_meta->null_mask)) {
+    case NullEval::DECIDED_TRUE:
+        return true;
+    case NullEval::DECIDED_FALSE:
+        return false;
+    case NullEval::COMPARE:
+        break;
+    }
+
     bool can_cast = lhs_type == rhs_type || (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
                     (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
                     ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
@@ -113,14 +153,14 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
     switch (lhs_type) {
     case TYPE_INT:
     case TYPE_FLOAT: {
-        double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(lhs_data))
-                                              : *reinterpret_cast<double*>(lhs_data);
+        double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
+                                              : static_cast<double>(read_float(lhs_data));
         double rhs_val;
         if (cond.is_rhs_val) {
             rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
         } else {
-            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(rhs_data))
-                                           : *reinterpret_cast<double*>(rhs_data);
+            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
+                                           : static_cast<double>(read_float(rhs_data));
         }
         switch (cond.op) {
         case OP_EQ:
@@ -188,7 +228,7 @@ bool SsiTxnCanConflictWithWriter(Transaction* reader_txn, Transaction* writer_tx
         return false;
     }
     timestamp_t reader_commit_ts = reader_txn->get_commit_ts();
-    return reader_commit_ts != INVALID_TS && reader_commit_ts > writer_txn->get_start_ts();
+    return reader_commit_ts != INVALID_TS && reader_commit_ts > writer_txn->get_read_ts();
 }
 
 void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
@@ -200,26 +240,37 @@ void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
     txn->set_prev_lsn(lsn);
 }
 
-void WriteCommitLog(Transaction* txn, LogManager* log_manager) {
+void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
     if (txn == nullptr || log_manager == nullptr) {
         return;
     }
-    CommitLogRecord record(txn->get_transaction_id());
+    // commit_ts 进 WAL：它是恢复期重建时间戳计数器的第二个来源。两次 checkpoint
+    // 之间被驱逐的数据页可能带着比 db.restart 里的快照更高的 commit_ts_，而这条
+    // 记录在那次页写之前就已经 durable（下面的 flush_log_to_disk_up_to 保证），
+    // 所以“db.restart 快照”与“保留 WAL 里 COMMIT 的最大 commit_ts”取 max 覆盖
+    // 一切已持久化的 commit_ts_。完整论证见
+    // RecoveryManager::get_recovered_next_timestamp()。
+    CommitLogRecord record(txn->get_transaction_id(), commit_ts);
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
+    FaultInjector::Point("after_commit_log_append");
     txn->set_prev_lsn(lsn);
-    log_manager->flush_log_to_disk();
+    // Returning from COMMIT means the commit record survived an OS crash,
+    // not merely that it reached the kernel page cache.
+    log_manager->flush_log_to_disk_up_to(lsn);
+    FaultInjector::Point("after_commit_wal_write");
 }
 
-void WriteAbortLog(Transaction* txn, LogManager* log_manager) {
+lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr || log_manager == nullptr) {
-        return;
+        return INVALID_LSN;
     }
     AbortLogRecord record(txn->get_transaction_id());
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
     log_manager->flush_log_to_disk();
+    return lsn;
 }
 
 std::optional<UndoLog> GetCurrentUndoLog(TransactionManager* txn_mgr, RmFileHandle* fh, const Rid& rid) {
@@ -244,7 +295,8 @@ TupleMeta FallbackCommittedMeta() {
     return meta;
 }
 
-void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, Transaction* txn) {
+void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, Transaction* txn,
+                     lsn_t page_lsn) {
     const std::string tab_name = write_record->GetTableName();
     auto& tab = sm_manager->db_.get_table(tab_name);
     auto* fh = sm_manager->fhs_.at(tab_name).get();
@@ -252,10 +304,18 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
 
     switch (write_record->GetWriteType()) {
     case WType::INSERT_TUPLE: {
+        // An inserted tuple has no index work to undo when the table has no
+        // indexes. Avoid fetching and copying the record just to discover
+        // that DeleteIndexEntries has nothing to do; this is the hot RC
+        // rollback path for heap-only tables.
+        if (tab.indexes.empty()) {
+            fh->delete_record(rid, nullptr, page_lsn);
+            break;
+        }
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
             DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
-            fh->delete_record(rid, nullptr);
+            fh->delete_record(rid, nullptr, page_lsn);
         }
         break;
     }
@@ -263,11 +323,12 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         RmRecord old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         if (fh->is_record(rid)) {
-            fh->update_record(rid, old_rec.data, nullptr);
+            fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
+                                   page_lsn);
         } else {
-            fh->insert_record(rid, old_rec.data);
+            fh->insert_record(rid, old_rec.data, page_lsn);
+            fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
         }
-        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
         InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
         break;
     }
@@ -287,8 +348,10 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
             }
         }
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
-        fh->update_record(rid, old_rec.data, nullptr);
-        fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta());
+        if (fh->is_record(rid)) {
+            fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
+                                   page_lsn);
+        }
         if (current_rec != nullptr) {
             for (const auto& index : tab.indexes) {
                 auto current_key = MakeIndexKey(index, current_rec->data);
@@ -331,9 +394,12 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     txn->set_state(TransactionState::GROWING);
     txn->set_start_ts(next_timestamp_.fetch_add(1));
     txn->set_read_ts(last_commit_ts_.load());
+    // start_ts orders transaction lifecycle events, but a committer may already
+    // have reserved a smaller commit_ts without publishing it. read_ts is the
+    // published snapshot frontier and therefore drives visibility and SSI.
     // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
     // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
-    running_txns_.AddTxn(txn->get_read_ts());
+    txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
     WriteBeginLog(txn, log_manager);
 
     std::unique_lock<std::mutex> lock(latch_);
@@ -357,7 +423,7 @@ void TransactionManager::BeginStatement(Transaction* txn) {
         timestamp_t old_read_ts = txn->get_read_ts();
         timestamp_t new_read_ts = last_commit_ts_.load();
         if (new_read_ts != old_read_ts) {
-            running_txns_.UpdateTxnReadTs(old_read_ts, new_read_ts);
+            running_txns_.UpdateTxnReadTsSlot(txn->get_watermark_slot(), new_read_ts);
             txn->set_read_ts(new_read_ts);
         }
     }
@@ -377,33 +443,83 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         return;
     }
 
-    WriteCommitLog(txn, log_manager);
-
-    // Allocate commit_ts (monotonic)
-    timestamp_t commit_ts = next_timestamp_.fetch_add(1);
-    txn->commit_ts_ = commit_ts;
-
-    // Update the watermark bookkeeping before publishing the commit timestamp.
-    // The latter is published below, after tuple metadata is committed.
-    running_txns_.UpdateCommitTs(commit_ts);
-    running_txns_.RemoveTxn(txn->get_read_ts());
-
-    // Mark all modified slots as committed
-    sm_manager_->mark_slots_committed(*txn, commit_ts);
-
-    // Concurrent commits can finish out of commit-ts allocation order. Publish
-    // the largest committed timestamp only; a plain store would allow a later
-    // commit with a smaller timestamp to move last_commit_ts_ backwards and
-    // make READ COMMITTED transactions spuriously report WW_CONFLICT.
-    timestamp_t published_ts = last_commit_ts_.load(std::memory_order_relaxed);
-    while (published_ts < commit_ts &&
-           !last_commit_ts_.compare_exchange_weak(published_ts, commit_ts, std::memory_order_release,
-                                                  std::memory_order_relaxed)) {
+    sm_manager_->prepare_commit_publication(*txn);
+    TransactionState expected_state = TransactionState::GROWING;
+    if (!txn->compare_exchange_state(expected_state, TransactionState::COMMITTING)) {
+        if (expected_state == TransactionState::COMMITTED || expected_state == TransactionState::ABORTED) {
+            RetireTransactionIfSafe(txn);
+            return;
+        }
+        throw InternalError("transaction is not ready to commit");
     }
 
+    FaultInjector::Point("before_commit_wal");
+    try {
+        timestamp_t commit_csn;
+        timestamp_t commit_ts;
+        {
+            // CSN and commit timestamp allocation must be ordered together.
+            // Otherwise an out-of-order publisher could move last_commit_ts_
+            // backwards when the frontier is advanced.
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            commit_csn = ++next_commit_csn_;
+            commit_ts = next_timestamp_.fetch_add(1);
+            txn->commit_ts_ = commit_ts;
+        }
+
+        // 时间戳分配移到 WAL 之前，只为让 COMMIT 记录能带上 commit_ts；它不发布
+        // 任何东西，因此不改变可见性顺序。分配后若 WriteCommitLog 抛出，catch 分支
+        // 直接 fail-stop 整个进程，不会留下一个占用了 CSN 却永不完成、卡住发布
+        // 前沿的事务。
+        //
+        // Once COMMITTING is visible, neither a WAL failure nor a publication
+        // failure may fall back to ordinary abort: the COMMIT record may
+        // already be present in the WAL prefix recovered after restart.
+        WriteCommitLog(txn, log_manager, commit_ts);
+        FaultInjector::Point("after_commit_wal_sync");
+
+        // Publish every modified slot outside the frontier mutex. A new RC
+        // statement still cannot observe this commit until its CSN is part of
+        // the contiguous completed frontier below.
+        FaultInjector::Point("before_tuple_publication");
+        sm_manager_->mark_slots_committed(*txn, commit_ts);
+        FaultInjector::Point("after_tuple_publication");
+        txn->set_state(TransactionState::COMMITTED);
+        FaultInjector::Point("before_published_csn_store");
+        {
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            completed_commits_.emplace(commit_csn, commit_ts);
+            while (true) {
+                auto next = completed_commits_.find(published_commit_csn_ + 1);
+                if (next == completed_commits_.end()) {
+                    break;
+                }
+                last_commit_ts_.store(next->second, std::memory_order_release);
+                ++published_commit_csn_;
+                completed_commits_.erase(next);
+            }
+        }
+        commit_frontier_cv_.notify_all();
+
+        // Do not return from COMMIT until this transaction is covered by the
+        // publication frontier. This provides read-your-commit even when a
+        // later CSN finished publishing first.
+        std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+        commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
+    } catch (...) {
+        // Once WriteCommitLog returned, recovery must treat this transaction
+        // as committed. Ordinary abort would make durable WAL and in-memory
+        // state disagree and may leave a partially published transaction.
+        FailStopAfterCommitMayBePersistent();
+    }
+
+    // Keep the committing transaction in the watermark until publication is
+    // complete; otherwise GC could reclaim its undo state in the publication
+    // window.
+    running_txns_.UpdateCommitTs(txn->get_commit_ts());
+    running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
-    txn->set_state(TransactionState::COMMITTED);
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
         CleanupTxnSsiState(txn->get_transaction_id());
         bool run_full_prune = false;
@@ -433,16 +549,24 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         RetireTransactionIfSafe(txn);
         return;
     }
+    if (txn->get_state() == TransactionState::COMMITTING) {
+        // The COMMIT WAL is already durable. Rolling this transaction back
+        // would create a state that recovery cannot distinguish from a lost
+        // committed transaction.
+        throw InternalError("cannot abort a transaction during commit publication");
+    }
 
     auto& write_set = txn->get_write_set();
     if (lock_manager_ != nullptr) {
         lock_manager_->cancel_transaction(txn);
     }
+    // The abort record must precede the physical undo. This gives every page
+    // modified by rollback a WAL record that can be used as its page LSN.
+    lsn_t abort_lsn = WriteAbortLog(txn, log_manager);
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(this, sm_manager_, it->get(), txn);
+        UndoWriteRecord(this, sm_manager_, it->get(), txn, abort_lsn);
     }
-    WriteAbortLog(txn, log_manager);
-    running_txns_.RemoveTxn(txn->get_read_ts());
+    running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);
     ReleaseLocks(txn, lock_manager_);
     txn->set_state(TransactionState::ABORTED);
@@ -474,10 +598,12 @@ void TransactionManager::unblock_new_transactions_after_checkpoint() {
     checkpoint_cv_.notify_all();
 }
 
-std::unordered_map<txn_id_t, lsn_t> TransactionManager::wait_active_transactions_drained_for_checkpoint() {
+bool TransactionManager::wait_active_transactions_drained_for_checkpoint(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
-    checkpoint_cv_.wait(checkpoint_lock, [&] { return active_txn_count_ == 0; });
-    return {};
+    // A client that ran BEGIN and then went silent keeps active_txn_count_
+    // above zero indefinitely. Waiting without a bound would keep every new
+    // transaction in the process blocked behind the checkpoint.
+    return checkpoint_cv_.wait_for(checkpoint_lock, timeout, [&] { return active_txn_count_ == 0; });
 }
 
 std::unordered_map<txn_id_t, lsn_t> TransactionManager::get_active_txn_lsn_snapshot() {
@@ -496,6 +622,29 @@ std::unordered_map<txn_id_t, lsn_t> TransactionManager::get_active_txn_lsn_snaps
         }
     }
     return snapshot;
+}
+
+void TransactionManager::seed_counters_after_recovery(timestamp_t next_timestamp, txn_id_t next_txn_id) {
+    // 单调抬高，绝不回退：本进程里可能已经跑过事务（测试里就会），把计数器往回拧
+    // 会让新事务重用已经写进数据页的 commit_ts_。
+    if (next_timestamp > next_timestamp_.load()) {
+        next_timestamp_.store(next_timestamp);
+    }
+    if (next_txn_id > next_txn_id_.load()) {
+        next_txn_id_.store(next_txn_id);
+    }
+
+    // read_ts 必须 >= 任何已持久化的 commit_ts_，而后者都 <= next_timestamp - 1
+    // （commit_ts 由 next_timestamp_.fetch_add(1) 分发，故已分发值都严格小于计数器）。
+    // 取到恰好 next_timestamp - 1 而不是 next_timestamp：否则本进程第一个提交拿到的
+    // commit_ts 会等于早先开始的事务的 read_ts，让读者看见自己快照之后的提交。
+    const timestamp_t seed_read_ts = next_timestamp_.load() - 1;
+    if (seed_read_ts > last_commit_ts_.load(std::memory_order_acquire)) {
+        last_commit_ts_.store(seed_read_ts, std::memory_order_release);
+        // 水位线也一起抬高，否则在本进程第一次提交之前 GC 会以 0 为水位线，
+        // 保守到什么都回收不了。
+        running_txns_.UpdateCommitTs(seed_read_ts);
+    }
 }
 
 UndoLog TransactionManager::GetUndoLog(UndoLink link) {
@@ -588,6 +737,17 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
                (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)))) {
             throw IncompatibleTypeError(coltype2str(lhs_col.type), coltype2str(rhs_type));
         }
+        // 同上：与执行器 compare() 共用三值逻辑
+        switch (eval_condition_nulls(cond, rec.data, lhs_col.null_byte, lhs_col.null_mask,
+                                     cond.is_rhs_val ? -1 : rhs_col.null_byte,
+                                     cond.is_rhs_val ? 0 : rhs_col.null_mask)) {
+        case NullEval::DECIDED_TRUE:
+            continue;
+        case NullEval::DECIDED_FALSE:
+            return false;
+        case NullEval::COMPARE:
+            break;
+        }
         int cmp = 0;
         if (lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) {
             std::string lhs(lhs_data, strnlen(lhs_data, lhs_col.len));
@@ -595,14 +755,14 @@ bool TransactionManager::TupleMatches(const std::string& tab_name, const std::ve
                 cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col.len));
             cmp = lhs.compare(rhs);
         } else {
-            double lhs = lhs_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(lhs_data))
-                                                  : *reinterpret_cast<const double*>(lhs_data);
+            double lhs = lhs_col.type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
+                                                  : static_cast<double>(read_float(lhs_data));
             double rhs;
             if (cond.is_rhs_val) {
                 rhs = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
             } else {
-                rhs = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(rhs_data))
-                                           : *reinterpret_cast<const double*>(rhs_data);
+                rhs = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
+                                           : static_cast<double>(read_float(rhs_data));
             }
             cmp = lhs == rhs ? 0 : (lhs < rhs ? -1 : 1);
         }
@@ -942,12 +1102,14 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
         return;
     }
 
+    bool no_active_transactions = false;
     {
         // Keep the transaction active-set transition and the txn_map lifetime
         // decision atomic with respect to GC's active-set snapshot.
         std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
         active_txn_ids_.erase(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+        no_active_transactions = active_txn_count_ == 0;
 
         std::unique_lock<std::mutex> lock(latch_);
         if (CanRetireTransactionUnlocked(txn)) {
@@ -958,6 +1120,9 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
         }
     }
     checkpoint_cv_.notify_all();
+    if (no_active_transactions) {
+        gc_cv_.notify_one();
+    }
 }
 
 timestamp_t TransactionManager::GetWatermark() {
@@ -965,39 +1130,68 @@ timestamp_t TransactionManager::GetWatermark() {
 }
 
 void TransactionManager::MaybeRunGarbageCollection() {
-    bool should_run = false;
+    bool notify_gc = false;
     {
-        std::unique_lock<std::mutex> lock(latch_);
+        std::lock_guard<std::mutex> lock(latch_);
         ++commits_since_gc_;
-        if (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD) {
+        gc_backlog_.store(txn_map.size(), std::memory_order_release);
+        if (!gc_requested_ && (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD)) {
             gc_requested_ = true;
             commits_since_gc_ = 0;
-        }
-        if (gc_requested_ && !gc_running_) {
-            gc_requested_ = false;
-            gc_running_ = true;
-            should_run = true;
+            notify_gc = true;
         }
     }
-    if (!should_run) {
-        return;
+    if (notify_gc) {
+        gc_cv_.notify_one();
     }
+}
 
-    try {
-        GarbageCollection();
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(latch_);
-        gc_running_ = false;
-        throw;
-    }
+void TransactionManager::GarbageCollectionLoop() {
+    std::unique_lock<std::mutex> lock(latch_);
+    while (!gc_stop_.load(std::memory_order_acquire)) {
+        gc_cv_.wait(lock, [this] { return gc_stop_.load(std::memory_order_acquire) || gc_requested_; });
+        if (gc_stop_.load(std::memory_order_acquire)) {
+            break;
+        }
+        // GarbageCollectionBatch uses the oldest active read timestamp as
+        // its safety boundary. It must not wait for a globally quiescent
+        // transaction set, otherwise a sustained workload can starve GC.
+        size_t batch_start_size = 0;
+        batch_start_size = txn_map.size();
+        gc_backlog_.store(batch_start_size, std::memory_order_release);
+        gc_requested_ = false;
+        gc_running_ = true;
+        lock.unlock();
 
-    {
-        std::lock_guard<std::mutex> lock(latch_);
+        bool more = false;
+        try {
+            more = GarbageCollectionBatch();
+        } catch (...) {
+            // GC is opportunistic. A transient metadata/storage error must
+            // not terminate the server or strand the worker in gc_running_.
+        }
+
+        lock.lock();
         gc_running_ = false;
+        const size_t batch_end_size = txn_map.size();
+        gc_backlog_.store(batch_end_size, std::memory_order_release);
+        gc_last_batch_size_.store(batch_start_size > batch_end_size ? batch_start_size - batch_end_size : 0,
+                                  std::memory_order_release);
+        if (more && !gc_stop_.load(std::memory_order_acquire)) {
+            gc_requested_ = true;
+        }
     }
 }
 
 void TransactionManager::GarbageCollection() {
+    // Explicit callers (checkpoint/tests) ask for convergence. Keep the
+    // background worker bounded by calling GarbageCollectionBatch() directly
+    // there, while this synchronous API drains successive bounded batches.
+    while (GarbageCollectionBatch()) {
+    }
+}
+
+bool TransactionManager::GarbageCollectionBatch() {
     // 安全条件：水位线是所有活跃事务读时间戳的最小值。只有 commit_ts（已提交）
     // 或 start_ts（已中止）严格小于水位线的事务，其 undo log 才不会被任何活跃
     // 事务的版本链遍历访问到，因而可安全从 txn_map 回收。
@@ -1015,7 +1209,8 @@ void TransactionManager::GarbageCollection() {
     std::vector<txn_id_t> to_erase;
     {
         std::unique_lock<std::mutex> lock(latch_);
-        for (auto it = txn_map.begin(); it != txn_map.end(); ++it) {
+        size_t scanned = 0;
+        for (auto it = txn_map.begin(); it != txn_map.end() && scanned < GC_SCAN_LIMIT; ++it, ++scanned) {
             Transaction* txn = it->second.get();
             if (txn == nullptr) {
                 to_erase.push_back(it->first);
@@ -1048,6 +1243,9 @@ void TransactionManager::GarbageCollection() {
                 continue;
             }
             to_erase.push_back(it->first);
+            if (to_erase.size() >= GC_BATCH_SIZE) {
+                break;
+            }
         }
         for (txn_id_t txn_id : to_erase) {
             txn_map.erase(txn_id);
@@ -1055,9 +1253,11 @@ void TransactionManager::GarbageCollection() {
     }
     // 回收 SmManager 侧随写操作单调增长的历史索引键/删除候选（需访问 tuple meta，
     // 不在 latch_ 下进行，避免与缓冲池操作死锁）
-    if (!to_erase.empty()) {
-        sm_manager_->prune_version_history(watermark);
-    }
+    // History/index candidates have the same watermark safety rule as txn_map
+    // entries and must be pruned even when this batch found no transaction
+    // object to erase.
+    sm_manager_->prune_version_history(watermark);
+    return to_erase.size() >= GC_BATCH_SIZE;
 }
 
 bool TransactionManager::TransactionsOverlap(Transaction* lhs, Transaction* rhs) {
@@ -1072,7 +1272,7 @@ bool TransactionManager::TransactionsOverlap(Transaction* lhs, Transaction* rhs)
     if (rhs->get_state() != TransactionState::COMMITTED) {
         rhs_end = std::numeric_limits<timestamp_t>::max();
     }
-    return lhs->get_start_ts() < rhs_end && rhs->get_start_ts() < lhs_end;
+    return lhs->get_read_ts() < rhs_end && rhs->get_read_ts() < lhs_end;
 }
 
 bool TransactionManager::CommittedBefore(txn_id_t lhs, txn_id_t rhs) {
@@ -1252,7 +1452,7 @@ bool TransactionManager::RecordPredicateRead(Transaction* txn, const std::string
             if (writer_state == TransactionState::ABORTED) {
                 continue;
             }
-            bool invisible = writer_state != TransactionState::COMMITTED || writer_commit_ts > txn->get_start_ts();
+            bool invisible = writer_state != TransactionState::COMMITTED || writer_commit_ts > txn->get_read_ts();
             if (!invisible) {
                 continue;
             }
@@ -1420,7 +1620,7 @@ bool TransactionManager::CheckInvisibleWrites(txn_id_t reader, Rid rid, const st
 
         bool invisible_to_reader =
             txn->get_state() == TransactionState::GROWING ||
-            (txn->get_state() == TransactionState::COMMITTED && txn->get_commit_ts() > reader_txn->get_start_ts());
+            (txn->get_state() == TransactionState::COMMITTED && txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)
             continue;
 
@@ -1497,7 +1697,7 @@ bool TransactionManager::CheckPredicateInvisibleWrites(txn_id_t reader, const st
 
         bool invisible_to_reader = writer_txn->get_state() == TransactionState::GROWING ||
                                    (writer_txn->get_state() == TransactionState::COMMITTED &&
-                                    writer_txn->get_commit_ts() > reader_txn->get_start_ts());
+                                    writer_txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)
             continue;
 

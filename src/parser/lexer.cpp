@@ -42,16 +42,21 @@ const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::ke
     {"DATETIME", TokenType::DATETIME},
     {"INDEX", TokenType::INDEX},
     {"AND", TokenType::AND},
+    {"IS", TokenType::IS},
+    {"NOT", TokenType::NOT},
+    {"NULL", TokenType::NULL_KW},
     {"ORDER", TokenType::ORDER},
     {"BY", TokenType::BY},
     {"ASC", TokenType::ASC},
     {"LIMIT", TokenType::LIMIT},
+    {"OFFSET", TokenType::OFFSET},
     {"JOIN", TokenType::JOIN},
     {"ON", TokenType::ON},
     {"GROUP", TokenType::GROUP},
     {"HAVING", TokenType::HAVING},
     {"UNION", TokenType::UNION},
     {"COUNT", TokenType::COUNT},
+    {"DISTINCT", TokenType::DISTINCT},
     {"SUM", TokenType::SUM},
     {"AVG", TokenType::AVG},
     {"MIN", TokenType::MIN},
@@ -175,6 +180,16 @@ Token Lexer::next_token() {
     }
 
     // Operator or punctuation
+    if (c == '$' && std::isdigit(static_cast<unsigned char>(peek_char()))) {
+        int start_line = line_;
+        int start_col = column_;
+        size_t start_pos = pos_;
+        advance();
+        while (std::isdigit(static_cast<unsigned char>(current_char()))) {
+            advance();
+        }
+        return Token(TokenType::PARAMETER, input_.substr(start_pos, pos_ - start_pos), start_line, start_col);
+    }
     return scan_operator();
 }
 
@@ -358,11 +373,11 @@ int64_t Lexer::parse_integer(std::string_view text) {
     return value;
 }
 
-double Lexer::parse_float(std::string_view text) {
+float Lexer::parse_float(std::string_view text) {
     std::string owned(text);
     char* end = nullptr;
     errno = 0;
-    double value = std::strtod(owned.c_str(), &end);
+    float value = std::strtof(owned.c_str(), &end);
     if (errno == ERANGE || end != owned.c_str() + owned.size()) {
         throw LexerError("Lexer Error: float literal out of range or malformed");
     }

@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -162,7 +163,7 @@ Value make_int_value(int value) {
     return v;
 }
 
-Value make_float_value(double value) {
+Value make_float_value(float value) {
     Value v;
     v.set_float(value);
     return v;
@@ -188,10 +189,10 @@ RmRecord make_record(const std::vector<ColMeta>& cols, const std::vector<Value>&
         char* dest = rec.data + col.offset;
         switch (col.type) {
         case TYPE_INT:
-            *reinterpret_cast<int*>(dest) = value.int_val;
+            write_unaligned(dest, value.int_val);
             break;
         case TYPE_FLOAT:
-            *reinterpret_cast<double*>(dest) = value.float_val;
+            write_float(dest, value.float_val);
             break;
         case TYPE_STRING:
         case TYPE_DATETIME:
@@ -228,6 +229,12 @@ AggExpr make_aggregate(AggType type, std::string col_name, std::string display_n
     return agg;
 }
 
+AggExpr make_count_distinct(std::string col_name, std::string display_name) {
+    AggExpr agg = make_aggregate(AggType::COUNT, std::move(col_name), std::move(display_name));
+    agg.is_distinct = true;
+    return agg;
+}
+
 TestExecutorQueryExpr make_agg_expr(const AggExpr& agg) {
     TestExecutorQueryExpr expr;
     expr.type = QueryExprType::AGGREGATE;
@@ -247,11 +254,11 @@ TestExecutorHavingCondition make_having_with_literal(const TestExecutorQueryExpr
 }
 
 int read_int(const RmRecord& rec, int offset) {
-    return *reinterpret_cast<int*>(rec.data + offset);
+    return read_unaligned<int>(rec.data + offset);
 }
 
-double read_float(const RmRecord& rec, int offset) {
-    return *reinterpret_cast<double*>(rec.data + offset);
+float read_float_value(const RmRecord& rec, int offset) {
+    return read_float(rec.data + offset);
 }
 
 std::string read_string(const RmRecord& rec, int offset, int len) {
@@ -298,6 +305,64 @@ TEST(AggregateExecutorTest, GroupsRowsAndComputesCountStarAndSum) {
     EXPECT_TRUE(exec.is_end());
 }
 
+TEST(AggregateExecutorTest, RejectsNonFiniteFloatSum) {
+    std::vector<ColMeta> cols = {make_col("t", "amount", TYPE_FLOAT, 4, 0)};
+    const float maximum = std::numeric_limits<float>::max();
+    auto child = make_child_executor(cols, {{make_float_value(maximum)}, {make_float_value(maximum)}});
+    std::vector<AggExpr> aggs = {make_aggregate(AggType::SUM, "amount", "total")};
+
+    AggregateExecutor exec(std::move(child), std::vector<TabCol>{}, aggs, std::vector<TestExecutorHavingCondition>{});
+    EXPECT_THROW(exec.beginTuple(), RMDBError);
+}
+
+TEST(AggregateExecutorTest, CountDistinctUsesIndependentPerGroupStatesAndSemanticFloatEquality) {
+    std::vector<ColMeta> cols = {
+        make_col("t", "dept", TYPE_STRING, 8, 0),
+        make_col("t", "id", TYPE_INT, 4, 8),
+        make_col("t", "ratio", TYPE_FLOAT, 4, 12),
+        make_col("t", "label", TYPE_STRING, 8, 16),
+    };
+
+    auto child = make_child_executor(
+        cols, {
+                  {make_string_value("eng"), make_int_value(1), make_float_value(-0.0f), make_string_value("alpha")},
+                  {make_string_value("eng"), make_int_value(1), make_float_value(0.0f), make_string_value("alpha")},
+                  {make_string_value("eng"), make_int_value(2), make_float_value(1.5f), make_string_value("beta")},
+                  {make_string_value("ops"), make_int_value(1), make_float_value(0.0f), make_string_value("alpha")},
+                  {make_string_value("ops"), make_int_value(1), make_float_value(2.5f), make_string_value("alpha")},
+              });
+
+    std::vector<TabCol> group_by = {{"t", "dept"}};
+    std::vector<AggExpr> aggs = {
+        make_count_distinct("id", "COUNT(DISTINCT id)"),
+        make_count_distinct("ratio", "COUNT(DISTINCT ratio)"),
+        make_count_distinct("label", "COUNT(DISTINCT label)"),
+    };
+
+    AggregateExecutor exec(std::move(child), group_by, aggs, std::vector<TestExecutorHavingCondition>());
+
+    exec.beginTuple();
+    ASSERT_FALSE(exec.is_end());
+    auto first = exec.Next();
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(read_string(*first, 0, 8), "eng");
+    EXPECT_EQ(read_int(*first, 8), 2);
+    EXPECT_EQ(read_int(*first, 12), 2);
+    EXPECT_EQ(read_int(*first, 16), 2);
+
+    exec.nextTuple();
+    ASSERT_FALSE(exec.is_end());
+    auto second = exec.Next();
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(read_string(*second, 0, 8), "ops");
+    EXPECT_EQ(read_int(*second, 8), 1);
+    EXPECT_EQ(read_int(*second, 12), 2);
+    EXPECT_EQ(read_int(*second, 16), 1);
+
+    exec.nextTuple();
+    EXPECT_TRUE(exec.is_end());
+}
+
 TEST(AggregateExecutorTest, HavingCanFilterOnAggregateResultAgainstIntegerLiteral) {
     std::vector<ColMeta> cols = {
         make_col("t", "dept", TYPE_STRING, 8, 0),
@@ -325,7 +390,7 @@ TEST(AggregateExecutorTest, HavingCanFilterOnAggregateResultAgainstIntegerLitera
     auto row = exec.Next();
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_string(*row, 0, 8), "eng");
-    EXPECT_DOUBLE_EQ(read_float(*row, 8), 15.0);
+    EXPECT_FLOAT_EQ(read_float_value(*row, 8), 15.0f);
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
@@ -342,6 +407,8 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
         make_count_star("cnt"),
         make_aggregate(AggType::SUM, "score", "sum_score"),
         make_aggregate(AggType::AVG, "score", "avg_score"),
+        make_aggregate(AggType::MIN, "score", "min_score"),
+        make_aggregate(AggType::MAX, "score", "max_score"),
     };
     std::vector<TestExecutorHavingCondition> having;
 
@@ -351,9 +418,18 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
     ASSERT_FALSE(exec.is_end());
     auto row = exec.Next();
     ASSERT_NE(row, nullptr);
+    // finalv3 A.3 allows the evaluator's aggregate-empty-set convention to use
+    // INT32 zero. FLOAT AVG keeps its existing SQL NULL behavior.
     EXPECT_EQ(read_int(*row, 0), 0);
+    EXPECT_FALSE(is_null(row->data, exec.cols()[0]));
+    EXPECT_FALSE(is_null(row->data, exec.cols()[1]));
+    EXPECT_TRUE(is_null(row->data, exec.cols()[2]));
+    EXPECT_FALSE(is_null(row->data, exec.cols()[3]));
+    EXPECT_FALSE(is_null(row->data, exec.cols()[4]));
     EXPECT_EQ(read_int(*row, 4), 0);
-    EXPECT_DOUBLE_EQ(read_float(*row, 8), 0.0);
+    EXPECT_FLOAT_EQ(read_float_value(*row, 8), 0.0f);
+    EXPECT_EQ(read_int(*row, 12), 0);
+    EXPECT_EQ(read_int(*row, 16), 0);
 
     exec.nextTuple();
     EXPECT_TRUE(exec.is_end());
@@ -418,7 +494,7 @@ TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {
     std::vector<ColMeta> cols = {
         make_col("t", "dept", TYPE_STRING, 8, 0),
         make_col("t", "score", TYPE_INT, 4, 8),
-        make_col("t", "bonus", TYPE_FLOAT, 8, 12),
+        make_col("t", "bonus", TYPE_FLOAT, 4, 12),
     };
 
     auto child = make_child_executor(cols, {
@@ -433,7 +509,8 @@ TEST(AggregateExecutorTest, OutputSchemaMatchesGroupAndAggregateLayout) {
 
     AggregateExecutor exec(std::move(child), group_by, aggs, having);
 
-    ASSERT_EQ(exec.tupleLen(), 20);
+    // dept(8) + best_score(4) + avg_bonus(4) + 1 byte trailing NULL bitmap
+    ASSERT_EQ(exec.tupleLen(), 16 + 1);
     ASSERT_EQ(exec.cols().size(), 3);
 
     EXPECT_EQ(exec.cols()[0].tab_name, "t");

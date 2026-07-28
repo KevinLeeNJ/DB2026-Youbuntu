@@ -23,6 +23,8 @@ See the Mulan PSL v2 for more details. */
 #include <ctime>
 #include <iostream>
 #include <memory>
+#include <set>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -197,6 +199,231 @@ TEST_F(RecordManagerTest, SimpleTest) {
     assert(mock.size() == add_cnt - del_cnt);
     std::cout << "insert " << add_cnt << '\n' << "delete " << del_cnt << '\n' << "update " << upd_cnt << '\n';
     // clean up
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, ApplyTupleUpdateInstallsTupleAndPageLsnTogether) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "apply_tuple_update_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 64;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+
+    char initial[record_size] = {};
+    Rid rid = file_handle->insert_record(initial, nullptr);
+    char updated[record_size] = {};
+    std::memcpy(updated, "updated", 8);
+    TupleMeta meta;
+    meta.writer_txn_id_ = 7;
+    meta.is_committed_ = false;
+    meta.is_deleted_ = false;
+
+    file_handle->apply_tuple_update(rid, updated, meta, 42);
+
+    auto record = file_handle->get_record(rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(std::memcmp(record->data, updated, record_size), 0);
+    EXPECT_EQ(file_handle->get_tuple_meta(rid).writer_txn_id_, 7);
+    EXPECT_FALSE(file_handle->get_tuple_meta(rid).is_committed_);
+    EXPECT_EQ(file_handle->get_page_lsn(rid), 42);
+
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, PreparedInsertInstallsTupleMetaAndPageLsnTogether) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "prepared_insert_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 64;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+    auto prepared = file_handle->prepare_insert_record();
+    char value[record_size] = {};
+    std::memcpy(value, "inserted", 9);
+    TupleMeta meta;
+    meta.writer_txn_id_ = 11;
+    meta.is_committed_ = false;
+    meta.is_deleted_ = false;
+
+    file_handle->finish_insert_record(prepared, value, &meta, 77);
+
+    auto record = file_handle->get_record(prepared.rid, nullptr);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(std::memcmp(record->data, value, record_size), 0);
+    EXPECT_EQ(file_handle->get_tuple_meta(prepared.rid).writer_txn_id_, 11);
+    EXPECT_FALSE(file_handle->get_tuple_meta(prepared.rid).is_committed_);
+    EXPECT_EQ(file_handle->get_page_lsn(prepared.rid), 77);
+
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, ConcurrentInsertsUseMultipleHeapPages) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "concurrent_insert_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 128;
+    constexpr int worker_count = 8;
+    constexpr int inserts_per_worker = 100;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (int worker = 0; worker < worker_count; ++worker) {
+        workers.emplace_back([&, worker] {
+            char record[record_size] = {};
+            std::memcpy(record, &worker, sizeof(worker));
+            for (int i = 0; i < inserts_per_worker; ++i) {
+                file_handle->insert_record(record, nullptr);
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    std::set<page_id_t> pages;
+    int record_count = 0;
+    for (RmScan scan(file_handle.get()); !scan.is_end(); scan.next()) {
+        pages.insert(scan.rid().page_no);
+        ++record_count;
+    }
+    EXPECT_EQ(record_count, worker_count * inserts_per_worker);
+    EXPECT_GT(pages.size(), 1u);
+
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+// insert_record(rid, ...) 是恢复 redo 和**事务回滚**（撤销 delete 时重插旧镜像）
+// 共用的路径。它曾无条件把「本页的 next_free_page_no」发布成空闲链表头，而这只在
+// 本页恰好是链表头时才正确。
+//
+// 诚实说明这个用例的强度：它在**修复前也能通过** —— 因为 free_page_candidates_
+// 才是运行期的真值来源，那个被填满的页仍留在候选向量里，prepare_insert_record()
+// 下次取到它、发现已满、剔除后重试，于是自愈了。所以这里守的是「可观察行为」
+// （空闲页仍被复用），而不是一个曾经暴露过的失败。真正会崩的那条路径由下面的
+// BulkLoadSurvivesAStaleFreePageHead 覆盖。
+TEST_F(RecordManagerTest, RefillingANonHeadPageKeepsFreeListConsistent) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "free_list_consistency_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    // 记录够大，使每页只放少量记录，便于精确造出「两个非满页」的局面。
+    constexpr int record_size = 1000;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+    const int per_page = file_handle->file_hdr_.num_records_per_page;
+    ASSERT_GE(per_page, 2) << "record_size 需要让每页至少放两条，否则造不出这个局面";
+
+    std::vector<char> record(record_size, 0);
+    std::vector<Rid> rids;
+    for (int i = 0; i < per_page * 2; ++i) {
+        std::memcpy(record.data(), &i, sizeof(i));
+        rids.push_back(file_handle->insert_record(record.data(), nullptr));
+    }
+    // 至少两个页，且此时都已装满。
+    std::set<page_id_t> pages;
+    for (const auto& rid : rids) {
+        pages.insert(rid.page_no);
+    }
+    ASSERT_GE(pages.size(), 2u);
+
+    // 各删一条，让两个页都变成非满 —— 两者都成为空闲候选，链表头是其中一个。
+    const Rid first_page_slot = rids.front();
+    const Rid second_page_slot = rids.back();
+    ASSERT_NE(first_page_slot.page_no, second_page_slot.page_no);
+    file_handle->delete_record(first_page_slot, nullptr);
+    file_handle->delete_record(second_page_slot, nullptr);
+
+    // 回滚形状：往**非链表头**的那个页重插，把它重新填满。
+    const page_id_t head_before = file_handle->file_hdr_.first_free_page_no;
+    const Rid non_head = head_before == first_page_slot.page_no ? second_page_slot : first_page_slot;
+    std::memcpy(record.data(), &non_head.slot_no, sizeof(non_head.slot_no));
+    file_handle->insert_record(non_head, record.data());
+
+    // 关键不变式：仍有空槽的那个页必须还能被分配到。旧代码把「本页的
+    // next_free_page_no」当成新的链表头发布，会把它连带丢掉，于是这条插入
+    // 会去扩一个新页而不是复用已有空槽。
+    const Rid still_free = non_head.page_no == first_page_slot.page_no ? second_page_slot : first_page_slot;
+    const Rid reused = file_handle->insert_record(record.data(), nullptr);
+    EXPECT_EQ(reused.page_no, still_free.page_no) << "真正空闲的页被从空闲候选里丢掉了";
+
+    rm_manager->close_file(file_handle.get());
+    rm_manager->destroy_file(filename);
+}
+
+// PinnedInserter（批量装载）过去直接跟着 file_hdr_.first_free_page_no 走，而那个
+// 链接可能指向一个已经满了的页；换页后它又不重新检查 slot_no，于是会在
+// get_slot(num_records_per_page) 处越界写出页外。这里显式把链表头指向一个满页来
+// 逼出那条路径。
+TEST_F(RecordManagerTest, BulkLoadSurvivesAStaleFreePageHead) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = "bulk_load_stale_head_test.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+
+    constexpr int record_size = 1000;
+    rm_manager->create_file(filename, record_size);
+    auto file_handle = rm_manager->open_file(filename);
+    const int per_page = file_handle->file_hdr_.num_records_per_page;
+    ASSERT_GE(per_page, 2);
+
+    std::vector<char> record(record_size, 0);
+    // 装满第一个记录页。
+    for (int i = 0; i < per_page; ++i) {
+        std::memcpy(record.data(), &i, sizeof(i));
+        file_handle->insert_record(record.data(), nullptr);
+    }
+    // 把链表头强行指回那个满页（模拟陈旧链接）。
+    {
+        std::scoped_lock lock(file_handle->free_space_latch_, file_handle->file_header_latch_);
+        file_handle->free_page_candidates_.clear();
+        file_handle->free_page_candidate_set_.clear();
+        file_handle->free_page_cursor_ = 0;
+        file_handle->file_hdr_.first_free_page_no = RM_FIRST_RECORD_PAGE;
+    }
+
+    // 批量装载必须自己发现该页已满并另取一页，而不是越界写。
+    const int bulk_rows = per_page * 3;
+    {
+        RmFileHandle::PinnedInserter inserter(file_handle.get());
+        for (int i = 0; i < bulk_rows; ++i) {
+            const int value = 1000 + i;
+            std::memcpy(record.data(), &value, sizeof(value));
+            const Rid rid = inserter.insert(record.data());
+            ASSERT_GE(rid.slot_no, 0);
+            ASSERT_LT(rid.slot_no, per_page) << "slot_no 越界，写到了页外";
+        }
+    }
+
+    int total = 0;
+    for (RmScan scan(file_handle.get()); !scan.is_end(); scan.next()) {
+        ++total;
+    }
+    EXPECT_EQ(total, per_page + bulk_rows);
+
     rm_manager->close_file(file_handle.get());
     rm_manager->destroy_file(filename);
 }

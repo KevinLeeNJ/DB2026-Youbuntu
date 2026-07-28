@@ -15,6 +15,10 @@ See the Mulan PSL v2 for more details. */
 
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <unordered_set>
+#include <vector>
 
 #include "bitmap.h"
 #include "common/context.h"
@@ -55,12 +59,84 @@ struct RmPageHandle {
 struct RmPinnedInsert {
     RmPageHandle page_handle;
     Rid rid;
+    std::unique_ptr<std::unique_lock<std::shared_mutex>> page_lock;
+    bool reserved{false};
 };
 
 /* A record paired with its TupleMeta, fetched in a single buffer-pool pin. */
 struct RmRecordWithMeta {
     TupleMeta meta;
     std::unique_ptr<RmRecord> record;
+};
+
+// A read-only view of a record slot. The guard keeps both the buffer-pool
+// frame resident and the page payload stable while executors consume view.
+struct RmRecordView {
+    const char* data = nullptr;
+    uint32_t size = 0;
+};
+
+class RmPageReadGuard {
+public:
+    RmPageReadGuard() = default;
+
+    RmPageReadGuard(BufferPoolManager* bpm, PageId page_id, Page* page)
+        : bpm_(bpm), page_id_(page_id), page_(page), page_lock_(page->latch()) {}
+
+    ~RmPageReadGuard() {
+        release();
+    }
+
+    RmPageReadGuard(const RmPageReadGuard&) = delete;
+    RmPageReadGuard& operator=(const RmPageReadGuard&) = delete;
+
+    RmPageReadGuard(RmPageReadGuard&& other) noexcept
+        : bpm_(other.bpm_), page_id_(other.page_id_), page_(other.page_), page_lock_(std::move(other.page_lock_)) {
+        other.bpm_ = nullptr;
+        other.page_ = nullptr;
+    }
+
+    RmPageReadGuard& operator=(RmPageReadGuard&& other) noexcept {
+        if (this != &other) {
+            release();
+            bpm_ = other.bpm_;
+            page_id_ = other.page_id_;
+            page_ = other.page_;
+            page_lock_ = std::move(other.page_lock_);
+            other.bpm_ = nullptr;
+            other.page_ = nullptr;
+        }
+        return *this;
+    }
+
+    Page* page() const {
+        return page_;
+    }
+
+private:
+    void release() {
+        if (page_ == nullptr) {
+            return;
+        }
+        page_lock_.unlock();
+        if (bpm_ != nullptr) {
+            bpm_->unpin_page(page_id_, false);
+        }
+        bpm_ = nullptr;
+        page_ = nullptr;
+    }
+
+    BufferPoolManager* bpm_ = nullptr;
+    PageId page_id_{};
+    Page* page_ = nullptr;
+    std::shared_lock<std::shared_mutex> page_lock_;
+};
+
+struct RmRecordViewWithMeta {
+    TupleMeta meta;
+    RmRecordView view;
+    std::unique_ptr<RmPageReadGuard> guard;
+    std::unique_ptr<RmRecord> owned;
 };
 
 /* 每个RmFileHandle对应一个表的数据文件，里面有多个page，每个page的数据封装在RmPageHandle中 */
@@ -73,7 +149,12 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     int fd_;             // 打开文件后产生的文件句柄
     RmFileHdr file_hdr_; // 文件头，维护当前表文件的元数据
-    std::mutex physical_latch_;
+    std::mutex free_space_latch_;
+    std::mutex extension_latch_;
+    mutable std::mutex file_header_latch_;
+    std::vector<page_id_t> free_page_candidates_;
+    std::unordered_set<page_id_t> free_page_candidate_set_;
+    size_t free_page_cursor_{0};
 
 public:
     RmFileHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd)
@@ -86,7 +167,8 @@ public:
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
     }
 
-    RmFileHdr get_file_hdr() {
+    RmFileHdr get_file_hdr() const {
+        std::lock_guard<std::mutex> lock(file_header_latch_);
         return file_hdr_;
     }
     int GetFd() {
@@ -108,29 +190,57 @@ public:
     std::unique_ptr<RmRecord> get_record(const Rid& rid, Context* context) const;
 
     /* Fetch both TupleMeta and record data in a single page pin, halving the
-       buffer-pool latch acquisitions compared to get_tuple_meta + get_record. */
+       buffer-pool latch acquisitions
+     * compared to get_tuple_meta + get_record. */
     RmRecordWithMeta get_record_with_meta(const Rid& rid, Context* context) const;
+
+    // Borrow the current committed slot without copying its payload. The
+    // returned guard must remain alive while view.data is accessed.
+    RmRecordViewWithMeta get_record_view_with_meta(const Rid& rid) const;
 
     Rid insert_record(char* buf, Context* context);
 
-    void insert_record(const Rid& rid, char* buf);
+    void insert_record(const Rid& rid, char* buf, lsn_t page_lsn = INVALID_LSN);
 
     RmPinnedInsert prepare_insert_record();
 
-    void finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta = nullptr);
+    void finish_insert_record(RmPinnedInsert& insert, char* buf, const TupleMeta* tuple_meta = nullptr,
+                              lsn_t page_lsn = INVALID_LSN);
 
     void abort_prepared_insert(RmPinnedInsert& insert);
 
-    void delete_record(const Rid& rid, Context* context);
+    void delete_record(const Rid& rid, Context* context, lsn_t page_lsn = INVALID_LSN);
 
-    void update_record(const Rid& rid, char* buf, Context* context);
+    void update_record(const Rid& rid, char* buf, Context* context, lsn_t page_lsn = INVALID_LSN);
+
+    // Apply the tuple image and its MVCC metadata as one page mutation. The
+    // page LSN is installed only after both payloads have been written while
+    // the same exclusive page latch is held.
+    void apply_tuple_update(const Rid& rid, const char* buf, const TupleMeta& meta, lsn_t page_lsn);
 
     RmPageHandle create_new_page_handle();
 
     RmPageHandle fetch_page_handle(int page_no) const;
 
     // MVCC: update TupleMeta for a slot (pins and unpins the page)
-    void set_tuple_meta(const Rid& rid, const TupleMeta& meta);
+    void set_tuple_meta(const Rid& rid, const TupleMeta& meta, lsn_t page_lsn = INVALID_LSN);
+
+    // Advance the page LSN after a WAL record has been installed for a tuple
+    // update. The page LSN is monotonic because recovery uses it as its redo
+    // idempotence guard.
+    void set_page_lsn(const Rid& rid, lsn_t lsn);
+
+    lsn_t get_page_lsn(const Rid& rid) const;
+
+    // Recovery rebuilds allocation metadata from the on-disk page bitmaps;
+    // the file header itself may have been stale when the process crashed.
+    void rebuild_file_header_from_pages();
+
+    // Recovery repair for a bounded set of pages. Unlike
+    // rebuild_file_header_from_pages(), this only inspects the supplied pages
+    // and advances the allocation boundary when a touched RID references a
+    // page that was allocated before its file-header update reached disk.
+    void repair_file_header_for_pages(const std::vector<page_id_t>& page_nos);
 
     // MVCC: get TupleMeta for a slot
     TupleMeta get_tuple_meta(const Rid& rid) const;
@@ -138,10 +248,6 @@ public:
     // Access buffer pool manager (for TupleMeta modifications that need explicit pin control)
     BufferPoolManager* get_bpm() {
         return buffer_pool_manager_;
-    }
-
-    std::mutex& get_physical_latch() {
-        return physical_latch_;
     }
 
     // Bulk-load: pins data page across rows to skip per-record fetch/unpin.
@@ -170,13 +276,15 @@ public:
         Rid insert(const char* buf) {
             int slot_no = Bitmap::first_bit(false, page.bitmap, fh->file_hdr_.num_records_per_page);
             if (slot_no == fh->file_hdr_.num_records_per_page) {
-                // Page full → advance to next free page
+                // Page full → hand it back and take a fresh one. Go through
+                // create_page_handle(): it is the only routine that guarantees
+                // a page with a free slot. Following first_free_page_no
+                // directly (as this code used to) can land on an already-full
+                // page, and the recomputed slot_no was then not re-checked —
+                // writing at get_slot(num_records_per_page), i.e. past the end
+                // of the page.
                 fh->buffer_pool_manager_->unpin_page(page.page->get_page_id(), true);
-                if (fh->file_hdr_.first_free_page_no == -1) {
-                    page = fh->create_new_page_handle();
-                } else {
-                    page = fh->fetch_page_handle(fh->file_hdr_.first_free_page_no);
-                }
+                page = fh->create_page_handle();
                 slot_no = Bitmap::first_bit(false, page.bitmap, fh->file_hdr_.num_records_per_page);
             }
             memcpy(page.get_slot(slot_no), buf, fh->file_hdr_.record_size);
@@ -189,7 +297,12 @@ public:
             Bitmap::set(page.bitmap, slot_no);
             page.page_hdr->num_records++;
             if (page.page_hdr->num_records >= fh->file_hdr_.num_records_per_page) {
-                fh->file_hdr_.first_free_page_no = page.page_hdr->next_free_page_no;
+                // Same stale-link hazard as insert_record(): publishing this
+                // page's own next pointer as the new list head is only correct
+                // when the page happens to be the head. Route through the
+                // candidate bookkeeping, which never publishes a stale link and
+                // also drops the page from free_page_candidates_.
+                fh->remove_free_page_candidate(page.page->get_page_id().page_no, page.page_hdr->next_free_page_no);
             }
             return Rid{page.page->get_page_id().page_no, slot_no};
         }
@@ -197,6 +310,10 @@ public:
 
 private:
     RmPageHandle create_page_handle();
+    RmPageHandle create_new_page_handle_unlocked();
 
     void release_page_handle(RmPageHandle& page_handle);
+    void add_free_page_candidate(page_id_t page_no);
+    void remove_free_page_candidate(page_id_t page_no, page_id_t next_free_page_no);
+    std::optional<page_id_t> select_free_page_candidate();
 };

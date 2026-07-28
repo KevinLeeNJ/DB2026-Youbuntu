@@ -39,13 +39,14 @@ SELECT grp, MIN(name) AS mn, MAX(name) AS mx FROM t_str GROUP BY grp ORDER BY gr
 +------------------+------------------+------------------+
 Total record(s): 2
 
+# Empty input: SQL MIN over no rows is NULL, not the empty string.
 query
 SELECT MIN(name) AS mn FROM t_str WHERE grp = 99;
 ----
 +------------------+
 |               mn |
 +------------------+
-|                  |
+|             NULL |
 +------------------+
 Total record(s): 1
 

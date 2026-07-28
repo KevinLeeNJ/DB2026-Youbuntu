@@ -11,10 +11,42 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstdint>
+#include <cstring>
+#include <string_view>
+#include <utility>
+
 #include "execution_defs.h"
 #include "common/common.h"
 #include "index/ix.h"
 #include "system/sm.h"
+
+struct TupleView {
+    const char* data = nullptr;
+    uint32_t size = 0;
+
+    explicit operator bool() const {
+        return data != nullptr;
+    }
+};
+
+template <typename T> class ScopedValueOverride {
+public:
+    ScopedValueOverride(T& value, T replacement) : value_(value), old_value_(value) {
+        value_ = std::move(replacement);
+    }
+
+    ~ScopedValueOverride() {
+        value_ = std::move(old_value_);
+    }
+
+    ScopedValueOverride(const ScopedValueOverride&) = delete;
+    ScopedValueOverride& operator=(const ScopedValueOverride&) = delete;
+
+private:
+    T& value_;
+    T old_value_;
+};
 
 class AbstractExecutor {
 public:
@@ -29,8 +61,8 @@ public:
     };
 
     virtual const std::vector<ColMeta>& cols() const {
-        std::vector<ColMeta>* _cols = nullptr;
-        return *_cols;
+        static const std::vector<ColMeta> empty_cols;
+        return empty_cols;
     };
 
     virtual std::string getType() {
@@ -49,9 +81,15 @@ public:
 
     virtual std::unique_ptr<RmRecord> Next() = 0;
 
+    // The view is valid until the next beginTuple()/nextTuple() call.
+    // Executors without a borrowed representation keep the legacy Next API.
+    virtual TupleView current() const {
+        return {};
+    }
+
     virtual ColMeta get_col_offset(const TabCol& target) {
         (void)target;
-        return ColMeta();
+        throw InternalError("get_col_offset is not implemented for " + getType());
     };
 
     virtual void set_counting_enabled(bool enabled) {
@@ -62,12 +100,27 @@ public:
         // no-op default; only IndexScanExecutor overrides
     }
 
+    virtual void set_lookup_key(const TabCol& /*target*/, const char* /*key*/, size_t /*len*/) {
+        // no-op default; only index-backed scans need dynamic lookup bytes
+    }
+
     virtual std::string scan_table_name() const {
         return "";
     }
 
+    // Stable view used by SSI plumbing; the legacy string-returning API stays
+    // available for compatibility with older executor implementations.
+    virtual std::string_view scan_table_name_view() const {
+        return {};
+    }
+
     virtual std::vector<Condition> scan_conditions() const {
         return {};
+    }
+
+    virtual const std::vector<Condition>& scan_conditions_ref() const {
+        static const std::vector<Condition> empty_conditions;
+        return empty_conditions;
     }
 
     virtual void record_current_read_for_ssi() {}
@@ -91,38 +144,93 @@ public:
     }
 
 protected:
+    struct ColumnAddress {
+        int offset{0};
+        int len{0};
+        ColType type{TYPE_INT};
+        int null_byte{-1};
+        uint8_t null_mask{0};
+    };
+
+    struct ConditionAddress {
+        ColumnAddress lhs;
+        ColumnAddress rhs;
+    };
+
+    static ColumnAddress make_column_address(const ColMeta& col) {
+        return ColumnAddress{col.offset, col.len, col.type, col.null_byte, col.null_mask};
+    }
+
+    std::vector<ConditionAddress> cache_condition_addresses(const std::vector<Condition>& conditions) {
+        std::vector<ConditionAddress> addresses;
+        addresses.reserve(conditions.size());
+        for (const auto& condition : conditions) {
+            ConditionAddress address;
+            address.lhs = make_column_address(get_col_offset(condition.lhs_col));
+            if (condition.is_rhs_val) {
+                address.rhs.type = condition.rhs_val.type;
+            } else {
+                address.rhs = make_column_address(get_col_offset(condition.rhs_col));
+            }
+            addresses.push_back(address);
+        }
+        return addresses;
+    }
+
+    bool conditions_match(const std::vector<Condition>& conditions, const std::vector<ConditionAddress>& addresses,
+                          const TupleView& tuple) const {
+        if (conditions.size() != addresses.size()) {
+            throw InternalError("condition address cache is out of date");
+        }
+        for (size_t i = 0; i < conditions.size(); ++i) {
+            if (!compare(conditions[i], tuple, addresses[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool conditions_match(const std::vector<Condition>& conditions, const std::vector<ConditionAddress>& addresses,
+                          const RmRecord& rec) const {
+        return conditions_match(conditions, addresses, TupleView{rec.data, static_cast<uint32_t>(rec.size)});
+    }
+
     /**
      * @brief 比较条件cond与记录rec是否匹配
      * @param cond 条件
      * @param rec 记录
      * @return true if rec matches cond, false otherwise
      */
-    bool compare(const Condition& cond, const RmRecord& rec) {
-        ColMeta lhs_col_meta = get_col_offset(cond.lhs_col);
-        ColMeta rhs_col_meta;
-        char* lhs_data = rec.data + lhs_col_meta.offset;
-        ColType lhs_type, rhs_type;
-        lhs_type = get_col_offset(cond.lhs_col).type;
-        char* rhs_data = nullptr;
-        if (!cond.is_rhs_val) {
-            rhs_col_meta = get_col_offset(cond.rhs_col);
-            rhs_data = rec.data + rhs_col_meta.offset;
-            rhs_type = rhs_col_meta.type;
-        } else {
-            rhs_type = cond.rhs_val.type;
+    bool compare(const Condition& cond, const TupleView& tuple, const ConditionAddress& address) const {
+        // 三值逻辑先行：`IS [NOT] NULL` 在这里定值并直接返回，不读数据字节；
+        // 任一操作数为 NULL 时整个比较为假（含 `<>`）。
+        switch (eval_condition_nulls(cond, tuple.data, address.lhs.null_byte, address.lhs.null_mask,
+                                     address.rhs.null_byte, address.rhs.null_mask)) {
+        case NullEval::DECIDED_TRUE:
+            return true;
+        case NullEval::DECIDED_FALSE:
+            return false;
+        case NullEval::COMPARE:
+            break;
         }
+        const ColType lhs_type = address.lhs.type;
+        const ColType rhs_type = cond.is_rhs_val ? cond.rhs_val.type : address.rhs.type;
+        const char* lhs_data = tuple.data + address.lhs.offset;
+        const char* rhs_data = cond.is_rhs_val ? nullptr : tuple.data + address.rhs.offset;
         if (can_cast(lhs_type, rhs_type) == false) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
         switch (lhs_type) {
         case TYPE_INT:
         case TYPE_FLOAT: {
-            double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*(int*)lhs_data) : *(double*)lhs_data;
+            const double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(lhs_data))
+                                                        : static_cast<double>(read_float(lhs_data));
             double rhs_val;
             if (cond.is_rhs_val) {
                 rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
             } else {
-                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*(int*)rhs_data) : *(double*)rhs_data;
+                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(read_unaligned<int>(rhs_data))
+                                               : static_cast<double>(read_float(rhs_data));
             }
             switch (cond.op) {
             case OP_EQ:
@@ -142,9 +250,10 @@ protected:
         }
         case TYPE_STRING:
         case TYPE_DATETIME: {
-            std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
-            std::string rhs_val =
-                cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta.len));
+            const std::string_view lhs_val(lhs_data, strnlen(lhs_data, address.lhs.len));
+            const std::string_view rhs_val = cond.is_rhs_val
+                                                 ? std::string_view(cond.rhs_val.str_val)
+                                                 : std::string_view(rhs_data, strnlen(rhs_data, address.rhs.len));
             switch (cond.op) {
             case OP_EQ:
                 return lhs_val == rhs_val;
@@ -162,6 +271,21 @@ protected:
         }
         }
         return false;
+    }
+
+    bool compare(const Condition& cond, const RmRecord& rec, const ConditionAddress& address) const {
+        return compare(cond, TupleView{rec.data, static_cast<uint32_t>(rec.size)}, address);
+    }
+
+    bool compare(const Condition& cond, const RmRecord& rec) {
+        ConditionAddress address;
+        address.lhs = make_column_address(get_col_offset(cond.lhs_col));
+        if (cond.is_rhs_val) {
+            address.rhs.type = cond.rhs_val.type;
+        } else {
+            address.rhs = make_column_address(get_col_offset(cond.rhs_col));
+        }
+        return compare(cond, rec, address);
     }
     /**
      * @brief 判断两个列类型是否可以进行转换

@@ -12,34 +12,50 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/watermark.h"
 
 auto Watermark::AddTxn(timestamp_t read_ts) -> void {
+    (void)AddTxnSlot(read_ts);
+}
+
+size_t Watermark::AddTxnSlot(timestamp_t read_ts) {
     std::lock_guard<std::mutex> lock(latch_);
-    auto it = current_reads_.find(read_ts);
-    if (it != current_reads_.end()) {
-        ++it->second;
+    auto it = std::find(active_read_ts_.begin(), active_read_ts_.end(), inactive_read_ts());
+    size_t slot;
+    if (it == active_read_ts_.end()) {
+        slot = active_read_ts_.size();
+        active_read_ts_.push_back(read_ts);
     } else {
-        current_reads_.emplace(read_ts, 1);
-        // 新的最小读时间戳会推低水位线
-        if (read_ts < watermark_) {
-            watermark_ = read_ts;
-        }
+        slot = static_cast<size_t>(it - active_read_ts_.begin());
+        *it = read_ts;
     }
+    recompute_watermark_locked();
+    return slot;
+}
+
+void Watermark::RemoveTxnSlot(size_t slot) {
+    std::lock_guard<std::mutex> lock(latch_);
+    if (slot >= active_read_ts_.size() || active_read_ts_[slot] == inactive_read_ts()) {
+        return;
+    }
+    active_read_ts_[slot] = inactive_read_ts();
+    recompute_watermark_locked();
+}
+
+void Watermark::UpdateTxnReadTsSlot(size_t slot, timestamp_t new_read_ts) {
+    std::lock_guard<std::mutex> lock(latch_);
+    if (slot >= active_read_ts_.size() || active_read_ts_[slot] == inactive_read_ts()) {
+        return;
+    }
+    active_read_ts_[slot] = new_read_ts;
+    recompute_watermark_locked();
 }
 
 auto Watermark::RemoveTxn(timestamp_t read_ts) -> void {
     std::lock_guard<std::mutex> lock(latch_);
-    auto it = current_reads_.find(read_ts);
-    if (it == current_reads_.end()) {
+    auto it = std::find(active_read_ts_.begin(), active_read_ts_.end(), read_ts);
+    if (it == active_read_ts_.end()) {
         return;
     }
-    if (--it->second == 0) {
-        current_reads_.erase(it);
-    }
-    // 重算水位线：无活跃事务时回退到 commit_ts_，否则取最小读时间戳
-    if (current_reads_.empty()) {
-        watermark_ = commit_ts_;
-    } else {
-        watermark_ = current_reads_.begin()->first;
-    }
+    *it = inactive_read_ts();
+    recompute_watermark_locked();
 }
 
 void Watermark::UpdateTxnReadTs(timestamp_t old_read_ts, timestamp_t new_read_ts) {
@@ -48,14 +64,18 @@ void Watermark::UpdateTxnReadTs(timestamp_t old_read_ts, timestamp_t new_read_ts
     }
 
     std::lock_guard<std::mutex> lock(latch_);
-    auto old_it = current_reads_.find(old_read_ts);
-    if (old_it != current_reads_.end()) {
-        if (--old_it->second == 0) {
-            current_reads_.erase(old_it);
+    auto old_it = std::find(active_read_ts_.begin(), active_read_ts_.end(), old_read_ts);
+    if (old_it != active_read_ts_.end()) {
+        *old_it = new_read_ts;
+    } else {
+        auto free_it = std::find(active_read_ts_.begin(), active_read_ts_.end(), inactive_read_ts());
+        if (free_it == active_read_ts_.end()) {
+            active_read_ts_.push_back(new_read_ts);
+        } else {
+            *free_it = new_read_ts;
         }
     }
-    ++current_reads_[new_read_ts];
-    watermark_ = current_reads_.begin()->first;
+    recompute_watermark_locked();
 }
 
 void Watermark::UpdateCommitTs(timestamp_t commit_ts) {
@@ -64,12 +84,20 @@ void Watermark::UpdateCommitTs(timestamp_t commit_ts) {
         commit_ts_ = commit_ts;
     }
     // 无活跃事务时，水位线跟随 commit_ts_ 上移
-    if (current_reads_.empty()) {
-        watermark_ = commit_ts_;
-    }
+    recompute_watermark_locked();
 }
 
 timestamp_t Watermark::GetWatermark() {
     std::lock_guard<std::mutex> lock(latch_);
     return watermark_;
+}
+
+void Watermark::recompute_watermark_locked() {
+    timestamp_t minimum = commit_ts_;
+    for (timestamp_t read_ts : active_read_ts_) {
+        if (read_ts != inactive_read_ts()) {
+            minimum = std::min(minimum, read_ts);
+        }
+    }
+    watermark_ = minimum;
 }

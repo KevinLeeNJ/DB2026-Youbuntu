@@ -11,13 +11,26 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <type_traits>
+
 #include "defs.h"
 #include "storage/buffer_pool_manager.h"
 
 constexpr int RM_NO_PAGE = -1;
 constexpr int RM_FILE_HDR_PAGE = 0;
 constexpr int RM_FIRST_RECORD_PAGE = 1;
-constexpr int RM_MAX_RECORD_SIZE = 512;
+// 单条记录（数据区 + 尾部 null bitmap）的上限。
+//
+// 这只是一个校验闸门，不影响页密度：num_records_per_page 由实际的 record_size
+// 算出，把闸门抬高不会让小记录的每页条数变少。而闸门定得太低是致命的——标准
+// TPC-C 的 customer.c_data 是 char(500)，整条记录 749 字节，512 的旧上限会让
+// CREATE TABLE 直接抛 InvalidRecordSizeError，装载预算一秒都用不上。final.md
+// 没有公开 DDL 的列宽，所以这里留足余量。
+//
+// 上界由"每页至少放得下一条记录"决定：
+//   RM_PAGE_META_OFFSET + TUPLE_META_SIZE + 1(bitmap) + record_size <= PAGE_SIZE
+// 即 record_size <= 4096 - 16 - 32 - 1 = 4047，2048 在安全区内（还剩一半）。
+constexpr int RM_MAX_RECORD_SIZE = 2048;
 
 // UndoLink — points to a physical undo storage location.
 // For in-memory undo (transitional): undo_page_id_ = 0, undo_slot_offset_ = log_index
@@ -41,12 +54,28 @@ struct UndoLink {
     }
 };
 
+// TupleMeta — 每个 slot 的版本元数据，按 num_records_per_page 个一组存放在页头之后。
+//
+// 布局很值钱：每页的元组数是 (可用空间) / (record_size + TUPLE_META_SIZE)，窄表
+// 上 TupleMeta 就是页密度的主要开销（new_orders 的记录只有 13 字节）。因此把两个
+// 标志位打包进 writer_txn_id_ 所在的那个 64 位存储单元，消掉原布局里
+// `bool bool + 6 字节纯 padding` 的空洞：40 → 32 字节。
+//
+// 位域刻意沿用原来的成员名，调用点写法不变（`meta.is_committed_ = true`），
+// 没有任何位移/掩码散落在外面。writer_txn_id_ 只让出高 2 位，剩下 62 位是有符号
+// 事务号，覆盖 ±2^61，远超任何可能的事务计数，且 INVALID_TXN_ID(-1) 正常回环。
 struct TupleMeta {
-    timestamp_t commit_ts_{INVALID_TS};      // commit timestamp (valid when is_committed_)
-    txn_id_t writer_txn_id_{INVALID_TXN_ID}; // transaction that wrote this version
-    bool is_committed_{false};               // true if the writer has committed
-    bool is_deleted_{false};                 // true if this tuple is logically deleted
-    UndoLink version_chain_head_;            // pointer to undo storage chain
+    static constexpr int WRITER_TXN_ID_BITS = 62; // 让出高 2 位给下面两个标志
+
+    timestamp_t commit_ts_{INVALID_TS};           // commit timestamp (valid when is_committed_)
+    txn_id_t writer_txn_id_ : WRITER_TXN_ID_BITS; // transaction that wrote this version
+    uint64_t is_committed_ : 1;                   // true if the writer has committed
+    uint64_t is_deleted_ : 1;                     // true if this tuple is logically deleted
+    UndoLink version_chain_head_;                 // pointer to undo storage chain
+
+    // 位域在 C++17 里不能带默认成员初始化器，因此默认值放在构造函数里；
+    // 语义与旧的 NSDMI 完全一致。
+    TupleMeta() : writer_txn_id_(INVALID_TXN_ID), is_committed_(0), is_deleted_(0) {}
 
     friend auto operator==(const TupleMeta& a, const TupleMeta& b) {
         return a.commit_ts_ == b.commit_ts_ && a.writer_txn_id_ == b.writer_txn_id_ &&
@@ -61,6 +90,11 @@ struct TupleMeta {
 
 // Size of TupleMeta in bytes (used for page layout calculations)
 constexpr int TUPLE_META_SIZE = sizeof(TupleMeta);
+
+// 位域打包依赖 Itanium ABI 的相邻位域合并规则（GCC/Clang on Linux）。真的没打包成
+// 一个 64 位单元时页密度会静默退化，所以在这里响亮地失败而不是默默变慢。
+static_assert(TUPLE_META_SIZE == 32, "TupleMeta must stay 32 bytes: page density depends on it");
+static_assert(std::is_trivially_copyable_v<TupleMeta>, "TupleMeta lives in raw page memory");
 
 /* 文件头，记录表数据文件的元信息，写入磁盘中文件的第0号页面 */
 struct RmFileHdr {
@@ -83,6 +117,23 @@ constexpr int AlignUp(int value, int alignment) {
 
 constexpr int RM_PAGE_META_OFFSET =
     AlignUp(static_cast<int>(Page::OFFSET_PAGE_HDR) + static_cast<int>(sizeof(RmPageHdr)), alignof(TupleMeta));
+
+/**
+ * @brief 一个页面最多能放多少条记录。
+ *
+ * 页面布局：RM_PAGE_META_OFFSET | n * TupleMeta | ceil(n/8) bitmap | n * record_size
+ * 约束：RM_PAGE_META_OFFSET + n * (record_size + TUPLE_META_SIZE) + ceil(n/8) <= PAGE_SIZE
+ * 解出的 n 就是下面的闭式解（BITMAP_WIDTH = 8 位/字节）。
+ */
+constexpr int rm_num_records_per_page(int record_size) {
+    constexpr int kBitmapWidth = 8;
+    const int effective_record_size = record_size + TUPLE_META_SIZE;
+    return (kBitmapWidth * (PAGE_SIZE - 1 - RM_PAGE_META_OFFSET) + 1) / (1 + effective_record_size * kBitmapWidth);
+}
+
+// 记录上限必须保证"每页至少一条"，否则插入会永远失败。
+static_assert(rm_num_records_per_page(RM_MAX_RECORD_SIZE) >= 1,
+              "RM_MAX_RECORD_SIZE is too large: a page could not hold a single record");
 
 /* 表中的记录 */
 struct RmRecord {
@@ -128,7 +179,7 @@ struct RmRecord {
     }
 
     void Deserialize(const char* data_) {
-        size = *reinterpret_cast<const int*>(data_);
+        size = read_unaligned<int>(data_);
         if (allocated_) {
             delete[] data;
         }

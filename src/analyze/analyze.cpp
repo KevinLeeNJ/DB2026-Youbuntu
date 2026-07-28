@@ -137,10 +137,13 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     switch (root->type) {
     case ast::AstType::UpdateStmt: {
         auto x = static_cast<const ast::UpdateStmt*>(root);
+        std::vector<ColMeta> all_cols;
+        get_all_cols({x->tab_name}, all_cols);
         query->set_clauses.reserve(x->set_clauses.size());
         for (const auto& set_clause : x->set_clauses) {
             SetClause clause;
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
+            const ColMeta* lhs_meta = resolve_column_meta(all_cols, clause.lhs);
             clause.op = convert_update_op(set_clause->op);
             if (set_clause->val != nullptr) {
                 clause.rhs = convert_sv_value(set_clause->val.get());
@@ -150,9 +153,38 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                 clause.rhs_col = {.tab_name = set_clause->rhs_col->tab_name.empty() ? x->tab_name
                                                                                     : set_clause->rhs_col->tab_name,
                                   .col_name = set_clause->rhs_col->col_name};
-                std::vector<ColMeta> all_cols;
-                get_all_cols({x->tab_name}, all_cols);
-                clause.rhs_col = check_column(all_cols, clause.rhs_col);
+                const ColMeta* rhs_meta = resolve_column_meta(all_cols, clause.rhs_col);
+                if (clause.op == UpdateOp::ASSIGNMENT) {
+                    if (!can_cast(lhs_meta->type, rhs_meta->type)) {
+                        throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(rhs_meta->type));
+                    }
+                } else {
+                    if (!is_numeric_type(lhs_meta->type) || !is_numeric_type(rhs_meta->type)) {
+                        throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(rhs_meta->type));
+                    }
+                    if (set_clause->val == nullptr || (!clause.rhs.is_null && !is_numeric_type(clause.rhs.type))) {
+                        throw IncompatibleTypeError(coltype2str(rhs_meta->type), coltype2str(clause.rhs.type));
+                    }
+                }
+                if (!set_clause->additional_terms.empty() && (clause.rhs_col.tab_name != clause.lhs.tab_name ||
+                                                              clause.rhs_col.col_name != clause.lhs.col_name)) {
+                    throw RMDBError("chained UPDATE arithmetic must use the target column as its base");
+                }
+                clause.additional_terms.reserve(set_clause->additional_terms.size());
+                for (const auto& ast_term : set_clause->additional_terms) {
+                    UpdateTerm term;
+                    term.op = convert_update_op(ast_term.op);
+                    if (term.op != UpdateOp::SELF_ADD && term.op != UpdateOp::SELF_SUB) {
+                        throw InternalError("Unexpected chained UPDATE operator");
+                    }
+                    term.rhs = convert_sv_value(ast_term.val.get());
+                    if (!term.rhs.is_null && !is_numeric_type(term.rhs.type)) {
+                        throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(term.rhs.type));
+                    }
+                    clause.additional_terms.push_back(std::move(term));
+                }
+            } else if (!clause.rhs.is_null && !can_cast(lhs_meta->type, clause.rhs.type)) {
+                throw IncompatibleTypeError(coltype2str(lhs_meta->type), coltype2str(clause.rhs.type));
             }
             query->set_clauses.push_back(clause);
         }
@@ -220,7 +252,7 @@ std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query) {
         ColType type = infer_expr_type(item.expr, all_cols);
         int len = sizeof(int);
         if (type == TYPE_FLOAT) {
-            len = sizeof(double);
+            len = sizeof(float);
         } else if (type == TYPE_STRING || type == TYPE_DATETIME) {
             if (item.expr.type != QueryExprType::COLUMN) {
                 throw RMDBError("UNION only supports string output from columns");
@@ -256,7 +288,7 @@ ColMeta Analyze::make_union_col_meta(const ColMeta& current, const ColMeta& next
     if ((current.type == TYPE_INT && next.type == TYPE_FLOAT) ||
         (current.type == TYPE_FLOAT && next.type == TYPE_INT)) {
         result.type = TYPE_FLOAT;
-        result.len = sizeof(double);
+        result.len = sizeof(float);
         return result;
     }
 
@@ -347,6 +379,18 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
     for (const auto& expr : sv_conds) {
         Condition cond;
         cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
+
+        // `IS [NOT] NULL` 不是二元比较：只标记 null_test，rhs 记为 NULL 字面量，
+        // 让下游的类型检查/索引选择统一通过 rhs_val.is_null 把它排除掉。
+        if (expr->op == ast::SV_OP_IS_NULL || expr->op == ast::SV_OP_IS_NOT_NULL) {
+            cond.op = OP_EQ;
+            cond.null_test = expr->op == ast::SV_OP_IS_NULL ? NullTest::IS_NULL : NullTest::IS_NOT_NULL;
+            cond.is_rhs_val = true;
+            cond.rhs_val.set_null();
+            cond.rhs_display = "NULL";
+            conds.push_back(cond);
+            continue;
+        }
         cond.op = convert_sv_comp_op(expr->op);
 
         if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
@@ -374,6 +418,12 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
 
         ColType rhs_type;
         if (cond.is_rhs_val) {
+            // NULL 与列类型无关（`IS [NOT] NULL` 以及 `col = NULL`）：不做类型
+            // 检查，也不需要 raw 字节。
+            if (cond.rhs_val.is_null) {
+                cond.rhs_val.type = lhs_type;
+                continue;
+            }
             rhs_type = cond.rhs_val.type;
             if (!can_cast(lhs_type, rhs_type)) {
                 throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
@@ -398,8 +448,12 @@ Value Analyze::convert_sv_value(const ast::Value* sv_val) {
 }
 
 void Analyze::cast_value(Value& val, ColType to) {
+    if (val.is_null) {
+        val.type = to;
+        return;
+    }
     if (to == TYPE_FLOAT && val.type == TYPE_INT) {
-        val.set_float(static_cast<double>(val.int_val));
+        val.set_float(static_cast<float>(val.int_val));
         return;
     }
     if (to == TYPE_INT && val.type == TYPE_FLOAT) {
@@ -430,6 +484,10 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         return OP_LE;
     case ast::SV_OP_GE:
         return OP_GE;
+    case ast::SV_OP_IS_NULL:
+    case ast::SV_OP_IS_NOT_NULL:
+        // 由 get_clause 提前处理成 Condition::null_test，不会走到这里
+        throw InternalError("IS [NOT] NULL is not a comparison operator");
     }
     throw InternalError("Unexpected comparison operator");
 }
