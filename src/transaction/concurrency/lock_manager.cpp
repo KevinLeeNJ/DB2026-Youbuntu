@@ -13,8 +13,47 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <stdexcept>
+#include <thread>
+
+#include "common/runtime_config.h"
+
+namespace {
+
+std::chrono::microseconds configured_si_conflict_backoff() {
+    const char* value = std::getenv("RMDB_SI_CONFLICT_BACKOFF_US");
+    return value == nullptr ? default_si_conflict_backoff() : parse_si_conflict_backoff(value);
+}
+
+bool configured_si_first_lock_wait() {
+    const char* value = std::getenv("RMDB_SI_FIRST_LOCK_WAIT");
+    if (value == nullptr || std::strcmp(value, "1") == 0) {
+        return true;
+    }
+    if (std::strcmp(value, "0") == 0) {
+        return false;
+    }
+    throw std::invalid_argument("RMDB_SI_FIRST_LOCK_WAIT must be 0 or 1");
+}
+
+} // namespace
+
+LockManager::LockManager()
+    : LockManager(configured_si_conflict_backoff(), configured_si_first_lock_wait()) {}
+
+LockManager::LockManager(std::chrono::microseconds si_conflict_backoff)
+    : LockManager(si_conflict_backoff, false) {}
+
+LockManager::LockManager(std::chrono::microseconds si_conflict_backoff, bool si_first_lock_wait)
+    : si_conflict_backoff_(si_conflict_backoff), si_first_lock_wait_enabled_(si_first_lock_wait) {
+    if (si_conflict_backoff_.count() < 0 ||
+        si_conflict_backoff_.count() > static_cast<int64_t>(MAX_SI_CONFLICT_BACKOFF_US)) {
+        throw std::invalid_argument("SI conflict backoff must be between 0 and 2000 microseconds");
+    }
+}
 
 LockManager::LockTableShard& LockManager::get_shard(const LockDataId& lock_data_id) {
     return lock_table_shards_[std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT];
@@ -34,6 +73,9 @@ LockObservabilitySnapshot LockManager::record_lock_observability() const {
             record_wait_granted_.load(std::memory_order_relaxed),
             record_wait_cancelled_.load(std::memory_order_relaxed),
             record_wait_ns_.load(std::memory_order_relaxed),
+            record_backoff_waits_.load(std::memory_order_acquire),
+            record_completion_waits_.load(std::memory_order_relaxed),
+            record_completion_aborts_.load(std::memory_order_relaxed),
             record_queue_depth_max_.load(std::memory_order_relaxed),
             record_cycle_checks_.load(std::memory_order_relaxed),
             record_cycle_victims_.load(std::memory_order_relaxed)};
@@ -45,6 +87,9 @@ LockObservabilitySnapshot LockManager::unique_key_lock_observability() const {
             unique_wait_granted_.load(std::memory_order_relaxed),
             unique_wait_cancelled_.load(std::memory_order_relaxed),
             unique_wait_ns_.load(std::memory_order_relaxed),
+            0,
+            0,
+            0,
             unique_queue_depth_max_.load(std::memory_order_relaxed),
             unique_cycle_checks_.load(std::memory_order_relaxed),
             unique_cycle_victims_.load(std::memory_order_relaxed)};
@@ -161,6 +206,9 @@ LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
             txn_id_t predecessor = queue->owner_txn_id_;
             for (const auto& waiter : queue->waiters_) {
                 if (waiter == nullptr || waiter->cancelled_) {
+                    continue;
+                }
+                if (waiter->completion_only_) {
                     continue;
                 }
                 if (predecessor != INVALID_TXN_ID) {
@@ -323,13 +371,20 @@ bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int ta
  * @param {int} tab_fd 记录所在的表的fd
  */
 bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
-    if (txn == nullptr) {
+    if (txn == nullptr || txn->is_lock_cancellation_requested()) {
         return false;
     }
 
     LockDataId lock_data_id(tab_fd, rid, LockDataType::RECORD);
     auto request_queue = get_or_create_queue(lock_data_id);
     std::unique_lock<std::mutex> lock(request_queue->latch_);
+
+    if (txn->is_lock_cancellation_requested()) {
+        lock.unlock();
+        release_queue_user(lock_data_id, request_queue);
+        try_remove_empty_queue(lock_data_id, request_queue);
+        return false;
+    }
 
     if (request_queue->owner_txn_id_ == INVALID_TXN_ID) {
         request_queue->owner_txn_id_ = txn->get_transaction_id();
@@ -352,20 +407,53 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     // cycle. This avoids aborting ordinary RC hot-row conflicts merely because
     // the requester happens to have a larger transaction id.
     // Preserve the established immediate SI/SER conflict for a transaction
-    // that has not acquired any other record lock. Once a transaction already
-    // owns a record lock, however, waiting is necessary to resolve genuine
-    // cross-record cycles (the cycle detector will pick one victim).
-    const bool can_wait_for_cycle =
-        txn->get_isolation_level() == IsolationLevel::READ_COMMITTED || !txn->get_lock_set()->empty();
-    if (!can_wait_for_cycle) {
+    // that has not acquired any other record lock unless the configured
+    // first-lock completion wait is frozen on this manager. A first-lock waiter
+    // cannot be the predecessor of another lock wait edge. Once a transaction
+    // already owns a lock, the existing cycle detector remains responsible for
+    // victim selection.
+    const IsolationLevel isolation_level = txn->get_isolation_level();
+    const bool owns_other_lock = !txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty();
+    const bool first_snapshot_lock_completion_wait =
+        si_first_lock_wait_enabled_ &&
+        (isolation_level == IsolationLevel::SNAPSHOT_ISOLATION || isolation_level == IsolationLevel::SERIALIZABLE) &&
+        !owns_other_lock;
+    const bool can_wait_for_cycle = isolation_level == IsolationLevel::READ_COMMITTED || owns_other_lock;
+    if (!can_wait_for_cycle && !first_snapshot_lock_completion_wait) {
+        if (si_conflict_backoff_.count() > 0) {
+            record_backoff_waits_.fetch_add(1, std::memory_order_release);
+            lock.unlock();
+            std::this_thread::sleep_for(si_conflict_backoff_);
+            lock.lock();
+        }
+        if (request_queue->owner_txn_id_ == txn->get_transaction_id()) {
+            txn->get_lock_set()->insert(lock_data_id);
+            lock.unlock();
+            release_queue_user(lock_data_id, request_queue);
+            return true;
+        }
+        if (request_queue->owner_txn_id_ == INVALID_TXN_ID && !txn->is_lock_cancellation_requested()) {
+            request_queue->owner_txn_id_ = txn->get_transaction_id();
+            request_queue->group_lock_mode_ = GroupLockMode::X;
+            note_wait_topology_change();
+            txn->get_lock_set()->insert(lock_data_id);
+            lock.unlock();
+            release_queue_user(lock_data_id, request_queue);
+            return true;
+        }
         record_immediate_conflict_.fetch_add(1, std::memory_order_relaxed);
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
+        try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
-    auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
+    auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE,
+                                                 first_snapshot_lock_completion_wait);
     request_queue->waiters_.push_back(request);
     record_wait_enqueued_.fetch_add(1, std::memory_order_relaxed);
+    if (first_snapshot_lock_completion_wait) {
+        record_completion_waits_.fetch_add(1, std::memory_order_relaxed);
+    }
     observe_queue_depth(record_queue_depth_max_, request_queue->waiters_.size());
     const auto wait_begin = std::chrono::steady_clock::now();
     note_wait_topology_change();
@@ -383,7 +471,7 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     // A transaction with no granted record or unique-key lock cannot be the
     // predecessor of another wait-for edge, so this first wait cannot close a
     // cycle. Avoid scanning all lock shards on the common hot-row path.
-    if (!txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty()) {
+    if (!first_snapshot_lock_completion_wait && owns_other_lock) {
         record_cycle_checks_.fetch_add(1, std::memory_order_relaxed);
         const txn_id_t cycle_victim = find_youngest_cycle_victim(txn->get_transaction_id());
         if (cycle_victim != INVALID_TXN_ID) {
@@ -393,8 +481,10 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         }
     }
     lock.lock();
-    request->cv_.wait(lock, [&request] { return request->granted_ || request->cancelled_; });
+    request->cv_.wait(lock,
+                      [&request] { return request->granted_ || request->cancelled_ || request->owner_completed_; });
     const bool cancelled = request->cancelled_;
+    const bool owner_completed = request->owner_completed_;
     record_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                         std::chrono::steady_clock::now() - wait_begin)
                                                         .count()),
@@ -407,13 +497,19 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
+    if (owner_completed) {
+        record_completion_aborts_.fetch_add(1, std::memory_order_relaxed);
+        record_immediate_conflict_.fetch_add(1, std::memory_order_relaxed);
+        try_remove_empty_queue(lock_data_id, request_queue);
+        return false;
+    }
     record_wait_granted_.fetch_add(1, std::memory_order_relaxed);
     txn->get_lock_set()->insert(lock_data_id);
     return true;
 }
 
 bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, const std::vector<char>& key) {
-    if (txn == nullptr) {
+    if (txn == nullptr || txn->is_lock_cancellation_requested()) {
         return false;
     }
 
@@ -426,6 +522,9 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
     auto& queue = shard.queues[lock_id];
     if (queue == nullptr) {
         queue = std::make_shared<UniqueKeyQueue>();
+    }
+    if (txn->is_lock_cancellation_requested()) {
+        return false;
     }
     const txn_id_t txn_id = txn->get_transaction_id();
     if (queue->owner == txn_id) {
@@ -651,6 +750,16 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
     note_wait_topology_change();
     txn->get_lock_set()->erase(lock_data_id);
     std::shared_ptr<LockRequest> next_request;
+    std::vector<std::shared_ptr<LockRequest>> completed_requests;
+    for (auto request_it = request_queue->waiters_.begin(); request_it != request_queue->waiters_.end();) {
+        if (!(*request_it)->completion_only_) {
+            ++request_it;
+            continue;
+        }
+        (*request_it)->owner_completed_ = true;
+        completed_requests.push_back(*request_it);
+        request_it = request_queue->waiters_.erase(request_it);
+    }
     if (request_queue->waiters_.empty()) {
         request_queue->group_lock_mode_ = GroupLockMode::NON_LOCK;
     } else {
@@ -664,6 +773,9 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
     lock.unlock();
     if (next_request != nullptr) {
         next_request->cv_.notify_one();
+    }
+    for (const auto& completed_request : completed_requests) {
+        completed_request->cv_.notify_one();
     }
     release_queue_user(lock_data_id, request_queue);
     try_remove_empty_queue(lock_data_id, request_queue);

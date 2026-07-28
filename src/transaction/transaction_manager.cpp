@@ -13,12 +13,15 @@ See the Mulan PSL v2 for more details. */
 #include "common/fault_injection.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
+#include "transaction/commit_timing_diagnostics.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> TransactionManager::txn_map = {};
@@ -237,12 +240,13 @@ void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
     }
     BeginLogRecord record(txn->get_transaction_id());
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
+    txn->set_begin_lsn(lsn);
     txn->set_prev_lsn(lsn);
 }
 
-void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
+lsn_t AppendCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
     if (txn == nullptr || log_manager == nullptr) {
-        return;
+        return INVALID_LSN;
     }
     // commit_ts 进 WAL：它是恢复期重建时间戳计数器的第二个来源。两次 checkpoint
     // 之间被驱逐的数据页可能带着比 db.restart 里的快照更高的 commit_ts_，而这条
@@ -255,10 +259,21 @@ void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commi
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     FaultInjector::Point("after_commit_log_append");
     txn->set_prev_lsn(lsn);
+    return lsn;
+}
+
+void WaitForCommitLog(LogManager* log_manager, lsn_t lsn) {
+    if (log_manager == nullptr || lsn == INVALID_LSN) {
+        return;
+    }
     // Returning from COMMIT means the commit record survived an OS crash,
     // not merely that it reached the kernel page cache.
     log_manager->flush_log_to_disk_up_to(lsn);
     FaultInjector::Point("after_commit_wal_write");
+}
+
+void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
+    WaitForCommitLog(log_manager, AppendCommitLog(txn, log_manager, commit_ts));
 }
 
 lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
@@ -553,12 +568,177 @@ void TransactionManager::BeginStatement(Transaction* txn) {
     }
 }
 
+bool TransactionManager::CommitPublicationHelpingEnabledFromEnvironment() {
+    static const bool enabled = [] {
+        const char* configured = std::getenv("RMDB_COMMIT_PUBLICATION_HELPING");
+        if (configured == nullptr) {
+            return true;
+        }
+        const std::string_view value(configured);
+        if (value == "1") {
+            return true;
+        }
+        if (value == "0") {
+            return false;
+        }
+        throw std::invalid_argument("RMDB_COMMIT_PUBLICATION_HELPING must be exactly 0 or 1");
+    }();
+    return enabled;
+}
+
+lsn_t TransactionManager::CompletedCommitLsn(const LogManager* log_manager) const {
+    if (log_manager == nullptr) {
+        return INVALID_LSN;
+    }
+    if (log_manager->durability_mode() == DurabilityMode::STRICT) {
+        return log_manager->get_durable_lsn();
+    }
+    return log_manager->get_persist_lsn();
+}
+
+void TransactionManager::RunCommitPublicationLeader(timestamp_t target_csn, LogManager* log_manager) {
+    for (;;) {
+        std::shared_ptr<CommitPublicationRequest> request;
+        {
+            std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+            for (;;) {
+                if (published_commit_csn_ >= target_csn) {
+                    commit_publication_leader_active_ = false;
+                    frontier_lock.unlock();
+                    commit_frontier_cv_.notify_all();
+                    return;
+                }
+
+                auto next = pending_commit_publications_.find(published_commit_csn_ + 1);
+                if (next != pending_commit_publications_.end() && !next->second->publishing &&
+                    next->second->commit_lsn <= CompletedCommitLsn(log_manager)) {
+                    request = next->second;
+                    request->publishing = true;
+                    break;
+                }
+
+                std::shared_ptr<CommitPublicationRequest> waiting_for_wal;
+                if (next != pending_commit_publications_.end() && !next->second->publishing) {
+                    waiting_for_wal = next->second;
+                }
+                const timestamp_t waiting_for_csn = published_commit_csn_ + 1;
+                const uint64_t observed_epoch = commit_publication_epoch_;
+                frontier_lock.unlock();
+                if (waiting_for_wal != nullptr) {
+                    InvokeCommitPublicationTestHook("leader_waiting_for_wal", waiting_for_wal->commit_csn,
+                                                    waiting_for_wal->commit_lsn);
+                } else {
+                    InvokeCommitPublicationTestHook("leader_waiting_for_request", waiting_for_csn, INVALID_LSN);
+                }
+                frontier_lock.lock();
+                commit_frontier_cv_.wait(frontier_lock, [&] { return commit_publication_epoch_ != observed_epoch; });
+            }
+        }
+
+        FaultInjector::Point("before_tuple_publication");
+        auto stage_begin = std::chrono::steady_clock::time_point{};
+        if (request->timing_enabled) {
+            stage_begin = std::chrono::steady_clock::now();
+        }
+        sm_manager_->mark_slots_committed(*request->txn, request->commit_ts);
+        if (request->timing_enabled) {
+            request->tuple_publication_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stage_begin)
+                    .count());
+        }
+        FaultInjector::Point("after_tuple_publication");
+
+        if (request->timing_enabled) {
+            stage_begin = std::chrono::steady_clock::now();
+        }
+        request->txn->set_state(TransactionState::COMMITTED);
+        FaultInjector::Point("before_published_csn_store");
+        {
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            if (request->commit_csn != published_commit_csn_ + 1) {
+                throw InternalError("commit publication frontier lost contiguous order");
+            }
+            last_commit_ts_.store(request->commit_ts, std::memory_order_release);
+            ++published_commit_csn_;
+        }
+        if (request->timing_enabled) {
+            request->frontier_publication_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stage_begin)
+                    .count());
+        }
+        FaultInjector::Point("after_commit_publication_frontier");
+        InvokeCommitPublicationTestHook("after_frontier", request->commit_csn, request->commit_lsn);
+
+        if (request->timing_enabled) {
+            stage_begin = std::chrono::steady_clock::now();
+        }
+        FaultInjector::Point("before_commit_helper_lock_release");
+        ReleaseLocks(request->txn, lock_manager_);
+        FaultInjector::Point("after_commit_helper_lock_release");
+        InvokeCommitPublicationTestHook("after_lock_release", request->commit_csn, request->commit_lsn);
+        if (request->timing_enabled) {
+            request->lock_release_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stage_begin)
+                    .count());
+        }
+
+        {
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            request->locks_released = true;
+            request->done = true;
+            pending_commit_publications_.erase(request->commit_csn);
+        }
+        commit_frontier_cv_.notify_all();
+    }
+}
+
+void TransactionManager::PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request,
+                                                LogManager* log_manager) {
+    {
+        std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+        ++commit_publication_epoch_;
+    }
+    commit_frontier_cv_.notify_all();
+
+    while (true) {
+        timestamp_t target_csn = INVALID_TS;
+        {
+            std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+            if (request->done) {
+                return;
+            }
+            if (commit_publication_leader_active_) {
+                commit_frontier_cv_.wait(frontier_lock,
+                                         [&] { return request->done || !commit_publication_leader_active_; });
+                if (request->done) {
+                    return;
+                }
+            }
+            if (!commit_publication_leader_active_) {
+                commit_publication_leader_active_ = true;
+                target_csn = request->commit_csn;
+            }
+        }
+        if (target_csn != INVALID_TS) {
+            RunCommitPublicationLeader(target_csn, log_manager);
+        }
+    }
+}
+
 /**
  * @description: 事务的提交方法
  * @param {Transaction*} txn 需要提交的事务
  * @param {LogManager*} log_manager 日志管理器指针
  */
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
+    if (commit_timing_enabled_) {
+        commit_impl<true>(txn, log_manager);
+    } else {
+        commit_impl<false>(txn, log_manager);
+    }
+}
+
+template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) {
         return;
     }
@@ -567,7 +747,12 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         return;
     }
 
-    sm_manager_->prepare_commit_publication(*txn);
+    commit_timing_diagnostics::OperationScope<TimingEnabled> timing;
+    {
+        commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
+            timing, commit_timing_diagnostics::Stage::PREPARE_PUBLICATION);
+        sm_manager_->prepare_commit_publication(*txn);
+    }
     TransactionState expected_state = TransactionState::GROWING;
     if (!txn->compare_exchange_state(expected_state, TransactionState::COMMITTING)) {
         if (expected_state == TransactionState::COMMITTED || expected_state == TransactionState::ABORTED) {
@@ -578,10 +763,14 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
 
     FaultInjector::Point("before_commit_wal");
+    std::shared_ptr<CommitPublicationRequest> publication_request;
+    bool locks_released_by_helper = false;
     try {
         timestamp_t commit_csn;
         timestamp_t commit_ts;
         {
+            commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
+                                                                       commit_timing_diagnostics::Stage::TIMESTAMP_CSN);
             // CSN and commit timestamp allocation must be ordered together.
             // Otherwise an out-of-order publisher could move last_commit_ts_
             // backwards when the frontier is advanced.
@@ -590,6 +779,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             commit_ts = next_timestamp_.fetch_add(1);
             txn->commit_ts_ = commit_ts;
         }
+        InvokeCommitPublicationTestHook("after_csn_allocated", commit_csn, INVALID_LSN);
 
         // 时间戳分配移到 WAL 之前，只为让 COMMIT 记录能带上 commit_ts；它不发布
         // 任何东西，因此不改变可见性顺序。分配后若 WriteCommitLog 抛出，catch 分支
@@ -599,65 +789,146 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         // Once COMMITTING is visible, neither a WAL failure nor a publication
         // failure may fall back to ordinary abort: the COMMIT record may
         // already be present in the WAL prefix recovered after restart.
-        WriteCommitLog(txn, log_manager, commit_ts);
-        FaultInjector::Point("after_commit_wal_sync");
-
-        // Publish every modified slot outside the frontier mutex. A new RC
-        // statement still cannot observe this commit until its CSN is part of
-        // the contiguous completed frontier below.
-        FaultInjector::Point("before_tuple_publication");
-        sm_manager_->mark_slots_committed(*txn, commit_ts);
-        FaultInjector::Point("after_tuple_publication");
-        txn->set_state(TransactionState::COMMITTED);
-        FaultInjector::Point("before_published_csn_store");
-        {
-            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
-            completed_commits_.emplace(commit_csn, commit_ts);
-            while (true) {
-                auto next = completed_commits_.find(published_commit_csn_ + 1);
-                if (next == completed_commits_.end()) {
-                    break;
+        if (commit_publication_helping_enabled_) {
+            publication_request = std::make_shared<CommitPublicationRequest>();
+            publication_request->txn = txn;
+            publication_request->commit_csn = commit_csn;
+            publication_request->commit_ts = commit_ts;
+            publication_request->timing_enabled = TimingEnabled;
+            txn->pin_commit_publication();
+            {
+                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
+                                                                           commit_timing_diagnostics::Stage::WAL);
+                publication_request->commit_lsn = AppendCommitLog(txn, log_manager, commit_ts);
+                {
+                    std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                    auto [_, inserted] = pending_commit_publications_.emplace(commit_csn, publication_request);
+                    if (!inserted) {
+                        throw InternalError("duplicate commit publication CSN");
+                    }
+                    ++commit_publication_epoch_;
                 }
-                last_commit_ts_.store(next->second, std::memory_order_release);
-                ++published_commit_csn_;
-                completed_commits_.erase(next);
+                commit_frontier_cv_.notify_all();
+                FaultInjector::Point("after_commit_publication_register");
+                InvokeCommitPublicationTestHook("after_registered", commit_csn, publication_request->commit_lsn);
+                WaitForCommitLog(log_manager, publication_request->commit_lsn);
+            }
+            // WAL completion is an independent publication prerequisite. Wake
+            // a leader that may already be sleeping on this request before the
+            // owner runs hooks or enters PublishOrWaitForCommit. Keep the
+            // notification here instead of installing a LogManager callback,
+            // which would couple LogManager lifetime to TransactionManager.
+            {
+                std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                ++commit_publication_epoch_;
+            }
+            commit_frontier_cv_.notify_all();
+            FaultInjector::Point("after_commit_wal_sync");
+            InvokeCommitPublicationTestHook("after_wal_wait", commit_csn, publication_request->commit_lsn);
+            {
+                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
+                    timing, commit_timing_diagnostics::Stage::FRONTIER_WAIT);
+                PublishOrWaitForCommit(publication_request, log_manager);
+            }
+            if constexpr (TimingEnabled) {
+                timing.add(commit_timing_diagnostics::Stage::TUPLE_PUBLICATION,
+                           publication_request->tuple_publication_ns);
+                timing.add(commit_timing_diagnostics::Stage::FRONTIER_PUBLICATION,
+                           publication_request->frontier_publication_ns);
+                timing.add(commit_timing_diagnostics::Stage::CLEANUP, publication_request->lock_release_ns);
+            }
+            locks_released_by_helper = publication_request->locks_released;
+        } else {
+            {
+                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
+                                                                           commit_timing_diagnostics::Stage::WAL);
+                WriteCommitLog(txn, log_manager, commit_ts);
+            }
+            FaultInjector::Point("after_commit_wal_sync");
+
+            // Publish every modified slot outside the frontier mutex. A new RC
+            // statement still cannot observe this commit until its CSN is part of
+            // the contiguous completed frontier below.
+            FaultInjector::Point("before_tuple_publication");
+            {
+                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
+                    timing, commit_timing_diagnostics::Stage::TUPLE_PUBLICATION);
+                sm_manager_->mark_slots_committed(*txn, commit_ts);
+            }
+            FaultInjector::Point("after_tuple_publication");
+            txn->set_state(TransactionState::COMMITTED);
+            FaultInjector::Point("before_published_csn_store");
+            {
+                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
+                    timing, commit_timing_diagnostics::Stage::FRONTIER_PUBLICATION);
+                std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                completed_commits_.emplace(commit_csn, commit_ts);
+                while (true) {
+                    auto next = completed_commits_.find(published_commit_csn_ + 1);
+                    if (next == completed_commits_.end()) {
+                        break;
+                    }
+                    last_commit_ts_.store(next->second, std::memory_order_release);
+                    ++published_commit_csn_;
+                    completed_commits_.erase(next);
+                }
+            }
+            commit_frontier_cv_.notify_all();
+
+            // Do not return from COMMIT until this transaction is covered by the
+            // publication frontier. This provides read-your-commit even when a
+            // later CSN finished publishing first.
+            {
+                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
+                    timing, commit_timing_diagnostics::Stage::FRONTIER_WAIT);
+                std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+                commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
             }
         }
-        commit_frontier_cv_.notify_all();
 
-        // Do not return from COMMIT until this transaction is covered by the
-        // publication frontier. This provides read-your-commit even when a
-        // later CSN finished publishing first.
-        std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
-        commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
+        // Keep the committing transaction in the watermark and checkpoint
+        // active set until publication and all owner-side cleanup complete.
+        // Any failure from this point is also fail-stop: the COMMIT record may
+        // already be durable and the transaction may already be visible.
+        FaultInjector::Point("before_commit_owner_cleanup");
+        InvokeCommitPublicationTestHook("before_owner_cleanup", commit_csn,
+                                        publication_request == nullptr ? txn->get_prev_lsn()
+                                                                       : publication_request->commit_lsn);
+        {
+            commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
+                                                                       commit_timing_diagnostics::Stage::CLEANUP);
+            running_txns_.UpdateCommitTs(txn->get_commit_ts());
+            running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
+            ClearWriteSet(txn);
+            if (!locks_released_by_helper) {
+                ReleaseLocks(txn, lock_manager_);
+            }
+            if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                CleanupTxnSsiState(txn->get_transaction_id());
+                bool run_full_prune = false;
+                {
+                    std::unique_lock<std::mutex> lock(latch_);
+                    ++commits_since_full_ssi_prune_;
+                    run_full_prune = ShouldRunFullSsiPruneUnlocked();
+                }
+                if (run_full_prune) {
+                    PruneSsiState();
+                }
+            }
+            if (publication_request != nullptr) {
+                txn->unpin_commit_publication();
+            }
+            RetireTransactionIfSafe(txn);
+            MaybeRunGarbageCollection();
+        }
+        timing.finish();
     } catch (...) {
-        // Once WriteCommitLog returned, recovery must treat this transaction
-        // as committed. Ordinary abort would make durable WAL and in-memory
-        // state disagree and may leave a partially published transaction.
+        // Once COMMITTING is visible, the COMMIT record may be persistent and
+        // the transaction may be partially or fully published. Ordinary
+        // exception return or abort would make recovery and in-memory state
+        // disagree, including for failures in owner-side cleanup.
         FailStopAfterCommitMayBePersistent();
     }
-
-    // Keep the committing transaction in the watermark until publication is
-    // complete; otherwise GC could reclaim its undo state in the publication
-    // window.
-    running_txns_.UpdateCommitTs(txn->get_commit_ts());
-    running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
-    ClearWriteSet(txn);
-    ReleaseLocks(txn, lock_manager_);
-    if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
-        CleanupTxnSsiState(txn->get_transaction_id());
-        bool run_full_prune = false;
-        {
-            std::unique_lock<std::mutex> lock(latch_);
-            ++commits_since_full_ssi_prune_;
-            run_full_prune = ShouldRunFullSsiPruneUnlocked();
-        }
-        if (run_full_prune) {
-            PruneSsiState();
-        }
-    }
-    RetireTransactionIfSafe(txn);
-    MaybeRunGarbageCollection();
 }
 
 /**
@@ -684,9 +955,14 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     if (lock_manager_ != nullptr) {
         lock_manager_->cancel_transaction(txn);
     }
-    // The abort record must precede the physical undo. This gives every page
-    // modified by rollback a WAL record that can be used as its page LSN.
-    lsn_t abort_lsn = WriteAbortLog(txn, log_manager);
+    lsn_t abort_lsn = INVALID_LSN;
+    if (!write_set.empty() || txn->get_prev_lsn() != txn->get_begin_lsn()) {
+        // The abort record must precede the physical undo. This gives every
+        // page modified by rollback a WAL record that can be used as its page
+        // LSN. Transactions with no writes and no WAL after BEGIN have no
+        // persistent state to undo and do not need to force an ABORT record.
+        abort_lsn = WriteAbortLog(txn, log_manager);
+    }
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
         UndoWriteRecord(this, sm_manager_, it->get(), txn, abort_lsn);
     }
@@ -1203,6 +1479,9 @@ bool TransactionManager::CanRetireTransactionUnlocked(Transaction* txn) const {
     if (txn == nullptr) {
         return false;
     }
+    if (txn->has_commit_publication_pin()) {
+        return false;
+    }
     TransactionState state = txn->get_state();
     if (state != TransactionState::COMMITTED && state != TransactionState::ABORTED) {
         return false;
@@ -1231,6 +1510,9 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
         // Keep the transaction active-set transition and the txn_map lifetime
         // decision atomic with respect to GC's active-set snapshot.
         std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
+        if (txn->has_commit_publication_pin()) {
+            return;
+        }
         active_txn_ids_.erase(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
         no_active_transactions = active_txn_count_ == 0;

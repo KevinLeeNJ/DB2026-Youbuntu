@@ -20,9 +20,13 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_set>
 #include <optional>
 #include <functional>
+#include <memory>
 #include <shared_mutex>
+#include <string_view>
 #include <thread>
+#include <utility>
 
+#include "commit_timing_diagnostics.h"
 #include "transaction.h"
 #include "watermark.h"
 #include "recovery/log_manager.h"
@@ -86,11 +90,20 @@ struct VersionUndoLink {
 
 class TransactionManager {
 public:
+    using CommitPublicationTestHook = std::function<void(std::string_view, timestamp_t, lsn_t)>;
+
     explicit TransactionManager(LockManager* lock_manager, SmManager* sm_manager,
-                                ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING) {
+                                ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING,
+                                std::optional<bool> commit_publication_helping = std::nullopt,
+                                CommitPublicationTestHook commit_publication_test_hook = {}) {
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
+        commit_timing_enabled_ = commit_timing_diagnostics::enabled();
+        commit_publication_helping_enabled_ = commit_publication_helping.has_value()
+                                                  ? *commit_publication_helping
+                                                  : CommitPublicationHelpingEnabledFromEnvironment();
+        commit_publication_test_hook_ = std::move(commit_publication_test_hook);
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
 
@@ -328,6 +341,34 @@ public:
     std::unordered_map<page_id_t, std::unique_ptr<PageVersionInfo>> version_info_;
 
 private:
+    struct CommitPublicationRequest {
+        Transaction* txn{nullptr};
+        timestamp_t commit_csn{0};
+        timestamp_t commit_ts{INVALID_TS};
+        lsn_t commit_lsn{INVALID_LSN};
+        bool timing_enabled{false};
+        bool publishing{false};
+        bool locks_released{false};
+        bool done{false};
+        uint64_t tuple_publication_ns{0};
+        uint64_t frontier_publication_ns{0};
+        uint64_t lock_release_ns{0};
+    };
+
+    template <bool TimingEnabled> void commit_impl(Transaction* txn, LogManager* log_manager);
+    static bool CommitPublicationHelpingEnabledFromEnvironment();
+    void PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request, LogManager* log_manager);
+    void RunCommitPublicationLeader(timestamp_t target_csn, LogManager* log_manager);
+    lsn_t CompletedCommitLsn(const LogManager* log_manager) const;
+    void InvokeCommitPublicationTestHook(std::string_view event, timestamp_t commit_csn, lsn_t commit_lsn) {
+        if (commit_publication_test_hook_) {
+            commit_publication_test_hook_(event, commit_csn, commit_lsn);
+        }
+    }
+
+    bool commit_timing_enabled_{false};
+    bool commit_publication_helping_enabled_{true};
+    CommitPublicationTestHook commit_publication_test_hook_;
     ConcurrencyMode concurrency_mode_;           // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
@@ -341,6 +382,9 @@ private:
     timestamp_t next_commit_csn_{0};
     timestamp_t published_commit_csn_{0};
     std::map<timestamp_t, timestamp_t> completed_commits_;
+    std::map<timestamp_t, std::shared_ptr<CommitPublicationRequest>> pending_commit_publications_;
+    bool commit_publication_leader_active_{false};
+    uint64_t commit_publication_epoch_{0};
     SmManager* sm_manager_;
     LockManager* lock_manager_;
 
