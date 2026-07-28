@@ -505,8 +505,9 @@ type txnContext struct {
 // the published result JSON alone, without any in-memory state surviving the
 // crash.
 type txnLedger struct {
-	values       map[string]float64
-	paymentEdges []paymentFloatEdge
+	values          map[string]float64
+	paymentEdges    []paymentFloatEdge
+	paymentEdgeSink paymentEdgeSink
 }
 
 type paymentFloatEdge struct {
@@ -519,11 +520,161 @@ type paymentFloatEdge struct {
 }
 
 func newTxnLedger() *txnLedger {
+	return newTxnLedgerWithSink(nil)
+}
+
+type paymentEdgeSink interface {
+	write([]paymentFloatEdge) error
+}
+
+func newTxnLedgerWithSink(sink paymentEdgeSink) *txnLedger {
 	values := make(map[string]float64, len(ledgerKeys))
 	for _, key := range ledgerKeys {
 		values[key] = 0
 	}
-	return &txnLedger{values: values}
+	return &txnLedger{values: values, paymentEdgeSink: sink}
+}
+
+type paymentChainNode struct {
+	selfLoops  int
+	advance    uint32
+	hasAdvance bool
+}
+
+type paymentChain struct {
+	initial uint32
+	current uint32
+	pending map[uint32]*paymentChainNode
+}
+
+// paymentChainAccumulator validates each committed Payment edge as it arrives.
+// Edges that are already connected to the known chain head are discarded; only
+// genuinely out-of-order fragments remain pending. This keeps the common case
+// bounded by the amount of cross-worker reordering instead of all committed
+// transactions.
+type paymentChainAccumulator struct {
+	mu     sync.Mutex
+	chains map[string]*paymentChain
+	edges  int
+	err    error
+}
+
+func newPaymentChainAccumulator() *paymentChainAccumulator {
+	return &paymentChainAccumulator{chains: make(map[string]*paymentChain)}
+}
+
+func canonicalPaymentBits(bits uint32) uint32 {
+	if bits<<1 == 0 {
+		return 0
+	}
+	return bits
+}
+
+func (a *paymentChainAccumulator) write(edges []paymentFloatEdge) error {
+	if a == nil || len(edges) == 0 {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.err != nil {
+		return a.err
+	}
+	for _, edge := range edges {
+		if err := a.addLocked(edge); err != nil {
+			a.err = err
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *paymentChainAccumulator) addLocked(edge paymentFloatEdge) error {
+	key, start, err := paymentEdgeKey(edge)
+	if err != nil {
+		return err
+	}
+	amount := math.Float32frombits(edge.AmountBits)
+	before := math.Float32frombits(edge.BeforeBits)
+	if amount <= 0 || math.IsNaN(float64(amount)) || math.IsInf(float64(amount), 0) {
+		return fmt.Errorf("Payment FLOAT32 edge %s has invalid amount 0x%08x", key, edge.AmountBits)
+	}
+	want := math.Float32bits(before + amount)
+	if !equalFloat32Bits(edge.AfterBits, want) {
+		return fmt.Errorf("Payment FLOAT32 edge %s is not 0 ULP: before=0x%08x amount=0x%08x after=0x%08x want=0x%08x",
+			key, edge.BeforeBits, edge.AmountBits, edge.AfterBits, want)
+	}
+	chain := a.chains[key]
+	if chain == nil {
+		chain = &paymentChain{initial: start, current: start, pending: make(map[uint32]*paymentChainNode)}
+		a.chains[key] = chain
+	}
+	nodeKey := canonicalPaymentBits(edge.BeforeBits)
+	currentValue := math.Float32frombits(chain.current)
+	if before < currentValue {
+		if !equalFloat32Bits(edge.BeforeBits, edge.AfterBits) {
+			return fmt.Errorf("Payment FLOAT32 chain %s forks before current value at 0x%08x", key, edge.BeforeBits)
+		}
+		// A self-loop may have completed after a later advancing edge even
+		// though it belongs to the already traversed chain prefix.
+		a.edges++
+		return nil
+	}
+	node := chain.pending[nodeKey]
+	if node == nil {
+		node = &paymentChainNode{}
+		chain.pending[nodeKey] = node
+	}
+	if equalFloat32Bits(edge.BeforeBits, edge.AfterBits) {
+		node.selfLoops++
+	} else {
+		if node.hasAdvance {
+			return fmt.Errorf("Payment FLOAT32 chain %s forks at 0x%08x", key, edge.BeforeBits)
+		}
+		node.advance = edge.AfterBits
+		node.hasAdvance = true
+	}
+	a.edges++
+	a.drainLocked(chain)
+	return nil
+}
+
+func (a *paymentChainAccumulator) drainLocked(chain *paymentChain) {
+	for {
+		nodeKey := canonicalPaymentBits(chain.current)
+		node := chain.pending[nodeKey]
+		if node == nil {
+			return
+		}
+		delete(chain.pending, nodeKey)
+		if !node.hasAdvance {
+			return
+		}
+		chain.current = node.advance
+	}
+}
+
+func (a *paymentChainAccumulator) finalize(expectedEdges int) (map[string]uint32, int, error) {
+	if a == nil {
+		return nil, 0, nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.err != nil {
+		return nil, a.edges, a.err
+	}
+	terminals := make(map[string]uint32, len(a.chains))
+	for key, chain := range a.chains {
+		a.drainLocked(chain)
+		if len(chain.pending) != 0 {
+			return nil, a.edges, fmt.Errorf("Payment FLOAT32 chain %s has an unlinked edge fragment", key)
+		}
+		terminals[key] = chain.current
+	}
+	if a.edges != expectedEdges {
+		return nil, a.edges, fmt.Errorf("Payment FLOAT32 evidence has %d edges, want two for each of %d commit(s)",
+			a.edges, expectedEdges/2)
+	}
+	return terminals, a.edges, nil
 }
 
 func (l *txnLedger) add(key string, delta float64) {
@@ -543,14 +694,18 @@ func (l *txnLedger) reset() {
 	l.paymentEdges = l.paymentEdges[:0]
 }
 
-func (l *txnLedger) merge(other *txnLedger) {
+func (l *txnLedger) merge(other *txnLedger) error {
 	if l == nil || other == nil {
-		return
+		return nil
 	}
 	for key, value := range other.values {
 		l.values[key] += value
 	}
+	if l.paymentEdgeSink != nil {
+		return l.paymentEdgeSink.write(other.paymentEdges)
+	}
 	l.paymentEdges = append(l.paymentEdges, other.paymentEdges...)
+	return nil
 }
 
 func (l *txnLedger) addPaymentEdge(edge paymentFloatEdge) {
@@ -564,6 +719,101 @@ func (l *txnLedger) paymentEdgeSnapshot() []paymentFloatEdge {
 		return nil
 	}
 	return append([]paymentFloatEdge(nil), l.paymentEdges...)
+}
+
+// paymentEdgeWriter is retained only for reading/re-publishing legacy result
+// files that carried raw Payment evidence. New benchmark runs use the online
+// paymentChainAccumulator instead.
+type paymentEdgeWriter struct {
+	mu        sync.Mutex
+	file      *os.File
+	encoder   *json.Encoder
+	tmpPath   string
+	finalPath string
+	closed    bool
+}
+
+func paymentEdgePath(resultPath string) string {
+	return resultPath + ".payment-edges.ndjson"
+}
+
+func validationStatePath(resultPath string) string {
+	dir, base := filepath.Split(resultPath)
+	return filepath.Join(dir, "."+base+".validation-state.json")
+}
+
+func newPaymentEdgeWriter(resultPath string) (*paymentEdgeWriter, error) {
+	finalPath := paymentEdgePath(resultPath)
+	tmp, err := os.CreateTemp(filepath.Dir(finalPath), ".tpcc-payment-edges-*.tmp")
+	if err != nil {
+		return nil, err
+	}
+	return &paymentEdgeWriter{
+		file:      tmp,
+		encoder:   json.NewEncoder(tmp),
+		tmpPath:   tmp.Name(),
+		finalPath: finalPath,
+	}, nil
+}
+
+func (w *paymentEdgeWriter) write(edges []paymentFloatEdge) error {
+	if w == nil || len(edges) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return errors.New("payment edge writer is closed")
+	}
+	for _, edge := range edges {
+		if err := w.encoder.Encode(edge); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *paymentEdgeWriter) closeAndPublish() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	if err := w.file.Sync(); err != nil {
+		_ = w.file.Close()
+		_ = os.Remove(w.tmpPath)
+		w.closed = true
+		return err
+	}
+	if err := w.file.Close(); err != nil {
+		_ = os.Remove(w.tmpPath)
+		w.closed = true
+		return err
+	}
+	if err := os.Rename(w.tmpPath, w.finalPath); err != nil {
+		_ = os.Remove(w.tmpPath)
+		w.closed = true
+		return err
+	}
+	w.closed = true
+	return nil
+}
+
+func (w *paymentEdgeWriter) abort() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	_ = w.file.Close()
+	_ = os.Remove(w.tmpPath)
+	w.closed = true
 }
 
 func (l *txnLedger) snapshot() map[string]float64 {
@@ -658,6 +908,13 @@ func liveAbortRatePercent(attempted, serverAborts uint64) float64 {
 	return float64(serverAborts) / float64(attempted) * 100
 }
 
+func liveTPMC(elapsed int, newOrderCommits uint64) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(newOrderCommits) / (float64(elapsed) / 60.0)
+}
+
 func printProgress(round, rounds int, phase string, elapsed, total int, stats *liveStats) {
 	index := phaseIndex(phase)
 	attempted := stats.attempted[index].Load()
@@ -667,9 +924,10 @@ func printProgress(round, rounds int, phase string, elapsed, total int, stats *l
 	newOrderCommits := stats.newOrderCommits[index].Load()
 	newOrderServerAborts := stats.newOrderServerAborts[index].Load()
 	abortRate := liveAbortRatePercent(attempted, serverAborts)
-	fmt.Printf("[round %d/%d %s %d/%ds] attempted=%d commits=%d server_aborts=%d new_order_attempted=%d new_order_commit=%d new_order_server_abort=%d tpmC=deferred abort_rate=%.2f%%\n",
+	tpmc := liveTPMC(elapsed, newOrderCommits)
+	fmt.Printf("[round %d/%d %s %d/%ds] attempted=%d commits=%d server_aborts=%d new_order_attempted=%d new_order_commit=%d new_order_server_abort=%d tpmC=%.2f abort_rate=%.2f%%\n",
 		round, rounds, phase, elapsed, total, attempted, commits, serverAborts, newOrderAttempted, newOrderCommits,
-		newOrderServerAborts, abortRate)
+		newOrderServerAborts, tpmc, abortRate)
 }
 
 func monitorProgress(round, rounds, warmupSeconds, measureSeconds, interval int, warmupEnd, measureEnd time.Time, stats *liveStats, stop <-chan struct{}, done chan<- struct{}) {
@@ -2372,10 +2630,14 @@ func (r *officialWorkerReport) attribute(finish, warmupEnd time.Time, measure ti
 
 func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
 	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
-	stop <-chan struct{}, output chan<- workerReport, factory backendFactory) {
+	stop <-chan struct{}, output chan<- workerReport, factory backendFactory, edgeSinks ...paymentEdgeSink) {
+	var edgeSink paymentEdgeSink
+	if len(edgeSinks) > 0 {
+		edgeSink = edgeSinks[0]
+	}
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	local := newResult(measureSeconds)
-	total, attempt := newTxnLedger(), newTxnLedger()
+	total, attempt := newTxnLedgerWithSink(edgeSink), newTxnLedger()
 	report := func(err error) {
 		output <- workerReport{result: local, ledger: total, err: err}
 	}
@@ -2427,7 +2689,13 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 		}
 		latency := float64(time.Since(start).Microseconds()) / 1000.0
 		if err == nil || errors.Is(err, errInvalidItem) {
-			total.merge(attempt)
+			if mergeErr := total.merge(attempt); mergeErr != nil {
+				c.rollback()
+				local.record(phase, txnType, "backend-error", latency, mergeErr.Error())
+				stats.record(phase, txnType, "backend-error")
+				report(fmt.Errorf("worker %d %s payment evidence: %w", workerID, txnType, mergeErr))
+				return
+			}
 		}
 
 		if err == nil {
@@ -2469,7 +2737,11 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 
 func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
 	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
-	factory backendFactory, ledger *txnLedger) (*result, error) {
+	factory backendFactory, ledger *txnLedger, edgeSinks ...paymentEdgeSink) (*result, error) {
+	var edgeSink paymentEdgeSink
+	if len(edgeSinks) > 0 {
+		edgeSink = edgeSinks[0]
+	}
 	partials := make(chan workerReport, workers)
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -2479,7 +2751,7 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 		go func(id int) {
 			defer wg.Done()
 			runWorker(id, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think, reconnectEachTxn,
-				maxConflictRetries, stats, stop, partials, factory)
+				maxConflictRetries, stats, stop, partials, factory, edgeSink)
 		}(workerID)
 	}
 	go func() {
@@ -2508,10 +2780,14 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 
 func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officialRoutingPlan, warmupEnd time.Time,
 	measure time.Duration, windows int, think time.Duration, maxConflictRetries int, stats []*liveStats, stop <-chan struct{},
-	output chan<- officialWorkerReport, c txnBackend) {
+	output chan<- officialWorkerReport, c txnBackend, edgeSinks ...paymentEdgeSink) {
+	var edgeSink paymentEdgeSink
+	if len(edgeSinks) > 0 {
+		edgeSink = edgeSinks[0]
+	}
 	rng := rand.New(rand.NewSource(workerSeed(seed, round, workerID)))
 	router := newOfficialRouter(plan, workerID)
-	report := officialWorkerReport{warmup: newResult(0), windows: make([]*result, windows), ledger: newTxnLedger()}
+	report := officialWorkerReport{warmup: newResult(0), windows: make([]*result, windows), ledger: newTxnLedgerWithSink(edgeSink)}
 	attempt := newTxnLedger()
 	for window := range report.windows {
 		report.windows[window] = newResult(int(measure / time.Second))
@@ -2566,7 +2842,10 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 		// The ledger is folded in before attribution: the database was changed
 		// regardless of which measurement bucket, if any, owns the completion.
 		if err == nil || errors.Is(err, errInvalidItem) {
-			report.ledger.merge(attempt)
+			if mergeErr := report.ledger.merge(attempt); mergeErr != nil {
+				report.err = fmt.Errorf("worker %d %s payment evidence: %w", workerID, txnType, mergeErr)
+				return
+			}
 		}
 		phase, local, window := report.attribute(finish, warmupEnd, measure)
 		if local == nil {
@@ -2638,7 +2917,11 @@ func monitorOfficialProgress(rounds, warmup, measure, interval int, start time.T
 
 func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
 	maxConflictRetries int, reconnectEachTxn bool, roundOffset int, factory backendFactory,
-	ledger *txnLedger) ([]*result, error) {
+	ledger *txnLedger, edgeSinks ...paymentEdgeSink) ([]*result, error) {
+	var edgeSink paymentEdgeSink
+	if len(edgeSinks) > 0 {
+		edgeSink = edgeSinks[0]
+	}
 	if reconnectEachTxn {
 		return nil, errors.New("official-equivalent does not allow reconnect-each-txn")
 	}
@@ -2673,7 +2956,7 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	go monitorOfficialProgress(rounds, warmup, measure, progress, start, stats, monitorStop, monitorDone)
 	for workerID, backend := range backends {
 		go runOfficialWorker(workerID, roundOffset+1, seed, p, plan, warmupEnd, measureDuration, rounds, think,
-			maxConflictRetries, stats, stop, partials, backend)
+			maxConflictRetries, stats, stop, partials, backend, edgeSink)
 	}
 
 	warmupResult := newResult(0)
@@ -2729,7 +3012,7 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	}
 	for round, window := range windows {
 		attempted, committed, expectedRollback, abandoned, completion := window.reportTotals()
-		fmt.Printf("[official window %d/%d] NewOrder/min=%.2f attempted=%d committed=%d expected_rollback=%d abandoned=%d completion=%.2f%% abort_rate=%.2f%%\n",
+		fmt.Printf("[official window %d/%d] tpmC=%.2f attempted=%d committed=%d expected_rollback=%d abandoned=%d completion=%.2f%% abort_rate=%.2f%%\n",
 			round+1, rounds, window.NewOrderPerMin, attempted, committed, expectedRollback, abandoned,
 			completion*100, window.AbortRate*100)
 	}
@@ -2790,20 +3073,110 @@ type document struct {
 	// before the first warmup transaction. Ledger is the total effect of every
 	// transaction this run committed, including the warmup and the transactions
 	// that finished after the last measurement window. Together they let the
-	// post-crash validation reconcile the recovered database without any state
-	// surviving the crash (final.md:322).
+	// post-crash validation reconcile the recovered database from the published
+	// result artifacts without any in-memory state surviving the crash (final.md:322).
 	Baselines map[string]float64 `json:"baselines,omitempty"`
 	Ledger    map[string]float64 `json:"ledger,omitempty"`
-	// PaymentEdges is the committed per-key binary32 update graph. Online
-	// consistency links it from the public initial value without assuming client
-	// completion order, catching gaps, forks and lost updates.
-	PaymentEdges        []paymentFloatEdge `json:"payment_float_edges,omitempty"`
-	PaymentTerminalBits map[string]uint32  `json:"payment_terminal_bits,omitempty"`
+	// PaymentEdges is the legacy inline form of the committed per-key binary32
+	// update graph. New runs validate this graph online and publish only its
+	// compact terminal summary.
+	PaymentEdges           []paymentFloatEdge `json:"payment_float_edges,omitempty"`
+	PaymentEdgeCount       int                `json:"payment_edge_count,omitempty"`
+	PaymentChainTerminals  map[string]uint32  `json:"payment_chain_terminals,omitempty"`
+	PaymentTerminalBits    map[string]uint32  `json:"payment_terminal_bits,omitempty"`
+	OnlinePaymentValidated bool               `json:"online_payment_validated,omitempty"`
 	// OnlineFloatBits captures the seven pre-crash aggregate cells as raw
 	// binary32 so recovery validation never passes through decimal tolerance.
 	OnlineFloatBits map[string]uint32 `json:"online_float_bits,omitempty"`
 	MedianTPMC      float64           `json:"median_tpmc"`
 	Rounds          []*result         `json:"rounds"`
+	// paymentEdgesPath is an internal lazy sidecar reference for legacy results.
+	paymentEdgesPath string
+}
+
+type publicConfig struct {
+	Mode               string `json:"mode"`
+	Backend            string `json:"backend"`
+	Isolation          string `json:"isolation"`
+	SQLitePath         string `json:"sqlite_path,omitempty"`
+	SQLiteBegin        string `json:"sqlite_begin,omitempty"`
+	Warehouses         int    `json:"warehouses"`
+	Workers            int    `json:"workers"`
+	Warmup             int    `json:"warmup"`
+	Measure            int    `json:"measure"`
+	Rounds             int    `json:"rounds"`
+	ProgressInterval   int    `json:"progress_interval"`
+	Seed               int64  `json:"seed"`
+	Think              string `json:"think"`
+	ReconnectEachTxn   bool   `json:"reconnect_each_txn"`
+	MaxConflictRetries int    `json:"max_conflict_retries"`
+	WarehousePolicy    string `json:"warehouse_policy"`
+}
+
+type publicResult struct {
+	MeasureSeconds   int                       `json:"measure_seconds"`
+	TPMC             float64                   `json:"tpmc"`
+	TxnTPM           map[string]float64        `json:"txn_tpm"`
+	Attempted        map[string]int            `json:"attempted"`
+	Committed        map[string]int            `json:"committed"`
+	ExpectedRollback map[string]int            `json:"expected_rollback"`
+	Abandoned        map[string]int            `json:"abandoned"`
+	Completion       map[string]float64        `json:"completion"`
+	AbortRate        float64                   `json:"abort_rate"`
+	LatencyMS        map[string]latencySummary `json:"latency_ms"`
+}
+
+type publicDocument struct {
+	Config     publicConfig    `json:"config"`
+	MedianTPMC float64         `json:"median_tpmc"`
+	Rounds     []*publicResult `json:"rounds"`
+}
+
+type validationState struct {
+	Config                 config             `json:"config"`
+	Baselines              map[string]float64 `json:"baselines,omitempty"`
+	Ledger                 map[string]float64 `json:"ledger,omitempty"`
+	PaymentEdgeCount       int                `json:"payment_edge_count,omitempty"`
+	PaymentChainTerminals  map[string]uint32  `json:"payment_chain_terminals,omitempty"`
+	OnlinePaymentValidated bool               `json:"online_payment_validated,omitempty"`
+	OnlineFloatBits        map[string]uint32  `json:"online_float_bits,omitempty"`
+	Rounds                 []*result          `json:"rounds"`
+}
+
+func makePublicDocument(doc document) publicDocument {
+	cfg := doc.Config
+	sqlitePath, sqliteBegin := "", ""
+	if cfg.Backend == "sqlite" {
+		sqlitePath, sqliteBegin = cfg.SQLitePath, cfg.SQLiteBegin
+	}
+	output := publicDocument{
+		Config: publicConfig{
+			Mode: cfg.Mode, Backend: cfg.Backend, Isolation: cfg.Isolation, SQLitePath: sqlitePath,
+			SQLiteBegin: sqliteBegin, Warehouses: cfg.Warehouses, Workers: cfg.Workers, Warmup: cfg.Warmup,
+			Measure: cfg.Measure, Rounds: cfg.Rounds, ProgressInterval: cfg.ProgressInterval, Seed: cfg.Seed,
+			Think: cfg.Think, ReconnectEachTxn: cfg.ReconnectEachTxn, MaxConflictRetries: cfg.MaxConflictRetries,
+			WarehousePolicy: cfg.WarehousePolicy,
+		},
+		MedianTPMC: doc.MedianTPMC,
+		Rounds:     make([]*publicResult, 0, len(doc.Rounds)),
+	}
+	for _, window := range doc.Rounds {
+		output.Rounds = append(output.Rounds, &publicResult{
+			MeasureSeconds: window.MeasureSeconds, TPMC: window.TPMC, TxnTPM: window.TxnTPM,
+			Attempted: window.Attempted, Committed: window.Committed, ExpectedRollback: window.ExpectedRollback,
+			Abandoned: window.Abandoned, Completion: window.Completion, AbortRate: window.AbortRate,
+			LatencyMS: window.LatencyMS,
+		})
+	}
+	return output
+}
+
+func makeValidationState(doc document) validationState {
+	return validationState{
+		Config: doc.Config, Baselines: doc.Baselines, Ledger: doc.Ledger, PaymentEdgeCount: doc.PaymentEdgeCount,
+		PaymentChainTerminals: doc.PaymentChainTerminals, OnlinePaymentValidated: doc.OnlinePaymentValidated,
+		OnlineFloatBits: doc.OnlineFloatBits, Rounds: doc.Rounds,
+	}
 }
 
 func validateMaxConflictRetries(value int) error {
@@ -2854,6 +3227,15 @@ func validateResultDocument(doc document) error {
 	}
 	if math.IsNaN(doc.MedianTPMC) || math.IsInf(doc.MedianTPMC, 0) || doc.MedianTPMC < 0 {
 		return fmt.Errorf("result has invalid median tpmC %.6g", doc.MedianTPMC)
+	}
+	if doc.PaymentChainTerminals != nil || doc.PaymentEdgeCount != 0 {
+		expectedEdges := int(math.Round(doc.Ledger[ledgerPaymentCommits])) * 2
+		if doc.PaymentEdgeCount != expectedEdges {
+			return fmt.Errorf("result has %d Payment FLOAT32 edges, want %d", doc.PaymentEdgeCount, expectedEdges)
+		}
+		if expectedEdges > 0 && len(doc.PaymentChainTerminals) == 0 {
+			return errors.New("result has Payment edges but no chain terminals")
+		}
 	}
 	return nil
 }
@@ -2968,35 +3350,63 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 	return nil
 }
 
-func publishResultDocument(path string, doc document) ([]byte, error) {
+func publishResultDocument(path string, doc document) error {
+	if doc.paymentEdgesPath == "" && len(doc.PaymentEdges) > 0 {
+		edgeSink, err := newPaymentEdgeWriter(path)
+		if err != nil {
+			return err
+		}
+		if err := edgeSink.write(doc.PaymentEdges); err != nil {
+			edgeSink.abort()
+			return err
+		}
+		if err := edgeSink.closeAndPublish(); err != nil {
+			return err
+		}
+		doc.paymentEdgesPath = paymentEdgePath(path)
+	}
 	if err := validateResultDocument(doc); err != nil {
-		return nil, err
+		return err
 	}
-	encoded, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return nil, err
+	if len(doc.PaymentTerminalBits) > 0 {
+		if _, err := paymentTerminalsForConsistency(doc); err != nil {
+			return err
+		}
+		doc.OnlinePaymentValidated = true
+		doc.PaymentTerminalBits = nil
 	}
+	if err := writeJSONAtomic(validationStatePath(path), makeValidationState(doc), false); err != nil {
+		return err
+	}
+	return writeJSONAtomic(path, makePublicDocument(doc), true)
+}
+
+func writeJSONAtomic(path string, value any, indent bool) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tpcc-result-*.tmp")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(encoded); err != nil {
+	encoder := json.NewEncoder(tmp)
+	if indent {
+		encoder.SetIndent("", "  ")
+	}
+	if err := encoder.Encode(value); err != nil {
 		tmp.Close()
-		return nil, err
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return nil, err
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		return nil, err
+		return err
 	}
-	return encoded, nil
+	return nil
 }
 
 func verifyCrashOracle(address string, timeout time.Duration, isolation, ackPath string) error {
@@ -3194,7 +3604,7 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 }
 
 func main() {
-	command := flag.String("command", "run", "run, feature-check, mixed-sql, data-ready, refresh-manifest, datagen, load, consistency, validate-result, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
+	command := flag.String("command", "run", "run, feature-check, mixed-sql, data-ready, refresh-manifest, datagen, load, consistency, validate-result, compact-result, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
 	mode := flag.String("mode", "official-equivalent", "official-equivalent for rmdb or sqlite-reference for SQLite")
 	backend := flag.String("backend", "rmdb", "rmdb or sqlite")
 	host := flag.String("host", "127.0.0.1", "RMDB host")
@@ -3480,13 +3890,8 @@ func main() {
 		return
 	}
 	if *command == "validate-result" {
-		data, err := os.ReadFile(*resultJSON)
+		doc, err := loadResultDocument(*resultJSON)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		var doc document
-		if err := json.Unmarshal(data, &doc); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -3494,6 +3899,19 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		return
+	}
+	if *command == "compact-result" {
+		doc, err := loadResultDocument(*resultJSON)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := publishResultDocument(*resultJSON, doc); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("[benchmark] compacted result=%s median_tpmC=%.2f\n", *resultJSON, doc.MedianTPMC)
 		return
 	}
 	if *command != "run" {
@@ -3599,10 +4017,11 @@ func main() {
 		*policy = "official-terminal-home"
 	}
 	ledger := newTxnLedger()
+	edgeSink := newPaymentChainAccumulator()
 	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, MaxConflictRetries: *maxConflictRetries, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}, Baselines: baselines}
 	if *mode == "official-equivalent" {
 		windows, runErr := runOfficialWindows(*rounds, *workers, *seed, p, *warmup, *measure, *progress, *think,
-			*maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger)
+			*maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger, edgeSink)
 		if runErr != nil {
 			fmt.Fprintln(os.Stderr, runErr)
 			os.Exit(1)
@@ -3618,7 +4037,7 @@ func main() {
 			monitorDone := make(chan struct{})
 			go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
 			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd,
-				*measure, *think, *reconnectEachTxn, *maxConflictRetries, stats, factory, ledger)
+				*measure, *think, *reconnectEachTxn, *maxConflictRetries, stats, factory, ledger, edgeSink)
 			close(monitorStop)
 			<-monitorDone
 			if roundErr != nil {
@@ -3626,7 +4045,7 @@ func main() {
 				os.Exit(1)
 			}
 			doc.Rounds = append(doc.Rounds, combined)
-			fmt.Printf("[round %d/%d] tpmC=deferred abort_rate=%.2f%%\n", round, *rounds, combined.AbortRate*100)
+			fmt.Printf("[round %d/%d] tpmC=%.2f abort_rate=%.2f%%\n", round, *rounds, combined.TPMC, combined.AbortRate*100)
 
 		}
 	}
@@ -3636,11 +4055,17 @@ func main() {
 	}
 	doc.MedianTPMC = median(values)
 	doc.Ledger = ledger.snapshot()
-	doc.PaymentEdges = ledger.paymentEdgeSnapshot()
-	encoded, err := publishResultDocument(*jsonOut, doc)
+	expectedEdges := int(math.Round(ledger.values[ledgerPaymentCommits])) * 2
+	terminals, edgeCount, err := edgeSink.finalize(expectedEdges)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Println(string(encoded))
+	doc.PaymentEdgeCount = edgeCount
+	doc.PaymentChainTerminals = terminals
+	if err := publishResultDocument(*jsonOut, doc); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("[benchmark] result=%s median_tpmC=%.2f\n", *jsonOut, doc.MedianTPMC)
 }

@@ -41,11 +41,9 @@ bool configured_si_first_lock_wait() {
 
 } // namespace
 
-LockManager::LockManager()
-    : LockManager(configured_si_conflict_backoff(), configured_si_first_lock_wait()) {}
+LockManager::LockManager() : LockManager(configured_si_conflict_backoff(), configured_si_first_lock_wait()) {}
 
-LockManager::LockManager(std::chrono::microseconds si_conflict_backoff)
-    : LockManager(si_conflict_backoff, false) {}
+LockManager::LockManager(std::chrono::microseconds si_conflict_backoff) : LockManager(si_conflict_backoff, false) {}
 
 LockManager::LockManager(std::chrono::microseconds si_conflict_backoff, bool si_first_lock_wait)
     : si_conflict_backoff_(si_conflict_backoff), si_first_lock_wait_enabled_(si_first_lock_wait) {

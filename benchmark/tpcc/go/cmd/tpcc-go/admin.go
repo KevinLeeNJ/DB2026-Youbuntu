@@ -757,12 +757,8 @@ func mergeResultFiles(outputPath, inputs string) error {
 		if path == "" {
 			return errors.New("--result-inputs contains an empty path")
 		}
-		data, err := os.ReadFile(path)
+		doc, err := loadResultDocument(path)
 		if err != nil {
-			return err
-		}
-		var doc document
-		if err := json.Unmarshal(data, &doc); err != nil {
 			return err
 		}
 		if err := validateMaxConflictRetries(doc.Config.MaxConflictRetries); err != nil {
@@ -788,10 +784,33 @@ func mergeResultFiles(outputPath, inputs string) error {
 		values = append(values, doc.Rounds[0].TPMC)
 	}
 	merged.MedianTPMC = median(values)
-	encoded, err := publishResultDocument(outputPath, merged)
+	edgeSink, err := newPaymentEdgeWriter(outputPath)
 	if err != nil {
 		return err
 	}
-	fmt.Println(string(encoded))
+	hasEdges := false
+	for _, doc := range documents {
+		if err := forEachPaymentEdge(doc, func(edge paymentFloatEdge) error {
+			hasEdges = true
+			return edgeSink.write([]paymentFloatEdge{edge})
+		}); err != nil {
+			edgeSink.abort()
+			return err
+		}
+	}
+	if hasEdges {
+		if err := edgeSink.closeAndPublish(); err != nil {
+			return err
+		}
+		merged.paymentEdgesPath = paymentEdgePath(outputPath)
+		merged.PaymentEdges = nil
+	} else {
+		edgeSink.abort()
+	}
+	err = publishResultDocument(outputPath, merged)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[benchmark] result=%s median_tpmC=%.2f\n", outputPath, merged.MedianTPMC)
 	return nil
 }

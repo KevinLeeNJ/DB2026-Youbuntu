@@ -147,8 +147,7 @@ TEST(LockManagerMetadataTest, SiFirstConflictClaimsLockReleasedDuringBackoff) {
         std::this_thread::yield();
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (lock_manager.record_lock_observability().backoff_waits == 0 &&
-           std::chrono::steady_clock::now() < deadline) {
+    while (lock_manager.record_lock_observability().backoff_waits == 0 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
     EXPECT_EQ(lock_manager.record_lock_observability().backoff_waits, 1u);
@@ -183,8 +182,7 @@ TEST(LockManagerMetadataTest, CancelledSiBackoffDoesNotClaimReleasedLock) {
         std::this_thread::yield();
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (lock_manager.record_lock_observability().backoff_waits == 0 &&
-           std::chrono::steady_clock::now() < deadline) {
+    while (lock_manager.record_lock_observability().backoff_waits == 0 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
     EXPECT_EQ(lock_manager.record_lock_observability().backoff_waits, 1u);

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -515,16 +516,45 @@ func paymentEdgeKey(edge paymentFloatEdge) (string, uint32, error) {
 	}
 }
 
+func forEachPaymentEdge(doc document, visit func(paymentFloatEdge) error) error {
+	if doc.paymentEdgesPath == "" {
+		for _, edge := range doc.PaymentEdges {
+			if err := visit(edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	file, err := os.Open(doc.paymentEdgesPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 4<<10), 1<<20)
+	line := 0
+	for scanner.Scan() {
+		line++
+		var edge paymentFloatEdge
+		if err := json.Unmarshal(scanner.Bytes(), &edge); err != nil {
+			return fmt.Errorf("decode Payment FLOAT32 evidence line %d: %w", line, err)
+		}
+		if err := visit(edge); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read Payment FLOAT32 evidence: %w", err)
+	}
+	return nil
+}
+
 // validatePaymentFloatChains treats committed updates as a per-key multiset of
 // before->after edges. Linking by raw bits, rather than client completion order,
 // accepts every serial interleaving while rejecting a missing edge or the fork
 // produced when two committed transactions both update the same old value.
 func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 	commits := int(math.Round(doc.Ledger[ledgerPaymentCommits]))
-	if len(doc.PaymentEdges) != commits*2 {
-		return nil, fmt.Errorf("Payment FLOAT32 evidence has %d edges, want two for each of %d commit(s)",
-			len(doc.PaymentEdges), commits)
-	}
 	type chainNode struct {
 		selfLoops  int
 		advance    uint32
@@ -542,19 +572,21 @@ func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 		return bits
 	}
 	grouped := make(map[string]*chain)
-	for _, edge := range doc.PaymentEdges {
+	edges := 0
+	err := forEachPaymentEdge(doc, func(edge paymentFloatEdge) error {
+		edges++
 		key, start, err := paymentEdgeKey(edge)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		amount := math.Float32frombits(edge.AmountBits)
 		before := math.Float32frombits(edge.BeforeBits)
 		if amount <= 0 || math.IsNaN(float64(amount)) || math.IsInf(float64(amount), 0) {
-			return nil, fmt.Errorf("Payment FLOAT32 edge %s has invalid amount 0x%08x", key, edge.AmountBits)
+			return fmt.Errorf("Payment FLOAT32 edge %s has invalid amount 0x%08x", key, edge.AmountBits)
 		}
 		want := math.Float32bits(before + amount)
 		if !equalFloat32Bits(edge.AfterBits, want) {
-			return nil, fmt.Errorf("Payment FLOAT32 edge %s is not 0 ULP: before=0x%08x amount=0x%08x after=0x%08x want=0x%08x",
+			return fmt.Errorf("Payment FLOAT32 edge %s is not 0 ULP: before=0x%08x amount=0x%08x after=0x%08x want=0x%08x",
 				key, edge.BeforeBits, edge.AmountBits, edge.AfterBits, want)
 		}
 		currentChain := grouped[key]
@@ -571,13 +603,20 @@ func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 		}
 		if equalFloat32Bits(edge.BeforeBits, edge.AfterBits) {
 			node.selfLoops++
-			continue
+			return nil
 		}
 		if node.hasAdvance {
-			return nil, fmt.Errorf("Payment FLOAT32 chain %s forks at 0x%08x", key, edge.BeforeBits)
+			return fmt.Errorf("Payment FLOAT32 chain %s forks at 0x%08x", key, edge.BeforeBits)
 		}
 		node.advance = edge.AfterBits
 		node.hasAdvance = true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if edges != commits*2 {
+		return nil, fmt.Errorf("Payment FLOAT32 evidence has %d edges, want two for each of %d commit(s)", edges, commits)
 	}
 	terminals := make(map[string]uint32, len(grouped))
 	for key, currentChain := range grouped {
@@ -604,6 +643,42 @@ func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 			remaining--
 		}
 		terminals[key] = current
+	}
+	return terminals, nil
+}
+
+func paymentTerminalsForConsistency(doc document) (map[string]uint32, error) {
+	commits := int(math.Round(doc.Ledger[ledgerPaymentCommits]))
+	expectedEdges := commits * 2
+	var terminals map[string]uint32
+	var err error
+	if doc.PaymentChainTerminals != nil || doc.PaymentEdgeCount != 0 {
+		if doc.PaymentEdgeCount != expectedEdges {
+			return nil, fmt.Errorf("Payment FLOAT32 summary has %d edges, want two for each of %d commit(s)",
+				doc.PaymentEdgeCount, commits)
+		}
+		if expectedEdges > 0 && len(doc.PaymentChainTerminals) == 0 {
+			return nil, errors.New("Payment FLOAT32 summary has no chain terminals")
+		}
+		terminals = doc.PaymentChainTerminals
+	} else {
+		// Legacy result files carry the raw edge stream either inline or in the
+		// sidecar. Keep reading them so old benchmark artifacts remain usable.
+		terminals, err = validatePaymentFloatChains(doc)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(doc.PaymentTerminalBits) > 0 {
+		if len(doc.PaymentTerminalBits) != len(terminals) {
+			return nil, errors.New("persisted Payment terminal summary has a different key count")
+		}
+		for key, want := range terminals {
+			if got := doc.PaymentTerminalBits[key]; got != want {
+				return nil, fmt.Errorf("persisted Payment terminal %s does not match the chain summary", key)
+			}
+		}
+		return doc.PaymentTerminalBits, nil
 	}
 	return terminals, nil
 }
@@ -987,6 +1062,17 @@ func loadPriorResult(resultPath string) (document, error) {
 	if resultPath == "" {
 		return document{}, errors.New("--result-json is required for consistency")
 	}
+	prior, err := loadResultDocument(resultPath)
+	if err != nil {
+		return document{}, err
+	}
+	if err := validateResultDocument(prior); err != nil {
+		return document{}, fmt.Errorf("invalid benchmark result: %w", err)
+	}
+	return prior, nil
+}
+
+func loadResultDocument(resultPath string) (document, error) {
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		return document{}, err
@@ -995,8 +1081,27 @@ func loadPriorResult(resultPath string) (document, error) {
 	if err := json.Unmarshal(data, &prior); err != nil {
 		return document{}, err
 	}
-	if err := validateResultDocument(prior); err != nil {
-		return document{}, fmt.Errorf("invalid benchmark result: %w", err)
+	stateData, stateErr := os.ReadFile(validationStatePath(resultPath))
+	if stateErr == nil {
+		var state validationState
+		if err := json.Unmarshal(stateData, &state); err != nil {
+			return document{}, fmt.Errorf("decode validation state: %w", err)
+		}
+		prior.Config = state.Config
+		prior.Baselines = state.Baselines
+		prior.Ledger = state.Ledger
+		prior.PaymentEdgeCount = state.PaymentEdgeCount
+		prior.PaymentChainTerminals = state.PaymentChainTerminals
+		prior.OnlinePaymentValidated = state.OnlinePaymentValidated
+		prior.OnlineFloatBits = state.OnlineFloatBits
+		prior.Rounds = state.Rounds
+	} else if !errors.Is(stateErr, os.ErrNotExist) {
+		return document{}, stateErr
+	}
+	if _, err := os.Stat(paymentEdgePath(resultPath)); err == nil {
+		prior.paymentEdgesPath = paymentEdgePath(resultPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return document{}, err
 	}
 	return prior, nil
 }
@@ -1021,7 +1126,7 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 		var terminals map[string]uint32
 		return runConsistencyTransactionThen(c, func() error {
 			var err error
-			terminals, err = validatePaymentFloatChains(prior)
+			terminals, err = paymentTerminalsForConsistency(prior)
 			if err != nil {
 				return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
 			}
@@ -1035,8 +1140,8 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 			return nil
 		}, func() error {
 			prior.OnlineFloatBits = bits
-			prior.PaymentTerminalBits = terminals
-			if _, err := publishResultDocument(resultPath, prior); err != nil {
+			prior.OnlinePaymentValidated = true
+			if err := publishResultDocument(resultPath, prior); err != nil {
 				return fmt.Errorf("[%s] persist online FLOAT32 evidence: %w", stage, err)
 			}
 			return nil
@@ -1047,18 +1152,13 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 			return fmt.Errorf("[%s] result carries %d online FLOAT32 baselines, want %d; run online consistency before crash",
 				stage, len(prior.OnlineFloatBits), postRecoveryAmountRuleCnt)
 		}
-		terminals, err := validatePaymentFloatChains(prior)
+		terminals, err := paymentTerminalsForConsistency(prior)
 		if err != nil {
 			return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
 		}
-		if len(prior.PaymentTerminalBits) != len(terminals) {
-			return fmt.Errorf("[%s] result carries %d Payment terminal bits, want %d; run online consistency before crash",
-				stage, len(prior.PaymentTerminalBits), len(terminals))
-		}
-		for key, want := range terminals {
-			if got, ok := prior.PaymentTerminalBits[key]; !ok || !equalFloat32Bits(got, want) {
-				return fmt.Errorf("[%s] persisted Payment terminal %s does not match the committed edge chain", stage, key)
-			}
+		if !prior.OnlinePaymentValidated && len(prior.PaymentTerminalBits) != len(terminals) {
+			return fmt.Errorf("[%s] result does not record a completed online Payment check; run online consistency before crash",
+				stage)
 		}
 		if err := checkPaymentTerminalBits(c, terminals, stage); err != nil {
 			return err

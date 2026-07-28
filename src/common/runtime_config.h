@@ -60,8 +60,7 @@ inline std::chrono::microseconds parse_si_conflict_backoff(std::string_view valu
     const char* begin = value.data();
     const char* end = begin + value.size();
     const auto result = std::from_chars(begin, end, microseconds);
-    if (value.empty() || result.ec != std::errc{} || result.ptr != end ||
-        microseconds > MAX_SI_CONFLICT_BACKOFF_US) {
+    if (value.empty() || result.ec != std::errc{} || result.ptr != end || microseconds > MAX_SI_CONFLICT_BACKOFF_US) {
         throw std::invalid_argument("RMDB_SI_CONFLICT_BACKOFF_US must be an integer between 0 and 2000");
     }
     return std::chrono::microseconds{microseconds};

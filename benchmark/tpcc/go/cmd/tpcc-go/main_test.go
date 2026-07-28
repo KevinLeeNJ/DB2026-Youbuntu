@@ -674,6 +674,206 @@ func TestLiveStatsCountsOnlyServerAbortInAbortRate(t *testing.T) {
 	}
 }
 
+func TestLiveTPMCUsesCommittedNewOrdersAndElapsedSeconds(t *testing.T) {
+	if got := liveTPMC(30, 15); got != 30 {
+		t.Fatalf("live tpmC = %v, want 30", got)
+	}
+	if got := liveTPMC(0, 15); got != 0 {
+		t.Fatalf("zero-elapsed live tpmC = %v, want 0", got)
+	}
+}
+
+func TestPaymentEdgeWriterDoesNotRetainCommittedEvidence(t *testing.T) {
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	sink, err := newPaymentEdgeWriter(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := newTxnLedgerWithSink(sink)
+	attempt := newTxnLedger()
+	attempt.addPaymentEdge(paymentFloatEdge{Kind: "warehouse", Warehouse: 1, BeforeBits: 1, AmountBits: 2, AfterBits: 3})
+	if err := total.merge(attempt); err != nil {
+		t.Fatal(err)
+	}
+	if len(total.paymentEdges) != 0 {
+		t.Fatalf("streaming ledger retained %d payment edges", len(total.paymentEdges))
+	}
+	if err := sink.closeAndPublish(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(paymentEdgePath(resultPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Split(strings.TrimSpace(string(data)), "\n"); len(lines) != 1 {
+		t.Fatalf("sidecar has %d lines, want 1", len(lines))
+	}
+}
+
+func TestPublishResultDocumentOmitsLargeInlinePaymentEvidence(t *testing.T) {
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	window := completeResult(1)
+	doc := document{
+		Config:     config{Rounds: 1, Measure: 1},
+		MedianTPMC: window.TPMC,
+		Rounds:     []*result{window},
+		PaymentEdges: []paymentFloatEdge{{Kind: "warehouse", Warehouse: 1,
+			BeforeBits: 1, AmountBits: 2, AfterBits: 3}},
+	}
+	if err := publishResultDocument(resultPath, doc); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "payment_float_edges") {
+		t.Fatal("result JSON still embeds payment FLOAT32 evidence")
+	}
+	if strings.Contains(string(data), "payment_chain_terminals") {
+		t.Fatal("public result JSON contains validation evidence")
+	}
+	if _, err := os.Stat(paymentEdgePath(resultPath)); err != nil {
+		t.Fatalf("payment evidence sidecar missing: %v", err)
+	}
+}
+
+func TestPaymentChainAccumulatorFoldsOutOfOrderEdges(t *testing.T) {
+	start := float32(300000)
+	middle := start + 10
+	end := middle + 20
+	a1 := float32(10)
+	a2 := float32(20)
+	accumulator := newPaymentChainAccumulator()
+	edges := []paymentFloatEdge{
+		{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(middle), AmountBits: math.Float32bits(a2), AfterBits: math.Float32bits(end)},
+		{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start), AmountBits: math.Float32bits(a1), AfterBits: math.Float32bits(middle)},
+	}
+	if err := accumulator.write(edges); err != nil {
+		t.Fatal(err)
+	}
+	terminals, count, err := accumulator.finalize(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || terminals["warehouse:1"] != math.Float32bits(end) {
+		t.Fatalf("online chain summary = count %d terminals %#v", count, terminals)
+	}
+}
+
+func TestPaymentChainAccumulatorRejectsForkWithoutRetainingRawEdges(t *testing.T) {
+	start := float32(300000)
+	accumulator := newPaymentChainAccumulator()
+	edges := []paymentFloatEdge{
+		{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start), AmountBits: math.Float32bits(float32(10)), AfterBits: math.Float32bits(start + 10)},
+		{Kind: "warehouse", Warehouse: 1, BeforeBits: math.Float32bits(start), AmountBits: math.Float32bits(float32(20)), AfterBits: math.Float32bits(start + 20)},
+	}
+	if err := accumulator.write(edges[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := accumulator.write(edges[1:]); err == nil || !strings.Contains(err.Error(), "fork") {
+		t.Fatalf("fork was not rejected: %v", err)
+	}
+}
+
+func TestCompactResultPublishesChainSummaryWithoutSidecar(t *testing.T) {
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	window := completeResult(1)
+	doc := document{
+		Config: config{Rounds: 1, Measure: 1}, Rounds: []*result{window}, MedianTPMC: window.TPMC,
+		Ledger: map[string]float64{ledgerPaymentCommits: 1}, PaymentEdgeCount: 2,
+		PaymentChainTerminals: map[string]uint32{
+			"warehouse:1":  math.Float32bits(300010),
+			"district:1:1": math.Float32bits(30010),
+		},
+		PaymentTerminalBits: map[string]uint32{
+			"warehouse:1":  math.Float32bits(300010),
+			"district:1:1": math.Float32bits(30010),
+		},
+	}
+	if err := publishResultDocument(resultPath, doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paymentEdgePath(resultPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("compact result unexpectedly created a sidecar: %v", err)
+	}
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "payment_chain_terminals") {
+		t.Fatal("public result contains Payment chain validation state")
+	}
+	state, err := os.ReadFile(validationStatePath(resultPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(state), "payment_chain_terminals") {
+		t.Fatal("validation state omitted chain terminals")
+	}
+	if strings.Contains(string(state), "payment_terminal_bits") {
+		t.Fatal("validation state retained duplicate Payment terminal map")
+	}
+	if !strings.Contains(string(state), `"online_payment_validated":true`) {
+		t.Fatal("validation state omitted online Payment validation marker")
+	}
+	loaded, err := loadResultDocument(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PaymentEdgeCount != doc.PaymentEdgeCount ||
+		loaded.PaymentChainTerminals["warehouse:1"] != doc.PaymentChainTerminals["warehouse:1"] {
+		t.Fatalf("loaded compact validation state = %#v", loaded.PaymentChainTerminals)
+	}
+}
+
+func TestPublicResultContainsOnlyConfigAndPerformance(t *testing.T) {
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	window := completeResult(1)
+	doc := document{
+		Config: config{
+			Mode: "diagnostic", Backend: "rmdb", Warehouses: 50, Workers: 32, Measure: 1, Rounds: 1,
+			BaselineCustomerTotal: 1500000,
+		},
+		Baselines: map[string]float64{"customer.rows": 1500000},
+		Ledger: map[string]float64{
+			ledgerPaymentCommits: 0,
+		},
+		MedianTPMC: window.TPMC,
+		Rounds:     []*result{window},
+	}
+	if err := publishResultDocument(resultPath, doc); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output map[string]json.RawMessage
+	if err := json.Unmarshal(data, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output) != 3 || output["config"] == nil || output["median_tpmc"] == nil || output["rounds"] == nil {
+		t.Fatalf("public result fields = %#v", output)
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(output["config"], &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["baseline_customer_total"] != nil {
+		t.Fatal("public config contains validation baseline")
+	}
+	var rounds []map[string]json.RawMessage
+	if err := json.Unmarshal(output["rounds"], &rounds); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"counts", "errors", "coverage", "NewOrder/min"} {
+		if rounds[0][field] != nil {
+			t.Fatalf("public round contains diagnostic field %q", field)
+		}
+	}
+}
+
 func writeResultDocument(t *testing.T, path string, doc document) {
 	t.Helper()
 	data, err := json.Marshal(doc)

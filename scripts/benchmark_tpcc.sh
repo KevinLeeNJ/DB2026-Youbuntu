@@ -4,9 +4,10 @@
 # Flow: start rmdb -> load + run -> kill -9 -> restart rmdb (wait for WAL
 # recovery) -> run consistency check against the recovered database.
 #
-# The consistency phase reads the pre-workload aggregate snapshot and the ledger
-# of committed transaction effects from the result.json written by the run phase,
-# so it does not depend on any in-memory state across the crash/restart.
+# The consistency phase reads the pre-workload aggregate snapshot, ledger and
+# compact online Payment-chain summary from the hidden validation-state file,
+# so result.json stays performance-only and no in-memory state must survive a
+# crash/restart.
 
 set -Eeuo pipefail
 
@@ -116,7 +117,9 @@ if [[ "$REGENERATE_DATA" -eq 1 ]]; then
 fi
 
 # Never leave a previous result available when preparation or execution fails.
-rm -f "$JSON_OUT"
+JSON_DIR="$(dirname "$JSON_OUT")"
+JSON_BASE="$(basename "$JSON_OUT")"
+rm -f "$JSON_OUT" "$JSON_DIR/.${JSON_BASE}.validation-state.json" "${JSON_OUT}.payment-edges.ndjson"
 
 # Auto-detect whether the CSV test data set is present. Refresh an old manifest
 # before falling back to the expensive CSV generator.
