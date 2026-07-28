@@ -610,10 +610,80 @@ def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
         verifier.close()
 
 
+def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
+    client = WireClient(server.port)
+    try:
+        client.command("CREATE TABLE empty_write_abort_wire (id INT, key_col INT, value INT);")
+        # The first index accepts the losing INSERT before the second index
+        # rejects its duplicate key. The executor has appended DML WAL but has
+        # not yet added a WriteRecord when it rolls that partial work back.
+        client.command("CREATE INDEX empty_write_abort_wire(id);")
+        client.command("CREATE INDEX empty_write_abort_wire(key_col);")
+        client.command("INSERT INTO empty_write_abort_wire VALUES (1, 10, 100);")
+        client.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        statements = [
+            (101, False, [], "BEGIN;"),
+            (102, False, [INT32, INT32, INT32],
+             "INSERT INTO empty_write_abort_wire VALUES ($1, $2, $3);"),
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {statement_id: types for statement_id, _, types, _ in statements}
+
+        wal_path = os.path.join(server.root, "db", "db.log")
+        wal_size_before = os.path.getsize(wal_path)
+        executed, status, failed, diagnostic, results = client.batch(
+            [(101, []), (102, [2, 10, 200])], parameter_types, schemas)
+        require((executed, status, failed) == (1, 1, 1),
+                "duplicate second-index key must return an AUTO_ABORT transaction abort")
+        require(diagnostic and results == [],
+                "AUTO_ABORT transaction abort must carry a diagnostic and no partial results")
+
+        # A broken write_set-only fast path could otherwise pass the recovery
+        # check by losing both the unflushed INSERT WAL and its in-memory
+        # partial work at SIGKILL. Prove the acknowledged abort advanced the
+        # real WAL file before any later transaction can flush it incidentally.
+        wal_size_after_abort = os.path.getsize(wal_path)
+        require(wal_size_after_abort > wal_size_before,
+                "AUTO_ABORT acknowledgement did not publish the losing transaction's WAL")
+
+        # The failed batch has ended its transaction, so the same connection
+        # must immediately observe only the pre-transaction row.
+        _, rows = client.query("SELECT id, key_col, value FROM empty_write_abort_wire ORDER BY id;")
+        require(rows == [[1, 10, 100]], "AUTO_ABORT left partial heap work visible before SIGKILL")
+
+        # Advance the durable frontier after the failed ACK as an independent
+        # guard that the complete loser chain is present at crash time.
+        flusher = WireClient(server.port)
+        try:
+            flusher.command("INSERT INTO empty_write_abort_wire VALUES (3, 30, 300);")
+        finally:
+            flusher.close()
+    finally:
+        client.close()
+
+    # BATCH_RESULT/TRANSACTION_ABORT acknowledges that rollback is complete.
+    server.stop(crash=True)
+    server.start()
+
+    verifier = WireClient(server.port)
+    try:
+        _, rows = verifier.query("SELECT id, key_col, value FROM empty_write_abort_wire ORDER BY id;")
+        require(rows == [[1, 10, 100], [3, 30, 300]], "unique-index AUTO_ABORT left a heap row after SIGKILL")
+        _, rows = verifier.query("SELECT id FROM empty_write_abort_wire WHERE id = 2;")
+        require(rows == [], "unique-index abort left the first secondary-index entry after SIGKILL")
+        _, rows = verifier.query("SELECT id FROM empty_write_abort_wire WHERE key_col = 10;")
+        require(rows == [[1]], "unique-index abort damaged the conflicting secondary index after SIGKILL")
+        _, rows = verifier.query("SELECT id FROM empty_write_abort_wire WHERE key_col = 30;")
+        require(rows == [[3]], "recovery lost the post-abort WAL-flushing transaction")
+    finally:
+        verifier.close()
+
+
 OBSERVABILITY_FIELDS = {
     "obs_abort": {"t_ms", "seq", "shrinking", "upgrade", "deadlock", "ww", "ssi", "unique"},
     "obs_lock": {"t_ms", "seq", "kind", "immediate_conflict", "wait_enqueued", "wait_granted",
-                 "wait_cancelled", "wait_ns", "queue_depth_max", "cycle_checks", "cycle_victims"},
+                 "wait_cancelled", "wait_ns", "backoff_waits", "queue_depth_max", "cycle_checks", "cycle_victims",
+                 "completion_waits", "completion_aborts"},
     "obs_ckpt": {"t_ms", "seq", "attempt", "preflush", "success", "drain_timeout", "deadline",
                  "final_data_fail", "initial_ns", "preblock_ns", "block_ns", "drain_ns", "final_wal_ns",
                  "final_data_ns", "meta_ns", "manifest_ns", "truncate_ns", "begin_blocked", "begin_wait_ns"},
@@ -726,12 +796,14 @@ def main():
         test_direct_column_update(server.port)
         test_chained_update(server.port)
         test_crash_recovery_smoke(server)
+        test_unique_index_auto_abort_then_sigkill_has_no_residue(server)
         test_abort_ack_then_sigkill_recovers_indexed_undo(server)
         test_sigusr1_observability(server)
-        print("live Wire v3 server baseline: PASS")
-        return 0
     finally:
         server.cleanup()
+
+    print("live Wire v3 server baseline: PASS")
+    return 0
 
 
 if __name__ == "__main__":

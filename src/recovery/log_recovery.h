@@ -93,6 +93,15 @@ public:
     uint64_t get_undo_applied_count() const {
         return undo_applied_count_;
     }
+    uint64_t get_loser_transaction_count() const {
+        return static_cast<uint64_t>(active_txn_last_lsn_.size());
+    }
+    uint64_t get_pruned_no_undo_transaction_count() const {
+        return pruned_no_undo_transaction_count_;
+    }
+    uint64_t get_undo_chain_record_read_count() const {
+        return undo_chain_record_read_count_;
+    }
     uint64_t get_index_probe_count() const {
         return index_probe_count_;
     }
@@ -336,6 +345,8 @@ private:
     uint64_t redo_skipped_count_{0};       // losers plus records with no open table
     uint64_t redo_missing_table_count_{0}; // subset of the above whose table is not open
     uint64_t undo_applied_count_{0};
+    uint64_t pruned_no_undo_transaction_count_{0};
+    uint64_t undo_chain_record_read_count_{0};
     uint64_t index_probe_count_{0};
     uint64_t index_mutation_count_{0};
     uint64_t index_unchanged_key_count_{0};

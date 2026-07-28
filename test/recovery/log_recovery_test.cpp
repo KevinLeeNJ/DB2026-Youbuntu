@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/context.h"
 #include "execution/execution_common.h"
+#include "execution/executor_insert.h"
 #include "index/ix.h"
 #include "record/rm.h"
 #include "recovery/checkpoint_manager.h"
@@ -396,6 +397,79 @@ TEST(RecoveryManagerTest, UncommittedInsertIsUndone) {
     OpenRecoveryDb db(db_name);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryManagerTest, BeginOnlyTransactionsDoNotExpandLoserUndoWork) {
+    ScopedTestDir test_dir("recovery_begin_only_scale_root");
+    const std::string db_name = "recovery_begin_only_scale_db";
+    CreateRecoveryTestDb(db_name);
+
+    constexpr txn_id_t kFirstBeginOnlyTxn = 1000;
+    constexpr int kBeginOnlyTxnCount = 20000;
+    constexpr txn_id_t kActiveLoserTxn = 30000;
+    constexpr txn_id_t kAbortedLoserTxn = 30001;
+    constexpr txn_id_t kCommittedTxn = 30002;
+    const Rid active_rid{1, 0};
+    const Rid aborted_rid{1, 1};
+    const Rid committed_rid{1, 2};
+    auto active_rec = MakeTuple(1, 10);
+    auto aborted_rec = MakeTuple(2, 20);
+    auto committed_rec = MakeTuple(3, 30);
+
+    {
+        OpenRecoveryDb db(db_name);
+        for (int i = 0; i < kBeginOnlyTxnCount; ++i) {
+            AppendBegin(*db.log_mgr_, kFirstBeginOnlyTxn + i);
+        }
+
+        auto active_lsn = AppendBegin(*db.log_mgr_, kActiveLoserTxn);
+        AppendInsert(*db.log_mgr_, kActiveLoserTxn, active_lsn, active_rid, active_rec);
+
+        auto aborted_lsn = AppendBegin(*db.log_mgr_, kAbortedLoserTxn);
+        aborted_lsn = AppendInsert(*db.log_mgr_, kAbortedLoserTxn, aborted_lsn, aborted_rid, aborted_rec);
+        AppendAbort(*db.log_mgr_, kAbortedLoserTxn, aborted_lsn);
+
+        auto committed_lsn = AppendBegin(*db.log_mgr_, kCommittedTxn);
+        committed_lsn = AppendInsert(*db.log_mgr_, kCommittedTxn, committed_lsn, committed_rid, committed_rec);
+        AppendCommit(*db.log_mgr_, kCommittedTxn, committed_lsn);
+        FlushLogs(*db.log_mgr_);
+
+        db.sm_mgr_.insert_record_with_indexes("t", active_rid, active_rec);
+        db.sm_mgr_.insert_record_with_indexes("t", aborted_rid, aborted_rec);
+        for (const auto& [rid, writer] :
+             std::vector<std::pair<Rid, txn_id_t>>{{active_rid, kActiveLoserTxn}, {aborted_rid, kAbortedLoserTxn}}) {
+            TupleMeta meta;
+            meta.writer_txn_id_ = writer;
+            meta.is_committed_ = false;
+            meta.is_deleted_ = false;
+            db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+        }
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    {
+        OpenRecoveryDb db(db_name);
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+
+        EXPECT_EQ(recovery.get_scanned_record_count(), static_cast<uint64_t>(kBeginOnlyTxnCount + 8));
+        EXPECT_EQ(recovery.get_pruned_no_undo_transaction_count(), static_cast<uint64_t>(kBeginOnlyTxnCount));
+        EXPECT_EQ(recovery.get_loser_transaction_count(), 2u);
+
+        recovery.redo();
+        recovery.undo();
+
+        EXPECT_EQ(recovery.get_dml_record_count(), 3u);
+        EXPECT_EQ(recovery.get_redo_applied_count(), 1u);
+        EXPECT_EQ(recovery.get_redo_skipped_count(), 2u);
+        EXPECT_EQ(recovery.get_undo_applied_count(), 2u);
+        EXPECT_EQ(recovery.get_undo_chain_record_read_count(), 5u);
+        EXPECT_FALSE(RecordExists(db.sm_mgr_, active_rid));
+        EXPECT_FALSE(RecordExists(db.sm_mgr_, aborted_rid));
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, committed_rid));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, committed_rid), 30);
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 3, committed_rid));
+    }
 }
 
 TEST(RecoveryManagerTest, UncommittedInsertBeyondStaleFileHeaderDoesNotAbortRecovery) {
