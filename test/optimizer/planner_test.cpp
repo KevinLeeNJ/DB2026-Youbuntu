@@ -103,6 +103,32 @@ TabMeta make_order_line_tab() {
     return tab;
 }
 
+TabMeta make_exact_outer_tab() {
+    TabMeta tab;
+    tab.name = "qz7";
+    tab.cols = {make_int_col(tab.name, "k", 0), make_int_col(tab.name, "v", 4)};
+    tab.indexes.push_back(make_index(tab.name, {tab.cols[0]}));
+    return tab;
+}
+
+TabMeta make_parameterized_inner_tab(const std::string& tab_name, bool trailing_unbound_col) {
+    TabMeta tab;
+    tab.name = tab_name;
+    tab.cols = {
+        make_int_col(tab.name, "p", 0),
+        make_int_col(tab.name, "q", 4),
+        make_int_col(tab.name, "r", 8),
+        make_int_col(tab.name, "s", 12),
+    };
+    if (!trailing_unbound_col) {
+        tab.indexes.push_back(make_index(tab.name, {tab.cols[0]}));
+        tab.indexes.push_back(make_index(tab.name, {tab.cols[0], tab.cols[1], tab.cols[2]}));
+    } else {
+        tab.indexes.push_back(make_index(tab.name, {tab.cols[0], tab.cols[1], tab.cols[2], tab.cols[3]}));
+    }
+    return tab;
+}
+
 Condition value_cond(const std::string& tab_name, const std::string& col_name, CompOp op, int value) {
     Condition cond;
     cond.lhs_col = {.tab_name = tab_name, .col_name = col_name};
@@ -264,6 +290,27 @@ std::unique_ptr<Query> make_order_line_suffix_lookup_query() {
     return query;
 }
 
+std::unique_ptr<Query> make_parameterized_exact_join_query(const std::string& inner_table) {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::SelectStmt>(
+        std::vector<std::unique_ptr<ast::SelectItem>>{},
+        std::vector<ast::TableRef>{ast::TableRef(inner_table, ""), ast::TableRef("qz7", "")},
+        std::vector<std::unique_ptr<ast::BinaryExpr>>{}, std::vector<std::unique_ptr<ast::Col>>{},
+        std::vector<std::unique_ptr<ast::HavingExpr>>{}, std::vector<std::unique_ptr<ast::OrderByItem>>{}, false, 0,
+        true);
+    query->tables = {inner_table, "qz7"};
+    query->has_aggregate = true;
+    query->select_items.push_back({.expr = make_count_star_expr(), .alias = "", .output_name = "COUNT(*)"});
+    query->output_names = {"COUNT(*)"};
+    query->conds = {
+        value_cond("qz7", "k", OP_EQ, 4),
+        join_cond("qz7", "k", inner_table, "p"),
+        value_cond(inner_table, "q", OP_EQ, 7),
+        value_cond(inner_table, "r", OP_EQ, 9),
+    };
+    return query;
+}
+
 std::unique_ptr<Query> make_reverse_index_query(int a_value, int z_value) {
     auto query = std::make_unique<Query>();
     query->parse = std::make_unique<ast::SelectStmt>(
@@ -411,6 +458,51 @@ TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) 
     ASSERT_EQ(aggregate->subplan_->tag, T_IndexSkipScan);
     auto* scan = static_cast<ScanPlan*>(aggregate->subplan_.get());
     EXPECT_EQ(scan->index_col_names_, (std::vector<std::string>{"ol_w_id", "ol_d_id", "ol_o_id", "ol_number"}));
+}
+
+TEST_F(PlannerAggregateTest, exact_outer_lookup_enables_parameterized_composite_exact_lookup) {
+    sm_manager_.db_.SetTabMeta("qz7", make_exact_outer_tab());
+    sm_manager_.db_.SetTabMeta("mv3", make_parameterized_inner_tab("mv3", false));
+    auto query = make_parameterized_exact_join_query("mv3");
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->tag, T_Projection);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    ASSERT_EQ(projection->subplan_->tag, T_Aggregate);
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
+    ASSERT_EQ(aggregate->subplan_->tag, T_NestLoop);
+    auto* join = static_cast<JoinPlan*>(aggregate->subplan_.get());
+    ASSERT_EQ(join->left_->tag, T_IndexScan);
+    auto* left_scan = static_cast<ScanPlan*>(join->left_.get());
+    EXPECT_EQ(left_scan->tab_name_, "qz7");
+    ASSERT_EQ(join->right_->tag, T_IndexScan);
+    auto* right_scan = static_cast<ScanPlan*>(join->right_.get());
+    EXPECT_EQ(right_scan->tab_name_, "mv3");
+    EXPECT_EQ(right_scan->index_col_names_, (std::vector<std::string>{"p", "q", "r"}));
+    EXPECT_EQ(join->inlj_left_col_.tab_name, "qz7");
+    EXPECT_EQ(join->inlj_left_col_.col_name, "k");
+    EXPECT_EQ(join->inlj_right_col_.tab_name, "mv3");
+    EXPECT_EQ(join->inlj_right_col_.col_name, "p");
+}
+
+TEST_F(PlannerAggregateTest, incomplete_parameterized_key_keeps_existing_skip_scan_order) {
+    sm_manager_.db_.SetTabMeta("qz7", make_exact_outer_tab());
+    sm_manager_.db_.SetTabMeta("nx9", make_parameterized_inner_tab("nx9", true));
+    auto query = make_parameterized_exact_join_query("nx9");
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
+    ASSERT_EQ(aggregate->subplan_->tag, T_NestLoop);
+    auto* join = static_cast<JoinPlan*>(aggregate->subplan_.get());
+    ASSERT_EQ(join->left_->tag, T_IndexSkipScan);
+    EXPECT_EQ(static_cast<ScanPlan*>(join->left_.get())->tab_name_, "nx9");
+    ASSERT_EQ(join->right_->tag, T_IndexScan);
+    EXPECT_EQ(static_cast<ScanPlan*>(join->right_.get())->tab_name_, "qz7");
 }
 
 TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_literal_values) {

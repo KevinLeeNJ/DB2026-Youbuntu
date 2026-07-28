@@ -154,6 +154,67 @@ private:
     size_t cursor_ = 0;
 };
 
+class ParameterizedProbeExecutor : public AbstractExecutor {
+public:
+    ParameterizedProbeExecutor()
+        : cols_{make_test_col("right_t", "id", TYPE_INT, sizeof(int), 0)}, record_(make_join_record(0)) {}
+
+    void beginTuple() override {
+        ++begin_calls_;
+        if (!lookup_key_bound_) {
+            ++unbound_begin_calls_;
+        } else {
+            keyed_values_.push_back(lookup_key_);
+        }
+        at_end_ = true;
+    }
+
+    void set_lookup_key(const TabCol& target, const char* key, size_t len) override {
+        EXPECT_EQ(target.tab_name, "right_t");
+        EXPECT_EQ(target.col_name, "id");
+        EXPECT_EQ(len, sizeof(int));
+        lookup_key_ = read_unaligned<int>(key);
+        lookup_key_bound_ = true;
+    }
+
+    void nextTuple() override {}
+
+    std::unique_ptr<RmRecord> Next() override {
+        return nullptr;
+    }
+
+    TupleView current() const override {
+        return {};
+    }
+
+    Rid& rid() override {
+        return _abstract_rid;
+    }
+
+    bool is_end() const override {
+        return at_end_;
+    }
+
+    const std::vector<ColMeta>& cols() const override {
+        return cols_;
+    }
+
+    size_t tupleLen() const override {
+        return static_cast<size_t>(record_.size);
+    }
+
+    int begin_calls_ = 0;
+    int unbound_begin_calls_ = 0;
+    std::vector<int> keyed_values_;
+
+private:
+    std::vector<ColMeta> cols_;
+    RmRecord record_;
+    bool lookup_key_bound_ = false;
+    bool at_end_ = true;
+    int lookup_key_ = 0;
+};
+
 class CountingResultSink : public QueryResultSink {
 public:
     void begin_query(const std::vector<ColMeta>& columns, const std::vector<std::string>& names) override {
@@ -1547,6 +1608,48 @@ TEST(ExecutorJoinFocusedTest, RightInputIsRewoundPerLeftRowNotPerOutputRow) {
     // path.
     EXPECT_EQ(right_ptr->next_record_calls_, 0);
     EXPECT_EQ(right_ptr->next_calls_, 6);
+}
+
+TEST(ExecutorJoinFocusedTest, ParameterizedInnerOpensOnlyAfterEachOuterKeyIsBound) {
+    auto left = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("left_t", "id", TYPE_INT, sizeof(int), 0)},
+        std::vector<RmRecord>{make_join_record(3), make_join_record(8)});
+    auto right = std::make_unique<ParameterizedProbeExecutor>();
+    auto* right_ptr = right.get();
+
+    Condition cond;
+    cond.lhs_col = {"left_t", "id"};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = false;
+    cond.rhs_col = {"right_t", "id"};
+
+    NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond}, cond.lhs_col, cond.rhs_col, "id");
+    exec.beginTuple();
+
+    EXPECT_TRUE(exec.is_end());
+    EXPECT_EQ(right_ptr->unbound_begin_calls_, 0);
+    EXPECT_EQ(right_ptr->begin_calls_, 2);
+    EXPECT_EQ(right_ptr->keyed_values_, (std::vector<int>{3, 8}));
+}
+
+TEST(ExecutorJoinFocusedTest, ParameterizedInnerDoesNotOpenWhenOuterIsEmpty) {
+    auto left = std::make_unique<CountingExecutor>(
+        std::vector<ColMeta>{make_test_col("left_t", "id", TYPE_INT, sizeof(int), 0)}, std::vector<RmRecord>{});
+    auto right = std::make_unique<ParameterizedProbeExecutor>();
+    auto* right_ptr = right.get();
+
+    Condition cond;
+    cond.lhs_col = {"left_t", "id"};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = false;
+    cond.rhs_col = {"right_t", "id"};
+
+    NestedLoopJoinExecutor exec(std::move(left), std::move(right), {cond}, cond.lhs_col, cond.rhs_col, "id");
+    exec.beginTuple();
+
+    EXPECT_TRUE(exec.is_end());
+    EXPECT_EQ(right_ptr->begin_calls_, 0);
+    EXPECT_TRUE(right_ptr->keyed_values_.empty());
 }
 
 // 回归测试：TPC-C 场景下每个写事务都会追加 undo log，曾因 txn_map 永不回收导致

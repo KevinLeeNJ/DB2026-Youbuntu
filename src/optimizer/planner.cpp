@@ -503,24 +503,73 @@ int skip_scan_access_score(const std::string& tab_name, const std::vector<std::s
     return score;
 }
 
-std::vector<std::string> index_cols_for_inlj(const TabMeta& right_tab, const TabCol& right_col,
-                                             const std::vector<Condition>& right_scan_conds) {
-    for (const auto& index : right_tab.indexes) {
-        std::vector<std::string> index_col_names;
-        index_col_names.reserve(index.cols.size());
-        for (const auto& col : index.cols) {
-            index_col_names.push_back(col.name);
+bool index_is_exact_value_lookup(const std::string& tab_name, const std::vector<std::string>& index_col_names,
+                                 const std::vector<Condition>& scan_conds) {
+    return !index_col_names.empty() &&
+           std::all_of(index_col_names.begin(), index_col_names.end(),
+                       [&](const std::string& col_name) { return has_value_equality(scan_conds, tab_name, col_name); });
+}
+
+bool index_can_bind_join_col(const IndexMeta& index, const TabCol& right_col,
+                             const std::vector<Condition>& right_scan_conds) {
+    for (const auto& col : index.cols) {
+        if (col.name == right_col.col_name) {
+            return true;
         }
-        for (const auto& col : index.cols) {
-            if (col.name == right_col.col_name) {
-                return index_col_names;
-            }
-            if (!has_value_equality(right_scan_conds, right_tab.name, col.name)) {
-                break;
-            }
+        if (!has_value_equality(right_scan_conds, index.tab_name, col.name)) {
+            return false;
         }
     }
-    return {};
+    return false;
+}
+
+bool index_is_parameterized_exact_lookup(const IndexMeta& index, const TabCol& right_col,
+                                         const std::vector<Condition>& right_scan_conds) {
+    bool binds_join_col = false;
+    for (const auto& col : index.cols) {
+        if (col.name == right_col.col_name) {
+            binds_join_col = true;
+            continue;
+        }
+        if (!has_value_equality(right_scan_conds, index.tab_name, col.name)) {
+            return false;
+        }
+    }
+    return binds_join_col;
+}
+
+std::vector<std::string> index_col_names(const IndexMeta& index) {
+    std::vector<std::string> names;
+    names.reserve(index.cols.size());
+    for (const auto& col : index.cols) {
+        names.push_back(col.name);
+    }
+    return names;
+}
+
+std::vector<std::string> index_cols_for_inlj(const TabMeta& right_tab, const TabCol& right_col,
+                                             const std::vector<Condition>& right_scan_conds) {
+    std::vector<std::string> prefix_candidate;
+    std::vector<std::string> exact_candidate;
+    for (const auto& index : right_tab.indexes) {
+        if (!index_can_bind_join_col(index, right_col, right_scan_conds)) {
+            continue;
+        }
+        auto candidate = index_col_names(index);
+        if (index_is_parameterized_exact_lookup(index, right_col, right_scan_conds)) {
+            if (candidate.size() > exact_candidate.size()) {
+                exact_candidate = std::move(candidate);
+            }
+            continue;
+        }
+        if (prefix_candidate.empty()) {
+            prefix_candidate = std::move(candidate);
+        }
+    }
+    if (!exact_candidate.empty()) {
+        return exact_candidate;
+    }
+    return prefix_candidate;
 }
 
 // Rebuild the right plan tree, replacing the scan leaf with new_scan (IndexScan).
@@ -951,10 +1000,72 @@ Planner::PhysicalPlanTemplate Planner::build_physical_plan_template(const Query&
         scan_decisions.push_back({scan_tag, std::move(index_col_names)});
     }
 
+    std::vector<char> enables_parameterized_exact_lookup(plan_tables.size(), false);
+    // This structural heuristic reasons about one join edge. Keep multi-table ordering on the
+    // existing score model until it has a cardinality-aware join-order search.
+    if (plan_tables.size() == 2) {
+        for (size_t outer_pos = 0; outer_pos < plan_tables.size(); ++outer_pos) {
+            const auto& outer_table_name = plan_tables[outer_pos];
+            const auto& outer_scan = scan_decisions[outer_pos];
+            if (outer_scan.tag != T_IndexScan ||
+                !index_is_exact_value_lookup(outer_table_name, outer_scan.index_col_names,
+                                             table_scan_conds[outer_pos])) {
+                continue;
+            }
+
+            auto& outer_tab = sm_manager_->db_.get_table(outer_table_name);
+            for (const auto& cond : join_conds) {
+                if (cond.op != OP_EQ || cond.is_rhs_val) {
+                    continue;
+                }
+
+                TabCol outer_col;
+                TabCol inner_col;
+                if (cond.lhs_col.tab_name == outer_table_name) {
+                    outer_col = cond.lhs_col;
+                    inner_col = cond.rhs_col;
+                } else if (cond.rhs_col.tab_name == outer_table_name) {
+                    outer_col = cond.rhs_col;
+                    inner_col = cond.lhs_col;
+                } else {
+                    continue;
+                }
+
+                auto inner_pos = std::find(plan_tables.begin(), plan_tables.end(), inner_col.tab_name);
+                if (inner_pos == plan_tables.end()) {
+                    continue;
+                }
+                size_t inner_table_pos = static_cast<size_t>(inner_pos - plan_tables.begin());
+                auto& inner_tab = sm_manager_->db_.get_table(inner_col.tab_name);
+                auto outer_meta = outer_tab.get_col(outer_col.col_name);
+                auto inner_meta = inner_tab.get_col(inner_col.col_name);
+                if (outer_meta == outer_tab.cols.end() || inner_meta == inner_tab.cols.end()) {
+                    continue;
+                }
+                if (outer_meta->type != inner_meta->type || outer_meta->len != inner_meta->len) {
+                    continue;
+                }
+
+                bool has_exact_inner =
+                    std::any_of(inner_tab.indexes.begin(), inner_tab.indexes.end(), [&](const auto& index) {
+                        return index_is_parameterized_exact_lookup(index, inner_col, table_scan_conds[inner_table_pos]);
+                    });
+                if (has_exact_inner) {
+                    enables_parameterized_exact_lookup[outer_pos] = true;
+                    break;
+                }
+            }
+        }
+    }
+
     std::vector<size_t> table_order(plan_tables.size());
     std::iota(table_order.begin(), table_order.end(), 0);
-    std::stable_sort(table_order.begin(), table_order.end(),
-                     [&](size_t lhs, size_t rhs) { return table_access_scores[lhs] > table_access_scores[rhs]; });
+    std::stable_sort(table_order.begin(), table_order.end(), [&](size_t lhs, size_t rhs) {
+        if (enables_parameterized_exact_lookup[lhs] != enables_parameterized_exact_lookup[rhs]) {
+            return enables_parameterized_exact_lookup[lhs] != 0;
+        }
+        return table_access_scores[lhs] > table_access_scores[rhs];
+    });
     std::vector<std::string> ordered_plan_tables;
     std::vector<std::vector<Condition>> ordered_table_scan_conds;
     std::vector<PhysicalPlanTemplate::ScanDecision> ordered_scan_decisions;
