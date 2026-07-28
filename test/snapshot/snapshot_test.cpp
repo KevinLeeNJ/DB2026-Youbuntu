@@ -30,6 +30,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -83,6 +84,28 @@ private:
     int count_;
     int total_;
     int generation_ = 0;
+};
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name, const char* value) : name_(name) {
+        if (const char* old_value = std::getenv(name_.c_str()); old_value != nullptr) {
+            old_value_ = old_value;
+        }
+        setenv(name_.c_str(), value, 1);
+    }
+
+    ~ScopedEnvironmentVariable() {
+        if (old_value_.has_value()) {
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+private:
+    std::string name_;
+    std::optional<std::string> old_value_;
 };
 
 TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) {
@@ -213,7 +236,7 @@ TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAc
 }
 
 TEST(SnapshotIsolationConcurrencyTest, RecordImmediateConflictIsObservable) {
-    LockManager lock_manager;
+    LockManager lock_manager(std::chrono::microseconds(0), false);
     Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction loser(1002, IsolationLevel::SNAPSHOT_ISOLATION);
     Rid rid{30, 0};
@@ -441,7 +464,7 @@ TEST(SnapshotIsolationConcurrencyTest, IndependentRecordLocksProgressConcurrentl
 
 class SharedTestDB {
 public:
-    SharedTestDB(const std::string& db_name) : db_name_(db_name) {
+    SharedTestDB(const std::string& db_name, bool use_environment_lock_config = true) : db_name_(db_name) {
         char cwd_buf[1024];
         getcwd(cwd_buf, sizeof(cwd_buf));
         original_cwd_ = cwd_buf;
@@ -455,7 +478,8 @@ public:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
-        lock_manager_ = std::make_unique<LockManager>();
+        lock_manager_ = use_environment_lock_config ? std::make_unique<LockManager>()
+                                                    : std::make_unique<LockManager>(std::chrono::microseconds{0});
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
@@ -668,6 +692,96 @@ private:
     IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
 
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitRetriesAfterOwnerCommitWithoutApplyingStaleWrite) {
+    ScopedEnvironmentVariable first_lock_wait("RMDB_SI_FIRST_LOCK_WAIT", "1");
+    SharedTestDB db("snapshot_si_first_lock_wait_stale");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_stale (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_stale values (1, 100);"));
+
+    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_stale set val = 200 where id = 1;"));
+
+    const uint64_t wait_count_before = db.lock()->record_lock_observability().wait_enqueued;
+    auto waiter_result = std::async(std::launch::async, [&]() {
+        try {
+            waiter.exec_sql("update si_first_wait_stale set val = 300 where id = 1;");
+            return std::optional<AbortReason>{};
+        } catch (TransactionAbortException& error) {
+            return std::optional<AbortReason>{error.GetAbortReason()};
+        }
+    });
+
+    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (db.lock()->record_lock_observability().wait_enqueued == wait_count_before &&
+           std::chrono::steady_clock::now() < enqueue_deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_GT(db.lock()->record_lock_observability().wait_enqueued, wait_count_before);
+    EXPECT_EQ(waiter_result.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+
+    ASSERT_TRUE(owner.exec_sql_ok("commit;"));
+    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    const auto abort_reason = waiter_result.get();
+    ASSERT_TRUE(abort_reason.has_value());
+    EXPECT_EQ(*abort_reason, AbortReason::DEADLOCK_PREVENTION);
+
+    const std::string final_state = verifier.exec_sql("select val from si_first_wait_stale where id = 1;");
+    EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              300 |"), std::string::npos);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitRetriesOnceAfterOwnerAbort) {
+    ScopedEnvironmentVariable first_lock_wait("RMDB_SI_FIRST_LOCK_WAIT", "1");
+    SharedTestDB db("snapshot_si_first_lock_wait_owner_abort");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_abort (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_abort values (1, 100);"));
+
+    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_abort set val = 200 where id = 1;"));
+
+    const uint64_t wait_count_before = db.lock()->record_lock_observability().wait_enqueued;
+    auto waiter_result = std::async(std::launch::async, [&]() {
+        try {
+            waiter.exec_sql("update si_first_wait_abort set val = 300 where id = 1;");
+            return std::optional<AbortReason>{};
+        } catch (TransactionAbortException& error) {
+            return std::optional<AbortReason>{error.GetAbortReason()};
+        }
+    });
+
+    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (db.lock()->record_lock_observability().wait_enqueued == wait_count_before &&
+           std::chrono::steady_clock::now() < enqueue_deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_GT(db.lock()->record_lock_observability().wait_enqueued, wait_count_before);
+    EXPECT_EQ(waiter_result.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+
+    ASSERT_TRUE(owner.exec_sql_ok("abort;"));
+    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    const auto abort_reason = waiter_result.get();
+    ASSERT_TRUE(abort_reason.has_value());
+    EXPECT_EQ(*abort_reason, AbortReason::DEADLOCK_PREVENTION);
+
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("update si_first_wait_abort set val = 300 where id = 1;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
+
+    const std::string final_state = verifier.exec_sql("select val from si_first_wait_abort where id = 1;");
+    EXPECT_NE(final_state.find("|              300 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
+}
+
 // =============================================================================
 // SnapshotTest — test fixture
 // =============================================================================
@@ -677,7 +791,10 @@ protected:
     void SetUp() override {
         const auto* test_info = ::testing::UnitTest::GetInstance()->current_test_info();
         std::string db_name = std::string("snapshot_") + test_info->name();
-        db_ = std::make_unique<SharedTestDB>(db_name);
+        // Legacy fixture cases intentionally assert immediate SI/SER conflict
+        // outcomes. Dedicated concurrency tests above exercise production
+        // completion-wait behavior with real owner completion.
+        db_ = std::make_unique<SharedTestDB>(db_name, false);
     }
 
     void TearDown() override {
@@ -1975,6 +2092,39 @@ TEST_F(SnapshotTest, SI_IndexScanFindsHistoricalIndexedKeyVersion) {
                            "Total record(s): 1";
     EXPECT_EQ(TestSession::trim_output(out), expected)
         << "Index scans in a transaction must not miss the visible old version after the current index key changes";
+
+    ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+}
+
+TEST_F(SnapshotTest, SI_ParameterizedCompositeExactJoinFindsHistoricalInnerVersion) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table qz7 (k int, v int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index qz7 (k);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create table mv3 (p int, q int, r int, v int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index mv3 (p, q, r);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into qz7 values (2, 20);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into mv3 values (2, 7, 9, 100);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into mv3 values (2, 7, 10, 200);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into mv3 values (2, 8, 9, 300);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into mv3 values (1, 7, 9, 400);"));
+
+    auto reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    auto writer = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("update mv3 set p = 3 where p = 2 and q = 7 and r = 9;"));
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+
+    std::string out =
+        reader->exec_sql("select mv3.v from mv3, qz7 where qz7.k = 2 and mv3.p = qz7.k and mv3.q = 7 and mv3.r = 9;");
+    std::string expected = "+------------------+\n"
+                           "|                v |\n"
+                           "+------------------+\n"
+                           "|              100 |\n"
+                           "+------------------+\n"
+                           "Total record(s): 1";
+    EXPECT_EQ(TestSession::trim_output(out), expected)
+        << "A parameterized exact inner scan must merge the historical composite key and filter non-matching rows";
 
     ASSERT_TRUE(reader->exec_sql_ok("commit;"));
 }

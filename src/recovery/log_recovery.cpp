@@ -222,6 +222,8 @@ void RecoveryManager::analyze() {
     redo_skipped_count_ = 0;
     redo_missing_table_count_ = 0;
     undo_applied_count_ = 0;
+    pruned_no_undo_transaction_count_ = 0;
+    undo_chain_record_read_count_ = 0;
     index_probe_count_ = 0;
     index_mutation_count_ = 0;
     index_unchanged_key_count_ = 0;
@@ -246,6 +248,13 @@ void RecoveryManager::analyze() {
     }
     scan_end_offset_ = file_size;
 
+    // Transactions restored from a checkpoint may already have undoable WAL
+    // before scan_begin_offset_. They remain conservatively eligible for undo
+    // unless a later COMMIT removes them. Transactions first seen as BEGIN in
+    // this scan need undo only if one of the three DML WAL types follows.
+    std::unordered_set<txn_id_t> checkpoint_active_txns;
+    std::unordered_set<txn_id_t> txns_with_undoable_wal;
+
     // A published restart offset lets the scan start at the last checkpoint
     // instead of at the beginning of the file.
     {
@@ -261,6 +270,7 @@ void RecoveryManager::analyze() {
                 const auto* checkpoint_log = static_cast<const CheckpointLogRecord*>(record.get());
                 for (const auto& [txn_id, last_lsn] : checkpoint_log->active_txns_) {
                     active_txn_last_lsn_[txn_id] = last_lsn;
+                    checkpoint_active_txns.insert(txn_id);
                 }
             }
         }
@@ -289,6 +299,7 @@ void RecoveryManager::analyze() {
                                     "); WAL retained");
             }
             active_txn_last_lsn_[record.txn_id] = record.lsn;
+            txns_with_undoable_wal.insert(record.txn_id);
             has_dml_records_ = true;
             const uint16_t table_id = intern_table(dml.table_name);
             const RecoveryTable& table = tables_[table_id];
@@ -306,6 +317,8 @@ void RecoveryManager::analyze() {
         case LogType::COMMIT: {
             committed_txns_.insert(record.txn_id);
             active_txn_last_lsn_.erase(record.txn_id);
+            checkpoint_active_txns.erase(record.txn_id);
+            txns_with_undoable_wal.erase(record.txn_id);
             // 8 字节载荷；旧 WAL 的 COMMIT 记录没有它，此时保持 INVALID_TS 并跳过。
             if (CommitLogRecord::HasCommitTs(record.total_len)) {
                 const timestamp_t commit_ts = read_unaligned<timestamp_t>(record.bytes + OFFSET_LOG_DATA);
@@ -346,6 +359,21 @@ void RecoveryManager::analyze() {
         throw InternalError("recovery stopped at WAL offset " + std::to_string(reader.next_offset()) +
                             " but the file is " + std::to_string(file_size) +
                             " bytes; the startup scan should have truncated it to a record boundary; WAL retained");
+    }
+
+    // BEGIN, COMMIT, ABORT and CHECKPOINT carry no physical operation for undo.
+    // A transaction first observed in this scan whose chain contains none of
+    // UPDATE/INSERT/DELETE can therefore be dropped without following its
+    // prev_lsn chain. Keep checkpoint-seeded transactions conservatively:
+    // their undoable WAL may precede scan_begin_offset_.
+    for (auto it = active_txn_last_lsn_.begin(); it != active_txn_last_lsn_.end();) {
+        const txn_id_t txn_id = it->first;
+        if (checkpoint_active_txns.count(txn_id) == 0 && txns_with_undoable_wal.count(txn_id) == 0) {
+            it = active_txn_last_lsn_.erase(it);
+            ++pruned_no_undo_transaction_count_;
+        } else {
+            ++it;
+        }
     }
     scan_end_offset_ = file_size;
 
@@ -510,6 +538,8 @@ void RecoveryManager::redo() {
  */
 void RecoveryManager::undo() {
     if (!has_dml_records_) {
+        LOG_INFO("recovery undo: 0 records, 0 loser txns, 0 chain records read, %llu no-undo txns pruned",
+                 static_cast<unsigned long long>(pruned_no_undo_transaction_count_));
         reset_wal_if_needed();
         return;
     }
@@ -519,14 +549,11 @@ void RecoveryManager::undo() {
     // transactions one after another would let an older transaction's rollback
     // run before a newer transaction's write on the same slot is undone.
     //
-    // Every record on a chain is fetched with its own ReadWalRecordAt, i.e. two
-    // preads (header, then body). That is affordable only because the number of
-    // loser records is bounded: at most one open transaction per connection, so
-    // 50, times the longest transaction's record count, 132 for Delivery, which
-    // is under 13,200 syscalls. The bound depends on no transaction spanning a
-    // checkpoint -- LOAD is the only shape that could, and it cannot run
-    // concurrently with the measured workload. If that ever changes, this turns
-    // into a streaming backward pass instead.
+    // Every record on a retained chain is fetched with its own ReadWalRecordAt
+    // (header and body preads). analyze() has already removed transactions with
+    // no undoable WAL, so high-frequency conflicts that wrote only BEGIN do not
+    // expand this random-read phase. The remaining work is proportional to
+    // DML-bearing losers, including an ABORT whose physical undo was interrupted.
     std::priority_queue<lsn_t> pending;
     for (const auto& [txn_id, last_lsn] : active_txn_last_lsn_) {
         (void)txn_id;
@@ -565,6 +592,7 @@ void RecoveryManager::undo() {
             throw InternalError("recovery could not re-read the WAL record for LSN " + std::to_string(current_lsn) +
                                 " at offset " + std::to_string(offset) + "; WAL retained");
         }
+        ++undo_chain_record_read_count_;
         if (record.log_type == LogType::BEGIN) {
             continue;
         }
@@ -598,7 +626,11 @@ void RecoveryManager::undo() {
             pending.push(record.prev_lsn);
         }
     }
-    LOG_INFO("recovery undo: %llu records", static_cast<unsigned long long>(undo_applied_count_));
+    LOG_INFO("recovery undo: %llu records, %llu loser txns, %llu chain records read, %llu no-undo txns pruned",
+             static_cast<unsigned long long>(undo_applied_count_),
+             static_cast<unsigned long long>(active_txn_last_lsn_.size()),
+             static_cast<unsigned long long>(undo_chain_record_read_count_),
+             static_cast<unsigned long long>(pruned_no_undo_transaction_count_));
 
     // Headers first: reset_touched_tuple_meta() skips any page at or beyond
     // num_pages, so a touched page still outside the header's page count would

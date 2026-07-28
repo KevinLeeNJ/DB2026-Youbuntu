@@ -382,9 +382,11 @@ public:
 
     void beginTuple() override {
         left_->beginTuple();
-        right_->set_counting_enabled(false);
-        right_->beginTuple();
-        right_->set_counting_enabled(true);
+        if (!inlj_mode_) {
+            right_->set_counting_enabled(false);
+            right_->beginTuple();
+            right_->set_counting_enabled(true);
+        }
         isend = false;
         clear_current_left(); // 获取左表的第一条记录
         reset_buffered_record();

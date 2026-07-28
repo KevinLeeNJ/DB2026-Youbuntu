@@ -38,9 +38,10 @@ constexpr lsn_t LSN_EXHAUSTION_MARGIN = 1 << 24;
     std::_Exit(134);
 }
 
-// Start the flush as soon as a full commit wave has assembled. The bounded
-// window below remains the latency cap when the workload is not saturated.
-constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 2;
+// High-concurrency A/B shows eight waiters balancing commit latency and
+// fdatasync amortization. Larger waves wait too long; smaller waves leave the
+// WAL device saturated with roughly half as many commits per sync.
+constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 8;
 // Upper bound on the coalescing window, reachable only below saturation where
 // no other committer is competing for the disk. PostgreSQL's commit_delay plays
 // the same role and is likewise capped in the millisecond range.

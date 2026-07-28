@@ -1311,6 +1311,37 @@ TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
     EXPECT_TRUE(executor.uses_rid_vector_cursor());
 }
 
+TEST_F(IndexScanFeatureTest, InjectedLeadingKeyCompletesCompositeExactLookup) {
+    create_three_int_table("composite_lookup");
+    insert_three_ints("composite_lookup", 1, 7, 9);
+    insert_three_ints("composite_lookup", 2, 7, 9);
+    insert_three_ints("composite_lookup", 2, 7, 10);
+    insert_three_ints("composite_lookup", 2, 8, 9);
+    sm_manager->create_index("composite_lookup", {"a", "b", "c"}, nullptr);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(
+        sm_manager.get(), "composite_lookup",
+        {table_int_cond("composite_lookup", "b", OP_EQ, 7), table_int_cond("composite_lookup", "c", OP_EQ, 9)},
+        {"a", "b", "c"}, &context);
+    int lookup_value = 2;
+    executor.set_lookup_key(TabCol{"composite_lookup", "a"}, reinterpret_cast<const char*>(&lookup_value),
+                            sizeof(lookup_value));
+
+    executor.beginTuple();
+    EXPECT_TRUE(executor.uses_single_rid_cursor());
+    ASSERT_FALSE(executor.is_end());
+    auto rec = executor.Next();
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 2);
+    EXPECT_EQ(*reinterpret_cast<int*>(rec->data + sizeof(int)), 7);
+    EXPECT_EQ(*reinterpret_cast<int*>(rec->data + 2 * sizeof(int)), 9);
+    executor.nextTuple();
+    EXPECT_TRUE(executor.is_end());
+}
+
 TEST_F(IndexScanFeatureTest, UsesCompositeIndexWithReorderedEqualityPrefixAndRange) {
     create_warehouse();
     sm_manager->create_index("warehouse", {"w_id", "name"}, nullptr);

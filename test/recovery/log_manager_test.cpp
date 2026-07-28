@@ -21,9 +21,12 @@ See the Mulan PSL v2 for more details. */
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -93,6 +96,32 @@ public:
 private:
     std::filesystem::path old_path_;
     std::filesystem::path dir_;
+};
+
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* previous = std::getenv(name);
+        if (previous != nullptr) {
+            previous_ = previous;
+        }
+        const int result = value == nullptr ? unsetenv(name) : setenv(name, value, 1);
+        if (result != 0) {
+            throw std::runtime_error("environment update failed");
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_.has_value()) {
+            setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+private:
+    std::string name_;
+    std::optional<std::string> previous_;
 };
 
 } // namespace
@@ -580,6 +609,172 @@ TEST(LogManagerTest, TransactionBeginCommitLogPrevLsn) {
     EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
     EXPECT_EQ(logs[1]->log_type_, LogType::COMMIT);
     EXPECT_EQ(logs[1]->prev_lsn_, logs[0]->lsn_);
+}
+
+TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
+    ScopedTestDir test_dir("transaction_begin_only_abort_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    BufferPoolManager bpm(8, &disk);
+    RmManager rm_mgr(&disk, &bpm);
+    IxManager ix_mgr(&disk, &bpm);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    LockManager lock_mgr(std::chrono::microseconds{0});
+    TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
+    LogManager log_mgr(&disk);
+
+    Transaction* owner = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction* txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
+    const Rid rid{3, 4};
+    ASSERT_TRUE(lock_mgr.lock_exclusive_on_record(owner, rid, 42));
+    ASSERT_FALSE(lock_mgr.lock_exclusive_on_record(txn, rid, 42));
+    ASSERT_TRUE(txn->get_write_set().empty());
+    ASSERT_EQ(txn->get_prev_lsn(), txn->get_begin_lsn());
+
+    txn_mgr.abort(txn, &log_mgr);
+
+    EXPECT_EQ(log_mgr.get_persist_lsn(), INVALID_LSN);
+    EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
+    EXPECT_EQ(log_mgr.get_pwrite_count(), 0u);
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
+
+    // The abort still performs the normal lock cleanup even though it does not
+    // append an ABORT record. Releasing the owner then lets a third transaction
+    // take the same lock, proving neither transaction left queue state behind.
+    txn_mgr.abort(owner, &log_mgr);
+    Transaction next(999);
+    ASSERT_TRUE(lock_mgr.lock_exclusive_on_record(&next, rid, 42));
+    ASSERT_FALSE(next.get_lock_set()->empty());
+    EXPECT_TRUE(lock_mgr.unlock(&next, *next.get_lock_set()->begin()));
+
+    log_mgr.flush_log_to_disk();
+    auto logs = ReadAllLogs(disk);
+    ASSERT_EQ(logs.size(), 2);
+    EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
+    EXPECT_EQ(logs[1]->log_type_, LogType::BEGIN);
+}
+
+TEST(LogManagerTest, EmptyWriteSetWithDmlWalStillFlushesAbort) {
+    ScopedTestDir test_dir("transaction_empty_write_set_dml_abort_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    BufferPoolManager bpm(8, &disk);
+    RmManager rm_mgr(&disk, &bpm);
+    IxManager ix_mgr(&disk, &bpm);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
+    LogManager log_mgr(&disk);
+
+    Transaction* txn = txn_mgr.begin(nullptr, &log_mgr);
+    auto record = MakeRecord("pending");
+    Rid rid{5, 6};
+    InsertLogRecord insert(txn->get_transaction_id(), record, rid, "t");
+    insert.prev_lsn_ = txn->get_prev_lsn();
+    const lsn_t insert_lsn = log_mgr.add_log_to_buffer(&insert);
+    txn->set_prev_lsn(insert_lsn);
+    ASSERT_TRUE(txn->get_write_set().empty());
+    ASSERT_NE(txn->get_prev_lsn(), txn->get_begin_lsn());
+
+    txn_mgr.abort(txn, &log_mgr);
+
+    EXPECT_EQ(log_mgr.get_pwrite_count(), 1u);
+    EXPECT_GT(disk.get_file_size(LOG_FILE_NAME), 0);
+    auto logs = ReadAllLogs(disk);
+    ASSERT_EQ(logs.size(), 3);
+    EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
+    EXPECT_EQ(logs[1]->log_type_, LogType::INSERT);
+    EXPECT_EQ(logs[2]->log_type_, LogType::ABORT);
+    EXPECT_EQ(logs[2]->prev_lsn_, logs[1]->lsn_);
+}
+
+TEST(LogManagerTest, SecondIndexConflictWithEmptyWriteSetPersistsAbortWal) {
+    ScopedTestDir test_dir("transaction_second_index_abort_test_root");
+    DiskManager disk;
+    BufferPoolManager bpm(64, &disk);
+    RmManager rm_mgr(&disk, &bpm);
+    IxManager ix_mgr(&disk, &bpm);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
+
+    sm_mgr.create_db("transaction_second_index_abort_test_db");
+    sm_mgr.open_db("transaction_second_index_abort_test_db");
+    LogManager log_mgr(&disk);
+    bpm.set_log_manager(&log_mgr);
+
+    sm_mgr.create_table(
+        "t", {{"id", TYPE_INT, sizeof(int)}, {"key_col", TYPE_INT, sizeof(int)}, {"value", TYPE_INT, sizeof(int)}},
+        nullptr);
+    sm_mgr.create_index("t", {"id"}, nullptr);
+    sm_mgr.create_index("t", {"key_col"}, nullptr);
+
+    Value one;
+    one.set_int(1);
+    Value ten;
+    ten.set_int(10);
+    Value hundred;
+    hundred.set_int(100);
+    InsertExecutor seed(&sm_mgr, "t", {one, ten, hundred}, nullptr);
+    seed.Next();
+    const Rid seed_rid = seed.rid();
+
+    Transaction* txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
+    txn->set_txn_mode(true);
+    int offset = 0;
+    Context context(&lock_mgr, &log_mgr, txn, nullptr, &offset, &txn_mgr);
+    Value two;
+    two.set_int(2);
+    Value two_hundred;
+    two_hundred.set_int(200);
+    InsertExecutor losing_insert(&sm_mgr, "t", {two, ten, two_hundred}, &context);
+
+    EXPECT_THROW(losing_insert.Next(), TransactionAbortException);
+    const Rid losing_rid = losing_insert.rid();
+    ASSERT_TRUE(txn->get_write_set().empty());
+    ASSERT_NE(txn->get_prev_lsn(), txn->get_begin_lsn());
+
+    txn_mgr.abort(txn, &log_mgr);
+
+    // The real executor appended INSERT WAL before the heap insert, then the
+    // first index accepted id=2 before the second index rejected key_col=10.
+    // Even though the executor locally removed that partial work before it
+    // could add a WriteRecord, abort must publish the complete loser chain.
+    const lsn_t abort_lsn = log_mgr.get_persist_lsn();
+    EXPECT_NE(abort_lsn, INVALID_LSN);
+    EXPECT_GT(log_mgr.get_pwrite_count(), 0u);
+    auto logs = ReadAllLogs(disk);
+    ASSERT_EQ(logs.size(), 3);
+    EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
+    EXPECT_EQ(logs[1]->log_type_, LogType::INSERT);
+    EXPECT_EQ(logs[2]->log_type_, LogType::ABORT);
+    EXPECT_EQ(logs[1]->prev_lsn_, logs[0]->lsn_);
+    EXPECT_EQ(logs[2]->prev_lsn_, logs[1]->lsn_);
+    EXPECT_EQ(logs[2]->lsn_, abort_lsn);
+
+    // ABORT does not need an fsync for the process-crash contract, but any
+    // subsequent WAL durability boundary must include it.
+    log_mgr.flush_log_to_disk_with_sync();
+    EXPECT_GE(log_mgr.get_durable_lsn(), abort_lsn);
+
+    auto* fh = sm_mgr.fhs_.at("t").get();
+    EXPECT_TRUE(fh->is_record(seed_rid));
+    EXPECT_FALSE(fh->is_record(losing_rid));
+
+    const auto& tab = sm_mgr.db_.get_table("t");
+    ASSERT_EQ(tab.indexes.size(), 2u);
+    auto* id_index = sm_mgr.ihs_.at(ix_mgr.get_index_name("t", tab.indexes[0].cols)).get();
+    auto* key_index = sm_mgr.ihs_.at(ix_mgr.get_index_name("t", tab.indexes[1].cols)).get();
+    int id_key = 2;
+    std::vector<Rid> rids;
+    EXPECT_FALSE(id_index->get_value(reinterpret_cast<const char*>(&id_key), &rids, nullptr));
+    int duplicate_key = 10;
+    rids.clear();
+    ASSERT_TRUE(key_index->get_value(reinterpret_cast<const char*>(&duplicate_key), &rids, nullptr));
+    ASSERT_EQ(rids.size(), 1u);
+    EXPECT_EQ(rids[0], seed_rid);
+
+    sm_mgr.close_db();
 }
 
 TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {

@@ -13,9 +13,11 @@ See the Mulan PSL v2 for more details. */
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
@@ -30,7 +32,10 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 
+#include "common/runtime_config.h"
 #include "errors.h"
+#include "execution/execution_timing_diagnostics.h"
+#include "execution/index_skip_scan_diagnostics.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
@@ -41,15 +46,36 @@ See the Mulan PSL v2 for more details. */
 #include "portal.h"
 #include "analyze/analyze.h"
 #include "protocol/wire_protocol.h"
+#include "transaction/commit_timing_diagnostics.h"
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 128
 
 static bool should_exit = false;
 
+namespace {
+
+BufferPoolRuntimeConfig load_buffer_pool_config_or_exit() {
+    BufferPoolRuntimeConfig config;
+    try {
+        const char* configured_gib = std::getenv("RMDB_BUFFER_POOL_GIB");
+        config = configured_gib == nullptr ? default_buffer_pool_config() : parse_buffer_pool_config(configured_gib);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[rmdb] configuration error: %s\n", error.what());
+        std::fflush(stderr);
+        std::exit(EXIT_FAILURE);
+    }
+    std::fprintf(stderr, "[rmdb] buffer pool: %zu GiB (%zu pages)\n", config.gibibytes, config.pages);
+    std::fflush(stderr);
+    return config;
+}
+
+} // namespace
+
 // 构建全局所需的管理器对象
+const auto buffer_pool_config = load_buffer_pool_config_or_exit();
 auto disk_manager = std::make_unique<DiskManager>();
-auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+auto buffer_pool_manager = std::make_unique<BufferPoolManager>(buffer_pool_config.pages, disk_manager.get());
 auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
 auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
 auto sm_manager =
@@ -126,12 +152,16 @@ void log_observability_statistics() {
     const auto log_lock = [now_ms, sequence](const char* kind, const LockObservabilitySnapshot& stats) {
         LOG_WARN(
             "obs_lock t_ms=%lld seq=%llu kind=%s immediate_conflict=%llu "
-            "wait_enqueued=%llu wait_granted=%llu wait_cancelled=%llu wait_ns=%llu queue_depth_max=%llu "
-            "cycle_checks=%llu cycle_victims=%llu",
+            "wait_enqueued=%llu wait_granted=%llu wait_cancelled=%llu wait_ns=%llu backoff_waits=%llu "
+            "completion_waits=%llu "
+            "completion_aborts=%llu queue_depth_max=%llu cycle_checks=%llu cycle_victims=%llu",
             now_ms, static_cast<unsigned long long>(sequence), kind,
             static_cast<unsigned long long>(stats.immediate_conflict),
             static_cast<unsigned long long>(stats.wait_enqueued), static_cast<unsigned long long>(stats.wait_granted),
             static_cast<unsigned long long>(stats.wait_cancelled), static_cast<unsigned long long>(stats.wait_ns),
+            static_cast<unsigned long long>(stats.backoff_waits),
+            static_cast<unsigned long long>(stats.completion_waits),
+            static_cast<unsigned long long>(stats.completion_aborts),
             static_cast<unsigned long long>(stats.queue_depth_max), static_cast<unsigned long long>(stats.cycle_checks),
             static_cast<unsigned long long>(stats.cycle_victims));
     };
@@ -161,6 +191,49 @@ void log_observability_statistics() {
              static_cast<unsigned long long>(bpm.eviction_dirty),
              static_cast<unsigned long long>(disk_manager->get_page_read_count()),
              static_cast<unsigned long long>(disk_manager->get_page_write_count()));
+    if (commit_timing_diagnostics::enabled()) {
+        const auto commit = commit_timing_diagnostics::snapshot();
+        LOG_WARN("obs_commit t_ms=%lld seq=%llu invocations=%llu failures=%llu total_ns=%llu prepare_ns=%llu "
+                 "timestamp_csn_ns=%llu wal_ns=%llu tuple_ns=%llu frontier_publish_ns=%llu frontier_wait_ns=%llu "
+                 "cleanup_ns=%llu",
+                 now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(commit.invocations),
+                 static_cast<unsigned long long>(commit.failures), static_cast<unsigned long long>(commit.total_ns),
+                 static_cast<unsigned long long>(commit.prepare_publication_ns),
+                 static_cast<unsigned long long>(commit.timestamp_csn_ns),
+                 static_cast<unsigned long long>(commit.wal_ns),
+                 static_cast<unsigned long long>(commit.tuple_publication_ns),
+                 static_cast<unsigned long long>(commit.frontier_publication_ns),
+                 static_cast<unsigned long long>(commit.frontier_wait_ns),
+                 static_cast<unsigned long long>(commit.cleanup_ns));
+    }
+    if (index_skip_scan_diagnostics::enabled()) {
+        for (const auto& stats : index_skip_scan_diagnostics::snapshots()) {
+            LOG_WARN("obs_skipscan t_ms=%lld seq=%llu statement_id=%u plan_hash=%llu table=%s index=%s prefix_cols=%zu "
+                     "invocations=%llu prefixes=%llu ranges=%llu descents=%llu build_ns=%llu build_ns_max=%llu",
+                     now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned int>(stats.statement_id),
+                     static_cast<unsigned long long>(stats.plan_hash), stats.table_name.c_str(),
+                     stats.index_name.c_str(), stats.prefix_column_count,
+                     static_cast<unsigned long long>(stats.invocations),
+                     static_cast<unsigned long long>(stats.prefixes), static_cast<unsigned long long>(stats.ranges),
+                     static_cast<unsigned long long>(stats.descents), static_cast<unsigned long long>(stats.build_ns),
+                     static_cast<unsigned long long>(stats.build_ns_max));
+        }
+    }
+    if (execution_timing_diagnostics::enabled()) {
+        for (const auto& stats : execution_timing_diagnostics::snapshots()) {
+            LOG_WARN(
+                "obs_exec t_ms=%lld seq=%llu statement_id=%u plan_hash=%llu invocations=%llu failures=%llu "
+                "aborts=%llu errors=%llu total_ns=%llu clone_bind_ns=%llu analyze_ns=%llu plan_ns=%llu "
+                "portal_start_ns=%llu portal_run_ns=%llu",
+                now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned int>(stats.statement_id),
+                static_cast<unsigned long long>(stats.plan_hash), static_cast<unsigned long long>(stats.invocations),
+                static_cast<unsigned long long>(stats.failures), static_cast<unsigned long long>(stats.aborts),
+                static_cast<unsigned long long>(stats.errors), static_cast<unsigned long long>(stats.total_ns),
+                static_cast<unsigned long long>(stats.clone_bind_ns), static_cast<unsigned long long>(stats.analyze_ns),
+                static_cast<unsigned long long>(stats.plan_ns), static_cast<unsigned long long>(stats.portal_start_ns),
+                static_cast<unsigned long long>(stats.portal_run_ns));
+        }
+    }
     minilog::Logger::get().flush();
 }
 
@@ -325,8 +398,179 @@ struct PreparedStatement {
     std::vector<Type> parameters;
     std::vector<std::string> names;
     std::vector<Type> result_types;
+    std::vector<std::string> diagnostic_plans;
+    std::uint64_t diagnostic_plan_hash = 0;
     std::uint64_t catalog_generation = 0;
 };
+
+const char* diagnostic_plan_tag(PlanTag tag) {
+    switch (tag) {
+    case T_Insert:
+        return "Insert";
+    case T_Update:
+        return "Update";
+    case T_Delete:
+        return "Delete";
+    case T_select:
+        return "Select";
+    case T_SeqScan:
+        return "SeqScan";
+    case T_IndexScan:
+        return "IndexScan";
+    case T_IndexSkipScan:
+        return "IndexSkipScan";
+    case T_Filter:
+        return "Filter";
+    case T_NestLoop:
+        return "NestedLoop";
+    case T_SortMerge:
+        return "SortMerge";
+    case T_Sort:
+        return "Sort";
+    case T_Projection:
+        return "Projection";
+    case T_Aggregate:
+        return "Aggregate";
+    case T_Limit:
+        return "Limit";
+    case T_Union:
+        return "Union";
+    case T_ExplainAnalyze:
+        return "ExplainAnalyze";
+    case T_Transaction_begin:
+        return "Begin";
+    case T_Transaction_commit:
+        return "Commit";
+    case T_Transaction_abort:
+        return "Abort";
+    case T_Transaction_rollback:
+        return "Rollback";
+    default:
+        return "Utility";
+    }
+}
+
+std::string join_diagnostic_names(const std::vector<std::string>& names) {
+    if (names.empty()) {
+        return "-";
+    }
+    std::ostringstream out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i != 0) {
+            out << ',';
+        }
+        out << names[i];
+    }
+    return out.str();
+}
+
+std::string scan_equality_mask(const ScanPlan& scan) {
+    if (scan.index_col_names_.empty()) {
+        return "-";
+    }
+    std::string mask;
+    mask.reserve(scan.index_col_names_.size());
+    for (const auto& index_col : scan.index_col_names_) {
+        const bool has_equality = std::any_of(scan.conds_.begin(), scan.conds_.end(), [&](const Condition& condition) {
+            return condition.is_rhs_val && condition.op == OP_EQ && condition.lhs_col.col_name == index_col;
+        });
+        mask.push_back(has_equality ? '1' : '0');
+    }
+    return mask;
+}
+
+void collect_scan_diagnostics(const Plan* plan, const char* root, std::uint16_t statement_id,
+                              std::vector<std::string>& mappings) {
+    if (plan == nullptr) {
+        return;
+    }
+    switch (plan->tag) {
+    case T_SeqScan:
+    case T_IndexScan:
+    case T_IndexSkipScan: {
+        const auto* scan = static_cast<const ScanPlan*>(plan);
+        std::ostringstream line;
+        line << "statement_id=" << statement_id << " root=" << root << " node=" << diagnostic_plan_tag(plan->tag)
+             << " table=" << scan->tab_name_ << " index_cols=" << join_diagnostic_names(scan->index_col_names_)
+             << " equality_mask=" << scan_equality_mask(*scan);
+        mappings.push_back(line.str());
+        return;
+    }
+    case T_select:
+    case T_ExplainAnalyze:
+    case T_Update:
+    case T_Delete:
+    case T_Insert:
+        collect_scan_diagnostics(static_cast<const DMLPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
+        return;
+    case T_Filter:
+        collect_scan_diagnostics(static_cast<const FilterPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
+        return;
+    case T_Projection:
+        collect_scan_diagnostics(static_cast<const ProjectionPlan*>(plan)->subplan_.get(), root, statement_id,
+                                 mappings);
+        return;
+    case T_Aggregate:
+        collect_scan_diagnostics(static_cast<const AggregatePlan*>(plan)->subplan_.get(), root, statement_id, mappings);
+        return;
+    case T_Sort:
+        collect_scan_diagnostics(static_cast<const SortPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
+        return;
+    case T_Limit:
+        collect_scan_diagnostics(static_cast<const LimitPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
+        return;
+    case T_NestLoop:
+    case T_SortMerge: {
+        const auto* join = static_cast<const JoinPlan*>(plan);
+        collect_scan_diagnostics(join->left_.get(), root, statement_id, mappings);
+        collect_scan_diagnostics(join->right_.get(), root, statement_id, mappings);
+        return;
+    }
+    case T_Union:
+        for (const auto& branch : static_cast<const UnionPlan*>(plan)->branches_) {
+            collect_scan_diagnostics(branch.get(), root, statement_id, mappings);
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+std::vector<std::string> describe_prepared_plan(std::uint16_t statement_id, const Plan* plan) {
+    std::vector<std::string> mappings;
+    collect_scan_diagnostics(plan, diagnostic_plan_tag(plan->tag), statement_id, mappings);
+    if (mappings.empty()) {
+        std::ostringstream line;
+        line << "statement_id=" << statement_id << " root=" << diagnostic_plan_tag(plan->tag)
+             << " node=None table=- index_cols=- equality_mask=-";
+        mappings.push_back(line.str());
+    }
+    return mappings;
+}
+
+std::uint64_t hash_prepared_plan(const std::vector<std::string>& mappings) {
+    // Stable FNV-1a is sufficient here: this is an attribution label, never a
+    // plan-cache key or an execution decision. Exclude the connection-local
+    // statement id so equal generic plans have the same diagnostic hash.
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto& mapping : mappings) {
+        std::size_t plan_offset = 0;
+        if (mapping.rfind("statement_id=", 0) == 0) {
+            const auto delimiter = mapping.find(' ');
+            if (delimiter != std::string::npos) {
+                plan_offset = delimiter + 1;
+            }
+        }
+        for (std::size_t i = plan_offset; i < mapping.size(); ++i) {
+            const auto byte = static_cast<unsigned char>(mapping[i]);
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        hash ^= 0xff;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
 
 std::string diagnostic(const std::exception& exception) {
     std::string text = exception.what();
@@ -401,8 +645,9 @@ struct ExecutionOutcome {
     bool catalog_changed = false;
 };
 
-ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                              QueryResultSink* result_sink) {
+template <bool TimingEnabled>
+ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
+                                   QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing) {
     std::vector<char> response(BUFFER_LENGTH, 0);
     int offset = 0;
     Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
@@ -418,13 +663,36 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
         SetTransaction(session, &context);
     }
     try {
-        std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
-        std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), &context);
+        std::unique_ptr<Query> query;
+        if constexpr (TimingEnabled) {
+            execution_timing_diagnostics::StageTimer timer(&timing->analyze_ns);
+            query = analyze->do_analyze(std::move(parse_tree));
+        } else {
+            query = analyze->do_analyze(std::move(parse_tree));
+        }
+        std::unique_ptr<Plan> plan;
+        if constexpr (TimingEnabled) {
+            execution_timing_diagnostics::StageTimer timer(&timing->plan_ns);
+            plan = optimizer->plan_query(std::move(query), &context);
+        } else {
+            plan = optimizer->plan_query(std::move(query), &context);
+        }
         const bool catalog_changed = plan->tag == T_CreateTable || plan->tag == T_DropTable ||
                                      plan->tag == T_CreateIndex || plan->tag == T_DropIndex || plan->tag == T_LoadData;
-        std::unique_ptr<PortalStmt> statement = portal->start(std::move(plan), &context);
+        std::unique_ptr<PortalStmt> statement;
+        if constexpr (TimingEnabled) {
+            execution_timing_diagnostics::StageTimer timer(&timing->portal_start_ns);
+            statement = portal->start(std::move(plan), &context);
+        } else {
+            statement = portal->start(std::move(plan), &context);
+        }
         const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        if constexpr (TimingEnabled) {
+            execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
+            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        } else {
+            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        }
         session.isolation = context.isolation_level_;
         portal->drop();
         if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
@@ -450,6 +718,16 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
     }
 }
 
+ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
+                              QueryResultSink* result_sink) {
+    return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr);
+}
+
+ExecutionOutcome execute_tree_timed(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
+                                    QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing) {
+    return execute_tree_impl<true>(std::move(parse_tree), session, result_sink, timing);
+}
+
 ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, QueryResultSink* result_sink) {
     auto parse_tree = ast::parse_sql(sql);
     return execute_tree(std::move(parse_tree), session, result_sink);
@@ -472,6 +750,10 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     auto bound = ast::clone_bound_tree(*template_tree, zero_values);
     std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(bound));
     std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query_tree), &context);
+    std::vector<std::string> diagnostic_plans;
+    if (index_skip_scan_diagnostics::enabled() || execution_timing_diagnostics::enabled()) {
+        diagnostic_plans = describe_prepared_plan(id, plan.get());
+    }
     std::unique_ptr<PortalStmt> statement = portal->start(std::move(plan), &context);
     const bool actual_query = statement->tag == PORTAL_ONE_SELECT;
     if (actual_query != query)
@@ -481,6 +763,10 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     result.query = query;
     result.template_tree = std::move(template_tree);
     result.parameters = std::move(parameters);
+    result.diagnostic_plans = std::move(diagnostic_plans);
+    if (!result.diagnostic_plans.empty()) {
+        result.diagnostic_plan_hash = hash_prepared_plan(result.diagnostic_plans);
+    }
     result.catalog_generation = catalog_generation.load(std::memory_order_acquire);
     if (actual_query) {
         result.names = statement->output_names;
@@ -739,6 +1025,24 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             replacement.emplace(statement.id, std::move(statement));
         }
         prepared.swap(replacement);
+        if (index_skip_scan_diagnostics::enabled()) {
+            try {
+                for (const auto& [id, statement] : prepared) {
+                    (void)id;
+                    for (const auto& mapping : statement.diagnostic_plans) {
+                        const std::string deduplication_key =
+                            std::to_string(statement.diagnostic_plan_hash) + ":" + mapping;
+                        if (index_skip_scan_diagnostics::register_prepared_plan(deduplication_key)) {
+                            LOG_WARN("skipdiag_prepare plan_hash=%llu %s",
+                                     static_cast<unsigned long long>(statement.diagnostic_plan_hash), mapping.c_str());
+                        }
+                    }
+                }
+                minilog::Logger::get().flush();
+            } catch (...) {
+                // Diagnostics must never alter PREPARE_SET behavior.
+            }
+        }
         wire_protocol::write_frame(fd, Tag::PREPARE_OK, response);
         return;
     }
@@ -778,15 +1082,18 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
     const std::size_t result_budget = wire_protocol::kMaxPayload - kBatchResultFixedBytes -
                                       static_cast<std::size_t>(operation_count) * kBatchResultEntryBytes;
     std::size_t encoded_result_bytes = 0;
+    const bool execution_timing_enabled = execution_timing_diagnostics::enabled();
+    const bool skip_scan_diagnostics_enabled = index_skip_scan_diagnostics::enabled();
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
+            const auto* prepared_statement = operations[i].statement;
             if (operations[i].statement->catalog_generation != catalog_generation.load(std::memory_order_acquire)) {
                 throw wire_protocol::ProtocolError("prepared statement is invalid after catalog change");
             }
             ProtocolCollector result;
             result.encoded_bytes = &encoded_result_bytes;
             result.encoded_limit = result_budget;
-            auto bound_tree = ast::clone_bound_tree(*operations[i].statement->template_tree, [&]() {
+            const auto bind_operation = [&]() {
                 std::vector<std::unique_ptr<ast::Value>> values;
                 values.reserve(operations[i].values.size());
                 for (const auto& value : operations[i].values) {
@@ -806,9 +1113,34 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                     } else
                         values.push_back(std::make_unique<ast::StringLit>(value.text));
                 }
-                return values;
-            }());
-            const auto outcome = execute_tree(std::move(bound_tree), session, &result);
+                return ast::clone_bound_tree(*prepared_statement->template_tree, values);
+            };
+            ExecutionOutcome outcome;
+            if (!execution_timing_enabled && !skip_scan_diagnostics_enabled) {
+                outcome = execute_tree(bind_operation(), session, &result);
+            } else {
+                std::optional<execution_timing_diagnostics::OperationScope> timing_scope;
+                std::optional<index_skip_scan_diagnostics::StatementScope> skip_scan_scope;
+                if (execution_timing_enabled) {
+                    timing_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
+                }
+                if (skip_scan_diagnostics_enabled) {
+                    skip_scan_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
+                }
+                std::unique_ptr<ast::TreeNode> bound_tree;
+                if (execution_timing_enabled) {
+                    execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().clone_bind_ns);
+                    bound_tree = bind_operation();
+                } else {
+                    bound_tree = bind_operation();
+                }
+                if (execution_timing_enabled) {
+                    outcome = execute_tree_timed(std::move(bound_tree), session, &result, &timing_scope->sample());
+                    timing_scope->finish();
+                } else {
+                    outcome = execute_tree(std::move(bound_tree), session, &result);
+                }
+            }
             if (outcome.query) {
                 results.emplace_back(i, std::move(result));
             }
@@ -816,6 +1148,10 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         }
     } catch (TransactionAbortException& exception) {
         failed = executed;
+        if (execution_timing_enabled && executed < operations.size()) {
+            execution_timing_diagnostics::observe_abort(operations[executed].statement->id,
+                                                        operations[executed].statement->diagnostic_plan_hash);
+        }
         abort_session(session, nullptr);
         Writer response;
         response.u16(executed);
@@ -831,6 +1167,10 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         return;
     } catch (const std::exception& exception) {
         failed = executed;
+        if (execution_timing_enabled && executed < operations.size()) {
+            execution_timing_diagnostics::observe_error(operations[executed].statement->id,
+                                                        operations[executed].statement->diagnostic_plan_hash);
+        }
         abort_session(session, nullptr);
         Writer response;
         response.u16(executed);

@@ -535,10 +535,9 @@ public:
         return group_commit_count_.load(std::memory_order_acquire);
     }
 
-    // Number of committers that became the flush leader. fsync_count divided by
-    // this is how many fdatasync calls an average leader performs for later
-    // arrivals before it can return to its own client (measured 90.9 under the
-    // 50-connection ranking load).
+    // Number of committers that became the flush leader. Comparing this with
+    // fsync_count shows how often one leader must flush again for later
+    // arrivals before it can return to its own client.
     uint64_t get_group_commit_leader_count() const {
         return group_commit_leader_count_.load(std::memory_order_acquire);
     }

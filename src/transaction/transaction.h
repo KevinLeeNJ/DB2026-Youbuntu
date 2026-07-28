@@ -80,6 +80,7 @@ private:
 public:
     explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {
+        begin_lsn_ = INVALID_LSN;
         prev_lsn_ = INVALID_LSN;
         thread_id_ = std::this_thread::get_id();
     }
@@ -125,6 +126,19 @@ public:
         return state_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
+    inline void pin_commit_publication() {
+        commit_publication_pins_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    inline void unpin_commit_publication() {
+        const auto previous = commit_publication_pins_.fetch_sub(1, std::memory_order_acq_rel);
+        assert(previous > 0);
+        (void)previous;
+    }
+    inline bool has_commit_publication_pin() const {
+        return commit_publication_pins_.load(std::memory_order_acquire) != 0;
+    }
+
     inline void mark_lock_cancellation_requested() {
         lock_cancellation_requested_.store(true, std::memory_order_release);
     }
@@ -138,6 +152,12 @@ public:
     }
     inline void set_prev_lsn(lsn_t prev_lsn) {
         prev_lsn_ = prev_lsn;
+    }
+    inline lsn_t get_begin_lsn() {
+        return begin_lsn_;
+    }
+    inline void set_begin_lsn(lsn_t begin_lsn) {
+        begin_lsn_ = begin_lsn;
     }
 
     inline std::deque<std::unique_ptr<WriteRecord>>& get_write_set() {
@@ -293,9 +313,11 @@ public:
 private:
     bool txn_mode_{false};                // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     std::atomic<TransactionState> state_; // 事务状态；GC/SSI may inspect it from another thread
+    std::atomic<uint32_t> commit_publication_pins_{0};
     std::atomic<bool> lock_cancellation_requested_{false};
     IsolationLevel isolation_level_; // 事务的隔离级别
     std::thread::id thread_id_;      // 当前事务对应的线程id
+    lsn_t begin_lsn_;                // BEGIN日志对应的lsn，用于识别尚未产生其他WAL的事务
     lsn_t prev_lsn_;                 // 当前事务执行的最后一条操作对应的lsn，用于系统故障恢复
     txn_id_t txn_id_;                // 事务的ID，唯一标识符
     timestamp_t start_ts_;           // 事务的开始时间戳

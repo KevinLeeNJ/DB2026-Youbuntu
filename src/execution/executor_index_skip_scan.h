@@ -10,7 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <chrono>
+
 #include "executor_index_scan.h"
+#include "index_skip_scan_diagnostics.h"
 
 class IndexSkipScanExecutor : public IndexScanExecutor {
     struct IndexRange {
@@ -65,7 +68,15 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         }
     }
 
-    void build_ranges(size_t suffix_pos) {
+    template <bool Observe> void build_ranges(size_t suffix_pos) {
+        const auto build_started = [&] {
+            if constexpr (Observe) {
+                return std::chrono::steady_clock::now();
+            }
+            return std::chrono::steady_clock::time_point{};
+        }();
+        uint64_t prefixes = 0;
+
         ranges_.clear();
         next_range_pos_ = 0;
 
@@ -76,6 +87,9 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
         Iid end = ih_->upper_bound(max_key.data());
 
         while (cursor != end) {
+            if constexpr (Observe) {
+                ++prefixes;
+            }
             {
                 IxScan probe(ih_, cursor, end, sm_manager_->get_bpm(), false);
                 if (probe.is_end()) {
@@ -103,6 +117,19 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
                 break;
             }
             cursor = next_cursor;
+        }
+
+        if constexpr (Observe) {
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - build_started)
+                    .count();
+            // Two initial bounds cover the whole index. Every distinct prefix
+            // then performs lower/upper bounds for its matching range plus one
+            // upper bound to advance to the next prefix.
+            const uint64_t descents = 2 + prefixes * 3;
+            index_skip_scan_diagnostics::observe_build(
+                index_skip_scan_diagnostics::current_statement_id(), index_skip_scan_diagnostics::current_plan_hash(),
+                tab_name_, index_name_, suffix_pos, prefixes, ranges_.size(), descents, static_cast<uint64_t>(elapsed));
         }
     }
 
@@ -173,7 +200,11 @@ public:
             return;
         }
 
-        build_ranges(*suffix_pos);
+        if (index_skip_scan_diagnostics::enabled()) {
+            build_ranges<true>(*suffix_pos);
+        } else {
+            build_ranges<false>(*suffix_pos);
+        }
         index_latch_guard_.unlock();
         open_next_range();
         advance_to_match();
