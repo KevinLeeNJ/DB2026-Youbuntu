@@ -228,9 +228,9 @@ TEST(LockManagerMetadataTest, SiFirstLockWaitEnvironmentIsStrictAndFrozenPerInst
     EXPECT_FALSE(immediate_manager.lock_exclusive_on_record(&immediate_contender, immediate_rid, 42));
     EXPECT_TRUE(immediate_manager.unlock(&immediate_owner, immediate_lock_id));
 
-    ASSERT_EQ(unsetenv("RMDB_SI_FIRST_LOCK_WAIT"), 0);
+    ASSERT_EQ(setenv("RMDB_SI_FIRST_LOCK_WAIT", "1", 1), 0);
     LockManager waiting_manager;
-    setenv("RMDB_SI_FIRST_LOCK_WAIT", "0", 1);
+    ASSERT_EQ(setenv("RMDB_SI_FIRST_LOCK_WAIT", "0", 1), 0);
 
     Transaction waiting_owner(1061, IsolationLevel::SERIALIZABLE);
     Transaction waiting_contender(1062, IsolationLevel::SERIALIZABLE);

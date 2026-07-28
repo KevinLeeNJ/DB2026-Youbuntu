@@ -31,6 +31,9 @@ struct TabCol {
 
 struct Value {
     ColType type = TYPE_INT; // type of value
+    // 0 means a literal. Prepared-plan inspection retains the original 1-based
+    // placeholder ordinal without turning it into a runtime value.
+    std::size_t parameter_ordinal = 0;
     union {
         int int_val = 0; // int value
         float float_val; // SQL FLOAT value

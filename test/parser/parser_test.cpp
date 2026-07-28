@@ -540,6 +540,148 @@ TEST(ParserTest, ParsesPreparedMarkersAndQuotedDollarText) {
     EXPECT_EQ(select->limit_parameter, 2u);
 }
 
+TEST(ParserTest, TypedPreparedBindingPreservesOrdinalsAndLimitTopology) {
+    auto template_tree = parse_ok("select a from tb where a=$1 limit $2 offset $1;");
+    std::vector<std::unique_ptr<ast::Value>> typed_parameters;
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_INT));
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+
+    auto typed_tree = ast::clone_bound_tree(*template_tree, typed_parameters);
+    auto typed_select = as_node<ast::SelectStmt>(typed_tree);
+    ASSERT_NE(typed_select, nullptr);
+    ASSERT_EQ(typed_select->conds.size(), 1u);
+    auto* rhs = dynamic_cast<const ast::Parameter*>(typed_select->conds[0]->rhs.get());
+    ASSERT_NE(rhs, nullptr);
+    EXPECT_EQ(rhs->ordinal, 1u);
+    ASSERT_TRUE(rhs->declared_type.has_value());
+    EXPECT_EQ(*rhs->declared_type, ast::SV_TYPE_INT);
+    EXPECT_TRUE(typed_select->limit_is_parameter);
+    EXPECT_EQ(typed_select->limit_parameter, 2u);
+    EXPECT_TRUE(typed_select->offset_is_parameter);
+    EXPECT_EQ(typed_select->offset_parameter, 1u);
+
+    std::vector<std::unique_ptr<ast::Value>> runtime_values;
+    runtime_values.push_back(std::make_unique<ast::IntLit>(7));
+    runtime_values.push_back(std::make_unique<ast::IntLit>(3));
+    auto runtime_tree = ast::clone_bound_tree(*template_tree, runtime_values);
+    auto runtime_select = as_node<ast::SelectStmt>(runtime_tree);
+    ASSERT_NE(runtime_select, nullptr);
+    EXPECT_FALSE(runtime_select->limit_is_parameter);
+    EXPECT_EQ(runtime_select->limit, 3);
+    EXPECT_FALSE(runtime_select->offset_is_parameter);
+    EXPECT_EQ(runtime_select->offset, 7);
+}
+
+TEST(ParserTest, TypedPreparedBindingRejectsNonIntegerLimit) {
+    auto template_tree = parse_ok("select a from tb limit $1;");
+    std::vector<std::unique_ptr<ast::Value>> typed_parameters;
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_FLOAT));
+    EXPECT_THROW((void)ast::clone_bound_tree(*template_tree, typed_parameters), std::logic_error);
+}
+
+TEST(ParserTest, RuntimePreparedLimitAndOffsetRejectInvalidValues) {
+    auto limit_template = parse_ok("select a from tb limit $1;");
+    auto offset_template = parse_ok("select a from tb limit 1 offset $1;");
+
+    std::vector<std::unique_ptr<ast::Value>> negative_limit;
+    negative_limit.push_back(std::make_unique<ast::IntLit>(-1));
+    EXPECT_THROW((void)ast::clone_bound_tree(*limit_template, negative_limit), std::logic_error);
+
+    std::vector<std::unique_ptr<ast::Value>> null_limit;
+    null_limit.push_back(std::make_unique<ast::NullLit>());
+    EXPECT_THROW((void)ast::clone_bound_tree(*limit_template, null_limit), std::logic_error);
+
+    std::vector<std::unique_ptr<ast::Value>> float_limit;
+    float_limit.push_back(std::make_unique<ast::FloatLit>(1.0f));
+    EXPECT_THROW((void)ast::clone_bound_tree(*limit_template, float_limit), std::logic_error);
+
+    std::vector<std::unique_ptr<ast::Value>> negative_offset;
+    negative_offset.push_back(std::make_unique<ast::IntLit>(-1));
+    EXPECT_THROW((void)ast::clone_bound_tree(*offset_template, negative_offset), std::logic_error);
+
+    std::vector<std::unique_ptr<ast::Value>> null_offset;
+    null_offset.push_back(std::make_unique<ast::NullLit>());
+    EXPECT_THROW((void)ast::clone_bound_tree(*offset_template, null_offset), std::logic_error);
+}
+
+TEST(ParserTest, RuntimePreparedLimitOffsetRejectsInt32Overflow) {
+    auto both_parameters = parse_ok("select a from tb limit $1 offset $2;");
+    std::vector<std::unique_ptr<ast::Value>> values;
+    values.push_back(std::make_unique<ast::IntLit>(std::numeric_limits<int>::max()));
+    values.push_back(std::make_unique<ast::IntLit>(1));
+    EXPECT_THROW((void)ast::clone_bound_tree(*both_parameters, values), std::logic_error);
+
+    auto constant_offset = parse_ok("select a from tb limit $1 offset 1;");
+    std::vector<std::unique_ptr<ast::Value>> one_value;
+    one_value.push_back(std::make_unique<ast::IntLit>(std::numeric_limits<int>::max()));
+    EXPECT_THROW((void)ast::clone_bound_tree(*constant_offset, one_value), std::logic_error);
+}
+
+TEST(ParserTest, TypedPreparedBindingPreservesRepeatedInsertAndJoinSlots) {
+    auto insert_template = parse_ok("insert into tb values ($1, $2, $1, $3);");
+    std::vector<std::unique_ptr<ast::Value>> typed_parameters;
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_STRING));
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(3, ast::SV_TYPE_STRING));
+    auto insert_tree = ast::clone_bound_tree(*insert_template, typed_parameters);
+    auto* insert = as_node<ast::InsertStmt>(insert_tree);
+    ASSERT_NE(insert, nullptr);
+    ASSERT_EQ(insert->vals.size(), 4u);
+    EXPECT_EQ(static_cast<const ast::Parameter&>(*insert->vals[0]).ordinal, 1u);
+    EXPECT_EQ(static_cast<const ast::Parameter&>(*insert->vals[1]).ordinal, 2u);
+    EXPECT_EQ(static_cast<const ast::Parameter&>(*insert->vals[2]).ordinal, 1u);
+    EXPECT_EQ(static_cast<const ast::Parameter&>(*insert->vals[3]).ordinal, 3u);
+    EXPECT_EQ(static_cast<const ast::Parameter&>(*insert->vals[0]).declared_type, ast::SV_TYPE_STRING);
+
+    std::vector<std::unique_ptr<ast::Value>> runtime_values;
+    runtime_values.push_back(std::make_unique<ast::StringLit>("char"));
+    runtime_values.push_back(std::make_unique<ast::IntLit>(9));
+    runtime_values.push_back(std::make_unique<ast::NullLit>());
+    auto runtime_tree = ast::clone_bound_tree(*insert_template, runtime_values);
+    auto* runtime_insert = as_node<ast::InsertStmt>(runtime_tree);
+    ASSERT_NE(runtime_insert, nullptr);
+    EXPECT_EQ(runtime_insert->vals[0]->type, ast::AstType::StringLit);
+    EXPECT_EQ(runtime_insert->vals[2]->type, ast::AstType::StringLit);
+    EXPECT_EQ(runtime_insert->vals[3]->type, ast::AstType::NullLit);
+
+    auto join_template = parse_ok("select x.a from x join y where x.a = $1 and y.b = $1;");
+    std::vector<std::unique_ptr<ast::Value>> join_parameter;
+    join_parameter.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_INT));
+    auto join_tree = ast::clone_bound_tree(*join_template, join_parameter);
+    auto* join = as_node<ast::SelectStmt>(join_tree);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->conds.size(), 2u);
+    ASSERT_EQ(join->jointree.size(), 1u);
+    for (const auto& condition : join->conds) {
+        auto* parameter = dynamic_cast<const ast::Parameter*>(condition->rhs.get());
+        ASSERT_NE(parameter, nullptr);
+        EXPECT_EQ(parameter->ordinal, 1u);
+    }
+    for (const auto& condition : join->jointree[0]->conds) {
+        auto* parameter = dynamic_cast<const ast::Parameter*>(condition->rhs.get());
+        ASSERT_NE(parameter, nullptr);
+        EXPECT_EQ(parameter->ordinal, 1u);
+    }
+}
+
+TEST(ParserTest, PreparedBindingRejectsSparseAndMismatchedSlots) {
+    auto template_tree = parse_ok("insert into tb values ($1, $2);");
+
+    std::vector<std::unique_ptr<ast::Value>> sparse;
+    sparse.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_INT));
+    sparse.push_back(nullptr);
+    EXPECT_THROW((void)ast::clone_bound_tree(*template_tree, sparse), std::logic_error);
+
+    std::vector<std::unique_ptr<ast::Value>> mismatched;
+    mismatched.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+    mismatched.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_INT));
+    EXPECT_THROW((void)ast::clone_bound_tree(*template_tree, mismatched), std::logic_error);
+
+    std::vector<std::unique_ptr<ast::Value>> too_short;
+    too_short.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_INT));
+    EXPECT_THROW((void)ast::clone_bound_tree(*template_tree, too_short), std::logic_error);
+}
+
 TEST(ParserTest, ParsesLimitOffsetClause) {
     auto literal_node = parse_ok("select a from tb limit 3 offset 7;");
     auto literal_select = as_node<ast::SelectStmt>(literal_node);

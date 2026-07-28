@@ -38,6 +38,31 @@ Value convert_ast_value_node(const ast::Value* sv_val) {
     case ast::AstType::NullLit:
         val.set_null();
         break;
+    case ast::AstType::Parameter: {
+        const auto* parameter = static_cast<const ast::Parameter*>(sv_val);
+        if (parameter->ordinal == 0 || !parameter->declared_type.has_value()) {
+            throw InternalError("Prepared parameter is missing its declared type");
+        }
+        switch (*parameter->declared_type) {
+        case ast::SV_TYPE_INT:
+            val.set_int(0);
+            break;
+        case ast::SV_TYPE_FLOAT:
+            val.set_float(0.0f);
+            break;
+        case ast::SV_TYPE_STRING:
+            val.set_str("");
+            break;
+        case ast::SV_TYPE_DATETIME:
+            val.set_str("");
+            val.type = TYPE_DATETIME;
+            break;
+        case ast::SV_TYPE_BOOL:
+            throw InternalError("BOOL prepared parameters are not supported");
+        }
+        val.parameter_ordinal = parameter->ordinal;
+        break;
+    }
     case ast::AstType::BoolLit:
     default:
         throw InternalError("Unexpected sv value type");

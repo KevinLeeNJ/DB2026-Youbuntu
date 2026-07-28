@@ -185,16 +185,21 @@ public:
 
 class LimitPlan : public Plan {
 public:
-    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit, int offset = 0) {
+    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit, int offset = 0,
+              std::size_t limit_parameter_ordinal = 0, std::size_t offset_parameter_ordinal = 0) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         limit_ = limit;
         offset_ = offset;
+        limit_parameter_ordinal_ = limit_parameter_ordinal;
+        offset_parameter_ordinal_ = offset_parameter_ordinal;
     }
     ~LimitPlan() {}
     std::unique_ptr<Plan> subplan_;
     int limit_;
     int offset_ = 0;
+    std::size_t limit_parameter_ordinal_ = 0;
+    std::size_t offset_parameter_ordinal_ = 0;
 };
 
 class UnionPlan : public Plan {

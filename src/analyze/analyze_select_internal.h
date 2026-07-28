@@ -43,9 +43,31 @@ template <typename T, typename = void> struct has_limit_member : std::false_type
 
 template <typename T> struct has_limit_member<T, std::void_t<decltype(std::declval<T>().limit)>> : std::true_type {};
 
+template <typename T, typename = void> struct has_limit_is_parameter_member : std::false_type {};
+
+template <typename T>
+struct has_limit_is_parameter_member<T, std::void_t<decltype(std::declval<T>().limit_is_parameter)>> : std::true_type {
+};
+
+template <typename T, typename = void> struct has_limit_parameter_member : std::false_type {};
+
+template <typename T>
+struct has_limit_parameter_member<T, std::void_t<decltype(std::declval<T>().limit_parameter)>> : std::true_type {};
+
 template <typename T, typename = void> struct has_offset_member : std::false_type {};
 
 template <typename T> struct has_offset_member<T, std::void_t<decltype(std::declval<T>().offset)>> : std::true_type {};
+
+template <typename T, typename = void> struct has_offset_is_parameter_member : std::false_type {};
+
+template <typename T>
+struct has_offset_is_parameter_member<T, std::void_t<decltype(std::declval<T>().offset_is_parameter)>>
+    : std::true_type {};
+
+template <typename T, typename = void> struct has_offset_parameter_member : std::false_type {};
+
+template <typename T>
+struct has_offset_parameter_member<T, std::void_t<decltype(std::declval<T>().offset_parameter)>> : std::true_type {};
 
 template <typename T, typename = void> struct has_has_select_star_member : std::false_type {};
 
@@ -215,12 +237,25 @@ template <typename SelectStmtT> void populate_limit_from_ast(Query& query, const
     query.has_limit = false;
     query.limit = 0;
     query.offset = 0;
+    query.limit_parameter_ordinal = 0;
+    query.offset_parameter_ordinal = 0;
     if constexpr (has_has_limit_member<SelectStmtT>::value && has_limit_member<SelectStmtT>::value) {
         query.has_limit = stmt.has_limit;
         query.limit = stmt.limit;
     }
+    if constexpr (has_limit_is_parameter_member<SelectStmtT>::value && has_limit_parameter_member<SelectStmtT>::value) {
+        if (stmt.limit_is_parameter) {
+            query.limit_parameter_ordinal = stmt.limit_parameter;
+        }
+    }
     if constexpr (has_offset_member<SelectStmtT>::value) {
         query.offset = stmt.offset;
+    }
+    if constexpr (has_offset_is_parameter_member<SelectStmtT>::value &&
+                  has_offset_parameter_member<SelectStmtT>::value) {
+        if (stmt.offset_is_parameter) {
+            query.offset_parameter_ordinal = stmt.offset_parameter;
+        }
     }
 }
 

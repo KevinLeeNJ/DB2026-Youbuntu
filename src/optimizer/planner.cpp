@@ -959,6 +959,9 @@ std::string Planner::make_physical_plan_cache_key(const Query& query, std::uint6
     }
     append_cache_key_part(key, query.has_limit);
     append_cache_key_part(key, query.limit);
+    append_cache_key_part(key, query.offset);
+    append_cache_key_part(key, std::to_string(query.limit_parameter_ordinal));
+    append_cache_key_part(key, std::to_string(query.offset_parameter_ordinal));
     return key;
 }
 
@@ -1590,8 +1593,11 @@ std::unique_ptr<Plan> Planner::generate_sort_plan(const Query* query, std::uniqu
         return plan;
     }
     // top-k must keep the rows discarded by OFFSET, otherwise nothing is left to skip over
+    const bool parameterized_limit = query->limit_parameter_ordinal != 0 || query->offset_parameter_ordinal != 0;
     const long long top_k = static_cast<long long>(query->limit) + query->offset;
-    int sort_limit = (query->has_limit && top_k <= std::numeric_limits<int>::max()) ? static_cast<int>(top_k) : -1;
+    int sort_limit = (query->has_limit && !parameterized_limit && top_k <= std::numeric_limits<int>::max())
+                         ? static_cast<int>(top_k)
+                         : -1;
     return std::make_unique<SortPlan>(T_Sort, std::move(plan), bind_order_by_output_names(*query), sort_limit);
 }
 
@@ -1600,10 +1606,12 @@ std::unique_ptr<Plan> Planner::generate_limit_plan(const Query* query, std::uniq
         return plan;
     }
     // A sort below already truncated the stream to limit rows, unless OFFSET still has to be skipped.
-    if (!query->order_by_items.empty() && !plan->order_satisfied_ && query->offset == 0) {
+    const bool parameterized_limit = query->limit_parameter_ordinal != 0 || query->offset_parameter_ordinal != 0;
+    if (!parameterized_limit && !query->order_by_items.empty() && !plan->order_satisfied_ && query->offset == 0) {
         return plan;
     }
-    return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->limit, query->offset);
+    return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->limit, query->offset,
+                                       query->limit_parameter_ordinal, query->offset_parameter_ordinal);
 }
 
 /**
@@ -1741,8 +1749,9 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
                                                                 query->conds, query->set_clauses, catalog_generation);
             auto cached = find_compiled_point_program(cache_key, catalog_generation);
             if (cached.has_value() && cached.value() != nullptr &&
-                (context == nullptr || context->txn_ == nullptr ||
-                 context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED)) {
+                (context == nullptr ||
+                 (context->txn_ == nullptr ? context->isolation_level_ == IsolationLevel::READ_COMMITTED
+                                           : context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED))) {
                 compiled_program = cached.value();
                 compiled_hit = true;
             } else {
@@ -1786,8 +1795,9 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
                                                                 query->conds, query->set_clauses, catalog_generation);
             auto cached = find_compiled_point_program(cache_key, catalog_generation);
             if (cached.has_value() && cached.value() != nullptr &&
-                (context == nullptr || context->txn_ == nullptr ||
-                 context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED)) {
+                (context == nullptr ||
+                 (context->txn_ == nullptr ? context->isolation_level_ == IsolationLevel::READ_COMMITTED
+                                           : context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED))) {
                 compiled_program = cached.value();
                 compiled_hit = true;
             } else {

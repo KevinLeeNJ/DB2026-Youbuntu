@@ -30,11 +30,11 @@ std::chrono::microseconds configured_si_conflict_backoff() {
 
 bool configured_si_first_lock_wait() {
     const char* value = std::getenv("RMDB_SI_FIRST_LOCK_WAIT");
-    if (value == nullptr || std::strcmp(value, "1") == 0) {
-        return true;
-    }
-    if (std::strcmp(value, "0") == 0) {
+    if (value == nullptr || std::strcmp(value, "0") == 0) {
         return false;
+    }
+    if (std::strcmp(value, "1") == 0) {
+        return true;
     }
     throw std::invalid_argument("RMDB_SI_FIRST_LOCK_WAIT must be 0 or 1");
 }
