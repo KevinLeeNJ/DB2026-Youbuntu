@@ -3472,7 +3472,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "consistency command is currently supported for rmdb only")
 			os.Exit(2)
 		}
-		if err := checkConsistency(address, *timeout, *isolation, *resultJSON, *consistencyStage); err != nil {
+		if err := checkConsistency(address, *timeout, *isolation, *resultJSON, *consistencyStage,
+			time.Duration(*progress)*time.Second); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

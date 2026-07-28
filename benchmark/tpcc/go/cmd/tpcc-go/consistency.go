@@ -312,6 +312,48 @@ type ruleRunner struct {
 	floatBits   map[string]uint32
 }
 
+type consistencyTxnClient interface {
+	sqlExecutor
+	begin() error
+	commit() error
+	rollback()
+}
+
+// runConsistencyTransaction keeps every rule in one explicit read-only
+// transaction. Besides giving the whole validation one SI snapshot, this avoids
+// turning each of the thousands of scalar SELECTs into a separate durable
+// auto-commit transaction. Any error after BEGIN gets a best-effort rollback;
+// rollback itself intentionally cannot hide the original validation error.
+func runConsistencyTransaction(c consistencyTxnClient, check func() error) error {
+	if err := c.begin(); err != nil {
+		return fmt.Errorf("begin consistency transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			c.rollback()
+		}
+	}()
+	if err := check(); err != nil {
+		return err
+	}
+	if err := c.commit(); err != nil {
+		return fmt.Errorf("commit consistency transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// runConsistencyTransactionThen runs externally visible publication only after
+// the read-only validation transaction has committed. In particular, a failed
+// COMMIT must leave the previous result.json byte-for-byte intact.
+func runConsistencyTransactionThen(c consistencyTxnClient, check, afterCommit func() error) error {
+	if err := runConsistencyTransaction(c, check); err != nil {
+		return err
+	}
+	return afterCommit()
+}
+
 func (r *ruleRunner) fail(format string, args ...any) {
 	r.failures = append(r.failures, fmt.Sprintf(format, args...))
 }
@@ -483,8 +525,23 @@ func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 		return nil, fmt.Errorf("Payment FLOAT32 evidence has %d edges, want two for each of %d commit(s)",
 			len(doc.PaymentEdges), commits)
 	}
-	grouped := make(map[string][]paymentFloatEdge)
-	initial := make(map[string]uint32)
+	type chainNode struct {
+		selfLoops  int
+		advance    uint32
+		hasAdvance bool
+	}
+	type chain struct {
+		initial uint32
+		edges   int
+		nodes   map[uint32]*chainNode
+	}
+	canonicalBits := func(bits uint32) uint32 {
+		if bits<<1 == 0 {
+			return 0
+		}
+		return bits
+	}
+	grouped := make(map[string]*chain)
 	for _, edge := range doc.PaymentEdges {
 		key, start, err := paymentEdgeKey(edge)
 		if err != nil {
@@ -500,74 +557,136 @@ func validatePaymentFloatChains(doc document) (map[string]uint32, error) {
 			return nil, fmt.Errorf("Payment FLOAT32 edge %s is not 0 ULP: before=0x%08x amount=0x%08x after=0x%08x want=0x%08x",
 				key, edge.BeforeBits, edge.AmountBits, edge.AfterBits, want)
 		}
-		grouped[key] = append(grouped[key], edge)
-		initial[key] = start
+		currentChain := grouped[key]
+		if currentChain == nil {
+			currentChain = &chain{initial: start, nodes: make(map[uint32]*chainNode)}
+			grouped[key] = currentChain
+		}
+		currentChain.edges++
+		beforeKey := canonicalBits(edge.BeforeBits)
+		node := currentChain.nodes[beforeKey]
+		if node == nil {
+			node = &chainNode{}
+			currentChain.nodes[beforeKey] = node
+		}
+		if equalFloat32Bits(edge.BeforeBits, edge.AfterBits) {
+			node.selfLoops++
+			continue
+		}
+		if node.hasAdvance {
+			return nil, fmt.Errorf("Payment FLOAT32 chain %s forks at 0x%08x", key, edge.BeforeBits)
+		}
+		node.advance = edge.AfterBits
+		node.hasAdvance = true
 	}
 	terminals := make(map[string]uint32, len(grouped))
-	for key, edges := range grouped {
-		current := initial[key]
-		for len(edges) > 0 {
-			// A positive binary32 amount can round away at a sufficiently large
-			// current value. Consume every such current->current edge before
-			// choosing the sole edge, if any, that advances the chain.
-			remaining := edges[:0]
-			for _, edge := range edges {
-				if equalFloat32Bits(edge.BeforeBits, current) && equalFloat32Bits(edge.AfterBits, current) {
-					continue
-				}
-				remaining = append(remaining, edge)
+	for key, currentChain := range grouped {
+		current := currentChain.initial
+		remaining := currentChain.edges
+		for remaining > 0 {
+			node := currentChain.nodes[canonicalBits(current)]
+			if node != nil {
+				// A positive binary32 amount can round away at a sufficiently
+				// large current value. Consume all such current->current edges
+				// before following the sole edge that advances the chain.
+				remaining -= node.selfLoops
+				node.selfLoops = 0
 			}
-			edges = remaining
-			if len(edges) == 0 {
+			if remaining == 0 {
 				break
 			}
-
-			match := -1
-			for i, edge := range edges {
-				if equalFloat32Bits(edge.BeforeBits, current) {
-					if match >= 0 {
-						return nil, fmt.Errorf("Payment FLOAT32 chain %s forks at 0x%08x", key, current)
-					}
-					match = i
-				}
-			}
-			if match < 0 {
+			if node == nil || !node.hasAdvance {
 				return nil, fmt.Errorf("Payment FLOAT32 chain %s has a gap after 0x%08x (%d edge(s) remain)",
-					key, current, len(edges))
+					key, current, remaining)
 			}
-			current = edges[match].AfterBits
-			edges[match] = edges[len(edges)-1]
-			edges = edges[:len(edges)-1]
+			current = node.advance
+			node.hasAdvance = false
+			remaining--
 		}
 		terminals[key] = current
 	}
 	return terminals, nil
 }
 
+const (
+	warehousePaymentTerminalsSQL = "select w_id, w_ytd from warehouse order by w_id;"
+	districtPaymentTerminalsSQL  = "select d_w_id, d_id, d_ytd from district order by d_w_id, d_id;"
+)
+
 func checkPaymentTerminalBits(c sqlExecutor, terminals map[string]uint32, stage string) error {
-	for key, want := range terminals {
+	needWarehouse, needDistrict := false, false
+	for key := range terminals {
 		parts := strings.Split(key, ":")
-		var sql string
-		switch parts[0] {
-		case "warehouse":
-			sql = fmt.Sprintf("select w_ytd from warehouse where w_id = %s;", parts[1])
-		case "district":
-			sql = fmt.Sprintf("select d_ytd from district where d_w_id = %s and d_id = %s;", parts[1], parts[2])
+		switch {
+		case len(parts) == 2 && parts[0] == "warehouse":
+			needWarehouse = true
+		case len(parts) == 3 && parts[0] == "district":
+			needDistrict = true
 		default:
 			return fmt.Errorf("[%s] invalid Payment terminal key %q", stage, key)
 		}
-		text, err := c.exec(sql)
-		if err != nil {
-			return fmt.Errorf("[%s] Payment terminal %s: %w", stage, key, err)
+	}
+
+	type terminalQuery struct {
+		sql         string
+		kind        string
+		keyColumns  int
+		shouldQuery bool
+	}
+	queries := []terminalQuery{
+		{sql: warehousePaymentTerminalsSQL, kind: "warehouse", keyColumns: 1, shouldQuery: needWarehouse},
+		{sql: districtPaymentTerminalsSQL, kind: "district", keyColumns: 2, shouldQuery: needDistrict},
+	}
+	seen := make(map[string]bool, len(terminals))
+	for _, query := range queries {
+		if !query.shouldQuery {
+			continue
 		}
-		value, err := scalarFloatStrict(text)
+		text, err := c.exec(query.sql)
 		if err != nil {
-			return fmt.Errorf("[%s] Payment terminal %s: %w", stage, key, err)
+			return fmt.Errorf("[%s] Payment terminal %s query: %w", stage, query.kind, err)
 		}
-		got := math.Float32bits(float32(value))
-		if !equalFloat32Bits(got, want) {
-			return fmt.Errorf("[%s] Payment terminal %s got 0x%08x, want 0x%08x (0 ULP)",
-				stage, key, got, want)
+		rows := parseRows(text)
+		for rowIndex, row := range rows {
+			if len(row) != query.keyColumns+1 {
+				return fmt.Errorf("[%s] Payment terminal %s row %d returned %d columns, want %d",
+					stage, query.kind, rowIndex+1, len(row), query.keyColumns+1)
+			}
+			ids := make([]int64, query.keyColumns)
+			for column := 0; column < query.keyColumns; column++ {
+				ids[column], err = strconv.ParseInt(strings.TrimSpace(row[column]), 10, 32)
+				if err != nil {
+					return fmt.Errorf("[%s] Payment terminal %s row %d has invalid key %q",
+						stage, query.kind, rowIndex+1, row[column])
+				}
+			}
+			key := fmt.Sprintf("warehouse:%d", ids[0])
+			if query.kind == "district" {
+				key = fmt.Sprintf("district:%d:%d", ids[0], ids[1])
+			}
+			want, tracked := terminals[key]
+			if !tracked {
+				continue
+			}
+			if seen[key] {
+				return fmt.Errorf("[%s] Payment terminal %s was returned more than once", stage, key)
+			}
+			value, valueErr := strconv.ParseFloat(strings.TrimSpace(row[query.keyColumns]), 64)
+			if valueErr != nil {
+				return fmt.Errorf("[%s] Payment terminal %s has invalid value %q",
+					stage, key, row[query.keyColumns])
+			}
+			got := math.Float32bits(float32(value))
+			if !equalFloat32Bits(got, want) {
+				return fmt.Errorf("[%s] Payment terminal %s got 0x%08x, want 0x%08x (0 ULP)",
+					stage, key, got, want)
+			}
+			seen[key] = true
+		}
+	}
+	for key := range terminals {
+		if !seen[key] {
+			return fmt.Errorf("[%s] Payment terminal %s was not returned by grouped query", stage, key)
 		}
 	}
 	return nil
@@ -882,7 +1001,8 @@ func loadPriorResult(resultPath string) (document, error) {
 	return prior, nil
 }
 
-func checkConsistency(address string, timeout time.Duration, isolation, resultPath, stage string) error {
+func checkConsistency(address string, timeout time.Duration, isolation, resultPath, stage string,
+	progressInterval time.Duration) error {
 	prior, err := loadPriorResult(resultPath)
 	if err != nil {
 		return err
@@ -897,45 +1017,54 @@ func checkConsistency(address string, timeout time.Duration, isolation, resultPa
 	}
 	defer c.close()
 	if strings.HasPrefix(stage, "online-") {
+		var bits map[string]uint32
+		var terminals map[string]uint32
+		return runConsistencyTransactionThen(c, func() error {
+			var err error
+			terminals, err = validatePaymentFloatChains(prior)
+			if err != nil {
+				return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
+			}
+			if err := checkPaymentTerminalBits(c, terminals, stage); err != nil {
+				return err
+			}
+			bits, err = checkOnlineConsistencyWithBits(c, model, stage)
+			if err != nil {
+				return err
+			}
+			return nil
+		}, func() error {
+			prior.OnlineFloatBits = bits
+			prior.PaymentTerminalBits = terminals
+			if _, err := publishResultDocument(resultPath, prior); err != nil {
+				return fmt.Errorf("[%s] persist online FLOAT32 evidence: %w", stage, err)
+			}
+			return nil
+		})
+	}
+	return runConsistencyTransaction(c, func() error {
+		if len(prior.OnlineFloatBits) != postRecoveryAmountRuleCnt {
+			return fmt.Errorf("[%s] result carries %d online FLOAT32 baselines, want %d; run online consistency before crash",
+				stage, len(prior.OnlineFloatBits), postRecoveryAmountRuleCnt)
+		}
 		terminals, err := validatePaymentFloatChains(prior)
 		if err != nil {
 			return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
 		}
+		if len(prior.PaymentTerminalBits) != len(terminals) {
+			return fmt.Errorf("[%s] result carries %d Payment terminal bits, want %d; run online consistency before crash",
+				stage, len(prior.PaymentTerminalBits), len(terminals))
+		}
+		for key, want := range terminals {
+			if got, ok := prior.PaymentTerminalBits[key]; !ok || !equalFloat32Bits(got, want) {
+				return fmt.Errorf("[%s] persisted Payment terminal %s does not match the committed edge chain", stage, key)
+			}
+		}
 		if err := checkPaymentTerminalBits(c, terminals, stage); err != nil {
 			return err
 		}
-		bits, err := checkOnlineConsistencyWithBits(c, model, stage)
-		if err != nil {
-			return err
-		}
-		prior.OnlineFloatBits = bits
-		prior.PaymentTerminalBits = terminals
-		if _, err := publishResultDocument(resultPath, prior); err != nil {
-			return fmt.Errorf("[%s] persist online FLOAT32 evidence: %w", stage, err)
-		}
-		return nil
-	}
-	if len(prior.OnlineFloatBits) != postRecoveryAmountRuleCnt {
-		return fmt.Errorf("[%s] result carries %d online FLOAT32 baselines, want %d; run online consistency before crash",
-			stage, len(prior.OnlineFloatBits), postRecoveryAmountRuleCnt)
-	}
-	terminals, err := validatePaymentFloatChains(prior)
-	if err != nil {
-		return fmt.Errorf("[%s] Payment FLOAT32 chain: %w", stage, err)
-	}
-	if len(prior.PaymentTerminalBits) != len(terminals) {
-		return fmt.Errorf("[%s] result carries %d Payment terminal bits, want %d; run online consistency before crash",
-			stage, len(prior.PaymentTerminalBits), len(terminals))
-	}
-	for key, want := range terminals {
-		if got, ok := prior.PaymentTerminalBits[key]; !ok || !equalFloat32Bits(got, want) {
-			return fmt.Errorf("[%s] persisted Payment terminal %s does not match the committed edge chain", stage, key)
-		}
-	}
-	if err := checkPaymentTerminalBits(c, terminals, stage); err != nil {
-		return err
-	}
-	return checkPostRecoveryConsistency(c, model, stage)
+		return checkPostRecoveryConsistencyWithProgress(c, model, stage, progressInterval)
+	})
 }
 
 func checkOnlineConsistency(c sqlExecutor, model consistencyModel, stage string) error {
@@ -962,6 +1091,11 @@ func checkOnlineConsistencyWithBits(c sqlExecutor, model consistencyModel, stage
 }
 
 func checkPostRecoveryConsistency(c sqlExecutor, model consistencyModel, stage string) error {
+	return checkPostRecoveryConsistencyWithProgress(c, model, stage, 0)
+}
+
+func checkPostRecoveryConsistencyWithProgress(c sqlExecutor, model consistencyModel, stage string,
+	progressInterval time.Duration) error {
 	runner := &ruleRunner{exec: c}
 	start := time.Now()
 	runner.runIntRules(postRecoveryIntRules(model))
@@ -979,21 +1113,20 @@ func checkPostRecoveryConsistency(c sqlExecutor, model consistencyModel, stage s
 	// reconciled one by one, plus the warehouse and district samples.
 	partitionStart := time.Now()
 	checkWarehouseYTD(runner, model)
-	partitions := 0
-	for wID := 1; wID <= model.warehouses; wID++ {
-		for dID := 1; dID <= model.districtsPerWarehouse; dID++ {
-			checkPartition(runner, wID, dID)
-			partitions++
-		}
+	totalPartitions := model.warehouses * model.districtsPerWarehouse
+	if groupedPartitionChecksEnabled() {
+		checkPartitionsGrouped(runner, model, stage)
+	} else {
+		checkPartitionsPoint(runner, model, stage, progressInterval)
 	}
 	fmt.Printf("[%s] %d warehouse/district partitions took %s\n",
-		stage, partitions, time.Since(partitionStart).Round(time.Millisecond))
+		stage, totalPartitions, time.Since(partitionStart).Round(time.Millisecond))
 	if len(runner.failures) > 0 {
 		return fmt.Errorf("[%s] consistency validation failed (%d rule(s))\n%s",
 			stage, len(runner.failures), strings.Join(runner.failures, "\n"))
 	}
 	fmt.Printf("consistency ok: stage=%s rules=%d integer + %d amount aggregates over %d partitions (%s)\n",
-		stage, runner.intRules, runner.amountRules, partitions, time.Since(start).Round(time.Millisecond))
+		stage, runner.intRules, runner.amountRules, totalPartitions, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -1030,59 +1163,462 @@ func checkWarehouseYTD(runner *ruleRunner, model consistencyModel) {
 	}
 }
 
+const (
+	partitionDNext       = "district next order id"
+	partitionOrderMax    = "orders maximum id"
+	partitionOrderCount  = "orders row count"
+	partitionOrderMin    = "orders minimum id"
+	partitionOrderLines  = "orders line-count sum"
+	partitionNewCount    = "new_orders row count"
+	partitionNewMin      = "new_orders minimum id"
+	partitionNewMax      = "new_orders maximum id"
+	partitionPending     = "orders pending row count"
+	partitionLineCount   = "order_line row count"
+	partitionPendingLine = "orders pending line-count sum"
+	partitionEmptyLine   = "order_line empty-delivery row count"
+)
+
+type partitionAggregateSpec struct {
+	name      string
+	scalarSQL string
+}
+
+type partitionQuerySpec struct {
+	sql        string
+	aggregates []partitionAggregateSpec
+}
+
+type partitionAggregateResult struct {
+	value int64
+	ok    bool
+}
+
+type partitionKey struct {
+	wID int
+	dID int
+}
+
+type groupedPartitionQuerySpec struct {
+	label        string
+	sql          string
+	aggregates   []string
+	districtHead bool
+}
+
+const groupedPartitionModeEnv = "RMDB_CONSISTENCY_PARTITION_MODE"
+
+// Grouped is the production default. Set RMDB_CONSISTENCY_PARTITION_MODE=point
+// to A/B against the previous six point queries per partition.
+func groupedPartitionChecksEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(groupedPartitionModeEnv))) {
+	case "point", "legacy", "0", "false", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// partitionQuerySpecs keeps the twelve final.md:345 values as separate logical
+// checks while combining expressions only when they read the same table with
+// exactly the same WHERE clause. This preserves filters and NULL semantics but
+// reduces each partition from twelve wire round trips to six.
+func partitionQuerySpecs(wID, dID int) []partitionQuerySpec {
+	ordersWhere := fmt.Sprintf("o_w_id = %d and o_d_id = %d", wID, dID)
+	newOrdersWhere := fmt.Sprintf("no_w_id = %d and no_d_id = %d", wID, dID)
+	orderLinesWhere := fmt.Sprintf("ol_w_id = %d and ol_d_id = %d", wID, dID)
+	return []partitionQuerySpec{
+		{
+			sql: fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", wID, dID),
+			aggregates: []partitionAggregateSpec{{
+				name:      partitionDNext,
+				scalarSQL: fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", wID, dID),
+			}},
+		},
+		{
+			sql: fmt.Sprintf("select max(o_id), count(o_id), min(o_id), sum(o_ol_cnt) from orders where %s;", ordersWhere),
+			aggregates: []partitionAggregateSpec{
+				{name: partitionOrderMax, scalarSQL: fmt.Sprintf("select max(o_id) from orders where %s;", ordersWhere)},
+				{name: partitionOrderCount, scalarSQL: fmt.Sprintf("select count(o_id) from orders where %s;", ordersWhere)},
+				{name: partitionOrderMin, scalarSQL: fmt.Sprintf("select min(o_id) from orders where %s;", ordersWhere)},
+				{name: partitionOrderLines, scalarSQL: fmt.Sprintf("select sum(o_ol_cnt) from orders where %s;", ordersWhere)},
+			},
+		},
+		{
+			sql: fmt.Sprintf("select count(no_o_id), min(no_o_id), max(no_o_id) from new_orders where %s;", newOrdersWhere),
+			aggregates: []partitionAggregateSpec{
+				{name: partitionNewCount, scalarSQL: fmt.Sprintf("select count(no_o_id) from new_orders where %s;", newOrdersWhere)},
+				{name: partitionNewMin, scalarSQL: fmt.Sprintf("select min(no_o_id) from new_orders where %s;", newOrdersWhere)},
+				{name: partitionNewMax, scalarSQL: fmt.Sprintf("select max(no_o_id) from new_orders where %s;", newOrdersWhere)},
+			},
+		},
+		{
+			sql: fmt.Sprintf("select count(o_id), sum(o_ol_cnt) from orders where %s and o_carrier_id = 0;", ordersWhere),
+			aggregates: []partitionAggregateSpec{
+				{
+					name:      partitionPending,
+					scalarSQL: fmt.Sprintf("select count(o_id) from orders where %s and o_carrier_id = 0;", ordersWhere),
+				},
+				{
+					name:      partitionPendingLine,
+					scalarSQL: fmt.Sprintf("select sum(o_ol_cnt) from orders where %s and o_carrier_id = 0;", ordersWhere),
+				},
+			},
+		},
+		{
+			sql: fmt.Sprintf("select count(ol_o_id) from order_line where %s;", orderLinesWhere),
+			aggregates: []partitionAggregateSpec{{
+				name:      partitionLineCount,
+				scalarSQL: fmt.Sprintf("select count(ol_o_id) from order_line where %s;", orderLinesWhere),
+			}},
+		},
+		{
+			sql: fmt.Sprintf("select count(*) from order_line where %s and ol_delivery_d = '';", orderLinesWhere),
+			aggregates: []partitionAggregateSpec{{
+				name:      partitionEmptyLine,
+				scalarSQL: fmt.Sprintf("select count(*) from order_line where %s and ol_delivery_d = '';", orderLinesWhere),
+			}},
+		},
+	}
+}
+
+// groupedPartitionQuerySpecs performs the same six scans as partitionQuerySpecs
+// once for the whole database. Predicates that differ remain separate scans, so
+// this does not depend on CASE support or change any logical rule.
+func groupedPartitionQuerySpecs() []groupedPartitionQuerySpec {
+	return []groupedPartitionQuerySpec{
+		{
+			label:        "district",
+			sql:          "select d_w_id, d_id, count(*), min(d_next_o_id), max(d_next_o_id) from district group by d_w_id, d_id;",
+			aggregates:   []string{partitionDNext},
+			districtHead: true,
+		},
+		{
+			label: "orders",
+			sql:   "select o_w_id, o_d_id, max(o_id), count(o_id), min(o_id), sum(o_ol_cnt) from orders group by o_w_id, o_d_id;",
+			aggregates: []string{
+				partitionOrderMax, partitionOrderCount, partitionOrderMin, partitionOrderLines,
+			},
+		},
+		{
+			label: "new_orders",
+			sql:   "select no_w_id, no_d_id, count(no_o_id), min(no_o_id), max(no_o_id) from new_orders group by no_w_id, no_d_id;",
+			aggregates: []string{
+				partitionNewCount, partitionNewMin, partitionNewMax,
+			},
+		},
+		{
+			label: "pending orders",
+			sql:   "select o_w_id, o_d_id, count(o_id), sum(o_ol_cnt) from orders where o_carrier_id = 0 group by o_w_id, o_d_id;",
+			aggregates: []string{
+				partitionPending, partitionPendingLine,
+			},
+		},
+		{
+			label:      "order_line",
+			sql:        "select ol_w_id, ol_d_id, count(ol_o_id) from order_line group by ol_w_id, ol_d_id;",
+			aggregates: []string{partitionLineCount},
+		},
+		{
+			label:      "empty-delivery order_line",
+			sql:        "select ol_w_id, ol_d_id, count(*) from order_line where ol_delivery_d = '' group by ol_w_id, ol_d_id;",
+			aggregates: []string{partitionEmptyLine},
+		},
+	}
+}
+
+func checkPartitionsPoint(runner *ruleRunner, model consistencyModel, stage string, progressInterval time.Duration) {
+	totalPartitions := model.warehouses * model.districtsPerWarehouse
+	partitions := 0
+	start := time.Now()
+	lastProgress := start
+	for wID := 1; wID <= model.warehouses; wID++ {
+		for dID := 1; dID <= model.districtsPerWarehouse; dID++ {
+			checkPartition(runner, wID, dID)
+			partitions++
+			now := time.Now()
+			if progressInterval > 0 && partitions < totalPartitions && now.Sub(lastProgress) >= progressInterval {
+				elapsed := now.Sub(start)
+				remaining := time.Duration(float64(elapsed) * float64(totalPartitions-partitions) / float64(partitions))
+				fmt.Printf("[%s] partition progress %d/%d (%.1f%%), elapsed %s, ETA %s\n",
+					stage, partitions, totalPartitions, 100*float64(partitions)/float64(totalPartitions),
+					elapsed.Round(time.Second), remaining.Round(time.Second))
+				lastProgress = now
+			}
+		}
+	}
+}
+
+func partitionScalarSpecs(queryIndex, wID, dID int) []partitionAggregateSpec {
+	return partitionQuerySpecs(wID, dID)[queryIndex].aggregates
+}
+
+func failGroupedPartitionQuery(runner *ruleRunner, queryIndex, wID, dID int, groupedSQL string, err error) {
+	for _, aggregate := range partitionScalarSpecs(queryIndex, wID, dID) {
+		runner.fail("partition w=%d d=%d %s: %v [%s; grouped as %s]",
+			wID, dID, aggregate.name, err, aggregate.scalarSQL, groupedSQL)
+	}
+}
+
+func parsePartitionKey(row []string) (partitionKey, error) {
+	if len(row) < 2 {
+		return partitionKey{}, fmt.Errorf("returned %d columns, want at least 2 partition keys", len(row))
+	}
+	parse := func(raw string, column int) (int, error) {
+		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("partition key column %d holds a non-integer value %q", column, raw)
+		}
+		return int(value), nil
+	}
+	wID, err := parse(row[0], 1)
+	if err != nil {
+		return partitionKey{}, err
+	}
+	dID, err := parse(row[1], 2)
+	if err != nil {
+		return partitionKey{}, err
+	}
+	return partitionKey{wID: wID, dID: dID}, nil
+}
+
+func parseAggregateValues(cells []string) ([]aggregateValue, error) {
+	values := make([]aggregateValue, len(cells))
+	for i, raw := range cells {
+		raw = strings.TrimSpace(raw)
+		if raw == "NULL" {
+			continue
+		}
+		number, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, fmt.Errorf("aggregate column %d holds a non-numeric value %q", i+1, raw)
+		}
+		values[i] = aggregateValue{number: number, present: true}
+	}
+	return values, nil
+}
+
+func checkPartitionsGrouped(runner *ruleRunner, model consistencyModel, stage string) {
+	results := make(map[partitionKey]map[string]partitionAggregateResult,
+		model.warehouses*model.districtsPerWarehouse)
+	queries := groupedPartitionQuerySpecs()
+	for queryIndex, query := range queries {
+		queryStart := time.Now()
+		fmt.Printf("[%s] grouped partition query %d/%d (%s) started\n",
+			stage, queryIndex+1, len(queries), query.label)
+		text, err := runner.exec.exec(query.sql)
+		if err != nil {
+			for wID := 1; wID <= model.warehouses; wID++ {
+				for dID := 1; dID <= model.districtsPerWarehouse; dID++ {
+					failGroupedPartitionQuery(runner, queryIndex, wID, dID, query.sql, err)
+				}
+			}
+			fmt.Printf("[%s] grouped partition query %d/%d (%s) failed after %s\n",
+				stage, queryIndex+1, len(queries), query.label, time.Since(queryStart).Round(time.Millisecond))
+			continue
+		}
+
+		rows := parseRows(text)
+		seen := make(map[partitionKey]bool, len(rows))
+		invalid := make(map[partitionKey]bool)
+		queryShapeValid := true
+		wantColumns := 2 + len(query.aggregates)
+		if query.districtHead {
+			wantColumns = 5
+		}
+		for rowIndex, row := range rows {
+			if len(row) != wantColumns {
+				err = fmt.Errorf("row %d returned %d columns, want %d", rowIndex+1, len(row), wantColumns)
+				for _, name := range query.aggregates {
+					runner.fail("partition grouped %s: %v [grouped as %s]", name, err, query.sql)
+				}
+				queryShapeValid = false
+				continue
+			}
+			key, keyErr := parsePartitionKey(row)
+			if keyErr != nil {
+				for _, name := range query.aggregates {
+					runner.fail("partition grouped %s: row %d: %v [grouped as %s]",
+						name, rowIndex+1, keyErr, query.sql)
+				}
+				queryShapeValid = false
+				continue
+			}
+			if key.wID < 1 || key.wID > model.warehouses ||
+				key.dID < 1 || key.dID > model.districtsPerWarehouse {
+				failGroupedPartitionQuery(runner, queryIndex, key.wID, key.dID, query.sql,
+					fmt.Errorf("unexpected partition returned by grouped query"))
+				continue
+			}
+			if seen[key] {
+				failGroupedPartitionQuery(runner, queryIndex, key.wID, key.dID, query.sql,
+					fmt.Errorf("duplicate partition returned by grouped query"))
+				invalid[key] = true
+				for _, name := range query.aggregates {
+					delete(results[key], name)
+				}
+				continue
+			}
+			seen[key] = true
+
+			cells := row[2:]
+			if query.districtHead {
+				values, valueErr := parseAggregateValues(cells)
+				if valueErr != nil {
+					failGroupedPartitionQuery(runner, queryIndex, key.wID, key.dID, query.sql, valueErr)
+					invalid[key] = true
+					continue
+				}
+				count := int64(0)
+				if values[0].present {
+					count = int64(math.Round(values[0].number))
+				}
+				if count != 1 {
+					failGroupedPartitionQuery(runner, queryIndex, key.wID, key.dID, query.sql,
+						fmt.Errorf("district group contains %d rows, want 1", count))
+					invalid[key] = true
+					continue
+				}
+				if values[1].present != values[2].present ||
+					(values[1].present && int64(math.Round(values[1].number)) != int64(math.Round(values[2].number))) {
+					failGroupedPartitionQuery(runner, queryIndex, key.wID, key.dID, query.sql,
+						fmt.Errorf("district group has inconsistent d_next_o_id values"))
+					invalid[key] = true
+					continue
+				}
+				value := int64(0)
+				if values[2].present {
+					value = int64(math.Round(values[2].number))
+				}
+				if results[key] == nil {
+					results[key] = make(map[string]partitionAggregateResult, 12)
+				}
+				results[key][partitionDNext] = partitionAggregateResult{value: value, ok: true}
+				continue
+			}
+
+			values, valueErr := parseAggregateValues(cells)
+			if valueErr != nil {
+				failGroupedPartitionQuery(runner, queryIndex, key.wID, key.dID, query.sql, valueErr)
+				invalid[key] = true
+				continue
+			}
+			if results[key] == nil {
+				results[key] = make(map[string]partitionAggregateResult, 12)
+			}
+			for i, name := range query.aggregates {
+				value := int64(0)
+				if values[i].present {
+					value = int64(math.Round(values[i].number))
+				}
+				results[key][name] = partitionAggregateResult{value: value, ok: true}
+			}
+		}
+
+		if queryShapeValid {
+			for wID := 1; wID <= model.warehouses; wID++ {
+				for dID := 1; dID <= model.districtsPerWarehouse; dID++ {
+					key := partitionKey{wID: wID, dID: dID}
+					if seen[key] || invalid[key] {
+						continue
+					}
+					if query.districtHead {
+						failGroupedPartitionQuery(runner, queryIndex, wID, dID, query.sql,
+							fmt.Errorf("grouped query did not return the district partition"))
+						continue
+					}
+					// A scalar aggregate returns one row for an empty input; its
+					// grouped equivalent returns no row. Zero here is the exact
+					// value checkPartition derives from COUNT=0 and NULL MIN/MAX/SUM.
+					if results[key] == nil {
+						results[key] = make(map[string]partitionAggregateResult, 12)
+					}
+					for _, name := range query.aggregates {
+						results[key][name] = partitionAggregateResult{value: 0, ok: true}
+					}
+				}
+			}
+		}
+		fmt.Printf("[%s] grouped partition query %d/%d (%s) processed %d row(s) in %s\n",
+			stage, queryIndex+1, len(queries), query.label, len(rows), time.Since(queryStart).Round(time.Millisecond))
+	}
+
+	for wID := 1; wID <= model.warehouses; wID++ {
+		for dID := 1; dID <= model.districtsPerWarehouse; dID++ {
+			checkPartitionResults(runner, wID, dID, results[partitionKey{wID: wID, dID: dID}])
+		}
+	}
+}
+
 // checkPartition reconciles one warehouse/district partition: order count,
 // order line count, the undelivered queue, the rows with an empty delivery time,
 // the o_carrier_id = 0 rows and d_next_o_id (final.md:345).
 func checkPartition(runner *ruleRunner, wID, dID int) {
-	// query reports the integer value of an aggregate, treating NULL as zero and
-	// telling the caller which of the two it was. MIN/MAX over an empty queue is
-	// legitimately NULL, so the callers guard on the row count instead.
-	query := func(sql string) (int64, bool) {
-		value, err := runner.nullableScalar(sql)
-		if err != nil {
-			runner.fail("partition w=%d d=%d: %v [%s]", wID, dID, err, sql)
-			return 0, false
+	results := make(map[string]partitionAggregateResult, 12)
+	for _, query := range partitionQuerySpecs(wID, dID) {
+		text, err := runner.exec.exec(query.sql)
+		if err == nil {
+			var values []aggregateValue
+			values, err = aggregateRow(text, len(query.aggregates))
+			if err == nil {
+				for i, aggregate := range query.aggregates {
+					value := int64(0)
+					if values[i].present {
+						value = int64(math.Round(values[i].number))
+					}
+					results[aggregate.name] = partitionAggregateResult{value: value, ok: true}
+				}
+				continue
+			}
 		}
-		if !value.present {
-			return 0, true
+		// A batched query failure is attributed to every logical value it
+		// prevented us from checking, using the original scalar SQL for precise
+		// diagnosis rather than hiding four rules behind one combined statement.
+		for _, aggregate := range query.aggregates {
+			runner.fail("partition w=%d d=%d %s: %v [%s; batched as %s]",
+				wID, dID, aggregate.name, err, aggregate.scalarSQL, query.sql)
 		}
-		return int64(math.Round(value.number)), true
 	}
-	dNext, okNext := query(fmt.Sprintf("select d_next_o_id from district where d_w_id = %d and d_id = %d;", wID, dID))
-	maxOrder, okMaxOrder := query(fmt.Sprintf("select max(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID))
+	checkPartitionResults(runner, wID, dID, results)
+}
+
+func checkPartitionResults(runner *ruleRunner, wID, dID int, results map[string]partitionAggregateResult) {
+	result := func(name string) (int64, bool) {
+		value := results[name]
+		return value.value, value.ok
+	}
+	dNext, okNext := result(partitionDNext)
+	maxOrder, okMaxOrder := result(partitionOrderMax)
 	if okNext && okMaxOrder && dNext-1 != maxOrder {
 		runner.fail("district order id mismatch w=%d d=%d: d_next=%d, max_order=%d", wID, dID, dNext, maxOrder)
 	}
-	countOrder, okCountOrder := query(fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID))
-	minOrder, okMinOrder := query(fmt.Sprintf("select min(o_id) from orders where o_w_id = %d and o_d_id = %d;", wID, dID))
+	countOrder, okCountOrder := result(partitionOrderCount)
+	minOrder, okMinOrder := result(partitionOrderMin)
 	if okCountOrder && okMaxOrder && okMinOrder && countOrder > 0 && countOrder != maxOrder-minOrder+1 {
 		runner.fail("orders gap w=%d d=%d: count=%d, min=%d, max=%d", wID, dID, countOrder, minOrder, maxOrder)
 	}
-	countNew, okNew := query(fmt.Sprintf("select count(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID))
-	minNew, okMinNew := query(fmt.Sprintf("select min(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID))
-	maxNew, okMaxNew := query(fmt.Sprintf("select max(no_o_id) from new_orders where no_w_id = %d and no_d_id = %d;", wID, dID))
+	countNew, okNew := result(partitionNewCount)
+	minNew, okMinNew := result(partitionNewMin)
+	maxNew, okMaxNew := result(partitionNewMax)
 	if okNew && okMinNew && okMaxNew && countNew > 0 && countNew != maxNew-minNew+1 {
 		runner.fail("new_orders gap w=%d d=%d: count=%d, min=%d, max=%d", wID, dID, countNew, minNew, maxNew)
 	}
 	if okNew && okMaxNew && okMaxOrder && countNew > 0 && maxNew != maxOrder {
 		runner.fail("new_orders tail mismatch w=%d d=%d: max_new_order=%d, max_order=%d", wID, dID, maxNew, maxOrder)
 	}
-	carrierZero, okCarrier := query(fmt.Sprintf("select count(o_id) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID))
+	carrierZero, okCarrier := result(partitionPending)
 	if okNew && okCarrier && carrierZero != countNew {
 		runner.fail("pending order mismatch w=%d d=%d: carrier_zero=%d, new_orders=%d", wID, dID, carrierZero, countNew)
 	}
-	sumLines, okSum := query(fmt.Sprintf("select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d;", wID, dID))
-	countLines, okCount := query(fmt.Sprintf("select count(ol_o_id) from order_line where ol_w_id = %d and ol_d_id = %d;", wID, dID))
+	sumLines, okSum := result(partitionOrderLines)
+	countLines, okCount := result(partitionLineCount)
 	if okSum && okCount && sumLines != countLines {
 		runner.fail("order_line count mismatch w=%d d=%d: sum_o_ol_cnt=%d, count_ol_o_id=%d", wID, dID, sumLines, countLines)
 	}
 	// The rows with an empty delivery time are exactly the lines of the orders
 	// that are still undelivered. This is the per-partition check final.md:345
 	// names ("空配送时间行数") and that the previous implementation was missing.
-	pendingLines, okPending := query(fmt.Sprintf(
-		"select sum(o_ol_cnt) from orders where o_w_id = %d and o_d_id = %d and o_carrier_id = 0;", wID, dID))
-	emptyLines, okEmpty := query(fmt.Sprintf(
-		"select count(*) from order_line where ol_w_id = %d and ol_d_id = %d and ol_delivery_d = '';", wID, dID))
+	pendingLines, okPending := result(partitionPendingLine)
+	emptyLines, okEmpty := result(partitionEmptyLine)
 	if okPending && okEmpty && pendingLines != emptyLines {
 		runner.fail("empty delivery time mismatch w=%d d=%d: undelivered_o_ol_cnt=%d, empty_delivery_rows=%d",
 			wID, dID, pendingLines, emptyLines)

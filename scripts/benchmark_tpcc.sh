@@ -253,6 +253,7 @@ fi
     "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
 "$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
+    --progress-interval "$PROGRESS_INTERVAL" \
     --consistency-stage online-official-equivalent --result-json "$JSON_OUT"
 if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
     echo "[benchmark] smoke/non-ranking: SIGKILL and recovery check"
@@ -266,6 +267,7 @@ RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port "$RESTART_TIMEOUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
+    --progress-interval "$PROGRESS_INTERVAL" \
     --consistency-stage post-recovery-official-equivalent --result-json "$JSON_OUT"
 if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
     echo "[benchmark] smoke/non-ranking complete: result=$JSON_OUT (not an official ranking result)"
