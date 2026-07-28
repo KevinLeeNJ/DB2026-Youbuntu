@@ -74,6 +74,10 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
+    // Catalog lifetime is guarded independently from data/index/page latches.
+    // Callers must acquire this outermost, before starting work that can take
+    // transaction, row, index, page, or WAL locks.
+    mutable std::shared_mutex catalog_latch_;
     std::atomic<std::uint64_t> catalog_generation_{0};
 
     void bump_catalog_generation() noexcept {
@@ -98,6 +102,9 @@ private:
     std::unordered_map<std::string, std::vector<Rid>> deleted_tuple_candidates_;
 
 public:
+    using CatalogSharedGuard = std::shared_lock<std::shared_mutex>;
+    using CatalogExclusiveGuard = std::unique_lock<std::shared_mutex>;
+
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
               IxManager* ix_manager)
         : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), rm_manager_(rm_manager),
@@ -120,6 +127,20 @@ public:
 
     IxManager* get_ix_manager() {
         return ix_manager_;
+    }
+
+    CatalogSharedGuard acquire_catalog_shared() const {
+        return CatalogSharedGuard(catalog_latch_);
+    }
+
+    CatalogExclusiveGuard acquire_catalog_exclusive() {
+        return CatalogExclusiveGuard(catalog_latch_);
+    }
+
+    // The caller must hold either catalog guard. Keeping this accessor
+    // non-locking avoids recursively locking the non-recursive shared_mutex.
+    const std::string& get_database_identity_under_catalog_guard() const noexcept {
+        return db_.name_;
     }
 
     std::uint64_t get_catalog_generation() const noexcept {

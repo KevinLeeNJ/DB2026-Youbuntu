@@ -417,6 +417,41 @@ TEST_F(PlannerAggregateTest, generate_select_plan_pushes_limit_into_sort_over_pr
     EXPECT_EQ(aggregate->subplan_->tag, T_SeqScan);
 }
 
+TEST_F(PlannerAggregateTest, parameterizedLimitRetainsLimitNodeAndDisablesPrepareTimeTopK) {
+    auto query = make_aggregate_query(true, true);
+    query->limit = 0;
+    query->offset = 0;
+    query->limit_parameter_ordinal = 2;
+    query->offset_parameter_ordinal = 1;
+
+    auto plan = planner_.generate_select_plan(std::move(query), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->tag, T_Limit);
+    auto* limit = static_cast<LimitPlan*>(plan.get());
+    EXPECT_EQ(limit->limit_parameter_ordinal_, 2u);
+    EXPECT_EQ(limit->offset_parameter_ordinal_, 1u);
+    ASSERT_NE(limit->subplan_, nullptr);
+    ASSERT_EQ(limit->subplan_->tag, T_Sort);
+    EXPECT_EQ(static_cast<SortPlan*>(limit->subplan_.get())->limit_, -1);
+}
+
+TEST_F(PlannerAggregateTest, physicalPlanCacheKeyIncludesLimitProvenance) {
+    auto first = make_aggregate_query(false, true);
+    first->limit = 0;
+    first->limit_parameter_ordinal = 1;
+    auto second = make_aggregate_query(false, true);
+    second->limit = 0;
+    second->limit_parameter_ordinal = 2;
+    auto offset = make_aggregate_query(false, true);
+    offset->limit = 0;
+    offset->limit_parameter_ordinal = 1;
+    offset->offset_parameter_ordinal = 2;
+
+    EXPECT_NE(planner_.make_physical_plan_cache_key(*first, 0), planner_.make_physical_plan_cache_key(*second, 0));
+    EXPECT_NE(planner_.make_physical_plan_cache_key(*first, 0), planner_.make_physical_plan_cache_key(*offset, 0));
+}
+
 TEST_F(PlannerAggregateTest, stock_level_join_starts_from_order_line_and_uses_stock_inlj) {
     sm_manager_.db_.SetTabMeta("stock", make_stock_tab());
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
@@ -609,6 +644,23 @@ TEST_F(PlannerAggregateTest, compiled_point_program_hits_for_update_and_delete_s
     EXPECT_EQ(second_delete_dml->compiled_point_program_->kind, PointProgramKind::Delete);
     EXPECT_EQ(second_delete_dml->subplan_, nullptr);
     EXPECT_EQ(planner_.point_program_cache_hits_.load(), 2U);
+}
+
+TEST_F(PlannerAggregateTest, prepared_si_context_does_not_use_cached_rc_point_program) {
+    planner_.enable_compiled_point_program_cache_ = true;
+    sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
+
+    auto populate = planner_.do_planner(make_point_update_query(1, 10), nullptr);
+    ASSERT_NE(static_cast<DMLPlan*>(populate.get())->subplan_, nullptr);
+
+    char response[64]{};
+    int offset = 0;
+    Context si_context(nullptr, nullptr, nullptr, response, &offset);
+    si_context.isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
+    auto si_plan = planner_.do_planner(make_point_update_query(2, 20), &si_context);
+    auto* si_dml = static_cast<DMLPlan*>(si_plan.get());
+    EXPECT_EQ(si_dml->compiled_point_program_, nullptr);
+    EXPECT_NE(si_dml->subplan_, nullptr);
 }
 
 TEST_F(PlannerAggregateTest, compiled_point_program_keys_include_chained_update_shape_but_not_values) {

@@ -66,6 +66,49 @@ TEST(AnalyzeConvertTest, convert_string_lit) {
     EXPECT_EQ(val.str_val, "hello");
 }
 
+TEST(AnalyzeConvertTest, convert_typed_parameter_preserves_ordinal) {
+    Analyze analyze(nullptr);
+    auto parameter = std::make_unique<ast::Parameter>(3, ast::SV_TYPE_FLOAT);
+    Value val = analyze.convert_sv_value(parameter.get());
+    EXPECT_EQ(val.type, TYPE_FLOAT);
+    EXPECT_EQ(val.parameter_ordinal, 3u);
+    EXPECT_EQ(val.raw, nullptr);
+}
+
+TEST(AnalyzeConvertTest, rejects_untyped_parameter) {
+    Analyze analyze(nullptr);
+    auto parameter = std::make_unique<ast::Parameter>(1);
+    EXPECT_THROW((void)analyze.convert_sv_value(parameter.get()), InternalError);
+}
+
+TEST(AnalyzeConvertTest, prepared_insert_preserves_repeated_char_slots_and_runtime_nulls) {
+    Analyze analyze(nullptr);
+    auto template_tree = ast::parse_sql("INSERT INTO t VALUES ($1, $2, $1, $3);");
+    std::vector<std::unique_ptr<ast::Value>> typed_parameters;
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_STRING));
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+    typed_parameters.push_back(std::make_unique<ast::Parameter>(3, ast::SV_TYPE_STRING));
+
+    auto typed_query = analyze.do_analyze(ast::clone_bound_tree(*template_tree, typed_parameters));
+    ASSERT_EQ(typed_query->values.size(), 4u);
+    EXPECT_EQ(typed_query->values[0].type, TYPE_STRING);
+    EXPECT_EQ(typed_query->values[0].parameter_ordinal, 1u);
+    EXPECT_EQ(typed_query->values[1].parameter_ordinal, 2u);
+    EXPECT_EQ(typed_query->values[2].type, TYPE_STRING);
+    EXPECT_EQ(typed_query->values[2].parameter_ordinal, 1u);
+    EXPECT_EQ(typed_query->values[3].parameter_ordinal, 3u);
+
+    std::vector<std::unique_ptr<ast::Value>> runtime_values;
+    runtime_values.push_back(std::make_unique<ast::StringLit>("char"));
+    runtime_values.push_back(std::make_unique<ast::IntLit>(7));
+    runtime_values.push_back(std::make_unique<ast::NullLit>());
+    auto runtime_query = analyze.do_analyze(ast::clone_bound_tree(*template_tree, runtime_values));
+    ASSERT_EQ(runtime_query->values.size(), 4u);
+    EXPECT_EQ(runtime_query->values[0].str_val, "char");
+    EXPECT_EQ(runtime_query->values[2].str_val, "char");
+    EXPECT_TRUE(runtime_query->values[3].is_null);
+}
+
 // =============================================================================
 // convert_sv_comp_op 测试
 // =============================================================================
@@ -282,6 +325,49 @@ TEST_F(AnalyzeUpdateTest, accepts_numeric_prepared_self_update_and_resolves_colu
     EXPECT_EQ(query->set_clauses[0].rhs_col.col_name, "f");
     EXPECT_EQ(query->set_clauses[0].rhs.type, TYPE_FLOAT);
     EXPECT_EQ(query->conds.size(), 1U);
+}
+
+TEST_F(AnalyzeUpdateTest, typed_prepared_parameters_retain_provenance) {
+    std::vector<std::unique_ptr<ast::Value>> parameters;
+    parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_FLOAT));
+    parameters.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+
+    auto query = analyze_.do_analyze(bind("UPDATE t SET f = f + $1 WHERE id = $2;", std::move(parameters)));
+
+    ASSERT_EQ(query->set_clauses.size(), 1U);
+    EXPECT_EQ(query->set_clauses[0].rhs.type, TYPE_FLOAT);
+    EXPECT_EQ(query->set_clauses[0].rhs.parameter_ordinal, 1U);
+    ASSERT_EQ(query->conds.size(), 1U);
+    EXPECT_EQ(query->conds[0].rhs_val.type, TYPE_INT);
+    EXPECT_EQ(query->conds[0].rhs_val.parameter_ordinal, 2U);
+    EXPECT_EQ(query->conds[0].rhs_val.raw, nullptr);
+}
+
+TEST_F(AnalyzeUpdateTest, typed_prepared_chained_update_retains_repeated_slots) {
+    std::vector<std::unique_ptr<ast::Value>> parameters;
+    parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_FLOAT));
+    parameters.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+
+    auto query =
+        analyze_.do_analyze(bind("UPDATE t SET f = f + $1 - $1 WHERE id = $2 AND id = $2;", std::move(parameters)));
+
+    ASSERT_EQ(query->set_clauses.size(), 1u);
+    const auto& clause = query->set_clauses[0];
+    EXPECT_EQ(clause.rhs.parameter_ordinal, 1u);
+    ASSERT_EQ(clause.additional_terms.size(), 1u);
+    EXPECT_EQ(clause.additional_terms[0].rhs.parameter_ordinal, 1u);
+    ASSERT_EQ(query->conds.size(), 2u);
+    EXPECT_EQ(query->conds[0].rhs_val.parameter_ordinal, 2u);
+    EXPECT_EQ(query->conds[1].rhs_val.parameter_ordinal, 2u);
+}
+
+TEST_F(AnalyzeUpdateTest, rejects_typed_char_parameter_for_numeric_delta) {
+    std::vector<std::unique_ptr<ast::Value>> parameters;
+    parameters.push_back(std::make_unique<ast::Parameter>(1, ast::SV_TYPE_STRING));
+    parameters.push_back(std::make_unique<ast::Parameter>(2, ast::SV_TYPE_INT));
+
+    EXPECT_THROW((void)analyze_.do_analyze(bind("UPDATE t SET f = f + $1 WHERE id = $2;", std::move(parameters))),
+                 IncompatibleTypeError);
 }
 
 TEST_F(AnalyzeUpdateTest, rejects_char_parameter_for_prepared_numeric_delta) {

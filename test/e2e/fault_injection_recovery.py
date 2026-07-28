@@ -283,7 +283,12 @@ def run_case(name: str, binary: Path, root: Path) -> None:
         checkpoint_case(server, name)
     elif name == "before_checkpoint_data_sync_throw":
         checkpoint_case(server, "before_checkpoint_data_sync", "throw")
-    elif name in {"mid_recovery_redo", "mid_recovery_undo", "mid_index_rebuild", "before_recovery_wal_reset"}:
+    elif name in {
+        "mid_recovery_redo",
+        "mid_recovery_undo",
+        "mid_index_rebuild",
+        "before_recovery_wal_reset",
+    }:
         recovery_case(server, name)
     else:
         raise ValueError(name)
@@ -340,7 +345,9 @@ def main() -> int:
                     f"PASS repetition={repetition} {name} "
                     f"({time.monotonic() - started:.2f}s)"
                 )
-    print(f"{len(selected) * args.repeat}/{len(selected) * args.repeat} fault-injection cases passed")
+    print(
+        f"{len(selected) * args.repeat}/{len(selected) * args.repeat} fault-injection cases passed"
+    )
     return 0
 
 

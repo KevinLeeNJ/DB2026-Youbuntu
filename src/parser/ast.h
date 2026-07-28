@@ -10,7 +10,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 #pragma once
 
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -231,8 +233,10 @@ struct NullLit : public Value {
 
 struct Parameter : public Value {
     std::size_t ordinal;
+    std::optional<SvType> declared_type;
 
-    explicit Parameter(std::size_t ordinal_) : Value(AstType::Parameter), ordinal(ordinal_) {}
+    explicit Parameter(std::size_t ordinal_, std::optional<SvType> declared_type_ = std::nullopt)
+        : Value(AstType::Parameter), ordinal(ordinal_), declared_type(declared_type_) {}
 };
 
 struct Col : public Expr {
@@ -367,7 +371,7 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
         return std::make_unique<NullLit>();
     case AstType::Parameter: {
         auto& parameter = static_cast<const Parameter&>(expr);
-        return std::make_unique<Parameter>(parameter.ordinal);
+        return std::make_unique<Parameter>(parameter.ordinal, parameter.declared_type);
     }
     default:
         throw std::logic_error("unsupported expression type for AST clone");
@@ -396,7 +400,7 @@ inline std::unique_ptr<Value> clone_value(const Value& value) {
         return std::make_unique<NullLit>();
     case AstType::Parameter: {
         const auto& x = static_cast<const Parameter&>(value);
-        return std::make_unique<Parameter>(x.ordinal);
+        return std::make_unique<Parameter>(x.ordinal, x.declared_type);
     }
     default:
         throw std::logic_error("unsupported value type for AST clone");
@@ -410,6 +414,10 @@ inline std::unique_ptr<Value> clone_bound_value(const Value& value,
     const auto& parameter = static_cast<const Parameter&>(value);
     if (parameter.ordinal == 0 || parameter.ordinal > bindings.size() || bindings[parameter.ordinal - 1] == nullptr) {
         throw std::logic_error("unbound AST parameter");
+    }
+    if (bindings[parameter.ordinal - 1]->type == AstType::Parameter &&
+        static_cast<const Parameter&>(*bindings[parameter.ordinal - 1]).ordinal != parameter.ordinal) {
+        throw std::logic_error("mismatched AST parameter binding");
     }
     return clone_value(*bindings[parameter.ordinal - 1]);
 }
@@ -634,22 +642,61 @@ inline std::unique_ptr<SelectStmt> clone_select_bound(const SelectStmt& x,
     for (const auto& join : x.jointree)
         joins.push_back(clone_join_bound(*join, b));
     int limit = x.limit;
+    bool limit_is_parameter = false;
+    std::size_t limit_parameter = 0;
     if (x.limit_is_parameter) {
-        if (x.limit_parameter == 0 || x.limit_parameter > b.size() || b[x.limit_parameter - 1] == nullptr ||
-            b[x.limit_parameter - 1]->type != AstType::IntLit)
+        if (x.limit_parameter == 0 || x.limit_parameter > b.size() || b[x.limit_parameter - 1] == nullptr)
             throw std::logic_error("LIMIT parameter must be INT32");
-        limit = static_cast<const IntLit*>(b[x.limit_parameter - 1].get())->val;
+        const auto* binding = b[x.limit_parameter - 1].get();
+        if (binding->type == AstType::IntLit) {
+            limit = static_cast<const IntLit*>(binding)->val;
+            if (limit < 0)
+                throw std::logic_error("LIMIT parameter must be non-negative");
+        } else if (binding->type == AstType::Parameter) {
+            const auto* parameter = static_cast<const Parameter*>(binding);
+            if (!parameter->declared_type.has_value() || parameter->declared_type != SV_TYPE_INT)
+                throw std::logic_error("LIMIT parameter must be INT32");
+            limit = 0;
+            limit_is_parameter = true;
+            limit_parameter = parameter->ordinal;
+        } else {
+            throw std::logic_error("LIMIT parameter must be INT32");
+        }
     }
     int offset = x.offset;
+    bool offset_is_parameter = false;
+    std::size_t offset_parameter = 0;
     if (x.offset_is_parameter) {
-        if (x.offset_parameter == 0 || x.offset_parameter > b.size() || b[x.offset_parameter - 1] == nullptr ||
-            b[x.offset_parameter - 1]->type != AstType::IntLit)
+        if (x.offset_parameter == 0 || x.offset_parameter > b.size() || b[x.offset_parameter - 1] == nullptr)
             throw std::logic_error("OFFSET parameter must be INT32");
-        offset = static_cast<const IntLit*>(b[x.offset_parameter - 1].get())->val;
+        const auto* binding = b[x.offset_parameter - 1].get();
+        if (binding->type == AstType::IntLit) {
+            offset = static_cast<const IntLit*>(binding)->val;
+            if (offset < 0)
+                throw std::logic_error("OFFSET parameter must be non-negative");
+        } else if (binding->type == AstType::Parameter) {
+            const auto* parameter = static_cast<const Parameter*>(binding);
+            if (!parameter->declared_type.has_value() || parameter->declared_type != SV_TYPE_INT)
+                throw std::logic_error("OFFSET parameter must be INT32");
+            offset = 0;
+            offset_is_parameter = true;
+            offset_parameter = parameter->ordinal;
+        } else {
+            throw std::logic_error("OFFSET parameter must be INT32");
+        }
+    }
+    if (!limit_is_parameter && limit < 0)
+        throw std::logic_error("LIMIT must be non-negative");
+    if (!offset_is_parameter && offset < 0)
+        throw std::logic_error("OFFSET must be non-negative");
+    if (!limit_is_parameter && !offset_is_parameter &&
+        static_cast<long long>(limit) + static_cast<long long>(offset) > std::numeric_limits<int>::max()) {
+        throw std::logic_error("LIMIT plus OFFSET exceeds INT32");
     }
     return std::make_unique<SelectStmt>(std::move(items), x.tabs, std::move(conds), std::move(groups),
                                         std::move(having), std::move(order), x.has_limit, limit, x.has_select_star,
-                                        std::move(joins), false, 0, offset);
+                                        std::move(joins), limit_is_parameter, limit_parameter, offset,
+                                        offset_is_parameter, offset_parameter);
 }
 
 inline std::unique_ptr<TreeNode> clone_bound_tree(const TreeNode& root, const std::vector<std::unique_ptr<Value>>& b) {

@@ -222,16 +222,21 @@ void log_observability_statistics() {
     if (execution_timing_diagnostics::enabled()) {
         for (const auto& stats : execution_timing_diagnostics::snapshots()) {
             LOG_WARN(
-                "obs_exec t_ms=%lld seq=%llu statement_id=%u plan_hash=%llu invocations=%llu failures=%llu "
-                "aborts=%llu errors=%llu total_ns=%llu clone_bind_ns=%llu analyze_ns=%llu plan_ns=%llu "
-                "portal_start_ns=%llu portal_run_ns=%llu",
+                "obs_exec t_ms=%lld seq=%llu statement_id=%u plan_hash=%llu route=%s fallback_reason=%s "
+                "invocations=%llu failures=%llu aborts=%llu errors=%llu total_ns=%llu bind_ns=%llu "
+                "clone_bind_ns=%llu analyze_ns=%llu plan_ns=%llu instantiate_ns=%llu portal_run_ns=%llu "
+                "executor_constructed=%llu executor_reused=%llu",
                 now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned int>(stats.statement_id),
-                static_cast<unsigned long long>(stats.plan_hash), static_cast<unsigned long long>(stats.invocations),
-                static_cast<unsigned long long>(stats.failures), static_cast<unsigned long long>(stats.aborts),
-                static_cast<unsigned long long>(stats.errors), static_cast<unsigned long long>(stats.total_ns),
+                static_cast<unsigned long long>(stats.plan_hash), execution_timing_diagnostics::route_name(stats.route),
+                execution_timing_diagnostics::fallback_reason_name(stats.fallback_reason),
+                static_cast<unsigned long long>(stats.invocations), static_cast<unsigned long long>(stats.failures),
+                static_cast<unsigned long long>(stats.aborts), static_cast<unsigned long long>(stats.errors),
+                static_cast<unsigned long long>(stats.total_ns), static_cast<unsigned long long>(stats.bind_ns),
                 static_cast<unsigned long long>(stats.clone_bind_ns), static_cast<unsigned long long>(stats.analyze_ns),
-                static_cast<unsigned long long>(stats.plan_ns), static_cast<unsigned long long>(stats.portal_start_ns),
-                static_cast<unsigned long long>(stats.portal_run_ns));
+                static_cast<unsigned long long>(stats.plan_ns), static_cast<unsigned long long>(stats.instantiate_ns),
+                static_cast<unsigned long long>(stats.portal_run_ns),
+                static_cast<unsigned long long>(stats.executor_constructed),
+                static_cast<unsigned long long>(stats.executor_reused));
         }
     }
     minilog::Logger::get().flush();
@@ -253,14 +258,24 @@ using wire_protocol::Type;
 using wire_protocol::Value;
 using wire_protocol::Writer;
 
-// Prepared statements are session-owned, but their analyzed metadata depends
-// on the process-wide catalog.  Bump this generation after every catalog
-// mutation so a statement prepared by another connection cannot silently use
-// stale column/index metadata.
-std::atomic<std::uint64_t> catalog_generation{0};
-
 Type protocol_type(ColType type) {
     return type == TYPE_INT ? Type::INT32 : type == TYPE_FLOAT ? Type::FLOAT32 : Type::CHAR;
+}
+
+bool changes_catalog(ast::AstType type) {
+    return type == ast::AstType::CreateTable || type == ast::AstType::DropTable || type == ast::AstType::CreateIndex ||
+           type == ast::AstType::DropIndex || type == ast::AstType::LoadStmt;
+}
+
+bool descriptor_runtime_eligible(const PreparedPlanDescriptor* descriptor) {
+    if (descriptor == nullptr || !descriptor->eligible()) {
+        return false;
+    }
+    if (descriptor->statement_kind() == PreparedStatementKind::Update) {
+        const DMLPlan* dml = descriptor->dml_plan();
+        return dml != nullptr && dml->compiled_point_program_ == nullptr && dml->subplan_ != nullptr;
+    }
+    return true;
 }
 
 std::vector<Value> protocol_row(const std::vector<ColMeta>& columns, const char* data, std::size_t size) {
@@ -400,6 +415,8 @@ struct PreparedStatement {
     std::vector<Type> result_types;
     std::vector<std::string> diagnostic_plans;
     std::uint64_t diagnostic_plan_hash = 0;
+    std::unique_ptr<const PreparedPlanDescriptor> descriptor;
+    std::string database_identity;
     std::uint64_t catalog_generation = 0;
 };
 
@@ -647,7 +664,8 @@ struct ExecutionOutcome {
 
 template <bool TimingEnabled>
 ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                   QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing) {
+                                   QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing,
+                                   bool catalog_guard_held = false) {
     std::vector<char> response(BUFFER_LENGTH, 0);
     int offset = 0;
     Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
@@ -657,6 +675,23 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
     if (parse_tree == nullptr)
         return {};
     const auto parsed_type = parse_tree->type;
+    const bool catalog_change = changes_catalog(parsed_type);
+    if (catalog_change) {
+        Transaction* active = session.running_transaction();
+        if (active != nullptr && active->get_txn_mode() && active->get_state() != TransactionState::COMMITTED &&
+            active->get_state() != TransactionState::ABORTED) {
+            throw RMDBError("structural DDL and LOAD are not allowed inside an explicit transaction");
+        }
+    }
+    std::optional<SmManager::CatalogSharedGuard> catalog_shared_guard;
+    std::optional<SmManager::CatalogExclusiveGuard> catalog_exclusive_guard;
+    if (!catalog_guard_held) {
+        if (catalog_change) {
+            catalog_exclusive_guard.emplace(sm_manager->acquire_catalog_exclusive());
+        } else {
+            catalog_shared_guard.emplace(sm_manager->acquire_catalog_shared());
+        }
+    }
     const bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
     const bool is_load = parsed_type == ast::AstType::LoadStmt;
     if (!is_checkpoint && !is_load) {
@@ -681,8 +716,8 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
                                      plan->tag == T_CreateIndex || plan->tag == T_DropIndex || plan->tag == T_LoadData;
         std::unique_ptr<PortalStmt> statement;
         if constexpr (TimingEnabled) {
-            execution_timing_diagnostics::StageTimer timer(&timing->portal_start_ns);
-            statement = portal->start(std::move(plan), &context);
+            execution_timing_diagnostics::StageTimer timer(&timing->instantiate_ns);
+            statement = portal->start(std::move(plan), &context, &timing->executor_constructed);
         } else {
             statement = portal->start(std::move(plan), &context);
         }
@@ -704,9 +739,6 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
             session.txn_id = INVALID_TXN_ID;
         }
         context.txn_ = nullptr;
-        if (catalog_changed) {
-            catalog_generation.fetch_add(1, std::memory_order_acq_rel);
-        }
         return {is_query, catalog_changed};
     } catch (TransactionAbortException& exception) {
         txn_manager->record_client_abort(exception.GetAbortReason());
@@ -723,9 +755,86 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
     return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr);
 }
 
+ExecutionOutcome execute_tree_under_catalog_guard(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
+                                                  QueryResultSink* result_sink) {
+    return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr, true);
+}
+
 ExecutionOutcome execute_tree_timed(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                    QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing) {
-    return execute_tree_impl<true>(std::move(parse_tree), session, result_sink, timing);
+                                    QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing,
+                                    bool catalog_guard_held = false) {
+    return execute_tree_impl<true>(std::move(parse_tree), session, result_sink, timing, catalog_guard_held);
+}
+
+ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
+    std::vector<::Value> values;
+    values.reserve(wire_values.size());
+    for (const auto& wire_value : wire_values) {
+        ::Value value;
+        value.type =
+            wire_value.type == Type::INT32 ? TYPE_INT : (wire_value.type == Type::FLOAT32 ? TYPE_FLOAT : TYPE_STRING);
+        if (!wire_value.present) {
+            value.set_null();
+            value.type = wire_value.type == Type::INT32 ? TYPE_INT
+                                                        : (wire_value.type == Type::FLOAT32 ? TYPE_FLOAT : TYPE_STRING);
+        } else if (wire_value.type == Type::INT32) {
+            value.set_int(wire_value.int32);
+        } else if (wire_value.type == Type::FLOAT32) {
+            float number;
+            std::memcpy(&number, &wire_value.float_bits, sizeof(number));
+            value.set_float(number);
+        } else {
+            value.set_str(wire_value.text);
+        }
+        values.push_back(std::move(value));
+    }
+    return ParameterFrame(std::move(values));
+}
+
+ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters,
+                                            SessionState& session, QueryResultSink* result_sink,
+                                            execution_timing_diagnostics::Sample* timing = nullptr) {
+    std::vector<char> response(BUFFER_LENGTH, 0);
+    int offset = 0;
+    Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
+    context.isolation_level_ = session.isolation;
+    context.result_sink_ = result_sink;
+    context.output_file_enabled_ = &session.output_file_enabled;
+    SetTransaction(session, &context);
+    try {
+        std::unique_ptr<PortalStmt> statement;
+        if (timing != nullptr) {
+            execution_timing_diagnostics::StageTimer timer(&timing->instantiate_ns);
+            statement = portal->start_prepared(descriptor, parameters, &context, &timing->executor_constructed);
+        } else {
+            statement = portal->start_prepared(descriptor, parameters, &context);
+        }
+        const bool is_query = statement->tag == PORTAL_ONE_SELECT;
+        if (timing != nullptr) {
+            execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
+            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        } else {
+            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        }
+        session.isolation = context.isolation_level_;
+        portal->drop();
+        if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
+            context.txn_->get_state() != TransactionState::COMMITTED &&
+            context.txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager->commit(context.txn_, context.log_mgr_);
+            session.forget_running_transaction();
+            session.txn_id = INVALID_TXN_ID;
+        }
+        context.txn_ = nullptr;
+        return {is_query, false};
+    } catch (TransactionAbortException& exception) {
+        txn_manager->record_client_abort(exception.GetAbortReason());
+        abort_session(session, &context);
+        throw;
+    } catch (...) {
+        abort_session(session, &context);
+        throw;
+    }
 }
 
 ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, QueryResultSink* result_sink) {
@@ -733,29 +842,44 @@ ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, Quer
     return execute_tree(std::move(parse_tree), session, result_sink);
 }
 
+std::vector<std::unique_ptr<ast::Value>> make_typed_parameter_nodes(const std::vector<Type>& parameters) {
+    std::vector<std::unique_ptr<ast::Value>> typed_parameters;
+    typed_parameters.reserve(parameters.size());
+    for (std::size_t i = 0; i < parameters.size(); ++i) {
+        ast::SvType declared_type;
+        switch (parameters[i]) {
+        case Type::INT32:
+            declared_type = ast::SV_TYPE_INT;
+            break;
+        case Type::FLOAT32:
+            declared_type = ast::SV_TYPE_FLOAT;
+            break;
+        case Type::CHAR:
+            declared_type = ast::SV_TYPE_STRING;
+            break;
+        default:
+            throw wire_protocol::ProtocolError("unsupported prepared parameter type");
+        }
+        typed_parameters.push_back(std::make_unique<ast::Parameter>(i + 1, declared_type));
+    }
+    return typed_parameters;
+}
+
 PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Type> parameters,
-                                   std::unique_ptr<ast::TreeNode> template_tree) {
+                                   std::unique_ptr<ast::TreeNode> template_tree, IsolationLevel isolation) {
     std::vector<char> response(BUFFER_LENGTH, 0);
     int offset = 0;
     Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
-    std::vector<std::unique_ptr<ast::Value>> zero_values;
-    for (Type type : parameters) {
-        if (type == Type::INT32)
-            zero_values.push_back(std::make_unique<ast::IntLit>(0));
-        else if (type == Type::FLOAT32)
-            zero_values.push_back(std::make_unique<ast::FloatLit>(0.0f));
-        else
-            zero_values.push_back(std::make_unique<ast::StringLit>(""));
-    }
-    auto bound = ast::clone_bound_tree(*template_tree, zero_values);
+    context.isolation_level_ = isolation;
+    auto typed_parameters = make_typed_parameter_nodes(parameters);
+    auto bound = ast::clone_bound_tree(*template_tree, typed_parameters);
     std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(bound));
     std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query_tree), &context);
     std::vector<std::string> diagnostic_plans;
     if (index_skip_scan_diagnostics::enabled() || execution_timing_diagnostics::enabled()) {
         diagnostic_plans = describe_prepared_plan(id, plan.get());
     }
-    std::unique_ptr<PortalStmt> statement = portal->start(std::move(plan), &context);
-    const bool actual_query = statement->tag == PORTAL_ONE_SELECT;
+    const bool actual_query = plan->tag == T_select;
     if (actual_query != query)
         throw wire_protocol::ProtocolError("prepared result kind does not match SQL");
     PreparedStatement result;
@@ -767,16 +891,46 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     if (!result.diagnostic_plans.empty()) {
         result.diagnostic_plan_hash = hash_prepared_plan(result.diagnostic_plans);
     }
-    result.catalog_generation = catalog_generation.load(std::memory_order_acquire);
+    result.database_identity = sm_manager->get_database_identity_under_catalog_guard();
+    result.catalog_generation = sm_manager->get_catalog_generation();
+    PreparedStatementKind statement_kind = PreparedStatementKind::Unsupported;
+    if (plan->tag == T_select) {
+        statement_kind = PreparedStatementKind::Select;
+    } else if (plan->tag == T_Insert) {
+        statement_kind = PreparedStatementKind::Insert;
+    } else if (plan->tag == T_Update) {
+        statement_kind = PreparedStatementKind::Update;
+    }
     if (actual_query) {
-        result.names = statement->output_names;
-        for (const auto& column : statement->root->cols()) {
+        auto [output_names, result_schema] = portal->inspect_select_plan(plan.get(), &context);
+        result.names = output_names;
+        for (const auto& column : result_schema) {
             result.result_types.push_back(column.type == TYPE_INT     ? Type::INT32
                                           : column.type == TYPE_FLOAT ? Type::FLOAT32
                                                                       : Type::CHAR);
         }
+        result.descriptor = PreparedPlanDescriptor::Build(std::move(plan), statement_kind, std::move(output_names),
+                                                          std::move(result_schema), result.database_identity,
+                                                          result.catalog_generation);
+    } else if (statement_kind != PreparedStatementKind::Unsupported) {
+        result.descriptor = PreparedPlanDescriptor::Build(std::move(plan), statement_kind, {}, {},
+                                                          result.database_identity, result.catalog_generation);
+    } else {
+        (void)portal->start(std::move(plan), &context);
     }
     return result;
+}
+
+void revalidate_prepared(PreparedStatement& statement, IsolationLevel isolation) {
+    auto typed_parameters = make_typed_parameter_nodes(statement.parameters);
+    auto template_tree = ast::clone_bound_tree(*statement.template_tree, typed_parameters);
+    PreparedStatement refreshed =
+        inspect_prepared(statement.id, statement.query, statement.parameters, std::move(template_tree), isolation);
+    if (refreshed.query != statement.query || refreshed.names != statement.names ||
+        refreshed.result_types != statement.result_types) {
+        throw wire_protocol::ProtocolError("prepared result schema changed after catalog update");
+    }
+    statement = std::move(refreshed);
 }
 
 void append_column_definition(Writer& writer, const std::string& name, Type type) {
@@ -895,6 +1049,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         if (count == 0 || count > 256) {
             throw wire_protocol::ProtocolError("invalid prepared statement count");
         }
+        auto catalog_guard = sm_manager->acquire_catalog_shared();
         std::vector<PreparedStatement> pending;
         std::unordered_map<std::uint16_t, bool> ids;
         for (std::uint16_t i = 0; i < count; ++i) {
@@ -929,6 +1084,9 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             auto template_tree = ast::parse_sql(template_sql);
             if (template_tree == nullptr)
                 throw wire_protocol::ProtocolError("empty prepared SQL");
+            if (changes_catalog(template_tree->type)) {
+                throw wire_protocol::ProtocolError("PREPARE_SET does not allow structural DDL or LOAD");
+            }
             std::vector<bool> seen(statement.parameters.size(), false);
             std::function<void(const ast::TreeNode&)> collect = [&](const ast::TreeNode& node) {
                 if (node.type == ast::AstType::Parameter) {
@@ -1011,11 +1169,12 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                 if (!marker_seen)
                     throw wire_protocol::ProtocolError("parameter markers must be dense");
             statement = inspect_prepared(statement.id, statement.query, std::move(statement.parameters),
-                                         std::move(template_tree));
+                                         std::move(template_tree), session.isolation);
             pending.push_back(std::move(statement));
         }
         reader.require_end();
-        if (catalog_generation.load(std::memory_order_acquire) != pending.front().catalog_generation) {
+        if (sm_manager->get_catalog_generation() != pending.front().catalog_generation ||
+            sm_manager->get_database_identity_under_catalog_guard() != pending.front().database_identity) {
             throw wire_protocol::ProtocolError("catalog changed during PREPARE_SET");
         }
         const auto response = prepare_set(pending);
@@ -1055,7 +1214,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         throw wire_protocol::ProtocolError("invalid batch operation count");
     }
     struct Operation {
-        const PreparedStatement* statement;
+        PreparedStatement* statement;
         std::vector<Value> values;
     };
     std::vector<Operation> operations;
@@ -1065,6 +1224,9 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         auto it = prepared.find(id);
         if (it == prepared.end()) {
             throw wire_protocol::ProtocolError("unknown prepared statement id");
+        }
+        if (it->second.template_tree == nullptr || changes_catalog(it->second.template_tree->type)) {
+            throw wire_protocol::ProtocolError("prepared structural DDL or LOAD is not executable");
         }
         Operation operation{&it->second, {}};
         for (Type type : operation.statement->parameters) {
@@ -1086,72 +1248,129 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
     const bool skip_scan_diagnostics_enabled = index_skip_scan_diagnostics::enabled();
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
-            const auto* prepared_statement = operations[i].statement;
-            if (operations[i].statement->catalog_generation != catalog_generation.load(std::memory_order_acquire)) {
-                throw wire_protocol::ProtocolError("prepared statement is invalid after catalog change");
+            auto* prepared_statement = operations[i].statement;
+            std::optional<execution_timing_diagnostics::OperationScope> timing_scope;
+            if (execution_timing_enabled) {
+                timing_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
             }
-            ProtocolCollector result;
-            result.encoded_bytes = &encoded_result_bytes;
-            result.encoded_limit = result_budget;
-            const auto bind_operation = [&]() {
-                std::vector<std::unique_ptr<ast::Value>> values;
-                values.reserve(operations[i].values.size());
-                for (const auto& value : operations[i].values) {
-                    if (value.type != operations[i].statement->parameters[values.size()])
-                        throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
-                    if (!value.present) {
-                        // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
-                        values.push_back(std::make_unique<ast::NullLit>());
-                        continue;
+            bool binding_parameters = false;
+            try {
+                auto catalog_guard = sm_manager->acquire_catalog_shared();
+                if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
+                    prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
+                    revalidate_prepared(*prepared_statement, session.isolation);
+                }
+                ProtocolCollector result;
+                result.encoded_bytes = &encoded_result_bytes;
+                result.encoded_limit = result_budget;
+                const auto make_bindings = [&]() {
+                    std::vector<std::unique_ptr<ast::Value>> values;
+                    values.reserve(operations[i].values.size());
+                    for (const auto& value : operations[i].values) {
+                        if (value.type != prepared_statement->parameters[values.size()])
+                            throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
+                        if (!value.present) {
+                            // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
+                            values.push_back(std::make_unique<ast::NullLit>());
+                            continue;
+                        }
+                        if (value.type == Type::INT32)
+                            values.push_back(std::make_unique<ast::IntLit>(value.int32));
+                        else if (value.type == Type::FLOAT32) {
+                            float number;
+                            std::memcpy(&number, &value.float_bits, sizeof(number));
+                            values.push_back(std::make_unique<ast::FloatLit>(number));
+                        } else
+                            values.push_back(std::make_unique<ast::StringLit>(value.text));
                     }
-                    if (value.type == Type::INT32)
-                        values.push_back(std::make_unique<ast::IntLit>(value.int32));
-                    else if (value.type == Type::FLOAT32) {
-                        float number;
-                        std::memcpy(&number, &value.float_bits, sizeof(number));
-                        values.push_back(std::make_unique<ast::FloatLit>(number));
-                    } else
-                        values.push_back(std::make_unique<ast::StringLit>(value.text));
-                }
-                return ast::clone_bound_tree(*prepared_statement->template_tree, values);
-            };
-            ExecutionOutcome outcome;
-            if (!execution_timing_enabled && !skip_scan_diagnostics_enabled) {
-                outcome = execute_tree(bind_operation(), session, &result);
-            } else {
-                std::optional<execution_timing_diagnostics::OperationScope> timing_scope;
-                std::optional<index_skip_scan_diagnostics::StatementScope> skip_scan_scope;
-                if (execution_timing_enabled) {
-                    timing_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
-                }
-                if (skip_scan_diagnostics_enabled) {
-                    skip_scan_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
-                }
-                std::unique_ptr<ast::TreeNode> bound_tree;
-                if (execution_timing_enabled) {
-                    execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().clone_bind_ns);
-                    bound_tree = bind_operation();
+                    return values;
+                };
+                ExecutionOutcome outcome;
+                if (descriptor_runtime_eligible(prepared_statement->descriptor.get())) {
+                    binding_parameters = true;
+                    std::optional<ParameterFrame> parameter_frame;
+                    if (execution_timing_enabled) {
+                        timing_scope->sample().route = execution_timing_diagnostics::Route::PreparedPlan;
+                        execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().bind_ns);
+                        parameter_frame.emplace(make_parameter_frame(operations[i].values));
+                    } else {
+                        parameter_frame.emplace(make_parameter_frame(operations[i].values));
+                    }
+                    binding_parameters = false;
+                    if (timing_scope.has_value()) {
+                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
+                    }
+                    outcome =
+                        execute_prepared_operation(*prepared_statement->descriptor, *parameter_frame, session, &result,
+                                                   execution_timing_enabled ? &timing_scope->sample() : nullptr);
+                    if (timing_scope.has_value()) {
+                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::None;
+                    }
+                } else if (!execution_timing_enabled && !skip_scan_diagnostics_enabled) {
+                    auto values = make_bindings();
+                    outcome = execute_tree_under_catalog_guard(
+                        ast::clone_bound_tree(*prepared_statement->template_tree, values), session, &result);
                 } else {
-                    bound_tree = bind_operation();
+                    if (timing_scope.has_value()) {
+                        timing_scope->sample().fallback_reason =
+                            prepared_statement->descriptor == nullptr
+                                ? execution_timing_diagnostics::FallbackReason::Null
+                                : execution_timing_diagnostics::FallbackReason::Shape;
+                    }
+                    std::optional<index_skip_scan_diagnostics::StatementScope> skip_scan_scope;
+                    if (skip_scan_diagnostics_enabled) {
+                        skip_scan_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
+                    }
+                    std::vector<std::unique_ptr<ast::Value>> values;
+                    binding_parameters = true;
+                    if (execution_timing_enabled) {
+                        execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().bind_ns);
+                        values = make_bindings();
+                    } else {
+                        values = make_bindings();
+                    }
+                    std::unique_ptr<ast::TreeNode> bound_tree;
+                    if (execution_timing_enabled) {
+                        execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().clone_bind_ns);
+                        bound_tree = ast::clone_bound_tree(*prepared_statement->template_tree, values);
+                    } else {
+                        bound_tree = ast::clone_bound_tree(*prepared_statement->template_tree, values);
+                    }
+                    binding_parameters = false;
+                    if (execution_timing_enabled) {
+                        outcome =
+                            execute_tree_timed(std::move(bound_tree), session, &result, &timing_scope->sample(), true);
+                    } else {
+                        outcome = execute_tree_under_catalog_guard(std::move(bound_tree), session, &result);
+                    }
                 }
-                if (execution_timing_enabled) {
-                    outcome = execute_tree_timed(std::move(bound_tree), session, &result, &timing_scope->sample());
+                if (outcome.query) {
+                    results.emplace_back(i, std::move(result));
+                }
+                ++executed;
+                if (timing_scope.has_value()) {
                     timing_scope->finish();
-                } else {
-                    outcome = execute_tree(std::move(bound_tree), session, &result);
                 }
+            } catch (TransactionAbortException&) {
+                if (timing_scope.has_value()) {
+                    if (binding_parameters) {
+                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
+                    }
+                    timing_scope->finish_abort();
+                }
+                throw;
+            } catch (...) {
+                if (timing_scope.has_value()) {
+                    if (binding_parameters) {
+                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
+                    }
+                    timing_scope->finish_error();
+                }
+                throw;
             }
-            if (outcome.query) {
-                results.emplace_back(i, std::move(result));
-            }
-            ++executed;
         }
     } catch (TransactionAbortException& exception) {
         failed = executed;
-        if (execution_timing_enabled && executed < operations.size()) {
-            execution_timing_diagnostics::observe_abort(operations[executed].statement->id,
-                                                        operations[executed].statement->diagnostic_plan_hash);
-        }
         abort_session(session, nullptr);
         Writer response;
         response.u16(executed);
@@ -1167,10 +1386,6 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         return;
     } catch (const std::exception& exception) {
         failed = executed;
-        if (execution_timing_enabled && executed < operations.size()) {
-            execution_timing_diagnostics::observe_error(operations[executed].statement->id,
-                                                        operations[executed].statement->diagnostic_plan_hash);
-        }
         abort_session(session, nullptr);
         Writer response;
         response.u16(executed);
@@ -1328,11 +1543,15 @@ int main(int argc, char** argv) {
         LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
         if (!sm_manager->is_dir(db_name)) {
             // Database not found, create a new one
+            auto catalog_guard = sm_manager->acquire_catalog_exclusive();
             sm_manager->create_db(db_name);
             LOG_INFO("database created: %s", db_name.c_str());
         }
         // Open database
-        sm_manager->open_db(db_name);
+        {
+            auto catalog_guard = sm_manager->acquire_catalog_exclusive();
+            sm_manager->open_db(db_name);
+        }
         LOG_INFO("database opened: %s", db_name.c_str());
 
         log_manager->initialize_from_existing_log();
@@ -1479,7 +1698,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        sm_manager->close_db();
+        {
+            auto catalog_guard = sm_manager->acquire_catalog_exclusive();
+            sm_manager->close_db();
+        }
         LOG_INFO("database has been closed");
     } catch (RMDBError& e) {
         LOG_ERROR("RMDB error: %s", e.what());

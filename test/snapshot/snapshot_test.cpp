@@ -92,7 +92,11 @@ public:
         if (const char* old_value = std::getenv(name_.c_str()); old_value != nullptr) {
             old_value_ = old_value;
         }
-        setenv(name_.c_str(), value, 1);
+        if (value == nullptr) {
+            unsetenv(name_.c_str());
+        } else {
+            setenv(name_.c_str(), value, 1);
+        }
     }
 
     ~ScopedEnvironmentVariable() {
@@ -107,6 +111,34 @@ private:
     std::string name_;
     std::optional<std::string> old_value_;
 };
+
+TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockConflictDoesNotWaitForOwnerCompletion) {
+    ScopedEnvironmentVariable first_lock_wait("RMDB_SI_FIRST_LOCK_WAIT", nullptr);
+    LockManager lock_manager;
+    Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction victim(1002, IsolationLevel::SNAPSHOT_ISOLATION);
+    Rid rid{31, 0};
+    LockDataId lock_id(42, rid, LockDataType::RECORD);
+
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    auto victim_result =
+        std::async(std::launch::async, [&] { return lock_manager.lock_exclusive_on_record(&victim, rid, 42); });
+    const auto status = victim_result.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(status, std::future_status::ready) << "default SI conflict must return before the lock owner completes";
+
+    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
+    ASSERT_EQ(victim_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    const bool acquired = victim_result.get();
+    EXPECT_FALSE(acquired);
+    if (acquired) {
+        EXPECT_TRUE(lock_manager.unlock(&victim, lock_id));
+    }
+
+    const auto stats = lock_manager.record_lock_observability();
+    EXPECT_EQ(stats.immediate_conflict, 1u);
+    EXPECT_EQ(stats.wait_enqueued, 0u);
+    EXPECT_EQ(stats.completion_waits, 0u);
+}
 
 TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) {
     LockManager lock_manager;

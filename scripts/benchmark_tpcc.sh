@@ -4,14 +4,16 @@
 # Flow: start rmdb -> load + run -> kill -9 -> restart rmdb (wait for WAL
 # recovery) -> run consistency check against the recovered database.
 #
-# The consistency phase reads the pre-workload aggregate snapshot and the ledger
-# of committed transaction effects from the result.json written by the run phase,
-# so it does not depend on any in-memory state across the crash/restart.
+# The consistency phase reads the pre-workload aggregate snapshot, ledger and
+# compact online Payment-chain summary from the hidden validation-state file,
+# so result.json stays performance-only and no in-memory state must survive a
+# crash/restart.
 
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_LOG="$ROOT_DIR/benchmark/tpcc/rmdb-server.log"
+OBSERVABILITY_LOG="$ROOT_DIR/rmdb.log"
 
 BINARY="$ROOT_DIR/build/bin/rmdb"
 DB_DIR="tpcc_benchmark_db"
@@ -29,6 +31,7 @@ RESTART_TIMEOUT=90
 REGENERATE_DATA=0
 THINK_MS=0
 RECONNECT_EACH_TXN=0
+MAX_CONFLICT_RETRIES=1
 ISOLATION="snapshot-isolation"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
 # final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
@@ -55,6 +58,7 @@ Usage: $0 [options]
   --restart-timeout N      seconds to wait for rmdb recovery after restart (default: 90)
   --think-ms N             pause N milliseconds between transactions (default: 0)
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
+  --max-conflict-retries N maximum retries after a conflict; -1 retries until phase end (default: 1)
   --isolation LEVEL        read-committed or snapshot-isolation (default: snapshot-isolation)
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
@@ -81,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         --restart-timeout) RESTART_TIMEOUT="$2"; shift 2 ;;
         --think-ms) THINK_MS="$2"; shift 2 ;;
         --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
+        --max-conflict-retries) MAX_CONFLICT_RETRIES="$2"; shift 2 ;;
         --isolation) ISOLATION="$2"; shift 2 ;;
         --go-binary) GO_BINARY="$2"; shift 2 ;;
         --regenerate-data|--overwrite-data-dir) REGENERATE_DATA=1; shift ;;
@@ -96,6 +101,10 @@ if [[ ! "$THINK_MS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 if [[ "$RECONNECT_EACH_TXN" != "0" && "$RECONNECT_EACH_TXN" != "1" ]]; then
     echo "--reconnect-each-txn must be 0 or 1" >&2
+    exit 2
+fi
+if [[ ! "$MAX_CONFLICT_RETRIES" =~ ^-?[0-9]+$ ]] || (( MAX_CONFLICT_RETRIES < -1 )); then
+    echo "--max-conflict-retries must be -1 or greater" >&2
     exit 2
 fi
 if [[ "$ISOLATION" != "read-committed" && "$ISOLATION" != "snapshot-isolation" ]]; then
@@ -116,7 +125,9 @@ if [[ "$REGENERATE_DATA" -eq 1 ]]; then
 fi
 
 # Never leave a previous result available when preparation or execution fails.
-rm -f "$JSON_OUT"
+JSON_DIR="$(dirname "$JSON_OUT")"
+JSON_BASE="$(basename "$JSON_OUT")"
+rm -f "$JSON_OUT" "$JSON_DIR/.${JSON_BASE}.validation-state.json" "${JSON_OUT}.payment-edges.ndjson"
 
 # Auto-detect whether the CSV test data set is present. Refresh an old manifest
 # before falling back to the expensive CSV generator.
@@ -209,6 +220,24 @@ wait_port() {
     assert_port_owned_by_server "$SERVER_PID"
 }
 
+# SIGUSR1 is handled asynchronously by rmdb. Wait for the server to emit the
+# complete counter set so the two snapshots bound only the workload interval.
+capture_observability() {
+    local label="$1" previous count attempt
+    previous="$(awk '/obs_abort / { count++ } END { print count + 0 }' "$OBSERVABILITY_LOG")"
+    kill -USR1 "$SERVER_PID"
+    for ((attempt = 0; attempt < 50; ++attempt)); do
+        count="$(awk '/obs_abort / { count++ } END { print count + 0 }' "$OBSERVABILITY_LOG")"
+        if (( count > previous )); then
+            echo "[benchmark] captured ${label} server observability snapshot"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "[benchmark] timed out waiting for ${label} server observability snapshot" >&2
+    return 1
+}
+
 GO_RECONNECT_ARGS=()
 if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
     GO_RECONNECT_ARGS=(--reconnect-each-txn)
@@ -246,11 +275,14 @@ if (( load_elapsed > LOAD_SQL_BUDGET_SECONDS )); then
     echo "[benchmark] load stage exceeded the official ${LOAD_SQL_BUDGET_SECONDS}s SQL budget: ${load_elapsed}s" >&2
     exit 1
 fi
+capture_observability "pre-workload"
 "$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
     --think "${THINK_MS}ms" --data-dir "$DATA_DIR" --json-out "$JSON_OUT" \
+    --max-conflict-retries "$MAX_CONFLICT_RETRIES" \
     "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
+capture_observability "post-workload"
 "$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --progress-interval "$PROGRESS_INTERVAL" \

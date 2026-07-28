@@ -17,7 +17,6 @@ import sys
 import tempfile
 import time
 
-
 META = 0x01
 ROW = 0x02
 COMMAND_OK = 0x10
@@ -103,7 +102,10 @@ class WireClient:
         self.sock.settimeout(5)
         handshake = b"RMDB\x00\x03\x00\x00"
         self.sock.sendall(handshake)
-        require(recv_exact(self.sock, len(handshake)) == handshake, "Wire v3 handshake was not echoed")
+        require(
+            recv_exact(self.sock, len(handshake)) == handshake,
+            "Wire v3 handshake was not echoed",
+        )
 
     def close(self):
         self.sock.close()
@@ -113,7 +115,10 @@ class WireClient:
 
     def read_frame(self):
         size, tag, flags, reserved = struct.unpack("!IBBH", recv_exact(self.sock, 8))
-        require(flags == 0 and reserved == 0, "server returned nonzero frame flags or reserved bits")
+        require(
+            flags == 0 and reserved == 0,
+            "server returned nonzero frame flags or reserved bits",
+        )
         require(size <= 1 << 20, "server exceeded frame payload limit")
         return tag, recv_exact(self.sock, size)
 
@@ -158,8 +163,14 @@ class WireClient:
                 require(offset == len(payload), "ROW has trailing bytes")
                 rows.append(row)
                 continue
-            require(tag == RESULT_END and len(payload) == 8, "query must end with RESULT_END")
-            require(struct.unpack("!Q", payload)[0] == len(rows), "RESULT_END row count is incorrect")
+            require(
+                tag == RESULT_END and len(payload) == 8,
+                "query must end with RESULT_END",
+            )
+            require(
+                struct.unpack("!Q", payload)[0] == len(rows),
+                "RESULT_END row count is incorrect",
+            )
             return schema, rows
 
     def readiness_probe(self):
@@ -172,14 +183,19 @@ class WireClient:
             tag, payload = self.read_frame()
             if tag == ROW:
                 continue
-            require(tag == RESULT_END and len(payload) == 8, "show tables query has no RESULT_END")
+            require(
+                tag == RESULT_END and len(payload) == 8,
+                "show tables query has no RESULT_END",
+            )
             return
 
     def prepare(self, statements):
         payload = bytearray(struct.pack("!H", len(statements)))
         for statement_id, query, parameter_types, sql in statements:
             encoded_sql = sql.encode("utf-8")
-            payload += struct.pack("!H B H", statement_id, int(query), len(parameter_types))
+            payload += struct.pack(
+                "!H B H", statement_id, int(query), len(parameter_types)
+            )
             payload += bytes(parameter_types)
             payload += struct.pack("!I", len(encoded_sql)) + encoded_sql
         self.write_frame(PREPARE_SET, bytes(payload))
@@ -195,18 +211,24 @@ class WireClient:
             require(offset + 4 <= len(payload), "truncated PREPARE_OK entry")
             returned_id, column_count = struct.unpack_from("!HH", payload, offset)
             offset += 4
-            require(returned_id == statement_id, "PREPARE_OK changed statement order or id")
+            require(
+                returned_id == statement_id, "PREPARE_OK changed statement order or id"
+            )
             columns = []
             for _ in range(column_count):
                 require(offset + 2 <= len(payload), "truncated prepared column name")
                 name_size = struct.unpack_from("!H", payload, offset)[0]
                 offset += 2
-                require(offset + name_size + 1 <= len(payload), "truncated prepared column")
+                require(
+                    offset + name_size + 1 <= len(payload), "truncated prepared column"
+                )
                 name = payload[offset : offset + name_size].decode("utf-8")
                 offset += name_size
                 columns.append((name, payload[offset]))
                 offset += 1
-            require(bool(columns) == bool(query), "prepared command/query schema mismatch")
+            require(
+                bool(columns) == bool(query), "prepared command/query schema mismatch"
+            )
             schemas[statement_id] = columns
         require(offset == len(payload), "PREPARE_OK has trailing bytes")
         return schemas
@@ -225,8 +247,13 @@ class WireClient:
         require(len(payload) >= 11, "truncated BATCH_RESULT")
         executed, status, failed, diagnostic_size = struct.unpack_from("!HBHI", payload)
         offset = 9
-        require(offset + diagnostic_size + 2 <= len(payload), "truncated BATCH_RESULT diagnostic")
-        diagnostic = payload[offset : offset + diagnostic_size].decode("utf-8", "replace")
+        require(
+            offset + diagnostic_size + 2 <= len(payload),
+            "truncated BATCH_RESULT diagnostic",
+        )
+        diagnostic = payload[offset : offset + diagnostic_size].decode(
+            "utf-8", "replace"
+        )
         offset += diagnostic_size
         result_count = struct.unpack_from("!H", payload, offset)[0]
         offset += 2
@@ -266,8 +293,17 @@ class Server:
         env.pop("RMDB_AUTO_CHECKPOINT_BYTES", None)
         env.pop("RMDB_CHECKPOINT_PREFLUSH_BYTES", None)
         env.pop("RMDB_CHECKPOINT_PREFLUSH_PAGES", None)
-        self.process = subprocess.Popen([self.binary, "db"], cwd=self.root, env=env, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL, start_new_session=True)
+        env.pop("RMDB_SI_FIRST_LOCK_WAIT", None)
+        env["RMDB_EXECUTION_TIMING_DIAGNOSTICS"] = "1"
+        env["ENABLE_COMPILED_POINT_PROGRAM"] = "1"
+        self.process = subprocess.Popen(
+            [self.binary, "db"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         deadline = time.monotonic() + 20
         last_error = None
         while time.monotonic() < deadline:
@@ -281,7 +317,9 @@ class Server:
             except (OSError, EOFError, ProtocolFailure) as error:
                 last_error = error
                 time.sleep(0.1)
-        raise ProtocolFailure("rmdb never passed Wire SQL readiness: " + str(last_error))
+        raise ProtocolFailure(
+            "rmdb never passed Wire SQL readiness: " + str(last_error)
+        )
 
     def stop(self, crash=False):
         if self.process is None or self.process.poll() is not None:
@@ -306,42 +344,320 @@ def test_stream_prepare_float_and_auto_abort(port):
 
     client.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
     statements = [
-        (1, False, [INT32, INT32], "UPDATE stock SET s_ytd = s_ytd WHERE s_w_id = $1 AND s_i_id = $2;"),
-        (2, False, [FLOAT32, INT32, INT32],
-         "UPDATE stock SET s_ytd = s_ytd + $1 WHERE s_w_id = $2 AND s_i_id = $3;"),
-        (3, False, [FLOAT32, INT32, INT32],
-         "UPDATE stock SET s_ytd = s_ytd - $1 WHERE s_w_id = $2 AND s_i_id = $3;"),
-        (4, True, [INT32, INT32], "SELECT s_ytd FROM stock WHERE s_w_id = $1 AND s_i_id = $2;"),
-        (5, False, [INT32, FLOAT32, CHAR], "INSERT INTO wire_values VALUES ($1, $2, $3);"),
+        (
+            1,
+            False,
+            [INT32, INT32],
+            "UPDATE stock SET s_ytd = s_ytd WHERE s_w_id = $1 AND s_i_id = $2;",
+        ),
+        (
+            2,
+            False,
+            [FLOAT32, INT32, INT32],
+            "UPDATE stock SET s_ytd = s_ytd + $1 WHERE s_w_id = $2 AND s_i_id = $3;",
+        ),
+        (
+            3,
+            False,
+            [FLOAT32, INT32, INT32],
+            "UPDATE stock SET s_ytd = s_ytd - $1 WHERE s_w_id = $2 AND s_i_id = $3;",
+        ),
+        (
+            4,
+            True,
+            [INT32, INT32],
+            "SELECT s_ytd FROM stock WHERE s_w_id = $1 AND s_i_id = $2;",
+        ),
+        (
+            5,
+            False,
+            [INT32, FLOAT32, CHAR],
+            "INSERT INTO wire_values VALUES ($1, $2, $3);",
+        ),
         (6, True, [INT32], "SELECT amount, note FROM wire_values WHERE id = $1;"),
         (7, False, [], "BEGIN;"),
-        (8, False, [FLOAT32, INT32, INT32],
-         "UPDATE stock SET s_ytd = s_ytd + $1 WHERE s_w_id = $2 AND s_i_id = $3;"),
-        (9, False, [FLOAT32, INT32, INT32],
-         "UPDATE stock SET s_ytd = s_ytd / $1 WHERE s_w_id = $2 AND s_i_id = $3;"),
+        (
+            8,
+            False,
+            [FLOAT32, INT32, INT32],
+            "UPDATE stock SET s_ytd = s_ytd + $1 WHERE s_w_id = $2 AND s_i_id = $3;",
+        ),
+        (
+            9,
+            False,
+            [FLOAT32, INT32, INT32],
+            "UPDATE stock SET s_ytd = s_ytd / $1 WHERE s_w_id = $2 AND s_i_id = $3;",
+        ),
     ]
     schemas = client.prepare(statements)
-    parameter_types = {statement_id: parameter_types for statement_id, _, parameter_types, _ in statements}
+    parameter_types = {
+        statement_id: parameter_types
+        for statement_id, _, parameter_types, _ in statements
+    }
 
     executed, status, failed, diagnostic, results = client.batch(
-        [(1, [1, 2]), (2, [0x3E800000, 1, 2]), (3, [0x3F000000, 1, 2]), (4, [1, 2])], parameter_types, schemas)
-    require((executed, status, failed, diagnostic) == (4, 0, 0xFFFF, ""), "prepared UPDATE batch failed")
-    require(results == [(3, [[0x3FA00000]])], "prepared FLOAT result did not preserve raw bits")
+        [(1, [1, 2]), (2, [0x3E800000, 1, 2]), (3, [0x3F000000, 1, 2]), (4, [1, 2])],
+        parameter_types,
+        schemas,
+    )
+    require(
+        (executed, status, failed, diagnostic) == (4, 0, 0xFFFF, ""),
+        "prepared UPDATE batch failed",
+    )
+    require(
+        results == [(3, [[0x3FA00000]])],
+        "prepared FLOAT result did not preserve raw bits",
+    )
 
     sentinel = 0x40490FDB
-    executed, status, failed, diagnostic, results = client.batch([(5, [7, sentinel, "wire-v3"]), (6, [7])],
-                                                                   parameter_types, schemas)
-    require((executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""), "typed parameter batch failed")
-    require(results == [(1, [[sentinel, "wire-v3"]])], "typed FLOAT/CHAR batch result mismatch")
+    second_float = 0xBF000000
+    executed, status, failed, diagnostic, results = client.batch(
+        [(5, [7, sentinel, "wire-v3"]), (6, [7])], parameter_types, schemas
+    )
+    require(
+        (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
+        "typed parameter batch failed",
+    )
+    require(
+        results == [(1, [[sentinel, "wire-v3"]])],
+        "typed FLOAT/CHAR batch result mismatch",
+    )
 
     executed, status, failed, diagnostic, results = client.batch(
-        [(7, []), (8, [0x3F800000, 1, 2]), (9, [0, 1, 2])], parameter_types, schemas)
-    require(executed == 2 and status == 2 and failed == 2 and results == [],
-            "AUTO_ABORT must return an error batch with no partial query results")
+        [(5, [8, second_float, "second"]), (6, [7]), (6, [8])], parameter_types, schemas
+    )
+    require(
+        (executed, status, failed, diagnostic) == (3, 0, 0xFFFF, ""),
+        "consecutive prepared INSERT batch failed",
+    )
+    require(
+        results == [(1, [[sentinel, "wire-v3"]]), (2, [[second_float, "second"]])],
+        "prepared INSERT reused stale CHAR/FLOAT parameters",
+    )
+
+    executed, status, failed, diagnostic, results = client.batch(
+        [(7, []), (8, [0x3F800000, 1, 2]), (9, [0, 1, 2])], parameter_types, schemas
+    )
+    require(
+        executed == 2 and status == 2 and failed == 2 and results == [],
+        "AUTO_ABORT must return an error batch with no partial query results",
+    )
     require(diagnostic, "AUTO_ABORT error must include a diagnostic")
     _, rows = client.query("SELECT s_ytd FROM stock WHERE s_w_id = 1 AND s_i_id = 2;")
-    require(rows == [[0x3FA00000]], "AUTO_ABORT did not roll back the preceding prepared update")
+    require(
+        rows == [[0x3FA00000]],
+        "AUTO_ABORT did not roll back the preceding prepared update",
+    )
     client.close()
+
+
+def test_prepared_select_fast_route(server):
+    client = WireClient(server.port)
+    try:
+        client.command("CREATE TABLE prepared_route (id INT, note CHAR(16));")
+        client.command("INSERT INTO prepared_route VALUES (1, 'one');")
+        client.command("INSERT INTO prepared_route VALUES (2, 'two');")
+        client.command("INSERT INTO prepared_route VALUES (3, 'three');")
+        statements = [
+            (
+                200,
+                True,
+                [INT32, INT32, INT32],
+                "SELECT id, note FROM prepared_route "
+                "WHERE id >= $1 AND id <= $1 LIMIT $2 OFFSET $3;",
+            ),
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {200: [INT32, INT32, INT32]}
+        executed, status, failed, diagnostic, results = client.batch(
+            [(200, [2, 1, 0]), (200, [3, 1, 0])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
+            "prepared SELECT fast-route batch failed",
+        )
+        require(
+            results == [(0, [[2, "two"]]), (1, [[3, "three"]])],
+            "prepared SELECT reused stale repeated parameters",
+        )
+
+        os.kill(server.process.pid, signal.SIGUSR1)
+        log_path = os.path.join(server.root, "rmdb.log")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                lines = open(log_path, "r", encoding="utf-8").read().splitlines()
+            except FileNotFoundError:
+                lines = []
+            matching = [
+                line
+                for line in lines
+                if "obs_exec " in line and "statement_id=200 " in line
+            ]
+            if matching:
+                fields = dict(
+                    token.split("=", 1)
+                    for token in matching[-1].split()
+                    if "=" in token
+                )
+                require(
+                    fields.get("route") == "prepared-plan",
+                    "prepared SELECT did not hit fast route",
+                )
+                require(
+                    fields.get("invocations") == "2",
+                    "prepared SELECT route count mismatch",
+                )
+                require(
+                    fields.get("clone_bind_ns") == "0",
+                    "prepared SELECT still cloned AST",
+                )
+                require(
+                    fields.get("analyze_ns") == "0", "prepared SELECT still ran Analyze"
+                )
+                require(
+                    fields.get("plan_ns") == "0", "prepared SELECT still ran Planner"
+                )
+                for statement_id, kind in ((2, "UPDATE"), (5, "INSERT")):
+                    dml_lines = [
+                        line
+                        for line in lines
+                        if "obs_exec " in line
+                        and "statement_id=" + str(statement_id) + " " in line
+                    ]
+                    require(
+                        dml_lines, "prepared " + kind + " route diagnostics are missing"
+                    )
+                    dml_fields = dict(
+                        token.split("=", 1)
+                        for token in dml_lines[-1].split()
+                        if "=" in token
+                    )
+                    require(
+                        dml_fields.get("route") == "prepared-plan",
+                        "prepared " + kind + " did not hit fast route",
+                    )
+                    require(
+                        dml_fields.get("clone_bind_ns") == "0",
+                        "prepared " + kind + " still cloned AST",
+                    )
+                    require(
+                        dml_fields.get("analyze_ns") == "0",
+                        "prepared " + kind + " still ran Analyze",
+                    )
+                    require(
+                        dml_fields.get("plan_ns") == "0",
+                        "prepared " + kind + " still ran Planner",
+                    )
+                return
+            time.sleep(0.05)
+        raise ProtocolFailure("prepared SELECT route diagnostics were not published")
+    finally:
+        client.close()
+
+
+def test_prepared_and_explicit_transaction_ddl_rejection(port):
+    client = WireClient(port)
+    try:
+        client.command("CREATE TABLE ddl_guard_probe (id INT);")
+        statements = [
+            (210, True, [INT32], "SELECT id FROM ddl_guard_probe WHERE id = $1;")
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {210: [INT32]}
+
+        sql = b"CREATE TABLE forbidden_prepared_ddl (id INT);"
+        payload = struct.pack("!H H B H I", 1, 211, 0, 0, len(sql)) + sql
+        client.write_frame(PREPARE_SET, payload)
+        tag, diagnostic = client.read_frame()
+        require(tag == ERROR and diagnostic, "PREPARE_SET must reject structural DDL")
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [(210, [1])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results)
+            == (1, 0, 0xFFFF, "", [(0, [])]),
+            "failed PREPARE_SET replaced the prior dictionary",
+        )
+
+        client.command("BEGIN;")
+        tag, diagnostic = client.stream_raw(
+            "CREATE TABLE forbidden_transaction_ddl (id INT);"
+        )
+        require(
+            tag == ERROR and diagnostic,
+            "explicit transaction structural DDL must return ERROR",
+        )
+        client.command("INSERT INTO ddl_guard_probe VALUES (7);")
+        client.command("COMMIT;")
+        _, rows = client.query("SELECT id FROM ddl_guard_probe WHERE id = 7;")
+        require(
+            rows == [[7]], "DDL rejection aborted or corrupted the explicit transaction"
+        )
+    finally:
+        client.close()
+
+
+def test_compiled_update_descriptor_falls_back_safely(server):
+    client = WireClient(server.port)
+    try:
+        client.command("CREATE TABLE compiled_fallback_probe (id INT, value INT);")
+        client.command("CREATE INDEX compiled_fallback_probe(id);")
+        client.command("INSERT INTO compiled_fallback_probe VALUES (1, 10);")
+        statements = [
+            (
+                220,
+                False,
+                [INT32, INT32],
+                "UPDATE compiled_fallback_probe SET value = value + $1 WHERE id = $2;",
+            ),
+        ]
+        parameter_types = {220: [INT32, INT32]}
+        client.prepare(statements)  # cache miss retains the ordinary scan
+        schemas = client.prepare(
+            statements
+        )  # cache hit produces the compiled point shape
+        executed, status, failed, diagnostic, results = client.batch(
+            [(220, [5, 1])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", []),
+            "compiled UPDATE descriptor fallback failed",
+        )
+        _, rows = client.query(
+            "SELECT value FROM compiled_fallback_probe WHERE id = 1;"
+        )
+        require(rows == [[15]], "compiled UPDATE descriptor fallback changed semantics")
+
+        os.kill(server.process.pid, signal.SIGUSR1)
+        deadline = time.monotonic() + 3
+        log_path = os.path.join(server.root, "rmdb.log")
+        while time.monotonic() < deadline:
+            try:
+                lines = open(log_path, "r", encoding="utf-8").read().splitlines()
+            except FileNotFoundError:
+                lines = []
+            matching = [
+                line
+                for line in lines
+                if "obs_exec " in line and "statement_id=220 " in line
+            ]
+            if matching:
+                fields = dict(
+                    token.split("=", 1)
+                    for token in matching[-1].split()
+                    if "=" in token
+                )
+                require(
+                    fields.get("route") == "fallback",
+                    "compiled UPDATE unexpectedly used prepared runtime",
+                )
+                return
+            time.sleep(0.05)
+        raise ProtocolFailure("compiled UPDATE fallback diagnostics were not published")
+    finally:
+        client.close()
 
 
 def test_snapshot_write_conflict(port):
@@ -359,11 +675,111 @@ def test_snapshot_write_conflict(port):
         victim.command("BEGIN;")
         winner.command("UPDATE si_probe SET value = value + 1 WHERE id = 1;")
         winner.command("COMMIT;")
-        tag, diagnostic = victim.stream_raw("UPDATE si_probe SET value = value + 1 WHERE id = 1;")
-        require(tag == TRANSACTION_ABORT, "stale SNAPSHOT ISOLATION writer must abort at UPDATE")
+        tag, diagnostic = victim.stream_raw(
+            "UPDATE si_probe SET value = value + 1 WHERE id = 1;"
+        )
+        require(
+            tag == TRANSACTION_ABORT,
+            "stale SNAPSHOT ISOLATION writer must abort at UPDATE",
+        )
         require(diagnostic, "SI transaction abort must include a diagnostic")
         _, rows = winner.query("SELECT value FROM si_probe WHERE id = 1;")
         require(rows == [[11]], "SI conflict victim changed the committed value")
+    finally:
+        winner.close()
+        victim.close()
+
+
+def test_active_snapshot_delete_conflict_aborts_immediately(port):
+    setup = WireClient(port)
+    setup.command("CREATE TABLE active_si_delete (id INT, value INT);")
+    setup.command("CREATE INDEX active_si_delete(id);")
+    setup.command("INSERT INTO active_si_delete VALUES (1, 10);")
+    setup.command("INSERT INTO active_si_delete VALUES (2, 20);")
+    setup.close()
+
+    winner = WireClient(port)
+    victim = WireClient(port)
+    verifier = WireClient(port)
+    try:
+        winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        winner.command("BEGIN;")
+        victim.command("BEGIN;")
+        winner.command("DELETE FROM active_si_delete WHERE id = 1;")
+
+        victim.sock.settimeout(1)
+        tag, _ = victim.stream_raw("DELETE FROM active_si_delete WHERE id = 1;")
+        victim.sock.settimeout(5)
+        require(
+            tag == TRANSACTION_ABORT,
+            "active SNAPSHOT ISOLATION DELETE conflict must abort before owner completion",
+        )
+
+        victim.command("BEGIN;")
+        _, rows = victim.query("SELECT value FROM active_si_delete WHERE id = 2;")
+        require(rows == [[20]], "DELETE conflict did not fully end the victim transaction")
+        victim.command("COMMIT;")
+
+        winner.command("COMMIT;")
+        _, rows = verifier.query("SELECT id, value FROM active_si_delete;")
+        require(
+            rows == [[2, 20]],
+            "active SI DELETE conflict did not preserve exactly the winner's delete",
+        )
+    finally:
+        winner.close()
+        victim.close()
+        verifier.close()
+
+
+def test_prepared_snapshot_write_conflict(port):
+    setup = WireClient(port)
+    setup.command("CREATE TABLE prepared_si_probe (id INT, value INT);")
+    setup.command("INSERT INTO prepared_si_probe VALUES (1, 10);")
+    setup.close()
+
+    winner = WireClient(port)
+    victim = WireClient(port)
+    try:
+        statements = [
+            (
+                230,
+                False,
+                [INT32, INT32],
+                "UPDATE prepared_si_probe SET value = value + $1 WHERE id = $2;",
+            ),
+        ]
+        parameter_types = {230: [INT32, INT32]}
+        winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        winner_schemas = winner.prepare(statements)
+        victim_schemas = victim.prepare(statements)
+        winner.command("BEGIN;")
+        victim.command("BEGIN;")
+
+        executed, status, failed, diagnostic, results = winner.batch(
+            [(230, [1, 1])], parameter_types, winner_schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", []),
+            "winner prepared SI UPDATE failed",
+        )
+        winner.command("COMMIT;")
+
+        executed, status, failed, diagnostic, results = victim.batch(
+            [(230, [1, 1])], parameter_types, victim_schemas
+        )
+        require(
+            executed == 0
+            and status == 1
+            and failed == 0
+            and diagnostic
+            and results == [],
+            "stale prepared SI UPDATE did not abort and roll back immediately",
+        )
+        _, rows = winner.query("SELECT value FROM prepared_si_probe WHERE id = 1;")
+        require(rows == [[11]], "stale prepared SI UPDATE changed the committed value")
     finally:
         winner.close()
         victim.close()
@@ -393,7 +809,10 @@ def test_stream_result_sink_ssi(port):
 
         reader.command("UPDATE ssi_probe SET value = value + 1 WHERE id = 1;")
         tag, diagnostic = writer.stream_raw("INSERT INTO ssi_probe VALUES (999, 999);")
-        require(tag == TRANSACTION_ABORT, "SSI writer victim must abort at the conflict statement")
+        require(
+            tag == TRANSACTION_ABORT,
+            "SSI writer victim must abort at the conflict statement",
+        )
         require(diagnostic, "SSI transaction abort must include a diagnostic")
 
         _, rows = reader.query("SELECT value FROM ssi_probe WHERE id = 999;")
@@ -414,15 +833,23 @@ def test_empty_integer_aggregates_use_typed_zero(port):
             "SELECT SUM(value) AS total, MIN(value) AS lowest, MAX(value) AS highest "
             "FROM aggregate_empty_probe WHERE id = 999;"
         )
-        require(schema == [("total", INT32), ("lowest", INT32), ("highest", INT32)],
-                "empty integer aggregates must retain INT32 schema")
-        require(rows == [[0, 0, 0]], "empty integer aggregates must use the evaluator's typed-zero convention")
+        require(
+            schema == [("total", INT32), ("lowest", INT32), ("highest", INT32)],
+            "empty integer aggregates must retain INT32 schema",
+        )
+        require(
+            rows == [[0, 0, 0]],
+            "empty integer aggregates must use the evaluator's typed-zero convention",
+        )
 
         _, rows = client.query(
             "SELECT SUM(value) AS total, MIN(value) AS lowest, MAX(value) AS highest "
             "FROM aggregate_empty_probe WHERE id = 1;"
         )
-        require(rows == [[None, None, None]], "nonempty all-NULL aggregate input must remain NULL")
+        require(
+            rows == [[None, None, None]],
+            "nonempty all-NULL aggregate input must remain NULL",
+        )
     finally:
         client.close()
 
@@ -435,7 +862,9 @@ def test_direct_column_update(port):
             "id INT, i_src INT, i_dst INT, f_src FLOAT, f_dst FLOAT, "
             "c_src CHAR(8), c_dst CHAR(8), n_src INT, n_dst INT);"
         )
-        client.command("INSERT INTO wire_copy VALUES (2, 7, 3, 1.5, 9.5, 'source', 'dest', NULL, 8);")
+        client.command(
+            "INSERT INTO wire_copy VALUES (2, 7, 3, 1.5, 9.5, 'source', 'dest', NULL, 8);"
+        )
         client.command(
             "UPDATE wire_copy SET "
             "i_src = i_dst, i_dst = i_src, f_dst = f_src, c_dst = c_src, n_dst = n_src "
@@ -446,7 +875,8 @@ def test_direct_column_update(port):
             "SELECT i_src, i_dst, f_dst, c_dst, n_dst FROM wire_copy WHERE id = 2;"
         )
         require(
-            schema == [
+            schema
+            == [
                 ("i_src", INT32),
                 ("i_dst", INT32),
                 ("f_dst", FLOAT32),
@@ -460,9 +890,13 @@ def test_direct_column_update(port):
             "direct column UPDATE did not copy old-row INT/FLOAT/CHAR/NULL values",
         )
 
-        tag, diagnostic = client.stream_raw("UPDATE wire_copy SET i_dst = c_src WHERE id = 2;")
+        tag, diagnostic = client.stream_raw(
+            "UPDATE wire_copy SET i_dst = c_src WHERE id = 2;"
+        )
         require(tag == ERROR, "incompatible direct column UPDATE must return ERROR")
-        require(diagnostic, "incompatible direct column UPDATE must include a diagnostic")
+        require(
+            diagnostic, "incompatible direct column UPDATE must include a diagnostic"
+        )
     finally:
         client.close()
 
@@ -470,18 +904,27 @@ def test_direct_column_update(port):
 def test_chained_update(port):
     client = WireClient(port)
     try:
-        client.command("CREATE TABLE wire_chain (id INT, a INT, b INT, c INT, d INT, f FLOAT, n INT);")
-        client.command("INSERT INTO wire_chain VALUES (2, 10, 20, 30, 40, 16777216.0, NULL);")
+        client.command(
+            "CREATE TABLE wire_chain (id INT, a INT, b INT, c INT, d INT, f FLOAT, n INT);"
+        )
+        client.command(
+            "INSERT INTO wire_chain VALUES (2, 10, 20, 30, 40, 16777216.0, NULL);"
+        )
         client.command(
             "UPDATE wire_chain SET "
             "a = a - 1 + 91, b = b + 3, c = c + 4, d = d + 5 "
             "WHERE id = (1 + 1);"
         )
-        client.command("UPDATE wire_chain SET f = f + 1 - 1, n = n - 1 + 91 WHERE id = 2;")
+        client.command(
+            "UPDATE wire_chain SET f = f + 1 - 1, n = n - 1 + 91 WHERE id = 2;"
+        )
 
-        schema, rows = client.query("SELECT a, b, c, d, f, n FROM wire_chain WHERE id = 2;")
+        schema, rows = client.query(
+            "SELECT a, b, c, d, f, n FROM wire_chain WHERE id = 2;"
+        )
         require(
-            schema == [
+            schema
+            == [
                 ("a", INT32),
                 ("b", INT32),
                 ("c", INT32),
@@ -497,11 +940,18 @@ def test_chained_update(port):
         )
 
         statements = [
-            (100, False, [INT32, INT32], "UPDATE wire_chain SET a = a - $1 + $2 WHERE id = 2;"),
+            (
+                100,
+                False,
+                [INT32, INT32],
+                "UPDATE wire_chain SET a = a - $1 + $2 WHERE id = 2;",
+            ),
             (101, True, [INT32], "SELECT a FROM wire_chain WHERE id = $1;"),
         ]
         schemas = client.prepare(statements)
-        parameter_types = {statement_id: types for statement_id, _, types, _ in statements}
+        parameter_types = {
+            statement_id: types for statement_id, _, types, _ in statements
+        }
         executed, status, failed, diagnostic, results = client.batch(
             [(100, [10, 5]), (101, [2])], parameter_types, schemas
         )
@@ -509,7 +959,10 @@ def test_chained_update(port):
             (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
             "prepared chained UPDATE batch failed",
         )
-        require(results == [(1, [[95]])], "prepared chained UPDATE produced a misordered first result")
+        require(
+            results == [(1, [[95]])],
+            "prepared chained UPDATE produced a misordered first result",
+        )
 
         executed, status, failed, diagnostic, results = client.batch(
             [(100, [3, 20]), (101, [2])], parameter_types, schemas
@@ -518,23 +971,43 @@ def test_chained_update(port):
             (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
             "repeated prepared chained UPDATE batch failed",
         )
-        require(results == [(1, [[112]])], "prepared chained UPDATE reused stale scalar terms")
+        require(
+            results == [(1, [[112]])],
+            "prepared chained UPDATE reused stale scalar terms",
+        )
 
-        tag, diagnostic = client.stream_raw("UPDATE wire_chain SET a = b + 1 + 2 WHERE id = 2;")
-        require(tag == ERROR and diagnostic, "cross-column chained UPDATE must return diagnostic ERROR")
-        tag, diagnostic = client.stream_raw("UPDATE wire_chain SET a = a + 1 + 'bad' WHERE id = 2;")
-        require(tag == ERROR and diagnostic, "incompatible chained UPDATE term must return diagnostic ERROR")
+        tag, diagnostic = client.stream_raw(
+            "UPDATE wire_chain SET a = b + 1 + 2 WHERE id = 2;"
+        )
+        require(
+            tag == ERROR and diagnostic,
+            "cross-column chained UPDATE must return diagnostic ERROR",
+        )
+        tag, diagnostic = client.stream_raw(
+            "UPDATE wire_chain SET a = a + 1 + 'bad' WHERE id = 2;"
+        )
+        require(
+            tag == ERROR and diagnostic,
+            "incompatible chained UPDATE term must return diagnostic ERROR",
+        )
 
-        client.command("CREATE TABLE wire_chain_atomic (id INT, a INT, source INT, b INT);")
+        client.command(
+            "CREATE TABLE wire_chain_atomic (id INT, a INT, source INT, b INT);"
+        )
         client.command("CREATE INDEX wire_chain_atomic(a);")
         client.command("INSERT INTO wire_chain_atomic VALUES (1, 1, 5, 10);")
         client.command("INSERT INTO wire_chain_atomic VALUES (2, 2, 5, 20);")
         tag, diagnostic = client.stream_raw(
             "UPDATE wire_chain_atomic SET a = source, b = b + 1 + 1 WHERE id >= 1;"
         )
-        require(tag == ERROR and diagnostic, "indexed chained UPDATE collision must return diagnostic ERROR")
+        require(
+            tag == ERROR and diagnostic,
+            "indexed chained UPDATE collision must return diagnostic ERROR",
+        )
         _, rows = client.query("SELECT a, b FROM wire_chain_atomic WHERE id = 1;")
-        require(rows == [[1, 10]], "failed chained UPDATE did not roll back its earlier row")
+        require(
+            rows == [[1, 10]], "failed chained UPDATE did not roll back its earlier row"
+        )
         _, rows = client.query("SELECT a, b FROM wire_chain_atomic WHERE id = 2;")
         require(rows == [[2, 20]], "failed chained UPDATE changed the conflicting row")
     finally:
@@ -557,7 +1030,9 @@ def test_crash_recovery_smoke(server):
 def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
     client = WireClient(server.port)
     try:
-        client.command("CREATE TABLE abort_crash_wire (id INT, key_col INT, value INT);")
+        client.command(
+            "CREATE TABLE abort_crash_wire (id INT, key_col INT, value INT);"
+        )
         client.command("CREATE INDEX abort_crash_wire(key_col);")
         client.command("INSERT INTO abort_crash_wire VALUES (1, 10, 100);")
         client.command("INSERT INTO abort_crash_wire VALUES (2, 20, 200);")
@@ -593,17 +1068,28 @@ def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
         # The complete table result proves the heap is back at its pre-ABORT
         # state; the equality predicates exercise the secondary index's old
         # and new keys after recovery.
-        _, rows = verifier.query("SELECT id, key_col, value FROM abort_crash_wire ORDER BY id;")
-        require(rows == [[1, 10, 100], [2, 20, 200], [4, 40, 400]],
-                "SIGKILL after ABORT acknowledgement left heap rows behind or changed")
+        _, rows = verifier.query(
+            "SELECT id, key_col, value FROM abort_crash_wire ORDER BY id;"
+        )
+        require(
+            rows == [[1, 10, 100], [2, 20, 200], [4, 40, 400]],
+            "SIGKILL after ABORT acknowledgement left heap rows behind or changed",
+        )
         _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 10;")
         require(rows == [[1]], "recovery lost the pre-ABORT secondary-index entry")
         _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 20;")
-        require(rows == [[2]], "recovery did not restore the deleted row's secondary-index entry")
+        require(
+            rows == [[2]],
+            "recovery did not restore the deleted row's secondary-index entry",
+        )
         _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 11;")
-        require(rows == [], "recovery retained the aborted UPDATE secondary-index entry")
+        require(
+            rows == [], "recovery retained the aborted UPDATE secondary-index entry"
+        )
         _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 30;")
-        require(rows == [], "recovery retained the aborted INSERT secondary-index entry")
+        require(
+            rows == [], "recovery retained the aborted INSERT secondary-index entry"
+        )
         _, rows = verifier.query("SELECT id FROM abort_crash_wire WHERE key_col = 40;")
         require(rows == [[4]], "recovery lost the WAL-stabilizing committed row")
     finally:
@@ -613,7 +1099,9 @@ def test_abort_ack_then_sigkill_recovers_indexed_undo(server):
 def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
     client = WireClient(server.port)
     try:
-        client.command("CREATE TABLE empty_write_abort_wire (id INT, key_col INT, value INT);")
+        client.command(
+            "CREATE TABLE empty_write_abort_wire (id INT, key_col INT, value INT);"
+        )
         # The first index accepts the losing INSERT before the second index
         # rejects its duplicate key. The executor has appended DML WAL but has
         # not yet added a WriteRecord when it rolls that partial work back.
@@ -623,33 +1111,51 @@ def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
         client.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
         statements = [
             (101, False, [], "BEGIN;"),
-            (102, False, [INT32, INT32, INT32],
-             "INSERT INTO empty_write_abort_wire VALUES ($1, $2, $3);"),
+            (
+                102,
+                False,
+                [INT32, INT32, INT32],
+                "INSERT INTO empty_write_abort_wire VALUES ($1, $2, $3);",
+            ),
         ]
         schemas = client.prepare(statements)
-        parameter_types = {statement_id: types for statement_id, _, types, _ in statements}
+        parameter_types = {
+            statement_id: types for statement_id, _, types, _ in statements
+        }
 
         wal_path = os.path.join(server.root, "db", "db.log")
         wal_size_before = os.path.getsize(wal_path)
         executed, status, failed, diagnostic, results = client.batch(
-            [(101, []), (102, [2, 10, 200])], parameter_types, schemas)
-        require((executed, status, failed) == (1, 1, 1),
-                "duplicate second-index key must return an AUTO_ABORT transaction abort")
-        require(diagnostic and results == [],
-                "AUTO_ABORT transaction abort must carry a diagnostic and no partial results")
+            [(101, []), (102, [2, 10, 200])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed) == (1, 1, 1),
+            "duplicate second-index key must return an AUTO_ABORT transaction abort",
+        )
+        require(
+            diagnostic and results == [],
+            "AUTO_ABORT transaction abort must carry a diagnostic and no partial results",
+        )
 
         # A broken write_set-only fast path could otherwise pass the recovery
         # check by losing both the unflushed INSERT WAL and its in-memory
         # partial work at SIGKILL. Prove the acknowledged abort advanced the
         # real WAL file before any later transaction can flush it incidentally.
         wal_size_after_abort = os.path.getsize(wal_path)
-        require(wal_size_after_abort > wal_size_before,
-                "AUTO_ABORT acknowledgement did not publish the losing transaction's WAL")
+        require(
+            wal_size_after_abort > wal_size_before,
+            "AUTO_ABORT acknowledgement did not publish the losing transaction's WAL",
+        )
 
         # The failed batch has ended its transaction, so the same connection
         # must immediately observe only the pre-transaction row.
-        _, rows = client.query("SELECT id, key_col, value FROM empty_write_abort_wire ORDER BY id;")
-        require(rows == [[1, 10, 100]], "AUTO_ABORT left partial heap work visible before SIGKILL")
+        _, rows = client.query(
+            "SELECT id, key_col, value FROM empty_write_abort_wire ORDER BY id;"
+        )
+        require(
+            rows == [[1, 10, 100]],
+            "AUTO_ABORT left partial heap work visible before SIGKILL",
+        )
 
         # Advance the durable frontier after the failed ACK as an independent
         # guard that the complete loser chain is present at crash time.
@@ -667,35 +1173,101 @@ def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
 
     verifier = WireClient(server.port)
     try:
-        _, rows = verifier.query("SELECT id, key_col, value FROM empty_write_abort_wire ORDER BY id;")
-        require(rows == [[1, 10, 100], [3, 30, 300]], "unique-index AUTO_ABORT left a heap row after SIGKILL")
+        _, rows = verifier.query(
+            "SELECT id, key_col, value FROM empty_write_abort_wire ORDER BY id;"
+        )
+        require(
+            rows == [[1, 10, 100], [3, 30, 300]],
+            "unique-index AUTO_ABORT left a heap row after SIGKILL",
+        )
         _, rows = verifier.query("SELECT id FROM empty_write_abort_wire WHERE id = 2;")
-        require(rows == [], "unique-index abort left the first secondary-index entry after SIGKILL")
-        _, rows = verifier.query("SELECT id FROM empty_write_abort_wire WHERE key_col = 10;")
-        require(rows == [[1]], "unique-index abort damaged the conflicting secondary index after SIGKILL")
-        _, rows = verifier.query("SELECT id FROM empty_write_abort_wire WHERE key_col = 30;")
+        require(
+            rows == [],
+            "unique-index abort left the first secondary-index entry after SIGKILL",
+        )
+        _, rows = verifier.query(
+            "SELECT id FROM empty_write_abort_wire WHERE key_col = 10;"
+        )
+        require(
+            rows == [[1]],
+            "unique-index abort damaged the conflicting secondary index after SIGKILL",
+        )
+        _, rows = verifier.query(
+            "SELECT id FROM empty_write_abort_wire WHERE key_col = 30;"
+        )
         require(rows == [[3]], "recovery lost the post-abort WAL-flushing transaction")
     finally:
         verifier.close()
 
 
 OBSERVABILITY_FIELDS = {
-    "obs_abort": {"t_ms", "seq", "shrinking", "upgrade", "deadlock", "ww", "ssi", "unique"},
-    "obs_lock": {"t_ms", "seq", "kind", "immediate_conflict", "wait_enqueued", "wait_granted",
-                 "wait_cancelled", "wait_ns", "backoff_waits", "queue_depth_max", "cycle_checks", "cycle_victims",
-                 "completion_waits", "completion_aborts"},
-    "obs_ckpt": {"t_ms", "seq", "attempt", "preflush", "success", "drain_timeout", "deadline",
-                 "final_data_fail", "initial_ns", "preblock_ns", "block_ns", "drain_ns", "final_wal_ns",
-                 "final_data_ns", "meta_ns", "manifest_ns", "truncate_ns", "begin_blocked", "begin_wait_ns"},
-    "obs_bpm": {"t_ms", "seq", "fetch_miss", "inflight_wait", "inflight_wait_ns", "no_victim",
-                "eviction_clean", "eviction_dirty", "page_reads", "page_writes"},
+    "obs_abort": {
+        "t_ms",
+        "seq",
+        "shrinking",
+        "upgrade",
+        "deadlock",
+        "ww",
+        "ssi",
+        "unique",
+    },
+    "obs_lock": {
+        "t_ms",
+        "seq",
+        "kind",
+        "immediate_conflict",
+        "wait_enqueued",
+        "wait_granted",
+        "wait_cancelled",
+        "wait_ns",
+        "backoff_waits",
+        "queue_depth_max",
+        "cycle_checks",
+        "cycle_victims",
+        "completion_waits",
+        "completion_aborts",
+    },
+    "obs_ckpt": {
+        "t_ms",
+        "seq",
+        "attempt",
+        "preflush",
+        "success",
+        "drain_timeout",
+        "deadline",
+        "final_data_fail",
+        "initial_ns",
+        "preblock_ns",
+        "block_ns",
+        "drain_ns",
+        "final_wal_ns",
+        "final_data_ns",
+        "meta_ns",
+        "manifest_ns",
+        "truncate_ns",
+        "begin_blocked",
+        "begin_wait_ns",
+    },
+    "obs_bpm": {
+        "t_ms",
+        "seq",
+        "fetch_miss",
+        "inflight_wait",
+        "inflight_wait_ns",
+        "no_victim",
+        "eviction_clean",
+        "eviction_dirty",
+        "page_reads",
+        "page_writes",
+    },
 }
 
 
-def read_observability_snapshots(log_path):
+def read_observability_snapshots(log_path, start_offset=0):
     try:
-        with open(log_path, "r", encoding="utf-8") as log_file:
-            lines = log_file.read().splitlines()
+        with open(log_path, "rb") as log_file:
+            log_file.seek(start_offset)
+            lines = log_file.read().decode("utf-8").splitlines()
     except FileNotFoundError:
         return {}
 
@@ -708,40 +1280,69 @@ def read_observability_snapshots(log_path):
         values = {}
         for token in payload.split():
             key, separator, value = token.partition("=")
-            require(separator and key and value, "malformed " + line_kind + " observability field")
+            require(
+                separator and key and value,
+                "malformed " + line_kind + " observability field",
+            )
             values[key] = value
-        require(set(values) == OBSERVABILITY_FIELDS[line_kind], line_kind + " omitted or added observability fields")
+        require(
+            set(values) == OBSERVABILITY_FIELDS[line_kind],
+            line_kind + " omitted or added observability fields",
+        )
         for key, value in values.items():
             if key != "kind":
-                require(value.isdigit(), line_kind + " field " + key + " is not an unsigned integer")
+                require(
+                    value.isdigit(),
+                    line_kind + " field " + key + " is not an unsigned integer",
+                )
         sequence = int(values["seq"])
-        snapshot = snapshots.setdefault(sequence, {"obs_lock": {}})
+        snapshot = snapshots.setdefault(sequence, {"obs_lock": {}, "_order": []})
         if line_kind == "obs_lock":
-            require(values["kind"] in ("record", "unique"), "obs_lock emitted an unknown kind")
+            require(
+                values["kind"] in ("record", "unique"),
+                "obs_lock emitted an unknown kind",
+            )
             snapshot["obs_lock"][values["kind"]] = values
+            snapshot["_order"].append(line_kind + ":" + values["kind"])
         else:
             snapshot[line_kind] = values
+            snapshot["_order"].append(line_kind)
     return snapshots
 
 
-def wait_for_observability_snapshot(log_path, after_sequence):
+def wait_for_observability_snapshot(log_path, start_offset):
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        snapshots = read_observability_snapshots(log_path)
+        snapshots = read_observability_snapshots(log_path, start_offset)
         for sequence in sorted(snapshots):
             snapshot = snapshots[sequence]
-            if sequence <= after_sequence:
-                continue
-            if ("obs_abort" in snapshot and "obs_ckpt" in snapshot and "obs_bpm" in snapshot and
-                    set(snapshot["obs_lock"]) == {"record", "unique"}):
-                for line_kind, values in snapshot.items():
-                    if line_kind == "obs_lock":
-                        for lock_values in values.values():
-                            require(int(lock_values["seq"]) == sequence,
-                                    "SIGUSR1 observability lines did not share one sequence")
-                    else:
-                        require(int(values["seq"]) == sequence,
-                                "SIGUSR1 observability lines did not share one sequence")
+            if (
+                "obs_abort" in snapshot
+                and "obs_ckpt" in snapshot
+                and "obs_bpm" in snapshot
+                and set(snapshot["obs_lock"]) == {"record", "unique"}
+            ):
+                require(
+                    snapshot["_order"]
+                    == [
+                        "obs_abort",
+                        "obs_lock:record",
+                        "obs_lock:unique",
+                        "obs_ckpt",
+                        "obs_bpm",
+                    ],
+                    "SIGUSR1 observability lines were incomplete or out of order",
+                )
+                for line_kind in ("obs_abort", "obs_ckpt", "obs_bpm"):
+                    require(
+                        int(snapshot[line_kind]["seq"]) == sequence,
+                        "SIGUSR1 observability lines did not share one sequence",
+                    )
+                for lock_values in snapshot["obs_lock"].values():
+                    require(
+                        int(lock_values["seq"]) == sequence,
+                        "SIGUSR1 observability lines did not share one sequence",
+                    )
                 return sequence, snapshot
         time.sleep(0.05)
     raise ProtocolFailure("SIGUSR1 did not publish complete observability lines")
@@ -762,9 +1363,13 @@ def force_snapshot_write_conflict(port):
         victim.command("BEGIN;")
         winner.command("UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;")
         winner.command("COMMIT;")
-        tag, diagnostic = victim.stream_raw("UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;")
-        require(tag == TRANSACTION_ABORT and diagnostic,
-                "observability probe did not create a SNAPSHOT ISOLATION write conflict")
+        tag, diagnostic = victim.stream_raw(
+            "UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;"
+        )
+        require(
+            tag == TRANSACTION_ABORT and diagnostic,
+            "observability probe did not create a SNAPSHOT ISOLATION write conflict",
+        )
     finally:
         winner.close()
         victim.close()
@@ -772,16 +1377,23 @@ def force_snapshot_write_conflict(port):
 
 def test_sigusr1_observability(server):
     log_path = os.path.join(server.root, "rmdb.log")
+    first_offset = os.path.getsize(log_path)
     os.kill(server.process.pid, signal.SIGUSR1)
-    first_sequence, first = wait_for_observability_snapshot(log_path, 0)
+    first_sequence, first = wait_for_observability_snapshot(log_path, first_offset)
 
     force_snapshot_write_conflict(server.port)
+    second_offset = os.path.getsize(log_path)
     os.kill(server.process.pid, signal.SIGUSR1)
-    second_sequence, second = wait_for_observability_snapshot(log_path, first_sequence)
+    second_sequence, second = wait_for_observability_snapshot(log_path, second_offset)
 
-    require(second_sequence > first_sequence, "consecutive SIGUSR1 requests did not produce increasing sequences")
-    require(int(second["obs_abort"]["ww"]) == int(first["obs_abort"]["ww"]) + 1,
-            "one EXEC_STREAM SNAPSHOT ISOLATION write conflict must increment ww exactly once")
+    require(
+        second_sequence > first_sequence,
+        "consecutive SIGUSR1 requests did not produce increasing sequences",
+    )
+    require(
+        int(second["obs_abort"]["ww"]) == int(first["obs_abort"]["ww"]) + 1,
+        "one EXEC_STREAM SNAPSHOT ISOLATION write conflict must increment ww exactly once",
+    )
 
 
 def main():
@@ -790,7 +1402,12 @@ def main():
     try:
         server.start()
         test_stream_prepare_float_and_auto_abort(server.port)
+        test_prepared_select_fast_route(server)
+        test_prepared_and_explicit_transaction_ddl_rejection(server.port)
+        test_compiled_update_descriptor_falls_back_safely(server)
         test_snapshot_write_conflict(server.port)
+        test_active_snapshot_delete_conflict_aborts_immediately(server.port)
+        test_prepared_snapshot_write_conflict(server.port)
         test_stream_result_sink_ssi(server.port)
         test_empty_integer_aggregates_use_typed_zero(server.port)
         test_direct_column_update(server.port)

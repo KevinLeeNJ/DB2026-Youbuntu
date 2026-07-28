@@ -38,6 +38,8 @@ public:
     bool has_limit = false;
     int limit = 0;
     int offset = 0;
+    std::size_t limit_parameter_ordinal = 0;
+    std::size_t offset_parameter_ordinal = 0;
     bool has_aggregate = false;
     bool has_select_star = false;
     std::vector<std::string> output_names;

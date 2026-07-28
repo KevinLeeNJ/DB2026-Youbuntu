@@ -30,22 +30,20 @@ std::chrono::microseconds configured_si_conflict_backoff() {
 
 bool configured_si_first_lock_wait() {
     const char* value = std::getenv("RMDB_SI_FIRST_LOCK_WAIT");
-    if (value == nullptr || std::strcmp(value, "1") == 0) {
-        return true;
-    }
-    if (std::strcmp(value, "0") == 0) {
+    if (value == nullptr || std::strcmp(value, "0") == 0) {
         return false;
+    }
+    if (std::strcmp(value, "1") == 0) {
+        return true;
     }
     throw std::invalid_argument("RMDB_SI_FIRST_LOCK_WAIT must be 0 or 1");
 }
 
 } // namespace
 
-LockManager::LockManager()
-    : LockManager(configured_si_conflict_backoff(), configured_si_first_lock_wait()) {}
+LockManager::LockManager() : LockManager(configured_si_conflict_backoff(), configured_si_first_lock_wait()) {}
 
-LockManager::LockManager(std::chrono::microseconds si_conflict_backoff)
-    : LockManager(si_conflict_backoff, false) {}
+LockManager::LockManager(std::chrono::microseconds si_conflict_backoff) : LockManager(si_conflict_backoff, false) {}
 
 LockManager::LockManager(std::chrono::microseconds si_conflict_backoff, bool si_first_lock_wait)
     : si_conflict_backoff_(si_conflict_backoff), si_first_lock_wait_enabled_(si_first_lock_wait) {

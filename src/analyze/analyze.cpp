@@ -429,7 +429,9 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
                 throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
             }
             cast_value(cond.rhs_val, lhs_type);
-            cond.rhs_val.init_raw(lhs_col->len);
+            if (cond.rhs_val.parameter_ordinal == 0) {
+                cond.rhs_val.init_raw(lhs_col->len);
+            }
             continue;
         } else {
             cond.rhs_col = check_column(all_cols, cond.rhs_col);

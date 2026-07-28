@@ -5,11 +5,6 @@
 This is a C++17 RMDB database system. Server code is under `src/`, with entry point `src/rmdb.cpp`; the standalone
 client is under `rmdb_client/`. Build artifacts belong in `build/` and `rmdb_client/build/`.
 
-`finalv2.md` is the normative specification for the 2026 national final. It overrides this guide, historical behavior,
-local benchmark clients, and incomplete tests. Before changing protocol, transactions, FLOAT, TPC-C, loading,
-persistence, recovery, or performance-critical behavior, read the relevant section and Appendix A. The conversion notice
-lists four quoted blocks missing from the source PDF; do not invent their exact contents.
-
 ## Project Layout
 
 - `src/parser`, `src/analyze`, `src/optimizer`: SQL parsing, semantic analysis, and planning.
