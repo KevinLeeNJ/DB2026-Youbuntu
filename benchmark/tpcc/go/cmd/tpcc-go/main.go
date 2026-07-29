@@ -865,12 +865,13 @@ type latencySummary struct {
 }
 
 type liveStats struct {
-	attempted            [2]atomic.Uint64
-	commits              [2]atomic.Uint64
-	serverAborts         [2]atomic.Uint64
-	newOrderAttempted    [2]atomic.Uint64
-	newOrderCommits      [2]atomic.Uint64
-	newOrderServerAborts [2]atomic.Uint64
+	attempted         [2]atomic.Uint64
+	commits           [2]atomic.Uint64
+	expectedRollbacks [2]atomic.Uint64
+	abandoned         [2]atomic.Uint64
+	serverAborts      [2]atomic.Uint64
+	newOrderAttempted [2]atomic.Uint64
+	newOrderCommits   [2]atomic.Uint64
 }
 
 func phaseIndex(phase string) int {
@@ -895,17 +896,20 @@ func (s *liveStats) record(phase, txnType, outcome string) {
 	}
 	if outcome == "server-abort" {
 		s.serverAborts[index].Add(1)
-		if txnType == "new_order" {
-			s.newOrderServerAborts[index].Add(1)
-		}
+	}
+	if outcome == "invalid-item-rollback" {
+		s.expectedRollbacks[index].Add(1)
+	}
+	if outcome == "abandoned" {
+		s.abandoned[index].Add(1)
 	}
 }
 
-func liveAbortRatePercent(attempted, serverAborts uint64) float64 {
+func liveAbortRatePercent(attempted, expectedRollbacks, abandoned, serverAborts uint64) float64 {
 	if attempted == 0 {
 		return 0
 	}
-	return float64(serverAborts) / float64(attempted) * 100
+	return float64(expectedRollbacks+abandoned+serverAborts) / float64(attempted) * 100
 }
 
 func liveTPMC(elapsed int, newOrderCommits uint64) float64 {
@@ -919,15 +923,16 @@ func printProgress(round, rounds int, phase string, elapsed, total int, stats *l
 	index := phaseIndex(phase)
 	attempted := stats.attempted[index].Load()
 	commits := stats.commits[index].Load()
+	expectedRollbacks := stats.expectedRollbacks[index].Load()
+	abandoned := stats.abandoned[index].Load()
 	serverAborts := stats.serverAborts[index].Load()
 	newOrderAttempted := stats.newOrderAttempted[index].Load()
 	newOrderCommits := stats.newOrderCommits[index].Load()
-	newOrderServerAborts := stats.newOrderServerAborts[index].Load()
-	abortRate := liveAbortRatePercent(attempted, serverAborts)
+	abortRate := liveAbortRatePercent(attempted, expectedRollbacks, abandoned, serverAborts)
 	tpmc := liveTPMC(elapsed, newOrderCommits)
-	fmt.Printf("[round %d/%d %s %d/%ds] attempted=%d commits=%d server_aborts=%d new_order_attempted=%d new_order_commit=%d new_order_server_abort=%d tpmC=%.2f abort_rate=%.2f%%\n",
-		round, rounds, phase, elapsed, total, attempted, commits, serverAborts, newOrderAttempted, newOrderCommits,
-		newOrderServerAborts, tpmc, abortRate)
+	fmt.Printf("[round %d/%d %s %d/%ds] attempted=%d commits=%d expected_rollback=%d abandoned=%d server_aborts=%d new_order_attempted=%d new_order_commit=%d tpmC=%.2f abort_rate=%.2f%%\n",
+		round, rounds, phase, elapsed, total, attempted, commits, expectedRollbacks, abandoned, serverAborts,
+		newOrderAttempted, newOrderCommits, tpmc, abortRate)
 }
 
 func monitorProgress(round, rounds, warmupSeconds, measureSeconds, interval int, warmupEnd, measureEnd time.Time, stats *liveStats, stop <-chan struct{}, done chan<- struct{}) {
@@ -1041,7 +1046,7 @@ func (r *result) merge(other *result) {
 }
 
 func (r *result) finalize() {
-	attemptedTotal, serverAborts := 0, 0
+	attemptedTotal, abortTotal := 0, 0
 	newOrderCommitted := r.Counts["measure"]["new_order"]["commit"]
 	if r.Attempted == nil {
 		r.Attempted = make(map[string]int)
@@ -1072,7 +1077,7 @@ func (r *result) finalize() {
 			r.Completion[txnType] = float64(outcomes["commit"]+expectedRollback) / float64(attempted)
 		}
 		attemptedTotal += attempted
-		serverAborts += outcomes["server-abort"]
+		abortTotal += expectedRollback + outcomes["abandoned"] + outcomes["server-abort"]
 	}
 	if r.MeasureSeconds > 0 {
 		r.TPMC = float64(newOrderCommitted) / (float64(r.MeasureSeconds) / 60.0)
@@ -1082,9 +1087,10 @@ func (r *result) finalize() {
 		}
 	}
 	if attemptedTotal > 0 {
-		// Expected business rollbacks and deadline abandonment have their own
-		// report fields. Neither is a server transaction abort.
-		r.AbortRate = float64(serverAborts) / float64(attemptedTotal)
+		// The benchmark table defines aborts as expected business rollbacks plus
+		// abandoned attempts. Keep server-abort for backward-compatible result
+		// parsing; it is also a failed logical attempt if encountered.
+		r.AbortRate = float64(abortTotal) / float64(attemptedTotal)
 	}
 	for txnType, values := range r.latencies {
 		if len(values) == 0 {
@@ -2581,16 +2587,19 @@ type conflictRetryOutcome int
 const (
 	conflictRetryCompleted conflictRetryOutcome = iota
 	conflictRetryDeadline
+	conflictRetryExhausted
 	conflictRetryStopped
 )
 
-const defaultMaxConflictRetries = -1
+const (
+	defaultMaxConflictRetries = 1
+	unlimitedConflictRetries  = -1
+)
 
 // runTxnWithConflictRetries keeps the logical transaction inputs in the caller:
-// attempt must recreate only the per-attempt RNG from the same seed. A finite
-// retry budget reports the final TRANSACTION_ABORT as a completed attempt so the
-// existing worker result path records server-abort. Only the phase deadline is
-// classified as abandoned.
+// attempt must recreate only the per-attempt RNG from the same seed. Exhausting
+// a finite retry budget and reaching the phase deadline are both abandoned
+// logical attempts in the benchmark report.
 func runTxnWithConflictRetries(phaseEnd time.Time, maxConflictRetries int, stop <-chan struct{},
 	now func() time.Time, attempt func() error) (error, conflictRetryOutcome) {
 	retries := 0
@@ -2605,7 +2614,7 @@ func runTxnWithConflictRetries(phaseEnd time.Time, maxConflictRetries int, stop 
 			return err, conflictRetryCompleted
 		}
 		if maxConflictRetries >= 0 && retries >= maxConflictRetries {
-			return err, conflictRetryCompleted
+			return err, conflictRetryExhausted
 		}
 		retries++
 	}
@@ -2681,9 +2690,13 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			report(nil)
 			return
 		}
-		if retryOutcome == conflictRetryDeadline {
+		if retryOutcome == conflictRetryDeadline || retryOutcome == conflictRetryExhausted {
 			latency := float64(time.Since(start).Microseconds()) / 1000.0
-			local.record(phase, txnType, "abandoned", latency, "phase deadline reached during conflict retry")
+			detail := "conflict retry budget exhausted"
+			if retryOutcome == conflictRetryDeadline {
+				detail = "phase deadline reached during conflict retry"
+			}
+			local.record(phase, txnType, "abandoned", latency, detail)
 			stats.record(phase, txnType, "abandoned")
 			continue
 		}
@@ -2828,11 +2841,15 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 		if retryOutcome == conflictRetryStopped {
 			return
 		}
-		if retryOutcome == conflictRetryDeadline {
+		if retryOutcome == conflictRetryDeadline || retryOutcome == conflictRetryExhausted {
 			phase, local, window := report.attribute(start, warmupEnd, measure)
 			if local != nil {
 				latency := float64(time.Since(start).Microseconds()) / 1000.0
-				local.record(phase, txnType, "abandoned", latency, "phase deadline reached during conflict retry")
+				detail := "conflict retry budget exhausted"
+				if retryOutcome == conflictRetryDeadline {
+					detail = "phase deadline reached during conflict retry"
+				}
+				local.record(phase, txnType, "abandoned", latency, detail)
 				stats[window+1].record(phase, txnType, "abandoned")
 			}
 			continue
@@ -3059,7 +3076,9 @@ type config struct {
 
 func (value *config) UnmarshalJSON(data []byte) error {
 	type configJSON config
-	decoded := configJSON{MaxConflictRetries: defaultMaxConflictRetries}
+	// Results written before the finite retry default had no field and used
+	// unlimited retries, so preserve their historical interpretation.
+	decoded := configJSON{MaxConflictRetries: unlimitedConflictRetries}
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
@@ -3180,7 +3199,7 @@ func makeValidationState(doc document) validationState {
 }
 
 func validateMaxConflictRetries(value int) error {
-	if value < defaultMaxConflictRetries {
+	if value < unlimitedConflictRetries {
 		return fmt.Errorf("max_conflict_retries must be -1 or greater, got %d", value)
 	}
 	return nil
@@ -3275,7 +3294,7 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 		return fmt.Errorf("result round %d new_order throughput mismatch", round)
 	}
 	measureCounts := window.Counts["measure"]
-	attemptedTotal, committedTotal, serverAborts := 0, 0, 0
+	attemptedTotal, committedTotal, abortTotal := 0, 0, 0
 	for txnType, outcomes := range measureCounts {
 		attempted := 0
 		for outcome, count := range outcomes {
@@ -3286,8 +3305,8 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 		}
 		attemptedTotal += attempted
 		committedTotal += outcomes["commit"]
-		serverAborts += outcomes["server-abort"]
 		expectedRollback := outcomes["invalid-item-rollback"]
+		abortTotal += expectedRollback + outcomes["abandoned"] + outcomes["server-abort"]
 		if window.Attempted[txnType] != attempted {
 			return fmt.Errorf("result round %d attempted/count mismatch for %s", round, txnType)
 		}
@@ -3306,7 +3325,7 @@ func validateResultWindow(window *result, measure int, mode string, round int) e
 		}
 	}
 	if attemptedTotal > 0 {
-		expectedAbortRate := float64(serverAborts) / float64(attemptedTotal)
+		expectedAbortRate := float64(abortTotal) / float64(attemptedTotal)
 		if math.Abs(window.AbortRate-expectedAbortRate) > 1e-9 {
 			return fmt.Errorf("result round %d abort rate mismatch", round)
 		}
@@ -3623,7 +3642,7 @@ func main() {
 	think := flag.Duration("think", 0, "delay between transactions")
 	reconnectEachTxn := flag.Bool("reconnect-each-txn", false, "reconnect after every transaction")
 	maxConflictRetries := flag.Int("max-conflict-retries", defaultMaxConflictRetries,
-		"maximum retries after the first TRANSACTION_ABORT; -1 retries until the phase deadline")
+		"maximum retries after the first TRANSACTION_ABORT; -1 retries until the phase deadline (default 1)")
 	dataDir := flag.String("data-dir", "benchmark/tpcc/data", "TPC-C CSV directory")
 	schemaDir := flag.String("schema-dir", "benchmark/tpcc/schema", "RMDB schema directory")
 	rmdbDBDir := flag.String("rmdb-db-dir", "", "RMDB database directory, used to resolve load paths")
@@ -3918,7 +3937,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unsupported command: %s\n", *command)
 		os.Exit(2)
 	}
-	fmt.Printf("[run] max_conflict_retries=%d (-1 retries until phase deadline)\n", *maxConflictRetries)
+	fmt.Printf("[run] max_conflict_retries=%d (-1 retries until phase deadline; default 1)\n", *maxConflictRetries)
 	if *oracleAck != "" {
 		if *oraclePrefix <= 0 || *oraclePrefix > 2000 {
 			fmt.Fprintln(os.Stderr, "oracle run requires --oracle-id-prefix in 1..2000")

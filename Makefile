@@ -23,6 +23,7 @@ TPCC_PORT ?= 8765
 TPCC_RESTART_TIMEOUT ?= 90
 TPCC_THINK_MS ?= 0
 TPCC_RECONNECT_EACH_TXN ?= 0
+TPCC_MAX_CONFLICT_RETRIES ?= 1
 TPCC_ISOLATION ?= snapshot-isolation
 TPCC_GO_BINARY := $(BUILD_DIR)/bin/tpcc-go
 TPCC_RANDOM_DB ?= tpcc_random_kill_db
@@ -123,6 +124,7 @@ benchmark: build tpcc-go
 		--restart-timeout $(TPCC_RESTART_TIMEOUT) \
 		--think-ms $(TPCC_THINK_MS) \
 		--reconnect-each-txn $(TPCC_RECONNECT_EACH_TXN) \
+		--max-conflict-retries $(TPCC_MAX_CONFLICT_RETRIES) \
 		--isolation $(TPCC_ISOLATION) \
 		--go-binary $(TPCC_GO_BINARY) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )

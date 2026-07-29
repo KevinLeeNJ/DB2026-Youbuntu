@@ -328,19 +328,19 @@ func TestOfficialWorkerReportAttributesByCompletionTime(t *testing.T) {
 	}
 }
 
-func TestConflictRetryDefaultRetriesUntilSuccess(t *testing.T) {
+func TestConflictRetryDefaultAllowsOneRetry(t *testing.T) {
 	now := time.Unix(100, 0)
 	attempts := 0
 	err, outcome := runTxnWithConflictRetries(now.Add(time.Second), defaultMaxConflictRetries,
 		make(chan struct{}), func() time.Time { return now }, func() error {
 			attempts++
-			if attempts < 3 {
+			if attempts == 1 {
 				return errAbort
 			}
 			return nil
 		})
-	if err != nil || outcome != conflictRetryCompleted || attempts != 3 {
-		t.Fatalf("retry result = (%v, %v), attempts = %d, want success after 3 attempts", err, outcome, attempts)
+	if err != nil || outcome != conflictRetryCompleted || attempts != 2 {
+		t.Fatalf("retry result = (%v, %v), attempts = %d, want success after one retry", err, outcome, attempts)
 	}
 }
 
@@ -364,7 +364,11 @@ func TestConflictRetryFiniteBudgetAllowsNRetries(t *testing.T) {
 					}
 					return errAbort
 				})
-			if outcome != conflictRetryCompleted || attempts != 3 || errors.Is(err, errAbort) != test.wantErr {
+			wantOutcome := conflictRetryCompleted
+			if test.wantErr {
+				wantOutcome = conflictRetryExhausted
+			}
+			if outcome != wantOutcome || attempts != 3 || errors.Is(err, errAbort) != test.wantErr {
 				t.Fatalf("retry result = (%v, %v), attempts = %d", err, outcome, attempts)
 			}
 		})
@@ -377,7 +381,7 @@ func TestConflictRetryStopsAtPhaseDeadline(t *testing.T) {
 	times := []time.Time{start, deadline}
 	clockCalls := 0
 	attempts := 0
-	err, outcome := runTxnWithConflictRetries(deadline, defaultMaxConflictRetries,
+	err, outcome := runTxnWithConflictRetries(deadline, unlimitedConflictRetries,
 		make(chan struct{}), func() time.Time {
 			now := times[clockCalls]
 			clockCalls++
@@ -562,12 +566,12 @@ func TestResultFinalizeReportsLogicalAttemptOutcomes(t *testing.T) {
 	if result.NewOrderPerMin != 1 {
 		t.Fatalf("NewOrder/min = %v, want committed-only numerator 1", result.NewOrderPerMin)
 	}
-	if result.AbortRate != 0 {
-		t.Fatalf("abort rate = %v, expected rollback and abandonment are not server aborts", result.AbortRate)
+	if got, want := result.AbortRate, 0.5; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("abort rate = %v, want expected rollback plus abandonment / all attempts = %v", got, want)
 	}
 }
 
-func TestResultValidationDerivesAbortRateFromServerAbortsOnly(t *testing.T) {
+func TestResultValidationDerivesAbortRateFromAllAbortedOutcomes(t *testing.T) {
 	result := newResult(60)
 	result.record("measure", "new_order", "commit", 1, "")
 	result.record("measure", "new_order", "server-abort", 1, "conflict")
@@ -575,13 +579,13 @@ func TestResultValidationDerivesAbortRateFromServerAbortsOnly(t *testing.T) {
 	result.record("measure", "new_order", "abandoned", 1, "deadline")
 	result.finalize()
 
-	if result.AbortRate != 0.25 {
-		t.Fatalf("abort rate = %v, want 1 server abort / 4 attempted", result.AbortRate)
+	if result.AbortRate != 0.75 {
+		t.Fatalf("abort rate = %v, want all three aborted outcomes / 4 attempted", result.AbortRate)
 	}
 	if err := validateResultWindow(result, 60, "sqlite-reference", 1); err != nil {
 		t.Fatal(err)
 	}
-	result.AbortRate = 0.75
+	result.AbortRate = 0.5
 	if err := validateResultWindow(result, 60, "sqlite-reference", 1); err == nil ||
 		!strings.Contains(err.Error(), "abort rate mismatch") {
 		t.Fatalf("validation error = %v, want abort rate mismatch", err)
@@ -642,7 +646,7 @@ func TestResultMetricsExcludeWarmupButKeepWarmupCounts(t *testing.T) {
 	}
 }
 
-func TestLiveStatsCountsOnlyServerAbortInAbortRate(t *testing.T) {
+func TestLiveStatsIncludesExpectedRollbackAndAbandonmentInAbortRate(t *testing.T) {
 	stats := &liveStats{}
 	stats.record("measure", "new_order", "commit")
 	stats.record("measure", "new_order", "invalid-item-rollback")
@@ -660,17 +664,21 @@ func TestLiveStatsCountsOnlyServerAbortInAbortRate(t *testing.T) {
 	if got := stats.serverAborts[index].Load(); got != 1 {
 		t.Fatalf("server aborts = %d, want 1", got)
 	}
+	if got := stats.expectedRollbacks[index].Load(); got != 1 {
+		t.Fatalf("expected rollbacks = %d, want 1", got)
+	}
+	if got := stats.abandoned[index].Load(); got != 1 {
+		t.Fatalf("abandoned = %d, want 1", got)
+	}
 	if got := stats.newOrderAttempted[index].Load(); got != 3 {
 		t.Fatalf("NewOrder attempted = %d, want 3", got)
 	}
 	if got := stats.newOrderCommits[index].Load(); got != 1 {
 		t.Fatalf("NewOrder commits = %d, want 1", got)
 	}
-	if got := stats.newOrderServerAborts[index].Load(); got != 0 {
-		t.Fatalf("NewOrder server aborts = %d, want 0", got)
-	}
-	if got := liveAbortRatePercent(stats.attempted[index].Load(), stats.serverAborts[index].Load()); got != 20 {
-		t.Fatalf("live abort rate = %v%%, want 20%%", got)
+	if got := liveAbortRatePercent(stats.attempted[index].Load(), stats.expectedRollbacks[index].Load(),
+		stats.abandoned[index].Load(), stats.serverAborts[index].Load()); got != 60 {
+		t.Fatalf("live abort rate = %v%%, want 60%%", got)
 	}
 }
 
@@ -927,19 +935,19 @@ func TestConfigJSONIncludesMaxConflictRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), `"max_conflict_retries":-1`) {
-		t.Fatalf("config JSON = %s, want max_conflict_retries=-1", encoded)
+	if !strings.Contains(string(encoded), `"max_conflict_retries":1`) {
+		t.Fatalf("config JSON = %s, want max_conflict_retries=1", encoded)
 	}
 }
 
-func TestConfigJSONDefaultsMissingMaxConflictRetriesToUnlimited(t *testing.T) {
+func TestConfigJSONPreservesUnlimitedRetryForLegacyResults(t *testing.T) {
 	var legacy config
 	if err := json.Unmarshal([]byte(`{"rounds":1}`), &legacy); err != nil {
 		t.Fatal(err)
 	}
-	if legacy.MaxConflictRetries != defaultMaxConflictRetries {
+	if legacy.MaxConflictRetries != unlimitedConflictRetries {
 		t.Fatalf("legacy max conflict retries = %d, want %d",
-			legacy.MaxConflictRetries, defaultMaxConflictRetries)
+			legacy.MaxConflictRetries, unlimitedConflictRetries)
 	}
 
 	var explicitZero config
@@ -957,7 +965,7 @@ func TestMergeResultFilesTreatsLegacyRetryModeAsUnlimited(t *testing.T) {
 	unlimitedPath := filepath.Join(dir, "unlimited.json")
 	outputPath := filepath.Join(dir, "merged.json")
 	baseConfig := config{Backend: "rmdb", Isolation: "snapshot-isolation", Warehouses: 1, Workers: 4,
-		Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, MaxConflictRetries: defaultMaxConflictRetries,
+		Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, MaxConflictRetries: unlimitedConflictRetries,
 		WarehousePolicy: "terminal-home"}
 	doc := document{Config: baseConfig, Rounds: []*result{completeResult(60)}}
 	writeLegacyResultDocument(t, legacyPath, doc)
@@ -974,9 +982,9 @@ func TestMergeResultFilesTreatsLegacyRetryModeAsUnlimited(t *testing.T) {
 	if err := json.Unmarshal(data, &merged); err != nil {
 		t.Fatal(err)
 	}
-	if merged.Config.MaxConflictRetries != defaultMaxConflictRetries {
+	if merged.Config.MaxConflictRetries != unlimitedConflictRetries {
 		t.Fatalf("merged max conflict retries = %d, want %d",
-			merged.Config.MaxConflictRetries, defaultMaxConflictRetries)
+			merged.Config.MaxConflictRetries, unlimitedConflictRetries)
 	}
 }
 
@@ -986,7 +994,7 @@ func TestMergeResultFilesRejectsLegacyAndExplicitZeroRetryModes(t *testing.T) {
 	zeroPath := filepath.Join(dir, "zero.json")
 	outputPath := filepath.Join(dir, "merged.json")
 	baseConfig := config{Backend: "rmdb", Isolation: "snapshot-isolation", Warehouses: 1, Workers: 4,
-		Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, MaxConflictRetries: defaultMaxConflictRetries,
+		Warmup: 10, Measure: 60, Rounds: 1, Seed: 11, MaxConflictRetries: unlimitedConflictRetries,
 		WarehousePolicy: "terminal-home"}
 	writeLegacyResultDocument(t, legacyPath,
 		document{Config: baseConfig, Rounds: []*result{completeResult(60)}})
@@ -1165,36 +1173,37 @@ func resultTransactionCount(result *result, phase string) int {
 	return total
 }
 
-func TestRunWorkerZeroConflictRetriesRecordsOneServerAbort(t *testing.T) {
+func TestRunWorkerZeroConflictRetriesRecordsOneAbandonment(t *testing.T) {
 	stop := make(chan struct{})
 	backend := &alwaysAbortBackend{onAttempt: func() { close(stop) }}
 	output := make(chan workerReport, 1)
-	now := time.Now()
+	now := time.Now().Add(-time.Second)
+	measureEnd := time.Now().Add(time.Second)
 	runWorker(0, 1, 1,
 		profile{warehouses: 1, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 1},
-		"terminal-home", now, now.Add(time.Second), 1, 0, false, 0, &liveStats{}, stop, output,
+		"terminal-home", now, measureEnd, 1, 0, false, 0, &liveStats{}, stop, output,
 		func() (txnBackend, error) { return backend, nil })
 	report := <-output
 	if report.err != nil {
 		t.Fatal(report.err)
 	}
 	serverAborts, abandoned := 0, 0
-	for txnType, outcomes := range report.result.Counts["measure"] {
+	for _, outcomes := range report.result.Counts["measure"] {
 		serverAborts += outcomes["server-abort"]
-		abandoned += report.result.Abandoned[txnType]
+		abandoned += outcomes["abandoned"]
 	}
-	if backend.attempts != 1 || serverAborts != 1 || abandoned != 0 {
-		t.Fatalf("attempts/server-aborts/abandoned = %d/%d/%d, want 1/1/0",
+	if backend.attempts != 1 || serverAborts != 0 || abandoned != 1 {
+		t.Fatalf("attempts/server-aborts/abandoned = %d/%d/%d, want 1/0/1",
 			backend.attempts, serverAborts, abandoned)
 	}
 }
 
-func TestOfficialWorkerZeroConflictRetriesRecordsOneServerAbort(t *testing.T) {
+func TestOfficialWorkerZeroConflictRetriesRecordsOneAbandonment(t *testing.T) {
 	stop := make(chan struct{})
 	backend := &alwaysAbortBackend{onAttempt: func() { close(stop) }}
 	stats := []*liveStats{{}, {}}
 	output := make(chan officialWorkerReport, 1)
-	warmupEnd := time.Now()
+	warmupEnd := time.Now().Add(-100 * time.Millisecond)
 	p := profile{warehouses: 50, districtsPerWarehouse: 1, customersPerDistrict: 1, itemCount: 25}
 	plan, err := newOfficialRoutingPlan(1, p, 2)
 	if err != nil {
@@ -1206,12 +1215,12 @@ func TestOfficialWorkerZeroConflictRetriesRecordsOneServerAbort(t *testing.T) {
 		t.Fatal(report.err)
 	}
 	serverAborts, abandoned := 0, 0
-	for txnType, outcomes := range report.windows[0].Counts["measure"] {
+	for _, outcomes := range report.windows[0].Counts["measure"] {
 		serverAborts += outcomes["server-abort"]
-		abandoned += report.windows[0].Abandoned[txnType]
+		abandoned += outcomes["abandoned"]
 	}
-	if backend.attempts != 1 || serverAborts != 1 || abandoned != 0 {
-		t.Fatalf("attempts/server-aborts/abandoned = %d/%d/%d, want 1/1/0",
+	if backend.attempts != 1 || serverAborts != 0 || abandoned != 1 {
+		t.Fatalf("attempts/server-aborts/abandoned = %d/%d/%d, want 1/0/1",
 			backend.attempts, serverAborts, abandoned)
 	}
 }
