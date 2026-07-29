@@ -542,7 +542,8 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         tombstone.is_deleted_ = true;
         tombstone.version_chain_head_ = undo_link;
         info.fh->set_tuple_meta(rid, tombstone, log_lsn);
-        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid, txn->get_read_ts());
+        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid, txn->get_read_ts(),
+                                                          RecordDataHash(visible_record));
     } else {
         info.fh->delete_record(rid, context);
     }

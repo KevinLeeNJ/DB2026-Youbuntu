@@ -380,22 +380,98 @@ TEST_F(ExecutorTest, seq_scan_empty_table) {
 TEST_F(ExecutorTest, tombstone_candidates_are_deduplicated_and_removable) {
     Rid first{1, 3};
     Rid second{2, 5};
+    Rid unhashed{3, 7};
+    constexpr std::uint64_t kFirstHash = 101;
+    constexpr std::uint64_t kSecondHash = 202;
 
     EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("t").empty());
 
-    sm_manager_->remember_deleted_tuple_candidate("t", first);
-    sm_manager_->remember_deleted_tuple_candidate("t", first);
-    sm_manager_->remember_deleted_tuple_candidate("t", second);
+    sm_manager_->remember_deleted_tuple_candidate("t", first, INVALID_TS, kFirstHash);
+    sm_manager_->remember_deleted_tuple_candidate("t", first, INVALID_TS, kFirstHash);
+    sm_manager_->remember_deleted_tuple_candidate("t", second, INVALID_TS, kSecondHash);
+    sm_manager_->remember_deleted_tuple_candidate("t", unhashed);
 
     auto candidates = sm_manager_->get_deleted_tuple_candidates("t");
-    ASSERT_EQ(candidates.size(), 2);
+    ASSERT_EQ(candidates.size(), 3);
     EXPECT_NE(std::find(candidates.begin(), candidates.end(), first), candidates.end());
     EXPECT_NE(std::find(candidates.begin(), candidates.end(), second), candidates.end());
+    EXPECT_NE(std::find(candidates.begin(), candidates.end(), unhashed), candidates.end());
+
+    auto first_hash_candidates = sm_manager_->get_deleted_tuple_candidates("t", kFirstHash);
+    EXPECT_EQ(first_hash_candidates.size(), 2);
+    EXPECT_NE(std::find(first_hash_candidates.begin(), first_hash_candidates.end(), first),
+              first_hash_candidates.end());
+    EXPECT_NE(std::find(first_hash_candidates.begin(), first_hash_candidates.end(), unhashed),
+              first_hash_candidates.end());
+    auto unmatched_candidates = sm_manager_->get_deleted_tuple_candidates("t", 303);
+    EXPECT_EQ(unmatched_candidates, std::vector<Rid>{unhashed});
+
+    sm_manager_->remember_deleted_tuple_candidate("t", first, INVALID_TS, kSecondHash);
+    first_hash_candidates = sm_manager_->get_deleted_tuple_candidates("t", kFirstHash);
+    EXPECT_EQ(first_hash_candidates, std::vector<Rid>{unhashed});
+    auto second_hash_candidates = sm_manager_->get_deleted_tuple_candidates("t", kSecondHash);
+    EXPECT_EQ(second_hash_candidates.size(), 3);
+    EXPECT_NE(std::find(second_hash_candidates.begin(), second_hash_candidates.end(), first),
+              second_hash_candidates.end());
+    EXPECT_NE(std::find(second_hash_candidates.begin(), second_hash_candidates.end(), second),
+              second_hash_candidates.end());
+    EXPECT_NE(std::find(second_hash_candidates.begin(), second_hash_candidates.end(), unhashed),
+              second_hash_candidates.end());
 
     sm_manager_->remove_deleted_tuple_candidate("t", first);
     candidates = sm_manager_->get_deleted_tuple_candidates("t");
-    ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0], second);
+    ASSERT_EQ(candidates.size(), 2);
+    EXPECT_EQ(std::find(candidates.begin(), candidates.end(), first), candidates.end());
+    second_hash_candidates = sm_manager_->get_deleted_tuple_candidates("t", kSecondHash);
+    EXPECT_EQ(second_hash_candidates.size(), 2);
+    EXPECT_EQ(std::find(second_hash_candidates.begin(), second_hash_candidates.end(), first),
+              second_hash_candidates.end());
+}
+
+TEST_F(ExecutorTest, deleted_tuple_hash_collision_still_compares_full_record) {
+    setup_db();
+    sm_manager_->create_table("delete_hash", make_int_cols({"id"}), nullptr);
+    insert_test_rows("delete_hash", {1});
+
+    char scan_buf[4096];
+    int scan_offset = 0;
+    Context scan_context(nullptr, nullptr, nullptr, scan_buf, &scan_offset);
+    SeqScanExecutor scan(sm_manager_.get(), "delete_hash", {}, &scan_context);
+    scan.beginTuple();
+    ASSERT_FALSE(scan.is_end());
+    const Rid rid = scan.rid();
+    auto deleted_record = scan.Next();
+    ASSERT_NE(deleted_record, nullptr);
+    scan.nextTuple();
+    RmRecord different_record(*deleted_record);
+    const int different_value = 2;
+    std::memcpy(different_record.data, &different_value, sizeof(different_value));
+
+    auto* fh = sm_manager_->fhs_.at("delete_hash").get();
+    TupleMeta tombstone = fh->get_tuple_meta(rid);
+    tombstone.writer_txn_id_ = 999;
+    tombstone.is_committed_ = false;
+    tombstone.is_deleted_ = true;
+    fh->set_tuple_meta(rid, tombstone);
+
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+    auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
+    char output[4096]{};
+    int output_offset = 0;
+    Context context(&lock_manager, nullptr, txn, output, &output_offset, &txn_manager);
+
+    // Force a fingerprint collision: the full tuple comparison must still reject a false match.
+    sm_manager_->remember_deleted_tuple_candidate("delete_hash", rid, txn->get_read_ts(),
+                                                  RecordDataHash(different_record));
+    EXPECT_FALSE(
+        DeletedTupleCandidatesConflictWithInsert(fh, sm_manager_.get(), "delete_hash", different_record, &context));
+
+    sm_manager_->remember_deleted_tuple_candidate("delete_hash", rid, txn->get_read_ts(),
+                                                  RecordDataHash(*deleted_record));
+    EXPECT_TRUE(
+        DeletedTupleCandidatesConflictWithInsert(fh, sm_manager_.get(), "delete_hash", *deleted_record, &context));
+    txn_manager.abort(txn, nullptr);
 }
 
 TEST_F(ExecutorTest, gc_retires_mixed_same_page_candidates_after_watermark_advances) {
@@ -463,13 +539,14 @@ TEST_F(ExecutorTest, gc_retires_mixed_same_page_candidates_after_watermark_advan
     EXPECT_FALSE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(1)).empty());
     EXPECT_FALSE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
 
-    sm_manager_->prune_version_history(6);
-    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(1)).empty());
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
-
     const Rid missing_page{fh->get_file_hdr().num_pages, 0};
     sm_manager_->remember_deleted_tuple_candidate("gc_retire", missing_page);
+    sm_manager_->prune_version_history(5);
+    EXPECT_FALSE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(1)).empty());
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("gc_retire"), std::vector<Rid>{retry_rid});
+
     sm_manager_->prune_version_history(6);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(1)).empty());
     EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
 
     const Rid registration_rid = rids[1];
@@ -511,6 +588,43 @@ TEST_F(ExecutorTest, gc_retirement_queue_does_not_starve_candidates_behind_defer
     const auto remaining = sm_manager_->get_deleted_tuple_candidates("gc_fair");
     EXPECT_EQ(remaining.size(), 512);
     EXPECT_EQ(std::find(remaining.begin(), remaining.end(), released), remaining.end());
+}
+
+TEST_F(ExecutorTest, gc_historical_handles_survive_bucket_rehash_and_reregistration) {
+    setup_db();
+    sm_manager_->create_table("gc_handles", make_int_cols({"id"}), nullptr);
+    insert_test_rows("gc_handles", {1});
+    sm_manager_->create_index("gc_handles", {"id"}, nullptr);
+
+    char buf[4096];
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buf, &offset);
+    SeqScanExecutor scan(sm_manager_.get(), "gc_handles", {}, &context);
+    scan.beginTuple();
+    ASSERT_FALSE(scan.is_end());
+    const Rid rid = scan.rid();
+
+    const auto& index = sm_manager_->db_.get_table("gc_handles").indexes.front();
+    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name("gc_handles", index.cols);
+    std::vector<char> key(sizeof(int));
+    const int value = 1;
+    std::memcpy(key.data(), &value, sizeof(value));
+
+    sm_manager_->remember_historical_index_key("gc_handles", index_name, key, rid, index, 5);
+    for (int i = 0; i < 64; ++i) {
+        sm_manager_->remember_historical_index_key("gc_handles", index_name + "_rehash_" + std::to_string(i), key, rid,
+                                                   index, 5);
+    }
+    sm_manager_->remember_historical_index_key("gc_handles", index_name, key, rid, index, 10);
+
+    sm_manager_->prune_version_history(6);
+    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("gc_handles", index_name, key), std::vector<Rid>{rid});
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_handles", index_name + "_rehash_0", key).empty());
+
+    sm_manager_->prune_version_history(10);
+    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("gc_handles", index_name, key), std::vector<Rid>{rid});
+    sm_manager_->prune_version_history(11);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_handles", index_name, key).empty());
 }
 
 TEST_F(ExecutorTest, seq_scan_all_records) {

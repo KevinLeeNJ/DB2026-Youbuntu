@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -215,6 +216,18 @@ inline bool RecordDataEquals(const RmRecord& lhs, const RmRecord& rhs) {
     return lhs.size == rhs.size && std::memcmp(lhs.data, rhs.data, lhs.size) == 0;
 }
 
+inline std::uint64_t RecordDataHash(const RmRecord& record) {
+    constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+    std::uint64_t hash = kFnvOffsetBasis;
+    for (int i = 0; i < record.size; ++i) {
+        hash ^= static_cast<unsigned char>(record.data[i]);
+        hash *= kFnvPrime;
+    }
+    // Zero denotes an unavailable fingerprint in the candidate registry.
+    return hash == 0 ? 1 : hash;
+}
+
 inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager* sm_manager,
                                                      const std::string& tab_name, const RmRecord& inserted_rec,
                                                      Context* context) {
@@ -223,7 +236,7 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
     }
 
     auto* txn = context->txn_;
-    auto candidate_rids = sm_manager->get_deleted_tuple_candidates(tab_name);
+    auto candidate_rids = sm_manager->get_deleted_tuple_candidates(tab_name, RecordDataHash(inserted_rec));
     for (const auto& rid : candidate_rids) {
         if (!fh->is_record(rid)) {
             sm_manager->remove_deleted_tuple_candidate(tab_name, rid);

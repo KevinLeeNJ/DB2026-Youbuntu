@@ -14,6 +14,9 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <iterator>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -59,6 +62,42 @@ private:
         timestamp_t retry_after_ts;
     };
 
+    struct DeletedRetireEntryState {
+        Rid rid;
+        std::uint64_t token;
+        std::uint64_t generation;
+        timestamp_t retry_after_ts;
+        std::uint64_t tuple_hash;
+    };
+
+    struct DeletedTupleCandidateTable {
+        std::unordered_map<Rid, DeletedRetireEntryState, RidHash> entries;
+        std::unordered_multimap<std::uint64_t, Rid> hashed_rids;
+        std::unordered_set<Rid, RidHash> unhashed_rids;
+
+        void add_to_hash_index(const Rid& rid, std::uint64_t tuple_hash) {
+            if (tuple_hash == 0) {
+                unhashed_rids.insert(rid);
+            } else {
+                hashed_rids.emplace(tuple_hash, rid);
+            }
+        }
+
+        void remove_from_hash_index(const Rid& rid, std::uint64_t tuple_hash) {
+            if (tuple_hash == 0) {
+                unhashed_rids.erase(rid);
+                return;
+            }
+            auto [begin, end] = hashed_rids.equal_range(tuple_hash);
+            for (auto entry = begin; entry != end; ++entry) {
+                if (entry->second == rid) {
+                    hashed_rids.erase(entry);
+                    return;
+                }
+            }
+        }
+    };
+
     struct HistoricalKeyLess {
         std::vector<ColType> col_types;
         std::vector<int> col_lens;
@@ -69,7 +108,10 @@ private:
     };
 
     struct HistoricalIndexBucket {
-        std::map<std::string, std::vector<RetireEntryState>, HistoricalKeyLess> entries;
+        using EntryStates = std::vector<std::shared_ptr<RetireEntryState>>;
+        using EntryMap = std::map<std::string, EntryStates, HistoricalKeyLess>;
+
+        EntryMap entries;
 
         HistoricalIndexBucket() = default;
         HistoricalIndexBucket(std::vector<ColType> types, std::vector<int> lens)
@@ -77,16 +119,12 @@ private:
     };
     struct HistoricalRetireCandidate {
         std::string bucket_key;
-        std::string encoded_key;
+        HistoricalIndexBucket* bucket;
+        HistoricalIndexBucket::EntryMap::iterator entry;
+        std::shared_ptr<RetireEntryState> state;
         Rid rid;
-        std::uint64_t token;
         std::uint64_t generation;
         timestamp_t last_observed_ts{INVALID_TS};
-
-        friend bool operator==(const HistoricalRetireCandidate& a, const HistoricalRetireCandidate& b) {
-            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid &&
-                   a.token == b.token;
-        }
     };
     struct DeletedRetireCandidate {
         std::string tab_name;
@@ -123,11 +161,16 @@ private:
 
     mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<RetireEntryState>> historical_retire_states_;
     std::deque<HistoricalRetireCandidate> historical_retire_queue_;
+    std::map<timestamp_t, std::deque<HistoricalRetireCandidate>> historical_deferred_retire_queue_;
+    bool historical_retire_prefer_deferred_{false};
     std::uint64_t next_historical_retire_token_{1};
     mutable std::mutex deleted_tuple_candidates_latch_;
-    std::unordered_map<std::string, std::unordered_map<Rid, RetireEntryState, RidHash>> deleted_tuple_candidates_;
+    std::unordered_map<std::string, DeletedTupleCandidateTable> deleted_tuple_candidates_;
     std::deque<DeletedRetireCandidate> deleted_retire_queue_;
+    std::map<timestamp_t, std::deque<DeletedRetireCandidate>> deleted_deferred_retire_queue_;
+    bool deleted_retire_prefer_deferred_{false};
     std::uint64_t next_deleted_retire_token_{1};
 
 public:
@@ -230,20 +273,27 @@ public:
                             .emplace(bucket_key, HistoricalIndexBucket(std::move(col_types), std::move(col_lens)))
                             .first;
         }
-        std::string encoded_key(key.data(), key.size());
-        auto& entries = bucket_it->second.entries[encoded_key];
-        auto entry = std::find_if(entries.begin(), entries.end(),
-                                  [&rid](const RetireEntryState& state) { return state.rid == rid; });
-        if (entry == entries.end()) {
+        auto [key_it, _] = bucket_it->second.entries.try_emplace(std::string(key.data(), key.size()));
+        auto& states = key_it->second;
+        auto entry =
+            std::find_if(states.begin(), states.end(), [&rid](const auto& state) { return state->rid == rid; });
+        if (entry == states.end()) {
             const std::uint64_t token = next_historical_retire_token_++;
-            entries.push_back(RetireEntryState{rid, token, 1, retry_after_ts});
-            historical_retire_queue_.push_back(
-                HistoricalRetireCandidate{bucket_key, std::move(encoded_key), rid, token, 1, retry_after_ts});
+            auto state = std::make_shared<RetireEntryState>(RetireEntryState{rid, token, 1, retry_after_ts});
+            states.push_back(state);
+            historical_retire_states_.emplace(token, state);
+            HistoricalRetireCandidate candidate{bucket_key, &bucket_it->second, key_it, std::move(state), rid,
+                                                1,          retry_after_ts};
+            if (retry_after_ts == INVALID_TS) {
+                historical_retire_queue_.push_back(std::move(candidate));
+            } else {
+                historical_deferred_retire_queue_[retry_after_ts].push_back(std::move(candidate));
+            }
         } else {
-            ++entry->generation;
+            ++(*entry)->generation;
             if (retry_after_ts != INVALID_TS &&
-                (entry->retry_after_ts == INVALID_TS || retry_after_ts > entry->retry_after_ts)) {
-                entry->retry_after_ts = retry_after_ts;
+                ((*entry)->retry_after_ts == INVALID_TS || retry_after_ts > (*entry)->retry_after_ts)) {
+                (*entry)->retry_after_ts = retry_after_ts;
             }
         }
     }
@@ -262,7 +312,7 @@ public:
         std::vector<Rid> result;
         result.reserve(key_it->second.size());
         for (const auto& entry : key_it->second) {
-            result.push_back(entry.rid);
+            result.push_back(entry->rid);
         }
         return result;
     }
@@ -276,7 +326,7 @@ public:
         }
         for (const auto& [_, entries] : it->second.entries) {
             for (const auto& entry : entries) {
-                result.push_back(entry.rid);
+                result.push_back(entry->rid);
             }
         }
         return result;
@@ -299,7 +349,7 @@ public:
             upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
         for (auto entry = begin; entry != end; ++entry) {
             for (const auto& state : entry->second) {
-                result.push_back(state.rid);
+                result.push_back(state->rid);
             }
         }
         return result;
@@ -329,7 +379,7 @@ public:
             upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
         for (auto entry = begin; entry != end; ++entry) {
             for (const auto& state : entry->second) {
-                out.emplace_back(entry->first, state.rid);
+                out.emplace_back(entry->first, state->rid);
             }
         }
     }
@@ -341,34 +391,55 @@ public:
     }
 
     void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid,
-                                          timestamp_t retry_after_ts = INVALID_TS) {
+                                          timestamp_t retry_after_ts = INVALID_TS, std::uint64_t tuple_hash = 0) {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
         auto& entries = deleted_tuple_candidates_[tab_name];
-        auto entry = entries.find(rid);
-        if (entry == entries.end()) {
+        auto entry = entries.entries.find(rid);
+        if (entry == entries.entries.end()) {
             const std::uint64_t token = next_deleted_retire_token_++;
-            entries.emplace(rid, RetireEntryState{rid, token, 1, retry_after_ts});
-            deleted_retire_queue_.push_back(DeletedRetireCandidate{tab_name, rid, token, 1, retry_after_ts});
+            entries.entries.emplace(rid, DeletedRetireEntryState{rid, token, 1, retry_after_ts, tuple_hash});
+            entries.add_to_hash_index(rid, tuple_hash);
+            DeletedRetireCandidate candidate{tab_name, rid, token, 1, retry_after_ts};
+            if (retry_after_ts == INVALID_TS) {
+                deleted_retire_queue_.push_back(std::move(candidate));
+            } else {
+                deleted_deferred_retire_queue_[retry_after_ts].push_back(std::move(candidate));
+            }
         } else {
             ++entry->second.generation;
             if (retry_after_ts != INVALID_TS &&
                 (entry->second.retry_after_ts == INVALID_TS || retry_after_ts > entry->second.retry_after_ts)) {
                 entry->second.retry_after_ts = retry_after_ts;
             }
+            if (tuple_hash != 0 && tuple_hash != entry->second.tuple_hash) {
+                entries.remove_from_hash_index(rid, entry->second.tuple_hash);
+                entry->second.tuple_hash = tuple_hash;
+                entries.add_to_hash_index(rid, tuple_hash);
+            }
         }
     }
 
-    std::vector<Rid> get_deleted_tuple_candidates(const std::string& tab_name) const {
+    std::vector<Rid> get_deleted_tuple_candidates(const std::string& tab_name, std::uint64_t tuple_hash = 0) const {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
         auto it = deleted_tuple_candidates_.find(tab_name);
         if (it == deleted_tuple_candidates_.end()) {
             return {};
         }
         std::vector<Rid> result;
-        result.reserve(it->second.size());
-        for (const auto& [rid, _] : it->second) {
-            result.push_back(rid);
+        const auto& table = it->second;
+        if (tuple_hash == 0) {
+            result.reserve(table.entries.size());
+            for (const auto& [rid, _] : table.entries) {
+                result.push_back(rid);
+            }
+            return result;
         }
+        auto [hashed_begin, hashed_end] = table.hashed_rids.equal_range(tuple_hash);
+        result.reserve(static_cast<size_t>(std::distance(hashed_begin, hashed_end)) + table.unhashed_rids.size());
+        for (auto entry = hashed_begin; entry != hashed_end; ++entry) {
+            result.push_back(entry->second);
+        }
+        result.insert(result.end(), table.unhashed_rids.begin(), table.unhashed_rids.end());
         return result;
     }
 
@@ -378,8 +449,13 @@ public:
         if (it == deleted_tuple_candidates_.end()) {
             return;
         }
-        it->second.erase(rid);
-        if (it->second.empty()) {
+        auto entry = it->second.entries.find(rid);
+        if (entry == it->second.entries.end()) {
+            return;
+        }
+        it->second.remove_from_hash_index(rid, entry->second.tuple_hash);
+        it->second.entries.erase(entry);
+        if (it->second.entries.empty()) {
             deleted_tuple_candidates_.erase(it);
         }
     }
