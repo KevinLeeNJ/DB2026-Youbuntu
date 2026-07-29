@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "row_mutation.h"
 #include "system/sm.h"
 
 class InsertExecutor : public AbstractExecutor {
@@ -26,31 +27,6 @@ private:
     std::string tab_name_;      // 表名称
     Rid rid_; // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
     SmManager* sm_manager_;
-
-    static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
-        std::vector<char> key(index.col_tot_len);
-        int offset = 0;
-        for (int i = 0; i < index.col_num; ++i) {
-            memcpy(key.data() + offset, rec_data + index.cols[i].offset, index.cols[i].len);
-            offset += index.cols[i].len;
-        }
-        return key;
-    }
-
-    void check_mvcc_unique_key_conflict(const IndexMeta& index, const std::vector<char>& key) {
-        if (context_ == nullptr || context_->txn_ == nullptr || context_->txn_mgr_ == nullptr) {
-            return;
-        }
-
-        const std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols);
-        auto candidate_rids = sm_manager_->get_historical_index_key_rids(tab_name_, index_name, key);
-
-        for (const auto& existing_rid : candidate_rids) {
-            if (HistoricalIndexKeyConflictsWithTxn(fh_, existing_rid, index, key, context_)) {
-                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
-            }
-        }
-    }
 
 public:
     InsertExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<Value> values, Context* context) {
@@ -96,96 +72,7 @@ public:
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
-        if (context_ != nullptr && context_->txn_ != nullptr &&
-            context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
-            DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, tab_name_, rec, context_)) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
-        }
-
-        std::vector<std::vector<char>> index_keys;
-        index_keys.reserve(tab_.indexes.size());
-        for (const auto& index : tab_.indexes) {
-            auto key = make_index_key(index, rec.data);
-            auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            ReserveUniqueKey(context_, ih->GetFd(), key);
-            check_mvcc_unique_key_conflict(index, key);
-            index_keys.push_back(std::move(key));
-        }
-
-        auto prepared_insert = fh_->prepare_insert_record();
-        bool insert_finished = false;
-        try {
-            rid_ = prepared_insert.rid;
-            lsn_t log_lsn = INVALID_LSN;
-            TupleMeta pending_meta;
-            if (context_ != nullptr && context_->txn_ != nullptr) {
-                pending_meta.writer_txn_id_ = context_->txn_->get_transaction_id();
-                pending_meta.is_committed_ = false;
-                pending_meta.is_deleted_ = false;
-                pending_meta.version_chain_head_ = UndoLink{};
-            }
-            if (context_ != nullptr && context_->log_mgr_ != nullptr && context_->txn_ != nullptr) {
-                InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
-                log_record.prev_lsn_ = context_->txn_->get_prev_lsn();
-                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
-                context_->txn_->set_prev_lsn(lsn);
-                log_lsn = lsn;
-            }
-            fh_->finish_insert_record(prepared_insert, rec.data,
-                                      context_ != nullptr && context_->txn_ != nullptr ? &pending_meta : nullptr,
-                                      log_lsn);
-            insert_finished = true;
-        } catch (...) {
-            if (!insert_finished) {
-                fh_->abort_prepared_insert(prepared_insert);
-            }
-            throw;
-        }
-        std::vector<size_t> inserted_indexes;
-        const auto rollback_index_inserts = [&] {
-            for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
-                auto& index = tab_.indexes[*it];
-                auto ih =
-                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                ih->delete_entry(index_keys[*it].data(), context_ == nullptr ? nullptr : context_->txn_);
-            }
-            fh_->delete_record(rid_, context_);
-        };
-        try {
-            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-                auto& index = tab_.indexes[i];
-                auto ih =
-                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                ih->insert_entry(index_keys[i].data(), rid_, context_ == nullptr ? nullptr : context_->txn_);
-                inserted_indexes.push_back(i);
-            }
-        } catch (const IndexEntryExistsError&) {
-            // The B+tree has no transaction context, so translate here: losing a
-            // race for a unique key inside an explicit transaction is a retryable
-            // conflict. A duplicate produced by an autocommit statement, CREATE
-            // INDEX or LOAD is deterministic and stays a permanent SQL error.
-            rollback_index_inserts();
-            if (context_ != nullptr && context_->txn_ != nullptr && context_->txn_->get_txn_mode()) {
-                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
-            }
-            throw;
-        } catch (...) {
-            rollback_index_inserts();
-            throw;
-        }
-        if (context_ != nullptr && context_->txn_ != nullptr) {
-            context_->txn_->append_write_record(std::make_unique<WriteRecord>(WType::INSERT_TUPLE, tab_name_, rid_));
-            context_->txn_->append_modified_slot(tab_name_, rid_);
-
-            if (context_->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE &&
-                context_->txn_mgr_ != nullptr) {
-                txn_id_t writer_id = context_->txn_->get_transaction_id();
-                if (context_->txn_mgr_->CheckWriteAgainstReaders(writer_id, rid_, tab_name_, std::nullopt,
-                                                                 std::optional<RmRecord>(rec), tab_.cols)) {
-                    throw TransactionAbortException(writer_id, AbortReason::SSI_DANGER);
-                }
-            }
-        }
+        rid_ = RowInsertEngine::InsertOne(sm_manager_, tab_name_, tab_, fh_, rec, context_, &rid_);
         return nullptr;
     }
     Rid& rid() override {

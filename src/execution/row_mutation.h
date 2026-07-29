@@ -77,3 +77,9 @@ public:
     // set. A successful delete is represented by true.
     static bool DeleteOne(const Rid& rid, RmRecord& visible_record, const DeleteRuntimeInfo& info, Context* context);
 };
+
+class RowInsertEngine {
+public:
+    static Rid InsertOne(SmManager* sm_manager, const std::string& tab_name, const TabMeta& tab, RmFileHandle* fh,
+                         RmRecord& record, Context* context, Rid* prepared_rid = nullptr);
+};

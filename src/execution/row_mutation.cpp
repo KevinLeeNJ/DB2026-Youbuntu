@@ -546,3 +546,103 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
     }
     return true;
 }
+
+Rid RowInsertEngine::InsertOne(SmManager* sm_manager, const std::string& tab_name, const TabMeta& tab, RmFileHandle* fh,
+                               RmRecord& record, Context* context, Rid* prepared_rid) {
+    if (sm_manager == nullptr || fh == nullptr || record.size != fh->get_file_hdr().record_size) {
+        throw InternalError("invalid row insert runtime metadata");
+    }
+    if (context != nullptr && context->txn_ != nullptr &&
+        context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
+        DeletedTupleCandidatesConflictWithInsert(fh, sm_manager, tab_name, record, context)) {
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+    }
+
+    std::vector<std::vector<char>> index_keys;
+    std::vector<std::string> index_names;
+    index_keys.reserve(tab.indexes.size());
+    index_names.reserve(tab.indexes.size());
+    for (const auto& index : tab.indexes) {
+        auto key = MakeIndexKey(index, record.data);
+        std::string index_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
+        auto ih = sm_manager->ihs_.at(index_name).get();
+        ReserveUniqueKey(context, ih->GetFd(), key);
+        if (context != nullptr && context->txn_ != nullptr && context->txn_mgr_ != nullptr) {
+            for (const auto& existing_rid : sm_manager->get_historical_index_key_rids(tab_name, index_name, key)) {
+                if (HistoricalIndexKeyConflictsWithTxn(fh, existing_rid, index, key, context)) {
+                    throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+                }
+            }
+        }
+        index_keys.push_back(std::move(key));
+        index_names.push_back(std::move(index_name));
+    }
+
+    auto prepared_insert = fh->prepare_insert_record();
+    Rid rid = prepared_insert.rid;
+    if (prepared_rid != nullptr) {
+        *prepared_rid = rid;
+    }
+    bool insert_finished = false;
+    try {
+        lsn_t log_lsn = INVALID_LSN;
+        TupleMeta pending_meta;
+        if (context != nullptr && context->txn_ != nullptr) {
+            pending_meta.writer_txn_id_ = context->txn_->get_transaction_id();
+            pending_meta.is_committed_ = false;
+            pending_meta.is_deleted_ = false;
+            pending_meta.version_chain_head_ = UndoLink{};
+        }
+        if (context != nullptr && context->log_mgr_ != nullptr && context->txn_ != nullptr) {
+            InsertLogRecord log_record(context->txn_->get_transaction_id(), record, rid, tab_name);
+            log_record.prev_lsn_ = context->txn_->get_prev_lsn();
+            log_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
+            context->txn_->set_prev_lsn(log_lsn);
+        }
+        fh->finish_insert_record(prepared_insert, record.data,
+                                 context != nullptr && context->txn_ != nullptr ? &pending_meta : nullptr, log_lsn);
+        insert_finished = true;
+    } catch (...) {
+        if (!insert_finished) {
+            fh->abort_prepared_insert(prepared_insert);
+        }
+        throw;
+    }
+
+    std::vector<size_t> inserted_indexes;
+    const auto rollback_index_inserts = [&] {
+        for (auto it = inserted_indexes.rbegin(); it != inserted_indexes.rend(); ++it) {
+            sm_manager->ihs_.at(index_names[*it])
+                ->delete_entry(index_keys[*it].data(), rid, context == nullptr ? nullptr : context->txn_);
+        }
+        fh->delete_record(rid, context);
+    };
+    try {
+        for (size_t i = 0; i < tab.indexes.size(); ++i) {
+            sm_manager->ihs_.at(index_names[i])
+                ->insert_entry(index_keys[i].data(), rid, context == nullptr ? nullptr : context->txn_);
+            inserted_indexes.push_back(i);
+        }
+    } catch (const IndexEntryExistsError&) {
+        rollback_index_inserts();
+        if (context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode()) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+        }
+        throw;
+    } catch (...) {
+        rollback_index_inserts();
+        throw;
+    }
+    if (context != nullptr && context->txn_ != nullptr) {
+        context->txn_->append_write_record(std::make_unique<WriteRecord>(WType::INSERT_TUPLE, tab_name, rid));
+        context->txn_->append_modified_slot(tab_name, rid);
+        if (context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE && context->txn_mgr_ != nullptr) {
+            const txn_id_t writer_id = context->txn_->get_transaction_id();
+            if (context->txn_mgr_->CheckWriteAgainstReaders(writer_id, rid, tab_name, std::nullopt,
+                                                            std::optional<RmRecord>(record), tab.cols)) {
+                throw TransactionAbortException(writer_id, AbortReason::SSI_DANGER);
+            }
+        }
+    }
+    return rid;
+}

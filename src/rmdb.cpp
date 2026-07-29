@@ -36,6 +36,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "execution/execution_timing_diagnostics.h"
 #include "execution/index_skip_scan_diagnostics.h"
+#include "execution/prepared_jit.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
@@ -191,6 +192,12 @@ void log_observability_statistics() {
              static_cast<unsigned long long>(bpm.eviction_dirty),
              static_cast<unsigned long long>(disk_manager->get_page_read_count()),
              static_cast<unsigned long long>(disk_manager->get_page_write_count()));
+    const auto jit_stats = prepared_jit_compiler().stats();
+    LOG_WARN(
+        "obs_jit t_ms=%lld seq=%llu attempts=%llu compiled=%llu unsupported=%llu failures=%llu code_bytes=%llu", now_ms,
+        static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(jit_stats.attempts),
+        static_cast<unsigned long long>(jit_stats.compiled), static_cast<unsigned long long>(jit_stats.unsupported),
+        static_cast<unsigned long long>(jit_stats.failures), static_cast<unsigned long long>(jit_stats.code_bytes));
     if (commit_timing_diagnostics::enabled()) {
         const auto commit = commit_timing_diagnostics::snapshot();
         LOG_WARN("obs_commit t_ms=%lld seq=%llu invocations=%llu failures=%llu total_ns=%llu prepare_ns=%llu "
@@ -416,6 +423,7 @@ struct PreparedStatement {
     std::vector<std::string> diagnostic_plans;
     std::uint64_t diagnostic_plan_hash = 0;
     std::unique_ptr<const PreparedPlanDescriptor> descriptor;
+    std::unique_ptr<PreparedJitProgram> jit_program;
     std::string database_identity;
     std::uint64_t catalog_generation = 0;
 };
@@ -791,7 +799,8 @@ ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
     return ParameterFrame(std::move(values));
 }
 
-ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters,
+ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor,
+                                            const PreparedJitProgram* jit_program, const ParameterFrame& parameters,
                                             SessionState& session, QueryResultSink* result_sink,
                                             execution_timing_diagnostics::Sample* timing = nullptr) {
     std::vector<char> response(BUFFER_LENGTH, 0);
@@ -802,22 +811,43 @@ ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descri
     context.output_file_enabled_ = &session.output_file_enabled;
     SetTransaction(session, &context);
     try {
-        std::unique_ptr<PortalStmt> statement;
-        if (timing != nullptr) {
-            execution_timing_diagnostics::StageTimer timer(&timing->instantiate_ns);
-            statement = portal->start_prepared(descriptor, parameters, &context, &timing->executor_constructed);
-        } else {
-            statement = portal->start_prepared(descriptor, parameters, &context);
+        bool is_query = false;
+        bool jit_handled = false;
+        if (jit_program != nullptr) {
+            PreparedJitExecutionStatus status;
+            if (timing != nullptr) {
+                execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
+                status = jit_program->Execute(parameters, sm_manager.get(), &context, result_sink);
+            } else {
+                status = jit_program->Execute(parameters, sm_manager.get(), &context, result_sink);
+            }
+            jit_handled = status == PreparedJitExecutionStatus::Handled;
+            if (jit_handled) {
+                is_query = jit_program->is_query();
+                if (timing != nullptr) {
+                    timing->route = execution_timing_diagnostics::Route::PreparedRuntime;
+                }
+            }
         }
-        const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        if (timing != nullptr) {
-            execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
-            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        } else {
-            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        std::unique_ptr<PortalStmt> statement;
+        if (!jit_handled) {
+            if (timing != nullptr) {
+                timing->route = execution_timing_diagnostics::Route::PreparedPlan;
+                execution_timing_diagnostics::StageTimer timer(&timing->instantiate_ns);
+                statement = portal->start_prepared(descriptor, parameters, &context, &timing->executor_constructed);
+            } else {
+                statement = portal->start_prepared(descriptor, parameters, &context);
+            }
+            is_query = statement->tag == PORTAL_ONE_SELECT;
+            if (timing != nullptr) {
+                execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
+                portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+            } else {
+                portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+            }
+            portal->drop();
         }
         session.isolation = context.isolation_level_;
-        portal->drop();
         if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
             context.txn_->get_state() != TransactionState::COMMITTED &&
             context.txn_->get_state() != TransactionState::ABORTED) {
@@ -917,6 +947,14 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
                                                           result.database_identity, result.catalog_generation);
     } else {
         (void)portal->start(std::move(plan), &context);
+    }
+    if (result.descriptor != nullptr) {
+        std::string jit_reason;
+        result.jit_program = prepared_jit_compiler().Compile(*result.descriptor, sm_manager.get(), &jit_reason);
+        if (result.jit_program != nullptr) {
+            LOG_DEBUG("prepared JIT compiled statement_id=%u code_bytes=%zu", static_cast<unsigned int>(result.id),
+                      result.jit_program->code_size());
+        }
     }
     return result;
 }
@@ -1300,9 +1338,9 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                     if (timing_scope.has_value()) {
                         timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
                     }
-                    outcome =
-                        execute_prepared_operation(*prepared_statement->descriptor, *parameter_frame, session, &result,
-                                                   execution_timing_enabled ? &timing_scope->sample() : nullptr);
+                    outcome = execute_prepared_operation(
+                        *prepared_statement->descriptor, prepared_statement->jit_program.get(), *parameter_frame,
+                        session, &result, execution_timing_enabled ? &timing_scope->sample() : nullptr);
                     if (timing_scope.has_value()) {
                         timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::None;
                     }

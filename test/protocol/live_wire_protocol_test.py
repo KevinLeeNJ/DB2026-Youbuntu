@@ -339,6 +339,7 @@ class Server:
 def test_stream_prepare_float_and_auto_abort(port):
     client = WireClient(port)
     client.command("CREATE TABLE stock (s_w_id INT, s_i_id INT, s_ytd FLOAT);")
+    client.command("CREATE INDEX stock(s_w_id, s_i_id);")
     client.command("CREATE TABLE wire_values (id INT, amount FLOAT, note CHAR(20));")
     client.command("INSERT INTO stock VALUES (1, 2, 1.5);")
 
@@ -518,7 +519,10 @@ def test_prepared_select_fast_route(server):
                 require(
                     fields.get("plan_ns") == "0", "prepared SELECT still ran Planner"
                 )
-                for statement_id, kind in ((2, "UPDATE"), (5, "INSERT")):
+                for statement_id, kind, route in (
+                    (2, "UPDATE", "prepared-runtime"),
+                    (5, "INSERT", "prepared-runtime"),
+                ):
                     dml_lines = [
                         line
                         for line in lines
@@ -534,8 +538,8 @@ def test_prepared_select_fast_route(server):
                         if "=" in token
                     )
                     require(
-                        dml_fields.get("route") == "prepared-plan",
-                        "prepared " + kind + " did not hit fast route",
+                        dml_fields.get("route") == route,
+                        "prepared " + kind + " used the wrong fast route",
                     )
                     require(
                         dml_fields.get("clone_bind_ns") == "0",
@@ -552,6 +556,124 @@ def test_prepared_select_fast_route(server):
                 return
             time.sleep(0.05)
         raise ProtocolFailure("prepared SELECT route diagnostics were not published")
+    finally:
+        client.close()
+
+
+def test_prepared_jit_point_select(server):
+    client = WireClient(server.port)
+    try:
+        client.command(
+            "CREATE TABLE prepared_jit_route (id INT, code CHAR(8), note CHAR(16));"
+        )
+        client.command("CREATE INDEX prepared_jit_route(id);")
+        client.command("CREATE INDEX prepared_jit_route(code);")
+        client.command("INSERT INTO prepared_jit_route VALUES (1, 'aa', 'one');")
+        client.command("INSERT INTO prepared_jit_route VALUES (2, 'bb', 'two');")
+        client.command("INSERT INTO prepared_jit_route VALUES (3, 'cc', 'three');")
+        client.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        statements = [
+            (
+                230,
+                True,
+                [INT32],
+                "SELECT id, note FROM prepared_jit_route WHERE id = $1;",
+            ),
+            (
+                231,
+                True,
+                [CHAR],
+                "SELECT id, code FROM prepared_jit_route WHERE code = $1;",
+            ),
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {230: [INT32], 231: [CHAR]}
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [(230, [2]), (230, [3]), (230, [99]), (231, ["aa"]), (231, ["bb"])],
+            parameter_types,
+            schemas,
+        )
+        require(
+            (executed, status, failed, diagnostic) == (5, 0, 0xFFFF, ""),
+            "prepared JIT point SELECT batch failed",
+        )
+        require(
+            results
+            == [
+                (0, [[2, "two"]]),
+                (1, [[3, "three"]]),
+                (2, []),
+                (3, [[1, "aa"]]),
+                (4, [[2, "bb"]]),
+            ],
+            "prepared JIT point SELECT reused parameters or encoded rows incorrectly",
+        )
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [(230, [None])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results)
+            == (1, 0, 0xFFFF, "", [(0, [])]),
+            "NULL point key did not fall back with SQL NULL semantics",
+        )
+
+        os.kill(server.process.pid, signal.SIGUSR1)
+        log_path = os.path.join(server.root, "rmdb.log")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                lines = open(log_path, "r", encoding="utf-8").read().splitlines()
+            except FileNotFoundError:
+                lines = []
+            runtime_lines = [
+                line
+                for line in lines
+                if "obs_exec " in line
+                and "statement_id=230 " in line
+                and "route=prepared-runtime " in line
+            ]
+            char_runtime_lines = [
+                line
+                for line in lines
+                if "obs_exec " in line
+                and "statement_id=231 " in line
+                and "route=prepared-runtime " in line
+            ]
+            jit_lines = [line for line in lines if "obs_jit " in line]
+            if runtime_lines and char_runtime_lines and jit_lines:
+                runtime_fields = dict(
+                    token.split("=", 1)
+                    for token in runtime_lines[-1].split()
+                    if "=" in token
+                )
+                char_runtime_fields = dict(
+                    token.split("=", 1)
+                    for token in char_runtime_lines[-1].split()
+                    if "=" in token
+                )
+                jit_fields = dict(
+                    token.split("=", 1)
+                    for token in jit_lines[-1].split()
+                    if "=" in token
+                )
+                require(
+                    runtime_fields.get("invocations") == "3",
+                    "INT32 prepared JIT invocation count mismatch",
+                )
+                require(
+                    char_runtime_fields.get("invocations") == "2",
+                    "CHAR prepared JIT invocation count mismatch",
+                )
+                require(
+                    int(jit_fields.get("compiled", "0")) >= 2
+                    and int(jit_fields.get("code_bytes", "0")) > 0,
+                    "PREPARE_SET did not compile native point programs",
+                )
+                return
+            time.sleep(0.05)
+        raise ProtocolFailure("prepared JIT diagnostics were not published")
     finally:
         client.close()
 
@@ -736,6 +858,7 @@ def test_active_snapshot_delete_conflict_aborts_immediately(port):
 def test_prepared_snapshot_write_conflict(port):
     setup = WireClient(port)
     setup.command("CREATE TABLE prepared_si_probe (id INT, value INT);")
+    setup.command("CREATE INDEX prepared_si_probe(id);")
     setup.command("INSERT INTO prepared_si_probe VALUES (1, 10);")
     setup.close()
 
@@ -1403,6 +1526,7 @@ def main():
         server.start()
         test_stream_prepare_float_and_auto_abort(server.port)
         test_prepared_select_fast_route(server)
+        test_prepared_jit_point_select(server)
         test_prepared_and_explicit_transaction_ddl_rejection(server.port)
         test_compiled_update_descriptor_falls_back_safely(server)
         test_snapshot_write_conflict(server.port)

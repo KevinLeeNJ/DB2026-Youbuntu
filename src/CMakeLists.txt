@@ -1,6 +1,8 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(analyze)
+add_subdirectory(compiled)
+add_subdirectory(jit)
 add_subdirectory(record)
 add_subdirectory(index)
 add_subdirectory(system)
@@ -20,6 +22,8 @@ target_link_libraries(parser execution pthread)
 
 add_executable(rmdb rmdb.cpp)
 target_link_libraries(rmdb parser execution pthread planner analyze wire_protocol)
+target_link_libraries(rmdb jit)
+target_compile_definitions(rmdb PRIVATE RMDB_ENABLE_JIT=1)
 
 # Offline post-recovery structural verifier used by crash-consistency tests.
 add_executable(rmdb_verify rmdb_verify.cpp)
