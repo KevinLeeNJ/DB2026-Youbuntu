@@ -408,6 +408,10 @@ std::optional<ProgramBuild> build_program(const PreparedPlanDescriptor& descript
         set_reason(reason, "point tuple exceeds the JIT frame limit");
         return std::nullopt;
     }
+    if (index->col_tot_len <= 0 || static_cast<std::uint64_t>(index->col_tot_len) > compiled::MAX_PROGRAM_VALUE_BYTES) {
+        set_reason(reason, "point index key exceeds the JIT frame limit");
+        return std::nullopt;
+    }
 
     compiled::TupleLayout layout;
     layout.byte_size = static_cast<std::uint32_t>(record_size);
@@ -422,7 +426,7 @@ std::optional<ProgramBuild> build_program(const PreparedPlanDescriptor& descript
 
     std::vector<compiled::RegisterDesc> registers = {
         {ValueType::TUPLE, 0, 0},
-        {ValueType::POINT_KEY, compiled::kNoOperand, 0},
+        {ValueType::POINT_KEY, compiled::kNoOperand, static_cast<std::uint32_t>(index->col_tot_len)},
         {ValueType::ROW_HANDLE, compiled::kNoOperand, 0},
         {ValueType::TUPLE, 0, 0},
     };

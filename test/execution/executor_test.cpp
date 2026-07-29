@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -395,6 +396,121 @@ TEST_F(ExecutorTest, tombstone_candidates_are_deduplicated_and_removable) {
     candidates = sm_manager_->get_deleted_tuple_candidates("t");
     ASSERT_EQ(candidates.size(), 1);
     EXPECT_EQ(candidates[0], second);
+}
+
+TEST_F(ExecutorTest, gc_retires_mixed_same_page_candidates_after_watermark_advances) {
+    setup_db();
+    sm_manager_->create_table("gc_retire", make_int_cols({"id"}), nullptr);
+    insert_test_rows("gc_retire", {1, 2, 3, 4});
+    sm_manager_->create_index("gc_retire", {"id"}, nullptr);
+
+    std::vector<Rid> rids;
+    {
+        char buf[4096];
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, buf, &offset);
+        SeqScanExecutor scan(sm_manager_.get(), "gc_retire", {}, &context);
+        for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
+            rids.push_back(scan.rid());
+        }
+    }
+    ASSERT_EQ(rids.size(), 4);
+    ASSERT_TRUE(
+        std::all_of(rids.begin(), rids.end(), [&rids](const Rid& rid) { return rid.page_no == rids.front().page_no; }));
+
+    const auto& index = sm_manager_->db_.get_table("gc_retire").indexes.front();
+    const std::string index_name = sm_manager_->get_ix_manager()->get_index_name("gc_retire", index.cols);
+    const auto make_key = [](int value) {
+        std::vector<char> key(sizeof(value));
+        std::memcpy(key.data(), &value, sizeof(value));
+        return key;
+    };
+    for (size_t i = 0; i < rids.size(); ++i) {
+        sm_manager_->remember_historical_index_key("gc_retire", index_name, make_key(static_cast<int>(i + 1)), rids[i],
+                                                   index);
+        sm_manager_->remember_deleted_tuple_candidate("gc_retire", rids[i]);
+    }
+
+    sm_manager_->prune_version_history(0);
+    EXPECT_EQ(sm_manager_->get_historical_index_rids("gc_retire", index_name).size(), rids.size());
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("gc_retire").size(), rids.size());
+
+    sm_manager_->prune_version_history(1);
+    EXPECT_TRUE(sm_manager_->get_historical_index_rids("gc_retire", index_name).empty());
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
+
+    auto* fh = sm_manager_->fhs_.at("gc_retire").get();
+    const Rid released = rids.back();
+    sm_manager_->remember_historical_index_key("gc_retire", index_name, make_key(4), released, index);
+    sm_manager_->remember_deleted_tuple_candidate("gc_retire", released);
+    fh->delete_record(released, nullptr);
+    sm_manager_->prune_version_history(1);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(4)).empty());
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
+
+    const Rid retry_rid = rids.front();
+    const TupleMeta committed_meta = fh->get_tuple_meta(retry_rid);
+    TupleMeta pending_meta = committed_meta;
+    pending_meta.is_committed_ = false;
+    pending_meta.commit_ts_ = INVALID_TS;
+    fh->set_tuple_meta(retry_rid, pending_meta);
+    sm_manager_->remember_historical_index_key("gc_retire", index_name, make_key(1), retry_rid, index);
+    sm_manager_->remember_deleted_tuple_candidate("gc_retire", retry_rid);
+    sm_manager_->prune_version_history(5);
+
+    fh->set_tuple_meta(retry_rid, committed_meta);
+    sm_manager_->prune_version_history(5);
+    EXPECT_FALSE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(1)).empty());
+    EXPECT_FALSE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
+
+    sm_manager_->prune_version_history(6);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(1)).empty());
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
+
+    const Rid missing_page{fh->get_file_hdr().num_pages, 0};
+    sm_manager_->remember_deleted_tuple_candidate("gc_retire", missing_page);
+    sm_manager_->prune_version_history(6);
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retire").empty());
+
+    const Rid registration_rid = rids[1];
+    sm_manager_->remember_historical_index_key("gc_retire", index_name, make_key(2), registration_rid, index, 10);
+    sm_manager_->prune_version_history(10);
+    EXPECT_FALSE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(2)).empty());
+    sm_manager_->prune_version_history(11);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retire", index_name, make_key(2)).empty());
+}
+
+TEST_F(ExecutorTest, gc_retirement_queue_does_not_starve_candidates_behind_deferred_prefix) {
+    setup_db();
+    sm_manager_->create_table("gc_fair", make_int_cols({"id"}), nullptr);
+    std::vector<int> ids(513);
+    std::iota(ids.begin(), ids.end(), 0);
+    insert_test_rows("gc_fair", ids);
+
+    std::vector<Rid> rids;
+    {
+        char buf[4096];
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, buf, &offset);
+        SeqScanExecutor scan(sm_manager_.get(), "gc_fair", {}, &context);
+        for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
+            rids.push_back(scan.rid());
+        }
+    }
+    ASSERT_EQ(rids.size(), 513);
+    for (const Rid& rid : rids) {
+        sm_manager_->remember_deleted_tuple_candidate("gc_fair", rid);
+    }
+
+    const Rid released = rids.back();
+    sm_manager_->fhs_.at("gc_fair")->delete_record(released, nullptr);
+    sm_manager_->prune_version_history(0);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("gc_fair").size(), 513);
+
+    sm_manager_->prune_version_history(0);
+    const auto remaining = sm_manager_->get_deleted_tuple_candidates("gc_fair");
+    EXPECT_EQ(remaining.size(), 512);
+    EXPECT_EQ(std::find(remaining.begin(), remaining.end(), released), remaining.end());
 }
 
 TEST_F(ExecutorTest, seq_scan_all_records) {
@@ -1754,6 +1870,7 @@ TEST_F(ExecutorTest, gc_concurrent_with_version_chain_reads_is_safe) {
         InsertExecutor exec(sm_manager_.get(), "gc_conc", vals, &ctx);
         exec.Next();
     }
+    sm_manager_->create_index("gc_conc", {"val"}, nullptr);
 
     Rid rid;
     {
@@ -1785,6 +1902,9 @@ TEST_F(ExecutorTest, gc_concurrent_with_version_chain_reads_is_safe) {
             char buf[4096];
             int offset = 0;
             Context ctx(&lock_manager, nullptr, txn, buf, &offset, &txn_manager);
+            Value next_value;
+            next_value.set_int(i + 1);
+            set_val.rhs = next_value;
             UpdateExecutor upd(sm_manager_.get(), "gc_conc", {set_val}, {}, {rid}, &ctx);
             try {
                 upd.Next();

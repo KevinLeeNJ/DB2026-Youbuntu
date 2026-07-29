@@ -463,7 +463,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
     try {
         for (const auto& update : index_updates) {
             info.sm_manager->remember_historical_index_key(*info.tab_name, update.index->name, update.old_key, rid,
-                                                           *update.index->meta);
+                                                           *update.index->meta,
+                                                           txn == nullptr ? INVALID_TS : txn->get_read_ts());
             update.index->handle->delete_entry(update.old_key.data(), rid, txn);
             deleted.emplace_back(update.index, update.old_key);
             update.index->handle->insert_entry(update.new_key.data(), rid, txn);
@@ -514,7 +515,8 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         for (const auto& index : *info.indexes) {
             auto key = MakeIndexKey(*index.meta, visible_record.data);
             ReserveUniqueKey(context, index.handle->GetFd(), key);
-            info.sm_manager->remember_historical_index_key(*info.tab_name, index.name, key, rid, *index.meta);
+            info.sm_manager->remember_historical_index_key(*info.tab_name, index.name, key, rid, *index.meta,
+                                                           txn == nullptr ? INVALID_TS : txn->get_read_ts());
             index.handle->delete_entry(key.data(), rid, txn);
             deleted.emplace_back(&index, std::move(key));
         }
@@ -540,7 +542,7 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         tombstone.is_deleted_ = true;
         tombstone.version_chain_head_ = undo_link;
         info.fh->set_tuple_meta(rid, tombstone, log_lsn);
-        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid);
+        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid, txn->get_read_ts());
     } else {
         info.fh->delete_record(rid, context);
     }

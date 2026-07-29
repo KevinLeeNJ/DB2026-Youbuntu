@@ -2066,6 +2066,8 @@ TEST_F(SnapshotTest, SI_DeleteSelfVisibilityAndRollback) {
                                  "Total record(s): 2";
     EXPECT_EQ(TestSession::trim_output(final_state), expected_final)
         << "Explicit SI abort must roll back INSERT, UPDATE, and DELETE effects";
+    db_->txn()->GarbageCollection();
+    EXPECT_TRUE(db_->sm()->get_deleted_tuple_candidates("t").empty());
 }
 
 // =============================================================================
@@ -2937,6 +2939,38 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_PostSnapshotDeleteThenInsertSameTuple
                                  "+------------------+------------------+\n"
                                  "Total record(s): 0";
     EXPECT_EQ(TestSession::trim_output(final_state), expected_final);
+}
+
+TEST_F(SnapshotTest, SI_GcRetainsHistoricalIndexKeyUntilLongSnapshotEnds) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table gc_history (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index gc_history (id);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into gc_history values (1, 100);"));
+
+    auto old_reader = create_session();
+    auto updater = create_session();
+    ASSERT_TRUE(old_reader->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(old_reader->exec_sql_ok("begin;"));
+    const std::string first_read = old_reader->exec_sql("select * from gc_history where id = 1;");
+    EXPECT_NE(first_read.find("|                1 |              100 |"), std::string::npos);
+
+    ASSERT_TRUE(updater->exec_sql_ok("update gc_history set id = 2 where id = 1;"));
+    const auto& index = db_->sm()->db_.get_table("gc_history").indexes.front();
+    const std::string index_name = db_->sm()->get_ix_manager()->get_index_name("gc_history", index.cols);
+    std::vector<char> old_key(sizeof(int));
+    const int old_id = 1;
+    std::memcpy(old_key.data(), &old_id, sizeof(old_id));
+    ASSERT_FALSE(db_->sm()->get_historical_index_key_rids("gc_history", index_name, old_key).empty());
+
+    db_->txn()->GarbageCollection();
+    EXPECT_FALSE(db_->sm()->get_historical_index_key_rids("gc_history", index_name, old_key).empty());
+    const std::string read_after_gc = old_reader->exec_sql("select * from gc_history where id = 1;");
+    EXPECT_NE(read_after_gc.find("|                1 |              100 |"), std::string::npos);
+
+    ASSERT_TRUE(old_reader->exec_sql_ok("commit;"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into gc_history values (3, 300);"));
+    db_->txn()->GarbageCollection();
+    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("gc_history", index_name, old_key).empty());
 }
 
 TEST_F(SnapshotTest, SI_WriteWriteConflict_UncommittedDeleteThenInsertSameUniqueKey) {

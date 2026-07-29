@@ -161,7 +161,7 @@ extern "C" ExecutionFrame* CreateFrame(const compiled::CompiledProgram* program,
             else if (desc.type == compiled::ValueType::BYTES)
                 capacity = desc.max_length;
             else if (desc.type == compiled::ValueType::POINT_KEY)
-                capacity = compiled::MAX_PROGRAM_VALUE_BYTES;
+                capacity = desc.max_length;
             if (capacity) {
                 owner->storage[i].resize(capacity);
                 slot.data = owner->storage[i].data();

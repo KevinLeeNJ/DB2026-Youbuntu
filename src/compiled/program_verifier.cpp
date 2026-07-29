@@ -194,9 +194,9 @@ VerifyResult VerifyProgram(const CompiledProgram& program) {
             frame_bytes += program.tuple_layouts()[reg.tuple_layout].byte_size;
         } else if (reg.tuple_layout != kNoOperand) {
             return Fail("non-tuple register references a tuple layout");
-        } else if (reg.type == ValueType::BYTES) {
+        } else if (reg.type == ValueType::BYTES || reg.type == ValueType::POINT_KEY) {
             if (reg.max_length == 0 || reg.max_length > MAX_PROGRAM_VALUE_BYTES) {
-                return Fail("byte register has an invalid length");
+                return Fail("variable-width register has an invalid length");
             }
             frame_bytes += reg.max_length;
         } else if (reg.max_length != 0) {
