@@ -337,19 +337,35 @@ TEST_F(SmManagerTest, drop_table_clears_only_its_runtime_version_history) {
     std::memcpy(survivor_key.data(), &survivor_value, sizeof(survivor_value));
     const Rid reused_rid{1, 2};
     const Rid survivor_rid{3, 4};
+    TupleMeta reused_tombstone;
+    reused_tombstone.writer_txn_id_ = 201;
+    reused_tombstone.is_deleted_ = true;
+    reused_tombstone.version_chain_head_ = UndoLink{0, 1, 201};
+    TupleMeta survivor_tombstone;
+    survivor_tombstone.writer_txn_id_ = 202;
+    survivor_tombstone.is_deleted_ = true;
+    survivor_tombstone.version_chain_head_ = UndoLink{0, 2, 202};
+    const std::string reused_row("reused", 6);
+    const std::string survivor_row("survivor", 8);
+    RmRecord reused_record(static_cast<int>(reused_row.size()));
+    std::memcpy(reused_record.data, reused_row.data(), reused_row.size());
+    RmRecord survivor_record(static_cast<int>(survivor_row.size()));
+    std::memcpy(survivor_record.data, survivor_row.data(), survivor_row.size());
 
     sm_manager_->remember_historical_index_key("reused_name", reused_index_name, reused_key, reused_rid, reused_index);
-    sm_manager_->remember_deleted_tuple_candidate("reused_name", reused_rid);
+    sm_manager_->remember_deleted_tuple_candidate_for_test("reused_name", reused_rid, reused_row, reused_tombstone);
     sm_manager_->remember_historical_index_key("survivor", survivor_index_name, survivor_key, survivor_rid,
                                                survivor_index);
-    sm_manager_->remember_deleted_tuple_candidate("survivor", survivor_rid);
+    sm_manager_->remember_deleted_tuple_candidate_for_test("survivor", survivor_rid, survivor_row, survivor_tombstone);
 
     sm_manager_->drop_table("reused_name", nullptr);
     EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("reused_name", reused_index_name, reused_key).empty());
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("reused_name").empty());
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("reused_name", reused_record).empty());
     EXPECT_EQ(sm_manager_->get_historical_index_key_rids("survivor", survivor_index_name, survivor_key),
               std::vector<Rid>{survivor_rid});
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("survivor"), std::vector<Rid>{survivor_rid});
+    auto survivor_candidates = sm_manager_->get_deleted_tuple_candidates("survivor", survivor_record);
+    ASSERT_EQ(survivor_candidates.size(), 1u);
+    EXPECT_EQ(survivor_candidates[0].rid, survivor_rid);
     ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
     EXPECT_TRUE(sm_manager_->historical_bucket_belongs_to_table(
         sm_manager_->historical_retire_queue_.front().bucket_key, "survivor"));
@@ -357,6 +373,129 @@ TEST_F(SmManagerTest, drop_table_clears_only_its_runtime_version_history) {
     sm_manager_->create_table("reused_name", cols, nullptr);
     sm_manager_->create_index("reused_name", {"id"}, nullptr);
     EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("reused_name", reused_index_name, reused_key).empty());
+}
+
+TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_unsafe_prefix) {
+    setup_db();
+    sm_manager_->create_table("candidate_gc", make_int_cols({"id"}), nullptr);
+    auto* fh = sm_manager_->fhs_.at("candidate_gc").get();
+
+    RmRecord record(sizeof(int));
+    const int value = 9;
+    std::memcpy(record.data, &value, sizeof(value));
+
+    // The first entry remains unsafe.  The other 513 entries are safe at
+    // watermark 11, which proves that a bounded FIFO pass does not repeatedly
+    // starve entries after an unsafe prefix.
+    Rid first_rid;
+    for (int i = 0; i < 514; ++i) {
+        Rid rid = fh->insert_record(record.data, nullptr);
+        TupleMeta tombstone;
+        tombstone.writer_txn_id_ = 1000 + i;
+        tombstone.is_deleted_ = true;
+        tombstone.is_committed_ = i != 0;
+        tombstone.commit_ts_ = i == 0 ? INVALID_TS : 10;
+        tombstone.version_chain_head_ = UndoLink{0, i + 1, 1000 + i};
+        fh->set_tuple_meta(rid, tombstone);
+        sm_manager_->remember_deleted_tuple_candidate("candidate_gc", rid, record, tombstone);
+        if (i == 0) {
+            first_rid = rid;
+        }
+    }
+
+    sm_manager_->prune_version_history(11);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 3u);
+    sm_manager_->prune_version_history(11);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 1u);
+
+    // Equality is not safe: exactly watermark must remain. Advancing the
+    // watermark by one makes the same tombstone reclaimable.
+    TupleMeta first_meta = fh->get_tuple_meta(first_rid);
+    first_meta.is_committed_ = true;
+    first_meta.commit_ts_ = 11;
+    fh->set_tuple_meta(first_rid, first_meta);
+    sm_manager_->prune_version_history(11);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 1u);
+    sm_manager_->prune_version_history(12);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 0u);
+}
+
+TEST_F(SmManagerTest, database_lifecycle_resets_all_deleted_tuple_candidate_diagnostics) {
+    setup_db();
+    sm_manager_->create_table("candidate_stats", make_int_cols({"id"}), nullptr);
+    auto* fh = sm_manager_->fhs_.at("candidate_stats").get();
+
+    RmRecord record(sizeof(int));
+    const int value = 17;
+    std::memcpy(record.data, &value, sizeof(value));
+    const Rid rid = fh->insert_record(record.data, nullptr);
+
+    TupleMeta tombstone;
+    tombstone.writer_txn_id_ = 301;
+    tombstone.is_deleted_ = true;
+    tombstone.version_chain_head_ = UndoLink{0, 1, 301};
+    fh->set_tuple_meta(rid, tombstone);
+
+    sm_manager_->set_deleted_tuple_candidate_diagnostics_enabled(true);
+    sm_manager_->remember_deleted_tuple_candidate("candidate_stats", rid, record, tombstone);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_stats", record).size(), 1u);
+    RmRecord different_record(sizeof(int));
+    const int different_value = 18;
+    std::memcpy(different_record.data, &different_value, sizeof(different_value));
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("candidate_stats", different_record).empty());
+    sm_manager_->note_deleted_tuple_candidate_validated(2);
+    sm_manager_->note_deleted_tuple_candidate_page_probe();
+
+    // Exercise both GC outcomes so the cumulative retire counters are nonzero.
+    sm_manager_->prune_version_history(10);
+    tombstone.is_committed_ = true;
+    tombstone.commit_ts_ = 9;
+    fh->set_tuple_meta(rid, tombstone);
+    sm_manager_->prune_version_history(10);
+    sm_manager_->remember_deleted_tuple_candidate("candidate_stats", rid, record, tombstone);
+
+    auto before = sm_manager_->get_deleted_tuple_candidate_stats();
+    EXPECT_GT(before.lookups, 0u);
+    EXPECT_GT(before.exact_hits, 0u);
+    EXPECT_GT(before.exact_misses, 0u);
+    EXPECT_GT(before.validated_candidates, 0u);
+    EXPECT_GT(before.page_probes, 0u);
+    EXPECT_GT(before.active_candidates, 0u);
+    EXPECT_GT(before.active_buckets, 0u);
+    EXPECT_GT(before.retire_pops, 0u);
+    EXPECT_GT(before.retire_requeues, 0u);
+    EXPECT_GT(before.retire_prunes, 0u);
+    EXPECT_GT(before.retire_max_queue, 0u);
+
+    sm_manager_->close_db();
+    db_opened_ = false;
+    auto after_close = sm_manager_->get_deleted_tuple_candidate_stats();
+    EXPECT_EQ(after_close.lookups, 0u);
+    EXPECT_EQ(after_close.exact_hits, 0u);
+    EXPECT_EQ(after_close.exact_misses, 0u);
+    EXPECT_EQ(after_close.validated_candidates, 0u);
+    EXPECT_EQ(after_close.page_probes, 0u);
+    EXPECT_EQ(after_close.active_candidates, 0u);
+    EXPECT_EQ(after_close.active_buckets, 0u);
+    EXPECT_EQ(after_close.retire_pops, 0u);
+    EXPECT_EQ(after_close.retire_requeues, 0u);
+    EXPECT_EQ(after_close.retire_prunes, 0u);
+    EXPECT_EQ(after_close.retire_max_queue, 0u);
+
+    sm_manager_->open_db(TEST_DB_NAME);
+    db_opened_ = true;
+    auto after_reopen = sm_manager_->get_deleted_tuple_candidate_stats();
+    EXPECT_EQ(after_reopen.lookups, 0u);
+    EXPECT_EQ(after_reopen.exact_hits, 0u);
+    EXPECT_EQ(after_reopen.exact_misses, 0u);
+    EXPECT_EQ(after_reopen.validated_candidates, 0u);
+    EXPECT_EQ(after_reopen.page_probes, 0u);
+    EXPECT_EQ(after_reopen.active_candidates, 0u);
+    EXPECT_EQ(after_reopen.active_buckets, 0u);
+    EXPECT_EQ(after_reopen.retire_pops, 0u);
+    EXPECT_EQ(after_reopen.retire_requeues, 0u);
+    EXPECT_EQ(after_reopen.retire_prunes, 0u);
+    EXPECT_EQ(after_reopen.retire_max_queue, 0u);
 }
 
 // =============================================================================

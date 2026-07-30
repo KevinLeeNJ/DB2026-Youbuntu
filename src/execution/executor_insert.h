@@ -116,6 +116,10 @@ public:
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
 
+        if (indexes_->empty()) {
+            CheckLogicalRowDeleteIntentForInsert(context_, sm_manager_, *tab_name_, rec);
+        }
+
         if (context_ != nullptr && context_->txn_ != nullptr &&
             context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
             DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, *tab_name_, rec, context_)) {

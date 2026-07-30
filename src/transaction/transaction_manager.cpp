@@ -78,6 +78,12 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
         lock_manager->unlock_unique_key(txn, lock_id);
     }
     txn->get_unique_key_lock_set()->clear();
+
+    auto logical_row_delete_intents = *txn->get_logical_row_delete_intent_set();
+    for (const auto& intent_id : logical_row_delete_intents) {
+        lock_manager->unregister_logical_row_delete_intent(txn, intent_id);
+    }
+    txn->get_logical_row_delete_intent_set()->clear();
 }
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
@@ -341,7 +347,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         break;
     }
     case WType::DELETE_TUPLE: {
-        RmRecord old_rec = write_record->GetRecord();
+        const RmRecord& old_rec = write_record->GetRecord();
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
         if (fh->is_record(rid)) {
             fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
@@ -356,7 +362,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         break;
     }
     case WType::UPDATE_TUPLE: {
-        RmRecord old_rec = write_record->GetRecord();
+        const RmRecord& old_rec = write_record->GetRecord();
         std::unique_ptr<RmRecord> current_rec;
         if (fh->is_record(rid)) {
             current_rec = fh->get_record(rid, nullptr);

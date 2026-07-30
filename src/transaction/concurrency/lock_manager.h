@@ -84,6 +84,14 @@ public:
     // separate from the B+ tree structural latch because history/current-index
     // validation must be protected across the whole write protocol.
     bool lock_exclusive_on_unique_key(Transaction* txn, int index_fd, const std::vector<char>& key);
+    // DELETE publishes a transaction-lifetime exact-row intent before writing
+    // its tombstone. INSERT only probes for another transaction's intent. This
+    // is directional: insert-before-delete and concurrent inserts remain valid.
+    bool register_logical_row_delete_intent(Transaction* txn, uint64_t table_runtime_id,
+                                            const std::vector<char>& record_bytes);
+    bool logical_row_delete_intent_conflicts(Transaction* txn, uint64_t table_runtime_id,
+                                             const std::vector<char>& record_bytes);
+    bool unregister_logical_row_delete_intent(Transaction* txn, const std::string& intent_id);
     bool unlock_unique_key(Transaction* txn, const std::string& lock_id);
 
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
@@ -158,6 +166,8 @@ private:
         std::mutex latch;
         std::unordered_map<std::string, std::shared_ptr<UniqueKeyQueue>> queues;
     };
+    bool lock_exclusive_on_unique_key_id(Transaction* txn, const std::string& lock_id);
+    static std::string make_unique_key_lock_id(int index_fd, const std::vector<char>& key);
     std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
     std::atomic<uint64_t> unique_immediate_conflict_{0};
     std::atomic<uint64_t> unique_wait_enqueued_{0};
@@ -167,4 +177,13 @@ private:
     std::atomic<uint64_t> unique_queue_depth_max_{0};
     std::atomic<uint64_t> unique_cycle_checks_{0};
     std::atomic<uint64_t> unique_cycle_victims_{0};
+
+    static constexpr size_t LOGICAL_ROW_INTENT_SHARD_COUNT = 64;
+    struct LogicalRowShard {
+        std::mutex latch;
+        std::unordered_map<std::string, std::unordered_set<txn_id_t>> delete_intents;
+    };
+    static std::string make_logical_row_delete_intent_id(uint64_t table_runtime_id,
+                                                         const std::vector<char>& record_bytes);
+    std::array<LogicalRowShard, LOGICAL_ROW_INTENT_SHARD_COUNT> logical_row_shards_;
 };

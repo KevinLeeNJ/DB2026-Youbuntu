@@ -457,7 +457,7 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         undo.old_meta_ = info.fh->get_tuple_meta(rid);
         undo.old_tuple_data_.assign(visible_record.data, visible_record.data + visible_record.size);
         undo.prev_version_ = undo.old_meta_.version_chain_head_;
-        const UndoLink undo_link = txn->AppendUndoLog(undo);
+        const UndoLink undo_link = txn->AppendUndoLog(std::move(undo));
         txn->append_modified_slot(*info.tab_name, rid);
         TupleMeta meta;
         meta.writer_txn_id_ = txn->get_transaction_id();
@@ -506,6 +506,9 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         return false;
     }
     auto* txn = context == nullptr ? nullptr : context->txn_;
+    if (info.indexes->empty()) {
+        RegisterLogicalRowDeleteIntent(context, info.sm_manager, *info.tab_name, visible_record);
+    }
     if (txn != nullptr && txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context->txn_mgr_ != nullptr &&
         context->txn_mgr_->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, *info.tab_name,
                                                     std::optional<RmRecord>(visible_record), std::nullopt,
@@ -547,7 +550,7 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         undo.old_meta_ = info.fh->get_tuple_meta(rid);
         undo.old_tuple_data_.assign(visible_record.data, visible_record.data + visible_record.size);
         undo.prev_version_ = undo.old_meta_.version_chain_head_;
-        const UndoLink undo_link = txn->AppendUndoLog(undo);
+        const UndoLink undo_link = txn->AppendUndoLog(std::move(undo));
         txn->append_write_record(
             std::make_unique<WriteRecord>(WType::DELETE_TUPLE, *info.tab_name, rid, visible_record));
         txn->append_modified_slot(*info.tab_name, rid);
@@ -557,7 +560,10 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         tombstone.is_deleted_ = true;
         tombstone.version_chain_head_ = undo_link;
         info.fh->set_tuple_meta(rid, tombstone, log_lsn);
-        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid);
+        // Publish the exact physical row key only after the tombstone is
+        // visible. INSERT copies this small bucket under the candidate latch
+        // and performs all page access after releasing it.
+        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid, visible_record, tombstone);
     } else {
         info.fh->delete_record(rid, context);
     }

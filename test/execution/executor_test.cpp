@@ -376,25 +376,158 @@ TEST_F(ExecutorTest, seq_scan_empty_table) {
     EXPECT_TRUE(exec.is_end());
 }
 
-TEST_F(ExecutorTest, tombstone_candidates_are_deduplicated_and_removable) {
+TEST_F(ExecutorTest, tombstone_candidates_use_exact_bytes_and_generation_safe_removal) {
     Rid first{1, 3};
     Rid second{2, 5};
+    TupleMeta first_meta;
+    first_meta.writer_txn_id_ = 101;
+    first_meta.is_deleted_ = true;
+    first_meta.version_chain_head_ = UndoLink{0, 1, 101};
+    TupleMeta second_meta;
+    second_meta.writer_txn_id_ = 102;
+    second_meta.is_deleted_ = true;
+    second_meta.version_chain_head_ = UndoLink{0, 2, 102};
 
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("t").empty());
+    const std::string first_bytes("\x01\x00", 2);
+    const std::string second_bytes("\x02\x00", 2);
+    RmRecord first_record(static_cast<int>(first_bytes.size()));
+    std::memcpy(first_record.data, first_bytes.data(), first_bytes.size());
+    RmRecord second_record(static_cast<int>(second_bytes.size()));
+    std::memcpy(second_record.data, second_bytes.data(), second_bytes.size());
 
-    sm_manager_->remember_deleted_tuple_candidate("t", first);
-    sm_manager_->remember_deleted_tuple_candidate("t", first);
-    sm_manager_->remember_deleted_tuple_candidate("t", second);
+    // Both entries are deliberately forced into one hash bucket. Exact binary
+    // equality, rather than the cached hash, decides which deletion is seen.
+    sm_manager_->set_deleted_tuple_candidate_test_hash_override(7);
+    sm_manager_->remember_deleted_tuple_candidate_for_test("t", first, first_bytes, first_meta);
+    sm_manager_->remember_deleted_tuple_candidate_for_test("t", second, second_bytes, second_meta);
 
-    auto candidates = sm_manager_->get_deleted_tuple_candidates("t");
-    ASSERT_EQ(candidates.size(), 2);
-    EXPECT_NE(std::find(candidates.begin(), candidates.end(), first), candidates.end());
-    EXPECT_NE(std::find(candidates.begin(), candidates.end(), second), candidates.end());
-
-    sm_manager_->remove_deleted_tuple_candidate("t", first);
-    candidates = sm_manager_->get_deleted_tuple_candidates("t");
+    auto candidates = sm_manager_->get_deleted_tuple_candidates("t", first_record);
     ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0], second);
+    EXPECT_EQ(candidates[0].rid, first);
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("t", second_record).size() == 1);
+
+    // Removal is generation-safe: an exact match removes only this candidate,
+    // never the colliding row-key bucket or a later candidate at the same RID.
+    sm_manager_->remove_deleted_tuple_candidate_if_current("t", first_record, candidates[0]);
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("t", first_record).empty());
+    candidates = sm_manager_->get_deleted_tuple_candidates("t", second_record);
+    ASSERT_EQ(candidates.size(), 1);
+    EXPECT_EQ(candidates[0].rid, second);
+}
+
+TEST_F(ExecutorTest, tombstone_candidate_diagnostics_count_the_third_record_probe_once) {
+    sm_manager_->set_deleted_tuple_candidate_diagnostics_enabled(true);
+    sm_manager_->note_deleted_tuple_candidate_validated(2);
+    sm_manager_->note_deleted_tuple_candidate_page_probe();
+
+    auto stats = sm_manager_->get_deleted_tuple_candidate_stats();
+    EXPECT_EQ(stats.validated_candidates, 1u);
+    EXPECT_EQ(stats.page_probes, 3u);
+
+    sm_manager_->set_deleted_tuple_candidate_diagnostics_enabled(false);
+    sm_manager_->note_deleted_tuple_candidate_validated(2);
+    sm_manager_->note_deleted_tuple_candidate_page_probe();
+    stats = sm_manager_->get_deleted_tuple_candidate_stats();
+    EXPECT_EQ(stats.validated_candidates, 1u);
+    EXPECT_EQ(stats.page_probes, 3u);
+}
+
+TEST_F(ExecutorTest, logical_row_delete_intent_blocks_insert_in_unpublished_tombstone_window) {
+    setup_db();
+    sm_manager_->create_table("t", make_int_cols({"id"}), nullptr);
+    std::vector<Value> seed_values;
+    Value seed_value;
+    seed_value.set_int(7);
+    seed_values.push_back(seed_value);
+    char seed_data[64] = {};
+    int seed_offset = 0;
+    Context seed_context(nullptr, nullptr, nullptr, seed_data, &seed_offset);
+    InsertExecutor seed_insert(sm_manager_.get(), "t", seed_values, &seed_context);
+    seed_insert.Next();
+
+    auto* fh = sm_manager_->fhs_.at("t").get();
+    Rid rid = seed_insert.rid();
+    auto visible = fh->get_record(rid, nullptr);
+    ASSERT_NE(visible, nullptr);
+    const TupleMeta original_meta = fh->get_tuple_meta(rid);
+
+    LockManager lock_manager;
+    Transaction deleting_txn(101, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction inserting_txn(102, IsolationLevel::SNAPSHOT_ISOLATION);
+    char data_send[64] = {};
+    int offset = 0;
+    Context deleting_context(&lock_manager, nullptr, &deleting_txn, data_send, &offset);
+    Context inserting_context(&lock_manager, nullptr, &inserting_txn, data_send, &offset);
+    auto catalog_guard = sm_manager_->acquire_catalog_shared();
+
+    // Model the precise old publication gap: the tombstone is already visible,
+    // but C1's deleted-tuple candidate has not yet been published. The INSERT
+    // must still abort because the DELETE intent precedes its probe of the
+    // currently empty candidate bucket.
+    RegisterLogicalRowDeleteIntent(&deleting_context, sm_manager_.get(), "t", *visible);
+    TupleMeta tombstone = original_meta;
+    tombstone.writer_txn_id_ = deleting_txn.get_transaction_id();
+    tombstone.is_committed_ = false;
+    tombstone.is_deleted_ = true;
+    tombstone.version_chain_head_ = UndoLink{0, 1, deleting_txn.get_transaction_id()};
+    fh->set_tuple_meta(rid, tombstone);
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("t", *visible).empty());
+
+    std::vector<Value> values;
+    Value value;
+    value.set_int(7);
+    values.push_back(value);
+    InsertExecutor insert(sm_manager_.get(), "t", values, &inserting_context);
+    EXPECT_THROW(insert.Next(), TransactionAbortException);
+    EXPECT_TRUE(inserting_txn.get_unique_key_lock_set()->empty());
+    EXPECT_TRUE(inserting_txn.get_logical_row_delete_intent_set()->empty());
+
+    // Exact identities do not over-serialize other rows, and unregistering the
+    // transaction-owned delete intent makes the original row available again.
+    RmRecord different_row(*visible);
+    int different_value = 8;
+    std::memcpy(different_row.data, &different_value, sizeof(different_value));
+    const uint64_t table_runtime_id = sm_manager_->get_table_runtime_id_under_catalog_guard("t");
+    EXPECT_FALSE(lock_manager.logical_row_delete_intent_conflicts(
+        &inserting_txn, table_runtime_id,
+        std::vector<char>(different_row.data, different_row.data + different_row.size)));
+    auto deleting_intents = *deleting_txn.get_logical_row_delete_intent_set();
+    ASSERT_EQ(deleting_intents.size(), 1u);
+    EXPECT_TRUE(lock_manager.unregister_logical_row_delete_intent(&deleting_txn, *deleting_intents.begin()));
+    EXPECT_FALSE(lock_manager.logical_row_delete_intent_conflicts(
+        &inserting_txn, table_runtime_id, std::vector<char>(visible->data, visible->data + visible->size)));
+    fh->set_tuple_meta(rid, original_meta);
+}
+
+TEST(LogicalRowDeleteIntentTest, IsDirectionalExactAndAllowsMultipleDeleteOwners) {
+    LockManager lock_manager;
+    Transaction inserter(201, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction first_deleter(202, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction second_deleter(203, IsolationLevel::SNAPSHOT_ISOLATION);
+    const uint64_t table_runtime_id = 77;
+    const std::vector<char> row{'a', '\0', 'b'};
+    const std::vector<char> different_row{'a', '\0', 'c'};
+
+    // An INSERT that probes first linearizes before a later DELETE and does not
+    // publish any ownership which could over-serialize that DELETE.
+    EXPECT_FALSE(lock_manager.logical_row_delete_intent_conflicts(&inserter, table_runtime_id, row));
+    EXPECT_TRUE(lock_manager.register_logical_row_delete_intent(&first_deleter, table_runtime_id, row));
+    EXPECT_FALSE(lock_manager.logical_row_delete_intent_conflicts(&first_deleter, table_runtime_id, row));
+
+    // Multiple transactions may delete equal bytes at different RIDs. Once an
+    // intent exists, a later exact INSERT conflicts, while different bytes do not.
+    EXPECT_TRUE(lock_manager.register_logical_row_delete_intent(&second_deleter, table_runtime_id, row));
+    EXPECT_TRUE(lock_manager.logical_row_delete_intent_conflicts(&inserter, table_runtime_id, row));
+    EXPECT_FALSE(lock_manager.logical_row_delete_intent_conflicts(&inserter, table_runtime_id, different_row));
+
+    auto first_intents = *first_deleter.get_logical_row_delete_intent_set();
+    auto second_intents = *second_deleter.get_logical_row_delete_intent_set();
+    ASSERT_EQ(first_intents.size(), 1u);
+    ASSERT_EQ(second_intents.size(), 1u);
+    EXPECT_TRUE(lock_manager.unregister_logical_row_delete_intent(&first_deleter, *first_intents.begin()));
+    EXPECT_TRUE(lock_manager.logical_row_delete_intent_conflicts(&inserter, table_runtime_id, row));
+    EXPECT_TRUE(lock_manager.unregister_logical_row_delete_intent(&second_deleter, *second_intents.begin()));
+    EXPECT_FALSE(lock_manager.logical_row_delete_intent_conflicts(&inserter, table_runtime_id, row));
 }
 
 TEST_F(ExecutorTest, seq_scan_all_records) {

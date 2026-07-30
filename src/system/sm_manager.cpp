@@ -166,9 +166,10 @@ void SmManager::open_db(const std::string& db_name) {
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        deleted_tuple_candidates_.clear();
+        clear_deleted_tuple_candidates_locked();
     }
     try {
+        table_runtime_ids_.clear();
         if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
             throw UnixError();
         }
@@ -187,6 +188,7 @@ void SmManager::open_db(const std::string& db_name) {
             // NULL 位地址不进磁盘元数据，每次打开库时按数据文件的 record_size 推导。
             tab_meta.bind_null_positions(file_handle->get_file_hdr().record_size);
             fhs_.emplace(tab_meta.name, std::move(file_handle));
+            table_runtime_ids_.emplace(tab_meta.name, next_table_runtime_id_++);
             for (auto& index : tab_meta.indexes) {
                 // 打开索引文件
                 const std::string index_name = ix_manager_->get_index_name(tab_meta.name, index.cols);
@@ -222,6 +224,7 @@ void SmManager::open_db(const std::string& db_name) {
     } catch (...) {
         fhs_.clear();
         ihs_.clear();
+        table_runtime_ids_.clear();
         db_ = DbMeta();
         chdir(original_cwd.c_str());
         throw;
@@ -269,6 +272,7 @@ void SmManager::close_db() {
     }
     fhs_.clear();
     ihs_.clear();
+    table_runtime_ids_.clear();
     db_.name_.clear();
     db_.tabs_.clear();
     {
@@ -278,7 +282,7 @@ void SmManager::close_db() {
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        deleted_tuple_candidates_.clear();
+        clear_deleted_tuple_candidates_locked();
     }
     if (chdir("..") < 0) { // 回到根目录
         throw UnixError();
@@ -287,6 +291,11 @@ void SmManager::close_db() {
 
 void SmManager::prune_version_history(timestamp_t watermark) {
     constexpr size_t kHistoryPruneBatch = 512;
+    // Hold the catalog lifetime guard while resolving table handles and
+    // touching their pages.  This is deliberately acquired only here: callers
+    // of this background GC path do not already own a catalog guard, avoiding
+    // recursive locking of catalog_latch_.
+    auto catalog_guard = acquire_catalog_shared();
     // Historical entries are placed on a retire queue when created. Each GC
     // pass examines only a bounded queue prefix; entries that are still
     // visible to an active snapshot are requeued for a later watermark.
@@ -345,42 +354,76 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         }
     }
 
-    // 回收 deleted_tuple_candidates_：同样的水位线条件
-    std::vector<std::pair<std::string, Rid>> del_snapshot;
+    // Deleted-tuple candidates use a FIFO retire queue instead of repeatedly
+    // scanning the first keys in an unordered map. Entries which remain visible
+    // to an old snapshot rotate to the tail, so they cannot starve later safe
+    // entries. The candidate latch is never held while a page is fetched.
+    std::vector<DeletedTupleRetireCandidate> deleted_snapshot;
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        del_snapshot.reserve(deleted_tuple_candidates_.size() * 2);
-        for (const auto& [tab_name, rids] : deleted_tuple_candidates_) {
-            for (const Rid& rid : rids) {
-                del_snapshot.emplace_back(tab_name, rid);
-                if (del_snapshot.size() >= kHistoryPruneBatch)
-                    break;
+        const size_t count = std::min(kHistoryPruneBatch, deleted_tuple_retire_queue_.size());
+        deleted_snapshot.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            deleted_snapshot.push_back(std::move(deleted_tuple_retire_queue_.front()));
+            deleted_tuple_retire_queue_.pop_front();
+        }
+        if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
+            deleted_tuple_candidate_retire_pops_.fetch_add(count, std::memory_order_relaxed);
+        }
+    }
+
+    std::vector<bool> deleted_requeue(deleted_snapshot.size(), false);
+    for (size_t i = 0; i < deleted_snapshot.size(); ++i) {
+        const auto& retired = deleted_snapshot[i];
+        auto fh_it = fhs_.find(retired.tab_name);
+        if (fh_it == fhs_.end() || !fh_it->second->is_record(retired.candidate.rid)) {
+            continue;
+        }
+        TupleMeta meta = fh_it->second->get_tuple_meta(retired.candidate.rid);
+        // A stale queue item must not touch a newer deletion at a reused RID.
+        if (!deleted_tuple_candidate_matches_meta(retired.candidate, meta)) {
+            continue;
+        }
+        // Keep precisely the candidates that can still be seen as concurrent
+        // by an active snapshot. Equality is intentionally unsafe here.
+        if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
+            deleted_requeue[i] = true;
+        }
+    }
+
+    if (!deleted_snapshot.empty()) {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        for (size_t i = 0; i < deleted_snapshot.size(); ++i) {
+            const auto& retired = deleted_snapshot[i];
+            if (deleted_requeue[i]) {
+                // Do not resurrect an entry removed by a concurrent foreground
+                // validation or by DROP TABLE while this batch touched pages.
+                auto table_it = deleted_tuple_candidates_.find(retired.tab_name);
+                if (table_it == deleted_tuple_candidates_.end()) {
+                    continue;
+                }
+                auto bucket_it = table_it->second.find(retired.row_key);
+                if (bucket_it == table_it->second.end()) {
+                    continue;
+                }
+                const bool still_current =
+                    std::any_of(bucket_it->second.begin(), bucket_it->second.end(), [&](const auto& current) {
+                        return current.candidate_id == retired.candidate.candidate_id &&
+                               current.writer_txn_id == retired.candidate.writer_txn_id &&
+                               current.version_chain_head == retired.candidate.version_chain_head;
+                    });
+                if (still_current) {
+                    deleted_tuple_retire_queue_.push_back(retired);
+                    if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
+                        deleted_tuple_candidate_retire_requeues_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } else if (erase_deleted_tuple_candidate_locked(retired.tab_name, retired.row_key, retired.candidate) &&
+                       deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
+                deleted_tuple_candidate_retire_prunes_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (del_snapshot.size() >= kHistoryPruneBatch)
-                break;
         }
-    }
-    std::vector<std::pair<std::string, Rid>> del_to_remove;
-    for (auto& [tab_name, rid] : del_snapshot) {
-        auto fh_it = fhs_.find(tab_name);
-        if (fh_it == fhs_.end()) {
-            del_to_remove.emplace_back(std::move(tab_name), rid);
-            continue;
-        }
-        RmFileHandle* fh = fh_it->second.get();
-        if (!fh->is_record(rid)) {
-            del_to_remove.emplace_back(std::move(tab_name), rid);
-            continue;
-        }
-        TupleMeta meta = fh->get_tuple_meta(rid);
-        // 候选仅在 tombstone 仍可能被并发 INSERT 检测时需要保留；若当前版本已提交
-        // 且 commit_ts < watermark，则无活跃事务会再把它视为并发删除。
-        if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark) {
-            del_to_remove.emplace_back(std::move(tab_name), rid);
-        }
-    }
-    for (auto& [tab_name, rid] : del_to_remove) {
-        remove_deleted_tuple_candidate(tab_name, rid);
+        update_deleted_tuple_retire_max_locked();
     }
 }
 
@@ -518,6 +561,7 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     db_.tabs_[tab_name] = tab;
     // fhs_[tab_name] = rm_manager_->open_file(tab_name);
     fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+    table_runtime_ids_.emplace(tab_name, next_table_runtime_id_++);
 
     flush_meta();
     bump_catalog_generation();
@@ -539,6 +583,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     rm_manager_->destroy_file(tab_name); // 删除表的磁盘文件
     db_.tabs_.erase(tab_name);           // 删除对应键值对
     fhs_.erase(tab_name);
+    table_runtime_ids_.erase(tab_name);
     flush_meta();
     bump_catalog_generation();
     clear_table_runtime_history(tab_name);
@@ -563,7 +608,22 @@ void SmManager::clear_table_runtime_history(const std::string& tab_name) {
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        deleted_tuple_candidates_.erase(tab_name);
+        auto table_it = deleted_tuple_candidates_.find(tab_name);
+        if (table_it != deleted_tuple_candidates_.end()) {
+            uint64_t removed_candidates = 0;
+            for (const auto& [_, candidates] : table_it->second) {
+                removed_candidates += candidates.size();
+            }
+            deleted_tuple_candidate_active_.fetch_sub(removed_candidates, std::memory_order_relaxed);
+            deleted_tuple_candidate_active_buckets_.fetch_sub(table_it->second.size(), std::memory_order_relaxed);
+            deleted_tuple_candidates_.erase(table_it);
+        }
+        deleted_tuple_retire_queue_.erase(std::remove_if(deleted_tuple_retire_queue_.begin(),
+                                                         deleted_tuple_retire_queue_.end(),
+                                                         [&](const DeletedTupleRetireCandidate& candidate) {
+                                                             return candidate.tab_name == tab_name;
+                                                         }),
+                                          deleted_tuple_retire_queue_.end());
     }
 }
 

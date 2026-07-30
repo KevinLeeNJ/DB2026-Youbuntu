@@ -128,6 +128,7 @@ benchmark: build tpcc-go
 		--isolation $(TPCC_ISOLATION) \
 		--go-binary $(TPCC_GO_BINARY) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
+
 benchmark-sqlite: tpcc-go
 	@rm -f $(TPCC_SQLITE_PATH) $(TPCC_SQLITE_PATH)-wal $(TPCC_SQLITE_PATH)-shm $(TPCC_SQLITE_RESULT)
 	@$(TPCC_GO_BINARY) --command load \

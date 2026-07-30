@@ -36,6 +36,36 @@ inline void ReserveUniqueKey(Context* context, int index_fd, const std::vector<c
     }
 }
 
+// A no-index SI/SERIALIZABLE DELETE publishes an exact-row intent before its
+// tombstone. INSERT atomically probes this registry before checking the slower
+// candidate store. The full on-page bytes are authoritative; hashing only
+// selects a shard. The caller holds the catalog shared guard.
+inline void CheckLogicalRowDeleteIntentForInsert(Context* context, SmManager* sm_manager, const std::string& tab_name,
+                                                 const RmRecord& record) {
+    if (context == nullptr || context->txn_ == nullptr || context->lock_mgr_ == nullptr || sm_manager == nullptr ||
+        context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+        return;
+    }
+    const uint64_t table_runtime_id = sm_manager->get_table_runtime_id_under_catalog_guard(tab_name);
+    std::vector<char> record_bytes(record.data, record.data + record.size);
+    if (context->lock_mgr_->logical_row_delete_intent_conflicts(context->txn_, table_runtime_id, record_bytes)) {
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+    }
+}
+
+inline void RegisterLogicalRowDeleteIntent(Context* context, SmManager* sm_manager, const std::string& tab_name,
+                                           const RmRecord& record) {
+    if (context == nullptr || context->txn_ == nullptr || context->lock_mgr_ == nullptr || sm_manager == nullptr ||
+        context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+        return;
+    }
+    const uint64_t table_runtime_id = sm_manager->get_table_runtime_id_under_catalog_guard(tab_name);
+    std::vector<char> record_bytes(record.data, record.data + record.size);
+    if (!context->lock_mgr_->register_logical_row_delete_intent(context->txn_, table_runtime_id, record_bytes)) {
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+    }
+}
+
 inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid, Context* context) {
     if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
         return fh->get_record(rid, context);
@@ -223,16 +253,24 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
     }
 
     auto* txn = context->txn_;
-    auto candidate_rids = sm_manager->get_deleted_tuple_candidates(tab_name);
-    for (const auto& rid : candidate_rids) {
-        if (!fh->is_record(rid)) {
-            sm_manager->remove_deleted_tuple_candidate(tab_name, rid);
+    // This is an exact physical-row bucket lookup. The returned vector is a
+    // copy, so neither page access nor transaction work is ever performed
+    // while SmManager's candidate latch is held.
+    auto candidates = sm_manager->get_deleted_tuple_candidates(tab_name, inserted_rec);
+    for (const auto& candidate : candidates) {
+        if (!fh->is_record(candidate.rid)) {
+            sm_manager->note_deleted_tuple_candidate_validated(1);
+            sm_manager->remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
             continue;
         }
 
-        TupleMeta meta = fh->get_tuple_meta(rid);
-        if (!meta.is_deleted_) {
-            sm_manager->remove_deleted_tuple_candidate(tab_name, rid);
+        TupleMeta meta = fh->get_tuple_meta(candidate.rid);
+        sm_manager->note_deleted_tuple_candidate_validated(2);
+        // candidate_id + delete version identity makes this cleanup ABA-safe:
+        // a reused RID or a later delete cannot be removed by an old lookup.
+        if (!meta.is_deleted_ || meta.writer_txn_id_ != candidate.writer_txn_id ||
+            meta.version_chain_head_ != candidate.version_chain_head) {
+            sm_manager->remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
             continue;
         }
         if (meta.writer_txn_id_ == txn->get_transaction_id()) {
@@ -244,7 +282,8 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
             continue;
         }
 
-        auto deleted_rec = fh->get_record(rid, context);
+        auto deleted_rec = fh->get_record(candidate.rid, context);
+        sm_manager->note_deleted_tuple_candidate_page_probe();
         if (deleted_rec != nullptr && RecordDataEquals(*deleted_rec, inserted_rec)) {
             return true;
         }

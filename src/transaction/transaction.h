@@ -214,6 +214,10 @@ public:
         return &unique_key_lock_set_;
     }
 
+    inline std::unordered_set<std::string>* get_logical_row_delete_intent_set() {
+        return &logical_row_delete_intent_set_;
+    }
+
     inline timestamp_t get_read_ts() const {
         return read_ts_;
     }
@@ -325,6 +329,8 @@ private:
     std::deque<std::unique_ptr<WriteRecord>> write_set_;  // 事务包含的所有写操作
     std::unordered_set<LockDataId> lock_set_;             // 事务申请的所有锁
     std::unordered_set<std::string> unique_key_lock_set_; // 事务持有的逻辑唯一键 reservation
+    // 无索引表精确行值的 delete intent，独立于 unique-key reservation。
+    std::unordered_set<std::string> logical_row_delete_intent_set_;
     std::deque<Page*> index_latch_page_set_;              // 维护事务执行过程中加锁的索引页面
     std::deque<Page*> index_deleted_page_set_;            // 维护事务执行过程中删除的索引页面
 

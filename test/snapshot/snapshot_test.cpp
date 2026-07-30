@@ -277,15 +277,11 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyCycleCancelsYoungestVictim) {
     std::vector<char> first_key{'a'};
     std::vector<char> second_key{'b'};
     const int index_fd = 7;
-    std::string first_lock(sizeof(index_fd), '\0');
-    std::string second_lock(sizeof(index_fd), '\0');
-    std::memcpy(first_lock.data(), &index_fd, sizeof(index_fd));
-    std::memcpy(second_lock.data(), &index_fd, sizeof(index_fd));
-    first_lock.push_back('a');
-    second_lock.push_back('b');
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&older, index_fd, first_key));
     ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&younger, index_fd, second_key));
+    const std::string first_lock = *older.get_unique_key_lock_set()->begin();
+    const std::string second_lock = *younger.get_unique_key_lock_set()->begin();
 
     std::atomic<bool> younger_started{false};
     std::atomic<bool> younger_acquired{true};
@@ -378,12 +374,10 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyOwnerHandoffPreservesFifoOrder) 
     Transaction first_waiter(1302, IsolationLevel::READ_COMMITTED);
     Transaction second_waiter(1303, IsolationLevel::READ_COMMITTED);
     const std::vector<char> key{'h', 'a', 'n', 'd', 'o', 'f', 'f'};
-    std::string lock_id(sizeof(int), '\0');
     const int index_fd = 77;
-    std::memcpy(lock_id.data(), &index_fd, sizeof(index_fd));
-    lock_id.append(key.data(), key.size());
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_unique_key(&owner, index_fd, key));
+    const std::string lock_id = *owner.get_unique_key_lock_set()->begin();
     std::atomic<bool> first_acquired{false};
     std::atomic<bool> second_acquired{false};
     std::atomic<bool> release_first{false};
@@ -2741,6 +2735,90 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_DeleteThenInsertDifferentTxn) {
     std::string final_state = t3->exec_sql("select * from t;");
     bool has_200 = final_state.find("200") != std::string::npos;
     EXPECT_TRUE(has_200) << "T2's insert should be visible after T1's delete";
+}
+
+TEST_F(SnapshotTest, SI_ConcurrentSameTupleInsertsNoIndexBothCommit) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table t (id int, val int);"));
+
+    auto first = create_session();
+    auto second = create_session();
+    auto verifier = create_session();
+    ASSERT_TRUE(first->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(second->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(first->exec_sql_ok("begin;"));
+    ASSERT_TRUE(second->exec_sql_ok("begin;"));
+
+    ASSERT_TRUE(first->exec_sql_ok("insert into t values (1, 100);"));
+    ASSERT_TRUE(second->exec_sql_ok("insert into t values (1, 100);"))
+        << "Equal no-index INSERTs must not reserve an exclusive logical row";
+    ASSERT_TRUE(first->exec_sql_ok("commit;"));
+    ASSERT_TRUE(second->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select count(*) from t;");
+    EXPECT_NE(final_state.find("|                2 |"), std::string::npos);
+}
+
+TEST_F(SnapshotTest, SI_InsertBeforeDeleteIntentAllowsBothDifferentRids) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto inserter = create_session();
+    auto deleter = create_session();
+    auto verifier = create_session();
+    ASSERT_TRUE(inserter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(inserter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("begin;"));
+
+    // INSERT's intent probe linearizes first and does not leave ownership.
+    // DELETE then removes the previously committed equal row at a different RID.
+    ASSERT_TRUE(inserter->exec_sql_ok("insert into t values (1, 100);"));
+    ASSERT_TRUE(deleter->exec_sql_ok("delete from t where id = 1 and val = 100;"));
+    ASSERT_TRUE(deleter->exec_sql_ok("commit;"));
+    ASSERT_TRUE(inserter->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select count(*) from t;");
+    EXPECT_NE(final_state.find("|                1 |"), std::string::npos);
+}
+
+TEST_F(SnapshotTest, SI_LogicalRowDeleteIntentReleasedOnAbortAndCommit) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table t (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into t values (1, 100);"));
+
+    auto aborted_deleter = create_session();
+    ASSERT_TRUE(aborted_deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(aborted_deleter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(aborted_deleter->exec_sql_ok("delete from t where id = 1 and val = 100;"));
+    ASSERT_TRUE(aborted_deleter->exec_sql_ok("abort;"));
+
+    auto after_abort = create_session();
+    ASSERT_TRUE(after_abort->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(after_abort->exec_sql_ok("begin;"));
+    ASSERT_TRUE(after_abort->exec_sql_ok("insert into t values (1, 100);"))
+        << "ABORT must release the exact-row delete intent";
+    ASSERT_TRUE(after_abort->exec_sql_ok("commit;"));
+
+    // This transaction deletes both identical RIDs while owning one idempotent
+    // intent. COMMIT must then release that intent for a fresh transaction.
+    auto committed_deleter = create_session();
+    ASSERT_TRUE(committed_deleter->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(committed_deleter->exec_sql_ok("begin;"));
+    ASSERT_TRUE(committed_deleter->exec_sql_ok("delete from t where id = 1 and val = 100;"));
+    ASSERT_TRUE(committed_deleter->exec_sql_ok("commit;"));
+
+    auto after_commit = create_session();
+    auto verifier = create_session();
+    ASSERT_TRUE(after_commit->exec_sql_ok("set transaction isolation level snapshot isolation;"));
+    ASSERT_TRUE(after_commit->exec_sql_ok("begin;"));
+    ASSERT_TRUE(after_commit->exec_sql_ok("insert into t values (1, 100);"))
+        << "COMMIT must release the exact-row delete intent";
+    ASSERT_TRUE(after_commit->exec_sql_ok("commit;"));
+
+    std::string final_state = verifier->exec_sql("select count(*) from t;");
+    EXPECT_NE(final_state.find("|                1 |"), std::string::npos);
 }
 
 TEST_F(SnapshotTest, SI_WriteWriteConflict_UncommittedDeleteThenInsertSameTupleNoIndex) {
