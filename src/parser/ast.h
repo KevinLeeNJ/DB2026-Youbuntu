@@ -31,8 +31,6 @@ enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 
 enum AggFuncType { AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
 
-enum SetKnobType { EnableNestLoop, EnableSortMerge };
-
 enum class SetOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
 
 enum class IsolationLevelType { SNAPSHOT_ISOLATION, SERIALIZABLE };
@@ -74,7 +72,6 @@ enum class AstType {
     UnionStmt,
     SelectFromUnionStmt,
     ExplainAnalyze,
-    SetStmt,
     SetTransaction,
     StaticCheckpoint,
     SetOutputFile,
@@ -569,15 +566,6 @@ struct ExplainAnalyze : public TreeNode {
 
     explicit ExplainAnalyze(std::unique_ptr<SelectStmt> select_)
         : TreeNode(AstType::ExplainAnalyze), select(std::move(select_)) {}
-};
-
-// set enable_nestloop
-struct SetStmt : public TreeNode {
-    SetKnobType set_knob_type_;
-    bool bool_val_;
-
-    SetStmt(SetKnobType& type, bool bool_value)
-        : TreeNode(AstType::SetStmt), set_knob_type_(type), bool_val_(bool_value) {}
 };
 
 // set transaction isolation level

@@ -52,6 +52,10 @@ public:
     bool ellipsis_;
     IsolationLevel isolation_level_;
     bool enable_ssi_read_tracking_{false};
+    // PREPARE_SET builds a reusable scan-backed descriptor. Point-program
+    // caching is an execution-plan optimization and must not make descriptor
+    // eligibility depend on whether an equivalent statement was seen earlier.
+    bool preparing_statement_{false};
     QueryResultSink* result_sink_{nullptr};
     // When set, overrides the legacy database-wide output.txt policy for this session.
     bool* output_file_enabled_{nullptr};

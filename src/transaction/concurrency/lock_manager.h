@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
@@ -32,9 +31,6 @@ struct LockObservabilitySnapshot {
     uint64_t wait_granted{0};
     uint64_t wait_cancelled{0};
     uint64_t wait_ns{0};
-    uint64_t backoff_waits{0};
-    uint64_t completion_waits{0};
-    uint64_t completion_aborts{0};
     uint64_t queue_depth_max{0};
     uint64_t cycle_checks{0};
     uint64_t cycle_victims{0};
@@ -50,15 +46,12 @@ class LockManager {
     /* 事务的加锁申请 */
     class LockRequest {
     public:
-        LockRequest(txn_id_t txn_id, LockMode lock_mode, bool completion_only = false)
-            : txn_id_(txn_id), lock_mode_(lock_mode), granted_(false), completion_only_(completion_only) {}
+        LockRequest(txn_id_t txn_id, LockMode lock_mode) : txn_id_(txn_id), lock_mode_(lock_mode), granted_(false) {}
 
         txn_id_t txn_id_;    // 申请加锁的事务ID
         LockMode lock_mode_; // 事务申请加锁的类型
         bool granted_;       // 该事务是否已经被赋予锁
         bool cancelled_{false};
-        bool completion_only_{false};
-        bool owner_completed_{false};
         std::condition_variable cv_;
     };
 
@@ -79,11 +72,7 @@ class LockManager {
     };
 
 public:
-    LockManager();
-
-    explicit LockManager(std::chrono::microseconds si_conflict_backoff);
-
-    LockManager(std::chrono::microseconds si_conflict_backoff, bool si_first_lock_wait);
+    LockManager() = default;
 
     ~LockManager() {}
 
@@ -146,8 +135,6 @@ private:
     static void observe_queue_depth(std::atomic<uint64_t>& maximum, size_t depth);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
-    std::chrono::microseconds si_conflict_backoff_;
-    const bool si_first_lock_wait_enabled_;
     std::mutex pending_latch_;
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
     std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
@@ -158,9 +145,6 @@ private:
     std::atomic<uint64_t> record_wait_granted_{0};
     std::atomic<uint64_t> record_wait_cancelled_{0};
     std::atomic<uint64_t> record_wait_ns_{0};
-    std::atomic<uint64_t> record_backoff_waits_{0};
-    std::atomic<uint64_t> record_completion_waits_{0};
-    std::atomic<uint64_t> record_completion_aborts_{0};
     std::atomic<uint64_t> record_queue_depth_max_{0};
     std::atomic<uint64_t> record_cycle_checks_{0};
     std::atomic<uint64_t> record_cycle_victims_{0};

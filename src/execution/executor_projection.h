@@ -150,6 +150,22 @@ public:
         finalize_layout();
     }
 
+    ProjectionExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<size_t>& projection_ordinals,
+                       const std::vector<std::string>& output_names) {
+        prev_ = std::move(prev);
+        len_ = 0;
+        if (projection_ordinals.size() != output_names.size()) {
+            throw InternalError("bound projection metadata size mismatch");
+        }
+        for (size_t i = 0; i < projection_ordinals.size(); ++i) {
+            if (projection_ordinals[i] >= prev_->cols().size()) {
+                throw InternalError("bound projection ordinal is out of range");
+            }
+            append_projection_col(projection_ordinals[i], output_names[i]);
+        }
+        finalize_layout();
+    }
+
     void beginTuple() override {
         prev_->beginTuple();          // 调用儿子节点的beginTuple方法，准备开始遍历记录
         _abstract_rid = prev_->rid(); // 初始化抽象记录号

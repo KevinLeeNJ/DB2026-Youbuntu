@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+#include "execution/prepared_plan_descriptor.h"
 #include "gtest/gtest.h"
 
 namespace {
@@ -162,6 +163,20 @@ std::unique_ptr<Query> make_point_update_query(int id, int value) {
     SetClause set_clause;
     set_clause.lhs = {.tab_name = "point_program", .col_name = "value"};
     set_clause.rhs.set_int(value);
+    query->set_clauses = {set_clause};
+    return query;
+}
+
+std::unique_ptr<Query> make_lock_only_point_update_query() {
+    auto query = std::make_unique<Query>();
+    query->parse = std::make_unique<ast::UpdateStmt>("point_program", std::vector<std::unique_ptr<ast::SetClause>>{},
+                                                     std::vector<std::unique_ptr<ast::BinaryExpr>>{});
+    query->conds = {value_cond("point_program", "id", OP_EQ, 1)};
+    SetClause set_clause;
+    set_clause.lhs = {.tab_name = "point_program", .col_name = "value"};
+    set_clause.is_self_ref = true;
+    set_clause.rhs_col = set_clause.lhs;
+    set_clause.op = UpdateOp::ASSIGNMENT;
     query->set_clauses = {set_clause};
     return query;
 }
@@ -479,6 +494,23 @@ TEST_F(PlannerAggregateTest, stock_level_join_starts_from_order_line_and_uses_st
     EXPECT_EQ(join->inlj_right_col_.col_name, "s_i_id");
 }
 
+TEST_F(PlannerAggregateTest, ordinaryJoinAlwaysPlansTheAutomaticNestedLoopPath) {
+    sm_manager_.db_.SetTabMeta("stock", make_stock_tab());
+    sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
+
+    auto plan = planner_.generate_select_plan(make_stock_level_query(), nullptr);
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->tag, T_Projection);
+    auto* projection = static_cast<ProjectionPlan*>(plan.get());
+    ASSERT_EQ(projection->subplan_->tag, T_Aggregate);
+    auto* aggregate = static_cast<AggregatePlan*>(projection->subplan_.get());
+    ASSERT_EQ(aggregate->subplan_->tag, T_NestLoop);
+    auto* join = static_cast<JoinPlan*>(aggregate->subplan_.get());
+    ASSERT_EQ(join->right_->tag, T_IndexScan);
+    EXPECT_EQ(join->inlj_index_col_name_, "s_i_id");
+}
+
 TEST_F(PlannerAggregateTest, suffix_equality_on_composite_index_uses_skip_scan) {
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
     auto query = make_order_line_suffix_lookup_query();
@@ -541,9 +573,6 @@ TEST_F(PlannerAggregateTest, incomplete_parameterized_key_keeps_existing_skip_sc
 }
 
 TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_literal_values) {
-    if (!planner_.enable_physical_plan_cache_) {
-        GTEST_SKIP() << "physical plan cache is disabled";
-    }
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
     auto first_query = make_order_line_suffix_lookup_query();
     auto second_query = make_order_line_suffix_lookup_query();
@@ -553,6 +582,8 @@ TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_lite
     auto second_plan = planner_.generate_select_plan(std::move(second_query), nullptr);
 
     ASSERT_EQ(planner_.physical_plan_cache_.size(), 1);
+    EXPECT_EQ(planner_.physical_plan_cache_misses_.load(), 1U);
+    EXPECT_EQ(planner_.physical_plan_cache_hits_.load(), 1U);
 
     auto* first_projection = static_cast<ProjectionPlan*>(first_plan.get());
     auto* first_aggregate = static_cast<AggregatePlan*>(first_projection->subplan_.get());
@@ -567,19 +598,19 @@ TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_lite
     EXPECT_EQ(second_scan->conds_[0].rhs_val.int_val, 7);
 }
 
-TEST_F(PlannerAggregateTest, physical_plan_cache_can_be_disabled) {
+TEST_F(PlannerAggregateTest, physical_plan_cache_is_enabled_by_default) {
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
-    planner_.enable_physical_plan_cache_ = false;
 
-    auto query = make_order_line_suffix_lookup_query();
-    ASSERT_NE(planner_.generate_select_plan(std::move(query), nullptr), nullptr);
-    EXPECT_TRUE(planner_.physical_plan_cache_.empty());
+    auto first_query = make_order_line_suffix_lookup_query();
+    auto second_query = make_order_line_suffix_lookup_query();
+    ASSERT_NE(planner_.generate_select_plan(std::move(first_query), nullptr), nullptr);
+    ASSERT_NE(planner_.generate_select_plan(std::move(second_query), nullptr), nullptr);
+    EXPECT_EQ(planner_.physical_plan_cache_.size(), 1U);
+    EXPECT_EQ(planner_.physical_plan_cache_misses_.load(), 1U);
+    EXPECT_EQ(planner_.physical_plan_cache_hits_.load(), 1U);
 }
 
 TEST_F(PlannerAggregateTest, physical_template_is_invalidated_by_catalog_generation) {
-    if (!planner_.enable_physical_plan_cache_) {
-        GTEST_SKIP() << "physical plan cache is disabled";
-    }
     sm_manager_.db_.SetTabMeta("order_line", make_order_line_tab());
 
     auto first_query = make_order_line_suffix_lookup_query();
@@ -592,6 +623,28 @@ TEST_F(PlannerAggregateTest, physical_template_is_invalidated_by_catalog_generat
 
     EXPECT_EQ(planner_.physical_plan_cache_.size(), 1);
     EXPECT_EQ(planner_.physical_plan_cache_generation_, sm_manager_.get_catalog_generation());
+}
+
+TEST_F(PlannerAggregateTest, physical_plan_cache_hit_and_overwrite_refresh_mru_before_capacity_eviction) {
+    const auto generation = sm_manager_.get_catalog_generation();
+    for (size_t i = 0; i < Planner::kPhysicalPlanCacheCapacity; ++i) {
+        planner_.cache_physical_plan_template("physical-" + std::to_string(i), generation, {});
+    }
+
+    ASSERT_TRUE(planner_.find_physical_plan_template("physical-0", generation).has_value());
+    planner_.cache_physical_plan_template("physical-1", generation, {});
+    planner_.cache_physical_plan_template("physical-overflow", generation, {});
+
+    EXPECT_EQ(planner_.physical_plan_cache_.size(), Planner::kPhysicalPlanCacheCapacity);
+    EXPECT_TRUE(planner_.physical_plan_cache_.count("physical-0"));
+    EXPECT_TRUE(planner_.physical_plan_cache_.count("physical-1"));
+    EXPECT_TRUE(planner_.physical_plan_cache_.count("physical-overflow"));
+    EXPECT_FALSE(planner_.physical_plan_cache_.count("physical-2"));
+    auto recency = planner_.physical_plan_cache_lru_.begin();
+    ASSERT_NE(recency, planner_.physical_plan_cache_lru_.end());
+    EXPECT_EQ(*recency++, "physical-overflow");
+    ASSERT_NE(recency, planner_.physical_plan_cache_lru_.end());
+    EXPECT_EQ(*recency, "physical-1");
 }
 
 TEST_F(PlannerAggregateTest, physical_template_reorders_current_index_conditions) {
@@ -618,7 +671,6 @@ TEST_F(PlannerAggregateTest, physical_template_reorders_current_index_conditions
 }
 
 TEST_F(PlannerAggregateTest, compiled_point_program_hits_for_update_and_delete_shapes) {
-    planner_.enable_compiled_point_program_cache_ = true;
     sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
 
     auto first_update = planner_.do_planner(make_point_update_query(1, 10), nullptr);
@@ -646,12 +698,56 @@ TEST_F(PlannerAggregateTest, compiled_point_program_hits_for_update_and_delete_s
     EXPECT_EQ(planner_.point_program_cache_hits_.load(), 2U);
 }
 
-TEST_F(PlannerAggregateTest, prepared_si_context_does_not_use_cached_rc_point_program) {
-    planner_.enable_compiled_point_program_cache_ = true;
+TEST_F(PlannerAggregateTest, lock_only_update_requires_exact_self_assignment_and_complete_point_key) {
+    sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
+
+    auto exact = planner_.do_planner(make_lock_only_point_update_query(), nullptr);
+    auto* exact_dml = static_cast<DMLPlan*>(exact.get());
+    ASSERT_TRUE(exact_dml->point_access_.has_value());
+    EXPECT_EQ(exact_dml->update_execution_mode_, UpdateExecutionMode::LockOnlySelfAssignment);
+
+    auto arithmetic_query = make_lock_only_point_update_query();
+    arithmetic_query->set_clauses[0].op = UpdateOp::SELF_ADD;
+    arithmetic_query->set_clauses[0].rhs.set_int(0);
+    auto arithmetic = planner_.do_planner(std::move(arithmetic_query), nullptr);
+    EXPECT_EQ(static_cast<DMLPlan*>(arithmetic.get())->update_execution_mode_, UpdateExecutionMode::Mutating);
+
+    auto other_column_query = make_lock_only_point_update_query();
+    other_column_query->set_clauses[0].rhs_col = {.tab_name = "point_program", .col_name = "id"};
+    auto other_column = planner_.do_planner(std::move(other_column_query), nullptr);
+    EXPECT_EQ(static_cast<DMLPlan*>(other_column.get())->update_execution_mode_, UpdateExecutionMode::Mutating);
+
+    auto literal_query = make_lock_only_point_update_query();
+    literal_query->set_clauses[0].is_self_ref = false;
+    literal_query->set_clauses[0].rhs.set_int(7);
+    auto literal = planner_.do_planner(std::move(literal_query), nullptr);
+    EXPECT_EQ(static_cast<DMLPlan*>(literal.get())->update_execution_mode_, UpdateExecutionMode::Mutating);
+
+    auto mixed_query = make_lock_only_point_update_query();
+    SetClause real_update;
+    real_update.lhs = {.tab_name = "point_program", .col_name = "id"};
+    real_update.rhs.set_int(9);
+    mixed_query->set_clauses.push_back(real_update);
+    auto mixed = planner_.do_planner(std::move(mixed_query), nullptr);
+    EXPECT_EQ(static_cast<DMLPlan*>(mixed.get())->update_execution_mode_, UpdateExecutionMode::Mutating);
+
+    auto non_point_query = make_lock_only_point_update_query();
+    non_point_query->conds[0].op = OP_GE;
+    auto non_point = planner_.do_planner(std::move(non_point_query), nullptr);
+    EXPECT_FALSE(static_cast<DMLPlan*>(non_point.get())->point_access_.has_value());
+    EXPECT_EQ(static_cast<DMLPlan*>(non_point.get())->update_execution_mode_, UpdateExecutionMode::Mutating);
+}
+
+TEST_F(PlannerAggregateTest, prepared_si_and_serializable_contexts_do_not_use_cached_rc_point_program) {
     sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
 
     auto populate = planner_.do_planner(make_point_update_query(1, 10), nullptr);
     ASSERT_NE(static_cast<DMLPlan*>(populate.get())->subplan_, nullptr);
+    ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
+    const auto cache_hits = planner_.point_program_cache_hits_.load();
+    const auto cache_misses = planner_.point_program_cache_misses_.load();
+    const auto cache_lru = planner_.point_program_cache_lru_;
+    const auto cached_program = planner_.point_program_cache_.begin()->second.program;
 
     char response[64]{};
     int offset = 0;
@@ -661,10 +757,82 @@ TEST_F(PlannerAggregateTest, prepared_si_context_does_not_use_cached_rc_point_pr
     auto* si_dml = static_cast<DMLPlan*>(si_plan.get());
     EXPECT_EQ(si_dml->compiled_point_program_, nullptr);
     EXPECT_NE(si_dml->subplan_, nullptr);
+
+    Transaction serializable_transaction(7, IsolationLevel::SERIALIZABLE);
+    Context serializable_context(nullptr, nullptr, &serializable_transaction, response, &offset);
+    auto serializable_plan = planner_.do_planner(make_point_update_query(3, 30), &serializable_context);
+    auto* serializable_dml = static_cast<DMLPlan*>(serializable_plan.get());
+    EXPECT_EQ(serializable_dml->compiled_point_program_, nullptr);
+    EXPECT_NE(serializable_dml->subplan_, nullptr);
+    EXPECT_EQ(planner_.point_program_cache_hits_.load(), cache_hits);
+    EXPECT_EQ(planner_.point_program_cache_misses_.load(), cache_misses);
+    EXPECT_EQ(planner_.point_program_cache_lru_, cache_lru);
+    ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
+    EXPECT_EQ(planner_.point_program_cache_.begin()->second.program, cached_program);
+}
+
+TEST_F(PlannerAggregateTest, prepared_update_ignores_warm_point_cache_without_polluting_it) {
+    sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
+    planner_.do_planner(make_point_update_query(1, 10), nullptr);
+    ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
+    const auto cache_hits = planner_.point_program_cache_hits_.load();
+    const auto cache_misses = planner_.point_program_cache_misses_.load();
+    const auto cache_lru = planner_.point_program_cache_lru_;
+
+    char response[64]{};
+    int offset = 0;
+    Context prepare_context(nullptr, nullptr, nullptr, response, &offset);
+    prepare_context.isolation_level_ = IsolationLevel::READ_COMMITTED;
+    prepare_context.preparing_statement_ = true;
+    auto query = make_point_update_query(2, 20);
+    query->conds[0].rhs_val.parameter_ordinal = 1;
+    query->set_clauses[0].rhs.parameter_ordinal = 2;
+    auto prepared_plan = planner_.do_planner(std::move(query), &prepare_context);
+    auto* prepared_dml = static_cast<DMLPlan*>(prepared_plan.get());
+    ASSERT_EQ(prepared_dml->compiled_point_program_, nullptr);
+    ASSERT_NE(prepared_dml->subplan_, nullptr);
+    EXPECT_EQ(planner_.point_program_cache_hits_.load(), cache_hits);
+    EXPECT_EQ(planner_.point_program_cache_misses_.load(), cache_misses);
+    EXPECT_EQ(planner_.point_program_cache_lru_, cache_lru);
+
+    auto descriptor = PreparedPlanDescriptor::Build(std::move(prepared_plan), PreparedStatementKind::Update, {}, {},
+                                                    "prepared-db", sm_manager_.get_catalog_generation());
+    ASSERT_TRUE(descriptor->eligible());
+    ASSERT_NE(descriptor->dml_plan(), nullptr);
+    EXPECT_EQ(descriptor->dml_plan()->compiled_point_program_, nullptr);
+    EXPECT_NE(descriptor->dml_plan()->subplan_, nullptr);
+    ASSERT_EQ(descriptor->parameter_layout().size(), 2U);
+}
+
+TEST_F(PlannerAggregateTest, compiled_point_cache_hit_and_overwrite_refresh_mru_before_capacity_eviction) {
+    const auto generation = sm_manager_.get_catalog_generation();
+    auto program = std::make_shared<CompiledPointProgram>();
+    program->catalog_generation = generation;
+    for (size_t i = 0; i < Planner::kCompiledPointProgramCacheCapacity; ++i) {
+        planner_.cache_compiled_point_program("point-" + std::to_string(i), generation, program);
+    }
+
+    ASSERT_TRUE(planner_.find_compiled_point_program("point-0", generation).has_value());
+    auto replacement = std::make_shared<CompiledPointProgram>();
+    replacement->catalog_generation = generation;
+    replacement->table_name = "replacement";
+    planner_.cache_compiled_point_program("point-1", generation, replacement);
+    planner_.cache_compiled_point_program("point-overflow", generation, program);
+
+    EXPECT_EQ(planner_.point_program_cache_.size(), Planner::kCompiledPointProgramCacheCapacity);
+    EXPECT_TRUE(planner_.point_program_cache_.count("point-0"));
+    EXPECT_TRUE(planner_.point_program_cache_.count("point-1"));
+    EXPECT_TRUE(planner_.point_program_cache_.count("point-overflow"));
+    EXPECT_FALSE(planner_.point_program_cache_.count("point-2"));
+    EXPECT_EQ(planner_.point_program_cache_.at("point-1").program, replacement);
+    auto recency = planner_.point_program_cache_lru_.begin();
+    ASSERT_NE(recency, planner_.point_program_cache_lru_.end());
+    EXPECT_EQ(*recency++, "point-overflow");
+    ASSERT_NE(recency, planner_.point_program_cache_lru_.end());
+    EXPECT_EQ(*recency, "point-1");
 }
 
 TEST_F(PlannerAggregateTest, compiled_point_program_keys_include_chained_update_shape_but_not_values) {
-    planner_.enable_compiled_point_program_cache_ = true;
     sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
 
     auto first = planner_.do_planner(make_point_chained_update_query(1, 1, 91, UpdateOp::SELF_ADD), nullptr);
@@ -683,7 +851,6 @@ TEST_F(PlannerAggregateTest, compiled_point_program_keys_include_chained_update_
 }
 
 TEST_F(PlannerAggregateTest, compiled_point_program_is_invalidated_by_catalog_generation) {
-    planner_.enable_compiled_point_program_cache_ = true;
     sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
 
     planner_.do_planner(make_point_update_query(1, 10), nullptr);

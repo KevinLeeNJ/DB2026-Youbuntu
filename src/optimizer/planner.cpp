@@ -73,6 +73,18 @@ std::optional<PointAccessPath> find_point_access_path(SmManager* sm_manager, con
     return std::nullopt;
 }
 
+bool is_lock_only_self_assignment_update(const std::string& tab_name, const std::vector<SetClause>& set_clauses,
+                                         const std::optional<PointAccessPath>& point_access) {
+    if (!point_access.has_value() || set_clauses.empty()) {
+        return false;
+    }
+    return std::all_of(set_clauses.begin(), set_clauses.end(), [&](const SetClause& clause) {
+        return clause.lhs.tab_name == tab_name && clause.is_self_ref && clause.op == UpdateOp::ASSIGNMENT &&
+               clause.rhs_col.tab_name == tab_name && clause.rhs_col.col_name == clause.lhs.col_name &&
+               clause.additional_terms.empty();
+    });
+}
+
 bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
     return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.is_distinct == rhs.is_distinct &&
            lhs.display_name == rhs.display_name && (lhs.is_star || same_tab_col(lhs.col, rhs.col));
@@ -389,8 +401,7 @@ void attach_display_names(Plan* plan, const std::unordered_map<std::string, std:
     case T_Projection:
         attach_display_names(static_cast<ProjectionPlan*>(plan)->subplan_.get(), table_name_to_display);
         break;
-    case T_NestLoop:
-    case T_SortMerge: {
+    case T_NestLoop: {
         auto* join = static_cast<JoinPlan*>(plan);
         attach_display_names(join->left_.get(), table_name_to_display);
         attach_display_names(join->right_.get(), table_name_to_display);
@@ -816,91 +827,6 @@ PlanTag Planner::choose_scan_plan_tag(std::string tab_name, std::vector<Conditio
     return T_SeqScan;
 }
 
-/**
- * @brief 表算子条件谓词生成
- *
- * @param conds 条件
- * @param tab_names 表名
- * @return std::vector<Condition>
- */
-std::vector<Condition> pop_conds(std::vector<Condition>& conds, std::string tab_names) {
-    // auto has_tab = [&](const std::string &tab_name) {
-    //     return std::find(tab_names.begin(), tab_names.end(), tab_name) != tab_names.end();
-    // };
-    std::vector<Condition> solved_conds;
-    solved_conds.reserve(conds.size());
-    auto it = conds.begin();
-    while (it != conds.end()) {
-        if ((tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val) ||
-            (it->lhs_col.tab_name.compare(it->rhs_col.tab_name) == 0)) {
-            solved_conds.emplace_back(std::move(*it));
-            it = conds.erase(it);
-        } else {
-            it++;
-        }
-    }
-    return solved_conds;
-}
-
-int push_conds(Condition* cond, Plan* plan) {
-    switch (plan->tag) {
-    case T_SeqScan:
-    case T_IndexSkipScan:
-    case T_IndexScan: {
-        auto* x = static_cast<ScanPlan*>(plan);
-        if (x->tab_name_.compare(cond->lhs_col.tab_name) == 0) {
-            return 1;
-        } else if (x->tab_name_.compare(cond->rhs_col.tab_name) == 0) {
-            return 2;
-        } else {
-            return 0;
-        }
-    }
-    case T_NestLoop:
-    case T_SortMerge: {
-        auto* x = static_cast<JoinPlan*>(plan);
-        int left_res = push_conds(cond, x->left_.get());
-        // 条件已经下推到左子节点
-        if (left_res == 3) {
-            return 3;
-        }
-        int right_res = push_conds(cond, x->right_.get());
-        // 条件已经下推到右子节点
-        if (right_res == 3) {
-            return 3;
-        }
-        // 左子节点或右子节点有一个没有匹配到条件的列
-        if (left_res == 0 || right_res == 0) {
-            return left_res + right_res;
-        }
-        // 左子节点匹配到条件的右边
-        if (left_res == 2) {
-            // 需要将左右两边的条件变换位置
-            std::swap(cond->lhs_col, cond->rhs_col);
-            cond->op = swap_comp_op(cond->op);
-        }
-        x->conds_.emplace_back(std::move(*cond));
-        return 3;
-    }
-    default:
-        break;
-    }
-    return false;
-}
-
-std::unique_ptr<Plan> pop_scan(std::vector<int>& scantbl, std::string table, std::vector<std::string>& joined_tables,
-                               std::vector<std::unique_ptr<Plan>>& plans) {
-    for (size_t i = 0; i < plans.size(); i++) {
-        auto* x = static_cast<ScanPlan*>(plans[i].get());
-        if (x->tab_name_.compare(table) == 0) {
-            scantbl[i] = 1;
-            joined_tables.emplace_back(x->tab_name_);
-            return std::move(plans[i]);
-        }
-    }
-    return nullptr;
-}
-
 std::unique_ptr<Query> Planner::logical_optimization(std::unique_ptr<Query> query, Context* context) {
     (void)context;
     std::stable_sort(query->conds.begin(), query->conds.end(), [](const Condition& lhs, const Condition& rhs) {
@@ -914,8 +840,6 @@ std::string Planner::make_physical_plan_cache_key(const Query& query, std::uint6
     std::string key;
     append_cache_key_part(key, std::string("physical-select-v1"));
     append_cache_key_part(key, std::to_string(catalog_generation));
-    append_cache_key_part(key, enable_nestedloop_join);
-    append_cache_key_part(key, enable_sortmerge_join);
     append_cache_key_part(key, query.is_union);
     append_cache_key_part(key, query.is_explain_analyze);
     append_cache_key_part(key, query.has_select_star);
@@ -1337,26 +1261,22 @@ CompiledPointProgramPtr Planner::build_compiled_point_program(PointProgramKind k
 
 std::optional<CompiledPointProgramPtr> Planner::find_compiled_point_program(const std::string& key,
                                                                             std::uint64_t catalog_generation) {
-    {
-        std::shared_lock<std::shared_mutex> lock(point_program_cache_latch_);
-        if (point_program_cache_generation_ == catalog_generation) {
-            auto cache_pos = point_program_cache_.find(key);
-            if (cache_pos != point_program_cache_.end()) {
-                point_program_cache_hits_.fetch_add(1, std::memory_order_relaxed);
-                return cache_pos->second.program;
-            }
-        }
-    }
-
-    // Generation mismatch is a logical invalidation even if no new DML has
-    // arrived yet. Clear old entries under the writer latch.
     std::unique_lock<std::shared_mutex> lock(point_program_cache_latch_);
     if (point_program_cache_generation_ != catalog_generation) {
         point_program_cache_.clear();
         point_program_cache_lru_.clear();
         point_program_cache_generation_ = catalog_generation;
+        return std::nullopt;
     }
-    return std::nullopt;
+    auto cache_pos = point_program_cache_.find(key);
+    if (cache_pos == point_program_cache_.end()) {
+        return std::nullopt;
+    }
+    point_program_cache_lru_.splice(point_program_cache_lru_.begin(), point_program_cache_lru_,
+                                    cache_pos->second.lru_position);
+    cache_pos->second.lru_position = point_program_cache_lru_.begin();
+    point_program_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    return cache_pos->second.program;
 }
 
 void Planner::cache_compiled_point_program(std::string key, std::uint64_t catalog_generation,
@@ -1375,6 +1295,9 @@ void Planner::cache_compiled_point_program(std::string key, std::uint64_t catalo
     auto cache_pos = point_program_cache_.find(key);
     if (cache_pos != point_program_cache_.end()) {
         cache_pos->second.program = std::move(program);
+        point_program_cache_lru_.splice(point_program_cache_lru_.begin(), point_program_cache_lru_,
+                                        cache_pos->second.lru_position);
+        cache_pos->second.lru_position = point_program_cache_lru_.begin();
         return;
     }
 
@@ -1396,9 +1319,7 @@ void Planner::cache_compiled_point_program(std::string key, std::uint64_t catalo
 
 std::optional<std::shared_ptr<const Planner::PhysicalPlanTemplate>>
 Planner::find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation) {
-    std::shared_lock<std::shared_mutex> lock(physical_plan_cache_latch_);
-    // Do not upgrade the reader lock on a miss caused by DDL. The writer path
-    // will invalidate the old generation before publishing the new entry.
+    std::unique_lock<std::shared_mutex> lock(physical_plan_cache_latch_);
     if (physical_plan_cache_generation_ != catalog_generation) {
         return std::nullopt;
     }
@@ -1408,6 +1329,9 @@ Planner::find_physical_plan_template(const std::string& key, std::uint64_t catal
         return std::nullopt;
     }
 
+    physical_plan_cache_lru_.splice(physical_plan_cache_lru_.begin(), physical_plan_cache_lru_,
+                                    cache_pos->second.lru_position);
+    cache_pos->second.lru_position = physical_plan_cache_lru_.begin();
     physical_plan_cache_hits_.fetch_add(1, std::memory_order_relaxed);
     return cache_pos->second.plan_template;
 }
@@ -1428,6 +1352,9 @@ void Planner::cache_physical_plan_template(std::string key, std::uint64_t catalo
     auto cache_pos = physical_plan_cache_.find(key);
     if (cache_pos != physical_plan_cache_.end()) {
         cache_pos->second.plan_template = std::make_shared<const PhysicalPlanTemplate>(std::move(plan_template));
+        physical_plan_cache_lru_.splice(physical_plan_cache_lru_.begin(), physical_plan_cache_lru_,
+                                        cache_pos->second.lru_position);
+        cache_pos->second.lru_position = physical_plan_cache_lru_.begin();
         return;
     }
 
@@ -1451,9 +1378,6 @@ void Planner::cache_physical_plan_template(std::string key, std::uint64_t catalo
 
 std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* context) {
     (void)context;
-    if (!enable_physical_plan_cache_) {
-        return instantiate_physical_plan(*query, build_physical_plan_template(*query));
-    }
     const std::uint64_t catalog_generation = sm_manager_->get_catalog_generation();
     const std::string cache_key = make_physical_plan_cache_key(*query, catalog_generation);
     auto cached_template = find_physical_plan_template(cache_key, catalog_generation);
@@ -1465,123 +1389,6 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     auto plan_template = build_physical_plan_template(*query);
     cache_physical_plan_template(cache_key, catalog_generation, plan_template);
     return instantiate_physical_plan(*query, plan_template);
-}
-
-std::unique_ptr<Plan> Planner::make_one_rel(Query* query) {
-    std::vector<std::string> tables = query->tables;
-    // // Scan table , 生成表算子列表tab_nodes
-    std::vector<std::unique_ptr<Plan>> table_scan_executors(tables.size());
-    for (size_t i = 0; i < tables.size(); i++) {
-        auto curr_conds = pop_conds(query->conds, tables[i]);
-        // int index_no = get_indexNo(tables[i], curr_conds);
-        std::vector<std::string> index_col_names;
-        PlanTag scan_tag = choose_scan_plan_tag(tables[i], curr_conds, index_col_names);
-        if (scan_tag == T_SeqScan) { // 该表没有可用索引
-            index_col_names.clear();
-            table_scan_executors[i] =
-                std::make_unique<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
-        } else { // 存在索引
-            table_scan_executors[i] =
-                std::make_unique<ScanPlan>(scan_tag, sm_manager_, tables[i], curr_conds, index_col_names);
-        }
-    }
-    // 只有一个表，不需要join。
-    if (tables.size() == 1) {
-        return std::move(table_scan_executors[0]);
-    }
-    // 获取where条件
-    auto conds = std::move(query->conds);
-    std::unique_ptr<Plan> table_join_executors;
-
-    std::vector<int> scantbl(tables.size(), -1);
-    // 当前 AST 将 JOIN 条件统一放入 query->conds，这里按条件生成连接计划。
-    if (conds.size() >= 1) {
-        // 有连接条件
-
-        // 根据连接条件，生成第一层join
-        std::vector<std::string> joined_tables;
-        joined_tables.reserve(tables.size());
-        auto it = conds.begin();
-        while (it != conds.end()) {
-            std::unique_ptr<Plan> left, right;
-            left = pop_scan(scantbl, it->lhs_col.tab_name, joined_tables, table_scan_executors);
-            right = pop_scan(scantbl, it->rhs_col.tab_name, joined_tables, table_scan_executors);
-            std::vector<Condition> join_conds{*it};
-            // 建立join
-            //  判断使用哪种join方式
-            if (enable_nestedloop_join && enable_sortmerge_join) {
-                // 默认nested loop join
-                table_join_executors =
-                    std::make_unique<JoinPlan>(T_NestLoop, std::move(left), std::move(right), join_conds);
-            } else if (enable_nestedloop_join) {
-                table_join_executors =
-                    std::make_unique<JoinPlan>(T_NestLoop, std::move(left), std::move(right), join_conds);
-            } else if (enable_sortmerge_join) {
-                table_join_executors =
-                    std::make_unique<JoinPlan>(T_SortMerge, std::move(left), std::move(right), join_conds);
-            } else {
-                // error
-                throw RMDBError("No join executor selected!");
-            }
-
-            // table_join_executors = std::make_unique<JoinPlan>(T_NestLoop, std::move(left), std::move(right),
-            // join_conds);
-            it = conds.erase(it);
-            break;
-        }
-        // 根据连接条件，生成第2-n层join
-        it = conds.begin();
-        while (it != conds.end()) {
-            std::unique_ptr<Plan> left_need_to_join_executors = nullptr;
-            std::unique_ptr<Plan> right_need_to_join_executors = nullptr;
-            bool isneedreverse = false;
-            if (std::find(joined_tables.begin(), joined_tables.end(), it->lhs_col.tab_name) == joined_tables.end()) {
-                left_need_to_join_executors =
-                    pop_scan(scantbl, it->lhs_col.tab_name, joined_tables, table_scan_executors);
-            }
-            if (std::find(joined_tables.begin(), joined_tables.end(), it->rhs_col.tab_name) == joined_tables.end()) {
-                right_need_to_join_executors =
-                    pop_scan(scantbl, it->rhs_col.tab_name, joined_tables, table_scan_executors);
-                isneedreverse = true;
-            }
-
-            if (left_need_to_join_executors != nullptr && right_need_to_join_executors != nullptr) {
-                std::vector<Condition> join_conds{*it};
-                std::unique_ptr<Plan> temp_join_executors =
-                    std::make_unique<JoinPlan>(T_NestLoop, std::move(left_need_to_join_executors),
-                                               std::move(right_need_to_join_executors), join_conds);
-                table_join_executors =
-                    std::make_unique<JoinPlan>(T_NestLoop, std::move(temp_join_executors),
-                                               std::move(table_join_executors), std::vector<Condition>());
-            } else if (left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
-                if (isneedreverse) {
-                    std::swap(it->lhs_col, it->rhs_col);
-                    it->op = swap_comp_op(it->op);
-                    left_need_to_join_executors = std::move(right_need_to_join_executors);
-                }
-                std::vector<Condition> join_conds{*it};
-                table_join_executors = std::make_unique<JoinPlan>(T_NestLoop, std::move(left_need_to_join_executors),
-                                                                  std::move(table_join_executors), join_conds);
-            } else {
-                push_conds(&(*it), table_join_executors.get());
-            }
-            it = conds.erase(it);
-        }
-    } else {
-        table_join_executors = std::move(table_scan_executors[0]);
-        scantbl[0] = 1;
-    }
-
-    // 连接剩余表
-    for (size_t i = 0; i < tables.size(); i++) {
-        if (scantbl[i] == -1) {
-            table_join_executors =
-                std::make_unique<JoinPlan>(T_NestLoop, std::move(table_scan_executors[i]),
-                                           std::move(table_join_executors), std::vector<Condition>());
-        }
-    }
-
-    return table_join_executors;
 }
 
 std::unique_ptr<Plan> Planner::generate_sort_plan(const Query* query, std::unique_ptr<Plan> plan) {
@@ -1682,6 +1489,11 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     if (parse == nullptr) {
         throw InternalError("Unexpected null AST root");
     }
+    const bool point_program_cache_eligible =
+        context == nullptr ||
+        (!context->preparing_statement_ &&
+         (context->txn_ == nullptr ? context->isolation_level_ == IsolationLevel::READ_COMMITTED
+                                   : context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED));
     switch (parse->type) {
     case ast::AstType::CreateTable: {
         auto x = static_cast<const ast::CreateTable*>(parse);
@@ -1743,15 +1555,12 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         std::optional<PointAccessPath> point_access = find_point_access_path(sm_manager_, x->tab_name, query->conds);
         CompiledPointProgramPtr compiled_program;
         bool compiled_hit = false;
-        if (enable_compiled_point_program_cache_ && point_access.has_value()) {
+        if (point_program_cache_eligible && point_access.has_value()) {
             const auto catalog_generation = sm_manager_->get_catalog_generation();
             const auto cache_key = make_point_program_cache_key(PointProgramKind::Delete, x->tab_name, *point_access,
                                                                 query->conds, query->set_clauses, catalog_generation);
             auto cached = find_compiled_point_program(cache_key, catalog_generation);
-            if (cached.has_value() && cached.value() != nullptr &&
-                (context == nullptr ||
-                 (context->txn_ == nullptr ? context->isolation_level_ == IsolationLevel::READ_COMMITTED
-                                           : context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED))) {
+            if (cached.has_value() && cached.value() != nullptr) {
                 compiled_program = cached.value();
                 compiled_hit = true;
             } else {
@@ -1789,15 +1598,12 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         std::optional<PointAccessPath> point_access = find_point_access_path(sm_manager_, x->tab_name, query->conds);
         CompiledPointProgramPtr compiled_program;
         bool compiled_hit = false;
-        if (enable_compiled_point_program_cache_ && point_access.has_value()) {
+        if (point_program_cache_eligible && point_access.has_value()) {
             const auto catalog_generation = sm_manager_->get_catalog_generation();
             const auto cache_key = make_point_program_cache_key(PointProgramKind::Update, x->tab_name, *point_access,
                                                                 query->conds, query->set_clauses, catalog_generation);
             auto cached = find_compiled_point_program(cache_key, catalog_generation);
-            if (cached.has_value() && cached.value() != nullptr &&
-                (context == nullptr ||
-                 (context->txn_ == nullptr ? context->isolation_level_ == IsolationLevel::READ_COMMITTED
-                                           : context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED))) {
+            if (cached.has_value() && cached.value() != nullptr) {
                 compiled_program = cached.value();
                 compiled_hit = true;
             } else {
@@ -1816,6 +1622,9 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         }
         auto dml = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
                                              std::vector<Value>(), query->conds, query->set_clauses);
+        if (is_lock_only_self_assignment_update(x->tab_name, query->set_clauses, point_access)) {
+            dml->update_execution_mode_ = UpdateExecutionMode::LockOnlySelfAssignment;
+        }
         dml->point_access_ = std::move(point_access);
         dml->compiled_point_program_ = std::move(compiled_program);
         plannerRoot = std::move(dml);
@@ -1843,6 +1652,9 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     }
     default:
         throw InternalError("Unexpected AST root");
+    }
+    if (plannerRoot != nullptr) {
+        plannerRoot->sm_manager_ = sm_manager_;
     }
     return plannerRoot;
 }

@@ -70,8 +70,6 @@ const std::unordered_map<std::string_view, TokenType, CIHash, CIEqual> Lexer::ke
     {"LEVEL", TokenType::LEVEL},
     {"SNAPSHOT", TokenType::SNAPSHOT},
     {"SERIALIZABLE", TokenType::SERIALIZABLE},
-    {"ENABLE_NESTLOOP", TokenType::ENABLE_NESTLOOP},
-    {"ENABLE_SORTMERGE", TokenType::ENABLE_SORTMERGE},
     {"STATIC_CHECKPOINT", TokenType::STATIC_CHECKPOINT},
     {"OUTPUT_FILE", TokenType::OUTPUT_FILE},
     {"OFF", TokenType::OFF},

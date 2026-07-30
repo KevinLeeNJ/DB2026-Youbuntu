@@ -86,34 +86,7 @@ private:
     int generation_ = 0;
 };
 
-class ScopedEnvironmentVariable {
-public:
-    ScopedEnvironmentVariable(const char* name, const char* value) : name_(name) {
-        if (const char* old_value = std::getenv(name_.c_str()); old_value != nullptr) {
-            old_value_ = old_value;
-        }
-        if (value == nullptr) {
-            unsetenv(name_.c_str());
-        } else {
-            setenv(name_.c_str(), value, 1);
-        }
-    }
-
-    ~ScopedEnvironmentVariable() {
-        if (old_value_.has_value()) {
-            setenv(name_.c_str(), old_value_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-private:
-    std::string name_;
-    std::optional<std::string> old_value_;
-};
-
-TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockConflictDoesNotWaitForOwnerCompletion) {
-    ScopedEnvironmentVariable first_lock_wait("RMDB_SI_FIRST_LOCK_WAIT", nullptr);
+TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockConflictReturnsImmediatelyWithoutHandoff) {
     LockManager lock_manager;
     Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction victim(1002, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -121,23 +94,14 @@ TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockConflictDoesNotWaitForO
     LockDataId lock_id(42, rid, LockDataType::RECORD);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
-    auto victim_result =
-        std::async(std::launch::async, [&] { return lock_manager.lock_exclusive_on_record(&victim, rid, 42); });
-    const auto status = victim_result.wait_for(std::chrono::seconds(1));
-    EXPECT_EQ(status, std::future_status::ready) << "default SI conflict must return before the lock owner completes";
-
-    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
-    ASSERT_EQ(victim_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    const bool acquired = victim_result.get();
-    EXPECT_FALSE(acquired);
-    if (acquired) {
-        EXPECT_TRUE(lock_manager.unlock(&victim, lock_id));
-    }
+    EXPECT_FALSE(lock_manager.lock_exclusive_on_record(&victim, rid, 42));
 
     const auto stats = lock_manager.record_lock_observability();
     EXPECT_EQ(stats.immediate_conflict, 1u);
     EXPECT_EQ(stats.wait_enqueued, 0u);
-    EXPECT_EQ(stats.completion_waits, 0u);
+    EXPECT_EQ(stats.wait_granted, 0u);
+    EXPECT_TRUE(victim.get_lock_set()->empty());
+    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
 }
 
 TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) {
@@ -265,21 +229,6 @@ TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAc
     EXPECT_EQ(stats.wait_enqueued, 1u);
     EXPECT_EQ(stats.wait_cancelled, 1u);
     EXPECT_GT(stats.wait_ns, 0u);
-}
-
-TEST(SnapshotIsolationConcurrencyTest, RecordImmediateConflictIsObservable) {
-    LockManager lock_manager(std::chrono::microseconds(0), false);
-    Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
-    Transaction loser(1002, IsolationLevel::SNAPSHOT_ISOLATION);
-    Rid rid{30, 0};
-    LockDataId lock_id(42, rid, LockDataType::RECORD);
-
-    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
-    EXPECT_FALSE(lock_manager.lock_exclusive_on_record(&loser, rid, 42));
-    EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
-    const auto stats = lock_manager.record_lock_observability();
-    EXPECT_EQ(stats.immediate_conflict, 1u);
-    EXPECT_EQ(stats.wait_enqueued, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
@@ -496,7 +445,7 @@ TEST(SnapshotIsolationConcurrencyTest, IndependentRecordLocksProgressConcurrentl
 
 class SharedTestDB {
 public:
-    SharedTestDB(const std::string& db_name, bool use_environment_lock_config = true) : db_name_(db_name) {
+    explicit SharedTestDB(const std::string& db_name) : db_name_(db_name) {
         char cwd_buf[1024];
         getcwd(cwd_buf, sizeof(cwd_buf));
         original_cwd_ = cwd_buf;
@@ -510,8 +459,7 @@ public:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
-        lock_manager_ = use_environment_lock_config ? std::make_unique<LockManager>()
-                                                    : std::make_unique<LockManager>(std::chrono::microseconds{0});
+        lock_manager_ = std::make_unique<LockManager>();
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
@@ -724,8 +672,7 @@ private:
     IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
 
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitRetriesAfterOwnerCommitWithoutApplyingStaleWrite) {
-    ScopedEnvironmentVariable first_lock_wait("RMDB_SI_FIRST_LOCK_WAIT", "1");
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockConflictAbortsBeforeOwnerCommitWithoutApplyingStaleWrite) {
     SharedTestDB db("snapshot_si_first_lock_wait_stale");
     TestSession setup(&db);
     ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_stale (id int, val int);"));
@@ -738,37 +685,19 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitRetriesAfterOwnerCommitWit
     ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_stale set val = 200 where id = 1;"));
 
-    const uint64_t wait_count_before = db.lock()->record_lock_observability().wait_enqueued;
-    auto waiter_result = std::async(std::launch::async, [&]() {
-        try {
-            waiter.exec_sql("update si_first_wait_stale set val = 300 where id = 1;");
-            return std::optional<AbortReason>{};
-        } catch (TransactionAbortException& error) {
-            return std::optional<AbortReason>{error.GetAbortReason()};
-        }
-    });
-
-    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (db.lock()->record_lock_observability().wait_enqueued == wait_count_before &&
-           std::chrono::steady_clock::now() < enqueue_deadline) {
-        std::this_thread::yield();
-    }
-    EXPECT_GT(db.lock()->record_lock_observability().wait_enqueued, wait_count_before);
-    EXPECT_EQ(waiter_result.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    const uint64_t waits_before = db.lock()->record_lock_observability().wait_enqueued;
+    EXPECT_EQ(TestSession::trim_output(
+                  waiter.exec_sql_expect_abort("update si_first_wait_stale set val = 300 where id = 1;")),
+              "abort");
+    EXPECT_EQ(db.lock()->record_lock_observability().wait_enqueued, waits_before);
 
     ASSERT_TRUE(owner.exec_sql_ok("commit;"));
-    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    const auto abort_reason = waiter_result.get();
-    ASSERT_TRUE(abort_reason.has_value());
-    EXPECT_EQ(*abort_reason, AbortReason::DEADLOCK_PREVENTION);
-
     const std::string final_state = verifier.exec_sql("select val from si_first_wait_stale where id = 1;");
     EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
     EXPECT_EQ(final_state.find("|              300 |"), std::string::npos);
 }
 
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitRetriesOnceAfterOwnerAbort) {
-    ScopedEnvironmentVariable first_lock_wait("RMDB_SI_FIRST_LOCK_WAIT", "1");
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockConflictCanRetryAfterOwnerAbort) {
     SharedTestDB db("snapshot_si_first_lock_wait_owner_abort");
     TestSession setup(&db);
     ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_abort (id int, val int);"));
@@ -781,30 +710,13 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitRetriesOnceAfterOwnerAbort
     ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_abort set val = 200 where id = 1;"));
 
-    const uint64_t wait_count_before = db.lock()->record_lock_observability().wait_enqueued;
-    auto waiter_result = std::async(std::launch::async, [&]() {
-        try {
-            waiter.exec_sql("update si_first_wait_abort set val = 300 where id = 1;");
-            return std::optional<AbortReason>{};
-        } catch (TransactionAbortException& error) {
-            return std::optional<AbortReason>{error.GetAbortReason()};
-        }
-    });
-
-    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (db.lock()->record_lock_observability().wait_enqueued == wait_count_before &&
-           std::chrono::steady_clock::now() < enqueue_deadline) {
-        std::this_thread::yield();
-    }
-    EXPECT_GT(db.lock()->record_lock_observability().wait_enqueued, wait_count_before);
-    EXPECT_EQ(waiter_result.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    const uint64_t waits_before = db.lock()->record_lock_observability().wait_enqueued;
+    EXPECT_EQ(TestSession::trim_output(
+                  waiter.exec_sql_expect_abort("update si_first_wait_abort set val = 300 where id = 1;")),
+              "abort");
+    EXPECT_EQ(db.lock()->record_lock_observability().wait_enqueued, waits_before);
 
     ASSERT_TRUE(owner.exec_sql_ok("abort;"));
-    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    const auto abort_reason = waiter_result.get();
-    ASSERT_TRUE(abort_reason.has_value());
-    EXPECT_EQ(*abort_reason, AbortReason::DEADLOCK_PREVENTION);
-
     ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
     ASSERT_TRUE(waiter.exec_sql_ok("update si_first_wait_abort set val = 300 where id = 1;"));
     ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
@@ -823,10 +735,7 @@ protected:
     void SetUp() override {
         const auto* test_info = ::testing::UnitTest::GetInstance()->current_test_info();
         std::string db_name = std::string("snapshot_") + test_info->name();
-        // Legacy fixture cases intentionally assert immediate SI/SER conflict
-        // outcomes. Dedicated concurrency tests above exercise production
-        // completion-wait behavior with real owner completion.
-        db_ = std::make_unique<SharedTestDB>(db_name, false);
+        db_ = std::make_unique<SharedTestDB>(db_name);
     }
 
     void TearDown() override {
@@ -950,8 +859,6 @@ TEST_F(SnapshotTest, RC_UpdateRechecksLatestVersionAfterWaitingForLock) {
 }
 
 TEST_F(SnapshotTest, RC_PointDmlRechecksResidualPredicateAfterRecordLockWait) {
-    ASSERT_EQ(std::getenv("ENABLE_POINT_DML"), nullptr) << "test requires default-on point DML semantics";
-
     auto run_case = [&](const std::string& table, const std::string& mutation) {
         auto setup = create_session();
         ASSERT_TRUE(setup->exec_sql_ok("create table " + table + " (id int, eligible int, payload int);"));
@@ -990,7 +897,7 @@ TEST_F(SnapshotTest, RC_PointDmlRechecksResidualPredicateAfterRecordLockWait) {
         const bool resolved = candidate.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
         EXPECT_TRUE(resolved) << "point DML did not resolve its indexed candidate";
         EXPECT_TRUE(has_point_access.load(std::memory_order_acquire))
-            << "mutation must use indexed point access with ENABLE_POINT_DML unset";
+            << "mutation must use indexed point access by default";
 
         release_waiter.set_value();
         const bool blocked = mutation_result.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
@@ -2368,7 +2275,7 @@ TEST_F(SnapshotTest, SI_Deadlock_ConcurrentUpdatesSameRecord) {
     auto t2 = create_session();
     auto t3 = create_session();
 
-    SimpleThreadBarrier b0(2), b1(2);
+    SimpleThreadBarrier b0(2);
     std::string t1_result, t2_result;
     bool t1_ok = true, t2_ok = true;
 
@@ -2377,7 +2284,6 @@ TEST_F(SnapshotTest, SI_Deadlock_ConcurrentUpdatesSameRecord) {
         t1_ok = t1_ok && t1->exec_sql_ok("begin;");
         b0.arrive_and_wait();
         t1_result = t1->exec_sql_expect_abort("update t set val = 200 where id = 1;");
-        b1.arrive_and_wait();
         t1_ok = t1_ok && t1->exec_sql_ok("commit;");
     });
 
@@ -2386,7 +2292,6 @@ TEST_F(SnapshotTest, SI_Deadlock_ConcurrentUpdatesSameRecord) {
         t2_ok = t2_ok && t2->exec_sql_ok("begin;");
         b0.arrive_and_wait();
         t2_result = t2->exec_sql_expect_abort("update t set val = 300 where id = 1;");
-        b1.arrive_and_wait();
         t2_ok = t2_ok && t2->exec_sql_ok("commit;");
     });
 

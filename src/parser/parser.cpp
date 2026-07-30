@@ -213,31 +213,15 @@ private:
 
     std::unique_ptr<TreeNode> parse_set_stmt() {
         expect(TokenType::SET, "expected SET");
-        if (match(TokenType::TRANSACTION)) {
-            expect(TokenType::ISOLATION, "expected ISOLATION");
-            expect(TokenType::LEVEL, "expected LEVEL");
-            if (match(TokenType::SNAPSHOT)) {
-                expect(TokenType::ISOLATION, "expected ISOLATION after SNAPSHOT");
-                return std::make_unique<SetTransaction>(IsolationLevelType::SNAPSHOT_ISOLATION);
-            }
-            expect(TokenType::SERIALIZABLE, "expected SNAPSHOT ISOLATION or SERIALIZABLE");
-            return std::make_unique<SetTransaction>(IsolationLevelType::SERIALIZABLE);
+        expect(TokenType::TRANSACTION, "expected TRANSACTION");
+        expect(TokenType::ISOLATION, "expected ISOLATION");
+        expect(TokenType::LEVEL, "expected LEVEL");
+        if (match(TokenType::SNAPSHOT)) {
+            expect(TokenType::ISOLATION, "expected ISOLATION after SNAPSHOT");
+            return std::make_unique<SetTransaction>(IsolationLevelType::SNAPSHOT_ISOLATION);
         }
-
-        SetKnobType knob = EnableNestLoop;
-        if (match(TokenType::ENABLE_NESTLOOP)) {
-            knob = EnableNestLoop;
-        } else if (match(TokenType::ENABLE_SORTMERGE)) {
-            knob = EnableSortMerge;
-        } else {
-            error("expected set knob name");
-        }
-        expect(TokenType::EQ, "expected '=' after set knob");
-        if (!check(TokenType::VALUE_BOOL)) {
-            error("expected boolean value");
-        }
-        auto bool_lit = parse_bool_literal();
-        return std::make_unique<SetStmt>(knob, bool_lit->val);
+        expect(TokenType::SERIALIZABLE, "expected SNAPSHOT ISOLATION or SERIALIZABLE");
+        return std::make_unique<SetTransaction>(IsolationLevelType::SERIALIZABLE);
     }
 
     std::unique_ptr<TreeNode> parse_ddl() {

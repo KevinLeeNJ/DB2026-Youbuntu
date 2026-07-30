@@ -11,9 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <charconv>
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -29,8 +27,6 @@ struct BufferPoolRuntimeConfig {
 static constexpr size_t DEFAULT_BUFFER_POOL_GIB = 3;
 static constexpr size_t MAX_BUFFER_POOL_GIB = 6;
 static constexpr size_t PAGES_PER_GIB = (size_t{1} << 30) / PAGE_SIZE;
-static constexpr uint32_t DEFAULT_SI_CONFLICT_BACKOFF_US = 1000;
-static constexpr uint32_t MAX_SI_CONFLICT_BACKOFF_US = 2000;
 
 static_assert((size_t{1} << 30) % PAGE_SIZE == 0, "PAGE_SIZE must divide one GiB exactly");
 static_assert(DEFAULT_BUFFER_POOL_GIB >= 1 && DEFAULT_BUFFER_POOL_GIB <= MAX_BUFFER_POOL_GIB,
@@ -53,19 +49,4 @@ inline BufferPoolRuntimeConfig parse_buffer_pool_config(std::string_view value) 
 
 inline BufferPoolRuntimeConfig default_buffer_pool_config() {
     return BufferPoolRuntimeConfig{DEFAULT_BUFFER_POOL_GIB, DEFAULT_BUFFER_POOL_GIB * PAGES_PER_GIB};
-}
-
-inline std::chrono::microseconds parse_si_conflict_backoff(std::string_view value) {
-    uint32_t microseconds = 0;
-    const char* begin = value.data();
-    const char* end = begin + value.size();
-    const auto result = std::from_chars(begin, end, microseconds);
-    if (value.empty() || result.ec != std::errc{} || result.ptr != end || microseconds > MAX_SI_CONFLICT_BACKOFF_US) {
-        throw std::invalid_argument("RMDB_SI_CONFLICT_BACKOFF_US must be an integer between 0 and 2000");
-    }
-    return std::chrono::microseconds{microseconds};
-}
-
-inline std::chrono::microseconds default_si_conflict_backoff() {
-    return std::chrono::microseconds{DEFAULT_SI_CONFLICT_BACKOFF_US};
 }

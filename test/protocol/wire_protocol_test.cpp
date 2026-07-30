@@ -53,6 +53,45 @@ TEST(WireProtocolTest, UsesBigEndianPayloadFields) {
                                                         0x89, 0xab, 0xcd, 0xef}));
 }
 
+TEST(WireProtocolTest, WriterPatchesAndRewindsWithoutChangingPayloadLayout) {
+    wire_protocol::Writer writer;
+    writer.u16(0);
+    const auto count_offset = writer.size();
+    writer.u32(0);
+    writer.bytes("old");
+    writer.patch_u16(0, 0x1234);
+    writer.patch_u32(count_offset, 0x89abcdef);
+    EXPECT_EQ(writer.data(), (std::vector<std::uint8_t>{0x12, 0x34, 0x89, 0xab, 0xcd, 0xef, 'o', 'l', 'd'}));
+
+    writer.rewind(count_offset);
+    writer.u32(7);
+    EXPECT_EQ(writer.data(), (std::vector<std::uint8_t>{0x12, 0x34, 0, 0, 0, 7}));
+    EXPECT_THROW(writer.patch_u16(writer.size(), 1), wire_protocol::ProtocolError);
+    EXPECT_THROW(writer.patch_u32(writer.size() - 1, 1), wire_protocol::ProtocolError);
+    EXPECT_THROW(writer.rewind(writer.size() + 1), wire_protocol::ProtocolError);
+}
+
+TEST(WireProtocolTest, EncodesRawTupleCellsExactlyOnceWithoutValueObjects) {
+    const std::int32_t integer = -2;
+    const std::uint32_t float_bits = 0x40490fdbU;
+    const char text[] = {'r', 'a', 'w'};
+
+    wire_protocol::Writer writer;
+    wire_protocol::encode_raw_value(writer, wire_protocol::Type::INT32, true, &integer, sizeof(integer));
+    wire_protocol::encode_raw_value(writer, wire_protocol::Type::FLOAT32, true, &float_bits, sizeof(float_bits));
+    wire_protocol::encode_raw_value(writer, wire_protocol::Type::CHAR, true, text, sizeof(text));
+    wire_protocol::encode_raw_value(writer, wire_protocol::Type::CHAR, false, nullptr, 0);
+
+    EXPECT_EQ(writer.data(), (std::vector<std::uint8_t>{1, 0xff, 0xff, 0xff, 0xfe, 1, 0x40, 0x49, 0x0f, 0xdb, 1, 0, 0,
+                                                        0, 3, 'r', 'a', 'w', 0}));
+
+    wire_protocol::Writer invalid;
+    EXPECT_THROW(wire_protocol::encode_raw_value(invalid, wire_protocol::Type::INT32, true, text, sizeof(text)),
+                 wire_protocol::ProtocolError);
+    EXPECT_THROW(wire_protocol::encode_raw_value(invalid, static_cast<wire_protocol::Type>(0xff), false, nullptr, 0),
+                 wire_protocol::ProtocolError);
+}
+
 TEST(WireProtocolTest, PrepareOkUsesOnlyTheSpecifiedSchemaFields) {
     const std::vector<wire_protocol::PreparedSchema> schemas = {
         {7, {{"value", wire_protocol::Type::INT32}, {"price", wire_protocol::Type::FLOAT32}}},

@@ -161,24 +161,6 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
         }
         break;
     }
-    case T_SetKnob: {
-        auto* x = static_cast<SetKnobPlan*>(plan);
-        switch (x->set_knob_type_) {
-        case ast::SetKnobType::EnableNestLoop: {
-            planner_->set_enable_nestedloop_join(x->bool_value_);
-            break;
-        }
-        case ast::SetKnobType::EnableSortMerge: {
-            planner_->set_enable_sortmerge_join(x->bool_value_);
-            break;
-        }
-        default: {
-            throw RMDBError("Not implemented!\n");
-            break;
-        }
-        }
-        break;
-    }
     case T_SetOutputFile: {
         auto* x = static_cast<SetOutputFilePlan*>(plan);
         if (context != nullptr && context->output_file_enabled_ != nullptr) {

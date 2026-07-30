@@ -33,7 +33,6 @@ typedef enum PlanTag {
     T_DropTable,
     T_CreateIndex,
     T_DropIndex,
-    T_SetKnob,
     T_Insert,
     T_Update,
     T_Delete,
@@ -47,7 +46,6 @@ typedef enum PlanTag {
     T_IndexSkipScan,
     T_Filter,
     T_NestLoop,
-    T_SortMerge, // sort merge join
     T_Sort,
     T_Projection,
     T_Aggregate,
@@ -65,6 +63,9 @@ class Plan {
 public:
     PlanTag tag;
     size_t runtime_rows_ = 0;
+    // Non-owning catalog owner used only while compiling a generation-scoped
+    // PreparedPlanDescriptor. Runtime state must not be stored in a Plan.
+    SmManager* sm_manager_ = nullptr;
     // Set when an index-backed child is configured to produce the requested
     // ORDER BY directly, so LIMIT can be pushed below the projection chain.
     bool order_satisfied_ = false;
@@ -77,6 +78,7 @@ public:
     ScanPlan(PlanTag tag, SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
              std::vector<std::string> index_col_names) {
         Plan::tag = tag;
+        Plan::sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
         TabMeta& tab = sm_manager->db_.get_table(tab_name_);
@@ -222,6 +224,11 @@ struct PointAccessPath {
     std::vector<size_t> condition_positions;
 };
 
+enum class UpdateExecutionMode {
+    Mutating,
+    LockOnlySelfAssignment,
+};
+
 // dml语句，包括insert; delete; update; select语句　
 class DMLPlan : public Plan {
 public:
@@ -229,6 +236,9 @@ public:
             std::vector<Condition> conds, std::vector<SetClause> set_clauses) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
+        if (subplan_ != nullptr) {
+            Plan::sm_manager_ = subplan_->sm_manager_;
+        }
         tab_name_ = std::move(tab_name);
         values_ = std::move(values);
         conds_ = std::move(conds);
@@ -241,6 +251,7 @@ public:
     std::vector<Condition> conds_;
     std::vector<SetClause> set_clauses_;
     std::optional<PointAccessPath> point_access_;
+    UpdateExecutionMode update_execution_mode_ = UpdateExecutionMode::Mutating;
     CompiledPointProgramPtr compiled_point_program_;
 };
 
@@ -268,18 +279,6 @@ public:
     }
     ~OtherPlan() {}
     std::string tab_name_;
-};
-
-// Set Knob Plan
-class SetKnobPlan : public Plan {
-public:
-    SetKnobPlan(ast::SetKnobType knob_type, bool bool_value) {
-        Plan::tag = T_SetKnob;
-        set_knob_type_ = knob_type;
-        bool_value_ = bool_value;
-    }
-    ast::SetKnobType set_knob_type_;
-    bool bool_value_;
 };
 
 // Set Transaction Isolation Level Plan

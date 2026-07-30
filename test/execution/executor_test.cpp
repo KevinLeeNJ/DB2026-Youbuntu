@@ -1836,6 +1836,67 @@ TEST_F(ExecutorTest, gc_concurrent_with_version_chain_reads_is_safe) {
 // RC aborts are common on TPC-C hot rows. A rolled-back insert frees a slot
 // while other transactions are allocating slots from the same table, so this
 // exercises the free-page chain and bitmap updates under that exact mix.
+TEST_F(ExecutorTest, rc_heap_only_abort_without_wal_restores_insert_delete_and_update) {
+    setup_db();
+    sm_manager_->create_table("rc_heap_abort", make_int_cols({"id"}), nullptr);
+
+    Value initial_value;
+    initial_value.set_int(10);
+    char seed_output[4096]{};
+    int seed_offset = 0;
+    Context seed_context(nullptr, nullptr, nullptr, seed_output, &seed_offset);
+    InsertExecutor seed(sm_manager_.get(), "rc_heap_abort", {initial_value}, &seed_context);
+    seed.Next();
+    const Rid seed_rid = seed.rid();
+
+    auto* fh = sm_manager_->fhs_.at("rc_heap_abort").get();
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, sm_manager_.get());
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char output[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, output, &offset, &txn_manager);
+        Value inserted_value;
+        inserted_value.set_int(20);
+        InsertExecutor insert(sm_manager_.get(), "rc_heap_abort", {inserted_value}, &context);
+        insert.Next();
+        const Rid inserted_rid = insert.rid();
+        ASSERT_NO_THROW(txn_manager.abort(txn, nullptr));
+        EXPECT_FALSE(fh->is_record(inserted_rid));
+    }
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char output[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, output, &offset, &txn_manager);
+        Value updated_value;
+        updated_value.set_int(30);
+        SetClause set_id{{"rc_heap_abort", "id"}, updated_value, false, {}, UpdateOp::ASSIGNMENT, {}};
+        UpdateExecutor update(sm_manager_.get(), "rc_heap_abort", {set_id}, {}, {seed_rid}, &context);
+        update.Next();
+        ASSERT_NO_THROW(txn_manager.abort(txn, nullptr));
+        auto restored = fh->get_record(seed_rid, nullptr);
+        ASSERT_NE(restored, nullptr);
+        EXPECT_EQ(*reinterpret_cast<int*>(restored->data), 10);
+    }
+
+    {
+        auto* txn = txn_manager.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+        char output[4096]{};
+        int offset = 0;
+        Context context(&lock_manager, nullptr, txn, output, &offset, &txn_manager);
+        DeleteExecutor delete_executor(sm_manager_.get(), "rc_heap_abort", {}, {seed_rid}, &context);
+        delete_executor.Next();
+        ASSERT_NO_THROW(txn_manager.abort(txn, nullptr));
+        auto restored = fh->get_record(seed_rid, nullptr);
+        ASSERT_NE(restored, nullptr);
+        EXPECT_EQ(*reinterpret_cast<int*>(restored->data), 10);
+    }
+}
+
 TEST_F(ExecutorTest, rc_concurrent_insert_rollback_preserves_committed_rows) {
     setup_db();
     sm_manager_->create_table("rc_insert_rollback", make_int_cols({"id"}), nullptr);

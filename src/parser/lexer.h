@@ -73,8 +73,6 @@ enum class TokenType {
     COMMIT,
     ABORT,
     ROLLBACK,
-    ENABLE_NESTLOOP,
-    ENABLE_SORTMERGE,
     TRANSACTION,
     ISOLATION,
     LEVEL,

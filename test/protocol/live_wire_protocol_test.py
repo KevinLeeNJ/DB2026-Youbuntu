@@ -290,12 +290,7 @@ class Server:
         # diagnostic checkpoint knobs from the caller: a tiny threshold could
         # checkpoint the buffered ABORT before this suite deliberately kills
         # the process.
-        env.pop("RMDB_AUTO_CHECKPOINT_BYTES", None)
-        env.pop("RMDB_CHECKPOINT_PREFLUSH_BYTES", None)
-        env.pop("RMDB_CHECKPOINT_PREFLUSH_PAGES", None)
-        env.pop("RMDB_SI_FIRST_LOCK_WAIT", None)
         env["RMDB_EXECUTION_TIMING_DIAGNOSTICS"] = "1"
-        env["ENABLE_COMPILED_POINT_PROGRAM"] = "1"
         self.process = subprocess.Popen(
             [self.binary, "db"],
             cwd=self.root,
@@ -436,6 +431,18 @@ def test_stream_prepare_float_and_auto_abort(port):
     )
 
     executed, status, failed, diagnostic, results = client.batch(
+        [(5, [9, None, None]), (6, [9]), (6, [7])], parameter_types, schemas
+    )
+    require(
+        (executed, status, failed, diagnostic) == (3, 0, 0xFFFF, ""),
+        "prepared NULL/multi-query batch failed",
+    )
+    require(
+        results == [(1, [[None, None]]), (2, [[sentinel, "wire-v3"]])],
+        "BATCH_RESULT did not preserve exact NULL cells or query operation order",
+    )
+
+    executed, status, failed, diagnostic, results = client.batch(
         [(7, []), (8, [0x3F800000, 1, 2]), (9, [0, 1, 2])], parameter_types, schemas
     )
     require(
@@ -447,6 +454,59 @@ def test_stream_prepare_float_and_auto_abort(port):
     require(
         rows == [[0x3FA00000]],
         "AUTO_ABORT did not roll back the preceding prepared update",
+    )
+    client.close()
+
+
+def test_batch_result_payload_limit_rolls_back_without_partial_results(port):
+    client = WireClient(port)
+    client.command(
+        "CREATE TABLE batch_limit_rows (id INT, payload CHAR(255));"
+    )
+    client.command("CREATE TABLE batch_limit_marker (id INT, value INT);")
+    client.command("INSERT INTO batch_limit_marker VALUES (1, 10);")
+    payload = "x" * 255
+    for row_id in range(46):
+        client.command(
+            "INSERT INTO batch_limit_rows VALUES "
+            f"({row_id}, '{payload}');"
+        )
+
+    statements = [
+        (1, False, [], "BEGIN;"),
+        (
+            2,
+            False,
+            [INT32, INT32],
+            "UPDATE batch_limit_marker SET value = value + $1 WHERE id = $2;",
+        ),
+        (
+            3,
+            True,
+            [],
+            "SELECT a.payload, b.payload FROM batch_limit_rows a JOIN batch_limit_rows b;",
+        ),
+    ]
+    schemas = client.prepare(statements)
+    parameter_types = {
+        statement_id: declared_types
+        for statement_id, _, declared_types, _ in statements
+    }
+    executed, status, failed, diagnostic, results = client.batch(
+        [(1, []), (2, [1, 1]), (3, [])], parameter_types, schemas
+    )
+    require(
+        executed == 2 and status == 2 and failed == 2 and results == [],
+        "oversized BATCH_RESULT must fail at the query with no partial results",
+    )
+    require(
+        "protocol limit" in diagnostic,
+        "oversized BATCH_RESULT must report the payload limit",
+    )
+    _, rows = client.query("SELECT value FROM batch_limit_marker WHERE id = 1;")
+    require(
+        rows == [[10]],
+        "oversized BATCH_RESULT did not roll back the preceding update",
     )
     client.close()
 
@@ -599,12 +659,13 @@ def test_prepared_and_explicit_transaction_ddl_rejection(port):
         client.close()
 
 
-def test_compiled_update_descriptor_falls_back_safely(server):
+def test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server):
     client = WireClient(server.port)
     try:
         client.command("CREATE TABLE compiled_fallback_probe (id INT, value INT);")
         client.command("CREATE INDEX compiled_fallback_probe(id);")
         client.command("INSERT INTO compiled_fallback_probe VALUES (1, 10);")
+        client.command("INSERT INTO compiled_fallback_probe VALUES (2, 20);")
         statements = [
             (
                 220,
@@ -614,21 +675,49 @@ def test_compiled_update_descriptor_falls_back_safely(server):
             ),
         ]
         parameter_types = {220: [INT32, INT32]}
-        client.prepare(statements)  # cache miss retains the ordinary scan
-        schemas = client.prepare(
-            statements
-        )  # cache hit produces the compiled point shape
+        schemas = client.prepare(statements)
         executed, status, failed, diagnostic, results = client.batch(
             [(220, [5, 1])], parameter_types, schemas
         )
         require(
             (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", []),
-            "compiled UPDATE descriptor fallback failed",
+            "cold prepared UPDATE failed",
+        )
+
+        schemas = client.prepare(statements)
+        executed, status, failed, diagnostic, results = client.batch(
+            [(220, [7, 1])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", []),
+            "hot prepared UPDATE failed",
         )
         _, rows = client.query(
             "SELECT value FROM compiled_fallback_probe WHERE id = 1;"
         )
-        require(rows == [[15]], "compiled UPDATE descriptor fallback changed semantics")
+        require(rows == [[22]], "cold/hot prepared UPDATE changed semantics")
+
+        fallback_statements = [
+            (
+                221,
+                False,
+                [INT32],
+                "DELETE FROM compiled_fallback_probe WHERE id = $1;",
+            ),
+        ]
+        fallback_parameter_types = {221: [INT32]}
+        fallback_schemas = client.prepare(fallback_statements)
+        executed, status, failed, diagnostic, results = client.batch(
+            [(221, [2])], fallback_parameter_types, fallback_schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", []),
+            "unsupported prepared DELETE fallback failed",
+        )
+        _, rows = client.query(
+            "SELECT value FROM compiled_fallback_probe WHERE id = 2;"
+        )
+        require(rows == [], "unsupported prepared DELETE fallback changed semantics")
 
         os.kill(server.process.pid, signal.SIGUSR1)
         deadline = time.monotonic() + 3
@@ -638,24 +727,48 @@ def test_compiled_update_descriptor_falls_back_safely(server):
                 lines = open(log_path, "r", encoding="utf-8").read().splitlines()
             except FileNotFoundError:
                 lines = []
-            matching = [
+            prepared_matching = [
                 line
                 for line in lines
                 if "obs_exec " in line and "statement_id=220 " in line
             ]
-            if matching:
-                fields = dict(
+            fallback_matching = [
+                line
+                for line in lines
+                if "obs_exec " in line and "statement_id=221 " in line
+            ]
+            if prepared_matching and fallback_matching:
+                prepared_fields = dict(
                     token.split("=", 1)
-                    for token in matching[-1].split()
+                    for token in prepared_matching[-1].split()
                     if "=" in token
                 )
                 require(
-                    fields.get("route") == "fallback",
-                    "compiled UPDATE unexpectedly used prepared runtime",
+                    prepared_fields.get("route") == "prepared-plan",
+                    "cold/hot UPDATE did not use prepared runtime",
+                )
+                require(
+                    prepared_fields.get("invocations") == "2",
+                    "cold/hot UPDATE prepared route count mismatch",
+                )
+                require(
+                    prepared_fields.get("clone_bind_ns") == "0"
+                    and prepared_fields.get("analyze_ns") == "0"
+                    and prepared_fields.get("plan_ns") == "0",
+                    "cold/hot UPDATE unexpectedly rebuilt its prepared plan",
+                )
+                fallback_fields = dict(
+                    token.split("=", 1)
+                    for token in fallback_matching[-1].split()
+                    if "=" in token
+                )
+                require(
+                    fallback_fields.get("route") == "fallback",
+                    "unsupported prepared DELETE did not use correctness fallback",
                 )
                 return
             time.sleep(0.05)
-        raise ProtocolFailure("compiled UPDATE fallback diagnostics were not published")
+        raise ProtocolFailure("prepared UPDATE/DELETE route diagnostics were not published")
     finally:
         client.close()
 
@@ -733,14 +846,15 @@ def test_active_snapshot_delete_conflict_aborts_immediately(port):
         verifier.close()
 
 
-def test_prepared_snapshot_write_conflict(port):
-    setup = WireClient(port)
+def test_prepared_snapshot_write_conflict(server):
+    setup = WireClient(server.port)
     setup.command("CREATE TABLE prepared_si_probe (id INT, value INT);")
+    setup.command("CREATE INDEX prepared_si_probe(id);")
     setup.command("INSERT INTO prepared_si_probe VALUES (1, 10);")
     setup.close()
 
-    winner = WireClient(port)
-    victim = WireClient(port)
+    winner = WireClient(server.port)
+    victim = WireClient(server.port)
     try:
         statements = [
             (
@@ -749,8 +863,14 @@ def test_prepared_snapshot_write_conflict(port):
                 [INT32, INT32],
                 "UPDATE prepared_si_probe SET value = value + $1 WHERE id = $2;",
             ),
+            (
+                231,
+                True,
+                [INT32],
+                "SELECT value FROM prepared_si_probe WHERE id = $1;",
+            ),
         ]
-        parameter_types = {230: [INT32, INT32]}
+        parameter_types = {230: [INT32, INT32], 231: [INT32]}
         winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
         victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
         winner_schemas = winner.prepare(statements)
@@ -768,21 +888,216 @@ def test_prepared_snapshot_write_conflict(port):
         winner.command("COMMIT;")
 
         executed, status, failed, diagnostic, results = victim.batch(
-            [(230, [1, 1])], parameter_types, victim_schemas
+            [(231, [1]), (230, [1, 1])], parameter_types, victim_schemas
         )
         require(
-            executed == 0
+            executed == 1
             and status == 1
-            and failed == 0
+            and failed == 1
             and diagnostic
             and results == [],
-            "stale prepared SI UPDATE did not abort and roll back immediately",
+            "stale prepared SI point UPDATE did not AUTO_ABORT without partial results",
         )
-        _, rows = winner.query("SELECT value FROM prepared_si_probe WHERE id = 1;")
+        _, rows = victim.query("SELECT value FROM prepared_si_probe WHERE id = 1;")
         require(rows == [[11]], "stale prepared SI UPDATE changed the committed value")
+
+        victim.command("BEGIN;")
+        executed, status, failed, diagnostic, results = victim.batch(
+            [(230, [2, 1])], parameter_types, victim_schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results)
+            == (1, 0, 0xFFFF, "", []),
+            "connection could not reuse prepared SI point UPDATE after AUTO_ABORT",
+        )
+        victim.command("COMMIT;")
+        _, rows = victim.query("SELECT value FROM prepared_si_probe WHERE id = 1;")
+        require(rows == [[13]], "post-AUTO_ABORT prepared point UPDATE did not commit")
+
+        os.kill(server.process.pid, signal.SIGUSR1)
+        log_path = os.path.join(server.root, "rmdb.log")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if not os.path.exists(log_path):
+                time.sleep(0.05)
+                continue
+            with open(log_path, "r", encoding="utf-8", errors="replace") as log:
+                matching = [
+                    line
+                    for line in log
+                    if "obs_exec " in line
+                    and "statement_id=230 " in line
+                    and "route=prepared-plan " in line
+                ]
+            if matching:
+                entries = [
+                    dict(
+                        token.split("=", 1)
+                        for token in line.split()
+                        if "=" in token
+                    )
+                    for line in matching
+                ]
+                latest_sequence = max(int(fields["seq"]) for fields in entries)
+                entries = [
+                    fields
+                    for fields in entries
+                    if int(fields["seq"]) == latest_sequence
+                ]
+                require(
+                    sum(int(fields["invocations"]) for fields in entries) == 3
+                    and sum(int(fields["aborts"]) for fields in entries) == 1,
+                    "prepared SI point UPDATE route counts are inconsistent",
+                )
+                require(
+                    sum(int(fields["executor_constructed"]) for fields in entries)
+                    == 3,
+                    "prepared SI UPDATE used the generic scan-plus-update route",
+                )
+                require(
+                    all(
+                        fields.get("clone_bind_ns") == "0"
+                        and fields.get("analyze_ns") == "0"
+                        and fields.get("plan_ns") == "0"
+                        for fields in entries
+                    ),
+                    "prepared SI point UPDATE rebuilt its prepared plan",
+                )
+                break
+            time.sleep(0.05)
+        else:
+            raise ProtocolFailure(
+                "prepared SI point UPDATE route diagnostics were not published"
+            )
     finally:
         winner.close()
         victim.close()
+
+
+def test_prepared_composite_float_char_point_update(server):
+    client = WireClient(server.port)
+    try:
+        client.command(
+            "CREATE TABLE prepared_composite_probe "
+            "(f_key FLOAT, c_key CHAR(8), value FLOAT);"
+        )
+        client.command(
+            "CREATE INDEX prepared_composite_probe(f_key, c_key);"
+        )
+        client.command(
+            "INSERT INTO prepared_composite_probe VALUES (1.5, 'ab', 2.25);"
+        )
+        client.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        statements = [
+            (
+                232,
+                False,
+                [FLOAT32, FLOAT32, CHAR],
+                "UPDATE prepared_composite_probe SET value = value + $1 "
+                "WHERE f_key = $2 AND c_key = $3;",
+            ),
+            (
+                233,
+                True,
+                [FLOAT32, CHAR],
+                "SELECT value, c_key FROM prepared_composite_probe "
+                "WHERE f_key = $1 AND c_key = $2;",
+            ),
+        ]
+        schemas = client.prepare(statements)
+        parameter_types = {
+            statement_id: types for statement_id, _, types, _ in statements
+        }
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [(232, [0x3F000000, 0x3FC00000, "ab"]), (233, [0x3FC00000, "ab"])],
+            parameter_types,
+            schemas,
+        )
+        require(
+            (executed, status, failed, diagnostic)
+            == (2, 0, 0xFFFF, ""),
+            "composite FLOAT+CHAR prepared point UPDATE failed",
+        )
+        require(
+            results == [(1, [[0x40300000, "ab"]])],
+            "composite point UPDATE changed FLOAT32 bits or CHAR length/padding",
+        )
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [
+                (232, [0x3F000000, 0x3FC00000, None]),
+                (232, [0x3F000000, None, "ab"]),
+                (233, [0x3FC00000, "ab"]),
+            ],
+            parameter_types,
+            schemas,
+        )
+        require(
+            (executed, status, failed, diagnostic)
+            == (3, 0, 0xFFFF, ""),
+            "NULL composite point keys did not complete as proven no-candidate updates",
+        )
+        require(
+            results == [(2, [[0x40300000, "ab"]])],
+            "NULL composite point key mutated the indexed row",
+        )
+
+        os.kill(server.process.pid, signal.SIGUSR1)
+        log_path = os.path.join(server.root, "rmdb.log")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if not os.path.exists(log_path):
+                time.sleep(0.05)
+                continue
+            with open(log_path, "r", encoding="utf-8", errors="replace") as log:
+                matching = [
+                    line
+                    for line in log
+                    if "obs_exec " in line
+                    and "statement_id=232 " in line
+                    and "route=prepared-plan " in line
+                ]
+            if matching:
+                entries = [
+                    dict(
+                        token.split("=", 1)
+                        for token in line.split()
+                        if "=" in token
+                    )
+                    for line in matching
+                ]
+                latest_sequence = max(int(fields["seq"]) for fields in entries)
+                entries = [
+                    fields
+                    for fields in entries
+                    if int(fields["seq"]) == latest_sequence
+                ]
+                require(
+                    sum(int(fields["invocations"]) for fields in entries) == 3
+                    and sum(
+                        int(fields["executor_constructed"]) for fields in entries
+                    )
+                    == 3,
+                    "composite prepared UPDATE used the generic scan-plus-update route",
+                )
+                require(
+                    all(
+                        fields.get("clone_bind_ns") == "0"
+                        and fields.get("analyze_ns") == "0"
+                        and fields.get("plan_ns") == "0"
+                        for fields in entries
+                    ),
+                    "composite prepared point UPDATE rebuilt its plan",
+                )
+                break
+            time.sleep(0.05)
+        else:
+            raise ProtocolFailure(
+                "composite prepared point UPDATE route diagnostics were not published"
+            )
+    finally:
+        client.close()
 
 
 def test_stream_result_sink_ssi(port):
@@ -1220,24 +1535,18 @@ OBSERVABILITY_FIELDS = {
         "wait_granted",
         "wait_cancelled",
         "wait_ns",
-        "backoff_waits",
         "queue_depth_max",
         "cycle_checks",
         "cycle_victims",
-        "completion_waits",
-        "completion_aborts",
     },
     "obs_ckpt": {
         "t_ms",
         "seq",
         "attempt",
-        "preflush",
         "success",
         "drain_timeout",
         "deadline",
         "final_data_fail",
-        "initial_ns",
-        "preblock_ns",
         "block_ns",
         "drain_ns",
         "final_wal_ns",
@@ -1402,12 +1711,16 @@ def main():
     try:
         server.start()
         test_stream_prepare_float_and_auto_abort(server.port)
+        test_batch_result_payload_limit_rolls_back_without_partial_results(
+            server.port
+        )
         test_prepared_select_fast_route(server)
         test_prepared_and_explicit_transaction_ddl_rejection(server.port)
-        test_compiled_update_descriptor_falls_back_safely(server)
+        test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server)
         test_snapshot_write_conflict(server.port)
         test_active_snapshot_delete_conflict_aborts_immediately(server.port)
-        test_prepared_snapshot_write_conflict(server.port)
+        test_prepared_snapshot_write_conflict(server)
+        test_prepared_composite_float_char_point_update(server)
         test_stream_result_sink_ssi(server.port)
         test_empty_integer_aggregates_use_typed_zero(server.port)
         test_direct_column_update(server.port)

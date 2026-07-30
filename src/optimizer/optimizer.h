@@ -64,11 +64,6 @@ public:
         case ast::AstType::TxnRollback:
             // rollback;
             return std::make_unique<OtherPlan>(T_Transaction_rollback, std::string());
-        case ast::AstType::SetStmt: {
-            auto x = static_cast<const ast::SetStmt*>(parse);
-            // Set Knob Plan
-            return std::make_unique<SetKnobPlan>(x->set_knob_type_, x->bool_val_);
-        }
         case ast::AstType::SetTransaction: {
             auto x = static_cast<const ast::SetTransaction*>(parse);
             return std::make_unique<SetTransactionPlan>(x->isolation_level_);

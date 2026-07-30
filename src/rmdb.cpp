@@ -152,30 +152,25 @@ void log_observability_statistics() {
     const auto log_lock = [now_ms, sequence](const char* kind, const LockObservabilitySnapshot& stats) {
         LOG_WARN(
             "obs_lock t_ms=%lld seq=%llu kind=%s immediate_conflict=%llu "
-            "wait_enqueued=%llu wait_granted=%llu wait_cancelled=%llu wait_ns=%llu backoff_waits=%llu "
-            "completion_waits=%llu "
-            "completion_aborts=%llu queue_depth_max=%llu cycle_checks=%llu cycle_victims=%llu",
+            "wait_enqueued=%llu wait_granted=%llu wait_cancelled=%llu wait_ns=%llu "
+            "queue_depth_max=%llu cycle_checks=%llu cycle_victims=%llu",
             now_ms, static_cast<unsigned long long>(sequence), kind,
             static_cast<unsigned long long>(stats.immediate_conflict),
             static_cast<unsigned long long>(stats.wait_enqueued), static_cast<unsigned long long>(stats.wait_granted),
             static_cast<unsigned long long>(stats.wait_cancelled), static_cast<unsigned long long>(stats.wait_ns),
-            static_cast<unsigned long long>(stats.backoff_waits),
-            static_cast<unsigned long long>(stats.completion_waits),
-            static_cast<unsigned long long>(stats.completion_aborts),
             static_cast<unsigned long long>(stats.queue_depth_max), static_cast<unsigned long long>(stats.cycle_checks),
             static_cast<unsigned long long>(stats.cycle_victims));
     };
     log_lock("record", record_locks);
     log_lock("unique", unique_locks);
     LOG_WARN(
-        "obs_ckpt t_ms=%lld seq=%llu attempt=%llu preflush=%llu success=%llu drain_timeout=%llu deadline=%llu "
-        "final_data_fail=%llu initial_ns=%llu preblock_ns=%llu block_ns=%llu drain_ns=%llu final_wal_ns=%llu "
+        "obs_ckpt t_ms=%lld seq=%llu attempt=%llu success=%llu drain_timeout=%llu deadline=%llu "
+        "final_data_fail=%llu block_ns=%llu drain_ns=%llu final_wal_ns=%llu "
         "final_data_ns=%llu meta_ns=%llu manifest_ns=%llu truncate_ns=%llu begin_blocked=%llu begin_wait_ns=%llu",
         now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(checkpoint.attempt),
-        static_cast<unsigned long long>(checkpoint.preflush), static_cast<unsigned long long>(checkpoint.success),
-        static_cast<unsigned long long>(checkpoint.drain_timeout), static_cast<unsigned long long>(checkpoint.deadline),
+        static_cast<unsigned long long>(checkpoint.success), static_cast<unsigned long long>(checkpoint.drain_timeout),
+        static_cast<unsigned long long>(checkpoint.deadline),
         static_cast<unsigned long long>(checkpoint.final_data_fail),
-        static_cast<unsigned long long>(checkpoint.initial_ns), static_cast<unsigned long long>(checkpoint.preblock_ns),
         static_cast<unsigned long long>(checkpoint.block_ns), static_cast<unsigned long long>(checkpoint.drain_ns),
         static_cast<unsigned long long>(checkpoint.final_wal_ns),
         static_cast<unsigned long long>(checkpoint.final_data_ns), static_cast<unsigned long long>(checkpoint.meta_ns),
@@ -308,41 +303,111 @@ std::vector<Value> protocol_row(const std::vector<ColMeta>& columns, const char*
     return row;
 }
 
-struct ProtocolCollector : QueryResultSink {
-    std::vector<std::string> names;
-    std::vector<Type> types;
-    std::vector<std::vector<Value>> rows;
-    bool query = false;
-    // A batch response is a single frame.  When this pointer is set, rows
-    // charge their encoded size against the batch-wide budget while the
-    // executor is still running, instead of discovering an oversized result
-    // only after the transaction has completed.
-    std::size_t* encoded_bytes = nullptr;
-    std::size_t encoded_limit = 0;
+class BatchResultBuilder final : public QueryResultSink {
+public:
+    BatchResultBuilder() {
+        write_success_header();
+    }
+
+    void begin_operation(std::uint16_t operation_index) {
+        if (operation_active_) {
+            throw wire_protocol::ProtocolError("batch result operation was not finished");
+        }
+        operation_active_ = true;
+        query_active_ = false;
+        operation_index_ = operation_index;
+        row_count_ = 0;
+    }
 
     void begin_query(const std::vector<ColMeta>& columns, const std::vector<std::string>& output_names) override {
-        query = true;
-        names = output_names;
-        types.clear();
-        for (const auto& column : columns) {
-            types.push_back(protocol_type(column.type));
+        if (!operation_active_ || query_active_ || columns.size() != output_names.size()) {
+            throw wire_protocol::ProtocolError("invalid batch query schema");
         }
+        query_active_ = true;
+        writer_.u16(operation_index_);
+        row_count_offset_ = writer_.size();
+        writer_.u32(0);
+        ++query_count_;
     }
 
     void append_row(const std::vector<ColMeta>& columns, const char* data, std::size_t size) override {
-        std::vector<Value> row = protocol_row(columns, data, size);
-        if (encoded_bytes != nullptr) {
-            Writer encoded_row;
-            for (std::size_t i = 0; i < row.size(); ++i) {
-                wire_protocol::encode_value(encoded_row, row[i], types[i]);
-            }
-            if (*encoded_bytes > encoded_limit || encoded_row.data().size() > encoded_limit - *encoded_bytes) {
-                throw wire_protocol::ProtocolError("batch result exceeds protocol limit");
-            }
-            *encoded_bytes += encoded_row.data().size();
+        if (!query_active_ || data == nullptr) {
+            throw wire_protocol::ProtocolError("batch query row emitted before schema");
         }
-        rows.push_back(std::move(row));
+        for (const auto& column : columns) {
+            if (column.offset < 0 || column.len < 0 || static_cast<std::size_t>(column.offset) > size ||
+                static_cast<std::size_t>(column.len) > size - static_cast<std::size_t>(column.offset) ||
+                (column.null_byte >= 0 && static_cast<std::size_t>(column.null_byte) >= size)) {
+                throw wire_protocol::ProtocolError("executor returned an invalid tuple");
+            }
+            const bool present = !is_null(data, column);
+            const char* cell = data + column.offset;
+            const Type type = protocol_type(column.type);
+            const std::size_t encoded_size = type == Type::CHAR && present
+                                                 ? strnlen(cell, static_cast<std::size_t>(column.len))
+                                                 : static_cast<std::size_t>(column.len);
+            wire_protocol::encode_raw_value(writer_, type, present, cell, encoded_size);
+        }
+        if (row_count_ == UINT32_MAX) {
+            throw wire_protocol::ProtocolError("batch query row count exceeds protocol limit");
+        }
+        ++row_count_;
     }
+
+    void finish_operation(bool query) {
+        if (!operation_active_ || query != query_active_) {
+            throw wire_protocol::ProtocolError("batch query result kind mismatch");
+        }
+        if (query_active_) {
+            writer_.patch_u32(row_count_offset_, row_count_);
+        }
+        operation_active_ = false;
+        query_active_ = false;
+    }
+
+    std::vector<std::uint8_t> success(std::uint16_t executed) {
+        if (operation_active_) {
+            throw wire_protocol::ProtocolError("batch result operation was not finished");
+        }
+        writer_.patch_u16(kExecutedOffset, executed);
+        writer_.patch_u16(kQueryCountOffset, query_count_);
+        return writer_.take();
+    }
+
+    std::vector<std::uint8_t> failure(std::uint16_t executed, std::uint8_t status, std::uint16_t failed,
+                                      const std::string& diagnostic) {
+        writer_.rewind(0);
+        operation_active_ = false;
+        query_active_ = false;
+        query_count_ = 0;
+        writer_.u16(executed);
+        writer_.u8(status);
+        writer_.u16(failed);
+        writer_.u32(static_cast<std::uint32_t>(diagnostic.size()));
+        writer_.bytes(diagnostic);
+        writer_.u16(0);
+        return writer_.take();
+    }
+
+private:
+    static constexpr std::size_t kExecutedOffset = 0;
+    static constexpr std::size_t kQueryCountOffset = 9;
+
+    void write_success_header() {
+        writer_.u16(0);
+        writer_.u8(0);
+        writer_.u16(0xffff);
+        writer_.u32(0);
+        writer_.u16(0);
+    }
+
+    Writer writer_;
+    std::uint16_t operation_index_{0};
+    std::size_t row_count_offset_{0};
+    std::uint32_t row_count_{0};
+    std::uint16_t query_count_{0};
+    bool operation_active_{false};
+    bool query_active_{false};
 };
 
 struct SessionState {
@@ -386,6 +451,40 @@ struct SessionState {
         running_txn = nullptr;
         running_txn_id = INVALID_TXN_ID;
     }
+};
+
+struct BatchExecutionContext {
+    explicit BatchExecutionContext(SessionState& session)
+        : context(lock_manager.get(), log_manager.get(), nullptr, nullptr, nullptr, txn_manager.get()),
+          catalog_guard(sm_manager->acquire_catalog_shared()) {
+        reset_for_operation(session, nullptr, true);
+    }
+
+    void reset_for_operation(SessionState& session, QueryResultSink* result_sink, bool typed_fast_path) {
+        if (!typed_fast_path && legacy_response.empty()) {
+            legacy_response.assign(BUFFER_LENGTH, 0);
+        }
+        if (legacy_offset > 0) {
+            const std::size_t used =
+                std::min(static_cast<std::size_t>(legacy_offset), static_cast<std::size_t>(legacy_response.size()));
+            std::fill_n(legacy_response.data(), used, '\0');
+        }
+        legacy_offset = 0;
+        context.txn_ = nullptr;
+        context.data_send_ = typed_fast_path ? nullptr : legacy_response.data();
+        context.offset_ = typed_fast_path ? nullptr : &legacy_offset;
+        context.ellipsis_ = false;
+        context.isolation_level_ = session.isolation;
+        context.enable_ssi_read_tracking_ = false;
+        context.result_sink_ = result_sink;
+        context.output_file_enabled_ = &session.output_file_enabled;
+    }
+
+    std::vector<char> legacy_response;
+    int legacy_offset{0};
+    Context context;
+    SmManager::CatalogSharedGuard catalog_guard;
+    BatchResultBuilder result;
 };
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
@@ -440,8 +539,6 @@ const char* diagnostic_plan_tag(PlanTag tag) {
         return "Filter";
     case T_NestLoop:
         return "NestedLoop";
-    case T_SortMerge:
-        return "SortMerge";
     case T_Sort:
         return "Sort";
     case T_Projection:
@@ -536,8 +633,7 @@ void collect_scan_diagnostics(const Plan* plan, const char* root, std::uint16_t 
     case T_Limit:
         collect_scan_diagnostics(static_cast<const LimitPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
         return;
-    case T_NestLoop:
-    case T_SortMerge: {
+    case T_NestLoop: {
         const auto* join = static_cast<const JoinPlan*>(plan);
         collect_scan_diagnostics(join->left_.get(), root, statement_id, mappings);
         collect_scan_diagnostics(join->right_.get(), root, statement_id, mappings);
@@ -665,10 +761,17 @@ struct ExecutionOutcome {
 template <bool TimingEnabled>
 ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
                                    QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing,
-                                   bool catalog_guard_held = false) {
-    std::vector<char> response(BUFFER_LENGTH, 0);
+                                   bool catalog_guard_held = false, Context* reusable_context = nullptr) {
+    std::vector<char> response;
     int offset = 0;
-    Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
+    std::optional<Context> owned_context;
+    if (reusable_context == nullptr) {
+        response.assign(BUFFER_LENGTH, 0);
+        owned_context.emplace(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset,
+                              txn_manager.get());
+        reusable_context = &*owned_context;
+    }
+    Context& context = *reusable_context;
     context.isolation_level_ = session.isolation;
     context.result_sink_ = result_sink;
     context.output_file_enabled_ = &session.output_file_enabled;
@@ -756,14 +859,15 @@ ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, Session
 }
 
 ExecutionOutcome execute_tree_under_catalog_guard(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                                  QueryResultSink* result_sink) {
-    return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr, true);
+                                                  QueryResultSink* result_sink, Context* reusable_context) {
+    return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr, true, reusable_context);
 }
 
 ExecutionOutcome execute_tree_timed(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
                                     QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing,
-                                    bool catalog_guard_held = false) {
-    return execute_tree_impl<true>(std::move(parse_tree), session, result_sink, timing, catalog_guard_held);
+                                    bool catalog_guard_held = false, Context* reusable_context = nullptr) {
+    return execute_tree_impl<true>(std::move(parse_tree), session, result_sink, timing, catalog_guard_held,
+                                   reusable_context);
 }
 
 ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
@@ -793,10 +897,12 @@ ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
 
 ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters,
                                             SessionState& session, QueryResultSink* result_sink,
+                                            Context* reusable_context,
                                             execution_timing_diagnostics::Sample* timing = nullptr) {
-    std::vector<char> response(BUFFER_LENGTH, 0);
-    int offset = 0;
-    Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
+    if (reusable_context == nullptr) {
+        throw InternalError("prepared operation requires a reusable Context");
+    }
+    Context& context = *reusable_context;
     context.isolation_level_ = session.isolation;
     context.result_sink_ = result_sink;
     context.output_file_enabled_ = &session.output_file_enabled;
@@ -871,6 +977,7 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     int offset = 0;
     Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
     context.isolation_level_ = isolation;
+    context.preparing_statement_ = true;
     auto typed_parameters = make_typed_parameter_nodes(parameters);
     auto bound = ast::clone_bound_tree(*template_tree, typed_parameters);
     std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(bound));
@@ -1236,16 +1343,11 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
     }
     reader.require_end();
 
-    std::vector<std::pair<std::uint16_t, ProtocolCollector>> results;
     std::uint16_t failed = 0xffff;
     std::uint16_t executed = 0;
-    constexpr std::size_t kBatchResultFixedBytes = 2 + 1 + 2 + 4 + 2;
-    constexpr std::size_t kBatchResultEntryBytes = 2 + 4;
-    const std::size_t result_budget = wire_protocol::kMaxPayload - kBatchResultFixedBytes -
-                                      static_cast<std::size_t>(operation_count) * kBatchResultEntryBytes;
-    std::size_t encoded_result_bytes = 0;
     const bool execution_timing_enabled = execution_timing_diagnostics::enabled();
     const bool skip_scan_diagnostics_enabled = index_skip_scan_diagnostics::enabled();
+    BatchExecutionContext batch(session);
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
             auto* prepared_statement = operations[i].statement;
@@ -1255,14 +1357,13 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             }
             bool binding_parameters = false;
             try {
-                auto catalog_guard = sm_manager->acquire_catalog_shared();
                 if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
                     prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
                     revalidate_prepared(*prepared_statement, session.isolation);
                 }
-                ProtocolCollector result;
-                result.encoded_bytes = &encoded_result_bytes;
-                result.encoded_limit = result_budget;
+                const bool prepared_fast_path = descriptor_runtime_eligible(prepared_statement->descriptor.get());
+                batch.reset_for_operation(session, &batch.result, prepared_fast_path);
+                batch.result.begin_operation(i);
                 const auto make_bindings = [&]() {
                     std::vector<std::unique_ptr<ast::Value>> values;
                     values.reserve(operations[i].values.size());
@@ -1286,7 +1387,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                     return values;
                 };
                 ExecutionOutcome outcome;
-                if (descriptor_runtime_eligible(prepared_statement->descriptor.get())) {
+                if (prepared_fast_path) {
                     binding_parameters = true;
                     std::optional<ParameterFrame> parameter_frame;
                     if (execution_timing_enabled) {
@@ -1300,16 +1401,17 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                     if (timing_scope.has_value()) {
                         timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
                     }
-                    outcome =
-                        execute_prepared_operation(*prepared_statement->descriptor, *parameter_frame, session, &result,
-                                                   execution_timing_enabled ? &timing_scope->sample() : nullptr);
+                    outcome = execute_prepared_operation(*prepared_statement->descriptor, *parameter_frame, session,
+                                                         &batch.result, &batch.context,
+                                                         execution_timing_enabled ? &timing_scope->sample() : nullptr);
                     if (timing_scope.has_value()) {
                         timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::None;
                     }
                 } else if (!execution_timing_enabled && !skip_scan_diagnostics_enabled) {
                     auto values = make_bindings();
                     outcome = execute_tree_under_catalog_guard(
-                        ast::clone_bound_tree(*prepared_statement->template_tree, values), session, &result);
+                        ast::clone_bound_tree(*prepared_statement->template_tree, values), session, &batch.result,
+                        &batch.context);
                 } else {
                     if (timing_scope.has_value()) {
                         timing_scope->sample().fallback_reason =
@@ -1338,15 +1440,14 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                     }
                     binding_parameters = false;
                     if (execution_timing_enabled) {
-                        outcome =
-                            execute_tree_timed(std::move(bound_tree), session, &result, &timing_scope->sample(), true);
+                        outcome = execute_tree_timed(std::move(bound_tree), session, &batch.result,
+                                                     &timing_scope->sample(), true, &batch.context);
                     } else {
-                        outcome = execute_tree_under_catalog_guard(std::move(bound_tree), session, &result);
+                        outcome = execute_tree_under_catalog_guard(std::move(bound_tree), session, &batch.result,
+                                                                   &batch.context);
                     }
                 }
-                if (outcome.query) {
-                    results.emplace_back(i, std::move(result));
-                }
+                batch.result.finish_operation(outcome.query);
                 ++executed;
                 if (timing_scope.has_value()) {
                     timing_scope->finish();
@@ -1371,49 +1472,21 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         }
     } catch (TransactionAbortException& exception) {
         failed = executed;
-        abort_session(session, nullptr);
-        Writer response;
-        response.u16(executed);
-        response.u8(1);
-        response.u16(failed);
+        abort_session(session, &batch.context);
         // TransactionAbortException does not override what(); use the same
         // diagnostic text the EXEC_STREAM path reports.
         const auto text = exception.GetInfo();
-        response.u32(static_cast<std::uint32_t>(text.size()));
-        response.bytes(text);
-        response.u16(0);
-        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, response.take());
+        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.failure(executed, 1, failed, text));
         return;
     } catch (const std::exception& exception) {
         failed = executed;
-        abort_session(session, nullptr);
-        Writer response;
-        response.u16(executed);
-        response.u8(2);
-        response.u16(failed);
+        abort_session(session, &batch.context);
         const auto text = diagnostic(exception);
-        response.u32(static_cast<std::uint32_t>(text.size()));
-        response.bytes(text);
-        response.u16(0);
-        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, response.take());
+        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.failure(executed, 2, failed, text));
         return;
     }
 
-    Writer response;
-    response.u16(executed);
-    response.u8(0);
-    response.u16(0xffff);
-    response.u32(0);
-    response.u16(static_cast<std::uint16_t>(results.size()));
-    for (const auto& [index, result] : results) {
-        response.u16(index);
-        response.u32(static_cast<std::uint32_t>(result.rows.size()));
-        for (const auto& row : result.rows) {
-            const auto bytes = make_row(result.types, row);
-            response.bytes(bytes.data(), bytes.size());
-        }
-    }
-    wire_protocol::write_frame(fd, Tag::BATCH_RESULT, response.take());
+    wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.success(executed));
 }
 
 void client_handler(int fd) {
@@ -1633,55 +1706,12 @@ int main(int argc, char** argv) {
             });
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
                 CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
-                CheckpointOptions checkpoint_options;
-                bool has_checkpoint_override = false;
-                auto read_positive_int64 = [&](const char* name, int64_t* target) {
-                    const char* value = std::getenv(name);
-                    if (value == nullptr) {
-                        return;
-                    }
-                    try {
-                        const auto parsed = std::stoll(value);
-                        if (parsed > 0) {
-                            *target = parsed;
-                            has_checkpoint_override = true;
-                        }
-                    } catch (const std::exception&) {
-                        // Keep the default for malformed diagnostic overrides.
-                    }
-                };
-                auto read_positive_size = [&](const char* name, size_t* target) {
-                    const char* value = std::getenv(name);
-                    if (value == nullptr) {
-                        return;
-                    }
-                    try {
-                        const auto parsed = std::stoull(value);
-                        if (parsed > 0) {
-                            *target = static_cast<size_t>(parsed);
-                            has_checkpoint_override = true;
-                        }
-                    } catch (const std::exception&) {
-                        // Keep the default for malformed diagnostic overrides.
-                    }
-                };
-                read_positive_int64("RMDB_AUTO_CHECKPOINT_BYTES", &checkpoint_options.auto_checkpoint_bytes);
-                read_positive_int64("RMDB_CHECKPOINT_PREFLUSH_BYTES", &checkpoint_options.preflush_trigger_bytes);
-                read_positive_size("RMDB_CHECKPOINT_PREFLUSH_PAGES", &checkpoint_options.preflush_batch_pages);
-                if (has_checkpoint_override) {
-                    checkpoint_mgr.SetOptions(checkpoint_options);
-                }
-                constexpr auto checkpoint_interval = std::chrono::seconds(2);
-                auto next_checkpoint = std::chrono::steady_clock::now() + checkpoint_interval;
                 while (!checkpoint_thread_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     if (checkpoint_thread_stop.load()) {
                         break;
                     }
-                    if (std::chrono::steady_clock::now() >= next_checkpoint) {
-                        checkpoint_mgr.RunIfNeeded();
-                        next_checkpoint = std::chrono::steady_clock::now() + checkpoint_interval;
-                    }
+                    checkpoint_mgr.Tick();
                 }
             });
 

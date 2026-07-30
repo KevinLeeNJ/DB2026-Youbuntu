@@ -215,6 +215,30 @@ void Writer::bytes(const void* data, std::size_t count) {
     bytes_.insert(bytes_.end(), first, first + count);
 }
 
+void Writer::patch_u16(std::size_t offset, std::uint16_t value) {
+    if (offset > bytes_.size() || bytes_.size() - offset < 2) {
+        throw ProtocolError("writer patch is outside payload");
+    }
+    bytes_[offset] = static_cast<std::uint8_t>(value >> 8);
+    bytes_[offset + 1] = static_cast<std::uint8_t>(value);
+}
+
+void Writer::patch_u32(std::size_t offset, std::uint32_t value) {
+    if (offset > bytes_.size() || bytes_.size() - offset < 4) {
+        throw ProtocolError("writer patch is outside payload");
+    }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        bytes_[offset++] = static_cast<std::uint8_t>(value >> shift);
+    }
+}
+
+void Writer::rewind(std::size_t size) {
+    if (size > bytes_.size()) {
+        throw ProtocolError("writer rewind is outside payload");
+    }
+    bytes_.resize(size);
+}
+
 bool read_exact(int fd, void* data, std::size_t count) {
     if (count == 0) {
         return true;
@@ -398,6 +422,34 @@ void encode_value(Writer& writer, const Value& value, Type expected) {
         writer.bytes(value.text);
         break;
     }
+}
+
+void encode_raw_value(Writer& writer, Type expected, bool present, const void* data, std::size_t size) {
+    if (!is_supported_type(expected)) {
+        throw ProtocolError("unknown typed value type");
+    }
+    writer.u8(present ? 1 : 0);
+    if (!present) {
+        return;
+    }
+    if (expected == Type::INT32 || expected == Type::FLOAT32) {
+        if (data == nullptr || size != sizeof(std::uint32_t)) {
+            throw ProtocolError("raw numeric value has invalid size");
+        }
+        std::uint32_t bits;
+        std::memcpy(&bits, data, sizeof(bits));
+        writer.u32(bits);
+        return;
+    }
+    if (expected == Type::CHAR) {
+        if ((data == nullptr && size != 0) || size > UINT32_MAX) {
+            throw ProtocolError("raw CHAR value has invalid size");
+        }
+        writer.u32(static_cast<std::uint32_t>(size));
+        writer.bytes(data, size);
+        return;
+    }
+    throw ProtocolError("unknown value type");
 }
 
 Value decode_value(Reader& reader, Type expected) {

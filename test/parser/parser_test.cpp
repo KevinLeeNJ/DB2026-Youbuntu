@@ -417,10 +417,11 @@ TEST(ParserTest, ParsesUnionWrapperAndExplainAnalyze) {
     EXPECT_EQ(explain->type, ast::AstType::ExplainAnalyze);
 }
 
-TEST(ParserTest, ParsesKnobsAndTransactionStatements) {
-    EXPECT_EQ(parse_ok("set enable_nestloop = true;")->type, ast::AstType::SetStmt);
+TEST(ParserTest, ParsesTransactionStatementsAndRejectsRemovedJoinKnobs) {
     EXPECT_EQ(parse_ok("set transaction isolation level snapshot isolation;")->type, ast::AstType::SetTransaction);
     EXPECT_EQ(parse_ok("set transaction isolation level serializable;")->type, ast::AstType::SetTransaction);
+    expect_parse_error("set enable_nestloop = true;");
+    expect_parse_error("set enable_sortmerge = true;");
     EXPECT_EQ(parse_ok("begin;")->type, ast::AstType::TxnBegin);
     EXPECT_EQ(parse_ok("commit;")->type, ast::AstType::TxnCommit);
     EXPECT_EQ(parse_ok("abort;")->type, ast::AstType::TxnAbort);
@@ -738,9 +739,11 @@ TEST(ParserTest, ParsesSetOutputFile) {
     auto on_semi = parse_ok("set output_file on;");
     EXPECT_EQ(on_semi->type, ast::AstType::SetOutputFile);
 
-    // normal SET statements still require a semicolon
-    EXPECT_NO_THROW((void)parse_ok("set enable_nestloop = true;"));
+    // Transaction SET statements still require a semicolon; removed optimizer
+    // knobs are rejected instead of mutating process-global planner state.
     EXPECT_NO_THROW((void)parse_ok("set transaction isolation level serializable;"));
+    expect_parse_error("set enable_nestloop = true;");
+    expect_parse_error("set enable_sortmerge = false;");
 }
 
 TEST(ParserTest, ParsesLoadStmt) {

@@ -397,6 +397,43 @@ public:
         rebuild_constraints();
     }
 
+    IndexScanExecutor(SmManager* sm_manager, std::string tab_name, const TabMeta& table, RmFileHandle* table_handle,
+                      const IndexMeta& index, IxIndexHandle* index_handle, std::string index_name,
+                      std::vector<Condition> conds, Context* context,
+                      ScanDirection direction = ScanDirection::Forward) {
+        sm_manager_ = sm_manager;
+        context_ = context;
+        direction_ = direction;
+        tab_name_ = std::move(tab_name);
+        tab_ = table;
+        conds_ = std::move(conds);
+        index_col_names_.reserve(index.cols.size());
+        for (const auto& column : index.cols) {
+            index_col_names_.push_back(column.name);
+        }
+        index_meta_ = index;
+        fh_ = table_handle;
+        cols_ = table.cols;
+        len_ = static_cast<size_t>(fh_->get_file_hdr().record_size);
+
+        for (auto& condition : conds_) {
+            if (condition.lhs_col.tab_name != tab_name_) {
+                assert(!condition.is_rhs_val && condition.rhs_col.tab_name == tab_name_);
+                std::swap(condition.lhs_col, condition.rhs_col);
+                condition.op = swap_comp_op(condition.op);
+            }
+        }
+        fed_conds_ = conds_;
+        condition_addresses_ = cache_condition_addresses(fed_conds_);
+        base_conds_ = conds_;
+        index_name_ = std::move(index_name);
+        ih_ = index_handle;
+        initialize_constraint_storage();
+        rid_scan_rids_.reserve(1);
+        compile_index_conditions();
+        rebuild_constraints();
+    }
+
     void beginTuple() override {
         scan_ = nullptr;
         index_scan_cursor_.reset();

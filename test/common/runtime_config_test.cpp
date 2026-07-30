@@ -33,16 +33,3 @@ TEST(RuntimeConfigTest, RejectsMalformedOrOutOfRangeBufferPoolSizes) {
         EXPECT_THROW((void)parse_buffer_pool_config(value), std::invalid_argument);
     }
 }
-
-TEST(RuntimeConfigTest, ParsesSiConflictBackoff) {
-    EXPECT_EQ(default_si_conflict_backoff(), std::chrono::microseconds(1000));
-    EXPECT_EQ(parse_si_conflict_backoff("0"), std::chrono::microseconds(0));
-    EXPECT_EQ(parse_si_conflict_backoff("250"), std::chrono::microseconds(250));
-    EXPECT_EQ(parse_si_conflict_backoff("2000"), std::chrono::microseconds(2000));
-}
-
-TEST(RuntimeConfigTest, RejectsMalformedOrOutOfRangeSiConflictBackoff) {
-    for (const std::string_view value : {"", "2001", "-1", "+3", "3x", " 3", "3 ", "4294967296"}) {
-        EXPECT_THROW((void)parse_si_conflict_backoff(value), std::invalid_argument);
-    }
-}

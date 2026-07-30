@@ -15,7 +15,6 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <cstdlib>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -38,9 +37,6 @@ See the Mulan PSL v2 for more details. */
 class Planner {
 private:
     SmManager* sm_manager_;
-
-    bool enable_nestedloop_join = true;
-    bool enable_sortmerge_join = false;
 
     struct PhysicalPlanTemplate {
         struct ScanDecision {
@@ -68,9 +64,8 @@ private:
     };
 
     static constexpr size_t kPhysicalPlanCacheCapacity = 256;
-    bool enable_physical_plan_cache_{true};
-    // Cache hits only copy an immutable shared_ptr. Allow concurrent readers;
-    // generation changes and insert/evict operations still take the writer lock.
+    // Hits update LRU recency, so lookup and insert/evict operations take the
+    // writer lock while immutable plan templates remain shared across callers.
     mutable std::shared_mutex physical_plan_cache_latch_;
     PhysicalPlanCacheLru physical_plan_cache_lru_;
     std::unordered_map<std::string, PhysicalPlanCacheEntry> physical_plan_cache_;
@@ -84,7 +79,6 @@ private:
     };
 
     static constexpr size_t kCompiledPointProgramCacheCapacity = 256;
-    bool enable_compiled_point_program_cache_{false};
     mutable std::shared_mutex point_program_cache_latch_;
     std::list<std::string> point_program_cache_lru_;
     std::unordered_map<std::string, PointProgramCacheEntry> point_program_cache_;
@@ -93,29 +87,9 @@ private:
     std::atomic<std::uint64_t> point_program_cache_misses_{0};
 
 public:
-    Planner(SmManager* sm_manager) : sm_manager_(sm_manager) {
-        if (const char* value = std::getenv("ENABLE_PLAN_CACHE"); value != nullptr) {
-            enable_physical_plan_cache_ =
-                std::string(value) != "0" && std::string(value) != "false" && std::string(value) != "off";
-        }
-        if (const char* value = std::getenv("ENABLE_COMPILED_POINT_PROGRAM"); value != nullptr) {
-            enable_compiled_point_program_cache_ =
-                std::string(value) != "0" && std::string(value) != "false" && std::string(value) != "off";
-        }
-        if (const char* value = std::getenv("ENABLE_POINT_DML"); value != nullptr && std::string(value) == "0") {
-            enable_compiled_point_program_cache_ = false;
-        }
-    }
+    Planner(SmManager* sm_manager) : sm_manager_(sm_manager) {}
 
     std::unique_ptr<Plan> do_planner(std::unique_ptr<Query> query, Context* context);
-
-    void set_enable_nestedloop_join(bool set_val) {
-        enable_nestedloop_join = set_val;
-    }
-
-    void set_enable_sortmerge_join(bool set_val) {
-        enable_sortmerge_join = set_val;
-    }
 
 private:
     std::unique_ptr<Query> logical_optimization(std::unique_ptr<Query> query, Context* context);
@@ -141,8 +115,6 @@ private:
     find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation);
     void cache_physical_plan_template(std::string key, std::uint64_t catalog_generation,
                                       PhysicalPlanTemplate plan_template);
-
-    std::unique_ptr<Plan> make_one_rel(Query* query);
 
     std::unique_ptr<Plan> generate_sort_plan(const Query* query, std::unique_ptr<Plan> plan);
     std::unique_ptr<Plan> generate_limit_plan(const Query* query, std::unique_ptr<Plan> plan);

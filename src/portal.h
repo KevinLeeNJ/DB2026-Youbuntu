@@ -20,7 +20,6 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -81,20 +80,12 @@ class Portal {
 private:
     SmManager* sm_manager_;
 
-    static bool point_dml_enabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("ENABLE_POINT_DML");
-            return value == nullptr || std::string(value) != "0";
-        }();
-        return enabled;
-    }
-
-    static void write_point_key_part(char* dest, const Value& value, const ColMeta& col) {
-        memset(dest, 0, col.len);
-        switch (col.type) {
+    static void write_point_key_part(char* dest, const Value& value, ColType type, int length) {
+        memset(dest, 0, length);
+        switch (type) {
         case TYPE_INT: {
             const int converted = value.type == TYPE_FLOAT ? static_cast<int>(value.float_val) : value.int_val;
-            memcpy(dest, &converted, col.len);
+            memcpy(dest, &converted, length);
             break;
         }
         case TYPE_FLOAT: {
@@ -104,20 +95,27 @@ private:
         }
         case TYPE_STRING:
         case TYPE_DATETIME:
-            memcpy(dest, value.str_val.data(), std::min(static_cast<size_t>(col.len), value.str_val.size()));
+            memcpy(dest, value.str_val.data(), std::min(static_cast<size_t>(length), value.str_val.size()));
             break;
         }
+    }
+
+    static void write_point_key_part(char* dest, const Value& value, const ColMeta& col) {
+        write_point_key_part(dest, value, col.type, col.len);
     }
 
     // nullopt means the point path is not safe and the caller must build the
     // original scan executor. A value with no RID is a proven no-match result.
     std::optional<std::optional<Rid>> resolve_point_rid(const DMLPlan& plan, Context* context) const {
-        if (!point_dml_enabled() || !plan.point_access_.has_value()) {
+        if (!plan.point_access_.has_value()) {
             return std::nullopt;
         }
-        if (context != nullptr && context->txn_ != nullptr &&
-            context->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-            return std::nullopt;
+        if (context != nullptr) {
+            const IsolationLevel isolation_level =
+                context->txn_ == nullptr ? context->isolation_level_ : context->txn_->get_isolation_level();
+            if (isolation_level != IsolationLevel::READ_COMMITTED) {
+                return std::nullopt;
+            }
         }
 
         const auto& path = *plan.point_access_;
@@ -168,6 +166,92 @@ private:
             }
         }
         return point_rid;
+    }
+
+    enum class PreparedPointUpdateResolutionKind {
+        NoCandidate,
+        NoVisible,
+        Visible,
+        Fallback,
+    };
+
+    struct PreparedPointUpdateResolution {
+        PreparedPointUpdateResolutionKind kind = PreparedPointUpdateResolutionKind::Fallback;
+        std::optional<Rid> rid;
+    };
+
+    PreparedPointUpdateResolution resolve_prepared_point_update(const PreparedUpdateExecutable& executable,
+                                                                const std::vector<Condition>& conditions,
+                                                                Context* context) const {
+        if (!executable.point_update.has_value() || context == nullptr || context->txn_ == nullptr ||
+            context->txn_mgr_ == nullptr || context->lock_mgr_ == nullptr ||
+            context->txn_->get_isolation_level() != IsolationLevel::SNAPSHOT_ISOLATION) {
+            return {};
+        }
+        const auto& point = *executable.point_update;
+        if (point.index == nullptr || point.index_handle == nullptr || executable.scan.table_handle == nullptr ||
+            point.key_length <= 0 || point.key_parts.size() != point.index->cols.size()) {
+            return {};
+        }
+
+        std::vector<char> key(point.key_length);
+        for (const auto& part : point.key_parts) {
+            if (part.condition_index >= conditions.size() || part.key_offset < 0 || part.target_length <= 0 ||
+                part.key_offset + part.target_length > point.key_length) {
+                return {};
+            }
+            const Condition& condition = conditions[part.condition_index];
+            if (!condition.is_rhs_val || condition.null_test != NullTest::NONE || condition.op != OP_EQ) {
+                return {};
+            }
+            if (condition.rhs_val.is_null) {
+                return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt};
+            }
+            write_point_key_part(key.data() + part.key_offset, condition.rhs_val, part.target_type, part.target_length);
+        }
+
+        std::vector<Rid> candidates;
+        const auto lookup = point.index_handle->lookup_unique(key.data());
+        if (lookup.status == UniqueLookupStatus::Duplicate) {
+            return {};
+        }
+        if (lookup.status == UniqueLookupStatus::Unique) {
+            candidates.push_back(lookup.rid);
+        }
+        for (const Rid& historical :
+             sm_manager_->get_historical_index_key_rids(executable.scan.table_name, point.index_name, key)) {
+            if (std::find(candidates.begin(), candidates.end(), historical) == candidates.end()) {
+                candidates.push_back(historical);
+            }
+        }
+        if (candidates.empty()) {
+            return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt};
+        }
+        if (candidates.size() != 1) {
+            return {};
+        }
+
+        RowMutationRuntimeInfo info{
+            sm_manager_, &executable.scan.table_name,  executable.scan.table, executable.scan.table_handle,
+            &conditions, &executable.bound_conditions, &executable.indexes};
+        std::optional<Rid> target;
+        for (const Rid& candidate : candidates) {
+            if (!executable.scan.table_handle->is_record(candidate)) {
+                continue;
+            }
+            auto visible = GetVisibleRecord(executable.scan.table_handle, candidate, context);
+            if (visible == nullptr || !RowMutationEngine::MatchesTarget(*visible, info)) {
+                continue;
+            }
+            if (target.has_value() && *target != candidate) {
+                return {};
+            }
+            target = candidate;
+        }
+        if (!target.has_value()) {
+            return {PreparedPointUpdateResolutionKind::NoVisible, std::nullopt};
+        }
+        return {PreparedPointUpdateResolutionKind::Visible, target};
     }
 
     struct ExecutorQueryExpr {
@@ -426,6 +510,23 @@ private:
         return bound;
     }
 
+    static std::vector<Condition> bind_prepared_conditions(const std::vector<PreparedConditionBinding>& bindings,
+                                                           const ParameterFrame& parameters) {
+        std::vector<Condition> conditions;
+        conditions.reserve(bindings.size());
+        for (const auto& binding : bindings) {
+            Condition condition = binding.condition;
+            if (condition.is_rhs_val && condition.rhs_val.parameter_ordinal != 0) {
+                condition.rhs_val = parameters.bind(condition.rhs_val.parameter_ordinal, condition.rhs_val.type);
+                if (!condition.rhs_val.is_null) {
+                    condition.rhs_val.init_raw(binding.rhs_raw_length);
+                }
+            }
+            conditions.push_back(std::move(condition));
+        }
+        return conditions;
+    }
+
     QueryExpr bind_prepared_query_expr(const QueryExpr& expression, const ParameterFrame& parameters) const {
         QueryExpr bound = expression;
         if (bound.type == QueryExprType::VALUE && bound.value.parameter_ordinal != 0) {
@@ -471,6 +572,29 @@ private:
         return values;
     }
 
+    static std::vector<Value> bind_prepared_insert_values(const PreparedInsertExecutable& executable,
+                                                          const ParameterFrame& parameters) {
+        std::vector<Value> values;
+        values.reserve(executable.values.size());
+        for (const auto& binding : executable.values) {
+            Value value = binding.parameter_ordinal == 0 ? binding.constant
+                                                         : parameters.bind(binding.parameter_ordinal, binding.type);
+            if (!value.is_null) {
+                if ((binding.type == TYPE_STRING || binding.type == TYPE_DATETIME) &&
+                    value.str_val.size() > static_cast<std::size_t>(binding.length)) {
+                    throw StringOverflowError();
+                }
+                if (binding.type == TYPE_FLOAT && !std::isfinite(value.float_val)) {
+                    throw RMDBError("prepared FLOAT parameter must be finite");
+                }
+            } else {
+                value.type = binding.type;
+            }
+            values.push_back(std::move(value));
+        }
+        return values;
+    }
+
     std::vector<SetClause> bind_prepared_set_clauses(const DMLPlan& dml, const ParameterFrame& parameters) const {
         auto& table = sm_manager_->db_.get_table(dml.tab_name_);
         std::vector<SetClause> clauses = dml.set_clauses_;
@@ -502,6 +626,108 @@ private:
             }
         }
         return clauses;
+    }
+
+    static std::vector<SetClause> bind_prepared_set_clauses(const std::vector<PreparedSetClauseBinding>& bindings,
+                                                            const ParameterFrame& parameters) {
+        std::vector<SetClause> clauses;
+        clauses.reserve(bindings.size());
+        for (const auto& binding : bindings) {
+            SetClause clause = binding.clause;
+            if (clause.rhs.parameter_ordinal != 0) {
+                clause.rhs = parameters.bind(clause.rhs.parameter_ordinal, clause.rhs.type);
+            }
+            for (auto& term : clause.additional_terms) {
+                if (term.rhs.parameter_ordinal != 0) {
+                    term.rhs = parameters.bind(term.rhs.parameter_ordinal, term.rhs.type);
+                }
+            }
+            const auto validate = [&](const Value& value) {
+                if (value.is_null) {
+                    return;
+                }
+                if ((binding.target_type == TYPE_STRING || binding.target_type == TYPE_DATETIME) &&
+                    value.str_val.size() > static_cast<std::size_t>(binding.target_length)) {
+                    throw StringOverflowError();
+                }
+                if (value.type == TYPE_FLOAT && !std::isfinite(value.float_val)) {
+                    throw RMDBError("prepared FLOAT parameter must be finite");
+                }
+            };
+            validate(clause.rhs);
+            for (const auto& term : clause.additional_terms) {
+                validate(term.rhs);
+            }
+            clauses.push_back(std::move(clause));
+        }
+        return clauses;
+    }
+
+    std::unique_ptr<AbstractExecutor> make_prepared_scan_executor(const PreparedScanExecutable& scan,
+                                                                  const ParameterFrame& parameters, Context* context,
+                                                                  std::uint64_t* executor_constructed) {
+        auto conditions = bind_prepared_conditions(scan.conditions, parameters);
+        std::unique_ptr<AbstractExecutor> executor;
+        if (!scan.uses_index) {
+            executor = std::make_unique<SeqScanExecutor>(scan.sm_manager, scan.table_name, *scan.table,
+                                                         scan.table_handle, std::move(conditions), context);
+        } else {
+            executor = std::make_unique<IndexScanExecutor>(
+                scan.sm_manager, scan.table_name, *scan.table, scan.table_handle, *scan.index, scan.index_handle,
+                scan.index_name, std::move(conditions), context,
+                scan.scan_backward ? ScanDirection::Backward : ScanDirection::Forward);
+        }
+        return record_executor_construction(std::move(executor), executor_constructed);
+    }
+
+    std::unique_ptr<AbstractExecutor> make_prepared_select_executor(const PreparedSelectExecutable& executable,
+                                                                    const ParameterFrame& parameters, Context* context,
+                                                                    std::uint64_t* executor_constructed) {
+        auto root = make_prepared_scan_executor(executable.scan, parameters, context, executor_constructed);
+        for (const auto& layer : executable.layers) {
+            switch (layer.kind) {
+            case PreparedSelectLayerKind::Filter:
+                root = record_executor_construction(
+                    std::make_unique<FilterExecutor>(std::move(root),
+                                                     bind_prepared_conditions(layer.conditions, parameters)),
+                    executor_constructed);
+                break;
+            case PreparedSelectLayerKind::Projection:
+                root = record_executor_construction(std::make_unique<ProjectionExecutor>(std::move(root),
+                                                                                         layer.projection_ordinals,
+                                                                                         layer.projection_names),
+                                                    executor_constructed);
+                break;
+            case PreparedSelectLayerKind::Limit: {
+                int runtime_limit = layer.limit;
+                int runtime_offset = layer.offset;
+                if (layer.limit_parameter_ordinal != 0) {
+                    const Value value = parameters.bind(layer.limit_parameter_ordinal, TYPE_INT);
+                    if (value.is_null || value.int_val < 0) {
+                        throw RMDBError("LIMIT must be a non-NULL, non-negative INT32");
+                    }
+                    runtime_limit = value.int_val;
+                }
+                if (layer.offset_parameter_ordinal != 0) {
+                    const Value value = parameters.bind(layer.offset_parameter_ordinal, TYPE_INT);
+                    if (value.is_null || value.int_val < 0) {
+                        throw RMDBError("OFFSET must be a non-NULL, non-negative INT32");
+                    }
+                    runtime_offset = value.int_val;
+                }
+                if (runtime_limit < 0 || runtime_offset < 0 ||
+                    runtime_limit > std::numeric_limits<int>::max() - runtime_offset) {
+                    throw RMDBError("LIMIT plus OFFSET exceeds INT32 range");
+                }
+                root = record_executor_construction(
+                    std::make_unique<LimitExecutor>(std::move(root), static_cast<std::size_t>(runtime_limit),
+                                                    static_cast<std::size_t>(runtime_offset)),
+                    executor_constructed);
+                break;
+            }
+            }
+        }
+        return root;
     }
 
     std::unique_ptr<AbstractExecutor> convert_prepared_plan_executor(const Plan* plan, const ParameterFrame& parameters,
@@ -660,8 +886,7 @@ private:
             }
             return output_names;
         }
-        case T_NestLoop:
-        case T_SortMerge: {
+        case T_NestLoop: {
             auto join_plan = static_cast<const JoinPlan*>(plan);
             auto output_names = get_plan_output_names(join_plan->left_.get());
             auto right_output_names = get_plan_output_names(join_plan->right_.get());
@@ -768,8 +993,7 @@ private:
         case T_Projection:
             collect_tables(static_cast<ProjectionPlan*>(plan)->subplan_.get(), tables);
             break;
-        case T_NestLoop:
-        case T_SortMerge: {
+        case T_NestLoop: {
             auto join = static_cast<JoinPlan*>(plan);
             collect_tables(join->left_.get(), tables);
             collect_tables(join->right_.get(), tables);
@@ -792,8 +1016,7 @@ private:
         case T_Projection:
             reset_runtime_rows(static_cast<ProjectionPlan*>(plan)->subplan_.get());
             break;
-        case T_NestLoop:
-        case T_SortMerge: {
+        case T_NestLoop: {
             auto join = static_cast<JoinPlan*>(plan);
             reset_runtime_rows(join->left_.get());
             reset_runtime_rows(join->right_.get());
@@ -853,8 +1076,7 @@ private:
             render_explain_plan(projection->subplan_.get(), depth + 1, out);
             break;
         }
-        case T_NestLoop:
-        case T_SortMerge: {
+        case T_NestLoop: {
             auto join = static_cast<JoinPlan*>(plan);
             std::set<std::string> table_set;
             collect_tables(plan, table_set);
@@ -937,7 +1159,8 @@ public:
 
     std::unique_ptr<PortalStmt> start_prepared(const PreparedPlanDescriptor& descriptor,
                                                const ParameterFrame& parameters, Context* context,
-                                               std::uint64_t* executor_constructed = nullptr) {
+                                               std::uint64_t* executor_constructed = nullptr,
+                                               PreparedRuntimeStats* runtime_stats = nullptr) {
         if (!descriptor.eligible() || descriptor.dml_plan() == nullptr) {
             throw InternalError("prepared descriptor is not eligible for execution");
         }
@@ -947,10 +1170,40 @@ public:
         const auto* dml = descriptor.dml_plan();
         switch (descriptor.statement_kind()) {
         case PreparedStatementKind::Select: {
+            if (const auto* executable = descriptor.select_executable();
+                executable != nullptr && executable->scan.sm_manager == sm_manager_ &&
+                sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
+                if (runtime_stats != nullptr) {
+                    ++runtime_stats->bound_executable_hits;
+                }
+                auto root = make_prepared_select_executor(*executable, parameters, context, executor_constructed);
+                return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, descriptor.output_names(), std::move(root));
+            }
+            if (runtime_stats != nullptr) {
+                ++runtime_stats->plan_nodes_visited;
+                ++runtime_stats->catalog_metadata_lookups;
+            }
             auto root = convert_prepared_plan_executor(dml->subplan_.get(), parameters, context, executor_constructed);
             return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, descriptor.output_names(), std::move(root));
         }
         case PreparedStatementKind::Insert: {
+            if (const auto* executable = descriptor.insert_executable();
+                executable != nullptr && executable->sm_manager == sm_manager_ &&
+                sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
+                if (runtime_stats != nullptr) {
+                    ++runtime_stats->bound_executable_hits;
+                }
+                auto root = record_executor_construction(
+                    std::make_unique<InsertExecutor>(*executable, bind_prepared_insert_values(*executable, parameters),
+                                                     context),
+                    executor_constructed);
+                return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
+                                                    std::move(root));
+            }
+            if (runtime_stats != nullptr) {
+                ++runtime_stats->plan_nodes_visited;
+                ++runtime_stats->catalog_metadata_lookups;
+            }
             auto root = record_executor_construction(
                 std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_,
                                                  bind_prepared_insert_values(*dml, parameters), context),
@@ -958,8 +1211,67 @@ public:
             return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{}, std::move(root));
         }
         case PreparedStatementKind::Update: {
+            if (const auto* executable = descriptor.update_executable();
+                executable != nullptr && executable->scan.sm_manager == sm_manager_ &&
+                descriptor.database_identity() == sm_manager_->get_database_identity_under_catalog_guard() &&
+                sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
+                if (runtime_stats != nullptr) {
+                    ++runtime_stats->bound_executable_hits;
+                }
+                auto conditions = bind_prepared_conditions(executable->conditions, parameters);
+                const auto point = resolve_prepared_point_update(*executable, conditions, context);
+                if (point.kind != PreparedPointUpdateResolutionKind::Fallback) {
+                    if (runtime_stats != nullptr) {
+                        if (point.kind == PreparedPointUpdateResolutionKind::Visible) {
+                            ++runtime_stats->point_update_hits;
+                        } else {
+                            if (point.kind == PreparedPointUpdateResolutionKind::NoCandidate) {
+                                ++runtime_stats->point_update_no_candidates;
+                            } else {
+                                ++runtime_stats->point_update_no_visible;
+                            }
+                        }
+                        if (executable->point_update->lock_only) {
+                            if (point.kind == PreparedPointUpdateResolutionKind::Visible) {
+                                ++runtime_stats->lock_only_update_hits;
+                            } else {
+                                ++runtime_stats->lock_only_update_misses;
+                            }
+                        }
+                    }
+                    auto root = record_executor_construction(
+                        std::make_unique<UpdateExecutor>(
+                            *executable, bind_prepared_set_clauses(executable->set_clauses, parameters),
+                            std::move(conditions), PointMutationTarget{point.rid}, context),
+                        executor_constructed);
+                    return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
+                                                        std::move(root));
+                }
+                if (runtime_stats != nullptr && executable->point_update.has_value()) {
+                    ++runtime_stats->point_update_fallbacks;
+                    if (executable->point_update->lock_only) {
+                        ++runtime_stats->lock_only_update_fallbacks;
+                    }
+                }
+                auto scan = make_prepared_scan_executor(executable->scan, parameters, context, executor_constructed);
+                std::vector<Rid> rids;
+                for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
+                    rids.push_back(scan->rid());
+                }
+                auto root = record_executor_construction(
+                    std::make_unique<UpdateExecutor>(*executable,
+                                                     bind_prepared_set_clauses(executable->set_clauses, parameters),
+                                                     std::move(conditions), std::move(rids), context),
+                    executor_constructed);
+                return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
+                                                    std::move(root));
+            }
             if (dml->compiled_point_program_ != nullptr || dml->subplan_ == nullptr) {
                 throw InternalError("compiled point UPDATE is not eligible for prepared runtime");
+            }
+            if (runtime_stats != nullptr) {
+                ++runtime_stats->plan_nodes_visited;
+                ++runtime_stats->catalog_metadata_lookups;
             }
             auto scan = convert_prepared_plan_executor(dml->subplan_.get(), parameters, context, executor_constructed);
             std::vector<Rid> rids;
@@ -995,7 +1307,6 @@ public:
         case T_StaticCheckpoint:
             return std::make_unique<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), std::move(plan));
-        case T_SetKnob:
         case T_SetTransaction:
         case T_SetOutputFile:
         case T_LoadData:
@@ -1032,7 +1343,7 @@ public:
             case T_Update: {
                 std::vector<Rid> rids;
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
-                auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
+                auto point_rid = resolve_point_rid(*x, context);
                 if (point_rid.has_value()) {
                     std::unique_ptr<AbstractExecutor> root = record_executor_construction(
                         std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_,
@@ -1064,7 +1375,7 @@ public:
             case T_Delete: {
                 std::vector<Rid> rids;
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
-                auto point_rid = point_dml_enabled() ? resolve_point_rid(*x, context) : std::nullopt;
+                auto point_rid = resolve_point_rid(*x, context);
                 if (point_rid.has_value()) {
                     std::unique_ptr<AbstractExecutor> root = record_executor_construction(
                         std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_,
@@ -1209,8 +1520,7 @@ public:
             executor = record_executor_construction(std::move(executor), executor_constructed);
             return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
         }
-        case T_NestLoop:
-        case T_SortMerge: {
+        case T_NestLoop: {
             auto x = static_cast<JoinPlan*>(plan);
             std::unique_ptr<AbstractExecutor> left =
                 convert_plan_executor(x->left_.get(), context, count_rows, executor_constructed);

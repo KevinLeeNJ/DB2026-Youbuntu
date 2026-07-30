@@ -85,8 +85,14 @@ public:
     void u32(std::uint32_t value);
     void u64(std::uint64_t value);
     void bytes(const void* data, std::size_t count);
+    void patch_u16(std::size_t offset, std::uint16_t value);
+    void patch_u32(std::size_t offset, std::uint32_t value);
+    void rewind(std::size_t size);
     void bytes(const std::string& value) {
         bytes(value.data(), value.size());
+    }
+    std::size_t size() const {
+        return bytes_.size();
     }
     const std::vector<std::uint8_t>& data() const {
         return bytes_;
@@ -110,6 +116,7 @@ void write_frame(int fd, Tag tag, const std::vector<std::uint8_t>& payload, std:
 std::vector<std::uint8_t> encode_prepare_ok(const std::vector<PreparedSchema>& schemas);
 
 void encode_value(Writer& writer, const Value& value, Type expected);
+void encode_raw_value(Writer& writer, Type expected, bool present, const void* data, std::size_t size);
 Value decode_value(Reader& reader, Type expected);
 
 } // namespace wire_protocol
