@@ -894,9 +894,7 @@ bool SmManager::flush_all_table_and_index_pages(bool wal_preflushed) {
         fds.push_back(ih->GetFd());
     }
     success = buffer_pool_manager_->flush_all_pages(fds, wal_preflushed) && success;
-    for (int fd : fds) {
-        disk_manager_->sync_file(fd);
-    }
+    disk_manager_->sync_files(fds);
     return success;
 }
 
@@ -960,7 +958,12 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
 }
 
 size_t SmManager::flush_dirty_pages(size_t max_pages) {
-    return buffer_pool_manager_->flush_dirty_pages(max_pages);
+    std::unordered_set<int> index_fds;
+    index_fds.reserve(ihs_.size());
+    for (const auto& [_, ih] : ihs_) {
+        index_fds.insert(ih->GetFd());
+    }
+    return buffer_pool_manager_->flush_dirty_pages(max_pages, index_fds);
 }
 
 void SmManager::rebuild_all_indexes() {

@@ -843,34 +843,53 @@ void BufferPoolManager::log_pool_stats() {
 }
 
 size_t BufferPoolManager::flush_dirty_pages(size_t max_pages) {
+    const std::unordered_set<int> no_index_fds;
+    return flush_dirty_pages(max_pages, no_index_fds);
+}
+
+size_t BufferPoolManager::flush_dirty_pages(size_t max_pages, const std::unordered_set<int>& index_fds) {
     log_pool_stats();
-    if (max_pages == 0) {
+    if (max_pages == 0 || pool_size_ == 0) {
         return 0;
     }
 
+    // Continue from the prior batch instead of restarting at the beginning of
+    // page_table_. A hot page can be dirtied again immediately after writeback;
+    // restarting would repeatedly select that prefix and starve older dirty
+    // frames, causing write amplification without shrinking the dirty set.
+    std::lock_guard<std::mutex> flush_lock(dirty_flush_latch_);
     std::vector<PageId> pages_to_flush;
     {
         std::shared_lock lock{latch_};
         pages_to_flush.reserve(std::min(max_pages, page_table_.size()));
-        for (const auto& [page_id, frame_id] : page_table_) {
-            if (pages_to_flush.size() >= max_pages) {
-                break;
-            }
+        size_t frames_scanned = 0;
+        while (frames_scanned < pool_size_ && pages_to_flush.size() < max_pages) {
+            const size_t frame_id = (dirty_flush_cursor_ + frames_scanned) % pool_size_;
+            ++frames_scanned;
             Page* page = &pages_[frame_id];
             if (page->state_.load(std::memory_order_acquire) == FrameState::VALID &&
                 page->is_dirty_.load(std::memory_order_acquire)) {
-                pages_to_flush.push_back(page_id);
+                pages_to_flush.push_back(page->id_);
             }
+        }
+        dirty_flush_cursor_ = (dirty_flush_cursor_ + frames_scanned) % pool_size_;
+    }
+
+    std::vector<PageId> table_pages;
+    std::vector<PageId> index_pages;
+    table_pages.reserve(pages_to_flush.size());
+    index_pages.reserve(pages_to_flush.size());
+    for (const PageId& page_id : pages_to_flush) {
+        if (index_fds.count(page_id.fd) > 0) {
+            index_pages.push_back(page_id);
+        } else {
+            table_pages.push_back(page_id);
         }
     }
 
-    size_t flushed_pages = 0;
-    for (const PageId& page_id : pages_to_flush) {
-        if (flush_page_impl(page_id, true)) {
-            ++flushed_pages;
-        }
-    }
-    return flushed_pages;
+    const auto table_result = flush_pages(table_pages, /*wal_preflushed=*/false);
+    const auto index_result = flush_pages(index_pages, /*wal_preflushed=*/true);
+    return table_result.pages_written + index_result.pages_written;
 }
 
 void BufferPoolManager::delete_all_pages(int fd) {

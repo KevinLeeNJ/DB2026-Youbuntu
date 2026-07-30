@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "checkpoint_manager.h"
 
 #include <atomic>
+#include <limits>
 
 #include "common/fault_injection.h"
 #include "recovery/log_manager.h"
@@ -185,18 +186,26 @@ bool CheckpointManager::RunIfNeeded() {
     const int64_t preflush_start = options_.auto_checkpoint_bytes > options_.preflush_trigger_bytes
                                        ? options_.auto_checkpoint_bytes - options_.preflush_trigger_bytes
                                        : 0;
-    if (log_offset >= preflush_start && log_offset < options_.auto_checkpoint_bytes) {
+    const int64_t force_checkpoint_offset =
+        options_.checkpoint_defer_bytes > std::numeric_limits<int64_t>::max() - options_.auto_checkpoint_bytes
+            ? std::numeric_limits<int64_t>::max()
+            : options_.auto_checkpoint_bytes + options_.checkpoint_defer_bytes;
+    size_t preflushed_pages = 0;
+    if (log_offset > 0 && log_offset >= preflush_start && log_offset < force_checkpoint_offset) {
         bool expected = false;
         if (g_preflush_running.compare_exchange_strong(expected, true)) {
             PreflushGuard preflush_guard{&g_preflush_running};
             if (txn_mgr_ != nullptr) {
                 txn_mgr_->observe_checkpoint_preflush();
             }
-            sm_mgr_->flush_dirty_pages(options_.preflush_batch_pages);
+            preflushed_pages = sm_mgr_->flush_dirty_pages(options_.preflush_batch_pages);
         }
     }
 
     if (log_offset < options_.auto_checkpoint_bytes) {
+        return false;
+    }
+    if (log_offset < force_checkpoint_offset && preflushed_pages == options_.preflush_batch_pages) {
         return false;
     }
     if (std::chrono::steady_clock::now() < drain_retry_time_ && log_offset < drain_retry_log_offset_) {

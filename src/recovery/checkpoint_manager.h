@@ -21,7 +21,14 @@ class TransactionManager;
 
 struct CheckpointOptions {
     int64_t auto_checkpoint_bytes = 1024LL * 1024 * 1024;
-    int64_t preflush_trigger_bytes = 64LL * 1024 * 1024;
+    // Spread dirty-page writeback across the whole WAL generation. Waiting
+    // until the last few MiB concentrates hundreds of thousands of writes in
+    // the clean-checkpoint pass and produces a multi-second foreground stall.
+    int64_t preflush_trigger_bytes = 512LL * 1024 * 1024;
+    // Once the soft WAL threshold is reached, keep preflushing until the dirty
+    // set fits below one batch. This bound prevents sustained writes from
+    // deferring WAL truncation indefinitely.
+    int64_t checkpoint_defer_bytes = 512LL * 1024 * 1024;
     // Keep the preflush pass bounded so checkpoint I/O does not monopolize
     // the storage device while foreground transactions are still running.
     size_t preflush_batch_pages = 4096;

@@ -19,9 +19,11 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <cassert>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "disk_manager.h"
@@ -67,6 +69,8 @@ private:
     std::atomic<uint64_t> no_victim_{0};
     std::atomic<uint64_t> eviction_clean_{0};
     std::atomic<uint64_t> eviction_dirty_{0};
+    std::mutex dirty_flush_latch_;
+    size_t dirty_flush_cursor_{0};
 
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
@@ -153,6 +157,10 @@ public:
     // checkpoint barrier. The page dirty epoch prevents a concurrent update
     // from being lost when the write completes.
     size_t flush_dirty_pages(size_t max_pages);
+    // Index pages do not carry page LSNs. Their fds must be identified so the
+    // batched writer does not interpret IxPageHdr bytes as an LSN; table pages
+    // still force their maximum copied LSN before any data write.
+    size_t flush_dirty_pages(size_t max_pages, const std::unordered_set<int>& index_fds);
 
     void delete_all_pages(int fd);
 

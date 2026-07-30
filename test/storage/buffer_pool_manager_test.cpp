@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdlib>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <unistd.h>
@@ -378,6 +379,46 @@ TEST_F(BufferPoolManagerTest, FlushDirtyPagesHonorsPageBudget) {
         EXPECT_STREQ(page->get_data(), "preflush");
         ASSERT_TRUE(bpm->unpin_page(page_id, false));
     }
+}
+
+TEST_F(BufferPoolManagerTest, FlushDirtyPagesDoesNotStarveBehindRedirtiedHotPage) {
+    auto bpm = std::make_unique<BufferPoolManager>(3, disk_manager_.get());
+    std::vector<PageId> page_ids;
+    for (int i = 0; i < 3; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm->new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm->unpin_page(page_id, true));
+        page_ids.push_back(page_id);
+    }
+
+    std::unordered_set<PageId, PageIdHash> flushed_ids;
+    for (int pass = 0; pass < 3; ++pass) {
+        ASSERT_EQ(bpm->flush_dirty_pages(1), 1u);
+        for (const PageId& page_id : page_ids) {
+            Page* page = bpm->fetch_page(page_id);
+            ASSERT_NE(page, nullptr);
+            const bool was_flushed = !page->is_dirty();
+            ASSERT_TRUE(bpm->unpin_page(page_id, was_flushed));
+            if (was_flushed) {
+                flushed_ids.insert(page_id);
+            }
+        }
+    }
+
+    EXPECT_EQ(flushed_ids.size(), page_ids.size());
+}
+
+TEST_F(BufferPoolManagerTest, FlushDirtyPagesCoalescesAdjacentPageWrites) {
+    auto bpm = std::make_unique<BufferPoolManager>(3, disk_manager_.get());
+    for (int i = 0; i < 3; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm->new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm->unpin_page(page_id, true));
+    }
+
+    const uint64_t writes_before = disk_manager_->get_page_write_count();
+    EXPECT_EQ(bpm->flush_dirty_pages(3), 3u);
+    EXPECT_EQ(disk_manager_->get_page_write_count() - writes_before, 1u);
 }
 
 TEST_F(BufferPoolManagerTest, ConcurrentFetchAndLastUnpinKeepPinnedFrameOutOfReplacer) {

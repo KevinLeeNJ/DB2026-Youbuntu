@@ -136,3 +136,38 @@ TEST(CheckpointDrainTest, CheckpointSucceedsAfterBlockedRoundIsAbandoned) {
     EXPECT_GT(stats.final_wal_ns, 0u);
     EXPECT_GT(stats.final_data_ns, 0u);
 }
+
+TEST(CheckpointDrainTest, AutomaticCheckpointDrainsDirtyBatchesBeforeBlocking) {
+    ScopedDrainTestDir test_dir("checkpoint_preflush_drain_root");
+    DrainTestDb db("checkpoint_preflush_drain_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+
+    const int fd = db.sm_mgr_.fhs_.at("t")->GetFd();
+    for (int i = 0; i < 2; ++i) {
+        PageId page_id{fd, INVALID_PAGE_ID};
+        ASSERT_NE(db.bpm_.new_page(&page_id), nullptr);
+        ASSERT_TRUE(db.bpm_.unpin_page(page_id, true));
+    }
+
+    BeginLogRecord begin_log(1);
+    db.log_mgr_.add_log_to_buffer(&begin_log);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = 1;
+    options.preflush_trigger_bytes = 1;
+    options.checkpoint_defer_bytes = 1024 * 1024;
+    options.preflush_batch_pages = 1;
+    checkpoint_mgr.SetOptions(options);
+
+    EXPECT_FALSE(checkpoint_mgr.RunIfNeeded());
+    EXPECT_FALSE(checkpoint_mgr.RunIfNeeded());
+    EXPECT_GT(db.log_mgr_.current_log_offset(), 0);
+    EXPECT_TRUE(checkpoint_mgr.RunIfNeeded());
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+
+    const auto stats = txn_mgr.checkpoint_observability();
+    EXPECT_EQ(stats.preflush, 3u);
+    EXPECT_EQ(stats.attempt, 1u);
+    EXPECT_EQ(stats.success, 1u);
+}

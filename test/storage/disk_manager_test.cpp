@@ -137,6 +137,26 @@ public:
     }
 };
 
+TEST_F(BigStorageTest, SyncFilesWaitsForAllFilesAndPropagatesErrors) {
+    constexpr char second_file[] = "sync_files_second";
+    if (disk_manager_->is_file(second_file)) {
+        disk_manager_->destroy_file(second_file);
+    }
+    disk_manager_->create_file(second_file);
+    const int second_fd = disk_manager_->open_file(second_file);
+
+    std::vector<char> page(PAGE_SIZE, 'x');
+    disk_manager_->write_page(fd_, 0, page.data(), PAGE_SIZE);
+    disk_manager_->write_page(second_fd, 0, page.data(), PAGE_SIZE);
+
+    EXPECT_NO_THROW(disk_manager_->sync_files({fd_, second_fd}));
+    EXPECT_NO_THROW(disk_manager_->sync_files({}));
+    EXPECT_THROW(disk_manager_->sync_files({fd_, -1, second_fd}), UnixError);
+
+    disk_manager_->close_file(second_fd);
+    disk_manager_->destroy_file(second_file);
+}
+
 // TODO: fix detected memory leaks found by Google Test
 TEST(StorageTest, SimpleTest) {
     srand((unsigned)time(nullptr));

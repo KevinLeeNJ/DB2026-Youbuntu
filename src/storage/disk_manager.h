@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "common/config.h"
 #include "errors.h"
@@ -82,6 +83,10 @@ public:
     // Flush a data or metadata file so a checkpoint can establish a durable
     // WAL -> data -> metadata ordering.
     void sync_file(int fd);
+    // Submit independent inode flushes together, then wait for every one. This
+    // preserves the checkpoint barrier while allowing the kernel to combine
+    // filesystem journal work instead of serializing one fdatasync per file.
+    void sync_files(const std::vector<int>& fds);
     void sync_path(const std::string& path);
     void sync_directory(const std::string& path);
 

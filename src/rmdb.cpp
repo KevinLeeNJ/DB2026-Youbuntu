@@ -1705,20 +1705,25 @@ int main(int argc, char** argv) {
                 };
                 read_positive_int64("RMDB_AUTO_CHECKPOINT_BYTES", &checkpoint_options.auto_checkpoint_bytes);
                 read_positive_int64("RMDB_CHECKPOINT_PREFLUSH_BYTES", &checkpoint_options.preflush_trigger_bytes);
+                read_positive_int64("RMDB_CHECKPOINT_DEFER_BYTES", &checkpoint_options.checkpoint_defer_bytes);
                 read_positive_size("RMDB_CHECKPOINT_PREFLUSH_PAGES", &checkpoint_options.preflush_batch_pages);
                 if (has_checkpoint_override) {
                     checkpoint_mgr.SetOptions(checkpoint_options);
                 }
-                constexpr auto checkpoint_interval = std::chrono::seconds(2);
-                auto next_checkpoint = std::chrono::steady_clock::now() + checkpoint_interval;
+                // A small periodic batch keeps writeback below the foreground
+                // latency horizon. RunCleanCheckpoint remains WAL-size driven;
+                // this interval only controls non-blocking dirty-page preflush.
+                constexpr auto checkpoint_poll_interval = std::chrono::milliseconds(100);
+                auto next_checkpoint_poll = std::chrono::steady_clock::now() + checkpoint_poll_interval;
                 while (!checkpoint_thread_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     if (checkpoint_thread_stop.load()) {
                         break;
                     }
-                    if (std::chrono::steady_clock::now() >= next_checkpoint) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= next_checkpoint_poll) {
                         checkpoint_mgr.RunIfNeeded();
-                        next_checkpoint = std::chrono::steady_clock::now() + checkpoint_interval;
+                        next_checkpoint_poll = std::chrono::steady_clock::now() + checkpoint_poll_interval;
                     }
                 }
             });

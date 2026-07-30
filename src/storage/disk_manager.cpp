@@ -11,8 +11,10 @@ See the Mulan PSL v2 for more details. */
 
 #include "storage/disk_manager.h"
 
-#include <assert.h>   // for assert
-#include <cerrno>     // for errno
+#include <assert.h> // for assert
+#include <cerrno>   // for errno
+#include <exception>
+#include <future>
 #include <sys/stat.h> // for stat
 #include <unistd.h>   // for lseek
 
@@ -377,6 +379,28 @@ void DiskManager::sync_file(int fd) {
     FaultInjector::Point("before_data_fsync");
     if (fd < 0 || fdatasync(fd) != 0) {
         throw UnixError();
+    }
+}
+
+void DiskManager::sync_files(const std::vector<int>& fds) {
+    std::vector<std::future<void>> syncs;
+    syncs.reserve(fds.size());
+    for (const int fd : fds) {
+        syncs.emplace_back(std::async(std::launch::async, [this, fd] { sync_file(fd); }));
+    }
+
+    std::exception_ptr first_error;
+    for (auto& sync : syncs) {
+        try {
+            sync.get();
+        } catch (...) {
+            if (first_error == nullptr) {
+                first_error = std::current_exception();
+            }
+        }
+    }
+    if (first_error != nullptr) {
+        std::rethrow_exception(first_error);
     }
 }
 
