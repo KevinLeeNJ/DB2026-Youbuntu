@@ -14,11 +14,11 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <queue>
 #include <string>
+#include <sys/mman.h>
 #include <unordered_set>
 #include <vector>
 
@@ -36,6 +36,39 @@ constexpr int kMaxDuplicateDrain = 16;
 // effect means the tree is not in a state this repair can fix, and the index
 // has to be rebuilt.
 constexpr size_t kRepairSpotCheckLimit = 64;
+
+class ReadOnlyWalMapping {
+public:
+    ReadOnlyWalMapping(int fd, int64_t length) {
+        if (fd < 0 || length <= 0 ||
+            static_cast<uint64_t>(length) > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            throw InternalError("recovery cannot map an invalid WAL range");
+        }
+        length_ = static_cast<size_t>(length);
+        void* mapped = mmap(nullptr, length_, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapped == MAP_FAILED) {
+            throw UnixError();
+        }
+        bytes_ = static_cast<const char*>(mapped);
+    }
+
+    ~ReadOnlyWalMapping() {
+        if (bytes_ != nullptr) {
+            (void)munmap(const_cast<char*>(bytes_), length_);
+        }
+    }
+
+    ReadOnlyWalMapping(const ReadOnlyWalMapping&) = delete;
+    ReadOnlyWalMapping& operator=(const ReadOnlyWalMapping&) = delete;
+
+    const char* bytes() const {
+        return bytes_;
+    }
+
+private:
+    const char* bytes_{nullptr};
+    size_t length_{0};
+};
 
 TupleMeta MakeCommittedMeta(txn_id_t writer) {
     TupleMeta meta;
@@ -108,6 +141,33 @@ void RecoveryManager::build_touched_index() {
     touched_sorted_ = touched_;
     std::sort(touched_sorted_.begin(), touched_sorted_.end());
     touched_sorted_.erase(std::unique(touched_sorted_.begin(), touched_sorted_.end()), touched_sorted_.end());
+}
+
+WalRecordView RecoveryManager::mapped_heap_redo_record(const HeapRedoRecord& location, const char* wal_bytes) const {
+    if (wal_bytes == nullptr || location.wal_offset < scan_begin_offset_ || location.wal_offset > scan_end_offset_ ||
+        location.wal_length < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
+        static_cast<int64_t>(location.wal_length) > scan_end_offset_ - location.wal_offset) {
+        throw InternalError("recovery heap-redo descriptor leaves the mapped WAL; WAL retained");
+    }
+
+    const char* header = wal_bytes + static_cast<size_t>(location.wal_offset);
+    const uint32_t total_len = read_unaligned<uint32_t>(header + OFFSET_LOG_TOT_LEN);
+    const LogType log_type = read_unaligned<LogType>(header + OFFSET_LOG_TYPE);
+    const bool heap_dml = log_type == LogType::INSERT || log_type == LogType::DELETE || log_type == LogType::UPDATE;
+    if (!heap_dml || total_len != location.wal_length) {
+        throw InternalError("recovery heap-redo descriptor no longer names its analyzed WAL record at offset " +
+                            std::to_string(location.wal_offset) + "; WAL retained");
+    }
+
+    WalRecordView record;
+    record.log_type = log_type;
+    record.lsn = read_unaligned<lsn_t>(header + OFFSET_LSN);
+    record.total_len = total_len;
+    record.txn_id = read_unaligned<txn_id_t>(header + OFFSET_LOG_TID);
+    record.prev_lsn = read_unaligned<lsn_t>(header + OFFSET_PREV_LSN);
+    record.offset = location.wal_offset;
+    record.bytes = header;
+    return record;
 }
 
 void RecoveryManager::validate_dml_rid(const RecoveryTable& table, const WalRecordView& record, const Rid& rid) const {
@@ -209,10 +269,13 @@ void RecoveryManager::analyze() {
     table_ids_.clear();
     touched_.clear();
     touched_sorted_.clear();
+    heap_redo_records_.clear();
     record_locations_.clear();
     record_locations_sorted_ = true;
     touched_tables_.clear();
     has_dml_records_ = false;
+    has_index_smo_records_ = false;
+    latest_index_bindings_.clear();
     max_lsn_ = INVALID_LSN;
     checkpoint_offset_ = 0;
     scan_begin_offset_ = 0;
@@ -229,6 +292,7 @@ void RecoveryManager::analyze() {
     index_unchanged_key_count_ = 0;
     index_duplicate_entry_count_ = 0;
     index_rebuild_count_ = 0;
+    index_smo_prepare_count_ = 0;
     persisted_next_timestamp_ = 0;
     persisted_next_txn_id_ = 0;
     max_wal_commit_ts_ = INVALID_TS;
@@ -306,12 +370,31 @@ void RecoveryManager::analyze() {
             // Before the narrowing cast below and before any later phase can
             // hand this RID to the record layer.
             validate_dml_rid(table, record, dml.rid);
+            // Sparse UPDATE parsing materializes a complete before image, so
+            // every later consumer keeps the same full-row contract. Check
+            // that contract here, before redo, undo, or index-key extraction
+            // can read a column offset from either image.
+            if (table.file_handle != nullptr) {
+                if (dml.before_image != nullptr) {
+                    validate_installable_image(table, record, dml.before_size);
+                }
+                if (dml.after_image != nullptr) {
+                    validate_installable_image(table, record, dml.after_size);
+                }
+            }
             touched_tables_.insert(table.name);
             TouchedTuple touched;
             touched.table_id = table_id;
             touched.page_no = dml.rid.page_no;
             touched.slot_no = static_cast<int16_t>(dml.rid.slot_no);
             touched_.push_back(touched);
+            HeapRedoRecord redo_record;
+            redo_record.wal_offset = record.offset;
+            redo_record.wal_length = record.total_len;
+            redo_record.table_id = table_id;
+            redo_record.page_no = dml.rid.page_no;
+            redo_record.slot_no = static_cast<int16_t>(dml.rid.slot_no);
+            heap_redo_records_.push_back(redo_record);
             break;
         }
         case LogType::COMMIT: {
@@ -335,6 +418,25 @@ void RecoveryManager::analyze() {
             break;
         case LogType::CHECKPOINT:
             break;
+        case LogType::INDEX_BIND: {
+            std::string_view index_name;
+            uint64_t generation = 0;
+            if (!ParseIndexBindWal(record, &index_name, &generation)) {
+                throw InternalError("recovery found a corrupt INDEX_BIND payload at WAL offset " +
+                                    std::to_string(record.offset) + "; WAL retained");
+            }
+            latest_index_bindings_[std::string(index_name)] = generation;
+            break;
+        }
+        case LogType::INDEX_SMO: {
+            IndexSmoWalView smo;
+            if (!ParseIndexSmoWal(record, &smo) || record.txn_id != INVALID_TXN_ID || record.prev_lsn != INVALID_LSN) {
+                throw InternalError("recovery found a corrupt INDEX_SMO payload at WAL offset " +
+                                    std::to_string(record.offset) + "; WAL retained");
+            }
+            has_index_smo_records_ = true;
+            break;
+        }
         }
 
         if (record.txn_id != INVALID_TXN_ID && (max_wal_txn_id_ == INVALID_TXN_ID || record.txn_id > max_wal_txn_id_)) {
@@ -430,78 +532,91 @@ void RecoveryManager::analyze() {
  * should be aimed at *how many* there are, not at their latency -- which is what
  * the next paragraph is about.
  *
- * NEXT STEP, NOT DONE HERE: replay page by page instead of record by record.
- * This pass visits records in WAL order, so it re-reads the same table page many
- * times: 463,212 distinct RIDs spread over roughly 101,000 pages cost 420,232
- * page reads and about 700,000 page writes, a 4.2x re-read amplification caused
- * by a 397 MB table against a 75 MB pool -- each page is fetched, evicted and
- * written back over and over. Merging by page would take both counts to about
- * 101,000 and is the single largest remaining lever in recovery.
- *
- * Why it is safe in principle: records on the same (page, slot) must be applied
- * in write order, but there is no dependency *across* pages. redo_existing_slot
- * only touches the slot it is given; file extension, free-list maintenance and
- * TupleMeta normalization all happen in separate serial phases
- * (repair_touched_file_headers, reset_touched_tuple_meta).
- *
- * Sketch:
- *  - analyze() also records, per DML record, {wal_offset, page_no, table_id}
- *    (16 bytes, ~9 MB for a 256 MB WAL). File-offset order is write order, by
- *    the prefix property, so no LSN field is needed for ordering.
- *  - redo() sorts that array by (table_id, page_no, wal_offset) -- a total
- *    order, so replay stays deterministic -- and mmaps the WAL read-only
- *    (<= 256 MB) so per-record random access costs a page-cache-warm fault
- *    instead of the two preads ReadWalRecordAt would issue.
- *  - Per (table, page) group: one fetch_page_handle and one exclusive page
- *    latch, then apply every record of the group whose slot bit is already set,
- *    taking max() of their LSNs for the page LSN. Records whose slot bit is not
- *    set are collected and, *after* the latch is dropped, replayed through
- *    today's redo_insert/redo_delete/redo_update -- insert_record takes the same
- *    page latch itself, so calling it under the latch would deadlock.
- *  - Keep verifying the record's own table name against the group's table_id, so
- *    the grouping key can never silently disagree with the record (the failure
- *    mode fixed in this round).
- *
- * Deferred deliberately: it is ~120 lines in the hottest recovery phase, it
- * reaches into the buffer pool's pin/latch protocol, and recovery already
- * finishes in about 30 s against a 90 s budget, so it is not on the critical
- * path. The thing that does threaten the budget is a whole-index rebuild (see
- * rebuild_indexes), which is a different fix.
+ * Heap DML is replayed in (table, page, WAL-offset) order. There is no
+ * cross-page dependency: record operations touch one RID, while file-header
+ * repair and tuple-meta normalization are separate serial phases. WAL offset
+ * preserves the original order of every operation that targets the same page.
+ * Existing redo helpers still own pin/latch/free-list handling; grouping only
+ * keeps the current page resident instead of repeatedly evicting and re-reading
+ * it. INDEX_BIND and INDEX_SMO retain their original forward WAL order.
  */
 void RecoveryManager::redo() {
-    if (!has_dml_records_) {
+    if (!has_dml_records_ && !has_index_smo_records_) {
         return;
     }
 
     WalReader reader(disk_manager_, scan_begin_offset_, scan_end_offset_);
     WalRecordView record;
-    WalDmlView dml;
+    std::unordered_set<int> smo_fds;
+    // INDEX_SMO full-page images must retain WAL order. INDEX_BIND has no
+    // physical redo action; analyze() already retained the latest generation.
     while (reader.next(&record)) {
-        switch (record.log_type) {
-        case LogType::INSERT:
-        case LogType::DELETE:
-        case LogType::UPDATE:
-            break;
-        default:
+        if (record.log_type == LogType::INDEX_BIND) {
             continue;
         }
-        if (!ParseWalDml(record, &dml)) {
-            // analyze() parsed the same bytes with the same parser and threw if
-            // any of them failed, so reaching this is a bug, not bad input.
-            throw InternalError("recovery failed to re-parse the DML payload at WAL offset " +
-                                std::to_string(record.offset) + " that analyze accepted; WAL retained");
+        if (record.log_type == LogType::INDEX_SMO) {
+            IndexSmoWalView smo;
+            if (!ParseIndexSmoWal(record, &smo)) {
+                throw InternalError("recovery failed to re-parse INDEX_SMO at WAL offset " +
+                                    std::to_string(record.offset) + "; WAL retained");
+            }
+            auto binding = latest_index_bindings_.find(std::string(smo.index_file_name));
+            if (binding == latest_index_bindings_.end() || binding->second != smo.index_generation) {
+                continue;
+            }
+            auto open_index = sm_manager_->ihs_.find(std::string(smo.index_file_name));
+            if (open_index == sm_manager_->ihs_.end() || open_index->second == nullptr) {
+                continue;
+            }
+            IxIndexHandle* index = open_index->second.get();
+            const int index_fd = index->GetFd();
+            // Dropping this fd's cached pages scans the whole buffer pool. Once
+            // is enough: all SMO after-images below bypass the buffer pool and
+            // are replayed in WAL order, so repeating the scan per record is
+            // both redundant and quadratic in WAL records times pool frames.
+            if (smo_fds.insert(index_fd).second) {
+                index->prepare_for_smo_redo();
+                ++index_smo_prepare_count_;
+            }
+            for (uint32_t page = 0; page < smo.page_count; ++page) {
+                disk_manager_->write_page(index_fd, smo.page_no(page), smo.page_image(page), PAGE_SIZE);
+            }
+            // The header is the publication point and must always be written
+            // after every node after-image.
+            disk_manager_->write_page(index_fd, IX_FILE_HDR_PAGE, smo.header_image, PAGE_SIZE);
+            index->install_recovered_smo_header(smo.header_image);
+            continue;
+        }
+    }
+    if (reader.next_offset() != scan_end_offset_) {
+        throw InternalError("recovery INDEX_SMO pass stopped before the analyzed WAL end; WAL retained");
+    }
+
+    std::sort(heap_redo_records_.begin(), heap_redo_records_.end());
+    std::unique_ptr<ReadOnlyWalMapping> wal_mapping;
+    if (!heap_redo_records_.empty()) {
+        wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_->GetLogFd(), scan_end_offset_);
+    }
+    WalDmlView dml;
+    for (const HeapRedoRecord& location : heap_redo_records_) {
+        record = mapped_heap_redo_record(location, wal_mapping->bytes());
+        if (!ParseWalDmlForRedo(record, &dml)) {
+            throw InternalError("recovery failed to parse mapped DML at WAL offset " + std::to_string(record.offset) +
+                                " that analyze accepted; WAL retained");
+        }
+        if (location.table_id >= tables_.size()) {
+            throw InternalError("recovery heap-redo descriptor has an invalid table id; WAL retained");
+        }
+        RecoveryTable* table = table_at(location.table_id);
+        if (dml.table_name != table->name || dml.rid.page_no != location.page_no ||
+            dml.rid.slot_no != location.slot_no) {
+            throw InternalError("recovery mapped DML target disagrees with analyze at WAL offset " +
+                                std::to_string(record.offset) + "; WAL retained");
         }
         if (committed_txns_.count(record.txn_id) == 0) {
             ++redo_skipped_count_; // a loser: undo() rolls it back instead
             continue;
         }
-        // Resolved from the record's own table name. An earlier version indexed
-        // touched_ by the record's position in this pass, which only worked as
-        // long as this loop's filter stayed byte-for-byte identical to
-        // analyze()'s. Any divergence would have written a correct RID into the
-        // wrong table's file, with no exception and nothing in the log. It
-        // bought one hash lookup per record, about 1% of this phase.
-        RecoveryTable* table = table_at(intern_table(dml.table_name));
         if (table->file_handle == nullptr) {
             // The table is no longer open, so there is nothing to replay into.
             // Counted so that applied + skipped covers every DML record.
@@ -526,6 +641,9 @@ void RecoveryManager::redo() {
         default:
             break;
         }
+    }
+    for (int fd : smo_fds) {
+        disk_manager_->sync_file(fd);
     }
     LOG_INFO("recovery redo: applied %llu, skipped %llu (%llu with no open table), %llu dml records, wal preads %llu",
              static_cast<unsigned long long>(redo_applied_count_), static_cast<unsigned long long>(redo_skipped_count_),
@@ -1058,7 +1176,7 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
         const auto drain = [&](const Rid& rid, int keep) {
             const int surplus = std::min(multiplicity(existing, rid) - keep, kMaxDuplicateDrain);
             for (int removed = 0; removed < surplus; ++removed) {
-                if (!index->delete_entry(key, rid, nullptr)) {
+                if (!index->delete_entry(key, rid, IndexWriteWalContext::RecoveryDurable())) {
                     break;
                 }
                 ++index_mutation_count_;
@@ -1070,10 +1188,10 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
         for (const Rid& rid : required) {
             if (contains(candidates, rid)) {
                 // Drained to zero above, so exactly one copy has to go back.
-                index->insert_entry(key, rid, nullptr, true);
+                index->insert_entry(key, rid, IndexWriteWalContext::RecoveryDurable(), true);
                 ++index_mutation_count_;
             } else if (multiplicity(existing, rid) == 0) {
-                index->insert_entry(key, rid, nullptr, true);
+                index->insert_entry(key, rid, IndexWriteWalContext::RecoveryDurable(), true);
                 ++index_mutation_count_;
             } else {
                 // Present and never deleted; only the surplus copies have to go.
@@ -1123,17 +1241,6 @@ void RecoveryManager::repair_touched_indexes() {
     const auto spine_begin = std::chrono::steady_clock::now();
     const uint64_t spine_reads_begin = disk_manager_->get_page_read_count();
     size_t repaired_endpoints = 0;
-    // The whole-tree checker is the reference oracle for the descent-path gate
-    // in stage 2, not a second line of defence: it reads every page of every
-    // index (leaves twice) and holds two page-number sets sized by the tree, so
-    // its cost is O(database) while the crash it is looking for is O(WAL). Keep
-    // it one environment variable away for A/B runs, bug reports and the
-    // whole-tree assertions in test/index/. Read per recovery rather than cached
-    // in a function-local static, so one test process can demonstrate both sides
-    // of the switch - a gate that passes is only evidence if the same corruption
-    // demonstrably costs a rebuild without it.
-    const char* full_validation_env = std::getenv("RMDB_RECOVERY_FULL_INDEX_VALIDATION");
-    const bool full_validation = full_validation_env != nullptr && std::string(full_validation_env) == "1";
     for (const auto& [index_name, plan] : plans) {
         if (!plan.index->refresh_leaf_chain_endpoint()) {
             LOG_ERROR("recovery could not follow the leaf chain of index %s", index_name.c_str());
@@ -1141,16 +1248,9 @@ void RecoveryManager::repair_touched_indexes() {
             continue;
         }
         ++repaired_endpoints;
-        if (full_validation && !plan.index->validate_structure()) {
-            LOG_ERROR("recovery found structurally invalid index %s (full validation)", index_name.c_str());
-            indexes_to_rebuild.insert(index_name);
-        }
     }
     const auto spine_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - spine_begin).count();
-    // Reported separately from the gate's own numbers so an A/B run against
-    // RMDB_RECOVERY_FULL_INDEX_VALIDATION=1 reads the whole-tree checker's cost
-    // off the same log line as the gate's.
     const uint64_t spine_reads = disk_manager_->get_page_read_count() - spine_reads_begin;
 
     // Drop the plans for indexes that are going to be rebuilt anyway, then pay
@@ -1181,13 +1281,11 @@ void RecoveryManager::repair_touched_indexes() {
         }
     }
     LOG_INFO("recovery index structure gate: %zu indexes, spine: %zu leaf endpoints refreshed, %lld ms, "
-             "%llu disk page reads%s; change set: %llu descents, "
+             "%llu disk page reads; change set: %llu descents, "
              "%llu keys covered, %llu pages validated, %llu page fetches, %llu disk page reads, "
              "%llu parent pointers repaired, %llu leaves with an empty successor, %zu to rebuild, %lld ms",
              total_indexes, repaired_endpoints, static_cast<long long>(spine_ms),
-             static_cast<unsigned long long>(spine_reads),
-             full_validation ? " (INCLUDES whole-tree validate_structure)" : "",
-             static_cast<unsigned long long>(gate_totals.descents),
+             static_cast<unsigned long long>(spine_reads), static_cast<unsigned long long>(gate_totals.descents),
              static_cast<unsigned long long>(gate_totals.keys_covered),
              static_cast<unsigned long long>(gate_totals.pages_validated),
              static_cast<unsigned long long>(gate_totals.page_fetches),

@@ -91,20 +91,20 @@ std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
 }
 
 void DeleteIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
-                        const Rid& rid, Transaction* txn) {
+                        const Rid& rid, const IndexWriteWalContext& wal_context) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->delete_entry(key.data(), rid, txn);
+        ih->delete_entry(key.data(), rid, wal_context);
     }
 }
 
 void InsertIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::string& tab_name, const RmRecord& rec,
-                        const Rid& rid, Transaction* txn) {
+                        const Rid& rid, const IndexWriteWalContext& wal_context) {
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->insert_entry(key.data(), rid, txn, true);
+        ih->insert_entry(key.data(), rid, wal_context, true);
     }
 }
 
@@ -310,12 +310,18 @@ TupleMeta FallbackCommittedMeta() {
     return meta;
 }
 
-void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, Transaction* txn,
-                     lsn_t page_lsn) {
+void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, lsn_t page_lsn) {
     const std::string tab_name = write_record->GetTableName();
     auto& tab = sm_manager->db_.get_table(tab_name);
     auto* fh = sm_manager->fhs_.at(tab_name).get();
     Rid rid = write_record->GetRid();
+    std::optional<IndexWriteWalContext> index_wal_context;
+    if (!tab.indexes.empty()) {
+        // Heap-only rollback has no index page to protect and is valid in
+        // embedded/no-WAL tests. Indexed rollback remains fail-closed: it must
+        // have the ABORT LSN that covers every structural after-image.
+        index_wal_context.emplace(IndexWriteWalContext::LiveRollback(page_lsn));
+    }
 
     switch (write_record->GetWriteType()) {
     case WType::INSERT_TUPLE: {
@@ -329,7 +335,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         }
         if (fh->is_record(rid)) {
             auto rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, txn);
+            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, *index_wal_context);
             fh->delete_record(rid, nullptr, page_lsn);
         }
         break;
@@ -344,7 +350,9 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
             fh->insert_record(rid, old_rec.data, page_lsn);
             fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
         }
-        InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, txn);
+        if (index_wal_context.has_value()) {
+            InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, *index_wal_context);
+        }
         break;
     }
     case WType::UPDATE_TUPLE: {
@@ -359,7 +367,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
                     continue;
                 }
                 auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-                ih->delete_entry(current_key.data(), rid, txn);
+                ih->delete_entry(current_key.data(), rid, *index_wal_context);
             }
         }
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
@@ -375,7 +383,7 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
                     continue;
                 }
                 auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-                ih->insert_entry(old_key.data(), rid, txn, true);
+                ih->insert_entry(old_key.data(), rid, *index_wal_context, true);
             }
         }
         break;
@@ -403,6 +411,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
         const bool blocked = checkpoint_blocking_new_txns_;
         if (blocked) {
+            InvokeCheckpointAdmissionTestHook("begin_waiting");
             const auto wait_begin = std::chrono::steady_clock::now();
             checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
             checkpoint_begin_blocked_.fetch_add(1, std::memory_order_relaxed);
@@ -416,6 +425,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         }
         active_txn_ids_.insert(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+        InvokeCheckpointAdmissionTestHook("begin_admitted");
     }
 
     txn->set_state(TransactionState::GROWING);
@@ -473,13 +483,10 @@ AbortObservabilitySnapshot TransactionManager::abort_observability() const {
 
 CheckpointObservabilitySnapshot TransactionManager::checkpoint_observability() const {
     return {checkpoint_attempt_.load(std::memory_order_relaxed),
-            checkpoint_preflush_.load(std::memory_order_relaxed),
             checkpoint_success_.load(std::memory_order_relaxed),
             checkpoint_drain_timeout_.load(std::memory_order_relaxed),
             checkpoint_deadline_.load(std::memory_order_relaxed),
             checkpoint_final_data_fail_.load(std::memory_order_relaxed),
-            checkpoint_initial_ns_.load(std::memory_order_relaxed),
-            checkpoint_preblock_ns_.load(std::memory_order_relaxed),
             checkpoint_block_ns_.load(std::memory_order_relaxed),
             checkpoint_drain_ns_.load(std::memory_order_relaxed),
             checkpoint_final_wal_ns_.load(std::memory_order_relaxed),
@@ -493,10 +500,6 @@ CheckpointObservabilitySnapshot TransactionManager::checkpoint_observability() c
 
 void TransactionManager::observe_checkpoint_attempt() {
     checkpoint_attempt_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_preflush() {
-    checkpoint_preflush_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TransactionManager::observe_checkpoint_success() {
@@ -513,14 +516,6 @@ void TransactionManager::observe_checkpoint_deadline() {
 
 void TransactionManager::observe_checkpoint_final_data_fail() {
     checkpoint_final_data_fail_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_initial_ns(uint64_t elapsed_ns) {
-    checkpoint_initial_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_preblock_ns(uint64_t elapsed_ns) {
-    checkpoint_preblock_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
 }
 
 void TransactionManager::observe_checkpoint_block_ns(uint64_t elapsed_ns) {
@@ -566,24 +561,6 @@ void TransactionManager::BeginStatement(Transaction* txn) {
             txn->set_read_ts(new_read_ts);
         }
     }
-}
-
-bool TransactionManager::CommitPublicationHelpingEnabledFromEnvironment() {
-    static const bool enabled = [] {
-        const char* configured = std::getenv("RMDB_COMMIT_PUBLICATION_HELPING");
-        if (configured == nullptr) {
-            return true;
-        }
-        const std::string_view value(configured);
-        if (value == "1") {
-            return true;
-        }
-        if (value == "0") {
-            return false;
-        }
-        throw std::invalid_argument("RMDB_COMMIT_PUBLICATION_HELPING must be exactly 0 or 1");
-    }();
-    return enabled;
 }
 
 lsn_t TransactionManager::CompletedCommitLsn(const LogManager* log_manager) const {
@@ -964,7 +941,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         abort_lsn = WriteAbortLog(txn, log_manager);
     }
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(this, sm_manager_, it->get(), txn, abort_lsn);
+        UndoWriteRecord(this, sm_manager_, it->get(), abort_lsn);
     }
     running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);
@@ -990,6 +967,12 @@ void TransactionManager::block_new_transactions_for_checkpoint() {
     checkpoint_blocking_new_txns_ = true;
 }
 
+void TransactionManager::InvokeCheckpointAdmissionTestHook(std::string_view event) {
+    if (checkpoint_admission_test_hook_) {
+        checkpoint_admission_test_hook_(event);
+    }
+}
+
 void TransactionManager::unblock_new_transactions_after_checkpoint() {
     {
         std::lock_guard<std::mutex> checkpoint_lock(checkpoint_latch_);
@@ -1000,6 +983,7 @@ void TransactionManager::unblock_new_transactions_after_checkpoint() {
 
 bool TransactionManager::wait_active_transactions_drained_for_checkpoint(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
+    InvokeCheckpointAdmissionTestHook("drain_waiting");
     // A client that ran BEGIN and then went silent keeps active_txn_count_
     // above zero indefinitely. Waiting without a bound would keep every new
     // transaction in the process blocked behind the checkpoint.

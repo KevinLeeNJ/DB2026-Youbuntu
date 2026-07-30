@@ -79,10 +79,14 @@ public:
      * @param {RmFileHandle*} file_handle 要关闭文件的句柄
      */
     void close_file(const RmFileHandle* file_handle) {
+        // Publish data pages before the header that can make newly allocated
+        // pages reachable. On failure keep both the handle and resident dirty
+        // pages intact so the caller can fail closed or retry.
+        if (!buffer_pool_manager_->flush_all_pages(file_handle->fd_)) {
+            throw InternalError("failed to flush record pages while closing file");
+        }
         disk_manager_->write_page(file_handle->fd_, RM_FILE_HDR_PAGE, (char*)&file_handle->file_hdr_,
                                   sizeof(file_handle->file_hdr_));
-        // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
-        buffer_pool_manager_->flush_all_pages(file_handle->fd_);
         buffer_pool_manager_->delete_all_pages(file_handle->fd_);
         disk_manager_->close_file(file_handle->fd_);
     }

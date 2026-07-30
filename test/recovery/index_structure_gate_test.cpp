@@ -130,7 +130,7 @@ std::vector<Rid> CreateLoadedDb(const std::string& db_name) {
         for (int i = 0; i < kRowCount; ++i) {
             auto row = MakeRow(i, i * 10);
             const Rid rid = file_handle->insert_record(row.data, nullptr);
-            index->insert_entry(MakeKey(i).data(), rid, nullptr);
+            index->insert_entry(MakeKey(i).data(), rid, IndexWriteWalContext::TestNoWal());
             rids.push_back(rid);
         }
         sm_mgr.close_db();
@@ -261,19 +261,6 @@ RecoveryOutcome RunRecoveryAndInspect(const std::string& db_name, const std::vec
     return outcome;
 }
 
-// Sets RMDB_RECOVERY_FULL_INDEX_VALIDATION for the duration of a scope, which
-// restores the pre-A-2 behaviour: the whole-tree checker runs before the gate and
-// its verdict decides.
-class ScopedFullValidation {
-public:
-    ScopedFullValidation() {
-        setenv("RMDB_RECOVERY_FULL_INDEX_VALIDATION", "1", 1);
-    }
-    ~ScopedFullValidation() {
-        unsetenv("RMDB_RECOVERY_FULL_INDEX_VALIDATION");
-    }
-};
-
 } // namespace
 
 // A parent back pointer that names the wrong page is the one invariant a real
@@ -318,44 +305,6 @@ TEST(IndexStructureGateTest, BrokenParentBackPointerIsRepairedInPlace) {
     EXPECT_TRUE(outcome.all_keys_resolve);
 }
 
-// The negative control for the test above, in the same process: with the
-// whole-tree checker in charge - which is what recovery did before A-2 - the same
-// single wrong pointer costs a rebuild of the entire index.
-TEST(IndexStructureGateTest, TheSameBrokenPointerCostsAFullRebuildUnderWholeTreeValidation) {
-    ScopedGateTestDir test_dir("index_gate_parent_pointer_control_root");
-    const std::string db_name = "index_gate_parent_pointer_control_db";
-    const std::vector<Rid> rids = CreateLoadedDb(db_name);
-
-    int first_key_under_broken_child = -1;
-    {
-        RawIndexFile raw(IndexFileName(db_name));
-        page_id_t broken_child = IX_NO_PAGE;
-        raw.with_node(raw.hdr().root_page_, false, [&](IxNodeHandle& root) {
-            ASSERT_FALSE(root.is_leaf_page());
-            ASSERT_GE(root.get_size(), 2);
-            broken_child = root.value_at(1);
-        });
-        ASSERT_NE(broken_child, IX_NO_PAGE);
-        raw.with_node(broken_child, true, [&](IxNodeHandle& child) {
-            ASSERT_GT(child.get_size(), 0);
-            memcpy(&first_key_under_broken_child, child.get_key(0), sizeof(int));
-            child.set_parent_page_no(IX_NO_PAGE);
-        });
-    }
-
-    {
-        OpenDb db(db_name);
-        AppendCommittedSelfUpdate(*db.log_mgr_, rids[static_cast<size_t>(first_key_under_broken_child)],
-                                  first_key_under_broken_child, first_key_under_broken_child * 10);
-    }
-
-    ScopedFullValidation full_validation;
-    const RecoveryOutcome outcome = RunRecoveryAndInspect(db_name, rids);
-    EXPECT_EQ(outcome.rebuilds, 1u) << "this control is useless unless whole-tree validation really rebuilds";
-    EXPECT_TRUE(outcome.structure_valid);
-    EXPECT_TRUE(outcome.all_keys_resolve);
-}
-
 // An emptied leaf stays in the tree and in the leaf chain forever, because
 // coalesce_or_redistribute() is unreachable from the delete path. Rejecting it
 // would send every index over new_orders into a rebuild after every crash, so
@@ -384,7 +333,8 @@ TEST(IndexStructureGateTest, AnEmptiedLeafIsNotReportedAsDamage) {
         OpenDb db(db_name);
         auto* file_handle = db.sm_mgr_.fhs_.at("t").get();
         for (int i = 0; i < emptied_leaf_key_count; ++i) {
-            ASSERT_TRUE(db.index()->delete_entry(MakeKey(i).data(), rids[static_cast<size_t>(i)], nullptr));
+            ASSERT_TRUE(db.index()->delete_entry(MakeKey(i).data(), rids[static_cast<size_t>(i)],
+                                                 IndexWriteWalContext::TestNoWal()));
             file_handle->delete_record(rids[static_cast<size_t>(i)], nullptr);
             deleted_keys.push_back(i);
         }

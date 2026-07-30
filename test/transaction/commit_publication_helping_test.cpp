@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -81,6 +82,28 @@ private:
     std::filesystem::path dir_;
 };
 
+class ScopedEnvironmentValue {
+public:
+    ScopedEnvironmentValue(const char* name, const char* value) : name_(name) {
+        if (const char* current = std::getenv(name); current != nullptr) {
+            old_value_ = current;
+        }
+        EXPECT_EQ(setenv(name, value, 1), 0);
+    }
+
+    ~ScopedEnvironmentValue() {
+        if (old_value_.has_value()) {
+            EXPECT_EQ(setenv(name_.c_str(), old_value_->c_str(), 1), 0);
+        } else {
+            EXPECT_EQ(unsetenv(name_.c_str()), 0);
+        }
+    }
+
+private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+
 class CommitPublicationHelpingTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -92,7 +115,7 @@ protected:
         ix_mgr_ = std::make_unique<IxManager>(disk_.get(), bpm_.get());
         sm_mgr_ = std::make_unique<SmManager>(disk_.get(), bpm_.get(), rm_mgr_.get(), ix_mgr_.get());
         log_mgr_ = std::make_unique<LogManager>(disk_.get());
-        lock_mgr_ = std::make_unique<LockManager>(0us);
+        lock_mgr_ = std::make_unique<LockManager>();
         sm_mgr_->create_db("db");
         sm_mgr_->open_db("db");
         sm_mgr_->create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
@@ -108,8 +131,11 @@ protected:
     }
 
     void MakeManager(TransactionManager::CommitPublicationTestHook hook = {}, bool helping = true) {
+        TransactionManager::CommitPublicationTestOptions test_options;
+        test_options.helping = helping;
+        test_options.hook = std::move(hook);
         txn_mgr_ = std::make_unique<TransactionManager>(lock_mgr_.get(), sm_mgr_.get(),
-                                                        ConcurrencyMode::TWO_PHASE_LOCKING, helping, std::move(hook));
+                                                        ConcurrencyMode::TWO_PHASE_LOCKING, std::move(test_options));
     }
 
     static Value IntValue(int value) {
@@ -497,7 +523,18 @@ TEST_F(CommitPublicationHelpingTest, OwnerCleanupFailureAfterPublicationIsFailSt
         ::testing::ExitedWithCode(134), "FATAL: COMMIT WAL/publication failed");
 }
 
-TEST_F(CommitPublicationHelpingTest, DisabledPathRetainsOriginalCommitPublication) {
+TEST_F(CommitPublicationHelpingTest, LegacyEnvironmentCannotDisableDefaultHelping) {
+    ScopedEnvironmentValue legacy_disable("RMDB_COMMIT_PUBLICATION_HELPING", "0");
+    txn_mgr_ = std::make_unique<TransactionManager>(lock_mgr_.get(), sm_mgr_.get());
+    EXPECT_TRUE(txn_mgr_->commit_publication_helping_enabled_for_test());
+
+    Transaction* txn = txn_mgr_->begin(nullptr, log_mgr_.get());
+    txn_mgr_->commit(txn, log_mgr_.get());
+
+    EXPECT_EQ(txn->get_state(), TransactionState::COMMITTED);
+}
+
+TEST_F(CommitPublicationHelpingTest, ExplicitTestOnlyDisabledPathRetainsDirectPublicationOracle) {
     MakeManager({}, false);
     Transaction* txn = txn_mgr_->begin(nullptr, log_mgr_.get());
     txn_mgr_->commit(txn, log_mgr_.get());

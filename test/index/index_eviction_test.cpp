@@ -19,14 +19,18 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -63,21 +67,31 @@ public:
     }
 
     void TearDown() override {
-        cleanup();
-    }
-
-    void open_storage() {
-        disk_manager = std::make_unique<DiskManager>();
-        buffer_pool_manager = std::make_unique<BufferPoolManager>(kSmallPoolFrames, disk_manager.get());
-        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
-    }
-
-    // Drops every process-local cache, which is what a restart does.
-    void restart_storage() {
+        IxIndexHandle::set_insert_split_fault(IxIndexHandle::InsertSplitFault::None);
+        IxIndexHandle::set_insert_split_test_hook({});
+        BufferPoolManager::set_flush_page_test_hook({});
+        // A fatal assertion can bypass close_index(). Release DiskManager last
+        // so its RAII cleanup closes every remaining fd before unlinking files;
+        // otherwise TearDown masks the primary failure with "File is opened".
         ix_manager.reset();
         buffer_pool_manager.reset();
         disk_manager.reset();
         open_storage();
+        cleanup();
+    }
+
+    void open_storage(size_t pool_frames = kSmallPoolFrames) {
+        disk_manager = std::make_unique<DiskManager>();
+        buffer_pool_manager = std::make_unique<BufferPoolManager>(pool_frames, disk_manager.get());
+        ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    }
+
+    // Drops every process-local cache, which is what a restart does.
+    void restart_storage(size_t pool_frames = kSmallPoolFrames) {
+        ix_manager.reset();
+        buffer_pool_manager.reset();
+        disk_manager.reset();
+        open_storage(pool_frames);
     }
 
     void cleanup() {
@@ -117,6 +131,14 @@ public:
             }
         }
         return missing;
+    }
+
+    int total_pin_count() const {
+        int total = 0;
+        for (size_t frame = 0; frame < buffer_pool_manager->pool_size_; ++frame) {
+            total += buffer_pool_manager->pages_[frame].pin_count_;
+        }
+        return total;
     }
 
     // Reads other pages of the same index until the buffer pool hands
@@ -165,10 +187,10 @@ TEST_F(IndexEvictionTest, NonAscendingBulkLoadKeepsEveryKeyAfterRestart) {
     {
         auto ih = open_index();
         {
-            IxIndexHandle::PinnedInserter inserter(ih.get());
+            IxIndexHandle::PinnedInserter inserter(ih.get(), IndexWriteWalContext::TestNoWal());
             for (const int value : insertion_order) {
                 auto k = key(value);
-                inserter.insert(k.data(), Rid{1, value}, nullptr, false);
+                inserter.insert(k.data(), Rid{1, value}, false);
             }
         }
         close_index(ih);
@@ -195,7 +217,7 @@ TEST_F(IndexEvictionTest, RandomInsertLoadKeepsEveryKeyAfterRestart) {
         auto ih = open_index();
         for (const int value : insertion_order) {
             auto k = key(value);
-            ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+            ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
         }
         close_index(ih);
     }
@@ -219,7 +241,7 @@ TEST_F(IndexEvictionTest, CachedInternalPageIsNotUsedAfterItsFrameIsReused) {
     auto ih = open_index();
     for (int value = 0; value < kKeyCount; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     ih->refresh_page_residency(true);
     ASSERT_FALSE(ih->cached_internal_pages_.empty());
@@ -254,7 +276,7 @@ TEST_F(IndexEvictionTest, CachedRootPageIsNotUsedAfterItsFrameIsReused) {
     auto ih = open_index();
     for (int value = 0; value < kKeyCount; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     ih->refresh_page_residency(false);
     ASSERT_NE(ih->cached_root_page_, nullptr);
@@ -277,6 +299,591 @@ TEST_F(IndexEvictionTest, CachedRootPageIsNotUsedAfterItsFrameIsReused) {
 
     buffer_pool_manager->unpin_page(PageId{ih->fd_, squatter}, false);
     close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, GlobalResidencyQuotaLeavesFramesForOrdinaryPressure) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto count_missing_wide = [&](IxIndexHandle* handle) {
+        int missing = 0;
+        for (int value = 0; value < 800; ++value) {
+            std::vector<char> k(512, 0);
+            const std::string encoded = std::to_string(1000000 + value);
+            std::memcpy(k.data(), encoded.data(), encoded.size());
+            std::vector<Rid> result;
+            if (!handle->get_value(k.data(), &result, nullptr) || result.size() != 1 ||
+                !(result.front() == Rid{1, value})) {
+                ++missing;
+            }
+        }
+        return missing;
+    };
+
+    ASSERT_EQ(buffer_pool_manager->index_internal_residency_budget(), 0U);
+    ih->refresh_page_residency(true);
+    ASSERT_EQ(ih->cached_root_page_, nullptr);
+    ASSERT_TRUE(ih->resident_internal_pages_.empty());
+
+    for (int value = 0; value < 800; ++value) {
+        std::vector<char> k(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(k.data(), encoded.data(), encoded.size());
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+    ih->refresh_page_residency(true);
+    EXPECT_LE(buffer_pool_manager->index_internal_resident_count(),
+              buffer_pool_manager->index_internal_residency_budget());
+    EXPECT_EQ(buffer_pool_manager->index_internal_resident_count(), ih->resident_internal_pages_.size());
+
+    const std::string pressure_file = table_name + "_pressure";
+    disk_manager->create_file(pressure_file);
+    const int pressure_fd = disk_manager->open_file(pressure_file);
+    for (int i = 0; i < 32; ++i) {
+        PageId page_id{pressure_fd, INVALID_PAGE_ID};
+        ASSERT_NE(buffer_pool_manager->new_page(&page_id), nullptr) << "pressure page " << i;
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(page_id, false));
+    }
+    EXPECT_EQ(count_missing_wide(ih.get()), 0);
+    EXPECT_TRUE(ih->validate_structure());
+
+    close_index(ih);
+    buffer_pool_manager->delete_all_pages(pressure_fd);
+    disk_manager->close_file(pressure_fd);
+    disk_manager->destroy_file(pressure_file);
+
+    restart_storage(8);
+    ih = open_index();
+    EXPECT_EQ(count_missing_wide(ih.get()), 0);
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, SplitAllocationFaultsLeaveRootLeafUnchangedAndRetryable) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+    auto expect_prefix = [&](int count) {
+        for (int value = 0; value < count; ++value) {
+            auto k = wide_key(value);
+            std::vector<Rid> result;
+            ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << value;
+            ASSERT_EQ(result, std::vector<Rid>({Rid{1, value}})) << value;
+        }
+    };
+
+    const int split_key = ih->file_hdr_->btree_order_;
+    for (int value = 0; value < split_key; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+    auto trigger = wide_key(split_key);
+
+    IxIndexHandle::set_insert_split_fault(IxIndexHandle::InsertSplitFault::SiblingAllocation);
+    EXPECT_THROW(ih->insert_entry(trigger.data(), Rid{1, split_key}, IndexWriteWalContext::TestNoWal()), InternalError);
+    EXPECT_TRUE(ih->validate_structure());
+    expect_prefix(split_key);
+    EXPECT_EQ(total_pin_count(), 0);
+
+    page_id_t stable_num_pages = IX_NO_PAGE;
+    int64_t stable_file_size = -1;
+    const std::string index_file = ix_manager->get_index_name(table_name, cols);
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        IxIndexHandle::set_insert_split_fault(IxIndexHandle::InsertSplitFault::NewRootAllocation);
+        EXPECT_THROW(ih->insert_entry(trigger.data(), Rid{1, split_key}, IndexWriteWalContext::TestNoWal()),
+                     InternalError);
+        EXPECT_TRUE(ih->validate_structure());
+        expect_prefix(split_key);
+        EXPECT_EQ(total_pin_count(), 0);
+        if (attempt == 0) {
+            stable_num_pages = ih->file_hdr_->num_pages_;
+            stable_file_size = disk_manager->get_file_size(index_file);
+        } else {
+            EXPECT_EQ(ih->file_hdr_->num_pages_, stable_num_pages);
+            EXPECT_EQ(disk_manager->get_file_size(index_file), stable_file_size);
+        }
+    }
+
+    close_index(ih);
+    restart_storage(8);
+    ih = open_index();
+    EXPECT_TRUE(ih->validate_structure());
+    expect_prefix(split_key);
+    ih->insert_entry(trigger.data(), Rid{1, split_key}, IndexWriteWalContext::TestNoWal());
+    EXPECT_TRUE(ih->validate_structure());
+    expect_prefix(split_key + 1);
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, CommitReacquireFaultRollsBackAppliedPagesAndRetrySucceeds) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    int commit_reacquires = 0;
+    int rollback_reacquires = 0;
+    std::mutex barrier_latch;
+    std::condition_variable barrier_cv;
+    bool rollback_flush_started = false;
+    bool restored_image_captured = false;
+    bool flush_at_page_latch = false;
+    bool flush_bypassed_unique_latch = false;
+    PageId rollback_page_id;
+    std::array<char, PAGE_SIZE> restored_image{};
+    std::future<bool> flush_future;
+    BufferPoolManager::set_flush_page_test_hook([&](PageId page_id, Page* page) {
+        std::scoped_lock lock{barrier_latch};
+        if (rollback_flush_started && page_id == rollback_page_id) {
+            flush_bypassed_unique_latch = page->latch().try_lock_shared();
+            if (flush_bypassed_unique_latch) {
+                page->latch().unlock_shared();
+            }
+            flush_at_page_latch = true;
+            barrier_cv.notify_all();
+        }
+    });
+    IxIndexHandle::set_insert_split_test_hook([&](IxIndexHandle::InsertSplitStage stage, PageId page_id, Page* page) {
+        if (stage == IxIndexHandle::InsertSplitStage::CommitBegin) {
+            commit_reacquires = 0;
+        } else if (stage == IxIndexHandle::InsertSplitStage::CommitReacquire && ++commit_reacquires == 7) {
+            throw InternalError("injected commit reacquire failure");
+        } else if (stage == IxIndexHandle::InsertSplitStage::RollbackReacquire) {
+            ++rollback_reacquires;
+        } else if (stage == IxIndexHandle::InsertSplitStage::RollbackBeforeImageRestore && !rollback_flush_started) {
+            std::unique_lock lock{barrier_latch};
+            rollback_page_id = page_id;
+            rollback_flush_started = true;
+            flush_future =
+                std::async(std::launch::async, [&] { return buffer_pool_manager->flush_page(rollback_page_id); });
+            barrier_cv.wait(lock, [&] { return flush_at_page_latch; });
+            EXPECT_FALSE(flush_bypassed_unique_latch);
+            EXPECT_EQ(flush_future.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+        } else if (stage == IxIndexHandle::InsertSplitStage::RollbackImageRestored && page_id == rollback_page_id) {
+            std::memcpy(restored_image.data(), page->get_data(), PAGE_SIZE);
+            restored_image_captured = true;
+        }
+    });
+
+    int failed_value = -1;
+    for (int value = 0; value < 2000; ++value) {
+        auto k = wide_key(value);
+        try {
+            ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+        } catch (const InternalError&) {
+            failed_value = value;
+            break;
+        }
+    }
+    ASSERT_GE(failed_value, 0);
+    ASSERT_GT(rollback_reacquires, 0);
+    IxIndexHandle::set_insert_split_test_hook({});
+    BufferPoolManager::set_flush_page_test_hook({});
+    ASSERT_TRUE(rollback_flush_started);
+    ASSERT_TRUE(restored_image_captured);
+    ASSERT_TRUE(flush_future.valid());
+    EXPECT_TRUE(flush_future.get());
+    std::array<char, PAGE_SIZE> disk_image{};
+    disk_manager->read_page(rollback_page_id.fd, rollback_page_id.page_no, disk_image.data(), PAGE_SIZE);
+    EXPECT_EQ(std::memcmp(disk_image.data(), restored_image.data(), PAGE_SIZE), 0);
+    EXPECT_TRUE(ih->validate_structure());
+    for (int value = 0; value < failed_value; ++value) {
+        auto k = wide_key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << value;
+        ASSERT_EQ(result, std::vector<Rid>({Rid{1, value}})) << value;
+    }
+    auto failed_key = wide_key(failed_value);
+    std::vector<Rid> absent;
+    EXPECT_FALSE(ih->get_value(failed_key.data(), &absent, nullptr));
+    ih->insert_entry(failed_key.data(), Rid{1, failed_value}, IndexWriteWalContext::TestNoWal());
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, CommitImageExcludesConcurrentFlushUntilImageIsComplete) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    const int split_key = ih->file_hdr_->btree_order_;
+    for (int value = 0; value < split_key; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+
+    std::mutex barrier_latch;
+    std::condition_variable barrier_cv;
+    bool commit_flush_started = false;
+    bool committed_image_captured = false;
+    bool flush_at_page_latch = false;
+    bool flush_bypassed_unique_latch = false;
+    bool manual_flush_verified = false;
+    PageId committed_page_id;
+    std::array<char, PAGE_SIZE> committed_image{};
+    std::future<bool> flush_future;
+    BufferPoolManager::set_flush_page_test_hook([&](PageId page_id, Page* page) {
+        std::scoped_lock lock{barrier_latch};
+        if (commit_flush_started && page_id == committed_page_id) {
+            flush_bypassed_unique_latch = page->latch().try_lock_shared();
+            if (flush_bypassed_unique_latch) {
+                page->latch().unlock_shared();
+            }
+            flush_at_page_latch = true;
+            barrier_cv.notify_all();
+        }
+    });
+    IxIndexHandle::set_insert_split_test_hook([&](IxIndexHandle::InsertSplitStage stage, PageId page_id, Page* page) {
+        if (stage == IxIndexHandle::InsertSplitStage::CommitBeforeImageApply && !commit_flush_started) {
+            std::unique_lock lock{barrier_latch};
+            committed_page_id = page_id;
+            commit_flush_started = true;
+            flush_future =
+                std::async(std::launch::async, [&] { return buffer_pool_manager->flush_page(committed_page_id); });
+            barrier_cv.wait(lock, [&] { return flush_at_page_latch; });
+            EXPECT_FALSE(flush_bypassed_unique_latch);
+            EXPECT_EQ(flush_future.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+        } else if (stage == IxIndexHandle::InsertSplitStage::CommitImageApplied && page_id == committed_page_id) {
+            std::memcpy(committed_image.data(), page->get_data(), PAGE_SIZE);
+            committed_image_captured = true;
+        } else if (stage == IxIndexHandle::InsertSplitStage::RootCacheRefresh) {
+            EXPECT_TRUE(committed_image_captured);
+            EXPECT_TRUE(flush_future.valid());
+            if (committed_image_captured && flush_future.valid()) {
+                const bool flushed = flush_future.get();
+                EXPECT_TRUE(flushed);
+                std::array<char, PAGE_SIZE> disk_image{};
+                disk_manager->read_page(committed_page_id.fd, committed_page_id.page_no, disk_image.data(), PAGE_SIZE);
+                EXPECT_EQ(std::memcmp(disk_image.data(), committed_image.data(), PAGE_SIZE), 0);
+                manual_flush_verified =
+                    flushed && std::memcmp(disk_image.data(), committed_image.data(), PAGE_SIZE) == 0;
+            }
+        }
+    });
+
+    auto trigger = wide_key(split_key);
+    EXPECT_NO_THROW(ih->insert_entry(trigger.data(), Rid{1, split_key}, IndexWriteWalContext::TestNoWal()));
+    IxIndexHandle::set_insert_split_test_hook({});
+    BufferPoolManager::set_flush_page_test_hook({});
+    ASSERT_TRUE(commit_flush_started);
+    ASSERT_TRUE(committed_image_captured);
+    EXPECT_TRUE(manual_flush_verified);
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, RootCacheRefreshFailureDoesNotFailCommittedSplit) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(16, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    const int split_key = ih->file_hdr_->btree_order_;
+    for (int value = 0; value < split_key; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+    bool refresh_fault_reached = false;
+    IxIndexHandle::set_insert_split_test_hook([&](IxIndexHandle::InsertSplitStage stage, PageId, Page*) {
+        if (stage == IxIndexHandle::InsertSplitStage::RootCacheRefresh) {
+            refresh_fault_reached = true;
+            throw InternalError("injected root cache refresh failure");
+        }
+    });
+    auto trigger = wide_key(split_key);
+    EXPECT_NO_THROW(ih->insert_entry(trigger.data(), Rid{1, split_key}, IndexWriteWalContext::TestNoWal()));
+    EXPECT_TRUE(refresh_fault_reached);
+    EXPECT_EQ(ih->cached_root_page_, nullptr);
+    EXPECT_EQ(ih->cached_root_page_no_, IX_NO_PAGE);
+    EXPECT_TRUE(ih->validate_structure());
+
+    IxIndexHandle::set_insert_split_test_hook({});
+    ih->refresh_page_residency(false);
+    EXPECT_NE(ih->cached_root_page_, nullptr);
+    EXPECT_EQ(ih->cached_root_page_no_, ih->file_hdr_->root_page_);
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, OtherFileFetchCannotConsumeFramesDuringSplitCommit) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    const std::string pressure_file = table_name + "_pressure";
+    disk_manager->create_file(pressure_file);
+    const int pressure_fd = disk_manager->open_file(pressure_file);
+    PageId pressure_id{pressure_fd, INVALID_PAGE_ID};
+    Page* pressure_page = buffer_pool_manager->new_page(&pressure_id);
+    ASSERT_NE(pressure_page, nullptr);
+    buffer_pool_manager->unpin_page(pressure_id, true);
+
+    const int split_key = ih->file_hdr_->btree_order_;
+    for (int value = 0; value < split_key; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+
+    std::atomic<bool> pressure_started{false};
+    std::atomic<bool> pressure_finished{false};
+    std::thread pressure_thread;
+    IxIndexHandle::set_insert_split_test_hook([&](IxIndexHandle::InsertSplitStage stage, PageId, Page*) {
+        if (stage != IxIndexHandle::InsertSplitStage::CommitReacquire || pressure_started.exchange(true)) {
+            return;
+        }
+        pressure_thread = std::thread([&] {
+            Page* page = buffer_pool_manager->fetch_page(pressure_id);
+            pressure_finished.store(true, std::memory_order_release);
+            if (page != nullptr) {
+                buffer_pool_manager->unpin_page(pressure_id, false);
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT_FALSE(pressure_finished.load(std::memory_order_acquire));
+    });
+
+    auto trigger = wide_key(split_key);
+    EXPECT_NO_THROW(ih->insert_entry(trigger.data(), Rid{1, split_key}, IndexWriteWalContext::TestNoWal()));
+    IxIndexHandle::set_insert_split_test_hook({});
+    ASSERT_TRUE(pressure_thread.joinable());
+    pressure_thread.join();
+    EXPECT_TRUE(pressure_finished.load(std::memory_order_acquire));
+    EXPECT_TRUE(ih->validate_structure());
+
+    close_index(ih);
+    disk_manager->close_file(pressure_fd);
+    disk_manager->destroy_file(pressure_file);
+}
+
+TEST_F(IndexEvictionTest, NextLeafPreflightFaultLeavesRandomTreeUnchangedAndRetryable) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    std::vector<int> order(300);
+    std::iota(order.begin(), order.end(), 0);
+    std::mt19937 rng(20260729);
+    std::shuffle(order.begin(), order.end(), rng);
+    std::vector<int> inserted;
+    int failed_value = -1;
+    IxIndexHandle::set_insert_split_fault(IxIndexHandle::InsertSplitFault::NextLeafFetch);
+    for (const int value : order) {
+        auto k = wide_key(value);
+        try {
+            ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+            inserted.push_back(value);
+        } catch (const InternalError&) {
+            failed_value = value;
+            break;
+        }
+    }
+    ASSERT_GE(failed_value, 0);
+    EXPECT_TRUE(ih->validate_structure());
+    for (const int value : inserted) {
+        auto k = wide_key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << value;
+        ASSERT_EQ(result, std::vector<Rid>({Rid{1, value}})) << value;
+    }
+    EXPECT_EQ(total_pin_count(), 0);
+
+    close_index(ih);
+    restart_storage(8);
+    ih = open_index();
+    EXPECT_TRUE(ih->validate_structure());
+    auto failed_key = wide_key(failed_value);
+    ih->insert_entry(failed_key.data(), Rid{1, failed_value}, IndexWriteWalContext::TestNoWal());
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, MovedChildPreflightFaultLeavesCascadeUnchangedAndRetryable) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    int failed_value = -1;
+    IxIndexHandle::set_insert_split_fault(IxIndexHandle::InsertSplitFault::MovedChildFetch);
+    for (int value = 0; value < 800; ++value) {
+        auto k = wide_key(value);
+        try {
+            ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+        } catch (const InternalError&) {
+            failed_value = value;
+            break;
+        }
+    }
+    ASSERT_GE(failed_value, 0);
+    EXPECT_TRUE(ih->validate_structure());
+    for (int value = 0; value < failed_value; ++value) {
+        auto k = wide_key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << value;
+        ASSERT_EQ(result, std::vector<Rid>({Rid{1, value}})) << value;
+    }
+    EXPECT_EQ(total_pin_count(), 0);
+
+    close_index(ih);
+    restart_storage(8);
+    ih = open_index();
+    EXPECT_TRUE(ih->validate_structure());
+    for (int value = failed_value; value < 800; ++value) {
+        auto k = wide_key(value);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+    EXPECT_TRUE(ih->validate_structure());
+    for (int value = 0; value < 800; ++value) {
+        auto k = wide_key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << value;
+        ASSERT_EQ(result, std::vector<Rid>({Rid{1, value}})) << value;
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, PinnedInserterUsesBoundedSplitPlanWithEightFrames) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+    cols = {ColMeta{.tab_name = table_name, .name = "k", .type = TYPE_STRING, .len = 512, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+    auto wide_key = [](int value) {
+        std::vector<char> result(512, 0);
+        const std::string encoded = std::to_string(1000000 + value);
+        std::memcpy(result.data(), encoded.data(), encoded.size());
+        return result;
+    };
+
+    {
+        IxIndexHandle::PinnedInserter inserter(ih.get(), IndexWriteWalContext::TestNoWal());
+        for (int value = 0; value < 800; ++value) {
+            auto k = wide_key(value);
+            inserter.insert(k.data(), Rid{1, value});
+        }
+    }
+    EXPECT_TRUE(ih->validate_structure());
+    close_index(ih);
+
+    restart_storage(8);
+    ih = open_index();
+    EXPECT_TRUE(ih->validate_structure());
+    for (int value = 0; value < 800; ++value) {
+        auto k = wide_key(value);
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(k.data(), &result, nullptr)) << value;
+        ASSERT_EQ(result, std::vector<Rid>({Rid{1, value}})) << value;
+    }
+    close_index(ih);
+}
+
+TEST_F(IndexEvictionTest, FullRefreshCannotKeepRootPinWhenGlobalQuotaIsFull) {
+    cleanup();
+    buffer_pool_manager = std::make_unique<BufferPoolManager>(10, disk_manager.get());
+    ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+
+    const std::string second_table = table_name + "_second";
+    const std::string third_table = table_name + "_third";
+    const std::vector<ColMeta> second_cols = {ColMeta{
+        .tab_name = second_table, .name = "k", .type = TYPE_STRING, .len = kKeyLen, .offset = 0, .index = true}};
+    const std::vector<ColMeta> third_cols = {
+        ColMeta{.tab_name = third_table, .name = "k", .type = TYPE_STRING, .len = kKeyLen, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    ix_manager->create_index(second_table, second_cols);
+    ix_manager->create_index(third_table, third_cols);
+    auto first = ix_manager->open_index(table_name, cols);
+    auto second = ix_manager->open_index(second_table, second_cols);
+    auto third = ix_manager->open_index(third_table, third_cols);
+
+    first->refresh_page_residency(false);
+    ASSERT_NE(first->cached_root_page_, nullptr);
+    first->unregister_internal_pages();
+    ASSERT_EQ(first->cached_root_page_, nullptr);
+
+    second->refresh_page_residency(false);
+    ASSERT_NE(second->cached_root_page_, nullptr);
+    third->refresh_page_residency(false);
+    ASSERT_NE(third->cached_root_page_, nullptr);
+    ASSERT_EQ(buffer_pool_manager->index_internal_resident_count(), 2U);
+    ASSERT_EQ(buffer_pool_manager->index_internal_residency_budget(), 2U);
+
+    first->refresh_page_residency(true);
+    EXPECT_EQ(first->cached_root_page_, nullptr);
+    EXPECT_EQ(first->cached_root_page_no_, IX_NO_PAGE);
+    EXPECT_TRUE(first->resident_internal_pages_.empty());
+    EXPECT_EQ(buffer_pool_manager->index_internal_resident_count(), 2U);
+
+    ix_manager->close_index(first.get());
+    first.reset();
+    ix_manager->close_index(second.get());
+    second.reset();
+    ix_manager->close_index(third.get());
+    third.reset();
+    ix_manager->destroy_index(second_table, second_cols);
+    ix_manager->destroy_index(third_table, third_cols);
 }
 
 // Measurement harness for the structure gate that crash recovery runs before it
@@ -347,7 +954,7 @@ TEST(IndexValidateStructureCost, DISABLED_ValidateStructureCostPerPage) {
     auto ih = ix_manager->open_index(table, cols);
     for (int value = 0; value < kKeyCount; ++value) {
         auto k = wide_key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     const int pages = ih->file_hdr_->num_pages_;
 

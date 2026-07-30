@@ -23,10 +23,12 @@ See the Mulan PSL v2 for more details. */
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sys/wait.h>
 #include <string>
 #include <unistd.h>
@@ -67,6 +69,15 @@ RmRecord MakeTuple(int id, int value) {
     return rec;
 }
 
+RmRecord MakeWideTuple(int id, char fill) {
+    constexpr int kPaddingBytes = 128;
+    RmRecord rec(static_cast<int>(sizeof(int)) + kPaddingBytes + null_bitmap_bytes(2));
+    memset(rec.data, fill, static_cast<size_t>(rec.size));
+    memcpy(rec.data, &id, sizeof(int));
+    rec.data[rec.size - 1] = 0;
+    return rec;
+}
+
 std::vector<char> MakeIntKey(int value) {
     std::vector<char> key(sizeof(int));
     memcpy(key.data(), &value, sizeof(int));
@@ -89,12 +100,27 @@ void CreateRecoveryTestDb(const std::string& db_name, const std::vector<std::str
     sm_mgr.close_db();
 }
 
+void CreateWideRecoveryTestDb(const std::string& db_name) {
+    DiskManager disk;
+    BufferPoolManager bpm(64, &disk);
+    RmManager rm_mgr(&disk, &bpm);
+    IxManager ix_mgr(&disk, &bpm);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+
+    sm_mgr.create_db(db_name);
+    sm_mgr.open_db(db_name);
+    sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"padding", TYPE_STRING, 128}}, nullptr);
+    sm_mgr.create_index("t", {"id"}, nullptr);
+    sm_mgr.close_db();
+}
+
 class OpenRecoveryDb {
 public:
     explicit OpenRecoveryDb(const std::string& db_name)
         : bpm_(64, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_), sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_),
           log_mgr_(std::make_unique<LogManager>(&disk_)) {
         sm_mgr_.open_db(db_name);
+        bpm_.set_log_manager(log_mgr_.get());
     }
 
     ~OpenRecoveryDb() {
@@ -170,6 +196,7 @@ void FlushLogs(LogManager& log_mgr) {
 // ended" check holds either way.
 void RunRecovery(const std::string& db_name) {
     OpenRecoveryDb db(db_name);
+    db.bpm_.set_log_manager(db.log_mgr_.get());
     auto recovery = std::make_unique<RecoveryManager>(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
     recovery->analyze();
     recovery->redo();
@@ -237,6 +264,11 @@ int RecordValue(SmManager& sm_mgr, const Rid& rid, const std::string& table_name
     return value;
 }
 
+int RecordId(SmManager& sm_mgr, const Rid& rid, const std::string& table_name = "t") {
+    auto record = sm_mgr.fhs_.at(table_name)->get_record(rid, nullptr);
+    return read_unaligned<int>(record->data);
+}
+
 std::vector<Rid> IndexEntriesFor(SmManager& sm_mgr, int key, const std::string& table_name = "t") {
     auto* index = sm_mgr.ihs_.at(sm_mgr.get_ix_manager()->get_index_name(table_name, {"id"})).get();
     std::vector<Rid> result;
@@ -247,6 +279,70 @@ std::vector<Rid> IndexEntriesFor(SmManager& sm_mgr, int key, const std::string& 
 bool IndexPointsTo(SmManager& sm_mgr, int key, const Rid& rid, const std::string& table_name = "t") {
     const auto result = IndexEntriesFor(sm_mgr, key, table_name);
     return result.size() == 1 && result[0] == rid;
+}
+
+Rid PrepareSinglePageIndexSmo(const std::string& db_name, int key, const Rid& requested_rid,
+                              bool renew_binding_after_smo, bool add_loser_insert = false, int smo_record_count = 1) {
+    OpenRecoveryDb db(db_name);
+    db.bpm_.set_log_manager(db.log_mgr_.get());
+    const std::string index_name = db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"});
+    IxIndexHandle* index = db.sm_mgr_.ihs_.at(index_name).get();
+    const int fd = index->GetFd();
+    constexpr page_id_t root_page_no = IX_INIT_ROOT_PAGE;
+
+    std::array<char, PAGE_SIZE> before{};
+    std::array<char, PAGE_SIZE> header{};
+    db.disk_.read_page(fd, root_page_no, before.data(), PAGE_SIZE);
+    db.disk_.read_page(fd, IX_FILE_HDR_PAGE, header.data(), PAGE_SIZE);
+
+    Rid rid = requested_rid;
+    if (add_loser_insert) {
+        auto record = MakeTuple(key, key * 10);
+        rid = db.sm_mgr_.fhs_.at("t")->insert_record(record.data, nullptr);
+        const txn_id_t txn_id = 901;
+        const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, txn_id);
+        AppendInsert(*db.log_mgr_, txn_id, begin_lsn, rid, record);
+        TupleMeta meta;
+        meta.writer_txn_id_ = txn_id;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+    }
+    EXPECT_GT(smo_record_count, 0);
+    lsn_t smo_lsn = INVALID_LSN;
+    for (int i = 0; i < smo_record_count; ++i) {
+        index->insert_entry(MakeIntKey(key + i).data(), rid, IndexWriteWalContext::TestNoWal());
+        Page* root = db.bpm_.fetch_page(PageId{fd, root_page_no});
+        if (root == nullptr) {
+            ADD_FAILURE() << "could not fetch root while preparing INDEX_SMO";
+            return rid;
+        }
+        IndexSmoWalData smo;
+        smo.index_file_name = index_name;
+        smo.pages.resize(1);
+        smo.pages[0].page_no = root_page_no;
+        {
+            std::shared_lock page_lock{root->latch()};
+            std::memcpy(smo.pages[0].bytes.data(), root->get_data(), PAGE_SIZE);
+        }
+        EXPECT_TRUE(db.bpm_.unpin_page(PageId{fd, root_page_no}, false));
+        smo.header = header;
+        smo_lsn = db.log_mgr_->append_index_smo(smo);
+    }
+    db.log_mgr_->flush_log_to_disk_up_to_durable(smo_lsn);
+    if (renew_binding_after_smo) {
+        db.bpm_.set_log_manager(db.log_mgr_.get());
+        db.sm_mgr_.drop_index("t", {"id"}, nullptr);
+        db.sm_mgr_.create_index("t", {"id"}, nullptr);
+        return rid;
+    }
+
+    // Model a crash before any page publication: retain only the pre-SMO page
+    // on disk. flush_page first clears the in-memory dirty bit so close_db
+    // cannot overwrite this deliberate old image.
+    EXPECT_TRUE(db.bpm_.flush_page(PageId{fd, root_page_no}));
+    db.disk_.write_page(fd, root_page_no, before.data(), PAGE_SIZE);
+    return rid;
 }
 
 // Walks the WAL by its length prefixes and returns the file offsets of the
@@ -283,6 +379,68 @@ void PatchWalBytes(const std::string& log_path, int64_t offset, const void* byte
 }
 
 } // namespace
+
+TEST(RecoveryManagerTest, IndexSmoOnlyWalRestoresTheAfterImage) {
+    ScopedTestDir test_dir("recovery_index_smo_only_root");
+    const std::string db_name = "recovery_index_smo_only_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 17};
+    PrepareSinglePageIndexSmo(db_name, 17, rid, false);
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 17, rid));
+}
+
+TEST(RecoveryManagerTest, MultipleIndexSmoRecordsPrepareEachIndexOnlyOnce) {
+    ScopedTestDir test_dir("recovery_index_smo_prepare_once_root");
+    const std::string db_name = "recovery_index_smo_prepare_once_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 19};
+    PrepareSinglePageIndexSmo(db_name, 19, rid, false, false, 3);
+
+    {
+        OpenRecoveryDb db(db_name);
+        EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 21, rid));
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        recovery.redo();
+        EXPECT_EQ(recovery.get_index_smo_prepare_count(), 1u);
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 19, rid));
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 21, rid));
+    }
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 19, rid));
+}
+
+TEST(RecoveryManagerTest, NewBindingSkipsOldSameNameIndexSmo) {
+    ScopedTestDir test_dir("recovery_index_smo_generation_root");
+    const std::string db_name = "recovery_index_smo_generation_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 23};
+    PrepareSinglePageIndexSmo(db_name, 23, rid, true);
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 23, rid));
+}
+
+TEST(RecoveryManagerTest, LoserIndexSmoIsRedoneBeforeTheLoserKeyIsUndone) {
+    ScopedTestDir test_dir("recovery_loser_index_smo_root");
+    const std::string db_name = "recovery_loser_index_smo_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    rid = PrepareSinglePageIndexSmo(db_name, 31, rid, false, true);
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 31, rid));
+}
 
 TEST(RecoveryApplyTest, InsertUpdateDeleteKeepIndexConsistent) {
     ScopedTestDir test_dir("recovery_apply_test_root");
@@ -548,6 +706,85 @@ TEST(RecoveryManagerTest, CommittedUpdateSurvivesRecovery) {
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
 }
 
+TEST(RecoveryManagerTest, CommittedRedoIgnoresHigherPageLsnFromLoser) {
+    ScopedTestDir test_dir("recovery_higher_loser_page_lsn_root");
+    const std::string db_name = "recovery_higher_loser_page_lsn_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto base_rec = MakeTuple(1, 10);
+    auto committed_rec = MakeTuple(2, 20);
+    auto loser_rec = MakeTuple(3, 30);
+    lsn_t committed_update_lsn = INVALID_LSN;
+    lsn_t loser_update_lsn = INVALID_LSN;
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, base_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto committed_lsn = AppendBegin(*db.log_mgr_, 100);
+        committed_update_lsn = AppendUpdate(*db.log_mgr_, 100, committed_lsn, rid, base_rec, committed_rec);
+        AppendCommit(*db.log_mgr_, 100, committed_update_lsn);
+
+        auto loser_lsn = AppendBegin(*db.log_mgr_, 200);
+        loser_update_lsn = AppendUpdate(*db.log_mgr_, 200, loser_lsn, rid, committed_rec, loser_rec);
+        FlushLogs(*db.log_mgr_);
+        ASSERT_GT(loser_update_lsn, committed_update_lsn);
+
+        // Model a page flushed after the later loser write. Its page LSN is
+        // ahead of the committed update, but recovery must still install the
+        // committed image before the ownership-guarded loser undo runs.
+        TupleMeta loser_meta;
+        loser_meta.writer_txn_id_ = 200;
+        loser_meta.is_committed_ = false;
+        loser_meta.is_deleted_ = false;
+        auto* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        file_handle->apply_tuple_update(rid, loser_rec.data, loser_meta, loser_update_lsn);
+        ASSERT_TRUE(db.sm_mgr_.flush_all_table_and_index_pages());
+        EXPECT_EQ(file_handle->get_page_lsn(rid), loser_update_lsn);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 20);
+    EXPECT_GE(db.sm_mgr_.fhs_.at("t")->get_page_lsn(rid), loser_update_lsn);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 3, rid));
+}
+
+TEST(RecoveryManagerTest, CommittedSparseUpdateRedoesFullRowAndRepairsBothIndexKeys) {
+    ScopedTestDir test_dir("recovery_committed_sparse_update_root");
+    const std::string db_name = "recovery_committed_sparse_update_db";
+    CreateWideRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeWideTuple(1, 'a');
+    auto new_rec = MakeWideTuple(2, 'a');
+    Rid log_rid = rid;
+    UpdateLogRecord shape(100, old_rec, new_rec, log_rid, "t");
+    ASSERT_TRUE(shape.sparse_encoding_);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
+        AppendCommit(*db.log_mgr_, 100, update_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordId(db.sm_mgr_, rid), 2);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
 TEST(RecoveryManagerTest, RedoUpdateMissingRidInstallsCommittedTupleMeta) {
     ScopedTestDir test_dir("recovery_redo_update_missing_rid_root");
     const std::string db_name = "recovery_redo_update_missing_rid_db";
@@ -609,6 +846,42 @@ TEST(RecoveryManagerTest, UncommittedUpdateIsUndone) {
     OpenRecoveryDb db(db_name);
     ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
     EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 10);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+TEST(RecoveryManagerTest, UncommittedSparseUpdateUndoesFullRowAndRepairsBothIndexKeys) {
+    ScopedTestDir test_dir("recovery_uncommitted_sparse_update_root");
+    const std::string db_name = "recovery_uncommitted_sparse_update_db";
+    CreateWideRecoveryTestDb(db_name);
+    Rid rid{1, 0};
+    auto old_rec = MakeWideTuple(1, 'a');
+    auto new_rec = MakeWideTuple(2, 'a');
+    Rid log_rid = rid;
+    UpdateLogRecord shape(100, old_rec, new_rec, log_rid, "t");
+    ASSERT_TRUE(shape.sparse_encoding_);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec);
+        FlushLogs(*db.log_mgr_);
+        db.sm_mgr_.update_record_with_indexes("t", rid, old_rec, new_rec);
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->set_tuple_meta(rid, meta);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+    EXPECT_EQ(RecordId(db.sm_mgr_, rid), 1);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
 }
@@ -814,8 +1087,8 @@ TEST(RecoveryManagerTest, LoserUpdateWithFlushedIndexWriteRestoresTheOldKey) {
 
         // Only the index moved to the new key; the heap still holds the old row.
         auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
-        index->delete_entry(MakeIntKey(1).data(), rid, nullptr);
-        index->insert_entry(MakeIntKey(2).data(), rid, nullptr, true);
+        index->delete_entry(MakeIntKey(1).data(), rid, IndexWriteWalContext::TestNoWal());
+        index->insert_entry(MakeIntKey(2).data(), rid, IndexWriteWalContext::TestNoWal(), true);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
@@ -846,7 +1119,7 @@ TEST(RecoveryManagerTest, CommittedUpdateRemovesStaleKeyAndKeepsTheAlreadyWritte
         // The new index entry reached disk but the old one was not removed, and
         // the heap page never made it out.
         auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
-        index->insert_entry(MakeIntKey(2).data(), rid, nullptr, true);
+        index->insert_entry(MakeIntKey(2).data(), rid, IndexWriteWalContext::TestNoWal(), true);
         db.sm_mgr_.flush_all_table_and_index_pages();
 
         auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
@@ -918,7 +1191,7 @@ TEST(RecoveryManagerTest, DuplicateIndexEntriesForOneRidAreAllRemoved) {
         OpenRecoveryDb db(db_name);
         db.sm_mgr_.insert_record_with_indexes("t", rid, rec);
         auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
-        index->insert_entry(MakeIntKey(1).data(), rid, nullptr, true);
+        index->insert_entry(MakeIntKey(1).data(), rid, IndexWriteWalContext::TestNoWal(), true);
         std::vector<Rid> duplicated;
         ASSERT_TRUE(index->get_value(MakeIntKey(1).data(), &duplicated, nullptr));
         ASSERT_EQ(duplicated.size(), 2u);
@@ -976,8 +1249,8 @@ TEST(RecoveryManagerTest, AbortedThenLoserUpdateOnOneSlotRollsBackToTheBaseRow) 
         meta.is_deleted_ = false;
         db.sm_mgr_.fhs_.at("t")->apply_tuple_update(rid, loser_rec.data, meta, INVALID_LSN);
         auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
-        index->delete_entry(MakeIntKey(1).data(), rid, nullptr);
-        index->insert_entry(MakeIntKey(3).data(), rid, nullptr, true);
+        index->delete_entry(MakeIntKey(1).data(), rid, IndexWriteWalContext::TestNoWal());
+        index->insert_entry(MakeIntKey(3).data(), rid, IndexWriteWalContext::TestNoWal(), true);
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
@@ -1026,15 +1299,6 @@ TEST(RecoveryManagerTest, CleanCheckpointTruncatesWalAndKeepsCommittedRows) {
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }
 
-// redo() must resolve every record's table from that record's own table name.
-// A previous version looked the table up by the record's *position* in the redo
-// pass, keeping the RID from the record but the table identity from analyze's
-// parallel array. That is only correct while redo's record filter stays
-// byte-for-byte identical to analyze's, and nothing enforces it: any divergence
-// writes a valid RID into the wrong table's file, with no exception and nothing
-// in the log. The divergence is injected here by retyping one DML record as a
-// CHECKPOINT record after analyze() has already counted it, so redo sees one DML
-// record fewer and positional lookup shifts by one.
 TEST(RecoveryManagerTest, RedoRoutesEachRecordToTheTableItNames) {
     ScopedTestDir test_dir("recovery_redo_table_identity_root");
     const std::string db_name = "recovery_redo_table_identity_db";
@@ -1056,20 +1320,146 @@ TEST(RecoveryManagerTest, RedoRoutesEachRecordToTheTableItNames) {
         OpenRecoveryDb db(db_name);
         RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
         recovery.analyze();
-
-        const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
-        ASSERT_EQ(dml_offsets.size(), 2u);
-        const LogType retyped = LogType::CHECKPOINT;
-        PatchWalBytes(LOG_FILE_NAME, dml_offsets[0] + OFFSET_LOG_TYPE, &retyped, sizeof(LogType));
-
         recovery.redo();
 
-        // The one surviving DML record names "u", so it must land in u and
-        // nowhere else.
-        EXPECT_TRUE(RecordExists(db.sm_mgr_, rid, "u"));
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid, "t"));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid, "t"), 10);
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid, "u"));
         EXPECT_EQ(RecordValue(db.sm_mgr_, rid, "u"), 20);
-        EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "t"));
     }
+}
+
+// The WAL file is immutable between analyze and redo in production. If it does
+// change, the descriptor must fail closed instead of shifting positional table
+// metadata onto a different DML record.
+TEST(RecoveryManagerTest, WalMutationAfterAnalyzeFailsClosed) {
+    ScopedTestDir test_dir("recovery_redo_wal_mutation_root");
+    const std::string db_name = "recovery_redo_wal_mutation_db";
+    CreateRecoveryTestDb(db_name, {"t", "u"});
+    const Rid rid{1, 0};
+    auto t_rec = MakeTuple(1, 10);
+    auto u_rec = MakeTuple(2, 20);
+
+    OpenRecoveryDb db(db_name);
+    auto lsn = AppendBegin(*db.log_mgr_, 100);
+    lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, t_rec, "t");
+    lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, u_rec, "u");
+    AppendCommit(*db.log_mgr_, 100, lsn);
+    FlushLogs(*db.log_mgr_);
+
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+    ASSERT_EQ(dml_offsets.size(), 2u);
+    const LogType retyped = LogType::CHECKPOINT;
+    PatchWalBytes(LOG_FILE_NAME, dml_offsets[0] + OFFSET_LOG_TYPE, &retyped, sizeof(LogType));
+
+    EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "t"));
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "u"));
+}
+
+// The WAL intentionally alternates page 2 and page 1. Grouped redo must process
+// page 1 first, but must retain INSERT-before-UPDATE order within each page.
+TEST(RecoveryManagerTest, HeapRedoGroupsPagesAndPreservesWalOrderWithinEachPage) {
+    ScopedTestDir test_dir("recovery_grouped_heap_redo_root");
+    const std::string db_name = "recovery_grouped_heap_redo_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid page_one{1, 0};
+    const Rid page_two{2, 0};
+    auto page_one_before = MakeTuple(1, 10);
+    auto page_one_after = MakeTuple(1, 11);
+    auto page_two_before = MakeTuple(2, 20);
+    auto page_two_after = MakeTuple(2, 21);
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        for (int page_no = 1; page_no <= 2; ++page_no) {
+            auto page = file_handle->create_new_page_handle();
+            ASSERT_EQ(page.page->get_page_id().page_no, page_no);
+            ASSERT_TRUE(db.bpm_.unpin_page(page.page->get_page_id(), true));
+        }
+        ASSERT_TRUE(db.bpm_.flush_all_pages(file_handle->GetFd()));
+
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, page_two, page_two_before);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, page_one, page_one_before);
+        lsn = AppendUpdate(*db.log_mgr_, 100, lsn, page_two, page_two_before, page_two_after);
+        lsn = AppendUpdate(*db.log_mgr_, 100, lsn, page_one, page_one_before, page_one_after);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, page_one));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, page_one), 11);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, page_two));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, page_two), 21);
+}
+
+TEST(RecoveryManagerTest, ReversePageWalOrderExtendsExactRidsAndKeepsFreeListIdempotent) {
+    ScopedTestDir test_dir("recovery_reverse_page_exact_rid_root");
+    const std::string db_name = "recovery_reverse_page_exact_rid_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid page_one{1, 1};
+    const Rid page_two{2, 3};
+    auto page_one_rec = MakeTuple(1, 10);
+    auto page_two_rec = MakeTuple(2, 20);
+
+    {
+        OpenRecoveryDb db(db_name);
+        ASSERT_EQ(db.sm_mgr_.fhs_.at("t")->get_file_hdr().num_pages, 1);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, page_two, page_two_rec);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, page_one, page_one_rec);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    const auto verify_recovered_state = [&] {
+        OpenRecoveryDb db(db_name);
+        auto* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        const RmFileHdr file_hdr = file_handle->get_file_hdr();
+        ASSERT_EQ(file_hdr.num_pages, 3);
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, page_one));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, page_one), 10);
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, page_two));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, page_two), 20);
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, page_one));
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, page_two));
+
+        std::set<page_id_t> free_pages;
+        page_id_t page_no = file_hdr.first_free_page_no;
+        int steps = 0;
+        while (page_no != RM_NO_PAGE && steps < file_hdr.num_pages) {
+            ASSERT_GE(page_no, RM_FIRST_RECORD_PAGE);
+            ASSERT_LT(page_no, file_hdr.num_pages);
+            ASSERT_TRUE(free_pages.insert(page_no).second) << "free-list contains a cycle";
+
+            RmPageHandle page_handle = file_handle->fetch_page_handle(page_no);
+            page_id_t next_free_page_no = RM_NO_PAGE;
+            {
+                std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+                EXPECT_EQ(page_handle.page_hdr->num_records, 1);
+                EXPECT_LT(page_handle.page_hdr->num_records, file_hdr.num_records_per_page);
+                next_free_page_no = page_handle.page_hdr->next_free_page_no;
+            }
+            ASSERT_TRUE(db.bpm_.unpin_page(page_handle.page->get_page_id(), false));
+            page_no = next_free_page_no;
+            ++steps;
+        }
+        EXPECT_EQ(page_no, RM_NO_PAGE) << "free-list did not terminate";
+        EXPECT_EQ(free_pages, (std::set<page_id_t>{1, 2}));
+        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+    };
+
+    RunRecovery(db_name);
+    verify_recovered_state();
+    RunRecovery(db_name);
+    verify_recovered_state();
 }
 
 // A DML payload that does not parse cannot be a torn tail: the record header
@@ -1170,7 +1560,7 @@ TEST(RecoveryManagerTest, DuplicateEntryForAStillLiveKeyIsDrainedToOne) {
         OpenRecoveryDb db(db_name);
         db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
         auto* index = db.sm_mgr_.ihs_.at(db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"})).get();
-        index->insert_entry(MakeIntKey(1).data(), rid, nullptr, true);
+        index->insert_entry(MakeIntKey(1).data(), rid, IndexWriteWalContext::TestNoWal(), true);
         ASSERT_EQ(IndexEntriesFor(db.sm_mgr_, 1).size(), 2u);
         db.sm_mgr_.flush_all_table_and_index_pages();
 

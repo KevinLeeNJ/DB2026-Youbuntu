@@ -15,10 +15,7 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
-// A record larger than the append buffer cannot have been written:
-// add_log_to_buffer rejects it. Treating a larger length as end-of-log keeps a
-// corrupt tail from steering the reader into an arbitrary offset.
-constexpr uint32_t kMaxRecordBytes = static_cast<uint32_t>(LOG_BUFFER_SIZE);
+constexpr uint32_t kMaxRecordBytes = MAX_INDEX_SMO_RECORD_BYTES;
 
 bool IsKnownLogType(LogType type) {
     switch (type) {
@@ -29,6 +26,8 @@ bool IsKnownLogType(LogType type) {
     case LogType::COMMIT:
     case LogType::ABORT:
     case LogType::CHECKPOINT:
+    case LogType::INDEX_BIND:
+    case LogType::INDEX_SMO:
         return true;
     default:
         return false;
@@ -69,12 +68,64 @@ bool ReadRidAndTable(const char* bytes, uint32_t total_len, int* offset, WalDmlV
         return false;
     }
     out->table_name = std::string_view(bytes + *offset, name_size);
+    *offset += static_cast<int>(name_size);
+    return static_cast<uint32_t>(*offset) == total_len;
+}
+
+bool ReadSparseUpdate(const char* bytes, uint32_t total_len, int* offset, WalDmlView* out, bool materialize_before) {
+    if (!LogPayloadReadable(total_len, *offset, sizeof(int)) ||
+        read_unaligned<int>(bytes + *offset) != UpdateLogRecord::kSparseBeforeVersion) {
+        return false;
+    }
+    *offset += sizeof(int);
+    if (!ReadImage(bytes, total_len, offset, &out->after_image, &out->after_size) ||
+        !LogPayloadReadable(total_len, *offset, sizeof(uint32_t))) {
+        return false;
+    }
+    const uint32_t span_count = read_unaligned<uint32_t>(bytes + *offset);
+    *offset += sizeof(uint32_t);
+    // Every span consumes two uint32 fields and at least one byte. Bound the
+    // loop before materializing so a corrupt count cannot amplify recovery CPU.
+    const uint32_t remaining = total_len - static_cast<uint32_t>(*offset);
+    if (span_count > static_cast<uint32_t>(out->after_size) || span_count > remaining / (sizeof(uint32_t) * 2 + 1)) {
+        return false;
+    }
+
+    if (materialize_before) {
+        out->materialized_before.assign(out->after_image, out->after_image + out->after_size);
+    }
+    uint32_t previous_offset = 0;
+    uint32_t previous_end = 0;
+    const uint32_t row_size = static_cast<uint32_t>(out->after_size);
+    for (uint32_t i = 0; i < span_count; ++i) {
+        if (!LogPayloadReadable(total_len, *offset, sizeof(uint32_t) * 2)) {
+            return false;
+        }
+        const uint32_t span_offset = read_unaligned<uint32_t>(bytes + *offset);
+        *offset += sizeof(uint32_t);
+        const uint32_t span_length = read_unaligned<uint32_t>(bytes + *offset);
+        *offset += sizeof(uint32_t);
+        if (span_length == 0 || span_offset > row_size || span_length > row_size - span_offset ||
+            (i > 0 && (span_offset <= previous_offset || span_offset < previous_end)) ||
+            !LogPayloadReadable(total_len, *offset, span_length)) {
+            return false;
+        }
+        if (materialize_before) {
+            memcpy(out->materialized_before.data() + span_offset, bytes + *offset, span_length);
+        }
+        *offset += static_cast<int>(span_length);
+        previous_offset = span_offset;
+        previous_end = span_offset + span_length;
+    }
+    if (materialize_before) {
+        out->before_size = out->after_size;
+        out->before_image = out->materialized_before.data();
+        out->before_is_materialized = true;
+    }
     return true;
 }
 
-} // namespace
-
-bool ParseWalDml(const WalRecordView& record, WalDmlView* out) {
+bool ParseWalDmlImpl(const WalRecordView& record, WalDmlView* out, bool materialize_sparse_before) {
     if (record.bytes == nullptr) {
         return false;
     }
@@ -92,9 +143,18 @@ bool ParseWalDml(const WalRecordView& record, WalDmlView* out) {
         }
         break;
     case LogType::UPDATE:
-        if (!ReadImage(record.bytes, record.total_len, &offset, &parsed.before_image, &parsed.before_size) ||
-            !ReadImage(record.bytes, record.total_len, &offset, &parsed.after_image, &parsed.after_size)) {
+        if (!LogPayloadReadable(record.total_len, offset, sizeof(int))) {
             return false;
+        }
+        if (read_unaligned<int>(record.bytes + offset) < 0) {
+            if (!ReadSparseUpdate(record.bytes, record.total_len, &offset, &parsed, materialize_sparse_before)) {
+                return false;
+            }
+        } else {
+            if (!ReadImage(record.bytes, record.total_len, &offset, &parsed.before_image, &parsed.before_size) ||
+                !ReadImage(record.bytes, record.total_len, &offset, &parsed.after_image, &parsed.after_size)) {
+                return false;
+            }
         }
         break;
     default:
@@ -103,8 +163,21 @@ bool ParseWalDml(const WalRecordView& record, WalDmlView* out) {
     if (!ReadRidAndTable(record.bytes, record.total_len, &offset, &parsed)) {
         return false;
     }
-    *out = parsed;
+    *out = std::move(parsed);
+    if (out->before_is_materialized) {
+        out->before_image = out->materialized_before.data();
+    }
     return true;
+}
+
+} // namespace
+
+bool ParseWalDml(const WalRecordView& record, WalDmlView* out) {
+    return ParseWalDmlImpl(record, out, true);
+}
+
+bool ParseWalDmlForRedo(const WalRecordView& record, WalDmlView* out) {
+    return ParseWalDmlImpl(record, out, false);
 }
 
 WalReader::WalReader(DiskManager* disk_manager, int64_t begin_offset, int64_t end_offset, int buffer_bytes)

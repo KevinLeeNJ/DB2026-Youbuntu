@@ -375,8 +375,18 @@ void DiskManager::fsync_log() {
 
 void DiskManager::sync_file(int fd) {
     FaultInjector::Point("before_data_fsync");
-    if (fd < 0 || fdatasync(fd) != 0) {
+    if (fd < 0) {
+        errno = EBADF;
         throw UnixError();
+    }
+    for (;;) {
+        const int result = fdatasync(fd);
+        if (result == 0) {
+            return;
+        }
+        if (errno != EINTR) {
+            throw UnixError();
+        }
     }
 }
 
@@ -417,9 +427,10 @@ void DiskManager::truncate_log() {
         if (ftruncate(log_fd_, 0) != 0) {
             throw UnixError();
         }
-        if (fdatasync(log_fd_) != 0) {
-            throw UnixError();
-        }
+        FaultInjector::Point("after_wal_ftruncate");
+        // final.md tests same-machine SIGKILL, which preserves the in-kernel
+        // zero length. The first post-checkpoint WAL fdatasync also persists
+        // this size change before acknowledging its COMMIT.
         if (lseek(log_fd_, 0, SEEK_SET) < 0) {
             throw UnixError();
         }

@@ -48,13 +48,10 @@ struct AbortObservabilitySnapshot {
 
 struct CheckpointObservabilitySnapshot {
     uint64_t attempt{0};
-    uint64_t preflush{0};
     uint64_t success{0};
     uint64_t drain_timeout{0};
     uint64_t deadline{0};
     uint64_t final_data_fail{0};
-    uint64_t initial_ns{0};
-    uint64_t preblock_ns{0};
     uint64_t block_ns{0};
     uint64_t drain_ns{0};
     uint64_t final_wal_ns{0};
@@ -91,23 +88,54 @@ struct VersionUndoLink {
 class TransactionManager {
 public:
     using CommitPublicationTestHook = std::function<void(std::string_view, timestamp_t, lsn_t)>;
+    using CheckpointAdmissionTestHook = std::function<void(std::string_view)>;
+
+    // Test-only injection for deterministic publication scheduling and the
+    // direct-publication negative oracle. Production construction does not
+    // accept a helping toggle and always enables helping.
+    struct CommitPublicationTestOptions {
+        bool helping{true};
+        CommitPublicationTestHook hook;
+    };
+
+    struct CheckpointAdmissionTestOptions {
+        CheckpointAdmissionTestHook hook;
+    };
 
     explicit TransactionManager(LockManager* lock_manager, SmManager* sm_manager,
-                                ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING,
-                                std::optional<bool> commit_publication_helping = std::nullopt,
-                                CommitPublicationTestHook commit_publication_test_hook = {}) {
+                                ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING)
+        : TransactionManager(lock_manager, sm_manager, concurrency_mode, CommitPublicationTestOptions{}) {}
+
+    // Test-only overload. Callers must opt in with the explicitly named
+    // options type; normal server/runtime construction cannot disable helping.
+    TransactionManager(LockManager* lock_manager, SmManager* sm_manager, ConcurrencyMode concurrency_mode,
+                       CommitPublicationTestOptions test_options) {
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
         commit_timing_enabled_ = commit_timing_diagnostics::enabled();
-        commit_publication_helping_enabled_ = commit_publication_helping.has_value()
-                                                  ? *commit_publication_helping
-                                                  : CommitPublicationHelpingEnabledFromEnvironment();
-        commit_publication_test_hook_ = std::move(commit_publication_test_hook);
+        commit_publication_helping_enabled_ = test_options.helping;
+        commit_publication_test_hook_ = std::move(test_options.hook);
+        gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
+    }
+
+    // Test-only overload for deterministic checkpoint admission scheduling.
+    // Production construction always leaves this hook empty.
+    TransactionManager(LockManager* lock_manager, SmManager* sm_manager, ConcurrencyMode concurrency_mode,
+                       CheckpointAdmissionTestOptions test_options) {
+        sm_manager_ = sm_manager;
+        lock_manager_ = lock_manager;
+        concurrency_mode_ = concurrency_mode;
+        commit_timing_enabled_ = commit_timing_diagnostics::enabled();
+        checkpoint_admission_test_hook_ = std::move(test_options.hook);
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
 
     ~TransactionManager();
+
+    bool commit_publication_helping_enabled_for_test() const noexcept {
+        return commit_publication_helping_enabled_;
+    }
 
     Transaction* begin(Transaction* txn, LogManager* log_manager,
                        IsolationLevel isolation_level = DEFAULT_ISOLATION_LEVEL);
@@ -122,13 +150,10 @@ public:
     AbortObservabilitySnapshot abort_observability() const;
     CheckpointObservabilitySnapshot checkpoint_observability() const;
     void observe_checkpoint_attempt();
-    void observe_checkpoint_preflush();
     void observe_checkpoint_success();
     void observe_checkpoint_drain_timeout();
     void observe_checkpoint_deadline();
     void observe_checkpoint_final_data_fail();
-    void observe_checkpoint_initial_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_preblock_ns(uint64_t elapsed_ns);
     void observe_checkpoint_block_ns(uint64_t elapsed_ns);
     void observe_checkpoint_drain_ns(uint64_t elapsed_ns);
     void observe_checkpoint_final_wal_ns(uint64_t elapsed_ns);
@@ -356,7 +381,7 @@ private:
     };
 
     template <bool TimingEnabled> void commit_impl(Transaction* txn, LogManager* log_manager);
-    static bool CommitPublicationHelpingEnabledFromEnvironment();
+    void InvokeCheckpointAdmissionTestHook(std::string_view event);
     void PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request, LogManager* log_manager);
     void RunCommitPublicationLeader(timestamp_t target_csn, LogManager* log_manager);
     lsn_t CompletedCommitLsn(const LogManager* log_manager) const;
@@ -410,6 +435,7 @@ private:
     bool checkpoint_blocking_new_txns_{false};
     int active_txn_count_{0};
     std::unordered_set<txn_id_t> active_txn_ids_;
+    CheckpointAdmissionTestHook checkpoint_admission_test_hook_;
 
     std::atomic<uint64_t> abort_lock_on_shrinking_{0};
     std::atomic<uint64_t> abort_upgrade_conflict_{0};
@@ -418,13 +444,10 @@ private:
     std::atomic<uint64_t> abort_ssi_danger_{0};
     std::atomic<uint64_t> abort_unique_key_conflict_{0};
     std::atomic<uint64_t> checkpoint_attempt_{0};
-    std::atomic<uint64_t> checkpoint_preflush_{0};
     std::atomic<uint64_t> checkpoint_success_{0};
     std::atomic<uint64_t> checkpoint_drain_timeout_{0};
     std::atomic<uint64_t> checkpoint_deadline_{0};
     std::atomic<uint64_t> checkpoint_final_data_fail_{0};
-    std::atomic<uint64_t> checkpoint_initial_ns_{0};
-    std::atomic<uint64_t> checkpoint_preblock_ns_{0};
     std::atomic<uint64_t> checkpoint_block_ns_{0};
     std::atomic<uint64_t> checkpoint_drain_ns_{0};
     std::atomic<uint64_t> checkpoint_final_wal_ns_{0};

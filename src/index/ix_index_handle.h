@@ -17,7 +17,9 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -39,8 +41,6 @@ struct UniqueLookupResult {
     // lookup_equal() to obtain all matching RIDs; NotFound is definitive.
     Rid rid;
 };
-
-static const bool binary_search = false;
 
 inline int ix_compare(const char* a, const char* b, ColType type, int col_len) {
     switch (type) {
@@ -288,12 +288,13 @@ public:
                                                   bool find_first = false);
 
     // for insert
-    page_id_t insert_entry(const char* key, const Rid& value, Transaction* transaction, bool allow_duplicate = false);
+    page_id_t insert_entry(const char* key, const Rid& value, const IndexWriteWalContext& wal_context,
+                           bool allow_duplicate = false);
 
     // Variants for callers that already hold the index exclusive latch.  Keeping
     // the mutation and its visibility bookkeeping under one latch closes the
     // historical-key reader/writer window.
-    page_id_t insert_entry_unlocked(const char* key, const Rid& value, Transaction* transaction,
+    page_id_t insert_entry_unlocked(const char* key, const Rid& value, const IndexWriteWalContext& wal_context,
                                     bool allow_duplicate = false);
 
     // Bulk-load batch insert: pins leaf across rows to skip root→leaf walk.
@@ -301,14 +302,15 @@ public:
         IxIndexHandle* ih;
         UniqueIndexLatch latch;
         IxNodeHandle leaf;
+        IndexWriteWalContext wal_context;
         bool active = false;
 
-        explicit PinnedInserter(IxIndexHandle* h);
+        PinnedInserter(IxIndexHandle* h, const IndexWriteWalContext& wal_context);
         ~PinnedInserter();
         PinnedInserter(const PinnedInserter&) = delete;
         PinnedInserter& operator=(const PinnedInserter&) = delete;
 
-        void insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate = false);
+        void insert(const char* key, const Rid& value, bool allow_duplicate = false);
     };
 
     // A structure-modification operation (SMO) - a split, a new root, or a
@@ -321,25 +323,74 @@ public:
     // Page::OFFSET_LSN), so WAL redo cannot repair them either.
     //
     // SmoScope closes that gap: while it is alive it records every page this
-    // operation touched, and on destruction - still under the caller's
-    // structure-exclusive latch - it writes the dirty ones plus the index header
-    // page out together. See publish_smo_pages() for what that does and does not
-    // guarantee.
+    // operation touched. Logged runtime changes append a complete redo image and
+    // attach its LSN as the write dependency of every page and the header.
+    // Unlogged origins publish all pages plus the header immediately.
     class SmoScope {
     public:
-        explicit SmoScope(const IxIndexHandle* index_handle) : index_handle_(index_handle) {
+        SmoScope(const IxIndexHandle* index_handle, const IndexWriteWalContext& wal_context)
+            : index_handle_(index_handle) {
             // SMOs never nest: the three entry points that open a scope
             // (insert_entry_unlocked, PinnedInserter::insert,
             // delete_entry_unlocked) never call each other.
             assert(!index_handle_->smo_active_);
             index_handle_->smo_pages_.clear();
             index_handle_->smo_structural_ = false;
+            index_handle_->smo_wal_context_ = wal_context;
             index_handle_->smo_active_ = true;
+            const auto origin = wal_context.origin();
+            wal_barrier_active_ = origin == IndexWriteWalContext::Origin::LoggedRuntime ||
+                                  origin == IndexWriteWalContext::Origin::LiveRollback;
+            if (wal_barrier_active_) {
+                index_handle_->buffer_pool_manager_->begin_index_smo(index_handle_->fd_);
+            }
         }
 
-        ~SmoScope() {
+        ~SmoScope() noexcept {
             index_handle_->smo_active_ = false;
-            index_handle_->publish_smo_pages();
+            if (wal_barrier_active_ && index_handle_->smo_structural_) {
+                std::fprintf(stderr,
+                             "FATAL: logged index structure modification unwound before durable INDEX_SMO publish\n");
+                std::fflush(stderr);
+                std::_Exit(134);
+            }
+            if (wal_barrier_active_ && !fail_closed_) {
+                index_handle_->buffer_pool_manager_->end_index_smo(index_handle_->fd_);
+            }
+            index_handle_->smo_pages_.clear();
+            index_handle_->smo_structural_ = false;
+            index_handle_->smo_wal_context_.reset();
+        }
+
+        void commit() {
+            frame_operation_.reset();
+            try {
+                bool barrier_released = false;
+                index_handle_->publish_smo_pages_impl(wal_barrier_active_ ? &barrier_released : nullptr);
+                if (barrier_released) {
+                    wal_barrier_active_ = false;
+                }
+                if (wal_barrier_active_) {
+                    index_handle_->buffer_pool_manager_->end_index_smo(index_handle_->fd_);
+                    wal_barrier_active_ = false;
+                }
+            } catch (...) {
+                // A dirty SMO page without durable redo must never become
+                // writeable. Keep the per-file barrier installed and force
+                // the caller to fail the operation/process.
+                fail_closed_ = wal_barrier_active_;
+                throw;
+            }
+        }
+
+        void begin_frame_operation() {
+            assert(!frame_operation_.has_value());
+            frame_operation_.emplace(index_handle_->buffer_pool_manager_->acquire_frame_operation(2));
+        }
+
+        const BufferPoolManager::FrameOperationToken& frame_operation() const {
+            assert(frame_operation_.has_value());
+            return *frame_operation_;
         }
 
         SmoScope(const SmoScope&) = delete;
@@ -347,44 +398,38 @@ public:
 
     private:
         const IxIndexHandle* index_handle_;
+        bool wal_barrier_active_{false};
+        bool fail_closed_{false};
+        std::optional<BufferPoolManager::FrameOperationToken> frame_operation_;
     };
 
-    // Observability for the SMO write-out. "SMOs" counts published operations,
-    // "pages" the page images those operations wrote, so pages/SMO is directly
+    // Observability for SMO protection. "SMOs" counts operations made safe
+    // either by WAL dependencies or immediate write-out, and "page images"
+    // counts the complete images protected by those operations. Their ratio is
     // comparable against the "leaf + sibling + next leaf + one parent per level"
     // expectation - a collection hole would show up as a suspiciously low ratio.
     static uint64_t smo_publish_count();
-    static uint64_t smo_pages_written();
-
-    // Switchable so the cost of the SMO write-out can be measured against the
-    // same binary (ENABLE_INDEX_SMO_FLUSH=0), and so one test process can show
-    // both sides of the switch - a crash test that passes is only evidence if
-    // the same construction demonstrably fails without the mechanism.
-    static bool smo_flush_enabled() {
-        return smo_flush_enabled_.load(std::memory_order_relaxed);
-    }
-    static void set_smo_flush_enabled(bool enabled) {
-        smo_flush_enabled_.store(enabled, std::memory_order_relaxed);
-    }
+    static uint64_t smo_page_image_count();
 
     IxNodeHandle* split(IxNodeHandle* node, bool right_edge_append = false);
 
-    void insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node, Transaction* transaction);
+    void insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node,
+                            const IndexWriteWalContext& wal_context);
 
     // for delete
-    bool delete_entry(const char* key, Transaction* transaction);
-    bool delete_entry(const char* key, const Rid& value, Transaction* transaction);
-    bool delete_entry_unlocked(const char* key, Transaction* transaction);
-    bool delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction);
+    bool delete_entry(const char* key, const IndexWriteWalContext& wal_context);
+    bool delete_entry(const char* key, const Rid& value, const IndexWriteWalContext& wal_context);
+    bool delete_entry_unlocked(const char* key, const IndexWriteWalContext& wal_context);
+    bool delete_entry_unlocked(const char* key, const Rid& value, const IndexWriteWalContext& wal_context);
 
-    bool coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction = nullptr,
+    bool coalesce_or_redistribute(IxNodeHandle* node, const IndexWriteWalContext& wal_context,
                                   bool* root_is_latched = nullptr);
     bool adjust_root(IxNodeHandle* old_root_node);
 
     void redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node, IxNodeHandle* parent, int index);
 
     bool coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, IxNodeHandle** parent, int index,
-                  Transaction* transaction, bool* root_is_latched);
+                  const IndexWriteWalContext& wal_context, bool* root_is_latched);
 
     Iid lower_bound(const char* key) const;
 
@@ -401,12 +446,11 @@ public:
     // than one RID. The rid is valid only for the Unique result.
     UniqueLookupResult lookup_unique(const char* key) const;
 
-    // first_leaf_/last_leaf_ reach disk only when a checkpoint publishes the
-    // header. After a crash they can therefore name leaves that have since been
-    // split or merged away, which makes the leaf chain look broken and makes
-    // delete_entry stop scanning early. Recompute both by descending the left and
-    // right edges of the tree: one page read per level. Returns false when even
-    // that spine is unusable, which means the index has to be rebuilt.
+    // A stale or torn header can name leaves that have since been split or
+    // merged away, which makes the leaf chain look broken and makes
+    // delete_entry stop scanning early. Recompute both by descending the left
+    // and right edges of the tree: one page read per level. Returns false when
+    // even that spine is unusable, which means the index has to be rebuilt.
     bool refresh_leaf_chain_endpoint();
 
     // Validate persisted parent/child relationships, key ordering, and the
@@ -428,16 +472,55 @@ public:
 
     // Rebuild the root cache and upper-level residency after recovery has
     // repaired or rebuilt the on-disk index structure.
-    // Refresh the root cache and, by default, the optional internal-page
-    // residency cache. Database startup can request root-only refresh to
-    // avoid walking every leaf of a large index.
+    // Refresh the root cache and, by default, the internal-page residency
+    // cache. Database startup can request root-only refresh to avoid walking
+    // every leaf of a large index.
     void refresh_page_residency(bool include_internal = true);
+    void prepare_for_smo_redo();
+    void install_recovered_smo_header(const char* header_image);
 
     Iid leaf_end() const;
 
     Iid leaf_begin() const;
 
 private:
+    enum class InsertSplitFault : uint8_t {
+        None,
+        SiblingAllocation,
+        NewRootAllocation,
+        NextLeafFetch,
+        MovedChildFetch,
+    };
+
+    enum class InsertSplitStage : uint8_t {
+        CommitBegin,
+        CommitReacquire,
+        CommitBeforeImageApply,
+        CommitImageApplied,
+        RollbackReacquire,
+        RollbackBeforeImageRestore,
+        RollbackImageRestored,
+        RootCacheRefresh,
+    };
+    using InsertSplitTestHook = std::function<void(InsertSplitStage, PageId, Page*)>;
+
+    static std::atomic<InsertSplitFault> insert_split_fault_;
+    static std::mutex insert_split_test_hook_latch_;
+    static InsertSplitTestHook insert_split_test_hook_;
+
+    static void set_insert_split_fault(InsertSplitFault fault) {
+        insert_split_fault_.store(fault, std::memory_order_relaxed);
+    }
+
+    static void maybe_inject_insert_split_fault(InsertSplitFault fault);
+    static void set_insert_split_test_hook(InsertSplitTestHook hook);
+    static void run_insert_split_test_hook(InsertSplitStage stage, PageId page_id = {}, Page* page = nullptr);
+
+    page_id_t insert_entry_with_split(page_id_t leaf_page_no, const char* key, const Rid& value, int insert_pos,
+                                      bool right_edge_append,
+                                      const BufferPoolManager::FrameOperationToken& frame_operation,
+                                      const IndexWriteWalContext& wal_context);
+
     bool try_append_hint(const char* key, IxNodeHandle& leaf) const;
     void remember_append_hint(page_id_t page_no) const;
 
@@ -445,27 +528,8 @@ private:
     // leaf, rejecting page numbers that leave the file.
     bool descend_leaf_chain_edge(bool rightmost, page_id_t* leaf_page_no) const;
 
-    // Root pages are shared by every lookup and are cheap to retain. Keep the
-    // historical internal-cache default for explicit refreshes; startup uses
-    // refresh_page_residency(false) when it only needs root pages.
-    static bool root_cache_enabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("ENABLE_INDEX_ROOT_CACHE");
-            return value == nullptr || std::string(value) != "0";
-        }();
-        return enabled;
-    }
-
-    static bool internal_page_cache_enabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("ENABLE_INDEX_INTERNAL_CACHE");
-            return value == nullptr || std::string(value) != "0";
-        }();
-        return enabled;
-    }
-
-    // Defaults from ENABLE_INDEX_SMO_FLUSH; see set_smo_flush_enabled().
-    static std::atomic<bool> smo_flush_enabled_;
+    // Root pages are shared by every lookup and are cheap to retain. Startup
+    // still uses refresh_page_residency(false) when it only needs root pages.
 
     // The single funnel through which a page becomes part of the current SMO's
     // page set. Called from fetch_node_into(), fetch_node() and create_node(),
@@ -485,6 +549,14 @@ private:
     // Without this every bulk-load row would publish its leaf.
     void note_structure_change() const {
         smo_structural_ = true;
+        assert(smo_wal_context_.has_value());
+        header_dependency_.merge(smo_wal_context_->dependency());
+        ++header_dirty_epoch_;
+    }
+
+    const IndexWriteWalContext& active_smo_wal_context() const {
+        assert(smo_active_ && smo_wal_context_.has_value());
+        return *smo_wal_context_;
     }
 
 #ifndef NDEBUG
@@ -493,17 +565,18 @@ private:
     }
 #endif
 
-    void publish_smo_pages() const noexcept;
-    void publish_smo_pages_impl() const;
+    void publish_smo_pages_impl(bool* wal_barrier_released = nullptr) const;
     void write_index_header_page() const;
 
-    void refresh_root_page_cache();
+    void refresh_root_page_cache(const BufferPoolManager::FrameOperationToken* frame_operation = nullptr) noexcept;
     void release_root_page_cache() const;
     void register_internal_pages();
-    void mark_internal_page_resident(page_id_t page_no, Page* page);
-    void cache_internal_page(page_id_t page_no, Page* page);
+    bool mark_internal_page_resident(page_id_t page_no, Page* page,
+                                     const BufferPoolManager::FrameOperationToken* frame_operation = nullptr);
+    bool cache_internal_page(page_id_t page_no, Page* page,
+                             const BufferPoolManager::FrameOperationToken* frame_operation = nullptr);
     void drop_cached_internal_page(page_id_t page_no) const;
-    void unregister_internal_pages() const;
+    void unregister_internal_pages(bool preserve_root_cache = false) const;
 
     // A cached raw Page* is only usable while its frame still holds the page we
     // asked for. The frame is meant to stay put - the cache pins it and the
@@ -521,11 +594,8 @@ private:
         if (page_no == IX_NO_PAGE) {
             return nullptr;
         }
-        if (root_cache_enabled() && cached_root_page_no_ == page_no && frame_holds(cached_root_page_, page_no)) {
+        if (cached_root_page_no_ == page_no && frame_holds(cached_root_page_, page_no)) {
             return cached_root_page_;
-        }
-        if (!internal_page_cache_enabled()) {
-            return nullptr;
         }
         auto it = cached_internal_pages_.find(page_no);
         if (it == cached_internal_pages_.end() || !frame_holds(it->second, page_no)) {
@@ -534,30 +604,35 @@ private:
         return it->second;
     }
 
-    void unpin_if_not_cached(PageId page_id, bool is_dirty = false) const {
+    void unpin_if_not_cached(PageId page_id) const {
+        if (page_id.fd == fd_ && cached_page(page_id.page_no) != nullptr) {
+            return;
+        }
+        buffer_pool_manager_->unpin_page(page_id, false);
+    }
+
+    void unpin_dirty_if_not_cached(PageId page_id, const IndexWriteWalContext& wal_context) const {
         // Every page an in-flight SMO dirties has to be in the set that
         // publish_smo_pages() writes out. note_smo_page() sits on the acquisition
         // paths, so this can only trip if a new code path obtains an index page
         // some other way - which is exactly the mistake that would silently
         // restore the old behaviour.
-        assert(!is_dirty || !smo_active_ || page_id.fd != fd_ || smo_collected(page_id.page_no));
+        assert(!smo_active_ || page_id.fd != fd_ || smo_collected(page_id.page_no));
         if (page_id.fd == fd_) {
             if (Page* page = cached_page(page_id.page_no); page != nullptr) {
-                if (is_dirty) {
-                    BufferPoolManager::mark_dirty(page);
-                }
+                BufferPoolManager::mark_dirty(page, wal_context.dependency());
                 return;
             }
         }
-        buffer_pool_manager_->unpin_page(page_id, is_dirty);
+        buffer_pool_manager_->unpin_page(page_id, wal_context.dependency());
     }
 
     // Releases the allocation pin create_node() left on a fresh page. This
     // cannot go through unpin_if_not_cached(): a new internal page is registered
     // in the internal-page cache while it still holds that pin, and skipping the
     // unpin because the page is "cached" would leak it.
-    void unpin_created_page(PageId page_id) const {
-        buffer_pool_manager_->unpin_page(page_id, true);
+    void unpin_created_page(PageId page_id, const IndexWriteWalContext& wal_context) const {
+        buffer_pool_manager_->unpin_page(page_id, wal_context.dependency());
     }
 
     void fetch_root_node_into(IxNodeHandle& out) const {
@@ -604,6 +679,7 @@ private:
 
     mutable std::unordered_set<page_id_t> resident_internal_pages_;
     mutable std::unordered_map<page_id_t, Page*> cached_internal_pages_;
+    std::vector<page_id_t> split_spare_pages_;
 
     // SMO bookkeeping, deliberately non-atomic. index_latch_ already orders it:
     // smo_active_ is only ever assigned by the holder of the structure-exclusive
@@ -614,7 +690,10 @@ private:
     // split costs no allocation once the vectors have grown.
     mutable bool smo_active_{false};
     mutable bool smo_structural_{false};
+    mutable std::optional<IndexWriteWalContext> smo_wal_context_;
     mutable std::vector<page_id_t> smo_pages_;
     mutable std::vector<PageId> smo_flush_batch_;
     mutable std::vector<char> header_image_;
+    mutable PageWriteDependency header_dependency_{PageWriteDependency::None()};
+    mutable uint64_t header_dirty_epoch_{0};
 };

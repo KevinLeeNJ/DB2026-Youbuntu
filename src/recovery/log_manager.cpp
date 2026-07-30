@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include "index_smo_log.h"
 #include "log_manager.h"
 #include "wal_reader.h"
 #include "minilog.h"
@@ -56,7 +57,8 @@ std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size) {
 
     LogRecord header;
     header.deserialize(src);
-    if (header.log_tot_len_ < LOG_HEADER_SIZE || static_cast<int>(header.log_tot_len_) > size) {
+    if (header.log_tot_len_ < LOG_HEADER_SIZE || header.log_tot_len_ > MAX_INDEX_SMO_RECORD_BYTES ||
+        static_cast<int>(header.log_tot_len_) > size) {
         return nullptr;
     }
 
@@ -100,20 +102,27 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
     if (log_record == nullptr) {
         return INVALID_LSN;
     }
-    if (log_record->log_tot_len_ > LOG_BUFFER_SIZE) {
-        throw std::length_error("log record is larger than log buffer");
+    if (log_record->log_tot_len_ > MAX_INDEX_SMO_RECORD_BYTES) {
+        throw std::length_error("log record exceeds the bounded WAL record size");
     }
 
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(latch_);
-            if (!log_buffer_->is_full(static_cast<int>(log_record->log_tot_len_))) {
+            const int record_bytes = static_cast<int>(log_record->log_tot_len_);
+            const bool ordinary_batch_has_room = log_buffer_->offset_ != 0 && log_buffer_->offset_ <= LOG_BUFFER_SIZE &&
+                                                 log_buffer_->offset_ + record_bytes <= LOG_BUFFER_SIZE;
+            if (log_buffer_->offset_ == 0 || ordinary_batch_has_room) {
+                // Capacity growth can throw, so it deliberately happens before
+                // allocating the LSN. Once fetch_add succeeds serialize() must
+                // be a deterministic, non-throwing copy into reserved memory.
+                log_buffer_->ensure_capacity(static_cast<size_t>(log_buffer_->offset_) + log_record->log_tot_len_);
                 lsn_t lsn = global_lsn_.fetch_add(1);
                 if (lsn > INT32_MAX - LSN_EXHAUSTION_MARGIN) {
                     FailStopOnLsnExhaustion(lsn);
                 }
                 log_record->lsn_ = lsn;
-                log_record->serialize(log_buffer_->buffer_ + log_buffer_->offset_);
+                log_record->serialize(log_buffer_->buffer_.data() + log_buffer_->offset_);
                 log_buffer_->offset_ += static_cast<int>(log_record->log_tot_len_);
                 if (log_record->log_type_ == LogType::COMMIT) {
                     commit_count_.fetch_add(1, std::memory_order_acq_rel);
@@ -123,6 +132,37 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
         }
         flush_buffer(false);
     }
+}
+
+lsn_t LogManager::append_index_smo(const IndexSmoWalData& data) {
+    IndexSmoWalData bound_data = data;
+    bound_data.index_generation = ensure_index_binding(data.index_file_name);
+    IndexSmoLogRecord record(bound_data);
+    return add_log_to_buffer(&record);
+}
+
+uint64_t LogManager::ensure_index_binding(const std::string& index_file_name) {
+    std::lock_guard<std::mutex> binding_lock(index_binding_latch_);
+    const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
+    auto it = index_bindings_.find(index_file_name);
+    if (it != index_bindings_.end() && it->second.epoch == epoch) {
+        return it->second.generation;
+    }
+    return publish_index_binding_locked(index_file_name, epoch);
+}
+
+uint64_t LogManager::renew_index_binding(const std::string& index_file_name) {
+    std::lock_guard<std::mutex> binding_lock(index_binding_latch_);
+    return publish_index_binding_locked(index_file_name, wal_epoch_.load(std::memory_order_acquire));
+}
+
+uint64_t LogManager::publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch) {
+    IndexBindLogRecord record(index_file_name);
+    const lsn_t lsn = add_log_to_buffer(&record);
+    flush_log_to_disk_up_to_impl(lsn, true);
+    const uint64_t generation = static_cast<uint64_t>(lsn) + 1U;
+    index_bindings_[index_file_name] = IndexBinding{generation, epoch};
+    return generation;
 }
 
 /**
@@ -143,6 +183,10 @@ void LogManager::flush_log_to_disk_with_sync() {
 
 void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
     flush_log_to_disk_up_to_impl(target_lsn, durability_mode_ == DurabilityMode::STRICT);
+}
+
+void LogManager::flush_log_to_disk_up_to_durable(lsn_t target_lsn) {
+    flush_log_to_disk_up_to_impl(target_lsn, true);
 }
 
 void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync) {
@@ -339,7 +383,7 @@ void LogManager::flush_buffer(bool sync) {
         bool write_succeeded = false;
         try {
             const auto write_begin = std::chrono::steady_clock::now();
-            disk_manager_->write_log(flushing_buffer_->buffer_, bytes);
+            disk_manager_->write_log(flushing_buffer_->buffer_.data(), bytes);
             wal_write_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                               std::chrono::steady_clock::now() - write_begin)
                                                               .count()),
@@ -361,6 +405,7 @@ void LogManager::flush_buffer(bool sync) {
                 log_file_offset_ += bytes;
                 persist_lsn_.store(target_lsn, std::memory_order_release);
                 flushing_buffer_->offset_ = 0;
+                flushing_buffer_->shrink_after_flush();
                 flushing_bytes_ = 0;
                 flushing_lsn_ = INVALID_LSN;
             }
@@ -374,6 +419,7 @@ void LogManager::flush_buffer(bool sync) {
             log_file_offset_ += flushing_bytes_;
             persist_lsn_.store(flushing_lsn_, std::memory_order_release);
             flushing_buffer_->offset_ = 0;
+            flushing_buffer_->shrink_after_flush();
             flushing_bytes_ = 0;
             flushing_lsn_ = INVALID_LSN;
             flushing_in_progress_ = false;
@@ -395,7 +441,9 @@ void LogManager::initialize_from_existing_log() {
     log_buffer_->offset_ = 0;
     flushing_buffer_->offset_ = 0;
     flushing_in_progress_ = false;
-    memset(log_buffer_->buffer_, 0, sizeof(log_buffer_->buffer_));
+    log_buffer_->shrink_after_flush();
+    flushing_buffer_->shrink_after_flush();
+    std::fill(log_buffer_->buffer_.begin(), log_buffer_->buffer_.end(), 0);
 
     int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
@@ -415,6 +463,20 @@ void LogManager::initialize_from_existing_log() {
     WalReader reader(disk_manager_, 0, file_size);
     WalRecordView record;
     while (reader.next(&record)) {
+        if (record.log_type == LogType::INDEX_SMO) {
+            IndexSmoWalView smo;
+            if (!ParseIndexSmoWal(record, &smo)) {
+                throw InternalError("corrupt complete INDEX_SMO WAL record at offset " + std::to_string(record.offset) +
+                                    "; WAL retained");
+            }
+        } else if (record.log_type == LogType::INDEX_BIND) {
+            std::string_view name;
+            uint64_t generation = 0;
+            if (!ParseIndexBindWal(record, &name, &generation)) {
+                throw InternalError("corrupt complete INDEX_BIND WAL record at offset " +
+                                    std::to_string(record.offset) + "; WAL retained");
+            }
+        }
         max_lsn = std::max(max_lsn, record.lsn);
         ++record_count;
     }
@@ -457,6 +519,7 @@ void LogManager::reset_log(lsn_t next_lsn) {
     // Treat the truncated prefix as durable so those stale LSNs do not cause
     // a false WAL-missing failure after restart.
     durable_lsn_.store(next_lsn == 0 ? INVALID_LSN : next_lsn - 1, std::memory_order_release);
+    wal_epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void LogManager::write_restart_manifest(const RestartManifest& manifest) {

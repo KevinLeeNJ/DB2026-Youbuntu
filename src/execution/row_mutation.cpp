@@ -341,12 +341,12 @@ void CheckHistoricalIndexConflicts(const RowMutationRuntimeInfo& info, const Row
 
 void RollbackIndexUpdates(const std::vector<std::pair<const RowMutationIndex*, std::vector<char>>>& deleted,
                           const std::vector<std::pair<const RowMutationIndex*, std::vector<char>>>& inserted,
-                          const Rid& rid, Transaction* txn) {
+                          const Rid& rid, const IndexWriteWalContext& wal_context) {
     for (auto it = inserted.rbegin(); it != inserted.rend(); ++it) {
-        it->first->handle->delete_entry(it->second.data(), rid, txn);
+        it->first->handle->delete_entry(it->second.data(), rid, wal_context);
     }
     for (auto it = deleted.rbegin(); it != deleted.rend(); ++it) {
-        it->first->handle->insert_entry(it->second.data(), rid, txn, true);
+        it->first->handle->insert_entry(it->second.data(), rid, wal_context, true);
     }
 }
 
@@ -378,6 +378,15 @@ std::vector<BoundMutationSetClause> BindMutationSetClauses(const TabMeta& tab,
         bound.push_back(item);
     }
     return bound;
+}
+
+bool RowMutationEngine::MatchesTarget(const RmRecord& visible_record, const RowMutationRuntimeInfo& info) {
+    return Matches(info.conditions, info.bound_conditions, visible_record);
+}
+
+bool RowMutationEngine::LockOnly(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info,
+                                 Context* context) {
+    return PrepareWrite(rid, visible_record, info, context);
 }
 
 bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info,
@@ -460,24 +469,28 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
 
     std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
     std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
+    std::optional<IndexWriteWalContext> wal_context;
+    if (!index_updates.empty()) {
+        wal_context.emplace(IndexWriteWalContext::LoggedRuntime(log_lsn));
+    }
     try {
         for (const auto& update : index_updates) {
             info.sm_manager->remember_historical_index_key(*info.tab_name, update.index->name, update.old_key, rid,
                                                            *update.index->meta);
-            update.index->handle->delete_entry(update.old_key.data(), rid, txn);
+            update.index->handle->delete_entry(update.old_key.data(), rid, *wal_context);
             deleted.emplace_back(update.index, update.old_key);
-            update.index->handle->insert_entry(update.new_key.data(), rid, txn);
+            update.index->handle->insert_entry(update.new_key.data(), rid, *wal_context);
             inserted.emplace_back(update.index, update.new_key);
         }
     } catch (const IndexEntryExistsError&) {
         // The B+tree has no transaction context, so translate here.
-        RollbackIndexUpdates(deleted, inserted, rid, txn);
+        RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
         if (txn != nullptr && txn->get_txn_mode()) {
             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
         }
         throw;
     } catch (...) {
-        RollbackIndexUpdates(deleted, inserted, rid, txn);
+        RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
         throw;
     }
     if (txn == nullptr) {
@@ -510,17 +523,21 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
     }
 
     std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
+    std::optional<IndexWriteWalContext> wal_context;
+    if (!info.indexes->empty()) {
+        wal_context.emplace(IndexWriteWalContext::LoggedRuntime(log_lsn));
+    }
     try {
         for (const auto& index : *info.indexes) {
             auto key = MakeIndexKey(*index.meta, visible_record.data);
             ReserveUniqueKey(context, index.handle->GetFd(), key);
             info.sm_manager->remember_historical_index_key(*info.tab_name, index.name, key, rid, *index.meta);
-            index.handle->delete_entry(key.data(), rid, txn);
+            index.handle->delete_entry(key.data(), rid, *wal_context);
             deleted.emplace_back(&index, std::move(key));
         }
     } catch (...) {
         std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
-        RollbackIndexUpdates(deleted, inserted, rid, txn);
+        RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
         throw;
     }
 

@@ -69,6 +69,14 @@ struct DeleteRuntimeInfo : RowMutationRuntimeInfo {};
 
 class RowMutationEngine {
 public:
+    // Evaluates the bound statement predicate against a snapshot-visible row.
+    static bool MatchesTarget(const RmRecord& visible_record, const RowMutationRuntimeInfo& info);
+
+    // Performs the same predicate, X-lock, and post-lock tuple-meta checks as a
+    // real mutation without creating a tuple version or any mutation side effects.
+    static bool LockOnly(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info,
+                         Context* context);
+
     // Returns false when the row no longer belongs to the statement's target
     // set (including the READ COMMITTED post-lock recheck).
     static bool UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info, Context* context);

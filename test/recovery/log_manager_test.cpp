@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "recovery/log_manager.h"
+#include "recovery/index_smo_log.h"
 #include "execution/executor_delete.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_update.h"
@@ -64,6 +65,10 @@ std::vector<std::unique_ptr<LogRecord>> ReadAllLogs(DiskManager& disk) {
         if (disk.read_log(buf.data(), static_cast<int>(buf.size()), offset) != static_cast<int>(buf.size())) {
             ADD_FAILURE() << "short log read at offset " << offset;
             return logs;
+        }
+        if (log_header.log_type_ == LogType::INDEX_BIND || log_header.log_type_ == LogType::INDEX_SMO) {
+            offset += static_cast<int64_t>(log_header.log_tot_len_);
+            continue;
         }
         auto decoded = DeserializeLogRecord(buf.data(), static_cast<int>(buf.size()));
         if (decoded == nullptr) {
@@ -132,6 +137,149 @@ TEST(LogManagerTest, DefaultsToStrictDurability) {
     EXPECT_EQ(log_mgr.durability_mode(), DurabilityMode::STRICT);
 }
 
+TEST(IndexSmoWalTest, RoundTripAndChecksumAreBounded) {
+    IndexSmoWalData data;
+    data.index_file_name = "t_id.idx";
+    data.index_generation = 7;
+    data.pages.resize(2);
+    data.pages[0].page_no = 2;
+    data.pages[1].page_no = 9;
+    std::fill(data.pages[0].bytes.begin(), data.pages[0].bytes.end(), 'a');
+    std::fill(data.pages[1].bytes.begin(), data.pages[1].bytes.end(), 'b');
+    data.header.fill('h');
+
+    IndexSmoLogRecord record(data);
+    record.lsn_ = 11;
+    std::vector<char> bytes(record.log_tot_len_);
+    record.serialize(bytes.data());
+    WalRecordView raw;
+    raw.bytes = bytes.data();
+    raw.total_len = record.log_tot_len_;
+    raw.log_type = LogType::INDEX_SMO;
+    raw.lsn = record.lsn_;
+    raw.txn_id = record.log_tid_;
+    raw.prev_lsn = record.prev_lsn_;
+
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(raw, &parsed));
+    EXPECT_EQ(parsed.index_file_name, data.index_file_name);
+    EXPECT_EQ(parsed.index_generation, 7U);
+    EXPECT_EQ(parsed.page_count, 2U);
+    EXPECT_EQ(parsed.page_no(1), 9);
+    EXPECT_EQ(std::memcmp(parsed.page_image(0), data.pages[0].bytes.data(), PAGE_SIZE), 0);
+
+    bytes[OFFSET_LOG_DATA + 3] ^= 1;
+    EXPECT_FALSE(ParseIndexSmoWal(raw, &parsed));
+}
+
+TEST(IndexSmoWalTest, AppendSupportsARecordLargerThanTheOrdinaryBuffer) {
+    ScopedTestDir test_dir("large_index_smo_wal_test");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+    IndexSmoWalData data;
+    data.index_file_name = "large.idx";
+    data.header.fill(0);
+    const size_t page_count = static_cast<size_t>(LOG_BUFFER_SIZE / PAGE_SIZE) + 8;
+    data.pages.resize(page_count);
+    for (size_t i = 0; i < page_count; ++i) {
+        data.pages[i].page_no = static_cast<page_id_t>(i + 1);
+        uint32_t state = static_cast<uint32_t>(i + 1) * 0x9e3779b9U;
+        for (char& byte : data.pages[i].bytes) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            byte = static_cast<char>(state);
+        }
+    }
+
+    EXPECT_EQ(log_mgr.get_fsync_count(), 0U);
+    EXPECT_GT(log_mgr.ensure_index_binding(data.index_file_name), 0U);
+    const uint64_t binding_fsyncs = log_mgr.get_fsync_count();
+    EXPECT_EQ(binding_fsyncs, 1U);
+
+    const lsn_t smo_lsn = log_mgr.append_index_smo(data);
+    EXPECT_GE(smo_lsn, 1);
+    EXPECT_EQ(log_mgr.get_fsync_count(), binding_fsyncs);
+    EXPECT_LT(log_mgr.get_durable_lsn(), smo_lsn);
+
+    log_mgr.flush_log_to_disk_up_to(smo_lsn);
+    EXPECT_GE(log_mgr.get_durable_lsn(), smo_lsn);
+    EXPECT_GT(log_mgr.get_fsync_count(), binding_fsyncs);
+    const int64_t wal_bytes = disk.get_file_size(LOG_FILE_NAME);
+    EXPECT_GT(wal_bytes, LOG_BUFFER_SIZE);
+
+    WalReader reader(&disk, 0, wal_bytes);
+    WalRecordView record;
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.log_type, LogType::INDEX_BIND);
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.log_type, LogType::INDEX_SMO);
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(record, &parsed));
+    EXPECT_EQ(parsed.page_count, page_count);
+    EXPECT_FALSE(reader.next(&record));
+    EXPECT_EQ(reader.next_offset(), wal_bytes);
+}
+
+TEST(IndexSmoWalTest, CompleteChecksumCorruptionFailsAndRetainsWal) {
+    ScopedTestDir test_dir("corrupt_index_smo_wal_test");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager writer(&disk);
+    IndexSmoWalData data;
+    data.index_file_name = "corrupt.idx";
+    data.pages.resize(1);
+    data.pages[0].page_no = 2;
+    const lsn_t smo_lsn = writer.append_index_smo(data);
+    writer.flush_log_to_disk_up_to_durable(smo_lsn);
+    const int64_t original_size = disk.get_file_size(LOG_FILE_NAME);
+    ASSERT_GT(original_size, 0);
+
+    std::fstream wal(LOG_FILE_NAME, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(wal.is_open());
+    wal.seekg(original_size - 1);
+    char byte = 0;
+    wal.read(&byte, 1);
+    byte ^= 1;
+    wal.seekp(original_size - 1);
+    wal.write(&byte, 1);
+    wal.flush();
+    ASSERT_TRUE(static_cast<bool>(wal));
+
+    LogManager restarted(&disk);
+    EXPECT_THROW(restarted.initialize_from_existing_log(), InternalError);
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), original_size);
+}
+
+TEST(IndexSmoWalTest, TruncatedPhysicalTailStopsAtAndTruncatesToTheLastCompleteRecord) {
+    ScopedTestDir test_dir("truncated_index_smo_wal_test");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager writer(&disk);
+    IndexSmoWalData data;
+    data.index_file_name = "truncated.idx";
+    data.pages.resize(1);
+    data.pages[0].page_no = 2;
+    const lsn_t smo_lsn = writer.append_index_smo(data);
+    writer.flush_log_to_disk_up_to_durable(smo_lsn);
+    const int64_t complete_size = disk.get_file_size(LOG_FILE_NAME);
+    ASSERT_GT(complete_size, 32);
+    ASSERT_EQ(::truncate(LOG_FILE_NAME.c_str(), complete_size - 17), 0);
+
+    LogManager restarted(&disk);
+    EXPECT_NO_THROW(restarted.initialize_from_existing_log());
+    const int64_t retained_size = disk.get_file_size(LOG_FILE_NAME);
+    EXPECT_GT(retained_size, 0);
+    EXPECT_LT(retained_size, complete_size - 17);
+    WalReader reader(&disk, 0, retained_size);
+    WalRecordView record;
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.log_type, LogType::INDEX_BIND);
+    EXPECT_FALSE(reader.next(&record));
+    EXPECT_EQ(reader.next_offset(), retained_size);
+}
+
 TEST(LogRecordTest, InsertRoundTripKeepsPayload) {
     auto rec = MakeRecord("abc123");
     Rid rid{3, 7};
@@ -198,6 +346,62 @@ TEST(LogRecordTest, UpdateRoundTripKeepsOldAndNewRecord) {
     EXPECT_EQ(decoded.table_name_, "stock");
     ExpectRecordEq(decoded.old_value_, old_rec);
     ExpectRecordEq(decoded.new_value_, new_rec);
+}
+
+TEST(LogRecordTest, SparseUpdateRoundTripMaterializesTheCompleteBeforeImage) {
+    std::string old_text(128, 'a');
+    std::string new_text = old_text;
+    new_text[10] = 'x';
+    new_text[13] = 'y';
+    new_text[50] = 'z';
+    auto old_rec = MakeRecord(old_text);
+    auto new_rec = MakeRecord(new_text);
+    Rid rid{9, 4};
+    UpdateLogRecord log(89, old_rec, new_rec, rid, "customer");
+
+    ASSERT_TRUE(log.sparse_encoding_);
+    ASSERT_EQ(log.before_spans_.size(), 2U);
+    EXPECT_EQ(log.before_spans_[0].offset, 10U);
+    EXPECT_EQ(log.before_spans_[0].length, 4U); // two equal bytes are cheaper than a second span header
+    const size_t legacy_bytes = LOG_HEADER_SIZE + sizeof(int) * 2 + old_text.size() + new_text.size() + sizeof(Rid) +
+                                sizeof(size_t) + std::string("customer").size();
+    EXPECT_LT(log.log_tot_len_, legacy_bytes);
+
+    std::vector<char> bytes(log.log_tot_len_);
+    log.serialize(bytes.data());
+    EXPECT_EQ(read_unaligned<int>(bytes.data() + OFFSET_LOG_DATA), UpdateLogRecord::kSparseBeforeVersion);
+
+    UpdateLogRecord decoded;
+    decoded.deserialize(bytes.data());
+    EXPECT_EQ(decoded.rid_, rid);
+    EXPECT_EQ(decoded.table_name_, "customer");
+    ExpectRecordEq(decoded.old_value_, old_rec);
+    ExpectRecordEq(decoded.new_value_, new_rec);
+}
+
+TEST(LogRecordTest, UpdateFallsBackToLegacyWhenSparseEncodingIsNotStrictlySmaller) {
+    auto old_rec = MakeRecord(std::string(64, 'a'));
+    auto new_rec = MakeRecord(std::string(64, 'b'));
+    Rid rid{10, 2};
+    UpdateLogRecord log(90, old_rec, new_rec, rid, "stock");
+
+    EXPECT_FALSE(log.sparse_encoding_);
+    std::vector<char> bytes(log.log_tot_len_);
+    log.serialize(bytes.data());
+    EXPECT_EQ(read_unaligned<int>(bytes.data() + OFFSET_LOG_DATA), old_rec.size);
+}
+
+TEST(LogRecordTest, UpdateRejectsNegativeImagesAndOversizedRecordsBeforeLengthNarrowing) {
+    auto old_rec = MakeRecord("a");
+    auto new_rec = MakeRecord("b");
+    Rid rid{10, 3};
+
+    old_rec.size = -1;
+    EXPECT_THROW(UpdateLogRecord(91, old_rec, new_rec, rid, "stock"), std::length_error);
+    old_rec.size = 1;
+
+    std::string oversized_name(MAX_INDEX_SMO_RECORD_BYTES, 't');
+    EXPECT_THROW(UpdateLogRecord(91, old_rec, new_rec, rid, std::move(oversized_name)), std::length_error);
 }
 
 TEST(LogRecordTest, CheckpointRoundTripKeepsActiveTxnTable) {
@@ -619,7 +823,7 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
     RmManager rm_mgr(&disk, &bpm);
     IxManager ix_mgr(&disk, &bpm);
     SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
-    LockManager lock_mgr(std::chrono::microseconds{0});
+    LockManager lock_mgr;
     TransactionManager txn_mgr(&lock_mgr, &sm_mgr);
     LogManager log_mgr(&disk);
 
@@ -715,9 +919,14 @@ TEST(LogManagerTest, SecondIndexConflictWithEmptyWriteSetPersistsAbortWal) {
     ten.set_int(10);
     Value hundred;
     hundred.set_int(100);
-    InsertExecutor seed(&sm_mgr, "t", {one, ten, hundred}, nullptr);
+    Transaction* seed_txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
+    seed_txn->set_txn_mode(true);
+    int seed_offset = 0;
+    Context seed_context(&lock_mgr, &log_mgr, seed_txn, nullptr, &seed_offset, &txn_mgr);
+    InsertExecutor seed(&sm_mgr, "t", {one, ten, hundred}, &seed_context);
     seed.Next();
     const Rid seed_rid = seed.rid();
+    txn_mgr.commit(seed_txn, &log_mgr);
 
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
     txn->set_txn_mode(true);
@@ -744,13 +953,18 @@ TEST(LogManagerTest, SecondIndexConflictWithEmptyWriteSetPersistsAbortWal) {
     EXPECT_NE(abort_lsn, INVALID_LSN);
     EXPECT_GT(log_mgr.get_pwrite_count(), 0u);
     auto logs = ReadAllLogs(disk);
-    ASSERT_EQ(logs.size(), 3);
+    ASSERT_EQ(logs.size(), 6);
     EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);
     EXPECT_EQ(logs[1]->log_type_, LogType::INSERT);
-    EXPECT_EQ(logs[2]->log_type_, LogType::ABORT);
+    EXPECT_EQ(logs[2]->log_type_, LogType::COMMIT);
+    EXPECT_EQ(logs[3]->log_type_, LogType::BEGIN);
+    EXPECT_EQ(logs[4]->log_type_, LogType::INSERT);
+    EXPECT_EQ(logs[5]->log_type_, LogType::ABORT);
     EXPECT_EQ(logs[1]->prev_lsn_, logs[0]->lsn_);
     EXPECT_EQ(logs[2]->prev_lsn_, logs[1]->lsn_);
-    EXPECT_EQ(logs[2]->lsn_, abort_lsn);
+    EXPECT_EQ(logs[4]->prev_lsn_, logs[3]->lsn_);
+    EXPECT_EQ(logs[5]->prev_lsn_, logs[4]->lsn_);
+    EXPECT_EQ(logs[5]->lsn_, abort_lsn);
 
     // ABORT does not need an fsync for the process-crash contract, but any
     // subsequent WAL durability boundary must include it.
@@ -790,6 +1004,7 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     sm_mgr.create_db("executor_dml_log_test_db");
     sm_mgr.open_db("executor_dml_log_test_db");
     LogManager log_mgr(&disk);
+    bpm.set_log_manager(&log_mgr);
 
     sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
     sm_mgr.create_index("t", {"id"}, nullptr);

@@ -23,6 +23,68 @@ constexpr int IX_INIT_ROOT_PAGE = 2;
 constexpr int IX_INIT_NUM_PAGES = 3;
 constexpr int IX_MAX_COL_LEN = 512;
 
+class IndexWriteWalContext {
+public:
+    enum class Origin : uint8_t {
+        LoggedRuntime,
+        LiveRollback,
+        RecoveryDurable,
+        UnloggedDdlBuild,
+        UnloggedRecoveryRebuild,
+        UnloggedBulkLoad,
+        TestNoWal,
+    };
+
+    static IndexWriteWalContext LoggedRuntime(lsn_t lsn) {
+        return RequiredWal(Origin::LoggedRuntime, lsn);
+    }
+
+    static IndexWriteWalContext LiveRollback(lsn_t abort_lsn) {
+        return RequiredWal(Origin::LiveRollback, abort_lsn);
+    }
+
+    static IndexWriteWalContext RecoveryDurable() {
+        return IndexWriteWalContext(Origin::RecoveryDurable, PageWriteDependency::None());
+    }
+
+    static IndexWriteWalContext UnloggedDdlBuild() {
+        return IndexWriteWalContext(Origin::UnloggedDdlBuild, PageWriteDependency::None());
+    }
+
+    static IndexWriteWalContext UnloggedRecoveryRebuild() {
+        return IndexWriteWalContext(Origin::UnloggedRecoveryRebuild, PageWriteDependency::None());
+    }
+
+    static IndexWriteWalContext UnloggedBulkLoad() {
+        return IndexWriteWalContext(Origin::UnloggedBulkLoad, PageWriteDependency::None());
+    }
+
+    static IndexWriteWalContext TestNoWal() {
+        return IndexWriteWalContext(Origin::TestNoWal, PageWriteDependency::None());
+    }
+
+    Origin origin() const {
+        return origin_;
+    }
+
+    const PageWriteDependency& dependency() const {
+        return dependency_;
+    }
+
+private:
+    static IndexWriteWalContext RequiredWal(Origin origin, lsn_t lsn) {
+        if (lsn == INVALID_LSN) {
+            throw InternalError("logged index write requires a valid WAL LSN");
+        }
+        return IndexWriteWalContext(origin, PageWriteDependency::Wal(lsn));
+    }
+
+    IndexWriteWalContext(Origin origin, PageWriteDependency dependency) : origin_(origin), dependency_(dependency) {}
+
+    Origin origin_;
+    PageWriteDependency dependency_;
+};
+
 class IxFileHdr {
 public:
     page_id_t first_free_page_no_;   // 文件中第一个空闲的磁盘页面的页面号

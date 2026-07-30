@@ -51,14 +51,14 @@ void InsertIndexEntryIdempotent(SmManager* sm_manager, const std::string& tab_na
             }
         }
     }
-    ih->insert_entry(key.data(), rid, nullptr, true);
+    ih->insert_entry(key.data(), rid, IndexWriteWalContext::RecoveryDurable(), true);
 }
 
 void DeleteIndexEntryIfExists(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index,
                               const RmRecord& rec, const Rid& rid) {
     auto key = MakeIndexKey(index, rec.data);
     auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-    ih->delete_entry(key.data(), rid, nullptr);
+    ih->delete_entry(key.data(), rid, IndexWriteWalContext::RecoveryDurable());
 }
 
 } // namespace
@@ -541,6 +541,30 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     fhs_.erase(tab_name);
     flush_meta();
     bump_catalog_generation();
+    clear_table_runtime_history(tab_name);
+}
+
+void SmManager::clear_table_runtime_history(const std::string& tab_name) {
+    {
+        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
+        for (auto it = historical_index_keys_.begin(); it != historical_index_keys_.end();) {
+            if (historical_bucket_belongs_to_table(it->first, tab_name)) {
+                it = historical_index_keys_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        historical_retire_queue_.erase(std::remove_if(historical_retire_queue_.begin(), historical_retire_queue_.end(),
+                                                      [&](const HistoricalRetireCandidate& candidate) {
+                                                          return historical_bucket_belongs_to_table(
+                                                              candidate.bucket_key, tab_name);
+                                                      }),
+                                       historical_retire_queue_.end());
+    }
+    {
+        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
+        deleted_tuple_candidates_.erase(tab_name);
+    }
 }
 
 /**
@@ -594,11 +618,11 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
             // 建不出索引。INSERT/UPDATE 路径保留唯一性检查不变：它是并发取号冲突
             // （重复 d_next_o_id 等，final.md:444）的响亮失败信号，而 TPC-C 的复合索引
             // 靠尾列天然唯一（final.md:171），正常负载下不会误拒。
-            index_handle->insert_entry(key.data(), scan.rid(), context == nullptr ? nullptr : context->txn_,
+            index_handle->insert_entry(key.data(), scan.rid(), IndexWriteWalContext::UnloggedDdlBuild(),
                                        /*allow_duplicate=*/true);
         }
-        // Index creation is complete, so it is now safe to build the optional
-        // root cache and upper-level residency state.
+        // Index creation is complete, so it is now safe to build the root
+        // cache and upper-level residency state.
         index_handle->refresh_page_residency();
     } catch (...) {
         ix_manager_->close_index(index_handle.get());
@@ -699,35 +723,38 @@ void SmManager::update_record_with_indexes(const std::string& tab_name, const Ri
     }
 }
 
-bool SmManager::flush_all_table_and_index_pages(bool wal_preflushed) {
-    bool success = true;
+bool SmManager::flush_all_table_and_index_pages(FlushDependencyPolicy policy) {
     std::vector<int> fds;
     fds.reserve(fhs_.size() + ihs_.size());
     for (const auto& [_, fh] : fhs_) {
-        rm_manager_->flush_file_header(fh.get());
         fds.push_back(fh->GetFd());
+    }
+    for (const auto& [_, ih] : ihs_) {
+        fds.push_back(ih->GetFd());
+    }
+    if (!buffer_pool_manager_->flush_all_pages(fds, policy)) {
+        return false;
+    }
+    for (const auto& [_, fh] : fhs_) {
+        rm_manager_->flush_file_header(fh.get());
     }
     for (const auto& [_, ih] : ihs_) {
         ix_manager_->flush_index_header(ih.get());
-        fds.push_back(ih->GetFd());
     }
-    success = buffer_pool_manager_->flush_all_pages(fds, wal_preflushed) && success;
     for (int fd : fds) {
         disk_manager_->sync_file(fd);
     }
-    return success;
+    return true;
 }
 
-bool SmManager::flush_dirty_data_pages(bool wal_preflushed) {
+size_t SmManager::flush_dirty_pages(size_t max_pages) {
+    std::shared_lock catalog_guard{catalog_latch_};
     std::vector<int> fds;
-    fds.reserve(fhs_.size() + ihs_.size());
+    fds.reserve(fhs_.size());
     for (const auto& [_, fh] : fhs_) {
         fds.push_back(fh->GetFd());
     }
-    for (const auto& [_, ih] : ihs_) {
-        fds.push_back(ih->GetFd());
-    }
-    return buffer_pool_manager_->flush_all_pages(fds, wal_preflushed);
+    return buffer_pool_manager_->flush_dirty_pages(fds, max_pages).pages_written;
 }
 
 bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& table_names) {
@@ -777,10 +804,6 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
     return true;
 }
 
-size_t SmManager::flush_dirty_pages(size_t max_pages) {
-    return buffer_pool_manager_->flush_dirty_pages(max_pages);
-}
-
 void SmManager::rebuild_all_indexes() {
     rebuild_indexes({});
 }
@@ -816,7 +839,8 @@ void SmManager::rebuild_indexes(const std::unordered_set<std::string>& index_nam
                 for (RmScan scan(file_handle); !scan.is_end(); scan.next()) {
                     auto record = file_handle->get_record(scan.rid(), nullptr);
                     auto key = MakeIndexKey(index, record->data);
-                    temp_handle->insert_entry(key.data(), scan.rid(), nullptr, true);
+                    temp_handle->insert_entry(key.data(), scan.rid(), IndexWriteWalContext::UnloggedRecoveryRebuild(),
+                                              true);
                 }
                 ix_manager_->close_index(temp_handle.get());
                 temp_handle.reset();
@@ -874,9 +898,9 @@ void SmManager::rebuild_indexes(const std::unordered_set<std::string>& index_nam
 
 void SmManager::refresh_index_residency() {
     for (auto& [_, index_handle] : ihs_) {
-        // Reopening a large benchmark must not walk every index leaf merely
-        // to warm optional residency state. Individual index creation and
-        // tests retain the explicit full-refresh default.
+        // Reopening a large benchmark must not walk and cache every internal
+        // index page during startup. Individual index creation and explicit
+        // full refreshes retain the include_internal=true default.
         index_handle->refresh_page_residency(false);
     }
 }
@@ -1023,7 +1047,8 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     for (const auto& index : tab.indexes) {
         auto ih = ihs_.at(get_ix_manager()->get_index_name(tab_name, index.cols)).get();
         idx_inserters.push_back(
-            {&index, std::vector<char>(index.col_tot_len), std::make_unique<IxIndexHandle::PinnedInserter>(ih)});
+            {&index, std::vector<char>(index.col_tot_len),
+             std::make_unique<IxIndexHandle::PinnedInserter>(ih, IndexWriteWalContext::UnloggedBulkLoad())});
     }
 
     RmFileHandle::PinnedInserter rm_inserter(fh);
@@ -1085,7 +1110,7 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
                             target.meta->cols[i].len);
                 off += target.meta->cols[i].len;
             }
-            target.inserter->insert(target.key.data(), rid, nullptr, true);
+            target.inserter->insert(target.key.data(), rid, true);
         }
     };
 
@@ -1106,6 +1131,8 @@ void SmManager::load_csv_data(const std::string& file_path, const std::string& t
     idx_inserters.clear();
     { RmFileHandle::PinnedInserter tmp(std::move(rm_inserter)); }
 
-    flush_all_table_and_index_pages();
+    if (!flush_all_table_and_index_pages()) {
+        throw InternalError("failed to flush loaded table and index pages");
+    }
     flush_meta();
 }

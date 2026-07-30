@@ -1,0 +1,81 @@
+/* Copyright (c) 2026 Team Youbuntu
+RMDB is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+        http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
+
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+#include <vector>
+
+#include "recovery/log_manager.h"
+#include "recovery/wal_reader.h"
+#include "storage/index_smo_wal.h"
+
+static constexpr uint32_t INDEX_SMO_MAGIC = 0x4958534dU;  // "IXSM"
+static constexpr uint32_t INDEX_BIND_MAGIC = 0x49584244U; // "IXBD"
+static constexpr uint16_t INDEX_SMO_VERSION_V1 = 1;
+static constexpr uint16_t INDEX_SMO_VERSION_V2 = 2;
+static constexpr uint16_t INDEX_BIND_VERSION = 1;
+static constexpr uint16_t INDEX_SMO_FLAG_HEADER_IMAGE = 1U;
+
+uint32_t IndexSmoCrc32(const char* bytes, size_t length);
+
+class IndexSmoLogRecord final : public LogRecord {
+public:
+    explicit IndexSmoLogRecord(const IndexSmoWalData& data);
+
+    void serialize(char* dest) const override;
+
+private:
+    std::vector<char> payload_;
+};
+
+class IndexBindLogRecord final : public LogRecord {
+public:
+    explicit IndexBindLogRecord(std::string_view index_file_name);
+    void serialize(char* dest) const override;
+
+private:
+    std::string index_file_name_;
+};
+
+struct IndexSmoWalView {
+    struct Page {
+        page_id_t page_no{INVALID_PAGE_ID};
+        const char* image{nullptr};
+    };
+
+    IndexSmoWalView() = default;
+    IndexSmoWalView(const IndexSmoWalView&) = delete;
+    IndexSmoWalView& operator=(const IndexSmoWalView&) = delete;
+    IndexSmoWalView(IndexSmoWalView&&) noexcept = default;
+    IndexSmoWalView& operator=(IndexSmoWalView&&) noexcept = default;
+
+    std::string_view index_file_name;
+    uint64_t index_generation{0};
+    uint32_t page_count{0};
+    const char* header_image{nullptr};
+
+    page_id_t page_no(uint32_t index) const;
+    const char* page_image(uint32_t index) const;
+
+private:
+    friend bool ParseIndexSmoWal(const WalRecordView& record, IndexSmoWalView* out);
+
+    std::vector<Page> pages_;
+    std::vector<std::array<char, PAGE_SIZE>> decoded_pages_;
+};
+
+// Validates magic, version, flags, bounded length arithmetic, sorted unique
+// page identities, mandatory full header image and the record checksum.
+bool ParseIndexSmoWal(const WalRecordView& record, IndexSmoWalView* out);
+bool ParseIndexBindWal(const WalRecordView& record, std::string_view* index_file_name, uint64_t* generation);

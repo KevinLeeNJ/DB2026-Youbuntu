@@ -94,6 +94,11 @@ private:
         combined.append(key.data(), key.size());
         return combined;
     }
+    static bool historical_bucket_belongs_to_table(const std::string& bucket_key, const std::string& tab_name) {
+        return bucket_key.size() > tab_name.size() && bucket_key.compare(0, tab_name.size(), tab_name) == 0 &&
+               bucket_key[tab_name.size()] == '\0';
+    }
+    void clear_table_runtime_history(const std::string& tab_name);
 
     mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
@@ -325,10 +330,11 @@ public:
      *  由 TransactionManager::GarbageCollection 在 txn_map 回收后调用。 */
     void prune_version_history(timestamp_t watermark);
 
-    bool flush_all_table_and_index_pages(bool wal_preflushed = false);
+    bool flush_all_table_and_index_pages(FlushDependencyPolicy policy = FlushDependencyPolicy::Enforce());
     bool flush_recovery_pages(const std::unordered_set<std::string>& table_names);
-    bool flush_dirty_data_pages(bool wal_preflushed = false);
 
+    // Compatibility wrapper for the recovery scale harness. This remains
+    // table-only and is not part of automatic checkpoint scheduling.
     size_t flush_dirty_pages(size_t max_pages);
 
     void rebuild_all_indexes();

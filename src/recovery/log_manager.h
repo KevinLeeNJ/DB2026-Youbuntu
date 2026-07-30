@@ -29,10 +29,12 @@ See the Mulan PSL v2 for more details. */
 #include "log_defs.h"
 #include "common/config.h"
 #include "record/rm_defs.h"
+#include "storage/index_smo_wal.h"
 
 /* 日志记录对应操作的类型 */
-enum LogType : int { UPDATE = 0, INSERT, DELETE, BEGIN, COMMIT, ABORT, CHECKPOINT };
-static std::string LogTypeStr[] = {"UPDATE", "INSERT", "DELETE", "BEGIN", "COMMIT", "ABORT", "CHECKPOINT"};
+enum LogType : int { UPDATE = 0, INSERT, DELETE, BEGIN, COMMIT, ABORT, CHECKPOINT, INDEX_BIND, INDEX_SMO };
+static std::string LogTypeStr[] = {"UPDATE", "INSERT",     "DELETE",     "BEGIN",    "COMMIT",
+                                   "ABORT",  "CHECKPOINT", "INDEX_BIND", "INDEX_SMO"};
 
 static bool LogPayloadReadable(uint32_t total_len, int offset, size_t bytes) {
     return offset >= 0 && static_cast<uint32_t>(offset) <= total_len &&
@@ -326,6 +328,16 @@ public:
  */
 class UpdateLogRecord : public LogRecord {
 public:
+    // Legacy UPDATE starts with a non-negative before-image size. A negative
+    // value is therefore an unambiguous in-band version marker while keeping
+    // LogType::UPDATE and mixed old/new WAL streams compatible.
+    static constexpr int kSparseBeforeVersion = -1;
+
+    struct BeforeSpan {
+        uint32_t offset{0};
+        uint32_t length{0};
+    };
+
     UpdateLogRecord() {
         log_type_ = LogType::UPDATE;
         lsn_ = INVALID_LSN;
@@ -335,28 +347,68 @@ public:
     }
     UpdateLogRecord(txn_id_t txn_id, RmRecord& old_value, RmRecord& new_value, Rid& rid, std::string table_name)
         : UpdateLogRecord() {
+        if (old_value.size < 0 || new_value.size < 0) {
+            throw std::length_error("UPDATE WAL row image has a negative size");
+        }
         log_tid_ = txn_id;
         old_value_ = old_value;
         new_value_ = new_value;
         rid_ = rid;
         table_name_ = std::move(table_name);
         table_name_size_ = table_name_.size();
-        log_tot_len_ += sizeof(int) + old_value_.size;
-        log_tot_len_ += sizeof(int) + new_value_.size;
-        log_tot_len_ += sizeof(Rid) + sizeof(size_t) + table_name_size_;
+        BuildBeforeSpans();
+        const uint64_t legacy_image_bytes =
+            sizeof(int) + static_cast<uint64_t>(old_value_.size) + sizeof(int) + static_cast<uint64_t>(new_value_.size);
+        uint64_t sparse_image_bytes =
+            sizeof(int) + sizeof(int) + static_cast<uint64_t>(new_value_.size) + sizeof(uint32_t);
+        for (const BeforeSpan& span : before_spans_) {
+            sparse_image_bytes += sizeof(uint32_t) + sizeof(uint32_t) + span.length;
+        }
+        sparse_encoding_ = old_value_.size == new_value_.size && sparse_image_bytes < legacy_image_bytes;
+        uint64_t total_bytes = static_cast<uint64_t>(LOG_HEADER_SIZE) +
+                               (sparse_encoding_ ? sparse_image_bytes : legacy_image_bytes) + sizeof(Rid) +
+                               sizeof(size_t);
+        if (table_name_size_ > UINT64_MAX - total_bytes) {
+            throw std::length_error("UPDATE WAL record length overflows uint64_t");
+        }
+        total_bytes += static_cast<uint64_t>(table_name_size_);
+        if (total_bytes > MAX_INDEX_SMO_RECORD_BYTES || total_bytes > UINT32_MAX) {
+            throw std::length_error("UPDATE WAL record exceeds the bounded WAL record size");
+        }
+        log_tot_len_ = static_cast<uint32_t>(total_bytes);
     }
 
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
         int offset = OFFSET_LOG_DATA;
-        memcpy(dest + offset, &old_value_.size, sizeof(int));
-        offset += sizeof(int);
-        memcpy(dest + offset, old_value_.data, old_value_.size);
-        offset += old_value_.size;
-        memcpy(dest + offset, &new_value_.size, sizeof(int));
-        offset += sizeof(int);
-        memcpy(dest + offset, new_value_.data, new_value_.size);
-        offset += new_value_.size;
+        if (sparse_encoding_) {
+            memcpy(dest + offset, &kSparseBeforeVersion, sizeof(int));
+            offset += sizeof(int);
+            memcpy(dest + offset, &new_value_.size, sizeof(int));
+            offset += sizeof(int);
+            memcpy(dest + offset, new_value_.data, new_value_.size);
+            offset += new_value_.size;
+            const uint32_t span_count = static_cast<uint32_t>(before_spans_.size());
+            memcpy(dest + offset, &span_count, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            for (const BeforeSpan& span : before_spans_) {
+                memcpy(dest + offset, &span.offset, sizeof(uint32_t));
+                offset += sizeof(uint32_t);
+                memcpy(dest + offset, &span.length, sizeof(uint32_t));
+                offset += sizeof(uint32_t);
+                memcpy(dest + offset, old_value_.data + span.offset, span.length);
+                offset += static_cast<int>(span.length);
+            }
+        } else {
+            memcpy(dest + offset, &old_value_.size, sizeof(int));
+            offset += sizeof(int);
+            memcpy(dest + offset, old_value_.data, old_value_.size);
+            offset += old_value_.size;
+            memcpy(dest + offset, &new_value_.size, sizeof(int));
+            offset += sizeof(int);
+            memcpy(dest + offset, new_value_.data, new_value_.size);
+            offset += new_value_.size;
+        }
         memcpy(dest + offset, &rid_, sizeof(Rid));
         offset += sizeof(Rid);
         memcpy(dest + offset, &table_name_size_, sizeof(size_t));
@@ -366,9 +418,54 @@ public:
     void deserialize(const char* src) override {
         LogRecord::deserialize(src);
         int offset = OFFSET_LOG_DATA;
-        if (!ReadRecordPayload(src, log_tot_len_, &offset, &old_value_) ||
-            !ReadRecordPayload(src, log_tot_len_, &offset, &new_value_) ||
-            !LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
+        if (!LogPayloadReadable(log_tot_len_, offset, sizeof(int))) {
+            return;
+        }
+        const int version_or_before_size = read_unaligned<int>(src + offset);
+        if (version_or_before_size >= 0) {
+            if (!ReadRecordPayload(src, log_tot_len_, &offset, &old_value_) ||
+                !ReadRecordPayload(src, log_tot_len_, &offset, &new_value_)) {
+                return;
+            }
+        } else {
+            offset += sizeof(int);
+            if (version_or_before_size != kSparseBeforeVersion ||
+                !ReadRecordPayload(src, log_tot_len_, &offset, &new_value_) ||
+                !LogPayloadReadable(log_tot_len_, offset, sizeof(uint32_t))) {
+                return;
+            }
+            const uint32_t span_count = read_unaligned<uint32_t>(src + offset);
+            offset += sizeof(uint32_t);
+            const uint32_t remaining = log_tot_len_ - static_cast<uint32_t>(offset);
+            if (span_count > static_cast<uint32_t>(new_value_.size) ||
+                span_count > remaining / (sizeof(uint32_t) * 2 + 1)) {
+                return;
+            }
+            old_value_ = new_value_;
+            uint32_t previous_offset = 0;
+            uint32_t previous_end = 0;
+            for (uint32_t i = 0; i < span_count; ++i) {
+                if (!LogPayloadReadable(log_tot_len_, offset, sizeof(uint32_t) * 2)) {
+                    return;
+                }
+                const uint32_t span_offset = read_unaligned<uint32_t>(src + offset);
+                offset += sizeof(uint32_t);
+                const uint32_t span_length = read_unaligned<uint32_t>(src + offset);
+                offset += sizeof(uint32_t);
+                const uint32_t row_size = static_cast<uint32_t>(new_value_.size);
+                if (span_length == 0 || span_offset > row_size || span_length > row_size - span_offset ||
+                    (i > 0 && (span_offset <= previous_offset || span_offset < previous_end)) ||
+                    !LogPayloadReadable(log_tot_len_, offset, span_length)) {
+                    return;
+                }
+                memcpy(old_value_.data + span_offset, src + offset, span_length);
+                offset += static_cast<int>(span_length);
+                previous_offset = span_offset;
+                previous_end = span_offset + span_length;
+            }
+            sparse_encoding_ = true;
+        }
+        if (!LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
             return;
         }
         rid_ = read_unaligned<Rid>(src + offset);
@@ -383,6 +480,11 @@ public:
             return;
         }
         table_name_.assign(src + offset, table_name_size_);
+        offset += static_cast<int>(table_name_size_);
+        if (static_cast<uint32_t>(offset) != log_tot_len_) {
+            table_name_.clear();
+            table_name_size_ = 0;
+        }
     }
 
     RmRecord old_value_;
@@ -390,6 +492,42 @@ public:
     Rid rid_;
     std::string table_name_;
     size_t table_name_size_{0};
+    bool sparse_encoding_{false};
+    std::vector<BeforeSpan> before_spans_;
+
+private:
+    void BuildBeforeSpans() {
+        before_spans_.clear();
+        if (old_value_.size != new_value_.size || old_value_.size <= 0) {
+            return;
+        }
+        const uint32_t row_size = static_cast<uint32_t>(old_value_.size);
+        uint32_t cursor = 0;
+        while (cursor < row_size) {
+            while (cursor < row_size && old_value_.data[cursor] == new_value_.data[cursor]) {
+                ++cursor;
+            }
+            if (cursor == row_size) {
+                break;
+            }
+            const uint32_t begin = cursor;
+            while (cursor < row_size && old_value_.data[cursor] != new_value_.data[cursor]) {
+                ++cursor;
+            }
+            if (!before_spans_.empty()) {
+                BeforeSpan& previous = before_spans_.back();
+                const uint32_t previous_end = previous.offset + previous.length;
+                if (begin - previous_end <= 2) {
+                    // Paying one or two unchanged bytes is cheaper than another
+                    // offset/length pair, and the before bytes still reconstruct
+                    // exactly when the whole merged span is applied.
+                    previous.length = cursor - previous.offset;
+                    continue;
+                }
+            }
+            before_spans_.push_back(BeforeSpan{begin, cursor - begin});
+        }
+    }
 };
 
 class CheckpointLogRecord : public LogRecord {
@@ -449,15 +587,27 @@ std::unique_ptr<LogRecord> DeserializeLogRecord(const char* src, int size);
 
 class LogBuffer {
 public:
-    LogBuffer() : offset_(0) {}
+    LogBuffer() : buffer_(LOG_BUFFER_SIZE + 1), offset_(0) {}
 
     bool is_full(int append_size) {
-        if (offset_ + append_size > LOG_BUFFER_SIZE)
+        if (offset_ + append_size > static_cast<int>(buffer_.size()))
             return true;
         return false;
     }
 
-    char buffer_[LOG_BUFFER_SIZE + 1];
+    void ensure_capacity(size_t bytes) {
+        if (buffer_.size() < bytes) {
+            buffer_.resize(bytes);
+        }
+    }
+
+    void shrink_after_flush() {
+        if (buffer_.size() > LOG_BUFFER_SIZE + 1) {
+            buffer_.resize(LOG_BUFFER_SIZE + 1);
+        }
+    }
+
+    std::vector<char> buffer_;
     int offset_; // 写入log的offset
 };
 
@@ -496,9 +646,15 @@ public:
     }
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
+    lsn_t append_index_smo(const IndexSmoWalData& data);
+    uint64_t ensure_index_binding(const std::string& index_file_name);
+    uint64_t renew_index_binding(const std::string& index_file_name);
     void flush_log_to_disk();
     void flush_log_to_disk_with_sync();
     void flush_log_to_disk_up_to(lsn_t target_lsn);
+    // Physical page/header publication always needs a stable WAL prefix,
+    // independently of the transaction commit durability mode.
+    void flush_log_to_disk_up_to_durable(lsn_t target_lsn);
     void initialize_from_existing_log();
 
     // recovery/checkpoint 成功落盘表页与元数据后调用：先把缓冲区残留日志刷盘，
@@ -595,6 +751,7 @@ private:
 
     void flush_buffer(bool sync);
     void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync);
+    uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch);
 
     // One leader performs the durable flush for all waiters that arrive
     // before it finishes. Waiters are released only after durable_lsn_ moves
@@ -627,4 +784,11 @@ private:
     int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};
+    struct IndexBinding {
+        uint64_t generation{0};
+        uint64_t epoch{0};
+    };
+    std::mutex index_binding_latch_;
+    std::unordered_map<std::string, IndexBinding> index_bindings_;
+    std::atomic<uint64_t> wal_epoch_{1};
 };

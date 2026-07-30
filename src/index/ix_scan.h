@@ -16,11 +16,9 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cassert>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <shared_mutex>
-#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -32,40 +30,19 @@ See the Mulan PSL v2 for more details. */
 enum class ScanDirection { Forward, Backward };
 
 class IxScan : public RecScan {
-public:
-    enum class Mode { LEGACY, HYBRID, COUPLED };
-
-    static Mode configured_mode() {
-        static const Mode mode = [] {
-            const char* value = std::getenv("IX_SCAN_MODE");
-            if (value == nullptr || std::string(value) == "hybrid") {
-                return Mode::HYBRID;
-            }
-            if (std::string(value) == "legacy") {
-                return Mode::LEGACY;
-            }
-            if (std::string(value) == "coupled") {
-                return Mode::COUPLED;
-            }
-            return Mode::HYBRID;
-        }();
-        return mode;
-    }
-
 private:
     const IxIndexHandle* ih_;
     IxIndexHandle::SharedIndexLatch index_latch_guard_;
     Iid iid_;
     Iid end_;
     BufferPoolManager* bpm_;
-    Mode mode_{Mode::HYBRID};
     ScanDirection direction_{ScanDirection::Forward};
     bool coupled_mode_{false};
     bool backward_end_{false};
     bool copy_keys_{false};
 
-    // Legacy cursor used for single-leaf hybrid scans and for internal
-    // callers that already hold a structure latch.
+    // Legacy cursor used for single-leaf forward scans, backward scans, and
+    // internal callers that deliberately do not acquire the structure latch.
     Page* pinned_leaf_page_{nullptr};
     IxNodeHandle leaf_;
     std::shared_lock<std::shared_mutex> leaf_latch_guard_;
@@ -506,17 +483,13 @@ public:
            ScanDirection direction = ScanDirection::Forward)
         : ih_(ih), index_latch_guard_(std::move(index_latch_guard)),
           iid_(direction == ScanDirection::Forward ? lower : upper),
-          end_(direction == ScanDirection::Forward ? upper : lower), bpm_(bpm),
-          mode_(index_latch_guard_.owns_lock() && direction == ScanDirection::Forward ? configured_mode()
-                                                                                      : Mode::LEGACY),
-          direction_(direction), copy_keys_(copy_keys) {
+          end_(direction == ScanDirection::Forward ? upper : lower), bpm_(bpm), direction_(direction),
+          copy_keys_(copy_keys) {
         if (direction_ == ScanDirection::Backward) {
             normalize_backward_position();
             return;
         }
-        const bool use_single_leaf =
-            index_latch_guard_.owns_lock() &&
-            (mode_ == Mode::LEGACY || (mode_ == Mode::HYBRID && lower.page_no == upper.page_no));
+        const bool use_single_leaf = index_latch_guard_.owns_lock() && lower.page_no == upper.page_no;
         if (use_single_leaf) {
             normalize_legacy_position();
             return;

@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -23,35 +23,31 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 PORT = 8765
 
+sys.path.insert(0, str(ROOT_DIR / "test" / "protocol"))
+from live_wire_protocol_test import COMMAND_OK, ERROR, TRANSACTION_ABORT, WireClient
+
 
 class SqlClient:
     def __init__(self) -> None:
-        self.sock = socket.create_connection(("127.0.0.1", PORT), timeout=10)
-        self.sock.settimeout(10)
+        self.wire = WireClient(PORT)
 
     def close(self) -> None:
-        self.sock.close()
+        self.wire.close()
 
-    def sql(self, statement: str) -> str:
-        self.sock.sendall(statement.encode("utf-8") + b"\0")
-        chunks = []
-        while True:
-            data = self.sock.recv(8192)
-            if not data:
-                raise RuntimeError(f"server 在回复前关闭连接: {statement}")
-            chunks.append(data)
-            if b"\0" in data:
-                return (
-                    b"".join(chunks)
-                    .split(b"\0", 1)[0]
-                    .decode("utf-8", errors="replace")
-                )
+    def ok(self, statement: str) -> None:
+        tag, payload = self.wire.stream_raw(statement)
+        if tag == COMMAND_OK and payload == b"":
+            return
+        diagnostic = payload.decode("utf-8", errors="replace")
+        if tag in (ERROR, TRANSACTION_ABORT):
+            raise RuntimeError(f"SQL 执行失败: {statement}\n{diagnostic}")
+        raise RuntimeError(
+            f"SQL 返回了意外的 Wire v3 frame tag={tag}: {statement}\n{diagnostic}"
+        )
 
-    def ok(self, statement: str) -> str:
-        reply = self.sql(statement)
-        if any(word in reply.lower() for word in ("failure", "error", "abort")):
-            raise RuntimeError(f"SQL 执行失败: {statement}\n{reply}")
-        return reply
+    def query(self, statement: str) -> list[list[object]]:
+        _, rows = self.wire.query(statement)
+        return rows
 
 
 class Server:
@@ -62,16 +58,25 @@ class Server:
         self.proc: subprocess.Popen[bytes] | None = None
 
     def start(
-        self, log_name: str, point: str | None = None, action: str = "abort"
+        self,
+        log_name: str,
+        point: str | None = None,
+        action: str = "abort",
+        skip: int = 0,
     ) -> None:
         self._assert_port_free()
         env = os.environ.copy()
         if point is None:
             env.pop("RMDB_FAULT_POINT", None)
             env.pop("RMDB_FAULT_ACTION", None)
+            env.pop("RMDB_FAULT_SKIP", None)
         else:
             env["RMDB_FAULT_POINT"] = point
             env["RMDB_FAULT_ACTION"] = action
+            if skip > 0:
+                env["RMDB_FAULT_SKIP"] = str(skip)
+            else:
+                env.pop("RMDB_FAULT_SKIP", None)
             # The fault matrix validates the strongest WAL boundary. The
             # regular benchmark remains PROCESS_CRASH by default.
             env["RMDB_DURABILITY_MODE"] = "strict"
@@ -155,14 +160,13 @@ def query_values(server: Server) -> dict[int, int]:
     server.start("verify")
     client = SqlClient()
     try:
-        reply = client.ok("select id, v from kv order by id;")
+        rows = client.query("select id, v from kv order by id;")
     finally:
         client.close()
         server.stop()
-    rows = re.findall(r"\|\s*(-?\d+)\s*\|\s*(-?\d+)\s*\|", reply)
     if not rows:
-        raise RuntimeError(f"恢复后没有读到 kv: {reply}")
-    return {int(row_id): int(value) for row_id, value in rows}
+        raise RuntimeError("恢复后没有读到 kv")
+    return {int(row[0]): int(row[1]) for row in rows}
 
 
 def query_value(server: Server) -> int:
@@ -185,7 +189,7 @@ def commit_case(server: Server, point: str, expected: int) -> None:
             client.ok("update kv set v = 20 where id = 1;")
             client.ok("update kv set v = 20 where id = 2;")
             client.ok("commit;")
-        except (OSError, RuntimeError):
+        except (EOFError, OSError, RuntimeError):
             pass
     finally:
         client.close()
@@ -203,7 +207,7 @@ def checkpoint_case(server: Server, point: str, action: str = "abort") -> None:
     try:
         try:
             client.ok("create static_checkpoint;")
-        except (OSError, RuntimeError):
+        except (EOFError, OSError, RuntimeError):
             pass
     finally:
         client.close()
@@ -214,6 +218,46 @@ def checkpoint_case(server: Server, point: str, action: str = "abort") -> None:
     actual = query_value(server)
     if actual != 10:
         raise RuntimeError(f"{point}/{action}: 恢复值为 {actual}，期望 10")
+
+
+def checkpoint_truncate_case(server: Server) -> None:
+    prepare_db(server)
+    # Startup recovery resets the WAL once before accepting connections. Skip
+    # that occurrence so this case crashes at the explicit checkpoint below.
+    server.start("fault", "after_wal_ftruncate", skip=1)
+    client = SqlClient()
+    try:
+        try:
+            client.ok("begin;")
+            client.ok("update kv set v = v + 1 where id = 1;")
+            client.ok("update kv set v = v + 1 where id = 2;")
+            client.ok("commit;")
+            client.ok("create static_checkpoint;")
+        except (EOFError, OSError, RuntimeError):
+            pass
+    finally:
+        client.close()
+    server.wait_exit()
+
+    # The first post-checkpoint commit must persist both the new WAL epoch and
+    # the preceding file-size change before its successful response.
+    server.start("post_truncate_commit")
+    client = SqlClient()
+    try:
+        client.ok("begin;")
+        client.ok("update kv set v = v + 10 where id = 1;")
+        client.ok("update kv set v = v + 10 where id = 2;")
+        client.ok("commit;")
+    finally:
+        client.close()
+        server.kill()
+
+    actual = query_values(server)
+    expected = {1: 21, 2: 21}
+    if actual != expected:
+        raise RuntimeError(
+            f"after_wal_ftruncate: 恢复值为 {actual}，期望 {expected}"
+        )
 
 
 def recovery_case(server: Server, point: str) -> None:
@@ -277,10 +321,11 @@ def run_case(name: str, binary: Path, root: Path) -> None:
     elif name in {
         "before_checkpoint_data_sync",
         "after_checkpoint_data_sync",
-        "after_background_page_write_before_final_wal_flush",
         "before_wal_truncate",
     }:
         checkpoint_case(server, name)
+    elif name == "after_wal_ftruncate":
+        checkpoint_truncate_case(server)
     elif name == "before_checkpoint_data_sync_throw":
         checkpoint_case(server, "before_checkpoint_data_sync", "throw")
     elif name in {
@@ -308,8 +353,8 @@ CASES = [
     "before_published_csn_store",
     "before_checkpoint_data_sync",
     "after_checkpoint_data_sync",
-    "after_background_page_write_before_final_wal_flush",
     "before_wal_truncate",
+    "after_wal_ftruncate",
     "before_checkpoint_data_sync_throw",
     "mid_recovery_redo",
     "mid_recovery_undo",

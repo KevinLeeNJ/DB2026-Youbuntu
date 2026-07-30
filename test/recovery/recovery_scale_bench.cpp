@@ -253,7 +253,7 @@ void BuildDatabase(const std::string& db_name, int64_t rows, size_t bpm_pages) {
         for (const auto& index_meta : tab_meta.indexes) {
             auto key = IndexKey(index_meta, row_bytes.data());
             db.sm_mgr_.ihs_.at(db.ix_mgr_.get_index_name(kTableName, index_meta.cols))
-                ->insert_entry(key.data(), rid, nullptr, true);
+                ->insert_entry(key.data(), rid, IndexWriteWalContext::TestNoWal(), true);
         }
     }
     db.sm_mgr_.close_db();
@@ -348,7 +348,7 @@ void RunWorkloadThenDie(const std::string& db_name, int64_t rows, int64_t wal_ta
                 for (const auto& index_meta : tab_meta.indexes) {
                     auto key = IndexKey(index_meta, old_value.data);
                     db.sm_mgr_.ihs_.at(db.ix_mgr_.get_index_name(kTableName, index_meta.cols))
-                        ->delete_entry(key.data(), rid, nullptr);
+                        ->delete_entry(key.data(), rid, IndexWriteWalContext::TestNoWal());
                 }
                 table->delete_record(rid, nullptr, prev_lsn);
                 continue;
@@ -375,8 +375,8 @@ void RunWorkloadThenDie(const std::string& db_name, int64_t rows, int64_t wal_ta
                     continue;
                 }
                 auto* index = db.sm_mgr_.ihs_.at(db.ix_mgr_.get_index_name(kTableName, index_meta.cols)).get();
-                index->delete_entry(old_key.data(), rid, nullptr);
-                index->insert_entry(new_key.data(), rid, nullptr, true);
+                index->delete_entry(old_key.data(), rid, IndexWriteWalContext::TestNoWal());
+                index->insert_entry(new_key.data(), rid, IndexWriteWalContext::TestNoWal(), true);
             }
         }
 
@@ -397,7 +397,7 @@ void RunWorkloadThenDie(const std::string& db_name, int64_t rows, int64_t wal_ta
             for (const auto& index_meta : tab_meta.indexes) {
                 auto key = IndexKey(index_meta, value.data);
                 db.sm_mgr_.ihs_.at(db.ix_mgr_.get_index_name(kTableName, index_meta.cols))
-                    ->insert_entry(key.data(), rid, nullptr, true);
+                    ->insert_entry(key.data(), rid, IndexWriteWalContext::TestNoWal(), true);
             }
         }
 
@@ -458,8 +458,8 @@ void RunWorkloadThenDie(const std::string& db_name, int64_t rows, int64_t wal_ta
                     continue;
                 }
                 auto* index = db.sm_mgr_.ihs_.at(db.ix_mgr_.get_index_name(kTableName, index_meta.cols)).get();
-                index->delete_entry(old_key.data(), rid, nullptr);
-                index->insert_entry(new_key.data(), rid, nullptr, true);
+                index->delete_entry(old_key.data(), rid, IndexWriteWalContext::TestNoWal());
+                index->insert_entry(new_key.data(), rid, IndexWriteWalContext::TestNoWal(), true);
             }
         }
     }
@@ -470,7 +470,7 @@ void RunWorkloadThenDie(const std::string& db_name, int64_t rows, int64_t wal_ta
         // before it truncated the WAL: the indexes are structurally intact on
         // disk, so recovery exercises the key-level index repair instead of
         // falling back to a rebuild.
-        db.sm_mgr_.flush_all_table_and_index_pages(true);
+        db.sm_mgr_.flush_all_table_and_index_pages(FlushDependencyPolicy::AlreadyDurable());
     }
 
     std::cout << "[scale] workload: " << committed_txns << " committed txns, " << kInFlightTxns << " in flight, "

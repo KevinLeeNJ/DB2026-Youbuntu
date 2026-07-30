@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -41,8 +42,11 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
 #include "system/sm_meta.h"
+#include "transaction/transaction_manager.h"
 
 namespace {
+
+static_assert(!std::is_default_constructible_v<IndexWriteWalContext>);
 
 class IndexHandleTest : public ::testing::Test {
 public:
@@ -127,13 +131,55 @@ public:
     }
 };
 
+TEST_F(IndexHandleTest, MutationDependencyIgnoresPoisonedIndexPayload) {
+    auto ih = open_index();
+    const PageId root_id{ih->GetFd(), ih->file_hdr_->root_page_};
+    Page* root = buffer_pool_manager->fetch_page(root_id);
+    ASSERT_NE(root, nullptr);
+    {
+        std::unique_lock root_guard{root->latch()};
+        reinterpret_cast<IxPageHdr*>(root->get_data())->next_free_page_no = 777;
+    }
+    ASSERT_TRUE(buffer_pool_manager->unpin_page(root_id, false));
+
+    const auto k = key(10);
+    ih->insert_entry(k.data(), Rid{1, 10}, IndexWriteWalContext::TestNoWal());
+
+    root = buffer_pool_manager->fetch_page(root_id);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(reinterpret_cast<IxPageHdr*>(root->get_data())->next_free_page_no, 777);
+    {
+        std::scoped_lock dirty_guard{root->dirty_latch_};
+        EXPECT_EQ(root->write_dependency_.kind(), PageWriteDependency::Kind::None);
+    }
+    ASSERT_TRUE(buffer_pool_manager->unpin_page(root_id, false));
+    EXPECT_TRUE(buffer_pool_manager->flush_page(root_id));
+    close_index(ih);
+}
+
+TEST(IndexWriteWalContextTest, LoggedOriginsRequireAndPreserveExactLsn) {
+    EXPECT_THROW((void)IndexWriteWalContext::LoggedRuntime(INVALID_LSN), InternalError);
+    EXPECT_THROW((void)IndexWriteWalContext::LiveRollback(INVALID_LSN), InternalError);
+
+    const auto runtime = IndexWriteWalContext::LoggedRuntime(17);
+    EXPECT_EQ(runtime.origin(), IndexWriteWalContext::Origin::LoggedRuntime);
+    EXPECT_EQ(runtime.dependency().kind(), PageWriteDependency::Kind::WalLsn);
+    EXPECT_EQ(runtime.dependency().wal_lsn(), 17);
+
+    const auto rollback = IndexWriteWalContext::LiveRollback(29);
+    EXPECT_EQ(rollback.origin(), IndexWriteWalContext::Origin::LiveRollback);
+    EXPECT_EQ(rollback.dependency().kind(), PageWriteDependency::Kind::WalLsn);
+    EXPECT_EQ(rollback.dependency().wal_lsn(), 29);
+    EXPECT_EQ(IndexWriteWalContext::RecoveryDurable().dependency().kind(), PageWriteDependency::Kind::None);
+}
+
 TEST_F(IndexHandleTest, InsertsUniqueKeysAndFindsValues) {
     auto ih = open_index();
     auto k10 = key(10);
     auto k20 = key(20);
 
-    ih->insert_entry(k10.data(), Rid{1, 10}, nullptr);
-    ih->insert_entry(k20.data(), Rid{1, 20}, nullptr);
+    ih->insert_entry(k10.data(), Rid{1, 10}, IndexWriteWalContext::TestNoWal());
+    ih->insert_entry(k20.data(), Rid{1, 20}, IndexWriteWalContext::TestNoWal());
 
     std::vector<Rid> result;
     EXPECT_TRUE(ih->get_value(k10.data(), &result, nullptr));
@@ -153,7 +199,7 @@ TEST_F(IndexHandleTest, UniqueLookupFindsSingleKey) {
     auto ih = open_index();
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{7, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{7, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto found = ih->lookup_unique(key(137).data());
@@ -182,19 +228,24 @@ TEST_F(IndexHandleTest, RejectsDuplicateKeys) {
     auto ih = open_index();
     auto k10 = key(10);
 
-    ih->insert_entry(k10.data(), Rid{1, 10}, nullptr);
+    ih->insert_entry(k10.data(), Rid{1, 10}, IndexWriteWalContext::TestNoWal());
 
-    EXPECT_THROW(ih->insert_entry(k10.data(), Rid{2, 10}, nullptr), IndexEntryExistsError);
+    EXPECT_THROW(ih->insert_entry(k10.data(), Rid{2, 10}, IndexWriteWalContext::TestNoWal()), IndexEntryExistsError);
 
     close_index(ih);
 }
 
 TEST_F(IndexHandleTest, ScansRangeInKeyOrderAcrossSplits) {
     auto ih = open_index();
+    ih->refresh_page_residency(false);
+    const page_id_t initial_root_page_no = ih->cached_root_page_no_;
     for (int value = 1000; value >= 0; --value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal());
     }
+    EXPECT_NE(ih->file_hdr_->root_page_, initial_root_page_no);
+    EXPECT_EQ(ih->cached_root_page_no_, ih->file_hdr_->root_page_);
+    ASSERT_NE(ih->cached_root_page_, nullptr);
 
     auto lower_key = key(123);
     auto upper_key = key(130);
@@ -231,7 +282,7 @@ TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundWhenEndLeafIsEmpty) {
     constexpr int kKeyCount = 8000;
     for (int value = 0; value < kKeyCount; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto leaves = leaf_snapshots(ih.get());
@@ -253,7 +304,7 @@ TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundWhenEndLeafIsEmpty) {
 
     for (int value : leaves[9].keys) {
         auto k = key(value);
-        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, nullptr));
+        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal()));
     }
 
     std::vector<int> scanned;
@@ -279,7 +330,7 @@ TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundAfterEndLeafShrinksBelowEndSlo
     constexpr int kKeyCount = 8000;
     for (int value = 0; value < kKeyCount; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto leaves = leaf_snapshots(ih.get());
@@ -306,7 +357,7 @@ TEST_F(IndexHandleTest, RangeScanStopsAtUpperBoundAfterEndLeafShrinksBelowEndSlo
             continue;
         }
         auto k = key(value);
-        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, nullptr));
+        ASSERT_TRUE(ih->delete_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal()));
     }
 
     std::vector<int> scanned;
@@ -340,7 +391,7 @@ TEST_F(IndexHandleTest, FloatKeysUseBinary32Ordering) {
     for (const auto& [value, slot] :
          std::vector<std::pair<float, int>>{{1.5F, 115}, {300000.01F, 3000100}, {-2.0F, 80}}) {
         auto k = float_key(value);
-        ih->insert_entry(k.data(), Rid{1, slot}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, slot}, IndexWriteWalContext::TestNoWal());
     }
 
     auto target = float_key(300000.01F);
@@ -365,7 +416,7 @@ TEST_F(IndexHandleTest, ReverseScanWalksLeafLinksWithoutReSeek) {
     auto ih = open_index();
     for (int value = 0; value < 200; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     std::vector<int> values;
@@ -389,7 +440,7 @@ TEST_F(IndexHandleTest, AppendSplitsPreserveOrder) {
     auto ih = open_index();
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     std::vector<int> values;
@@ -409,7 +460,7 @@ TEST_F(IndexHandleTest, HybridUsesPinnedCursorForSingleLeafRange) {
     auto ih = open_index();
     for (int value : {10, 20, 30}) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto lower_key = key(10);
@@ -436,7 +487,7 @@ TEST_F(IndexHandleTest, EqualRangeMatchesLowerBoundPlusUpperBound) {
     // Insert enough keys to cause several leaf splits (btree_order is small).
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     // For every key (including non-existent ones at boundaries), verify that
@@ -503,7 +554,7 @@ TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
     auto ih = open_index();
     for (int value = 0; value < 1000; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     close_index(ih);
 
@@ -519,7 +570,7 @@ TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
 
     for (int value = 1000; value < 2000; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto k = key(1500);
@@ -530,25 +581,10 @@ TEST_F(IndexHandleTest, ReopenRestoresPageAllocationCursor) {
     close_index(ih);
 }
 
-// num_pages_ only ever reaches disk through the checkpoint path, so a crash
-// leaves the persisted header naming fewer pages than the file actually holds.
-// Trusting it would make the next create_node() hand out page numbers that
-// live nodes already occupy, and recovery would overwrite a live subtree.
+// A damaged or stale header can name fewer pages than the file actually holds.
+// Trusting it would make the next create_node() hand out page numbers that live
+// nodes already occupy, and recovery would overwrite a live subtree.
 TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
-    // This test is about what the IxIndexHandle constructor does when the
-    // persisted num_pages_ is behind the real file length. Splits now publish
-    // the index header themselves, so that condition has to be created on
-    // purpose instead of assumed - which is the whole point of the SMO
-    // write-out, but it means the precondition below would otherwise never hold.
-    struct SmoFlushOff {
-        SmoFlushOff() {
-            IxIndexHandle::set_smo_flush_enabled(false);
-        }
-        ~SmoFlushOff() {
-            IxIndexHandle::set_smo_flush_enabled(true);
-        }
-    } smo_flush_off;
-
     constexpr int kCheckpointedKeys = 1000;
     constexpr int kKeysAfterCheckpoint = 1400;
     const auto index_name = ix_manager->get_index_name(table_name, cols);
@@ -557,32 +593,43 @@ TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
     auto ih = open_index();
     for (int value = 0; value < kCheckpointedKeys; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     close_index(ih);
+    std::vector<char> checkpoint_header(PAGE_SIZE, 0);
+    {
+        const int header_fd = disk_manager->open_file(index_name);
+        disk_manager->read_page(header_fd, IX_FILE_HDR_PAGE, checkpoint_header.data(), PAGE_SIZE);
+        disk_manager->close_file(header_fd);
+    }
 
-    // More leaf splits allocate pages after that header was published. The
-    // root does not move, so only num_pages_ goes stale - which is the case
-    // the fix has to survive. A stale root_page_ needs its own WAL record and
-    // is out of scope here.
+    // More leaf splits allocate pages after that snapshot. The root does not
+    // move, so restoring the snapshot makes only num_pages_ stale - which is
+    // the case the fix has to survive. A stale root_page_ needs its own WAL
+    // record and is out of scope here.
     ih = open_index();
     const page_id_t root_before = ih->file_hdr_->root_page_;
     const page_id_t pages_at_checkpoint = ih->file_hdr_->num_pages_;
     for (int value = kCheckpointedKeys; value < kKeysAfterCheckpoint; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     ASSERT_EQ(ih->file_hdr_->root_page_, root_before) << "test needs a workload that does not move the root";
     ASSERT_GT(ih->file_hdr_->num_pages_, pages_at_checkpoint);
 
-    // Persist the node pages but not the header, which is exactly what kill -9
-    // leaves behind: close_index()/flush_index_header() never ran.
+    // Persist every current node image, then inject the older header snapshot.
+    // This constructs the fault directly without a production write-out switch.
     const int fd = ih->GetFd();
     ASSERT_TRUE(buffer_pool_manager->flush_all_pages(fd));
     ih->release_root_page_cache();
     buffer_pool_manager->delete_all_pages(fd);
     disk_manager->close_file(fd);
     ih.reset();
+    {
+        const int header_fd = disk_manager->open_file(index_name);
+        disk_manager->write_page(header_fd, IX_FILE_HDR_PAGE, checkpoint_header.data(), PAGE_SIZE);
+        disk_manager->close_file(header_fd);
+    }
 
     // The precondition the fix exists for: the persisted page count is behind
     // the real file length.
@@ -617,7 +664,7 @@ TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
     constexpr int kKeysAfterRestart = 2400;
     for (int value = kKeysAfterCheckpoint; value < kKeysAfterRestart; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
     for (int value = 0; value < kKeysAfterRestart; ++value) {
         auto k = key(value);
@@ -634,7 +681,7 @@ TEST_F(IndexHandleTest, StaleHeaderPageCountDoesNotReallocateLivePages) {
     close_index(ih);
 }
 
-TEST_F(IndexHandleTest, CachesMultiLevelInternalPagesAcrossReopen) {
+TEST_F(IndexHandleTest, DefaultRefreshCachesMultiLevelInternalPagesAcrossReopen) {
     cleanup();
     cols = {ColMeta{.tab_name = table_name, .name = "id", .type = TYPE_STRING, .len = 128, .offset = 0, .index = true}};
     ix_manager->create_index(table_name, cols);
@@ -648,7 +695,7 @@ TEST_F(IndexHandleTest, CachesMultiLevelInternalPagesAcrossReopen) {
     };
     for (int value = 0; value < 4000; ++value) {
         auto k = wide_key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     ih->refresh_page_residency();
@@ -691,6 +738,48 @@ TEST_F(IndexHandleTest, CachesMultiLevelInternalPagesAcrossReopen) {
     close_index(ih);
 }
 
+TEST_F(IndexHandleTest, RootShrinkTransfersPromotedInternalPinExactlyOnce) {
+    cleanup();
+    cols = {ColMeta{.tab_name = table_name, .name = "id", .type = TYPE_STRING, .len = 128, .offset = 0, .index = true}};
+    ix_manager->create_index(table_name, cols);
+    auto ih = open_index();
+
+    for (int value = 0; value < 4000; ++value) {
+        std::vector<char> k(128, 0);
+        const std::string encoded = std::to_string(value);
+        std::memcpy(k.data(), encoded.data(), encoded.size());
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
+    }
+    ih->refresh_page_residency(true);
+
+    IxNodeHandle old_root(ih->file_hdr_.get(), ih->cached_root_page_);
+    ASSERT_FALSE(old_root.is_leaf_page());
+    ASSERT_GT(old_root.get_size(), 1);
+    const page_id_t promoted_page_no = old_root.value_at(0);
+    auto promoted = ih->cached_internal_pages_.find(promoted_page_no);
+    ASSERT_NE(promoted, ih->cached_internal_pages_.end());
+    Page* promoted_page = promoted->second;
+    ASSERT_EQ(promoted_page->pin_count_, 1);
+
+    {
+        auto structure_guard = ih->lock_exclusive();
+        IxIndexHandle::SmoScope smo(ih.get(), IndexWriteWalContext::TestNoWal());
+        {
+            std::unique_lock root_guard{old_root.page->latch()};
+            BufferPoolManager::mark_dirty(old_root.page, PageWriteDependency::None());
+            old_root.set_size(1);
+        }
+        ASSERT_TRUE(ih->adjust_root(&old_root));
+        smo.commit();
+    }
+    EXPECT_EQ(ih->cached_root_page_no_, promoted_page_no);
+    EXPECT_EQ(ih->cached_root_page_, promoted_page);
+    EXPECT_EQ(ih->cached_internal_pages_.count(promoted_page_no), 0U);
+    EXPECT_EQ(promoted_page->pin_count_, 1);
+    EXPECT_EQ(buffer_pool_manager->index_internal_resident_count(), ih->resident_internal_pages_.size());
+    close_index(ih);
+}
+
 TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     auto ih = open_index();
     auto duplicate_key = key(777);
@@ -699,7 +788,7 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     for (int i = 0; i < 1000; ++i) {
         Rid rid{i + 1, i};
         inserted.push_back(rid);
-        ih->insert_entry(duplicate_key.data(), rid, nullptr, true);
+        ih->insert_entry(duplicate_key.data(), rid, IndexWriteWalContext::TestNoWal(), true);
     }
 
     std::vector<Rid> result;
@@ -714,7 +803,7 @@ TEST_F(IndexHandleTest, DuplicateKeyRangeSpansLeavesAndDeleteByRidRemovesOne) {
     EXPECT_EQ(duplicate_lookup.status, UniqueLookupStatus::Duplicate);
 
     Rid target = inserted[inserted.size() / 2];
-    EXPECT_TRUE(ih->delete_entry(duplicate_key.data(), target, nullptr));
+    EXPECT_TRUE(ih->delete_entry(duplicate_key.data(), target, IndexWriteWalContext::TestNoWal()));
 
     result.clear();
     ASSERT_TRUE(ih->get_value(duplicate_key.data(), &result, nullptr));
@@ -728,7 +817,7 @@ TEST_F(IndexHandleTest, LeafLocalMutationDoesNotInvalidateTopologyEpoch) {
     auto ih = open_index();
     for (int value = 0; value < 200; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     const auto leaves = leaf_snapshots(ih.get());
@@ -742,9 +831,9 @@ TEST_F(IndexHandleTest, LeafLocalMutationDoesNotInvalidateTopologyEpoch) {
         auto duplicate_key = key(snapshot.keys[1]);
         const Rid duplicate_rid{9001, snapshot.keys[1]};
         const auto epoch_before = ih->topology_epoch_.load(std::memory_order_relaxed);
-        ih->insert_entry(duplicate_key.data(), duplicate_rid, nullptr, true);
+        ih->insert_entry(duplicate_key.data(), duplicate_rid, IndexWriteWalContext::TestNoWal(), true);
         EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
-        ASSERT_TRUE(ih->delete_entry(duplicate_key.data(), duplicate_rid, nullptr));
+        ASSERT_TRUE(ih->delete_entry(duplicate_key.data(), duplicate_rid, IndexWriteWalContext::TestNoWal()));
         EXPECT_EQ(ih->topology_epoch_.load(std::memory_order_relaxed), epoch_before);
         tested = true;
         break;
@@ -772,8 +861,8 @@ TEST_F(IndexHandleTest, ConcurrentInsertDeleteByRidDoesNotCorruptTree) {
             for (int i = 0; i < iterations; ++i) {
                 Rid rid{thread_id + 1, i};
                 try {
-                    ih->insert_entry(duplicate_key.data(), rid, nullptr, true);
-                    if (!ih->delete_entry(duplicate_key.data(), rid, nullptr)) {
+                    ih->insert_entry(duplicate_key.data(), rid, IndexWriteWalContext::TestNoWal(), true);
+                    if (!ih->delete_entry(duplicate_key.data(), rid, IndexWriteWalContext::TestNoWal())) {
                         failures.fetch_add(1, std::memory_order_relaxed);
                     }
                 } catch (...) {
@@ -802,7 +891,7 @@ TEST_F(IndexHandleTest, LongScanAllowsStructuralChangesWithoutMissingOrDuplicati
     auto ih = open_index();
     for (int value = 0; value < 2000; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto inserted_key = key(5000);
@@ -830,7 +919,7 @@ TEST_F(IndexHandleTest, LongScanAllowsStructuralChangesWithoutMissingOrDuplicati
         while (!scan_ready.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        ih->insert_entry(inserted_key.data(), Rid{5001, 5000}, nullptr);
+        ih->insert_entry(inserted_key.data(), Rid{5001, 5000}, IndexWriteWalContext::TestNoWal());
         insert_done.store(true, std::memory_order_release);
     });
 
@@ -838,7 +927,8 @@ TEST_F(IndexHandleTest, LongScanAllowsStructuralChangesWithoutMissingOrDuplicati
         while (!scan_ready.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        delete_result.store(ih->delete_entry(deleted_key.data(), nullptr), std::memory_order_release);
+        delete_result.store(ih->delete_entry(deleted_key.data(), IndexWriteWalContext::TestNoWal()),
+                            std::memory_order_release);
         delete_done.store(true, std::memory_order_release);
     });
 
@@ -899,12 +989,12 @@ TEST_F(IndexHandleTest, DeletesKeysAndKeepsRemainingEntriesSearchable) {
     auto ih = open_index();
     for (int value = 0; value < 300; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     for (int value = 25; value < 275; value += 2) {
         auto k = key(value);
-        EXPECT_TRUE(ih->delete_entry(k.data(), nullptr));
+        EXPECT_TRUE(ih->delete_entry(k.data(), IndexWriteWalContext::TestNoWal()));
     }
 
     for (int value = 0; value < 300; ++value) {
@@ -927,7 +1017,7 @@ TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
     auto ih = open_index();
     for (int value = 0; value < 2500; ++value) {
         auto k = key(value);
-        ih->insert_entry(k.data(), Rid{value + 1, value}, nullptr);
+        ih->insert_entry(k.data(), Rid{value + 1, value}, IndexWriteWalContext::TestNoWal());
     }
 
     auto leaves = leaf_snapshots(ih.get());
@@ -941,7 +1031,7 @@ TEST_F(IndexHandleTest, ScanSkipsEmptyLeafLeftByDeletes) {
     page_id_t emptied_page = leaves[1].page_no;
     for (int value : leaves[1].keys) {
         auto k = key(value);
-        EXPECT_TRUE(ih->delete_entry(k.data(), nullptr)) << value;
+        EXPECT_TRUE(ih->delete_entry(k.data(), IndexWriteWalContext::TestNoWal())) << value;
     }
 
     leaves = leaf_snapshots(ih.get());
@@ -994,6 +1084,9 @@ public:
     std::unique_ptr<RmManager> rm_manager;
     std::unique_ptr<IxManager> ix_manager;
     std::unique_ptr<SmManager> sm_manager;
+    std::unique_ptr<LockManager> lock_manager;
+    std::unique_ptr<LogManager> log_manager;
+    std::unique_ptr<TransactionManager> txn_manager;
     std::string db_name = "index_scan_feature_test_db";
     bool opened = false;
 
@@ -1009,14 +1102,22 @@ public:
         }
         sm_manager->create_db(db_name);
         sm_manager->open_db(db_name);
+        lock_manager = std::make_unique<LockManager>();
+        log_manager = std::make_unique<LogManager>(disk_manager.get());
+        buffer_pool_manager->set_log_manager(log_manager.get());
+        txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
         opened = true;
     }
 
     void TearDown() override {
+        txn_manager.reset();
         if (opened) {
             sm_manager->close_db();
             opened = false;
         }
+        buffer_pool_manager->set_log_manager(nullptr);
+        log_manager.reset();
+        lock_manager.reset();
         if (sm_manager->is_dir(db_name)) {
             sm_manager->drop_db(db_name);
         }
@@ -1046,16 +1147,29 @@ public:
         sm_manager->create_table("scores", cols, nullptr);
     }
 
+    template <typename Body> void run_logged_write(Body&& body) {
+        Transaction* txn = txn_manager->begin(nullptr, log_manager.get(), IsolationLevel::READ_COMMITTED);
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(lock_manager.get(), log_manager.get(), txn, data_send, &offset, txn_manager.get());
+        try {
+            body(&context);
+            txn_manager->commit(txn, log_manager.get());
+        } catch (...) {
+            txn_manager->abort(txn, log_manager.get());
+            throw;
+        }
+    }
+
     void insert_row(int w_id, const std::string& name) {
         Value id;
         id.set_int(w_id);
         Value name_val;
         name_val.set_str(name);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), "warehouse", {id, name_val}, &context);
-        executor.Next();
+        run_logged_write([&](Context* context) {
+            InsertExecutor executor(sm_manager.get(), "warehouse", {id, name_val}, context);
+            executor.Next();
+        });
     }
 
     void insert_two_ints(const std::string& tab_name, int a, int b) {
@@ -1063,11 +1177,10 @@ public:
         av.set_int(a);
         Value bv;
         bv.set_int(b);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), tab_name, {av, bv}, &context);
-        executor.Next();
+        run_logged_write([&](Context* context) {
+            InsertExecutor executor(sm_manager.get(), tab_name, {av, bv}, context);
+            executor.Next();
+        });
     }
 
     void insert_three_ints(const std::string& tab_name, int a, int b, int c) {
@@ -1077,11 +1190,10 @@ public:
         bv.set_int(b);
         Value cv;
         cv.set_int(c);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), tab_name, {av, bv, cv}, &context);
-        executor.Next();
+        run_logged_write([&](Context* context) {
+            InsertExecutor executor(sm_manager.get(), tab_name, {av, bv, cv}, context);
+            executor.Next();
+        });
     }
 
     void insert_score(int sid, int cid, float score) {
@@ -1091,11 +1203,10 @@ public:
         cid_val.set_int(cid);
         Value score_val;
         score_val.set_float(score);
-        char data_send[BUFFER_LENGTH] = {};
-        int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
-        InsertExecutor executor(sm_manager.get(), "scores", {sid_val, cid_val, score_val}, &context);
-        executor.Next();
+        run_logged_write([&](Context* context) {
+            InsertExecutor executor(sm_manager.get(), "scores", {sid_val, cid_val, score_val}, context);
+            executor.Next();
+        });
     }
 
     static Condition int_cond(CompOp op, int value) {
@@ -1423,26 +1534,28 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     insert_row(700, "newdance");
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}), std::vector<int>({700}));
 
-    char data_send[BUFFER_LENGTH] = {};
-    int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
     std::vector<Rid> delete_rids;
-    IndexScanExecutor delete_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &context);
+    Context scan_context(nullptr, nullptr, nullptr);
+    IndexScanExecutor delete_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &scan_context);
     for (delete_scan.beginTuple(); !delete_scan.is_end(); delete_scan.nextTuple()) {
         delete_rids.push_back(delete_scan.rid());
     }
-    DeleteExecutor delete_exec(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, delete_rids, &context);
-    delete_exec.Next();
+    run_logged_write([&](Context* context) {
+        DeleteExecutor delete_exec(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, delete_rids, context);
+        delete_exec.Next();
+    });
     EXPECT_TRUE(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}).empty());
 
     std::vector<Rid> update_rids;
-    IndexScanExecutor update_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &context);
+    IndexScanExecutor update_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &scan_context);
     for (update_scan.beginTuple(); !update_scan.is_end(); update_scan.nextTuple()) {
         update_rids.push_back(update_scan.rid());
     }
-    UpdateExecutor update_exec(sm_manager.get(), "warehouse", {set_int_clause("warehouse", "w_id", 507)},
-                               {int_cond(OP_EQ, 534)}, update_rids, &context);
-    update_exec.Next();
+    run_logged_write([&](Context* context) {
+        UpdateExecutor update_exec(sm_manager.get(), "warehouse", {set_int_clause("warehouse", "w_id", 507)},
+                                   {int_cond(OP_EQ, 534)}, update_rids, context);
+        update_exec.Next();
+    });
     EXPECT_EQ(scan_ids({int_cond(OP_GT, 100), int_cond(OP_LT, 534)}, {"w_id"}), std::vector<int>({500, 507}));
 }
 
@@ -1462,18 +1575,20 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
     create_warehouse();
     sm_manager->create_index("warehouse", {"name"}, nullptr);
 
-    char data_send[BUFFER_LENGTH] = {};
-    int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
     std::vector<Rid> rids;
     IndexScanExecutor scan(sm_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &context);
     for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
         rids.push_back(scan.rid());
     }
 
-    UpdateExecutor update_exec(sm_manager.get(), "warehouse", {set_string_clause("warehouse", "name", "qweruiop")},
-                               {string_cond(OP_EQ, "asdfhjkl")}, rids, &context);
-    EXPECT_THROW(update_exec.Next(), IndexEntryExistsError);
+    EXPECT_THROW(run_logged_write([&](Context* write_context) {
+                     UpdateExecutor update_exec(sm_manager.get(), "warehouse",
+                                                {set_string_clause("warehouse", "name", "qweruiop")},
+                                                {string_cond(OP_EQ, "asdfhjkl")}, rids, write_context);
+                     update_exec.Next();
+                 }),
+                 IndexEntryExistsError);
 
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "asdfhjkl")}, {"name"}), std::vector<int>({534}));
     EXPECT_EQ(scan_ids({string_cond(OP_EQ, "qweruiop")}, {"name"}), std::vector<int>({10}));

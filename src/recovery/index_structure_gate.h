@@ -54,10 +54,9 @@ See the Mulan PSL v2 for more details. */
  * Division of labour, so nobody has to guess later:
  *   - this class runs on every recovery and covers the change set;
  *   - validate_structure() stays as the whole-tree assertion and is reachable
- *     from tests (test/index/) and from recovery under
- *     RMDB_RECOVERY_FULL_INDEX_VALIDATION=1. It is the reference oracle this
- *     class is checked against, and the escape hatch when the gate cannot even
- *     set itself up.
+ *     from tests (test/index/). It is the reference oracle this class is checked
+ *     against, and the fail-closed fallback when the gate cannot even set itself
+ *     up.
  *
  * How to use it: construct one per index, then feed it every distinct repair key
  * in ascending B+tree order and stop at the first false. `Ready` means the

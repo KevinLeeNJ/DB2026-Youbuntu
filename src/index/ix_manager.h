@@ -132,6 +132,10 @@ public:
         }
 
         disk_manager_->set_fd2pageno(fd, IX_INIT_NUM_PAGES);
+        // Publish a new WAL-only generation before this index instance can be
+        // made visible in the catalog. A same-name drop/recreate must never
+        // accept an older INDEX_SMO record.
+        buffer_pool_manager_->renew_index_binding(ix_name);
 
         // Close index file
         disk_manager_->close_file(fd);
@@ -161,19 +165,17 @@ public:
     }
 
     void close_index(const IxIndexHandle* ih) {
-        std::vector<char> data(ih->file_hdr_->tot_len_);
-        ih->file_hdr_->serialize(data.data());
-        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data.data(), ih->file_hdr_->tot_len_);
-        // 缓冲区的所有页刷到磁盘，注意这句话必须写在close_file前面
-        buffer_pool_manager_->flush_all_pages(ih->fd_);
+        // Publish page images before the header that names their structure.
+        if (!buffer_pool_manager_->flush_all_pages(ih->fd_)) {
+            throw InternalError("failed to flush index pages while closing index");
+        }
+        ih->write_index_header_page();
         ih->release_root_page_cache();
         buffer_pool_manager_->delete_all_pages(ih->fd_);
         disk_manager_->close_file(ih->fd_);
     }
 
     void flush_index_header(const IxIndexHandle* ih) {
-        std::vector<char> data(ih->file_hdr_->tot_len_);
-        ih->file_hdr_->serialize(data.data());
-        disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data.data(), ih->file_hdr_->tot_len_);
+        ih->write_index_header_page();
     }
 };

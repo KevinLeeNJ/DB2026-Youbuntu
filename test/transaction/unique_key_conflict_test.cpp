@@ -56,6 +56,7 @@ protected:
         ix_mgr_ = std::make_unique<IxManager>(disk_.get(), bpm_.get());
         sm_mgr_ = std::make_unique<SmManager>(disk_.get(), bpm_.get(), rm_mgr_.get(), ix_mgr_.get());
         log_mgr_ = std::make_unique<LogManager>(disk_.get());
+        bpm_->set_log_manager(log_mgr_.get());
         lock_mgr_ = std::make_unique<LockManager>();
         sm_mgr_->create_db("unique_key_conflict_db");
         sm_mgr_->open_db("unique_key_conflict_db");

@@ -22,29 +22,23 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_set>
 #include <vector>
 #include "index_structure_gate.h"
+#include "index_smo_log.h"
 #include "log_manager.h"
 #include "wal_reader.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
 
-class RedoLogsInPage {
-public:
-    RedoLogsInPage() {
-        table_file_ = nullptr;
-    }
-    RmFileHandle* table_file_;
-    std::vector<lsn_t> redo_logs_; // 在该page上需要redo的操作的lsn
-};
-
 /**
- * Crash recovery over a WAL that is streamed, never materialized.
+ * Crash recovery over a WAL whose records are never deserialized en masse.
  *
  * analyze() makes one forward pass and keeps only what the later phases need:
  * the committed/loser transaction sets, an 8-byte descriptor per DML record,
- * and an lsn -> file offset index. redo() is a second forward pass that reuses
- * one buffer; undo() reads individual records through the offset index, which
- * costs one pread per loser record. Nothing holds a deserialized record map,
- * so peak recovery memory is a few tens of MB rather than twice the WAL size.
+ * a compact heap-redo location per DML record, and an lsn -> file offset index.
+ * redo() keeps INDEX_SMO replay in WAL order, then reads heap DML directly from
+ * a read-only WAL mapping in (table, page, WAL-offset) order. undo() reads
+ * individual records through the offset index. Nothing holds a deserialized
+ * record map, so recovery memory remains proportional to record metadata rather
+ * than to the WAL payload.
  *
  * Precondition: LogManager::initialize_from_existing_log() must have run on the
  * same WAL file first. It applies exactly the record-header validation this
@@ -130,6 +124,9 @@ public:
     uint64_t get_index_parent_pointer_repair_count() const {
         return index_parent_pointer_repair_count_;
     }
+    uint64_t get_index_smo_prepare_count() const {
+        return index_smo_prepare_count_;
+    }
 
     /**
      * 重启后 TransactionManager::next_timestamp_ 必须取的值。analyze() 之后可用。
@@ -214,6 +211,29 @@ private:
         int64_t offset{0};
     };
 
+    // Location and target of one heap DML record. Sorting these by table/page
+    // makes every page's records consecutive while WAL offset preserves their
+    // original order within that page. The explicit target metadata also lets
+    // redo fail closed if the mapped WAL changes after analyze().
+    struct HeapRedoRecord {
+        int64_t wal_offset{0};
+        uint32_t wal_length{0};
+        uint16_t table_id{0};
+        int16_t slot_no{0};
+        int32_t page_no{0};
+
+        bool operator<(const HeapRedoRecord& other) const {
+            if (table_id != other.table_id) {
+                return table_id < other.table_id;
+            }
+            if (page_no != other.page_no) {
+                return page_no < other.page_no;
+            }
+            return wal_offset < other.wal_offset;
+        }
+    };
+    static_assert(sizeof(HeapRedoRecord) <= 24, "heap redo descriptors must remain compact");
+
     // One (key, rid) pair the index repair has to reconcile. `key_slot` indexes
     // the fixed-stride key arena of the index being repaired.
     struct IndexRepairEntry {
@@ -259,6 +279,7 @@ private:
     }
     int64_t offset_of_lsn(lsn_t lsn) const;
     void build_touched_index();
+    WalRecordView mapped_heap_redo_record(const HeapRedoRecord& location, const char* wal_bytes) const;
 
     // Guards against a corrupt RID reaching the record layer. The WAL carries
     // no per-record checksum, so a header that passed the length and type
@@ -331,10 +352,13 @@ private:
     std::string table_name_scratch_;           // reused, so name lookups do not allocate
     std::vector<TouchedTuple> touched_;        // one entry per DML record, WAL order
     std::vector<TouchedTuple> touched_sorted_; // distinct, ordered by table and page
+    std::vector<HeapRedoRecord> heap_redo_records_;
     std::vector<WalRecordLocation> record_locations_;
     bool record_locations_sorted_{true};
     std::unordered_set<std::string> touched_tables_;
     bool has_dml_records_{false};
+    bool has_index_smo_records_{false};
+    std::unordered_map<std::string, uint64_t> latest_index_bindings_;
     lsn_t max_lsn_{INVALID_LSN}; // analyze 扫描到的最大 lsn，用于 recovery 后推进 global_lsn
     int64_t checkpoint_offset_{0};
     int64_t scan_begin_offset_{0}; // first record analyze/redo replay
@@ -353,6 +377,7 @@ private:
     uint64_t index_duplicate_entry_count_{0};
     uint64_t index_rebuild_count_{0};
     uint64_t index_parent_pointer_repair_count_{0};
+    uint64_t index_smo_prepare_count_{0};
 
     // 计数器恢复的两个来源，见 get_recovered_next_timestamp()。
     timestamp_t persisted_next_timestamp_{0};

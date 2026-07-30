@@ -203,6 +203,30 @@ TEST_F(RecordManagerTest, SimpleTest) {
     rm_manager->destroy_file(filename);
 }
 
+TEST_F(RecordManagerTest, CloseFailsClosedWhenWalDependencyCannotFlush) {
+    auto bpm = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
+    RmManager rm_manager(disk_manager_.get(), bpm.get());
+    const std::string filename = "close_fail_closed.txt";
+    if (disk_manager_->is_file(filename)) {
+        disk_manager_->destroy_file(filename);
+    }
+    rm_manager.create_file(filename, sizeof(int));
+    auto file = rm_manager.open_file(filename);
+    int value = 7;
+    const Rid rid = file->insert_record(reinterpret_cast<char*>(&value), nullptr);
+    Page* page = bpm->fetch_page(PageId{file->GetFd(), rid.page_no});
+    ASSERT_NE(page, nullptr);
+    BufferPoolManager::mark_dirty(page, PageWriteDependency::Wal(7));
+    ASSERT_TRUE(bpm->unpin_page(PageId{file->GetFd(), rid.page_no}, false));
+
+    EXPECT_THROW(rm_manager.close_file(file.get()), InternalError);
+    EXPECT_TRUE(bpm->is_page_resident(PageId{file->GetFd(), rid.page_no}));
+
+    // Cleanup without pretending the failed close succeeded.
+    disk_manager_->close_file(file->GetFd());
+    disk_manager_->destroy_file(filename);
+}
+
 TEST_F(RecordManagerTest, ApplyTupleUpdateInstallsTupleAndPageLsnTogether) {
     auto buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
     auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());

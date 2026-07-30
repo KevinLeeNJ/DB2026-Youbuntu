@@ -31,9 +31,9 @@ struct WalRecordView {
     const char* bytes{nullptr}; // total_len bytes, starting at the record header
 };
 
-// The payload of an INSERT/DELETE/UPDATE record, parsed in place. Recovery
-// never needs a heap copy of the row images: it hands them straight to the
-// record layer, which copies into the page under its own latch.
+// The payload of an INSERT/DELETE/UPDATE record. Legacy images and the sparse
+// UPDATE after-anchor borrow record.bytes. A sparse UPDATE's before image is
+// materialized here by copying the anchor and applying its before-byte spans.
 struct WalDmlView {
     std::string_view table_name;
     Rid rid{};
@@ -43,12 +43,20 @@ struct WalDmlView {
     // INSERT and UPDATE carry the image recovery must install during redo.
     const char* after_image{nullptr};
     int after_size{0};
+    std::vector<char> materialized_before;
+    bool before_is_materialized{false};
 };
 
 // Parses the payload of a DML record. Returns false when the record is not a
 // DML record or when its payload is malformed, in which case *out is untouched.
-// The returned pointers alias record.bytes and share its lifetime.
+// Borrowed pointers alias record.bytes and share its lifetime. For a sparse
+// UPDATE, before_image instead aliases out->materialized_before.
 bool ParseWalDml(const WalRecordView& record, WalDmlView* out);
+
+// Redo only needs an UPDATE's after image. This variant still validates every
+// sparse before span and the exact payload end, but avoids materializing the
+// complete before image.
+bool ParseWalDmlForRedo(const WalRecordView& record, WalDmlView* out);
 
 // Reads the single record stored at `offset`, using *scratch as its buffer.
 // Undo needs random access along a transaction's prev_lsn chain, which is at

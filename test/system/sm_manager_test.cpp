@@ -17,7 +17,9 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <vector>
 #include <unistd.h>
@@ -208,6 +210,36 @@ TEST_F(SmManagerTest, flush_and_reload_meta_with_index) {
     EXPECT_TRUE(tab.is_index({"a"}));
 }
 
+TEST_F(SmManagerTest, LoadFlushFailureDoesNotPublishMetadataOrReportSuccess) {
+    setup_db();
+    sm_manager_->create_table("load_fail", make_int_cols({"id"}), nullptr);
+    {
+        std::ofstream csv("load_fail.csv", std::ios::trunc);
+        ASSERT_TRUE(csv.is_open());
+        csv << "id\n1\n";
+    }
+
+    constexpr std::string_view kMetadataSentinel = "load_metadata_must_not_publish";
+    sm_manager_->db_.get_table("load_fail").name = std::string(kMetadataSentinel);
+    struct FlushHookReset {
+        ~FlushHookReset() {
+            BufferPoolManager::set_flush_batch_before_write_test_hook({});
+        }
+    } hook_reset;
+    BufferPoolManager::set_flush_batch_before_write_test_hook(
+        [](PageId, Page*) { throw std::runtime_error("injected load flush failure"); });
+
+    EXPECT_THROW(sm_manager_->load_csv_data("./load_fail.csv", "load_fail", nullptr), InternalError);
+
+    std::ifstream meta(DB_META_NAME);
+    const std::string meta_contents((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(meta_contents.find(kMetadataSentinel), std::string::npos);
+
+    BufferPoolManager::set_flush_batch_before_write_test_hook({});
+    sm_manager_->db_.get_table("load_fail").name = "load_fail";
+    std::remove("load_fail.csv");
+}
+
 // =============================================================================
 // 表操作测试
 // =============================================================================
@@ -283,6 +315,48 @@ TEST_F(SmManagerTest, drop_table_cascades_indexes) {
     sm_manager_->drop_table("cascade_tab", nullptr);
     EXPECT_FALSE(sm_manager_->db_.is_table("cascade_tab"));
     EXPECT_EQ(sm_manager_->ihs_.size(), 0);
+}
+
+TEST_F(SmManagerTest, drop_table_clears_only_its_runtime_version_history) {
+    setup_db();
+    auto cols = make_int_cols({"id"});
+    sm_manager_->create_table("reused_name", cols, nullptr);
+    sm_manager_->create_index("reused_name", {"id"}, nullptr);
+    sm_manager_->create_table("survivor", cols, nullptr);
+    sm_manager_->create_index("survivor", {"id"}, nullptr);
+
+    const auto& reused_index = sm_manager_->db_.get_table("reused_name").indexes[0];
+    const auto& survivor_index = sm_manager_->db_.get_table("survivor").indexes[0];
+    const std::string reused_index_name = sm_manager_->ix_manager_->get_index_name("reused_name", reused_index.cols);
+    const std::string survivor_index_name = sm_manager_->ix_manager_->get_index_name("survivor", survivor_index.cols);
+    int reused_value = 7;
+    int survivor_value = 11;
+    std::vector<char> reused_key(sizeof(reused_value));
+    std::vector<char> survivor_key(sizeof(survivor_value));
+    std::memcpy(reused_key.data(), &reused_value, sizeof(reused_value));
+    std::memcpy(survivor_key.data(), &survivor_value, sizeof(survivor_value));
+    const Rid reused_rid{1, 2};
+    const Rid survivor_rid{3, 4};
+
+    sm_manager_->remember_historical_index_key("reused_name", reused_index_name, reused_key, reused_rid, reused_index);
+    sm_manager_->remember_deleted_tuple_candidate("reused_name", reused_rid);
+    sm_manager_->remember_historical_index_key("survivor", survivor_index_name, survivor_key, survivor_rid,
+                                               survivor_index);
+    sm_manager_->remember_deleted_tuple_candidate("survivor", survivor_rid);
+
+    sm_manager_->drop_table("reused_name", nullptr);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("reused_name", reused_index_name, reused_key).empty());
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("reused_name").empty());
+    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("survivor", survivor_index_name, survivor_key),
+              std::vector<Rid>{survivor_rid});
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("survivor"), std::vector<Rid>{survivor_rid});
+    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
+    EXPECT_TRUE(sm_manager_->historical_bucket_belongs_to_table(
+        sm_manager_->historical_retire_queue_.front().bucket_key, "survivor"));
+
+    sm_manager_->create_table("reused_name", cols, nullptr);
+    sm_manager_->create_index("reused_name", {"id"}, nullptr);
+    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("reused_name", reused_index_name, reused_key).empty());
 }
 
 // =============================================================================
@@ -362,9 +436,39 @@ TEST_F(SmManagerTest, create_index_success) {
     EXPECT_TRUE(tab.is_index({"a"}));
     EXPECT_FALSE(tab.is_index({"b"}));
 
-    // 验证索引句柄已打开
+    // 验证索引句柄已打开，且 CREATE INDEX 在树构建完成后默认建立根缓存。
     std::string ix_name = sm_manager_->ix_manager_->get_index_name("idx_tab", tab.indexes[0].cols);
-    EXPECT_TRUE(sm_manager_->ihs_.find(ix_name) != sm_manager_->ihs_.end());
+    auto handle = sm_manager_->ihs_.find(ix_name);
+    ASSERT_NE(handle, sm_manager_->ihs_.end());
+    ASSERT_NE(handle->second->cached_root_page_, nullptr);
+    EXPECT_EQ(handle->second->cached_root_page_no_, handle->second->file_hdr_->root_page_);
+    EXPECT_TRUE(
+        buffer_pool_manager_->is_page_resident(PageId{handle->second->fd_, handle->second->cached_root_page_no_}));
+}
+
+TEST_F(SmManagerTest, PostRecoveryRefreshRestoresRootCacheAfterReopen) {
+    setup_db();
+    auto cols = make_int_cols({"a"});
+    sm_manager_->create_table("reopen_idx_tab", cols, nullptr);
+    sm_manager_->create_index("reopen_idx_tab", {"a"}, nullptr);
+
+    sm_manager_->close_db();
+    db_opened_ = false;
+    sm_manager_->open_db(TEST_DB_NAME);
+    db_opened_ = true;
+
+    const std::string ix_name =
+        sm_manager_->ix_manager_->get_index_name("reopen_idx_tab", std::vector<std::string>{"a"});
+    auto handle = sm_manager_->ihs_.find(ix_name);
+    ASSERT_NE(handle, sm_manager_->ihs_.end());
+    EXPECT_EQ(handle->second->cached_root_page_, nullptr);
+
+    // Production invokes this exact root-only hook after WAL recovery.
+    sm_manager_->refresh_index_residency();
+    ASSERT_NE(handle->second->cached_root_page_, nullptr);
+    EXPECT_EQ(handle->second->cached_root_page_no_, handle->second->file_hdr_->root_page_);
+    EXPECT_TRUE(
+        buffer_pool_manager_->is_page_resident(PageId{handle->second->fd_, handle->second->cached_root_page_no_}));
 }
 
 TEST_F(SmManagerTest, create_compound_index_success) {
@@ -423,11 +527,16 @@ TEST_F(SmManagerTest, drop_index_success) {
     sm_manager_->create_table("drop_idx_tab", cols, nullptr);
     sm_manager_->create_index("drop_idx_tab", {"a"}, nullptr);
     EXPECT_EQ(sm_manager_->ihs_.size(), 1);
+    auto* handle = sm_manager_->ihs_.begin()->second.get();
+    const PageId cached_root_id{handle->fd_, handle->cached_root_page_no_};
+    ASSERT_NE(handle->cached_root_page_, nullptr);
+    EXPECT_TRUE(buffer_pool_manager_->is_page_resident(cached_root_id));
 
     sm_manager_->drop_index("drop_idx_tab", {"a"}, nullptr);
     auto& tab = sm_manager_->db_.get_table("drop_idx_tab");
     EXPECT_EQ(tab.indexes.size(), 0);
     EXPECT_EQ(sm_manager_->ihs_.size(), 0);
+    EXPECT_FALSE(buffer_pool_manager_->is_page_resident(cached_root_id));
 }
 
 TEST_F(SmManagerTest, drop_one_index_keeps_others) {

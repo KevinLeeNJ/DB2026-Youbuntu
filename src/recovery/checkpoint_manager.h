@@ -20,11 +20,7 @@ class SmManager;
 class TransactionManager;
 
 struct CheckpointOptions {
-    int64_t auto_checkpoint_bytes = 1024LL * 1024 * 1024;
-    int64_t preflush_trigger_bytes = 64LL * 1024 * 1024;
-    // Keep the preflush pass bounded so checkpoint I/O does not monopolize
-    // the storage device while foreground transactions are still running.
-    size_t preflush_batch_pages = 4096;
+    int64_t auto_checkpoint_bytes = 4LL * 1024 * 1024 * 1024;
 };
 
 class CheckpointManager {
@@ -32,6 +28,7 @@ public:
     CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr);
 
     bool RunCleanCheckpoint();
+    bool Tick();
     bool RunIfNeeded();
     void SetOptions(CheckpointOptions options);
 

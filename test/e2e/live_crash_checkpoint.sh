@@ -130,28 +130,20 @@ stop_server_gracefully() {
 }
 
 run_crash_workload() {
-    python3 - "$PORT" <<'PY'
-import socket
+    python3 - "$ROOT_DIR" "$PORT" "$SERVER_PID" <<'PY'
+import os
+import signal
 import sys
 
-port = int(sys.argv[1])
+root_dir = sys.argv[1]
+port = int(sys.argv[2])
+server_pid = int(sys.argv[3])
+sys.path.insert(0, root_dir + "/test/protocol")
 
-def expect_ok(reply, sql):
-    if "failure" in reply.lower() or "error" in reply.lower():
-        raise AssertionError(f"unexpected failure for {sql!r}: {reply!r}")
+from live_wire_protocol_test import WireClient
 
-with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
-    sock.settimeout(5)
-
-    def exchange(sql, expect_response=True):
-        sock.sendall(sql.encode("utf-8") + b"\0")
-        if not expect_response:
-            return ""
-        data = sock.recv(8192)
-        if not data:
-            raise AssertionError(f"server closed before replying to {sql!r}")
-        return data.split(b"\0", 1)[0].decode("utf-8", errors="replace")
-
+client = WireClient(port)
+try:
     for sql in [
         "create table t (id int, v int);",
         "insert into t values (1, 10);",
@@ -162,54 +154,49 @@ with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
         "update t set v = 999 where id = 1;",
         "delete from t where id = 2;",
     ]:
-        expect_ok(exchange(sql), sql)
+        client.command(sql)
 
-    exchange("crash", expect_response=False)
+    os.kill(server_pid, signal.SIGKILL)
+finally:
+    client.close()
 PY
 }
 
 verify_recovery_and_append() {
-    python3 - "$PORT" <<'PY'
-import socket
+    python3 - "$ROOT_DIR" "$PORT" <<'PY'
 import sys
 
-port = int(sys.argv[1])
+root_dir = sys.argv[1]
+port = int(sys.argv[2])
+sys.path.insert(0, root_dir + "/test/protocol")
 
-with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
-    sock.settimeout(5)
+from live_wire_protocol_test import WireClient
 
-    def exchange(sql):
-        sock.sendall(sql.encode("utf-8") + b"\0")
-        data = sock.recv(8192)
-        if not data:
-            raise AssertionError(f"server closed before replying to {sql!r}")
-        return data.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+client = WireClient(port)
+try:
+    _, recovered = client.query("select * from t;")
+    recovered_rows = sorted(tuple(row) for row in recovered)
+    expected_recovered = [(1, 10), (2, 20)]
+    if recovered_rows != expected_recovered:
+        raise AssertionError(
+            f"expected recovered rows {expected_recovered}, got {recovered_rows}"
+        )
 
-    recovered = exchange("select * from t;")
-    if "Total record(s): 2" not in recovered:
-        raise AssertionError("expected exactly two recovered rows, got:\n" + recovered)
-    if "|                1 |               10 |" not in recovered:
-        raise AssertionError("committed row id=1/v=10 was not recovered:\n" + recovered)
-    if "|                2 |               20 |" not in recovered:
-        raise AssertionError("committed row id=2/v=20 was not recovered:\n" + recovered)
-    if "|                3 |" in recovered or "999" in recovered:
-        raise AssertionError("uncommitted changes survived crash recovery:\n" + recovered)
+    client.command("insert into t values (4, 40);")
 
-    insert_reply = exchange("insert into t values (4, 40);")
-    if "failure" in insert_reply.lower() or "error" in insert_reply.lower():
-        raise AssertionError("insert after recovery failed:\n" + insert_reply)
+    _, after_append = client.query("select * from t;")
+    after_append_rows = sorted(tuple(row) for row in after_append)
+    expected_after_append = [(1, 10), (2, 20), (4, 40)]
+    if after_append_rows != expected_after_append:
+        raise AssertionError(
+            f"expected rows after append {expected_after_append}, got {after_append_rows}"
+        )
 
-    after_append = exchange("select * from t;")
-    if "Total record(s): 3" not in after_append:
-        raise AssertionError("expected append after recovery to be durable-visible:\n" + after_append)
-    if "|                4 |               40 |" not in after_append:
-        raise AssertionError("post-recovery inserted row missing:\n" + after_append)
-
-    print("Recovered rows after crash:")
-    print(recovered.rstrip())
+    print("Recovered rows after crash:", recovered_rows)
     print()
-    print("Rows after post-recovery append:")
-    print(after_append.rstrip())
+    print("Rows after post-recovery append:", after_append_rows)
+finally:
+    client.close()
 PY
 }
 

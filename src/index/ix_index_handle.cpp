@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "ix_index_handle.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 
 #include "ix_scan.h"
@@ -20,7 +21,7 @@ See the Mulan PSL v2 for more details. */
 namespace {
 
 std::atomic<uint64_t> g_smo_publish_count{0};
-std::atomic<uint64_t> g_smo_pages_written{0};
+std::atomic<uint64_t> g_smo_page_image_count{0};
 
 // One line roughly every few seconds of TPC-C, so the SMO rate and the pages
 // per SMO can be read straight out of the server log after a benchmark run
@@ -39,69 +40,50 @@ bool SmoStatsLoggingEnabled() {
 
 } // namespace
 
-std::atomic<bool> IxIndexHandle::smo_flush_enabled_{[] {
-    const char* value = std::getenv("ENABLE_INDEX_SMO_FLUSH");
-    return value == nullptr || std::string(value) != "0";
-}()};
+std::atomic<IxIndexHandle::InsertSplitFault> IxIndexHandle::insert_split_fault_{InsertSplitFault::None};
+std::mutex IxIndexHandle::insert_split_test_hook_latch_;
+IxIndexHandle::InsertSplitTestHook IxIndexHandle::insert_split_test_hook_;
+
+void IxIndexHandle::maybe_inject_insert_split_fault(InsertSplitFault fault) {
+    InsertSplitFault expected = fault;
+    if (insert_split_fault_.compare_exchange_strong(expected, InsertSplitFault::None, std::memory_order_relaxed)) {
+        throw InternalError("injected index split preflight failure");
+    }
+}
+
+void IxIndexHandle::set_insert_split_test_hook(InsertSplitTestHook hook) {
+    std::scoped_lock lock{insert_split_test_hook_latch_};
+    insert_split_test_hook_ = std::move(hook);
+}
+
+void IxIndexHandle::run_insert_split_test_hook(InsertSplitStage stage, PageId page_id, Page* page) {
+    InsertSplitTestHook hook;
+    {
+        std::scoped_lock lock{insert_split_test_hook_latch_};
+        hook = insert_split_test_hook_;
+    }
+    if (hook) {
+        hook(stage, page_id, page);
+    }
+}
 
 uint64_t IxIndexHandle::smo_publish_count() {
     return g_smo_publish_count.load(std::memory_order_relaxed);
 }
 
-uint64_t IxIndexHandle::smo_pages_written() {
-    return g_smo_pages_written.load(std::memory_order_relaxed);
+uint64_t IxIndexHandle::smo_page_image_count() {
+    return g_smo_page_image_count.load(std::memory_order_relaxed);
 }
 
-/**
- * @brief Publish one structure-modification operation's pages to the index file.
- *
- * Called by ~SmoScope, i.e. still under the structure-exclusive latch, so no
- * other index thread can read a half-published tree and nothing else can dirty
- * these pages while they are being written.
- *
- * The index header page goes out last and unconditionally. It is what carries
- * root_page_, num_pages_, first_leaf_ and last_leaf_, none of which live in a
- * tree page, and without it a root split would publish a new root that no
- * persisted header names. Writing it last is the better of two imperfect
- * orders: if the header is lost, the file still describes the previous tree
- * shape, whereas a header written first can name a page that was never written
- * at all - i.e. a hole that reads back as zeros.
- *
- * These are plain pwrites with no fsync, which is sound for the crash model the
- * finals specify (SIGKILL plus a restart of the same machine, final.md:349):
- * SIGKILL does not discard the kernel page cache. The durability audit only
- * scores objects in the WAL namespace (final.md:332-335), so index page writes
- * are neither counted nor penalised.
- *
- * What this does NOT give: atomicity *between* the pwrites. A SIGKILL landing
- * between two of them still leaves part of the set on disk. The exposure shrinks
- * from "however long the buffer pool takes to evict the rest", i.e. seconds to
- * minutes, to the handful of microseconds a few write syscalls take - six to
- * seven orders of magnitude - but that is a reduction, not a proof. Closing it
- * from construction requires making the SMO physically idempotent through the
- * log (an IX_SMO full-page-image record, which is what InnoDB does) at a cost
- * of roughly +36% WAL volume.
- */
-void IxIndexHandle::publish_smo_pages() const noexcept {
-    if (!smo_structural_ || smo_pages_.empty() || !smo_flush_enabled()) {
+// Capture the complete after-image under the index structure latch. Runtime
+// mutations append a redo-only INDEX_SMO record and attach its LSN to every
+// dirty page and the index header before releasing the buffer pool's per-file
+// write barrier. Eviction, checkpoint and close then enforce WAL-before-data.
+// Origins without runtime WAL retain immediate pages-before-header publication.
+void IxIndexHandle::publish_smo_pages_impl(bool* wal_barrier_released) const {
+    if (!smo_structural_ || smo_pages_.empty()) {
         return;
     }
-
-    // ~SmoScope may run while an exception (IndexEntryExistsError, for one) is
-    // already propagating, so nothing here may escape. Failing to publish is a
-    // degradation, not damage: the pages stay dirty in the buffer pool and reach
-    // disk the old way, on eviction.
-    try {
-        publish_smo_pages_impl();
-    } catch (const std::exception& error) {
-        LOG_WARN("index %s could not publish its structure change: %s", disk_manager_->get_file_name(fd_).c_str(),
-                 error.what());
-    } catch (...) {
-        LOG_WARN("index %s could not publish its structure change", disk_manager_->get_file_name(fd_).c_str());
-    }
-}
-
-void IxIndexHandle::publish_smo_pages_impl() const {
     std::sort(smo_pages_.begin(), smo_pages_.end());
     smo_pages_.erase(std::unique(smo_pages_.begin(), smo_pages_.end()), smo_pages_.end());
 
@@ -112,31 +94,80 @@ void IxIndexHandle::publish_smo_pages_impl() const {
             smo_flush_batch_.push_back(PageId{fd_, page_no});
         }
     }
+    const auto observe_publication = [this](uint64_t page_images) {
+        const uint64_t published = g_smo_publish_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_smo_page_image_count.fetch_add(page_images, std::memory_order_relaxed);
+        if (published % kSmoLogInterval == 0 && SmoStatsLoggingEnabled()) {
+            LOG_WARN("index SMO protection stats: %lu operations, %lu page images",
+                     static_cast<unsigned long>(published), static_cast<unsigned long>(smo_page_image_count()));
+            minilog::Logger::get().flush();
+        }
+    };
 
-    // wal_preflushed: index pages have no page LSN, so there is no log record to
-    // wait for - see BufferPoolManager::flush_pages().
-    const auto flushed = buffer_pool_manager_->flush_pages(smo_flush_batch_, /*wal_preflushed=*/true);
-    write_index_header_page();
-
-    const uint64_t published = g_smo_publish_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_smo_pages_written.fetch_add(flushed.pages_written, std::memory_order_relaxed);
-    if (published % kSmoLogInterval == 0 && SmoStatsLoggingEnabled()) {
-        LOG_WARN("index SMO write-out stats: %lu operations, %lu page images", static_cast<unsigned long>(published),
-                 static_cast<unsigned long>(smo_pages_written()));
-        // The logger buffers 1 MiB and a benchmark run ends in SIGKILL, so a line
-        // that is not flushed is a line that never existed. One fflush per
-        // kSmoLogInterval operations - tens of seconds apart - is what makes this
-        // counter readable at all.
-        minilog::Logger::get().flush();
+    if (wal_barrier_released != nullptr) {
+        IndexSmoWalData data;
+        data.index_file_name = disk_manager_->get_file_name(fd_);
+        data.pages.reserve(smo_flush_batch_.size());
+        for (const PageId& page_id : smo_flush_batch_) {
+            Page* page = buffer_pool_manager_->fetch_page(page_id);
+            if (page == nullptr) {
+                throw InternalError("INDEX_SMO could not capture a resident page image");
+            }
+            IndexSmoPageImage image;
+            image.page_no = page_id.page_no;
+            {
+                std::shared_lock page_lock{page->latch()};
+                std::memcpy(image.bytes.data(), page->get_data(), PAGE_SIZE);
+            }
+            data.pages.push_back(std::move(image));
+            unpin_if_not_cached(page_id);
+        }
+        data.header.fill(0);
+        file_hdr_->serialize(data.header.data());
+        const lsn_t smo_lsn = buffer_pool_manager_->append_index_smo(data);
+        const PageWriteDependency dependency = PageWriteDependency::Wal(smo_lsn);
+        for (const PageId& page_id : smo_flush_batch_) {
+            Page* page = buffer_pool_manager_->fetch_page(page_id);
+            if (page == nullptr) {
+                throw InternalError("INDEX_SMO could not install page WAL dependency");
+            }
+            BufferPoolManager::mark_dirty(page, dependency);
+            unpin_if_not_cached(page_id);
+        }
+        header_dependency_.merge(dependency);
+        buffer_pool_manager_->end_index_smo(fd_);
+        *wal_barrier_released = true;
+        observe_publication(data.pages.size());
+        return;
     }
+
+    const auto flushed = buffer_pool_manager_->flush_pages(smo_flush_batch_, FlushDependencyPolicy::Enforce());
+    if (!flushed.success) {
+        throw InternalError("index SMO page publication failed");
+    }
+    write_index_header_page();
+    observe_publication(flushed.pages_written);
 }
 
 void IxIndexHandle::write_index_header_page() const {
-    if (header_image_.size() != static_cast<size_t>(file_hdr_->tot_len_)) {
-        header_image_.assign(static_cast<size_t>(file_hdr_->tot_len_), 0);
+    buffer_pool_manager_->begin_index_file_write(fd_);
+    try {
+        const uint64_t dependency_epoch = header_dirty_epoch_;
+        const PageWriteDependency dependency = header_dependency_;
+        if (header_image_.size() != static_cast<size_t>(file_hdr_->tot_len_)) {
+            header_image_.assign(static_cast<size_t>(file_hdr_->tot_len_), 0);
+        }
+        file_hdr_->serialize(header_image_.data());
+        buffer_pool_manager_->ensure_write_dependency(dependency);
+        disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, header_image_.data(), file_hdr_->tot_len_);
+        if (header_dirty_epoch_ == dependency_epoch) {
+            header_dependency_ = PageWriteDependency::None();
+        }
+    } catch (...) {
+        buffer_pool_manager_->end_index_file_write(fd_);
+        throw;
     }
-    file_hdr_->serialize(header_image_.data());
-    disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, header_image_.data(), file_hdr_->tot_len_);
+    buffer_pool_manager_->end_index_file_write(fd_);
 }
 
 /**
@@ -292,14 +323,13 @@ IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffe
     // reopened. Reconstruct the allocation cursor from the persisted index
     // header instead of incrementing an unrelated value left on this fd.
     //
-    // num_pages_ lives only in this in-memory header: create_node() bumps it
-    // without logging, and the header reaches disk only through the checkpoint
-    // path. After a crash it can therefore name fewer pages than the file
-    // actually holds, and trusting it would make create_node() hand out page
-    // numbers that live nodes already occupy - recovery would overwrite a live
-    // subtree with a fresh node. The file length is a safe upper bound: a page
-    // number that has ever been written is inside the file, so starting after
-    // the last written page can never reuse one.
+    // num_pages_ lives in the index header and create_node() bumps it without
+    // logging. A stale or torn header can therefore name fewer pages than the
+    // file actually holds, and trusting it would make create_node() hand out
+    // page numbers that live nodes already occupy - recovery would overwrite a
+    // live subtree with a fresh node. The file length is a safe upper bound: a
+    // page number that has ever been written is inside the file, so starting
+    // after the last written page can never reuse one.
     const int64_t file_size = disk_manager_->get_file_size(disk_manager_->get_file_name(fd));
     if (file_size > 0) {
         const auto pages_on_disk = static_cast<page_id_t>((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
@@ -320,20 +350,31 @@ IxIndexHandle::~IxIndexHandle() {
 void IxIndexHandle::refresh_page_residency(bool include_internal) {
     auto structure_guard = lock_exclusive();
     refresh_root_page_cache();
-    if (include_internal && internal_page_cache_enabled()) {
+    if (include_internal) {
         register_internal_pages();
     }
 }
-void IxIndexHandle::refresh_root_page_cache() {
-    if (root_cache_enabled() && (cached_root_page_ == nullptr || cached_root_page_no_ != file_hdr_->root_page_)) {
-        Page* new_root = buffer_pool_manager_->fetch_page(PageId{fd_, file_hdr_->root_page_});
-        if (new_root == nullptr) {
-            throw InternalError("failed to fetch index root page");
-        }
+
+void IxIndexHandle::prepare_for_smo_redo() {
+    release_root_page_cache();
+    unregister_internal_pages();
+    buffer_pool_manager_->delete_all_pages(fd_);
+}
+
+void IxIndexHandle::install_recovered_smo_header(const char* header_image) {
+    file_hdr_->col_types_.clear();
+    file_hdr_->col_lens_.clear();
+    file_hdr_->deserialize(const_cast<char*>(header_image));
+    disk_manager_->set_fd2pageno(fd_, file_hdr_->num_pages_);
+}
+void IxIndexHandle::refresh_root_page_cache(const BufferPoolManager::FrameOperationToken* frame_operation) noexcept {
+    if (cached_root_page_ == nullptr || cached_root_page_no_ != file_hdr_->root_page_) {
+        const PageId new_root_id{fd_, file_hdr_->root_page_};
         Page* old_root = cached_root_page_;
         PageId old_root_id{fd_, cached_root_page_no_};
-        cached_root_page_ = new_root;
-        cached_root_page_no_ = file_hdr_->root_page_;
+        cached_root_page_ = nullptr;
+        cached_root_page_no_ = IX_NO_PAGE;
+
         if (old_root != nullptr && old_root_id.page_no != IX_NO_PAGE) {
             if (resident_internal_pages_.erase(old_root_id.page_no) != 0) {
                 buffer_pool_manager_->unmark_resident(old_root_id);
@@ -341,23 +382,64 @@ void IxIndexHandle::refresh_root_page_cache() {
             drop_cached_internal_page(old_root_id.page_no);
             buffer_pool_manager_->unpin_page(old_root_id, false);
         }
-    }
-    if (cached_root_page_ != nullptr) {
-        IxNodeHandle root(file_hdr_.get(), cached_root_page_);
-        if (!root.is_leaf_page()) {
-            // Keep the root classified as an internal page without walking
-            // the entire tree. Full internal residency is still established
-            // by an explicit refresh_page_residency(true).
-            mark_internal_page_resident(file_hdr_->root_page_, cached_root_page_);
+
+        Page* new_root = nullptr;
+        bool marked_resident = false;
+        try {
+            run_insert_split_test_hook(InsertSplitStage::RootCacheRefresh);
+            new_root = frame_operation == nullptr ? buffer_pool_manager_->fetch_page(new_root_id)
+                                                  : frame_operation->fetch_page(new_root_id);
+            if (new_root == nullptr) {
+                if (resident_internal_pages_.erase(new_root_id.page_no) != 0) {
+                    buffer_pool_manager_->unmark_resident(new_root_id);
+                }
+                drop_cached_internal_page(new_root_id.page_no);
+                return;
+            }
+
+            // A height reduction promotes an internal child that may already
+            // own a cache pin. The fetch above supplies the new root pin;
+            // release the old internal-cache pin before installing it as root
+            // so ownership remains exactly one pin.
+            drop_cached_internal_page(new_root_id.page_no);
+            marked_resident = buffer_pool_manager_->try_mark_resident(new_root_id, ResidencyClass::IndexInternal);
+            if (!marked_resident) {
+                resident_internal_pages_.erase(new_root_id.page_no);
+                buffer_pool_manager_->unpin_page(new_root_id, false);
+                return;
+            }
+            resident_internal_pages_.insert(new_root_id.page_no);
+            cached_root_page_ = new_root;
+            cached_root_page_no_ = new_root_id.page_no;
+        } catch (...) {
+            const bool was_resident = resident_internal_pages_.erase(new_root_id.page_no) != 0;
+            drop_cached_internal_page(new_root_id.page_no);
+            if (marked_resident || was_resident) {
+                buffer_pool_manager_->unmark_resident(new_root_id);
+            }
+            if (new_root != nullptr) {
+                buffer_pool_manager_->unpin_page(new_root_id, false);
+            }
         }
     }
 }
 
-void IxIndexHandle::mark_internal_page_resident(page_id_t page_no, Page* page) {
-    if (resident_internal_pages_.insert(page_no).second) {
-        buffer_pool_manager_->mark_resident(PageId{fd_, page_no}, ResidencyClass::IndexInternal);
+bool IxIndexHandle::mark_internal_page_resident(page_id_t page_no, Page* page,
+                                                const BufferPoolManager::FrameOperationToken* frame_operation) {
+    if (resident_internal_pages_.find(page_no) != resident_internal_pages_.end()) {
+        return cache_internal_page(page_no, page, frame_operation);
     }
-    cache_internal_page(page_no, page);
+    const PageId page_id{fd_, page_no};
+    if (!buffer_pool_manager_->try_mark_resident(page_id, ResidencyClass::IndexInternal)) {
+        return false;
+    }
+    resident_internal_pages_.insert(page_no);
+    if (!cache_internal_page(page_no, page, frame_operation)) {
+        resident_internal_pages_.erase(page_no);
+        buffer_pool_manager_->unmark_resident(page_id);
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -371,22 +453,25 @@ void IxIndexHandle::mark_internal_page_resident(page_id_t page_no, Page* page) {
  * entry in cached_internal_pages_ holds exactly one pin, released by
  * drop_cached_internal_page().
  */
-void IxIndexHandle::cache_internal_page(page_id_t page_no, Page* page) {
-    if (!internal_page_cache_enabled() || page_no == file_hdr_->root_page_ || page_no == IX_NO_PAGE) {
-        return;
+bool IxIndexHandle::cache_internal_page(page_id_t page_no, Page* page,
+                                        const BufferPoolManager::FrameOperationToken* frame_operation) {
+    if (page_no == file_hdr_->root_page_ || page_no == IX_NO_PAGE) {
+        return true;
     }
     auto [it, inserted] = cached_internal_pages_.try_emplace(page_no, page);
     if (!inserted) {
         // The pin for this page is already held; only the frame may have moved.
         it->second = page;
-        return;
+        return true;
     }
-    Page* pinned = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
+    Page* pinned = frame_operation == nullptr ? buffer_pool_manager_->fetch_page(PageId{fd_, page_no})
+                                              : frame_operation->fetch_page(PageId{fd_, page_no});
     if (pinned == nullptr) {
         cached_internal_pages_.erase(it);
-        return;
+        return false;
     }
     it->second = pinned;
+    return true;
 }
 
 void IxIndexHandle::drop_cached_internal_page(page_id_t page_no) const {
@@ -399,18 +484,13 @@ void IxIndexHandle::drop_cached_internal_page(page_id_t page_no) const {
 void IxIndexHandle::release_root_page_cache() const {
     auto structure_guard = lock_exclusive();
     unregister_internal_pages();
-    if (cached_root_page_ == nullptr || cached_root_page_no_ == IX_NO_PAGE) {
-        return;
-    }
-    buffer_pool_manager_->unpin_page(PageId{fd_, cached_root_page_no_}, false);
-    cached_root_page_ = nullptr;
-    cached_root_page_no_ = IX_NO_PAGE;
 }
 
 void IxIndexHandle::register_internal_pages() {
     // Recovery can rewrite a page in place, replace the root, or rebuild the
-    // whole index. Drop all old raw pointers before walking the repaired tree.
-    unregister_internal_pages();
+    // whole index. Drop non-root raw pointers before walking the repaired tree,
+    // but preserve a valid root pin together with its BPM quota lease.
+    unregister_internal_pages(/*preserve_root_cache=*/true);
 
     std::unordered_set<page_id_t> reachable;
     std::vector<page_id_t> pending;
@@ -420,6 +500,11 @@ void IxIndexHandle::register_internal_pages() {
     pending.reserve(reachable.size());
     if (file_hdr_->root_page_ != IX_NO_PAGE) {
         pending.push_back(file_hdr_->root_page_);
+    }
+    if (cached_root_page_ != nullptr && cached_root_page_no_ == file_hdr_->root_page_ &&
+        resident_internal_pages_.find(cached_root_page_no_) != resident_internal_pages_.end()) {
+        // Root residency is independent of whether the current root is a leaf.
+        reachable.insert(cached_root_page_no_);
     }
 
     try {
@@ -437,10 +522,9 @@ void IxIndexHandle::register_internal_pages() {
             }
             IxNodeHandle node(file_hdr_.get(), page);
             if (!node.is_leaf_page()) {
-                reachable.insert(page_no);
-                resident_internal_pages_.insert(page_no);
-                buffer_pool_manager_->mark_resident(PageId{fd_, page_no}, ResidencyClass::IndexInternal);
-                cache_internal_page(page_no, page);
+                if (mark_internal_page_resident(page_no, page)) {
+                    reachable.insert(page_no);
+                }
                 for (int child_idx = 0; child_idx < node.get_size(); ++child_idx) {
                     pending.push_back(node.value_at(child_idx));
                 }
@@ -450,18 +534,37 @@ void IxIndexHandle::register_internal_pages() {
             }
         }
     } catch (...) {
-        unregister_internal_pages();
+        unregister_internal_pages(/*preserve_root_cache=*/true);
         throw;
     }
 
     resident_internal_pages_ = std::move(reachable);
 }
 
-void IxIndexHandle::unregister_internal_pages() const {
+void IxIndexHandle::unregister_internal_pages(bool preserve_root_cache) const {
+    bool keep_root =
+        preserve_root_cache && cached_root_page_ != nullptr && cached_root_page_no_ != IX_NO_PAGE &&
+        frame_holds(cached_root_page_, cached_root_page_no_) &&
+        resident_internal_pages_.find(cached_root_page_no_) != resident_internal_pages_.end() &&
+        buffer_pool_manager_->get_residency_class(PageId{fd_, cached_root_page_no_}) == ResidencyClass::IndexInternal;
     for (const page_id_t page_no : resident_internal_pages_) {
+        if (keep_root && page_no == cached_root_page_no_) {
+            continue;
+        }
         buffer_pool_manager_->unmark_resident(PageId{fd_, page_no});
     }
     resident_internal_pages_.clear();
+    if (keep_root) {
+        resident_internal_pages_.insert(cached_root_page_no_);
+    } else if (cached_root_page_ != nullptr && cached_root_page_no_ != IX_NO_PAGE) {
+        // A long-lived raw root pointer is valid only while the same page owns
+        // both its cache pin and its BPM quota lease.
+        if (frame_holds(cached_root_page_, cached_root_page_no_)) {
+            buffer_pool_manager_->unpin_page(PageId{fd_, cached_root_page_no_}, false);
+        }
+        cached_root_page_ = nullptr;
+        cached_root_page_no_ = IX_NO_PAGE;
+    }
     // Release the pin every cache entry owns before dropping the pointers.
     for (const auto& [page_no, page] : cached_internal_pages_) {
         (void)page;
@@ -573,7 +676,7 @@ IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
             IxNodeHandle next_leaf;
             fetch_node_into(node->get_next_leaf(), next_leaf);
             next_leaf.set_prev_leaf(new_node->get_page_no());
-            unpin_if_not_cached(next_leaf.get_page_id(), true);
+            unpin_dirty_if_not_cached(next_leaf.get_page_id(), active_smo_wal_context());
         }
         node->set_next_leaf(new_node->get_page_no());
     } else {
@@ -600,7 +703,7 @@ IxNodeHandle* IxIndexHandle::split(IxNodeHandle* node, bool right_edge_append) {
  * @note 本函数执行完毕后，new node和old node都需要在函数外面进行unpin
  */
 void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node,
-                                       Transaction* transaction) {
+                                       const IndexWriteWalContext& wal_context) {
     note_structure_change();
     if (old_node->is_root_page()) {
         IxNodeHandle* new_root = create_node();
@@ -614,7 +717,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
         new_node->set_parent_page_no(new_root->get_page_no());
         update_root_page_no(new_root->get_page_no());
         refresh_root_page_cache();
-        unpin_created_page(new_root->get_page_id());
+        unpin_created_page(new_root->get_page_id(), active_smo_wal_context());
         delete new_root;
         return;
     }
@@ -627,11 +730,437 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
 
     if (parent.get_size() >= parent.get_max_size()) {
         IxNodeHandle* new_parent = split(&parent);
-        insert_into_parent(&parent, new_parent->get_key(0), new_parent, transaction);
-        unpin_created_page(new_parent->get_page_id());
+        insert_into_parent(&parent, new_parent->get_key(0), new_parent, wal_context);
+        unpin_created_page(new_parent->get_page_id(), active_smo_wal_context());
         delete new_parent;
     }
-    unpin_if_not_cached(parent.get_page_id(), true);
+    unpin_dirty_if_not_cached(parent.get_page_id(), active_smo_wal_context());
+}
+
+page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const char* key, const Rid& value,
+                                                 int insert_pos, bool right_edge_append,
+                                                 const BufferPoolManager::FrameOperationToken& frame_operation,
+                                                 const IndexWriteWalContext& wal_context) {
+    struct PlannedPage {
+        PageId id;
+        bool existed;
+        std::array<char, PAGE_SIZE> before{};
+        std::unique_ptr<Page> after{std::make_unique<Page>()};
+    };
+
+    std::vector<PlannedPage> pages;
+    std::unordered_map<page_id_t, size_t> page_index;
+    std::vector<page_id_t> acquired_new_pages;
+    bool allocation_started = false;
+
+    struct AllocationGuard {
+        std::vector<page_id_t>* acquired;
+        std::vector<page_id_t>* spare;
+        bool committed{false};
+
+        ~AllocationGuard() {
+            if (!committed && !acquired->empty()) {
+                try {
+                    spare->insert(spare->end(), acquired->begin(), acquired->end());
+                } catch (...) {
+                    // A bookkeeping allocation failure cannot be repaired here;
+                    // preserve the original split exception.
+                }
+            }
+        }
+    } allocation_guard{&acquired_new_pages, &split_spare_pages_};
+
+    auto add_page = [&](PageId id, bool existed, const char* data) -> size_t {
+        const size_t index = pages.size();
+        pages.push_back(PlannedPage{.id = id, .existed = existed});
+        if (data != nullptr) {
+            std::memcpy(pages.back().before.data(), data, PAGE_SIZE);
+            std::memcpy(pages.back().after->get_data(), data, PAGE_SIZE);
+        }
+        page_index.emplace(id.page_no, index);
+        return index;
+    };
+
+    auto load_existing = [&](page_id_t page_no, InsertSplitFault fault = InsertSplitFault::None) -> size_t {
+        if (fault != InsertSplitFault::None) {
+            maybe_inject_insert_split_fault(fault);
+        }
+        auto found = page_index.find(page_no);
+        if (found != page_index.end()) {
+            return found->second;
+        }
+        if (allocation_started) {
+            throw InternalError("index split preflight attempted a new read after allocation");
+        }
+        Page* source = cached_page(page_no);
+        const bool fetched = source == nullptr;
+        if (fetched) {
+            source = frame_operation.fetch_page(PageId{fd_, page_no});
+        }
+        if (source == nullptr) {
+            throw InternalError("index split preflight could not fetch page " + std::to_string(page_no));
+        }
+        size_t index;
+        {
+            std::shared_lock page_lock{source->latch()};
+            index = add_page(PageId{fd_, page_no}, true, source->get_data());
+        }
+        if (fetched) {
+            buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, false);
+        }
+        return index;
+    };
+
+    auto allocate_page = [&](InsertSplitFault fault) -> page_id_t {
+        maybe_inject_insert_split_fault(fault);
+        allocation_started = true;
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        Page* page = nullptr;
+        if (!split_spare_pages_.empty()) {
+            page_id.page_no = split_spare_pages_.back();
+            split_spare_pages_.pop_back();
+            page = frame_operation.fetch_page(page_id);
+            if (page != nullptr) {
+                std::unique_lock page_lock{page->latch()};
+                std::memset(page->get_data(), 0, PAGE_SIZE);
+            }
+        } else {
+            page = frame_operation.new_page(&page_id);
+        }
+        if (page == nullptr) {
+            if (page_id.page_no != INVALID_PAGE_ID) {
+                file_hdr_->num_pages_ = std::max(file_hdr_->num_pages_, page_id.page_no + 1);
+                acquired_new_pages.push_back(page_id.page_no);
+            }
+            throw InternalError("index split preflight could not allocate page");
+        }
+        file_hdr_->num_pages_ = std::max(file_hdr_->num_pages_, page_id.page_no + 1);
+        acquired_new_pages.push_back(page_id.page_no);
+        {
+            std::shared_lock page_lock{page->latch()};
+            add_page(page_id, false, page->get_data());
+        }
+        // A preallocated page may be evicted before commit. Marking its zero
+        // image dirty makes that eviction materialize a readable page rather
+        // than leaving a short-file hole that cannot be fetched again.
+        buffer_pool_manager_->unpin_page(page_id, wal_context.dependency());
+        return page_id.page_no;
+    };
+
+    auto node_at = [&](page_id_t page_no) {
+        return IxNodeHandle(file_hdr_.get(), pages[page_index.at(page_no)].after.get());
+    };
+
+    const page_id_t old_root_page_no = file_hdr_->root_page_;
+    const page_id_t old_last_leaf_page_no = file_hdr_->last_leaf_;
+    page_id_t planned_root_page_no = old_root_page_no;
+    page_id_t planned_last_leaf_page_no = old_last_leaf_page_no;
+    load_existing(leaf_page_no);
+
+    // Complete every fallible read before the first allocation. Besides the
+    // leaf-chain neighbor, pre-read the complete ancestor path and the children
+    // that an internal split will move. Once allocation_started is true,
+    // load_existing() is deliberately forbidden from reaching the buffer pool.
+    {
+        IxNodeHandle leaf_before = node_at(leaf_page_no);
+        const page_id_t next_leaf_page_no = leaf_before.get_next_leaf();
+        if (next_leaf_page_no != IX_LEAF_HEADER_PAGE) {
+            load_existing(next_leaf_page_no, InsertSplitFault::NextLeafFetch);
+        }
+
+        page_id_t child_page_no = leaf_page_no;
+        page_id_t parent_page_no = leaf_before.get_parent_page_no();
+        bool split_cascades = true;
+        while (parent_page_no != IX_NO_PAGE) {
+            load_existing(parent_page_no);
+            IxNodeHandle parent = node_at(parent_page_no);
+            int child_idx = 0;
+            while (child_idx < parent.get_size() && parent.value_at(child_idx) != child_page_no) {
+                ++child_idx;
+            }
+            if (child_idx == parent.get_size()) {
+                throw InternalError("index split preflight found a parent without its child");
+            }
+
+            if (split_cascades && parent.get_size() + 1 >= parent.get_max_size()) {
+                const int future_size = parent.get_size() + 1;
+                const int left_size = future_size / 2;
+                const int inserted_sibling_pos = child_idx + 1;
+                for (int output_pos = left_size; output_pos < future_size; ++output_pos) {
+                    if (output_pos == inserted_sibling_pos) {
+                        continue;
+                    }
+                    const int original_pos = output_pos < inserted_sibling_pos ? output_pos : output_pos - 1;
+                    load_existing(parent.value_at(original_pos), InsertSplitFault::MovedChildFetch);
+                }
+            } else {
+                split_cascades = false;
+            }
+
+            child_page_no = parent_page_no;
+            parent_page_no = parent.get_parent_page_no();
+        }
+    }
+
+    {
+        IxNodeHandle leaf = node_at(leaf_page_no);
+        leaf.insert_pair(insert_pos, key, value);
+    }
+
+    page_id_t current_page_no = leaf_page_no;
+    bool append_split = right_edge_append;
+    while (true) {
+        IxNodeHandle current_before_allocation = node_at(current_page_no);
+        if (current_before_allocation.get_size() < current_before_allocation.get_max_size()) {
+            break;
+        }
+
+        const bool current_is_leaf = current_before_allocation.is_leaf_page();
+        const page_id_t parent_page_no = current_before_allocation.get_parent_page_no();
+        const page_id_t sibling_page_no = allocate_page(InsertSplitFault::SiblingAllocation);
+
+        IxNodeHandle current = node_at(current_page_no);
+        IxNodeHandle sibling = node_at(sibling_page_no);
+        std::memcpy(sibling.page_hdr, current.page_hdr, sizeof(IxPageHdr));
+        sibling.set_parent_page_no(parent_page_no);
+
+        const int old_size = current.get_size();
+        int left_size = old_size / 2;
+        if (append_split && current_is_leaf) {
+            left_size = std::max(1, (old_size * 4) / 5);
+            if (left_size >= old_size) {
+                left_size = old_size / 2;
+            }
+        }
+        const int right_size = old_size - left_size;
+        sibling.set_size(0);
+        sibling.insert_pairs(0, current.get_key(left_size), current.get_rid(left_size), right_size);
+        current.set_size(left_size);
+
+        if (current_is_leaf) {
+            const page_id_t next_leaf_page_no = current.get_next_leaf();
+            sibling.set_prev_leaf(current_page_no);
+            sibling.set_next_leaf(next_leaf_page_no);
+            current.set_next_leaf(sibling_page_no);
+            if (next_leaf_page_no != IX_LEAF_HEADER_PAGE) {
+                load_existing(next_leaf_page_no, InsertSplitFault::NextLeafFetch);
+                IxNodeHandle next_leaf = node_at(next_leaf_page_no);
+                next_leaf.set_prev_leaf(sibling_page_no);
+            }
+            if (planned_last_leaf_page_no == current_page_no) {
+                planned_last_leaf_page_no = sibling_page_no;
+            }
+        } else {
+            std::vector<page_id_t> moved_children;
+            moved_children.reserve(static_cast<size_t>(sibling.get_size()));
+            for (int child_idx = 0; child_idx < sibling.get_size(); ++child_idx) {
+                moved_children.push_back(sibling.value_at(child_idx));
+            }
+            for (const page_id_t child_page_no : moved_children) {
+                load_existing(child_page_no, InsertSplitFault::MovedChildFetch);
+                IxNodeHandle child = node_at(child_page_no);
+                child.set_parent_page_no(sibling_page_no);
+            }
+        }
+
+        std::vector<char> promoted_key(static_cast<size_t>(file_hdr_->col_tot_len_));
+        std::memcpy(promoted_key.data(), sibling.get_key(0), promoted_key.size());
+        if (parent_page_no == IX_NO_PAGE) {
+            const page_id_t new_root_page_no = allocate_page(InsertSplitFault::NewRootAllocation);
+            IxNodeHandle left = node_at(current_page_no);
+            IxNodeHandle right = node_at(sibling_page_no);
+            IxNodeHandle new_root = node_at(new_root_page_no);
+            new_root.page_hdr->is_leaf = false;
+            new_root.set_size(0);
+            new_root.set_parent_page_no(IX_NO_PAGE);
+            new_root.insert_pair(0, left.get_key(0), Rid{current_page_no, -1});
+            new_root.insert_pair(1, right.get_key(0), Rid{sibling_page_no, -1});
+            left.set_parent_page_no(new_root_page_no);
+            right.set_parent_page_no(new_root_page_no);
+            planned_root_page_no = new_root_page_no;
+            break;
+        }
+
+        load_existing(parent_page_no);
+        IxNodeHandle parent = node_at(parent_page_no);
+        int insert_position = 0;
+        while (insert_position < parent.get_size() && parent.value_at(insert_position) != current_page_no) {
+            ++insert_position;
+        }
+        if (insert_position == parent.get_size()) {
+            throw InternalError("index split preflight found a parent without its child");
+        }
+        parent.insert_pair(insert_position + 1, promoted_key.data(), Rid{sibling_page_no, -1});
+        IxNodeHandle right = node_at(sibling_page_no);
+        right.set_parent_page_no(parent_page_no);
+        current_page_no = parent_page_no;
+        append_split = false;
+    }
+
+    if (insert_pos == 0) {
+        page_id_t child_page_no = leaf_page_no;
+        while (true) {
+            IxNodeHandle child = node_at(child_page_no);
+            const page_id_t parent_page_no = child.get_parent_page_no();
+            if (parent_page_no == IX_NO_PAGE) {
+                break;
+            }
+            load_existing(parent_page_no);
+            IxNodeHandle parent = node_at(parent_page_no);
+            int child_idx = 0;
+            while (child_idx < parent.get_size() && parent.value_at(child_idx) != child_page_no) {
+                ++child_idx;
+            }
+            if (child_idx == parent.get_size()) {
+                throw InternalError("index split preflight lost a separator child");
+            }
+            parent.set_key(child_idx, child.get_key(0));
+            if (child_idx != 0) {
+                break;
+            }
+            child_page_no = parent_page_no;
+        }
+    }
+
+    std::vector<size_t> commit_order;
+    commit_order.reserve(pages.size());
+    for (size_t index = 0; index < pages.size(); ++index) {
+        if (!pages[index].existed) {
+            commit_order.push_back(index);
+        }
+    }
+    for (size_t index = 0; index < pages.size(); ++index) {
+        if (pages[index].existed) {
+            commit_order.push_back(index);
+        }
+    }
+
+    auto acquire_page = [&](const PlannedPage& planned, bool* fetched) -> Page* {
+        try {
+            run_insert_split_test_hook(InsertSplitStage::CommitReacquire);
+            Page* page = cached_page(planned.id.page_no);
+            *fetched = page == nullptr;
+            if (*fetched) {
+                page = frame_operation.fetch_page(planned.id);
+            }
+            return page;
+        } catch (...) {
+            *fetched = false;
+            return nullptr;
+        }
+    };
+    auto release_page = [&](const PlannedPage& planned, bool fetched) {
+        if (fetched) {
+            buffer_pool_manager_->unpin_page(planned.id, false);
+        }
+    };
+    auto note_image_locked = [&](InsertSplitStage stage, PageId page_id, Page* page) noexcept {
+        try {
+            // Test observers may synchronize another thread, but must not call
+            // BPM or reacquire this page latch while the image latch is held.
+            run_insert_split_test_hook(stage, page_id, page);
+        } catch (...) {
+            // Image-stage hooks are observers, never commit fault injectors.
+        }
+    };
+
+    std::vector<size_t> applied;
+    auto rollback_applied = [&]() -> bool {
+        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+            PlannedPage& planned = pages[*it];
+            if (!planned.existed) {
+                continue;
+            }
+            bool fetched = false;
+            Page* page = nullptr;
+            try {
+                run_insert_split_test_hook(InsertSplitStage::RollbackReacquire);
+                page = cached_page(planned.id.page_no);
+                fetched = page == nullptr;
+                if (fetched) {
+                    page = frame_operation.fetch_page(planned.id);
+                }
+            } catch (...) {
+                page = nullptr;
+            }
+            if (page == nullptr) {
+                return false;
+            }
+            {
+                std::unique_lock page_lock{page->latch()};
+                BufferPoolManager::mark_dirty(page, wal_context.dependency());
+                note_image_locked(InsertSplitStage::RollbackBeforeImageRestore, planned.id, page);
+                std::memcpy(page->get_data(), planned.before.data(), PAGE_SIZE);
+                note_image_locked(InsertSplitStage::RollbackImageRestored, planned.id, page);
+            }
+            release_page(planned, fetched);
+        }
+        return true;
+    };
+
+    Page* current_page = nullptr;
+    bool current_fetched = false;
+    size_t current_index = 0;
+    run_insert_split_test_hook(InsertSplitStage::CommitBegin);
+    for (const size_t next_index : commit_order) {
+        PlannedPage& next = pages[next_index];
+        bool next_fetched = false;
+        Page* next_page = acquire_page(next, &next_fetched);
+        if (next_page == nullptr) {
+            if (current_page != nullptr) {
+                PlannedPage& current = pages[current_index];
+                if (current.existed) {
+                    std::unique_lock page_lock{current_page->latch()};
+                    BufferPoolManager::mark_dirty(current_page, wal_context.dependency());
+                    note_image_locked(InsertSplitStage::RollbackBeforeImageRestore, current.id, current_page);
+                    std::memcpy(current_page->get_data(), current.before.data(), PAGE_SIZE);
+                    note_image_locked(InsertSplitStage::RollbackImageRestored, current.id, current_page);
+                }
+                release_page(current, current_fetched);
+            }
+            if (!rollback_applied()) {
+                throw InternalError("index split commit failed and rollback could not restore the old tree");
+            }
+            throw InternalError("index split commit could not fetch page " + std::to_string(next.id.page_no));
+        }
+        if (current_page != nullptr) {
+            PlannedPage& current = pages[current_index];
+            release_page(current, current_fetched);
+            applied.push_back(current_index);
+        }
+        {
+            std::unique_lock page_lock{next_page->latch()};
+            BufferPoolManager::mark_dirty(next_page, wal_context.dependency());
+            note_image_locked(InsertSplitStage::CommitBeforeImageApply, next.id, next_page);
+            std::memcpy(next_page->get_data(), next.after->get_data(), PAGE_SIZE);
+            note_image_locked(InsertSplitStage::CommitImageApplied, next.id, next_page);
+        }
+        current_page = next_page;
+        current_fetched = next_fetched;
+        current_index = next_index;
+    }
+    if (current_page != nullptr) {
+        PlannedPage& current = pages[current_index];
+        release_page(current, current_fetched);
+        applied.push_back(current_index);
+    }
+
+    file_hdr_->root_page_ = planned_root_page_no;
+    file_hdr_->last_leaf_ = planned_last_leaf_page_no;
+    topology_epoch_.fetch_add(1, std::memory_order_relaxed);
+    note_structure_change();
+    for (const PlannedPage& planned : pages) {
+        note_smo_page(planned.id.page_no);
+    }
+
+    if (planned_root_page_no != old_root_page_no) {
+        refresh_root_page_cache(&frame_operation);
+    }
+    if (right_edge_append) {
+        remember_append_hint(planned_last_leaf_page_no);
+    }
+    allocation_guard.committed = true;
+    return leaf_page_no;
 }
 
 /**
@@ -640,7 +1169,7 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle* old_node, const char* key, 
  * @param transaction 事务指针
  * @return page_id_t 插入到的叶结点的page_no
  */
-page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transaction* transaction,
+page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, const IndexWriteWalContext& wal_context,
                                       bool allow_duplicate) {
     // The common case only changes one existing leaf entry. Structure-shared
     // protects the root-to-leaf route while the leaf latch serializes writers
@@ -677,12 +1206,13 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
         const bool needs_structure_change = pos == 0 || leaf.get_size() + 1 >= leaf.get_max_size();
         if (!needs_structure_change) {
             const page_id_t inserted_page_no = leaf.get_page_no();
+            BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
             leaf.insert_pair(pos, key, value);
             if (pos == leaf.get_size() - 1 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE) {
                 remember_append_hint(inserted_page_no);
             }
             leaf_guard.unlock();
-            unpin_if_not_cached(leaf.get_page_id(), true);
+            unpin_if_not_cached(leaf.get_page_id());
             return inserted_page_no;
         }
 
@@ -691,12 +1221,12 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, Transac
     }
 
     auto structure_guard = lock_exclusive();
-    return insert_entry_unlocked(key, value, transaction, allow_duplicate);
+    return insert_entry_unlocked(key, value, wal_context, allow_duplicate);
 }
 
-page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value, Transaction* transaction,
-                                               bool allow_duplicate) {
-    SmoScope smo(this);
+page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value,
+                                               const IndexWriteWalContext& wal_context, bool allow_duplicate) {
+    SmoScope smo(this, wal_context);
     IxNodeHandle leaf;
     if (!try_append_hint(key, leaf)) {
         fetch_node_into(file_hdr_->root_page_, leaf);
@@ -722,35 +1252,35 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
     }
 
     const bool right_edge_append = pos == leaf.get_size() && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE;
-    leaf.insert_pair(pos, key, value);
     page_id_t inserted_page_no = leaf.get_page_no();
-    bool did_split = false;
-    if (leaf.get_size() >= leaf.get_max_size()) {
-        did_split = true;
-        IxNodeHandle* new_leaf = split(&leaf, right_edge_append);
-        if (file_hdr_->last_leaf_ == leaf.get_page_no()) {
-            file_hdr_->last_leaf_ = new_leaf->get_page_no();
-        }
-        insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, transaction);
-        if (right_edge_append) {
-            remember_append_hint(new_leaf->get_page_no());
-        }
-        unpin_created_page(new_leaf->get_page_id());
-        delete new_leaf;
+    if (leaf.get_size() + 1 >= leaf.get_max_size()) {
+        unpin_if_not_cached(leaf.get_page_id());
+        smo.begin_frame_operation();
+        inserted_page_no = insert_entry_with_split(inserted_page_no, key, value, pos, right_edge_append,
+                                                   smo.frame_operation(), wal_context);
+        smo.commit();
+        return inserted_page_no;
     }
 
-    if (right_edge_append && !did_split) {
+    {
+        std::unique_lock leaf_guard{leaf.page->latch()};
+        BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+        leaf.insert_pair(pos, key, value);
+    }
+    if (right_edge_append) {
         remember_append_hint(leaf.get_page_no());
     }
 
     if (pos == 0) {
         maintain_parent(&leaf);
     }
-    unpin_if_not_cached(leaf.get_page_id(), true);
+    unpin_if_not_cached(leaf.get_page_id());
+    smo.commit();
     return inserted_page_no;
 }
 
-IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h), latch(h->lock_exclusive()) {
+IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h, const IndexWriteWalContext& write_wal_context)
+    : ih(h), latch(h->lock_exclusive()), wal_context(write_wal_context) {
     ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
     while (!leaf.is_leaf_page()) {
         page_id_t child_page_no = leaf.value_at(0);
@@ -762,18 +1292,11 @@ IxIndexHandle::PinnedInserter::PinnedInserter(IxIndexHandle* h) : ih(h), latch(h
 
 IxIndexHandle::PinnedInserter::~PinnedInserter() {
     if (active) {
-        ih->unpin_if_not_cached(leaf.get_page_id(), true);
+        ih->unpin_if_not_cached(leaf.get_page_id());
     }
 }
 
-void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Transaction* txn, bool allow_duplicate) {
-    SmoScope smo(ih);
-    // This object holds the leaf pinned across rows, so unlike the other two
-    // entry points it does not necessarily re-fetch it inside the scope. Record
-    // it explicitly - it is the one page note_smo_page()'s acquisition funnel
-    // cannot see.
-    ih->note_smo_page(leaf.get_page_no());
-
+void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, bool allow_duplicate) {
     // Skip root→leaf walk if key belongs in the pinned leaf (ascending bulk load).
     if (leaf.get_size() > 0) {
         int cmp_first = ix_compare(key, leaf.get_key(0), ih->file_hdr_->col_types_, ih->file_hdr_->col_lens_);
@@ -791,7 +1314,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
             // While the walk is in flight `leaf` names a page this object no
             // longer owns, so a throwing fetch must not reach the destructor.
             active = false;
-            ih->unpin_if_not_cached(leaf.get_page_id(), true);
+            ih->unpin_if_not_cached(leaf.get_page_id());
             ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
             while (!leaf.is_leaf_page()) {
                 page_id_t child_page_no = leaf.internal_lookup(key);
@@ -816,32 +1339,38 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
     }
 
     const bool right_edge_append = pos == leaf.get_size() && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE;
-    leaf.insert_pair(pos, key, value);
-    if (leaf.get_size() >= leaf.get_max_size()) {
-        IxNodeHandle* new_leaf = ih->split(&leaf, right_edge_append);
-        if (ih->file_hdr_->last_leaf_ == leaf.get_page_no()) {
-            ih->file_hdr_->last_leaf_ = new_leaf->get_page_no();
-        }
-        ih->insert_into_parent(&leaf, new_leaf->get_key(0), new_leaf, txn);
-        page_id_t new_leaf_page_no = new_leaf->get_page_no();
-        if (right_edge_append) {
-            ih->remember_append_hint(new_leaf_page_no);
-        }
-        ih->unpin_created_page(new_leaf->get_page_id());
-        delete new_leaf;
-
-        // Reposition to the right leaf after split.
+    if (leaf.get_size() + 1 >= leaf.get_max_size()) {
+        // Release the bulk-load cursor before entering the shared split planner:
+        // prior rows made this page dirty, but this row has not modified it yet.
         active = false;
-        ih->unpin_if_not_cached(leaf.get_page_id(), true);
-        ih->fetch_node_into(new_leaf_page_no, leaf);
+        ih->unpin_if_not_cached(leaf.get_page_id());
+        ih->insert_entry_unlocked(key, value, wal_context, allow_duplicate);
+
+        ih->fetch_node_into(ih->file_hdr_->root_page_, leaf);
+        while (!leaf.is_leaf_page()) {
+            const page_id_t child_page_no = leaf.internal_lookup(key);
+            ih->unpin_if_not_cached(leaf.get_page_id());
+            ih->fetch_node_into(child_page_no, leaf);
+        }
         active = true;
-    } else if (right_edge_append) {
-        ih->remember_append_hint(leaf.get_page_no());
+        return;
     }
 
+    SmoScope smo(ih, wal_context);
+    // This object holds the leaf pinned across rows, so note the page explicitly.
+    ih->note_smo_page(leaf.get_page_no());
+    {
+        std::unique_lock leaf_guard{leaf.page->latch()};
+        BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+        leaf.insert_pair(pos, key, value);
+    }
+    if (right_edge_append) {
+        ih->remember_append_hint(leaf.get_page_no());
+    }
     if (pos == 0) {
         ih->maintain_parent(&leaf);
     }
+    smo.commit();
 }
 
 /**
@@ -849,7 +1378,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, Tr
  * @param key 要删除的key值
  * @param transaction 事务指针
  */
-bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
+bool IxIndexHandle::delete_entry(const char* key, const IndexWriteWalContext& wal_context) {
     {
         auto structure_guard = lock_shared();
         IxNodeHandle leaf;
@@ -871,9 +1400,10 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
 
         const bool needs_structure_change = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
         if (!needs_structure_change) {
+            BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
             leaf.erase_pair(pos);
             leaf_guard.unlock();
-            unpin_if_not_cached(leaf.get_page_id(), true);
+            unpin_if_not_cached(leaf.get_page_id());
             return true;
         }
 
@@ -882,12 +1412,12 @@ bool IxIndexHandle::delete_entry(const char* key, Transaction* transaction) {
     }
 
     auto structure_guard = lock_exclusive();
-    return delete_entry_unlocked(key, transaction);
+    return delete_entry_unlocked(key, wal_context);
 }
 
-bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transaction) {
-    SmoScope smo(this);
-    auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction);
+bool IxIndexHandle::delete_entry_unlocked(const char* key, const IndexWriteWalContext& wal_context) {
+    SmoScope smo(this, wal_context);
+    auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, nullptr);
     int old_size = leaf->get_size();
     int pos = leaf->lower_bound(key);
     if (pos >= old_size || ix_compare(leaf->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
@@ -896,16 +1426,21 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, Transaction* transact
         return false;
     }
 
-    leaf->erase_pair(pos);
+    {
+        std::unique_lock leaf_guard{leaf->page->latch()};
+        BufferPoolManager::mark_dirty(leaf->page, wal_context.dependency());
+        leaf->erase_pair(pos);
+    }
     if (leaf->get_size() > 0) {
         maintain_parent(leaf);
     }
-    unpin_if_not_cached(leaf->get_page_id(), true);
+    unpin_if_not_cached(leaf->get_page_id());
     delete leaf;
+    smo.commit();
     return true;
 }
 
-bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction* transaction) {
+bool IxIndexHandle::delete_entry(const char* key, const Rid& value, const IndexWriteWalContext& wal_context) {
     bool needs_structure_fallback = false;
     {
         auto structure_guard = lock_shared();
@@ -937,9 +1472,10 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
                 if (*leaf.get_rid(pos) == value) {
                     needs_structure_fallback = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
                     if (!needs_structure_fallback) {
+                        BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
                         leaf.erase_pair(pos);
                         leaf_guard.unlock();
-                        unpin_if_not_cached(leaf.get_page_id(), true);
+                        unpin_if_not_cached(leaf.get_page_id());
                         return true;
                     }
                     break;
@@ -971,29 +1507,54 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, Transaction*
         return false;
     }
     auto guard = lock_exclusive();
-    return delete_entry_unlocked(key, value, transaction);
+    return delete_entry_unlocked(key, value, wal_context);
 }
 
-bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Transaction* transaction) {
-    (void)transaction;
-    SmoScope smo(this);
-    Iid lower = lower_bound(key);
-    Iid upper = upper_bound(key);
-    IxScan scan(this, lower, upper, buffer_pool_manager_, false);
-    while (!scan.is_end()) {
-        Iid iid = scan.iid();
-        if (scan.rid() == value) {
-            IxNodeHandle leaf;
-            fetch_node_into(iid.page_no, leaf);
-            leaf.erase_pair(iid.slot_no);
+bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, const IndexWriteWalContext& wal_context) {
+    SmoScope smo(this, wal_context);
+    const Iid lower = lower_bound(key);
+    IxNodeHandle leaf;
+    fetch_node_into(lower.page_no, leaf);
+    for (;;) {
+        page_id_t next_leaf = IX_LEAF_HEADER_PAGE;
+        bool found = false;
+        bool stop = false;
+        {
+            std::unique_lock leaf_guard{leaf.page->latch()};
+            int pos = leaf.lower_bound(key);
+            while (pos < leaf.get_size()) {
+                const int cmp = ix_compare(leaf.get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_);
+                if (cmp > 0) {
+                    stop = true;
+                    break;
+                }
+                if (*leaf.get_rid(pos) == value) {
+                    BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+                    leaf.erase_pair(pos);
+                    found = true;
+                    break;
+                }
+                ++pos;
+            }
+            if (!found && !stop && leaf.get_next_leaf() != IX_LEAF_HEADER_PAGE) {
+                next_leaf = leaf.get_next_leaf();
+            }
+        }
+        if (found) {
             if (leaf.get_size() > 0) {
                 maintain_parent(&leaf);
             }
-            unpin_if_not_cached(leaf.get_page_id(), true);
+            unpin_if_not_cached(leaf.get_page_id());
+            smo.commit();
             return true;
         }
-        scan.next();
+        unpin_if_not_cached(leaf.get_page_id());
+        if (stop || next_leaf == IX_LEAF_HEADER_PAGE) {
+            break;
+        }
+        fetch_node_into(next_leaf, leaf);
     }
+    smo.commit();
     return false;
 }
 
@@ -1008,7 +1569,8 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, Tra
  * If sibling's size + input page's size >= 2 * page's minsize, then redistribute.
  * Otherwise, merge(Coalesce).
  */
-bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* transaction, bool* root_is_latched) {
+bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, const IndexWriteWalContext& wal_context,
+                                             bool* root_is_latched) {
     if (node->is_root_page()) {
         return adjust_root(node);
     }
@@ -1031,11 +1593,11 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle* node, Transaction* tr
         redistribute(neighbor, node, parent, index);
     } else {
         topology_epoch_.fetch_add(1, std::memory_order_relaxed);
-        deleted = coalesce(&neighbor, &node, &parent, index, transaction, root_is_latched);
+        deleted = coalesce(&neighbor, &node, &parent, index, wal_context, root_is_latched);
     }
 
-    unpin_if_not_cached(neighbor->get_page_id(), true);
-    unpin_if_not_cached(parent->get_page_id(), true);
+    unpin_dirty_if_not_cached(neighbor->get_page_id(), active_smo_wal_context());
+    unpin_dirty_if_not_cached(parent->get_page_id(), active_smo_wal_context());
     return deleted;
 }
 
@@ -1050,12 +1612,26 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
         topology_epoch_.fetch_add(1, std::memory_order_relaxed);
         note_structure_change();
         page_id_t child_page_no = old_root_node->value_at(0);
+        const bool child_was_cached = cached_page(child_page_no) != nullptr;
         IxNodeHandle child;
         fetch_node_into(child_page_no, child);
-        child.set_parent_page_no(IX_NO_PAGE);
+        {
+            std::unique_lock child_guard{child.page->latch()};
+            BufferPoolManager::mark_dirty(child.page, active_smo_wal_context().dependency());
+            child.set_parent_page_no(IX_NO_PAGE);
+        }
         update_root_page_no(child_page_no);
         refresh_root_page_cache();
-        unpin_if_not_cached(child.get_page_id(), true);
+        if (child_was_cached) {
+            // refresh_root_page_cache transferred the internal cache pin into
+            // the root cache pin; fetch_node_into did not acquire another pin.
+            unpin_if_not_cached(child.get_page_id());
+        } else {
+            // The child was fetched before it became the cached root. Release
+            // that operation pin directly instead of mistaking it for the new
+            // root cache's ownership pin.
+            buffer_pool_manager_->unpin_page(child.get_page_id(), false);
+        }
         return true;
     }
     if (old_root_node->is_leaf_page() && old_root_node->get_size() == 0) {
@@ -1110,7 +1686,7 @@ void IxIndexHandle::redistribute(IxNodeHandle* neighbor_node, IxNodeHandle* node
  * @note Assume that *neighbor_node is the left sibling of *node (neighbor -> node)
  */
 bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, IxNodeHandle** parent, int index,
-                             Transaction* transaction, bool* root_is_latched) {
+                             const IndexWriteWalContext& wal_context, bool* root_is_latched) {
     note_structure_change();
     if (index == 0) {
         std::swap(*neighbor_node, *node);
@@ -1134,7 +1710,7 @@ bool IxIndexHandle::coalesce(IxNodeHandle** neighbor_node, IxNodeHandle** node, 
 
     (*parent)->erase_pair(index);
     release_node_handle(*right);
-    return coalesce_or_redistribute(*parent, transaction, root_is_latched);
+    return coalesce_or_redistribute(*parent, wal_context, root_is_latched);
 }
 
 /**
@@ -1617,18 +2193,18 @@ void IxIndexHandle::fetch_node_into(int page_no, IxNodeHandle& out) const {
  * 与Record的处理不同，Record将未插入满的记录页认为是free_page
  */
 IxNodeHandle* IxIndexHandle::create_node() {
-    IxNodeHandle* node;
-    file_hdr_->num_pages_++;
-
     PageId new_page_id = {.fd = fd_, .page_no = INVALID_PAGE_ID};
     // 从3开始分配page_no，第一次分配之后，new_page_id.page_no=3，file_hdr_.num_pages=4
     Page* page = buffer_pool_manager_->new_page(&new_page_id);
+    if (page == nullptr) {
+        throw InternalError("failed to allocate index page");
+    }
+    file_hdr_->num_pages_ = std::max(file_hdr_->num_pages_, new_page_id.page_no + 1);
     // A page that has only been allocated occupies no bytes in the file yet, so
     // it reads back as a hole full of zeros. Publishing it with the rest of the
     // SMO is the only thing that stops a parent from pointing at one.
     note_smo_page(new_page_id.page_no);
-    node = new IxNodeHandle(file_hdr_.get(), page);
-    return node;
+    return new IxNodeHandle(file_hdr_.get(), page);
 }
 
 /**
@@ -1649,21 +2225,29 @@ void IxIndexHandle::maintain_parent(IxNodeHandle* node) {
     IxNodeHandle* next = &slot_b;
     while (curr->get_parent_page_no() != IX_NO_PAGE) {
         fetch_node_into(curr->get_parent_page_no(), *next);
-        int rank = next->find_child(curr);
-        char* parent_key = next->get_key(rank);
-        char* child_first_key = curr->get_key(0);
-        if (memcmp(parent_key, child_first_key, file_hdr_->col_tot_len_) == 0) {
-            unpin_if_not_cached(next->get_page_id(), true);
+        bool changed = false;
+        {
+            std::unique_lock parent_guard{next->page->latch()};
+            int rank = next->find_child(curr);
+            char* parent_key = next->get_key(rank);
+            char* child_first_key = curr->get_key(0);
+            if (memcmp(parent_key, child_first_key, file_hdr_->col_tot_len_) != 0) {
+                // A separator key is as much a part of the tree's shape as a child
+                // pointer. Publish the dependency and epoch under the same page
+                // latch as the image change so a concurrent flush cannot observe
+                // the new separator with the old WAL dependency.
+                BufferPoolManager::mark_dirty(next->page, active_smo_wal_context().dependency());
+                topology_epoch_.fetch_add(1, std::memory_order_relaxed);
+                note_structure_change();
+                memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_);
+                changed = true;
+            }
+        }
+        if (!changed) {
+            unpin_if_not_cached(next->get_page_id());
             break;
         }
-        // A separator key is as much a part of the tree's shape as a child
-        // pointer: if the new separator reaches disk without the leaf that
-        // justifies it (or the other way round), a range of keys stops being
-        // reachable by descent even though every page still validates.
-        topology_epoch_.fetch_add(1, std::memory_order_relaxed);
-        note_structure_change();
-        memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_);
-        unpin_if_not_cached(next->get_page_id(), true);
+        unpin_if_not_cached(next->get_page_id());
         std::swap(curr, next);
     }
 }
@@ -1680,12 +2264,12 @@ void IxIndexHandle::erase_leaf(IxNodeHandle* leaf) {
     IxNodeHandle prev;
     fetch_node_into(leaf->get_prev_leaf(), prev);
     prev.set_next_leaf(leaf->get_next_leaf());
-    unpin_if_not_cached(prev.get_page_id(), true);
+    unpin_dirty_if_not_cached(prev.get_page_id(), active_smo_wal_context());
 
     IxNodeHandle next;
     fetch_node_into(leaf->get_next_leaf(), next);
     next.set_prev_leaf(leaf->get_prev_leaf()); // 注意此处是SetPrevLeaf()
-    unpin_if_not_cached(next.get_page_id(), true);
+    unpin_dirty_if_not_cached(next.get_page_id(), active_smo_wal_context());
 }
 
 /**
@@ -1720,6 +2304,6 @@ void IxIndexHandle::maintain_child(IxNodeHandle* node, int child_idx) {
         IxNodeHandle child;
         fetch_node_into(child_page_no, child);
         child.set_parent_page_no(node->get_page_no());
-        unpin_if_not_cached(child.get_page_id(), true);
+        unpin_dirty_if_not_cached(child.get_page_id(), active_smo_wal_context());
     }
 }

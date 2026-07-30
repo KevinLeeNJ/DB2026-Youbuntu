@@ -67,6 +67,47 @@ enum class FrameState : uint8_t {
     FLUSHING,
 };
 
+// A page image may depend on WAL bytes that must be durable before the image
+// reaches its data file. Keep that dependency in frame metadata rather than in
+// the payload: table pages happen to store an LSN at byte zero, while index
+// pages store IxPageHdr there.
+class PageWriteDependency {
+public:
+    enum class Kind : uint8_t { None, WalLsn };
+
+    static PageWriteDependency None() {
+        return PageWriteDependency(Kind::None, INVALID_LSN);
+    }
+
+    static PageWriteDependency Wal(lsn_t lsn) {
+        return lsn == INVALID_LSN ? None() : PageWriteDependency(Kind::WalLsn, lsn);
+    }
+
+    Kind kind() const {
+        return kind_;
+    }
+
+    lsn_t wal_lsn() const {
+        return wal_lsn_;
+    }
+
+    void merge(const PageWriteDependency& other) {
+        if (other.kind_ != Kind::WalLsn) {
+            return;
+        }
+        if (kind_ != Kind::WalLsn || other.wal_lsn_ > wal_lsn_) {
+            kind_ = Kind::WalLsn;
+            wal_lsn_ = other.wal_lsn_;
+        }
+    }
+
+private:
+    PageWriteDependency(Kind kind, lsn_t wal_lsn) : kind_(kind), wal_lsn_(wal_lsn) {}
+
+    Kind kind_;
+    lsn_t wal_lsn_;
+};
+
 /**
  * @description: Page类声明, Page是RMDB数据块的单位、是负责数据操作Record模块的操作对象，
  * Page对象在磁盘上有文件存储, 若在Buffer中则有帧偏移, 并非特指Buffer或Disk上的数据
@@ -131,6 +172,7 @@ private:
     // Distinguishes the page image captured by a flush from writes that arrive
     // after that image has reached disk.
     std::atomic<uint64_t> dirty_epoch_{0};
+    PageWriteDependency write_dependency_{PageWriteDependency::None()};
     std::mutex dirty_latch_;
 
     // Buffer-pool pinning protects residency; this protects the page payload.

@@ -55,6 +55,17 @@ void Append(std::vector<char>* bytes, LogRecord& record, lsn_t lsn) {
     record.serialize(bytes->data() + begin);
 }
 
+WalRecordView BorrowRecord(std::vector<char>* bytes) {
+    WalRecordView view;
+    view.bytes = bytes->data();
+    view.log_type = read_unaligned<LogType>(view.bytes + OFFSET_LOG_TYPE);
+    view.lsn = read_unaligned<lsn_t>(view.bytes + OFFSET_LSN);
+    view.total_len = read_unaligned<uint32_t>(view.bytes + OFFSET_LOG_TOT_LEN);
+    view.txn_id = read_unaligned<txn_id_t>(view.bytes + OFFSET_LOG_TID);
+    view.prev_lsn = read_unaligned<lsn_t>(view.bytes + OFFSET_PREV_LSN);
+    return view;
+}
+
 void WriteWal(const std::vector<char>& bytes) {
     std::ofstream out(LOG_FILE_NAME, std::ios::binary | std::ios::trunc);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -313,6 +324,100 @@ TEST(WalReaderTest, ParseWalDmlRejectsAPayloadCutShortByItsOwnLength) {
     ASSERT_TRUE(reader.next(&view));
     WalDmlView dml;
     EXPECT_FALSE(ParseWalDml(view, &dml));
+}
+
+TEST(WalReaderTest, SparseUpdateMaterializesACompleteBeforeImage) {
+    Rid rid{4, 2};
+    auto old_row = MakeRow(64, 'a');
+    auto new_row = MakeRow(64, 'a');
+    new_row.data[5] = 'x';
+    new_row.data[20] = 'y';
+    UpdateLogRecord update(12, old_row, new_row, rid, "stock");
+    ASSERT_TRUE(update.sparse_encoding_);
+    update.lsn_ = 201;
+    std::vector<char> bytes(update.log_tot_len_);
+    update.serialize(bytes.data());
+
+    WalRecordView view = BorrowRecord(&bytes);
+    WalDmlView dml;
+    ASSERT_TRUE(ParseWalDml(view, &dml));
+    EXPECT_TRUE(dml.before_is_materialized);
+    EXPECT_EQ(dml.before_image, dml.materialized_before.data());
+    EXPECT_EQ(dml.before_size, 64);
+    EXPECT_EQ(dml.after_size, 64);
+    EXPECT_EQ(std::string(dml.before_image, dml.before_size), std::string(64, 'a'));
+    EXPECT_EQ(std::string(dml.after_image, dml.after_size),
+              std::string(5, 'a') + "x" + std::string(14, 'a') + "y" + std::string(43, 'a'));
+    EXPECT_EQ(dml.rid, rid);
+    EXPECT_EQ(dml.table_name, "stock");
+
+    WalDmlView redo_dml;
+    ASSERT_TRUE(ParseWalDmlForRedo(view, &redo_dml));
+    EXPECT_FALSE(redo_dml.before_is_materialized);
+    EXPECT_TRUE(redo_dml.materialized_before.empty());
+    EXPECT_EQ(redo_dml.before_image, nullptr);
+    EXPECT_EQ(redo_dml.after_size, 64);
+    EXPECT_EQ(std::string(redo_dml.after_image, redo_dml.after_size),
+              std::string(5, 'a') + "x" + std::string(14, 'a') + "y" + std::string(43, 'a'));
+    EXPECT_EQ(redo_dml.rid, rid);
+    EXPECT_EQ(redo_dml.table_name, "stock");
+}
+
+TEST(WalReaderTest, SparseUpdateRejectsMalformedVersionSpansAndTrailingBytes) {
+    Rid rid{4, 3};
+    auto old_row = MakeRow(64, 'a');
+    auto new_row = MakeRow(64, 'a');
+    new_row.data[5] = 'x';
+    new_row.data[20] = 'y';
+    UpdateLogRecord update(13, old_row, new_row, rid, "stock");
+    ASSERT_TRUE(update.sparse_encoding_);
+    ASSERT_EQ(update.before_spans_.size(), 2U);
+    update.lsn_ = 202;
+    std::vector<char> valid(update.log_tot_len_);
+    update.serialize(valid.data());
+
+    const int span_count_offset = OFFSET_LOG_DATA + sizeof(int) + sizeof(int) + new_row.size;
+    const int first_span_offset = span_count_offset + sizeof(uint32_t);
+    const int second_span_offset =
+        first_span_offset + sizeof(uint32_t) * 2 + static_cast<int>(update.before_spans_[0].length);
+    const auto rejected = [&](std::vector<char> bytes) {
+        WalRecordView view = BorrowRecord(&bytes);
+        WalDmlView dml;
+        WalDmlView redo_dml;
+        return !ParseWalDml(view, &dml) && !ParseWalDmlForRedo(view, &redo_dml);
+    };
+
+    {
+        auto bytes = valid;
+        const int unknown_version = -2;
+        memcpy(bytes.data() + OFFSET_LOG_DATA, &unknown_version, sizeof(unknown_version));
+        EXPECT_TRUE(rejected(std::move(bytes)));
+    }
+    {
+        auto bytes = valid;
+        const uint32_t count_bomb = static_cast<uint32_t>(new_row.size + 1);
+        memcpy(bytes.data() + span_count_offset, &count_bomb, sizeof(count_bomb));
+        EXPECT_TRUE(rejected(std::move(bytes)));
+    }
+    {
+        auto bytes = valid;
+        const uint32_t overlap = update.before_spans_[0].offset;
+        memcpy(bytes.data() + second_span_offset, &overlap, sizeof(overlap));
+        EXPECT_TRUE(rejected(std::move(bytes)));
+    }
+    {
+        auto bytes = valid;
+        const uint32_t out_of_bounds = static_cast<uint32_t>(new_row.size + 1);
+        memcpy(bytes.data() + first_span_offset + sizeof(uint32_t), &out_of_bounds, sizeof(out_of_bounds));
+        EXPECT_TRUE(rejected(std::move(bytes)));
+    }
+    {
+        auto bytes = valid;
+        bytes.push_back('!');
+        const uint32_t length_with_trailing_byte = static_cast<uint32_t>(bytes.size());
+        memcpy(bytes.data() + OFFSET_LOG_TOT_LEN, &length_with_trailing_byte, sizeof(length_with_trailing_byte));
+        EXPECT_TRUE(rejected(std::move(bytes)));
+    }
 }
 
 TEST(WalReaderTest, ReadWalRecordAtMatchesTheStreamingScan) {
