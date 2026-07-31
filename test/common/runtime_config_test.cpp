@@ -14,10 +14,10 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/runtime_config.h"
 
-TEST(RuntimeConfigTest, DefaultBufferPoolIsThreeGiB) {
+TEST(RuntimeConfigTest, DefaultBufferPoolIsSixGiB) {
     const auto config = default_buffer_pool_config();
-    EXPECT_EQ(config.gibibytes, 3);
-    EXPECT_EQ(config.pages, 3 * PAGES_PER_GIB);
+    EXPECT_EQ(config.gibibytes, 6);
+    EXPECT_EQ(config.pages, 6 * PAGES_PER_GIB);
 }
 
 TEST(RuntimeConfigTest, ParsesAuthorizedBufferPoolSizes) {
@@ -35,7 +35,7 @@ TEST(RuntimeConfigTest, RejectsMalformedOrOutOfRangeBufferPoolSizes) {
 }
 
 TEST(RuntimeConfigTest, ParsesSiConflictBackoff) {
-    EXPECT_EQ(default_si_conflict_backoff(), std::chrono::microseconds(1000));
+    EXPECT_EQ(default_si_conflict_backoff(), std::chrono::microseconds(0));
     EXPECT_EQ(parse_si_conflict_backoff("0"), std::chrono::microseconds(0));
     EXPECT_EQ(parse_si_conflict_backoff("250"), std::chrono::microseconds(250));
     EXPECT_EQ(parse_si_conflict_backoff("2000"), std::chrono::microseconds(2000));

@@ -535,9 +535,8 @@ public:
         return group_commit_count_.load(std::memory_order_acquire);
     }
 
-    // Number of committers that became the flush leader. Comparing this with
-    // fsync_count shows how often one leader must flush again for later
-    // arrivals before it can return to its own client.
+    // Number of flush waves led by committers. A leader returns once its own
+    // target is covered and hands any remaining queue to the next waiter.
     uint64_t get_group_commit_leader_count() const {
         return group_commit_leader_count_.load(std::memory_order_acquire);
     }
@@ -588,6 +587,7 @@ private:
         lsn_t target_lsn{INVALID_LSN};
         bool require_sync{true};
         bool done{false};
+        bool leader{false};
         std::exception_ptr error;
         uint64_t enqueue_time_ns{0};
         std::condition_variable cv;
@@ -596,9 +596,9 @@ private:
     void flush_buffer(bool sync);
     void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync);
 
-    // One leader performs the durable flush for all waiters that arrive
-    // before it finishes. Waiters are released only after durable_lsn_ moves
-    // past their target LSN.
+    // One leader performs each flush wave. Covered waiters are released only
+    // after the required written/durable LSN reaches their target; any
+    // remaining queue is handed to the next waiter.
     std::mutex group_commit_latch_;
     std::condition_variable group_commit_cv_;
     bool group_commit_leader_active_{false};

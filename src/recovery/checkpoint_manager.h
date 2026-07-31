@@ -20,17 +20,14 @@ class SmManager;
 class TransactionManager;
 
 struct CheckpointOptions {
-    int64_t auto_checkpoint_bytes = 1024LL * 1024 * 1024;
-    // Spread dirty-page writeback across the whole WAL generation. Waiting
-    // until the last few MiB concentrates hundreds of thousands of writes in
-    // the clean-checkpoint pass and produces a multi-second foreground stall.
-    int64_t preflush_trigger_bytes = 512LL * 1024 * 1024;
-    // Once the soft WAL threshold is reached, keep preflushing until the dirty
-    // set fits below one batch. This bound prevents sustained writes from
-    // deferring WAL truncation indefinitely.
-    int64_t checkpoint_defer_bytes = 512LL * 1024 * 1024;
-    // Keep the preflush pass bounded so checkpoint I/O does not monopolize
-    // the storage device while foreground transactions are still running.
+    // A clean checkpoint is deliberately infrequent: the final quiescent pass
+    // is much cheaper than repeatedly writing hot pages during normal traffic.
+    int64_t auto_checkpoint_bytes = 4LL * 1024 * 1024 * 1024;
+    // Spread writeback over the second half of a WAL generation. The final
+    // clean checkpoint still owns the durability barrier and truncation, but
+    // it should only have to write the pages dirtied since the last tick.
+    int64_t preflush_trigger_bytes = 2LL * 1024 * 1024 * 1024;
+    int64_t checkpoint_defer_bytes = 2LL * 1024 * 1024 * 1024;
     size_t preflush_batch_pages = 4096;
 };
 
@@ -48,6 +45,11 @@ private:
     LogManager* log_mgr_;
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};
+    // Monotonic identifier for the current WAL lifetime. It lets the buffer
+    // pool bound one background write attempt per page without clearing a
+    // pool-sized table after every checkpoint.
+    uint64_t preflush_generation_{1};
+    int64_t last_log_offset_{0};
     // Backoff state for automatic checkpoints after a drain failure. Retrying
     // every scheduler tick would make the whole process flap between blocked
     // and unblocked while a stuck transaction stays open.

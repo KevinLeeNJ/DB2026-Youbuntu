@@ -49,6 +49,11 @@ struct BufferPoolObservabilitySnapshot {
     uint64_t eviction_dirty{0};
 };
 
+struct PreflushBatchResult {
+    size_t pages_written{0};
+    bool scan_complete{false};
+};
+
 class BufferPoolManager {
 private:
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
@@ -71,6 +76,8 @@ private:
     std::atomic<uint64_t> eviction_dirty_{0};
     std::mutex dirty_flush_latch_;
     size_t dirty_flush_cursor_{0};
+    uint64_t preflush_scan_generation_{0};
+    size_t preflush_scan_remaining_{0};
 
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
@@ -151,7 +158,7 @@ public:
     // page LSN at all - byte 0 of an index page is IxPageHdr, not Page::OFFSET_LSN
     // - so there is no WAL record to wait for and treating those bytes as an LSN
     // would make a split block on the log.
-    FlushBatchResult flush_pages(std::vector<PageId>& page_ids, bool wal_preflushed);
+    FlushBatchResult flush_pages(std::vector<PageId>& page_ids, bool wal_preflushed, bool skip_pinned = false);
 
     // Write at most max_pages dirty resident pages without requiring a
     // checkpoint barrier. The page dirty epoch prevents a concurrent update
@@ -161,6 +168,10 @@ public:
     // batched writer does not interpret IxPageHdr bytes as an LSN; table pages
     // still force their maximum copied LSN before any data write.
     size_t flush_dirty_pages(size_t max_pages, const std::unordered_set<int>& index_fds);
+    // Each resident page is attempted once per WAL generation, bounding write
+    // amplification when a hot page is dirtied again before the checkpoint.
+    PreflushBatchResult preflush_dirty_pages(size_t max_pages, const std::unordered_set<int>& index_fds,
+                                             uint64_t generation);
 
     void delete_all_pages(int fd);
 
@@ -182,6 +193,9 @@ private:
     frame_id_t take_free_frame();
     void recycle_frame(frame_id_t frame_id);
     void clear_residency(frame_id_t frame_id);
+    static void reset_preflush_state(Page* page);
+    size_t flush_selected_pages(std::vector<PageId>& pages_to_flush, const std::unordered_set<int>& index_fds,
+                                bool skip_pinned);
     void flush_log_before_page_write(lsn_t page_lsn);
     bool flush_page_impl(PageId page_id, bool dirty_only);
 };

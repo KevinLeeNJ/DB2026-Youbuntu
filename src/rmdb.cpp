@@ -803,9 +803,10 @@ ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descri
                                             const PreparedJitProgram* jit_program, const ParameterFrame& parameters,
                                             SessionState& session, QueryResultSink* result_sink,
                                             execution_timing_diagnostics::Sample* timing = nullptr) {
-    std::vector<char> response(BUFFER_LENGTH, 0);
-    int offset = 0;
-    Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
+    // EXEC_BATCH always supplies a result sink for queries, and prepared
+    // descriptors only cover SELECT/INSERT/UPDATE. The legacy fixed response
+    // buffer is therefore unused on this hot path.
+    Context context(lock_manager.get(), log_manager.get(), nullptr, nullptr, nullptr, txn_manager.get());
     context.isolation_level_ = session.isolation;
     context.result_sink_ = result_sink;
     context.output_file_enabled_ = &session.output_file_enabled;
@@ -1284,6 +1285,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
     std::size_t encoded_result_bytes = 0;
     const bool execution_timing_enabled = execution_timing_diagnostics::enabled();
     const bool skip_scan_diagnostics_enabled = index_skip_scan_diagnostics::enabled();
+    auto catalog_guard = sm_manager->acquire_catalog_shared();
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
             auto* prepared_statement = operations[i].statement;
@@ -1293,7 +1295,6 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             }
             bool binding_parameters = false;
             try {
-                auto catalog_guard = sm_manager->acquire_catalog_shared();
                 if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
                     prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
                     revalidate_prepared(*prepared_statement, session.isolation);
@@ -1710,9 +1711,10 @@ int main(int argc, char** argv) {
                 if (has_checkpoint_override) {
                     checkpoint_mgr.SetOptions(checkpoint_options);
                 }
-                // A small periodic batch keeps writeback below the foreground
-                // latency horizon. RunCleanCheckpoint remains WAL-size driven;
-                // this interval only controls non-blocking dirty-page preflush.
+                // Keep the preflush budget small and regular. RunIfNeeded only
+                // scans the pool once the soft WAL threshold is reached, so the
+                // 100ms cadence smooths page I/O without adding work during the
+                // normal below-threshold period.
                 constexpr auto checkpoint_poll_interval = std::chrono::milliseconds(100);
                 auto next_checkpoint_poll = std::chrono::steady_clock::now() + checkpoint_poll_interval;
                 while (!checkpoint_thread_stop.load()) {

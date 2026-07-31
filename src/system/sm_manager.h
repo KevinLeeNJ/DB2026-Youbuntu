@@ -472,6 +472,7 @@ public:
     bool flush_dirty_data_pages(bool wal_preflushed = false);
 
     size_t flush_dirty_pages(size_t max_pages);
+    PreflushBatchResult preflush_dirty_pages(size_t max_pages, uint64_t generation);
 
     void rebuild_all_indexes();
     void rebuild_indexes(const std::unordered_set<std::string>& index_names);

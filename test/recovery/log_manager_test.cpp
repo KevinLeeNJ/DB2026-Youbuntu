@@ -419,7 +419,7 @@ TEST(LogManagerTest, SaturatedGroupCommitReleasesEveryWaiterOnlyWhenDurable) {
     }
 
     EXPECT_EQ(completed.load(), kThreads * kCommitsPerThread);
-    EXPECT_GE(log_mgr.get_group_commit_leader_count(), 1u);
+    EXPECT_GT(log_mgr.get_group_commit_leader_count(), 1u);
     // Coalescing must still happen: far fewer fdatasync calls than commits.
     EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kThreads * kCommitsPerThread));
 }
@@ -654,7 +654,7 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
     EXPECT_EQ(logs[1]->log_type_, LogType::BEGIN);
 }
 
-TEST(LogManagerTest, EmptyWriteSetWithDmlWalStillFlushesAbort) {
+TEST(LogManagerTest, EmptyWriteSetWithDmlWalBuffersAbortUntilWalBoundary) {
     ScopedTestDir test_dir("transaction_empty_write_set_dml_abort_test_db");
     DiskManager disk;
     disk.create_file(LOG_FILE_NAME);
@@ -678,6 +678,10 @@ TEST(LogManagerTest, EmptyWriteSetWithDmlWalStillFlushesAbort) {
 
     txn_mgr.abort(txn, &log_mgr);
 
+    EXPECT_EQ(log_mgr.get_pwrite_count(), 0u);
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
+
+    log_mgr.flush_log_to_disk();
     EXPECT_EQ(log_mgr.get_pwrite_count(), 1u);
     EXPECT_GT(disk.get_file_size(LOG_FILE_NAME), 0);
     auto logs = ReadAllLogs(disk);
@@ -739,9 +743,15 @@ TEST(LogManagerTest, SecondIndexConflictWithEmptyWriteSetPersistsAbortWal) {
     // The real executor appended INSERT WAL before the heap insert, then the
     // first index accepted id=2 before the second index rejected key_col=10.
     // Even though the executor locally removed that partial work before it
-    // could add a WriteRecord, abort must publish the complete loser chain.
-    const lsn_t abort_lsn = log_mgr.get_persist_lsn();
+    // could add a WriteRecord, abort must append the complete loser chain. It
+    // remains buffered until a real WAL boundary needs to publish it.
+    const lsn_t abort_lsn = txn->get_prev_lsn();
     EXPECT_NE(abort_lsn, INVALID_LSN);
+    EXPECT_EQ(log_mgr.get_persist_lsn(), INVALID_LSN);
+    EXPECT_EQ(log_mgr.get_pwrite_count(), 0u);
+
+    log_mgr.flush_log_to_disk();
+    EXPECT_EQ(log_mgr.get_persist_lsn(), abort_lsn);
     EXPECT_GT(log_mgr.get_pwrite_count(), 0u);
     auto logs = ReadAllLogs(disk);
     ASSERT_EQ(logs.size(), 3);

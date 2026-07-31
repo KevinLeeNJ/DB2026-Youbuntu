@@ -387,7 +387,9 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     if (request_queue->owner_txn_id_ == INVALID_TXN_ID) {
         request_queue->owner_txn_id_ = txn->get_transaction_id();
         request_queue->group_lock_mode_ = GroupLockMode::X;
-        note_wait_topology_change();
+        if (!request_queue->waiters_.empty()) {
+            note_wait_topology_change();
+        }
         txn->get_lock_set()->insert(lock_data_id);
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
@@ -433,7 +435,9 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
         if (request_queue->owner_txn_id_ == INVALID_TXN_ID && !txn->is_lock_cancellation_requested()) {
             request_queue->owner_txn_id_ = txn->get_transaction_id();
             request_queue->group_lock_mode_ = GroupLockMode::X;
-            note_wait_topology_change();
+            if (!request_queue->waiters_.empty()) {
+                note_wait_topology_change();
+            }
             txn->get_lock_set()->insert(lock_data_id);
             lock.unlock();
             release_queue_user(lock_data_id, request_queue);
@@ -606,7 +610,9 @@ bool LockManager::unlock_unique_key(Transaction* txn, const std::string& lock_id
     }
     auto queue = it->second;
     queue->owner = INVALID_TXN_ID;
-    note_wait_topology_change();
+    if (!queue->waiters.empty()) {
+        note_wait_topology_change();
+    }
     txn->get_unique_key_lock_set()->erase(lock_id);
     queue->cv.notify_all();
     if (queue->waiters.empty()) {
@@ -744,8 +750,11 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
         return false;
     }
 
+    const bool had_waiters = !request_queue->waiters_.empty();
     request_queue->owner_txn_id_ = INVALID_TXN_ID;
-    note_wait_topology_change();
+    if (had_waiters) {
+        note_wait_topology_change();
+    }
     txn->get_lock_set()->erase(lock_data_id);
     std::shared_ptr<LockRequest> next_request;
     std::vector<std::shared_ptr<LockRequest>> completed_requests;

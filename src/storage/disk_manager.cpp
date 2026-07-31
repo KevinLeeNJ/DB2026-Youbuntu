@@ -17,6 +17,8 @@ See the Mulan PSL v2 for more details. */
 #include <future>
 #include <sys/stat.h> // for stat
 #include <unistd.h>   // for lseek
+#include <unordered_set>
+#include <vector>
 
 #include "defs.h"
 #include "common/fault_injection.h"
@@ -383,9 +385,28 @@ void DiskManager::sync_file(int fd) {
 }
 
 void DiskManager::sync_files(const std::vector<int>& fds) {
-    std::vector<std::future<void>> syncs;
-    syncs.reserve(fds.size());
+    // A checkpoint collects descriptors from both table and index metadata.
+    // Keep the barrier once per open file: duplicate fdatasync calls do not
+    // add durability, but they can serialize behind the same filesystem
+    // journal and extend the foreground checkpoint window.
+    std::vector<int> unique_fds;
+    unique_fds.reserve(fds.size());
+    std::unordered_set<int> seen;
+    seen.reserve(fds.size());
     for (const int fd : fds) {
+        if (seen.insert(fd).second) {
+            unique_fds.push_back(fd);
+        }
+    }
+
+    if (unique_fds.size() == 1) {
+        sync_file(unique_fds.front());
+        return;
+    }
+
+    std::vector<std::future<void>> syncs;
+    syncs.reserve(unique_fds.size());
+    for (const int fd : unique_fds) {
         syncs.emplace_back(std::async(std::launch::async, [this, fd] { sync_file(fd); }));
     }
 

@@ -62,6 +62,11 @@ void BufferPoolManager::clear_residency(frame_id_t frame_id) {
     residency_classes_[frame_id] = ResidencyClass::Normal;
 }
 
+void BufferPoolManager::reset_preflush_state(Page* page) {
+    page->preflush_generation_ = 0;
+    page->preflush_attempted_ = false;
+}
+
 void BufferPoolManager::flush_log_before_page_write(lsn_t page_lsn) {
     if (log_manager_ != nullptr) {
         log_manager_->flush_log_to_disk_up_to(page_lsn);
@@ -158,6 +163,7 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
                 target_page->id_ = page_id;
                 target_page->is_dirty_ = false;
                 target_page->dirty_epoch_ = 0;
+                reset_preflush_state(target_page);
                 target_page->pin_count_ = 1;
                 target_page->state_.store(FrameState::LOADING, std::memory_order_release);
                 page_table_.insert_or_assign(page_id, fid);
@@ -470,6 +476,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
         page->id_ = *page_id;
         page->is_dirty_ = false;
         page->dirty_epoch_ = 0;
+        reset_preflush_state(page);
         page->pin_count_ = 1;
         page->state_.store(FrameState::LOADING, std::memory_order_release);
         page_table_.insert_or_assign(*page_id, fid);
@@ -658,7 +665,8 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, bool wal_pr
     return flush_pages(candidates, wal_preflushed).success;
 }
 
-BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<PageId>& page_ids, bool wal_preflushed) {
+BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<PageId>& page_ids, bool wal_preflushed,
+                                                                   bool skip_pinned) {
     FlushBatchResult result;
     if (page_ids.empty()) {
         return result;
@@ -703,6 +711,10 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
                     !page->is_dirty_.load(std::memory_order_acquire)) {
                     continue;
                 }
+                std::scoped_lock pin_lock{page->pin_latch_};
+                if (skip_pinned && page->pin_count_ != 0) {
+                    continue;
+                }
                 replacer_->pin(hit->second);
                 page->state_.store(FrameState::FLUSHING, std::memory_order_release);
                 claimed.push_back(
@@ -710,10 +722,71 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
             }
         }
 
-        size_t claimed_begin = 0;
         if (image.size() < claimed.size() * PAGE_SIZE) {
             image.resize(claimed.size() * PAGE_SIZE);
         }
+
+        // Capture the complete batch before doing any write. Apart from making
+        // the write image independent from foreground mutations, this gives us
+        // one WAL high-water mark for the whole batch. The old implementation
+        // computed that mark once per contiguous run, so a sparse batch could
+        // force the same WAL buffer repeatedly (and, in STRICT mode, repeat
+        // fdatasync) before writing its next page.
+        bool copied = true;
+        lsn_t max_page_lsn = INVALID_LSN;
+        for (size_t i = 0; i < claimed.size(); ++i) {
+            Page* page = &pages_[claimed[i].frame_id];
+            try {
+                std::shared_lock page_lock(page->latch_);
+                std::memcpy(image.data() + i * PAGE_SIZE, page->data_, PAGE_SIZE);
+                max_page_lsn = std::max(max_page_lsn, page->get_page_lsn());
+            } catch (...) {
+                copied = false;
+                break;
+            }
+        }
+        if (copied) {
+            try {
+                if (!wal_preflushed) {
+                    flush_log_before_page_write(max_page_lsn);
+                }
+            } catch (...) {
+                copied = false;
+            }
+        }
+
+        const auto finish_claimed = [&](size_t begin, size_t end, bool written) {
+            std::unique_lock lock{latch_};
+            for (size_t i = begin; i < end; ++i) {
+                const auto& claimed_page = claimed[i];
+                Page* page = &pages_[claimed_page.frame_id];
+                auto hit = page_table_.find(claimed_page.page_id);
+                if (hit == page_table_.end() || hit->second != claimed_page.frame_id ||
+                    page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
+                    continue;
+                }
+                if (written) {
+                    std::scoped_lock dirty_lock{page->dirty_latch_};
+                    if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
+                        page->is_dirty_ = false;
+                    }
+                }
+                page->state_.store(FrameState::VALID, std::memory_order_release);
+                std::scoped_lock pin_lock{page->pin_latch_};
+                if (page->pin_count_ == 0 && residency_classes_[claimed_page.frame_id] == ResidencyClass::Normal) {
+                    replacer_->unpin(claimed_page.frame_id);
+                }
+                page->io_cv_.notify_all();
+            }
+        };
+
+        if (!copied) {
+            finish_claimed(0, claimed.size(), false);
+            success = false;
+            continue;
+        }
+
+        size_t claimed_begin = 0;
         while (claimed_begin < claimed.size()) {
             size_t claimed_end = claimed_begin + 1;
             while (claimed_end < claimed.size() &&
@@ -723,58 +796,24 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
             }
 
             const size_t page_count = claimed_end - claimed_begin;
-            bool copied = true;
-            lsn_t max_page_lsn = INVALID_LSN;
-            for (size_t i = claimed_begin; i < claimed_end; ++i) {
-                Page* page = &pages_[claimed[i].frame_id];
-                try {
-                    std::shared_lock page_lock(page->latch_);
-                    std::memcpy(image.data() + (i - claimed_begin) * PAGE_SIZE, page->data_, PAGE_SIZE);
-                    max_page_lsn = std::max(max_page_lsn, page->get_page_lsn());
-                } catch (...) {
-                    copied = false;
-                    break;
-                }
+            bool written = true;
+            try {
+                disk_manager_->write_page(claimed[claimed_begin].page_id.fd, claimed[claimed_begin].page_id.page_no,
+                                          image.data() + claimed_begin * PAGE_SIZE,
+                                          static_cast<int>(page_count * PAGE_SIZE));
+            } catch (...) {
+                written = false;
             }
-            if (copied) {
-                try {
-                    if (!wal_preflushed) {
-                        flush_log_before_page_write(max_page_lsn);
-                    }
-                    disk_manager_->write_page(claimed[claimed_begin].page_id.fd, claimed[claimed_begin].page_id.page_no,
-                                              image.data(), static_cast<int>(page_count * PAGE_SIZE));
-                } catch (...) {
-                    copied = false;
-                }
-            }
-            success = copied && success;
-            if (copied) {
+            finish_claimed(claimed_begin, claimed_end, written);
+            success = written && success;
+            if (written) {
                 result.pages_written += page_count;
-            }
-
-            {
-                std::unique_lock lock{latch_};
-                for (size_t i = claimed_begin; i < claimed_end; ++i) {
-                    const auto& claimed_page = claimed[i];
-                    Page* page = &pages_[claimed_page.frame_id];
-                    auto hit = page_table_.find(claimed_page.page_id);
-                    if (hit == page_table_.end() || hit->second != claimed_page.frame_id ||
-                        page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
-                        continue;
-                    }
-                    if (copied) {
-                        std::scoped_lock dirty_lock{page->dirty_latch_};
-                        if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
-                            page->is_dirty_ = false;
-                        }
-                    }
-                    page->state_.store(FrameState::VALID, std::memory_order_release);
-                    std::scoped_lock pin_lock{page->pin_latch_};
-                    if (page->pin_count_ == 0 && residency_classes_[claimed_page.frame_id] == ResidencyClass::Normal) {
-                        replacer_->unpin(claimed_page.frame_id);
-                    }
-                    page->io_cv_.notify_all();
-                }
+            } else {
+                // Keep the remaining claims dirty and immediately make them
+                // available again; a later flush can retry without losing the
+                // stable images that were already written above.
+                finish_claimed(claimed_end, claimed.size(), false);
+                break;
             }
             claimed_begin = claimed_end;
         }
@@ -847,6 +886,25 @@ size_t BufferPoolManager::flush_dirty_pages(size_t max_pages) {
     return flush_dirty_pages(max_pages, no_index_fds);
 }
 
+size_t BufferPoolManager::flush_selected_pages(std::vector<PageId>& pages_to_flush,
+                                               const std::unordered_set<int>& index_fds, bool skip_pinned) {
+    std::vector<PageId> table_pages;
+    std::vector<PageId> index_pages;
+    table_pages.reserve(pages_to_flush.size());
+    index_pages.reserve(pages_to_flush.size());
+    for (const PageId& page_id : pages_to_flush) {
+        if (index_fds.count(page_id.fd) > 0) {
+            index_pages.push_back(page_id);
+        } else {
+            table_pages.push_back(page_id);
+        }
+    }
+
+    const auto table_result = flush_pages(table_pages, /*wal_preflushed=*/false, skip_pinned);
+    const auto index_result = flush_pages(index_pages, /*wal_preflushed=*/true, skip_pinned);
+    return table_result.pages_written + index_result.pages_written;
+}
+
 size_t BufferPoolManager::flush_dirty_pages(size_t max_pages, const std::unordered_set<int>& index_fds) {
     log_pool_stats();
     if (max_pages == 0 || pool_size_ == 0) {
@@ -875,21 +933,75 @@ size_t BufferPoolManager::flush_dirty_pages(size_t max_pages, const std::unorder
         dirty_flush_cursor_ = (dirty_flush_cursor_ + frames_scanned) % pool_size_;
     }
 
-    std::vector<PageId> table_pages;
-    std::vector<PageId> index_pages;
-    table_pages.reserve(pages_to_flush.size());
-    index_pages.reserve(pages_to_flush.size());
-    for (const PageId& page_id : pages_to_flush) {
-        if (index_fds.count(page_id.fd) > 0) {
-            index_pages.push_back(page_id);
-        } else {
-            table_pages.push_back(page_id);
-        }
+    return flush_selected_pages(pages_to_flush, index_fds, /*skip_pinned=*/false);
+}
+
+PreflushBatchResult BufferPoolManager::preflush_dirty_pages(size_t max_pages, const std::unordered_set<int>& index_fds,
+                                                            uint64_t generation) {
+    log_pool_stats();
+    if (max_pages == 0 || pool_size_ == 0) {
+        return {};
     }
 
-    const auto table_result = flush_pages(table_pages, /*wal_preflushed=*/false);
-    const auto index_result = flush_pages(index_pages, /*wal_preflushed=*/true);
-    return table_result.pages_written + index_result.pages_written;
+    std::lock_guard<std::mutex> flush_lock(dirty_flush_latch_);
+    if (preflush_scan_generation_ != generation || preflush_scan_remaining_ == 0) {
+        preflush_scan_generation_ = generation;
+        preflush_scan_remaining_ = pool_size_;
+    }
+
+    // A bounded scan keeps a sparse dirty set from taking the buffer-pool latch
+    // for a full multi-gigabyte pool on every 100 ms scheduler tick.
+    constexpr size_t kFramesPerBatchPage = 4;
+    constexpr size_t kExhaustiveBatchPages = 64;
+    const size_t scan_budget =
+        max_pages < kExhaustiveBatchPages
+            ? pool_size_
+            : (max_pages > pool_size_ / kFramesPerBatchPage ? pool_size_
+                                                            : std::min(pool_size_, max_pages * kFramesPerBatchPage));
+    const size_t frames_to_scan = std::min(scan_budget, preflush_scan_remaining_);
+    const bool exhaustive_scan = scan_budget == pool_size_;
+    std::vector<PageId> pages_to_flush;
+    pages_to_flush.reserve(std::min(max_pages, page_table_.size()));
+    size_t frames_scanned = 0;
+    {
+        std::shared_lock lock{latch_};
+        while (frames_scanned < frames_to_scan && (exhaustive_scan || pages_to_flush.size() < max_pages)) {
+            const size_t frame_id = (dirty_flush_cursor_ + frames_scanned) % pool_size_;
+            ++frames_scanned;
+            Page* page = &pages_[frame_id];
+            if (page->state_.load(std::memory_order_acquire) != FrameState::VALID ||
+                !page->is_dirty_.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            if (page->preflush_generation_ != generation) {
+                page->preflush_generation_ = generation;
+                page->preflush_attempted_ = false;
+            }
+            if (page->preflush_attempted_) {
+                continue;
+            }
+
+            // Do not turn a page currently used by a foreground operation into
+            // an I/O wait point. It remains eligible for the next scan.
+            std::scoped_lock pin_lock{page->pin_latch_};
+            if (page->pin_count_ != 0) {
+                continue;
+            }
+            if (pages_to_flush.size() < max_pages) {
+                page->preflush_attempted_ = true;
+                pages_to_flush.push_back(page->id_);
+            }
+        }
+    }
+    dirty_flush_cursor_ = (dirty_flush_cursor_ + frames_scanned) % pool_size_;
+    preflush_scan_remaining_ -= frames_scanned;
+
+    const bool scan_complete = preflush_scan_remaining_ == 0;
+    if (scan_complete) {
+        preflush_scan_remaining_ = pool_size_;
+    }
+    return {flush_selected_pages(pages_to_flush, index_fds, /*skip_pinned=*/true), scan_complete};
 }
 
 void BufferPoolManager::delete_all_pages(int fd) {

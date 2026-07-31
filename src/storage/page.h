@@ -131,6 +131,11 @@ private:
     // Distinguishes the page image captured by a flush from writes that arrive
     // after that image has reached disk.
     std::atomic<uint64_t> dirty_epoch_{0};
+    // Background checkpoint writeback attempts a page at most once per WAL
+    // generation. If it is dirtied again, the final quiescent checkpoint writes
+    // the latest image instead of repeatedly rewriting it in the background.
+    uint64_t preflush_generation_{0};
+    bool preflush_attempted_{false};
     std::mutex dirty_latch_;
 
     // Buffer-pool pinning protects residency; this protects the page payload.

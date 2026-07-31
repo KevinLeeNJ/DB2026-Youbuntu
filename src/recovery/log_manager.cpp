@@ -191,7 +191,12 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
         group_commit_cv_.notify_one();
 
         if (!become_leader) {
-            waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
+            waiter->cv.wait(group_lock, [&waiter] { return waiter->done || waiter->leader; });
+            if (waiter->leader) {
+                become_leader = true;
+            }
+        }
+        if (!become_leader) {
             if (waiter->error != nullptr) {
                 std::rethrow_exception(waiter->error);
             }
@@ -199,9 +204,10 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
         }
     }
 
-    // A concurrent commit may have joined while the leader was writing or
-    // syncing. Keep extending the batch until every pending target is
-    // covered by the durable LSN.
+    // A concurrent commit may join while this leader is writing or syncing.
+    // One leader owns one flush wave: after its own target is covered it hands
+    // the role to the first remaining waiter instead of staying responsible
+    // for an indefinitely refilled queue.
     for (;;) {
         try {
             // Allow commits arriving together to append before the active
@@ -249,7 +255,8 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
         }
 
         std::vector<std::shared_ptr<CommitWaiter>> notify;
-        bool group_done = false;
+        std::shared_ptr<CommitWaiter> next_leader;
+        bool leader_done = false;
         const lsn_t written_lsn = persist_lsn_.load(std::memory_order_acquire);
         const lsn_t durable_lsn = durable_lsn_.load(std::memory_order_acquire);
         {
@@ -264,13 +271,20 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
                     ++it;
                 }
             }
+            leader_done = waiter->done;
             if (group_commit_waiters_.empty()) {
                 group_commit_leader_active_ = false;
-                group_done = true;
+            } else if (leader_done) {
+                next_leader = group_commit_waiters_.front();
+                next_leader->leader = true;
+                group_commit_leader_count_.fetch_add(1, std::memory_order_acq_rel);
             }
         }
         for (const auto& pending : notify) {
             pending->cv.notify_one();
+        }
+        if (next_leader != nullptr) {
+            next_leader->cv.notify_one();
         }
         if (!notify.empty()) {
             const uint64_t now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -282,7 +296,7 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
                 group_commit_wait_ns_.fetch_add(now_ns - pending->enqueue_time_ns, std::memory_order_acq_rel);
             }
         }
-        if (group_done) {
+        if (leader_done) {
             return;
         }
     }

@@ -950,9 +950,7 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
             }
         }
     }
-    for (const int fd : fds) {
-        disk_manager_->sync_file(fd);
-    }
+    disk_manager_->sync_files(fds);
     FaultInjector::Point("after_recovery_data_sync");
     return true;
 }
@@ -964,6 +962,15 @@ size_t SmManager::flush_dirty_pages(size_t max_pages) {
         index_fds.insert(ih->GetFd());
     }
     return buffer_pool_manager_->flush_dirty_pages(max_pages, index_fds);
+}
+
+PreflushBatchResult SmManager::preflush_dirty_pages(size_t max_pages, uint64_t generation) {
+    std::unordered_set<int> index_fds;
+    index_fds.reserve(ihs_.size());
+    for (const auto& [_, ih] : ihs_) {
+        index_fds.insert(ih->GetFd());
+    }
+    return buffer_pool_manager_->preflush_dirty_pages(max_pages, index_fds, generation);
 }
 
 void SmManager::rebuild_all_indexes() {

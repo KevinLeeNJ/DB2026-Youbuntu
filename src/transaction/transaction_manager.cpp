@@ -66,18 +66,23 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
     if (txn == nullptr || lock_manager == nullptr) {
         return;
     }
-    auto lock_set = txn->get_lock_set();
-    std::vector<LockDataId> locks(lock_set->begin(), lock_set->end());
-    for (const auto& lock_id : locks) {
-        lock_manager->unlock(txn, lock_id);
+    auto* lock_set = txn->get_lock_set();
+    while (!lock_set->empty()) {
+        auto lock_it = lock_set->begin();
+        const LockDataId lock_id = *lock_it;
+        if (!lock_manager->unlock(txn, lock_id)) {
+            lock_set->erase(lock_it);
+        }
     }
-    lock_set->clear();
 
-    auto unique_key_locks = *txn->get_unique_key_lock_set();
-    for (const auto& lock_id : unique_key_locks) {
-        lock_manager->unlock_unique_key(txn, lock_id);
+    auto* unique_key_locks = txn->get_unique_key_lock_set();
+    while (!unique_key_locks->empty()) {
+        auto lock_it = unique_key_locks->begin();
+        const std::string lock_id = *lock_it;
+        if (!lock_manager->unlock_unique_key(txn, lock_id)) {
+            unique_key_locks->erase(lock_it);
+        }
     }
-    txn->get_unique_key_lock_set()->clear();
 }
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
@@ -284,7 +289,11 @@ lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
     txn->set_prev_lsn(lsn);
-    log_manager->flush_log_to_disk();
+    // ABORT is not an acknowledgement durability boundary. Physical undo
+    // installs this LSN on every affected table page, so eviction/writeback
+    // will force the WAL before that page can reach disk. Keeping the record in
+    // the active buffer lets a later page flush, COMMIT, or checkpoint write it
+    // together with useful WAL instead of issuing one pwrite per conflict.
     return lsn;
 }
 
@@ -401,8 +410,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
 
     {
         std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
-        const bool blocked = checkpoint_blocking_new_txns_;
-        if (blocked) {
+        if (checkpoint_blocking_new_txns_) {
             const auto wait_begin = std::chrono::steady_clock::now();
             checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
             checkpoint_begin_blocked_.fetch_add(1, std::memory_order_relaxed);
@@ -411,8 +419,6 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
                         .count()),
                 std::memory_order_relaxed);
-        } else {
-            checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
         }
         active_txn_ids_.insert(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());

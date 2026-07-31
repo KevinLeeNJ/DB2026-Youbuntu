@@ -26,10 +26,10 @@ struct BufferPoolRuntimeConfig {
     size_t pages;
 };
 
-static constexpr size_t DEFAULT_BUFFER_POOL_GIB = 3;
+static constexpr size_t DEFAULT_BUFFER_POOL_GIB = 6;
 static constexpr size_t MAX_BUFFER_POOL_GIB = 6;
 static constexpr size_t PAGES_PER_GIB = (size_t{1} << 30) / PAGE_SIZE;
-static constexpr uint32_t DEFAULT_SI_CONFLICT_BACKOFF_US = 1000;
+static constexpr uint32_t DEFAULT_SI_CONFLICT_BACKOFF_US = 0;
 static constexpr uint32_t MAX_SI_CONFLICT_BACKOFF_US = 2000;
 
 static_assert((size_t{1} << 30) % PAGE_SIZE == 0, "PAGE_SIZE must divide one GiB exactly");

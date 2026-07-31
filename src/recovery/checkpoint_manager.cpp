@@ -33,11 +33,6 @@ constexpr std::chrono::seconds kCheckpointDeadline{10};
 // time and this much extra WAL before blocking writers again.
 constexpr std::chrono::seconds kDrainRetryBackoff{30};
 constexpr int64_t kDrainRetryBackoffBytes = 32LL * 1024 * 1024;
-// Bounded extra preflush rounds before the blocking window opens. A round that
-// finds fewer than this many dirty pages is not worth another pass.
-constexpr int kPreblockFlushRounds = 4;
-constexpr size_t kPreblockFlushProgressPages = 256;
-
 uint64_t ElapsedNs(std::chrono::steady_clock::time_point begin) {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
@@ -85,28 +80,10 @@ bool CheckpointManager::RunCleanCheckpoint() {
 
     const auto deadline = std::chrono::steady_clock::now() + kCheckpointDeadline;
 
-    // Writers remain active during this pass. Let each page batch establish
-    // its own WAL-before-data boundary instead of treating the initial flush
-    // as sufficient for pages dirtied concurrently with this checkpoint.
-    const auto initial_begin = std::chrono::steady_clock::now();
-    log_mgr_->flush_log_to_disk_with_sync();
-    if (!sm_mgr_->flush_dirty_data_pages(false)) {
-        txn_mgr_->observe_checkpoint_initial_ns(ElapsedNs(initial_begin));
-        return false;
-    }
-    txn_mgr_->observe_checkpoint_initial_ns(ElapsedNs(initial_begin));
-    // Keep draining the dirty set while writers are still running, so the
-    // blocking window below only has to write the residue.
-    const auto preblock_begin = std::chrono::steady_clock::now();
-    for (int round = 0; round < kPreblockFlushRounds; ++round) {
-        if (sm_mgr_->flush_dirty_pages(options_.preflush_batch_pages) < kPreblockFlushProgressPages) {
-            break;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            break;
-        }
-    }
-    txn_mgr_->observe_checkpoint_preblock_ns(ElapsedNs(preblock_begin));
+    // The periodic preflush has already handled pages that stayed cold. Do not
+    // write the remaining hot set while writers are active: those images would
+    // commonly be written again after the drain and create checkpoint write
+    // amplification. The final pass below writes each remaining page once.
     FaultInjector::Point("after_background_page_write_before_final_wal_flush");
 
     struct BlockGuard {
@@ -174,6 +151,11 @@ bool CheckpointManager::RunCleanCheckpoint() {
     log_mgr_->reset_log(log_mgr_->get_global_lsn());
     txn_mgr_->observe_checkpoint_truncate_ns(ElapsedNs(truncate_begin));
     txn_mgr_->observe_checkpoint_success();
+    ++preflush_generation_;
+    if (preflush_generation_ == 0) {
+        preflush_generation_ = 1;
+    }
+    last_log_offset_ = log_mgr_->current_log_offset();
     return true;
 }
 
@@ -183,29 +165,42 @@ bool CheckpointManager::RunIfNeeded() {
     }
 
     const int64_t log_offset = log_mgr_->current_log_offset();
-    const int64_t preflush_start = options_.auto_checkpoint_bytes > options_.preflush_trigger_bytes
+    if (log_offset < last_log_offset_) {
+        ++preflush_generation_;
+        if (preflush_generation_ == 0) {
+            preflush_generation_ = 1;
+        }
+    }
+    last_log_offset_ = log_offset;
+    PreflushBatchResult preflush_result;
+    bool preflush_ran = false;
+    const bool preflush_enabled = options_.preflush_trigger_bytes > 0 && options_.preflush_batch_pages > 0;
+    const int64_t preflush_start = preflush_enabled && options_.auto_checkpoint_bytes > options_.preflush_trigger_bytes
                                        ? options_.auto_checkpoint_bytes - options_.preflush_trigger_bytes
                                        : 0;
     const int64_t force_checkpoint_offset =
-        options_.checkpoint_defer_bytes > std::numeric_limits<int64_t>::max() - options_.auto_checkpoint_bytes
-            ? std::numeric_limits<int64_t>::max()
-            : options_.auto_checkpoint_bytes + options_.checkpoint_defer_bytes;
-    size_t preflushed_pages = 0;
-    if (log_offset > 0 && log_offset >= preflush_start && log_offset < force_checkpoint_offset) {
+        options_.checkpoint_defer_bytes > 0 &&
+                options_.checkpoint_defer_bytes <= std::numeric_limits<int64_t>::max() - options_.auto_checkpoint_bytes
+            ? options_.auto_checkpoint_bytes + options_.checkpoint_defer_bytes
+            : options_.auto_checkpoint_bytes;
+    if (preflush_enabled && log_offset > 0 && log_offset >= preflush_start && log_offset < force_checkpoint_offset) {
         bool expected = false;
         if (g_preflush_running.compare_exchange_strong(expected, true)) {
             PreflushGuard preflush_guard{&g_preflush_running};
+            preflush_ran = true;
             if (txn_mgr_ != nullptr) {
                 txn_mgr_->observe_checkpoint_preflush();
             }
-            preflushed_pages = sm_mgr_->flush_dirty_pages(options_.preflush_batch_pages);
+            preflush_result = sm_mgr_->preflush_dirty_pages(options_.preflush_batch_pages, preflush_generation_);
         }
     }
 
     if (log_offset < options_.auto_checkpoint_bytes) {
         return false;
     }
-    if (log_offset < force_checkpoint_offset && preflushed_pages == options_.preflush_batch_pages) {
+    if (preflush_enabled && log_offset < force_checkpoint_offset &&
+        (!preflush_ran || !preflush_result.scan_complete ||
+         preflush_result.pages_written == options_.preflush_batch_pages)) {
         return false;
     }
     if (std::chrono::steady_clock::now() < drain_retry_time_ && log_offset < drain_retry_log_offset_) {
