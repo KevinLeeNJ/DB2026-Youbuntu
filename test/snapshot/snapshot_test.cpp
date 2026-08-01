@@ -42,6 +42,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 #include "errors.h"
 #include "execution/execution_manager.h"
+#include "execution/row_mutation.h"
 #include "gtest/gtest.h"
 #include "index/ix_manager.h"
 #include "optimizer/optimizer.h"
@@ -86,7 +87,13 @@ private:
     int generation_ = 0;
 };
 
-TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockConflictReturnsImmediatelyWithoutHandoff) {
+std::vector<char> IntIndexKey(int value) {
+    std::vector<char> key(sizeof(value));
+    std::memcpy(key.data(), &value, sizeof(value));
+    return key;
+}
+
+TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockWaitsWithoutCycleScan) {
     LockManager lock_manager;
     Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction victim(1002, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -94,14 +101,23 @@ TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockConflictReturnsImmediat
     LockDataId lock_id(42, rid, LockDataType::RECORD);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
-    EXPECT_FALSE(lock_manager.lock_exclusive_on_record(&victim, rid, 42));
+    LockAcquireResult victim_result = LockAcquireResult::Value::Cancelled;
+    std::thread victim_thread([&] {
+        victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42);
+    });
 
+    while (lock_manager.record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
     const auto stats = lock_manager.record_lock_observability();
-    EXPECT_EQ(stats.immediate_conflict, 1u);
-    EXPECT_EQ(stats.wait_enqueued, 0u);
-    EXPECT_EQ(stats.wait_granted, 0u);
-    EXPECT_TRUE(victim.get_lock_set()->empty());
+    EXPECT_EQ(stats.immediate_conflict, 0u);
+    EXPECT_EQ(stats.cycle_checks, 0u);
+    EXPECT_EQ(owner.get_lock_set()->count(lock_id), 1u);
     ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
+    victim_thread.join();
+    EXPECT_EQ(victim_result.value(), LockAcquireResult::Value::Granted);
+    EXPECT_EQ(victim.get_lock_set()->count(lock_id), 1u);
+    ASSERT_TRUE(lock_manager.unlock(&victim, lock_id));
 }
 
 TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) {
@@ -245,9 +261,11 @@ TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
 
     std::atomic<bool> younger_started{false};
     std::atomic<bool> younger_acquired{true};
+    LockAcquireResult younger_result = LockAcquireResult::Value::Granted;
     std::thread younger_waiter([&] {
         younger_started.store(true);
-        younger_acquired.store(lock_manager.lock_exclusive_on_record(&younger, first, 42));
+        younger_result = lock_manager.lock_exclusive_on_record(&younger, first, 42);
+        younger_acquired.store(younger_result);
         if (!younger_acquired.load()) {
             lock_manager.cancel_transaction(&younger);
             lock_manager.unlock(&younger, second_lock);
@@ -256,7 +274,9 @@ TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
     while (!younger_started.load()) {
         std::this_thread::yield();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    while (lock_manager.record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
 
     // The older requester closes the cycle. The youngest transaction must be
     // cancelled and release its second lock so the older transaction wins.
@@ -265,6 +285,7 @@ TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
 
     EXPECT_TRUE(older_acquired);
     EXPECT_FALSE(younger_acquired.load());
+    EXPECT_EQ(younger_result.value(), LockAcquireResult::Value::DeadlockVictim);
     EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
     EXPECT_TRUE(lock_manager.unlock(&older, second_lock));
     EXPECT_TRUE(lock_manager.unlock(&older, first_lock));
@@ -549,7 +570,8 @@ public:
 
     /// Execute SQL after allowing a test to observe the fully resolved portal.
     std::string exec_sql_with_portal_ready_hook(const std::string& sql,
-                                                const std::function<void(const PortalStmt&)>& portal_ready_hook) {
+                                                const std::function<void(const PortalStmt&)>& portal_ready_hook,
+                                                bool clean_up_abort = true) {
         char data_send[BUFFER_LENGTH];
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
@@ -577,7 +599,9 @@ public:
             session_isolation_ = context.isolation_level_;
             finish_statement(&context);
         } catch (TransactionAbortException&) {
-            handle_abort(&context);
+            if (clean_up_abort) {
+                handle_abort(&context);
+            }
             throw;
         } catch (...) {
             abort_statement(&context);
@@ -585,6 +609,12 @@ public:
         }
 
         return std::string(data_send, offset);
+    }
+
+    // Used only by a cancellation-lifetime test in which another thread owns
+    // the real TransactionManager::abort call.
+    std::string exec_sql_without_abort_cleanup(const std::string& sql) {
+        return exec_sql_with_portal_ready_hook(sql, {}, false);
     }
 
     /// Execute SQL and expect TransactionAbortException (returns "abort\n").
@@ -666,32 +696,38 @@ private:
     IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
 
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockConflictAbortsBeforeOwnerCommitWithoutApplyingStaleWrite) {
-    SharedTestDB db("snapshot_si_first_lock_wait_stale");
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitsWhileOwnerRemainsActive) {
+    SharedTestDB db("snapshot_si_first_lock_wait_conflict");
     TestSession setup(&db);
-    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_stale (id int, val int);"));
-    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_stale values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_conflict (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_conflict values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_conflict values (2, 20);"));
 
     TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
     TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
     TestSession verifier(&db);
     ASSERT_TRUE(owner.exec_sql_ok("begin;"));
     ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
-    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_stale set val = 200 where id = 1;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_conflict set val = 200 where id = 1;"));
 
-    const uint64_t waits_before = db.lock()->record_lock_observability().wait_enqueued;
-    EXPECT_EQ(TestSession::trim_output(
-                  waiter.exec_sql_expect_abort("update si_first_wait_stale set val = 300 where id = 1;")),
-              "abort");
-    EXPECT_EQ(db.lock()->record_lock_observability().wait_enqueued, waits_before);
-
-    ASSERT_TRUE(owner.exec_sql_ok("commit;"));
-    const std::string final_state = verifier.exec_sql("select val from si_first_wait_stale where id = 1;");
-    EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
-    EXPECT_EQ(final_state.find("|              300 |"), std::string::npos);
+    auto waiter_result = std::async(std::launch::async, [&] {
+        return waiter.exec_sql_ok("update si_first_wait_conflict set val = val + 1 where id = 1;");
+    });
+    while (db.lock()->record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
+    ASSERT_NE(owner.current_transaction(), nullptr);
+    EXPECT_NE(owner.current_transaction()->get_state(), TransactionState::ABORTED);
+    EXPECT_EQ(db.lock()->record_lock_observability().immediate_conflict, 0u);
+    ASSERT_TRUE(owner.exec_sql_ok("abort;"));
+    ASSERT_TRUE(waiter_result.get());
+    ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
+    const std::string final_state = verifier.exec_sql("select val from si_first_wait_conflict where id = 1;");
+    EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
 }
 
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockConflictCanRetryAfterOwnerAbort) {
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerAbortContinuesWithSnapshot) {
     SharedTestDB db("snapshot_si_first_lock_wait_owner_abort");
     TestSession setup(&db);
     ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_abort (id int, val int);"));
@@ -701,23 +737,214 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockConflictCanRetryAfterOwnerAbor
     TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
     TestSession verifier(&db);
     ASSERT_TRUE(owner.exec_sql_ok("begin;"));
-    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_abort set val = 200 where id = 1;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
 
-    const uint64_t waits_before = db.lock()->record_lock_observability().wait_enqueued;
-    EXPECT_EQ(TestSession::trim_output(
-                  waiter.exec_sql_expect_abort("update si_first_wait_abort set val = 300 where id = 1;")),
-              "abort");
-    EXPECT_EQ(db.lock()->record_lock_observability().wait_enqueued, waits_before);
+    auto waiter_result = std::async(std::launch::async, [&] {
+        return waiter.exec_sql_ok("update si_first_wait_abort set val = val + 1 where id = 1;");
+    });
+    while (db.lock()->record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
 
     ASSERT_TRUE(owner.exec_sql_ok("abort;"));
-    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
-    ASSERT_TRUE(waiter.exec_sql_ok("update si_first_wait_abort set val = 300 where id = 1;"));
+    ASSERT_TRUE(waiter_result.get());
     ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
 
     const std::string final_state = verifier.exec_sql("select val from si_first_wait_abort where id = 1;");
-    EXPECT_NE(final_state.find("|              300 |"), std::string::npos);
+    EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
     EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
+    EXPECT_EQ(db.lock()->record_lock_observability().immediate_conflict, 0u);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerCommitStillAbortsStaleWriter) {
+    SharedTestDB db("snapshot_si_first_lock_wait_owner_commit");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_commit (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_commit values (1, 100);"));
+
+    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_commit set val = 200 where id = 1;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+
+    auto waiter_result = std::async(std::launch::async, [&] {
+        return TestSession::trim_output(
+            waiter.exec_sql_expect_abort("update si_first_wait_commit set val = val + 1 where id = 1;"));
+    });
+    while (db.lock()->record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
+
+    ASSERT_TRUE(owner.exec_sql_ok("commit;"));
+    EXPECT_EQ(waiter_result.get(), "abort");
+
+    const std::string final_state = verifier.exec_sql("select val from si_first_wait_commit where id = 1;");
+    EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              201 |"), std::string::npos);
+    EXPECT_EQ(db.lock()->record_lock_observability().immediate_conflict, 0u);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, SiHeldUnrelatedLockWaitsThenOwnerAbortUsesSnapshotValue) {
+    SharedTestDB db("snapshot_si_held_lock_wait_owner_abort");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_held_lock_wait_abort (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_held_lock_wait_abort values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_held_lock_wait_abort values (2, 20);"));
+
+    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("update si_held_lock_wait_abort set val = 21 where id = 2;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_held_lock_wait_abort set val = 200 where id = 1;"));
+
+    auto waiter_result = std::async(std::launch::async, [&] {
+        return waiter.exec_sql_ok("update si_held_lock_wait_abort set val = val + 1 where id = 1;");
+    });
+    while (db.lock()->record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
+
+    ASSERT_TRUE(owner.exec_sql_ok("abort;"));
+    ASSERT_TRUE(waiter_result.get());
+    ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
+
+    const std::string final_state = verifier.exec_sql("select val from si_held_lock_wait_abort where id = 1;");
+    EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, AbortWaitsForCompletedHandoffPrepareWrite) {
+    SharedTestDB db("snapshot_completed_handoff_abort_lifetime");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table completed_handoff_abort (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into completed_handoff_abort values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into completed_handoff_abort values (2, 20);"));
+
+    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("update completed_handoff_abort set val = 21 where id = 2;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update completed_handoff_abort set val = 200 where id = 1;"));
+
+    std::mutex handoff_latch;
+    std::condition_variable handoff_cv;
+    bool completed_entered = false;
+    bool release_completed = false;
+    db.lock()->set_record_handoff_checked_test_hook([&] {
+        std::unique_lock<std::mutex> lock(handoff_latch);
+        completed_entered = true;
+        handoff_cv.notify_all();
+        handoff_cv.wait(lock, [&] { return release_completed; });
+    });
+
+    std::atomic<bool> waiter_saw_abort{false};
+    auto waiter_result = std::async(std::launch::async, [&] {
+        try {
+            waiter.exec_sql_without_abort_cleanup("update completed_handoff_abort set val = val + 1 where id = 1;");
+        } catch (TransactionAbortException& error) {
+            waiter_saw_abort.store(error.GetAbortReason() == AbortReason::LOCK_CANCELLED);
+        }
+    });
+    while (db.lock()->record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
+    auto owner_abort = std::async(std::launch::async, [&] { return owner.exec_sql_ok("abort;"); });
+    {
+        std::unique_lock<std::mutex> lock(handoff_latch);
+        handoff_cv.wait(lock, [&] { return completed_entered; });
+    }
+
+    Transaction* waiter_txn = waiter.current_transaction();
+    ASSERT_NE(waiter_txn, nullptr);
+    auto waiter_abort = std::async(std::launch::async, [&] { db.txn()->abort(waiter_txn, db.log()); });
+    const auto cancellation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!waiter_txn->is_lock_cancellation_requested() && std::chrono::steady_clock::now() < cancellation_deadline) {
+        std::this_thread::yield();
+    }
+    const bool cancellation_observed = waiter_txn->is_lock_cancellation_requested();
+    {
+        std::lock_guard<std::mutex> lock(handoff_latch);
+        release_completed = true;
+    }
+    handoff_cv.notify_all();
+    if (!cancellation_observed) {
+        owner_abort.wait();
+        waiter_result.wait();
+        waiter_abort.wait();
+        FAIL() << "external abort did not publish cancellation before the handoff deadline";
+        return;
+    }
+    ASSERT_TRUE(owner_abort.get());
+    waiter_result.get();
+    waiter_abort.get();
+    EXPECT_TRUE(waiter_saw_abort.load());
+    const std::string final_state = verifier.exec_sql("select val from completed_handoff_abort where id = 1;");
+    EXPECT_NE(final_state.find("|              100 |"), std::string::npos);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, SerializableOwnerAbortRemovesSsiStateBeforeWakingWaiter) {
+    SharedTestDB db("serializable_owner_abort_ssi_handoff");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table serializable_abort_handoff (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into serializable_abort_handoff values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into serializable_abort_handoff values (2, 20);"));
+
+    TestSession owner(&db, IsolationLevel::SERIALIZABLE);
+    TestSession waiter(&db, IsolationLevel::SERIALIZABLE);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(waiter.exec_sql_ok("update serializable_abort_handoff set val = 21 where id = 2;"));
+    // Register owner as an SSI record reader before it takes the row lock.
+    ASSERT_NE(owner.exec_sql("select val from serializable_abort_handoff where id = 1;").find("|              100 |"),
+              std::string::npos);
+    ASSERT_TRUE(owner.exec_sql_ok("update serializable_abort_handoff set val = 200 where id = 1;"));
+
+    std::mutex abort_hook_latch;
+    std::condition_variable abort_hook_cv;
+    bool abort_hook_entered = false;
+    bool release_abort = false;
+    db.txn()->set_abort_before_lock_release_test_hook([&](txn_id_t txn_id) {
+        if (txn_id != owner.current_transaction()->get_transaction_id()) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(abort_hook_latch);
+        abort_hook_entered = true;
+        abort_hook_cv.notify_all();
+        abort_hook_cv.wait(lock, [&] { return release_abort; });
+    });
+
+    auto waiter_result = std::async(std::launch::async, [&] {
+        return waiter.exec_sql_ok("update serializable_abort_handoff set val = val + 1 where id = 1;");
+    });
+    while (db.lock()->record_lock_observability().wait_enqueued != 1) {
+        std::this_thread::yield();
+    }
+    auto owner_abort = std::async(std::launch::async, [&] { return owner.exec_sql_ok("abort;"); });
+    {
+        std::unique_lock<std::mutex> lock(abort_hook_latch);
+        abort_hook_cv.wait(lock, [&] { return abort_hook_entered; });
+    }
+    ASSERT_NE(owner.current_transaction(), nullptr);
+    EXPECT_EQ(owner.current_transaction()->get_state(), TransactionState::ABORTED);
+    {
+        std::lock_guard<std::mutex> lock(abort_hook_latch);
+        release_abort = true;
+    }
+    abort_hook_cv.notify_all();
+    ASSERT_TRUE(owner_abort.get());
+    EXPECT_TRUE(waiter_result.get()) << "a rolled-back owner must not leave an SSI reader edge";
+    ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
+
+    const std::string final_state = verifier.exec_sql("select val from serializable_abort_handoff where id = 1;");
+    EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
 }
 
 // =============================================================================
@@ -1052,11 +1279,13 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
 
         t1_ok = t1_ok && t1->exec_sql_ok("update account set balance = 120 where id = 1;"); // step 4
 
-        barrier.arrive_and_wait(); // barrier 1: after T2 step 5 (BEGIN)
+        barrier.arrive_and_wait(); // barrier 1: both snapshots are established
 
-        barrier.arrive_and_wait(); // barrier 2: after T2 step 6 (UPDATE — WW conflict in T2)
-
+        // T2's first record-lock conflict waits through the existing FIFO
+        // handoff path; the stale snapshot check still decides the outcome.
         t1_ok = t1_ok && t1->exec_sql_ok("commit;"); // step 7
+
+        barrier.arrive_and_wait(); // barrier 2: after T2 observes stale WW conflict
 
         barrier.arrive_and_wait(); // barrier 3: after T2 step 8 (COMMIT)
     });
@@ -1071,7 +1300,8 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
 
         barrier.arrive_and_wait(); // barrier 1
 
-        // step 6: this UPDATE should ABORT due to WW conflict with T1's uncommitted update
+        // With no previously held record/unique lock, step 6 enters FIFO and
+        // then fails the SI stale-write check after T1 commits.
         t2_output = t2->exec_sql_expect_abort("update account set balance = 90 where id = 1;");
 
         barrier.arrive_and_wait(); // barrier 2
@@ -1124,10 +1354,9 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SER) {
 
         t1_ok = t1_ok && t1->exec_sql_ok("update account set balance = 120 where id = 1;"); // step 4
 
-        barrier.arrive_and_wait(); // barrier 1
-        barrier.arrive_and_wait(); // barrier 2
-
+        barrier.arrive_and_wait();                   // barrier 1
         t1_ok = t1_ok && t1->exec_sql_ok("commit;"); // step 7
+        barrier.arrive_and_wait();                   // barrier 2
 
         barrier.arrive_and_wait(); // barrier 3
     });
@@ -1531,10 +1760,9 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_Update) {
         ASSERT_TRUE(t1->exec_sql_ok("begin;"));
         ASSERT_TRUE(t1->exec_sql_ok("update t set val = 150 where id = 1;"));
 
-        barrier.arrive_and_wait(); // allow T2 to attempt update
-        barrier.arrive_and_wait(); // wait for T2 result
-
+        barrier.arrive_and_wait(); // both snapshots are established
         ASSERT_TRUE(t1->exec_sql_ok("commit;"));
+        barrier.arrive_and_wait(); // T2 observed the first-conflict stale WW abort
     });
 
     std::thread th2([&]() {
@@ -1543,6 +1771,7 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_Update) {
 
         barrier.arrive_and_wait(); // wait for T1's update
 
+        // T2 waits for T1, then the SI stale-write check aborts it.
         t2_result = t2->exec_sql_expect_abort("update t set val = 199 where id = 1;");
 
         barrier.arrive_and_wait(); // signal T1
@@ -2138,6 +2367,283 @@ TEST_F(SnapshotTest, RC_IndexScanSeesDeletedKeyDuringUncommittedDelete) {
     ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
 }
 
+TEST_F(SnapshotTest, SI_IndexedDeletePublishesTombstoneBeforeGcVisibleIndexRemoval) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table p2b_delete_publish (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index p2b_delete_publish (id);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_publish values (1, 100);"));
+
+    const auto& table = db_->sm()->db_.get_table("p2b_delete_publish");
+    ASSERT_EQ(table.indexes.size(), 1u);
+    const IndexMeta& index = table.indexes.front();
+    const std::string index_name = db_->sm()->get_ix_manager()->get_index_name("p2b_delete_publish", index.cols);
+    auto* index_handle = db_->sm()->ihs_.at(index_name).get();
+    auto* file_handle = db_->sm()->fhs_.at("p2b_delete_publish").get();
+    const std::vector<char> key = IntIndexKey(1);
+    std::vector<Rid> original_rids;
+    ASSERT_TRUE(index_handle->get_value(key.data(), &original_rids, nullptr));
+    ASSERT_EQ(original_rids.size(), 1u);
+
+    auto writer = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    auto reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+
+    std::mutex hook_latch;
+    std::condition_variable hook_cv;
+    bool hook_entered = false;
+    bool release_hook = false;
+    RowMutationEngine::SetDeletePublicationTestHook([&] {
+        std::unique_lock<std::mutex> lock(hook_latch);
+        hook_entered = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_hook; });
+    });
+    const auto release_writer = [&] {
+        {
+            std::lock_guard<std::mutex> lock(hook_latch);
+            release_hook = true;
+        }
+        hook_cv.notify_all();
+    };
+    auto delete_result = std::async(
+        std::launch::async, [&] { return writer->exec_sql_ok("delete from p2b_delete_publish where id = 1;"); });
+    struct HookCleanup {
+        std::function<void()> release;
+        ~HookCleanup() {
+            release();
+            RowMutationEngine::SetDeletePublicationTestHook({});
+        }
+    } hook_cleanup{release_writer};
+    {
+        std::unique_lock<std::mutex> lock(hook_latch);
+        if (!hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return hook_entered; })) {
+            lock.unlock();
+            release_writer();
+            delete_result.wait();
+            FAIL() << "delete publication hook did not run before watchdog deadline";
+            return;
+        }
+    }
+
+    std::vector<Rid> physical_rids;
+    EXPECT_FALSE(index_handle->get_value(key.data(), &physical_rids, nullptr));
+    const auto historical_rids = db_->sm()->get_historical_index_key_rids("p2b_delete_publish", index_name, key);
+    ASSERT_EQ(historical_rids, original_rids);
+    const TupleMeta tombstone = file_handle->get_tuple_meta(original_rids.front());
+    EXPECT_FALSE(tombstone.is_committed_);
+    EXPECT_TRUE(tombstone.is_deleted_);
+
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+    db_->txn()->GarbageCollection();
+    EXPECT_EQ(db_->sm()->get_historical_index_key_rids("p2b_delete_publish", index_name, key), original_rids)
+        << "GC must requeue a history entry whose current tuple meta is an active tombstone";
+    const std::string old_visible = reader->exec_sql("select * from p2b_delete_publish where id = 1;");
+    EXPECT_NE(old_visible.find("|                1 |              100 |"), std::string::npos);
+
+    release_writer();
+    EXPECT_TRUE(delete_result.get());
+    RowMutationEngine::SetDeletePublicationTestHook({});
+    ASSERT_TRUE(writer->exec_sql_ok("commit;"));
+    const std::string still_old_visible = reader->exec_sql("select * from p2b_delete_publish where id = 1;");
+    EXPECT_NE(still_old_visible.find("|                1 |              100 |"), std::string::npos);
+    ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+
+    // Advance the strict watermark past the delete commit, then prove the old
+    // historical entry and physical index entry are both gone before reuse.
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_publish values (2, 200);"));
+    db_->txn()->GarbageCollection();
+    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("p2b_delete_publish", index_name, key).empty());
+    physical_rids.clear();
+    EXPECT_FALSE(index_handle->get_value(key.data(), &physical_rids, nullptr));
+    auto fresh_reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(fresh_reader->exec_sql_ok("begin;"));
+    EXPECT_EQ(TestSession::trim_output(fresh_reader->exec_sql("select * from p2b_delete_publish where id = 1;")),
+              "+------------------+------------------+\n"
+              "|               id |              val |\n"
+              "+------------------+------------------+\n"
+              "+------------------+------------------+\n"
+              "Total record(s): 0");
+    ASSERT_TRUE(fresh_reader->exec_sql_ok("commit;"));
+
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_publish values (1, 300);"));
+    std::vector<Rid> reinserted_rids;
+    ASSERT_TRUE(index_handle->get_value(key.data(), &reinserted_rids, nullptr));
+    EXPECT_EQ(reinserted_rids.size(), 1u);
+    EXPECT_NE(reinserted_rids.front(), original_rids.front());
+    EXPECT_NE(setup->exec_sql("select * from p2b_delete_publish where id = 1;")
+                  .find("|                1 |              300 |"),
+              std::string::npos);
+}
+
+TEST_F(SnapshotTest, SI_IndexedDeleteAbortRestoresOneExactIndexEntryAndGcRetiresState) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table p2b_delete_abort (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index p2b_delete_abort (id);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index p2b_delete_abort (val);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_abort values (1, 100);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_abort values (2, 200);"));
+
+    const auto& table = db_->sm()->db_.get_table("p2b_delete_abort");
+    ASSERT_EQ(table.indexes.size(), 2u);
+    const auto id_index = std::find_if(table.indexes.begin(), table.indexes.end(), [](const IndexMeta& index) {
+        return index.cols.size() == 1 && index.cols.front().name == "id";
+    });
+    const auto val_index = std::find_if(table.indexes.begin(), table.indexes.end(), [](const IndexMeta& index) {
+        return index.cols.size() == 1 && index.cols.front().name == "val";
+    });
+    ASSERT_NE(id_index, table.indexes.end());
+    ASSERT_NE(val_index, table.indexes.end());
+    const std::string id_index_name = db_->sm()->get_ix_manager()->get_index_name("p2b_delete_abort", id_index->cols);
+    const std::string val_index_name = db_->sm()->get_ix_manager()->get_index_name("p2b_delete_abort", val_index->cols);
+    auto* id_index_handle = db_->sm()->ihs_.at(id_index_name).get();
+    auto* val_index_handle = db_->sm()->ihs_.at(val_index_name).get();
+    auto* file_handle = db_->sm()->fhs_.at("p2b_delete_abort").get();
+    const std::vector<char> id_key = IntIndexKey(1);
+    const std::vector<char> other_id_key = IntIndexKey(2);
+    const std::vector<char> val_key = IntIndexKey(100);
+    const std::vector<char> other_val_key = IntIndexKey(200);
+    std::vector<Rid> original_id_rids;
+    std::vector<Rid> other_id_rids;
+    std::vector<Rid> original_val_rids;
+    ASSERT_TRUE(id_index_handle->get_value(id_key.data(), &original_id_rids, nullptr));
+    ASSERT_TRUE(id_index_handle->get_value(other_id_key.data(), &other_id_rids, nullptr));
+    ASSERT_EQ(original_id_rids.size(), 1u);
+    ASSERT_EQ(other_id_rids.size(), 1u);
+
+    // SQL CREATE INDEX is unique in this test tree. Use the public index API
+    // to construct the duplicate (key,RID) state needed to verify that DELETE
+    // undo restores precisely its own RID rather than treating any same-key
+    // entry as sufficient.
+    ASSERT_TRUE(
+        val_index_handle->delete_entry(other_val_key.data(), other_id_rids.front(), IndexWriteWalContext::TestNoWal()));
+    val_index_handle->insert_entry(val_key.data(), other_id_rids.front(), IndexWriteWalContext::TestNoWal(), true);
+    ASSERT_TRUE(val_index_handle->get_value(val_key.data(), &original_val_rids, nullptr));
+    ASSERT_EQ(original_val_rids.size(), 2u);
+    ASSERT_NE(std::find(original_val_rids.begin(), original_val_rids.end(), original_id_rids.front()),
+              original_val_rids.end());
+    ASSERT_NE(std::find(original_val_rids.begin(), original_val_rids.end(), other_id_rids.front()),
+              original_val_rids.end());
+
+    auto writer = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("delete from p2b_delete_abort where id = 1;"));
+    ASSERT_TRUE(writer->exec_sql_ok("rollback;"));
+
+    std::vector<Rid> restored_id_rids;
+    std::vector<Rid> restored_val_rids;
+    ASSERT_TRUE(id_index_handle->get_value(id_key.data(), &restored_id_rids, nullptr));
+    ASSERT_TRUE(val_index_handle->get_value(val_key.data(), &restored_val_rids, nullptr));
+    EXPECT_EQ(restored_id_rids, original_id_rids) << "abort must restore exactly one old (key,RID) entry";
+    EXPECT_EQ(restored_val_rids.size(), original_val_rids.size());
+    for (const Rid& expected_rid : original_val_rids) {
+        EXPECT_EQ(std::count(restored_val_rids.begin(), restored_val_rids.end(), expected_rid), 1)
+            << "a duplicate key's surviving RID must not suppress restoration of the deleted RID or create a duplicate";
+    }
+    auto restored_record = file_handle->get_record(original_id_rids.front(), nullptr);
+    ASSERT_NE(restored_record, nullptr);
+    EXPECT_NE(
+        setup->exec_sql("select * from p2b_delete_abort where id = 1;").find("|                1 |              100 |"),
+        std::string::npos);
+
+    // Return the manually constructed duplicate to a table-consistent state
+    // before exercising the independent GC-retirement assertions.
+    ASSERT_TRUE(
+        val_index_handle->delete_entry(val_key.data(), other_id_rids.front(), IndexWriteWalContext::TestNoWal()));
+    val_index_handle->insert_entry(other_val_key.data(), other_id_rids.front(), IndexWriteWalContext::TestNoWal());
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_abort values (3, 300);"));
+    db_->txn()->GarbageCollection();
+    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("p2b_delete_abort", id_index_name, id_key).empty());
+    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("p2b_delete_abort", val_index_name, val_key).empty());
+    EXPECT_TRUE(db_->sm()->get_deleted_tuple_candidates("p2b_delete_abort", *restored_record).empty());
+}
+
+TEST_F(SnapshotTest, SI_IndexedDeleteAbortRestoresIndexBeforePublishingOldMetaToGc) {
+    auto setup = create_session();
+    ASSERT_TRUE(setup->exec_sql_ok("create table p2b_delete_abort_publish (id int, val int);"));
+    ASSERT_TRUE(setup->exec_sql_ok("create index p2b_delete_abort_publish (id);"));
+    ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_abort_publish values (1, 100);"));
+
+    const auto& table = db_->sm()->db_.get_table("p2b_delete_abort_publish");
+    ASSERT_EQ(table.indexes.size(), 1u);
+    const IndexMeta& index = table.indexes.front();
+    const std::string index_name = db_->sm()->get_ix_manager()->get_index_name("p2b_delete_abort_publish", index.cols);
+    auto* index_handle = db_->sm()->ihs_.at(index_name).get();
+    auto* file_handle = db_->sm()->fhs_.at("p2b_delete_abort_publish").get();
+    const std::vector<char> key = IntIndexKey(1);
+    std::vector<Rid> original_rids;
+    ASSERT_TRUE(index_handle->get_value(key.data(), &original_rids, nullptr));
+    ASSERT_EQ(original_rids.size(), 1u);
+
+    auto writer = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(writer->exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer->exec_sql_ok("delete from p2b_delete_abort_publish where id = 1;"));
+
+    std::mutex hook_latch;
+    std::condition_variable hook_cv;
+    bool hook_entered = false;
+    bool release_hook = false;
+    db_->txn()->set_abort_delete_undo_publication_test_hook([&] {
+        std::unique_lock<std::mutex> lock(hook_latch);
+        hook_entered = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_hook; });
+    });
+    const auto release_rollback = [&] {
+        {
+            std::lock_guard<std::mutex> lock(hook_latch);
+            release_hook = true;
+        }
+        hook_cv.notify_all();
+    };
+    auto rollback_result = std::async(std::launch::async, [&] { return writer->exec_sql_ok("rollback;"); });
+    struct HookCleanup {
+        TransactionManager* txn_mgr;
+        std::function<void()> release;
+        std::future<bool>* rollback;
+
+        ~HookCleanup() {
+            release();
+            if (rollback->valid()) {
+                rollback->wait();
+            }
+            txn_mgr->set_abort_delete_undo_publication_test_hook({});
+        }
+    } hook_cleanup{db_->txn(), release_rollback, &rollback_result};
+    {
+        std::unique_lock<std::mutex> lock(hook_latch);
+        if (!hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return hook_entered; })) {
+            lock.unlock();
+            release_rollback();
+            rollback_result.wait();
+            FAIL() << "delete undo publication hook did not run before watchdog deadline";
+            return;
+        }
+    }
+
+    std::vector<Rid> restored_physical_rids;
+    ASSERT_TRUE(index_handle->get_value(key.data(), &restored_physical_rids, nullptr));
+    EXPECT_EQ(restored_physical_rids, original_rids)
+        << "old physical (key,RID) must be present before old tuple meta is committed";
+    const TupleMeta tombstone = file_handle->get_tuple_meta(original_rids.front());
+    EXPECT_FALSE(tombstone.is_committed_);
+    EXPECT_TRUE(tombstone.is_deleted_);
+
+    auto reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(reader->exec_sql_ok("begin;"));
+    db_->txn()->GarbageCollection();
+    EXPECT_EQ(db_->sm()->get_historical_index_key_rids("p2b_delete_abort_publish", index_name, key), original_rids)
+        << "GC must retain history while DELETE undo still exposes its tombstone";
+    EXPECT_NE(reader->exec_sql("select * from p2b_delete_abort_publish where id = 1;")
+                  .find("|                1 |              100 |"),
+              std::string::npos)
+        << "an SI index scan must follow the still-unpublished tombstone to the old row";
+    ASSERT_TRUE(reader->exec_sql_ok("commit;"));
+
+    release_rollback();
+    EXPECT_TRUE(rollback_result.get());
+    db_->txn()->set_abort_delete_undo_publication_test_hook({});
+}
+
 TEST_F(SnapshotTest, SER_IndexScanFindsHistoricalIndexedKeyVersion) {
     auto s = create_session();
     ASSERT_TRUE(s->exec_sql_ok("create table t (id int, val int);"));
@@ -2684,14 +3190,16 @@ TEST_F(SnapshotTest, SI_WriteWriteConflict_DeleteConflict) {
         ASSERT_TRUE(t1->exec_sql_ok("begin;"));
         ASSERT_TRUE(t1->exec_sql_ok("delete from t where id = 1;"));
         b0.arrive_and_wait();
-        b1.arrive_and_wait();
         ASSERT_TRUE(t1->exec_sql_ok("commit;"));
+        b1.arrive_and_wait();
     });
 
     std::thread th2([&]() {
         ASSERT_TRUE(t2->exec_sql_ok("set transaction isolation level snapshot isolation;"));
         ASSERT_TRUE(t2->exec_sql_ok("begin;"));
         b0.arrive_and_wait();
+        // With no other held lock, wait for the active owner and then reject
+        // the stale SI writer.
         t2_result = t2->exec_sql_expect_abort("delete from t where id = 1;");
         b1.arrive_and_wait();
         ASSERT_TRUE(t2->exec_sql_ok("commit;"));

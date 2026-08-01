@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -36,6 +37,29 @@ struct LockObservabilitySnapshot {
     uint64_t cycle_victims{0};
 };
 
+// Record-lock acquisition needs to tell an executor whether a failed wait was
+// a deadlock victim selection or an ordinary transaction cancellation. Keep an
+// implicit bool conversion so existing low-level callers retain their compact
+// success checks while mutation paths can preserve the abort classification.
+class LockAcquireResult {
+public:
+    enum class Value { Granted, Cancelled, DeadlockVictim, WriteConflict };
+
+    constexpr LockAcquireResult(Value value) : value_(value) {}
+    constexpr LockAcquireResult(bool granted) : value_(granted ? Value::Granted : Value::Cancelled) {}
+
+    constexpr operator bool() const {
+        return value_ == Value::Granted;
+    }
+
+    constexpr Value value() const {
+        return value_;
+    }
+
+private:
+    Value value_;
+};
+
 class LockManager {
     /* 加锁类型，包括共享锁、排他锁、意向共享锁、意向排他锁、SIX（意向排他锁+共享锁） */
     enum class LockMode { SHARED, EXLUCSIVE, INTENTION_SHARED, INTENTION_EXCLUSIVE, S_IX };
@@ -46,12 +70,13 @@ class LockManager {
     /* 事务的加锁申请 */
     class LockRequest {
     public:
-        LockRequest(txn_id_t txn_id, LockMode lock_mode) : txn_id_(txn_id), lock_mode_(lock_mode), granted_(false) {}
+        enum class State { Waiting, GrantedUnpublished, Completed, Cancelled, DeadlockVictim };
 
-        txn_id_t txn_id_;    // 申请加锁的事务ID
-        LockMode lock_mode_; // 事务申请加锁的类型
-        bool granted_;       // 该事务是否已经被赋予锁
-        bool cancelled_{false};
+        LockRequest(txn_id_t txn_id, LockMode lock_mode) : txn_id_(txn_id), lock_mode_(lock_mode) {}
+
+        txn_id_t txn_id_;       // 申请加锁的事务ID
+        LockMode lock_mode_;    // 事务申请加锁的类型
+        State state_{State::Waiting}; // protected by LockRequestQueue::latch_
         std::condition_variable cv_;
     };
 
@@ -78,7 +103,7 @@ public:
 
     bool lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
-    bool lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
+    LockAcquireResult lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
     // Reserve a logical unique-index key for the lifetime of txn. This is
     // separate from the B+ tree structural latch because history/current-index
@@ -106,6 +131,10 @@ public:
 
     // Cancel pending lock requests owned by txn. Granted locks are released by the transaction manager.
     void cancel_transaction(Transaction* txn);
+    // Wait until every record/unique-key waiter has stopped accessing txn.
+    // Transaction retirement must not free a cancelled waiter underneath its
+    // lock acquisition path.
+    void wait_for_transaction_lock_requests(txn_id_t txn_id);
 
     uint64_t wait_cycle_abort_count() const {
         return wait_cycle_abort_count_.load(std::memory_order_acquire);
@@ -114,6 +143,17 @@ public:
     LockObservabilitySnapshot record_lock_observability() const;
     LockObservabilitySnapshot unique_key_lock_observability() const;
 
+    // Test-only hooks for the owner-handoff cancellation window. Production
+    // construction leaves these empty.
+    void set_record_handoff_test_hook(std::function<void()> hook);
+    void set_record_handoff_published_test_hook(std::function<void()> hook);
+    void set_record_handoff_checked_test_hook(std::function<void()> hook);
+    void set_record_handoff_pre_notify_test_hook(std::function<void()> hook);
+    void set_unique_handoff_published_test_hook(std::function<void()> hook);
+    void set_cycle_cancel_before_record_queue_test_hook(std::function<void()> hook);
+    void set_cycle_cancel_before_flag_test_hook(std::function<void()> hook);
+    void cancel_waiting_transaction_for_test(txn_id_t txn_id);
+
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
 
@@ -121,6 +161,11 @@ private:
         LockDataId lock_data_id;
         std::shared_ptr<LockRequestQueue> queue;
         std::shared_ptr<LockRequest> request;
+    };
+
+    struct WaitingTxn {
+        Transaction* txn;
+        size_t registrations{0};
     };
 
     LockTableShard& get_shard(const LockDataId& lock_data_id);
@@ -137,15 +182,24 @@ private:
     WaitForGraph build_wait_for_graph_snapshot();
     txn_id_t find_youngest_cycle_victim(txn_id_t requester);
     void note_wait_topology_change();
-    void register_waiting_txn(Transaction* txn);
+    bool register_waiting_txn(Transaction* txn);
     void unregister_waiting_txn(txn_id_t txn_id);
-    void cancel_waiting_transaction(txn_id_t txn_id);
+    void unregister_waiting_txn_locked(txn_id_t txn_id);
+    bool cancel_waiting_transaction(txn_id_t txn_id);
+    void run_record_handoff_test_hook();
+    void run_record_handoff_published_test_hook();
+    void run_record_handoff_checked_test_hook();
+    void run_record_handoff_pre_notify_test_hook();
+    void run_unique_handoff_published_test_hook();
+    void run_cycle_cancel_before_record_queue_test_hook();
+    void run_cycle_cancel_before_flag_test_hook();
     static void observe_queue_depth(std::atomic<uint64_t>& maximum, size_t depth);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
     std::mutex pending_latch_;
+    std::condition_variable pending_cv_;
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
-    std::unordered_map<txn_id_t, Transaction*> waiting_txns_;
+    std::unordered_map<txn_id_t, WaitingTxn> waiting_txns_;
     std::atomic<uint64_t> wait_topology_epoch_{0};
     std::atomic<uint64_t> wait_cycle_abort_count_{0};
     std::atomic<uint64_t> record_immediate_conflict_{0};
@@ -156,6 +210,21 @@ private:
     std::atomic<uint64_t> record_queue_depth_max_{0};
     std::atomic<uint64_t> record_cycle_checks_{0};
     std::atomic<uint64_t> record_cycle_victims_{0};
+    std::mutex record_handoff_test_hook_latch_;
+    std::function<void()> record_handoff_test_hook_;
+    std::function<void()> record_handoff_published_test_hook_;
+    std::function<void()> record_handoff_checked_test_hook_;
+    std::atomic<bool> record_handoff_test_hook_enabled_{false};
+    std::atomic<bool> record_handoff_published_test_hook_enabled_{false};
+    std::atomic<bool> record_handoff_checked_test_hook_enabled_{false};
+    std::function<void()> record_handoff_pre_notify_test_hook_;
+    std::atomic<bool> record_handoff_pre_notify_test_hook_enabled_{false};
+    std::function<void()> unique_handoff_published_test_hook_;
+    std::atomic<bool> unique_handoff_published_test_hook_enabled_{false};
+    std::function<void()> cycle_cancel_before_record_queue_test_hook_;
+    std::function<void()> cycle_cancel_before_flag_test_hook_;
+    std::atomic<bool> cycle_cancel_before_record_queue_test_hook_enabled_{false};
+    std::atomic<bool> cycle_cancel_before_flag_test_hook_enabled_{false};
     static constexpr size_t UNIQUE_KEY_SHARD_COUNT = 64;
     struct UniqueKeyQueue {
         txn_id_t owner{INVALID_TXN_ID};

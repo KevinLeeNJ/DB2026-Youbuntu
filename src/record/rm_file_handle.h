@@ -69,6 +69,16 @@ struct RmRecordWithMeta {
     std::unique_ptr<RmRecord> record;
 };
 
+enum class RmTupleMetaProbeState : uint8_t { Present, Absent, Retry };
+
+// The GC path needs to determine both allocation and MVCC state while holding
+// a single page pin and shared latch. `Retry` means that the probe could not
+// acquire a page; it is never evidence that a candidate is reclaimable.
+struct RmTupleMetaProbe {
+    RmTupleMetaProbeState state{RmTupleMetaProbeState::Absent};
+    TupleMeta meta;
+};
+
 // A read-only view of a record slot. The guard keeps both the buffer-pool
 // frame resident and the page payload stable while executors consume view.
 struct RmRecordView {
@@ -200,7 +210,7 @@ public:
 
     Rid insert_record(char* buf, Context* context);
 
-    void insert_record(const Rid& rid, char* buf, lsn_t page_lsn = INVALID_LSN);
+    void insert_record(const Rid& rid, char* buf, lsn_t page_lsn = INVALID_LSN, const TupleMeta* tuple_meta = nullptr);
 
     RmPinnedInsert prepare_insert_record();
 
@@ -244,6 +254,11 @@ public:
 
     // MVCC: get TupleMeta for a slot
     TupleMeta get_tuple_meta(const Rid& rid) const;
+
+    // Read allocation and TupleMeta in one bounded, read-only page probe.
+    // Invalid page/slot bounds are Absent before touching BPM; unavailable BPM
+    // resources and probe exceptions return Retry.
+    RmTupleMetaProbe probe_tuple_meta(const Rid& rid) const;
 
     // Access buffer pool manager (for TupleMeta modifications that need explicit pin control)
     BufferPoolManager* get_bpm() {

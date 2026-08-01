@@ -13,6 +13,27 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 
+namespace {
+
+class PagePinGuard {
+public:
+    PagePinGuard(BufferPoolManager* buffer_pool_manager, PageId page_id)
+        : buffer_pool_manager_(buffer_pool_manager), page_id_(page_id) {}
+
+    ~PagePinGuard() {
+        buffer_pool_manager_->unpin_page(page_id_, false);
+    }
+
+    PagePinGuard(const PagePinGuard&) = delete;
+    PagePinGuard& operator=(const PagePinGuard&) = delete;
+
+private:
+    BufferPoolManager* buffer_pool_manager_;
+    PageId page_id_;
+};
+
+} // namespace
+
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
@@ -181,7 +202,7 @@ void RmFileHandle::abort_prepared_insert(RmPinnedInsert& insert) {
  * @param {Rid&} rid 要插入记录的位置
  * @param {char*} buf 要插入记录的数据
  */
-void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
+void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn, const TupleMeta* tuple_meta) {
     // This overload takes the slot from the caller, and its callers include redo
     // and undo, where the Rid comes straight out of a WAL record — i.e. from
     // unvalidated bytes on disk.  Recovery validates on its side, but fail loudly
@@ -221,13 +242,17 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
 
         char* slot = pageHandle.get_slot(rid.slot_no);
         memcpy(slot, buf, file_hdr_.record_size);
-        // Initialize TupleMeta to safe defaults
         TupleMeta& meta = pageHandle.get_meta(rid.slot_no);
-        meta.commit_ts_ = 0;
-        meta.writer_txn_id_ = INVALID_TXN_ID;
-        meta.is_committed_ = true;
-        meta.is_deleted_ = false;
-        meta.version_chain_head_ = UndoLink{};
+        if (tuple_meta != nullptr) {
+            meta = *tuple_meta;
+        } else {
+            // Initialize TupleMeta to safe defaults.
+            meta.commit_ts_ = 0;
+            meta.writer_txn_id_ = INVALID_TXN_ID;
+            meta.is_committed_ = true;
+            meta.is_deleted_ = false;
+            meta.version_chain_head_ = UndoLink{};
+        }
         if (page_lsn != INVALID_LSN && pageHandle.page->get_page_lsn() < page_lsn) {
             pageHandle.page->set_page_lsn(page_lsn);
         }
@@ -633,6 +658,31 @@ TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
     }
     buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
     return meta;
+}
+
+RmTupleMetaProbe RmFileHandle::probe_tuple_meta(const Rid& rid) const {
+    const RmFileHdr file_hdr = get_file_hdr();
+    if (rid.page_no < RM_FIRST_RECORD_PAGE || rid.page_no >= file_hdr.num_pages || rid.slot_no < 0 ||
+        rid.slot_no >= file_hdr.num_records_per_page) {
+        return {};
+    }
+
+    const PageId page_id{fd_, rid.page_no};
+    try {
+        Page* page = buffer_pool_manager_->fetch_page(page_id);
+        if (page == nullptr) {
+            return RmTupleMetaProbe{RmTupleMetaProbeState::Retry, {}};
+        }
+        PagePinGuard pin_guard(buffer_pool_manager_, page_id);
+        RmPageHandle page_handle(&file_hdr, page);
+        std::shared_lock<std::shared_mutex> page_lock(page->latch());
+        if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+            return {};
+        }
+        return RmTupleMetaProbe{RmTupleMetaProbeState::Present, page_handle.get_meta(rid.slot_no)};
+    } catch (...) {
+        return RmTupleMetaProbe{RmTupleMetaProbeState::Retry, {}};
+    }
 }
 
 void RmFileHandle::release_page_handle(RmPageHandle& page_handle) {
