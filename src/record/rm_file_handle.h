@@ -266,6 +266,79 @@ public:
     // the group; invalid slots remain Absent.
     std::vector<RmTupleMetaProbe> probe_tuple_meta_batch(page_id_t page_no, const std::vector<int>& slot_nos) const;
 
+    // Visit several slots from one record page while holding one buffer-pool
+    // pin and one shared page latch. The visitor is called once for every
+    // input slot with Absent, Present, or Retry and an optional TupleMeta.
+    //
+    // The visitor must only update caller-owned probe state. In particular, it
+    // must not acquire catalog/history latches while the page latch is held.
+    // This API is used by GC to avoid allocating a result vector for every
+    // page group.
+    template <typename Visitor>
+    void visit_tuple_meta_batch(page_id_t page_no, const std::vector<int>& slot_nos, Visitor&& visitor) const {
+        const RmFileHdr file_hdr = get_file_hdr();
+        const auto valid_slot = [&](int slot_no) { return slot_no >= 0 && slot_no < file_hdr.num_records_per_page; };
+        const auto visit_absent = [&]() {
+            for (size_t i = 0; i < slot_nos.size(); ++i) {
+                visitor(i, RmTupleMetaProbeState::Absent, nullptr);
+            }
+        };
+        const auto visit_retry = [&]() {
+            for (size_t i = 0; i < slot_nos.size(); ++i) {
+                visitor(i, valid_slot(slot_nos[i]) ? RmTupleMetaProbeState::Retry : RmTupleMetaProbeState::Absent,
+                        nullptr);
+            }
+        };
+
+        if (page_no < RM_FIRST_RECORD_PAGE || page_no >= file_hdr.num_pages) {
+            visit_absent();
+            return;
+        }
+
+        bool has_valid_slot = false;
+        for (const int slot_no : slot_nos) {
+            has_valid_slot = has_valid_slot || valid_slot(slot_no);
+        }
+        if (!has_valid_slot) {
+            visit_absent();
+            return;
+        }
+
+        const PageId page_id{fd_, page_no};
+        Page* page = nullptr;
+        try {
+            page = buffer_pool_manager_->fetch_page(page_id);
+        } catch (...) {
+            visit_retry();
+            return;
+        }
+        if (page == nullptr) {
+            visit_retry();
+            return;
+        }
+
+        std::optional<RmPageReadGuard> page_guard;
+        try {
+            page_guard.emplace(buffer_pool_manager_, page_id, page);
+        } catch (...) {
+            buffer_pool_manager_->unpin_page(page_id, false);
+            visit_retry();
+            return;
+        }
+        RmPageHandle page_handle(&file_hdr, page_guard->page());
+        // Do not catch Visitor exceptions here. The guard above releases the
+        // pin/latch during stack unwinding; catching and retrying would invoke
+        // already-visited slots a second time.
+        for (size_t i = 0; i < slot_nos.size(); ++i) {
+            const int slot_no = slot_nos[i];
+            if (!valid_slot(slot_no) || !Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                visitor(i, RmTupleMetaProbeState::Absent, nullptr);
+                continue;
+            }
+            visitor(i, RmTupleMetaProbeState::Present, &page_handle.get_meta(slot_no));
+        }
+    }
+
     // Access buffer pool manager (for TupleMeta modifications that need explicit pin control)
     BufferPoolManager* get_bpm() {
         return buffer_pool_manager_;

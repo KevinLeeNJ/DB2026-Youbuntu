@@ -164,6 +164,7 @@ void SmManager::open_db(const std::string& db_name) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
         historical_retire_queue_.clear();
+        historical_queued_generations_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
@@ -280,6 +281,7 @@ void SmManager::close_db() {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         historical_index_keys_.clear();
         historical_retire_queue_.clear();
+        historical_queued_generations_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
@@ -300,17 +302,47 @@ void SmManager::prune_version_history(timestamp_t watermark) {
     // Historical entries are placed on a retire queue when created. Each GC
     // pass examines only a bounded queue prefix; entries that are still
     // visible to an active snapshot are requeued for a later watermark.
-    std::vector<HistoricalRetireCandidate> hist_snapshot;
+    struct HistoricalProbeItem {
+        HistoricalRetireCandidate candidate;
+        bool requeue{false};
+    };
+    std::vector<HistoricalProbeItem> hist_snapshot;
     {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         const size_t count = std::min(kHistoryPruneBatch, historical_retire_queue_.size());
         hist_snapshot.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            hist_snapshot.push_back(std::move(historical_retire_queue_.front()));
+            auto candidate = std::move(historical_retire_queue_.front());
             historical_retire_queue_.pop_front();
+            const auto retire_key = make_historical_retire_key(candidate);
+            auto queued_it = historical_queued_generations_.find(retire_key);
+            if (queued_it == historical_queued_generations_.end()) {
+                continue;
+            }
+            historical_queued_generations_.erase(queued_it);
+            auto bucket_it = historical_index_keys_.find(candidate.bucket_key);
+            if (bucket_it == historical_index_keys_.end()) {
+                continue;
+            }
+            auto key_it = bucket_it->second.entries.find(candidate.encoded_key);
+            if (key_it == bucket_it->second.entries.end()) {
+                continue;
+            }
+            auto current = std::find_if(key_it->second.begin(), key_it->second.end(),
+                                        [&](const auto& entry) { return entry.rid == candidate.rid; });
+            if (current == key_it->second.end() ||
+                current->retire_state != HistoricalIndexBucket::RetireState::Queued) {
+                continue;
+            }
+            // The queue node is only a logical ticket. A queued refresh may
+            // have advanced the Entry generation after the node was appended.
+            // Capture the current generation exactly when ownership changes to
+            // InFlight; no deque update or scan is needed on the foreground path.
+            candidate.generation = current->generation;
+            current->retire_state = HistoricalIndexBucket::RetireState::InFlight;
+            hist_snapshot.push_back(HistoricalProbeItem{std::move(candidate)});
         }
     }
-    std::vector<bool> hist_requeue(hist_snapshot.size(), false);
     struct PageProbeGroup {
         RmFileHandle* file_handle;
         page_id_t page_no;
@@ -338,7 +370,7 @@ void SmManager::prune_version_history(timestamp_t watermark) {
     hist_groups.reserve(hist_snapshot.size());
     hist_group_indices.reserve(hist_snapshot.size());
     for (size_t i = 0; i < hist_snapshot.size(); ++i) {
-        const auto& candidate = hist_snapshot[i];
+        const auto& candidate = hist_snapshot[i].candidate;
         const size_t nul = candidate.bucket_key.find('\0');
         const std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
         const auto fh_it = fhs_.find(tab_name);
@@ -356,27 +388,27 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         group.candidate_indices.push_back(i);
     }
     for (const auto& group : hist_groups) {
-        const auto probes = group.file_handle->probe_tuple_meta_batch(group.page_no, group.slots);
-        for (size_t j = 0; j < probes.size(); ++j) {
-            const auto& probe = probes[j];
-            const size_t candidate_index = group.candidate_indices[j];
-            if (probe.state == RmTupleMetaProbeState::Retry) {
-                hist_requeue[candidate_index] = true;
-                continue;
-            }
-            if (probe.state == RmTupleMetaProbeState::Absent) {
-                continue;
-            }
-            const TupleMeta& meta = probe.meta;
-            if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
-                hist_requeue[candidate_index] = true;
-            }
-        }
+        group.file_handle->visit_tuple_meta_batch(
+            group.page_no, group.slots, [&](size_t j, RmTupleMetaProbeState state, const TupleMeta* meta) {
+                const size_t candidate_index = group.candidate_indices[j];
+                auto& item = hist_snapshot[candidate_index];
+                if (state == RmTupleMetaProbeState::Retry) {
+                    item.requeue = true;
+                    return;
+                }
+                if (state == RmTupleMetaProbeState::Absent) {
+                    return;
+                }
+                if (meta == nullptr ||
+                    !(meta->is_committed_ && meta->commit_ts_ != INVALID_TS && meta->commit_ts_ < watermark)) {
+                    item.requeue = true;
+                }
+            });
     }
     if (!hist_snapshot.empty()) {
         std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
         for (size_t i = 0; i < hist_snapshot.size(); ++i) {
-            const auto& candidate = hist_snapshot[i];
+            const auto& candidate = hist_snapshot[i].candidate;
             auto it = historical_index_keys_.find(candidate.bucket_key);
             if (it == historical_index_keys_.end()) {
                 continue;
@@ -386,13 +418,17 @@ void SmManager::prune_version_history(timestamp_t watermark) {
                 continue;
             }
             auto& entries = key_it->second;
-            const auto current = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
-                return entry.rid == candidate.rid && entry.generation == candidate.generation;
-            });
+            const auto current = std::find_if(entries.begin(), entries.end(),
+                                              [&](const auto& entry) { return entry.rid == candidate.rid; });
             if (current == entries.end()) {
                 continue;
             }
-            if (!hist_requeue[i]) {
+            if (current->generation != candidate.generation) {
+                current->retire_state = HistoricalIndexBucket::RetireState::Queued;
+                historical_queued_generations_.insert(make_historical_retire_key(candidate));
+                historical_retire_queue_.push_back(HistoricalRetireCandidate{
+                    candidate.bucket_key, candidate.encoded_key, candidate.rid, current->generation});
+            } else if (!hist_snapshot[i].requeue) {
                 entries.erase(current);
                 if (entries.empty()) {
                     it->second.entries.erase(key_it);
@@ -401,6 +437,8 @@ void SmManager::prune_version_history(timestamp_t watermark) {
                     historical_index_keys_.erase(it);
                 }
             } else {
+                current->retire_state = HistoricalIndexBucket::RetireState::Queued;
+                historical_queued_generations_.insert(make_historical_retire_key(candidate));
                 historical_retire_queue_.push_back(candidate);
             }
         }
@@ -676,6 +714,13 @@ void SmManager::clear_table_runtime_history(const std::string& tab_name) {
                                                               candidate.bucket_key, tab_name);
                                                       }),
                                        historical_retire_queue_.end());
+        for (auto it = historical_queued_generations_.begin(); it != historical_queued_generations_.end();) {
+            if (historical_bucket_belongs_to_table(it->bucket_key, tab_name)) {
+                it = historical_queued_generations_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);

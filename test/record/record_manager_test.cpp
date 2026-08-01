@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include <iostream>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -519,6 +520,24 @@ TEST(RecordManagerTupleMetaProbeTest, reports_state_and_never_leaks_a_pin) {
     EXPECT_EQ(batch[0].meta.writer_txn_id_, 77);
     EXPECT_EQ(batch[1].state, RmTupleMetaProbeState::Present);
     EXPECT_EQ(batch[2].state, RmTupleMetaProbeState::Absent);
+    std::vector<RmTupleMetaProbeState> visited_states;
+    visited_states.reserve(3);
+    fh->visit_tuple_meta_batch(
+        first.page_no, {first.slot_no, first.slot_no + 1, -1},
+        [&](size_t, RmTupleMetaProbeState state, const TupleMeta*) { visited_states.push_back(state); });
+    ASSERT_EQ(visited_states.size(), 3u);
+    EXPECT_EQ(visited_states[0], RmTupleMetaProbeState::Present);
+    EXPECT_EQ(visited_states[1], RmTupleMetaProbeState::Present);
+    EXPECT_EQ(visited_states[2], RmTupleMetaProbeState::Absent);
+    int callback_count = 0;
+    EXPECT_THROW(fh->visit_tuple_meta_batch(first.page_no, {first.slot_no, first.slot_no + 1},
+                                            [&](size_t, RmTupleMetaProbeState, const TupleMeta*) {
+                                                ++callback_count;
+                                                throw std::runtime_error("visitor failure");
+                                            }),
+                 std::runtime_error);
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_EQ(fh->probe_tuple_meta(first).state, RmTupleMetaProbeState::Present);
     const auto bitmap_unset = fh->probe_tuple_meta_batch(second.page_no, {second.slot_no, second.slot_no + 1});
     ASSERT_EQ(bitmap_unset.size(), 2u);
     EXPECT_EQ(bitmap_unset[0].state, RmTupleMetaProbeState::Present);

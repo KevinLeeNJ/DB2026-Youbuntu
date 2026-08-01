@@ -687,49 +687,13 @@ RmTupleMetaProbe RmFileHandle::probe_tuple_meta(const Rid& rid) const {
 
 std::vector<RmTupleMetaProbe> RmFileHandle::probe_tuple_meta_batch(page_id_t page_no,
                                                                    const std::vector<int>& slot_nos) const {
-    const RmFileHdr file_hdr = get_file_hdr();
     std::vector<RmTupleMetaProbe> probes(slot_nos.size());
-    if (page_no < RM_FIRST_RECORD_PAGE || page_no >= file_hdr.num_pages) {
-        return probes;
-    }
-
-    std::vector<bool> valid(slot_nos.size(), false);
-    bool has_valid_slot = false;
-    for (size_t i = 0; i < slot_nos.size(); ++i) {
-        valid[i] = slot_nos[i] >= 0 && slot_nos[i] < file_hdr.num_records_per_page;
-        has_valid_slot = has_valid_slot || valid[i];
-    }
-    if (!has_valid_slot) {
-        return probes;
-    }
-
-    auto mark_retry = [&]() {
-        for (size_t i = 0; i < probes.size(); ++i) {
-            if (valid[i]) {
-                probes[i].state = RmTupleMetaProbeState::Retry;
-            }
+    visit_tuple_meta_batch(page_no, slot_nos, [&](size_t index, RmTupleMetaProbeState state, const TupleMeta* meta) {
+        probes[index].state = state;
+        if (meta != nullptr) {
+            probes[index].meta = *meta;
         }
-    };
-
-    const PageId page_id{fd_, page_no};
-    try {
-        Page* page = buffer_pool_manager_->fetch_page(page_id);
-        if (page == nullptr) {
-            mark_retry();
-            return probes;
-        }
-        PagePinGuard pin_guard(buffer_pool_manager_, page_id);
-        RmPageHandle page_handle(&file_hdr, page);
-        std::shared_lock<std::shared_mutex> page_lock(page->latch());
-        for (size_t i = 0; i < probes.size(); ++i) {
-            if (!valid[i] || !Bitmap::is_set(page_handle.bitmap, slot_nos[i])) {
-                continue;
-            }
-            probes[i] = RmTupleMetaProbe{RmTupleMetaProbeState::Present, page_handle.get_meta(slot_nos[i])};
-        }
-    } catch (...) {
-        mark_retry();
-    }
+    });
     return probes;
 }
 

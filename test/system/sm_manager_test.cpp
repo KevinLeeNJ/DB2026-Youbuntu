@@ -439,46 +439,26 @@ TEST_F(SmManagerTest, historical_retire_generation_prevents_aba_and_keeps_equali
     meta.commit_ts_ = 10;
     fh->set_tuple_meta(rid, meta);
 
-    // First retire A normally, then re-add the same (key, RID) as B. A detached
-    // old work item must not erase the new physical identity.
+    // A queued ticket is a logical identity. Repeated refreshes update the
+    // Entry generation without appending more queue nodes.
     sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
     const auto bucket_key = sm_manager_->make_historical_index_key("historical_aba", index_name, {});
     auto& entries = sm_manager_->historical_index_keys_.at(bucket_key).entries.at(std::string(key.data(), key.size()));
     ASSERT_EQ(entries.size(), 1u);
     const uint64_t generation_a = entries.front().generation;
-    const auto stale_a = sm_manager_->historical_retire_queue_.front();
-    sm_manager_->prune_version_history(11);
-    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key).empty());
-
     sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
-    auto& readded_entries =
-        sm_manager_->historical_index_keys_.at(bucket_key).entries.at(std::string(key.data(), key.size()));
-    ASSERT_EQ(readded_entries.size(), 1u);
-    const uint64_t generation_b = readded_entries.front().generation;
+    const uint64_t generation_b = entries.front().generation;
     EXPECT_GT(generation_b, generation_a);
     ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
-    sm_manager_->historical_retire_queue_.clear(); // Detach B's current work item for this stale-A batch.
-    sm_manager_->historical_retire_queue_.push_back(stale_a);
-
-    sm_manager_->prune_version_history(11);
+    ASSERT_EQ(sm_manager_->historical_queued_generations_.size(), 1u);
+    sm_manager_->prune_version_history(10);
     EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
 
-    sm_manager_->historical_retire_queue_.push_back(
-        SmManager::HistoricalRetireCandidate{bucket_key, std::string(key.data(), key.size()), rid, generation_b});
-    // A repeat remember refreshes the current generation. A detached old item
-    // must not remove the refreshed entry even though (key,RID) is unchanged.
     sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
-    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 2u);
-    const uint64_t generation_c = readded_entries.front().generation;
+    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
+    const uint64_t generation_c = entries.front().generation;
     EXPECT_GT(generation_c, generation_b);
-    const auto stale_b = sm_manager_->historical_retire_queue_.front();
-    sm_manager_->historical_retire_queue_.clear();
-    sm_manager_->historical_retire_queue_.push_back(stale_b);
-    sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
-
-    sm_manager_->historical_retire_queue_.push_back(
-        SmManager::HistoricalRetireCandidate{bucket_key, std::string(key.data(), key.size()), rid, generation_c});
+    ASSERT_EQ(sm_manager_->historical_queued_generations_.size(), 1u);
     sm_manager_->prune_version_history(10);
     EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
     sm_manager_->prune_version_history(11);

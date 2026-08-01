@@ -92,9 +92,12 @@ private:
     };
 
     struct HistoricalIndexBucket {
+        enum class RetireState : uint8_t { Queued, InFlight };
+
         struct Entry {
             Rid rid;
             uint64_t generation{0};
+            RetireState retire_state{RetireState::Queued};
         };
 
         std::map<std::string, std::vector<Entry>, HistoricalKeyLess> entries;
@@ -114,6 +117,31 @@ private:
                    a.generation == b.generation;
         }
     };
+
+    struct HistoricalRetireKey {
+        std::string bucket_key;
+        std::string encoded_key;
+        Rid rid;
+
+        friend bool operator==(const HistoricalRetireKey& a, const HistoricalRetireKey& b) {
+            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid;
+        }
+    };
+
+    struct HistoricalRetireKeyHash {
+        size_t operator()(const HistoricalRetireKey& key) const noexcept {
+            size_t hash = std::hash<std::string>{}(key.bucket_key);
+            hash ^=
+                std::hash<std::string>{}(key.encoded_key) + static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<int>{}(key.rid.page_no) + static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<int>{}(key.rid.slot_no) + static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+
+    static HistoricalRetireKey make_historical_retire_key(const HistoricalRetireCandidate& candidate) {
+        return HistoricalRetireKey{candidate.bucket_key, candidate.encoded_key, candidate.rid};
+    }
 
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
@@ -153,6 +181,10 @@ private:
     mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
     std::deque<HistoricalRetireCandidate> historical_retire_queue_;
+    // A queued ticket is a logical identity. The current generation remains
+    // in the Entry; this side index only records that one queue node exists.
+    // It is empty for entries owned by an in-flight GC batch.
+    std::unordered_set<HistoricalRetireKey, HistoricalRetireKeyHash> historical_queued_generations_;
     uint64_t next_historical_index_generation_{1};
     mutable std::mutex deleted_tuple_candidates_latch_;
     using DeletedTupleBucket =
@@ -320,16 +352,26 @@ public:
         const auto current =
             std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.rid == rid; });
         const uint64_t generation = next_historical_index_generation_++;
+        const HistoricalRetireKey retire_key{bucket_key, encoded_key, rid};
         if (current == entries.end()) {
             entries.push_back(HistoricalIndexBucket::Entry{rid, generation});
+            historical_queued_generations_.insert(retire_key);
+            historical_retire_queue_.push_back(HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation});
         } else {
             current->generation = generation;
+            // Keep one queue item per logical entry. A refresh while the item
+            // is queued updates the side index in place; a refresh while GC
+            // owns the item is observed during reconcile and causes one fresh
+            // item to be queued there.
+            if (current->retire_state == HistoricalIndexBucket::RetireState::Queued) {
+                const auto [queued_it, inserted] = historical_queued_generations_.insert(retire_key);
+                (void)queued_it;
+                if (inserted) {
+                    historical_retire_queue_.push_back(
+                        HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation});
+                }
+            }
         }
-        // A foreground remember can race a detached GC batch. Refreshing the
-        // generation makes that older item stale even when the physical
-        // (key,RID) is unchanged, then gives the newest identity its own work
-        // item. The bucket still has at most one current entry per RID.
-        historical_retire_queue_.push_back(HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation});
     }
 
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
