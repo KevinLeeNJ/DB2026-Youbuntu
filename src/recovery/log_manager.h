@@ -683,44 +683,6 @@ public:
         return log_file_offset_ + static_cast<int64_t>(flushing_bytes_) + static_cast<int64_t>(log_buffer_->offset_);
     }
 
-    uint64_t get_fsync_count() const {
-        return fsync_count_.load(std::memory_order_acquire);
-    }
-
-    uint64_t get_group_commit_count() const {
-        return group_commit_count_.load(std::memory_order_acquire);
-    }
-
-    // Number of committers that became the flush leader. Comparing this with
-    // fsync_count shows how often one leader must flush again for later
-    // arrivals before it can return to its own client.
-    uint64_t get_group_commit_leader_count() const {
-        return group_commit_leader_count_.load(std::memory_order_acquire);
-    }
-
-    uint64_t get_group_commit_waiter_count() const {
-        return group_commit_waiter_count_.load(std::memory_order_acquire);
-    }
-
-    uint64_t get_group_commit_wait_ns() const {
-        return group_commit_wait_ns_.load(std::memory_order_acquire);
-    }
-
-    uint64_t get_pwrite_count() const {
-        return pwrite_count_.load(std::memory_order_acquire);
-    }
-    uint64_t get_pwrite_bytes() const {
-        return pwrite_bytes_.load(std::memory_order_acquire);
-    }
-    uint64_t get_wal_write_ns() const {
-        return wal_write_ns_.load(std::memory_order_acquire);
-    }
-    uint64_t get_wal_fsync_ns() const {
-        return wal_fsync_ns_.load(std::memory_order_acquire);
-    }
-    uint64_t get_commit_count() const {
-        return commit_count_.load(std::memory_order_acquire);
-    }
     DurabilityMode durability_mode() const {
         return durability_mode_;
     }
@@ -745,7 +707,6 @@ private:
         bool require_sync{true};
         bool done{false};
         std::exception_ptr error;
-        uint64_t enqueue_time_ns{0};
         std::condition_variable cv;
     };
 
@@ -771,16 +732,6 @@ private:
     int flushing_bytes_{0};
     std::atomic<lsn_t> persist_lsn_{INVALID_LSN}; // 最后一个已 pwrite 到 OS page cache 的日志号
     std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
-    std::atomic<uint64_t> fsync_count_{0};
-    std::atomic<uint64_t> group_commit_count_{0};
-    std::atomic<uint64_t> group_commit_leader_count_{0};
-    std::atomic<uint64_t> group_commit_waiter_count_{0};
-    std::atomic<uint64_t> group_commit_wait_ns_{0};
-    std::atomic<uint64_t> pwrite_count_{0};
-    std::atomic<uint64_t> pwrite_bytes_{0};
-    std::atomic<uint64_t> wal_write_ns_{0};
-    std::atomic<uint64_t> wal_fsync_ns_{0};
-    std::atomic<uint64_t> commit_count_{0};
     int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};

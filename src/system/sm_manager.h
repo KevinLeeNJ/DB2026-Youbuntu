@@ -64,20 +64,6 @@ public:
         UndoLink version_chain_head;
     };
 
-    struct DeletedTupleCandidateStats {
-        uint64_t lookups{0};
-        uint64_t exact_hits{0};
-        uint64_t exact_misses{0};
-        uint64_t validated_candidates{0};
-        uint64_t page_probes{0};
-        uint64_t active_candidates{0};
-        uint64_t active_buckets{0};
-        uint64_t retire_pops{0};
-        uint64_t retire_requeues{0};
-        uint64_t retire_prunes{0};
-        uint64_t retire_max_queue{0};
-    };
-
     DbMeta db_; // 当前打开的数据库的元数据
     std::unordered_map<std::string, std::unique_ptr<RmFileHandle>>
         fhs_; // file name -> record file handle, 当前数据库中每张表的数据文件
@@ -175,21 +161,6 @@ private:
     std::deque<DeletedTupleRetireCandidate> deleted_tuple_retire_queue_;
     uint64_t next_deleted_tuple_candidate_id_{1};
 
-    // These counters are intentionally observational only. They are not part
-    // of any persistent state or conflict decision, and callers may leave
-    // diagnostics disabled in production.
-    std::atomic<bool> deleted_tuple_candidate_diagnostics_enabled_{false};
-    std::atomic<uint64_t> deleted_tuple_candidate_lookups_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_exact_hits_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_exact_misses_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_validated_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_page_probes_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_active_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_active_buckets_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_retire_pops_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_retire_requeues_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_retire_prunes_{0};
-    std::atomic<uint64_t> deleted_tuple_candidate_retire_max_queue_{0};
     std::optional<size_t> deleted_tuple_candidate_test_hash_override_;
 
     DeletedTupleRowKey make_deleted_tuple_row_key(const char* data, size_t size) const {
@@ -202,14 +173,6 @@ private:
     static bool deleted_tuple_candidate_matches_meta(const DeletedTupleCandidate& candidate, const TupleMeta& meta) {
         return meta.is_deleted_ && candidate.writer_txn_id == meta.writer_txn_id_ &&
                candidate.version_chain_head == meta.version_chain_head_;
-    }
-
-    void update_deleted_tuple_retire_max_locked() {
-        const uint64_t size = deleted_tuple_retire_queue_.size();
-        uint64_t observed = deleted_tuple_candidate_retire_max_queue_.load(std::memory_order_relaxed);
-        while (size > observed && !deleted_tuple_candidate_retire_max_queue_.compare_exchange_weak(
-                                      observed, size, std::memory_order_relaxed, std::memory_order_relaxed)) {
-        }
     }
 
     bool erase_deleted_tuple_candidate_locked(const std::string& tab_name, const DeletedTupleRowKey& row_key,
@@ -231,10 +194,8 @@ private:
             return false;
         }
         candidates.erase(candidate_it);
-        deleted_tuple_candidate_active_.fetch_sub(1, std::memory_order_relaxed);
         if (candidates.empty()) {
             table_it->second.erase(bucket_it);
-            deleted_tuple_candidate_active_buckets_.fetch_sub(1, std::memory_order_relaxed);
         }
         if (table_it->second.empty()) {
             deleted_tuple_candidates_.erase(table_it);
@@ -245,17 +206,6 @@ private:
     void clear_deleted_tuple_candidates_locked() {
         deleted_tuple_candidates_.clear();
         deleted_tuple_retire_queue_.clear();
-        deleted_tuple_candidate_lookups_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_exact_hits_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_exact_misses_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_validated_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_page_probes_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_active_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_active_buckets_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_retire_pops_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_retire_requeues_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_retire_prunes_.store(0, std::memory_order_relaxed);
-        deleted_tuple_candidate_retire_max_queue_.store(0, std::memory_order_relaxed);
     }
 
 public:
@@ -480,15 +430,11 @@ public:
         auto row_key = make_deleted_tuple_row_key(record.data, record.size);
         auto& buckets = deleted_tuple_candidates_[tab_name];
         auto [bucket_it, inserted] = buckets.try_emplace(row_key);
-        if (inserted) {
-            deleted_tuple_candidate_active_buckets_.fetch_add(1, std::memory_order_relaxed);
-        }
+        (void)inserted;
         DeletedTupleCandidate candidate{next_deleted_tuple_candidate_id_++, rid, tombstone.writer_txn_id_,
                                         tombstone.version_chain_head_};
         bucket_it->second.push_back(candidate);
-        deleted_tuple_candidate_active_.fetch_add(1, std::memory_order_relaxed);
         deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate});
-        update_deleted_tuple_retire_max_locked();
     }
 
     // Test-only entry point. A forced hash exercises the guarantee that hash
@@ -499,40 +445,24 @@ public:
         auto row_key = make_deleted_tuple_row_key(record_bytes.data(), record_bytes.size());
         auto& buckets = deleted_tuple_candidates_[tab_name];
         auto [bucket_it, inserted] = buckets.try_emplace(row_key);
-        if (inserted) {
-            deleted_tuple_candidate_active_buckets_.fetch_add(1, std::memory_order_relaxed);
-        }
+        (void)inserted;
         DeletedTupleCandidate candidate{next_deleted_tuple_candidate_id_++, rid, tombstone.writer_txn_id_,
                                         tombstone.version_chain_head_};
         bucket_it->second.push_back(candidate);
-        deleted_tuple_candidate_active_.fetch_add(1, std::memory_order_relaxed);
         deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate});
-        update_deleted_tuple_retire_max_locked();
     }
 
     std::vector<DeletedTupleCandidate> get_deleted_tuple_candidates(const std::string& tab_name,
                                                                     const RmRecord& record) {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
         auto row_key = make_deleted_tuple_row_key(record.data, record.size);
-        if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-            deleted_tuple_candidate_lookups_.fetch_add(1, std::memory_order_relaxed);
-        }
         auto table_it = deleted_tuple_candidates_.find(tab_name);
         if (table_it == deleted_tuple_candidates_.end()) {
-            if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-                deleted_tuple_candidate_exact_misses_.fetch_add(1, std::memory_order_relaxed);
-            }
             return {};
         }
         auto bucket_it = table_it->second.find(row_key);
         if (bucket_it == table_it->second.end()) {
-            if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-                deleted_tuple_candidate_exact_misses_.fetch_add(1, std::memory_order_relaxed);
-            }
             return {};
-        }
-        if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-            deleted_tuple_candidate_exact_hits_.fetch_add(1, std::memory_order_relaxed);
         }
         return bucket_it->second;
     }
@@ -544,49 +474,12 @@ public:
         erase_deleted_tuple_candidate_locked(tab_name, row_key, candidate);
     }
 
-    void set_deleted_tuple_candidate_diagnostics_enabled(bool enabled) {
-        deleted_tuple_candidate_diagnostics_enabled_.store(enabled, std::memory_order_relaxed);
-    }
-
     void set_deleted_tuple_candidate_test_hash_override(std::optional<size_t> forced_hash) {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
         if (!deleted_tuple_candidates_.empty()) {
             throw InternalError("cannot change deleted tuple candidate hash while entries exist");
         }
         deleted_tuple_candidate_test_hash_override_ = forced_hash;
-    }
-
-    bool deleted_tuple_candidate_diagnostics_enabled() const {
-        return deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed);
-    }
-
-    void note_deleted_tuple_candidate_validated(size_t page_probes) {
-        if (!deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-            return;
-        }
-        deleted_tuple_candidate_validated_.fetch_add(1, std::memory_order_relaxed);
-        deleted_tuple_candidate_page_probes_.fetch_add(page_probes, std::memory_order_relaxed);
-    }
-
-    void note_deleted_tuple_candidate_page_probe() {
-        if (!deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-            return;
-        }
-        deleted_tuple_candidate_page_probes_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    DeletedTupleCandidateStats get_deleted_tuple_candidate_stats() const {
-        return DeletedTupleCandidateStats{deleted_tuple_candidate_lookups_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_exact_hits_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_exact_misses_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_validated_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_page_probes_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_active_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_active_buckets_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_retire_pops_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_retire_requeues_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_retire_prunes_.load(std::memory_order_relaxed),
-                                          deleted_tuple_candidate_retire_max_queue_.load(std::memory_order_relaxed)};
     }
 
     /** @brief 按水位线回收版本链相关历史结构。

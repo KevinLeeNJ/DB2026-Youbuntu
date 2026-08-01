@@ -65,7 +65,6 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
     if (fd2path_.count(fd) == 0) {
         throw FileNotOpenError(fd);
     }
-    page_write_count_.fetch_add(1, std::memory_order_relaxed);
     WritePageAt(fd, page_no, offset, num_bytes);
 }
 
@@ -84,7 +83,6 @@ void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_byt
     if (fd2path_.count(fd) == 0) {
         throw FileNotOpenError(fd);
     }
-    page_read_count_.fetch_add(1, std::memory_order_relaxed);
     ReadPageAt(fd, page_no, offset, num_bytes);
 }
 

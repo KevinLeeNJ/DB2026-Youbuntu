@@ -115,12 +115,6 @@ void BufferPoolManager::FrameOperationToken::release() noexcept {
     }
 }
 
-BufferPoolObservabilitySnapshot BufferPoolManager::observability_snapshot() const {
-    return {fetch_miss_.load(std::memory_order_relaxed),       inflight_wait_.load(std::memory_order_relaxed),
-            inflight_wait_ns_.load(std::memory_order_relaxed), no_victim_.load(std::memory_order_relaxed),
-            eviction_clean_.load(std::memory_order_relaxed),   eviction_dirty_.load(std::memory_order_relaxed)};
-}
-
 frame_id_t BufferPoolManager::take_free_frame() {
     if (!recycled_frames_.empty()) {
         const frame_id_t frame_id = recycled_frames_.back();
@@ -337,17 +331,11 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
         }
 
         if (wait_page != nullptr) {
-            const auto wait_begin = std::chrono::steady_clock::now();
-            inflight_wait_.fetch_add(1, std::memory_order_relaxed);
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
-            inflight_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                  std::chrono::steady_clock::now() - wait_begin)
-                                                                  .count()),
-                                        std::memory_order_relaxed);
             continue;
         }
 
@@ -369,18 +357,11 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                     return target_page;
                 }
             } else {
-                fetch_miss_.fetch_add(1, std::memory_order_relaxed);
                 fid = take_free_frame();
                 if (fid == INVALID_FRAME_ID) {
                     fid = take_unblocked_victim_locked();
                     if (fid == INVALID_FRAME_ID) {
-                        no_victim_.fetch_add(1, std::memory_order_relaxed);
                         return nullptr;
-                    }
-                    if (pages_[fid].is_dirty_.load(std::memory_order_acquire)) {
-                        eviction_dirty_.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        eviction_clean_.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
 
@@ -411,17 +392,11 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
         }
 
         if (wait_page != nullptr) {
-            const auto wait_begin = std::chrono::steady_clock::now();
-            inflight_wait_.fetch_add(1, std::memory_order_relaxed);
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
-            inflight_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                  std::chrono::steady_clock::now() - wait_begin)
-                                                                  .count()),
-                                        std::memory_order_relaxed);
             continue;
         }
 
@@ -770,13 +745,7 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
         if (fid == INVALID_FRAME_ID) {
             fid = take_unblocked_victim_locked();
             if (fid == INVALID_FRAME_ID) {
-                no_victim_.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;
-            }
-            if (pages_[fid].is_dirty_.load(std::memory_order_acquire)) {
-                eviction_dirty_.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                eviction_clean_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -1161,68 +1130,8 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
     return result;
 }
 
-void BufferPoolManager::log_pool_stats() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("RMDB_LOG_BPM_STATS");
-        return value != nullptr && std::string(value) == "1";
-    }();
-    if (!enabled) {
-        return;
-    }
-    // The preflush loop calls in bursts; one line per second is what makes the
-    // resident/pinned counts readable as a time series.
-    static std::atomic<int64_t> next_log_ns{0};
-    const auto now_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    int64_t expected_ns = next_log_ns.load(std::memory_order_relaxed);
-    if (now_ns < expected_ns ||
-        !next_log_ns.compare_exchange_strong(expected_ns, now_ns + 1'000'000'000, std::memory_order_relaxed)) {
-        return;
-    }
-
-    size_t resident_pages = 0;
-    size_t index_internal_frames = 0;
-    size_t pinned_frames = 0;
-    size_t dirty_frames = 0;
-    {
-        std::shared_lock lock{latch_};
-        resident_pages = page_table_.size();
-        for (size_t frame_id = 0; frame_id < pool_size_; ++frame_id) {
-            if (residency_classes_[frame_id] == ResidencyClass::IndexInternal) {
-                ++index_internal_frames;
-            }
-            const Page& page = pages_[frame_id];
-            if (page.state_.load(std::memory_order_acquire) != FrameState::VALID) {
-                continue;
-            }
-            // pin_count_ is read without its latch: this is a diagnostic, and a
-            // torn read costs one unit of accuracy in a number that is only ever
-            // compared by order of magnitude.
-            if (page.pin_count_ > 0) {
-                ++pinned_frames;
-            }
-            if (page.is_dirty_.load(std::memory_order_acquire)) {
-                ++dirty_frames;
-            }
-        }
-    }
-    // WARN, not INFO: the server runs at WARN outside recovery (rmdb.cpp sets the
-    // level), so an INFO line here would be silently discarded. The env gate is
-    // what keeps this quiet by default.
-    LOG_WARN("bpm stats: %zu/%zu frames resident, %zu evictable, %zu pinned, %zu index-internal, %zu dirty, "
-             "%lu page reads, %lu page writes",
-             resident_pages, pool_size_, replacer_->Size(), pinned_frames, index_internal_frames, dirty_frames,
-             static_cast<unsigned long>(disk_manager_->get_page_read_count()),
-             static_cast<unsigned long>(disk_manager_->get_page_write_count()));
-    // A benchmark run ends in SIGKILL, which throws away the logger's 1 MiB
-    // buffer. Without this the whole time series is lost.
-    minilog::Logger::get().flush();
-}
-
 BufferPoolManager::FlushBatchResult BufferPoolManager::flush_dirty_pages(const std::vector<int>& allowed_fds,
                                                                          size_t max_pages) {
-    log_pool_stats();
     FlushBatchResult result;
     if (max_pages == 0 || allowed_fds.empty() || pool_size_ == 0) {
         return result;

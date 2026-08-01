@@ -497,11 +497,6 @@ struct RecoveryTiming {
     uint64_t index_unchanged_keys{0};
     uint64_t index_duplicate_entries{0};
     uint64_t index_rebuilds{0};
-    uint64_t analyze_page_reads{0};
-    uint64_t redo_page_reads{0};
-    uint64_t undo_page_reads{0};
-    uint64_t page_reads{0};
-    uint64_t page_writes{0};
     uint64_t wal_reads{0};
     uint64_t wal_read_bytes{0};
 };
@@ -556,23 +551,17 @@ RecoveryTiming RecoverAndMeasure(const std::string& db_name, size_t bpm_pages, u
     db.bpm_.set_log_manager(&db.log_mgr_);
 
     RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, &db.log_mgr_);
-    uint64_t reads_before = db.disk_.get_page_read_count();
     phase_begin = std::chrono::steady_clock::now();
     recovery.analyze();
     timing.analyze_ms = ElapsedMs(phase_begin);
-    timing.analyze_page_reads = db.disk_.get_page_read_count() - reads_before;
 
-    reads_before = db.disk_.get_page_read_count();
     phase_begin = std::chrono::steady_clock::now();
     recovery.redo();
     timing.redo_ms = ElapsedMs(phase_begin);
-    timing.redo_page_reads = db.disk_.get_page_read_count() - reads_before;
 
-    reads_before = db.disk_.get_page_read_count();
     phase_begin = std::chrono::steady_clock::now();
     recovery.undo();
     timing.undo_ms = ElapsedMs(phase_begin);
-    timing.undo_page_reads = db.disk_.get_page_read_count() - reads_before;
     db.sm_mgr_.refresh_index_residency();
     timing.total_ms = ElapsedMs(total_begin);
 
@@ -586,8 +575,6 @@ RecoveryTiming RecoverAndMeasure(const std::string& db_name, size_t bpm_pages, u
     timing.index_unchanged_keys = recovery.get_index_unchanged_key_count();
     timing.index_duplicate_entries = recovery.get_index_duplicate_entry_count();
     timing.index_rebuilds = recovery.get_index_rebuild_count();
-    timing.page_reads = db.disk_.get_page_read_count();
-    timing.page_writes = db.disk_.get_page_write_count();
     timing.wal_reads = db.disk_.get_log_read_count();
     timing.wal_read_bytes = db.disk_.get_log_read_bytes();
 
@@ -599,12 +586,9 @@ RecoveryTiming RecoverAndMeasure(const std::string& db_name, size_t bpm_pages, u
 void PrintTiming(const char* label, const RecoveryTiming& timing) {
     std::cout << "[scale] " << label << "\n"
               << "         wal startup scan : " << timing.startup_scan_ms << " ms\n"
-              << "         analyze          : " << timing.analyze_ms << " ms (" << timing.analyze_page_reads
-              << " page reads)\n"
-              << "         redo             : " << timing.redo_ms << " ms (" << timing.redo_page_reads
-              << " page reads)\n"
-              << "         undo+meta+index  : " << timing.undo_ms << " ms (" << timing.undo_page_reads
-              << " page reads)\n"
+              << "         analyze          : " << timing.analyze_ms << " ms\n"
+              << "         redo             : " << timing.redo_ms << " ms\n"
+              << "         undo+meta+index  : " << timing.undo_ms << " ms\n"
               << "         total            : " << timing.total_ms << " ms\n"
               << "         records scanned  : " << timing.scanned_records << "\n"
               << "         dml records      : " << timing.dml_records << "\n"
@@ -616,8 +600,6 @@ void PrintTiming(const char* label, const RecoveryTiming& timing) {
               << "         index unchanged  : " << timing.index_unchanged_keys << "\n"
               << "         index duplicates : " << timing.index_duplicate_entries << "\n"
               << "         index rebuilds   : " << timing.index_rebuilds << "\n"
-              << "         page reads       : " << timing.page_reads << "\n"
-              << "         page writes      : " << timing.page_writes << "\n"
               << "         wal preads       : " << timing.wal_reads << " (" << timing.wal_read_bytes << " bytes)\n";
     if (timing.index_rebuilds > 0) {
         // Made loud on purpose. The previous round's numbers were read as

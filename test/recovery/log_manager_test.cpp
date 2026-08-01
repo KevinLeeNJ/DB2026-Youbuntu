@@ -209,19 +209,14 @@ TEST(IndexSmoWalTest, AppendSupportsARecordLargerThanTheOrdinaryBuffer) {
         }
     }
 
-    EXPECT_EQ(log_mgr.get_fsync_count(), 0U);
     EXPECT_GT(log_mgr.ensure_index_binding(data.index_file_name), 0U);
-    const uint64_t binding_fsyncs = log_mgr.get_fsync_count();
-    EXPECT_EQ(binding_fsyncs, 1U);
 
     const lsn_t smo_lsn = log_mgr.append_index_smo(data);
     EXPECT_GE(smo_lsn, 1);
-    EXPECT_EQ(log_mgr.get_fsync_count(), binding_fsyncs);
     EXPECT_LT(log_mgr.get_durable_lsn(), smo_lsn);
 
     log_mgr.flush_log_to_disk_up_to(smo_lsn);
     EXPECT_GE(log_mgr.get_durable_lsn(), smo_lsn);
-    EXPECT_GT(log_mgr.get_fsync_count(), binding_fsyncs);
     const int64_t wal_bytes = disk.get_file_size(LOG_FILE_NAME);
     EXPECT_GT(wal_bytes, LOG_BUFFER_SIZE);
 
@@ -559,9 +554,6 @@ TEST(LogManagerTest, ProcessCrashCommitWaitsForPwriteWithoutFsync) {
 
     EXPECT_EQ(log_mgr.get_persist_lsn(), commit_lsn);
     EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
-    EXPECT_EQ(log_mgr.get_commit_count(), 1u);
-    EXPECT_EQ(log_mgr.get_pwrite_count(), 1u);
-    EXPECT_GT(log_mgr.get_pwrite_bytes(), 0u);
 
     log_mgr.flush_log_to_disk_with_sync();
     EXPECT_EQ(log_mgr.get_durable_lsn(), commit_lsn);
@@ -602,9 +594,6 @@ TEST(LogManagerTest, ConcurrentDurableFlushesShareAGroup) {
     }
 
     EXPECT_EQ(log_mgr.get_durable_lsn(), target_lsn);
-    EXPECT_GE(log_mgr.get_group_commit_count(), 1u);
-    EXPECT_GE(log_mgr.get_group_commit_waiter_count(), 1u);
-    EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kWaiterCount));
 }
 
 // Under a continuously refilled queue the leader keeps extending the batch, so
@@ -639,9 +628,6 @@ TEST(LogManagerTest, SaturatedGroupCommitReleasesEveryWaiterOnlyWhenDurable) {
     }
 
     EXPECT_EQ(completed.load(), kThreads * kCommitsPerThread);
-    EXPECT_GE(log_mgr.get_group_commit_leader_count(), 1u);
-    // Coalescing must still happen: far fewer fdatasync calls than commits.
-    EXPECT_LT(log_mgr.get_fsync_count(), static_cast<uint64_t>(kThreads * kCommitsPerThread));
 }
 
 TEST(LogManagerTest, GroupCommitPropagatesFlushErrorToEveryWaiter) {
@@ -853,11 +839,11 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
     LockAcquireResult lock_result = LockAcquireResult::Value::Granted;
     std::thread waiter([&] { lock_result = lock_mgr.lock_exclusive_on_record(txn, rid, 42); });
     const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (lock_mgr.record_lock_observability().wait_enqueued != 1 &&
+    while (!lock_mgr.has_record_waiters_for_test() &&
            std::chrono::steady_clock::now() < enqueue_deadline) {
         std::this_thread::yield();
     }
-    if (lock_mgr.record_lock_observability().wait_enqueued != 1) {
+    if (!lock_mgr.has_record_waiters_for_test()) {
         txn_mgr.abort(txn, &log_mgr);
         waiter.join();
         txn_mgr.abort(owner, &log_mgr);
@@ -873,7 +859,6 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
 
     EXPECT_EQ(log_mgr.get_persist_lsn(), INVALID_LSN);
     EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);
-    EXPECT_EQ(log_mgr.get_pwrite_count(), 0u);
     EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), 0);
 
     // The abort still performs the normal lock cleanup even though it does not
@@ -916,7 +901,6 @@ TEST(LogManagerTest, EmptyWriteSetWithDmlWalStillFlushesAbort) {
 
     txn_mgr.abort(txn, &log_mgr);
 
-    EXPECT_EQ(log_mgr.get_pwrite_count(), 1u);
     EXPECT_GT(disk.get_file_size(LOG_FILE_NAME), 0);
     auto logs = ReadAllLogs(disk);
     ASSERT_EQ(logs.size(), 3);
@@ -985,7 +969,6 @@ TEST(LogManagerTest, SecondIndexConflictWithEmptyWriteSetPersistsAbortWal) {
     // could add a WriteRecord, abort must publish the complete loser chain.
     const lsn_t abort_lsn = log_mgr.get_persist_lsn();
     EXPECT_NE(abort_lsn, INVALID_LSN);
-    EXPECT_GT(log_mgr.get_pwrite_count(), 0u);
     auto logs = ReadAllLogs(disk);
     ASSERT_EQ(logs.size(), 6);
     EXPECT_EQ(logs[0]->log_type_, LogType::BEGIN);

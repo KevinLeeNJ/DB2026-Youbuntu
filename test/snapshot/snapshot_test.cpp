@@ -120,15 +120,12 @@ TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockWaitsWithoutCycleScan) 
     LockAcquireResult victim_result = LockAcquireResult::Value::Cancelled;
     std::thread victim_thread([&] { victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42); });
 
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&victim);
                                         lock_manager.unlock(&owner, lock_id);
                                         victim_thread.join();
                                     }));
-    const auto stats = lock_manager.record_lock_observability();
-    EXPECT_EQ(stats.immediate_conflict, 0u);
-    EXPECT_EQ(stats.cycle_checks, 0u);
     EXPECT_EQ(owner.get_lock_set()->count(lock_id), 1u);
     ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
     victim_thread.join();
@@ -189,11 +186,6 @@ TEST(SnapshotIsolationConcurrencyTest, ExplicitReadCommittedWriterWaitsForRecord
     EXPECT_TRUE(acquired.load());
     EXPECT_EQ(waiter.get_lock_set()->count(LockDataId(42, rid, LockDataType::RECORD)), 1u);
     EXPECT_TRUE(lock_manager.unlock(&waiter, LockDataId(42, rid, LockDataType::RECORD)));
-    const auto stats = lock_manager.record_lock_observability();
-    EXPECT_EQ(stats.wait_enqueued, 1u);
-    EXPECT_EQ(stats.wait_granted, 1u);
-    EXPECT_EQ(stats.wait_cancelled, 0u);
-    EXPECT_GT(stats.wait_ns, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, RecordLockWaitersAreGrantedInFifoOrder) {
@@ -258,10 +250,6 @@ TEST(SnapshotIsolationConcurrencyTest, CancelledRecordLockWaiterReturnsWithoutAc
     EXPECT_EQ(waiter.get_lock_set()->count(lock_id), 0u);
     EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
     EXPECT_FALSE(lock_manager.unlock(&waiter, lock_id));
-    const auto stats = lock_manager.record_lock_observability();
-    EXPECT_EQ(stats.wait_enqueued, 1u);
-    EXPECT_EQ(stats.wait_cancelled, 1u);
-    EXPECT_GT(stats.wait_ns, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
@@ -291,7 +279,7 @@ TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
     while (!younger_started.load()) {
         std::this_thread::yield();
     }
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&younger);
                                         lock_manager.unlock(&older, first_lock);
@@ -306,7 +294,6 @@ TEST(SnapshotIsolationConcurrencyTest, WaitForCycleCancelsYoungestVictim) {
     EXPECT_TRUE(older_acquired);
     EXPECT_FALSE(younger_acquired.load());
     EXPECT_EQ(younger_result.value(), LockAcquireResult::Value::DeadlockVictim);
-    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
     EXPECT_TRUE(lock_manager.unlock(&older, second_lock));
     EXPECT_TRUE(lock_manager.unlock(&older, first_lock));
 }
@@ -343,7 +330,6 @@ TEST(SnapshotIsolationConcurrencyTest, UniqueKeyCycleCancelsYoungestVictim) {
 
     EXPECT_TRUE(older_acquired);
     EXPECT_FALSE(younger_acquired.load());
-    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
     EXPECT_TRUE(lock_manager.unlock_unique_key(&older, second_lock));
     EXPECT_TRUE(lock_manager.unlock_unique_key(&older, first_lock));
 }
@@ -404,7 +390,6 @@ TEST(SnapshotIsolationConcurrencyTest, WaitForGraphRebuildsAfterOwnerHandoff) {
     younger_thread.join();
 
     EXPECT_TRUE(older_has_second.load());
-    EXPECT_GE(lock_manager.wait_cycle_abort_count(), 1u);
     EXPECT_TRUE(lock_manager.unlock(&older, second_lock));
     EXPECT_TRUE(lock_manager.unlock(&older, first_lock));
 }
@@ -733,14 +718,13 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitsWhileOwnerRemainsActive) 
     auto waiter_result = std::async(std::launch::async, [&] {
         return waiter.exec_sql_ok("update si_first_wait_conflict set val = val + 1 where id = 1;");
     });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
                                     [&] {
                                         owner.exec_sql_ok("abort;");
                                         waiter_result.wait_for(std::chrono::seconds(2));
                                     }));
     ASSERT_NE(owner.current_transaction(), nullptr);
     EXPECT_NE(owner.current_transaction()->get_state(), TransactionState::ABORTED);
-    EXPECT_EQ(db.lock()->record_lock_observability().immediate_conflict, 0u);
     ASSERT_TRUE(owner.exec_sql_ok("abort;"));
     ASSERT_TRUE(waiter_result.get());
     ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
@@ -765,7 +749,7 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerAbortContinuesWit
     auto waiter_result = std::async(std::launch::async, [&] {
         return waiter.exec_sql_ok("update si_first_wait_abort set val = val + 1 where id = 1;");
     });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
                                     [&] {
                                         owner.exec_sql_ok("abort;");
                                         waiter_result.wait_for(std::chrono::seconds(2));
@@ -778,7 +762,6 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerAbortContinuesWit
     const std::string final_state = verifier.exec_sql("select val from si_first_wait_abort where id = 1;");
     EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
     EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
-    EXPECT_EQ(db.lock()->record_lock_observability().immediate_conflict, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerCommitStillAbortsStaleWriter) {
@@ -798,7 +781,7 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerCommitStillAborts
         return TestSession::trim_output(
             waiter.exec_sql_expect_abort("update si_first_wait_commit set val = val + 1 where id = 1;"));
     });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
                                     [&] {
                                         owner.exec_sql_ok("abort;");
                                         waiter_result.wait_for(std::chrono::seconds(2));
@@ -810,7 +793,6 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerCommitStillAborts
     const std::string final_state = verifier.exec_sql("select val from si_first_wait_commit where id = 1;");
     EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
     EXPECT_EQ(final_state.find("|              201 |"), std::string::npos);
-    EXPECT_EQ(db.lock()->record_lock_observability().immediate_conflict, 0u);
 }
 
 TEST(SnapshotIsolationConcurrencyTest, SiHeldUnrelatedLockWaitsThenOwnerAbortUsesSnapshotValue) {
@@ -831,7 +813,7 @@ TEST(SnapshotIsolationConcurrencyTest, SiHeldUnrelatedLockWaitsThenOwnerAbortUse
     auto waiter_result = std::async(std::launch::async, [&] {
         return waiter.exec_sql_ok("update si_held_lock_wait_abort set val = val + 1 where id = 1;");
     });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
                                     [&] {
                                         owner.exec_sql_ok("abort;");
                                         waiter_result.wait_for(std::chrono::seconds(2));
@@ -880,7 +862,7 @@ TEST(SnapshotIsolationConcurrencyTest, AbortWaitsForCompletedHandoffPrepareWrite
             waiter_saw_abort.store(error.GetAbortReason() == AbortReason::LOCK_CANCELLED);
         }
     });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
                                     [&] {
                                         owner.exec_sql_ok("abort;");
                                         waiter_result.wait_for(std::chrono::seconds(2));
@@ -954,7 +936,7 @@ TEST(SnapshotIsolationConcurrencyTest, SerializableOwnerAbortRemovesSsiStateBefo
     auto waiter_result = std::async(std::launch::async, [&] {
         return waiter.exec_sql_ok("update serializable_abort_handoff set val = val + 1 where id = 1;");
     });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
                                     [&] {
                                         owner.exec_sql_ok("abort;");
                                         waiter_result.wait_for(std::chrono::seconds(2));

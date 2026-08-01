@@ -11,34 +11,13 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_index_handle.h"
 
+#include "minilog.h"
+
 #include <algorithm>
 #include <array>
 #include <functional>
 
 #include "ix_scan.h"
-#include "minilog.h"
-
-namespace {
-
-std::atomic<uint64_t> g_smo_publish_count{0};
-std::atomic<uint64_t> g_smo_page_image_count{0};
-
-// One line roughly every few seconds of TPC-C, so the SMO rate and the pages
-// per SMO can be read straight out of the server log after a benchmark run
-// without adding anything to the per-row path.
-constexpr uint64_t kSmoLogInterval = 4096;
-
-// Opt-in, and emitted at WARN because the server runs at WARN outside recovery
-// (rmdb.cpp sets the level) - an INFO line here is simply discarded.
-bool SmoStatsLoggingEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("RMDB_LOG_INDEX_SMO_STATS");
-        return value != nullptr && std::string(value) == "1";
-    }();
-    return enabled;
-}
-
-} // namespace
 
 std::atomic<IxIndexHandle::InsertSplitFault> IxIndexHandle::insert_split_fault_{InsertSplitFault::None};
 std::mutex IxIndexHandle::insert_split_test_hook_latch_;
@@ -67,14 +46,6 @@ void IxIndexHandle::run_insert_split_test_hook(InsertSplitStage stage, PageId pa
     }
 }
 
-uint64_t IxIndexHandle::smo_publish_count() {
-    return g_smo_publish_count.load(std::memory_order_relaxed);
-}
-
-uint64_t IxIndexHandle::smo_page_image_count() {
-    return g_smo_page_image_count.load(std::memory_order_relaxed);
-}
-
 // Capture the complete after-image under the index structure latch. Runtime
 // mutations append a redo-only INDEX_SMO record and attach its LSN to every
 // dirty page and the index header before releasing the buffer pool's per-file
@@ -94,16 +65,6 @@ void IxIndexHandle::publish_smo_pages_impl(bool* wal_barrier_released) const {
             smo_flush_batch_.push_back(PageId{fd_, page_no});
         }
     }
-    const auto observe_publication = [this](uint64_t page_images) {
-        const uint64_t published = g_smo_publish_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        g_smo_page_image_count.fetch_add(page_images, std::memory_order_relaxed);
-        if (published % kSmoLogInterval == 0 && SmoStatsLoggingEnabled()) {
-            LOG_WARN("index SMO protection stats: %lu operations, %lu page images",
-                     static_cast<unsigned long>(published), static_cast<unsigned long>(smo_page_image_count()));
-            minilog::Logger::get().flush();
-        }
-    };
-
     if (wal_barrier_released != nullptr) {
         IndexSmoWalData data;
         data.index_file_name = disk_manager_->get_file_name(fd_);
@@ -137,7 +98,6 @@ void IxIndexHandle::publish_smo_pages_impl(bool* wal_barrier_released) const {
         header_dependency_.merge(dependency);
         buffer_pool_manager_->end_index_smo(fd_);
         *wal_barrier_released = true;
-        observe_publication(data.pages.size());
         return;
     }
 
@@ -146,7 +106,6 @@ void IxIndexHandle::publish_smo_pages_impl(bool* wal_barrier_released) const {
         throw InternalError("index SMO page publication failed");
     }
     write_index_header_page();
-    observe_publication(flushed.pages_written);
 }
 
 void IxIndexHandle::write_index_header_page() const {

@@ -259,13 +259,11 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
     auto candidates = sm_manager->get_deleted_tuple_candidates(tab_name, inserted_rec);
     for (const auto& candidate : candidates) {
         if (!fh->is_record(candidate.rid)) {
-            sm_manager->note_deleted_tuple_candidate_validated(1);
             sm_manager->remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
             continue;
         }
 
         TupleMeta meta = fh->get_tuple_meta(candidate.rid);
-        sm_manager->note_deleted_tuple_candidate_validated(2);
         // candidate_id + delete version identity makes this cleanup ABA-safe:
         // a reused RID or a later delete cannot be removed by an old lookup.
         if (!meta.is_deleted_ || meta.writer_txn_id_ != candidate.writer_txn_id ||
@@ -283,7 +281,6 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
         }
 
         auto deleted_rec = fh->get_record(candidate.rid, context);
-        sm_manager->note_deleted_tuple_candidate_page_probe();
         if (deleted_rec != nullptr && RecordDataEquals(*deleted_rec, inserted_rec)) {
             return true;
         }

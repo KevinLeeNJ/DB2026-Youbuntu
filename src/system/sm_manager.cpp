@@ -419,9 +419,6 @@ void SmManager::prune_version_history(timestamp_t watermark) {
             deleted_snapshot.push_back(std::move(deleted_tuple_retire_queue_.front()));
             deleted_tuple_retire_queue_.pop_front();
         }
-        if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-            deleted_tuple_candidate_retire_pops_.fetch_add(count, std::memory_order_relaxed);
-        }
     }
 
     std::vector<bool> deleted_requeue(deleted_snapshot.size(), false);
@@ -493,16 +490,11 @@ void SmManager::prune_version_history(timestamp_t watermark) {
                     });
                 if (still_current) {
                     deleted_tuple_retire_queue_.push_back(retired);
-                    if (deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-                        deleted_tuple_candidate_retire_requeues_.fetch_add(1, std::memory_order_relaxed);
-                    }
                 }
-            } else if (erase_deleted_tuple_candidate_locked(retired.tab_name, retired.row_key, retired.candidate) &&
-                       deleted_tuple_candidate_diagnostics_enabled_.load(std::memory_order_relaxed)) {
-                deleted_tuple_candidate_retire_prunes_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                erase_deleted_tuple_candidate_locked(retired.tab_name, retired.row_key, retired.candidate);
             }
         }
-        update_deleted_tuple_retire_max_locked();
     }
 }
 
@@ -689,12 +681,6 @@ void SmManager::clear_table_runtime_history(const std::string& tab_name) {
         std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
         auto table_it = deleted_tuple_candidates_.find(tab_name);
         if (table_it != deleted_tuple_candidates_.end()) {
-            uint64_t removed_candidates = 0;
-            for (const auto& [_, candidates] : table_it->second) {
-                removed_candidates += candidates.size();
-            }
-            deleted_tuple_candidate_active_.fetch_sub(removed_candidates, std::memory_order_relaxed);
-            deleted_tuple_candidate_active_buckets_.fetch_sub(table_it->second.size(), std::memory_order_relaxed);
             deleted_tuple_candidates_.erase(table_it);
         }
         deleted_tuple_retire_queue_.erase(std::remove_if(deleted_tuple_retire_queue_.begin(),

@@ -13,7 +13,6 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_LOG="$ROOT_DIR/benchmark/tpcc/rmdb-server.log"
-OBSERVABILITY_LOG="$ROOT_DIR/rmdb.log"
 
 BINARY="$ROOT_DIR/build/bin/rmdb"
 DB_DIR="tpcc_benchmark_db"
@@ -220,24 +219,6 @@ wait_port() {
     assert_port_owned_by_server "$SERVER_PID"
 }
 
-# SIGUSR1 is handled asynchronously by rmdb. Wait for the server to emit the
-# complete counter set so the two snapshots bound only the workload interval.
-capture_observability() {
-    local label="$1" previous count attempt
-    previous="$(awk '/obs_abort / { count++ } END { print count + 0 }' "$OBSERVABILITY_LOG")"
-    kill -USR1 "$SERVER_PID"
-    for ((attempt = 0; attempt < 50; ++attempt)); do
-        count="$(awk '/obs_abort / { count++ } END { print count + 0 }' "$OBSERVABILITY_LOG")"
-        if (( count > previous )); then
-            echo "[benchmark] captured ${label} server observability snapshot"
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "[benchmark] timed out waiting for ${label} server observability snapshot" >&2
-    return 1
-}
-
 GO_RECONNECT_ARGS=()
 if [[ "$RECONNECT_EACH_TXN" == "1" ]]; then
     GO_RECONNECT_ARGS=(--reconnect-each-txn)
@@ -275,14 +256,12 @@ if (( load_elapsed > LOAD_SQL_BUDGET_SECONDS )); then
     echo "[benchmark] load stage exceeded the official ${LOAD_SQL_BUDGET_SECONDS}s SQL budget: ${load_elapsed}s" >&2
     exit 1
 fi
-capture_observability "pre-workload"
 "$GO_BINARY" --mode official-equivalent --port "$PORT" --isolation "$ISOLATION" \
     --workers "$WORKERS" --warmup "$WARMUP" --measure "$MEASURE" --rounds "$ROUNDS" \
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
     --think "${THINK_MS}ms" --data-dir "$DATA_DIR" --json-out "$JSON_OUT" \
     --max-conflict-retries "$MAX_CONFLICT_RETRIES" \
     "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
-capture_observability "post-workload"
 "$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --progress-interval "$PROGRESS_INTERVAL" \

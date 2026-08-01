@@ -155,10 +155,6 @@ TEST_F(BufferPoolManagerTest, FailedDirtyEvictionRetainsOriginalPage) {
     PageId missing_page{fd_, 99};
     EXPECT_EQ(bpm->fetch_page(missing_page), nullptr);
     EXPECT_TRUE(bpm->is_page_resident(old_page_id));
-    const auto stats = bpm->observability_snapshot();
-    EXPECT_EQ(stats.fetch_miss, 1u);
-    EXPECT_EQ(stats.eviction_dirty, 1u);
-
     Page* retained_page = bpm->fetch_page(old_page_id);
     ASSERT_NE(retained_page, nullptr);
     EXPECT_EQ(std::memcmp(retained_page->get_data(), "dirty-page", 11), 0);
@@ -371,10 +367,6 @@ TEST_F(BufferPoolManagerTest, ReplacerFallbackAndExhaustionRemainUnchanged) {
     PageId exhausted_page{fd_, INVALID_PAGE_ID};
     EXPECT_EQ(bpm->new_page(&exhausted_page), nullptr);
     EXPECT_EQ(bpm->fetch_page(first_page), nullptr);
-    const auto stats = bpm->observability_snapshot();
-    EXPECT_GE(stats.eviction_clean, 1u);
-    EXPECT_GE(stats.no_victim, 2u);
-    EXPECT_GE(stats.fetch_miss, 1u);
 }
 
 TEST_F(BufferPoolManagerTest, PageTableReserveAndLoadFactorAvoidPoolSizedRehash) {

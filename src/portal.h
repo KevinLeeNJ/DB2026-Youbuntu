@@ -664,8 +664,7 @@ private:
     }
 
     std::unique_ptr<AbstractExecutor> make_prepared_scan_executor(const PreparedScanExecutable& scan,
-                                                                  const ParameterFrame& parameters, Context* context,
-                                                                  std::uint64_t* executor_constructed) {
+                                                                  const ParameterFrame& parameters, Context* context) {
         auto conditions = bind_prepared_conditions(scan.conditions, parameters);
         std::unique_ptr<AbstractExecutor> executor;
         if (!scan.uses_index) {
@@ -677,26 +676,22 @@ private:
                 scan.index_name, std::move(conditions), context,
                 scan.scan_backward ? ScanDirection::Backward : ScanDirection::Forward);
         }
-        return record_executor_construction(std::move(executor), executor_constructed);
+        return executor;
     }
 
     std::unique_ptr<AbstractExecutor> make_prepared_select_executor(const PreparedSelectExecutable& executable,
-                                                                    const ParameterFrame& parameters, Context* context,
-                                                                    std::uint64_t* executor_constructed) {
-        auto root = make_prepared_scan_executor(executable.scan, parameters, context, executor_constructed);
+                                                                    const ParameterFrame& parameters,
+                                                                    Context* context) {
+        auto root = make_prepared_scan_executor(executable.scan, parameters, context);
         for (const auto& layer : executable.layers) {
             switch (layer.kind) {
             case PreparedSelectLayerKind::Filter:
-                root = record_executor_construction(
-                    std::make_unique<FilterExecutor>(std::move(root),
-                                                     bind_prepared_conditions(layer.conditions, parameters)),
-                    executor_constructed);
+                root = std::make_unique<FilterExecutor>(std::move(root),
+                                                        bind_prepared_conditions(layer.conditions, parameters));
                 break;
             case PreparedSelectLayerKind::Projection:
-                root = record_executor_construction(std::make_unique<ProjectionExecutor>(std::move(root),
-                                                                                         layer.projection_ordinals,
-                                                                                         layer.projection_names),
-                                                    executor_constructed);
+                root = std::make_unique<ProjectionExecutor>(std::move(root), layer.projection_ordinals,
+                                                            layer.projection_names);
                 break;
             case PreparedSelectLayerKind::Limit: {
                 int runtime_limit = layer.limit;
@@ -719,10 +714,8 @@ private:
                     runtime_limit > std::numeric_limits<int>::max() - runtime_offset) {
                     throw RMDBError("LIMIT plus OFFSET exceeds INT32 range");
                 }
-                root = record_executor_construction(
-                    std::make_unique<LimitExecutor>(std::move(root), static_cast<std::size_t>(runtime_limit),
-                                                    static_cast<std::size_t>(runtime_offset)),
-                    executor_constructed);
+                root = std::make_unique<LimitExecutor>(std::move(root), static_cast<std::size_t>(runtime_limit),
+                                                       static_cast<std::size_t>(runtime_offset));
                 break;
             }
             }
@@ -731,13 +724,11 @@ private:
     }
 
     std::unique_ptr<AbstractExecutor> convert_prepared_plan_executor(const Plan* plan, const ParameterFrame& parameters,
-                                                                     Context* context,
-                                                                     std::uint64_t* executor_constructed) {
+                                                                     Context* context) {
         switch (plan->tag) {
         case T_Projection: {
             const auto* projection = static_cast<const ProjectionPlan*>(plan);
-            auto child =
-                convert_prepared_plan_executor(projection->subplan_.get(), parameters, context, executor_constructed);
+            auto child = convert_prepared_plan_executor(projection->subplan_.get(), parameters, context);
             std::unique_ptr<AbstractExecutor> executor;
             if (projection->preserve_col_names_) {
                 std::vector<TabCol> columns;
@@ -751,14 +742,14 @@ private:
                     std::move(child),
                     to_executor_select_items(bind_prepared_select_items(projection->select_items_, parameters)));
             }
-            return record_executor_construction(std::move(executor), executor_constructed);
+            return executor;
         }
         case T_Filter: {
             const auto* filter = static_cast<const FilterPlan*>(plan);
             auto executor = std::make_unique<FilterExecutor>(
-                convert_prepared_plan_executor(filter->subplan_.get(), parameters, context, executor_constructed),
+                convert_prepared_plan_executor(filter->subplan_.get(), parameters, context),
                 bind_prepared_conditions(filter->conds_, parameters));
-            return record_executor_construction(std::move(executor), executor_constructed);
+            return executor;
         }
         case T_SeqScan:
         case T_IndexScan: {
@@ -773,7 +764,7 @@ private:
                     sm_manager_, scan->tab_name_, std::move(conditions), scan->index_col_names_, context,
                     scan->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
             }
-            return record_executor_construction(std::move(executor), executor_constructed);
+            return executor;
         }
         case T_Sort: {
             const auto* sort = static_cast<const SortPlan*>(plan);
@@ -782,9 +773,9 @@ private:
                 item.expr = bind_prepared_query_expr(item.expr, parameters);
             }
             auto executor = std::make_unique<SortExecutor>(
-                convert_prepared_plan_executor(sort->subplan_.get(), parameters, context, executor_constructed),
-                std::move(order_by), sort->limit_);
-            return record_executor_construction(std::move(executor), executor_constructed);
+                convert_prepared_plan_executor(sort->subplan_.get(), parameters, context), std::move(order_by),
+                sort->limit_);
+            return executor;
         }
         case T_Limit: {
             const auto* limit = static_cast<const LimitPlan*>(plan);
@@ -809,9 +800,9 @@ private:
                 throw RMDBError("LIMIT plus OFFSET exceeds INT32 range");
             }
             auto executor = std::make_unique<LimitExecutor>(
-                convert_prepared_plan_executor(limit->subplan_.get(), parameters, context, executor_constructed),
+                convert_prepared_plan_executor(limit->subplan_.get(), parameters, context),
                 static_cast<std::size_t>(runtime_limit), static_cast<std::size_t>(runtime_offset));
-            return record_executor_construction(std::move(executor), executor_constructed);
+            return executor;
         }
         default:
             throw InternalError("unsupported prepared plan shape");
@@ -1128,20 +1119,12 @@ private:
         }
     }
 
-    static std::unique_ptr<AbstractExecutor> record_executor_construction(std::unique_ptr<AbstractExecutor> executor,
-                                                                          std::uint64_t* constructed) {
-        if (constructed != nullptr && executor != nullptr) {
-            ++*constructed;
-        }
-        return executor;
-    }
-
     static std::unique_ptr<AbstractExecutor> maybe_count(std::unique_ptr<AbstractExecutor> executor, Plan* plan,
-                                                         bool count_rows, std::uint64_t* constructed) {
+                                                         bool count_rows) {
         if (!count_rows) {
             return executor;
         }
-        return record_executor_construction(std::make_unique<CountingExecutor>(std::move(executor), plan), constructed);
+        return std::make_unique<CountingExecutor>(std::move(executor), plan);
     }
 
 public:
@@ -1158,9 +1141,7 @@ public:
     }
 
     std::unique_ptr<PortalStmt> start_prepared(const PreparedPlanDescriptor& descriptor,
-                                               const ParameterFrame& parameters, Context* context,
-                                               std::uint64_t* executor_constructed = nullptr,
-                                               PreparedRuntimeStats* runtime_stats = nullptr) {
+                                               const ParameterFrame& parameters, Context* context) {
         if (!descriptor.eligible() || descriptor.dml_plan() == nullptr) {
             throw InternalError("prepared descriptor is not eligible for execution");
         }
@@ -1173,41 +1154,23 @@ public:
             if (const auto* executable = descriptor.select_executable();
                 executable != nullptr && executable->scan.sm_manager == sm_manager_ &&
                 sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
-                if (runtime_stats != nullptr) {
-                    ++runtime_stats->bound_executable_hits;
-                }
-                auto root = make_prepared_select_executor(*executable, parameters, context, executor_constructed);
+                auto root = make_prepared_select_executor(*executable, parameters, context);
                 return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, descriptor.output_names(), std::move(root));
             }
-            if (runtime_stats != nullptr) {
-                ++runtime_stats->plan_nodes_visited;
-                ++runtime_stats->catalog_metadata_lookups;
-            }
-            auto root = convert_prepared_plan_executor(dml->subplan_.get(), parameters, context, executor_constructed);
+            auto root = convert_prepared_plan_executor(dml->subplan_.get(), parameters, context);
             return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, descriptor.output_names(), std::move(root));
         }
         case PreparedStatementKind::Insert: {
             if (const auto* executable = descriptor.insert_executable();
                 executable != nullptr && executable->sm_manager == sm_manager_ &&
                 sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
-                if (runtime_stats != nullptr) {
-                    ++runtime_stats->bound_executable_hits;
-                }
-                auto root = record_executor_construction(
-                    std::make_unique<InsertExecutor>(*executable, bind_prepared_insert_values(*executable, parameters),
-                                                     context),
-                    executor_constructed);
+                auto root = std::make_unique<InsertExecutor>(
+                    *executable, bind_prepared_insert_values(*executable, parameters), context);
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
                                                     std::move(root));
             }
-            if (runtime_stats != nullptr) {
-                ++runtime_stats->plan_nodes_visited;
-                ++runtime_stats->catalog_metadata_lookups;
-            }
-            auto root = record_executor_construction(
-                std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_,
-                                                 bind_prepared_insert_values(*dml, parameters), context),
-                executor_constructed);
+            auto root = std::make_unique<InsertExecutor>(sm_manager_, dml->tab_name_,
+                                                         bind_prepared_insert_values(*dml, parameters), context);
             return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{}, std::move(root));
         }
         case PreparedStatementKind::Update: {
@@ -1215,74 +1178,37 @@ public:
                 executable != nullptr && executable->scan.sm_manager == sm_manager_ &&
                 descriptor.database_identity() == sm_manager_->get_database_identity_under_catalog_guard() &&
                 sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
-                if (runtime_stats != nullptr) {
-                    ++runtime_stats->bound_executable_hits;
-                }
                 auto conditions = bind_prepared_conditions(executable->conditions, parameters);
                 const auto point = resolve_prepared_point_update(*executable, conditions, context);
                 if (point.kind != PreparedPointUpdateResolutionKind::Fallback) {
-                    if (runtime_stats != nullptr) {
-                        if (point.kind == PreparedPointUpdateResolutionKind::Visible) {
-                            ++runtime_stats->point_update_hits;
-                        } else {
-                            if (point.kind == PreparedPointUpdateResolutionKind::NoCandidate) {
-                                ++runtime_stats->point_update_no_candidates;
-                            } else {
-                                ++runtime_stats->point_update_no_visible;
-                            }
-                        }
-                        if (executable->point_update->lock_only) {
-                            if (point.kind == PreparedPointUpdateResolutionKind::Visible) {
-                                ++runtime_stats->lock_only_update_hits;
-                            } else {
-                                ++runtime_stats->lock_only_update_misses;
-                            }
-                        }
-                    }
-                    auto root = record_executor_construction(
-                        std::make_unique<UpdateExecutor>(
-                            *executable, bind_prepared_set_clauses(executable->set_clauses, parameters),
-                            std::move(conditions), PointMutationTarget{point.rid}, context),
-                        executor_constructed);
+                    auto root = std::make_unique<UpdateExecutor>(
+                        *executable, bind_prepared_set_clauses(executable->set_clauses, parameters),
+                        std::move(conditions), PointMutationTarget{point.rid}, context);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
                                                         std::move(root));
                 }
-                if (runtime_stats != nullptr && executable->point_update.has_value()) {
-                    ++runtime_stats->point_update_fallbacks;
-                    if (executable->point_update->lock_only) {
-                        ++runtime_stats->lock_only_update_fallbacks;
-                    }
-                }
-                auto scan = make_prepared_scan_executor(executable->scan, parameters, context, executor_constructed);
+                auto scan = make_prepared_scan_executor(executable->scan, parameters, context);
                 std::vector<Rid> rids;
                 for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                     rids.push_back(scan->rid());
                 }
-                auto root = record_executor_construction(
-                    std::make_unique<UpdateExecutor>(*executable,
-                                                     bind_prepared_set_clauses(executable->set_clauses, parameters),
-                                                     std::move(conditions), std::move(rids), context),
-                    executor_constructed);
+                auto root = std::make_unique<UpdateExecutor>(
+                    *executable, bind_prepared_set_clauses(executable->set_clauses, parameters), std::move(conditions),
+                    std::move(rids), context);
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
                                                     std::move(root));
             }
             if (dml->compiled_point_program_ != nullptr || dml->subplan_ == nullptr) {
                 throw InternalError("compiled point UPDATE is not eligible for prepared runtime");
             }
-            if (runtime_stats != nullptr) {
-                ++runtime_stats->plan_nodes_visited;
-                ++runtime_stats->catalog_metadata_lookups;
-            }
-            auto scan = convert_prepared_plan_executor(dml->subplan_.get(), parameters, context, executor_constructed);
+            auto scan = convert_prepared_plan_executor(dml->subplan_.get(), parameters, context);
             std::vector<Rid> rids;
             for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                 rids.push_back(scan->rid());
             }
-            auto root = record_executor_construction(
-                std::make_unique<UpdateExecutor>(
-                    sm_manager_, dml->tab_name_, bind_prepared_set_clauses(*dml, parameters),
-                    bind_prepared_conditions(dml->conds_, parameters), std::move(rids), context),
-                executor_constructed);
+            auto root = std::make_unique<UpdateExecutor>(
+                sm_manager_, dml->tab_name_, bind_prepared_set_clauses(*dml, parameters),
+                bind_prepared_conditions(dml->conds_, parameters), std::move(rids), context);
             return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{}, std::move(root));
         }
         case PreparedStatementKind::Unsupported:
@@ -1292,8 +1218,7 @@ public:
     }
 
     // 将查询执行计划转换成对应的算子树
-    std::unique_ptr<PortalStmt> start(std::unique_ptr<Plan> plan, Context* context,
-                                      std::uint64_t* executor_constructed = nullptr) {
+    std::unique_ptr<PortalStmt> start(std::unique_ptr<Plan> plan, Context* context) {
         // 这里可以将select进行拆分，例如：一个select，带有return的select等
         switch (plan->tag) {
         case T_Help:
@@ -1326,16 +1251,14 @@ public:
             auto* x = static_cast<DMLPlan*>(plan.get());
             switch (x->tag) {
             case T_select: {
-                std::unique_ptr<AbstractExecutor> root =
-                    convert_plan_executor(x->subplan_.get(), context, false, executor_constructed);
+                std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_.get(), context);
                 std::vector<std::string> output_names = get_plan_output_names(x->subplan_.get());
                 return std::make_unique<PortalStmt>(PORTAL_ONE_SELECT, std::move(output_names), std::move(root),
                                                     std::move(plan));
             }
             case T_ExplainAnalyze: {
                 reset_runtime_rows(x->subplan_.get());
-                std::unique_ptr<AbstractExecutor> root =
-                    convert_plan_executor(x->subplan_.get(), context, true, executor_constructed);
+                std::unique_ptr<AbstractExecutor> root = convert_plan_executor(x->subplan_.get(), context, true);
                 return std::make_unique<PortalStmt>(PORTAL_EXPLAIN_ANALYZE, std::vector<std::string>(), std::move(root),
                                                     std::move(plan));
             }
@@ -1345,10 +1268,9 @@ public:
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = resolve_point_rid(*x, context);
                 if (point_rid.has_value()) {
-                    std::unique_ptr<AbstractExecutor> root = record_executor_construction(
+                    std::unique_ptr<AbstractExecutor> root =
                         std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_,
-                                                         PointMutationTarget{*point_rid}, context, true),
-                        executor_constructed);
+                                                         PointMutationTarget{*point_rid}, context, true);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                         std::move(root), std::move(plan));
                 }
@@ -1358,17 +1280,15 @@ public:
                     // falls back to the original scan semantics.
                     auto fallback_plan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
                                                                     x->compiled_point_program_->index_col_names);
-                    scan = convert_plan_executor(fallback_plan.get(), context, false, executor_constructed);
+                    scan = convert_plan_executor(fallback_plan.get(), context);
                 } else {
-                    scan = convert_plan_executor(x->subplan_.get(), context, false, executor_constructed);
+                    scan = convert_plan_executor(x->subplan_.get(), context);
                 }
                 for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                     rids.push_back(scan->rid());
                 }
-                std::unique_ptr<AbstractExecutor> root = record_executor_construction(
-                    std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids,
-                                                     context),
-                    executor_constructed);
+                std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
+                    sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
@@ -1377,10 +1297,8 @@ public:
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = resolve_point_rid(*x, context);
                 if (point_rid.has_value()) {
-                    std::unique_ptr<AbstractExecutor> root = record_executor_construction(
-                        std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_,
-                                                         PointMutationTarget{*point_rid}, context, true),
-                        executor_constructed);
+                    std::unique_ptr<AbstractExecutor> root = std::make_unique<DeleteExecutor>(
+                        sm_manager_, x->tab_name_, x->conds_, PointMutationTarget{*point_rid}, context, true);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                         std::move(root), std::move(plan));
                 }
@@ -1388,26 +1306,24 @@ public:
                 if (compiled_program) {
                     auto fallback_plan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_, x->tab_name_, x->conds_,
                                                                     x->compiled_point_program_->index_col_names);
-                    scan = convert_plan_executor(fallback_plan.get(), context, false, executor_constructed);
+                    scan = convert_plan_executor(fallback_plan.get(), context);
                 } else {
-                    scan = convert_plan_executor(x->subplan_.get(), context, false, executor_constructed);
+                    scan = convert_plan_executor(x->subplan_.get(), context);
                 }
                 for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                     rids.push_back(scan->rid());
                 }
 
-                std::unique_ptr<AbstractExecutor> root = record_executor_construction(
-                    std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context),
-                    executor_constructed);
+                std::unique_ptr<AbstractExecutor> root =
+                    std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
 
             case T_Insert: {
-                std::unique_ptr<AbstractExecutor> root = record_executor_construction(
-                    std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context),
-                    executor_constructed);
+                std::unique_ptr<AbstractExecutor> root =
+                    std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
@@ -1464,13 +1380,11 @@ public:
     // 清空资源
     void drop() {}
 
-    std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false,
-                                                            std::uint64_t* executor_constructed = nullptr) {
+    std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false) {
         switch (plan->tag) {
         case T_Projection: {
             auto x = static_cast<ProjectionPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> subplan =
-                convert_plan_executor(x->subplan_.get(), context, count_rows, executor_constructed);
+            std::unique_ptr<AbstractExecutor> subplan = convert_plan_executor(x->subplan_.get(), context, count_rows);
             std::unique_ptr<AbstractExecutor> executor;
             if (x->preserve_col_names_) {
                 std::vector<TabCol> cols;
@@ -1483,24 +1397,21 @@ public:
                 auto select_items = to_executor_select_items(x->select_items_);
                 executor = std::make_unique<ProjectionExecutor>(std::move(subplan), select_items);
             }
-            executor = record_executor_construction(std::move(executor), executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Filter: {
             auto x = static_cast<FilterPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<FilterExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows, executor_constructed), x->conds_);
-            executor = record_executor_construction(std::move(executor), executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+                convert_plan_executor(x->subplan_.get(), context, count_rows), x->conds_);
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Aggregate: {
             auto x = static_cast<AggregatePlan*>(plan);
             auto having_conds = to_executor_having_conds(x->having_conds_);
-            std::unique_ptr<AbstractExecutor> executor = std::make_unique<AggregateExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows, executor_constructed), x->group_by_cols_,
-                x->agg_exprs_, having_conds, context);
-            executor = record_executor_construction(std::move(executor), executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+            std::unique_ptr<AbstractExecutor> executor =
+                std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
+                                                    x->group_by_cols_, x->agg_exprs_, having_conds, context);
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_SeqScan:
         case T_IndexSkipScan:
@@ -1517,47 +1428,39 @@ public:
                     sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context,
                     x->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
             }
-            executor = record_executor_construction(std::move(executor), executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_NestLoop: {
             auto x = static_cast<JoinPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> left =
-                convert_plan_executor(x->left_.get(), context, count_rows, executor_constructed);
-            std::unique_ptr<AbstractExecutor> right =
-                convert_plan_executor(x->right_.get(), context, count_rows, executor_constructed);
+            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_.get(), context, count_rows);
+            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_.get(), context, count_rows);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                 std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
                 x->inlj_index_col_name_);
-            join = record_executor_construction(std::move(join), executor_constructed);
-            return maybe_count(std::move(join), plan, count_rows, executor_constructed);
+            return maybe_count(std::move(join), plan, count_rows);
         }
         case T_Sort: {
             auto x = static_cast<SortPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<SortExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows, executor_constructed),
-                bind_sort_output_names(*x), x->limit_);
-            executor = record_executor_construction(std::move(executor), executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+                convert_plan_executor(x->subplan_.get(), context, count_rows), bind_sort_output_names(*x), x->limit_);
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Limit: {
             auto x = static_cast<LimitPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> executor = std::make_unique<LimitExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows, executor_constructed),
-                static_cast<size_t>(x->limit_), static_cast<size_t>(x->offset_));
-            executor = record_executor_construction(std::move(executor), executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+            std::unique_ptr<AbstractExecutor> executor =
+                std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
+                                                static_cast<size_t>(x->limit_), static_cast<size_t>(x->offset_));
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Union: {
             auto x = static_cast<UnionPlan*>(plan);
             std::vector<std::unique_ptr<AbstractExecutor>> branches;
             branches.reserve(x->branches_.size());
             for (const auto& branch_plan : x->branches_) {
-                branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows, executor_constructed));
+                branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows));
             }
-            auto executor = record_executor_construction(std::make_unique<UnionExecutor>(std::move(branches), x->cols_),
-                                                         executor_constructed);
-            return maybe_count(std::move(executor), plan, count_rows, executor_constructed);
+            auto executor = std::make_unique<UnionExecutor>(std::move(branches), x->cols_);
+            return maybe_count(std::move(executor), plan, count_rows);
         }
         default:
             break;

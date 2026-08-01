@@ -193,11 +193,6 @@ TEST(CheckpointDrainTest, CheckpointBlockWinsAdmissionRaceAndTimeoutUnblocksBegi
     ASSERT_EQ(checkpoint_result.wait_for(std::chrono::seconds(15)), std::future_status::ready)
         << "RunCleanCheckpoint never returned";
     EXPECT_FALSE(checkpoint_result.get()) << "checkpoint should abandon the round when the drain times out";
-    const auto stats = txn_mgr.checkpoint_observability();
-    EXPECT_EQ(stats.attempt, 1u);
-    EXPECT_EQ(stats.drain_timeout, 1u);
-    EXPECT_GT(stats.drain_ns, 0u);
-    EXPECT_GT(stats.block_ns, 0u);
 
     txn_mgr.abort(probe_txn, &db.log_mgr_);
     txn_mgr.abort(idle_txn, &db.log_mgr_);
@@ -260,10 +255,6 @@ TEST(CheckpointDrainTest, BeginWinsAdmissionRaceAndCheckpointDrainsUntilRetire) 
     txn_mgr.abort(active_txn, &db.log_mgr_);
     ASSERT_EQ(checkpoint_result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     EXPECT_TRUE(checkpoint_result.get());
-    const auto stats = txn_mgr.checkpoint_observability();
-    EXPECT_EQ(stats.attempt, 1u);
-    EXPECT_EQ(stats.drain_timeout, 0u);
-    EXPECT_EQ(stats.success, 1u);
 }
 
 // If a checkpoint stage throws after BlockGuard has closed admission, stack
@@ -297,9 +288,6 @@ TEST(CheckpointDrainTest, ExceptionDuringDrainUnblocksAdmission) {
     txn_mgr.abort(txn, &db.log_mgr_);
 
     EXPECT_TRUE(checkpoint_mgr.RunCleanCheckpoint()) << "exception left the global checkpoint running guard set";
-    const auto stats = txn_mgr.checkpoint_observability();
-    EXPECT_EQ(stats.attempt, 2u);
-    EXPECT_EQ(stats.success, 1u);
 }
 
 // The abandoned round must leave no residual blocking: once the stuck
@@ -320,12 +308,6 @@ TEST(CheckpointDrainTest, CheckpointSucceedsAfterBlockedRoundIsAbandoned) {
     // not be gated by the automatic retry backoff.
     EXPECT_TRUE(checkpoint_mgr.RunCleanCheckpoint());
     EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
-    const auto stats = txn_mgr.checkpoint_observability();
-    EXPECT_EQ(stats.attempt, 2u);
-    EXPECT_EQ(stats.drain_timeout, 1u);
-    EXPECT_EQ(stats.success, 1u);
-    EXPECT_GT(stats.final_wal_ns, 0u);
-    EXPECT_GT(stats.final_data_ns, 0u);
 }
 
 TEST(CheckpointScheduleTest, TickPreflushesBeforeTargetAndCheckpointsAtResidue) {
@@ -346,16 +328,12 @@ TEST(CheckpointScheduleTest, TickPreflushesBeforeTargetAndCheckpointsAtResidue) 
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_FALSE(IsDirty(&db.bpm_, dirty_page));
-    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
     EXPECT_EQ(db.log_mgr_.current_log_offset(), below_target);
 
     ASSERT_GT(AppendBegin(&db.log_mgr_, 201), options.auto_checkpoint_bytes);
     EXPECT_TRUE(checkpoint_mgr.Tick());
     EXPECT_FALSE(IsDirty(&db.bpm_, dirty_page));
     EXPECT_EQ(db.log_mgr_.current_log_offset(), 0);
-    const auto stats = txn_mgr.checkpoint_observability();
-    EXPECT_EQ(stats.attempt, 1u);
-    EXPECT_EQ(stats.success, 1u);
 }
 
 TEST(CheckpointScheduleTest, TickPreflushDoesNotFlushDirtyIndexPages) {
@@ -383,7 +361,6 @@ TEST(CheckpointScheduleTest, TickPreflushDoesNotFlushDirtyIndexPages) {
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_FALSE(IsDirty(&db.bpm_, table_page));
     EXPECT_TRUE(IsDirty(&db.bpm_, index_root));
-    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
 }
 
 TEST(CheckpointScheduleTest, TickUsesQuadraticPreflushBatch) {
@@ -409,7 +386,6 @@ TEST(CheckpointScheduleTest, TickUsesQuadraticPreflushBatch) {
     ASSERT_LT(expected_batch, kDirtyPages);
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - expected_batch);
-    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
 }
 
 TEST(CheckpointScheduleTest, TickLeavesPagesDirtyBelowSoftWatermark) {
@@ -426,7 +402,6 @@ TEST(CheckpointScheduleTest, TickLeavesPagesDirtyBelowSoftWatermark) {
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 1u);
-    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
 }
 
 TEST(CheckpointScheduleTest, TickDoesNotPreflushAtZeroForOneByteTarget) {
@@ -442,7 +417,6 @@ TEST(CheckpointScheduleTest, TickDoesNotPreflushAtZeroForOneByteTarget) {
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 1u);
-    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
 }
 
 TEST(CheckpointScheduleTest, TickUsesStrictTwoPercentResidueBoundary) {
@@ -463,7 +437,6 @@ TEST(CheckpointScheduleTest, TickUsesStrictTwoPercentResidueBoundary) {
         checkpoint_mgr.SetOptions(options);
 
         EXPECT_TRUE(checkpoint_mgr.Tick());
-        EXPECT_EQ(txn_mgr.checkpoint_observability().success, 1u);
     }
     {
         DrainTestDb db("checkpoint_strict_residue_over_limit_db", false, kPoolFrames);
@@ -477,7 +450,6 @@ TEST(CheckpointScheduleTest, TickUsesStrictTwoPercentResidueBoundary) {
 
         EXPECT_FALSE(checkpoint_mgr.Tick());
         EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, residue_limit + 1);
-        EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
     }
 }
 
@@ -498,10 +470,8 @@ TEST(CheckpointScheduleTest, TickForcesCheckpointAtHardWatermark) {
     // still above the actual pool's 2% gate, so the blocking checkpoint waits.
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_GT(db.sm_mgr_.table_dirty_page_stats().dirty_pages, DirtyResidueLimit(db));
-    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
     ASSERT_GT(AppendBegin(&db.log_mgr_, 361), target + target / 10);
     EXPECT_TRUE(checkpoint_mgr.Tick());
-    EXPECT_EQ(txn_mgr.checkpoint_observability().success, 1u);
 }
 
 TEST(CheckpointScheduleTest, ExplicitCleanWaitsForInFlightPreflush) {

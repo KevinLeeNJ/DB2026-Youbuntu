@@ -207,15 +207,13 @@ TEST_F(PortalAggregateTest, start_builds_limit_sort_projection_aggregate_executo
     auto full_plan = std::make_unique<DMLPlan>(T_select, std::move(subplan), std::string(), std::vector<Value>{},
                                                std::vector<Condition>{}, std::vector<SetClause>{});
 
-    std::uint64_t executor_constructed = 0;
-    auto stmt = portal_->start(std::move(full_plan), &context, &executor_constructed);
+    auto stmt = portal_->start(std::move(full_plan), &context);
 
     ASSERT_NE(stmt, nullptr);
     EXPECT_EQ(stmt->tag, PORTAL_ONE_SELECT);
     EXPECT_EQ(stmt->output_names, (std::vector<std::string>{"id", "max_score"}));
     ASSERT_NE(stmt->root, nullptr);
     EXPECT_EQ(stmt->root->getType(), "LimitExecutor");
-    EXPECT_EQ(executor_constructed, 5u);
 
     auto* limit = dynamic_cast<LimitExecutor*>(stmt->root.get());
     ASSERT_NE(limit, nullptr);
@@ -274,11 +272,9 @@ TEST_F(PortalAggregateTest, prepared_select_binds_request_local_conditions_and_l
     char buffer[256];
     int offset = 0;
     Context context(nullptr, nullptr, nullptr, buffer, &offset);
-    std::uint64_t executor_constructed = 0;
-    auto statement = portal_->start_prepared(*descriptor, parameters, &context, &executor_constructed);
+    auto statement = portal_->start_prepared(*descriptor, parameters, &context);
 
     ASSERT_NE(statement, nullptr);
-    EXPECT_EQ(executor_constructed, 3u);
     auto* runtime_limit_executor = dynamic_cast<LimitExecutor*>(statement->root.get());
     ASSERT_NE(runtime_limit_executor, nullptr);
     EXPECT_EQ(runtime_limit_executor->limit_, 5u);
@@ -359,16 +355,10 @@ TEST_F(PortalAggregateTest, prepared_insert_uses_bound_metadata_without_visiting
     int offset = 0;
     Transaction* transaction = transaction_manager_->begin(nullptr, log_manager_.get(), IsolationLevel::READ_COMMITTED);
     Context context(lock_manager_.get(), log_manager_.get(), transaction, buffer, &offset, transaction_manager_.get());
-    std::uint64_t executor_constructed = 0;
-    PreparedRuntimeStats runtime_stats;
-    auto statement = portal_->start_prepared(*descriptor, parameters, &context, &executor_constructed, &runtime_stats);
+    auto statement = portal_->start_prepared(*descriptor, parameters, &context);
 
     ASSERT_NE(statement, nullptr);
     EXPECT_EQ(statement->tag, PORTAL_DML_WITHOUT_SELECT);
-    EXPECT_EQ(executor_constructed, 1u);
-    EXPECT_EQ(runtime_stats.bound_executable_hits, 1u);
-    EXPECT_EQ(runtime_stats.plan_nodes_visited, 0u);
-    EXPECT_EQ(runtime_stats.catalog_metadata_lookups, 0u);
     auto* insert = dynamic_cast<InsertExecutor*>(statement->root.get());
     ASSERT_NE(insert, nullptr);
     EXPECT_EQ(insert->tab_, executable->table);
@@ -489,13 +479,7 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
         char buffer[256]{};
         int offset = 0;
         Context context(nullptr, nullptr, nullptr, buffer, &offset);
-        PreparedRuntimeStats stats;
-        std::uint64_t constructed = 0;
-        auto statement = portal_->start_prepared(*descriptor, parameters, &context, &constructed, &stats);
-        EXPECT_EQ(stats.bound_executable_hits, 1U);
-        EXPECT_EQ(stats.plan_nodes_visited, 0U);
-        EXPECT_EQ(stats.catalog_metadata_lookups, 0U);
-        EXPECT_EQ(constructed, 2U);
+        auto statement = portal_->start_prepared(*descriptor, parameters, &context);
 
         std::vector<int> ids;
         for (statement->root->beginTuple(); !statement->root->is_end(); statement->root->nextTuple()) {
@@ -630,15 +614,7 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     null_value.type = TYPE_STRING;
     null_value.set_null();
     ParameterFrame parameters({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value});
-    PreparedRuntimeStats stats;
-    std::uint64_t constructed = 0;
-    auto statement = portal_->start_prepared(*descriptor, parameters, &context, &constructed, &stats);
-    ASSERT_EQ(stats.bound_executable_hits, 1U);
-    EXPECT_EQ(stats.point_update_hits, 1U);
-    EXPECT_EQ(stats.point_update_fallbacks, 0U);
-    EXPECT_EQ(stats.plan_nodes_visited, 0U);
-    EXPECT_EQ(stats.catalog_metadata_lookups, 0U);
-    EXPECT_EQ(constructed, 1U);
+    auto statement = portal_->start_prepared(*descriptor, parameters, &context);
     QlManager ql_manager(sm_manager_.get(), &transaction_manager, nullptr);
     txn_id_t txn_id = transaction->get_transaction_id();
     portal_->run(std::move(statement), &ql_manager, &txn_id, &context);
@@ -696,14 +672,11 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     Context miss_context(&lock_manager, &log_manager, miss_transaction, buffer, &offset, &transaction_manager);
     Value missing_key;
     missing_key.set_int(999);
-    PreparedRuntimeStats miss_stats;
     auto miss_statement = portal_->start_prepared(
         *descriptor,
         ParameterFrame({missing_key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
-        &miss_context, nullptr, &miss_stats);
+        &miss_context);
     miss_statement->root->Next();
-    EXPECT_EQ(miss_stats.point_update_hits, 0U);
-    EXPECT_EQ(miss_stats.point_update_no_candidates, 1U);
     EXPECT_TRUE(miss_transaction->get_write_set().empty());
     EXPECT_EQ(miss_transaction->GetUndoLogNum(), 0U);
     transaction_manager.abort(miss_transaction, &log_manager);
@@ -713,13 +686,10 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     Context residual_context(&lock_manager, &log_manager, residual_transaction, buffer, &offset, &transaction_manager);
     Value false_residual;
     false_residual.set_int(999);
-    PreparedRuntimeStats residual_stats;
     auto residual_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({key, false_residual, int_delta, float_delta, new_id, new_code, null_value}),
-        &residual_context, nullptr, &residual_stats);
+        &residual_context);
     residual_statement->root->Next();
-    EXPECT_EQ(residual_stats.point_update_hits, 0U);
-    EXPECT_EQ(residual_stats.point_update_no_visible, 1U);
     EXPECT_TRUE(residual_transaction->get_write_set().empty());
     EXPECT_EQ(residual_transaction->GetUndoLogNum(), 0U);
     transaction_manager.abort(residual_transaction, &log_manager);
@@ -728,13 +698,10 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
         Transaction* fallback_transaction = transaction_manager.begin(nullptr, &log_manager, level);
         Context fallback_context(&lock_manager, &log_manager, fallback_transaction, buffer, &offset,
                                  &transaction_manager);
-        PreparedRuntimeStats fallback_stats;
         auto fallback_statement = portal_->start_prepared(
             *descriptor, ParameterFrame({key, false_residual, int_delta, float_delta, new_id, new_code, null_value}),
-            &fallback_context, nullptr, &fallback_stats);
+            &fallback_context);
         fallback_statement->root->Next();
-        EXPECT_EQ(fallback_stats.point_update_hits, 0U);
-        EXPECT_EQ(fallback_stats.point_update_fallbacks, 1U);
         EXPECT_TRUE(fallback_transaction->get_write_set().empty());
         transaction_manager.abort(fallback_transaction, &log_manager);
     }
@@ -744,21 +711,16 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     Transaction* writer_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     Context writer_context(&lock_manager, &log_manager, writer_transaction, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats writer_stats;
     auto writer_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
-        &writer_context, nullptr, &writer_stats);
+        &writer_context);
     writer_statement->root->Next();
-    ASSERT_EQ(writer_stats.point_update_hits, 1U);
     transaction_manager.commit(writer_transaction, &log_manager);
 
     Context stale_context(&lock_manager, &log_manager, stale_transaction, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats stale_stats;
     auto stale_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
-        &stale_context, nullptr, &stale_stats);
-    EXPECT_EQ(stale_stats.point_update_hits, 1U)
-        << "the historical key must recover the row visible to the stale snapshot";
+        &stale_context);
     try {
         stale_statement->root->Next();
         FAIL() << "a newer committed point UPDATE must abort the stale writer";
@@ -779,21 +741,17 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     quarter.set_float(0.25F);
     Value own_code;
     own_code.set_str("own");
-    PreparedRuntimeStats own_first_stats;
     auto own_first = portal_->start_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &own_context, nullptr, &own_first_stats);
+        &own_context);
     own_first->root->Next();
-    ASSERT_EQ(own_first_stats.point_update_hits, 1U);
 
     Value next_payload;
     next_payload.set_int(78);
-    PreparedRuntimeStats own_second_stats;
     auto own_second = portal_->start_prepared(
         *descriptor, ParameterFrame({current_key, next_payload, one, quarter, current_key, own_code, null_value}),
-        &own_context, nullptr, &own_second_stats);
+        &own_context);
     own_second->root->Next();
-    EXPECT_EQ(own_second_stats.point_update_hits, 1U);
     auto own_visible = GetVisibleRecord(executable->scan.table_handle, changed_lookup.rid, &own_context);
     ASSERT_NE(own_visible, nullptr);
     EXPECT_EQ(read_unaligned<int>(own_visible->data + columns[1].offset), 79);
@@ -817,18 +775,15 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
 
     Context concurrent_context(&lock_manager, &log_manager, concurrent_transaction, buffer, &offset,
                                &transaction_manager);
-    PreparedRuntimeStats concurrent_stats;
     auto concurrent_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &concurrent_context, nullptr, &concurrent_stats);
-    EXPECT_EQ(concurrent_stats.point_update_hits, 1U);
+        &concurrent_context);
 
-    const auto lock_observability_before = lock_manager.record_lock_observability();
     auto waiter_result = std::async(std::launch::async, [&] { concurrent_statement->root->Next(); });
     const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     bool waiter_enqueued = false;
     while (std::chrono::steady_clock::now() < enqueue_deadline) {
-        if (lock_manager.record_lock_observability().wait_enqueued > lock_observability_before.wait_enqueued) {
+        if (lock_manager.has_record_waiters_for_test()) {
             waiter_enqueued = true;
             break;
         }
@@ -880,11 +835,9 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
 
     Context stale_delete_context(&lock_manager, &log_manager, stale_delete_transaction, buffer, &offset,
                                  &transaction_manager);
-    PreparedRuntimeStats stale_delete_stats;
     auto stale_delete_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &stale_delete_context, nullptr, &stale_delete_stats);
-    EXPECT_EQ(stale_delete_stats.point_update_hits, 1U);
+        &stale_delete_context);
     try {
         stale_delete_statement->root->Next();
         FAIL() << "a newer committed DELETE must abort the stale point writer";
@@ -918,14 +871,10 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     Transaction* recreated_transaction =
         transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
     Context recreated_context(&lock_manager, nullptr, recreated_transaction, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats recreated_stats;
     auto recreated_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &recreated_context, nullptr, &recreated_stats);
+        &recreated_context);
     recreated_statement->root->Next();
-    EXPECT_EQ(recreated_stats.bound_executable_hits, 0U);
-    EXPECT_EQ(recreated_stats.point_update_hits, 0U);
-    EXPECT_GT(recreated_stats.plan_nodes_visited, 0U);
     transaction_manager.abort(recreated_transaction, nullptr);
 }
 
@@ -1000,16 +949,9 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     bound_id.set_int(1);
     Value bound_payload;
     bound_payload.set_int(10);
-    PreparedRuntimeStats stats;
-    std::uint64_t constructed = 0;
-    auto statement =
-        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &context, &constructed, &stats);
+    auto statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &context);
     statement->root->Next();
 
-    EXPECT_EQ(stats.lock_only_update_hits, 1U);
-    EXPECT_EQ(stats.lock_only_update_misses, 0U);
-    EXPECT_EQ(stats.lock_only_update_fallbacks, 0U);
-    EXPECT_EQ(constructed, 1U);
     EXPECT_EQ(transaction->get_lock_set()->count(
                   LockDataId(executable->scan.table_handle->GetFd(), rid, LockDataType::RECORD)),
               1U);
@@ -1026,14 +968,13 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
 
     Transaction competing(100000, IsolationLevel::SNAPSHOT_ISOLATION);
     const LockDataId record_lock(executable->scan.table_handle->GetFd(), rid, LockDataType::RECORD);
-    const auto lock_observability_before = lock_manager.record_lock_observability();
     auto contender_result = std::async(std::launch::async, [&] {
         return lock_manager.lock_exclusive_on_record(&competing, rid, executable->scan.table_handle->GetFd());
     });
     const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     bool contender_enqueued = false;
     while (std::chrono::steady_clock::now() < enqueue_deadline) {
-        if (lock_manager.record_lock_observability().wait_enqueued > lock_observability_before.wait_enqueued) {
+        if (lock_manager.has_record_waiters_for_test()) {
             contender_enqueued = true;
             break;
         }
@@ -1056,11 +997,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     ASSERT_TRUE(lock_manager.unlock(&competing, record_lock));
 
     auto expect_context_fallback = [&](Context* incomplete_context) {
-        PreparedRuntimeStats fallback_stats;
-        auto fallback = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}),
-                                                incomplete_context, nullptr, &fallback_stats);
-        EXPECT_EQ(fallback_stats.lock_only_update_hits, 0U);
-        EXPECT_EQ(fallback_stats.lock_only_update_fallbacks, 1U);
+        auto fallback =
+            portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), incomplete_context);
         EXPECT_NE(fallback, nullptr);
     };
     Context null_transaction_context(&lock_manager, nullptr, nullptr, buffer, &offset, &transaction_manager);
@@ -1081,11 +1019,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     const lsn_t wal_global_before = log_manager.get_global_lsn();
     const int64_t wal_offset_before = log_manager.current_log_offset();
     const lsn_t txn_lsn_before = wal_transaction->get_prev_lsn();
-    PreparedRuntimeStats wal_stats;
-    auto wal_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &wal_context,
-                                                 nullptr, &wal_stats);
+    auto wal_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &wal_context);
     wal_statement->root->Next();
-    EXPECT_EQ(wal_stats.lock_only_update_hits, 1U);
     EXPECT_EQ(log_manager.get_global_lsn(), wal_global_before);
     EXPECT_EQ(log_manager.current_log_offset(), wal_offset_before);
     EXPECT_EQ(wal_transaction->get_prev_lsn(), txn_lsn_before);
@@ -1096,12 +1031,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     Context miss_context(&lock_manager, nullptr, miss_transaction, buffer, &offset, &transaction_manager);
     Value false_residual;
     false_residual.set_int(999);
-    PreparedRuntimeStats miss_stats;
-    auto miss = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, false_residual}), &miss_context, nullptr,
-                                        &miss_stats);
+    auto miss = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, false_residual}), &miss_context);
     miss->root->Next();
-    EXPECT_EQ(miss_stats.lock_only_update_hits, 0U);
-    EXPECT_EQ(miss_stats.lock_only_update_misses, 1U);
     EXPECT_TRUE(miss_transaction->get_lock_set()->empty());
     EXPECT_TRUE(miss_transaction->get_write_set().empty());
     EXPECT_EQ(miss_transaction->GetUndoLogNum(), 0U);
@@ -1111,12 +1042,9 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
         Transaction* fallback_transaction = transaction_manager.begin(nullptr, &log_manager, level);
         Context fallback_context(&lock_manager, &log_manager, fallback_transaction, buffer, &offset,
                                  &transaction_manager);
-        PreparedRuntimeStats fallback_stats;
-        auto fallback = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}),
-                                                &fallback_context, nullptr, &fallback_stats);
+        auto fallback =
+            portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &fallback_context);
         fallback->root->Next();
-        EXPECT_EQ(fallback_stats.lock_only_update_hits, 0U);
-        EXPECT_EQ(fallback_stats.lock_only_update_fallbacks, 1U);
         EXPECT_GT(fallback_transaction->GetUndoLogNum(), 0U);
         EXPECT_FALSE(fallback_transaction->get_write_set().empty());
         transaction_manager.abort(fallback_transaction, &log_manager);
@@ -1153,16 +1081,14 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     ASSERT_EQ(current_payload(), 11);
 
     Context stale_context(&lock_manager, nullptr, stale, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats stale_stats;
-    auto stale_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}),
-                                                   &stale_context, nullptr, &stale_stats);
+    auto stale_statement =
+        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &stale_context);
     try {
         stale_statement->root->Next();
         FAIL() << "a newer committed writer must abort the stale snapshot";
     } catch (TransactionAbortException& error) {
         EXPECT_EQ(error.GetAbortReason(), AbortReason::WW_CONFLICT);
     }
-    EXPECT_EQ(stale_stats.lock_only_update_hits, 1U);
     transaction_manager.abort(stale, nullptr);
 
     Transaction* own_write = transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -1176,11 +1102,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     Value payload_15;
     payload_15.set_int(15);
     Context own_context(&lock_manager, &log_manager, own_write, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats own_stats;
-    auto own_statement =
-        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &own_context, nullptr, &own_stats);
+    auto own_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &own_context);
     own_statement->root->Next();
-    EXPECT_EQ(own_stats.lock_only_update_hits, 1U);
     EXPECT_EQ(own_write->GetUndoLogNum(), undo_after_update);
     EXPECT_EQ(own_write->get_write_set().size(), writes_after_update);
     EXPECT_EQ(own_write->modified_slots_.size(), modified_after_update);
@@ -1194,11 +1117,9 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     execute_relative_update(committing_own_write, 4);
     Context commit_context(&lock_manager, &log_manager, committing_own_write, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats commit_stats;
-    auto commit_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}),
-                                                    &commit_context, nullptr, &commit_stats);
+    auto commit_statement =
+        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &commit_context);
     commit_statement->root->Next();
-    EXPECT_EQ(commit_stats.lock_only_update_hits, 1U);
     transaction_manager.commit(committing_own_write, &log_manager);
     EXPECT_EQ(current_payload(), 15);
 
@@ -1226,11 +1147,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     Transaction* duplicate_transaction =
         transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
     Context duplicate_context(&lock_manager, nullptr, duplicate_transaction, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats duplicate_stats;
-    auto duplicate_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}),
-                                                       &duplicate_context, nullptr, &duplicate_stats);
-    EXPECT_EQ(duplicate_stats.lock_only_update_hits, 0U);
-    EXPECT_EQ(duplicate_stats.lock_only_update_fallbacks, 1U);
+    auto duplicate_statement =
+        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &duplicate_context);
     transaction_manager.abort(duplicate_transaction, nullptr);
     ASSERT_TRUE(executable->point_update->index_handle->delete_entry(reinterpret_cast<const char*>(&key), second_rid,
                                                                      IndexWriteWalContext::TestNoWal()));
@@ -1245,11 +1163,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
                                                historical_key, second_rid, *executable->point_update->index);
     Transaction* multiple_transaction = transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
     Context multiple_context(&lock_manager, nullptr, multiple_transaction, buffer, &offset, &transaction_manager);
-    PreparedRuntimeStats multiple_stats;
-    auto multiple_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}),
-                                                      &multiple_context, nullptr, &multiple_stats);
-    EXPECT_EQ(multiple_stats.lock_only_update_hits, 0U);
-    EXPECT_EQ(multiple_stats.lock_only_update_fallbacks, 1U);
+    auto multiple_statement =
+        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &multiple_context);
     transaction_manager.abort(multiple_transaction, nullptr);
 }
 

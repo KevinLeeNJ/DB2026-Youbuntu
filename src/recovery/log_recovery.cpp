@@ -1239,7 +1239,6 @@ void RecoveryManager::repair_touched_indexes() {
     // right edges, one page read per level, and fails only when even that spine
     // is unusable.
     const auto spine_begin = std::chrono::steady_clock::now();
-    const uint64_t spine_reads_begin = disk_manager_->get_page_read_count();
     size_t repaired_endpoints = 0;
     for (const auto& [index_name, plan] : plans) {
         if (!plan.index->refresh_leaf_chain_endpoint()) {
@@ -1251,7 +1250,6 @@ void RecoveryManager::repair_touched_indexes() {
     }
     const auto spine_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - spine_begin).count();
-    const uint64_t spine_reads = disk_manager_->get_page_read_count() - spine_reads_begin;
 
     // Drop the plans for indexes that are going to be rebuilt anyway, then pay
     // for the key collection only for the rest.
@@ -1266,7 +1264,6 @@ void RecoveryManager::repair_touched_indexes() {
     // damage. It runs before any mutation, so a tree the repair cannot fix key
     // by key never gets written to.
     const auto gate_begin = std::chrono::steady_clock::now();
-    const uint64_t gate_reads_begin = disk_manager_->get_page_read_count();
     RecoveryIndexGate::Stats gate_totals;
     for (auto& [index_name, plan] : plans) {
         sort_index_repair_entries(&plan);
@@ -1280,16 +1277,15 @@ void RecoveryManager::repair_touched_indexes() {
             indexes_to_rebuild.insert(index_name);
         }
     }
-    LOG_INFO("recovery index structure gate: %zu indexes, spine: %zu leaf endpoints refreshed, %lld ms, "
-             "%llu disk page reads; change set: %llu descents, "
-             "%llu keys covered, %llu pages validated, %llu page fetches, %llu disk page reads, "
+    LOG_INFO("recovery index structure gate: %zu indexes, spine: %zu leaf endpoints refreshed, %lld ms; "
+             "change set: %llu descents, "
+             "%llu keys covered, %llu pages validated, %llu page fetches, "
              "%llu parent pointers repaired, %llu leaves with an empty successor, %zu to rebuild, %lld ms",
              total_indexes, repaired_endpoints, static_cast<long long>(spine_ms),
-             static_cast<unsigned long long>(spine_reads), static_cast<unsigned long long>(gate_totals.descents),
+             static_cast<unsigned long long>(gate_totals.descents),
              static_cast<unsigned long long>(gate_totals.keys_covered),
              static_cast<unsigned long long>(gate_totals.pages_validated),
              static_cast<unsigned long long>(gate_totals.page_fetches),
-             static_cast<unsigned long long>(disk_manager_->get_page_read_count() - gate_reads_begin),
              static_cast<unsigned long long>(gate_totals.parent_pointers_repaired),
              static_cast<unsigned long long>(gate_totals.chain_bounds_unknown), indexes_to_rebuild.size(),
              static_cast<long long>(

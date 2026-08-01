@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 #include "lock_manager.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <functional>
 
@@ -39,36 +38,6 @@ private:
 
 LockManager::LockTableShard& LockManager::get_shard(const LockDataId& lock_data_id) {
     return lock_table_shards_[std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT];
-}
-
-void LockManager::observe_queue_depth(std::atomic<uint64_t>& maximum, size_t depth) {
-    uint64_t observed = maximum.load(std::memory_order_relaxed);
-    const uint64_t wanted = static_cast<uint64_t>(depth);
-    while (observed < wanted &&
-           !maximum.compare_exchange_weak(observed, wanted, std::memory_order_relaxed, std::memory_order_relaxed)) {
-    }
-}
-
-LockObservabilitySnapshot LockManager::record_lock_observability() const {
-    return {record_immediate_conflict_.load(std::memory_order_relaxed),
-            record_wait_enqueued_.load(std::memory_order_relaxed),
-            record_wait_granted_.load(std::memory_order_relaxed),
-            record_wait_cancelled_.load(std::memory_order_relaxed),
-            record_wait_ns_.load(std::memory_order_relaxed),
-            record_queue_depth_max_.load(std::memory_order_relaxed),
-            record_cycle_checks_.load(std::memory_order_relaxed),
-            record_cycle_victims_.load(std::memory_order_relaxed)};
-}
-
-LockObservabilitySnapshot LockManager::unique_key_lock_observability() const {
-    return {unique_immediate_conflict_.load(std::memory_order_relaxed),
-            unique_wait_enqueued_.load(std::memory_order_relaxed),
-            unique_wait_granted_.load(std::memory_order_relaxed),
-            unique_wait_cancelled_.load(std::memory_order_relaxed),
-            unique_wait_ns_.load(std::memory_order_relaxed),
-            unique_queue_depth_max_.load(std::memory_order_relaxed),
-            unique_cycle_checks_.load(std::memory_order_relaxed),
-            unique_cycle_victims_.load(std::memory_order_relaxed)};
 }
 
 std::shared_ptr<LockManager::LockRequestQueue> LockManager::get_or_create_queue(const LockDataId& lock_data_id) {
@@ -185,6 +154,31 @@ void LockManager::unregister_waiting_txn_locked(txn_id_t txn_id) {
 
 void LockManager::note_wait_topology_change() {
     wait_topology_epoch_.fetch_add(1, std::memory_order_release);
+}
+
+bool LockManager::has_record_waiters_for_test() {
+    for (auto& shard : lock_table_shards_) {
+        std::lock_guard<std::mutex> shard_lock(shard.latch_);
+        for (const auto& [_, queue] : shard.lock_table_) {
+            std::lock_guard<std::mutex> queue_lock(queue->latch_);
+            if (!queue->waiters_.empty()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool LockManager::has_unique_waiters_for_test() {
+    for (auto& shard : unique_key_shards_) {
+        std::lock_guard<std::mutex> shard_lock(shard.latch);
+        for (const auto& [_, queue] : shard.queues) {
+            if (!queue->waiters.empty()) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void LockManager::set_record_handoff_test_hook(std::function<void()> hook) {
@@ -599,7 +593,6 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     const IsolationLevel isolation = txn->get_isolation_level();
     const bool immediate_snapshot_conflict = !owns_other_lock && isolation == IsolationLevel::SERIALIZABLE;
     if (immediate_snapshot_conflict) {
-        record_immediate_conflict_.fetch_add(1, std::memory_order_relaxed);
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         try_remove_empty_queue(lock_data_id, request_queue);
@@ -608,30 +601,23 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
 
     auto request = std::make_shared<LockRequest>(txn->get_transaction_id(), LockMode::EXLUCSIVE);
     request_queue->waiters_.push_back(request);
-    const auto wait_begin = std::chrono::steady_clock::now();
     note_wait_topology_change();
     if (!register_pending_lock(txn, lock_data_id, request_queue, request)) {
         request->state_ = LockRequest::State::Cancelled;
         request_queue->waiters_.pop_back();
-        record_wait_cancelled_.fetch_add(1, std::memory_order_relaxed);
         note_wait_topology_change();
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
-    record_wait_enqueued_.fetch_add(1, std::memory_order_relaxed);
-    observe_queue_depth(record_queue_depth_max_, request_queue->waiters_.size());
     lock.unlock();
     // A transaction with no granted record or unique-key lock cannot be the
     // predecessor of another wait-for edge, so this first wait cannot close a
     // cycle. Avoid scanning all lock shards on the common hot-row path.
     if (owns_other_lock) {
-        record_cycle_checks_.fetch_add(1, std::memory_order_relaxed);
         const txn_id_t cycle_victim = find_youngest_cycle_victim(txn->get_transaction_id());
         if (cycle_victim != INVALID_TXN_ID && cancel_waiting_transaction(cycle_victim)) {
-            record_cycle_victims_.fetch_add(1, std::memory_order_relaxed);
-            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
         }
     }
     lock.lock();
@@ -675,10 +661,6 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
         request->state_ = LockRequest::State::Completed;
         run_record_handoff_checked_test_hook();
     }
-    record_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                        std::chrono::steady_clock::now() - wait_begin)
-                                                        .count()),
-                              std::memory_order_relaxed);
     lock.unlock();
     if (next_request != nullptr) {
         next_request->cv_.notify_one();
@@ -686,11 +668,9 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     unregister_pending_lock(txn->get_transaction_id(), lock_data_id, request);
     release_queue_user(lock_data_id, request_queue);
     if (cancelled) {
-        record_wait_cancelled_.fetch_add(1, std::memory_order_relaxed);
         try_remove_empty_queue(lock_data_id, request_queue);
         return deadlock_victim ? LockAcquireResult::Value::DeadlockVictim : LockAcquireResult::Value::Cancelled;
     }
-    record_wait_granted_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -802,11 +782,9 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
     // Preserve SI/serializable's established immediate unique-key conflict
     // behavior. RC uses the shared wait-for cycle policy.
     if (txn->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-        unique_immediate_conflict_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     queue->waiters.push_back(txn_id);
-    const auto wait_begin = std::chrono::steady_clock::now();
     note_wait_topology_change();
     if (!register_waiting_txn(txn)) {
         queue->waiters.erase(std::find(queue->waiters.begin(), queue->waiters.end(), txn_id));
@@ -814,18 +792,13 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
         queue->cv.notify_all();
         return false;
     }
-    unique_wait_enqueued_.fetch_add(1, std::memory_order_relaxed);
-    observe_queue_depth(unique_queue_depth_max_, queue->waiters.size());
     lock.unlock();
     // The first unique-key wait of a lock-free transaction cannot form a
     // cycle. Defer graph construction until the transaction already owns a
     // lock and can therefore have an outgoing wait-for edge.
     if (!txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty()) {
-        unique_cycle_checks_.fetch_add(1, std::memory_order_relaxed);
         const txn_id_t cycle_victim = find_youngest_cycle_victim(txn_id);
         if (cycle_victim != INVALID_TXN_ID && cancel_waiting_transaction(cycle_victim)) {
-            unique_cycle_victims_.fetch_add(1, std::memory_order_relaxed);
-            wait_cycle_abort_count_.fetch_add(1, std::memory_order_acq_rel);
         }
     }
     lock.lock();
@@ -834,11 +807,6 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
                (queue->owner == INVALID_TXN_ID && !queue->waiters.empty() && queue->waiters.front() == txn_id);
     });
     if (txn->is_lock_cancellation_requested()) {
-        unique_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                            std::chrono::steady_clock::now() - wait_begin)
-                                                            .count()),
-                                  std::memory_order_relaxed);
-        unique_wait_cancelled_.fetch_add(1, std::memory_order_relaxed);
         auto it = std::find(queue->waiters.begin(), queue->waiters.end(), txn_id);
         if (it != queue->waiters.end()) {
             queue->waiters.erase(it);
@@ -849,11 +817,6 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
         return false;
     }
     queue->waiters.pop_front();
-    unique_wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                        std::chrono::steady_clock::now() - wait_begin)
-                                                        .count()),
-                              std::memory_order_relaxed);
-    unique_wait_granted_.fetch_add(1, std::memory_order_relaxed);
     queue->owner = txn_id;
     note_wait_topology_change();
     // Publish ownership before dropping the waiter registration. An abort that
@@ -870,7 +833,6 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
     }
     unregister_waiting_txn(txn_id);
     if (cancelled_after_publish) {
-        unique_wait_cancelled_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     return true;

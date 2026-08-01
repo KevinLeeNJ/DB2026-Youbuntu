@@ -13,7 +13,6 @@ See the Mulan PSL v2 for more details. */
 #include "common/fault_injection.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
-#include "transaction/commit_timing_diagnostics.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -442,17 +441,8 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         const bool blocked = checkpoint_blocking_new_txns_;
         if (blocked) {
             InvokeCheckpointAdmissionTestHook("begin_waiting");
-            const auto wait_begin = std::chrono::steady_clock::now();
-            checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
-            checkpoint_begin_blocked_.fetch_add(1, std::memory_order_relaxed);
-            checkpoint_begin_wait_ns_.fetch_add(
-                static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
-                        .count()),
-                std::memory_order_relaxed);
-        } else {
-            checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
         }
+        checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
         active_txn_ids_.insert(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
         InvokeCheckpointAdmissionTestHook("begin_admitted");
@@ -477,105 +467,6 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         active_serializable_txns_.insert(txn->get_transaction_id());
     }
     return txn;
-}
-
-void TransactionManager::record_client_abort(AbortReason reason) {
-    switch (reason) {
-    case AbortReason::LOCK_ON_SHIRINKING:
-        abort_lock_on_shrinking_.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case AbortReason::UPGRADE_CONFLICT:
-        abort_upgrade_conflict_.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case AbortReason::DEADLOCK_PREVENTION:
-        abort_deadlock_prevention_.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case AbortReason::LOCK_CANCELLED:
-        break;
-    case AbortReason::WW_CONFLICT:
-        abort_ww_conflict_.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case AbortReason::SSI_DANGER:
-        abort_ssi_danger_.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case AbortReason::UNIQUE_KEY_CONFLICT:
-        abort_unique_key_conflict_.fetch_add(1, std::memory_order_relaxed);
-        break;
-    }
-}
-
-AbortObservabilitySnapshot TransactionManager::abort_observability() const {
-    return {abort_lock_on_shrinking_.load(std::memory_order_relaxed),
-            abort_upgrade_conflict_.load(std::memory_order_relaxed),
-            abort_deadlock_prevention_.load(std::memory_order_relaxed),
-            abort_ww_conflict_.load(std::memory_order_relaxed),
-            abort_ssi_danger_.load(std::memory_order_relaxed),
-            abort_unique_key_conflict_.load(std::memory_order_relaxed)};
-}
-
-CheckpointObservabilitySnapshot TransactionManager::checkpoint_observability() const {
-    return {checkpoint_attempt_.load(std::memory_order_relaxed),
-            checkpoint_success_.load(std::memory_order_relaxed),
-            checkpoint_drain_timeout_.load(std::memory_order_relaxed),
-            checkpoint_deadline_.load(std::memory_order_relaxed),
-            checkpoint_final_data_fail_.load(std::memory_order_relaxed),
-            checkpoint_block_ns_.load(std::memory_order_relaxed),
-            checkpoint_drain_ns_.load(std::memory_order_relaxed),
-            checkpoint_final_wal_ns_.load(std::memory_order_relaxed),
-            checkpoint_final_data_ns_.load(std::memory_order_relaxed),
-            checkpoint_meta_ns_.load(std::memory_order_relaxed),
-            checkpoint_manifest_ns_.load(std::memory_order_relaxed),
-            checkpoint_truncate_ns_.load(std::memory_order_relaxed),
-            checkpoint_begin_blocked_.load(std::memory_order_relaxed),
-            checkpoint_begin_wait_ns_.load(std::memory_order_relaxed)};
-}
-
-void TransactionManager::observe_checkpoint_attempt() {
-    checkpoint_attempt_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_success() {
-    checkpoint_success_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_drain_timeout() {
-    checkpoint_drain_timeout_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_deadline() {
-    checkpoint_deadline_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_final_data_fail() {
-    checkpoint_final_data_fail_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_block_ns(uint64_t elapsed_ns) {
-    checkpoint_block_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_drain_ns(uint64_t elapsed_ns) {
-    checkpoint_drain_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_final_wal_ns(uint64_t elapsed_ns) {
-    checkpoint_final_wal_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_final_data_ns(uint64_t elapsed_ns) {
-    checkpoint_final_data_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_meta_ns(uint64_t elapsed_ns) {
-    checkpoint_meta_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_manifest_ns(uint64_t elapsed_ns) {
-    checkpoint_manifest_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
-}
-
-void TransactionManager::observe_checkpoint_truncate_ns(uint64_t elapsed_ns) {
-    checkpoint_truncate_ns_.fetch_add(elapsed_ns, std::memory_order_relaxed);
 }
 
 void TransactionManager::BeginStatement(Transaction* txn) {
@@ -645,21 +536,9 @@ void TransactionManager::RunCommitPublicationLeader(timestamp_t target_csn, LogM
         }
 
         FaultInjector::Point("before_tuple_publication");
-        auto stage_begin = std::chrono::steady_clock::time_point{};
-        if (request->timing_enabled) {
-            stage_begin = std::chrono::steady_clock::now();
-        }
         sm_manager_->mark_slots_committed(*request->txn, request->commit_ts);
-        if (request->timing_enabled) {
-            request->tuple_publication_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stage_begin)
-                    .count());
-        }
         FaultInjector::Point("after_tuple_publication");
 
-        if (request->timing_enabled) {
-            stage_begin = std::chrono::steady_clock::now();
-        }
         request->txn->set_state(TransactionState::COMMITTED);
         FaultInjector::Point("before_published_csn_store");
         {
@@ -670,27 +549,13 @@ void TransactionManager::RunCommitPublicationLeader(timestamp_t target_csn, LogM
             last_commit_ts_.store(request->commit_ts, std::memory_order_release);
             ++published_commit_csn_;
         }
-        if (request->timing_enabled) {
-            request->frontier_publication_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stage_begin)
-                    .count());
-        }
         FaultInjector::Point("after_commit_publication_frontier");
         InvokeCommitPublicationTestHook("after_frontier", request->commit_csn, request->commit_lsn);
 
-        if (request->timing_enabled) {
-            stage_begin = std::chrono::steady_clock::now();
-        }
         FaultInjector::Point("before_commit_helper_lock_release");
         ReleaseLocks(request->txn, lock_manager_);
         FaultInjector::Point("after_commit_helper_lock_release");
         InvokeCommitPublicationTestHook("after_lock_release", request->commit_csn, request->commit_lsn);
-        if (request->timing_enabled) {
-            request->lock_release_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stage_begin)
-                    .count());
-        }
-
         {
             std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
             request->locks_released = true;
@@ -740,14 +605,10 @@ void TransactionManager::PublishOrWaitForCommit(const std::shared_ptr<CommitPubl
  * @param {LogManager*} log_manager 日志管理器指针
  */
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
-    if (commit_timing_enabled_) {
-        commit_impl<true>(txn, log_manager);
-    } else {
-        commit_impl<false>(txn, log_manager);
-    }
+    commit_impl(txn, log_manager);
 }
 
-template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) {
+void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) {
         return;
     }
@@ -756,12 +617,7 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
         return;
     }
 
-    commit_timing_diagnostics::OperationScope<TimingEnabled> timing;
-    {
-        commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
-            timing, commit_timing_diagnostics::Stage::PREPARE_PUBLICATION);
-        sm_manager_->prepare_commit_publication(*txn);
-    }
+    sm_manager_->prepare_commit_publication(*txn);
     TransactionState expected_state = TransactionState::GROWING;
     if (!txn->compare_exchange_state(expected_state, TransactionState::COMMITTING)) {
         if (expected_state == TransactionState::COMMITTED || expected_state == TransactionState::ABORTED) {
@@ -778,8 +634,6 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
         timestamp_t commit_csn;
         timestamp_t commit_ts;
         {
-            commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
-                                                                       commit_timing_diagnostics::Stage::TIMESTAMP_CSN);
             // CSN and commit timestamp allocation must be ordered together.
             // Otherwise an out-of-order publisher could move last_commit_ts_
             // backwards when the frontier is advanced.
@@ -803,11 +657,8 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
             publication_request->txn = txn;
             publication_request->commit_csn = commit_csn;
             publication_request->commit_ts = commit_ts;
-            publication_request->timing_enabled = TimingEnabled;
             txn->pin_commit_publication();
             {
-                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
-                                                                           commit_timing_diagnostics::Stage::WAL);
                 publication_request->commit_lsn = AppendCommitLog(txn, log_manager, commit_ts);
                 {
                     std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
@@ -834,42 +685,21 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
             commit_frontier_cv_.notify_all();
             FaultInjector::Point("after_commit_wal_sync");
             InvokeCommitPublicationTestHook("after_wal_wait", commit_csn, publication_request->commit_lsn);
-            {
-                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
-                    timing, commit_timing_diagnostics::Stage::FRONTIER_WAIT);
-                PublishOrWaitForCommit(publication_request, log_manager);
-            }
-            if constexpr (TimingEnabled) {
-                timing.add(commit_timing_diagnostics::Stage::TUPLE_PUBLICATION,
-                           publication_request->tuple_publication_ns);
-                timing.add(commit_timing_diagnostics::Stage::FRONTIER_PUBLICATION,
-                           publication_request->frontier_publication_ns);
-                timing.add(commit_timing_diagnostics::Stage::CLEANUP, publication_request->lock_release_ns);
-            }
+            PublishOrWaitForCommit(publication_request, log_manager);
             locks_released_by_helper = publication_request->locks_released;
         } else {
-            {
-                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
-                                                                           commit_timing_diagnostics::Stage::WAL);
-                WriteCommitLog(txn, log_manager, commit_ts);
-            }
+            WriteCommitLog(txn, log_manager, commit_ts);
             FaultInjector::Point("after_commit_wal_sync");
 
             // Publish every modified slot outside the frontier mutex. A new RC
             // statement still cannot observe this commit until its CSN is part of
             // the contiguous completed frontier below.
             FaultInjector::Point("before_tuple_publication");
-            {
-                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
-                    timing, commit_timing_diagnostics::Stage::TUPLE_PUBLICATION);
-                sm_manager_->mark_slots_committed(*txn, commit_ts);
-            }
+            sm_manager_->mark_slots_committed(*txn, commit_ts);
             FaultInjector::Point("after_tuple_publication");
             txn->set_state(TransactionState::COMMITTED);
             FaultInjector::Point("before_published_csn_store");
             {
-                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
-                    timing, commit_timing_diagnostics::Stage::FRONTIER_PUBLICATION);
                 std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
                 completed_commits_.emplace(commit_csn, commit_ts);
                 while (true) {
@@ -887,12 +717,8 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
             // Do not return from COMMIT until this transaction is covered by the
             // publication frontier. This provides read-your-commit even when a
             // later CSN finished publishing first.
-            {
-                commit_timing_diagnostics::StageTimer<TimingEnabled> timer(
-                    timing, commit_timing_diagnostics::Stage::FRONTIER_WAIT);
-                std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
-                commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
-            }
+            std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+            commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
         }
 
         // Keep the committing transaction in the watermark and checkpoint
@@ -904,8 +730,6 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
                                         publication_request == nullptr ? txn->get_prev_lsn()
                                                                        : publication_request->commit_lsn);
         {
-            commit_timing_diagnostics::StageTimer<TimingEnabled> timer(timing,
-                                                                       commit_timing_diagnostics::Stage::CLEANUP);
             running_txns_.UpdateCommitTs(txn->get_commit_ts());
             running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
             ClearWriteSet(txn);
@@ -930,7 +754,6 @@ template <bool TimingEnabled> void TransactionManager::commit_impl(Transaction* 
             RetireTransactionIfSafe(txn);
             MaybeRunGarbageCollection();
         }
-        timing.finish();
     } catch (...) {
         // Once COMMITTING is visible, the COMMIT record may be persistent and
         // the transaction may be partially or fully published. Ordinary
@@ -1573,7 +1396,6 @@ void TransactionManager::MaybeRunGarbageCollection() {
     {
         std::lock_guard<std::mutex> lock(latch_);
         ++commits_since_gc_;
-        gc_backlog_.store(txn_map.size(), std::memory_order_release);
         if (!gc_requested_ && (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD)) {
             gc_requested_ = true;
             commits_since_gc_ = 0;
@@ -1595,9 +1417,6 @@ void TransactionManager::GarbageCollectionLoop() {
         // GarbageCollectionBatch uses the oldest active read timestamp as
         // its safety boundary. It must not wait for a globally quiescent
         // transaction set, otherwise a sustained workload can starve GC.
-        size_t batch_start_size = 0;
-        batch_start_size = txn_map.size();
-        gc_backlog_.store(batch_start_size, std::memory_order_release);
         gc_requested_ = false;
         gc_running_ = true;
         lock.unlock();
@@ -1612,10 +1431,6 @@ void TransactionManager::GarbageCollectionLoop() {
 
         lock.lock();
         gc_running_ = false;
-        const size_t batch_end_size = txn_map.size();
-        gc_backlog_.store(batch_end_size, std::memory_order_release);
-        gc_last_batch_size_.store(batch_start_size > batch_end_size ? batch_start_size - batch_end_size : 0,
-                                  std::memory_order_release);
         if (more && !gc_stop_.load(std::memory_order_acquire)) {
             gc_requested_ = true;
         }

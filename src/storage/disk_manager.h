@@ -112,14 +112,6 @@ public:
         fd2pageno_[fd] = start_page_no;
     }
 
-    // I/O counters used to report recovery cost once, after recovery finishes.
-    // They must never be printed per transaction on the measured hot path.
-    uint64_t get_page_read_count() const {
-        return page_read_count_.load(std::memory_order_relaxed);
-    }
-    uint64_t get_page_write_count() const {
-        return page_write_count_.load(std::memory_order_relaxed);
-    }
     uint64_t get_log_read_count() const {
         return log_read_count_.load(std::memory_order_relaxed);
     }
@@ -152,8 +144,6 @@ private:
 
     int log_fd_ = -1;        // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
     int64_t log_offset_ = 0; // 日志文件追加偏移
-    std::atomic<uint64_t> page_read_count_{0};
-    std::atomic<uint64_t> page_write_count_{0};
     std::atomic<uint64_t> log_read_count_{0};
     std::atomic<uint64_t> log_read_bytes_{0};
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0

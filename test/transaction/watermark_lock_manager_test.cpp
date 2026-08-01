@@ -78,7 +78,7 @@ TEST(LockManagerMetadataTest, DuplicateUnlockAfterOwnerHandoffDoesNotReleaseNewO
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
     std::atomic<bool> waiter_acquired{false};
     std::thread waiter_thread([&] { waiter_acquired.store(lock_manager.lock_exclusive_on_record(&waiter, rid, 42)); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&waiter);
                                         lock_manager.unlock(&owner, lock_id);
@@ -107,7 +107,7 @@ TEST(LockManagerMetadataTest, CancellingWaitingRecordLockLeavesQueueUsable) {
     std::atomic<bool> waiter_acquired{true};
     std::thread waiter_thread(
         [&] { waiter_acquired.store(lock_manager.lock_exclusive_on_record(&cancelled, rid, 42)); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&cancelled);
                                         lock_manager.unlock(&owner, lock_id);
@@ -145,7 +145,7 @@ TEST(LockManagerMetadataTest, CancellationDuringOwnerHandoffReleasesGrantedOwner
 
     LockAcquireResult waiter_result = LockAcquireResult::Value::Granted;
     std::thread waiter_thread([&] { waiter_result = lock_manager.lock_exclusive_on_record(&waiter, rid, 42); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&waiter);
                                         lock_manager.unlock(&owner, lock_id);
@@ -221,7 +221,7 @@ TEST(LockManagerMetadataTest, DeadlockVictimDuringOwnerHandoffReleasesGrantedOwn
 
     LockAcquireResult victim_result = LockAcquireResult::Value::Granted;
     std::thread victim_thread([&] { victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         release_handoff();
                                         lock_manager.cancel_transaction(&victim);
@@ -292,7 +292,7 @@ TEST(LockManagerMetadataTest, StaleCycleCancellationAfterHandoffCompletionIsNoOp
 
     LockAcquireResult waiter_result = LockAcquireResult::Value::Cancelled;
     std::thread waiter_thread([&] { waiter_result = lock_manager.lock_exclusive_on_record(&waiter, rid, 42); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&waiter);
                                         lock_manager.unlock(&owner, lock_id);
@@ -311,7 +311,6 @@ TEST(LockManagerMetadataTest, StaleCycleCancellationAfterHandoffCompletionIsNoOp
             owner_release.join();
             waiter_thread.join();
         }));
-    const auto victims_before = lock_manager.record_lock_observability().cycle_victims;
     std::thread canceller([&] { lock_manager.cancel_waiting_transaction_for_test(waiter.get_transaction_id()); });
     ASSERT_TRUE(WaitForNotification(
         hook_cv, hook_latch, [&] { return canceller_snapshot; },
@@ -343,7 +342,6 @@ TEST(LockManagerMetadataTest, StaleCycleCancellationAfterHandoffCompletionIsNoOp
 
     EXPECT_EQ(waiter_result.value(), LockAcquireResult::Value::Granted);
     EXPECT_FALSE(waiter.is_lock_cancellation_requested());
-    EXPECT_EQ(lock_manager.record_lock_observability().cycle_victims, victims_before);
     EXPECT_EQ(waiter.get_lock_set()->count(lock_id), 1u);
     EXPECT_TRUE(lock_manager.unlock(&waiter, lock_id));
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&next, rid, 42));
@@ -389,7 +387,7 @@ TEST(LockManagerMetadataTest, UniqueHandoffPublishesBeforeAbortCanRetireWaiter) 
     std::atomic<bool> waiter_result{false};
     std::thread waiter_thread(
         [&] { waiter_result.store(lock_manager.lock_exclusive_on_unique_key(waiter, index_fd, key)); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.unique_key_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_unique_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(waiter);
                                         lock_manager.unlock_unique_key(owner,
@@ -459,7 +457,7 @@ TEST(LockManagerMetadataTest, UniqueCycleCancellationPublishesFlagBeforeWakeup) 
     });
     std::atomic<bool> result{true};
     std::thread waiter([&] { result.store(lock_manager.lock_exclusive_on_unique_key(&victim, index_fd, key)); });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.unique_key_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_unique_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&victim);
                                         lock_manager.unlock_unique_key(&owner,
@@ -501,11 +499,7 @@ TEST(LockManagerMetadataTest, SerializableFirstRecordConflictReturnsWriteConflic
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
 
     const LockAcquireResult result = lock_manager.lock_exclusive_on_record(&contender, rid, 42);
-    const auto stats = lock_manager.record_lock_observability();
     EXPECT_EQ(result.value(), LockAcquireResult::Value::WriteConflict);
-    EXPECT_EQ(stats.immediate_conflict, 1u);
-    EXPECT_EQ(stats.wait_enqueued, 0u);
-    EXPECT_EQ(stats.cycle_checks, 0u);
     EXPECT_EQ(owner.get_lock_set()->count(lock_id), 1u);
     EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
     EXPECT_TRUE(contender.get_lock_set()->empty());
@@ -524,15 +518,12 @@ TEST(LockManagerMetadataTest, SiFirstRecordConflictWaitsOnce) {
     std::thread contender_thread(
         [&] { contender_result = lock_manager.lock_exclusive_on_record(&contender, rid, 42); });
 
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
                                     [&] {
                                         lock_manager.cancel_transaction(&contender);
                                         lock_manager.unlock(&owner, lock_id);
                                         contender_thread.join();
                                     }));
-    const auto queued = lock_manager.record_lock_observability();
-    EXPECT_EQ(queued.immediate_conflict, 0u);
-    EXPECT_EQ(queued.cycle_checks, 0u);
 
     ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
     contender_thread.join();

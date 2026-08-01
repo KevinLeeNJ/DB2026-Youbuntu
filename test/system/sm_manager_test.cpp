@@ -404,9 +404,9 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_
     }
 
     sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 3u);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 3u);
     sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 1u);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
 
     // Equality is not safe: exactly watermark must remain. Advancing the
     // watermark by one makes the same tombstone reclaimable.
@@ -415,9 +415,9 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_
     first_meta.commit_ts_ = 11;
     fh->set_tuple_meta(first_rid, first_meta);
     sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 1u);
+    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
     sm_manager_->prune_version_history(12);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidate_stats().active_candidates, 0u);
+    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).empty());
 }
 
 TEST_F(SmManagerTest, historical_retire_generation_prevents_aba_and_keeps_equality) {
@@ -579,84 +579,6 @@ TEST_F(SmManagerTest, gc_requeues_candidates_when_tuple_probe_must_retry) {
     sm_manager_->prune_version_history(11);
     EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retry", "synthetic_index", key).empty());
     EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retry", record).empty());
-}
-
-TEST_F(SmManagerTest, database_lifecycle_resets_all_deleted_tuple_candidate_diagnostics) {
-    setup_db();
-    sm_manager_->create_table("candidate_stats", make_int_cols({"id"}), nullptr);
-    auto* fh = sm_manager_->fhs_.at("candidate_stats").get();
-
-    RmRecord record(sizeof(int));
-    const int value = 17;
-    std::memcpy(record.data, &value, sizeof(value));
-    const Rid rid = fh->insert_record(record.data, nullptr);
-
-    TupleMeta tombstone;
-    tombstone.writer_txn_id_ = 301;
-    tombstone.is_deleted_ = true;
-    tombstone.version_chain_head_ = UndoLink{0, 1, 301};
-    fh->set_tuple_meta(rid, tombstone);
-
-    sm_manager_->set_deleted_tuple_candidate_diagnostics_enabled(true);
-    sm_manager_->remember_deleted_tuple_candidate("candidate_stats", rid, record, tombstone);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_stats", record).size(), 1u);
-    RmRecord different_record(sizeof(int));
-    const int different_value = 18;
-    std::memcpy(different_record.data, &different_value, sizeof(different_value));
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("candidate_stats", different_record).empty());
-    sm_manager_->note_deleted_tuple_candidate_validated(2);
-    sm_manager_->note_deleted_tuple_candidate_page_probe();
-
-    // Exercise both GC outcomes so the cumulative retire counters are nonzero.
-    sm_manager_->prune_version_history(10);
-    tombstone.is_committed_ = true;
-    tombstone.commit_ts_ = 9;
-    fh->set_tuple_meta(rid, tombstone);
-    sm_manager_->prune_version_history(10);
-    sm_manager_->remember_deleted_tuple_candidate("candidate_stats", rid, record, tombstone);
-
-    auto before = sm_manager_->get_deleted_tuple_candidate_stats();
-    EXPECT_GT(before.lookups, 0u);
-    EXPECT_GT(before.exact_hits, 0u);
-    EXPECT_GT(before.exact_misses, 0u);
-    EXPECT_GT(before.validated_candidates, 0u);
-    EXPECT_GT(before.page_probes, 0u);
-    EXPECT_GT(before.active_candidates, 0u);
-    EXPECT_GT(before.active_buckets, 0u);
-    EXPECT_GT(before.retire_pops, 0u);
-    EXPECT_GT(before.retire_requeues, 0u);
-    EXPECT_GT(before.retire_prunes, 0u);
-    EXPECT_GT(before.retire_max_queue, 0u);
-
-    sm_manager_->close_db();
-    db_opened_ = false;
-    auto after_close = sm_manager_->get_deleted_tuple_candidate_stats();
-    EXPECT_EQ(after_close.lookups, 0u);
-    EXPECT_EQ(after_close.exact_hits, 0u);
-    EXPECT_EQ(after_close.exact_misses, 0u);
-    EXPECT_EQ(after_close.validated_candidates, 0u);
-    EXPECT_EQ(after_close.page_probes, 0u);
-    EXPECT_EQ(after_close.active_candidates, 0u);
-    EXPECT_EQ(after_close.active_buckets, 0u);
-    EXPECT_EQ(after_close.retire_pops, 0u);
-    EXPECT_EQ(after_close.retire_requeues, 0u);
-    EXPECT_EQ(after_close.retire_prunes, 0u);
-    EXPECT_EQ(after_close.retire_max_queue, 0u);
-
-    sm_manager_->open_db(TEST_DB_NAME);
-    db_opened_ = true;
-    auto after_reopen = sm_manager_->get_deleted_tuple_candidate_stats();
-    EXPECT_EQ(after_reopen.lookups, 0u);
-    EXPECT_EQ(after_reopen.exact_hits, 0u);
-    EXPECT_EQ(after_reopen.exact_misses, 0u);
-    EXPECT_EQ(after_reopen.validated_candidates, 0u);
-    EXPECT_EQ(after_reopen.page_probes, 0u);
-    EXPECT_EQ(after_reopen.active_candidates, 0u);
-    EXPECT_EQ(after_reopen.active_buckets, 0u);
-    EXPECT_EQ(after_reopen.retire_pops, 0u);
-    EXPECT_EQ(after_reopen.retire_requeues, 0u);
-    EXPECT_EQ(after_reopen.retire_prunes, 0u);
-    EXPECT_EQ(after_reopen.retire_max_queue, 0u);
 }
 
 // =============================================================================

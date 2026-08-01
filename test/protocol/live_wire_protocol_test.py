@@ -7,7 +7,6 @@ server's network/result-sink path are observable by CTest.
 """
 
 import os
-import re
 import select
 import shutil
 import signal
@@ -288,11 +287,6 @@ class Server:
     def start(self):
         env = os.environ.copy()
         env["RMDB_PORT"] = str(self.port)
-        # Live protocol tests exercise normal server behavior.  Do not inherit
-        # diagnostic checkpoint knobs from the caller: a tiny threshold could
-        # checkpoint the buffered ABORT before this suite deliberately kills
-        # the process.
-        env["RMDB_EXECUTION_TIMING_DIAGNOSTICS"] = "1"
         self.process = subprocess.Popen(
             [self.binary, "db"],
             cwd=self.root,
@@ -543,77 +537,6 @@ def test_prepared_select_fast_route(server):
             "prepared SELECT reused stale repeated parameters",
         )
 
-        os.kill(server.process.pid, signal.SIGUSR1)
-        log_path = os.path.join(server.root, "rmdb.log")
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                lines = open(log_path, "r", encoding="utf-8").read().splitlines()
-            except FileNotFoundError:
-                lines = []
-            matching = [
-                line
-                for line in lines
-                if "obs_exec " in line and "statement_id=200 " in line
-            ]
-            if matching:
-                fields = dict(
-                    token.split("=", 1)
-                    for token in matching[-1].split()
-                    if "=" in token
-                )
-                require(
-                    fields.get("route") == "prepared-plan",
-                    "prepared SELECT did not hit fast route",
-                )
-                require(
-                    fields.get("invocations") == "2",
-                    "prepared SELECT route count mismatch",
-                )
-                require(
-                    fields.get("clone_bind_ns") == "0",
-                    "prepared SELECT still cloned AST",
-                )
-                require(
-                    fields.get("analyze_ns") == "0", "prepared SELECT still ran Analyze"
-                )
-                require(
-                    fields.get("plan_ns") == "0", "prepared SELECT still ran Planner"
-                )
-                for statement_id, kind in ((2, "UPDATE"), (5, "INSERT")):
-                    dml_lines = [
-                        line
-                        for line in lines
-                        if "obs_exec " in line
-                        and "statement_id=" + str(statement_id) + " " in line
-                    ]
-                    require(
-                        dml_lines, "prepared " + kind + " route diagnostics are missing"
-                    )
-                    dml_fields = dict(
-                        token.split("=", 1)
-                        for token in dml_lines[-1].split()
-                        if "=" in token
-                    )
-                    require(
-                        dml_fields.get("route") == "prepared-plan",
-                        "prepared " + kind + " did not hit fast route",
-                    )
-                    require(
-                        dml_fields.get("clone_bind_ns") == "0",
-                        "prepared " + kind + " still cloned AST",
-                    )
-                    require(
-                        dml_fields.get("analyze_ns") == "0",
-                        "prepared " + kind + " still ran Analyze",
-                    )
-                    require(
-                        dml_fields.get("plan_ns") == "0",
-                        "prepared " + kind + " still ran Planner",
-                    )
-                return
-            time.sleep(0.05)
-        raise ProtocolFailure("prepared SELECT route diagnostics were not published")
     finally:
         client.close()
 
@@ -721,56 +644,6 @@ def test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server):
         )
         require(rows == [], "unsupported prepared DELETE fallback changed semantics")
 
-        os.kill(server.process.pid, signal.SIGUSR1)
-        deadline = time.monotonic() + 3
-        log_path = os.path.join(server.root, "rmdb.log")
-        while time.monotonic() < deadline:
-            try:
-                lines = open(log_path, "r", encoding="utf-8").read().splitlines()
-            except FileNotFoundError:
-                lines = []
-            prepared_matching = [
-                line
-                for line in lines
-                if "obs_exec " in line and "statement_id=220 " in line
-            ]
-            fallback_matching = [
-                line
-                for line in lines
-                if "obs_exec " in line and "statement_id=221 " in line
-            ]
-            if prepared_matching and fallback_matching:
-                prepared_fields = dict(
-                    token.split("=", 1)
-                    for token in prepared_matching[-1].split()
-                    if "=" in token
-                )
-                require(
-                    prepared_fields.get("route") == "prepared-plan",
-                    "cold/hot UPDATE did not use prepared runtime",
-                )
-                require(
-                    prepared_fields.get("invocations") == "2",
-                    "cold/hot UPDATE prepared route count mismatch",
-                )
-                require(
-                    prepared_fields.get("clone_bind_ns") == "0"
-                    and prepared_fields.get("analyze_ns") == "0"
-                    and prepared_fields.get("plan_ns") == "0",
-                    "cold/hot UPDATE unexpectedly rebuilt its prepared plan",
-                )
-                fallback_fields = dict(
-                    token.split("=", 1)
-                    for token in fallback_matching[-1].split()
-                    if "=" in token
-                )
-                require(
-                    fallback_fields.get("route") == "fallback",
-                    "unsupported prepared DELETE did not use correctness fallback",
-                )
-                return
-            time.sleep(0.05)
-        raise ProtocolFailure("prepared UPDATE/DELETE route diagnostics were not published")
     finally:
         client.close()
 
@@ -989,61 +862,6 @@ def test_prepared_snapshot_write_conflict(server):
         _, rows = victim.query("SELECT value FROM prepared_si_probe WHERE id = 1;")
         require(rows == [[13]], "post-AUTO_ABORT prepared point UPDATE did not commit")
 
-        os.kill(server.process.pid, signal.SIGUSR1)
-        log_path = os.path.join(server.root, "rmdb.log")
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if not os.path.exists(log_path):
-                time.sleep(0.05)
-                continue
-            with open(log_path, "r", encoding="utf-8", errors="replace") as log:
-                matching = [
-                    line
-                    for line in log
-                    if "obs_exec " in line
-                    and "statement_id=230 " in line
-                    and "route=prepared-plan " in line
-                ]
-            if matching:
-                entries = [
-                    dict(
-                        token.split("=", 1)
-                        for token in line.split()
-                        if "=" in token
-                    )
-                    for line in matching
-                ]
-                latest_sequence = max(int(fields["seq"]) for fields in entries)
-                entries = [
-                    fields
-                    for fields in entries
-                    if int(fields["seq"]) == latest_sequence
-                ]
-                require(
-                    sum(int(fields["invocations"]) for fields in entries) == 3
-                    and sum(int(fields["aborts"]) for fields in entries) == 1,
-                    "prepared SI point UPDATE route counts are inconsistent",
-                )
-                require(
-                    sum(int(fields["executor_constructed"]) for fields in entries)
-                    == 3,
-                    "prepared SI UPDATE used the generic scan-plus-update route",
-                )
-                require(
-                    all(
-                        fields.get("clone_bind_ns") == "0"
-                        and fields.get("analyze_ns") == "0"
-                        and fields.get("plan_ns") == "0"
-                        for fields in entries
-                    ),
-                    "prepared SI point UPDATE rebuilt its prepared plan",
-                )
-                break
-            time.sleep(0.05)
-        else:
-            raise ProtocolFailure(
-                "prepared SI point UPDATE route diagnostics were not published"
-            )
     finally:
         winner.close()
         victim.close()
@@ -1118,59 +936,6 @@ def test_prepared_composite_float_char_point_update(server):
             "NULL composite point key mutated the indexed row",
         )
 
-        os.kill(server.process.pid, signal.SIGUSR1)
-        log_path = os.path.join(server.root, "rmdb.log")
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if not os.path.exists(log_path):
-                time.sleep(0.05)
-                continue
-            with open(log_path, "r", encoding="utf-8", errors="replace") as log:
-                matching = [
-                    line
-                    for line in log
-                    if "obs_exec " in line
-                    and "statement_id=232 " in line
-                    and "route=prepared-plan " in line
-                ]
-            if matching:
-                entries = [
-                    dict(
-                        token.split("=", 1)
-                        for token in line.split()
-                        if "=" in token
-                    )
-                    for line in matching
-                ]
-                latest_sequence = max(int(fields["seq"]) for fields in entries)
-                entries = [
-                    fields
-                    for fields in entries
-                    if int(fields["seq"]) == latest_sequence
-                ]
-                require(
-                    sum(int(fields["invocations"]) for fields in entries) == 3
-                    and sum(
-                        int(fields["executor_constructed"]) for fields in entries
-                    )
-                    == 3,
-                    "composite prepared UPDATE used the generic scan-plus-update route",
-                )
-                require(
-                    all(
-                        fields.get("clone_bind_ns") == "0"
-                        and fields.get("analyze_ns") == "0"
-                        and fields.get("plan_ns") == "0"
-                        for fields in entries
-                    ),
-                    "composite prepared point UPDATE rebuilt its plan",
-                )
-                break
-            time.sleep(0.05)
-        else:
-            raise ProtocolFailure(
-                "composite prepared point UPDATE route diagnostics were not published"
-            )
     finally:
         client.close()
 
@@ -1590,196 +1355,6 @@ def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
         verifier.close()
 
 
-OBSERVABILITY_FIELDS = {
-    "obs_abort": {
-        "t_ms",
-        "seq",
-        "shrinking",
-        "upgrade",
-        "deadlock",
-        "ww",
-        "ssi",
-        "unique",
-    },
-    "obs_lock": {
-        "t_ms",
-        "seq",
-        "kind",
-        "immediate_conflict",
-        "wait_enqueued",
-        "wait_granted",
-        "wait_cancelled",
-        "wait_ns",
-        "queue_depth_max",
-        "cycle_checks",
-        "cycle_victims",
-    },
-    "obs_ckpt": {
-        "t_ms",
-        "seq",
-        "attempt",
-        "success",
-        "drain_timeout",
-        "deadline",
-        "final_data_fail",
-        "block_ns",
-        "drain_ns",
-        "final_wal_ns",
-        "final_data_ns",
-        "meta_ns",
-        "manifest_ns",
-        "truncate_ns",
-        "begin_blocked",
-        "begin_wait_ns",
-    },
-    "obs_bpm": {
-        "t_ms",
-        "seq",
-        "fetch_miss",
-        "inflight_wait",
-        "inflight_wait_ns",
-        "no_victim",
-        "eviction_clean",
-        "eviction_dirty",
-        "page_reads",
-        "page_writes",
-    },
-}
-
-
-def read_observability_snapshots(log_path, start_offset=0):
-    try:
-        with open(log_path, "rb") as log_file:
-            log_file.seek(start_offset)
-            lines = log_file.read().decode("utf-8").splitlines()
-    except FileNotFoundError:
-        return {}
-
-    snapshots = {}
-    for line in lines:
-        match = re.search(r"\b(obs_abort|obs_lock|obs_ckpt|obs_bpm) (.*)$", line)
-        if not match:
-            continue
-        line_kind, payload = match.groups()
-        values = {}
-        for token in payload.split():
-            key, separator, value = token.partition("=")
-            require(
-                separator and key and value,
-                "malformed " + line_kind + " observability field",
-            )
-            values[key] = value
-        require(
-            set(values) == OBSERVABILITY_FIELDS[line_kind],
-            line_kind + " omitted or added observability fields",
-        )
-        for key, value in values.items():
-            if key != "kind":
-                require(
-                    value.isdigit(),
-                    line_kind + " field " + key + " is not an unsigned integer",
-                )
-        sequence = int(values["seq"])
-        snapshot = snapshots.setdefault(sequence, {"obs_lock": {}, "_order": []})
-        if line_kind == "obs_lock":
-            require(
-                values["kind"] in ("record", "unique"),
-                "obs_lock emitted an unknown kind",
-            )
-            snapshot["obs_lock"][values["kind"]] = values
-            snapshot["_order"].append(line_kind + ":" + values["kind"])
-        else:
-            snapshot[line_kind] = values
-            snapshot["_order"].append(line_kind)
-    return snapshots
-
-
-def wait_for_observability_snapshot(log_path, start_offset):
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        snapshots = read_observability_snapshots(log_path, start_offset)
-        for sequence in sorted(snapshots):
-            snapshot = snapshots[sequence]
-            if (
-                "obs_abort" in snapshot
-                and "obs_ckpt" in snapshot
-                and "obs_bpm" in snapshot
-                and set(snapshot["obs_lock"]) == {"record", "unique"}
-            ):
-                require(
-                    snapshot["_order"]
-                    == [
-                        "obs_abort",
-                        "obs_lock:record",
-                        "obs_lock:unique",
-                        "obs_ckpt",
-                        "obs_bpm",
-                    ],
-                    "SIGUSR1 observability lines were incomplete or out of order",
-                )
-                for line_kind in ("obs_abort", "obs_ckpt", "obs_bpm"):
-                    require(
-                        int(snapshot[line_kind]["seq"]) == sequence,
-                        "SIGUSR1 observability lines did not share one sequence",
-                    )
-                for lock_values in snapshot["obs_lock"].values():
-                    require(
-                        int(lock_values["seq"]) == sequence,
-                        "SIGUSR1 observability lines did not share one sequence",
-                    )
-                return sequence, snapshot
-        time.sleep(0.05)
-    raise ProtocolFailure("SIGUSR1 did not publish complete observability lines")
-
-
-def force_snapshot_write_conflict(port):
-    setup = WireClient(port)
-    setup.command("CREATE TABLE obs_si_probe (id INT, value INT);")
-    setup.command("INSERT INTO obs_si_probe VALUES (1, 10);")
-    setup.close()
-
-    winner = WireClient(port)
-    victim = WireClient(port)
-    try:
-        winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
-        victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
-        winner.command("BEGIN;")
-        victim.command("BEGIN;")
-        winner.command("UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;")
-        winner.command("COMMIT;")
-        tag, diagnostic = victim.stream_raw(
-            "UPDATE obs_si_probe SET value = value + 1 WHERE id = 1;"
-        )
-        require(
-            tag == TRANSACTION_ABORT and diagnostic,
-            "observability probe did not create a SNAPSHOT ISOLATION write conflict",
-        )
-    finally:
-        winner.close()
-        victim.close()
-
-
-def test_sigusr1_observability(server):
-    log_path = os.path.join(server.root, "rmdb.log")
-    first_offset = os.path.getsize(log_path)
-    os.kill(server.process.pid, signal.SIGUSR1)
-    first_sequence, first = wait_for_observability_snapshot(log_path, first_offset)
-
-    force_snapshot_write_conflict(server.port)
-    second_offset = os.path.getsize(log_path)
-    os.kill(server.process.pid, signal.SIGUSR1)
-    second_sequence, second = wait_for_observability_snapshot(log_path, second_offset)
-
-    require(
-        second_sequence > first_sequence,
-        "consecutive SIGUSR1 requests did not produce increasing sequences",
-    )
-    require(
-        int(second["obs_abort"]["ww"]) == int(first["obs_abort"]["ww"]) + 1,
-        "one EXEC_STREAM SNAPSHOT ISOLATION write conflict must increment ww exactly once",
-    )
-
-
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
     server = Server(sys.argv[1])
@@ -1803,7 +1378,6 @@ def main():
         test_crash_recovery_smoke(server)
         test_unique_index_auto_abort_then_sigkill_has_no_residue(server)
         test_abort_ack_then_sigkill_recovers_indexed_undo(server)
-        test_sigusr1_observability(server)
     finally:
         server.cleanup()
 

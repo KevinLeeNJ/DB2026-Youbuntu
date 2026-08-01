@@ -26,17 +26,6 @@ See the Mulan PSL v2 for more details. */
 
 static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
 
-struct LockObservabilitySnapshot {
-    uint64_t immediate_conflict{0};
-    uint64_t wait_enqueued{0};
-    uint64_t wait_granted{0};
-    uint64_t wait_cancelled{0};
-    uint64_t wait_ns{0};
-    uint64_t queue_depth_max{0};
-    uint64_t cycle_checks{0};
-    uint64_t cycle_victims{0};
-};
-
 // Record-lock acquisition needs to tell an executor whether a failed wait was
 // a deadlock victim selection or an ordinary transaction cancellation. Keep an
 // implicit bool conversion so existing low-level callers retain their compact
@@ -136,12 +125,10 @@ public:
     // lock acquisition path.
     void wait_for_transaction_lock_requests(txn_id_t txn_id);
 
-    uint64_t wait_cycle_abort_count() const {
-        return wait_cycle_abort_count_.load(std::memory_order_acquire);
-    }
-
-    LockObservabilitySnapshot record_lock_observability() const;
-    LockObservabilitySnapshot unique_key_lock_observability() const;
+    // Test-only state probes. These inspect the real wait queues and are not
+    // maintained as production counters.
+    bool has_record_waiters_for_test();
+    bool has_unique_waiters_for_test();
 
     // Test-only hooks for the owner-handoff cancellation window. Production
     // construction leaves these empty.
@@ -193,7 +180,6 @@ private:
     void run_unique_handoff_published_test_hook();
     void run_cycle_cancel_before_record_queue_test_hook();
     void run_cycle_cancel_before_flag_test_hook();
-    static void observe_queue_depth(std::atomic<uint64_t>& maximum, size_t depth);
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
     std::mutex pending_latch_;
@@ -201,15 +187,6 @@ private:
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;
     std::unordered_map<txn_id_t, WaitingTxn> waiting_txns_;
     std::atomic<uint64_t> wait_topology_epoch_{0};
-    std::atomic<uint64_t> wait_cycle_abort_count_{0};
-    std::atomic<uint64_t> record_immediate_conflict_{0};
-    std::atomic<uint64_t> record_wait_enqueued_{0};
-    std::atomic<uint64_t> record_wait_granted_{0};
-    std::atomic<uint64_t> record_wait_cancelled_{0};
-    std::atomic<uint64_t> record_wait_ns_{0};
-    std::atomic<uint64_t> record_queue_depth_max_{0};
-    std::atomic<uint64_t> record_cycle_checks_{0};
-    std::atomic<uint64_t> record_cycle_victims_{0};
     std::mutex record_handoff_test_hook_latch_;
     std::function<void()> record_handoff_test_hook_;
     std::function<void()> record_handoff_published_test_hook_;
@@ -238,14 +215,6 @@ private:
     bool lock_exclusive_on_unique_key_id(Transaction* txn, const std::string& lock_id);
     static std::string make_unique_key_lock_id(int index_fd, const std::vector<char>& key);
     std::array<UniqueKeyShard, UNIQUE_KEY_SHARD_COUNT> unique_key_shards_;
-    std::atomic<uint64_t> unique_immediate_conflict_{0};
-    std::atomic<uint64_t> unique_wait_enqueued_{0};
-    std::atomic<uint64_t> unique_wait_granted_{0};
-    std::atomic<uint64_t> unique_wait_cancelled_{0};
-    std::atomic<uint64_t> unique_wait_ns_{0};
-    std::atomic<uint64_t> unique_queue_depth_max_{0};
-    std::atomic<uint64_t> unique_cycle_checks_{0};
-    std::atomic<uint64_t> unique_cycle_victims_{0};
 
     static constexpr size_t LOGICAL_ROW_INTENT_SHARD_COUNT = 64;
     struct LogicalRowShard {

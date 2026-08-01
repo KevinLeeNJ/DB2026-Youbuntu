@@ -11,9 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include <algorithm>
-#include <atomic>
 #include <condition_variable>
-#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -40,15 +38,6 @@ class LogManager;
 enum class ResidencyClass : uint8_t {
     Normal,
     IndexInternal,
-};
-
-struct BufferPoolObservabilitySnapshot {
-    uint64_t fetch_miss{0};
-    uint64_t inflight_wait{0};
-    uint64_t inflight_wait_ns{0};
-    uint64_t no_victim{0};
-    uint64_t eviction_clean{0};
-    uint64_t eviction_dirty{0};
 };
 
 class FlushDependencyPolicy {
@@ -104,12 +93,6 @@ private:
     std::unordered_map<int, size_t> index_writes_inflight_;
     bool frame_operation_active_{false};
     uint64_t frame_operation_generation_{0};
-    std::atomic<uint64_t> fetch_miss_{0};
-    std::atomic<uint64_t> inflight_wait_{0};
-    std::atomic<uint64_t> inflight_wait_ns_{0};
-    std::atomic<uint64_t> no_victim_{0};
-    std::atomic<uint64_t> eviction_clean_{0};
-    std::atomic<uint64_t> eviction_dirty_{0};
 
 public:
     static void set_flush_page_test_hook(FlushPageTestHook hook);
@@ -262,8 +245,6 @@ public:
         log_manager_ = log_manager;
     }
 
-    BufferPoolObservabilitySnapshot observability_snapshot() const;
-
     // The frame array is fixed for this manager's lifetime, so this is a
     // lock-free read-only capacity query for checkpoint pacing.
     size_t frame_capacity() const noexcept {
@@ -271,14 +252,6 @@ public:
     }
 
 private:
-    // Env-gated (RMDB_LOG_BPM_STATS=1) snapshot of how much of the pool is
-    // actually available for replacement. Emitted from the background preflush
-    // tick - the only periodic call the buffer pool receives - so nothing is
-    // added to any request path. Written to answer a specific question: whether
-    // the index's resident/pinned internal pages measurably shrink the effective
-    // pool.
-    void log_pool_stats();
-
     frame_id_t take_free_frame();
     frame_id_t take_unblocked_victim_locked();
     bool index_smo_blocked_locked(int fd) const;

@@ -36,11 +36,6 @@ constexpr int64_t kDrainRetryBackoffBytes = 32LL * 1024 * 1024;
 constexpr size_t kMinPreflushBatchPages = 64;
 constexpr size_t kMaxPreflushBatchPages = 1024;
 
-uint64_t ElapsedNs(std::chrono::steady_clock::time_point begin) {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
-}
-
 } // namespace
 
 CheckpointManager::CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr)
@@ -57,10 +52,6 @@ bool CheckpointManager::RunCleanCheckpoint() {
     }
     running_.store(true);
     std::unique_lock<std::shared_mutex> preflush_guard{preflush_latch_};
-    if (txn_mgr_ != nullptr) {
-        txn_mgr_->observe_checkpoint_attempt();
-    }
-
     struct RunningGuard {
         std::atomic<bool>* local_running;
 
@@ -78,22 +69,16 @@ bool CheckpointManager::RunCleanCheckpoint() {
 
     struct BlockGuard {
         TransactionManager* txn_mgr;
-        std::chrono::steady_clock::time_point begin;
 
         explicit BlockGuard(TransactionManager* mgr) : txn_mgr(mgr) {
             txn_mgr->block_new_transactions_for_checkpoint();
-            begin = std::chrono::steady_clock::now();
         }
 
         ~BlockGuard() {
-            txn_mgr->observe_checkpoint_block_ns(ElapsedNs(begin));
             txn_mgr->unblock_new_transactions_after_checkpoint();
         }
     } block_guard(txn_mgr_);
-    const auto drain_begin = std::chrono::steady_clock::now();
     if (!txn_mgr_->wait_active_transactions_drained_for_checkpoint(kDrainTimeout)) {
-        txn_mgr_->observe_checkpoint_drain_ns(ElapsedNs(drain_begin));
-        txn_mgr_->observe_checkpoint_drain_timeout();
         // Abandon this round. ~BlockGuard releases the block immediately, so a
         // stuck transaction can never freeze every other transaction. The WAL
         // keeps growing, which only makes the next recovery slower.
@@ -101,16 +86,11 @@ bool CheckpointManager::RunCleanCheckpoint() {
         drain_retry_log_offset_ = log_mgr_->current_log_offset() + kDrainRetryBackoffBytes;
         return false;
     }
-    txn_mgr_->observe_checkpoint_drain_ns(ElapsedNs(drain_begin));
     if (std::chrono::steady_clock::now() >= deadline) {
-        txn_mgr_->observe_checkpoint_deadline();
         return false;
     }
-    const auto final_wal_begin = std::chrono::steady_clock::now();
     log_mgr_->flush_log_to_disk_with_sync();
-    txn_mgr_->observe_checkpoint_final_wal_ns(ElapsedNs(final_wal_begin));
     FaultInjector::Point("before_checkpoint_data_sync");
-    const auto final_data_begin = std::chrono::steady_clock::now();
     bool final_data_stable = false;
     try {
         final_data_stable = sm_mgr_->flush_all_table_and_index_pages(FlushDependencyPolicy::AlreadyDurable());
@@ -119,15 +99,10 @@ bool CheckpointManager::RunCleanCheckpoint() {
         // restart manifest intact so this checkpoint can be retried.
     }
     if (!final_data_stable) {
-        txn_mgr_->observe_checkpoint_final_data_ns(ElapsedNs(final_data_begin));
-        txn_mgr_->observe_checkpoint_final_data_fail();
         return false;
     }
-    txn_mgr_->observe_checkpoint_final_data_ns(ElapsedNs(final_data_begin));
     FaultInjector::Point("after_checkpoint_data_sync");
-    const auto meta_begin = std::chrono::steady_clock::now();
     sm_mgr_->flush_meta();
-    txn_mgr_->observe_checkpoint_meta_ns(ElapsedNs(meta_begin));
     // Publish the restart manifest before truncating WAL. If anything after
     // this point fails, the complete WAL is still available for recovery.
     //
@@ -140,14 +115,9 @@ bool CheckpointManager::RunCleanCheckpoint() {
     manifest.checkpoint_offset = 0;
     manifest.next_timestamp = txn_mgr_->peek_next_timestamp();
     manifest.next_txn_id = txn_mgr_->peek_next_txn_id();
-    const auto manifest_begin = std::chrono::steady_clock::now();
     log_mgr_->write_restart_manifest(manifest);
-    txn_mgr_->observe_checkpoint_manifest_ns(ElapsedNs(manifest_begin));
     FaultInjector::Point("before_wal_truncate");
-    const auto truncate_begin = std::chrono::steady_clock::now();
     log_mgr_->reset_log(log_mgr_->get_global_lsn());
-    txn_mgr_->observe_checkpoint_truncate_ns(ElapsedNs(truncate_begin));
-    txn_mgr_->observe_checkpoint_success();
     return true;
 }
 

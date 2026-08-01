@@ -32,10 +32,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 
-#include "common/runtime_config.h"
 #include "errors.h"
-#include "execution/execution_timing_diagnostics.h"
-#include "execution/index_skip_scan_diagnostics.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
@@ -46,36 +43,16 @@ See the Mulan PSL v2 for more details. */
 #include "portal.h"
 #include "analyze/analyze.h"
 #include "protocol/wire_protocol.h"
-#include "transaction/commit_timing_diagnostics.h"
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 128
 
 static bool should_exit = false;
 
-namespace {
-
-BufferPoolRuntimeConfig load_buffer_pool_config_or_exit() {
-    BufferPoolRuntimeConfig config;
-    try {
-        const char* configured_gib = std::getenv("RMDB_BUFFER_POOL_GIB");
-        config = configured_gib == nullptr ? default_buffer_pool_config() : parse_buffer_pool_config(configured_gib);
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[rmdb] configuration error: %s\n", error.what());
-        std::fflush(stderr);
-        std::exit(EXIT_FAILURE);
-    }
-    std::fprintf(stderr, "[rmdb] buffer pool: %zu GiB (%zu pages)\n", config.gibibytes, config.pages);
-    std::fflush(stderr);
-    return config;
-}
-
-} // namespace
-
 // 构建全局所需的管理器对象
-const auto buffer_pool_config = load_buffer_pool_config_or_exit();
+static constexpr size_t SERVER_BUFFER_POOL_PAGES = (size_t{3} << 30) / PAGE_SIZE;
 auto disk_manager = std::make_unique<DiskManager>();
-auto buffer_pool_manager = std::make_unique<BufferPoolManager>(buffer_pool_config.pages, disk_manager.get());
+auto buffer_pool_manager = std::make_unique<BufferPoolManager>(SERVER_BUFFER_POOL_PAGES, disk_manager.get());
 auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
 auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
 auto sm_manager =
@@ -94,148 +71,6 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
-
-// SIGUSR1 asks the server to publish its WAL/group-commit counters once. A
-// signal handler may not format or log, and `final.md:416` forbids per-
-// transaction logging on a measured run, so the handler only increments this
-// lock-free request counter. The observability thread consumes every request
-// and is the only path that flushes the logger for these snapshots.
-static std::atomic<uint64_t> observability_requests{0};
-static_assert(std::atomic<uint64_t>::is_always_lock_free,
-              "SIGUSR1 observability requests require a lock-free atomic counter");
-static std::atomic<uint64_t> observability_sequence{0};
-
-void sigusr1_handler(int signo) {
-    (void)signo;
-    observability_requests.fetch_add(1, std::memory_order_relaxed);
-}
-
-// Counters are monotonic since startup: take one line before and one after a
-// measurement window and subtract to get rates for that window alone.
-void log_wal_statistics() {
-    LOG_WARN("walstats t_ms=%lld commits=%llu fsyncs=%llu leaders=%llu batches=%llu waiters=%llu wait_ns=%llu "
-             "pwrites=%llu pwrite_bytes=%llu write_ns=%llu fsync_ns=%llu txnmap_lookups=%llu",
-             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch())
-                                        .count()),
-             static_cast<unsigned long long>(log_manager->get_commit_count()),
-             static_cast<unsigned long long>(log_manager->get_fsync_count()),
-             static_cast<unsigned long long>(log_manager->get_group_commit_leader_count()),
-             static_cast<unsigned long long>(log_manager->get_group_commit_count()),
-             static_cast<unsigned long long>(log_manager->get_group_commit_waiter_count()),
-             static_cast<unsigned long long>(log_manager->get_group_commit_wait_ns()),
-             static_cast<unsigned long long>(log_manager->get_pwrite_count()),
-             static_cast<unsigned long long>(log_manager->get_pwrite_bytes()),
-             static_cast<unsigned long long>(log_manager->get_wal_write_ns()),
-             static_cast<unsigned long long>(log_manager->get_wal_fsync_ns()),
-             static_cast<unsigned long long>(txn_manager->DebugTxnMapLookupCount()));
-}
-
-void log_observability_statistics() {
-    const uint64_t sequence = observability_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    const auto now_ms = static_cast<long long>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-    const auto aborts = txn_manager->abort_observability();
-    const auto record_locks = lock_manager->record_lock_observability();
-    const auto unique_locks = lock_manager->unique_key_lock_observability();
-    const auto checkpoint = txn_manager->checkpoint_observability();
-    const auto bpm = buffer_pool_manager->observability_snapshot();
-
-    LOG_WARN("obs_abort t_ms=%lld seq=%llu shrinking=%llu upgrade=%llu deadlock=%llu ww=%llu ssi=%llu unique=%llu",
-             now_ms, static_cast<unsigned long long>(sequence),
-             static_cast<unsigned long long>(aborts.lock_on_shrinking),
-             static_cast<unsigned long long>(aborts.upgrade_conflict),
-             static_cast<unsigned long long>(aborts.deadlock_prevention),
-             static_cast<unsigned long long>(aborts.ww_conflict), static_cast<unsigned long long>(aborts.ssi_danger),
-             static_cast<unsigned long long>(aborts.unique_key_conflict));
-    const auto log_lock = [now_ms, sequence](const char* kind, const LockObservabilitySnapshot& stats) {
-        LOG_WARN(
-            "obs_lock t_ms=%lld seq=%llu kind=%s immediate_conflict=%llu "
-            "wait_enqueued=%llu wait_granted=%llu wait_cancelled=%llu wait_ns=%llu "
-            "queue_depth_max=%llu cycle_checks=%llu cycle_victims=%llu",
-            now_ms, static_cast<unsigned long long>(sequence), kind,
-            static_cast<unsigned long long>(stats.immediate_conflict),
-            static_cast<unsigned long long>(stats.wait_enqueued), static_cast<unsigned long long>(stats.wait_granted),
-            static_cast<unsigned long long>(stats.wait_cancelled), static_cast<unsigned long long>(stats.wait_ns),
-            static_cast<unsigned long long>(stats.queue_depth_max), static_cast<unsigned long long>(stats.cycle_checks),
-            static_cast<unsigned long long>(stats.cycle_victims));
-    };
-    log_lock("record", record_locks);
-    log_lock("unique", unique_locks);
-    LOG_WARN(
-        "obs_ckpt t_ms=%lld seq=%llu attempt=%llu success=%llu drain_timeout=%llu deadline=%llu "
-        "final_data_fail=%llu block_ns=%llu drain_ns=%llu final_wal_ns=%llu "
-        "final_data_ns=%llu meta_ns=%llu manifest_ns=%llu truncate_ns=%llu begin_blocked=%llu begin_wait_ns=%llu",
-        now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(checkpoint.attempt),
-        static_cast<unsigned long long>(checkpoint.success), static_cast<unsigned long long>(checkpoint.drain_timeout),
-        static_cast<unsigned long long>(checkpoint.deadline),
-        static_cast<unsigned long long>(checkpoint.final_data_fail),
-        static_cast<unsigned long long>(checkpoint.block_ns), static_cast<unsigned long long>(checkpoint.drain_ns),
-        static_cast<unsigned long long>(checkpoint.final_wal_ns),
-        static_cast<unsigned long long>(checkpoint.final_data_ns), static_cast<unsigned long long>(checkpoint.meta_ns),
-        static_cast<unsigned long long>(checkpoint.manifest_ns),
-        static_cast<unsigned long long>(checkpoint.truncate_ns),
-        static_cast<unsigned long long>(checkpoint.begin_blocked),
-        static_cast<unsigned long long>(checkpoint.begin_wait_ns));
-    LOG_WARN("obs_bpm t_ms=%lld seq=%llu fetch_miss=%llu inflight_wait=%llu inflight_wait_ns=%llu no_victim=%llu "
-             "eviction_clean=%llu eviction_dirty=%llu page_reads=%llu page_writes=%llu",
-             now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(bpm.fetch_miss),
-             static_cast<unsigned long long>(bpm.inflight_wait), static_cast<unsigned long long>(bpm.inflight_wait_ns),
-             static_cast<unsigned long long>(bpm.no_victim), static_cast<unsigned long long>(bpm.eviction_clean),
-             static_cast<unsigned long long>(bpm.eviction_dirty),
-             static_cast<unsigned long long>(disk_manager->get_page_read_count()),
-             static_cast<unsigned long long>(disk_manager->get_page_write_count()));
-    if (commit_timing_diagnostics::enabled()) {
-        const auto commit = commit_timing_diagnostics::snapshot();
-        LOG_WARN("obs_commit t_ms=%lld seq=%llu invocations=%llu failures=%llu total_ns=%llu prepare_ns=%llu "
-                 "timestamp_csn_ns=%llu wal_ns=%llu tuple_ns=%llu frontier_publish_ns=%llu frontier_wait_ns=%llu "
-                 "cleanup_ns=%llu",
-                 now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(commit.invocations),
-                 static_cast<unsigned long long>(commit.failures), static_cast<unsigned long long>(commit.total_ns),
-                 static_cast<unsigned long long>(commit.prepare_publication_ns),
-                 static_cast<unsigned long long>(commit.timestamp_csn_ns),
-                 static_cast<unsigned long long>(commit.wal_ns),
-                 static_cast<unsigned long long>(commit.tuple_publication_ns),
-                 static_cast<unsigned long long>(commit.frontier_publication_ns),
-                 static_cast<unsigned long long>(commit.frontier_wait_ns),
-                 static_cast<unsigned long long>(commit.cleanup_ns));
-    }
-    if (index_skip_scan_diagnostics::enabled()) {
-        for (const auto& stats : index_skip_scan_diagnostics::snapshots()) {
-            LOG_WARN("obs_skipscan t_ms=%lld seq=%llu statement_id=%u plan_hash=%llu table=%s index=%s prefix_cols=%zu "
-                     "invocations=%llu prefixes=%llu ranges=%llu descents=%llu build_ns=%llu build_ns_max=%llu",
-                     now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned int>(stats.statement_id),
-                     static_cast<unsigned long long>(stats.plan_hash), stats.table_name.c_str(),
-                     stats.index_name.c_str(), stats.prefix_column_count,
-                     static_cast<unsigned long long>(stats.invocations),
-                     static_cast<unsigned long long>(stats.prefixes), static_cast<unsigned long long>(stats.ranges),
-                     static_cast<unsigned long long>(stats.descents), static_cast<unsigned long long>(stats.build_ns),
-                     static_cast<unsigned long long>(stats.build_ns_max));
-        }
-    }
-    if (execution_timing_diagnostics::enabled()) {
-        for (const auto& stats : execution_timing_diagnostics::snapshots()) {
-            LOG_WARN(
-                "obs_exec t_ms=%lld seq=%llu statement_id=%u plan_hash=%llu route=%s fallback_reason=%s "
-                "invocations=%llu failures=%llu aborts=%llu errors=%llu total_ns=%llu bind_ns=%llu "
-                "clone_bind_ns=%llu analyze_ns=%llu plan_ns=%llu instantiate_ns=%llu portal_run_ns=%llu "
-                "executor_constructed=%llu executor_reused=%llu",
-                now_ms, static_cast<unsigned long long>(sequence), static_cast<unsigned int>(stats.statement_id),
-                static_cast<unsigned long long>(stats.plan_hash), execution_timing_diagnostics::route_name(stats.route),
-                execution_timing_diagnostics::fallback_reason_name(stats.fallback_reason),
-                static_cast<unsigned long long>(stats.invocations), static_cast<unsigned long long>(stats.failures),
-                static_cast<unsigned long long>(stats.aborts), static_cast<unsigned long long>(stats.errors),
-                static_cast<unsigned long long>(stats.total_ns), static_cast<unsigned long long>(stats.bind_ns),
-                static_cast<unsigned long long>(stats.clone_bind_ns), static_cast<unsigned long long>(stats.analyze_ns),
-                static_cast<unsigned long long>(stats.plan_ns), static_cast<unsigned long long>(stats.instantiate_ns),
-                static_cast<unsigned long long>(stats.portal_run_ns),
-                static_cast<unsigned long long>(stats.executor_constructed),
-                static_cast<unsigned long long>(stats.executor_reused));
-        }
-    }
-    minilog::Logger::get().flush();
-}
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -512,178 +347,10 @@ struct PreparedStatement {
     std::vector<Type> parameters;
     std::vector<std::string> names;
     std::vector<Type> result_types;
-    std::vector<std::string> diagnostic_plans;
-    std::uint64_t diagnostic_plan_hash = 0;
     std::unique_ptr<const PreparedPlanDescriptor> descriptor;
     std::string database_identity;
     std::uint64_t catalog_generation = 0;
 };
-
-const char* diagnostic_plan_tag(PlanTag tag) {
-    switch (tag) {
-    case T_Insert:
-        return "Insert";
-    case T_Update:
-        return "Update";
-    case T_Delete:
-        return "Delete";
-    case T_select:
-        return "Select";
-    case T_SeqScan:
-        return "SeqScan";
-    case T_IndexScan:
-        return "IndexScan";
-    case T_IndexSkipScan:
-        return "IndexSkipScan";
-    case T_Filter:
-        return "Filter";
-    case T_NestLoop:
-        return "NestedLoop";
-    case T_Sort:
-        return "Sort";
-    case T_Projection:
-        return "Projection";
-    case T_Aggregate:
-        return "Aggregate";
-    case T_Limit:
-        return "Limit";
-    case T_Union:
-        return "Union";
-    case T_ExplainAnalyze:
-        return "ExplainAnalyze";
-    case T_Transaction_begin:
-        return "Begin";
-    case T_Transaction_commit:
-        return "Commit";
-    case T_Transaction_abort:
-        return "Abort";
-    case T_Transaction_rollback:
-        return "Rollback";
-    default:
-        return "Utility";
-    }
-}
-
-std::string join_diagnostic_names(const std::vector<std::string>& names) {
-    if (names.empty()) {
-        return "-";
-    }
-    std::ostringstream out;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (i != 0) {
-            out << ',';
-        }
-        out << names[i];
-    }
-    return out.str();
-}
-
-std::string scan_equality_mask(const ScanPlan& scan) {
-    if (scan.index_col_names_.empty()) {
-        return "-";
-    }
-    std::string mask;
-    mask.reserve(scan.index_col_names_.size());
-    for (const auto& index_col : scan.index_col_names_) {
-        const bool has_equality = std::any_of(scan.conds_.begin(), scan.conds_.end(), [&](const Condition& condition) {
-            return condition.is_rhs_val && condition.op == OP_EQ && condition.lhs_col.col_name == index_col;
-        });
-        mask.push_back(has_equality ? '1' : '0');
-    }
-    return mask;
-}
-
-void collect_scan_diagnostics(const Plan* plan, const char* root, std::uint16_t statement_id,
-                              std::vector<std::string>& mappings) {
-    if (plan == nullptr) {
-        return;
-    }
-    switch (plan->tag) {
-    case T_SeqScan:
-    case T_IndexScan:
-    case T_IndexSkipScan: {
-        const auto* scan = static_cast<const ScanPlan*>(plan);
-        std::ostringstream line;
-        line << "statement_id=" << statement_id << " root=" << root << " node=" << diagnostic_plan_tag(plan->tag)
-             << " table=" << scan->tab_name_ << " index_cols=" << join_diagnostic_names(scan->index_col_names_)
-             << " equality_mask=" << scan_equality_mask(*scan);
-        mappings.push_back(line.str());
-        return;
-    }
-    case T_select:
-    case T_ExplainAnalyze:
-    case T_Update:
-    case T_Delete:
-    case T_Insert:
-        collect_scan_diagnostics(static_cast<const DMLPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
-        return;
-    case T_Filter:
-        collect_scan_diagnostics(static_cast<const FilterPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
-        return;
-    case T_Projection:
-        collect_scan_diagnostics(static_cast<const ProjectionPlan*>(plan)->subplan_.get(), root, statement_id,
-                                 mappings);
-        return;
-    case T_Aggregate:
-        collect_scan_diagnostics(static_cast<const AggregatePlan*>(plan)->subplan_.get(), root, statement_id, mappings);
-        return;
-    case T_Sort:
-        collect_scan_diagnostics(static_cast<const SortPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
-        return;
-    case T_Limit:
-        collect_scan_diagnostics(static_cast<const LimitPlan*>(plan)->subplan_.get(), root, statement_id, mappings);
-        return;
-    case T_NestLoop: {
-        const auto* join = static_cast<const JoinPlan*>(plan);
-        collect_scan_diagnostics(join->left_.get(), root, statement_id, mappings);
-        collect_scan_diagnostics(join->right_.get(), root, statement_id, mappings);
-        return;
-    }
-    case T_Union:
-        for (const auto& branch : static_cast<const UnionPlan*>(plan)->branches_) {
-            collect_scan_diagnostics(branch.get(), root, statement_id, mappings);
-        }
-        return;
-    default:
-        return;
-    }
-}
-
-std::vector<std::string> describe_prepared_plan(std::uint16_t statement_id, const Plan* plan) {
-    std::vector<std::string> mappings;
-    collect_scan_diagnostics(plan, diagnostic_plan_tag(plan->tag), statement_id, mappings);
-    if (mappings.empty()) {
-        std::ostringstream line;
-        line << "statement_id=" << statement_id << " root=" << diagnostic_plan_tag(plan->tag)
-             << " node=None table=- index_cols=- equality_mask=-";
-        mappings.push_back(line.str());
-    }
-    return mappings;
-}
-
-std::uint64_t hash_prepared_plan(const std::vector<std::string>& mappings) {
-    // Stable FNV-1a is sufficient here: this is an attribution label, never a
-    // plan-cache key or an execution decision. Exclude the connection-local
-    // statement id so equal generic plans have the same diagnostic hash.
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (const auto& mapping : mappings) {
-        std::size_t plan_offset = 0;
-        if (mapping.rfind("statement_id=", 0) == 0) {
-            const auto delimiter = mapping.find(' ');
-            if (delimiter != std::string::npos) {
-                plan_offset = delimiter + 1;
-            }
-        }
-        for (std::size_t i = plan_offset; i < mapping.size(); ++i) {
-            const auto byte = static_cast<unsigned char>(mapping[i]);
-            hash ^= byte;
-            hash *= 1099511628211ULL;
-        }
-        hash ^= 0xff;
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
 
 std::string diagnostic(const std::exception& exception) {
     std::string text = exception.what();
@@ -758,10 +425,9 @@ struct ExecutionOutcome {
     bool catalog_changed = false;
 };
 
-template <bool TimingEnabled>
 ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                   QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing,
-                                   bool catalog_guard_held = false, Context* reusable_context = nullptr) {
+                                   QueryResultSink* result_sink, bool catalog_guard_held = false,
+                                   Context* reusable_context = nullptr) {
     std::vector<char> response;
     int offset = 0;
     std::optional<Context> owned_context;
@@ -801,36 +467,13 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
         SetTransaction(session, &context);
     }
     try {
-        std::unique_ptr<Query> query;
-        if constexpr (TimingEnabled) {
-            execution_timing_diagnostics::StageTimer timer(&timing->analyze_ns);
-            query = analyze->do_analyze(std::move(parse_tree));
-        } else {
-            query = analyze->do_analyze(std::move(parse_tree));
-        }
-        std::unique_ptr<Plan> plan;
-        if constexpr (TimingEnabled) {
-            execution_timing_diagnostics::StageTimer timer(&timing->plan_ns);
-            plan = optimizer->plan_query(std::move(query), &context);
-        } else {
-            plan = optimizer->plan_query(std::move(query), &context);
-        }
+        std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
+        std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), &context);
         const bool catalog_changed = plan->tag == T_CreateTable || plan->tag == T_DropTable ||
                                      plan->tag == T_CreateIndex || plan->tag == T_DropIndex || plan->tag == T_LoadData;
-        std::unique_ptr<PortalStmt> statement;
-        if constexpr (TimingEnabled) {
-            execution_timing_diagnostics::StageTimer timer(&timing->instantiate_ns);
-            statement = portal->start(std::move(plan), &context, &timing->executor_constructed);
-        } else {
-            statement = portal->start(std::move(plan), &context);
-        }
+        std::unique_ptr<PortalStmt> statement = portal->start(std::move(plan), &context);
         const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        if constexpr (TimingEnabled) {
-            execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
-            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        } else {
-            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        }
+        portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
         session.isolation = context.isolation_level_;
         portal->drop();
         if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
@@ -843,8 +486,7 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
         }
         context.txn_ = nullptr;
         return {is_query, catalog_changed};
-    } catch (TransactionAbortException& exception) {
-        txn_manager->record_client_abort(exception.GetAbortReason());
+    } catch (TransactionAbortException&) {
         abort_session(session, &context);
         throw;
     } catch (...) {
@@ -855,19 +497,12 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
 
 ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
                               QueryResultSink* result_sink) {
-    return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr);
+    return execute_tree_impl(std::move(parse_tree), session, result_sink);
 }
 
 ExecutionOutcome execute_tree_under_catalog_guard(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
                                                   QueryResultSink* result_sink, Context* reusable_context) {
-    return execute_tree_impl<false>(std::move(parse_tree), session, result_sink, nullptr, true, reusable_context);
-}
-
-ExecutionOutcome execute_tree_timed(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                    QueryResultSink* result_sink, execution_timing_diagnostics::Sample* timing,
-                                    bool catalog_guard_held = false, Context* reusable_context = nullptr) {
-    return execute_tree_impl<true>(std::move(parse_tree), session, result_sink, timing, catalog_guard_held,
-                                   reusable_context);
+    return execute_tree_impl(std::move(parse_tree), session, result_sink, true, reusable_context);
 }
 
 ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
@@ -897,8 +532,7 @@ ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
 
 ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters,
                                             SessionState& session, QueryResultSink* result_sink,
-                                            Context* reusable_context,
-                                            execution_timing_diagnostics::Sample* timing = nullptr) {
+                                            Context* reusable_context) {
     if (reusable_context == nullptr) {
         throw InternalError("prepared operation requires a reusable Context");
     }
@@ -908,20 +542,9 @@ ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descri
     context.output_file_enabled_ = &session.output_file_enabled;
     SetTransaction(session, &context);
     try {
-        std::unique_ptr<PortalStmt> statement;
-        if (timing != nullptr) {
-            execution_timing_diagnostics::StageTimer timer(&timing->instantiate_ns);
-            statement = portal->start_prepared(descriptor, parameters, &context, &timing->executor_constructed);
-        } else {
-            statement = portal->start_prepared(descriptor, parameters, &context);
-        }
+        std::unique_ptr<PortalStmt> statement = portal->start_prepared(descriptor, parameters, &context);
         const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        if (timing != nullptr) {
-            execution_timing_diagnostics::StageTimer timer(&timing->portal_run_ns);
-            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        } else {
-            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        }
+        portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
         session.isolation = context.isolation_level_;
         portal->drop();
         if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
@@ -933,8 +556,7 @@ ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descri
         }
         context.txn_ = nullptr;
         return {is_query, false};
-    } catch (TransactionAbortException& exception) {
-        txn_manager->record_client_abort(exception.GetAbortReason());
+    } catch (TransactionAbortException&) {
         abort_session(session, &context);
         throw;
     } catch (...) {
@@ -982,10 +604,6 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     auto bound = ast::clone_bound_tree(*template_tree, typed_parameters);
     std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(bound));
     std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query_tree), &context);
-    std::vector<std::string> diagnostic_plans;
-    if (index_skip_scan_diagnostics::enabled() || execution_timing_diagnostics::enabled()) {
-        diagnostic_plans = describe_prepared_plan(id, plan.get());
-    }
     const bool actual_query = plan->tag == T_select;
     if (actual_query != query)
         throw wire_protocol::ProtocolError("prepared result kind does not match SQL");
@@ -994,10 +612,6 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     result.query = query;
     result.template_tree = std::move(template_tree);
     result.parameters = std::move(parameters);
-    result.diagnostic_plans = std::move(diagnostic_plans);
-    if (!result.diagnostic_plans.empty()) {
-        result.diagnostic_plan_hash = hash_prepared_plan(result.diagnostic_plans);
-    }
     result.database_identity = sm_manager->get_database_identity_under_catalog_guard();
     result.catalog_generation = sm_manager->get_catalog_generation();
     PreparedStatementKind statement_kind = PreparedStatementKind::Unsupported;
@@ -1291,24 +905,6 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             replacement.emplace(statement.id, std::move(statement));
         }
         prepared.swap(replacement);
-        if (index_skip_scan_diagnostics::enabled()) {
-            try {
-                for (const auto& [id, statement] : prepared) {
-                    (void)id;
-                    for (const auto& mapping : statement.diagnostic_plans) {
-                        const std::string deduplication_key =
-                            std::to_string(statement.diagnostic_plan_hash) + ":" + mapping;
-                        if (index_skip_scan_diagnostics::register_prepared_plan(deduplication_key)) {
-                            LOG_WARN("skipdiag_prepare plan_hash=%llu %s",
-                                     static_cast<unsigned long long>(statement.diagnostic_plan_hash), mapping.c_str());
-                        }
-                    }
-                }
-                minilog::Logger::get().flush();
-            } catch (...) {
-                // Diagnostics must never alter PREPARE_SET behavior.
-            }
-        }
         wire_protocol::write_frame(fd, Tag::PREPARE_OK, response);
         return;
     }
@@ -1345,19 +941,11 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
 
     std::uint16_t failed = 0xffff;
     std::uint16_t executed = 0;
-    const bool execution_timing_enabled = execution_timing_diagnostics::enabled();
-    const bool skip_scan_diagnostics_enabled = index_skip_scan_diagnostics::enabled();
     BatchExecutionContext batch(session);
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
             auto* prepared_statement = operations[i].statement;
-            std::optional<execution_timing_diagnostics::OperationScope> timing_scope;
-            if (execution_timing_enabled) {
-                timing_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
-            }
-            bool binding_parameters = false;
-            try {
-                if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
+            if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
                     prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
                     revalidate_prepared(*prepared_statement, session.isolation);
                 }
@@ -1388,88 +976,18 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
                 };
                 ExecutionOutcome outcome;
                 if (prepared_fast_path) {
-                    binding_parameters = true;
-                    std::optional<ParameterFrame> parameter_frame;
-                    if (execution_timing_enabled) {
-                        timing_scope->sample().route = execution_timing_diagnostics::Route::PreparedPlan;
-                        execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().bind_ns);
-                        parameter_frame.emplace(make_parameter_frame(operations[i].values));
-                    } else {
-                        parameter_frame.emplace(make_parameter_frame(operations[i].values));
-                    }
-                    binding_parameters = false;
-                    if (timing_scope.has_value()) {
-                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
-                    }
-                    outcome = execute_prepared_operation(*prepared_statement->descriptor, *parameter_frame, session,
-                                                         &batch.result, &batch.context,
-                                                         execution_timing_enabled ? &timing_scope->sample() : nullptr);
-                    if (timing_scope.has_value()) {
-                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::None;
-                    }
-                } else if (!execution_timing_enabled && !skip_scan_diagnostics_enabled) {
+                    const auto parameter_frame = make_parameter_frame(operations[i].values);
+                    outcome = execute_prepared_operation(*prepared_statement->descriptor, parameter_frame, session,
+                                                         &batch.result, &batch.context);
+                } else {
                     auto values = make_bindings();
                     outcome = execute_tree_under_catalog_guard(
                         ast::clone_bound_tree(*prepared_statement->template_tree, values), session, &batch.result,
                         &batch.context);
-                } else {
-                    if (timing_scope.has_value()) {
-                        timing_scope->sample().fallback_reason =
-                            prepared_statement->descriptor == nullptr
-                                ? execution_timing_diagnostics::FallbackReason::Null
-                                : execution_timing_diagnostics::FallbackReason::Shape;
-                    }
-                    std::optional<index_skip_scan_diagnostics::StatementScope> skip_scan_scope;
-                    if (skip_scan_diagnostics_enabled) {
-                        skip_scan_scope.emplace(prepared_statement->id, prepared_statement->diagnostic_plan_hash);
-                    }
-                    std::vector<std::unique_ptr<ast::Value>> values;
-                    binding_parameters = true;
-                    if (execution_timing_enabled) {
-                        execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().bind_ns);
-                        values = make_bindings();
-                    } else {
-                        values = make_bindings();
-                    }
-                    std::unique_ptr<ast::TreeNode> bound_tree;
-                    if (execution_timing_enabled) {
-                        execution_timing_diagnostics::StageTimer timer(&timing_scope->sample().clone_bind_ns);
-                        bound_tree = ast::clone_bound_tree(*prepared_statement->template_tree, values);
-                    } else {
-                        bound_tree = ast::clone_bound_tree(*prepared_statement->template_tree, values);
-                    }
-                    binding_parameters = false;
-                    if (execution_timing_enabled) {
-                        outcome = execute_tree_timed(std::move(bound_tree), session, &batch.result,
-                                                     &timing_scope->sample(), true, &batch.context);
-                    } else {
-                        outcome = execute_tree_under_catalog_guard(std::move(bound_tree), session, &batch.result,
-                                                                   &batch.context);
-                    }
                 }
                 batch.result.finish_operation(outcome.query);
                 ++executed;
-                if (timing_scope.has_value()) {
-                    timing_scope->finish();
                 }
-            } catch (TransactionAbortException&) {
-                if (timing_scope.has_value()) {
-                    if (binding_parameters) {
-                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
-                    }
-                    timing_scope->finish_abort();
-                }
-                throw;
-            } catch (...) {
-                if (timing_scope.has_value()) {
-                    if (binding_parameters) {
-                        timing_scope->sample().fallback_reason = execution_timing_diagnostics::FallbackReason::Bind;
-                    }
-                    timing_scope->finish_error();
-                }
-                throw;
-            }
-        }
     } catch (TransactionAbortException& exception) {
         failed = executed;
         abort_session(session, &batch.context);
@@ -1590,7 +1108,6 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGUSR1, sigusr1_handler);
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"
@@ -1631,40 +1148,28 @@ int main(int argc, char** argv) {
         buffer_pool_manager->set_log_manager(log_manager.get());
 
         // recovery database
-        // Per-phase cost is reported once, here, so recovery tuning is not
-        // guesswork. Nothing below runs on the measured transaction path.
         {
-            // The default level is WARN, which would swallow the numbers this
-            // block exists to produce. The window is startup only and closes
-            // before any transaction runs, so no measured path is affected.
             minilog::Logger::get().set_level(minilog::LogLevel::INFO);
             const auto phase_elapsed_ms = [](std::chrono::steady_clock::time_point begin) {
                 return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
                     .count();
             };
-            const uint64_t page_reads_before = disk_manager->get_page_read_count();
-            const uint64_t page_writes_before = disk_manager->get_page_write_count();
             const auto recovery_begin = std::chrono::steady_clock::now();
 
             auto phase_begin = recovery_begin;
             recovery->analyze();
-            LOG_INFO("recovery analyze: %lld ms, wal reads: %llu (%llu bytes), page reads: %llu",
+            LOG_INFO("recovery analyze: %lld ms, wal reads: %llu (%llu bytes)",
                      static_cast<long long>(phase_elapsed_ms(phase_begin)),
                      static_cast<unsigned long long>(disk_manager->get_log_read_count()),
-                     static_cast<unsigned long long>(disk_manager->get_log_read_bytes()),
-                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - page_reads_before));
+                     static_cast<unsigned long long>(disk_manager->get_log_read_bytes()));
 
             phase_begin = std::chrono::steady_clock::now();
-            const uint64_t redo_page_reads_before = disk_manager->get_page_read_count();
             recovery->redo();
-            LOG_INFO("recovery redo: %lld ms, page reads: %llu", static_cast<long long>(phase_elapsed_ms(phase_begin)),
-                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - redo_page_reads_before));
+            LOG_INFO("recovery redo: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
 
             phase_begin = std::chrono::steady_clock::now();
-            const uint64_t undo_page_reads_before = disk_manager->get_page_read_count();
             recovery->undo();
-            LOG_INFO("recovery undo: %lld ms, page reads: %llu", static_cast<long long>(phase_elapsed_ms(phase_begin)),
-                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - undo_page_reads_before));
+            LOG_INFO("recovery undo: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
 
             // 必须在任何事务开始之前、恢复读完 WAL 与重启清单之后做：commit_ts_ 持久化
             // 在数据页里，而计数器只活在内存里。计数器从 0 重启会让上一世提交的行被
@@ -1681,29 +1186,12 @@ int main(int argc, char** argv) {
             LOG_INFO("recovery index residency refresh: %lld ms",
                      static_cast<long long>(phase_elapsed_ms(phase_begin)));
 
-            LOG_INFO("database recovery finished in %lld ms, page reads: %llu, page writes: %llu",
-                     static_cast<long long>(phase_elapsed_ms(recovery_begin)),
-                     static_cast<unsigned long long>(disk_manager->get_page_read_count() - page_reads_before),
-                     static_cast<unsigned long long>(disk_manager->get_page_write_count() - page_writes_before));
+            LOG_INFO("database recovery finished in %lld ms", static_cast<long long>(phase_elapsed_ms(recovery_begin)));
             minilog::Logger::get().set_level(minilog::LogLevel::WARN);
         }
 
         {
             std::atomic<bool> checkpoint_thread_stop{false};
-            std::atomic<bool> observability_thread_stop{false};
-            std::thread observability_thread([&observability_thread_stop] {
-                uint64_t served_requests = 0;
-                constexpr auto observability_poll_interval = std::chrono::milliseconds(25);
-                while (!observability_thread_stop.load(std::memory_order_acquire)) {
-                    const uint64_t requested = observability_requests.load(std::memory_order_acquire);
-                    while (served_requests != requested) {
-                        log_wal_statistics();
-                        log_observability_statistics();
-                        ++served_requests;
-                    }
-                    std::this_thread::sleep_for(observability_poll_interval);
-                }
-            });
             std::thread checkpoint_thread([&checkpoint_thread_stop] {
                 CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
                 while (!checkpoint_thread_stop.load()) {
@@ -1718,10 +1206,6 @@ int main(int argc, char** argv) {
             // 开启服务端，开始接受客户端连接
             start_server(server_port);
 
-            observability_thread_stop.store(true, std::memory_order_release);
-            if (observability_thread.joinable()) {
-                observability_thread.join();
-            }
             checkpoint_thread_stop.store(true);
             if (checkpoint_thread.joinable()) {
                 checkpoint_thread.join();

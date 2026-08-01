@@ -582,8 +582,6 @@ TEST_F(PlannerAggregateTest, physical_template_reuses_shape_without_reusing_lite
     auto second_plan = planner_.generate_select_plan(std::move(second_query), nullptr);
 
     ASSERT_EQ(planner_.physical_plan_cache_.size(), 1);
-    EXPECT_EQ(planner_.physical_plan_cache_misses_.load(), 1U);
-    EXPECT_EQ(planner_.physical_plan_cache_hits_.load(), 1U);
 
     auto* first_projection = static_cast<ProjectionPlan*>(first_plan.get());
     auto* first_aggregate = static_cast<AggregatePlan*>(first_projection->subplan_.get());
@@ -606,8 +604,6 @@ TEST_F(PlannerAggregateTest, physical_plan_cache_is_enabled_by_default) {
     ASSERT_NE(planner_.generate_select_plan(std::move(first_query), nullptr), nullptr);
     ASSERT_NE(planner_.generate_select_plan(std::move(second_query), nullptr), nullptr);
     EXPECT_EQ(planner_.physical_plan_cache_.size(), 1U);
-    EXPECT_EQ(planner_.physical_plan_cache_misses_.load(), 1U);
-    EXPECT_EQ(planner_.physical_plan_cache_hits_.load(), 1U);
 }
 
 TEST_F(PlannerAggregateTest, physical_template_is_invalidated_by_catalog_generation) {
@@ -695,7 +691,6 @@ TEST_F(PlannerAggregateTest, compiled_point_program_hits_for_update_and_delete_s
     ASSERT_NE(second_delete_dml->compiled_point_program_, nullptr);
     EXPECT_EQ(second_delete_dml->compiled_point_program_->kind, PointProgramKind::Delete);
     EXPECT_EQ(second_delete_dml->subplan_, nullptr);
-    EXPECT_EQ(planner_.point_program_cache_hits_.load(), 2U);
 }
 
 TEST_F(PlannerAggregateTest, lock_only_update_requires_exact_self_assignment_and_complete_point_key) {
@@ -744,8 +739,6 @@ TEST_F(PlannerAggregateTest, prepared_si_and_serializable_contexts_do_not_use_ca
     auto populate = planner_.do_planner(make_point_update_query(1, 10), nullptr);
     ASSERT_NE(static_cast<DMLPlan*>(populate.get())->subplan_, nullptr);
     ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
-    const auto cache_hits = planner_.point_program_cache_hits_.load();
-    const auto cache_misses = planner_.point_program_cache_misses_.load();
     const auto cache_lru = planner_.point_program_cache_lru_;
     const auto cached_program = planner_.point_program_cache_.begin()->second.program;
 
@@ -764,8 +757,6 @@ TEST_F(PlannerAggregateTest, prepared_si_and_serializable_contexts_do_not_use_ca
     auto* serializable_dml = static_cast<DMLPlan*>(serializable_plan.get());
     EXPECT_EQ(serializable_dml->compiled_point_program_, nullptr);
     EXPECT_NE(serializable_dml->subplan_, nullptr);
-    EXPECT_EQ(planner_.point_program_cache_hits_.load(), cache_hits);
-    EXPECT_EQ(planner_.point_program_cache_misses_.load(), cache_misses);
     EXPECT_EQ(planner_.point_program_cache_lru_, cache_lru);
     ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
     EXPECT_EQ(planner_.point_program_cache_.begin()->second.program, cached_program);
@@ -775,8 +766,6 @@ TEST_F(PlannerAggregateTest, prepared_update_ignores_warm_point_cache_without_po
     sm_manager_.db_.SetTabMeta("point_program", make_point_program_tab());
     planner_.do_planner(make_point_update_query(1, 10), nullptr);
     ASSERT_EQ(planner_.point_program_cache_.size(), 1U);
-    const auto cache_hits = planner_.point_program_cache_hits_.load();
-    const auto cache_misses = planner_.point_program_cache_misses_.load();
     const auto cache_lru = planner_.point_program_cache_lru_;
 
     char response[64]{};
@@ -791,8 +780,6 @@ TEST_F(PlannerAggregateTest, prepared_update_ignores_warm_point_cache_without_po
     auto* prepared_dml = static_cast<DMLPlan*>(prepared_plan.get());
     ASSERT_EQ(prepared_dml->compiled_point_program_, nullptr);
     ASSERT_NE(prepared_dml->subplan_, nullptr);
-    EXPECT_EQ(planner_.point_program_cache_hits_.load(), cache_hits);
-    EXPECT_EQ(planner_.point_program_cache_misses_.load(), cache_misses);
     EXPECT_EQ(planner_.point_program_cache_lru_, cache_lru);
 
     auto descriptor = PreparedPlanDescriptor::Build(std::move(prepared_plan), PreparedStatementKind::Update, {}, {},

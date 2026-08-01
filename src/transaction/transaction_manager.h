@@ -26,7 +26,6 @@ See the Mulan PSL v2 for more details. */
 #include <thread>
 #include <utility>
 
-#include "commit_timing_diagnostics.h"
 #include "transaction.h"
 #include "watermark.h"
 #include "recovery/log_manager.h"
@@ -36,32 +35,6 @@ See the Mulan PSL v2 for more details. */
 
 /* 系统采用的并发控制算法，当前题目中要求两阶段封锁并发控制算法 */
 enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
-
-struct AbortObservabilitySnapshot {
-    uint64_t lock_on_shrinking{0};
-    uint64_t upgrade_conflict{0};
-    uint64_t deadlock_prevention{0};
-    uint64_t ww_conflict{0};
-    uint64_t ssi_danger{0};
-    uint64_t unique_key_conflict{0};
-};
-
-struct CheckpointObservabilitySnapshot {
-    uint64_t attempt{0};
-    uint64_t success{0};
-    uint64_t drain_timeout{0};
-    uint64_t deadline{0};
-    uint64_t final_data_fail{0};
-    uint64_t block_ns{0};
-    uint64_t drain_ns{0};
-    uint64_t final_wal_ns{0};
-    uint64_t final_data_ns{0};
-    uint64_t meta_ns{0};
-    uint64_t manifest_ns{0};
-    uint64_t truncate_ns{0};
-    uint64_t begin_blocked{0};
-    uint64_t begin_wait_ns{0};
-};
 
 /// 版本链中的第一个撤销链接，将表堆元组链接到撤销日志。
 struct VersionUndoLink {
@@ -115,7 +88,6 @@ public:
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
-        commit_timing_enabled_ = commit_timing_diagnostics::enabled();
         commit_publication_helping_enabled_ = test_options.helping;
         commit_publication_test_hook_ = std::move(test_options.hook);
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
@@ -128,7 +100,6 @@ public:
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
-        commit_timing_enabled_ = commit_timing_diagnostics::enabled();
         checkpoint_admission_test_hook_ = std::move(test_options.hook);
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
@@ -160,22 +131,6 @@ public:
     void set_abort_delete_undo_publication_test_hook(AbortDeleteUndoPublicationTestHook hook) {
         abort_delete_undo_publication_test_hook_ = std::move(hook);
     }
-
-    void record_client_abort(AbortReason reason);
-    AbortObservabilitySnapshot abort_observability() const;
-    CheckpointObservabilitySnapshot checkpoint_observability() const;
-    void observe_checkpoint_attempt();
-    void observe_checkpoint_success();
-    void observe_checkpoint_drain_timeout();
-    void observe_checkpoint_deadline();
-    void observe_checkpoint_final_data_fail();
-    void observe_checkpoint_block_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_drain_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_final_wal_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_final_data_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_meta_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_manifest_ns(uint64_t elapsed_ns);
-    void observe_checkpoint_truncate_ns(uint64_t elapsed_ns);
 
     void block_new_transactions_for_checkpoint();
 
@@ -240,7 +195,6 @@ public:
 
         // Counts only the lookups that reach the global txn_map mutex, which is
         // the cost a session avoids by caching the transaction it is running.
-        txn_map_lookup_count_.fetch_add(1, std::memory_order_relaxed);
         std::unique_lock<std::mutex> lock(latch_);
         auto it = TransactionManager::txn_map.find(txn_id);
         if (it == TransactionManager::txn_map.end())
@@ -350,20 +304,8 @@ public:
     size_t DebugActivePredicateTableCount();
     size_t DebugTxnMapSize();
 
-    uint64_t DebugTxnMapLookupCount() const {
-        return txn_map_lookup_count_.load(std::memory_order_relaxed);
-    }
-
     // GC observability: the backlog is the current txn-map population waiting
     // for bounded background collection (including entries not yet eligible).
-    size_t DebugGcBacklog() const {
-        return gc_backlog_.load(std::memory_order_acquire);
-    }
-
-    size_t DebugGcLastBatchSize() const {
-        return gc_last_batch_size_.load(std::memory_order_acquire);
-    }
-
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
 
@@ -386,16 +328,12 @@ private:
         timestamp_t commit_csn{0};
         timestamp_t commit_ts{INVALID_TS};
         lsn_t commit_lsn{INVALID_LSN};
-        bool timing_enabled{false};
         bool publishing{false};
         bool locks_released{false};
         bool done{false};
-        uint64_t tuple_publication_ns{0};
-        uint64_t frontier_publication_ns{0};
-        uint64_t lock_release_ns{0};
     };
 
-    template <bool TimingEnabled> void commit_impl(Transaction* txn, LogManager* log_manager);
+    void commit_impl(Transaction* txn, LogManager* log_manager);
     void InvokeCheckpointAdmissionTestHook(std::string_view event);
     void PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request, LogManager* log_manager);
     void RunCommitPublicationLeader(timestamp_t target_csn, LogManager* log_manager);
@@ -406,7 +344,6 @@ private:
         }
     }
 
-    bool commit_timing_enabled_{false};
     bool commit_publication_helping_enabled_{true};
     CommitPublicationTestHook commit_publication_test_hook_;
     AbortBeforeLockReleaseTestHook abort_before_lock_release_test_hook_;
@@ -437,9 +374,6 @@ private:
     uint64_t commits_since_gc_{0};
     bool gc_running_{false};
     bool gc_requested_{false};
-    std::atomic<uint64_t> txn_map_lookup_count_{0};
-    std::atomic<size_t> gc_backlog_{0};
-    std::atomic<size_t> gc_last_batch_size_{0};
 
     /** 节流式触发垃圾回收：按提交计数或 txn_map 规模决定是否真正执行。 */
     void MaybeRunGarbageCollection();
@@ -453,27 +387,6 @@ private:
     int active_txn_count_{0};
     std::unordered_set<txn_id_t> active_txn_ids_;
     CheckpointAdmissionTestHook checkpoint_admission_test_hook_;
-
-    std::atomic<uint64_t> abort_lock_on_shrinking_{0};
-    std::atomic<uint64_t> abort_upgrade_conflict_{0};
-    std::atomic<uint64_t> abort_deadlock_prevention_{0};
-    std::atomic<uint64_t> abort_ww_conflict_{0};
-    std::atomic<uint64_t> abort_ssi_danger_{0};
-    std::atomic<uint64_t> abort_unique_key_conflict_{0};
-    std::atomic<uint64_t> checkpoint_attempt_{0};
-    std::atomic<uint64_t> checkpoint_success_{0};
-    std::atomic<uint64_t> checkpoint_drain_timeout_{0};
-    std::atomic<uint64_t> checkpoint_deadline_{0};
-    std::atomic<uint64_t> checkpoint_final_data_fail_{0};
-    std::atomic<uint64_t> checkpoint_block_ns_{0};
-    std::atomic<uint64_t> checkpoint_drain_ns_{0};
-    std::atomic<uint64_t> checkpoint_final_wal_ns_{0};
-    std::atomic<uint64_t> checkpoint_final_data_ns_{0};
-    std::atomic<uint64_t> checkpoint_meta_ns_{0};
-    std::atomic<uint64_t> checkpoint_manifest_ns_{0};
-    std::atomic<uint64_t> checkpoint_truncate_ns_{0};
-    std::atomic<uint64_t> checkpoint_begin_blocked_{0};
-    std::atomic<uint64_t> checkpoint_begin_wait_ns_{0};
 
     std::condition_variable gc_cv_;
     std::thread gc_thread_;

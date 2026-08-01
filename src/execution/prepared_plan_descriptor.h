@@ -46,19 +46,6 @@ struct PreparedLimitOffsetLayout {
     std::optional<std::size_t> offset_ordinal;
 };
 
-struct PreparedRuntimeStats {
-    std::uint64_t bound_executable_hits = 0;
-    std::uint64_t plan_nodes_visited = 0;
-    std::uint64_t catalog_metadata_lookups = 0;
-    std::uint64_t lock_only_update_hits = 0;
-    std::uint64_t lock_only_update_misses = 0;
-    std::uint64_t lock_only_update_fallbacks = 0;
-    std::uint64_t point_update_hits = 0;
-    std::uint64_t point_update_no_candidates = 0;
-    std::uint64_t point_update_no_visible = 0;
-    std::uint64_t point_update_fallbacks = 0;
-};
-
 class PreparedPlanDescriptor final {
 public:
     static std::unique_ptr<const PreparedPlanDescriptor>

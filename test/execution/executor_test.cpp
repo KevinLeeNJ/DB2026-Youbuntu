@@ -415,23 +415,6 @@ TEST_F(ExecutorTest, tombstone_candidates_use_exact_bytes_and_generation_safe_re
     EXPECT_EQ(candidates[0].rid, second);
 }
 
-TEST_F(ExecutorTest, tombstone_candidate_diagnostics_count_the_third_record_probe_once) {
-    sm_manager_->set_deleted_tuple_candidate_diagnostics_enabled(true);
-    sm_manager_->note_deleted_tuple_candidate_validated(2);
-    sm_manager_->note_deleted_tuple_candidate_page_probe();
-
-    auto stats = sm_manager_->get_deleted_tuple_candidate_stats();
-    EXPECT_EQ(stats.validated_candidates, 1u);
-    EXPECT_EQ(stats.page_probes, 3u);
-
-    sm_manager_->set_deleted_tuple_candidate_diagnostics_enabled(false);
-    sm_manager_->note_deleted_tuple_candidate_validated(2);
-    sm_manager_->note_deleted_tuple_candidate_page_probe();
-    stats = sm_manager_->get_deleted_tuple_candidate_stats();
-    EXPECT_EQ(stats.validated_candidates, 1u);
-    EXPECT_EQ(stats.page_probes, 3u);
-}
-
 TEST_F(ExecutorTest, logical_row_delete_intent_blocks_insert_in_unpublished_tombstone_window) {
     setup_db();
     sm_manager_->create_table("t", make_int_cols({"id"}), nullptr);

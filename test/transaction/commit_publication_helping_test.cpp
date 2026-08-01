@@ -214,7 +214,7 @@ TEST_F(CommitPublicationHelpingTest, LaterOwnerPublishesDurablePrefixAndReleases
         const bool unique_acquired = lock_mgr_->lock_exclusive_on_unique_key(waiter, 91, unique_key);
         waiter_has_both.store(record_acquired && unique_acquired, std::memory_order_release);
     });
-    while (lock_mgr_->record_lock_observability().wait_enqueued == 0) {
+    while (!lock_mgr_->has_record_waiters_for_test()) {
         std::this_thread::yield();
     }
 
@@ -539,7 +539,6 @@ TEST_F(CommitPublicationHelpingTest, ExplicitTestOnlyDisabledPathRetainsDirectPu
     Transaction* txn = txn_mgr_->begin(nullptr, log_mgr_.get());
     txn_mgr_->commit(txn, log_mgr_.get());
 
-    EXPECT_EQ(log_mgr_->get_commit_count(), 1u);
     EXPECT_GE(log_mgr_->get_durable_lsn(), 0);
 }
 

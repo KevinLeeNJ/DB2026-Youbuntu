@@ -403,14 +403,6 @@ public:
         std::optional<BufferPoolManager::FrameOperationToken> frame_operation_;
     };
 
-    // Observability for SMO protection. "SMOs" counts operations made safe
-    // either by WAL dependencies or immediate write-out, and "page images"
-    // counts the complete images protected by those operations. Their ratio is
-    // comparable against the "leaf + sibling + next leaf + one parent per level"
-    // expectation - a collection hole would show up as a suspiciously low ratio.
-    static uint64_t smo_publish_count();
-    static uint64_t smo_page_image_count();
-
     IxNodeHandle* split(IxNodeHandle* node, bool right_edge_append = false);
 
     void insert_into_parent(IxNodeHandle* old_node, const char* key, IxNodeHandle* new_node,
