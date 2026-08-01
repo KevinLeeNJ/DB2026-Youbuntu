@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <shared_mutex>
 
 class LogManager;
 class SmManager;
@@ -38,6 +39,10 @@ private:
     LogManager* log_mgr_;
     CheckpointOptions options_{};
     std::atomic<bool> running_{false};
+    // Tick holds a shared lock only while it preflushes table pages.  A clean
+    // checkpoint takes the exclusive side, so its WAL/data/manifest sequence
+    // can never interleave with an in-flight background page batch.
+    std::shared_mutex preflush_latch_;
     // Backoff state for automatic checkpoints after a drain failure. Retrying
     // every scheduler tick would make the whole process flap between blocked
     // and unblocked while a stuck transaction stays open.

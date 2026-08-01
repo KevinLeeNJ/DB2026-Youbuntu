@@ -211,28 +211,28 @@ void LockManager::set_record_handoff_pre_notify_test_hook(std::function<void()> 
     std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
     record_handoff_pre_notify_test_hook_ = std::move(hook);
     record_handoff_pre_notify_test_hook_enabled_.store(static_cast<bool>(record_handoff_pre_notify_test_hook_),
-                                                        std::memory_order_release);
+                                                       std::memory_order_release);
 }
 
 void LockManager::set_unique_handoff_published_test_hook(std::function<void()> hook) {
     std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
     unique_handoff_published_test_hook_ = std::move(hook);
     unique_handoff_published_test_hook_enabled_.store(static_cast<bool>(unique_handoff_published_test_hook_),
-                                                       std::memory_order_release);
+                                                      std::memory_order_release);
 }
 
 void LockManager::set_cycle_cancel_before_record_queue_test_hook(std::function<void()> hook) {
     std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
     cycle_cancel_before_record_queue_test_hook_ = std::move(hook);
-    cycle_cancel_before_record_queue_test_hook_enabled_.store(static_cast<bool>(cycle_cancel_before_record_queue_test_hook_),
-                                                               std::memory_order_release);
+    cycle_cancel_before_record_queue_test_hook_enabled_.store(
+        static_cast<bool>(cycle_cancel_before_record_queue_test_hook_), std::memory_order_release);
 }
 
 void LockManager::set_cycle_cancel_before_flag_test_hook(std::function<void()> hook) {
     std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
     cycle_cancel_before_flag_test_hook_ = std::move(hook);
     cycle_cancel_before_flag_test_hook_enabled_.store(static_cast<bool>(cycle_cancel_before_flag_test_hook_),
-                                                       std::memory_order_release);
+                                                      std::memory_order_release);
 }
 
 void LockManager::run_record_handoff_test_hook() {
@@ -281,10 +281,16 @@ void LockManager::run_record_handoff_checked_test_hook() {
 }
 
 void LockManager::run_record_handoff_pre_notify_test_hook() {
-    if (!record_handoff_pre_notify_test_hook_enabled_.load(std::memory_order_acquire)) return;
+    if (!record_handoff_pre_notify_test_hook_enabled_.load(std::memory_order_acquire))
+        return;
     std::function<void()> hook;
-    { std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_); hook = std::move(record_handoff_pre_notify_test_hook_); record_handoff_pre_notify_test_hook_enabled_.store(false, std::memory_order_release); }
-    if (hook) hook();
+    {
+        std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
+        hook = std::move(record_handoff_pre_notify_test_hook_);
+        record_handoff_pre_notify_test_hook_enabled_.store(false, std::memory_order_release);
+    }
+    if (hook)
+        hook();
 }
 
 void LockManager::run_unique_handoff_published_test_hook() {
@@ -303,17 +309,29 @@ void LockManager::run_unique_handoff_published_test_hook() {
 }
 
 void LockManager::run_cycle_cancel_before_record_queue_test_hook() {
-    if (!cycle_cancel_before_record_queue_test_hook_enabled_.load(std::memory_order_acquire)) return;
+    if (!cycle_cancel_before_record_queue_test_hook_enabled_.load(std::memory_order_acquire))
+        return;
     std::function<void()> hook;
-    { std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_); hook = std::move(cycle_cancel_before_record_queue_test_hook_); cycle_cancel_before_record_queue_test_hook_enabled_.store(false, std::memory_order_release); }
-    if (hook) hook();
+    {
+        std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
+        hook = std::move(cycle_cancel_before_record_queue_test_hook_);
+        cycle_cancel_before_record_queue_test_hook_enabled_.store(false, std::memory_order_release);
+    }
+    if (hook)
+        hook();
 }
 
 void LockManager::run_cycle_cancel_before_flag_test_hook() {
-    if (!cycle_cancel_before_flag_test_hook_enabled_.load(std::memory_order_acquire)) return;
+    if (!cycle_cancel_before_flag_test_hook_enabled_.load(std::memory_order_acquire))
+        return;
     std::function<void()> hook;
-    { std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_); hook = std::move(cycle_cancel_before_flag_test_hook_); cycle_cancel_before_flag_test_hook_enabled_.store(false, std::memory_order_release); }
-    if (hook) hook();
+    {
+        std::lock_guard<std::mutex> lock(record_handoff_test_hook_latch_);
+        hook = std::move(cycle_cancel_before_flag_test_hook_);
+        cycle_cancel_before_flag_test_hook_enabled_.store(false, std::memory_order_release);
+    }
+    if (hook)
+        hook();
 }
 
 void LockManager::cancel_waiting_transaction_for_test(txn_id_t txn_id) {
@@ -500,9 +518,12 @@ bool LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
         txn->mark_lock_deadlock_victim();
         txn->mark_lock_cancellation_requested();
     }
-    for (const auto& request : record_notifications) request->cv_.notify_one();
-    for (const auto& request : record_next_notifications) request->cv_.notify_one();
-    for (const auto& queue : unique_notifications) queue->cv.notify_all();
+    for (const auto& request : record_notifications)
+        request->cv_.notify_one();
+    for (const auto& request : record_next_notifications)
+        request->cv_.notify_one();
+    for (const auto& queue : unique_notifications)
+        queue->cv.notify_all();
     if (txn != nullptr) {
         txn->unpin_lock_operation();
     }
@@ -625,8 +646,8 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
         run_record_handoff_published_test_hook();
     }
     const bool deadlock_victim = request->state_ == LockRequest::State::DeadlockVictim;
-    const bool cancelled = deadlock_victim || request->state_ == LockRequest::State::Cancelled ||
-                           txn->is_lock_cancellation_requested();
+    const bool cancelled =
+        deadlock_victim || request->state_ == LockRequest::State::Cancelled || txn->is_lock_cancellation_requested();
     std::shared_ptr<LockRequest> next_request;
     if (cancelled && owns_queue) {
         // unlock() grants ownership before the waiter can publish it in its
@@ -684,7 +705,7 @@ std::string LockManager::make_unique_key_lock_id(int index_fd, const std::vector
 }
 
 std::string LockManager::make_logical_row_delete_intent_id(uint64_t table_runtime_id,
-                                                            const std::vector<char>& record_bytes) {
+                                                           const std::vector<char>& record_bytes) {
     std::string intent_id(1, 'R');
     intent_id.append(sizeof(table_runtime_id), '\0');
     std::memcpy(intent_id.data() + 1, &table_runtime_id, sizeof(table_runtime_id));
@@ -697,13 +718,12 @@ bool LockManager::lock_exclusive_on_unique_key(Transaction* txn, int index_fd, c
 }
 
 bool LockManager::register_logical_row_delete_intent(Transaction* txn, uint64_t table_runtime_id,
-                                                      const std::vector<char>& record_bytes) {
+                                                     const std::vector<char>& record_bytes) {
     if (txn == nullptr || txn->is_lock_cancellation_requested()) {
         return false;
     }
     const std::string intent_id = make_logical_row_delete_intent_id(table_runtime_id, record_bytes);
-    auto& shard =
-        logical_row_shards_[std::hash<std::string>{}(intent_id) % LOGICAL_ROW_INTENT_SHARD_COUNT];
+    auto& shard = logical_row_shards_[std::hash<std::string>{}(intent_id) % LOGICAL_ROW_INTENT_SHARD_COUNT];
     std::lock_guard<std::mutex> lock(shard.latch);
     if (txn->is_lock_cancellation_requested()) {
         return false;
@@ -714,13 +734,12 @@ bool LockManager::register_logical_row_delete_intent(Transaction* txn, uint64_t 
 }
 
 bool LockManager::logical_row_delete_intent_conflicts(Transaction* txn, uint64_t table_runtime_id,
-                                                       const std::vector<char>& record_bytes) {
+                                                      const std::vector<char>& record_bytes) {
     if (txn == nullptr || txn->is_lock_cancellation_requested()) {
         return true;
     }
     const std::string intent_id = make_logical_row_delete_intent_id(table_runtime_id, record_bytes);
-    auto& shard =
-        logical_row_shards_[std::hash<std::string>{}(intent_id) % LOGICAL_ROW_INTENT_SHARD_COUNT];
+    auto& shard = logical_row_shards_[std::hash<std::string>{}(intent_id) % LOGICAL_ROW_INTENT_SHARD_COUNT];
     std::lock_guard<std::mutex> lock(shard.latch);
     if (txn->is_lock_cancellation_requested()) {
         return true;
@@ -737,8 +756,7 @@ bool LockManager::unregister_logical_row_delete_intent(Transaction* txn, const s
     if (txn == nullptr) {
         return false;
     }
-    auto& shard =
-        logical_row_shards_[std::hash<std::string>{}(intent_id) % LOGICAL_ROW_INTENT_SHARD_COUNT];
+    auto& shard = logical_row_shards_[std::hash<std::string>{}(intent_id) % LOGICAL_ROW_INTENT_SHARD_COUNT];
     std::lock_guard<std::mutex> lock(shard.latch);
     auto it = shard.delete_intents.find(intent_id);
     if (it == shard.delete_intents.end() || it->second.erase(txn->get_transaction_id()) == 0) {

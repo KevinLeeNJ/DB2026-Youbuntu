@@ -264,6 +264,12 @@ public:
 
     BufferPoolObservabilitySnapshot observability_snapshot() const;
 
+    // The frame array is fixed for this manager's lifetime, so this is a
+    // lock-free read-only capacity query for checkpoint pacing.
+    size_t frame_capacity() const noexcept {
+        return pool_size_;
+    }
+
 private:
     // Env-gated (RMDB_LOG_BPM_STATS=1) snapshot of how much of the pool is
     // actually available for replacement. Emitted from the background preflush

@@ -89,6 +89,8 @@ class TransactionManager {
 public:
     using CommitPublicationTestHook = std::function<void(std::string_view, timestamp_t, lsn_t)>;
     using CheckpointAdmissionTestHook = std::function<void(std::string_view)>;
+    using AbortBeforeLockReleaseTestHook = std::function<void(txn_id_t)>;
+    using AbortDeleteUndoPublicationTestHook = std::function<void()>;
 
     // Test-only injection for deterministic publication scheduling and the
     // direct-publication negative oracle. Production construction does not
@@ -145,6 +147,19 @@ public:
     void commit(Transaction* txn, LogManager* log_manager);
 
     void abort(Transaction* txn, LogManager* log_manager);
+
+    // Test-only ordering hook. It runs after abort undo and SSI cleanup, but
+    // before ReleaseLocks can wake another transaction.
+    void set_abort_before_lock_release_test_hook(AbortBeforeLockReleaseTestHook hook) {
+        abort_before_lock_release_test_hook_ = std::move(hook);
+    }
+
+    // Test-only ordering hook. It runs after DELETE undo restores all old
+    // (key,RID) index entries, but before the old committed tuple meta is
+    // published. Callers must install and clear it outside the abort thread.
+    void set_abort_delete_undo_publication_test_hook(AbortDeleteUndoPublicationTestHook hook) {
+        abort_delete_undo_publication_test_hook_ = std::move(hook);
+    }
 
     void record_client_abort(AbortReason reason);
     AbortObservabilitySnapshot abort_observability() const;
@@ -394,6 +409,8 @@ private:
     bool commit_timing_enabled_{false};
     bool commit_publication_helping_enabled_{true};
     CommitPublicationTestHook commit_publication_test_hook_;
+    AbortBeforeLockReleaseTestHook abort_before_lock_release_test_hook_;
+    AbortDeleteUndoPublicationTestHook abort_delete_undo_publication_test_hook_;
     ConcurrencyMode concurrency_mode_;           // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳

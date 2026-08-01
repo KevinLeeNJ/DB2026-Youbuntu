@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shutil
 import signal
@@ -16,40 +15,99 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import struct
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 SERVER_BIN = ROOT_DIR / "build" / "bin" / "rmdb"
 PORT = 8765
 
+# Reuse the black-box Wire v3 codec so this recovery matrix exercises the same
+# handshake and frame contract as the live protocol suite.
+sys.path.insert(0, str(ROOT_DIR / "test" / "protocol"))
+import live_wire_protocol_test as wire  # noqa: E402
 
-class SqlClient:
+
+class SqlClient(wire.WireClient):
     def __init__(self, port: int = PORT):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
-        self.sock.settimeout(10)
-
-    def close(self) -> None:
-        self.sock.close()
+        super().__init__(port)
 
     def sql(self, statement: str, expect_response: bool = True) -> str:
-        self.sock.sendall(statement.encode("utf-8") + b"\0")
+        self.write_frame(wire.EXEC_STREAM, statement.encode("utf-8"))
         if not expect_response:
+            if statement.strip().lower() == "crash":
+                LiveServer.crash_active()
             return ""
-        chunks = []
+
+        tag, payload = self.read_frame()
+        if tag == wire.COMMAND_OK:
+            wire.require(payload == b"", "COMMAND_OK carried a payload")
+            return "COMMAND_OK"
+        if tag in (wire.ERROR, wire.TRANSACTION_ABORT):
+            kind = "TRANSACTION_ABORT" if tag == wire.TRANSACTION_ABORT else "ERROR"
+            detail = payload.decode("utf-8", "replace")
+            raise AssertionError(f"{kind}: {statement}\n{detail}")
+        wire.require(tag == wire.META, f"unexpected response tag {tag:#x}: {statement}")
+
+        schema = self._read_schema(payload)
+        rows = []
         while True:
-            data = self.sock.recv(8192)
-            if not data:
-                raise AssertionError(f"server 在回复前关闭连接: {statement}")
-            chunks.append(data)
-            if b"\0" in data:
-                break
-        return b"".join(chunks).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+            tag, payload = self.read_frame()
+            if tag == wire.ROW:
+                offset = 0
+                row = []
+                for _, value_type in schema:
+                    value, offset = wire.parse_cell(payload, offset, value_type)
+                    row.append(value)
+                wire.require(offset == len(payload), "ROW has trailing bytes")
+                rows.append(row)
+                continue
+            if tag in (wire.ERROR, wire.TRANSACTION_ABORT):
+                kind = "TRANSACTION_ABORT" if tag == wire.TRANSACTION_ABORT else "ERROR"
+                detail = payload.decode("utf-8", "replace")
+                raise AssertionError(f"{kind}: {statement}\n{detail}")
+            wire.require(
+                tag == wire.RESULT_END and len(payload) == 8,
+                f"query did not end with RESULT_END: {statement}",
+            )
+            wire.require(
+                struct.unpack("!Q", payload)[0] == len(rows),
+                "RESULT_END row count is incorrect",
+            )
+            return self._format_rows(rows)
+
+    @staticmethod
+    def _read_schema(payload: bytes) -> list[tuple[str, int]]:
+        wire.require(len(payload) >= 2, "truncated META")
+        column_count = struct.unpack_from("!H", payload)[0]
+        wire.require(column_count > 0, "META must have at least one column")
+        offset = 2
+        schema = []
+        for _ in range(column_count):
+            wire.require(offset + 2 <= len(payload), "truncated META name length")
+            name_size = struct.unpack_from("!H", payload, offset)[0]
+            offset += 2
+            wire.require(offset + name_size + 1 <= len(payload), "truncated META column")
+            name = payload[offset : offset + name_size].decode("utf-8")
+            offset += name_size
+            schema.append((name, payload[offset]))
+            offset += 1
+        wire.require(offset == len(payload), "META has trailing bytes")
+        return schema
+
+    @staticmethod
+    def _format_rows(rows: list[list[object | None]]) -> str:
+        # Keep the two legacy parsing affordances used by this matrix and by
+        # crash_repro_strong.py: integer cells begin a '| ... |' row and an
+        # empty result has the exact Total record(s): 0 marker.
+        lines = [
+            "| " + " | ".join("NULL" if value is None else str(value) for value in row) + " |"
+            for row in rows
+        ]
+        lines.append(f"Total record(s): {len(rows)}")
+        return "\n".join(lines)
 
     def ok(self, statement: str) -> str:
-        reply = self.sql(statement)
-        lower = reply.lower()
-        if "failure" in lower or "error" in lower or "abort" in lower:
-            raise AssertionError(f"SQL 执行失败: {statement}\n{reply}")
-        return reply
+        return self.sql(statement)
 
 
 @dataclass
@@ -61,6 +119,8 @@ class TestResult:
 
 
 class LiveServer:
+    _active_server: LiveServer | None = None
+
     def __init__(self, work_dir: Path, db_name: str):
         self.work_dir = work_dir
         self.db_name = db_name
@@ -75,15 +135,28 @@ class LiveServer:
             [str(SERVER_BIN), self.db_name], cwd=self.work_dir, stdout=out, stderr=err
         )
         wait_for_server()
+        LiveServer._active_server = self
         return time.monotonic() - start
+
+    @classmethod
+    def crash_active(cls) -> None:
+        server = cls._active_server
+        if server is None or server.proc is None or server.proc.poll() is not None:
+            raise AssertionError("没有可崩溃的 live server")
+        server.proc.send_signal(signal.SIGKILL)
 
     def wait_crashed(self) -> int:
         if self.proc is None:
             raise AssertionError("server 尚未启动")
-        return self.proc.wait(timeout=10)
+        status = self.proc.wait(timeout=10)
+        if LiveServer._active_server is self:
+            LiveServer._active_server = None
+        return status
 
     def stop(self) -> None:
         if self.proc is None or self.proc.poll() is not None:
+            if LiveServer._active_server is self:
+                LiveServer._active_server = None
             return
         self.proc.send_signal(signal.SIGINT)
         try:
@@ -95,6 +168,8 @@ class LiveServer:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=3)
+        if LiveServer._active_server is self:
+            LiveServer._active_server = None
 
 
 def assert_port_free() -> None:
@@ -111,19 +186,20 @@ def assert_port_free() -> None:
 
 def wait_for_server() -> None:
     deadline = time.monotonic() + 10
-    last_error: OSError | None = None
+    last_error: BaseException | None = None
     while time.monotonic() < deadline:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.2)
+        client: SqlClient | None = None
         try:
-            sock.connect(("127.0.0.1", PORT))
+            client = SqlClient()
+            client.readiness_probe()
             return
-        except OSError as exc:
+        except (OSError, EOFError, wire.ProtocolFailure) as exc:
             last_error = exc
             time.sleep(0.005)
         finally:
-            sock.close()
-    raise AssertionError(f"server 未在端口 {PORT} 就绪: {last_error}")
+            if client is not None:
+                client.close()
+    raise AssertionError(f"server 未通过 Wire SQL readiness: {last_error}")
 
 
 def parse_first_int(output: str) -> int:
@@ -293,7 +369,6 @@ def main() -> int:
         return 1
 
     work_root = Path(tempfile.mkdtemp(prefix="rmdb-live-matrix."))
-    keep_workdir = os.environ.get("KEEP_RMDB_LIVE_CRASH_WORKDIR") == "1"
     print(f"工作目录: {work_root}")
     results: list[TestResult] = []
     try:
@@ -372,10 +447,7 @@ def main() -> int:
 
         return 0 if all(result.ok for result in results) else 1
     finally:
-        if keep_workdir:
-            print(f"保留工作目录: {work_root}")
-        else:
-            shutil.rmtree(work_root, ignore_errors=True)
+        shutil.rmtree(work_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

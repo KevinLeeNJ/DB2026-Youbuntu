@@ -137,6 +137,7 @@ enum class AbortReason {
     LOCK_ON_SHIRINKING = 0,
     UPGRADE_CONFLICT,
     DEADLOCK_PREVENTION,
+    LOCK_CANCELLED,
     WW_CONFLICT,
     SSI_DANGER,
     UNIQUE_KEY_CONFLICT
@@ -171,6 +172,10 @@ public:
 
         case AbortReason::DEADLOCK_PREVENTION: {
             return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention";
+        } break;
+
+        case AbortReason::LOCK_CANCELLED: {
+            return "Transaction " + std::to_string(txn_id_) + " aborted because its lock wait was cancelled";
         } break;
 
         case AbortReason::WW_CONFLICT: {

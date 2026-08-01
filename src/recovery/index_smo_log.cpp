@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/index_smo_log.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -25,6 +26,21 @@ constexpr uint32_t kBindFixedPayloadBytes =
 constexpr uint32_t kV1PageEntryBytes = sizeof(page_id_t) + PAGE_SIZE;
 constexpr uint32_t kChecksumBytes = sizeof(uint32_t);
 constexpr uint32_t kImageEnvelopeBytes = sizeof(uint8_t) * 2 + sizeof(uint16_t) + sizeof(uint32_t) * 2;
+
+constexpr std::array<uint32_t, 256> MakeCrc32Table() {
+    std::array<uint32_t, 256> table{};
+    for (uint32_t value = 0; value < table.size(); ++value) {
+        uint32_t crc = value;
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = 0U - (crc & 1U);
+            crc = (crc >> 1U) ^ (0xedb88320U & mask);
+        }
+        table[value] = crc;
+    }
+    return table;
+}
+
+constexpr std::array<uint32_t, 256> kCrc32Table = MakeCrc32Table();
 
 enum class ImageCodec : uint8_t {
     RAW = 0,
@@ -191,11 +207,8 @@ bool ParseV2Image(const char* bytes, uint32_t limit, uint32_t* offset,
 uint32_t IndexSmoCrc32(const char* bytes, size_t length) {
     uint32_t crc = 0xffffffffU;
     for (size_t i = 0; i < length; ++i) {
-        crc ^= static_cast<uint8_t>(bytes[i]);
-        for (int bit = 0; bit < 8; ++bit) {
-            const uint32_t mask = 0U - (crc & 1U);
-            crc = (crc >> 1U) ^ (0xedb88320U & mask);
-        }
+        const uint8_t table_index = static_cast<uint8_t>(crc ^ static_cast<uint8_t>(bytes[i]));
+        crc = (crc >> 8U) ^ kCrc32Table[table_index];
     }
     return ~crc;
 }

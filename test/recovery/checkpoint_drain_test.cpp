@@ -56,9 +56,9 @@ private:
 
 class DrainTestDb {
 public:
-    explicit DrainTestDb(const std::string& db_name, bool with_index = false)
-        : bpm_(64, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_), sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_),
-          log_mgr_(&disk_) {
+    explicit DrainTestDb(const std::string& db_name, bool with_index = false, size_t pool_size = 64)
+        : bpm_(pool_size, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_),
+          sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_), log_mgr_(&disk_) {
         sm_mgr_.create_db(db_name);
         sm_mgr_.open_db(db_name);
         bpm_.set_log_manager(&log_mgr_);
@@ -89,6 +89,21 @@ PageId MakeDirtyTablePage(DrainTestDb* db) {
         EXPECT_TRUE(db->bpm_.unpin_page(page_id, true));
     }
     return page_id;
+}
+
+size_t MakeDirtyTablePages(DrainTestDb* db, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const PageId page_id = MakeDirtyTablePage(db);
+        EXPECT_NE(page_id.page_no, INVALID_PAGE_ID);
+        if (page_id.page_no == INVALID_PAGE_ID) {
+            return i;
+        }
+    }
+    return count;
+}
+
+size_t DirtyResidueLimit(const DrainTestDb& db) {
+    return db.bpm_.frame_capacity() / 50;
 }
 
 bool IsDirty(BufferPoolManager* bpm, PageId page_id) {
@@ -313,7 +328,7 @@ TEST(CheckpointDrainTest, CheckpointSucceedsAfterBlockedRoundIsAbandoned) {
     EXPECT_GT(stats.final_data_ns, 0u);
 }
 
-TEST(CheckpointScheduleTest, TickRunsOnlyWhenTargetIsReached) {
+TEST(CheckpointScheduleTest, TickPreflushesBeforeTargetAndCheckpointsAtResidue) {
     ScopedDrainTestDir test_dir("checkpoint_target_only_root");
     DrainTestDb db("checkpoint_target_only_db");
     LockManager lock_mgr;
@@ -330,7 +345,7 @@ TEST(CheckpointScheduleTest, TickRunsOnlyWhenTargetIsReached) {
     checkpoint_mgr.SetOptions(options);
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    EXPECT_TRUE(IsDirty(&db.bpm_, dirty_page));
+    EXPECT_FALSE(IsDirty(&db.bpm_, dirty_page));
     EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
     EXPECT_EQ(db.log_mgr_.current_log_offset(), below_target);
 
@@ -341,4 +356,188 @@ TEST(CheckpointScheduleTest, TickRunsOnlyWhenTargetIsReached) {
     const auto stats = txn_mgr.checkpoint_observability();
     EXPECT_EQ(stats.attempt, 1u);
     EXPECT_EQ(stats.success, 1u);
+}
+
+TEST(CheckpointScheduleTest, TickPreflushDoesNotFlushDirtyIndexPages) {
+    ScopedDrainTestDir test_dir("checkpoint_table_only_preflush_root");
+    DrainTestDb db("checkpoint_table_only_preflush_db", true);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+
+    const PageId table_page = MakeDirtyTablePage(&db);
+    ASSERT_NE(table_page.page_no, INVALID_PAGE_ID);
+    const int index_fd = db.sm_mgr_.ihs_.begin()->second->GetFd();
+    const PageId index_root{index_fd, IX_INIT_ROOT_PAGE};
+    Page* index_page = db.bpm_.fetch_page(index_root);
+    ASSERT_NE(index_page, nullptr);
+    BufferPoolManager::mark_dirty(index_page);
+    ASSERT_TRUE(db.bpm_.unpin_page(index_root, false));
+    ASSERT_TRUE(IsDirty(&db.bpm_, index_root));
+
+    const int64_t log_offset = AppendBegin(&db.log_mgr_, 250);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = log_offset + 1;
+    checkpoint_mgr.SetOptions(options);
+
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_FALSE(IsDirty(&db.bpm_, table_page));
+    EXPECT_TRUE(IsDirty(&db.bpm_, index_root));
+    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
+}
+
+TEST(CheckpointScheduleTest, TickUsesQuadraticPreflushBatch) {
+    ScopedDrainTestDir test_dir("checkpoint_quadratic_preflush_root");
+    DrainTestDb db("checkpoint_quadratic_preflush_db", false, 512);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+
+    constexpr size_t kDirtyPages = 400;
+    ASSERT_EQ(MakeDirtyTablePages(&db, kDirtyPages), kDirtyPages);
+    const int64_t log_offset = AppendBegin(&db.log_mgr_, 300);
+    ASSERT_GT(log_offset, 0);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = (log_offset * 4) / 3;
+    ASSERT_GT(options.auto_checkpoint_bytes, log_offset);
+    checkpoint_mgr.SetOptions(options);
+
+    const int64_t soft = options.auto_checkpoint_bytes / 2 + options.auto_checkpoint_bytes % 2;
+    const double progress =
+        static_cast<double>(log_offset - soft) / static_cast<double>(options.auto_checkpoint_bytes - soft);
+    const size_t expected_batch = 64 + static_cast<size_t>(progress * progress * (1024 - 64));
+    ASSERT_LT(expected_batch, kDirtyPages);
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - expected_batch);
+    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
+}
+
+TEST(CheckpointScheduleTest, TickLeavesPagesDirtyBelowSoftWatermark) {
+    ScopedDrainTestDir test_dir("checkpoint_soft_watermark_root");
+    DrainTestDb db("checkpoint_soft_watermark_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    ASSERT_NE(MakeDirtyTablePage(&db).page_no, INVALID_PAGE_ID);
+    const int64_t log_offset = AppendBegin(&db.log_mgr_, 350);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = log_offset * 3;
+    checkpoint_mgr.SetOptions(options);
+
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 1u);
+    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
+}
+
+TEST(CheckpointScheduleTest, TickDoesNotPreflushAtZeroForOneByteTarget) {
+    ScopedDrainTestDir test_dir("checkpoint_one_byte_target_root");
+    DrainTestDb db("checkpoint_one_byte_target_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    ASSERT_NE(MakeDirtyTablePage(&db).page_no, INVALID_PAGE_ID);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = 1;
+    checkpoint_mgr.SetOptions(options);
+
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 1u);
+    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
+}
+
+TEST(CheckpointScheduleTest, TickUsesStrictTwoPercentResidueBoundary) {
+    constexpr size_t kPoolFrames = 8192;
+    constexpr size_t kPreflushBatch = 1024;
+    const size_t residue_limit = kPoolFrames / 50;
+    ASSERT_EQ(residue_limit, 163u);
+
+    ScopedDrainTestDir test_dir("checkpoint_strict_residue_root");
+    {
+        DrainTestDb db("checkpoint_strict_residue_at_limit_db", false, kPoolFrames);
+        LockManager lock_mgr;
+        TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+        CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+        ASSERT_EQ(MakeDirtyTablePages(&db, kPreflushBatch + residue_limit), kPreflushBatch + residue_limit);
+        CheckpointOptions options;
+        options.auto_checkpoint_bytes = AppendBegin(&db.log_mgr_, 355);
+        checkpoint_mgr.SetOptions(options);
+
+        EXPECT_TRUE(checkpoint_mgr.Tick());
+        EXPECT_EQ(txn_mgr.checkpoint_observability().success, 1u);
+    }
+    {
+        DrainTestDb db("checkpoint_strict_residue_over_limit_db", false, kPoolFrames);
+        LockManager lock_mgr;
+        TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+        CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+        ASSERT_EQ(MakeDirtyTablePages(&db, kPreflushBatch + residue_limit + 1), kPreflushBatch + residue_limit + 1);
+        CheckpointOptions options;
+        options.auto_checkpoint_bytes = AppendBegin(&db.log_mgr_, 356);
+        checkpoint_mgr.SetOptions(options);
+
+        EXPECT_FALSE(checkpoint_mgr.Tick());
+        EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, residue_limit + 1);
+        EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
+    }
+}
+
+TEST(CheckpointScheduleTest, TickForcesCheckpointAtHardWatermark) {
+    ScopedDrainTestDir test_dir("checkpoint_hard_watermark_root");
+    DrainTestDb db("checkpoint_hard_watermark_db", false, 8192);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    constexpr size_t kDirtyPages = 8000;
+    ASSERT_EQ(MakeDirtyTablePages(&db, kDirtyPages), kDirtyPages);
+    const int64_t target = AppendBegin(&db.log_mgr_, 360);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = target;
+    checkpoint_mgr.SetOptions(options);
+
+    // At 100%, 1024 pages are preflushed but the remaining table residue is
+    // still above the actual pool's 2% gate, so the blocking checkpoint waits.
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_GT(db.sm_mgr_.table_dirty_page_stats().dirty_pages, DirtyResidueLimit(db));
+    EXPECT_EQ(txn_mgr.checkpoint_observability().attempt, 0u);
+    ASSERT_GT(AppendBegin(&db.log_mgr_, 361), target + target / 10);
+    EXPECT_TRUE(checkpoint_mgr.Tick());
+    EXPECT_EQ(txn_mgr.checkpoint_observability().success, 1u);
+}
+
+TEST(CheckpointScheduleTest, ExplicitCleanWaitsForInFlightPreflush) {
+    ScopedDrainTestDir test_dir("checkpoint_preflush_serial_root");
+    DrainTestDb db("checkpoint_preflush_serial_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    ASSERT_NE(MakeDirtyTablePage(&db).page_no, INVALID_PAGE_ID);
+    const int64_t log_offset = AppendBegin(&db.log_mgr_, 400);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = log_offset + 1;
+    checkpoint_mgr.SetOptions(options);
+
+    std::promise<void> preflush_entered_signal;
+    auto preflush_entered = preflush_entered_signal.get_future();
+    std::promise<void> release_preflush_signal;
+    const auto release_preflush = release_preflush_signal.get_future().share();
+    std::atomic<bool> first_preflush{true};
+    BufferPoolManager::set_flush_batch_before_write_test_hook([&](PageId, Page*) {
+        if (first_preflush.exchange(false)) {
+            preflush_entered_signal.set_value();
+            release_preflush.wait();
+        }
+    });
+    struct HookReset {
+        ~HookReset() {
+            BufferPoolManager::set_flush_batch_before_write_test_hook({});
+        }
+    } hook_reset;
+
+    auto tick = std::async(std::launch::async, [&] { return checkpoint_mgr.Tick(); });
+    ASSERT_EQ(preflush_entered.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto explicit_clean = std::async(std::launch::async, [&] { return checkpoint_mgr.RunCleanCheckpoint(); });
+    EXPECT_EQ(explicit_clean.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    release_preflush_signal.set_value();
+    EXPECT_FALSE(tick.get());
+    EXPECT_TRUE(explicit_clean.get());
 }

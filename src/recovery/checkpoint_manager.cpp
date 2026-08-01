@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 #include "common/fault_injection.h"
 #include "recovery/log_manager.h"
@@ -32,6 +33,8 @@ constexpr std::chrono::seconds kCheckpointDeadline{10};
 // time and this much extra WAL before blocking writers again.
 constexpr std::chrono::seconds kDrainRetryBackoff{30};
 constexpr int64_t kDrainRetryBackoffBytes = 32LL * 1024 * 1024;
+constexpr size_t kMinPreflushBatchPages = 64;
+constexpr size_t kMaxPreflushBatchPages = 1024;
 
 uint64_t ElapsedNs(std::chrono::steady_clock::time_point begin) {
     return static_cast<uint64_t>(
@@ -52,10 +55,11 @@ bool CheckpointManager::RunCleanCheckpoint() {
     if (!g_checkpoint_running.compare_exchange_strong(expected, true)) {
         return false;
     }
+    running_.store(true);
+    std::unique_lock<std::shared_mutex> preflush_guard{preflush_latch_};
     if (txn_mgr_ != nullptr) {
         txn_mgr_->observe_checkpoint_attempt();
     }
-    running_.store(true);
 
     struct RunningGuard {
         std::atomic<bool>* local_running;
@@ -157,12 +161,42 @@ bool CheckpointManager::Tick() {
     }
 
     const int64_t target = std::max<int64_t>(1, options_.auto_checkpoint_bytes);
-    const int64_t log_offset = log_mgr_->current_log_offset();
-    if (log_offset < target) {
+    const int64_t soft_watermark = target / 2 + target % 2;
+    if (log_mgr_->current_log_offset() < soft_watermark) {
         return false;
     }
-    if (std::chrono::steady_clock::now() < drain_retry_time_ && log_offset < drain_retry_log_offset_) {
-        return false;
+
+    bool run_checkpoint = false;
+    {
+        std::shared_lock<std::shared_mutex> preflush_guard{preflush_latch_};
+        // A clean checkpoint sets running_ before waiting for this lock.  The
+        // second check closes the race with a Tick that was already headed for
+        // the shared side when an explicit checkpoint arrived.
+        if (running_.load()) {
+            return false;
+        }
+        const int64_t log_offset = log_mgr_->current_log_offset();
+        if (log_offset < soft_watermark) {
+            return false;
+        }
+
+        const double progress = std::clamp(static_cast<double>(log_offset - soft_watermark) /
+                                               static_cast<double>(std::max<int64_t>(1, target - soft_watermark)),
+                                           0.0, 1.0);
+        const size_t batch_pages =
+            kMinPreflushBatchPages +
+            static_cast<size_t>(progress * progress *
+                                static_cast<double>(kMaxPreflushBatchPages - kMinPreflushBatchPages));
+        sm_mgr_->flush_dirty_table_pages(batch_pages);
+
+        if (log_offset < target ||
+            (std::chrono::steady_clock::now() < drain_retry_time_ && log_offset < drain_retry_log_offset_)) {
+            return false;
+        }
+        const TableDirtyPageStats dirty_stats = sm_mgr_->table_dirty_page_stats();
+        const int64_t hard_watermark = target > INT64_MAX - target / 10 ? INT64_MAX : target + target / 10;
+        const size_t residue_limit = dirty_stats.frame_capacity / 50;
+        run_checkpoint = log_offset >= hard_watermark || dirty_stats.dirty_pages <= residue_limit;
     }
-    return RunCleanCheckpoint();
+    return run_checkpoint && RunCleanCheckpoint();
 }

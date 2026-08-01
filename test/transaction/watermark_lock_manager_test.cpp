@@ -14,12 +14,58 @@ See the Mulan PSL v2 for more details. */
 #include <future>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
 #include "transaction/watermark.h"
+
+namespace {
+
+template <typename Observe, typename Cleanup> bool WaitForLockEnqueued(Observe&& observe, Cleanup&& cleanup) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!observe()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            cleanup();
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+template <typename Observe, typename Cleanup> bool WaitForCondition(Observe&& observe, Cleanup&& cleanup) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!observe()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            cleanup();
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+template <typename Predicate, typename Cleanup>
+bool WaitForNotification(std::condition_variable& cv, std::mutex& latch, Predicate&& predicate, Cleanup&& cleanup) {
+    std::unique_lock<std::mutex> lock(latch);
+    if (cv.wait_for(lock, std::chrono::seconds(2), std::forward<Predicate>(predicate))) {
+        return true;
+    }
+    lock.unlock();
+    cleanup();
+    return false;
+}
+
+void JoinIfJoinable(std::thread& thread) {
+    if (thread.joinable()) {
+        thread.join();
+    }
+}
+
+} // namespace
 
 TEST(LockManagerMetadataTest, DuplicateUnlockAfterOwnerHandoffDoesNotReleaseNewOwner) {
     LockManager lock_manager;
@@ -30,17 +76,14 @@ TEST(LockManagerMetadataTest, DuplicateUnlockAfterOwnerHandoffDoesNotReleaseNewO
     LockDataId lock_id(42, rid, LockDataType::RECORD);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
-    std::atomic<bool> waiter_started{false};
     std::atomic<bool> waiter_acquired{false};
-    std::thread waiter_thread([&] {
-        waiter_started.store(true);
-        waiter_acquired.store(lock_manager.lock_exclusive_on_record(&waiter, rid, 42));
-    });
-
-    while (!waiter_started.load()) {
-        std::this_thread::yield();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::thread waiter_thread([&] { waiter_acquired.store(lock_manager.lock_exclusive_on_record(&waiter, rid, 42)); });
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&waiter);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        waiter_thread.join();
+                                    }));
     ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
     waiter_thread.join();
 
@@ -61,17 +104,15 @@ TEST(LockManagerMetadataTest, CancellingWaitingRecordLockLeavesQueueUsable) {
     LockDataId lock_id(42, rid, LockDataType::RECORD);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
-    std::atomic<bool> waiter_started{false};
     std::atomic<bool> waiter_acquired{true};
-    std::thread waiter_thread([&] {
-        waiter_started.store(true);
-        waiter_acquired.store(lock_manager.lock_exclusive_on_record(&cancelled, rid, 42));
-    });
-
-    while (!waiter_started.load()) {
-        std::this_thread::yield();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::thread waiter_thread(
+        [&] { waiter_acquired.store(lock_manager.lock_exclusive_on_record(&cancelled, rid, 42)); });
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&cancelled);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        waiter_thread.join();
+                                    }));
     lock_manager.cancel_transaction(&cancelled);
     waiter_thread.join();
 
@@ -99,23 +140,43 @@ TEST(LockManagerMetadataTest, CancellationDuringOwnerHandoffReleasesGrantedOwner
         std::unique_lock<std::mutex> lock(hook_latch);
         handoff_entered = true;
         hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release_handoff; });
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_handoff; });
     });
 
     LockAcquireResult waiter_result = LockAcquireResult::Value::Granted;
     std::thread waiter_thread([&] { waiter_result = lock_manager.lock_exclusive_on_record(&waiter, rid, 42); });
-    while (lock_manager.record_lock_observability().wait_enqueued != 1) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&waiter);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        waiter_thread.join();
+                                    }));
     std::thread owner_release([&] { EXPECT_TRUE(lock_manager.unlock(&owner, lock_id)); });
-    {
-        std::unique_lock<std::mutex> lock(hook_latch);
-        hook_cv.wait(lock, [&] { return handoff_entered; });
-    }
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return handoff_entered; },
+        [&] {
+            {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                release_handoff = true;
+            }
+            hook_cv.notify_all();
+            lock_manager.cancel_transaction(&waiter);
+            owner_release.join();
+            waiter_thread.join();
+        }));
     std::thread canceller([&] { lock_manager.cancel_transaction(&waiter); });
-    while (!waiter.is_lock_cancellation_requested()) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForCondition([&] { return waiter.is_lock_cancellation_requested(); },
+                                 [&] {
+                                     lock_manager.cancel_transaction(&waiter);
+                                     canceller.join();
+                                     {
+                                         std::lock_guard<std::mutex> lock(hook_latch);
+                                         release_handoff = true;
+                                     }
+                                     hook_cv.notify_all();
+                                     owner_release.join();
+                                     waiter_thread.join();
+                                 }));
     {
         std::lock_guard<std::mutex> lock(hook_latch);
         release_handoff = true;
@@ -148,28 +209,51 @@ TEST(LockManagerMetadataTest, DeadlockVictimDuringOwnerHandoffReleasesGrantedOwn
         std::unique_lock<std::mutex> lock(hook_latch);
         pre_notify = true;
         hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release_notify; });
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_notify; });
     });
+    auto release_handoff = [&] {
+        {
+            std::lock_guard<std::mutex> lock(hook_latch);
+            release_notify = true;
+        }
+        hook_cv.notify_all();
+    };
 
     LockAcquireResult victim_result = LockAcquireResult::Value::Granted;
     std::thread victim_thread([&] { victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42); });
-    while (lock_manager.record_lock_observability().wait_enqueued != 1) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        release_handoff();
+                                        lock_manager.cancel_transaction(&victim);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        JoinIfJoinable(victim_thread);
+                                    }));
     std::thread owner_release([&] { EXPECT_TRUE(lock_manager.unlock(&owner, lock_id)); });
-    {
-        std::unique_lock<std::mutex> lock(hook_latch);
-        hook_cv.wait(lock, [&] { return pre_notify; });
-    }
-    std::thread detector([&] { lock_manager.cancel_waiting_transaction_for_test(victim.get_transaction_id()); });
-    detector.join();
-    {
-        std::lock_guard<std::mutex> lock(hook_latch);
-        release_notify = true;
-    }
-    hook_cv.notify_all();
-    owner_release.join();
-    victim_thread.join();
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return pre_notify; },
+        [&] {
+            release_handoff();
+            lock_manager.cancel_transaction(&victim);
+            JoinIfJoinable(owner_release);
+            JoinIfJoinable(victim_thread);
+        }));
+    std::atomic<bool> detector_done{false};
+    std::thread detector([&] {
+        lock_manager.cancel_waiting_transaction_for_test(victim.get_transaction_id());
+        detector_done.store(true, std::memory_order_release);
+    });
+    ASSERT_TRUE(WaitForCondition([&] { return detector_done.load(std::memory_order_acquire); },
+                                 [&] {
+                                     release_handoff();
+                                     lock_manager.cancel_transaction(&victim);
+                                     JoinIfJoinable(detector);
+                                     JoinIfJoinable(owner_release);
+                                     JoinIfJoinable(victim_thread);
+                                 }));
+    release_handoff();
+    JoinIfJoinable(detector);
+    JoinIfJoinable(owner_release);
+    JoinIfJoinable(victim_thread);
 
     EXPECT_EQ(victim_result.value(), LockAcquireResult::Value::DeadlockVictim);
     EXPECT_TRUE(victim.is_lock_cancellation_requested());
@@ -197,31 +281,52 @@ TEST(LockManagerMetadataTest, StaleCycleCancellationAfterHandoffCompletionIsNoOp
         std::unique_lock<std::mutex> lock(hook_latch);
         check_entered = true;
         hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release_check; });
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_check; });
     });
     lock_manager.set_cycle_cancel_before_record_queue_test_hook([&] {
         std::unique_lock<std::mutex> lock(hook_latch);
         canceller_snapshot = true;
         hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release_canceller; });
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_canceller; });
     });
 
     LockAcquireResult waiter_result = LockAcquireResult::Value::Cancelled;
     std::thread waiter_thread([&] { waiter_result = lock_manager.lock_exclusive_on_record(&waiter, rid, 42); });
-    while (lock_manager.record_lock_observability().wait_enqueued != 1) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&waiter);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        waiter_thread.join();
+                                    }));
     std::thread owner_release([&] { EXPECT_TRUE(lock_manager.unlock(&owner, lock_id)); });
-    {
-        std::unique_lock<std::mutex> lock(hook_latch);
-        hook_cv.wait(lock, [&] { return check_entered; });
-    }
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return check_entered; },
+        [&] {
+            {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                release_check = true;
+            }
+            hook_cv.notify_all();
+            lock_manager.cancel_transaction(&waiter);
+            owner_release.join();
+            waiter_thread.join();
+        }));
     const auto victims_before = lock_manager.record_lock_observability().cycle_victims;
     std::thread canceller([&] { lock_manager.cancel_waiting_transaction_for_test(waiter.get_transaction_id()); });
-    {
-        std::unique_lock<std::mutex> lock(hook_latch);
-        hook_cv.wait(lock, [&] { return canceller_snapshot; });
-    }
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return canceller_snapshot; },
+        [&] {
+            {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                release_canceller = true;
+                release_check = true;
+            }
+            hook_cv.notify_all();
+            lock_manager.cancel_transaction(&waiter);
+            canceller.join();
+            owner_release.join();
+            waiter_thread.join();
+        }));
     {
         std::lock_guard<std::mutex> lock(hook_latch);
         release_check = true;
@@ -278,29 +383,51 @@ TEST(LockManagerMetadataTest, UniqueHandoffPublishesBeforeAbortCanRetireWaiter) 
         std::unique_lock<std::mutex> lock(hook_latch);
         published = true;
         hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release; });
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release; });
     });
 
     std::atomic<bool> waiter_result{false};
-    std::thread waiter_thread([&] { waiter_result.store(lock_manager.lock_exclusive_on_unique_key(waiter, index_fd, key)); });
-    while (lock_manager.unique_key_lock_observability().wait_enqueued != 1) {
-        std::this_thread::yield();
-    }
+    std::thread waiter_thread(
+        [&] { waiter_result.store(lock_manager.lock_exclusive_on_unique_key(waiter, index_fd, key)); });
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.unique_key_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(waiter);
+                                        lock_manager.unlock_unique_key(owner,
+                                                                       *owner->get_unique_key_lock_set()->begin());
+                                        waiter_thread.join();
+                                    }));
     const std::string lock_id = *owner->get_unique_key_lock_set()->begin();
     ASSERT_TRUE(lock_manager.unlock_unique_key(owner, lock_id));
-    {
-        std::unique_lock<std::mutex> lock(hook_latch);
-        hook_cv.wait(lock, [&] { return published; });
-    }
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return published; },
+        [&] {
+            {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                release = true;
+            }
+            hook_cv.notify_all();
+            lock_manager.cancel_transaction(waiter);
+            waiter_thread.join();
+        }));
     auto abort_waiter = std::async(std::launch::async, [&] { transaction_manager.abort(waiter, nullptr); });
-    while (!waiter->is_lock_cancellation_requested()) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForCondition([&] { return waiter->is_lock_cancellation_requested(); },
+                                 [&] {
+                                     lock_manager.cancel_transaction(waiter);
+                                     {
+                                         std::lock_guard<std::mutex> lock(hook_latch);
+                                         release = true;
+                                     }
+                                     hook_cv.notify_all();
+                                     waiter_thread.join();
+                                     ASSERT_EQ(abort_waiter.wait_for(std::chrono::seconds(2)),
+                                               std::future_status::ready);
+                                 }));
     {
         std::lock_guard<std::mutex> lock(hook_latch);
         release = true;
     }
     hook_cv.notify_all();
+    ASSERT_EQ(abort_waiter.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     waiter_thread.join();
     abort_waiter.get();
 
@@ -328,16 +455,30 @@ TEST(LockManagerMetadataTest, UniqueCycleCancellationPublishesFlagBeforeWakeup) 
         std::unique_lock<std::mutex> lock(hook_latch);
         removed = true;
         hook_cv.notify_all();
-        hook_cv.wait(lock, [&] { return release_flag; });
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_flag; });
     });
     std::atomic<bool> result{true};
     std::thread waiter([&] { result.store(lock_manager.lock_exclusive_on_unique_key(&victim, index_fd, key)); });
-    while (lock_manager.unique_key_lock_observability().wait_enqueued != 1) std::this_thread::yield();
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.unique_key_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&victim);
+                                        lock_manager.unlock_unique_key(&owner,
+                                                                       *owner.get_unique_key_lock_set()->begin());
+                                        waiter.join();
+                                    }));
     std::thread detector([&] { lock_manager.cancel_waiting_transaction_for_test(victim.get_transaction_id()); });
-    {
-        std::unique_lock<std::mutex> lock(hook_latch);
-        hook_cv.wait(lock, [&] { return removed; });
-    }
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return removed; },
+        [&] {
+            {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                release_flag = true;
+            }
+            hook_cv.notify_all();
+            lock_manager.cancel_transaction(&victim);
+            detector.join();
+            waiter.join();
+        }));
     EXPECT_FALSE(victim.is_lock_cancellation_requested());
     {
         std::lock_guard<std::mutex> lock(hook_latch);
@@ -380,13 +521,15 @@ TEST(LockManagerMetadataTest, SiFirstRecordConflictWaitsOnce) {
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
 
     LockAcquireResult contender_result = LockAcquireResult::Value::Cancelled;
-    std::thread contender_thread([&] {
-        contender_result = lock_manager.lock_exclusive_on_record(&contender, rid, 42);
-    });
+    std::thread contender_thread(
+        [&] { contender_result = lock_manager.lock_exclusive_on_record(&contender, rid, 42); });
 
-    while (lock_manager.record_lock_observability().wait_enqueued != 1) {
-        std::this_thread::yield();
-    }
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.record_lock_observability().wait_enqueued >= 1; },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&contender);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        contender_thread.join();
+                                    }));
     const auto queued = lock_manager.record_lock_observability();
     EXPECT_EQ(queued.immediate_conflict, 0u);
     EXPECT_EQ(queued.cycle_checks, 0u);

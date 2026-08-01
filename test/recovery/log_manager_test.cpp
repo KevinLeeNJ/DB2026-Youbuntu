@@ -21,7 +21,9 @@ See the Mulan PSL v2 for more details. */
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -135,6 +137,20 @@ TEST(LogManagerTest, DefaultsToStrictDurability) {
     DiskManager disk;
     LogManager log_mgr(&disk);
     EXPECT_EQ(log_mgr.durability_mode(), DurabilityMode::STRICT);
+}
+
+TEST(IndexSmoWalTest, Crc32MatchesIeeeKnownAnswers) {
+    const char empty[] = "";
+    EXPECT_EQ(IndexSmoCrc32(empty, 0), 0U);
+
+    constexpr char digits[] = "123456789";
+    EXPECT_EQ(IndexSmoCrc32(digits, sizeof(digits) - 1), 0xcbf43926U);
+
+    std::array<char, 256> every_byte{};
+    for (size_t i = 0; i < every_byte.size(); ++i) {
+        every_byte[i] = static_cast<char>(i);
+    }
+    EXPECT_EQ(IndexSmoCrc32(every_byte.data(), every_byte.size()), 0x29058c73U);
 }
 
 TEST(IndexSmoWalTest, RoundTripAndChecksumAreBounded) {
@@ -830,12 +846,30 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
     Transaction* owner = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
     const Rid rid{3, 4};
+    const Rid unrelated_rid{3, 5};
+    const LockDataId unrelated_lock(42, unrelated_rid, LockDataType::RECORD);
     ASSERT_TRUE(lock_mgr.lock_exclusive_on_record(owner, rid, 42));
-    ASSERT_FALSE(lock_mgr.lock_exclusive_on_record(txn, rid, 42));
+    ASSERT_TRUE(lock_mgr.lock_exclusive_on_record(txn, unrelated_rid, 42));
+    LockAcquireResult lock_result = LockAcquireResult::Value::Granted;
+    std::thread waiter([&] { lock_result = lock_mgr.lock_exclusive_on_record(txn, rid, 42); });
+    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (lock_mgr.record_lock_observability().wait_enqueued != 1 &&
+           std::chrono::steady_clock::now() < enqueue_deadline) {
+        std::this_thread::yield();
+    }
+    if (lock_mgr.record_lock_observability().wait_enqueued != 1) {
+        txn_mgr.abort(txn, &log_mgr);
+        waiter.join();
+        txn_mgr.abort(owner, &log_mgr);
+        FAIL() << "SI transaction that already owns another record lock did not enter FIFO";
+        return;
+    }
     ASSERT_TRUE(txn->get_write_set().empty());
     ASSERT_EQ(txn->get_prev_lsn(), txn->get_begin_lsn());
 
     txn_mgr.abort(txn, &log_mgr);
+    waiter.join();
+    ASSERT_EQ(lock_result.value(), LockAcquireResult::Value::Cancelled);
 
     EXPECT_EQ(log_mgr.get_persist_lsn(), INVALID_LSN);
     EXPECT_EQ(log_mgr.get_durable_lsn(), INVALID_LSN);

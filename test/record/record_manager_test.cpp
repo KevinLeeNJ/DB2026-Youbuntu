@@ -485,3 +485,56 @@ TEST(RecordManagerIsRecordTest, is_record_unpins_page) {
     rm_manager->close_file(fh.get());
     rm_manager->destroy_file(filename);
 }
+
+TEST(RecordManagerTupleMetaProbeTest, reports_state_and_never_leaks_a_pin) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), bpm.get());
+    const std::string filename = "tuple_meta_probe_test.txt";
+    if (disk_manager->is_file(filename)) {
+        disk_manager->destroy_file(filename);
+    }
+    constexpr int record_size = 64;
+    rm_manager->create_file(filename, record_size);
+    auto fh = rm_manager->open_file(filename);
+
+    std::vector<char> value(record_size, 0);
+    const Rid first = fh->insert_record(value.data(), nullptr);
+    const int slots_per_page = fh->get_file_hdr().num_records_per_page;
+    for (int i = 1; i < slots_per_page; ++i) {
+        fh->insert_record(value.data(), nullptr);
+    }
+    const Rid second = fh->insert_record(value.data(), nullptr);
+    ASSERT_NE(first.page_no, second.page_no);
+    TupleMeta meta;
+    meta.writer_txn_id_ = 77;
+    fh->set_tuple_meta(first, meta);
+
+    const auto present = fh->probe_tuple_meta(first);
+    ASSERT_EQ(present.state, RmTupleMetaProbeState::Present);
+    EXPECT_EQ(present.meta.writer_txn_id_, 77);
+    EXPECT_EQ(fh->probe_tuple_meta(Rid{0, 0}).state, RmTupleMetaProbeState::Absent);
+    EXPECT_EQ(fh->probe_tuple_meta(Rid{first.page_no, -1}).state, RmTupleMetaProbeState::Absent);
+    EXPECT_EQ(fh->probe_tuple_meta(Rid{first.page_no, fh->get_file_hdr().num_records_per_page}).state,
+              RmTupleMetaProbeState::Absent);
+
+    // With one frame occupied by page two, a valid probe of page one fails its
+    // fetch cleanly. The held page remains pinned exactly once, then returns to
+    // zero after its caller releases it.
+    Page* held = bpm->fetch_page(PageId{fh->GetFd(), second.page_no});
+    ASSERT_NE(held, nullptr);
+    EXPECT_EQ(fh->probe_tuple_meta(first).state, RmTupleMetaProbeState::Retry);
+    EXPECT_TRUE(bpm->unpin_page(PageId{fh->GetFd(), second.page_no}, false));
+    EXPECT_EQ(fh->probe_tuple_meta(first).state, RmTupleMetaProbeState::Present);
+    EXPECT_EQ(fh->probe_tuple_meta(Rid{second.page_no, second.slot_no + 1}).state, RmTupleMetaProbeState::Absent);
+    for (const Rid rid : {first, second}) {
+        const PageId page_id{fh->GetFd(), rid.page_no};
+        const auto page_it = bpm->page_table_.find(page_id);
+        if (page_it != bpm->page_table_.end()) {
+            EXPECT_EQ(bpm->pages_[page_it->second].pin_count_, 0);
+        }
+    }
+
+    rm_manager->close_file(fh.get());
+    rm_manager->destroy_file(filename);
+}

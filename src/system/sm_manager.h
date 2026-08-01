@@ -30,6 +30,11 @@ See the Mulan PSL v2 for more details. */
 
 class Context;
 
+struct TableDirtyPageStats {
+    size_t dirty_pages{0};
+    size_t frame_capacity{0};
+};
+
 struct ColDef {
     std::string name; // Column name
     ColType type;     // Type of column
@@ -101,7 +106,12 @@ private:
     };
 
     struct HistoricalIndexBucket {
-        std::map<std::string, std::vector<Rid>, HistoricalKeyLess> entries;
+        struct Entry {
+            Rid rid;
+            uint64_t generation{0};
+        };
+
+        std::map<std::string, std::vector<Entry>, HistoricalKeyLess> entries;
 
         HistoricalIndexBucket() = default;
         HistoricalIndexBucket(std::vector<ColType> types, std::vector<int> lens)
@@ -111,9 +121,11 @@ private:
         std::string bucket_key;
         std::string encoded_key;
         Rid rid;
+        uint64_t generation{0};
 
         friend bool operator==(const HistoricalRetireCandidate& a, const HistoricalRetireCandidate& b) {
-            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid;
+            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid &&
+                   a.generation == b.generation;
         }
     };
 
@@ -155,6 +167,7 @@ private:
     mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
     std::deque<HistoricalRetireCandidate> historical_retire_queue_;
+    uint64_t next_historical_index_generation_{1};
     mutable std::mutex deleted_tuple_candidates_latch_;
     using DeletedTupleBucket =
         std::unordered_map<DeletedTupleRowKey, std::vector<DeletedTupleCandidate>, DeletedTupleRowKeyHash>;
@@ -352,12 +365,21 @@ public:
                             .emplace(bucket_key, HistoricalIndexBucket(std::move(col_types), std::move(col_lens)))
                             .first;
         }
-        auto& rids = bucket_it->second.entries[std::string(key.data(), key.size())];
-        if (std::find(rids.begin(), rids.end(), rid) == rids.end()) {
-            rids.push_back(rid);
+        const std::string encoded_key(key.data(), key.size());
+        auto& entries = bucket_it->second.entries[encoded_key];
+        const auto current =
+            std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.rid == rid; });
+        const uint64_t generation = next_historical_index_generation_++;
+        if (current == entries.end()) {
+            entries.push_back(HistoricalIndexBucket::Entry{rid, generation});
+        } else {
+            current->generation = generation;
         }
-        historical_retire_queue_.push_back(
-            HistoricalRetireCandidate{bucket_key, std::string(key.data(), key.size()), rid});
+        // A foreground remember can race a detached GC batch. Refreshing the
+        // generation makes that older item stale even when the physical
+        // (key,RID) is unchanged, then gives the newest identity its own work
+        // item. The bucket still has at most one current entry per RID.
+        historical_retire_queue_.push_back(HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation});
     }
 
     std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
@@ -368,7 +390,15 @@ public:
             return {};
         }
         auto key_it = it->second.entries.find(std::string(key.data(), key.size()));
-        return key_it == it->second.entries.end() ? std::vector<Rid>{} : key_it->second;
+        std::vector<Rid> result;
+        if (key_it == it->second.entries.end()) {
+            return result;
+        }
+        result.reserve(key_it->second.size());
+        for (const auto& entry : key_it->second) {
+            result.push_back(entry.rid);
+        }
+        return result;
     }
 
     std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {
@@ -378,8 +408,10 @@ public:
         if (it == historical_index_keys_.end()) {
             return result;
         }
-        for (const auto& [_, rids] : it->second.entries) {
-            result.insert(result.end(), rids.begin(), rids.end());
+        for (const auto& [_, entries] : it->second.entries) {
+            for (const auto& entry : entries) {
+                result.push_back(entry.rid);
+            }
         }
         return result;
     }
@@ -400,7 +432,9 @@ public:
         auto end =
             upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
         for (auto entry = begin; entry != end; ++entry) {
-            result.insert(result.end(), entry->second.begin(), entry->second.end());
+            for (const auto& historical_entry : entry->second) {
+                result.push_back(historical_entry.rid);
+            }
         }
         return result;
     }
@@ -428,8 +462,8 @@ public:
         auto end =
             upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
         for (auto entry = begin; entry != end; ++entry) {
-            for (const Rid& rid : entry->second) {
-                out.emplace_back(entry->first, rid);
+            for (const auto& historical_entry : entry->second) {
+                out.emplace_back(entry->first, historical_entry.rid);
             }
         }
     }
@@ -564,6 +598,9 @@ public:
 
     bool flush_all_table_and_index_pages(FlushDependencyPolicy policy = FlushDependencyPolicy::Enforce());
     bool flush_recovery_pages(const std::unordered_set<std::string>& table_names);
+
+    TableDirtyPageStats table_dirty_page_stats();
+    size_t flush_dirty_table_pages(size_t max_pages);
 
     // Compatibility wrapper for the recovery scale harness. This remains
     // table-only and is not part of automatic checkpoint scheduling.

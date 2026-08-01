@@ -110,7 +110,13 @@ void InsertIndexEntries(SmManager* sm_manager, const TabMeta& tab, const std::st
     for (const auto& index : tab.indexes) {
         auto key = MakeIndexKey(index, rec.data);
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        ih->insert_entry(key.data(), rid, wal_context, true);
+        std::vector<Rid> existing;
+        ih->get_value(key.data(), &existing, nullptr);
+        if (std::find(existing.begin(), existing.end(), rid) == existing.end()) {
+            // Preserve duplicate-key indexes while making repeated abort/local
+            // compensation of the same physical (key,RID) a no-op.
+            ih->insert_entry(key.data(), rid, wal_context, true);
+        }
     }
 }
 
@@ -316,7 +322,8 @@ TupleMeta FallbackCommittedMeta() {
     return meta;
 }
 
-void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, lsn_t page_lsn) {
+void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, lsn_t page_lsn,
+                     const TransactionManager::AbortDeleteUndoPublicationTestHook& delete_undo_publication_hook) {
     const std::string tab_name = write_record->GetTableName();
     auto& tab = sm_manager->db_.get_table(tab_name);
     auto* fh = sm_manager->fhs_.at(tab_name).get();
@@ -348,17 +355,34 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
     }
     case WType::DELETE_TUPLE: {
         const RmRecord& old_rec = write_record->GetRecord();
+        const TupleMeta current_meta = fh->get_tuple_meta(rid);
         auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
+        const TupleMeta old_meta = undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta();
+
+        // A normal transactional delete leaves the record allocated under an
+        // uncommitted tombstone. Keep that tombstone in place until every old
+        // physical (key,RID) has been restored: GC must not observe the old
+        // committed meta while the physical index still lacks the old key.
+        // Recovery/legacy undo may find an absent bitmap slot. Recreate that
+        // slot under the same unpublished tombstone, never under the default
+        // committed meta supplied by insert_record().
         if (fh->is_record(rid)) {
-            fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
-                                   page_lsn);
+            // The current heap record is already the delete tombstone.
         } else {
-            fh->insert_record(rid, old_rec.data, page_lsn);
-            fh->set_tuple_meta(rid, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(), page_lsn);
+            TupleMeta unpublished_tombstone = current_meta;
+            unpublished_tombstone.is_committed_ = false;
+            unpublished_tombstone.is_deleted_ = true;
+            fh->insert_record(rid, old_rec.data, page_lsn, &unpublished_tombstone);
         }
         if (index_wal_context.has_value()) {
             InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, *index_wal_context);
         }
+        // InsertIndexEntries has released all index latches. This test-only
+        // seam deliberately runs before taking the heap page latch below.
+        if (delete_undo_publication_hook) {
+            delete_undo_publication_hook();
+        }
+        fh->apply_tuple_update(rid, old_rec.data, old_meta, page_lsn);
         break;
     }
     case WType::UPDATE_TUPLE: {
@@ -465,6 +489,8 @@ void TransactionManager::record_client_abort(AbortReason reason) {
         break;
     case AbortReason::DEADLOCK_PREVENTION:
         abort_deadlock_prevention_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case AbortReason::LOCK_CANCELLED:
         break;
     case AbortReason::WW_CONFLICT:
         abort_ww_conflict_.fetch_add(1, std::memory_order_relaxed);
@@ -937,7 +963,15 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     auto& write_set = txn->get_write_set();
     if (lock_manager_ != nullptr) {
         lock_manager_->cancel_transaction(txn);
+        // A cancelled waiter still dereferences txn while it unregisters from
+        // its queue. Do not retire this transaction until that handoff has
+        // completed; otherwise abort races a waiter into use-after-free.
+        lock_manager_->wait_for_transaction_lock_requests(txn->get_transaction_id());
     }
+    // A row mutation keeps this pin through its post-lock checks and physical
+    // write path.  Do not publish ABORTED, release its locks, or retire it
+    // while that caller can still dereference txn.
+    txn->wait_for_lock_operations();
     lsn_t abort_lsn = INVALID_LSN;
     if (!write_set.empty() || txn->get_prev_lsn() != txn->get_begin_lsn()) {
         // The abort record must precede the physical undo. This gives every
@@ -947,11 +981,14 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         abort_lsn = WriteAbortLog(txn, log_manager);
     }
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(this, sm_manager_, it->get(), abort_lsn);
+        UndoWriteRecord(this, sm_manager_, it->get(), abort_lsn, abort_delete_undo_publication_test_hook_);
     }
     running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);
-    ReleaseLocks(txn, lock_manager_);
+    // Physical undo is complete. Remove this transaction from the SSI
+    // conflict surface before releasing a record lock can wake a serializable
+    // writer; otherwise that writer can observe a rolled-back owner as a
+    // GROWING reader and manufacture a false dangerous structure.
     txn->set_state(TransactionState::ABORTED);
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
         CleanupTxnSsiState(txn->get_transaction_id());
@@ -964,6 +1001,12 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
             PruneSsiState();
         }
     }
+    if (abort_before_lock_release_test_hook_) {
+        abort_before_lock_release_test_hook_(txn->get_transaction_id());
+    }
+    // Abort WAL and all heap/index undo precede this handoff. Waiters can now
+    // proceed without seeing this transaction as an SSI reader or writer.
+    ReleaseLocks(txn, lock_manager_);
     RetireTransactionIfSafe(txn);
     MaybeRunGarbageCollection();
 }

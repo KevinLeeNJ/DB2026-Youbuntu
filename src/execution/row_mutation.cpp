@@ -21,6 +21,35 @@ See the Mulan PSL v2 for more details.
 
 namespace {
 
+RowMutationEngine::DeletePublicationTestHook delete_publication_test_hook;
+
+void InvokeDeletePublicationTestHook() {
+    if (delete_publication_test_hook) {
+        delete_publication_test_hook();
+    }
+}
+
+class RowMutationTxnPin {
+public:
+    explicit RowMutationTxnPin(Context* context) : txn_(context == nullptr ? nullptr : context->txn_) {
+        if (txn_ != nullptr) {
+            txn_->pin_lock_operation();
+        }
+    }
+
+    ~RowMutationTxnPin() {
+        if (txn_ != nullptr) {
+            txn_->unpin_lock_operation();
+        }
+    }
+
+    RowMutationTxnPin(const RowMutationTxnPin&) = delete;
+    RowMutationTxnPin& operator=(const RowMutationTxnPin&) = delete;
+
+private:
+    Transaction* txn_;
+};
+
 const ColMeta& FindColumn(const TabMeta& tab, const TabCol& target) {
     for (const auto& col : tab.cols) {
         if (col.tab_name == target.tab_name && col.name == target.col_name) {
@@ -160,8 +189,22 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
     }
 
     auto* txn = context->txn_;
-    if (context->lock_mgr_ != nullptr && !context->lock_mgr_->lock_exclusive_on_record(txn, rid, info.fh->GetFd())) {
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+    if (context->lock_mgr_ != nullptr) {
+        const LockAcquireResult lock_result = context->lock_mgr_->lock_exclusive_on_record(txn, rid, info.fh->GetFd());
+        if (!lock_result) {
+            AbortReason reason = AbortReason::LOCK_CANCELLED;
+            if (lock_result.value() == LockAcquireResult::Value::DeadlockVictim) {
+                reason = AbortReason::DEADLOCK_PREVENTION;
+            } else if (lock_result.value() == LockAcquireResult::Value::WriteConflict) {
+                reason = AbortReason::WW_CONFLICT;
+            }
+            throw TransactionAbortException(txn->get_transaction_id(), reason);
+        }
+    }
+    if (txn->is_lock_cancellation_requested()) {
+        throw TransactionAbortException(txn->get_transaction_id(), txn->is_lock_deadlock_victim()
+                                                                       ? AbortReason::DEADLOCK_PREVENTION
+                                                                       : AbortReason::LOCK_CANCELLED);
     }
     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context->txn_mgr_ != nullptr) {
         auto current_record = GetCurrentRecordForRcWrite(info.fh, rid, txn, context);
@@ -346,7 +389,14 @@ void RollbackIndexUpdates(const std::vector<std::pair<const RowMutationIndex*, s
         it->first->handle->delete_entry(it->second.data(), rid, wal_context);
     }
     for (auto it = deleted.rbegin(); it != deleted.rend(); ++it) {
-        it->first->handle->insert_entry(it->second.data(), rid, wal_context, true);
+        std::vector<Rid> existing;
+        it->first->handle->get_value(it->second.data(), &existing, nullptr);
+        if (std::find(existing.begin(), existing.end(), rid) == existing.end()) {
+            // `allow_duplicate` retains non-unique-index semantics; the
+            // explicit RID probe only makes retrying this exact after-image
+            // idempotent.
+            it->first->handle->insert_entry(it->second.data(), rid, wal_context, true);
+        }
     }
 }
 
@@ -380,17 +430,25 @@ std::vector<BoundMutationSetClause> BindMutationSetClauses(const TabMeta& tab,
     return bound;
 }
 
+void RowMutationEngine::SetDeletePublicationTestHook(DeletePublicationTestHook hook) {
+    // Tests install/remove this only while no delete is executing. Keeping the
+    // production default empty avoids any scheduling policy or runtime mode.
+    delete_publication_test_hook = std::move(hook);
+}
+
 bool RowMutationEngine::MatchesTarget(const RmRecord& visible_record, const RowMutationRuntimeInfo& info) {
     return Matches(info.conditions, info.bound_conditions, visible_record);
 }
 
 bool RowMutationEngine::LockOnly(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info,
                                  Context* context) {
+    RowMutationTxnPin pin(context);
     return PrepareWrite(rid, visible_record, info, context);
 }
 
 bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info,
                                   Context* context) {
+    RowMutationTxnPin pin(context);
     if (!PrepareWrite(rid, visible_record, info, context)) {
         return false;
     }
@@ -502,6 +560,7 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
 
 bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, const DeleteRuntimeInfo& info,
                                   Context* context) {
+    RowMutationTxnPin pin(context);
     if (!PrepareWrite(rid, visible_record, info, context)) {
         return false;
     }
@@ -516,6 +575,21 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
     }
 
+    struct IndexDelete {
+        const RowMutationIndex* index;
+        std::vector<char> key;
+    };
+    std::vector<IndexDelete> index_deletes;
+    index_deletes.reserve(info.indexes->size());
+    // Do not leave a heap tombstone behind because a later unique-key
+    // reservation failed. SQL autocommit also has a Transaction object, so it
+    // deliberately follows this same all-or-nothing transaction path.
+    for (const auto& index : *info.indexes) {
+        auto key = MakeIndexKey(*index.meta, visible_record.data);
+        ReserveUniqueKey(context, index.handle->GetFd(), key);
+        index_deletes.push_back(IndexDelete{&index, std::move(key)});
+    }
+
     lsn_t log_lsn = INVALID_LSN;
     if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
         Rid log_rid = rid;
@@ -523,25 +597,6 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         log_record.prev_lsn_ = txn->get_prev_lsn();
         log_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(log_lsn);
-    }
-
-    std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
-    std::optional<IndexWriteWalContext> wal_context;
-    if (!info.indexes->empty()) {
-        wal_context.emplace(IndexWriteWalContext::LoggedRuntime(log_lsn));
-    }
-    try {
-        for (const auto& index : *info.indexes) {
-            auto key = MakeIndexKey(*index.meta, visible_record.data);
-            ReserveUniqueKey(context, index.handle->GetFd(), key);
-            info.sm_manager->remember_historical_index_key(*info.tab_name, index.name, key, rid, *index.meta);
-            index.handle->delete_entry(key.data(), rid, *wal_context);
-            deleted.emplace_back(&index, std::move(key));
-        }
-    } catch (...) {
-        std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
-        RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
-        throw;
     }
 
     if (txn != nullptr) {
@@ -564,7 +619,46 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         // visible. INSERT copies this small bucket under the candidate latch
         // and performs all page access after releasing it.
         info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid, visible_record, tombstone);
+
+        std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
+        std::optional<IndexWriteWalContext> wal_context;
+        if (!index_deletes.empty()) {
+            wal_context.emplace(IndexWriteWalContext::LoggedRuntime(log_lsn));
+        }
+        try {
+            for (const auto& delete_entry : index_deletes) {
+                // GC may observe this history entry only after the tombstone
+                // above is visible, so an active delete always requeues it.
+                info.sm_manager->remember_historical_index_key(*info.tab_name, delete_entry.index->name,
+                                                               delete_entry.key, rid, *delete_entry.index->meta);
+                delete_entry.index->handle->delete_entry(delete_entry.key.data(), rid, *wal_context);
+                deleted.emplace_back(delete_entry.index, delete_entry.key);
+            }
+        } catch (...) {
+            std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
+            RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
+            throw;
+        }
+        InvokeDeletePublicationTestHook();
     } else {
+        // Preserve the embedded/no-transaction physical-delete behavior.
+        std::optional<IndexWriteWalContext> wal_context;
+        if (!index_deletes.empty()) {
+            wal_context.emplace(IndexWriteWalContext::LoggedRuntime(log_lsn));
+        }
+        std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
+        try {
+            for (const auto& delete_entry : index_deletes) {
+                info.sm_manager->remember_historical_index_key(*info.tab_name, delete_entry.index->name,
+                                                               delete_entry.key, rid, *delete_entry.index->meta);
+                delete_entry.index->handle->delete_entry(delete_entry.key.data(), rid, *wal_context);
+                deleted.emplace_back(delete_entry.index, delete_entry.key);
+            }
+        } catch (...) {
+            std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> inserted;
+            RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
+            throw;
+        }
         info.fh->delete_record(rid, context);
     }
     return true;

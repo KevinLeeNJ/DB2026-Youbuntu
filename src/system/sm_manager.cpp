@@ -318,11 +318,15 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         if (fh_it == fhs_.end()) {
             continue;
         }
-        RmFileHandle* fh = fh_it->second.get();
-        if (!fh->is_record(candidate.rid)) {
+        const RmTupleMetaProbe probe = fh_it->second->probe_tuple_meta(candidate.rid);
+        if (probe.state == RmTupleMetaProbeState::Retry) {
+            hist_requeue[i] = true;
             continue;
         }
-        TupleMeta meta = fh->get_tuple_meta(candidate.rid);
+        if (probe.state == RmTupleMetaProbeState::Absent) {
+            continue;
+        }
+        const TupleMeta& meta = probe.meta;
         if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
             hist_requeue[i] = true;
         }
@@ -339,10 +343,16 @@ void SmManager::prune_version_history(timestamp_t watermark) {
             if (key_it == it->second.entries.end()) {
                 continue;
             }
-            auto& rids = key_it->second;
+            auto& entries = key_it->second;
+            const auto current = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+                return entry.rid == candidate.rid && entry.generation == candidate.generation;
+            });
+            if (current == entries.end()) {
+                continue;
+            }
             if (!hist_requeue[i]) {
-                rids.erase(std::remove(rids.begin(), rids.end(), candidate.rid), rids.end());
-                if (rids.empty()) {
+                entries.erase(current);
+                if (entries.empty()) {
                     it->second.entries.erase(key_it);
                 }
                 if (it->second.entries.empty()) {
@@ -376,10 +386,18 @@ void SmManager::prune_version_history(timestamp_t watermark) {
     for (size_t i = 0; i < deleted_snapshot.size(); ++i) {
         const auto& retired = deleted_snapshot[i];
         auto fh_it = fhs_.find(retired.tab_name);
-        if (fh_it == fhs_.end() || !fh_it->second->is_record(retired.candidate.rid)) {
+        if (fh_it == fhs_.end()) {
             continue;
         }
-        TupleMeta meta = fh_it->second->get_tuple_meta(retired.candidate.rid);
+        const RmTupleMetaProbe probe = fh_it->second->probe_tuple_meta(retired.candidate.rid);
+        if (probe.state == RmTupleMetaProbeState::Retry) {
+            deleted_requeue[i] = true;
+            continue;
+        }
+        if (probe.state == RmTupleMetaProbeState::Absent) {
+            continue;
+        }
+        const TupleMeta& meta = probe.meta;
         // A stale queue item must not touch a newer deletion at a reused RID.
         if (!deleted_tuple_candidate_matches_meta(retired.candidate, meta)) {
             continue;
@@ -807,7 +825,17 @@ bool SmManager::flush_all_table_and_index_pages(FlushDependencyPolicy policy) {
     return true;
 }
 
-size_t SmManager::flush_dirty_pages(size_t max_pages) {
+TableDirtyPageStats SmManager::table_dirty_page_stats() {
+    std::shared_lock catalog_guard{catalog_latch_};
+    std::vector<int> fds;
+    fds.reserve(fhs_.size());
+    for (const auto& [_, fh] : fhs_) {
+        fds.push_back(fh->GetFd());
+    }
+    return TableDirtyPageStats{buffer_pool_manager_->count_dirty_pages(fds), buffer_pool_manager_->frame_capacity()};
+}
+
+size_t SmManager::flush_dirty_table_pages(size_t max_pages) {
     std::shared_lock catalog_guard{catalog_latch_};
     std::vector<int> fds;
     fds.reserve(fhs_.size());
@@ -815,6 +843,10 @@ size_t SmManager::flush_dirty_pages(size_t max_pages) {
         fds.push_back(fh->GetFd());
     }
     return buffer_pool_manager_->flush_dirty_pages(fds, max_pages).pages_written;
+}
+
+size_t SmManager::flush_dirty_pages(size_t max_pages) {
+    return flush_dirty_table_pages(max_pages);
 }
 
 bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& table_names) {

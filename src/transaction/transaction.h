@@ -13,9 +13,11 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -145,6 +147,36 @@ public:
 
     inline bool is_lock_cancellation_requested() const {
         return lock_cancellation_requested_.load(std::memory_order_acquire);
+    }
+
+    inline void mark_lock_deadlock_victim() {
+        lock_deadlock_victim_.store(true, std::memory_order_release);
+    }
+
+    inline bool is_lock_deadlock_victim() const {
+        return lock_deadlock_victim_.load(std::memory_order_acquire);
+    }
+
+    // A lock waiter or row-mutation path pins the transaction while it may
+    // dereference it.  TransactionManager::abort waits for these users before
+    // retirement, so cancellation cannot free a transaction underneath an
+    // in-flight lock handoff or the mutation that follows it.
+    inline void pin_lock_operation() {
+        std::lock_guard<std::mutex> lock(lock_operation_latch_);
+        ++lock_operation_pins_;
+    }
+
+    inline void unpin_lock_operation() {
+        std::lock_guard<std::mutex> lock(lock_operation_latch_);
+        assert(lock_operation_pins_ > 0);
+        if (--lock_operation_pins_ == 0) {
+            lock_operation_cv_.notify_all();
+        }
+    }
+
+    inline void wait_for_lock_operations() {
+        std::unique_lock<std::mutex> lock(lock_operation_latch_);
+        lock_operation_cv_.wait(lock, [&] { return lock_operation_pins_ == 0; });
     }
 
     inline lsn_t get_prev_lsn() {
@@ -319,6 +351,10 @@ private:
     std::atomic<TransactionState> state_; // 事务状态；GC/SSI may inspect it from another thread
     std::atomic<uint32_t> commit_publication_pins_{0};
     std::atomic<bool> lock_cancellation_requested_{false};
+    std::atomic<bool> lock_deadlock_victim_{false};
+    std::mutex lock_operation_latch_;
+    std::condition_variable lock_operation_cv_;
+    uint32_t lock_operation_pins_{0};
     IsolationLevel isolation_level_; // 事务的隔离级别
     std::thread::id thread_id_;      // 当前事务对应的线程id
     lsn_t begin_lsn_;                // BEGIN日志对应的lsn，用于识别尚未产生其他WAL的事务
@@ -331,8 +367,8 @@ private:
     std::unordered_set<std::string> unique_key_lock_set_; // 事务持有的逻辑唯一键 reservation
     // 无索引表精确行值的 delete intent，独立于 unique-key reservation。
     std::unordered_set<std::string> logical_row_delete_intent_set_;
-    std::deque<Page*> index_latch_page_set_;              // 维护事务执行过程中加锁的索引页面
-    std::deque<Page*> index_deleted_page_set_;            // 维护事务执行过程中删除的索引页面
+    std::deque<Page*> index_latch_page_set_;   // 维护事务执行过程中加锁的索引页面
+    std::deque<Page*> index_deleted_page_set_; // 维护事务执行过程中删除的索引页面
 
     std::atomic<timestamp_t> read_ts_{0};
     size_t watermark_slot_{std::numeric_limits<size_t>::max()};

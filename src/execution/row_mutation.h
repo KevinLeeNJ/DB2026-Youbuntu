@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details.
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "execution_common.h"
@@ -69,6 +70,12 @@ struct DeleteRuntimeInfo : RowMutationRuntimeInfo {};
 
 class RowMutationEngine {
 public:
+    // Test-only scheduling seam for the delete publication sequence. It runs
+    // after the uncommitted tombstone is visible and every physical index
+    // entry has been removed, with no index/history/page latch held.
+    using DeletePublicationTestHook = std::function<void()>;
+    static void SetDeletePublicationTestHook(DeletePublicationTestHook hook);
+
     // Evaluates the bound statement predicate against a snapshot-visible row.
     static bool MatchesTarget(const RmRecord& visible_record, const RowMutationRuntimeInfo& info);
 
