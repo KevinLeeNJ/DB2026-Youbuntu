@@ -16,8 +16,11 @@ See the Mulan PSL v2 for more details. */
 
 #include <memory>
 #include <cmath>
+#include <chrono>
+#include <future>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/config.h"
@@ -819,15 +822,46 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
         &concurrent_context, nullptr, &concurrent_stats);
     EXPECT_EQ(concurrent_stats.point_update_hits, 1U);
-    try {
-        concurrent_statement->root->Next();
-        FAIL() << "an uncommitted point writer must conflict";
-    } catch (TransactionAbortException& error) {
-        EXPECT_TRUE(error.GetAbortReason() == AbortReason::DEADLOCK_PREVENTION ||
-                    error.GetAbortReason() == AbortReason::WW_CONFLICT);
+
+    const auto lock_observability_before = lock_manager.record_lock_observability();
+    auto waiter_result = std::async(std::launch::async, [&] { concurrent_statement->root->Next(); });
+    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool waiter_enqueued = false;
+    while (std::chrono::steady_clock::now() < enqueue_deadline) {
+        if (lock_manager.record_lock_observability().wait_enqueued > lock_observability_before.wait_enqueued) {
+            waiter_enqueued = true;
+            break;
+        }
+        std::this_thread::yield();
     }
-    transaction_manager.abort(concurrent_transaction, &log_manager);
+    if (!waiter_enqueued) {
+        transaction_manager.abort(uncommitted_writer, &log_manager);
+        if (waiter_result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            transaction_manager.abort(concurrent_transaction, &log_manager);
+        }
+        ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
+            << "SI first-lock waiter was not enqueued before the deadline";
+        EXPECT_NO_THROW(waiter_result.get());
+        transaction_manager.abort(concurrent_transaction, &log_manager);
+        return;
+    }
+
     transaction_manager.abort(uncommitted_writer, &log_manager);
+    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
+        << "SI first-lock waiter did not finish after owner abort";
+    EXPECT_NO_THROW(waiter_result.get());
+    transaction_manager.abort(concurrent_transaction, &log_manager);
+
+    const int post_wait_id = 2;
+    const auto post_wait_lookup =
+        executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&post_wait_id));
+    ASSERT_EQ(post_wait_lookup.status, UniqueLookupStatus::Unique);
+    EXPECT_EQ(post_wait_lookup.rid, changed_lookup.rid);
+    auto post_wait_record = executable->scan.table_handle->get_record(post_wait_lookup.rid, nullptr);
+    ASSERT_NE(post_wait_record, nullptr);
+    EXPECT_EQ(read_unaligned<int>(post_wait_record->data + columns[0].offset), 2);
+    EXPECT_EQ(read_unaligned<int>(post_wait_record->data + columns[1].offset), 77);
+    EXPECT_FLOAT_EQ(read_float(post_wait_record->data + columns[2].offset), 1.75F);
 
     Transaction* stale_delete_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -991,8 +1025,35 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     EXPECT_EQ(executable->point_update->index_handle->lookup_unique(reinterpret_cast<const char*>(&key)).rid, rid);
 
     Transaction competing(100000, IsolationLevel::SNAPSHOT_ISOLATION);
-    EXPECT_FALSE(lock_manager.lock_exclusive_on_record(&competing, rid, executable->scan.table_handle->GetFd()));
+    const LockDataId record_lock(executable->scan.table_handle->GetFd(), rid, LockDataType::RECORD);
+    const auto lock_observability_before = lock_manager.record_lock_observability();
+    auto contender_result = std::async(std::launch::async, [&] {
+        return lock_manager.lock_exclusive_on_record(&competing, rid, executable->scan.table_handle->GetFd());
+    });
+    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool contender_enqueued = false;
+    while (std::chrono::steady_clock::now() < enqueue_deadline) {
+        if (lock_manager.record_lock_observability().wait_enqueued > lock_observability_before.wait_enqueued) {
+            contender_enqueued = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!contender_enqueued) {
+        transaction_manager.abort(transaction, nullptr);
+        if (contender_result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            competing.mark_lock_cancellation_requested();
+        }
+        ASSERT_EQ(contender_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
+            << "SI self-assignment contender was not enqueued before the deadline";
+        EXPECT_FALSE(contender_result.get());
+        return;
+    }
     transaction_manager.abort(transaction, nullptr);
+    ASSERT_EQ(contender_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
+        << "SI self-assignment contender did not finish after owner abort";
+    EXPECT_TRUE(contender_result.get());
+    ASSERT_TRUE(lock_manager.unlock(&competing, record_lock));
 
     auto expect_context_fallback = [&](Context* incomplete_context) {
         PreparedRuntimeStats fallback_stats;
