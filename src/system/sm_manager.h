@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_set>
 #include <deque>
 #include <optional>
+#include <queue>
 
 #include "common/context.h"
 #include "common/fault_injection.h"
@@ -80,6 +81,7 @@ private:
         std::string tab_name;
         DeletedTupleRowKey row_key;
         DeletedTupleCandidate candidate;
+        std::optional<timestamp_t> retry_after_watermark;
     };
 
     struct HistoricalKeyLess {
@@ -92,7 +94,7 @@ private:
     };
 
     struct HistoricalIndexBucket {
-        enum class RetireState : uint8_t { Queued, InFlight };
+        enum class RetireState : uint8_t { Queued, InFlight, Deferred };
 
         struct Entry {
             Rid rid;
@@ -111,10 +113,23 @@ private:
         std::string encoded_key;
         Rid rid;
         uint64_t generation{0};
+        std::optional<timestamp_t> retry_after_watermark;
 
         friend bool operator==(const HistoricalRetireCandidate& a, const HistoricalRetireCandidate& b) {
             return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid &&
                    a.generation == b.generation;
+        }
+    };
+
+    struct HistoricalRetireCandidateCompare {
+        bool operator()(const HistoricalRetireCandidate& lhs, const HistoricalRetireCandidate& rhs) const {
+            return lhs.retry_after_watermark > rhs.retry_after_watermark;
+        }
+    };
+
+    struct DeletedTupleRetireCandidateCompare {
+        bool operator()(const DeletedTupleRetireCandidate& lhs, const DeletedTupleRetireCandidate& rhs) const {
+            return lhs.retry_after_watermark > rhs.retry_after_watermark;
         }
     };
 
@@ -181,9 +196,13 @@ private:
     mutable std::shared_mutex historical_index_keys_latch_;
     std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
     std::deque<HistoricalRetireCandidate> historical_retire_queue_;
+    std::priority_queue<HistoricalRetireCandidate, std::vector<HistoricalRetireCandidate>,
+                        HistoricalRetireCandidateCompare>
+        historical_deferred_retire_queue_;
     // A queued ticket is a logical identity. The current generation remains
-    // in the Entry; this side index only records that one queue node exists.
-    // It is empty for entries owned by an in-flight GC batch.
+    // in the Entry; this side index only records that one ready queue node
+    // exists. It is empty for entries owned by an in-flight or deferred GC
+    // ticket.
     std::unordered_set<HistoricalRetireKey, HistoricalRetireKeyHash> historical_queued_generations_;
     uint64_t next_historical_index_generation_{1};
     mutable std::mutex deleted_tuple_candidates_latch_;
@@ -191,6 +210,9 @@ private:
         std::unordered_map<DeletedTupleRowKey, std::vector<DeletedTupleCandidate>, DeletedTupleRowKeyHash>;
     std::unordered_map<std::string, DeletedTupleBucket> deleted_tuple_candidates_;
     std::deque<DeletedTupleRetireCandidate> deleted_tuple_retire_queue_;
+    std::priority_queue<DeletedTupleRetireCandidate, std::vector<DeletedTupleRetireCandidate>,
+                        DeletedTupleRetireCandidateCompare>
+        deleted_tuple_deferred_retire_queue_;
     uint64_t next_deleted_tuple_candidate_id_{1};
 
     std::optional<size_t> deleted_tuple_candidate_test_hash_override_;
@@ -238,6 +260,7 @@ private:
     void clear_deleted_tuple_candidates_locked() {
         deleted_tuple_candidates_.clear();
         deleted_tuple_retire_queue_.clear();
+        deleted_tuple_deferred_retire_queue_ = {};
     }
 
 public:
@@ -356,7 +379,7 @@ public:
         if (current == entries.end()) {
             entries.push_back(HistoricalIndexBucket::Entry{rid, generation});
             historical_queued_generations_.insert(retire_key);
-            historical_retire_queue_.push_back(HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation});
+            historical_retire_queue_.push_back(HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation, {}});
         } else {
             current->generation = generation;
             // Keep one queue item per logical entry. A refresh while the item
@@ -368,7 +391,7 @@ public:
                 (void)queued_it;
                 if (inserted) {
                     historical_retire_queue_.push_back(
-                        HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation});
+                        HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation, {}});
                 }
             }
         }
@@ -476,7 +499,7 @@ public:
         DeletedTupleCandidate candidate{next_deleted_tuple_candidate_id_++, rid, tombstone.writer_txn_id_,
                                         tombstone.version_chain_head_};
         bucket_it->second.push_back(candidate);
-        deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate});
+        deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate, {}});
     }
 
     // Test-only entry point. A forced hash exercises the guarantee that hash
@@ -491,7 +514,7 @@ public:
         DeletedTupleCandidate candidate{next_deleted_tuple_candidate_id_++, rid, tombstone.writer_txn_id_,
                                         tombstone.version_chain_head_};
         bucket_it->second.push_back(candidate);
-        deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate});
+        deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate, {}});
     }
 
     std::vector<DeletedTupleCandidate> get_deleted_tuple_candidates(const std::string& tab_name,

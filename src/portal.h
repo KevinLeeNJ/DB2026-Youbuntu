@@ -178,6 +178,7 @@ private:
     struct PreparedPointUpdateResolution {
         PreparedPointUpdateResolutionKind kind = PreparedPointUpdateResolutionKind::Fallback;
         std::optional<Rid> rid;
+        std::unique_ptr<RmRecord> visible_record;
     };
 
     PreparedPointUpdateResolution resolve_prepared_point_update(const PreparedUpdateExecutable& executable,
@@ -205,7 +206,7 @@ private:
                 return {};
             }
             if (condition.rhs_val.is_null) {
-                return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt};
+                return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt, nullptr};
             }
             write_point_key_part(key.data() + part.key_offset, condition.rhs_val, part.target_type, part.target_length);
         }
@@ -225,7 +226,7 @@ private:
             }
         }
         if (candidates.empty()) {
-            return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt};
+            return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt, nullptr};
         }
         if (candidates.size() != 1) {
             return {};
@@ -235,10 +236,8 @@ private:
             sm_manager_, &executable.scan.table_name,  executable.scan.table, executable.scan.table_handle,
             &conditions, &executable.bound_conditions, &executable.indexes};
         std::optional<Rid> target;
+        std::unique_ptr<RmRecord> visible_record;
         for (const Rid& candidate : candidates) {
-            if (!executable.scan.table_handle->is_record(candidate)) {
-                continue;
-            }
             auto visible = GetVisibleRecord(executable.scan.table_handle, candidate, context);
             if (visible == nullptr || !RowMutationEngine::MatchesTarget(*visible, info)) {
                 continue;
@@ -247,11 +246,12 @@ private:
                 return {};
             }
             target = candidate;
+            visible_record = std::move(visible);
         }
         if (!target.has_value()) {
-            return {PreparedPointUpdateResolutionKind::NoVisible, std::nullopt};
+            return {PreparedPointUpdateResolutionKind::NoVisible, std::nullopt, nullptr};
         }
-        return {PreparedPointUpdateResolutionKind::Visible, target};
+        return {PreparedPointUpdateResolutionKind::Visible, target, std::move(visible_record)};
     }
 
     struct ExecutorQueryExpr {
@@ -1179,11 +1179,12 @@ public:
                 descriptor.database_identity() == sm_manager_->get_database_identity_under_catalog_guard() &&
                 sm_manager_->get_catalog_generation() == descriptor.catalog_generation()) {
                 auto conditions = bind_prepared_conditions(executable->conditions, parameters);
-                const auto point = resolve_prepared_point_update(*executable, conditions, context);
+                auto point = resolve_prepared_point_update(*executable, conditions, context);
                 if (point.kind != PreparedPointUpdateResolutionKind::Fallback) {
                     auto root = std::make_unique<UpdateExecutor>(
                         *executable, bind_prepared_set_clauses(executable->set_clauses, parameters),
-                        std::move(conditions), PointMutationTarget{point.rid}, context);
+                        std::move(conditions), PointMutationTarget{point.rid}, std::move(point.visible_record),
+                        context);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
                                                         std::move(root));
                 }

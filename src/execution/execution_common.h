@@ -83,6 +83,9 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
     // publication window instead of treating the transient link as corruption.
     for (int attempt = 0; attempt < 2; ++attempt) {
         auto record_with_meta = fh->get_record_with_meta(rid, context);
+        if (record_with_meta.record == nullptr) {
+            return nullptr;
+        }
         TupleMeta meta = record_with_meta.meta;
         auto base_record = std::move(record_with_meta.record);
         std::optional<UndoLog> current_undo;
@@ -223,6 +226,9 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
 inline std::optional<RmRecordWithMeta> GetCurrentRecordForRcWrite(RmFileHandle* fh, const Rid& rid, Transaction* txn,
                                                                   Context* context) {
     auto record_with_meta = fh->get_record_with_meta(rid, context);
+    if (record_with_meta.record == nullptr) {
+        return std::nullopt;
+    }
     const TupleMeta& meta = record_with_meta.meta;
     if (meta.is_deleted_ || (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id())) {
         return std::nullopt;

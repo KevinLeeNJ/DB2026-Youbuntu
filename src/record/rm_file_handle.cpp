@@ -62,14 +62,22 @@ RmRecordWithMeta RmFileHandle::get_record_with_meta(const Rid& rid, Context* con
     RmPageHandle tmp_page_handle = fetch_page_handle(rid.page_no);
     TupleMeta meta;
     std::unique_ptr<RmRecord> record_ptr;
+    bool present = false;
     {
         std::shared_lock<std::shared_mutex> page_lock(tmp_page_handle.page->latch());
-        meta = tmp_page_handle.get_meta(rid.slot_no);
-        int size_ = tmp_page_handle.file_hdr->record_size;
-        char* data_ = tmp_page_handle.get_slot(rid.slot_no);
-        record_ptr = std::make_unique<RmRecord>(size_, data_);
+        present = rid.slot_no >= 0 && rid.slot_no < tmp_page_handle.file_hdr->num_records_per_page &&
+                  Bitmap::is_set(tmp_page_handle.bitmap, rid.slot_no);
+        if (present) {
+            meta = tmp_page_handle.get_meta(rid.slot_no);
+            int size_ = tmp_page_handle.file_hdr->record_size;
+            char* data_ = tmp_page_handle.get_slot(rid.slot_no);
+            record_ptr = std::make_unique<RmRecord>(size_, data_);
+        }
     }
     buffer_pool_manager_->unpin_page(tmp_page_handle.page->get_page_id(), false);
+    if (!present) {
+        return RmRecordWithMeta{TupleMeta{}, nullptr};
+    }
     return RmRecordWithMeta{meta, std::move(record_ptr)};
 }
 

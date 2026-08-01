@@ -487,6 +487,27 @@ TEST(RecordManagerIsRecordTest, is_record_unpins_page) {
     rm_manager->destroy_file(filename);
 }
 
+TEST(RecordManagerRecordWithMetaTest, absent_slot_returns_no_record) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    auto bpm = std::make_unique<BufferPoolManager>(10, disk_manager.get());
+    auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), bpm.get());
+    const std::string filename = "record_with_meta_absent_test.txt";
+    if (disk_manager->is_file(filename)) {
+        disk_manager->destroy_file(filename);
+    }
+    rm_manager->create_file(filename, 64);
+    auto fh = rm_manager->open_file(filename);
+
+    char buf[64] = {};
+    const Rid present = fh->insert_record(buf, nullptr);
+    ASSERT_EQ(present.slot_no, 0);
+    const auto absent = fh->get_record_with_meta(Rid{present.page_no, present.slot_no + 1}, nullptr);
+    EXPECT_EQ(absent.record, nullptr);
+
+    rm_manager->close_file(fh.get());
+    rm_manager->destroy_file(filename);
+}
+
 TEST(RecordManagerTupleMetaProbeTest, reports_state_and_never_leaks_a_pin) {
     auto disk_manager = std::make_unique<DiskManager>();
     auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager.get());

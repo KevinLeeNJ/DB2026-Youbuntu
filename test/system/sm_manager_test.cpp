@@ -416,6 +416,9 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_
     fh->set_tuple_meta(first_rid, first_meta);
     sm_manager_->prune_version_history(11);
     EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
+    EXPECT_EQ(sm_manager_->deleted_tuple_retire_queue_.size(), 0u);
+    ASSERT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.size(), 1u);
+    EXPECT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.top().retry_after_watermark, 11);
     sm_manager_->prune_version_history(12);
     EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).empty());
 }
@@ -455,12 +458,14 @@ TEST_F(SmManagerTest, historical_retire_generation_prevents_aba_and_keeps_equali
     EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
 
     sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
-    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
+    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 0u);
+    ASSERT_EQ(sm_manager_->historical_deferred_retire_queue_.size(), 1u);
     const uint64_t generation_c = entries.front().generation;
     EXPECT_GT(generation_c, generation_b);
-    ASSERT_EQ(sm_manager_->historical_queued_generations_.size(), 1u);
+    ASSERT_EQ(sm_manager_->historical_queued_generations_.size(), 0u);
     sm_manager_->prune_version_history(10);
     EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
+    EXPECT_EQ(sm_manager_->historical_deferred_retire_queue_.size(), 1u);
     sm_manager_->prune_version_history(11);
     EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key).empty());
 }
@@ -497,6 +502,9 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_aba_does_not_erase_current_generat
     ASSERT_EQ(current.size(), 1u);
     EXPECT_EQ(current.front().writer_txn_id, current_tombstone.writer_txn_id_);
     EXPECT_EQ(current.front().version_chain_head, current_tombstone.version_chain_head_);
+    EXPECT_EQ(sm_manager_->deleted_tuple_retire_queue_.size(), 0u);
+    ASSERT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.size(), 1u);
+    EXPECT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.top().retry_after_watermark, 11);
     sm_manager_->prune_version_history(12);
     EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("deleted_aba", record).empty());
 }

@@ -29,7 +29,9 @@ private:
     std::vector<Rid> rids_;
     std::optional<Rid> point_rid_;
     bool point_lookup_{false};
+    bool point_consumed_{false};
     bool lock_only_{false};
+    std::unique_ptr<RmRecord> cached_point_record_;
     std::string tab_name_storage_;
     const std::string* tab_name_;
     std::vector<SetClause> set_clauses_;
@@ -106,11 +108,25 @@ public:
         point_lookup_ = true;
         lock_only_ = executable.point_update.has_value() && executable.point_update->lock_only;
     }
+    UpdateExecutor(const PreparedUpdateExecutable& executable, std::vector<SetClause> set_clauses,
+                   std::vector<Condition> conditions, PointMutationTarget target,
+                   std::unique_ptr<RmRecord> cached_record, Context* context)
+        : UpdateExecutor(executable, std::move(set_clauses), std::move(conditions), std::vector<Rid>{}, context) {
+        point_rid_ = target.rid;
+        point_lookup_ = true;
+        lock_only_ = executable.point_update.has_value() && executable.point_update->lock_only;
+        cached_point_record_ = std::move(cached_record);
+    }
     std::unique_ptr<RmRecord> Next() override {
+        if (point_lookup_ && point_consumed_) {
+            return nullptr;
+        }
         const size_t rid_count = point_lookup_ ? (point_rid_.has_value() ? 1 : 0) : rids_.size();
         for (size_t rid_index = 0; rid_index < rid_count; ++rid_index) {
             Rid& rid = point_lookup_ ? *point_rid_ : rids_[rid_index];
-            std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
+            std::unique_ptr<RmRecord> rec = point_lookup_ && cached_point_record_ != nullptr
+                                                ? std::move(cached_point_record_)
+                                                : GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
                 if (context_ != nullptr && context_->txn_ != nullptr &&
                     context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
@@ -134,6 +150,9 @@ public:
                                        affected_index_bitmap_};
                 RowMutationEngine::UpdateOne(rid, *rec, info, context_);
             }
+        }
+        if (point_lookup_) {
+            point_consumed_ = true;
         }
         return nullptr;
     }
