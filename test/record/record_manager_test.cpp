@@ -513,6 +513,16 @@ TEST(RecordManagerTupleMetaProbeTest, reports_state_and_never_leaks_a_pin) {
     const auto present = fh->probe_tuple_meta(first);
     ASSERT_EQ(present.state, RmTupleMetaProbeState::Present);
     EXPECT_EQ(present.meta.writer_txn_id_, 77);
+    const auto batch = fh->probe_tuple_meta_batch(first.page_no, {first.slot_no, first.slot_no + 1, -1});
+    ASSERT_EQ(batch.size(), 3u);
+    EXPECT_EQ(batch[0].state, RmTupleMetaProbeState::Present);
+    EXPECT_EQ(batch[0].meta.writer_txn_id_, 77);
+    EXPECT_EQ(batch[1].state, RmTupleMetaProbeState::Present);
+    EXPECT_EQ(batch[2].state, RmTupleMetaProbeState::Absent);
+    const auto bitmap_unset = fh->probe_tuple_meta_batch(second.page_no, {second.slot_no, second.slot_no + 1});
+    ASSERT_EQ(bitmap_unset.size(), 2u);
+    EXPECT_EQ(bitmap_unset[0].state, RmTupleMetaProbeState::Present);
+    EXPECT_EQ(bitmap_unset[1].state, RmTupleMetaProbeState::Absent);
     EXPECT_EQ(fh->probe_tuple_meta(Rid{0, 0}).state, RmTupleMetaProbeState::Absent);
     EXPECT_EQ(fh->probe_tuple_meta(Rid{first.page_no, -1}).state, RmTupleMetaProbeState::Absent);
     EXPECT_EQ(fh->probe_tuple_meta(Rid{first.page_no, fh->get_file_hdr().num_records_per_page}).state,
@@ -524,6 +534,10 @@ TEST(RecordManagerTupleMetaProbeTest, reports_state_and_never_leaks_a_pin) {
     Page* held = bpm->fetch_page(PageId{fh->GetFd(), second.page_no});
     ASSERT_NE(held, nullptr);
     EXPECT_EQ(fh->probe_tuple_meta(first).state, RmTupleMetaProbeState::Retry);
+    const auto retry_batch = fh->probe_tuple_meta_batch(first.page_no, {first.slot_no, first.slot_no + 1});
+    ASSERT_EQ(retry_batch.size(), 2u);
+    EXPECT_EQ(retry_batch[0].state, RmTupleMetaProbeState::Retry);
+    EXPECT_EQ(retry_batch[1].state, RmTupleMetaProbeState::Retry);
     EXPECT_TRUE(bpm->unpin_page(PageId{fh->GetFd(), second.page_no}, false));
     EXPECT_EQ(fh->probe_tuple_meta(first).state, RmTupleMetaProbeState::Present);
     EXPECT_EQ(fh->probe_tuple_meta(Rid{second.page_no, second.slot_no + 1}).state, RmTupleMetaProbeState::Absent);

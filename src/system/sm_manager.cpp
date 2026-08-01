@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include "index/ix.h"
@@ -310,25 +311,66 @@ void SmManager::prune_version_history(timestamp_t watermark) {
         }
     }
     std::vector<bool> hist_requeue(hist_snapshot.size(), false);
+    struct PageProbeGroup {
+        RmFileHandle* file_handle;
+        page_id_t page_no;
+        std::vector<int> slots;
+        std::vector<size_t> candidate_indices;
+    };
+    struct PageProbeKey {
+        RmFileHandle* file_handle;
+        page_id_t page_no;
+
+        bool operator==(const PageProbeKey& other) const {
+            return file_handle == other.file_handle && page_no == other.page_no;
+        }
+    };
+    struct PageProbeKeyHash {
+        size_t operator()(const PageProbeKey& key) const noexcept {
+            const size_t handle_hash = std::hash<RmFileHandle*>{}(key.file_handle);
+            const size_t page_hash = std::hash<page_id_t>{}(key.page_no);
+            return handle_hash ^
+                   (page_hash + static_cast<size_t>(0x9e3779b9) + (handle_hash << 6) + (handle_hash >> 2));
+        }
+    };
+    std::vector<PageProbeGroup> hist_groups;
+    std::unordered_map<PageProbeKey, size_t, PageProbeKeyHash> hist_group_indices;
+    hist_groups.reserve(hist_snapshot.size());
+    hist_group_indices.reserve(hist_snapshot.size());
     for (size_t i = 0; i < hist_snapshot.size(); ++i) {
         const auto& candidate = hist_snapshot[i];
-        size_t nul = candidate.bucket_key.find('\0');
-        std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
-        auto fh_it = fhs_.find(tab_name);
+        const size_t nul = candidate.bucket_key.find('\0');
+        const std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
+        const auto fh_it = fhs_.find(tab_name);
         if (fh_it == fhs_.end()) {
             continue;
         }
-        const RmTupleMetaProbe probe = fh_it->second->probe_tuple_meta(candidate.rid);
-        if (probe.state == RmTupleMetaProbeState::Retry) {
-            hist_requeue[i] = true;
-            continue;
+        RmFileHandle* file_handle = fh_it->second.get();
+        const PageProbeKey key{file_handle, candidate.rid.page_no};
+        auto [group_it, inserted] = hist_group_indices.emplace(key, hist_groups.size());
+        if (inserted) {
+            hist_groups.push_back(PageProbeGroup{file_handle, candidate.rid.page_no, {}, {}});
         }
-        if (probe.state == RmTupleMetaProbeState::Absent) {
-            continue;
-        }
-        const TupleMeta& meta = probe.meta;
-        if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
-            hist_requeue[i] = true;
+        auto& group = hist_groups[group_it->second];
+        group.slots.push_back(candidate.rid.slot_no);
+        group.candidate_indices.push_back(i);
+    }
+    for (const auto& group : hist_groups) {
+        const auto probes = group.file_handle->probe_tuple_meta_batch(group.page_no, group.slots);
+        for (size_t j = 0; j < probes.size(); ++j) {
+            const auto& probe = probes[j];
+            const size_t candidate_index = group.candidate_indices[j];
+            if (probe.state == RmTupleMetaProbeState::Retry) {
+                hist_requeue[candidate_index] = true;
+                continue;
+            }
+            if (probe.state == RmTupleMetaProbeState::Absent) {
+                continue;
+            }
+            const TupleMeta& meta = probe.meta;
+            if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
+                hist_requeue[candidate_index] = true;
+            }
         }
     }
     if (!hist_snapshot.empty()) {
@@ -383,29 +425,48 @@ void SmManager::prune_version_history(timestamp_t watermark) {
     }
 
     std::vector<bool> deleted_requeue(deleted_snapshot.size(), false);
+    std::vector<PageProbeGroup> deleted_groups;
+    std::unordered_map<PageProbeKey, size_t, PageProbeKeyHash> deleted_group_indices;
+    deleted_groups.reserve(deleted_snapshot.size());
+    deleted_group_indices.reserve(deleted_snapshot.size());
     for (size_t i = 0; i < deleted_snapshot.size(); ++i) {
         const auto& retired = deleted_snapshot[i];
-        auto fh_it = fhs_.find(retired.tab_name);
+        const auto fh_it = fhs_.find(retired.tab_name);
         if (fh_it == fhs_.end()) {
             continue;
         }
-        const RmTupleMetaProbe probe = fh_it->second->probe_tuple_meta(retired.candidate.rid);
-        if (probe.state == RmTupleMetaProbeState::Retry) {
-            deleted_requeue[i] = true;
-            continue;
+        RmFileHandle* file_handle = fh_it->second.get();
+        const PageProbeKey key{file_handle, retired.candidate.rid.page_no};
+        auto [group_it, inserted] = deleted_group_indices.emplace(key, deleted_groups.size());
+        if (inserted) {
+            deleted_groups.push_back(PageProbeGroup{file_handle, retired.candidate.rid.page_no, {}, {}});
         }
-        if (probe.state == RmTupleMetaProbeState::Absent) {
-            continue;
-        }
-        const TupleMeta& meta = probe.meta;
-        // A stale queue item must not touch a newer deletion at a reused RID.
-        if (!deleted_tuple_candidate_matches_meta(retired.candidate, meta)) {
-            continue;
-        }
-        // Keep precisely the candidates that can still be seen as concurrent
-        // by an active snapshot. Equality is intentionally unsafe here.
-        if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
-            deleted_requeue[i] = true;
+        auto& group = deleted_groups[group_it->second];
+        group.slots.push_back(retired.candidate.rid.slot_no);
+        group.candidate_indices.push_back(i);
+    }
+    for (const auto& group : deleted_groups) {
+        const auto probes = group.file_handle->probe_tuple_meta_batch(group.page_no, group.slots);
+        for (size_t j = 0; j < probes.size(); ++j) {
+            const auto& probe = probes[j];
+            const size_t candidate_index = group.candidate_indices[j];
+            if (probe.state == RmTupleMetaProbeState::Retry) {
+                deleted_requeue[candidate_index] = true;
+                continue;
+            }
+            if (probe.state == RmTupleMetaProbeState::Absent) {
+                continue;
+            }
+            const TupleMeta& meta = probe.meta;
+            // A stale queue item must not touch a newer deletion at a reused RID.
+            if (!deleted_tuple_candidate_matches_meta(deleted_snapshot[candidate_index].candidate, meta)) {
+                continue;
+            }
+            // Keep precisely the candidates that can still be seen as concurrent
+            // by an active snapshot. Equality is intentionally unsafe here.
+            if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
+                deleted_requeue[candidate_index] = true;
+            }
         }
     }
 

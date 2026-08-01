@@ -260,6 +260,12 @@ public:
     // resources and probe exceptions return Retry.
     RmTupleMetaProbe probe_tuple_meta(const Rid& rid) const;
 
+    // Probe several slots from one record page while holding one buffer-pool
+    // pin and one shared page latch. Results correspond to slot_nos in order.
+    // A fetch failure or probe exception returns Retry for every valid slot in
+    // the group; invalid slots remain Absent.
+    std::vector<RmTupleMetaProbe> probe_tuple_meta_batch(page_id_t page_no, const std::vector<int>& slot_nos) const;
+
     // Access buffer pool manager (for TupleMeta modifications that need explicit pin control)
     BufferPoolManager* get_bpm() {
         return buffer_pool_manager_;
