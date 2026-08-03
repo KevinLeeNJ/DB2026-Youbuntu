@@ -109,7 +109,7 @@ template <typename Observe, typename Cleanup> bool WaitForLockEnqueued(Observe&&
 
 } // namespace
 
-TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockWaitsWithoutCycleScan) {
+TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockReturnsWriteConflictImmediately) {
     LockManager lock_manager;
     Transaction owner(1001, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction victim(1002, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -117,21 +117,12 @@ TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockWaitsWithoutCycleScan) 
     LockDataId lock_id(42, rid, LockDataType::RECORD);
 
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
-    LockAcquireResult victim_result = LockAcquireResult::Value::Cancelled;
-    std::thread victim_thread([&] { victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42); });
-
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
-                                    [&] {
-                                        lock_manager.cancel_transaction(&victim);
-                                        lock_manager.unlock(&owner, lock_id);
-                                        victim_thread.join();
-                                    }));
+    const LockAcquireResult victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42);
+    EXPECT_EQ(victim_result.value(), LockAcquireResult::Value::WriteConflict);
     EXPECT_EQ(owner.get_lock_set()->count(lock_id), 1u);
-    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
-    victim_thread.join();
-    EXPECT_EQ(victim_result.value(), LockAcquireResult::Value::Granted);
-    EXPECT_EQ(victim.get_lock_set()->count(lock_id), 1u);
-    ASSERT_TRUE(lock_manager.unlock(&victim, lock_id));
+    EXPECT_TRUE(victim.get_lock_set()->empty());
+    EXPECT_FALSE(lock_manager.has_record_waiters_for_test());
+    EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
 }
 
 TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) {
@@ -701,102 +692,82 @@ private:
     IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
 
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitsWhileOwnerRemainsActive) {
-    SharedTestDB db("snapshot_si_first_lock_wait_conflict");
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockAbortsWhileOwnerRemainsActive) {
+    SharedTestDB db("snapshot_si_first_lock_immediate_conflict");
     TestSession setup(&db);
-    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_conflict (id int, val int);"));
-    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_conflict values (1, 100);"));
-    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_conflict values (2, 20);"));
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_immediate_conflict (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_immediate_conflict values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_immediate_conflict values (2, 20);"));
 
     TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
-    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession victim(&db, IsolationLevel::SNAPSHOT_ISOLATION);
     TestSession verifier(&db);
     ASSERT_TRUE(owner.exec_sql_ok("begin;"));
-    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
-    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_conflict set val = 200 where id = 1;"));
+    ASSERT_TRUE(victim.exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_immediate_conflict set val = 200 where id = 1;"));
 
-    auto waiter_result = std::async(std::launch::async, [&] {
-        return waiter.exec_sql_ok("update si_first_wait_conflict set val = val + 1 where id = 1;");
-    });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
-                                    [&] {
-                                        owner.exec_sql_ok("abort;");
-                                        waiter_result.wait_for(std::chrono::seconds(2));
-                                    }));
+    const std::string victim_abort = victim.exec_sql_expect_abort(
+        "update si_first_immediate_conflict set val = val + 1 where id = 1;");
+    EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
     ASSERT_NE(owner.current_transaction(), nullptr);
     EXPECT_NE(owner.current_transaction()->get_state(), TransactionState::ABORTED);
+    ASSERT_TRUE(owner.exec_sql_ok("commit;"));
+
+    const std::string final_state = verifier.exec_sql("select val from si_first_immediate_conflict where id = 1;");
+    EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              101 |"), std::string::npos);
+}
+
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockOwnerAbortDoesNotReviveAbortedVictim) {
+    SharedTestDB db("snapshot_si_first_lock_abort_owner_abort");
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_abort_owner_abort (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_abort_owner_abort values (1, 100);"));
+
+    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession victim(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession verifier(&db);
+    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_abort_owner_abort set val = 200 where id = 1;"));
+    ASSERT_TRUE(victim.exec_sql_ok("begin;"));
+
+    const std::string victim_abort = victim.exec_sql_expect_abort(
+        "update si_first_abort_owner_abort set val = val + 1 where id = 1;");
+    EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
     ASSERT_TRUE(owner.exec_sql_ok("abort;"));
-    ASSERT_TRUE(waiter_result.get());
-    ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
-    const std::string final_state = verifier.exec_sql("select val from si_first_wait_conflict where id = 1;");
-    EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
+
+    const std::string final_state = verifier.exec_sql("select val from si_first_abort_owner_abort where id = 1;");
+    EXPECT_NE(final_state.find("|              100 |"), std::string::npos);
+    EXPECT_EQ(final_state.find("|              101 |"), std::string::npos);
     EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
 }
 
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerAbortContinuesWithSnapshot) {
-    SharedTestDB db("snapshot_si_first_lock_wait_owner_abort");
+TEST(SnapshotIsolationConcurrencyTest, SiFirstLockOwnerCommitStillLeavesVictimAborted) {
+    SharedTestDB db("snapshot_si_first_lock_abort_owner_commit");
     TestSession setup(&db);
-    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_abort (id int, val int);"));
-    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_abort values (1, 100);"));
+    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_abort_owner_commit (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_abort_owner_commit values (1, 100);"));
 
     TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
-    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession victim(&db, IsolationLevel::SNAPSHOT_ISOLATION);
     TestSession verifier(&db);
     ASSERT_TRUE(owner.exec_sql_ok("begin;"));
-    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_abort set val = 200 where id = 1;"));
-    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
+    ASSERT_TRUE(owner.exec_sql_ok("update si_first_abort_owner_commit set val = 200 where id = 1;"));
+    ASSERT_TRUE(victim.exec_sql_ok("begin;"));
 
-    auto waiter_result = std::async(std::launch::async, [&] {
-        return waiter.exec_sql_ok("update si_first_wait_abort set val = val + 1 where id = 1;");
-    });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
-                                    [&] {
-                                        owner.exec_sql_ok("abort;");
-                                        waiter_result.wait_for(std::chrono::seconds(2));
-                                    }));
-
-    ASSERT_TRUE(owner.exec_sql_ok("abort;"));
-    ASSERT_TRUE(waiter_result.get());
-    ASSERT_TRUE(waiter.exec_sql_ok("commit;"));
-
-    const std::string final_state = verifier.exec_sql("select val from si_first_wait_abort where id = 1;");
-    EXPECT_NE(final_state.find("|              101 |"), std::string::npos);
-    EXPECT_EQ(final_state.find("|              200 |"), std::string::npos);
-}
-
-TEST(SnapshotIsolationConcurrencyTest, SiFirstLockWaitThenOwnerCommitStillAbortsStaleWriter) {
-    SharedTestDB db("snapshot_si_first_lock_wait_owner_commit");
-    TestSession setup(&db);
-    ASSERT_TRUE(setup.exec_sql_ok("create table si_first_wait_commit (id int, val int);"));
-    ASSERT_TRUE(setup.exec_sql_ok("insert into si_first_wait_commit values (1, 100);"));
-
-    TestSession owner(&db, IsolationLevel::SNAPSHOT_ISOLATION);
-    TestSession waiter(&db, IsolationLevel::SNAPSHOT_ISOLATION);
-    TestSession verifier(&db);
-    ASSERT_TRUE(owner.exec_sql_ok("begin;"));
-    ASSERT_TRUE(owner.exec_sql_ok("update si_first_wait_commit set val = 200 where id = 1;"));
-    ASSERT_TRUE(waiter.exec_sql_ok("begin;"));
-
-    auto waiter_result = std::async(std::launch::async, [&] {
-        return TestSession::trim_output(
-            waiter.exec_sql_expect_abort("update si_first_wait_commit set val = val + 1 where id = 1;"));
-    });
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return db.lock()->has_record_waiters_for_test(); },
-                                    [&] {
-                                        owner.exec_sql_ok("abort;");
-                                        waiter_result.wait_for(std::chrono::seconds(2));
-                                    }));
+    const std::string victim_abort = victim.exec_sql_expect_abort(
+        "update si_first_abort_owner_commit set val = val + 1 where id = 1;");
+    EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
 
     ASSERT_TRUE(owner.exec_sql_ok("commit;"));
-    EXPECT_EQ(waiter_result.get(), "abort");
 
-    const std::string final_state = verifier.exec_sql("select val from si_first_wait_commit where id = 1;");
+    const std::string final_state = verifier.exec_sql("select val from si_first_abort_owner_commit where id = 1;");
     EXPECT_NE(final_state.find("|              200 |"), std::string::npos);
     EXPECT_EQ(final_state.find("|              201 |"), std::string::npos);
 }
 
-TEST(SnapshotIsolationConcurrencyTest, SiHeldUnrelatedLockWaitsThenOwnerAbortUsesSnapshotValue) {
-    SharedTestDB db("snapshot_si_held_lock_wait_owner_abort");
+TEST(SnapshotIsolationConcurrencyTest, SiHeldUnrelatedLockStillWaitsThenOwnerAbortUsesSnapshotValue) {
+    SharedTestDB db("snapshot_si_held_lock_still_wait_owner_abort");
     TestSession setup(&db);
     ASSERT_TRUE(setup.exec_sql_ok("create table si_held_lock_wait_abort (id int, val int);"));
     ASSERT_TRUE(setup.exec_sql_ok("insert into si_held_lock_wait_abort values (1, 100);"));

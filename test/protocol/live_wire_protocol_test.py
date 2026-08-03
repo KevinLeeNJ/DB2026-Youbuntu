@@ -7,7 +7,6 @@ server's network/result-sink path are observable by CTest.
 """
 
 import os
-import select
 import shutil
 import signal
 import socket
@@ -15,7 +14,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 META = 0x01
@@ -678,7 +676,7 @@ def test_snapshot_write_conflict(port):
         victim.close()
 
 
-def test_active_snapshot_delete_conflict_waits_then_rechecks(port):
+def test_active_snapshot_delete_conflict_aborts_immediately(port):
     setup = WireClient(port)
     setup.command("CREATE TABLE active_si_delete (id INT, value INT);")
     setup.command("CREATE INDEX active_si_delete(id);")
@@ -686,111 +684,42 @@ def test_active_snapshot_delete_conflict_waits_then_rechecks(port):
     setup.command("INSERT INTO active_si_delete VALUES (2, 20);")
     setup.close()
 
-    owner = WireClient(port)
-    waiter = WireClient(port)
-    commit_owner = WireClient(port)
-    stale_waiter = WireClient(port)
+    winner = WireClient(port)
+    victim = WireClient(port)
     verifier = WireClient(port)
-    waiter_threads = []
-
-    def launch_delete(client, sql):
-        started = threading.Event()
-        result = {}
-        errors = []
-
-        def run():
-            started.set()
-            try:
-                result["response"] = client.stream_raw(sql)
-            except Exception as error:  # propagate assertion/socket failures below
-                errors.append(error)
-
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
-        waiter_threads.append((thread, result, errors))
-        require(started.wait(timeout=1), "waiter thread did not start")
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            readable, _, _ = select.select([client.sock], [], [], min(remaining, 0.05))
-            require(
-                not readable,
-                "SI waiter received a response before the active owner completed",
-            )
-            if not thread.is_alive():
-                raise ProtocolFailure("SI waiter completed before the active owner completed")
-        require(thread.is_alive(), "SI waiter did not remain blocked before owner release")
-
-    def finish_delete(expected_tag):
-        thread, result, errors = waiter_threads.pop()
-        thread.join(timeout=2)
-        require(not thread.is_alive(), "SI waiter did not finish after owner release")
-        if errors:
-            raise errors[0]
-        tag, diagnostic = result["response"]
-        require(tag == expected_tag, "unexpected SI DELETE response after owner release")
-        if expected_tag == TRANSACTION_ABORT:
-            require(diagnostic, "SI DELETE response must include a diagnostic when it aborts")
-        return tag, diagnostic
-
     try:
-        for client in (owner, waiter, commit_owner, stale_waiter):
-            client.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+        winner.command("BEGIN;")
+        victim.command("BEGIN;")
+        winner.command("DELETE FROM active_si_delete WHERE id = 1;")
 
-        owner.command("BEGIN;")
-        waiter.command("BEGIN;")
-        owner.command("DELETE FROM active_si_delete WHERE id = 1;")
-        launch_delete(waiter, "DELETE FROM active_si_delete WHERE id = 1;")
-        owner.command("ROLLBACK;")
-        tag, diagnostic = finish_delete(COMMAND_OK)
-        require(not diagnostic, "successful SI DELETE must not carry a diagnostic")
-
-        waiter.command("ROLLBACK;")
-        _, rows = verifier.query("SELECT id, value FROM active_si_delete;")
-        require(rows == [[1, 10], [2, 20]], "waiter rollback did not restore the aborted owner's row")
-
-        waiter.command("BEGIN;")
-        waiter.command("DELETE FROM active_si_delete WHERE id = 1;")
-        waiter.command("COMMIT;")
-
-        commit_owner.command("BEGIN;")
-        stale_waiter.command("BEGIN;")
-        commit_owner.command("DELETE FROM active_si_delete WHERE id = 2;")
-        launch_delete(stale_waiter, "DELETE FROM active_si_delete WHERE id = 2;")
-        commit_owner.command("COMMIT;")
-        tag, diagnostic = finish_delete(TRANSACTION_ABORT)
+        victim.sock.settimeout(1)
+        tag, diagnostic = victim.stream_raw("DELETE FROM active_si_delete WHERE id = 1;")
+        victim.sock.settimeout(5)
+        require(
+            tag == TRANSACTION_ABORT,
+            "active SNAPSHOT ISOLATION DELETE conflict must abort before owner completion",
+        )
         require(
             b"write-write conflict" in diagnostic or b"stale" in diagnostic,
-            "stale SI DELETE abort must report its conflict",
+            "active SI DELETE abort must report its conflict",
         )
 
-        stale_waiter.command("BEGIN;")
-        _, rows = stale_waiter.query("SELECT id, value FROM active_si_delete;")
-        require(rows == [], "AUTO_ABORT did not end the stale SI transaction")
-        stale_waiter.command("ROLLBACK;")
+        victim.command("BEGIN;")
+        _, rows = victim.query("SELECT value FROM active_si_delete WHERE id = 2;")
+        require(rows == [[20]], "DELETE conflict did not fully end the victim transaction")
+        victim.command("COMMIT;")
 
+        winner.command("COMMIT;")
         _, rows = verifier.query("SELECT id, value FROM active_si_delete;")
         require(
-            rows == [],
-            "SI DELETE wait/recheck did not preserve owner abort/commit semantics",
+            rows == [[2, 20]],
+            "active SI DELETE conflict did not preserve exactly the winner's delete",
         )
     finally:
-        for client in (owner, commit_owner):
-            try:
-                client.command("ROLLBACK;")
-            except (ProtocolFailure, OSError, EOFError, socket.timeout):
-                pass
-        for thread, _, _ in waiter_threads:
-            thread.join(timeout=2)
-        for client in (waiter, stale_waiter):
-            try:
-                client.command("ROLLBACK;")
-            except (ProtocolFailure, OSError, EOFError, socket.timeout):
-                pass
-        owner.close()
-        waiter.close()
-        commit_owner.close()
-        stale_waiter.close()
+        winner.close()
+        victim.close()
         verifier.close()
 
 
@@ -1368,7 +1297,7 @@ def main():
         test_prepared_and_explicit_transaction_ddl_rejection(server.port)
         test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server)
         test_snapshot_write_conflict(server.port)
-        test_active_snapshot_delete_conflict_waits_then_rechecks(server.port)
+        test_active_snapshot_delete_conflict_aborts_immediately(server.port)
         test_prepared_snapshot_write_conflict(server)
         test_prepared_composite_float_char_point_update(server)
         test_stream_result_sink_ssi(server.port)

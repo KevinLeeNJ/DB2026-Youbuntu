@@ -505,7 +505,7 @@ TEST(LockManagerMetadataTest, SerializableFirstRecordConflictReturnsWriteConflic
     EXPECT_TRUE(contender.get_lock_set()->empty());
 }
 
-TEST(LockManagerMetadataTest, SiFirstRecordConflictWaitsOnce) {
+TEST(LockManagerMetadataTest, SiFirstRecordConflictReturnsWriteConflictImmediately) {
     LockManager lock_manager;
     Transaction owner(1073, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction contender(1074, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -514,23 +514,11 @@ TEST(LockManagerMetadataTest, SiFirstRecordConflictWaitsOnce) {
     const LockDataId lock_id(42, rid, LockDataType::RECORD);
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
 
-    LockAcquireResult contender_result = LockAcquireResult::Value::Cancelled;
-    std::thread contender_thread(
-        [&] { contender_result = lock_manager.lock_exclusive_on_record(&contender, rid, 42); });
-
-    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
-                                    [&] {
-                                        lock_manager.cancel_transaction(&contender);
-                                        lock_manager.unlock(&owner, lock_id);
-                                        contender_thread.join();
-                                    }));
-
-    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
-    contender_thread.join();
-
-    EXPECT_EQ(contender_result.value(), LockAcquireResult::Value::Granted);
-    EXPECT_EQ(contender.get_lock_set()->count(lock_id), 1u);
-    EXPECT_TRUE(lock_manager.unlock(&contender, lock_id));
+    const LockAcquireResult contender_result = lock_manager.lock_exclusive_on_record(&contender, rid, 42);
+    EXPECT_EQ(contender_result.value(), LockAcquireResult::Value::WriteConflict);
+    EXPECT_TRUE(contender.get_lock_set()->empty());
+    EXPECT_FALSE(lock_manager.has_record_waiters_for_test());
+    EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&next, rid, 42));
     EXPECT_TRUE(lock_manager.unlock(&next, lock_id));
 }

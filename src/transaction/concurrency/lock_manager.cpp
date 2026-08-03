@@ -585,13 +585,14 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
 
     const bool owns_other_lock = !txn->get_lock_set()->empty() || !txn->get_unique_key_lock_set()->empty();
 
-    // SERIALIZABLE keeps its established first-write behavior: an active
-    // conflicting owner aborts a lock-free writer immediately. SI and READ
-    // COMMITTED use the existing FIFO handoff path. Once a transaction has
-    // already acquired a record or unique-key lock, preserve the existing
-    // cycle path.
+    // SI/SERIALIZABLE keep the final-branch first-write behavior: an active
+    // conflicting owner aborts a lock-free writer immediately. READ COMMITTED
+    // uses the FIFO handoff path. Once a transaction has already acquired a
+    // record or unique-key lock, preserve the existing cycle path.
     const IsolationLevel isolation = txn->get_isolation_level();
-    const bool immediate_snapshot_conflict = !owns_other_lock && isolation == IsolationLevel::SERIALIZABLE;
+    const bool immediate_snapshot_conflict = !owns_other_lock &&
+                                             (isolation == IsolationLevel::SNAPSHOT_ISOLATION ||
+                                              isolation == IsolationLevel::SERIALIZABLE);
     if (immediate_snapshot_conflict) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
