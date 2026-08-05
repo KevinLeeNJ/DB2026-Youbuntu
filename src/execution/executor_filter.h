@@ -87,6 +87,37 @@ public:
         len_ = prev_->tupleLen();
     }
 
+    void replace_prepared_conditions(std::vector<Condition>& staged_conditions) noexcept {
+        assert(staged_conditions.size() == conds_.size());
+        conds_.swap(staged_conditions);
+        scan_conditions_cache_.clear();
+    }
+
+    void clear_prepared_parameters(const std::vector<size_t>& condition_indexes) noexcept {
+        clear_prepared_parameter_values(conds_, condition_indexes);
+        scan_conditions_cache_.clear();
+    }
+
+    const std::vector<Condition>& prepared_conditions_ref() const noexcept {
+        return conds_;
+    }
+
+    void begin_operation(Context* context) noexcept override {
+        context_ = context;
+        predicate_recorded_ = false;
+        prev_->begin_operation(context);
+    }
+
+    void end_operation() noexcept override {
+        fallback_record_.reset();
+        current_view_ = {};
+        scan_conditions_cache_.clear();
+        isend_ = true;
+        predicate_recorded_ = false;
+        prev_->end_operation();
+        context_ = nullptr;
+    }
+
     void beginTuple() override {
         record_predicate_read();
         with_child_tracking_suppressed([this] { prev_->beginTuple(); });

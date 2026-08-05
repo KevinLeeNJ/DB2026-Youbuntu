@@ -30,6 +30,31 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
+void ValidateCatalogSharedGuard(const SmManager::CatalogSharedGuard& guard, const std::shared_mutex* catalog_latch) {
+    if (!guard.owns_lock() || guard.mutex() != catalog_latch) {
+        throw InternalError("fixed checkpoint requires the database catalog shared guard");
+    }
+}
+
+void FlushMetaImageAtomically(DiskManager* disk_manager, const std::string& image) {
+    const std::string temp_meta = std::string(DB_META_NAME) + ".tmp";
+    std::ofstream ofs(temp_meta, std::ios::trunc);
+    if (!ofs.is_open()) {
+        throw UnixError();
+    }
+    ofs << image;
+    ofs.flush();
+    if (!ofs) {
+        throw UnixError();
+    }
+    ofs.close();
+    disk_manager->sync_path(temp_meta);
+    if (rename(temp_meta.c_str(), DB_META_NAME.c_str()) != 0) {
+        throw UnixError();
+    }
+    disk_manager->sync_directory(".");
+}
+
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
     std::vector<char> key(index.col_tot_len);
     int offset = 0;
@@ -254,6 +279,59 @@ void SmManager::flush_meta() {
         throw UnixError();
     }
     disk_manager_->sync_directory(".");
+}
+
+FixedCheckpointHeaderSnapshot
+SmManager::capture_fixed_checkpoint_headers(const CatalogSharedGuard& catalog_guard) const {
+    ValidateCatalogSharedGuard(catalog_guard, &catalog_latch_);
+
+    FixedCheckpointHeaderSnapshot snapshot;
+    snapshot.database_identity = db_.name_;
+    snapshot.catalog_generation = catalog_generation_.load(std::memory_order_acquire);
+    snapshot.data_and_index_fds.reserve(fhs_.size() + ihs_.size());
+    snapshot.table_headers.reserve(fhs_.size());
+    snapshot.index_file_names.reserve(ihs_.size());
+    snapshot.index_headers.reserve(ihs_.size());
+
+    for (const auto& [_, file_handle] : fhs_) {
+        auto header = file_handle->capture_file_header_snapshot();
+        snapshot.data_and_index_fds.push_back(header.fd);
+        snapshot.table_headers.push_back(std::move(header));
+    }
+    for (const auto& [index_file_name, index_handle] : ihs_) {
+        auto header = index_handle->capture_index_header_snapshot();
+        snapshot.data_and_index_fds.push_back(header.fd);
+        snapshot.index_file_names.push_back(index_file_name);
+        snapshot.index_headers.push_back(std::move(header));
+    }
+
+    std::ostringstream meta_image;
+    meta_image << db_;
+    if (!meta_image) {
+        throw UnixError();
+    }
+    snapshot.db_meta_image = meta_image.str();
+    return snapshot;
+}
+
+void SmManager::write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapshot& snapshot,
+                                               const CatalogSharedGuard& catalog_guard) {
+    ValidateCatalogSharedGuard(catalog_guard, &catalog_latch_);
+    if (snapshot.database_identity != db_.name_ ||
+        snapshot.catalog_generation != catalog_generation_.load(std::memory_order_acquire)) {
+        throw InternalError("fixed checkpoint snapshot belongs to a different catalog generation");
+    }
+
+    for (const auto& header : snapshot.table_headers) {
+        rm_manager_->write_detached_file_header(header);
+    }
+    for (const auto& header : snapshot.index_headers) {
+        ix_manager_->write_detached_index_header(header);
+    }
+    for (const int fd : snapshot.data_and_index_fds) {
+        disk_manager_->sync_file(fd);
+    }
+    FlushMetaImageAtomically(disk_manager_, snapshot.db_meta_image);
 }
 
 /**

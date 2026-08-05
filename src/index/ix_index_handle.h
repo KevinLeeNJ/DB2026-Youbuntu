@@ -42,6 +42,12 @@ struct UniqueLookupResult {
     Rid rid;
 };
 
+struct IxIndexHeaderSnapshot {
+    int fd{-1};
+    std::vector<char> bytes;
+    PageWriteDependency dependency{PageWriteDependency::None()};
+};
+
 inline int ix_compare(const char* a, const char* b, ColType type, int col_len) {
     switch (type) {
     case TYPE_INT: {
@@ -280,6 +286,10 @@ public:
     UniqueIndexLatch lock_exclusive() const {
         return UniqueIndexLatch(index_latch_);
     }
+
+    // Capture both the serialized header and its WAL dependency under the
+    // structure latch. The returned value has no references to this handle.
+    IxIndexHeaderSnapshot capture_index_header_snapshot() const;
 
     // for search
     bool get_value(const char* key, std::vector<Rid>* result, Transaction* transaction);

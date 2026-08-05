@@ -34,8 +34,8 @@ See the Mulan PSL v2 for more details. */
  * analyze() makes one forward pass and keeps only what the later phases need:
  * the committed/loser transaction sets, an 8-byte descriptor per DML record,
  * a compact heap-redo location per DML record, and an lsn -> file offset index.
- * redo() keeps INDEX_SMO replay in WAL order, then reads heap DML directly from
- * a read-only WAL mapping in (table, page, WAL-offset) order. undo() reads
+ * redo() keeps INDEX_SMO replay in WAL order, then reads heap DML through a
+ * bounded read-only WAL window in (table, page, WAL-offset) order. undo() reads
  * individual records through the offset index. Nothing holds a deserialized
  * record map, so recovery memory remains proportional to record metadata rather
  * than to the WAL payload.
@@ -279,7 +279,7 @@ private:
     }
     int64_t offset_of_lsn(lsn_t lsn) const;
     void build_touched_index();
-    WalRecordView mapped_heap_redo_record(const HeapRedoRecord& location, const char* wal_bytes) const;
+    WalRecordView mapped_heap_redo_record(const HeapRedoRecord& location, const char* record_bytes) const;
 
     // Guards against a corrupt RID reaching the record layer. The WAL carries
     // no per-record checksum, so a header that passed the length and type
@@ -309,10 +309,15 @@ private:
                             const TupleMeta& meta, lsn_t lsn);
     void redo_insert(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
     void redo_delete(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
-    void redo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
+    bool redo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table,
+                     bool defer_on_active_loser = true);
+    bool redo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table,
+                           bool defer_on_active_loser);
+    void replay_deferred_committed_deltas();
     void undo_insert(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
     void undo_delete(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
     void undo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
+    void undo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
     void repair_touched_file_headers();
     void reset_touched_tuple_meta();
     void repair_touched_indexes();
@@ -353,6 +358,11 @@ private:
     std::vector<TouchedTuple> touched_;        // one entry per DML record, WAL order
     std::vector<TouchedTuple> touched_sorted_; // distinct, ordered by table and page
     std::vector<HeapRedoRecord> heap_redo_records_;
+    // A delta cannot safely patch a tuple still owned by any active loser: the
+    // page does not identify which WAL version supplied its unchanged bytes.
+    // Keep the committed delta descriptors in WAL order until loser undo. A
+    // later full-image DML erases the entry because it is a complete anchor.
+    std::map<TouchedTuple, std::vector<HeapRedoRecord>> deferred_committed_deltas_;
     std::vector<WalRecordLocation> record_locations_;
     bool record_locations_sorted_{true};
     std::unordered_set<std::string> touched_tables_;

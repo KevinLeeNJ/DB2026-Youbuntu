@@ -24,6 +24,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "common/config.h"
+#include "execution/prepared_select_execution_frame.h"
 #include "gtest/gtest.h"
 #include "index/ix.h"
 #include "record/rm.h"
@@ -439,9 +440,9 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
     nullable_equals.lhs_col.col_name = "nullable_text";
     nullable_equals.rhs_val.parameter_ordinal = 3;
 
-    auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "prepared_select_rows",
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_.get(), "prepared_select_rows",
                                            std::vector<Condition>{lower, upper, code_equals, nullable_equals},
-                                           std::vector<std::string>{});
+                                           std::vector<std::string>{"id"});
     SelectItem id_item;
     id_item.expr.type = QueryExprType::COLUMN;
     id_item.expr.col = {.tab_name = "prepared_select_rows", .col_name = "id"};
@@ -460,7 +461,9 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
                                                     TEST_DB_NAME, sm_manager_->get_catalog_generation());
     ASSERT_TRUE(descriptor->eligible());
     ASSERT_NE(descriptor->select_executable(), nullptr);
-    ASSERT_FALSE(descriptor->select_executable()->scan.uses_index);
+    ASSERT_TRUE(descriptor->select_executable()->scan.uses_index);
+    auto execution_frame = PreparedSelectExecutionFrame::Build(*descriptor->select_executable());
+    ASSERT_NE(execution_frame, nullptr);
 
     auto execute = [&](int lower_bound, const std::string& code_value,
                        std::optional<std::string> nullable) -> std::vector<int> {
@@ -476,26 +479,55 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
             nullable_value.set_null();
         }
         ParameterFrame parameters({lower_value, code, nullable_value});
-        char buffer[256]{};
-        int offset = 0;
-        Context context(nullptr, nullptr, nullptr, buffer, &offset);
-        auto statement = portal_->start_prepared(*descriptor, parameters, &context);
-
         std::vector<int> ids;
-        for (statement->root->beginTuple(); !statement->root->is_end(); statement->root->nextTuple()) {
-            auto record = statement->root->Next();
-            EXPECT_NE(record, nullptr);
-            if (record == nullptr) {
-                break;
+        run_logged_write([&](Context* context) {
+            auto lease = execution_frame->begin_operation(parameters, context);
+            auto& root = lease.root();
+            for (root.beginTuple(); !root.is_end(); root.nextTuple()) {
+                auto record = root.Next();
+                EXPECT_NE(record, nullptr);
+                if (record == nullptr) {
+                    break;
+                }
+                ids.push_back(read_unaligned<int>(record->data + root.cols()[0].offset));
             }
-            ids.push_back(read_unaligned<int>(record->data + statement->root->cols()[0].offset));
-        }
+            lease.close();
+        });
         return ids;
     };
 
     EXPECT_EQ(execute(1, "aa", "x"), (std::vector<int>{1, 2}));
     EXPECT_EQ(execute(2, "aa", "x"), (std::vector<int>{2}));
     EXPECT_TRUE(execute(1, "aa", std::nullopt).empty());
+    EXPECT_THROW((void)execute(1, "string-too-long", "x"), StringOverflowError);
+    EXPECT_EQ(execute(1, "aa", "x"), (std::vector<int>{1, 2}));
+
+    class ThrowingQueryResultSink final : public QueryResultSink {
+    public:
+        void begin_query(const std::vector<ColMeta>&, const std::vector<std::string>&) override {}
+
+        void append_row(const std::vector<ColMeta>&, const char*, std::size_t) override {
+            throw ExecutionException("injected prepared SELECT result sink failure");
+        }
+    };
+
+    Value error_lower;
+    error_lower.set_int(1);
+    Value error_code;
+    error_code.set_str("aa");
+    Value error_nullable;
+    error_nullable.set_str("x");
+    ParameterFrame error_parameters({error_lower, error_code, error_nullable});
+    QlManager ql_manager(sm_manager_.get(), transaction_manager_.get(), nullptr);
+    const std::vector<std::string> output_names{"id", "code"};
+
+    EXPECT_THROW(run_logged_write([&](Context* context) {
+                     ThrowingQueryResultSink sink;
+                     context->result_sink_ = &sink;
+                     auto lease = execution_frame->begin_operation(error_parameters, context);
+                     ql_manager.select_from(lease.root(), output_names, context);
+                 }),
+                 ExecutionException);
     EXPECT_EQ(execute(1, "aa", "x"), (std::vector<int>{1, 2}));
 }
 

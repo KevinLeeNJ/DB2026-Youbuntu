@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <unordered_set>
 
 #include "minilog.h"
@@ -23,6 +24,17 @@ namespace {
 
 bool IsValidPageId(const PageId& page_id) {
     return page_id.fd >= 0 && page_id.page_no != INVALID_PAGE_ID;
+}
+
+constexpr size_t kMinimumDirtyScanFrames = 4096;
+
+size_t DirtyScanFrameBudget(size_t batch_pages) {
+    constexpr size_t kMultiplier = 8;
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (batch_pages > max_size / kMultiplier) {
+        return max_size;
+    }
+    return std::max(kMinimumDirtyScanFrames, batch_pages * kMultiplier);
 }
 
 } // namespace
@@ -137,8 +149,8 @@ size_t BufferPoolManager::available_frames_locked() const {
     return unused + recycled_frames_.size() + replacer_->Size();
 }
 
-bool BufferPoolManager::operation_authorized_locked(const FrameOperationToken* operation) const {
-    return operation != nullptr && operation->manager_ == this && operation->generation_ == frame_operation_generation_;
+bool BufferPoolManager::operation_authorized(const FrameOperationToken* operation, uint64_t generation) const {
+    return operation != nullptr && operation->manager_ == this && operation->generation_ == generation;
 }
 
 BufferPoolManager::FrameOperationToken BufferPoolManager::acquire_frame_operation(size_t minimum_available_frames) {
@@ -146,22 +158,299 @@ BufferPoolManager::FrameOperationToken BufferPoolManager::acquire_frame_operatio
         throw InternalError("buffer pool frame operation reservation exceeds pool size");
     }
     std::unique_lock lock{latch_};
-    frame_operation_cv_.wait(
-        lock, [&] { return !frame_operation_active_ && available_frames_locked() >= minimum_available_frames; });
-    frame_operation_active_ = true;
-    ++frame_operation_generation_;
-    return FrameOperationToken(this, frame_operation_generation_);
+    frame_operation_cv_.wait(lock, [&] { return !frame_operation_active_.load(std::memory_order_acquire); });
+    const uint64_t previous_generation = frame_operation_generation_.load(std::memory_order_acquire);
+    if (previous_generation == std::numeric_limits<uint64_t>::max()) {
+        throw InternalError("buffer pool frame operation generation exhausted");
+    }
+    const uint64_t generation = previous_generation + 1;
+    frame_operation_generation_.store(generation, std::memory_order_release);
+    frame_operation_active_.store(true, std::memory_order_release);
+
+    // Publishing the gate prevents new unauthorized fast hits. Taking every
+    // shard exclusively drains hits that observed the previous open gate but
+    // had not completed their pin yet. Release each shard immediately so an
+    // unpin can make a frame available while the reservation waits below.
+    for (ResidentDirectoryShard& shard : resident_directory_) {
+        std::unique_lock shard_lock{shard.latch};
+    }
+    frame_operation_cv_.wait(lock, [&] { return available_frames_locked() >= minimum_available_frames; });
+    return FrameOperationToken(this, generation);
 }
 
 void BufferPoolManager::release_frame_operation(uint64_t generation) noexcept {
     {
         std::unique_lock lock{latch_};
-        if (!frame_operation_active_ || generation != frame_operation_generation_) {
+        if (!frame_operation_active_.load(std::memory_order_acquire) ||
+            generation != frame_operation_generation_.load(std::memory_order_acquire)) {
             return;
         }
-        frame_operation_active_ = false;
+        frame_operation_active_.store(false, std::memory_order_release);
     }
     frame_operation_cv_.notify_all();
+}
+
+size_t BufferPoolManager::resident_directory_shard_index(PageId page_id) const noexcept {
+    static_assert((RESIDENT_DIRECTORY_SHARD_COUNT & (RESIDENT_DIRECTORY_SHARD_COUNT - 1)) == 0,
+                  "resident directory shard count must be a power of two");
+    return PageIdHash{}(page_id) & (RESIDENT_DIRECTORY_SHARD_COUNT - 1);
+}
+
+void BufferPoolManager::install_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state) {
+    assert(IsValidPageId(page_id));
+    assert(frame_id >= 0 && static_cast<size_t>(frame_id) < pool_size_);
+    assert(state == FrameState::LOADING || state == FrameState::VALID);
+    Page* page = &pages_[frame_id];
+    assert(page->id_ == page_id);
+
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::unique_lock shard_lock{shard.latch};
+    auto resident = shard.entries.find(page_id);
+    assert(resident == shard.entries.end() || resident->second == frame_id);
+    page_table_.insert_or_assign(page_id, frame_id);
+    if (state == FrameState::VALID) {
+        std::scoped_lock pin_lock{page->pin_latch_};
+        if (page->pin_count_ == 0 && residency_classes_[frame_id] == ResidencyClass::Normal) {
+            replacer_->unpin(frame_id);
+        }
+        page->state_.store(FrameState::VALID, std::memory_order_release);
+        shard.entries.insert_or_assign(page_id, frame_id);
+    } else {
+        shard.entries.erase(page_id);
+        page->state_.store(FrameState::LOADING, std::memory_order_release);
+    }
+}
+
+void BufferPoolManager::set_mapped_frame_state_locked(PageId page_id, frame_id_t frame_id, FrameState state) {
+    assert(IsValidPageId(page_id));
+    assert(frame_id >= 0 && static_cast<size_t>(frame_id) < pool_size_);
+    assert(state == FrameState::VALID || state == FrameState::FLUSHING || state == FrameState::EVICTING);
+    auto authoritative = page_table_.find(page_id);
+    assert(authoritative != page_table_.end() && authoritative->second == frame_id);
+    Page* page = &pages_[frame_id];
+    assert(page->id_ == page_id);
+
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::unique_lock shard_lock{shard.latch};
+    auto resident = shard.entries.find(page_id);
+    assert(resident == shard.entries.end() || resident->second == frame_id);
+    if (state == FrameState::VALID) {
+        std::scoped_lock pin_lock{page->pin_latch_};
+        if (page->pin_count_ == 0 && residency_classes_[frame_id] == ResidencyClass::Normal) {
+            replacer_->unpin(frame_id);
+        }
+        page->state_.store(FrameState::VALID, std::memory_order_release);
+        shard.entries.insert_or_assign(page_id, frame_id);
+    } else {
+        shard.entries.erase(page_id);
+        if (state == FrameState::FLUSHING) {
+            // A clean last-unpin may have raced with the caller's first
+            // replacer pin while this transition waited for the shard. Pin
+            // again under shard -> pin_latch before publishing FLUSHING so
+            // the frame cannot become a victim during the write.
+            std::scoped_lock pin_lock{page->pin_latch_};
+            replacer_->pin(frame_id);
+        }
+        page->state_.store(state, std::memory_order_release);
+    }
+}
+
+void BufferPoolManager::erase_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state) {
+    assert(IsValidPageId(page_id));
+    assert(frame_id >= 0 && static_cast<size_t>(frame_id) < pool_size_);
+    assert(state == FrameState::EVICTING || state == FrameState::FREE);
+
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::unique_lock shard_lock{shard.latch};
+    auto resident = shard.entries.find(page_id);
+    assert(resident == shard.entries.end() || resident->second == frame_id);
+    if (resident != shard.entries.end()) {
+        shard.entries.erase(resident);
+    }
+    auto authoritative = page_table_.find(page_id);
+    assert(authoritative != page_table_.end() && authoritative->second == frame_id);
+    page_table_.erase(authoritative);
+    pages_[frame_id].state_.store(state, std::memory_order_release);
+}
+
+bool BufferPoolManager::claim_page_for_eviction_locked(PageId page_id, frame_id_t frame_id, bool removed_from_replacer,
+                                                       bool require_normal_residency) {
+    if (!IsValidPageId(page_id) || frame_id < 0 || static_cast<size_t>(frame_id) >= pool_size_) {
+        return false;
+    }
+    auto authoritative = page_table_.find(page_id);
+    if (authoritative == page_table_.end() || authoritative->second != frame_id) {
+        return false;
+    }
+
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::unique_lock shard_lock{shard.latch};
+    Page* page = &pages_[frame_id];
+    auto resident = shard.entries.find(page_id);
+    if (resident == shard.entries.end() || resident->second != frame_id || !(page->id_ == page_id) ||
+        page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+        return false;
+    }
+
+    std::scoped_lock pin_lock{page->pin_latch_};
+    if (resident->second != frame_id || !(page->id_ == page_id) ||
+        page->state_.load(std::memory_order_acquire) != FrameState::VALID || page->pin_count_ != 0 ||
+        (require_normal_residency && residency_classes_[frame_id] != ResidencyClass::Normal)) {
+        return false;
+    }
+    if (!removed_from_replacer) {
+        replacer_->pin(frame_id);
+    }
+    shard.entries.erase(resident);
+    page->state_.store(FrameState::EVICTING, std::memory_order_release);
+    return true;
+}
+
+void BufferPoolManager::restore_blocked_victims_locked(const std::vector<frame_id_t>& blocked) {
+    for (const frame_id_t frame_id : blocked) {
+        if (frame_id < 0 || static_cast<size_t>(frame_id) >= pool_size_) {
+            continue;
+        }
+        Page* page = &pages_[frame_id];
+        const PageId page_id = page->id_;
+        if (!IsValidPageId(page_id)) {
+            continue;
+        }
+
+        ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+        std::unique_lock shard_lock{shard.latch};
+        auto authoritative = page_table_.find(page_id);
+        auto resident = shard.entries.find(page_id);
+        std::scoped_lock pin_lock{page->pin_latch_};
+        if (authoritative != page_table_.end() && authoritative->second == frame_id &&
+            resident != shard.entries.end() && resident->second == frame_id && page->id_ == page_id &&
+            page->state_.load(std::memory_order_acquire) == FrameState::VALID && page->pin_count_ == 0 &&
+            residency_classes_[frame_id] == ResidencyClass::Normal) {
+            replacer_->unpin(frame_id);
+        }
+    }
+}
+
+Page* BufferPoolManager::fetch_resident_page_fast(PageId page_id, const FrameOperationToken* operation) {
+    const uint64_t generation_before = frame_operation_generation_.load(std::memory_order_acquire);
+    const bool active_before = frame_operation_active_.load(std::memory_order_acquire);
+    if (active_before && !operation_authorized(operation, generation_before)) {
+        return nullptr;
+    }
+
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::shared_lock shard_lock{shard.latch};
+    const uint64_t generation_after = frame_operation_generation_.load(std::memory_order_acquire);
+    const bool active_after = frame_operation_active_.load(std::memory_order_acquire);
+    if (generation_before != generation_after || active_before != active_after ||
+        (active_after && !operation_authorized(operation, generation_after))) {
+        return nullptr;
+    }
+
+    auto resident = shard.entries.find(page_id);
+    if (resident == shard.entries.end() || resident->second < 0 ||
+        static_cast<size_t>(resident->second) >= pool_size_) {
+        return nullptr;
+    }
+    const frame_id_t frame_id = resident->second;
+    Page* page = &pages_[frame_id];
+    if (!(page->id_ == page_id) || page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+        return nullptr;
+    }
+
+    std::scoped_lock pin_lock{page->pin_latch_};
+    if (!(page->id_ == page_id) || page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+        return nullptr;
+    }
+    if (page->pin_count_ == 0) {
+        replacer_->pin(frame_id);
+    }
+    ++page->pin_count_;
+    return page;
+}
+
+BufferPoolManager::FastUnpinResult BufferPoolManager::unpin_clean_page_fast(PageId page_id) {
+    bool became_available = false;
+    {
+        ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+        std::shared_lock shard_lock{shard.latch};
+        auto resident = shard.entries.find(page_id);
+        if (resident == shard.entries.end() || resident->second < 0 ||
+            static_cast<size_t>(resident->second) >= pool_size_) {
+            return FastUnpinResult::Miss;
+        }
+
+        const frame_id_t frame_id = resident->second;
+        Page* page = &pages_[frame_id];
+        if (!(page->id_ == page_id) || page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+            return FastUnpinResult::Miss;
+        }
+
+        std::scoped_lock pin_lock{page->pin_latch_};
+        if (!(page->id_ == page_id) || page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+            return FastUnpinResult::Miss;
+        }
+        if (page->pin_count_ == 0) {
+            return FastUnpinResult::InvalidPin;
+        }
+        --page->pin_count_;
+        became_available = page->pin_count_ == 0 && residency_classes_[frame_id] == ResidencyClass::Normal;
+        if (became_available) {
+            replacer_->unpin(frame_id);
+        }
+    }
+
+    if (became_available && frame_operation_active_.load(std::memory_order_acquire)) {
+        // If a frame reservation is active, synchronize with its BPM-latch
+        // wait boundary after releasing shard/pin locks. This closes the
+        // check-then-sleep window without introducing shard -> global order.
+        std::shared_lock operation_handshake{latch_};
+        frame_operation_cv_.notify_all();
+    }
+    return FastUnpinResult::Success;
+}
+
+bool BufferPoolManager::resident_directory_is_consistent_for_test() {
+    std::shared_lock global_lock{latch_};
+    for (const auto& [page_id, frame_id] : page_table_) {
+        if (frame_id < 0 || static_cast<size_t>(frame_id) >= pool_size_) {
+            return false;
+        }
+        const Page* page = &pages_[frame_id];
+        if (!(page->id_ == page_id)) {
+            return false;
+        }
+        const ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+        std::shared_lock shard_lock{shard.latch};
+        auto resident = shard.entries.find(page_id);
+        if (page->state_.load(std::memory_order_acquire) == FrameState::VALID) {
+            if (resident == shard.entries.end() || resident->second != frame_id) {
+                return false;
+            }
+        } else if (resident != shard.entries.end()) {
+            return false;
+        }
+    }
+
+    for (size_t shard_index = 0; shard_index < resident_directory_.size(); ++shard_index) {
+        const ResidentDirectoryShard& shard = resident_directory_[shard_index];
+        std::shared_lock shard_lock{shard.latch};
+        for (const auto& [page_id, frame_id] : shard.entries) {
+            if (resident_directory_shard_index(page_id) != shard_index || frame_id < 0 ||
+                static_cast<size_t>(frame_id) >= pool_size_) {
+                return false;
+            }
+            auto authoritative = page_table_.find(page_id);
+            if (authoritative == page_table_.end() || authoritative->second != frame_id) {
+                return false;
+            }
+            const Page* page = &pages_[frame_id];
+            if (!(page->id_ == page_id) || page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // Reaching this with a non-Normal class means a frame was reused while its
@@ -179,6 +468,26 @@ void BufferPoolManager::clear_residency(frame_id_t frame_id) {
         --index_internal_resident_count_;
     }
     residency_classes_[frame_id] = ResidencyClass::Normal;
+}
+
+void BufferPoolManager::clear_checkpoint_cohort_marker_locked(Page* page) {
+    const uint64_t page_epoch = page->checkpoint_cohort_epoch_;
+    if (page_epoch == 0) {
+        return;
+    }
+    page->checkpoint_cohort_epoch_ = 0;
+    if (page_epoch == active_checkpoint_cohort_epoch_) {
+        assert(checkpoint_cohort_pages_remaining_ > 0);
+        --checkpoint_cohort_pages_remaining_;
+    }
+}
+
+void BufferPoolManager::finish_checkpoint_cohort_if_complete_locked() {
+    if (active_checkpoint_cohort_epoch_ == 0 || checkpoint_cohort_pages_remaining_ != 0) {
+        return;
+    }
+    checkpoint_cohort_pending_frames_.clear();
+    active_checkpoint_cohort_epoch_ = 0;
 }
 
 void BufferPoolManager::ensure_write_dependency(const PageWriteDependency& dependency) {
@@ -267,21 +576,28 @@ frame_id_t BufferPoolManager::take_unblocked_victim_locked() {
     std::vector<frame_id_t> blocked;
     blocked.reserve(pool_size_);
     frame_id_t candidate = INVALID_FRAME_ID;
-    while (blocked.size() < pool_size_ && replacer_->victim(&candidate)) {
-        const Page& page = pages_[candidate];
-        if (!page.is_dirty_.load(std::memory_order_acquire) || !IsValidPageId(page.id_) ||
-            !index_smo_blocked_locked(page.id_.fd)) {
-            for (frame_id_t fid : blocked) {
-                replacer_->unpin(fid);
-            }
-            return candidate;
+    frame_id_t claimed = INVALID_FRAME_ID;
+    size_t examined = 0;
+    while (examined++ < pool_size_ && replacer_->victim(&candidate)) {
+        if (candidate < 0 || static_cast<size_t>(candidate) >= pool_size_) {
+            continue;
         }
-        blocked.push_back(candidate);
+        const Page& page = pages_[candidate];
+        const PageId page_id = page.id_;
+        if (IsValidPageId(page_id) && page.is_dirty_.load(std::memory_order_acquire) &&
+            index_smo_blocked_locked(page_id.fd)) {
+            // The candidate remains VALID. Reinsert it only after rechecking
+            // that a fast hit did not pin it while it was outside CLOCK.
+            blocked.push_back(candidate);
+            continue;
+        }
+        if (claim_page_for_eviction_locked(page_id, candidate, true, true)) {
+            claimed = candidate;
+            break;
+        }
     }
-    for (frame_id_t fid : blocked) {
-        replacer_->unpin(fid);
-    }
-    return INVALID_FRAME_ID;
+    restore_blocked_victims_locked(blocked);
+    return claimed;
 }
 
 /**
@@ -298,6 +614,10 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
 
 Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationToken* operation) {
     while (true) {
+        if (Page* resident = fetch_resident_page_fast(page_id, operation); resident != nullptr) {
+            return resident;
+        }
+
         Page* target_page = nullptr;
         Page* wait_page = nullptr;
         PageId old_page_id;
@@ -308,10 +628,13 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
 
         {
             std::shared_lock lock{latch_};
-            if (frame_operation_active_ && !operation_authorized_locked(operation)) {
+            const bool operation_active = frame_operation_active_.load(std::memory_order_acquire);
+            const uint64_t operation_generation = frame_operation_generation_.load(std::memory_order_acquire);
+            if (operation_active && !operation_authorized(operation, operation_generation)) {
                 lock.unlock();
                 std::unique_lock operation_lock{latch_};
-                frame_operation_cv_.wait(operation_lock, [&] { return !frame_operation_active_; });
+                frame_operation_cv_.wait(operation_lock,
+                                         [&] { return !frame_operation_active_.load(std::memory_order_acquire); });
                 continue;
             }
             auto hit = page_table_.find(page_id);
@@ -341,8 +664,11 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
 
         {
             std::unique_lock lock{latch_};
-            frame_operation_cv_.wait(
-                lock, [&] { return !frame_operation_active_ || operation_authorized_locked(operation); });
+            frame_operation_cv_.wait(lock, [&] {
+                const bool operation_active = frame_operation_active_.load(std::memory_order_acquire);
+                const uint64_t operation_generation = frame_operation_generation_.load(std::memory_order_acquire);
+                return !operation_active || operation_authorized(operation, operation_generation);
+            });
             auto hit = page_table_.find(page_id);
             if (hit != page_table_.end()) {
                 target_page = &pages_[hit->second];
@@ -366,7 +692,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                 }
 
                 target_page = &pages_[fid];
-                clear_residency(fid);
                 old_page_id = target_page->id_;
                 {
                     std::scoped_lock dirty_lock{target_page->dirty_latch_};
@@ -376,18 +701,20 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                     target_page->is_dirty_ = false;
                     target_page->dirty_epoch_ = 0;
                     target_page->write_dependency_ = PageWriteDependency::None();
+                    if (!old_page_dirty || !IsValidPageId(old_page_id)) {
+                        clear_checkpoint_cohort_marker_locked(target_page);
+                    }
                 }
                 if (IsValidPageId(old_page_id)) {
-                    page_table_.erase(old_page_id);
+                    erase_page_mapping_locked(old_page_id, fid, FrameState::EVICTING);
                 }
+                clear_residency(fid);
                 if (old_page_dirty && IsValidPageId(old_page_id)) {
                     claim_index_file_write_locked(old_page_id.fd);
                 }
-                target_page->state_.store(FrameState::EVICTING, std::memory_order_release);
                 target_page->id_ = page_id;
                 target_page->pin_count_ = 1;
-                target_page->state_.store(FrameState::LOADING, std::memory_order_release);
-                page_table_.insert_or_assign(page_id, fid);
+                install_page_mapping_locked(page_id, fid, FrameState::LOADING);
             }
         }
 
@@ -420,12 +747,16 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
             std::scoped_lock lock{latch_};
             auto hit = page_table_.find(page_id);
             if (loaded && hit != page_table_.end() && hit->second == fid && target_page->id_ == page_id) {
-                target_page->state_.store(FrameState::VALID, std::memory_order_release);
+                {
+                    std::scoped_lock dirty_lock{target_page->dirty_latch_};
+                    clear_checkpoint_cohort_marker_locked(target_page);
+                }
+                set_mapped_frame_state_locked(page_id, fid, FrameState::VALID);
             } else if (!old_page_write_succeeded && IsValidPageId(old_page_id)) {
                 // The frame still contains the old page image. Restore its
                 // ownership instead of discarding the only dirty copy.
                 if (hit != page_table_.end() && hit->second == fid) {
-                    page_table_.erase(hit);
+                    erase_page_mapping_locked(page_id, fid, FrameState::EVICTING);
                 }
                 target_page->id_ = old_page_id;
                 {
@@ -435,25 +766,20 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                     target_page->write_dependency_ = old_dependency;
                 }
                 target_page->pin_count_ = 0;
-                target_page->state_.store(FrameState::VALID, std::memory_order_release);
-                page_table_.insert_or_assign(old_page_id, fid);
-                if (residency_classes_[fid] == ResidencyClass::Normal) {
-                    replacer_->unpin(fid);
-                }
+                install_page_mapping_locked(old_page_id, fid, FrameState::VALID);
             } else {
-                if (hit != page_table_.end() && hit->second == fid) {
-                    page_table_.erase(hit);
-                }
+                assert(hit != page_table_.end() && hit->second == fid);
                 target_page->reset_memory();
                 target_page->id_ = PageId{};
                 {
                     std::scoped_lock dirty_lock{target_page->dirty_latch_};
                     target_page->is_dirty_ = false;
                     target_page->dirty_epoch_ = 0;
+                    clear_checkpoint_cohort_marker_locked(target_page);
                     target_page->write_dependency_ = PageWriteDependency::None();
                 }
                 target_page->pin_count_ = 0;
-                target_page->state_.store(FrameState::FREE, std::memory_order_release);
+                erase_page_mapping_locked(page_id, fid, FrameState::FREE);
                 clear_residency(fid);
                 recycle_frame(fid);
             }
@@ -493,6 +819,8 @@ bool BufferPoolManager::try_mark_resident(PageId page_id, ResidencyClass residen
     if (page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
         return false;
     }
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::unique_lock shard_lock{shard.latch};
     ResidencyClass& current = residency_classes_[hit->second];
     if (current == residency_class) {
         return true;
@@ -525,6 +853,8 @@ void BufferPoolManager::unmark_resident(PageId page_id) {
         return;
     }
     Page* page = &pages_[hit->second];
+    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
+    std::unique_lock shard_lock{shard.latch};
     ResidencyClass& current = residency_classes_[hit->second];
     if (current != ResidencyClass::IndexInternal) {
         return;
@@ -549,6 +879,17 @@ void BufferPoolManager::unmark_resident(PageId page_id) {
  * @param {bool} is_dirty 若目标page应该被标记为dirty则为true，否则为false
  */
 bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
+    if (!is_dirty) {
+        switch (unpin_clean_page_fast(page_id)) {
+        case FastUnpinResult::Success:
+            return true;
+        case FastUnpinResult::InvalidPin:
+            return false;
+        case FastUnpinResult::Miss:
+            break;
+        }
+    }
+
     PageWriteDependency dependency = PageWriteDependency::None();
     if (is_dirty) {
         std::shared_lock lock{latch_};
@@ -658,7 +999,7 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
                 // Keep an unpinned page out of the replacer while its stable
                 // image is being written.
                 replacer_->pin(hit->second);
-                page->state_.store(FrameState::FLUSHING, std::memory_order_release);
+                set_mapped_frame_state_locked(page_id, fid, FrameState::FLUSHING);
                 claim_index_file_write_locked(page_id.fd);
             }
         }
@@ -702,16 +1043,13 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
             page->state_.load(std::memory_order_acquire) == FrameState::FLUSHING) {
             if (flushed) {
                 std::scoped_lock dirty_lock{page->dirty_latch_};
+                clear_checkpoint_cohort_marker_locked(page);
                 if (page->dirty_epoch_.load(std::memory_order_acquire) == flushed_dirty_epoch) {
                     page->is_dirty_ = false;
                     page->write_dependency_ = PageWriteDependency::None();
                 }
             }
-            page->state_.store(FrameState::VALID, std::memory_order_release);
-            std::scoped_lock pin_lock{page->pin_latch_};
-            if (page->pin_count_ == 0 && residency_classes_[fid] == ResidencyClass::Normal) {
-                replacer_->unpin(fid);
-            }
+            set_mapped_frame_state_locked(page_id, fid, FrameState::VALID);
         }
         release_index_file_write_locked(page_id.fd);
     }
@@ -739,8 +1077,11 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
     frame_id_t fid = INVALID_FRAME_ID;
     {
         std::unique_lock lock{latch_};
-        frame_operation_cv_.wait(lock,
-                                 [&] { return !frame_operation_active_ || operation_authorized_locked(operation); });
+        frame_operation_cv_.wait(lock, [&] {
+            const bool operation_active = frame_operation_active_.load(std::memory_order_acquire);
+            const uint64_t operation_generation = frame_operation_generation_.load(std::memory_order_acquire);
+            return !operation_active || operation_authorized(operation, operation_generation);
+        });
         fid = take_free_frame();
         if (fid == INVALID_FRAME_ID) {
             fid = take_unblocked_victim_locked();
@@ -751,7 +1092,6 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
 
         page_id->page_no = disk_manager_->allocate_page(page_id->fd);
         page = &pages_[fid];
-        clear_residency(fid);
         old_page_id = page->id_;
         {
             std::scoped_lock dirty_lock{page->dirty_latch_};
@@ -761,18 +1101,20 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
             page->is_dirty_ = false;
             page->dirty_epoch_ = 0;
             page->write_dependency_ = PageWriteDependency::None();
+            if (!old_page_dirty || !IsValidPageId(old_page_id)) {
+                clear_checkpoint_cohort_marker_locked(page);
+            }
         }
         if (IsValidPageId(old_page_id)) {
-            page_table_.erase(old_page_id);
+            erase_page_mapping_locked(old_page_id, fid, FrameState::EVICTING);
         }
+        clear_residency(fid);
         if (old_page_dirty && IsValidPageId(old_page_id)) {
             claim_index_file_write_locked(old_page_id.fd);
         }
-        page->state_.store(FrameState::EVICTING, std::memory_order_release);
         page->id_ = *page_id;
         page->pin_count_ = 1;
-        page->state_.store(FrameState::LOADING, std::memory_order_release);
-        page_table_.insert_or_assign(*page_id, fid);
+        install_page_mapping_locked(*page_id, fid, FrameState::LOADING);
     }
 
     bool initialized = false;
@@ -794,10 +1136,14 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
         std::scoped_lock lock{latch_};
         auto hit = page_table_.find(*page_id);
         if (initialized && hit != page_table_.end() && hit->second == fid) {
-            page->state_.store(FrameState::VALID, std::memory_order_release);
+            {
+                std::scoped_lock dirty_lock{page->dirty_latch_};
+                clear_checkpoint_cohort_marker_locked(page);
+            }
+            set_mapped_frame_state_locked(*page_id, fid, FrameState::VALID);
         } else if (!old_page_write_succeeded && IsValidPageId(old_page_id)) {
             if (hit != page_table_.end() && hit->second == fid) {
-                page_table_.erase(hit);
+                erase_page_mapping_locked(*page_id, fid, FrameState::EVICTING);
             }
             page->id_ = old_page_id;
             {
@@ -807,25 +1153,20 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
                 page->write_dependency_ = old_dependency;
             }
             page->pin_count_ = 0;
-            page->state_.store(FrameState::VALID, std::memory_order_release);
-            page_table_.insert_or_assign(old_page_id, fid);
-            if (residency_classes_[fid] == ResidencyClass::Normal) {
-                replacer_->unpin(fid);
-            }
+            install_page_mapping_locked(old_page_id, fid, FrameState::VALID);
         } else {
-            if (hit != page_table_.end() && hit->second == fid) {
-                page_table_.erase(hit);
-            }
+            assert(hit != page_table_.end() && hit->second == fid);
             page->reset_memory();
             page->id_ = PageId{};
             {
                 std::scoped_lock dirty_lock{page->dirty_latch_};
                 page->is_dirty_ = false;
                 page->dirty_epoch_ = 0;
+                clear_checkpoint_cohort_marker_locked(page);
                 page->write_dependency_ = PageWriteDependency::None();
             }
             page->pin_count_ = 0;
-            page->state_.store(FrameState::FREE, std::memory_order_release);
+            erase_page_mapping_locked(*page_id, fid, FrameState::FREE);
             clear_residency(fid);
             recycle_frame(fid);
         }
@@ -865,15 +1206,9 @@ bool BufferPoolManager::delete_page(PageId page_id) {
             if (page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
                 wait_page = page;
             } else {
-                replacer_->pin(fid);
-                std::scoped_lock pin_lock{page->pin_latch_};
-                if (page->pin_count_ != 0) {
-                    if (residency_classes_[fid] == ResidencyClass::Normal) {
-                        replacer_->unpin(fid);
-                    }
+                if (!claim_page_for_eviction_locked(page_id, fid, false, false)) {
                     return false;
                 }
-                page->state_.store(FrameState::EVICTING, std::memory_order_release);
                 claim_index_file_write_locked(page_id.fd);
             }
         }
@@ -906,7 +1241,6 @@ bool BufferPoolManager::delete_page(PageId page_id) {
             std::scoped_lock lock{latch_};
             auto hit = page_table_.find(page_id);
             if (deleted && hit != page_table_.end() && hit->second == fid) {
-                page_table_.erase(hit);
                 page->reset_memory();
                 page->id_ = PageId{};
                 page->pin_count_ = 0;
@@ -914,16 +1248,14 @@ bool BufferPoolManager::delete_page(PageId page_id) {
                     std::scoped_lock dirty_lock{page->dirty_latch_};
                     page->is_dirty_ = false;
                     page->dirty_epoch_ = 0;
+                    clear_checkpoint_cohort_marker_locked(page);
                     page->write_dependency_ = PageWriteDependency::None();
                 }
-                page->state_.store(FrameState::FREE, std::memory_order_release);
+                erase_page_mapping_locked(page_id, fid, FrameState::FREE);
                 clear_residency(fid);
                 recycle_frame(fid);
             } else if (!deleted && hit != page_table_.end() && hit->second == fid) {
-                page->state_.store(FrameState::VALID, std::memory_order_release);
-                if (residency_classes_[fid] == ResidencyClass::Normal) {
-                    replacer_->unpin(fid);
-                }
+                set_mapped_frame_state_locked(page_id, fid, FrameState::VALID);
             }
             release_index_file_write_locked(page_id.fd);
         }
@@ -1036,7 +1368,7 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
                     continue;
                 }
                 replacer_->pin(hit->second);
-                page->state_.store(FrameState::FLUSHING, std::memory_order_release);
+                set_mapped_frame_state_locked(page_id, hit->second, FrameState::FLUSHING);
                 claim_index_file_write_locked(page_id.fd);
                 claimed.push_back(ClaimedPage{page_id, hit->second});
             }
@@ -1086,6 +1418,9 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
                     }
                     disk_manager_->write_page(claimed[claimed_begin].page_id.fd, claimed[claimed_begin].page_id.page_no,
                                               image.data(), static_cast<int>(page_count * PAGE_SIZE));
+                    for (size_t i = claimed_begin; i < claimed_end; ++i) {
+                        run_flush_page_after_write_test_hook(claimed[i].page_id, &pages_[claimed[i].frame_id]);
+                    }
                 } catch (...) {
                     copied = false;
                 }
@@ -1107,17 +1442,16 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
                         continue;
                     }
                     if (copied) {
-                        std::scoped_lock dirty_lock{page->dirty_latch_};
-                        if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
-                            page->is_dirty_ = false;
-                            page->write_dependency_ = PageWriteDependency::None();
+                        {
+                            std::scoped_lock dirty_lock{page->dirty_latch_};
+                            clear_checkpoint_cohort_marker_locked(page);
+                            if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
+                                page->is_dirty_ = false;
+                                page->write_dependency_ = PageWriteDependency::None();
+                            }
                         }
                     }
-                    page->state_.store(FrameState::VALID, std::memory_order_release);
-                    std::scoped_lock pin_lock{page->pin_latch_};
-                    if (page->pin_count_ == 0 && residency_classes_[claimed_page.frame_id] == ResidencyClass::Normal) {
-                        replacer_->unpin(claimed_page.frame_id);
-                    }
+                    set_mapped_frame_state_locked(claimed_page.page_id, claimed_page.frame_id, FrameState::VALID);
                     page->io_cv_.notify_all();
                     release_index_file_write_locked(claimed_page.page_id.fd);
                 }
@@ -1142,8 +1476,9 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_dirty_pages(const s
     {
         std::unique_lock lock{latch_};
         pages_to_flush.reserve(std::min(max_pages, pool_size_));
+        const size_t frame_budget = std::min(pool_size_, DirtyScanFrameBudget(max_pages));
         size_t frames_examined = 0;
-        while (frames_examined < pool_size_ && pages_to_flush.size() < max_pages) {
+        while (frames_examined < frame_budget && pages_to_flush.size() < max_pages) {
             const frame_id_t frame_id = next_dirty_flush_frame_;
             next_dirty_flush_frame_ =
                 static_cast<frame_id_t>((static_cast<size_t>(next_dirty_flush_frame_) + 1) % pool_size_);
@@ -1162,6 +1497,179 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_dirty_pages(const s
     return flush_pages(pages_to_flush, FlushDependencyPolicy::Enforce());
 }
 
+BufferPoolManager::CheckpointCohort
+BufferPoolManager::begin_checkpoint_cohort(const std::vector<int>& allowed_fds,
+                                           std::chrono::milliseconds settle_timeout) {
+    const std::unordered_set<int> fd_set(allowed_fds.begin(), allowed_fds.end());
+    std::unique_lock lock{latch_};
+    finish_checkpoint_cohort_if_complete_locked();
+    if (active_checkpoint_cohort_epoch_ != 0) {
+        throw InternalError("checkpoint cohort already active");
+    }
+
+    // A flush or dirty-victim eviction may already have copied an older image
+    // while a writer re-dirties the frame. Waiting for every allowed file's
+    // claimed write to settle ensures that begin never skips that FLUSHING or
+    // EVICTING frame: success restores it as VALID+dirty or discharges it by a
+    // successful write. wait_for releases latch_, so completions and ordinary
+    // buffer-pool admission remain live while the cut is waiting.
+    const auto allowed_writes_settled = [&] {
+        for (const int fd : fd_set) {
+            auto inflight = index_writes_inflight_.find(fd);
+            if (inflight != index_writes_inflight_.end() && inflight->second != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!index_smo_cv_.wait_for(lock, settle_timeout, allowed_writes_settled)) {
+        return CheckpointCohort{};
+    }
+
+    // Another coordinator may have installed a cohort while this caller was
+    // asleep. The active epoch is the authoritative ownership record, so no
+    // second page-table scan is needed merely to detect it.
+    finish_checkpoint_cohort_if_complete_locked();
+    if (active_checkpoint_cohort_epoch_ != 0) {
+        throw InternalError("checkpoint cohort already active");
+    }
+    if (next_checkpoint_cohort_epoch_ == std::numeric_limits<uint64_t>::max()) {
+        throw InternalError("checkpoint cohort epoch exhausted");
+    }
+
+    CheckpointCohort cohort;
+    cohort.epoch = next_checkpoint_cohort_epoch_++;
+    cohort.success = true;
+    active_checkpoint_cohort_epoch_ = cohort.epoch;
+    checkpoint_cohort_pages_remaining_ = 0;
+    checkpoint_cohort_pending_frames_.clear();
+
+    // This is the cohort's only full resident-page scan. The fixed frame-id
+    // queue drives every later pacing tick.
+    for (const auto& [page_id, frame_id] : page_table_) {
+        if (fd_set.find(page_id.fd) == fd_set.end()) {
+            continue;
+        }
+        Page* page = &pages_[frame_id];
+        if (page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
+            continue;
+        }
+        std::scoped_lock dirty_lock{page->dirty_latch_};
+        if (!page->is_dirty_.load(std::memory_order_acquire)) {
+            continue;
+        }
+        page->checkpoint_cohort_epoch_ = cohort.epoch;
+        checkpoint_cohort_pending_frames_.push_back(frame_id);
+        ++checkpoint_cohort_pages_remaining_;
+        ++cohort.pages_marked;
+    }
+    return cohort;
+}
+
+BufferPoolManager::CheckpointCohortFlushResult BufferPoolManager::flush_checkpoint_cohort(uint64_t epoch,
+                                                                                          size_t max_pages) {
+    CheckpointCohortFlushResult result;
+    if (epoch == 0) {
+        result.success = false;
+        return result;
+    }
+
+    constexpr size_t kMaxCheckpointFramesPerTick = 1024;
+    std::vector<PageId> pages_to_flush;
+    {
+        std::unique_lock lock{latch_};
+        checkpoint_cohort_frames_visited_for_test_ = 0;
+        finish_checkpoint_cohort_if_complete_locked();
+        if (active_checkpoint_cohort_epoch_ == 0) {
+            return result;
+        }
+        if (active_checkpoint_cohort_epoch_ != epoch) {
+            result.success = false;
+            return result;
+        }
+        if (max_pages == 0) {
+            result.pages_remaining = checkpoint_cohort_pages_remaining_;
+            return result;
+        }
+
+        const size_t frames_to_visit = std::min(checkpoint_cohort_pending_frames_.size(), kMaxCheckpointFramesPerTick);
+        const size_t pages_to_select = std::min(max_pages, kMaxCheckpointFramesPerTick);
+        pages_to_flush.reserve(std::min(pages_to_select, frames_to_visit));
+        for (size_t visited = 0; visited < frames_to_visit && pages_to_flush.size() < pages_to_select; ++visited) {
+            ++checkpoint_cohort_frames_visited_for_test_;
+            const frame_id_t frame_id = checkpoint_cohort_pending_frames_.front();
+            checkpoint_cohort_pending_frames_.pop_front();
+            if (frame_id < 0 || static_cast<size_t>(frame_id) >= pool_size_) {
+                continue;
+            }
+
+            Page* page = &pages_[frame_id];
+            std::scoped_lock dirty_lock{page->dirty_latch_};
+            if (page->checkpoint_cohort_epoch_ != epoch) {
+                // A foreground flush, successful victim write, delete, or
+                // cancel already discharged this fixed-frame obligation.
+                continue;
+            }
+            if (page->state_.load(std::memory_order_acquire) == FrameState::VALID) {
+                if (page->is_dirty_.load(std::memory_order_acquire)) {
+                    pages_to_flush.push_back(page->id_);
+                } else {
+                    // A clean marked page can only be an already-persisted
+                    // image. Settle it defensively rather than rotating it
+                    // forever if a future write path misses marker cleanup.
+                    clear_checkpoint_cohort_marker_locked(page);
+                    continue;
+                }
+            }
+            // Keep both selected pages and transient FLUSHING/EVICTING/LOADING
+            // frames in the queue. Success clears their marker; failure keeps
+            // it, so the next bounded visit retries without a global scan.
+            checkpoint_cohort_pending_frames_.push_back(frame_id);
+        }
+        finish_checkpoint_cohort_if_complete_locked();
+    }
+
+    FlushBatchResult flushed = flush_pages(pages_to_flush, FlushDependencyPolicy::Enforce());
+    result.pages_written = flushed.pages_written;
+    result.success = flushed.success;
+
+    std::unique_lock lock{latch_};
+    if (active_checkpoint_cohort_epoch_ == epoch) {
+        result.pages_remaining = checkpoint_cohort_pages_remaining_;
+        finish_checkpoint_cohort_if_complete_locked();
+    }
+    return result;
+}
+
+size_t BufferPoolManager::cancel_checkpoint_cohort(uint64_t epoch) {
+    if (epoch == 0) {
+        return 0;
+    }
+
+    size_t pages_cancelled = 0;
+    std::unique_lock lock{latch_};
+    finish_checkpoint_cohort_if_complete_locked();
+    if (active_checkpoint_cohort_epoch_ != epoch) {
+        return 0;
+    }
+    for (const frame_id_t frame_id : checkpoint_cohort_pending_frames_) {
+        if (frame_id < 0 || static_cast<size_t>(frame_id) >= pool_size_) {
+            continue;
+        }
+        Page* page = &pages_[frame_id];
+        std::scoped_lock dirty_lock{page->dirty_latch_};
+        if (page->checkpoint_cohort_epoch_ != epoch) {
+            continue;
+        }
+        page->checkpoint_cohort_epoch_ = 0;
+        ++pages_cancelled;
+    }
+    checkpoint_cohort_pending_frames_.clear();
+    checkpoint_cohort_pages_remaining_ = 0;
+    active_checkpoint_cohort_epoch_ = 0;
+    return pages_cancelled;
+}
+
 size_t BufferPoolManager::index_internal_resident_count() {
     std::shared_lock lock{latch_};
     return index_internal_resident_count_;
@@ -1175,10 +1683,10 @@ size_t BufferPoolManager::count_dirty_pages(const std::vector<int>& allowed_fds)
     const std::unordered_set<int> fd_set(allowed_fds.begin(), allowed_fds.end());
     size_t dirty_pages = 0;
     std::shared_lock lock{latch_};
-    for (size_t frame_id = 0; frame_id < pool_size_; ++frame_id) {
+    for (const auto& [page_id, frame_id] : page_table_) {
         const Page& page = pages_[frame_id];
         if (page.state_.load(std::memory_order_acquire) == FrameState::VALID &&
-            fd_set.find(page.id_.fd) != fd_set.end() && page.is_dirty_.load(std::memory_order_acquire)) {
+            fd_set.find(page_id.fd) != fd_set.end() && page.is_dirty_.load(std::memory_order_acquire)) {
             ++dirty_pages;
         }
     }
@@ -1193,14 +1701,19 @@ void BufferPoolManager::delete_all_pages(int fd) {
             continue;
         }
 
+        const PageId page_id = it->first;
         frame_id_t frame_id = it->second;
         Page* page = &pages_[frame_id];
         if (page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
             ++it;
             continue;
         }
+        if (!claim_page_for_eviction_locked(page_id, frame_id, false, false)) {
+            ++it;
+            continue;
+        }
+        ++it;
 
-        replacer_->pin(frame_id);
         clear_residency(frame_id);
         recycle_frame(frame_id);
         page->reset_memory();
@@ -1209,11 +1722,11 @@ void BufferPoolManager::delete_all_pages(int fd) {
             std::scoped_lock dirty_lock{page->dirty_latch_};
             page->is_dirty_ = false;
             page->dirty_epoch_ = 0;
+            clear_checkpoint_cohort_marker_locked(page);
             page->write_dependency_ = PageWriteDependency::None();
         }
         page->id_ = PageId{};
-        page->state_.store(FrameState::FREE, std::memory_order_release);
-        it = page_table_.erase(it);
+        erase_page_mapping_locked(page_id, frame_id, FrameState::FREE);
     }
     lock.unlock();
     frame_operation_cv_.notify_all();

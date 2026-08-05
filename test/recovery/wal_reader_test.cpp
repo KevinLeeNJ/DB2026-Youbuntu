@@ -363,6 +363,52 @@ TEST(WalReaderTest, SparseUpdateMaterializesACompleteBeforeImage) {
     EXPECT_EQ(redo_dml.table_name, "stock");
 }
 
+TEST(WalReaderTest, BidirectionalUpdateBorrowsValidatedBeforeAndAfterSpans) {
+    Rid rid{4, 3};
+    auto old_row = MakeRow(64, 'a');
+    auto new_row = MakeRow(64, 'a');
+    new_row.data[5] = 'x';
+    new_row.data[20] = 'y';
+    UpdateLogRecord update(13, old_row, new_row, rid, "stock", true);
+    ASSERT_TRUE(update.bidirectional_delta_encoding_);
+    update.lsn_ = 202;
+    std::vector<char> bytes(update.log_tot_len_);
+    update.serialize(bytes.data());
+
+    WalRecordView view = BorrowRecord(&bytes);
+    WalDmlView dml;
+    ASSERT_TRUE(ParseWalDml(view, &dml));
+    EXPECT_EQ(dml.before_image, nullptr);
+    EXPECT_EQ(dml.after_image, nullptr);
+    ASSERT_TRUE(dml.update_delta.present());
+    EXPECT_EQ(dml.update_delta.row_size, 64U);
+    EXPECT_EQ(dml.update_delta.flags, UpdateLogRecord::kIndexKeysUnchangedFlag);
+    EXPECT_EQ(dml.update_delta.span_count, 2U);
+    EXPECT_EQ(dml.rid, rid);
+    EXPECT_EQ(dml.table_name, "stock");
+
+    uint32_t cursor = 0;
+    WalUpdateDeltaSpan span;
+    ASSERT_TRUE(ReadWalUpdateDeltaSpan(dml.update_delta, &cursor, &span));
+    EXPECT_EQ(span.offset, 5U);
+    EXPECT_EQ(span.length, 1U);
+    EXPECT_EQ(span.before_bytes[0], 'a');
+    EXPECT_EQ(span.after_bytes[0], 'x');
+    ASSERT_TRUE(ReadWalUpdateDeltaSpan(dml.update_delta, &cursor, &span));
+    EXPECT_EQ(span.offset, 20U);
+    EXPECT_EQ(span.length, 1U);
+    EXPECT_EQ(span.before_bytes[0], 'a');
+    EXPECT_EQ(span.after_bytes[0], 'y');
+    EXPECT_EQ(cursor, dml.update_delta.span_bytes_length);
+
+    auto malformed = bytes;
+    const uint32_t unknown_flags = 2;
+    const int flags_offset = OFFSET_LOG_DATA + sizeof(int) + sizeof(uint32_t);
+    memcpy(malformed.data() + flags_offset, &unknown_flags, sizeof(unknown_flags));
+    WalRecordView malformed_view = BorrowRecord(&malformed);
+    EXPECT_FALSE(ParseWalDml(malformed_view, &dml));
+}
+
 TEST(WalReaderTest, SparseUpdateRejectsMalformedVersionSpansAndTrailingBytes) {
     Rid rid{4, 3};
     auto old_row = MakeRow(64, 'a');
@@ -389,7 +435,7 @@ TEST(WalReaderTest, SparseUpdateRejectsMalformedVersionSpansAndTrailingBytes) {
 
     {
         auto bytes = valid;
-        const int unknown_version = -2;
+        const int unknown_version = -3;
         memcpy(bytes.data() + OFFSET_LOG_DATA, &unknown_version, sizeof(unknown_version));
         EXPECT_TRUE(rejected(std::move(bytes)));
     }

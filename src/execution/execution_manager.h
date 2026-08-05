@@ -43,6 +43,8 @@ public:
     void run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context);
     void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
                      Context* context);
+    void select_from(AbstractExecutor& executorTreeRoot, const std::vector<std::string>& output_names,
+                     Context* context);
     void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
                      Context* context);
 

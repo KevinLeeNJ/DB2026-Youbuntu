@@ -91,6 +91,32 @@ public:
     SeqScanExecutor(SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds, Context* context)
         : SeqScanExecutor(sm_manager, tab_name, sm_manager->db_.get_table(tab_name),
                           sm_manager->fhs_.at(tab_name).get(), std::move(conds), context) {}
+
+    void replace_prepared_conditions(std::vector<Condition>& staged_conditions) noexcept {
+        assert(staged_conditions.size() == fed_conds_.size());
+        fed_conds_.swap(staged_conditions);
+    }
+
+    void clear_prepared_parameters(const std::vector<size_t>& condition_indexes) noexcept {
+        clear_prepared_parameter_values(fed_conds_, condition_indexes);
+    }
+
+    const std::vector<Condition>& prepared_conditions_ref() const noexcept {
+        return fed_conds_;
+    }
+
+    void begin_operation(Context* context) noexcept override {
+        context_ = context;
+        predicate_recorded_ = false;
+    }
+
+    void end_operation() noexcept override {
+        scan_.reset();
+        buffered_tuple_ = {};
+        predicate_recorded_ = false;
+        context_ = nullptr;
+    }
+
     std::unique_ptr<RmRecord> visible_record(const Rid& rid) {
         return GetVisibleRecord(fh_, rid, context_);
     }
@@ -167,7 +193,7 @@ public:
     }
 
     bool is_end() const override {
-        return scan_->is_end();
+        return scan_ == nullptr || scan_->is_end();
     }
     std::string getType() override {
         return "SeqScanExecutor"; // 返回执行器的名称

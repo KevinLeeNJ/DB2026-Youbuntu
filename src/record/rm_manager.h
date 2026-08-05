@@ -95,4 +95,14 @@ public:
         disk_manager_->write_page(file_handle->fd_, RM_FILE_HDR_PAGE, (char*)&file_handle->file_hdr_,
                                   sizeof(file_handle->file_hdr_));
     }
+
+    // Write a header captured at a fixed checkpoint cut without consulting the
+    // live file handle. The catalog guard held by the caller keeps fd open.
+    void write_detached_file_header(const RmFileHeaderSnapshot& snapshot) {
+        if (snapshot.fd < 0) {
+            throw InternalError("invalid detached record header snapshot");
+        }
+        disk_manager_->write_page(snapshot.fd, RM_FILE_HDR_PAGE, snapshot.bytes.data(),
+                                  static_cast<int>(snapshot.bytes.size()));
+    }
 };

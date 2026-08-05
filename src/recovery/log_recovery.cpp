@@ -37,37 +37,92 @@ constexpr int kMaxDuplicateDrain = 16;
 // has to be rebuilt.
 constexpr size_t kRepairSpotCheckLimit = 64;
 
+// Keep the redo WAL view bounded. Heap redo records are sorted by table/page,
+// so their WAL offsets are not necessarily sequential; retaining the whole WAL
+// mapping would make every touched file page resident during recovery. A
+// single 64 MiB window is enough for normal records, while the bounded scratch
+// path below handles the (rare) record that straddles a window boundary.
+constexpr size_t kWalMappingWindowBytes = size_t{64} * 1024 * 1024;
+constexpr uint32_t kMaxRedoRecordBytes = MAX_INDEX_SMO_RECORD_BYTES;
+
 class ReadOnlyWalMapping {
 public:
-    ReadOnlyWalMapping(int fd, int64_t length) {
+    ReadOnlyWalMapping(DiskManager* disk_manager, int fd, int64_t length) : disk_manager_(disk_manager), fd_(fd) {
         if (fd < 0 || length <= 0 ||
             static_cast<uint64_t>(length) > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-            throw InternalError("recovery cannot map an invalid WAL range");
+            throw InternalError("recovery cannot read an invalid WAL range");
         }
-        length_ = static_cast<size_t>(length);
-        void* mapped = mmap(nullptr, length_, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mapped == MAP_FAILED) {
-            throw UnixError();
-        }
-        bytes_ = static_cast<const char*>(mapped);
+        length_ = length;
     }
 
     ~ReadOnlyWalMapping() {
-        if (bytes_ != nullptr) {
-            (void)munmap(const_cast<char*>(bytes_), length_);
-        }
+        unmap();
     }
 
     ReadOnlyWalMapping(const ReadOnlyWalMapping&) = delete;
     ReadOnlyWalMapping& operator=(const ReadOnlyWalMapping&) = delete;
 
-    const char* bytes() const {
-        return bytes_;
+    const char* record_bytes(int64_t offset, uint32_t length, std::vector<char>* scratch) {
+        const int64_t record_length = static_cast<int64_t>(length);
+        if (offset < 0 || length < static_cast<uint32_t>(LOG_HEADER_SIZE) || length > kMaxRedoRecordBytes ||
+            offset > length_ - record_length) {
+            throw InternalError("recovery heap-redo descriptor leaves the WAL range; WAL retained");
+        }
+        const int64_t record_end = offset + record_length;
+        if (mapped_bytes_ != nullptr && offset >= mapped_offset_ &&
+            record_end <= mapped_offset_ + static_cast<int64_t>(mapped_length_)) {
+            return mapped_bytes_ + (offset - mapped_offset_);
+        }
+
+        const int64_t window_offset =
+            (offset / static_cast<int64_t>(kWalMappingWindowBytes)) * static_cast<int64_t>(kWalMappingWindowBytes);
+        const int64_t window_end = std::min<int64_t>(length_, window_offset + kWalMappingWindowBytes);
+        if (record_end <= window_end) {
+            map_window(window_offset, window_end - window_offset);
+            return mapped_bytes_ + (offset - mapped_offset_);
+        }
+
+        // A WAL record is bounded by kMaxRedoRecordBytes, so this allocation is
+        // bounded and only occurs at a window boundary. The record header and
+        // length are revalidated by mapped_heap_redo_record() after copying.
+        if (scratch == nullptr || disk_manager_ == nullptr) {
+            throw InternalError("recovery cannot buffer a WAL record crossing its mapping window; WAL retained");
+        }
+        scratch->resize(length);
+        if (disk_manager_->read_log_chunk(scratch->data(), static_cast<int>(length), offset) !=
+            static_cast<int>(length)) {
+            throw InternalError("recovery could not read a WAL record crossing its mapping window; WAL retained");
+        }
+        return scratch->data();
     }
 
 private:
-    const char* bytes_{nullptr};
-    size_t length_{0};
+    void map_window(int64_t offset, int64_t length) {
+        unmap();
+        mapped_length_ = static_cast<size_t>(length);
+        void* mapped = mmap(nullptr, mapped_length_, PROT_READ, MAP_PRIVATE, fd_, offset);
+        if (mapped == MAP_FAILED) {
+            throw UnixError();
+        }
+        mapped_bytes_ = static_cast<const char*>(mapped);
+        mapped_offset_ = offset;
+    }
+
+    void unmap() {
+        if (mapped_bytes_ != nullptr) {
+            (void)munmap(const_cast<char*>(mapped_bytes_), mapped_length_);
+            mapped_bytes_ = nullptr;
+            mapped_offset_ = 0;
+            mapped_length_ = 0;
+        }
+    }
+
+    DiskManager* disk_manager_{nullptr};
+    int fd_{-1};
+    int64_t length_{0};
+    const char* mapped_bytes_{nullptr};
+    int64_t mapped_offset_{0};
+    size_t mapped_length_{0};
 };
 
 TupleMeta MakeCommittedMeta(txn_id_t writer) {
@@ -143,14 +198,14 @@ void RecoveryManager::build_touched_index() {
     touched_sorted_.erase(std::unique(touched_sorted_.begin(), touched_sorted_.end()), touched_sorted_.end());
 }
 
-WalRecordView RecoveryManager::mapped_heap_redo_record(const HeapRedoRecord& location, const char* wal_bytes) const {
-    if (wal_bytes == nullptr || location.wal_offset < scan_begin_offset_ || location.wal_offset > scan_end_offset_ ||
+WalRecordView RecoveryManager::mapped_heap_redo_record(const HeapRedoRecord& location, const char* record_bytes) const {
+    if (record_bytes == nullptr || location.wal_offset < scan_begin_offset_ || location.wal_offset > scan_end_offset_ ||
         location.wal_length < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
         static_cast<int64_t>(location.wal_length) > scan_end_offset_ - location.wal_offset) {
-        throw InternalError("recovery heap-redo descriptor leaves the mapped WAL; WAL retained");
+        throw InternalError("recovery heap-redo descriptor leaves the WAL range; WAL retained");
     }
 
-    const char* header = wal_bytes + static_cast<size_t>(location.wal_offset);
+    const char* header = record_bytes;
     const uint32_t total_len = read_unaligned<uint32_t>(header + OFFSET_LOG_TOT_LEN);
     const LogType log_type = read_unaligned<LogType>(header + OFFSET_LOG_TYPE);
     const bool heap_dml = log_type == LogType::INSERT || log_type == LogType::DELETE || log_type == LogType::UPDATE;
@@ -270,6 +325,7 @@ void RecoveryManager::analyze() {
     touched_.clear();
     touched_sorted_.clear();
     heap_redo_records_.clear();
+    deferred_committed_deltas_.clear();
     record_locations_.clear();
     record_locations_sorted_ = true;
     touched_tables_.clear();
@@ -375,6 +431,9 @@ void RecoveryManager::analyze() {
             // that contract here, before redo, undo, or index-key extraction
             // can read a column offset from either image.
             if (table.file_handle != nullptr) {
+                if (dml.update_delta.present()) {
+                    validate_installable_image(table, record, static_cast<int>(dml.update_delta.row_size));
+                }
                 if (dml.before_image != nullptr) {
                     validate_installable_image(table, record, dml.before_size);
                 }
@@ -595,11 +654,13 @@ void RecoveryManager::redo() {
     std::sort(heap_redo_records_.begin(), heap_redo_records_.end());
     std::unique_ptr<ReadOnlyWalMapping> wal_mapping;
     if (!heap_redo_records_.empty()) {
-        wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_->GetLogFd(), scan_end_offset_);
+        wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_, disk_manager_->GetLogFd(), scan_end_offset_);
     }
+    std::vector<char> wal_scratch;
     WalDmlView dml;
     for (const HeapRedoRecord& location : heap_redo_records_) {
-        record = mapped_heap_redo_record(location, wal_mapping->bytes());
+        const char* bytes = wal_mapping->record_bytes(location.wal_offset, location.wal_length, &wal_scratch);
+        record = mapped_heap_redo_record(location, bytes);
         if (!ParseWalDmlForRedo(record, &dml)) {
             throw InternalError("recovery failed to parse mapped DML at WAL offset " + std::to_string(record.offset) +
                                 " that analyze accepted; WAL retained");
@@ -625,23 +686,33 @@ void RecoveryManager::redo() {
             continue;
         }
         ++redo_applied_count_;
+        const TouchedTuple target{location.table_id, location.slot_no, location.page_no};
         switch (record.log_type) {
         case LogType::INSERT:
             redo_insert(record, dml, *table);
+            deferred_committed_deltas_.erase(target);
             FaultInjector::Point("mid_recovery_redo");
             break;
         case LogType::DELETE:
             redo_delete(record, dml, *table);
+            deferred_committed_deltas_.erase(target);
             FaultInjector::Point("mid_recovery_redo");
             break;
         case LogType::UPDATE:
-            redo_update(record, dml, *table);
+            if (!redo_update(record, dml, *table)) {
+                deferred_committed_deltas_[target].push_back(location);
+            } else if (!dml.update_delta.present()) {
+                deferred_committed_deltas_.erase(target);
+            }
             FaultInjector::Point("mid_recovery_redo");
             break;
         default:
             break;
         }
     }
+    // No later recovery phase consults heap_redo_records_; undo follows the
+    // LSN index and touched_sorted_ owns the page-repair work.
+    std::vector<HeapRedoRecord>().swap(heap_redo_records_);
     for (int fd : smo_fds) {
         disk_manager_->sync_file(fd);
     }
@@ -744,6 +815,7 @@ void RecoveryManager::undo() {
             pending.push(record.prev_lsn);
         }
     }
+    replay_deferred_committed_deltas();
     LOG_INFO("recovery undo: %llu records, %llu loser txns, %llu chain records read, %llu no-undo txns pruned",
              static_cast<unsigned long long>(undo_applied_count_),
              static_cast<unsigned long long>(active_txn_last_lsn_.size()),
@@ -875,6 +947,13 @@ void RecoveryManager::collect_wal_index_keys() {
         if (!ParseWalDml(record, &dml)) {
             throw InternalError("recovery failed to re-parse the DML payload at WAL offset " +
                                 std::to_string(record.offset) + " that analyze accepted; WAL retained");
+        }
+        // This encoding is emitted only when the UPDATE plan proves that no
+        // indexed column can change. The final heap sweep below still supplies
+        // the surviving key; there is no historical key for this record to
+        // remove from an index.
+        if (dml.update_delta.present()) {
+            continue;
         }
         // index_plans was resolved once per table; this loop runs once per WAL
         // record, and rebuilding the index name here used to cost a string
@@ -1478,16 +1557,168 @@ void RecoveryManager::redo_delete(const WalRecordView& record, const WalDmlView&
     }
 }
 
-void RecoveryManager::redo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+bool RecoveryManager::redo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table,
+                                  bool defer_on_active_loser) {
+    if (dml.update_delta.present()) {
+        return redo_update_delta(record, dml, table, defer_on_active_loser);
+    }
     validate_installable_image(table, record, dml.after_size);
     const TupleMeta meta = MakeCommittedMeta(record.txn_id);
     if (redo_existing_slot(table, dml.rid, dml.after_image, dml.after_size, meta, record.lsn)) {
-        return;
+        return true;
     }
     table.file_handle->insert_record(dml.rid, const_cast<char*>(dml.after_image), record.lsn);
     if (table.file_handle->is_record(dml.rid)) {
         table.file_handle->set_tuple_meta(dml.rid, meta, record.lsn);
     }
+    return true;
+}
+
+bool RecoveryManager::redo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table,
+                                        bool defer_on_active_loser) {
+    validate_installable_image(table, record, static_cast<int>(dml.update_delta.row_size));
+    uint32_t validation_cursor = 0;
+    for (uint32_t i = 0; i < dml.update_delta.span_count; ++i) {
+        WalUpdateDeltaSpan span;
+        if (!ReadWalUpdateDeltaSpan(dml.update_delta, &validation_cursor, &span)) {
+            throw InternalError("recovery UPDATE delta changed after analyze at LSN " + std::to_string(record.lsn) +
+                                "; WAL retained");
+        }
+    }
+    if (validation_cursor != dml.update_delta.span_bytes_length) {
+        throw InternalError("recovery UPDATE delta has trailing span bytes at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
+    if (table.file_handle == nullptr || dml.rid.page_no < 0 ||
+        dml.rid.page_no >= table.file_handle->get_file_hdr().num_pages) {
+        throw InternalError("recovery UPDATE delta has no durable base page at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
+
+    RmPageHandle page_handle;
+    try {
+        page_handle = table.file_handle->fetch_page_handle(dml.rid.page_no);
+    } catch (const std::exception&) {
+        throw InternalError("recovery UPDATE delta could not fetch its base page at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
+
+    bool occupied = false;
+    bool skipped_for_loser = false;
+    bool unknown_uncommitted_writer = false;
+    bool dirtied = false;
+    bool decoded = true;
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        occupied = dml.rid.slot_no >= 0 && dml.rid.slot_no < page_handle.file_hdr->num_records_per_page &&
+                   Bitmap::is_set(page_handle.bitmap, dml.rid.slot_no);
+        if (occupied) {
+            TupleMeta& current_meta = page_handle.get_meta(dml.rid.slot_no);
+            // A page-level LSN cannot identify which row version supplied the
+            // bytes outside this delta. The active owner may be either an older
+            // aborted writer whose dirty page survived or a later loser. In
+            // both cases, applying only the changed spans and publishing
+            // committed metadata could seal unrelated loser bytes into the
+            // committed row. Preserve any active-loser-owned image for undo;
+            // replay_deferred_committed_deltas() applies the retained deltas in
+            // forward order after every loser is gone. A tuple may also retain
+            // uncommitted metadata for a transaction whose COMMIT WAL is
+            // durable; its body is a known committed image and is safe to use.
+            // Any owner in neither analyzed set has no explainable WAL chain,
+            // so recovery must fail instead of guessing which bytes are valid.
+            if (defer_on_active_loser && !current_meta.is_committed_) {
+                skipped_for_loser = active_txn_last_lsn_.count(current_meta.writer_txn_id_) != 0;
+                const bool committed_writer = committed_txns_.count(current_meta.writer_txn_id_) != 0;
+                unknown_uncommitted_writer = !skipped_for_loser && !committed_writer;
+            }
+            if (!skipped_for_loser && !unknown_uncommitted_writer) {
+                char* row = page_handle.get_slot(dml.rid.slot_no);
+                uint32_t cursor = 0;
+                for (uint32_t i = 0; i < dml.update_delta.span_count; ++i) {
+                    WalUpdateDeltaSpan span;
+                    if (!ReadWalUpdateDeltaSpan(dml.update_delta, &cursor, &span)) {
+                        decoded = false;
+                        break;
+                    }
+                    memcpy(row + span.offset, span.after_bytes, span.length);
+                }
+                decoded = decoded && cursor == dml.update_delta.span_bytes_length;
+                if (decoded) {
+                    current_meta = MakeCommittedMeta(record.txn_id);
+                    if (record.lsn != INVALID_LSN && page_handle.page->get_page_lsn() < record.lsn) {
+                        page_handle.page->set_page_lsn(record.lsn);
+                    }
+                    dirtied = true;
+                }
+            }
+        }
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), dirtied);
+    if (!decoded) {
+        throw InternalError("recovery UPDATE delta changed during committed redo at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
+    if (unknown_uncommitted_writer) {
+        throw InternalError("recovery UPDATE delta found an uncommitted base without an active WAL owner at LSN " +
+                            std::to_string(record.lsn) + "; WAL retained");
+    }
+    if (skipped_for_loser) {
+        return false;
+    }
+    if (!occupied) {
+        // A committed INSERT earlier in the retained WAL is replayed before
+        // this record by the per-page WAL-offset sort. If the slot is still
+        // absent, the checkpoint/base-page invariant is broken; a delta cannot
+        // safely synthesize the missing bytes.
+        throw InternalError("recovery UPDATE delta has no base tuple at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
+    return true;
+}
+
+void RecoveryManager::replay_deferred_committed_deltas() {
+    if (deferred_committed_deltas_.empty()) {
+        return;
+    }
+
+    // Any later full-image INSERT/DELETE/UPDATE erased this RID's descriptors
+    // during the first redo pass: that record completely anchors the resulting
+    // body (or tombstone), including the effects of earlier committed deltas.
+    // The remaining descriptors therefore form the suffix of committed v2
+    // assignments after the last full anchor and can be applied directly in
+    // their original per-RID WAL order once all loser effects are undone.
+    ReadOnlyWalMapping wal_mapping(disk_manager_, disk_manager_->GetLogFd(), scan_end_offset_);
+    std::vector<char> scratch;
+    WalDmlView dml;
+    for (const auto& [target, records] : deferred_committed_deltas_) {
+        if (target.table_id >= tables_.size()) {
+            throw InternalError("recovery deferred UPDATE has an invalid table id; WAL retained");
+        }
+        RecoveryTable& table = tables_[target.table_id];
+        if (table.file_handle == nullptr) {
+            throw InternalError("recovery lost an open table while replaying a deferred UPDATE; WAL retained");
+        }
+        int64_t previous_offset = -1;
+        for (const HeapRedoRecord& location : records) {
+            if (location.table_id != target.table_id || location.page_no != target.page_no ||
+                location.slot_no != target.slot_no || location.wal_offset <= previous_offset) {
+                throw InternalError("recovery deferred UPDATE descriptors are inconsistent; WAL retained");
+            }
+            previous_offset = location.wal_offset;
+            const char* bytes = wal_mapping.record_bytes(location.wal_offset, location.wal_length, &scratch);
+            const WalRecordView record = mapped_heap_redo_record(location, bytes);
+            if (record.log_type != LogType::UPDATE || committed_txns_.count(record.txn_id) == 0 ||
+                !ParseWalDmlForRedo(record, &dml) || !dml.update_delta.present() || dml.table_name != table.name ||
+                dml.rid.page_no != target.page_no || dml.rid.slot_no != target.slot_no) {
+                throw InternalError("recovery deferred UPDATE no longer matches analyze; WAL retained");
+            }
+            if (!redo_update(record, dml, table, false)) {
+                throw InternalError("recovery re-deferred an UPDATE after loser undo; WAL retained");
+            }
+            FaultInjector::Point("mid_recovery_redo");
+        }
+    }
+    deferred_committed_deltas_.clear();
 }
 
 void RecoveryManager::undo_insert(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
@@ -1524,6 +1755,10 @@ void RecoveryManager::undo_delete(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::undo_update(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    if (dml.update_delta.present()) {
+        undo_update_delta(record, dml, table);
+        return;
+    }
     // apply_tuple_update() copies record_size bytes out of before_image; see the
     // note above redo_insert().
     validate_installable_image(table, record, dml.before_size);
@@ -1540,4 +1775,73 @@ void RecoveryManager::undo_update(const WalRecordView& record, const WalDmlView&
         return;
     }
     table.file_handle->apply_tuple_update(dml.rid, dml.before_image, MakeLoserMeta(record.txn_id), record.lsn);
+}
+
+void RecoveryManager::undo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
+    validate_installable_image(table, record, static_cast<int>(dml.update_delta.row_size));
+    if (table.file_handle == nullptr || dml.rid.page_no < 0 ||
+        dml.rid.page_no >= table.file_handle->get_file_hdr().num_pages) {
+        // The loser's page may never have reached disk (notably for an INSERT
+        // followed by UPDATE in the same transaction), so absence is a no-op.
+        return;
+    }
+
+    RmPageHandle page_handle;
+    try {
+        page_handle = table.file_handle->fetch_page_handle(dml.rid.page_no);
+    } catch (const std::exception&) {
+        throw InternalError("recovery UPDATE delta could not fetch a loser page at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
+
+    bool dirtied = false;
+    bool decoded = true;
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+        const bool occupied = dml.rid.slot_no >= 0 && dml.rid.slot_no < page_handle.file_hdr->num_records_per_page &&
+                              Bitmap::is_set(page_handle.bitmap, dml.rid.slot_no);
+        if (occupied) {
+            TupleMeta& meta = page_handle.get_meta(dml.rid.slot_no);
+            if (meta.writer_txn_id_ == record.txn_id) {
+                char* row = page_handle.get_slot(dml.rid.slot_no);
+                uint32_t cursor = 0;
+                bool after_matches = true;
+                for (uint32_t i = 0; i < dml.update_delta.span_count; ++i) {
+                    WalUpdateDeltaSpan span;
+                    if (!ReadWalUpdateDeltaSpan(dml.update_delta, &cursor, &span)) {
+                        decoded = false;
+                        after_matches = false;
+                        break;
+                    }
+                    if (memcmp(row + span.offset, span.after_bytes, span.length) != 0) {
+                        after_matches = false;
+                    }
+                }
+                decoded = decoded && cursor == dml.update_delta.span_bytes_length;
+                if (decoded && after_matches) {
+                    cursor = 0;
+                    for (uint32_t i = 0; i < dml.update_delta.span_count; ++i) {
+                        WalUpdateDeltaSpan span;
+                        if (!ReadWalUpdateDeltaSpan(dml.update_delta, &cursor, &span)) {
+                            decoded = false;
+                            break;
+                        }
+                        memcpy(row + span.offset, span.before_bytes, span.length);
+                    }
+                    if (decoded && cursor == dml.update_delta.span_bytes_length) {
+                        meta = MakeLoserMeta(record.txn_id);
+                        if (record.lsn != INVALID_LSN && page_handle.page->get_page_lsn() < record.lsn) {
+                            page_handle.page->set_page_lsn(record.lsn);
+                        }
+                        dirtied = true;
+                    }
+                }
+            }
+        }
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), dirtied);
+    if (!decoded) {
+        throw InternalError("recovery UPDATE delta changed during loser undo at LSN " + std::to_string(record.lsn) +
+                            "; WAL retained");
+    }
 }

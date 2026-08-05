@@ -391,14 +391,25 @@ IndexBindLogRecord::IndexBindLogRecord(std::string_view index_file_name) : index
     prev_lsn_ = INVALID_LSN;
 }
 
+IndexBindLogRecord::IndexBindLogRecord(std::string_view index_file_name, uint64_t existing_generation)
+    : IndexBindLogRecord(index_file_name) {
+    if (existing_generation == 0) {
+        throw std::invalid_argument("INDEX_BIND V2 requires a nonzero existing generation");
+    }
+    version_ = INDEX_BIND_VERSION_V2;
+    explicit_generation_ = existing_generation;
+}
+
 void IndexBindLogRecord::serialize(char* dest) const {
     LogRecord::serialize(dest);
     uint32_t offset = OFFSET_LOG_DATA;
     AppendScalar(dest, &offset, INDEX_BIND_MAGIC);
-    AppendScalar(dest, &offset, INDEX_BIND_VERSION);
+    AppendScalar(dest, &offset, version_);
     AppendScalar(dest, &offset, static_cast<uint16_t>(0));
     AppendScalar(dest, &offset, static_cast<uint32_t>(index_file_name_.size()));
-    AppendScalar(dest, &offset, static_cast<uint64_t>(lsn_) + 1U);
+    const uint64_t generation =
+        version_ == INDEX_BIND_VERSION_V1 ? static_cast<uint64_t>(lsn_) + 1U : explicit_generation_;
+    AppendScalar(dest, &offset, generation);
     std::memcpy(dest + offset, index_file_name_.data(), index_file_name_.size());
     offset += index_file_name_.size();
     AppendScalar(dest, &offset, IndexSmoCrc32(dest, offset));
@@ -426,8 +437,10 @@ bool ParseIndexBindWal(const WalRecordView& record, std::string_view* index_file
     offset += sizeof(uint32_t);
     const uint64_t parsed_generation = read_unaligned<uint64_t>(record.bytes + offset);
     offset += sizeof(uint64_t);
-    if (magic != INDEX_BIND_MAGIC || version != INDEX_BIND_VERSION || reserved != 0 || name_bytes == 0 ||
-        name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES || parsed_generation != static_cast<uint64_t>(record.lsn) + 1U ||
+    if (magic != INDEX_BIND_MAGIC || (version != INDEX_BIND_VERSION_V1 && version != INDEX_BIND_VERSION_V2) ||
+        reserved != 0 || name_bytes == 0 || name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES || parsed_generation == 0 ||
+        record.lsn == INVALID_LSN ||
+        (version == INDEX_BIND_VERSION_V1 && parsed_generation != static_cast<uint64_t>(record.lsn) + 1U) ||
         offset + name_bytes + kChecksumBytes != record.total_len) {
         return false;
     }

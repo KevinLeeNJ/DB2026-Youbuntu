@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "wal_reader.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstring>
 
 namespace {
@@ -125,6 +126,56 @@ bool ReadSparseUpdate(const char* bytes, uint32_t total_len, int* offset, WalDml
     return true;
 }
 
+bool ReadBidirectionalUpdate(const char* bytes, uint32_t total_len, int* offset, WalDmlView* out) {
+    if (!LogPayloadReadable(total_len, *offset, sizeof(int)) ||
+        read_unaligned<int>(bytes + *offset) != UpdateLogRecord::kBidirectionalDeltaVersion) {
+        return false;
+    }
+    *offset += sizeof(int);
+    if (!LogPayloadReadable(total_len, *offset, sizeof(uint32_t) * 3)) {
+        return false;
+    }
+
+    WalUpdateDeltaView delta;
+    delta.row_size = read_unaligned<uint32_t>(bytes + *offset);
+    *offset += sizeof(uint32_t);
+    delta.flags = read_unaligned<uint32_t>(bytes + *offset);
+    *offset += sizeof(uint32_t);
+    delta.span_count = read_unaligned<uint32_t>(bytes + *offset);
+    *offset += sizeof(uint32_t);
+    const uint32_t remaining = total_len - static_cast<uint32_t>(*offset);
+    if (delta.row_size == 0 || delta.row_size > static_cast<uint32_t>(INT_MAX) ||
+        delta.flags != UpdateLogRecord::kIndexKeysUnchangedFlag || delta.span_count > delta.row_size ||
+        delta.span_count > remaining / (sizeof(uint32_t) * 2 + 2)) {
+        return false;
+    }
+
+    delta.span_bytes = bytes + *offset;
+    const int spans_begin = *offset;
+    uint32_t previous_offset = 0;
+    uint32_t previous_end = 0;
+    for (uint32_t i = 0; i < delta.span_count; ++i) {
+        if (!LogPayloadReadable(total_len, *offset, sizeof(uint32_t) * 2)) {
+            return false;
+        }
+        const uint32_t span_offset = read_unaligned<uint32_t>(bytes + *offset);
+        *offset += sizeof(uint32_t);
+        const uint32_t span_length = read_unaligned<uint32_t>(bytes + *offset);
+        *offset += sizeof(uint32_t);
+        if (span_length == 0 || span_offset > delta.row_size || span_length > delta.row_size - span_offset ||
+            (i > 0 && (span_offset <= previous_offset || span_offset < previous_end)) ||
+            !LogPayloadReadable(total_len, *offset, static_cast<size_t>(span_length) * 2)) {
+            return false;
+        }
+        *offset += static_cast<int>(span_length) * 2;
+        previous_offset = span_offset;
+        previous_end = span_offset + span_length;
+    }
+    delta.span_bytes_length = static_cast<uint32_t>(*offset - spans_begin);
+    out->update_delta = delta;
+    return true;
+}
+
 bool ParseWalDmlImpl(const WalRecordView& record, WalDmlView* out, bool materialize_sparse_before) {
     if (record.bytes == nullptr) {
         return false;
@@ -146,7 +197,11 @@ bool ParseWalDmlImpl(const WalRecordView& record, WalDmlView* out, bool material
         if (!LogPayloadReadable(record.total_len, offset, sizeof(int))) {
             return false;
         }
-        if (read_unaligned<int>(record.bytes + offset) < 0) {
+        if (read_unaligned<int>(record.bytes + offset) == UpdateLogRecord::kBidirectionalDeltaVersion) {
+            if (!ReadBidirectionalUpdate(record.bytes, record.total_len, &offset, &parsed)) {
+                return false;
+            }
+        } else if (read_unaligned<int>(record.bytes + offset) < 0) {
             if (!ReadSparseUpdate(record.bytes, record.total_len, &offset, &parsed, materialize_sparse_before)) {
                 return false;
             }
@@ -171,6 +226,28 @@ bool ParseWalDmlImpl(const WalRecordView& record, WalDmlView* out, bool material
 }
 
 } // namespace
+
+bool ReadWalUpdateDeltaSpan(const WalUpdateDeltaView& delta, uint32_t* cursor, WalUpdateDeltaSpan* span) {
+    if (cursor == nullptr || span == nullptr || !delta.present() || *cursor > delta.span_bytes_length ||
+        delta.span_bytes_length - *cursor < sizeof(uint32_t) * 2) {
+        return false;
+    }
+    const char* bytes = delta.span_bytes + *cursor;
+    const uint32_t span_offset = read_unaligned<uint32_t>(bytes);
+    const uint32_t span_length = read_unaligned<uint32_t>(bytes + sizeof(uint32_t));
+    const uint32_t payload_offset = sizeof(uint32_t) * 2;
+    if (span_length == 0 || span_offset > delta.row_size || span_length > delta.row_size - span_offset ||
+        static_cast<uint64_t>(payload_offset) + static_cast<uint64_t>(span_length) * 2 >
+            delta.span_bytes_length - *cursor) {
+        return false;
+    }
+    span->offset = span_offset;
+    span->length = span_length;
+    span->before_bytes = bytes + payload_offset;
+    span->after_bytes = span->before_bytes + span_length;
+    *cursor += payload_offset + span_length * 2;
+    return true;
+}
 
 bool ParseWalDml(const WalRecordView& record, WalDmlView* out) {
     return ParseWalDmlImpl(record, out, true);

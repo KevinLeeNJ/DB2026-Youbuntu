@@ -36,6 +36,19 @@ struct TableDirtyPageStats {
     size_t frame_capacity{0};
 };
 
+// Values captured at one transaction-free checkpoint cut. File descriptors
+// remain valid while the caller continuously holds the catalog shared guard;
+// every other field owns its storage and does not borrow a live catalog/handle.
+struct FixedCheckpointHeaderSnapshot {
+    std::string database_identity;
+    std::uint64_t catalog_generation{0};
+    std::vector<int> data_and_index_fds;
+    std::vector<std::string> index_file_names;
+    std::vector<RmFileHeaderSnapshot> table_headers;
+    std::vector<IxIndexHeaderSnapshot> index_headers;
+    std::string db_meta_image;
+};
+
 struct ColDef {
     std::string name; // Column name
     ColType type;     // Type of column
@@ -328,6 +341,16 @@ public:
     void close_db();
 
     void flush_meta();
+
+    // Capture only after transaction admission is blocked and active
+    // transactions have drained. The same guard must stay locked continuously
+    // through write_fixed_checkpoint_headers(); it pins the database and all
+    // fds while foreground transactions may resume between the two calls. The
+    // write step publishes only the captured headers, fdatasyncs every captured
+    // data/index fd, then atomically replaces db.meta with its captured image.
+    FixedCheckpointHeaderSnapshot capture_fixed_checkpoint_headers(const CatalogSharedGuard& catalog_guard) const;
+    void write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapshot& snapshot,
+                                        const CatalogSharedGuard& catalog_guard);
 
     void show_tables(Context* context);
 

@@ -166,6 +166,18 @@ public:
         finalize_layout();
     }
 
+    void begin_operation(Context* context) noexcept override {
+        context_ = context;
+        prev_->begin_operation(context);
+    }
+
+    void end_operation() noexcept override {
+        fallback_input_.reset();
+        current_view_ = {};
+        prev_->end_operation();
+        context_ = nullptr;
+    }
+
     void beginTuple() override {
         prev_->beginTuple();          // 调用儿子节点的beginTuple方法，准备开始遍历记录
         _abstract_rid = prev_->rid(); // 初始化抽象记录号

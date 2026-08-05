@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,17 @@ constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 8;
 // no other committer is competing for the disk. PostgreSQL's commit_delay plays
 // the same role and is likewise capped in the millisecond range.
 constexpr std::chrono::milliseconds GROUP_COMMIT_BATCH_WINDOW{2};
+
+bool IsLegalEmptyCheckpoint(const char* bytes, size_t bytes_size) {
+    constexpr size_t kEmptyCheckpointBytes = LOG_HEADER_SIZE + sizeof(size_t);
+    return bytes != nullptr && bytes_size == kEmptyCheckpointBytes &&
+           read_unaligned<LogType>(bytes + OFFSET_LOG_TYPE) == LogType::CHECKPOINT &&
+           read_unaligned<uint32_t>(bytes + OFFSET_LOG_TOT_LEN) == kEmptyCheckpointBytes &&
+           read_unaligned<lsn_t>(bytes + OFFSET_LSN) != INVALID_LSN &&
+           read_unaligned<txn_id_t>(bytes + OFFSET_LOG_TID) == INVALID_TXN_ID &&
+           read_unaligned<lsn_t>(bytes + OFFSET_PREV_LSN) == INVALID_LSN &&
+           read_unaligned<size_t>(bytes + OFFSET_LOG_DATA) == 0;
+}
 
 } // namespace
 
@@ -132,8 +144,16 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
 }
 
 lsn_t LogManager::append_index_smo(const IndexSmoWalData& data) {
+    // Keep the binding stable until the dependent SMO record is appended.
+    // A checkpoint WAL cut takes the same lock before replacing all visible
+    // generations, so it cannot land between generation lookup and append.
+    std::lock_guard<std::mutex> binding_lock(index_binding_latch_);
     IndexSmoWalData bound_data = data;
-    bound_data.index_generation = ensure_index_binding(data.index_file_name);
+    const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
+    auto binding = index_bindings_.find(data.index_file_name);
+    bound_data.index_generation = binding != index_bindings_.end() && binding->second.epoch == epoch
+                                      ? binding->second.generation
+                                      : publish_index_binding_locked(data.index_file_name, epoch);
     IndexSmoLogRecord record(bound_data);
     return add_log_to_buffer(&record);
 }
@@ -151,6 +171,92 @@ uint64_t LogManager::ensure_index_binding(const std::string& index_file_name) {
 uint64_t LogManager::renew_index_binding(const std::string& index_file_name) {
     std::lock_guard<std::mutex> binding_lock(index_binding_latch_);
     return publish_index_binding_locked(index_file_name, wal_epoch_.load(std::memory_order_acquire));
+}
+
+CheckpointWalCut LogManager::create_checkpoint_wal_cut(const std::vector<std::string>& index_file_names) {
+    // Validate every name and bound the eventual checkpoint batch before
+    // entering either WAL mutex.
+    CheckpointLogRecord checkpoint;
+    size_t batch_bytes = checkpoint.log_tot_len_;
+    for (const std::string& index_file_name : index_file_names) {
+        IndexBindLogRecord validated(index_file_name);
+        if (validated.log_tot_len_ > static_cast<size_t>(INT_MAX) - batch_bytes) {
+            throw std::length_error("checkpoint WAL cut exceeds the append-buffer limit");
+        }
+        batch_bytes += validated.log_tot_len_;
+    }
+
+    CheckpointWalCut cut;
+    cut.index_bindings.reserve(index_file_names.size());
+    for (const std::string& index_file_name : index_file_names) {
+        cut.index_bindings.emplace_back(index_file_name, 0);
+    }
+
+    // Global lock order for binding-sensitive WAL is binding_latch -> latch.
+    // append_index_smo() follows the same order. The durable flush never needs
+    // index_binding_latch_, so retaining it across the sync cannot form a cycle.
+    std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
+    const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
+    std::vector<IndexBindLogRecord> binding_records;
+    binding_records.reserve(index_file_names.size());
+    for (size_t i = 0; i < index_file_names.size(); ++i) {
+        const std::string& index_file_name = index_file_names[i];
+        auto binding = index_bindings_.find(index_file_name);
+        if (binding == index_bindings_.end() || binding->second.epoch != epoch) {
+            // Establish a normal V1 generation durably before the cut. If this
+            // fails, no checkpoint record has been appended and the caller can
+            // safely abandon the round.
+            const uint64_t generation = publish_index_binding_locked(index_file_name, epoch);
+            binding = index_bindings_.find(index_file_name);
+            assert(binding != index_bindings_.end() && binding->second.generation == generation);
+        }
+        cut.index_bindings[i].second = binding->second.generation;
+        // V2 reissues the current identity; it deliberately does not renew it.
+        // Thus a crash before manifest publication cannot invalidate older SMO
+        // records still reachable through the previous restart boundary.
+        binding_records.emplace_back(index_file_name, binding->second.generation);
+    }
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        if (batch_bytes > static_cast<size_t>(INT_MAX - log_buffer_->offset_)) {
+            throw std::length_error("checkpoint WAL cut overflows the append buffer");
+        }
+        const size_t record_count = binding_records.size() + 1;
+        const lsn_t next_lsn = global_lsn_.load(std::memory_order_acquire);
+        if (record_count > static_cast<size_t>(INT32_MAX - LSN_EXHAUSTION_MARGIN) ||
+            next_lsn > INT32_MAX - LSN_EXHAUSTION_MARGIN - static_cast<lsn_t>(record_count - 1)) {
+            FailStopOnLsnExhaustion(next_lsn);
+        }
+
+        // A currently flushing buffer precedes the active buffer in the WAL.
+        // All three terms are protected by latch_, making this the exact byte
+        // address at which the checkpoint will be serialized.
+        cut.checkpoint_offset =
+            log_file_offset_ + static_cast<int64_t>(flushing_bytes_) + static_cast<int64_t>(log_buffer_->offset_);
+        log_buffer_->ensure_capacity(static_cast<size_t>(log_buffer_->offset_) + batch_bytes);
+
+        cut.checkpoint_lsn = global_lsn_.fetch_add(1);
+        checkpoint.lsn_ = cut.checkpoint_lsn;
+        checkpoint.serialize(log_buffer_->buffer_.data() + log_buffer_->offset_);
+        log_buffer_->offset_ += static_cast<int>(checkpoint.log_tot_len_);
+
+        for (size_t i = 0; i < binding_records.size(); ++i) {
+            IndexBindLogRecord& record = binding_records[i];
+            record.lsn_ = global_lsn_.fetch_add(1);
+            record.serialize(log_buffer_->buffer_.data() + log_buffer_->offset_);
+            log_buffer_->offset_ += static_cast<int>(record.log_tot_len_);
+            cut.last_lsn = record.lsn_;
+        }
+        if (binding_records.empty()) {
+            cut.last_lsn = cut.checkpoint_lsn;
+        }
+    }
+
+    // One durable prefix operation covers the complete contiguous batch. Keep
+    // binding_latch_ until it succeeds so no INDEX_SMO can cross the cut before
+    // the same-generation binding context itself reaches stable storage.
+    flush_log_to_disk_up_to_impl(cut.last_lsn, true);
+    return cut;
 }
 
 uint64_t LogManager::publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch) {
@@ -400,6 +506,9 @@ void LogManager::flush_buffer(bool sync) {
 }
 
 void LogManager::initialize_from_existing_log() {
+    // Match the binding-sensitive append order. Startup is normally
+    // single-threaded, but keeping one order makes later reuse safe too.
+    std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
     std::lock_guard<std::mutex> lock(latch_);
     log_buffer_->offset_ = 0;
     flushing_buffer_->offset_ = 0;
@@ -407,6 +516,9 @@ void LogManager::initialize_from_existing_log() {
     log_buffer_->shrink_after_flush();
     flushing_buffer_->shrink_after_flush();
     std::fill(log_buffer_->buffer_.begin(), log_buffer_->buffer_.end(), 0);
+    index_bindings_.clear();
+
+    RestartManifest manifest = read_restart_manifest();
 
     int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0) {
@@ -414,8 +526,26 @@ void LogManager::initialize_from_existing_log() {
         persist_lsn_ = INVALID_LSN;
         durable_lsn_.store(INVALID_LSN, std::memory_order_release);
         global_lsn_.store(0);
+        if (manifest.checkpoint_offset != 0) {
+            manifest.checkpoint_offset = 0;
+            write_restart_manifest(manifest);
+        }
         return;
     }
+
+    int64_t scan_start_offset = 0;
+    if (manifest.checkpoint_offset > 0) {
+        constexpr size_t kEmptyCheckpointBytes = LOG_HEADER_SIZE + sizeof(size_t);
+        const int64_t restart_offset = manifest.checkpoint_offset;
+        std::vector<char> checkpoint_bytes(kEmptyCheckpointBytes);
+        if (restart_offset <= file_size - static_cast<int64_t>(kEmptyCheckpointBytes) &&
+            disk_manager_->read_log_chunk(checkpoint_bytes.data(), static_cast<int>(checkpoint_bytes.size()),
+                                          restart_offset) == static_cast<int>(checkpoint_bytes.size()) &&
+            IsLegalEmptyCheckpoint(checkpoint_bytes.data(), checkpoint_bytes.size())) {
+            scan_start_offset = restart_offset;
+        }
+    }
+    const bool rejected_restart_offset = manifest.checkpoint_offset > 0 && scan_start_offset == 0;
 
     // Stream the file once instead of issuing a stat plus a pread per record:
     // this runs before recovery on the full retained WAL, so it used to pay the
@@ -423,7 +553,9 @@ void LogManager::initialize_from_existing_log() {
     const auto scan_begin = std::chrono::steady_clock::now();
     lsn_t max_lsn = INVALID_LSN;
     uint64_t record_count = 0;
-    WalReader reader(disk_manager_, 0, file_size);
+    std::unordered_map<std::string, IndexBinding> scanned_bindings;
+    const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
+    WalReader reader(disk_manager_, scan_start_offset, file_size);
     WalRecordView record;
     while (reader.next(&record)) {
         if (record.log_type == LogType::INDEX_SMO) {
@@ -439,14 +571,15 @@ void LogManager::initialize_from_existing_log() {
                 throw InternalError("corrupt complete INDEX_BIND WAL record at offset " +
                                     std::to_string(record.offset) + "; WAL retained");
             }
+            scanned_bindings[std::string(name)] = IndexBinding{generation, epoch};
         }
         max_lsn = std::max(max_lsn, record.lsn);
         ++record_count;
     }
     const int64_t offset = reader.next_offset();
-    LOG_INFO("wal startup scan: %llu records, %lld bytes, %llu preads, %lld ms",
-             static_cast<unsigned long long>(record_count), static_cast<long long>(offset),
-             static_cast<unsigned long long>(reader.read_count()),
+    LOG_INFO("wal startup scan: %llu records, [%lld,%lld), %llu preads, %lld ms",
+             static_cast<unsigned long long>(record_count), static_cast<long long>(scan_start_offset),
+             static_cast<long long>(offset), static_cast<unsigned long long>(reader.read_count()),
              static_cast<long long>(
                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scan_begin)
                      .count()));
@@ -455,10 +588,18 @@ void LogManager::initialize_from_existing_log() {
     persist_lsn_ = max_lsn;
     durable_lsn_.store(max_lsn, std::memory_order_release);
     global_lsn_.store(max_lsn == INVALID_LSN ? 0 : max_lsn + 1);
+    index_bindings_.swap(scanned_bindings);
     if (offset < file_size) {
         disk_manager_->truncate_log_to(offset);
     }
     disk_manager_->SetLogOffset(offset);
+    if (rejected_restart_offset) {
+        // RecoveryManager reads the same manifest after this method. Publish
+        // the fail-safe decision so it cannot independently accept a boundary
+        // that startup rejected (for example a non-empty CHECKPOINT).
+        manifest.checkpoint_offset = 0;
+        write_restart_manifest(manifest);
+    }
 }
 
 void LogManager::reset_log(lsn_t next_lsn) {

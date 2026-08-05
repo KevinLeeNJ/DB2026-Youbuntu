@@ -172,6 +172,11 @@ private:
     // Distinguishes the page image captured by a flush from writes that arrive
     // after that image has reached disk.
     std::atomic<uint64_t> dirty_epoch_{0};
+    // Non-zero while this resident page belongs to a fixed checkpoint cohort.
+    // The marker is deliberately independent of dirty_epoch_: once the marked
+    // image reaches disk, a concurrent re-dirty keeps the page dirty but does
+    // not keep the old checkpoint obligation alive.
+    uint64_t checkpoint_cohort_epoch_{0};
     PageWriteDependency write_dependency_{PageWriteDependency::None()};
     std::mutex dirty_latch_;
 

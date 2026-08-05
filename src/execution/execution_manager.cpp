@@ -196,14 +196,20 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
 // 执行select语句，select语句的输出除了需要返回客户端外，还需要写入output.txt文件中
 void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
                             Context* context) {
-    const auto& result_cols = executorTreeRoot->cols();
-    std::vector<std::string> captions = std::move(output_names);
-    if (captions.size() != result_cols.size()) {
-        captions.clear();
-        captions.reserve(result_cols.size());
+    select_from(*executorTreeRoot, output_names, context);
+}
+
+void QlManager::select_from(AbstractExecutor& executorTreeRoot, const std::vector<std::string>& output_names,
+                            Context* context) {
+    const auto& result_cols = executorTreeRoot.cols();
+    const std::vector<std::string>* captions = &output_names;
+    std::vector<std::string> fallback_captions;
+    if (captions->size() != result_cols.size()) {
+        fallback_captions.reserve(result_cols.size());
         for (const auto& col : result_cols) {
-            captions.push_back(col.name);
+            fallback_captions.push_back(col.name);
         }
+        captions = &fallback_captions;
     }
 
     struct SsiReadTrackingGuard {
@@ -225,12 +231,12 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     } ssi_read_tracking_guard(context);
 
     if (context != nullptr && context->result_sink_ != nullptr) {
-        context->result_sink_->begin_query(result_cols, captions);
-        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-            TupleView tuple = executorTreeRoot->current();
+        context->result_sink_->begin_query(result_cols, *captions);
+        for (executorTreeRoot.beginTuple(); !executorTreeRoot.is_end(); executorTreeRoot.nextTuple()) {
+            TupleView tuple = executorTreeRoot.current();
             std::unique_ptr<RmRecord> fallback;
             if (!tuple) {
-                fallback = executorTreeRoot->Next();
+                fallback = executorTreeRoot.Next();
                 if (fallback) {
                     tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
                 }
@@ -249,9 +255,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Format the result directly into the request response buffer. If execution
     // aborts, client_handler replaces the buffer with the error response.
-    RecordPrinter rec_printer(captions.size());
+    RecordPrinter rec_printer(captions->size());
     rec_printer.print_separator(context);
-    rec_printer.print_record(captions, context);
+    rec_printer.print_record(*captions, context);
     rec_printer.print_separator(context);
 
     const bool output_file_enabled =
@@ -259,7 +265,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     std::ostringstream out_file_stream;
     if (output_file_enabled) {
         out_file_stream << "|";
-        for (const auto& cap : captions) {
+        for (const auto& cap : *captions) {
             out_file_stream << " " << cap << " |";
         }
         out_file_stream << "\n";
@@ -268,11 +274,11 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     // 执行query_plan
     std::vector<std::string> columns;
     columns.reserve(result_cols.size());
-    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-        TupleView tuple = executorTreeRoot->current();
+    for (executorTreeRoot.beginTuple(); !executorTreeRoot.is_end(); executorTreeRoot.nextTuple()) {
+        TupleView tuple = executorTreeRoot.current();
         std::unique_ptr<RmRecord> fallback;
         if (!tuple) {
-            fallback = executorTreeRoot->Next();
+            fallback = executorTreeRoot.Next();
             if (fallback) {
                 tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
             }

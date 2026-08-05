@@ -87,6 +87,19 @@ public:
         return {};
     }
 
+    // A prepared execution frame can outlive the request-local Context that
+    // drives one execution.  These hooks make that lifetime boundary explicit:
+    // every node in a reusable tree must receive the current operation's
+    // Context, and must drop it (together with any cursor/page state in the
+    // concrete node) before COMMIT/ABORT can run.
+    virtual void begin_operation(Context* context) noexcept {
+        context_ = context;
+    }
+
+    virtual void end_operation() noexcept {
+        context_ = nullptr;
+    }
+
     virtual ColMeta get_col_offset(const TabCol& target) {
         (void)target;
         throw InternalError("get_col_offset is not implemented for " + getType());
@@ -144,6 +157,27 @@ public:
     }
 
 protected:
+    static constexpr size_t kRetainedPreparedParameterBytes = 256;
+
+    static void clear_prepared_parameter_values(std::vector<Condition>& conditions,
+                                                const std::vector<size_t>& condition_indexes) noexcept {
+        for (size_t condition_index : condition_indexes) {
+            if (condition_index >= conditions.size()) {
+                continue;
+            }
+            Value& value = conditions[condition_index].rhs_val;
+            value.raw.reset();
+            value.parameter_ordinal = 0;
+            value.is_null = true;
+            value.int_val = 0;
+            if (value.str_val.capacity() > kRetainedPreparedParameterBytes) {
+                std::string{}.swap(value.str_val);
+            } else {
+                value.str_val.clear();
+            }
+        }
+    }
+
     struct ColumnAddress {
         int offset{0};
         int len{0};

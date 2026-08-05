@@ -13,6 +13,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <assert.h>
 
+#include <array>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +27,11 @@ See the Mulan PSL v2 for more details. */
 #include "rm_defs.h"
 
 class RmManager;
+
+struct RmFileHeaderSnapshot {
+    int fd{-1};
+    std::array<char, sizeof(RmFileHdr)> bytes{};
+};
 
 /* 对表数据文件中的页面进行封装 */
 struct RmPageHandle {
@@ -67,6 +74,19 @@ struct RmPinnedInsert {
 struct RmRecordWithMeta {
     TupleMeta meta;
     std::unique_ptr<RmRecord> record;
+};
+
+// One input to the page-grouped record reader. Callers sort requests by
+// rid.page_no while original_position maps each copied tuple back to its
+// logical scan order.
+struct RmBatchReadRequest {
+    Rid rid;
+    size_t original_position{0};
+};
+
+struct RmCopiedRecordWithMeta {
+    TupleMeta meta;
+    bool present{false};
 };
 
 enum class RmTupleMetaProbeState : uint8_t { Present, Absent, Retry };
@@ -181,6 +201,15 @@ public:
         std::lock_guard<std::mutex> lock(file_header_latch_);
         return file_hdr_;
     }
+
+    RmFileHeaderSnapshot capture_file_header_snapshot() const {
+        std::lock_guard<std::mutex> lock(file_header_latch_);
+        RmFileHeaderSnapshot snapshot;
+        snapshot.fd = fd_;
+        std::memcpy(snapshot.bytes.data(), &file_hdr_, sizeof(file_hdr_));
+        return snapshot;
+    }
+
     int GetFd() {
         return fd_;
     }
@@ -207,6 +236,14 @@ public:
     // Borrow the current committed slot without copying its payload. The
     // returned guard must remain alive while view.data is accessed.
     RmRecordViewWithMeta get_record_view_with_meta(const Rid& rid) const;
+
+    // Copy a page-grouped RID batch into caller-owned storage. Requests with
+    // the same page_no must be contiguous; each group uses one buffer-pool pin
+    // and one shared page latch. copied and record_arena are indexed by
+    // original_position, preserving the caller's logical RID order.
+    void copy_records_with_meta_batch(const std::vector<RmBatchReadRequest>& page_grouped_requests,
+                                      std::vector<RmCopiedRecordWithMeta>& copied,
+                                      std::vector<char>& record_arena) const;
 
     Rid insert_record(char* buf, Context* context);
 

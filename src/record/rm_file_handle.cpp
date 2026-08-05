@@ -96,6 +96,49 @@ RmRecordViewWithMeta RmFileHandle::get_record_view_with_meta(const Rid& rid) con
         std::move(guard), nullptr};
 }
 
+void RmFileHandle::copy_records_with_meta_batch(const std::vector<RmBatchReadRequest>& page_grouped_requests,
+                                                std::vector<RmCopiedRecordWithMeta>& copied,
+                                                std::vector<char>& record_arena) const {
+    const size_t record_size = static_cast<size_t>(file_hdr_.record_size);
+    if (record_arena.size() < copied.size() * record_size) {
+        throw InternalError("record batch arena is smaller than its output tuple array");
+    }
+
+    size_t group_begin = 0;
+    while (group_begin < page_grouped_requests.size()) {
+        const page_id_t page_no = page_grouped_requests[group_begin].rid.page_no;
+        size_t group_end = group_begin + 1;
+        while (group_end < page_grouped_requests.size() && page_grouped_requests[group_end].rid.page_no == page_no) {
+            ++group_end;
+        }
+        for (size_t i = group_begin; i < group_end; ++i) {
+            if (page_grouped_requests[i].original_position >= copied.size()) {
+                throw InternalError("record batch output position is out of range");
+            }
+        }
+
+        RmPageHandle page_handle = fetch_page_handle(page_no);
+        PagePinGuard page_pin(buffer_pool_manager_, page_handle.page->get_page_id());
+        {
+            std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            for (size_t i = group_begin; i < group_end; ++i) {
+                const auto& request = page_grouped_requests[i];
+                auto& result = copied[request.original_position];
+                result.present = request.rid.slot_no >= 0 &&
+                                 request.rid.slot_no < page_handle.file_hdr->num_records_per_page &&
+                                 Bitmap::is_set(page_handle.bitmap, request.rid.slot_no);
+                if (!result.present) {
+                    continue;
+                }
+                result.meta = page_handle.get_meta(request.rid.slot_no);
+                std::memcpy(record_arena.data() + request.original_position * record_size,
+                            page_handle.get_slot(request.rid.slot_no), record_size);
+            }
+        }
+        group_begin = group_end;
+    }
+}
+
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据

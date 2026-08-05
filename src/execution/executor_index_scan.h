@@ -71,7 +71,6 @@ protected:
     };
 
     std::string tab_name_;             // 表名称
-    TabMeta tab_;                      // 表的元数据
     std::vector<Condition> conds_;     // 扫描条件
     RmFileHandle* fh_;                 // 表的数据文件句柄
     std::vector<ColMeta> cols_;        // 需要读取的字段
@@ -80,13 +79,12 @@ protected:
     std::vector<ConditionAddress> condition_addresses_;
     std::vector<Condition> base_conds_; // original conditions from construction, for INLJ key injection
 
-    std::vector<std::string> index_col_names_; // index scan涉及到的索引包含的字段
-    IndexMeta index_meta_;                     // index scan涉及到的索引元数据
+    IndexMeta index_meta_; // index scan涉及到的索引元数据
 
     struct CompiledIndexCondition {
         size_t index_col_ordinal;
         CompOp op;
-        Value literal;
+        size_t condition_ordinal;
     };
 
     struct BoundValue {
@@ -135,7 +133,121 @@ protected:
     bool merged_key_ordered_{false};
     RmRecordViewWithMeta buffered_tuple_;
 
+    static constexpr size_t kHeapBatchSize = 32;
+    std::vector<Rid> heap_batch_rids_;
+    std::vector<RmBatchReadRequest> heap_batch_requests_;
+    std::vector<RmCopiedRecordWithMeta> heap_batch_copies_;
+    std::vector<char> heap_batch_record_arena_;
+    size_t heap_batch_position_{0};
+    bool heap_batch_enabled_{false};
+    bool heap_batch_end_{true};
+
     SmManager* sm_manager_;
+
+    static constexpr size_t kRetainedPreparedCandidateCapacity = 4096;
+
+    template <typename T> static void clear_prepared_candidate_vector(std::vector<T>& values) noexcept {
+        values.clear();
+        if (values.capacity() > kRetainedPreparedCandidateCapacity) {
+            std::vector<T>{}.swap(values);
+        }
+    }
+
+    void clear_heap_batch_state() noexcept {
+        buffered_tuple_ = {};
+        heap_batch_rids_.clear();
+        heap_batch_requests_.clear();
+        heap_batch_copies_.clear();
+        heap_batch_record_arena_.clear();
+        heap_batch_position_ = 0;
+        heap_batch_enabled_ = false;
+        heap_batch_end_ = true;
+    }
+
+    void release_operation_state() noexcept {
+        // `scan_` can point into any of the three optional cursor owners. Drop
+        // the non-owning pointer first, then destroy IxScan before clearing the
+        // containers referenced by the lightweight cursors.
+        scan_ = nullptr;
+        index_scan_cursor_.reset();
+        single_rid_cursor_.reset();
+        rid_vector_cursor_.reset();
+        clear_prepared_candidate_vector(rid_scan_rids_);
+        clear_prepared_candidate_vector(historical_rids_);
+        clear_prepared_candidate_vector(historical_entries_);
+        seen_rids_.clear();
+        if (seen_rids_.bucket_count() > kRetainedPreparedCandidateCapacity) {
+            std::unordered_set<uint64_t>{}.swap(seen_rids_);
+        }
+        clear_heap_batch_state();
+        predicate_recorded_ = false;
+        lookup_key_valid_ = false;
+        use_historical_index_candidates_ = false;
+        historical_candidates_merged_ = false;
+        merged_key_ordered_ = false;
+    }
+
+    bool refill_heap_batch() {
+        heap_batch_rids_.clear();
+        heap_batch_requests_.clear();
+        heap_batch_copies_.clear();
+        heap_batch_position_ = 0;
+
+        while (heap_batch_rids_.size() < kHeapBatchSize && !scan_->is_end()) {
+            heap_batch_rids_.push_back(scan_->rid());
+            scan_->next();
+        }
+        if (heap_batch_rids_.empty()) {
+            heap_batch_end_ = true;
+            return false;
+        }
+
+        heap_batch_requests_.reserve(kHeapBatchSize);
+        for (size_t i = 0; i < heap_batch_rids_.size(); ++i) {
+            heap_batch_requests_.push_back(RmBatchReadRequest{heap_batch_rids_[i], i});
+        }
+        std::sort(heap_batch_requests_.begin(), heap_batch_requests_.end(),
+                  [](const RmBatchReadRequest& lhs, const RmBatchReadRequest& rhs) {
+                      return lhs.rid.page_no < rhs.rid.page_no;
+                  });
+
+        heap_batch_copies_.resize(heap_batch_rids_.size());
+        heap_batch_record_arena_.resize(heap_batch_rids_.size() * len_);
+        fh_->copy_records_with_meta_batch(heap_batch_requests_, heap_batch_copies_, heap_batch_record_arena_);
+        heap_batch_end_ = false;
+        return true;
+    }
+
+    void advance_batched_to_match() {
+        buffered_tuple_ = {};
+        for (;;) {
+            if (heap_batch_position_ >= heap_batch_rids_.size() && !refill_heap_batch()) {
+                return;
+            }
+
+            rid_ = heap_batch_rids_[heap_batch_position_];
+            RmRecordViewWithMeta tuple;
+            const auto& copied = heap_batch_copies_[heap_batch_position_];
+            if (copied.present) {
+                bool needs_heap_reread = false;
+                tuple = GetVisibleTupleFromCopiedBase(copied.meta,
+                                                      heap_batch_record_arena_.data() + heap_batch_position_ * len_,
+                                                      static_cast<uint32_t>(len_), context_, &needs_heap_reread);
+                if (needs_heap_reread) {
+                    tuple = GetVisibleTuple(fh_, rid_, context_);
+                }
+            }
+            if (tuple.view.data != nullptr) {
+                const TupleView view{tuple.view.data, tuple.view.size};
+                if (conditions_match(fed_conds_, condition_addresses_, view)) {
+                    record_tuple_read(rid_);
+                    buffered_tuple_ = std::move(tuple);
+                    return;
+                }
+            }
+            ++heap_batch_position_;
+        }
+    }
 
     void record_predicate_read() {
         if (predicate_recorded_ || context_ == nullptr || !context_->enable_ssi_read_tracking_ ||
@@ -264,7 +376,8 @@ protected:
     void compile_index_conditions() {
         compiled_index_conditions_.clear();
         compiled_index_conditions_.reserve(conds_.size());
-        for (const auto& cond : conds_) {
+        for (size_t condition_ordinal = 0; condition_ordinal < fed_conds_.size(); ++condition_ordinal) {
+            const auto& cond = fed_conds_[condition_ordinal];
             // NULL 不进索引键：`IS [NOT] NULL` 与 `col = NULL` 留给 fed_conds_ 过滤
             if (!is_indexable_value_condition(cond) || cond.lhs_col.tab_name != tab_name_ || cond.op == OP_NE) {
                 continue;
@@ -273,7 +386,7 @@ protected:
             if (ordinal == index_meta_.cols.size()) {
                 continue;
             }
-            compiled_index_conditions_.push_back(CompiledIndexCondition{ordinal, cond.op, cond.rhs_val});
+            compiled_index_conditions_.push_back(CompiledIndexCondition{ordinal, cond.op, condition_ordinal});
         }
     }
 
@@ -289,15 +402,16 @@ protected:
         for (const auto& compiled : compiled_index_conditions_) {
             const auto& col = index_meta_.cols[compiled.index_col_ordinal];
             auto& constraint = constraints_[compiled.index_col_ordinal];
+            const Value& literal = fed_conds_[compiled.condition_ordinal].rhs_val;
             switch (compiled.op) {
             case OP_EQ:
-                write_value_to_key_part(constraint.eq.data(), compiled.literal, col);
+                write_value_to_key_part(constraint.eq.data(), literal, col);
                 constraint.eq_present = true;
                 break;
             case OP_GT:
             case OP_GE: {
                 bool inclusive = compiled.op == OP_GE;
-                write_value_to_key_part(value_key_scratch_.data(), compiled.literal, col);
+                write_value_to_key_part(value_key_scratch_.data(), literal, col);
                 bool replace = !constraint.lower.present;
                 if (!replace) {
                     int cmp = compare_key_part(value_key_scratch_.data(), constraint.lower.data.data(), col);
@@ -313,7 +427,7 @@ protected:
             case OP_LT:
             case OP_LE: {
                 bool inclusive = compiled.op == OP_LE;
-                write_value_to_key_part(value_key_scratch_.data(), compiled.literal, col);
+                write_value_to_key_part(value_key_scratch_.data(), literal, col);
                 bool replace = !constraint.upper.present;
                 if (!replace) {
                     int cmp = compare_key_part(value_key_scratch_.data(), constraint.upper.data.data(), col);
@@ -367,13 +481,12 @@ public:
         context_ = context;
         direction_ = direction;
         tab_name_ = std::move(tab_name);
-        tab_ = sm_manager_->db_.get_table(tab_name_);
+        TabMeta& table = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
         // index_no_ = index_no;
-        index_col_names_ = index_col_names;
-        index_meta_ = *(tab_.get_index_meta(index_col_names_));
+        index_meta_ = *(table.get_index_meta(index_col_names));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
-        cols_ = tab_.cols;
+        cols_ = table.cols;
         // 同 SeqScanExecutor：包含尾部 null bitmap
         len_ = static_cast<size_t>(fh_->get_file_hdr().record_size);
 
@@ -405,12 +518,7 @@ public:
         context_ = context;
         direction_ = direction;
         tab_name_ = std::move(tab_name);
-        tab_ = table;
         conds_ = std::move(conds);
-        index_col_names_.reserve(index.cols.size());
-        for (const auto& column : index.cols) {
-            index_col_names_.push_back(column.name);
-        }
         index_meta_ = index;
         fh_ = table_handle;
         cols_ = table.cols;
@@ -434,7 +542,36 @@ public:
         rebuild_constraints();
     }
 
+    void replace_prepared_conditions(std::vector<Condition>& staged_conditions) noexcept {
+        assert(staged_conditions.size() == fed_conds_.size());
+        assert(compiled_index_conditions_.capacity() >= staged_conditions.size());
+        fed_conds_.swap(staged_conditions);
+        compile_index_conditions();
+        rebuild_constraints();
+        lookup_key_valid_ = false;
+    }
+
+    void clear_prepared_parameters(const std::vector<size_t>& condition_indexes) noexcept {
+        clear_prepared_parameter_values(fed_conds_, condition_indexes);
+    }
+
+    const std::vector<Condition>& prepared_conditions_ref() const noexcept {
+        return fed_conds_;
+    }
+
+    void begin_operation(Context* context) noexcept override {
+        clear_heap_batch_state();
+        context_ = context;
+        predicate_recorded_ = false;
+    }
+
+    void end_operation() noexcept override {
+        release_operation_state();
+        context_ = nullptr;
+    }
+
     void beginTuple() override {
+        clear_heap_batch_state();
         scan_ = nullptr;
         index_scan_cursor_.reset();
         single_rid_cursor_.reset();
@@ -635,15 +772,24 @@ public:
                                        direction_);
             scan_ = &*index_scan_cursor_;
         }
+        heap_batch_enabled_ = direction_ == ScanDirection::Forward && !exact_key_lookup;
         advance_to_match();
     }
 
     void nextTuple() override {
-        scan_->next();
+        if (heap_batch_enabled_) {
+            ++heap_batch_position_;
+        } else {
+            scan_->next();
+        }
         advance_to_match();
     }
 
     void advance_to_match() {
+        if (heap_batch_enabled_) {
+            advance_batched_to_match();
+            return;
+        }
         buffered_tuple_ = {};
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
@@ -684,7 +830,7 @@ public:
     }
 
     bool is_end() const override {
-        return scan_ == nullptr || scan_->is_end();
+        return scan_ == nullptr || (heap_batch_enabled_ ? heap_batch_end_ : scan_->is_end());
     }
 
     const std::vector<ColMeta>& cols() const override {

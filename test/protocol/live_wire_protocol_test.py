@@ -512,6 +512,7 @@ def test_prepared_select_fast_route(server):
         client.command("INSERT INTO prepared_route VALUES (1, 'one');")
         client.command("INSERT INTO prepared_route VALUES (2, 'two');")
         client.command("INSERT INTO prepared_route VALUES (3, 'three');")
+        client.command("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
         statements = [
             (
                 200,
@@ -524,15 +525,66 @@ def test_prepared_select_fast_route(server):
         schemas = client.prepare(statements)
         parameter_types = {200: [INT32, INT32, INT32]}
         executed, status, failed, diagnostic, results = client.batch(
-            [(200, [2, 1, 0]), (200, [3, 1, 0])], parameter_types, schemas
+            [(200, [1, 0, 0]), (200, [2, 1, 0]), (200, [3, 1, 0])],
+            parameter_types,
+            schemas,
         )
         require(
-            (executed, status, failed, diagnostic) == (2, 0, 0xFFFF, ""),
+            (executed, status, failed, diagnostic) == (3, 0, 0xFFFF, ""),
             "prepared SELECT fast-route batch failed",
         )
         require(
-            results == [(0, [[2, "two"]]), (1, [[3, "three"]])],
+            results == [(0, []), (1, [[2, "two"]]), (2, [[3, "three"]])],
             "prepared SELECT reused stale repeated parameters",
+        )
+
+        ddl_client = WireClient(server.port)
+        try:
+            ddl_client.command("CREATE INDEX prepared_route(id);")
+        finally:
+            ddl_client.close()
+        executed, status, failed, diagnostic, results = client.batch(
+            [(200, [2, 1, 0])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results)
+            == (1, 0, 0xFFFF, "", [(0, [[2, "two"]])]),
+            "prepared SELECT did not revalidate after a catalog generation change",
+        )
+
+        executed, status, failed, diagnostic, results = client.batch(
+            [(200, [2, -1, 0])], parameter_types, schemas
+        )
+        require(
+            executed == 0 and status != 0 and failed == 0 and results == [],
+            "invalid prepared LIMIT did not abort the operation",
+        )
+        executed, status, failed, diagnostic, results = client.batch(
+            [(200, [1, 1, 0])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results)
+            == (1, 0, 0xFFFF, "", [(0, [[1, "one"]])]),
+            "prepared SELECT frame was not reusable after a bind exception",
+        )
+
+        replacement = [
+            (
+                200,
+                True,
+                [INT32],
+                "SELECT id, note FROM prepared_route WHERE id = $1;",
+            ),
+        ]
+        schemas = client.prepare(replacement)
+        parameter_types = {200: [INT32]}
+        executed, status, failed, diagnostic, results = client.batch(
+            [(200, [3])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results)
+            == (1, 0, 0xFFFF, "", [(0, [[3, "three"]])]),
+            "re-PREPARE did not replace and destroy the old SELECT frame",
         )
 
     finally:

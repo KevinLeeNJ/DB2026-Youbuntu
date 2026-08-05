@@ -178,4 +178,23 @@ public:
     void flush_index_header(const IxIndexHandle* ih) {
         ih->write_index_header_page();
     }
+
+    // Publish a fixed-cut header image without taking the live index latch.
+    // The per-file gate serializes this write with SMO page/header publication,
+    // while the detached dependency preserves WAL-before-data ordering.
+    void write_detached_index_header(const IxIndexHeaderSnapshot& snapshot) {
+        if (snapshot.fd < 0 || snapshot.bytes.empty() || snapshot.bytes.size() > PAGE_SIZE) {
+            throw InternalError("invalid detached index header snapshot");
+        }
+        buffer_pool_manager_->begin_index_file_write(snapshot.fd);
+        try {
+            buffer_pool_manager_->ensure_write_dependency(snapshot.dependency);
+            disk_manager_->write_page(snapshot.fd, IX_FILE_HDR_PAGE, snapshot.bytes.data(),
+                                      static_cast<int>(snapshot.bytes.size()));
+        } catch (...) {
+            buffer_pool_manager_->end_index_file_write(snapshot.fd);
+            throw;
+        }
+        buffer_pool_manager_->end_index_file_write(snapshot.fd);
+    }
 };

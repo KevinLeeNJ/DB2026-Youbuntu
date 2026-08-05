@@ -24,7 +24,10 @@ static constexpr uint32_t INDEX_SMO_MAGIC = 0x4958534dU;  // "IXSM"
 static constexpr uint32_t INDEX_BIND_MAGIC = 0x49584244U; // "IXBD"
 static constexpr uint16_t INDEX_SMO_VERSION_V1 = 1;
 static constexpr uint16_t INDEX_SMO_VERSION_V2 = 2;
-static constexpr uint16_t INDEX_BIND_VERSION = 1;
+static constexpr uint16_t INDEX_BIND_VERSION_V1 = 1;
+static constexpr uint16_t INDEX_BIND_VERSION_V2 = 2;
+// Kept as an alias for code that emits the original renew-binding format.
+static constexpr uint16_t INDEX_BIND_VERSION = INDEX_BIND_VERSION_V1;
 static constexpr uint16_t INDEX_SMO_FLAG_HEADER_IMAGE = 1U;
 
 uint32_t IndexSmoCrc32(const char* bytes, size_t length);
@@ -42,10 +45,13 @@ private:
 class IndexBindLogRecord final : public LogRecord {
 public:
     explicit IndexBindLogRecord(std::string_view index_file_name);
+    IndexBindLogRecord(std::string_view index_file_name, uint64_t existing_generation);
     void serialize(char* dest) const override;
 
 private:
     std::string index_file_name_;
+    uint16_t version_{INDEX_BIND_VERSION_V1};
+    uint64_t explicit_generation_{0};
 };
 
 struct IndexSmoWalView {

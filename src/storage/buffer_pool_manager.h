@@ -11,8 +11,12 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -75,6 +79,19 @@ private:
         pages_; // buffer_pool中的Page对象数组，在构造空间中申请内存空间，在析构函数中释放，大小为BUFFER_POOL_SIZE
     std::unordered_map<PageId, frame_id_t, PageIdHash>
         page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
+    static constexpr size_t RESIDENT_DIRECTORY_SHARD_COUNT = 64;
+    struct ResidentDirectoryShard {
+        mutable std::shared_mutex latch;
+        std::unordered_map<PageId, frame_id_t, PageIdHash> entries;
+    };
+    enum class FastUnpinResult : uint8_t {
+        Miss,
+        Success,
+        InvalidPin,
+    };
+    // page_table_ remains the sole authoritative resident-page map. This
+    // sharded directory is a derived index containing only VALID mappings.
+    std::array<ResidentDirectoryShard, RESIDENT_DIRECTORY_SHARD_COUNT> resident_directory_;
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
     std::vector<ResidencyClass> residency_classes_;
@@ -91,8 +108,13 @@ private:
     std::condition_variable_any index_smo_cv_;
     std::unordered_map<int, size_t> index_smo_barriers_;
     std::unordered_map<int, size_t> index_writes_inflight_;
-    bool frame_operation_active_{false};
-    uint64_t frame_operation_generation_{0};
+    std::atomic<bool> frame_operation_active_{false};
+    std::atomic<uint64_t> frame_operation_generation_{0};
+    uint64_t next_checkpoint_cohort_epoch_{1};
+    uint64_t active_checkpoint_cohort_epoch_{0};
+    size_t checkpoint_cohort_pages_remaining_{0};
+    std::deque<frame_id_t> checkpoint_cohort_pending_frames_;
+    size_t checkpoint_cohort_frames_visited_for_test_{0};
 
 public:
     static void set_flush_page_test_hook(FlushPageTestHook hook);
@@ -139,6 +161,12 @@ public:
         page_table_.max_load_factor(0.7F);
         const size_t expected_resident_pages = pool_size_ + (pool_size_ + 4) / 5;
         page_table_.reserve(expected_resident_pages);
+        const size_t expected_pages_per_shard =
+            (expected_resident_pages + RESIDENT_DIRECTORY_SHARD_COUNT - 1) / RESIDENT_DIRECTORY_SHARD_COUNT;
+        for (auto& shard : resident_directory_) {
+            shard.entries.max_load_factor(0.7F);
+            shard.entries.reserve(expected_pages_per_shard);
+        }
     }
 
     ~BufferPoolManager() = default;
@@ -230,13 +258,45 @@ public:
 
     // Write at most max_pages dirty resident pages whose file descriptor is in
     // allowed_fds, without requiring a checkpoint barrier. An empty whitelist
-    // intentionally flushes nothing: background callers must explicitly prove
-    // that every file is a table file, so index payload can never be mistaken
-    // for a page LSN. Selection advances round-robin over buffer frames.
+    // intentionally flushes nothing. Typed page dependencies preserve
+    // WAL-before-data for table and index payloads, and the index-SMO gate
+    // serializes structural writes. Selection advances round-robin.
     FlushBatchResult flush_dirty_pages(const std::vector<int>& allowed_fds, size_t max_pages);
 
-    // Count dirty, valid resident pages in the explicit file whitelist. This is
-    // used by focused storage tests.
+    struct CheckpointCohort {
+        uint64_t epoch = 0;
+        size_t pages_marked = 0;
+        bool success = false;
+    };
+
+    struct CheckpointCohortFlushResult {
+        size_t pages_written = 0;
+        size_t pages_remaining = 0;
+        bool success = true;
+    };
+
+    // Capture a fixed set of dirty, valid resident pages in the explicit file
+    // whitelist. Only one unfinished cohort may exist at a time; this prevents
+    // a later checkpoint from silently replacing an earlier obligation. The
+    // call waits, while releasing the BPM latch, for already-claimed writes in
+    // the whitelist to settle. A timeout returns success=false and epoch=0
+    // without changing any page marker or consuming an epoch.
+    CheckpointCohort
+    begin_checkpoint_cohort(const std::vector<int>& allowed_fds,
+                            std::chrono::milliseconds settle_timeout = std::chrono::milliseconds(5000));
+
+    // Flush at most max_pages members of the named fixed cohort. Successful
+    // writes discharge membership even when the page was re-dirtied after its
+    // image was copied; that newer image remains dirty for a later checkpoint.
+    CheckpointCohortFlushResult flush_checkpoint_cohort(uint64_t epoch, size_t max_pages);
+
+    // Abandon only the named cohort after a checkpoint-stage failure. This is
+    // idempotent and does not make pages clean or weaken their WAL dependency.
+    size_t cancel_checkpoint_cohort(uint64_t epoch);
+
+    // Count dirty, valid resident pages in the explicit file whitelist. The
+    // page table is the resident-page index, so this remains exact without
+    // scanning unused frames in a large pool.
     size_t count_dirty_pages(const std::vector<int>& allowed_fds);
 
     void delete_all_pages(int fd);
@@ -259,8 +319,18 @@ private:
     void release_index_file_write_locked(int fd);
     void recycle_frame(frame_id_t frame_id);
     size_t available_frames_locked() const;
-    bool operation_authorized_locked(const FrameOperationToken* operation) const;
+    bool operation_authorized(const FrameOperationToken* operation, uint64_t generation) const;
     void release_frame_operation(uint64_t generation) noexcept;
+    size_t resident_directory_shard_index(PageId page_id) const noexcept;
+    void install_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state);
+    void set_mapped_frame_state_locked(PageId page_id, frame_id_t frame_id, FrameState state);
+    void erase_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state);
+    bool claim_page_for_eviction_locked(PageId page_id, frame_id_t frame_id, bool removed_from_replacer,
+                                        bool require_normal_residency);
+    void restore_blocked_victims_locked(const std::vector<frame_id_t>& blocked);
+    bool resident_directory_is_consistent_for_test();
+    Page* fetch_resident_page_fast(PageId page_id, const FrameOperationToken* operation);
+    FastUnpinResult unpin_clean_page_fast(PageId page_id);
     Page* fetch_page_impl(PageId page_id, const FrameOperationToken* operation);
     Page* new_page_impl(PageId* page_id, const FrameOperationToken* operation);
     void clear_residency(frame_id_t frame_id);
@@ -268,5 +338,7 @@ private:
     static void run_flush_page_test_hook(PageId page_id, Page* page);
     static void run_flush_page_after_write_test_hook(PageId page_id, Page* page);
     static void run_flush_batch_before_write_test_hook(PageId page_id, Page* page);
+    void clear_checkpoint_cohort_marker_locked(Page* page);
+    void finish_checkpoint_cohort_if_complete_locked();
     bool flush_page_impl(PageId page_id, bool dirty_only);
 };

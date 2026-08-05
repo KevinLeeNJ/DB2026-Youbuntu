@@ -24,6 +24,23 @@ public:
     LimitExecutor(std::unique_ptr<AbstractExecutor> prev, size_t limit, size_t offset = 0)
         : prev_(std::move(prev)), limit_(limit), offset_(offset) {}
 
+    void replace_prepared_bounds(size_t limit, size_t offset) noexcept {
+        limit_ = limit;
+        offset_ = offset;
+        returned_ = 0;
+    }
+
+    void begin_operation(Context* context) noexcept override {
+        context_ = context;
+        prev_->begin_operation(context);
+    }
+
+    void end_operation() noexcept override {
+        returned_ = 0;
+        prev_->end_operation();
+        context_ = nullptr;
+    }
+
     void beginTuple() override {
         returned_ = 0;
         prev_->beginTuple();

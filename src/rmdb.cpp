@@ -41,6 +41,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/plan.h"
 #include "optimizer/planner.h"
 #include "portal.h"
+#include "execution/prepared_select_execution_frame.h"
 #include "analyze/analyze.h"
 #include "protocol/wire_protocol.h"
 
@@ -66,8 +67,6 @@ auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(
 // PROCESS_CRASH available to focused LogManager tests, but never let an
 // omitted or misspelled environment variable weaken the production path.
 auto log_manager = std::make_unique<LogManager>(disk_manager.get(), DurabilityMode::STRICT);
-auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get(),
-                                                  log_manager.get());
 
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
@@ -348,6 +347,9 @@ struct PreparedStatement {
     std::vector<std::string> names;
     std::vector<Type> result_types;
     std::unique_ptr<const PreparedPlanDescriptor> descriptor;
+    // Declared after descriptor so normal destruction releases the frame's
+    // borrowed metadata pointers before destroying their owner.
+    std::unique_ptr<PreparedSelectExecutionFrame> select_frame;
     std::string database_identity;
     std::uint64_t catalog_generation = 0;
 };
@@ -452,17 +454,19 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
             throw RMDBError("structural DDL and LOAD are not allowed inside an explicit transaction");
         }
     }
+    const bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
+    const bool is_load = parsed_type == ast::AstType::LoadStmt;
     std::optional<SmManager::CatalogSharedGuard> catalog_shared_guard;
     std::optional<SmManager::CatalogExclusiveGuard> catalog_exclusive_guard;
-    if (!catalog_guard_held) {
+    // A clean checkpoint acquires checkpoint coordination before the catalog
+    // guard. Do not reverse that order in the generic execution path.
+    if (!catalog_guard_held && !is_checkpoint) {
         if (catalog_change) {
             catalog_exclusive_guard.emplace(sm_manager->acquire_catalog_exclusive());
         } else {
             catalog_shared_guard.emplace(sm_manager->acquire_catalog_shared());
         }
     }
-    const bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
-    const bool is_load = parsed_type == ast::AstType::LoadStmt;
     if (!is_checkpoint && !is_load) {
         SetTransaction(session, &context);
     }
@@ -530,21 +534,53 @@ ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
     return ParameterFrame(std::move(values));
 }
 
-ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters,
+ExecutionOutcome execute_prepared_operation(PreparedStatement& prepared_statement, const ParameterFrame& parameters,
                                             SessionState& session, QueryResultSink* result_sink,
                                             Context* reusable_context) {
     if (reusable_context == nullptr) {
         throw InternalError("prepared operation requires a reusable Context");
     }
+    if (prepared_statement.descriptor == nullptr) {
+        throw InternalError("prepared operation requires a plan descriptor");
+    }
+    const PreparedPlanDescriptor& descriptor = *prepared_statement.descriptor;
     Context& context = *reusable_context;
     context.isolation_level_ = session.isolation;
     context.result_sink_ = result_sink;
     context.output_file_enabled_ = &session.output_file_enabled;
     SetTransaction(session, &context);
     try {
-        std::unique_ptr<PortalStmt> statement = portal->start_prepared(descriptor, parameters, &context);
-        const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        if (parameters.size() != descriptor.parameter_layout().size()) {
+            throw RMDBError("prepared parameter count does not match descriptor");
+        }
+        bool is_query = false;
+        const PreparedSelectExecutable* select_executable = descriptor.select_executable();
+        const bool reusable_select =
+            descriptor.statement_kind() == PreparedStatementKind::Select && select_executable != nullptr &&
+            select_executable->scan.sm_manager == sm_manager.get() &&
+            descriptor.catalog_generation() == sm_manager->get_catalog_generation() &&
+            descriptor.database_identity() == sm_manager->get_database_identity_under_catalog_guard();
+        if (reusable_select) {
+            if (prepared_statement.select_frame == nullptr) {
+                prepared_statement.select_frame = PreparedSelectExecutionFrame::Build(*select_executable);
+            }
+            if (prepared_statement.select_frame != nullptr) {
+                // The lease must unwind before commit/abort: index and heap
+                // page guards cannot survive into transaction completion.
+                auto lease = prepared_statement.select_frame->begin_operation(parameters, &context);
+                ql_manager->select_from(lease.root(), descriptor.output_names(), &context);
+                lease.close();
+                is_query = true;
+            } else {
+                std::unique_ptr<PortalStmt> statement = portal->start_prepared(descriptor, parameters, &context);
+                is_query = statement->tag == PORTAL_ONE_SELECT;
+                portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+            }
+        } else {
+            std::unique_ptr<PortalStmt> statement = portal->start_prepared(descriptor, parameters, &context);
+            is_query = statement->tag == PORTAL_ONE_SELECT;
+            portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
+        }
         session.isolation = context.isolation_level_;
         portal->drop();
         if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
@@ -651,6 +687,9 @@ void revalidate_prepared(PreparedStatement& statement, IsolationLevel isolation)
         refreshed.result_types != statement.result_types) {
         throw wire_protocol::ProtocolError("prepared result schema changed after catalog update");
     }
+    // The frame borrows binding metadata from the old descriptor. Destroy it
+    // before move-assigning the refreshed descriptor.
+    statement.select_frame.reset();
     statement = std::move(refreshed);
 }
 
@@ -805,8 +844,8 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             auto template_tree = ast::parse_sql(template_sql);
             if (template_tree == nullptr)
                 throw wire_protocol::ProtocolError("empty prepared SQL");
-            if (changes_catalog(template_tree->type)) {
-                throw wire_protocol::ProtocolError("PREPARE_SET does not allow structural DDL or LOAD");
+            if (changes_catalog(template_tree->type) || template_tree->type == ast::AstType::StaticCheckpoint) {
+                throw wire_protocol::ProtocolError("PREPARE_SET does not allow structural DDL, LOAD, or checkpoint");
             }
             std::vector<bool> seen(statement.parameters.size(), false);
             std::function<void(const ast::TreeNode&)> collect = [&](const ast::TreeNode& node) {
@@ -928,8 +967,9 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         if (it == prepared.end()) {
             throw wire_protocol::ProtocolError("unknown prepared statement id");
         }
-        if (it->second.template_tree == nullptr || changes_catalog(it->second.template_tree->type)) {
-            throw wire_protocol::ProtocolError("prepared structural DDL or LOAD is not executable");
+        if (it->second.template_tree == nullptr || changes_catalog(it->second.template_tree->type) ||
+            it->second.template_tree->type == ast::AstType::StaticCheckpoint) {
+            throw wire_protocol::ProtocolError("prepared structural DDL, LOAD, or checkpoint is not executable");
         }
         Operation operation{&it->second, {}};
         for (Type type : operation.statement->parameters) {
@@ -946,48 +986,48 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         for (std::uint16_t i = 0; i < operation_count; ++i) {
             auto* prepared_statement = operations[i].statement;
             if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
-                    prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
-                    revalidate_prepared(*prepared_statement, session.isolation);
-                }
-                const bool prepared_fast_path = descriptor_runtime_eligible(prepared_statement->descriptor.get());
-                batch.reset_for_operation(session, &batch.result, prepared_fast_path);
-                batch.result.begin_operation(i);
-                const auto make_bindings = [&]() {
-                    std::vector<std::unique_ptr<ast::Value>> values;
-                    values.reserve(operations[i].values.size());
-                    for (const auto& value : operations[i].values) {
-                        if (value.type != prepared_statement->parameters[values.size()])
-                            throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
-                        if (!value.present) {
-                            // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
-                            values.push_back(std::make_unique<ast::NullLit>());
-                            continue;
-                        }
-                        if (value.type == Type::INT32)
-                            values.push_back(std::make_unique<ast::IntLit>(value.int32));
-                        else if (value.type == Type::FLOAT32) {
-                            float number;
-                            std::memcpy(&number, &value.float_bits, sizeof(number));
-                            values.push_back(std::make_unique<ast::FloatLit>(number));
-                        } else
-                            values.push_back(std::make_unique<ast::StringLit>(value.text));
+                prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
+                revalidate_prepared(*prepared_statement, session.isolation);
+            }
+            const bool prepared_fast_path = descriptor_runtime_eligible(prepared_statement->descriptor.get());
+            batch.reset_for_operation(session, &batch.result, prepared_fast_path);
+            batch.result.begin_operation(i);
+            const auto make_bindings = [&]() {
+                std::vector<std::unique_ptr<ast::Value>> values;
+                values.reserve(operations[i].values.size());
+                for (const auto& value : operations[i].values) {
+                    if (value.type != prepared_statement->parameters[values.size()])
+                        throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
+                    if (!value.present) {
+                        // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
+                        values.push_back(std::make_unique<ast::NullLit>());
+                        continue;
                     }
-                    return values;
-                };
-                ExecutionOutcome outcome;
-                if (prepared_fast_path) {
-                    const auto parameter_frame = make_parameter_frame(operations[i].values);
-                    outcome = execute_prepared_operation(*prepared_statement->descriptor, parameter_frame, session,
-                                                         &batch.result, &batch.context);
-                } else {
-                    auto values = make_bindings();
-                    outcome = execute_tree_under_catalog_guard(
-                        ast::clone_bound_tree(*prepared_statement->template_tree, values), session, &batch.result,
-                        &batch.context);
+                    if (value.type == Type::INT32)
+                        values.push_back(std::make_unique<ast::IntLit>(value.int32));
+                    else if (value.type == Type::FLOAT32) {
+                        float number;
+                        std::memcpy(&number, &value.float_bits, sizeof(number));
+                        values.push_back(std::make_unique<ast::FloatLit>(number));
+                    } else
+                        values.push_back(std::make_unique<ast::StringLit>(value.text));
                 }
-                batch.result.finish_operation(outcome.query);
-                ++executed;
-                }
+                return values;
+            };
+            ExecutionOutcome outcome;
+            if (prepared_fast_path) {
+                const auto parameter_frame = make_parameter_frame(operations[i].values);
+                outcome = execute_prepared_operation(*prepared_statement, parameter_frame, session, &batch.result,
+                                                     &batch.context);
+            } else {
+                auto values = make_bindings();
+                outcome =
+                    execute_tree_under_catalog_guard(ast::clone_bound_tree(*prepared_statement->template_tree, values),
+                                                     session, &batch.result, &batch.context);
+            }
+            batch.result.finish_operation(outcome.query);
+            ++executed;
+        }
     } catch (TransactionAbortException& exception) {
         failed = executed;
         abort_session(session, &batch.context);
@@ -1149,6 +1189,8 @@ int main(int argc, char** argv) {
 
         // recovery database
         {
+            auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(),
+                                                              sm_manager.get(), log_manager.get());
             minilog::Logger::get().set_level(minilog::LogLevel::INFO);
             const auto phase_elapsed_ms = [](std::chrono::steady_clock::time_point begin) {
                 return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)

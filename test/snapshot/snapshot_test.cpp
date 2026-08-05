@@ -706,8 +706,8 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockAbortsWhileOwnerRemainsActive)
     ASSERT_TRUE(victim.exec_sql_ok("begin;"));
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_immediate_conflict set val = 200 where id = 1;"));
 
-    const std::string victim_abort = victim.exec_sql_expect_abort(
-        "update si_first_immediate_conflict set val = val + 1 where id = 1;");
+    const std::string victim_abort =
+        victim.exec_sql_expect_abort("update si_first_immediate_conflict set val = val + 1 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
     ASSERT_NE(owner.current_transaction(), nullptr);
     EXPECT_NE(owner.current_transaction()->get_state(), TransactionState::ABORTED);
@@ -731,8 +731,8 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockOwnerAbortDoesNotReviveAborted
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_abort_owner_abort set val = 200 where id = 1;"));
     ASSERT_TRUE(victim.exec_sql_ok("begin;"));
 
-    const std::string victim_abort = victim.exec_sql_expect_abort(
-        "update si_first_abort_owner_abort set val = val + 1 where id = 1;");
+    const std::string victim_abort =
+        victim.exec_sql_expect_abort("update si_first_abort_owner_abort set val = val + 1 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
     ASSERT_TRUE(owner.exec_sql_ok("abort;"));
 
@@ -755,8 +755,8 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockOwnerCommitStillLeavesVictimAb
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_abort_owner_commit set val = 200 where id = 1;"));
     ASSERT_TRUE(victim.exec_sql_ok("begin;"));
 
-    const std::string victim_abort = victim.exec_sql_expect_abort(
-        "update si_first_abort_owner_commit set val = val + 1 where id = 1;");
+    const std::string victim_abort =
+        victim.exec_sql_expect_abort("update si_first_abort_owner_commit set val = val + 1 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
 
     ASSERT_TRUE(owner.exec_sql_ok("commit;"));

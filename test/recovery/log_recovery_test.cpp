@@ -159,9 +159,9 @@ lsn_t AppendDelete(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const R
 }
 
 lsn_t AppendUpdate(LogManager& log_mgr, txn_id_t txn_id, lsn_t prev_lsn, const Rid& rid, RmRecord& old_rec,
-                   RmRecord& new_rec) {
+                   RmRecord& new_rec, bool index_keys_unchanged = false) {
     Rid log_rid = rid;
-    UpdateLogRecord update(txn_id, old_rec, new_rec, log_rid, "t");
+    UpdateLogRecord update(txn_id, old_rec, new_rec, log_rid, "t", index_keys_unchanged);
     update.prev_lsn_ = prev_lsn;
     return log_mgr.add_log_to_buffer(&update);
 }
@@ -391,6 +391,30 @@ TEST(RecoveryManagerTest, IndexSmoOnlyWalRestoresTheAfterImage) {
 
     OpenRecoveryDb db(db_name);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 17, rid));
+}
+
+TEST(RecoveryManagerTest, UnpublishedCheckpointCutDoesNotInvalidateEarlierIndexSmo) {
+    ScopedTestDir test_dir("recovery_unpublished_checkpoint_cut_root");
+    const std::string db_name = "recovery_unpublished_checkpoint_cut_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 18};
+    PrepareSinglePageIndexSmo(db_name, 18, rid, false);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.log_mgr_->initialize_from_existing_log();
+        const std::string index_name = db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"});
+        const CheckpointWalCut cut = db.log_mgr_->create_checkpoint_wal_cut({index_name});
+        ASSERT_EQ(cut.index_bindings.size(), 1U);
+        // Deliberately do not publish cut.checkpoint_offset. Recovery must use
+        // the old boundary and still accept the earlier same-generation SMO.
+        EXPECT_EQ(db.log_mgr_->read_restart_offset(), 0);
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 18, rid));
 }
 
 TEST(RecoveryManagerTest, MultipleIndexSmoRecordsPrepareEachIndexOnlyOnce) {
@@ -785,6 +809,66 @@ TEST(RecoveryManagerTest, CommittedSparseUpdateRedoesFullRowAndRepairsBothIndexK
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 2, rid));
 }
 
+TEST(RecoveryManagerTest, CommittedBidirectionalDeltaRedoesAgainstTheDurableBase) {
+    ScopedTestDir test_dir("recovery_committed_delta_update_root");
+    const std::string db_name = "recovery_committed_delta_update_db";
+    CreateWideRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto old_rec = MakeWideTuple(1, 'a');
+    auto new_rec = MakeWideTuple(1, 'a');
+    constexpr int kChangedOffset = sizeof(int) + 20;
+    new_rec.data[kChangedOffset] = 'z';
+    Rid log_rid = rid;
+    UpdateLogRecord shape(100, old_rec, new_rec, log_rid, "t", true);
+    ASSERT_TRUE(shape.bidirectional_delta_encoding_);
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, old_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec, true);
+        AppendCommit(*db.log_mgr_, 100, update_lsn);
+        FlushLogs(*db.log_mgr_);
+
+        // Legal crash window: the UPDATE body and writer ownership reached the
+        // page before the durable COMMIT was published into tuple metadata.
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->apply_tuple_update(rid, new_rec.data, meta, update_lsn);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    auto recovered = db.sm_mgr_.fhs_.at("t")->get_record(rid, nullptr);
+    EXPECT_EQ(recovered->data[kChangedOffset], 'z');
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryManagerTest, CommittedBidirectionalDeltaWithoutABaseFailsClosed) {
+    ScopedTestDir test_dir("recovery_missing_delta_base_root");
+    const std::string db_name = "recovery_missing_delta_base_db";
+    CreateWideRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto old_rec = MakeWideTuple(1, 'a');
+    auto new_rec = MakeWideTuple(1, 'a');
+    new_rec.data[sizeof(int) + 20] = 'z';
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        auto update_lsn = AppendUpdate(*db.log_mgr_, 100, begin_lsn, rid, old_rec, new_rec, true);
+        AppendCommit(*db.log_mgr_, 100, update_lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    EXPECT_THROW(RunRecovery(db_name), InternalError);
+}
+
 TEST(RecoveryManagerTest, RedoUpdateMissingRidInstallsCommittedTupleMeta) {
     ScopedTestDir test_dir("recovery_redo_update_missing_rid_root");
     const std::string db_name = "recovery_redo_update_missing_rid_db";
@@ -884,6 +968,94 @@ TEST(RecoveryManagerTest, UncommittedSparseUpdateUndoesFullRowAndRepairsBothInde
     EXPECT_EQ(RecordId(db.sm_mgr_, rid), 1);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 2, rid));
+}
+
+TEST(RecoveryManagerTest, LaterLoserDeltaPreservesTheEarlierCommittedDeltaDuringRecovery) {
+    ScopedTestDir test_dir("recovery_later_loser_delta_root");
+    const std::string db_name = "recovery_later_loser_delta_db";
+    CreateWideRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto base_rec = MakeWideTuple(1, 'a');
+    auto committed_rec = MakeWideTuple(1, 'a');
+    auto loser_rec = MakeWideTuple(1, 'a');
+    constexpr int kCommittedOffset = sizeof(int) + 20;
+    constexpr int kLoserOffset = sizeof(int) + 40;
+    committed_rec.data[kCommittedOffset] = 'c';
+    loser_rec.data[kCommittedOffset] = 'c';
+    loser_rec.data[kLoserOffset] = 'l';
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, base_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto committed_lsn = AppendBegin(*db.log_mgr_, 100);
+        committed_lsn = AppendUpdate(*db.log_mgr_, 100, committed_lsn, rid, base_rec, committed_rec, true);
+        AppendCommit(*db.log_mgr_, 100, committed_lsn);
+
+        auto loser_lsn = AppendBegin(*db.log_mgr_, 200);
+        loser_lsn = AppendUpdate(*db.log_mgr_, 200, loser_lsn, rid, committed_rec, loser_rec, true);
+        FlushLogs(*db.log_mgr_);
+
+        TupleMeta meta;
+        meta.writer_txn_id_ = 200;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->apply_tuple_update(rid, loser_rec.data, meta, loser_lsn);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    auto recovered = db.sm_mgr_.fhs_.at("t")->get_record(rid, nullptr);
+    EXPECT_EQ(recovered->data[kCommittedOffset], 'c');
+    EXPECT_EQ(recovered->data[kLoserOffset], 'a');
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryManagerTest, OlderAbortedLoserBytesAreNotSealedByALaterCommittedDelta) {
+    ScopedTestDir test_dir("recovery_older_aborted_loser_delta_root");
+    const std::string db_name = "recovery_older_aborted_loser_delta_db";
+    CreateWideRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto base_rec = MakeWideTuple(1, 'a');
+    auto loser_rec = MakeWideTuple(1, 'a');
+    auto committed_rec = MakeWideTuple(1, 'a');
+    constexpr int kLoserOffset = sizeof(int) + 20;
+    constexpr int kCommittedOffset = sizeof(int) + 40;
+    loser_rec.data[kLoserOffset] = 'l';
+    committed_rec.data[kCommittedOffset] = 'c';
+
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.insert_record_with_indexes("t", rid, base_rec);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+
+        auto loser_lsn = AppendBegin(*db.log_mgr_, 100);
+        loser_lsn = AppendUpdate(*db.log_mgr_, 100, loser_lsn, rid, base_rec, loser_rec, true);
+        AppendAbort(*db.log_mgr_, 100, loser_lsn);
+
+        auto committed_lsn = AppendBegin(*db.log_mgr_, 200);
+        committed_lsn = AppendUpdate(*db.log_mgr_, 200, committed_lsn, rid, base_rec, committed_rec, true);
+        AppendCommit(*db.log_mgr_, 200, committed_lsn);
+        FlushLogs(*db.log_mgr_);
+
+        TupleMeta meta;
+        meta.writer_txn_id_ = 100;
+        meta.is_committed_ = false;
+        meta.is_deleted_ = false;
+        db.sm_mgr_.fhs_.at("t")->apply_tuple_update(rid, loser_rec.data, meta, loser_lsn);
+        db.sm_mgr_.flush_all_table_and_index_pages();
+    }
+
+    RunRecovery(db_name);
+
+    OpenRecoveryDb db(db_name);
+    auto recovered = db.sm_mgr_.fhs_.at("t")->get_record(rid, nullptr);
+    EXPECT_EQ(recovered->data[kLoserOffset], 'a');
+    EXPECT_EQ(recovered->data[kCommittedOffset], 'c');
+    EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }
 
 TEST(RecoveryManagerTest, AbortedUpdateDoesNotUndoLaterCommittedSameValueUpdate) {

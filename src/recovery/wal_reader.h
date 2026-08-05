@@ -31,6 +31,31 @@ struct WalRecordView {
     const char* bytes{nullptr}; // total_len bytes, starting at the record header
 };
 
+struct WalUpdateDeltaSpan {
+    uint32_t offset{0};
+    uint32_t length{0};
+    const char* before_bytes{nullptr};
+    const char* after_bytes{nullptr};
+};
+
+// Allocation-free borrowed view of a bidirectional UPDATE delta. `span_bytes`
+// aliases the WAL record and contains exactly `span_count` validated spans.
+struct WalUpdateDeltaView {
+    const char* span_bytes{nullptr};
+    uint32_t span_bytes_length{0};
+    uint32_t row_size{0};
+    uint32_t span_count{0};
+    uint32_t flags{0};
+
+    bool present() const {
+        return span_bytes != nullptr;
+    }
+};
+
+// Advances one validated span without allocating. `cursor` is a byte offset
+// inside delta.span_bytes and must start at zero.
+bool ReadWalUpdateDeltaSpan(const WalUpdateDeltaView& delta, uint32_t* cursor, WalUpdateDeltaSpan* span);
+
 // The payload of an INSERT/DELETE/UPDATE record. Legacy images and the sparse
 // UPDATE after-anchor borrow record.bytes. A sparse UPDATE's before image is
 // materialized here by copying the anchor and applying its before-byte spans.
@@ -45,6 +70,7 @@ struct WalDmlView {
     int after_size{0};
     std::vector<char> materialized_before;
     bool before_is_materialized{false};
+    WalUpdateDeltaView update_delta;
 };
 
 // Parses the payload of a DML record. Returns false when the record is not a

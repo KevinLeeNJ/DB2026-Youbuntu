@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 
 #include "ix_scan.h"
+#include "ix_smo_image.h"
 
 std::atomic<IxIndexHandle::InsertSplitFault> IxIndexHandle::insert_split_fault_{InsertSplitFault::None};
 std::mutex IxIndexHandle::insert_split_test_hook_latch_;
@@ -80,6 +81,11 @@ void IxIndexHandle::publish_smo_pages_impl(bool* wal_barrier_released) const {
                 std::shared_lock page_lock{page->latch()};
                 std::memcpy(image.bytes.data(), page->get_data(), PAGE_SIZE);
             }
+            // Erased/moved slots retain arbitrary old bytes in the live page.
+            // They are outside the B+tree's logical contents, so canonicalize
+            // only the WAL copy to give the existing zero-run codec long,
+            // deterministic runs. Unknown layouts deliberately stay raw.
+            TryCanonicalizeIxPageImageForWal(*file_hdr_, page_id.page_no, &image.bytes);
             data.pages.push_back(std::move(image));
             unpin_if_not_cached(page_id);
         }
@@ -127,6 +133,19 @@ void IxIndexHandle::write_index_header_page() const {
         throw;
     }
     buffer_pool_manager_->end_index_file_write(fd_);
+}
+
+IxIndexHeaderSnapshot IxIndexHandle::capture_index_header_snapshot() const {
+    auto index_guard = lock_shared();
+    if (file_hdr_->tot_len_ <= 0 || file_hdr_->tot_len_ > PAGE_SIZE) {
+        throw InternalError("invalid index header length during fixed checkpoint");
+    }
+    IxIndexHeaderSnapshot snapshot;
+    snapshot.fd = fd_;
+    snapshot.bytes.assign(static_cast<size_t>(file_hdr_->tot_len_), 0);
+    file_hdr_->serialize(snapshot.bytes.data());
+    snapshot.dependency = header_dependency_;
+    return snapshot;
 }
 
 /**

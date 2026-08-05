@@ -10,11 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <shared_mutex>
+#include <memory>
 
 class LogManager;
 class SmManager;
@@ -27,6 +26,7 @@ struct CheckpointOptions {
 class CheckpointManager {
 public:
     CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr);
+    ~CheckpointManager();
 
     bool RunCleanCheckpoint();
     bool Tick();
@@ -34,18 +34,22 @@ public:
     void SetOptions(CheckpointOptions options);
 
 private:
+    struct FuzzyCheckpointState;
+
+    bool StartFuzzyCheckpoint();
+    bool AdvanceFuzzyCheckpoint();
+    void CancelFuzzyCheckpoint() noexcept;
+    void DeferAutomaticRetry() noexcept;
+    int64_t RetainedWalBytes(int64_t current_offset) noexcept;
+
     TransactionManager* txn_mgr_;
     SmManager* sm_mgr_;
     LogManager* log_mgr_;
     CheckpointOptions options_{};
-    std::atomic<bool> running_{false};
-    // Tick holds a shared lock only while it preflushes table pages.  A clean
-    // checkpoint takes the exclusive side, so its WAL/data/manifest sequence
-    // can never interleave with an in-flight background page batch.
-    std::shared_mutex preflush_latch_;
-    // Backoff state for automatic checkpoints after a drain failure. Retrying
-    // every scheduler tick would make the whole process flap between blocked
-    // and unblocked while a stuck transaction stays open.
+    std::unique_ptr<FuzzyCheckpointState> fuzzy_checkpoint_;
+    // Backoff state for automatic checkpoints after a failed or over-budget
+    // round. Retrying every scheduler tick would make the whole process flap
+    // between blocked and unblocked while the underlying condition persists.
     std::chrono::steady_clock::time_point drain_retry_time_{};
     int64_t drain_retry_log_offset_{0};
 };

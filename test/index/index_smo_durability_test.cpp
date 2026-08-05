@@ -24,6 +24,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #undef private
 
+#include "index/ix_smo_image.h"
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -116,6 +118,35 @@ std::vector<char> SerializeLegacyIndexSmo(const IndexSmoWalData& data) {
     AppendTestScalar(&bytes, IndexSmoCrc32(bytes.data(), bytes.size()));
     EXPECT_EQ(bytes.size(), total_length);
     return bytes;
+}
+
+IxFileHdr WalImageLayout(int col_len = 13, int btree_order = 11) {
+    IxFileHdr file_hdr;
+    file_hdr.col_tot_len_ = col_len;
+    file_hdr.btree_order_ = btree_order;
+    file_hdr.keys_size_ = IxKeysSize(btree_order + 1, col_len);
+    return file_hdr;
+}
+
+std::array<char, PAGE_SIZE> WalImagePage(const IxFileHdr& file_hdr, int num_key, char fill = 'x') {
+    std::array<char, PAGE_SIZE> image;
+    image.fill(fill);
+    const IxPageHdr page_hdr{
+        .next_free_page_no = IX_NO_PAGE,
+        .parent = 7,
+        .num_key = num_key,
+        .is_leaf = true,
+        .prev_leaf = 3,
+        .next_leaf = 9,
+    };
+    std::memcpy(image.data(), &page_hdr, sizeof(page_hdr));
+    for (int i = 0; i < num_key; ++i) {
+        std::fill_n(image.data() + sizeof(IxPageHdr) + i * file_hdr.col_tot_len_, file_hdr.col_tot_len_,
+                    static_cast<char>('A' + i % 25));
+        const Rid rid{i + 20, i + 30};
+        std::memcpy(image.data() + sizeof(IxPageHdr) + file_hdr.keys_size_ + i * sizeof(Rid), &rid, sizeof(rid));
+    }
+    return image;
 }
 
 class IndexSmoDurabilityTest : public ::testing::Test {
@@ -398,6 +429,99 @@ TEST_F(IndexSmoDurabilityTest, AnEmptyLeafIsNotStructuralDamage) {
     crash_and_reopen_storage(ih);
     auto reopened = open_index();
     EXPECT_TRUE(reopened->validate_structure());
+}
+
+TEST(IndexSmoWalImageTest, CanonicalizesOnlyUnusedKeyAndRidSlots) {
+    const IxFileHdr file_hdr = WalImageLayout();
+    constexpr int num_key = 5;
+    auto image = WalImagePage(file_hdr, num_key);
+    const auto original = image;
+    const size_t rid_begin = sizeof(IxPageHdr) + file_hdr.keys_size_;
+    const size_t capacity = static_cast<size_t>(file_hdr.btree_order_ + 1);
+    const size_t live_key_end = sizeof(IxPageHdr) + num_key * file_hdr.col_tot_len_;
+    const size_t live_rid_end = rid_begin + num_key * sizeof(Rid);
+    const size_t capacity_end = rid_begin + capacity * sizeof(Rid);
+
+    ASSERT_TRUE(TryCanonicalizeIxPageImageForWal(file_hdr, IX_INIT_ROOT_PAGE, &image));
+    EXPECT_EQ(std::memcmp(image.data(), original.data(), sizeof(IxPageHdr)), 0);
+    EXPECT_EQ(std::memcmp(image.data() + sizeof(IxPageHdr), original.data() + sizeof(IxPageHdr),
+                          num_key * file_hdr.col_tot_len_),
+              0);
+    EXPECT_EQ(std::memcmp(image.data() + rid_begin, original.data() + rid_begin, num_key * sizeof(Rid)), 0);
+    EXPECT_TRUE(
+        std::all_of(image.begin() + live_key_end, image.begin() + rid_begin, [](char byte) { return byte == 0; }));
+    EXPECT_TRUE(
+        std::all_of(image.begin() + live_rid_end, image.begin() + capacity_end, [](char byte) { return byte == 0; }));
+    EXPECT_TRUE(std::equal(image.begin() + capacity_end, image.end(), original.begin() + capacity_end))
+        << "bytes outside the known node layout are not canonicalization padding";
+}
+
+TEST(IndexSmoWalImageTest, HandlesFullAndLeafListHeaderPages) {
+    const IxFileHdr file_hdr = WalImageLayout();
+    const int capacity = file_hdr.btree_order_ + 1;
+    auto full = WalImagePage(file_hdr, capacity);
+    const auto full_original = full;
+    ASSERT_TRUE(TryCanonicalizeIxPageImageForWal(file_hdr, IX_INIT_ROOT_PAGE, &full));
+    const size_t raw_key_end = sizeof(IxPageHdr) + capacity * file_hdr.col_tot_len_;
+    const size_t rid_begin = sizeof(IxPageHdr) + file_hdr.keys_size_;
+    EXPECT_TRUE(std::equal(full.begin(), full.begin() + raw_key_end, full_original.begin()));
+    EXPECT_TRUE(std::all_of(full.begin() + raw_key_end, full.begin() + rid_begin, [](char byte) { return byte == 0; }))
+        << "the key/RID alignment gap is not a live key";
+    EXPECT_TRUE(std::equal(full.begin() + rid_begin, full.end(), full_original.begin() + rid_begin));
+
+    auto leaf_header = WalImagePage(file_hdr, 0);
+    const auto leaf_header_original = leaf_header;
+    ASSERT_TRUE(TryCanonicalizeIxPageImageForWal(file_hdr, IX_LEAF_HEADER_PAGE, &leaf_header));
+    EXPECT_EQ(std::memcmp(leaf_header.data(), leaf_header_original.data(), sizeof(IxPageHdr)), 0);
+    const size_t capacity_end = rid_begin + capacity * sizeof(Rid);
+    EXPECT_TRUE(std::all_of(leaf_header.begin() + sizeof(IxPageHdr), leaf_header.begin() + capacity_end,
+                            [](char byte) { return byte == 0; }));
+    EXPECT_TRUE(
+        std::equal(leaf_header.begin() + capacity_end, leaf_header.end(), leaf_header_original.begin() + capacity_end));
+}
+
+TEST(IndexSmoWalImageTest, InvalidLayoutsAndCountsKeepTheRawImage) {
+    IxFileHdr file_hdr = WalImageLayout();
+    auto expect_unchanged = [&](page_id_t page_no, std::array<char, PAGE_SIZE> image) {
+        const auto original = image;
+        EXPECT_FALSE(TryCanonicalizeIxPageImageForWal(file_hdr, page_no, &image));
+        EXPECT_EQ(image, original);
+    };
+
+    auto negative = WalImagePage(file_hdr, 0);
+    const int negative_count = -1;
+    std::memcpy(negative.data() + offsetof(IxPageHdr, num_key), &negative_count, sizeof(negative_count));
+    expect_unchanged(IX_INIT_ROOT_PAGE, negative);
+
+    auto too_many = WalImagePage(file_hdr, 0);
+    const int excess_count = file_hdr.btree_order_ + 2;
+    std::memcpy(too_many.data() + offsetof(IxPageHdr, num_key), &excess_count, sizeof(excess_count));
+    expect_unchanged(IX_INIT_ROOT_PAGE, too_many);
+
+    expect_unchanged(IX_LEAF_HEADER_PAGE, WalImagePage(file_hdr, 1));
+
+    file_hdr.keys_size_++;
+    expect_unchanged(IX_INIT_ROOT_PAGE, WalImagePage(WalImageLayout(), 3));
+
+    file_hdr = WalImageLayout(512, 100);
+    expect_unchanged(IX_INIT_ROOT_PAGE, WalImagePage(WalImageLayout(), 0));
+}
+
+TEST(IndexSmoWalImageTest, CanonicalSlotsMateriallyReduceExistingWalEncoding) {
+    const IxFileHdr file_hdr = WalImageLayout(4, 300);
+    IndexSmoWalData raw;
+    raw.index_file_name = "canonical_slots.idx";
+    raw.index_generation = 53;
+    raw.pages.resize(1);
+    raw.pages[0].page_no = IX_INIT_ROOT_PAGE;
+    raw.pages[0].bytes = WalImagePage(file_hdr, 100);
+    raw.header.fill('h');
+
+    IndexSmoWalData canonical = raw;
+    ASSERT_TRUE(TryCanonicalizeIxPageImageForWal(file_hdr, canonical.pages[0].page_no, &canonical.pages[0].bytes));
+    const auto raw_bytes = SerializeIndexSmo(raw);
+    const auto canonical_bytes = SerializeIndexSmo(canonical);
+    EXPECT_LT(canonical_bytes.size() * 100, raw_bytes.size() * 75);
 }
 
 TEST(IndexSmoWalV2Test, RoundTripsMixedRawAndRleImagesWithMaterialSizeReduction) {

@@ -502,7 +502,16 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
     lsn_t log_lsn = INVALID_LSN;
     if (context != nullptr && context->log_mgr_ != nullptr && txn != nullptr) {
         Rid log_rid = rid;
-        UpdateLogRecord log_record(txn->get_transaction_id(), visible_record, *new_record, log_rid, *info.tab_name);
+        // The bidirectional UPDATE delta omits the full-row anchor, so recovery
+        // can use it only when the plan proves that no index key can change.
+        // Keep this deliberately stricter than `index_updates.empty()`: an
+        // indexed SET clause whose runtime old/new keys happen to compare equal
+        // still uses the full-image-compatible WAL format.
+        const bool index_keys_unchanged =
+            std::none_of(info.affected_index_bitmap->begin(), info.affected_index_bitmap->end(),
+                         [](bool affected) { return affected; });
+        UpdateLogRecord log_record(txn->get_transaction_id(), visible_record, *new_record, log_rid, *info.tab_name,
+                                   index_keys_unchanged);
         log_record.prev_lsn_ = txn->get_prev_lsn();
         log_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(log_lsn);

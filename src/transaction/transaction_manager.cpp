@@ -66,23 +66,25 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
         return;
     }
     auto lock_set = txn->get_lock_set();
-    std::vector<LockDataId> locks(lock_set->begin(), lock_set->end());
-    for (const auto& lock_id : locks) {
-        lock_manager->unlock(txn, lock_id);
+    while (!lock_set->empty()) {
+        auto lock = lock_set->extract(lock_set->begin());
+        // unlock() also erases from the transaction set. The node was already
+        // extracted so that releasing a transaction never copies or allocates
+        // a second lock set; erasing a missing entry is intentionally harmless.
+        lock_manager->unlock(txn, lock.value());
     }
-    lock_set->clear();
 
-    auto unique_key_locks = *txn->get_unique_key_lock_set();
-    for (const auto& lock_id : unique_key_locks) {
-        lock_manager->unlock_unique_key(txn, lock_id);
+    auto unique_key_locks = txn->get_unique_key_lock_set();
+    while (!unique_key_locks->empty()) {
+        auto lock = unique_key_locks->extract(unique_key_locks->begin());
+        lock_manager->unlock_unique_key(txn, lock.value());
     }
-    txn->get_unique_key_lock_set()->clear();
 
-    auto logical_row_delete_intents = *txn->get_logical_row_delete_intent_set();
-    for (const auto& intent_id : logical_row_delete_intents) {
-        lock_manager->unregister_logical_row_delete_intent(txn, intent_id);
+    auto logical_row_delete_intents = txn->get_logical_row_delete_intent_set();
+    while (!logical_row_delete_intents->empty()) {
+        auto intent = logical_row_delete_intents->extract(logical_row_delete_intents->begin());
+        lock_manager->unregister_logical_row_delete_intent(txn, intent.value());
     }
-    txn->get_logical_row_delete_intent_set()->clear();
 }
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
@@ -450,13 +452,20 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
 
     txn->set_state(TransactionState::GROWING);
     txn->set_start_ts(next_timestamp_.fetch_add(1));
-    txn->set_read_ts(last_commit_ts_.load());
-    // start_ts orders transaction lifecycle events, but a committer may already
-    // have reserved a smaller commit_ts without publishing it. read_ts is the
-    // published snapshot frontier and therefore drives visibility and SSI.
-    // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
-    // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
-    txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
+    {
+        // Snapshot selection and its GC pin are one publication-frontier
+        // operation. Without this guard, GC could sample a newer watermark in
+        // the gap between reading last_commit_ts_ and installing the slot, then
+        // reclaim version history still needed by this transaction.
+        std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+        txn->set_read_ts(last_commit_ts_.load(std::memory_order_acquire));
+        // start_ts orders transaction lifecycle events, but a committer may already
+        // have reserved a smaller commit_ts without publishing it. read_ts is the
+        // published snapshot frontier and therefore drives visibility and SSI.
+        // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
+        // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
+        txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
+    }
     WriteBeginLog(txn, log_manager);
 
     std::unique_lock<std::mutex> lock(latch_);
@@ -1450,7 +1459,15 @@ bool TransactionManager::GarbageCollectionBatch() {
     // 或 start_ts（已中止）严格小于水位线的事务，其 undo log 才不会被任何活跃
     // 事务的版本链遍历访问到，因而可安全从 txn_map 回收。
     // 与 GetUndoLog 互斥：二者都持 latch_。
-    timestamp_t watermark = running_txns_.GetWatermark();
+    timestamp_t watermark;
+    {
+        // Pair with begin(): GC must not sample the watermark between a
+        // transaction choosing its published snapshot and pinning that snapshot
+        // in running_txns_. The frontier lock is released before checkpoint,
+        // txn-map, buffer-pool, or version-history work begins.
+        std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+        watermark = running_txns_.GetWatermark();
+    }
     // active_txn_ids_ is maintained under checkpoint_latch_. Take a conservative
     // snapshot first, then release that lock before scanning txn_map_ so GC does
     // not block transaction begin/commit for the duration of the scan.

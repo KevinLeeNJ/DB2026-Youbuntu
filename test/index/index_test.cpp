@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1075,6 +1076,22 @@ public:
     bool uses_rid_vector_cursor() const {
         return rid_vector_cursor_.has_value();
     }
+
+    bool uses_heap_batch() const {
+        return heap_batch_enabled_;
+    }
+
+    size_t heap_batch_size() const {
+        return heap_batch_rids_.size();
+    }
+
+    size_t heap_batch_page_count() const {
+        std::unordered_set<page_id_t> pages;
+        for (const Rid& rid : heap_batch_rids_) {
+            pages.insert(rid.page_no);
+        }
+        return pages.size();
+    }
 };
 
 class IndexScanFeatureTest : public ::testing::Test {
@@ -1145,6 +1162,24 @@ public:
     void create_scores() {
         std::vector<ColDef> cols = {{"sid", TYPE_INT, 4}, {"cid", TYPE_INT, 4}, {"score", TYPE_FLOAT, 4}};
         sm_manager->create_table("scores", cols, nullptr);
+    }
+
+    void create_wide_batch_rows(int count) {
+        std::vector<ColDef> cols = {{"a", TYPE_INT, 4}, {"b", TYPE_INT, 4}, {"padding", TYPE_STRING, 500}};
+        sm_manager->create_table("batch_rows", cols, nullptr);
+        run_logged_write([&](Context* context) {
+            for (int value = 0; value < count; ++value) {
+                Value a;
+                a.set_int(value);
+                Value b;
+                b.set_int((value * 17) % count);
+                Value padding;
+                padding.set_str(std::string(500, static_cast<char>('a' + value % 26)));
+                InsertExecutor executor(sm_manager.get(), "batch_rows", {a, b, padding}, context);
+                executor.Next();
+            }
+        });
+        sm_manager->create_index("batch_rows", {"b"}, nullptr);
     }
 
     template <typename Body> void run_logged_write(Body&& body) {
@@ -1360,6 +1395,7 @@ TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
     EXPECT_TRUE(executor.uses_single_rid_cursor());
     EXPECT_FALSE(executor.uses_empty_single_rid_cursor());
     EXPECT_FALSE(executor.uses_rid_vector_cursor());
+    EXPECT_FALSE(executor.uses_heap_batch());
 
     std::vector<int> result;
     for (; !executor.is_end(); executor.nextTuple()) {
@@ -1420,6 +1456,110 @@ TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
     EXPECT_EQ(result, std::vector<int>({10, 20}));
     EXPECT_FALSE(executor.uses_single_rid_cursor());
     EXPECT_TRUE(executor.uses_rid_vector_cursor());
+    EXPECT_FALSE(executor.uses_heap_batch());
+}
+
+TEST_F(IndexScanFeatureTest, ForwardRangeBatchPreservesOrderAcrossHeapPages) {
+    constexpr int kRowCount = 40;
+    create_wide_batch_rows(kRowCount);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "batch_rows", {}, {"b"}, &context);
+
+    std::vector<int> actual;
+    executor.beginTuple();
+    ASSERT_TRUE(executor.uses_heap_batch());
+    EXPECT_EQ(executor.heap_batch_size(), 32);
+    EXPECT_GT(executor.heap_batch_page_count(), 1);
+    EXPECT_LT(executor.heap_batch_page_count(), executor.heap_batch_size());
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto record = executor.Next();
+        ASSERT_NE(record, nullptr);
+        actual.push_back(*reinterpret_cast<int*>(record->data));
+    }
+
+    std::vector<int> expected(kRowCount);
+    for (int value = 0; value < kRowCount; ++value) {
+        expected[(value * 17) % kRowCount] = value;
+    }
+    EXPECT_EQ(actual, expected);
+}
+
+TEST_F(IndexScanFeatureTest, BackwardRangeKeepsScalarPath) {
+    constexpr int kRowCount = 40;
+    create_wide_batch_rows(kRowCount);
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    ObservableIndexScanExecutor executor(sm_manager.get(), "batch_rows", {}, {"b"}, &context, ScanDirection::Backward);
+
+    std::vector<int> actual;
+    executor.beginTuple();
+    ASSERT_FALSE(executor.uses_heap_batch());
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto record = executor.Next();
+        ASSERT_NE(record, nullptr);
+        actual.push_back(*reinterpret_cast<int*>(record->data));
+    }
+
+    std::vector<int> expected(kRowCount);
+    for (int value = 0; value < kRowCount; ++value) {
+        expected[kRowCount - 1 - (value * 17) % kRowCount] = value;
+    }
+    EXPECT_EQ(actual, expected);
+}
+
+TEST_F(IndexScanFeatureTest, ForwardBatchUsesSnapshotVersionsAfterConcurrentUpdateAndDelete) {
+    constexpr int kRowCount = 40;
+    create_wide_batch_rows(kRowCount);
+
+    Transaction* reader = txn_manager->begin(nullptr, log_manager.get(), IsolationLevel::SNAPSHOT_ISOLATION);
+
+    const auto find_rid = [&](int indexed_value) {
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        ObservableIndexScanExecutor executor(
+            sm_manager.get(), "batch_rows", {table_int_cond("batch_rows", "b", OP_EQ, indexed_value)}, {"b"}, &context);
+        executor.beginTuple();
+        EXPECT_FALSE(executor.uses_heap_batch());
+        EXPECT_FALSE(executor.is_end());
+        return executor.rid();
+    };
+    const Rid updated_rid = find_rid((5 * 17) % kRowCount);
+    const Rid deleted_rid = find_rid((6 * 17) % kRowCount);
+
+    run_logged_write([&](Context* context) {
+        UpdateExecutor update(sm_manager.get(), "batch_rows", {set_int_clause("batch_rows", "a", 500)},
+                              {table_int_cond("batch_rows", "b", OP_EQ, (5 * 17) % kRowCount)}, {updated_rid}, context);
+        update.Next();
+        DeleteExecutor remove(sm_manager.get(), "batch_rows",
+                              {table_int_cond("batch_rows", "b", OP_EQ, (6 * 17) % kRowCount)}, {deleted_rid}, context);
+        remove.Next();
+    });
+
+    char data_send[BUFFER_LENGTH] = {};
+    int offset = 0;
+    Context reader_context(lock_manager.get(), log_manager.get(), reader, data_send, &offset, txn_manager.get());
+    ObservableIndexScanExecutor executor(sm_manager.get(), "batch_rows", {}, {"b"}, &reader_context);
+    std::vector<int> actual;
+    executor.beginTuple();
+    ASSERT_TRUE(executor.uses_heap_batch());
+    for (; !executor.is_end(); executor.nextTuple()) {
+        auto record = executor.Next();
+        ASSERT_NE(record, nullptr);
+        actual.push_back(*reinterpret_cast<int*>(record->data));
+    }
+    txn_manager->commit(reader, log_manager.get());
+
+    std::vector<int> expected(kRowCount);
+    for (int value = 0; value < kRowCount; ++value) {
+        expected[(value * 17) % kRowCount] = value;
+    }
+    EXPECT_EQ(actual, expected);
 }
 
 TEST_F(IndexScanFeatureTest, InjectedLeadingKeyCompletesCompositeExactLookup) {

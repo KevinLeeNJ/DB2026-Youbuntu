@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <deque>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -332,6 +334,8 @@ public:
     // value is therefore an unambiguous in-band version marker while keeping
     // LogType::UPDATE and mixed old/new WAL streams compatible.
     static constexpr int kSparseBeforeVersion = -1;
+    static constexpr int kBidirectionalDeltaVersion = -2;
+    static constexpr uint32_t kIndexKeysUnchangedFlag = 1U;
 
     struct BeforeSpan {
         uint32_t offset{0};
@@ -345,7 +349,8 @@ public:
         log_tid_ = INVALID_TXN_ID;
         prev_lsn_ = INVALID_LSN;
     }
-    UpdateLogRecord(txn_id_t txn_id, RmRecord& old_value, RmRecord& new_value, Rid& rid, std::string table_name)
+    UpdateLogRecord(txn_id_t txn_id, RmRecord& old_value, RmRecord& new_value, Rid& rid, std::string table_name,
+                    bool index_keys_unchanged = false)
         : UpdateLogRecord() {
         if (old_value.size < 0 || new_value.size < 0) {
             throw std::length_error("UPDATE WAL row image has a negative size");
@@ -361,13 +366,19 @@ public:
             sizeof(int) + static_cast<uint64_t>(old_value_.size) + sizeof(int) + static_cast<uint64_t>(new_value_.size);
         uint64_t sparse_image_bytes =
             sizeof(int) + sizeof(int) + static_cast<uint64_t>(new_value_.size) + sizeof(uint32_t);
+        uint64_t bidirectional_delta_bytes = sizeof(int) + sizeof(uint32_t) * 3;
         for (const BeforeSpan& span : before_spans_) {
             sparse_image_bytes += sizeof(uint32_t) + sizeof(uint32_t) + span.length;
+            bidirectional_delta_bytes += sizeof(uint32_t) + sizeof(uint32_t) + static_cast<uint64_t>(span.length) * 2;
         }
-        sparse_encoding_ = old_value_.size == new_value_.size && sparse_image_bytes < legacy_image_bytes;
-        uint64_t total_bytes = static_cast<uint64_t>(LOG_HEADER_SIZE) +
-                               (sparse_encoding_ ? sparse_image_bytes : legacy_image_bytes) + sizeof(Rid) +
-                               sizeof(size_t);
+        const bool same_sized_rows = old_value_.size == new_value_.size && old_value_.size > 0;
+        bidirectional_delta_encoding_ = index_keys_unchanged && same_sized_rows &&
+                                        bidirectional_delta_bytes < std::min(legacy_image_bytes, sparse_image_bytes);
+        sparse_encoding_ = !bidirectional_delta_encoding_ && same_sized_rows && sparse_image_bytes < legacy_image_bytes;
+        const uint64_t image_bytes = bidirectional_delta_encoding_
+                                         ? bidirectional_delta_bytes
+                                         : (sparse_encoding_ ? sparse_image_bytes : legacy_image_bytes);
+        uint64_t total_bytes = static_cast<uint64_t>(LOG_HEADER_SIZE) + image_bytes + sizeof(Rid) + sizeof(size_t);
         if (table_name_size_ > UINT64_MAX - total_bytes) {
             throw std::length_error("UPDATE WAL record length overflows uint64_t");
         }
@@ -381,7 +392,28 @@ public:
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
         int offset = OFFSET_LOG_DATA;
-        if (sparse_encoding_) {
+        if (bidirectional_delta_encoding_) {
+            memcpy(dest + offset, &kBidirectionalDeltaVersion, sizeof(int));
+            offset += sizeof(int);
+            const uint32_t row_size = static_cast<uint32_t>(new_value_.size);
+            memcpy(dest + offset, &row_size, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            memcpy(dest + offset, &kIndexKeysUnchangedFlag, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            const uint32_t span_count = static_cast<uint32_t>(before_spans_.size());
+            memcpy(dest + offset, &span_count, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            for (const BeforeSpan& span : before_spans_) {
+                memcpy(dest + offset, &span.offset, sizeof(uint32_t));
+                offset += sizeof(uint32_t);
+                memcpy(dest + offset, &span.length, sizeof(uint32_t));
+                offset += sizeof(uint32_t);
+                memcpy(dest + offset, old_value_.data + span.offset, span.length);
+                offset += static_cast<int>(span.length);
+                memcpy(dest + offset, new_value_.data + span.offset, span.length);
+                offset += static_cast<int>(span.length);
+            }
+        } else if (sparse_encoding_) {
             memcpy(dest + offset, &kSparseBeforeVersion, sizeof(int));
             offset += sizeof(int);
             memcpy(dest + offset, &new_value_.size, sizeof(int));
@@ -427,10 +459,9 @@ public:
                 !ReadRecordPayload(src, log_tot_len_, &offset, &new_value_)) {
                 return;
             }
-        } else {
+        } else if (version_or_before_size == kSparseBeforeVersion) {
             offset += sizeof(int);
-            if (version_or_before_size != kSparseBeforeVersion ||
-                !ReadRecordPayload(src, log_tot_len_, &offset, &new_value_) ||
+            if (!ReadRecordPayload(src, log_tot_len_, &offset, &new_value_) ||
                 !LogPayloadReadable(log_tot_len_, offset, sizeof(uint32_t))) {
                 return;
             }
@@ -464,6 +495,49 @@ public:
                 previous_end = span_offset + span_length;
             }
             sparse_encoding_ = true;
+        } else if (version_or_before_size == kBidirectionalDeltaVersion) {
+            offset += sizeof(int);
+            if (!LogPayloadReadable(log_tot_len_, offset, sizeof(uint32_t) * 3)) {
+                return;
+            }
+            const uint32_t row_size = read_unaligned<uint32_t>(src + offset);
+            offset += sizeof(uint32_t);
+            const uint32_t flags = read_unaligned<uint32_t>(src + offset);
+            offset += sizeof(uint32_t);
+            const uint32_t span_count = read_unaligned<uint32_t>(src + offset);
+            offset += sizeof(uint32_t);
+            const uint32_t remaining = log_tot_len_ - static_cast<uint32_t>(offset);
+            if (row_size == 0 || row_size > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+                flags != kIndexKeysUnchangedFlag || span_count > row_size ||
+                span_count > remaining / (sizeof(uint32_t) * 2 + 2)) {
+                return;
+            }
+            uint32_t previous_offset = 0;
+            uint32_t previous_end = 0;
+            before_spans_.clear();
+            before_spans_.reserve(span_count);
+            for (uint32_t i = 0; i < span_count; ++i) {
+                if (!LogPayloadReadable(log_tot_len_, offset, sizeof(uint32_t) * 2)) {
+                    return;
+                }
+                const uint32_t span_offset = read_unaligned<uint32_t>(src + offset);
+                offset += sizeof(uint32_t);
+                const uint32_t span_length = read_unaligned<uint32_t>(src + offset);
+                offset += sizeof(uint32_t);
+                if (span_length == 0 || span_offset > row_size || span_length > row_size - span_offset ||
+                    (i > 0 && (span_offset <= previous_offset || span_offset < previous_end)) ||
+                    !LogPayloadReadable(log_tot_len_, offset, static_cast<size_t>(span_length) * 2)) {
+                    before_spans_.clear();
+                    return;
+                }
+                offset += static_cast<int>(span_length) * 2;
+                before_spans_.push_back(BeforeSpan{span_offset, span_length});
+                previous_offset = span_offset;
+                previous_end = span_offset + span_length;
+            }
+            bidirectional_delta_encoding_ = true;
+        } else {
+            return;
         }
         if (!LogPayloadReadable(log_tot_len_, offset, sizeof(Rid))) {
             return;
@@ -493,6 +567,7 @@ public:
     std::string table_name_;
     size_t table_name_size_{0};
     bool sparse_encoding_{false};
+    bool bidirectional_delta_encoding_{false};
     std::vector<BeforeSpan> before_spans_;
 
 private:
@@ -633,6 +708,21 @@ struct RestartManifest {
     txn_id_t next_txn_id{0};
 };
 
+/**
+ * A durable, self-contained WAL boundary for a fuzzy checkpoint.
+ *
+ * `checkpoint_offset` is the exact byte offset of the empty CHECKPOINT record.
+ * Every binding in `index_bindings` is serialized contiguously immediately
+ * after that record, in caller order. `last_lsn` covers the complete batch and
+ * is durable before create_checkpoint_wal_cut() returns.
+ */
+struct CheckpointWalCut {
+    int64_t checkpoint_offset{0};
+    lsn_t checkpoint_lsn{INVALID_LSN};
+    lsn_t last_lsn{INVALID_LSN};
+    std::vector<std::pair<std::string, uint64_t>> index_bindings;
+};
+
 class LogManager {
 public:
     static constexpr const char* RESTART_FILE_NAME = "db.restart";
@@ -649,6 +739,7 @@ public:
     lsn_t append_index_smo(const IndexSmoWalData& data);
     uint64_t ensure_index_binding(const std::string& index_file_name);
     uint64_t renew_index_binding(const std::string& index_file_name);
+    CheckpointWalCut create_checkpoint_wal_cut(const std::vector<std::string>& index_file_names);
     void flush_log_to_disk();
     void flush_log_to_disk_with_sync();
     void flush_log_to_disk_up_to(lsn_t target_lsn);
@@ -732,7 +823,7 @@ private:
     int flushing_bytes_{0};
     std::atomic<lsn_t> persist_lsn_{INVALID_LSN}; // 最后一个已 pwrite 到 OS page cache 的日志号
     std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
-    int64_t log_file_offset_{0}; // 日志文件当前追加偏移
+    int64_t log_file_offset_{0};                  // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};
     struct IndexBinding {

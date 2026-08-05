@@ -104,7 +104,6 @@ class IndexSkipScanExecutor : public IndexScanExecutor {
             }
             cursor = next_cursor;
         }
-
     }
 
     void open_next_range() {

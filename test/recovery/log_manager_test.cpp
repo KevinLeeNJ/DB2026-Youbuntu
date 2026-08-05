@@ -153,6 +153,70 @@ TEST(IndexSmoWalTest, Crc32MatchesIeeeKnownAnswers) {
     EXPECT_EQ(IndexSmoCrc32(every_byte.data(), every_byte.size()), 0x29058c73U);
 }
 
+TEST(IndexSmoWalTest, IndexBindV2ReissuesAnExplicitGenerationAndRejectsMalformedRecords) {
+    const auto make_view = [](const std::vector<char>& bytes) {
+        WalRecordView view;
+        view.bytes = bytes.data();
+        view.total_len = static_cast<uint32_t>(bytes.size());
+        view.log_type = read_unaligned<LogType>(bytes.data() + OFFSET_LOG_TYPE);
+        view.lsn = read_unaligned<lsn_t>(bytes.data() + OFFSET_LSN);
+        view.txn_id = read_unaligned<txn_id_t>(bytes.data() + OFFSET_LOG_TID);
+        view.prev_lsn = read_unaligned<lsn_t>(bytes.data() + OFFSET_PREV_LSN);
+        return view;
+    };
+    const auto rewrite_crc = [](std::vector<char>* bytes) {
+        const uint32_t crc = IndexSmoCrc32(bytes->data(), bytes->size() - sizeof(uint32_t));
+        std::memcpy(bytes->data() + bytes->size() - sizeof(uint32_t), &crc, sizeof(crc));
+    };
+
+    IndexBindLogRecord legacy("a.idx");
+    legacy.lsn_ = 11;
+    std::vector<char> legacy_bytes(legacy.log_tot_len_);
+    legacy.serialize(legacy_bytes.data());
+    std::string_view name;
+    uint64_t generation = 0;
+    WalRecordView view = make_view(legacy_bytes);
+    ASSERT_TRUE(ParseIndexBindWal(view, &name, &generation));
+    EXPECT_EQ(name, "a.idx");
+    EXPECT_EQ(generation, 12U);
+
+    IndexBindLogRecord reissue("a.idx", 7);
+    reissue.lsn_ = 41;
+    std::vector<char> reissue_bytes(reissue.log_tot_len_);
+    reissue.serialize(reissue_bytes.data());
+    view = make_view(reissue_bytes);
+    ASSERT_TRUE(ParseIndexBindWal(view, &name, &generation));
+    EXPECT_EQ(generation, 7U);
+    EXPECT_THROW(IndexBindLogRecord("a.idx", 0), std::invalid_argument);
+
+    std::vector<char> malformed = reissue_bytes;
+    malformed.back() ^= 1;
+    view = make_view(malformed);
+    EXPECT_FALSE(ParseIndexBindWal(view, &name, &generation));
+
+    malformed = reissue_bytes;
+    const uint16_t unknown_version = INDEX_BIND_VERSION_V2 + 1;
+    std::memcpy(malformed.data() + OFFSET_LOG_DATA + sizeof(uint32_t), &unknown_version, sizeof(unknown_version));
+    rewrite_crc(&malformed);
+    view = make_view(malformed);
+    EXPECT_FALSE(ParseIndexBindWal(view, &name, &generation));
+
+    malformed = reissue_bytes;
+    const uint64_t zero_generation = 0;
+    constexpr size_t kGenerationOffset = OFFSET_LOG_DATA + sizeof(uint32_t) + sizeof(uint16_t) * 2 + sizeof(uint32_t);
+    std::memcpy(malformed.data() + kGenerationOffset, &zero_generation, sizeof(zero_generation));
+    rewrite_crc(&malformed);
+    view = make_view(malformed);
+    EXPECT_FALSE(ParseIndexBindWal(view, &name, &generation));
+
+    malformed = legacy_bytes;
+    const uint64_t wrong_v1_generation = 99;
+    std::memcpy(malformed.data() + kGenerationOffset, &wrong_v1_generation, sizeof(wrong_v1_generation));
+    rewrite_crc(&malformed);
+    view = make_view(malformed);
+    EXPECT_FALSE(ParseIndexBindWal(view, &name, &generation));
+}
+
 TEST(IndexSmoWalTest, RoundTripAndChecksumAreBounded) {
     IndexSmoWalData data;
     data.index_file_name = "t_id.idx";
@@ -388,6 +452,28 @@ TEST(LogRecordTest, SparseUpdateRoundTripMaterializesTheCompleteBeforeImage) {
     EXPECT_EQ(decoded.table_name_, "customer");
     ExpectRecordEq(decoded.old_value_, old_rec);
     ExpectRecordEq(decoded.new_value_, new_rec);
+}
+
+TEST(LogRecordTest, BidirectionalDeltaRequiresProofThatIndexKeysAreUnchanged) {
+    std::string old_text(128, 'a');
+    std::string new_text = old_text;
+    new_text[10] = 'x';
+    new_text[50] = 'y';
+    auto old_rec = MakeRecord(old_text);
+    auto new_rec = MakeRecord(new_text);
+    Rid rid{9, 5};
+
+    UpdateLogRecord proven(90, old_rec, new_rec, rid, "stock", true);
+    ASSERT_TRUE(proven.bidirectional_delta_encoding_);
+    EXPECT_FALSE(proven.sparse_encoding_);
+    std::vector<char> proven_bytes(proven.log_tot_len_);
+    proven.serialize(proven_bytes.data());
+    EXPECT_EQ(read_unaligned<int>(proven_bytes.data() + OFFSET_LOG_DATA), UpdateLogRecord::kBidirectionalDeltaVersion);
+
+    UpdateLogRecord not_proven(90, old_rec, new_rec, rid, "stock");
+    EXPECT_FALSE(not_proven.bidirectional_delta_encoding_);
+    EXPECT_TRUE(not_proven.sparse_encoding_);
+    EXPECT_LT(proven.log_tot_len_, not_proven.log_tot_len_);
 }
 
 TEST(LogRecordTest, UpdateFallsBackToLegacyWhenSparseEncodingIsNotStrictlySmaller) {
@@ -795,6 +881,274 @@ TEST(LogManagerTest, InvalidRestartOffsetReturnsZero) {
     EXPECT_EQ(log_mgr.read_restart_offset(), 0);
 }
 
+TEST(LogManagerTest, CheckpointWalCutIsContiguousDurableAndReissuesBindings) {
+    ScopedTestDir test_dir("checkpoint_wal_cut_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    const uint64_t a_generation = log_mgr.ensure_index_binding("a.idx");
+    const uint64_t b_generation = log_mgr.ensure_index_binding("b.idx");
+    BeginLogRecord begin(200);
+    ASSERT_EQ(log_mgr.add_log_to_buffer(&begin), 2);
+    const int64_t expected_cut_offset = log_mgr.current_log_offset();
+    const CheckpointWalCut cut = log_mgr.create_checkpoint_wal_cut({"a.idx", "b.idx"});
+
+    EXPECT_EQ(cut.checkpoint_offset, expected_cut_offset);
+    EXPECT_EQ(cut.checkpoint_lsn, 3);
+    EXPECT_EQ(cut.last_lsn, 5);
+    ASSERT_EQ(cut.index_bindings.size(), 2U);
+    EXPECT_EQ(cut.index_bindings[0].first, "a.idx");
+    EXPECT_EQ(cut.index_bindings[0].second, a_generation);
+    EXPECT_EQ(cut.index_bindings[1].first, "b.idx");
+    EXPECT_EQ(cut.index_bindings[1].second, b_generation);
+    EXPECT_GE(log_mgr.get_durable_lsn(), cut.last_lsn);
+
+    const int64_t cut_end = disk.get_file_size(LOG_FILE_NAME);
+    WalReader reader(&disk, 0, cut_end);
+    WalRecordView record;
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.log_type, LogType::INDEX_BIND);
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.log_type, LogType::INDEX_BIND);
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.log_type, LogType::BEGIN);
+    ASSERT_TRUE(reader.next(&record));
+    EXPECT_EQ(record.offset, cut.checkpoint_offset);
+    EXPECT_EQ(record.log_type, LogType::CHECKPOINT);
+    auto decoded_checkpoint = DeserializeLogRecord(record.bytes, static_cast<int>(record.total_len));
+    ASSERT_NE(decoded_checkpoint, nullptr);
+    const auto* checkpoint = dynamic_cast<const CheckpointLogRecord*>(decoded_checkpoint.get());
+    ASSERT_NE(checkpoint, nullptr);
+    EXPECT_TRUE(checkpoint->active_txns_.empty());
+    int64_t expected_offset = record.offset + record.total_len;
+    for (size_t i = 0; i < cut.index_bindings.size(); ++i) {
+        ASSERT_TRUE(reader.next(&record));
+        EXPECT_EQ(record.offset, expected_offset);
+        EXPECT_EQ(record.log_type, LogType::INDEX_BIND);
+        std::string_view name;
+        uint64_t generation = 0;
+        ASSERT_TRUE(ParseIndexBindWal(record, &name, &generation));
+        EXPECT_EQ(name, cut.index_bindings[i].first);
+        EXPECT_EQ(generation, cut.index_bindings[i].second);
+        expected_offset += record.total_len;
+    }
+    EXPECT_FALSE(reader.next(&record));
+    EXPECT_EQ(expected_offset, cut_end);
+
+    IndexSmoWalData smo;
+    smo.index_file_name = "a.idx";
+    smo.pages.resize(1);
+    smo.pages[0].page_no = 2;
+    const lsn_t smo_lsn = log_mgr.append_index_smo(smo);
+    log_mgr.flush_log_to_disk_up_to_durable(smo_lsn);
+
+    WalReader with_smo(&disk, cut_end, disk.get_file_size(LOG_FILE_NAME));
+    ASSERT_TRUE(with_smo.next(&record));
+    EXPECT_EQ(record.log_type, LogType::INDEX_SMO);
+    IndexSmoWalView parsed_smo;
+    ASSERT_TRUE(ParseIndexSmoWal(record, &parsed_smo));
+    EXPECT_EQ(parsed_smo.index_generation, cut.index_bindings[0].second);
+}
+
+TEST(LogManagerTest, FailedCheckpointWalCutKeepsTheCurrentBindingUsable) {
+    ScopedTestDir test_dir("failed_checkpoint_wal_cut_binding_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    LogManager log_mgr(&disk);
+
+    const uint64_t original_generation = log_mgr.ensure_index_binding("a.idx");
+    const int valid_log_fd = disk.GetLogFd();
+    ASSERT_GE(valid_log_fd, 0);
+    disk.SetLogFd(-2);
+    EXPECT_THROW(log_mgr.create_checkpoint_wal_cut({"a.idx"}), UnixError);
+    disk.SetLogFd(valid_log_fd);
+
+    IndexSmoWalData smo;
+    smo.index_file_name = "a.idx";
+    smo.pages.resize(1);
+    smo.pages[0].page_no = 2;
+    const lsn_t smo_lsn = log_mgr.append_index_smo(smo);
+    ASSERT_NO_THROW(log_mgr.flush_log_to_disk_up_to_durable(smo_lsn));
+
+    WalReader reader(&disk, 0, disk.get_file_size(LOG_FILE_NAME));
+    WalRecordView record;
+    size_t bind_count = 0;
+    bool found_smo = false;
+    while (reader.next(&record)) {
+        if (record.log_type == LogType::INDEX_BIND) {
+            std::string_view name;
+            uint64_t generation = 0;
+            ASSERT_TRUE(ParseIndexBindWal(record, &name, &generation));
+            EXPECT_EQ(name, "a.idx");
+            EXPECT_EQ(generation, original_generation);
+            ++bind_count;
+        } else if (record.log_type == LogType::INDEX_SMO) {
+            IndexSmoWalView parsed;
+            ASSERT_TRUE(ParseIndexSmoWal(record, &parsed));
+            EXPECT_EQ(parsed.index_generation, original_generation);
+            found_smo = true;
+        }
+    }
+    EXPECT_EQ(bind_count, 2U);
+    EXPECT_TRUE(found_smo);
+}
+
+TEST(LogManagerTest, ValidCheckpointWalCutSkipsAnObsoletePrefixAtStartup) {
+    ScopedTestDir test_dir("valid_checkpoint_wal_cut_restart_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    CheckpointWalCut cut;
+    int64_t wal_bytes = 0;
+    {
+        LogManager writer(&disk);
+        BeginLogRecord obsolete(201);
+        ASSERT_EQ(writer.add_log_to_buffer(&obsolete), 0);
+        cut = writer.create_checkpoint_wal_cut({"a.idx"});
+        writer.write_restart_offset(cut.checkpoint_offset);
+        wal_bytes = disk.get_file_size(LOG_FILE_NAME);
+    }
+
+    // A valid restart boundary makes bytes before it obsolete. Make the old
+    // record unrecognizable so scanning from zero would truncate immediately.
+    {
+        std::fstream wal(LOG_FILE_NAME, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(wal.is_open());
+        const int unknown_type = 999;
+        wal.seekp(OFFSET_LOG_TYPE);
+        wal.write(reinterpret_cast<const char*>(&unknown_type), sizeof(unknown_type));
+        wal.flush();
+        ASSERT_TRUE(static_cast<bool>(wal));
+    }
+
+    LogManager restarted(&disk);
+    ASSERT_NO_THROW(restarted.initialize_from_existing_log());
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), wal_bytes);
+    EXPECT_EQ(restarted.get_global_lsn(), cut.last_lsn + 1);
+    EXPECT_EQ(restarted.read_restart_offset(), cut.checkpoint_offset);
+
+    IndexSmoWalData smo;
+    smo.index_file_name = "a.idx";
+    smo.pages.resize(1);
+    smo.pages[0].page_no = 2;
+    const lsn_t smo_lsn = restarted.append_index_smo(smo);
+    EXPECT_EQ(smo_lsn, cut.last_lsn + 1);
+}
+
+TEST(LogManagerTest, NonCheckpointRestartOffsetFallsBackAndIsSanitized) {
+    ScopedTestDir test_dir("non_checkpoint_restart_fallback_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    int64_t second_offset = 0;
+    {
+        LogManager writer(&disk);
+        BeginLogRecord first(202);
+        writer.add_log_to_buffer(&first);
+        second_offset = writer.current_log_offset();
+        BeginLogRecord second(203);
+        writer.add_log_to_buffer(&second);
+        writer.flush_log_to_disk_with_sync();
+        RestartManifest manifest;
+        manifest.checkpoint_offset = second_offset;
+        manifest.next_timestamp = 77;
+        writer.write_restart_manifest(manifest);
+    }
+
+    LogManager restarted(&disk);
+    ASSERT_NO_THROW(restarted.initialize_from_existing_log());
+    EXPECT_EQ(restarted.get_global_lsn(), 2);
+    const RestartManifest manifest = restarted.read_restart_manifest();
+    EXPECT_EQ(manifest.checkpoint_offset, 0);
+    EXPECT_EQ(manifest.next_timestamp, 77);
+}
+
+TEST(LogManagerTest, NonEmptyCheckpointRestartOffsetFallsBackToZero) {
+    ScopedTestDir test_dir("nonempty_checkpoint_restart_fallback_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    int64_t checkpoint_offset = 0;
+    {
+        LogManager writer(&disk);
+        BeginLogRecord first(204);
+        writer.add_log_to_buffer(&first);
+        checkpoint_offset = writer.current_log_offset();
+        CheckpointLogRecord checkpoint(std::unordered_map<txn_id_t, lsn_t>{{204, 0}});
+        writer.add_log_to_buffer(&checkpoint);
+        BeginLogRecord last(205);
+        writer.add_log_to_buffer(&last);
+        writer.flush_log_to_disk_with_sync();
+        writer.write_restart_offset(checkpoint_offset);
+    }
+
+    // A high LSN before the invalid boundary makes fallback-to-zero
+    // observable without exposing startup's internal scan offset.
+    {
+        std::fstream wal(LOG_FILE_NAME, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(wal.is_open());
+        const lsn_t old_prefix_lsn = 100;
+        wal.seekp(OFFSET_LSN);
+        wal.write(reinterpret_cast<const char*>(&old_prefix_lsn), sizeof(old_prefix_lsn));
+        wal.flush();
+        ASSERT_TRUE(static_cast<bool>(wal));
+    }
+
+    LogManager restarted(&disk);
+    ASSERT_NO_THROW(restarted.initialize_from_existing_log());
+    EXPECT_EQ(restarted.get_global_lsn(), 101);
+    EXPECT_EQ(restarted.read_restart_offset(), 0);
+}
+
+TEST(LogManagerTest, OutOfRangeRestartOffsetFallsBackToZero) {
+    ScopedTestDir test_dir("out_of_range_restart_fallback_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    int64_t wal_bytes = 0;
+    {
+        LogManager writer(&disk);
+        BeginLogRecord begin(206);
+        writer.add_log_to_buffer(&begin);
+        writer.flush_log_to_disk_with_sync();
+        wal_bytes = disk.get_file_size(LOG_FILE_NAME);
+        writer.write_restart_offset(wal_bytes + 1);
+    }
+
+    LogManager restarted(&disk);
+    ASSERT_NO_THROW(restarted.initialize_from_existing_log());
+    EXPECT_EQ(restarted.get_global_lsn(), 1);
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), wal_bytes);
+    EXPECT_EQ(restarted.read_restart_offset(), 0);
+}
+
+TEST(LogManagerTest, CheckpointWalCutStartupTruncatesATornTailAtIntactEof) {
+    ScopedTestDir test_dir("checkpoint_wal_cut_torn_tail_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    CheckpointWalCut cut;
+    int64_t cut_end = 0;
+    {
+        LogManager writer(&disk);
+        BeginLogRecord obsolete(207);
+        writer.add_log_to_buffer(&obsolete);
+        cut = writer.create_checkpoint_wal_cut({"a.idx"});
+        cut_end = disk.get_file_size(LOG_FILE_NAME);
+        writer.write_restart_offset(cut.checkpoint_offset);
+        BeginLogRecord torn(208);
+        writer.add_log_to_buffer(&torn);
+        writer.flush_log_to_disk_with_sync();
+    }
+    ASSERT_GT(disk.get_file_size(LOG_FILE_NAME), cut_end);
+    ASSERT_EQ(::truncate(LOG_FILE_NAME.c_str(), disk.get_file_size(LOG_FILE_NAME) - 1), 0);
+
+    LogManager restarted(&disk);
+    ASSERT_NO_THROW(restarted.initialize_from_existing_log());
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), cut_end);
+    EXPECT_EQ(restarted.current_log_offset(), cut_end);
+    EXPECT_EQ(restarted.get_global_lsn(), cut.last_lsn + 1);
+
+    BeginLogRecord after_restart(209);
+    EXPECT_EQ(restarted.add_log_to_buffer(&after_restart), cut.last_lsn + 1);
+}
+
 TEST(LogManagerTest, TransactionBeginCommitLogPrevLsn) {
     ScopedTestDir test_dir("transaction_log_test_db");
     DiskManager disk;
@@ -839,8 +1193,7 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
     LockAcquireResult lock_result = LockAcquireResult::Value::Granted;
     std::thread waiter([&] { lock_result = lock_mgr.lock_exclusive_on_record(txn, rid, 42); });
     const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!lock_mgr.has_record_waiters_for_test() &&
-           std::chrono::steady_clock::now() < enqueue_deadline) {
+    while (!lock_mgr.has_record_waiters_for_test() && std::chrono::steady_clock::now() < enqueue_deadline) {
         std::this_thread::yield();
     }
     if (!lock_mgr.has_record_waiters_for_test()) {

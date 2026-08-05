@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #undef private
 
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -208,6 +209,39 @@ TEST_F(SmManagerTest, flush_and_reload_meta_with_index) {
     auto& tab = sm_manager_->db_.get_table("test_tab");
     EXPECT_EQ(tab.indexes.size(), 1);
     EXPECT_TRUE(tab.is_index({"a"}));
+}
+
+TEST_F(SmManagerTest, fixed_checkpoint_header_snapshot_is_detached_and_self_contained) {
+    setup_db();
+    sm_manager_->create_table("checkpoint_tab", make_int_cols({"id", "value"}), nullptr);
+    sm_manager_->create_index("checkpoint_tab", {"id"}, nullptr);
+
+    SmManager::CatalogSharedGuard no_guard;
+    EXPECT_THROW(sm_manager_->capture_fixed_checkpoint_headers(no_guard), InternalError);
+
+    auto catalog_guard = sm_manager_->acquire_catalog_shared();
+    auto snapshot = sm_manager_->capture_fixed_checkpoint_headers(catalog_guard);
+    ASSERT_EQ(snapshot.table_headers.size(), 1);
+    ASSERT_EQ(snapshot.index_headers.size(), 1);
+    ASSERT_EQ(snapshot.data_and_index_fds.size(), 2);
+    ASSERT_EQ(snapshot.index_file_names.size(), 1);
+    EXPECT_EQ(snapshot.database_identity, TEST_DB_NAME);
+    EXPECT_EQ(snapshot.catalog_generation, sm_manager_->get_catalog_generation());
+    EXPECT_EQ(snapshot.index_file_names.front(),
+              ix_manager_->get_index_name("checkpoint_tab", std::vector<std::string>{"id"}));
+    EXPECT_FALSE(snapshot.db_meta_image.empty());
+
+    ASSERT_NO_THROW(sm_manager_->write_fixed_checkpoint_headers(snapshot, catalog_guard));
+
+    std::array<char, sizeof(RmFileHdr)> table_header{};
+    disk_manager_->read_page(snapshot.table_headers.front().fd, RM_FILE_HDR_PAGE, table_header.data(),
+                             static_cast<int>(table_header.size()));
+    EXPECT_EQ(table_header, snapshot.table_headers.front().bytes);
+
+    std::vector<char> index_header(snapshot.index_headers.front().bytes.size());
+    disk_manager_->read_page(snapshot.index_headers.front().fd, IX_FILE_HDR_PAGE, index_header.data(),
+                             static_cast<int>(index_header.size()));
+    EXPECT_EQ(index_header, snapshot.index_headers.front().bytes);
 }
 
 TEST_F(SmManagerTest, LoadFlushFailureDoesNotPublishMetadataOrReportSuccess) {
