@@ -344,8 +344,7 @@ private:
     void commit_impl(Transaction* txn, LogManager* log_manager);
     void InvokeCheckpointAdmissionTestHook(std::string_view event);
     void PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request, LogManager* log_manager);
-    void RunCommitPublicationWork(const std::shared_ptr<CommitPublicationRequest>& request,
-                                  LogManager* log_manager);
+    void RunCommitPublicationWork(const std::shared_ptr<CommitPublicationRequest>& request, LogManager* log_manager);
     lsn_t CompletedCommitLsn(const LogManager* log_manager) const;
     void InvokeCommitPublicationTestHook(std::string_view event, timestamp_t commit_csn, lsn_t commit_lsn) {
         if (commit_publication_test_hook_) {

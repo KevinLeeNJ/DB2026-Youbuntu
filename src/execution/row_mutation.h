@@ -81,14 +81,16 @@ public:
 
     // Performs the same predicate, X-lock, and post-lock tuple-meta checks as a
     // real mutation without creating a tuple version or any mutation side effects.
-    static bool LockOnly(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info,
-                         Context* context);
+    static bool LockOnly(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info, Context* context,
+                         bool install_si_workspace = false);
 
     // Returns false when the row no longer belongs to the statement's target
     // set (including the READ COMMITTED post-lock recheck).
-    static bool UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info, Context* context);
+    static bool UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info, Context* context,
+                          bool install_si_workspace = false);
 
     // Returns false when the row no longer belongs to the statement's target
     // set. A successful delete is represented by true.
-    static bool DeleteOne(const Rid& rid, RmRecord& visible_record, const DeleteRuntimeInfo& info, Context* context);
+    static bool DeleteOne(const Rid& rid, RmRecord& visible_record, const DeleteRuntimeInfo& info, Context* context,
+                          bool install_si_workspace = false);
 };

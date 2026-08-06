@@ -179,6 +179,7 @@ private:
         PreparedPointUpdateResolutionKind kind = PreparedPointUpdateResolutionKind::Fallback;
         std::optional<Rid> rid;
         std::unique_ptr<RmRecord> visible_record;
+        std::optional<PointMutationWorkspaceAlias> workspace_alias;
     };
 
     PreparedPointUpdateResolution resolve_prepared_point_update(const PreparedUpdateExecutable& executable,
@@ -206,9 +207,25 @@ private:
                 return {};
             }
             if (condition.rhs_val.is_null) {
-                return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt, nullptr};
+                return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt, nullptr, std::nullopt};
             }
             write_point_key_part(key.data() + part.key_offset, condition.rhs_val, part.target_type, part.target_length);
+        }
+
+        PointMutationWorkspaceAlias workspace_alias{point.index_handle->GetFd(), key};
+        if (auto workspace_hit = context->txn_->LookupSiLockedRowWorkspace(
+                executable.scan.table_handle->GetFd(), workspace_alias.index_fd, workspace_alias.key.data(),
+                workspace_alias.key.size());
+            workspace_hit.has_value()) {
+            auto workspace_visible = std::move(workspace_hit->second);
+            RowMutationRuntimeInfo info{
+                sm_manager_, &executable.scan.table_name,  executable.scan.table, executable.scan.table_handle,
+                &conditions, &executable.bound_conditions, &executable.indexes};
+            if (!RowMutationEngine::MatchesTarget(*workspace_visible, info)) {
+                return {PreparedPointUpdateResolutionKind::NoVisible, std::nullopt, nullptr, std::nullopt};
+            }
+            return {PreparedPointUpdateResolutionKind::Visible, workspace_hit->first, std::move(workspace_visible),
+                    std::move(workspace_alias)};
         }
 
         std::vector<Rid> candidates;
@@ -226,7 +243,7 @@ private:
             }
         }
         if (candidates.empty()) {
-            return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt, nullptr};
+            return {PreparedPointUpdateResolutionKind::NoCandidate, std::nullopt, nullptr, std::nullopt};
         }
         if (candidates.size() != 1) {
             return {};
@@ -249,9 +266,10 @@ private:
             visible_record = std::move(visible);
         }
         if (!target.has_value()) {
-            return {PreparedPointUpdateResolutionKind::NoVisible, std::nullopt, nullptr};
+            return {PreparedPointUpdateResolutionKind::NoVisible, std::nullopt, nullptr, std::nullopt};
         }
-        return {PreparedPointUpdateResolutionKind::Visible, target, std::move(visible_record)};
+        return {PreparedPointUpdateResolutionKind::Visible, target, std::move(visible_record),
+                std::move(workspace_alias)};
     }
 
     struct ExecutorQueryExpr {
@@ -1183,8 +1201,8 @@ public:
                 if (point.kind != PreparedPointUpdateResolutionKind::Fallback) {
                     auto root = std::make_unique<UpdateExecutor>(
                         *executable, bind_prepared_set_clauses(executable->set_clauses, parameters),
-                        std::move(conditions), PointMutationTarget{point.rid}, std::move(point.visible_record),
-                        context);
+                        std::move(conditions), PointMutationTarget{point.rid, std::move(point.workspace_alias)},
+                        std::move(point.visible_record), context);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{},
                                                         std::move(root));
                 }
@@ -1271,7 +1289,7 @@ public:
                 if (point_rid.has_value()) {
                     std::unique_ptr<AbstractExecutor> root =
                         std::make_unique<UpdateExecutor>(sm_manager_, x->tab_name_, x->set_clauses_, x->conds_,
-                                                         PointMutationTarget{*point_rid}, context, true);
+                                                         PointMutationTarget{*point_rid, std::nullopt}, context, true);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                         std::move(root), std::move(plan));
                 }
@@ -1298,8 +1316,9 @@ public:
                 const bool compiled_program = x->compiled_point_program_ != nullptr;
                 auto point_rid = resolve_point_rid(*x, context);
                 if (point_rid.has_value()) {
-                    std::unique_ptr<AbstractExecutor> root = std::make_unique<DeleteExecutor>(
-                        sm_manager_, x->tab_name_, x->conds_, PointMutationTarget{*point_rid}, context, true);
+                    std::unique_ptr<AbstractExecutor> root =
+                        std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_,
+                                                         PointMutationTarget{*point_rid, std::nullopt}, context, true);
                     return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                         std::move(root), std::move(plan));
                 }

@@ -1401,9 +1401,8 @@ bool BufferPoolManager::flush_all_pages_for_recovery(const std::vector<int>& fds
                     return;
                 }
                 const RecoveryTask task = tasks[task_index];
-                const FlushBatchResult result = flush_sorted_pages(candidates, task.begin, task.end,
-                                                                   FlushDependencyPolicy::Enforce(),
-                                                                   worker_images[worker_index]);
+                const FlushBatchResult result = flush_sorted_pages(
+                    candidates, task.begin, task.end, FlushDependencyPolicy::Enforce(), worker_images[worker_index]);
                 if (!result.success) {
                     failed.store(true, std::memory_order_release);
                     return;
@@ -1454,10 +1453,9 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
 }
 
 BufferPoolManager::FlushBatchResult BufferPoolManager::flush_sorted_pages(const std::vector<PageId>& candidates,
-                                                                           size_t candidate_begin,
-                                                                           size_t candidate_end,
-                                                                           FlushDependencyPolicy policy,
-                                                                           std::vector<char>& image) {
+                                                                          size_t candidate_begin, size_t candidate_end,
+                                                                          FlushDependencyPolicy policy,
+                                                                          std::vector<char>& image) {
     FlushBatchResult result;
     if (candidate_begin >= candidate_end) {
         return result;

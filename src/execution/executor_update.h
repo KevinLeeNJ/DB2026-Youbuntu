@@ -31,6 +31,7 @@ private:
     bool point_lookup_{false};
     bool point_consumed_{false};
     bool lock_only_{false};
+    std::optional<PointMutationWorkspaceAlias> point_workspace_alias_;
     std::unique_ptr<RmRecord> cached_point_record_;
     std::string tab_name_storage_;
     const std::string* tab_name_;
@@ -88,6 +89,7 @@ public:
         : UpdateExecutor(sm_manager, tab_name, std::move(set_clauses), std::move(conds), std::vector<Rid>{}, context) {
         point_rid_ = target.rid;
         point_lookup_ = point_path;
+        point_workspace_alias_ = std::move(target.workspace_alias);
     }
     UpdateExecutor(const PreparedUpdateExecutable& executable, std::vector<SetClause> set_clauses,
                    std::vector<Condition> conditions, std::vector<Rid> rids, Context* context)
@@ -106,6 +108,7 @@ public:
         : UpdateExecutor(executable, std::move(set_clauses), std::move(conditions), std::vector<Rid>{}, context) {
         point_rid_ = target.rid;
         point_lookup_ = true;
+        point_workspace_alias_ = std::move(target.workspace_alias);
         lock_only_ = executable.point_update.has_value() && executable.point_update->lock_only;
     }
     UpdateExecutor(const PreparedUpdateExecutable& executable, std::vector<SetClause> set_clauses,
@@ -114,6 +117,7 @@ public:
         : UpdateExecutor(executable, std::move(set_clauses), std::move(conditions), std::vector<Rid>{}, context) {
         point_rid_ = target.rid;
         point_lookup_ = true;
+        point_workspace_alias_ = std::move(target.workspace_alias);
         lock_only_ = executable.point_update.has_value() && executable.point_update->lock_only;
         cached_point_record_ = std::move(cached_record);
     }
@@ -136,7 +140,7 @@ public:
             }
             if (lock_only_) {
                 RowMutationRuntimeInfo info{sm_manager_, tab_name_, tab_, fh_, &conds_, bound_conditions_, indexes_};
-                RowMutationEngine::LockOnly(rid, *rec, info, context_);
+                RowMutationEngine::LockOnly(rid, *rec, info, context_, point_workspace_alias_.has_value());
             } else {
                 UpdateRuntimeInfo info{sm_manager_,
                                        tab_name_,
@@ -148,7 +152,16 @@ public:
                                        &set_clauses_,
                                        bound_set_clauses_,
                                        affected_index_bitmap_};
-                RowMutationEngine::UpdateOne(rid, *rec, info, context_);
+                RowMutationEngine::UpdateOne(rid, *rec, info, context_, point_workspace_alias_.has_value());
+            }
+            const bool indexed_update =
+                !lock_only_ && std::any_of(affected_index_bitmap_->begin(), affected_index_bitmap_->end(),
+                                           [](bool affected) { return affected; });
+            if (point_workspace_alias_.has_value() && context_ != nullptr && context_->txn_ != nullptr &&
+                context_->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION && !indexed_update) {
+                context_->txn_->RememberSiLockedRowWorkspaceAlias(fh_->GetFd(), point_workspace_alias_->index_fd,
+                                                                  point_workspace_alias_->key.data(),
+                                                                  point_workspace_alias_->key.size(), rid);
             }
         }
         if (point_lookup_) {

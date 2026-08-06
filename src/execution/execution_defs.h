@@ -12,12 +12,19 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include "defs.h"
 #include "errors.h"
 
 // A point DML target is intentionally distinct from the legacy vector-RID
 // constructor so braced vector arguments in existing callers remain unambiguous.
+struct PointMutationWorkspaceAlias {
+    int index_fd = -1;
+    std::vector<char> key;
+};
+
 struct PointMutationTarget {
     std::optional<Rid> rid;
+    std::optional<PointMutationWorkspaceAlias> workspace_alias;
 };

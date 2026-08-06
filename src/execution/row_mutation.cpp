@@ -441,21 +441,37 @@ bool RowMutationEngine::MatchesTarget(const RmRecord& visible_record, const RowM
 }
 
 bool RowMutationEngine::LockOnly(const Rid& rid, RmRecord& visible_record, const RowMutationRuntimeInfo& info,
-                                 Context* context) {
+                                 Context* context, bool install_si_workspace) {
     RowMutationTxnPin pin(context);
-    return PrepareWrite(rid, visible_record, info, context);
+    if (!PrepareWrite(rid, visible_record, info, context)) {
+        return false;
+    }
+    if (install_si_workspace && context != nullptr && context->txn_ != nullptr &&
+        context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION) {
+        context->txn_->InstallSiLockedRowWorkspaceRow(info.fh->GetFd(), rid, visible_record);
+    }
+    return true;
 }
 
 bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, const UpdateRuntimeInfo& info,
-                                  Context* context) {
+                                  Context* context, bool install_si_workspace) {
     RowMutationTxnPin pin(context);
     if (!PrepareWrite(rid, visible_record, info, context)) {
         return false;
     }
 
+    auto* txn = context == nullptr ? nullptr : context->txn_;
+    const bool use_si_workspace =
+        install_si_workspace && txn != nullptr && txn->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
+    if (use_si_workspace) {
+        // PrepareWrite above acquired the X lock and repeated the stale-write
+        // check. Only after that point may a transaction-local owned copy be
+        // published for a later exact-key operation.
+        txn->InstallSiLockedRowWorkspaceRow(info.fh->GetFd(), rid, visible_record);
+    }
+
     auto new_record = std::make_unique<RmRecord>(visible_record);
     ApplyUpdate(*new_record, visible_record, info);
-    auto* txn = context == nullptr ? nullptr : context->txn_;
 
     if (txn != nullptr && txn->get_isolation_level() == IsolationLevel::SERIALIZABLE && context->txn_mgr_ != nullptr) {
         if (context->txn_mgr_->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, *info.tab_name,
@@ -497,6 +513,19 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         }
         CheckHistoricalIndexConflicts(info, index, new_key, rid, context);
         index_updates.push_back(IndexUpdate{&index, std::move(old_key), std::move(new_key)});
+    }
+    if (txn != nullptr && txn->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION) {
+        if (!use_si_workspace) {
+            // A generic path can modify a row cached by an earlier prepared
+            // point update. It does not maintain that owned copy, so retire it
+            // before the physical write rather than serving stale data later.
+            txn->InvalidateSiLockedRowWorkspaceAliases(info.fh->GetFd(), rid, true);
+        } else if (std::any_of(info.affected_index_bitmap->begin(), info.affected_index_bitmap->end(),
+                               [](bool affected) { return affected; })) {
+            // An exact-key alias is valid only while its indexed key is stable.
+            // Drop all aliases for this row before making an indexed UPDATE visible.
+            txn->InvalidateSiLockedRowWorkspaceAliases(info.fh->GetFd(), rid);
+        }
     }
 
     lsn_t log_lsn = INVALID_LSN;
@@ -563,17 +592,27 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
     if (txn == nullptr) {
         const TupleMeta committed_meta = info.fh->get_tuple_meta(rid);
         info.fh->apply_tuple_update(rid, new_record->data, committed_meta, log_lsn);
+    } else if (use_si_workspace) {
+        txn->InstallSiLockedRowWorkspaceRow(info.fh->GetFd(), rid, *new_record);
     }
     return true;
 }
 
 bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, const DeleteRuntimeInfo& info,
-                                  Context* context) {
+                                  Context* context, bool install_si_workspace) {
     RowMutationTxnPin pin(context);
     if (!PrepareWrite(rid, visible_record, info, context)) {
         return false;
     }
     auto* txn = context == nullptr ? nullptr : context->txn_;
+    if (install_si_workspace && txn != nullptr && txn->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION) {
+        txn->InstallSiLockedRowWorkspaceRow(info.fh->GetFd(), rid, visible_record);
+    }
+    if (txn != nullptr && txn->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION) {
+        // A delete invalidates every point-key alias (and its backing row)
+        // before the tombstone can be observed by a later operation.
+        txn->InvalidateSiLockedRowWorkspaceAliases(info.fh->GetFd(), rid, true);
+    }
     if (info.indexes->empty()) {
         RegisterLogicalRowDeleteIntent(context, info.sm_manager, *info.tab_name, visible_record);
     }

@@ -13,10 +13,12 @@ See the Mulan PSL v2 for more details. */
 #include "common/fault_injection.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <sys/mman.h>
@@ -46,6 +48,7 @@ constexpr size_t kRepairSpotCheckLimit = 64;
 // path below handles the (rare) record that straddles a window boundary.
 constexpr size_t kWalMappingWindowBytes = size_t{64} * 1024 * 1024;
 constexpr uint32_t kMaxRedoRecordBytes = MAX_INDEX_SMO_RECORD_BYTES;
+constexpr size_t kHeapRedoWorkerCount = 4;
 
 class ReadOnlyWalMapping {
 public:
@@ -654,63 +657,169 @@ void RecoveryManager::redo() {
     }
 
     std::sort(heap_redo_records_.begin(), heap_redo_records_.end());
-    std::unique_ptr<ReadOnlyWalMapping> wal_mapping;
-    if (!heap_redo_records_.empty()) {
-        wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_, disk_manager_->GetLogFd(), scan_end_offset_);
+    struct HeapRedoRun {
+        size_t begin;
+        size_t end;
+    };
+    std::vector<HeapRedoRun> page_runs;
+    for (size_t begin = 0; begin < heap_redo_records_.size();) {
+        size_t end = begin + 1;
+        while (end < heap_redo_records_.size() &&
+               heap_redo_records_[end].table_id == heap_redo_records_[begin].table_id &&
+               heap_redo_records_[end].page_no == heap_redo_records_[begin].page_no) {
+            ++end;
+        }
+        page_runs.push_back(HeapRedoRun{begin, end});
+        begin = end;
     }
-    std::vector<char> wal_scratch;
-    WalDmlView dml;
-    for (const HeapRedoRecord& location : heap_redo_records_) {
-        const char* bytes = wal_mapping->record_bytes(location.wal_offset, location.wal_length, &wal_scratch);
-        record = mapped_heap_redo_record(location, bytes);
-        if (!ParseWalDmlForRedo(record, &dml)) {
-            throw InternalError("recovery failed to parse mapped DML at WAL offset " + std::to_string(record.offset) +
-                                " that analyze accepted; WAL retained");
+    std::vector<int32_t> initial_num_pages(tables_.size(), 0);
+    for (size_t table_id = 0; table_id < tables_.size(); ++table_id) {
+        if (tables_[table_id].file_handle != nullptr) {
+            initial_num_pages[table_id] = tables_[table_id].file_handle->get_file_hdr().num_pages;
         }
-        if (location.table_id >= tables_.size()) {
-            throw InternalError("recovery heap-redo descriptor has an invalid table id; WAL retained");
-        }
-        RecoveryTable* table = table_at(location.table_id);
-        if (dml.table_name != table->name || dml.rid.page_no != location.page_no ||
-            dml.rid.slot_no != location.slot_no) {
-            throw InternalError("recovery mapped DML target disagrees with analyze at WAL offset " +
-                                std::to_string(record.offset) + "; WAL retained");
-        }
-        if (committed_txns_.count(record.txn_id) == 0) {
-            ++redo_skipped_count_; // a loser: undo() rolls it back instead
-            continue;
-        }
-        if (table->file_handle == nullptr) {
-            // The table is no longer open, so there is nothing to replay into.
-            // Counted so that applied + skipped covers every DML record.
-            ++redo_skipped_count_;
-            ++redo_missing_table_count_;
-            continue;
-        }
-        ++redo_applied_count_;
-        const TouchedTuple target{location.table_id, location.slot_no, location.page_no};
-        switch (record.log_type) {
-        case LogType::INSERT:
-            redo_insert(record, dml, *table);
-            deferred_committed_deltas_.erase(target);
-            FaultInjector::Point("mid_recovery_redo");
-            break;
-        case LogType::DELETE:
-            redo_delete(record, dml, *table);
-            deferred_committed_deltas_.erase(target);
-            FaultInjector::Point("mid_recovery_redo");
-            break;
-        case LogType::UPDATE:
-            if (!redo_update(record, dml, *table)) {
-                deferred_committed_deltas_[target].push_back(location);
-            } else if (!dml.update_delta.present()) {
-                deferred_committed_deltas_.erase(target);
+    }
+    std::vector<HeapRedoRun> parallel_runs;
+    std::vector<HeapRedoRun> extension_runs;
+    parallel_runs.reserve(page_runs.size());
+    extension_runs.reserve(page_runs.size());
+    for (const HeapRedoRun& run : page_runs) {
+        const HeapRedoRecord& first = heap_redo_records_[run.begin];
+        const bool extension_capable = first.table_id < tables_.size() &&
+                                       tables_[first.table_id].file_handle != nullptr &&
+                                       first.page_no >= initial_num_pages[first.table_id];
+        (extension_capable ? extension_runs : parallel_runs).push_back(run);
+    }
+
+    struct HeapRedoWorker {
+        std::unique_ptr<ReadOnlyWalMapping> wal_mapping;
+        std::vector<char> scratch;
+        WalDmlView dml;
+        uint64_t applied{0};
+        uint64_t skipped{0};
+        uint64_t missing{0};
+        std::map<TouchedTuple, std::vector<HeapRedoRecord>> deferred;
+    };
+
+    const size_t worker_count = std::min(kHeapRedoWorkerCount, page_runs.size());
+    std::vector<HeapRedoWorker> workers(worker_count);
+    std::atomic<size_t> next_run{0};
+    std::atomic<bool> stop{false};
+    std::mutex exception_latch;
+    std::exception_ptr first_exception;
+    auto process_run = [&](HeapRedoWorker& worker, const HeapRedoRun& run) {
+        for (size_t index = run.begin; index < run.end; ++index) {
+            if (stop.load(std::memory_order_acquire)) {
+                return;
             }
-            FaultInjector::Point("mid_recovery_redo");
-            break;
-        default:
-            break;
+            const HeapRedoRecord& location = heap_redo_records_[index];
+            const char* bytes =
+                worker.wal_mapping->record_bytes(location.wal_offset, location.wal_length, &worker.scratch);
+            const WalRecordView mapped = mapped_heap_redo_record(location, bytes);
+            if (!ParseWalDmlForRedo(mapped, &worker.dml)) {
+                throw InternalError("recovery failed to parse mapped DML at WAL offset " +
+                                    std::to_string(mapped.offset) + " that analyze accepted; WAL retained");
+            }
+            if (location.table_id >= tables_.size()) {
+                throw InternalError("recovery heap-redo descriptor has an invalid table id; WAL retained");
+            }
+            RecoveryTable* table = table_at(location.table_id);
+            if (worker.dml.table_name != table->name || worker.dml.rid.page_no != location.page_no ||
+                worker.dml.rid.slot_no != location.slot_no) {
+                throw InternalError("recovery mapped DML target disagrees with analyze at WAL offset " +
+                                    std::to_string(mapped.offset) + "; WAL retained");
+            }
+            if (committed_txns_.count(mapped.txn_id) == 0) {
+                ++worker.skipped;
+                continue;
+            }
+            if (table->file_handle == nullptr) {
+                ++worker.skipped;
+                ++worker.missing;
+                continue;
+            }
+            ++worker.applied;
+            const TouchedTuple target{location.table_id, location.slot_no, location.page_no};
+            switch (mapped.log_type) {
+            case LogType::INSERT:
+                redo_insert(mapped, worker.dml, *table);
+                worker.deferred.erase(target);
+                FaultInjector::Point("mid_recovery_redo");
+                break;
+            case LogType::DELETE:
+                redo_delete(mapped, worker.dml, *table);
+                worker.deferred.erase(target);
+                FaultInjector::Point("mid_recovery_redo");
+                break;
+            case LogType::UPDATE:
+                if (!redo_update(mapped, worker.dml, *table)) {
+                    worker.deferred[target].push_back(location);
+                } else if (!worker.dml.update_delta.present()) {
+                    worker.deferred.erase(target);
+                }
+                FaultInjector::Point("mid_recovery_redo");
+                break;
+            default:
+                break;
+            }
         }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(worker_count);
+    const auto join_workers = [&] {
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    };
+    try {
+        for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+            threads.emplace_back([&, worker_index] {
+                auto& worker = workers[worker_index];
+                try {
+                    worker.wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_, disk_manager_->GetLogFd(),
+                                                                              scan_end_offset_);
+                    while (!stop.load(std::memory_order_acquire)) {
+                        const size_t run_index = next_run.fetch_add(1, std::memory_order_relaxed);
+                        if (run_index >= parallel_runs.size()) {
+                            break;
+                        }
+                        process_run(worker, parallel_runs[run_index]);
+                    }
+                } catch (...) {
+                    stop.store(true, std::memory_order_release);
+                    std::lock_guard<std::mutex> lock(exception_latch);
+                    if (first_exception == nullptr) {
+                        first_exception = std::current_exception();
+                    }
+                }
+            });
+        }
+    } catch (...) {
+        stop.store(true, std::memory_order_release);
+        join_workers();
+        throw;
+    }
+    join_workers();
+    if (first_exception != nullptr) {
+        std::rethrow_exception(first_exception);
+    }
+    for (const HeapRedoRun& run : extension_runs) {
+        process_run(workers.front(), run);
+    }
+    for (auto& worker : workers) {
+        redo_applied_count_ += worker.applied;
+        redo_skipped_count_ += worker.skipped;
+        redo_missing_table_count_ += worker.missing;
+        for (auto& [target, records] : worker.deferred) {
+            auto [_, inserted] = deferred_committed_deltas_.emplace(target, std::move(records));
+            if (!inserted) {
+                throw InternalError("recovery parallel heap-redo split one tuple across page runs; WAL retained");
+            }
+        }
+    }
+    if (redo_applied_count_ + redo_skipped_count_ != touched_.size()) {
+        throw InternalError("recovery heap-redo counters do not cover every DML record; WAL retained");
     }
     // No later recovery phase consults heap_redo_records_; undo follows the
     // LSN index and touched_sorted_ owns the page-repair work.

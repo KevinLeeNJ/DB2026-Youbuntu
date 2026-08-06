@@ -60,6 +60,7 @@ void ClearWriteSet(Transaction* txn) {
         return;
     }
     txn->get_write_set().clear();
+    txn->ClearSiLockedRowWorkspace();
 }
 
 void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
@@ -1959,10 +1960,9 @@ bool TransactionManager::CheckInvisibleWrites(txn_id_t reader, Rid rid, const st
         if (txn->get_state() == TransactionState::ABORTED)
             continue;
 
-        bool invisible_to_reader = txn->get_state() == TransactionState::GROWING ||
-                                   txn->get_state() == TransactionState::COMMITTING ||
-                                   (txn->get_state() == TransactionState::COMMITTED &&
-                                    txn->get_commit_ts() > reader_txn->get_read_ts());
+        bool invisible_to_reader =
+            txn->get_state() == TransactionState::GROWING || txn->get_state() == TransactionState::COMMITTING ||
+            (txn->get_state() == TransactionState::COMMITTED && txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)
             continue;
 

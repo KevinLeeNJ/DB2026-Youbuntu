@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/common.h"
@@ -47,6 +48,28 @@ struct UndoLog {
 
 class Transaction {
 private:
+    // The prepared SI point-update path may revisit a row already locked by
+    // this transaction.  Retain an owned copy only for that case: executor
+    // records may borrow a buffer-pool page and therefore cannot outlive one
+    // operation.  The small fixed limits keep a pathological transaction from
+    // turning this into an unbounded per-transaction cache.
+    static constexpr size_t SI_LOCKED_ROW_WORKSPACE_MAX_ROWS = 64;
+    static constexpr size_t SI_LOCKED_ROW_WORKSPACE_MAX_ALIASES = 128;
+    static constexpr size_t SI_LOCKED_ROW_WORKSPACE_MAX_BYTES = 256 * 1024;
+
+    struct SiLockedRowWorkspaceEntry {
+        int table_fd_;
+        Rid rid_;
+        std::unique_ptr<RmRecord> record_;
+    };
+
+    struct SiLockedRowWorkspaceAlias {
+        int table_fd_;
+        int index_fd_;
+        std::vector<char> key_;
+        Rid rid_;
+    };
+
     struct UpdateWriteKey {
         std::string tab_name_;
         Rid rid_;
@@ -285,6 +308,101 @@ public:
         modified_slot_set_.clear();
     }
 
+    std::optional<std::pair<Rid, std::unique_ptr<RmRecord>>>
+    LookupSiLockedRowWorkspace(int table_fd, int index_fd, const char* key, size_t key_size) const {
+        if (key == nullptr || key_size == 0) {
+            return std::nullopt;
+        }
+        for (const auto& alias : si_locked_row_workspace_aliases_) {
+            if (alias.table_fd_ != table_fd || alias.index_fd_ != index_fd || alias.key_.size() != key_size ||
+                !std::equal(alias.key_.begin(), alias.key_.end(), key)) {
+                continue;
+            }
+            for (const auto& entry : si_locked_row_workspace_rows_) {
+                if (entry.table_fd_ == table_fd && entry.rid_ == alias.rid_ && entry.record_ != nullptr) {
+                    return std::make_pair(alias.rid_, std::make_unique<RmRecord>(*entry.record_));
+                }
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    void InstallSiLockedRowWorkspaceRow(int table_fd, const Rid& rid, const RmRecord& record) {
+        if (record.size < 0 || record.data == nullptr ||
+            static_cast<size_t>(record.size) > SI_LOCKED_ROW_WORKSPACE_MAX_BYTES) {
+            return;
+        }
+        for (auto& entry : si_locked_row_workspace_rows_) {
+            if (entry.table_fd_ != table_fd || entry.rid_ != rid) {
+                continue;
+            }
+            const size_t old_size = static_cast<size_t>(entry.record_->size);
+            const size_t new_size = static_cast<size_t>(record.size);
+            if (si_locked_row_workspace_bytes_ - old_size + new_size > SI_LOCKED_ROW_WORKSPACE_MAX_BYTES) {
+                return;
+            }
+            entry.record_ = std::make_unique<RmRecord>(record);
+            si_locked_row_workspace_bytes_ = si_locked_row_workspace_bytes_ - old_size + new_size;
+            return;
+        }
+        if (si_locked_row_workspace_rows_.size() >= SI_LOCKED_ROW_WORKSPACE_MAX_ROWS ||
+            si_locked_row_workspace_bytes_ + static_cast<size_t>(record.size) > SI_LOCKED_ROW_WORKSPACE_MAX_BYTES) {
+            return;
+        }
+        si_locked_row_workspace_rows_.push_back(
+            SiLockedRowWorkspaceEntry{table_fd, rid, std::make_unique<RmRecord>(record)});
+        si_locked_row_workspace_bytes_ += static_cast<size_t>(record.size);
+    }
+
+    void RememberSiLockedRowWorkspaceAlias(int table_fd, int index_fd, const char* key, size_t key_size,
+                                           const Rid& rid) {
+        if (key == nullptr || key_size == 0 || key_size > SI_LOCKED_ROW_WORKSPACE_MAX_BYTES) {
+            return;
+        }
+        for (auto& alias : si_locked_row_workspace_aliases_) {
+            if (alias.table_fd_ == table_fd && alias.index_fd_ == index_fd && alias.key_.size() == key_size &&
+                std::equal(alias.key_.begin(), alias.key_.end(), key)) {
+                alias.rid_ = rid;
+                return;
+            }
+        }
+        if (si_locked_row_workspace_aliases_.size() >= SI_LOCKED_ROW_WORKSPACE_MAX_ALIASES ||
+            si_locked_row_workspace_bytes_ + key_size > SI_LOCKED_ROW_WORKSPACE_MAX_BYTES) {
+            return;
+        }
+        si_locked_row_workspace_aliases_.push_back(
+            SiLockedRowWorkspaceAlias{table_fd, index_fd, std::vector<char>(key, key + key_size), rid});
+        si_locked_row_workspace_bytes_ += key_size;
+    }
+
+    void InvalidateSiLockedRowWorkspaceAliases(int table_fd, const Rid& rid, bool remove_row = false) {
+        for (auto it = si_locked_row_workspace_aliases_.begin(); it != si_locked_row_workspace_aliases_.end();) {
+            if (it->table_fd_ == table_fd && it->rid_ == rid) {
+                si_locked_row_workspace_bytes_ -= it->key_.size();
+                it = si_locked_row_workspace_aliases_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!remove_row) {
+            return;
+        }
+        for (auto it = si_locked_row_workspace_rows_.begin(); it != si_locked_row_workspace_rows_.end(); ++it) {
+            if (it->table_fd_ == table_fd && it->rid_ == rid) {
+                si_locked_row_workspace_bytes_ -= static_cast<size_t>(it->record_->size);
+                si_locked_row_workspace_rows_.erase(it);
+                break;
+            }
+        }
+    }
+
+    void ClearSiLockedRowWorkspace() {
+        si_locked_row_workspace_rows_.clear();
+        si_locked_row_workspace_aliases_.clear();
+        si_locked_row_workspace_bytes_ = 0;
+    }
+
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
         std::scoped_lock<std::mutex> lck(latch_);
@@ -369,6 +487,10 @@ private:
     std::unordered_set<std::string> logical_row_delete_intent_set_;
     std::deque<Page*> index_latch_page_set_;   // 维护事务执行过程中加锁的索引页面
     std::deque<Page*> index_deleted_page_set_; // 维护事务执行过程中删除的索引页面
+
+    std::vector<SiLockedRowWorkspaceEntry> si_locked_row_workspace_rows_;
+    std::vector<SiLockedRowWorkspaceAlias> si_locked_row_workspace_aliases_;
+    size_t si_locked_row_workspace_bytes_{0};
 
     std::atomic<timestamp_t> read_ts_{0};
     size_t watermark_slot_{std::numeric_limits<size_t>::max()};
