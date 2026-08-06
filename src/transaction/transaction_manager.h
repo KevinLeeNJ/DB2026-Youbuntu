@@ -324,19 +324,28 @@ public:
 
 private:
     struct CommitPublicationRequest {
+        enum class State {
+            REGISTERED,
+            SLOT_PUBLISHING,
+            SLOT_READY,
+            FRONTIER_ADVANCING,
+            FRONTIER_PUBLISHED,
+            LOCKS_RELEASING,
+            DONE,
+        };
+
         Transaction* txn{nullptr};
         timestamp_t commit_csn{0};
         timestamp_t commit_ts{INVALID_TS};
         lsn_t commit_lsn{INVALID_LSN};
-        bool publishing{false};
-        bool locks_released{false};
-        bool done{false};
+        State state{State::REGISTERED};
     };
 
     void commit_impl(Transaction* txn, LogManager* log_manager);
     void InvokeCheckpointAdmissionTestHook(std::string_view event);
     void PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request, LogManager* log_manager);
-    void RunCommitPublicationLeader(timestamp_t target_csn, LogManager* log_manager);
+    void RunCommitPublicationWork(const std::shared_ptr<CommitPublicationRequest>& request,
+                                  LogManager* log_manager);
     lsn_t CompletedCommitLsn(const LogManager* log_manager) const;
     void InvokeCommitPublicationTestHook(std::string_view event, timestamp_t commit_csn, lsn_t commit_lsn) {
         if (commit_publication_test_hook_) {
@@ -353,16 +362,16 @@ private:
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
     std::mutex latch_;                           // 用于txn_map的并发
     // Commit publication is ordered by a small completion frontier rather
-    // than by holding one mutex while touching every tuple page. A commit may
-    // publish outside this mutex; readers advance only through contiguous
-    // completed CSNs, so an out-of-order publisher remains invisible.
+    // than by holding one mutex while touching every tuple page. Any committer
+    // can publish a durable request's tuple slots outside this mutex; readers
+    // advance only through contiguous ready CSNs, so an out-of-order publisher
+    // remains invisible until the frontier catches up.
     std::mutex commit_frontier_latch_;
     std::condition_variable commit_frontier_cv_;
     timestamp_t next_commit_csn_{0};
     timestamp_t published_commit_csn_{0};
     std::map<timestamp_t, timestamp_t> completed_commits_;
     std::map<timestamp_t, std::shared_ptr<CommitPublicationRequest>> pending_commit_publications_;
-    bool commit_publication_leader_active_{false};
     uint64_t commit_publication_epoch_{0};
     SmManager* sm_manager_;
     LockManager* lock_manager_;

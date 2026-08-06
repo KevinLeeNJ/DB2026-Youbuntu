@@ -15,10 +15,12 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <queue>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -835,7 +837,57 @@ void RecoveryManager::undo() {
     // affected index; if that also fails, recovery stops with WAL retained.
     if (!touched_sorted_.empty()) {
         FaultInjector::Point("mid_index_rebuild");
-        repair_touched_indexes();
+
+        // Index repair now only reads heap pages and writes index pages. Start
+        // an opportunistic heap-only flush after all heap mutations are done,
+        // so its writeback can overlap that independent index work. It is not
+        // a durability barrier: the normal final flush still re-scans heap and
+        // index pages, writes headers, and fdatasyncs before WAL is reset.
+        const auto preflush_begin = std::chrono::steady_clock::now();
+        bool preflush_succeeded = false;
+        std::exception_ptr preflush_exception;
+        std::thread heap_preflush([&] {
+            try {
+                preflush_succeeded = sm_manager_->preflush_recovery_heap_pages(touched_tables_);
+            } catch (...) {
+                preflush_exception = std::current_exception();
+            }
+        });
+
+        std::exception_ptr repair_exception;
+        std::unordered_set<std::string> indexes_to_rebuild;
+        try {
+            indexes_to_rebuild = repair_touched_indexes();
+        } catch (...) {
+            repair_exception = std::current_exception();
+        }
+
+        const auto preflush_wait_begin = std::chrono::steady_clock::now();
+        heap_preflush.join();
+        const auto preflush_end = std::chrono::steady_clock::now();
+        const auto elapsed_ms = [](std::chrono::steady_clock::duration duration) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+        };
+        LOG_INFO("recovery heap preflush: total %lld ms, repair wait %lld ms",
+                 static_cast<long long>(elapsed_ms(preflush_end - preflush_begin)),
+                 static_cast<long long>(elapsed_ms(preflush_end - preflush_wait_begin)));
+
+        // Always join before propagating either failure. Preserve the repair
+        // exception when both paths fail, while retaining WAL in every case.
+        if (repair_exception != nullptr) {
+            std::rethrow_exception(repair_exception);
+        }
+        if (preflush_exception != nullptr) {
+            std::rethrow_exception(preflush_exception);
+        }
+        if (!preflush_succeeded) {
+            throw InternalError("recovery heap preflush failed; WAL retained");
+        }
+
+        // Rebuilding creates, opens, closes, and renames index files. Keep it
+        // outside the overlap window because DiskManager's fd maps are not
+        // synchronized for concurrent mutation and heap writeback lookup.
+        rebuild_indexes(indexes_to_rebuild);
     }
     if (!sm_manager_->flush_recovery_pages(touched_tables_)) {
         // Recovery results are not durable. Keep the complete WAL and refuse
@@ -1297,14 +1349,14 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
     return true;
 }
 
-void RecoveryManager::repair_touched_indexes() {
+std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
     std::map<std::string, IndexRepairPlan> plans;
     // Only names and key widths at this point. Collecting the keys costs a WAL
     // pass and a heap sweep, so it waits until the spine check below has dropped
     // the indexes that cannot be repaired in place at all.
     plan_touched_indexes(&plans);
     if (plans.empty()) {
-        return;
+        return {};
     }
     const size_t total_indexes = plans.size();
 
@@ -1396,7 +1448,7 @@ void RecoveryManager::repair_touched_indexes() {
     for (auto& table : tables_) {
         table.index_plans.clear();
     }
-    rebuild_indexes(indexes_to_rebuild);
+    return indexes_to_rebuild;
 }
 
 void RecoveryManager::rebuild_indexes(const std::unordered_set<std::string>& index_names) {

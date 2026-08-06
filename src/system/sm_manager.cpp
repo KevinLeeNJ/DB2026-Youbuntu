@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
@@ -24,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "index/ix.h"
+#include "minilog.h"
 #include "record/rm.h"
 #include "record_printer.h"
 #include "transaction/transaction_manager.h"
@@ -1150,9 +1152,11 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
     }
     std::sort(fds.begin(), fds.end());
     fds.erase(std::unique(fds.begin(), fds.end()), fds.end());
-    if (!buffer_pool_manager_->flush_all_pages(fds)) {
+    const auto pages_begin = std::chrono::steady_clock::now();
+    if (!buffer_pool_manager_->flush_all_pages_for_recovery(fds)) {
         return false;
     }
+    const auto pages_end = std::chrono::steady_clock::now();
     // Headers are written outside the buffer pool. Write them only after the
     // repaired pages, then sync every affected file before WAL can be reset.
     for (const auto& tab_name : table_names) {
@@ -1170,11 +1174,34 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
             }
         }
     }
+    const auto headers_end = std::chrono::steady_clock::now();
     for (const int fd : fds) {
         disk_manager_->sync_file(fd);
     }
+    const auto sync_end = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [](std::chrono::steady_clock::duration duration) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    };
+    LOG_INFO("recovery data flush: pages %lld ms, headers %lld ms, sync %lld ms",
+             static_cast<long long>(elapsed_ms(pages_end - pages_begin)),
+             static_cast<long long>(elapsed_ms(headers_end - pages_end)),
+             static_cast<long long>(elapsed_ms(sync_end - headers_end)));
     FaultInjector::Point("after_recovery_data_sync");
     return true;
+}
+
+bool SmManager::preflush_recovery_heap_pages(const std::unordered_set<std::string>& table_names) {
+    std::vector<int> heap_fds;
+    heap_fds.reserve(table_names.size());
+    for (const auto& tab_name : table_names) {
+        auto fh_it = fhs_.find(tab_name);
+        if (fh_it != fhs_.end()) {
+            heap_fds.push_back(fh_it->second->GetFd());
+        }
+    }
+    std::sort(heap_fds.begin(), heap_fds.end());
+    heap_fds.erase(std::unique(heap_fds.begin(), heap_fds.end()), heap_fds.end());
+    return buffer_pool_manager_->flush_all_pages_for_recovery(heap_fds);
 }
 
 void SmManager::rebuild_all_indexes() {

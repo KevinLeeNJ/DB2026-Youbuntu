@@ -14,7 +14,9 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <thread>
 #include <unordered_set>
 
 #include "minilog.h"
@@ -1319,10 +1321,145 @@ bool BufferPoolManager::flush_all_pages(const std::vector<int>& fds, FlushDepend
     return flush_pages(candidates, policy).success;
 }
 
+bool BufferPoolManager::flush_all_pages_for_recovery(const std::vector<int>& fds) {
+    if (fds.empty()) {
+        return true;
+    }
+
+    const std::unordered_set<int> fd_set(fds.begin(), fds.end());
+    std::vector<PageId> candidates;
+    {
+        std::shared_lock lock{latch_};
+        candidates.reserve(page_table_.size());
+        for (const auto& [page_id, frame_id] : page_table_) {
+            if (fd_set.find(page_id.fd) == fd_set.end()) {
+                continue;
+            }
+            Page* page = &pages_[frame_id];
+            if (page->state_.load(std::memory_order_acquire) == FrameState::VALID && page->is_dirty_) {
+                candidates.push_back(page_id);
+            }
+        }
+    }
+    if (candidates.empty()) {
+        return true;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const PageId& lhs, const PageId& rhs) {
+        if (lhs.fd != rhs.fd) {
+            return lhs.fd < rhs.fd;
+        }
+        return lhs.page_no < rhs.page_no;
+    });
+
+    constexpr size_t kRecoveryTaskPages = 256;
+    constexpr size_t kMaxRecoveryWorkers = 4;
+    struct RecoveryTask {
+        size_t begin;
+        size_t end;
+    };
+    std::vector<RecoveryTask> tasks;
+    for (size_t run_begin = 0; run_begin < candidates.size();) {
+        size_t run_end = run_begin + 1;
+        while (run_end < candidates.size() && candidates[run_end].fd == candidates[run_begin].fd &&
+               candidates[run_end].page_no == candidates[run_end - 1].page_no + 1) {
+            ++run_end;
+        }
+        for (size_t task_begin = run_begin; task_begin < run_end; task_begin += kRecoveryTaskPages) {
+            tasks.push_back(RecoveryTask{task_begin, std::min(task_begin + kRecoveryTaskPages, run_end)});
+        }
+        run_begin = run_end;
+    }
+
+    const size_t worker_count = std::min(kMaxRecoveryWorkers, tasks.size());
+    constexpr size_t kClaimPages = 64;
+    std::vector<std::vector<char>> worker_images;
+    worker_images.reserve(worker_count);
+    for (size_t i = 0; i < worker_count; ++i) {
+        // Allocate every worker's image before it can claim a frame. This keeps
+        // allocation failure from leaving a claimed frame in FLUSHING state.
+        worker_images.emplace_back();
+        worker_images.back().reserve(kClaimPages * PAGE_SIZE);
+    }
+
+    std::atomic<size_t> next_task{0};
+    std::atomic<bool> failed{false};
+    std::mutex exception_latch;
+    std::exception_ptr worker_exception;
+    auto record_exception = [&](std::exception_ptr exception) {
+        failed.store(true, std::memory_order_release);
+        std::scoped_lock lock{exception_latch};
+        if (worker_exception == nullptr) {
+            worker_exception = exception;
+        }
+    };
+    auto worker = [&](size_t worker_index) {
+        try {
+            while (!failed.load(std::memory_order_acquire)) {
+                const size_t task_index = next_task.fetch_add(1, std::memory_order_relaxed);
+                if (task_index >= tasks.size()) {
+                    return;
+                }
+                const RecoveryTask task = tasks[task_index];
+                const FlushBatchResult result = flush_sorted_pages(candidates, task.begin, task.end,
+                                                                   FlushDependencyPolicy::Enforce(),
+                                                                   worker_images[worker_index]);
+                if (!result.success) {
+                    failed.store(true, std::memory_order_release);
+                    return;
+                }
+            }
+        } catch (...) {
+            record_exception(std::current_exception());
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (size_t i = 0; i < worker_count; ++i) {
+            workers.emplace_back(worker, i);
+        }
+    } catch (...) {
+        record_exception(std::current_exception());
+    }
+    for (std::thread& thread : workers) {
+        thread.join();
+    }
+    if (worker_exception != nullptr) {
+        std::rethrow_exception(worker_exception);
+    }
+    return !failed.load(std::memory_order_acquire);
+}
+
 BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<PageId>& page_ids,
                                                                    FlushDependencyPolicy policy) {
-    FlushBatchResult result;
     if (page_ids.empty()) {
+        return FlushBatchResult{};
+    }
+
+    // Sorted so that runs of adjacent page numbers become single pwrites.
+    std::sort(page_ids.begin(), page_ids.end(), [](const PageId& lhs, const PageId& rhs) {
+        if (lhs.fd != rhs.fd) {
+            return lhs.fd < rhs.fd;
+        }
+        return lhs.page_no < rhs.page_no;
+    });
+    constexpr size_t kClaimPages = 64;
+    // Reserve before the first claim. flush_sorted_pages only resizes within
+    // this capacity after a claim, so it cannot allocate or throw there.
+    std::vector<char> image;
+    image.reserve(std::min(kClaimPages, page_ids.size()) * PAGE_SIZE);
+    return flush_sorted_pages(page_ids, 0, page_ids.size(), policy, image);
+}
+
+BufferPoolManager::FlushBatchResult BufferPoolManager::flush_sorted_pages(const std::vector<PageId>& candidates,
+                                                                           size_t candidate_begin,
+                                                                           size_t candidate_end,
+                                                                           FlushDependencyPolicy policy,
+                                                                           std::vector<char>& image) {
+    FlushBatchResult result;
+    if (candidate_begin >= candidate_end) {
         return result;
     }
 
@@ -1334,28 +1471,18 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
         PageWriteDependency dependency{PageWriteDependency::None()};
     };
 
-    // Sorted so that runs of adjacent page numbers become single pwrites.
-    std::sort(page_ids.begin(), page_ids.end(), [](const PageId& lhs, const PageId& rhs) {
-        if (lhs.fd != rhs.fd) {
-            return lhs.fd < rhs.fd;
-        }
-        return lhs.page_no < rhs.page_no;
-    });
-
-    const std::vector<PageId>& candidates = page_ids;
-    // Grown, never shrunk, and never larger than the batch actually claimed. A
-    // checkpoint reaches the full kClaimPages once and keeps it; an index
-    // structure change publishes a handful of pages and must not pay for
-    // zero-filling 256 KiB it will not use.
-    std::vector<char> image;
+    const size_t required_image_size = std::min(kClaimPages, candidate_end - candidate_begin) * PAGE_SIZE;
+    if (image.capacity() < required_image_size) {
+        throw InternalError("flush image must be allocated before claiming pages");
+    }
     std::vector<ClaimedPage> claimed;
     claimed.reserve(kClaimPages);
     bool success = true;
-    for (size_t candidate_begin = 0; candidate_begin < candidates.size();) {
+    for (; candidate_begin < candidate_end;) {
         claimed.clear();
         {
             std::unique_lock lock{latch_};
-            while (candidate_begin < candidates.size() && claimed.size() < kClaimPages) {
+            while (candidate_begin < candidate_end && claimed.size() < kClaimPages) {
                 const PageId page_id = candidates[candidate_begin++];
                 index_smo_cv_.wait(lock, [&] { return !index_smo_blocked_locked(page_id.fd); });
                 auto hit = page_table_.find(page_id);
@@ -1375,9 +1502,11 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
         }
 
         size_t claimed_begin = 0;
-        if (image.size() < claimed.size() * PAGE_SIZE) {
-            image.resize(claimed.size() * PAGE_SIZE);
-        }
+        // The caller reserved the largest possible claim for this range before
+        // any frame transition.
+        // char default construction within existing capacity cannot allocate or
+        // throw, while preserving the old small-batch initialization cost.
+        image.resize(claimed.size() * PAGE_SIZE);
         while (claimed_begin < claimed.size()) {
             size_t claimed_end = claimed_begin + 1;
             while (claimed_end < claimed.size() &&

@@ -578,6 +578,11 @@ public:
     void prune_version_history(timestamp_t watermark);
 
     bool flush_all_table_and_index_pages(FlushDependencyPolicy policy = FlushDependencyPolicy::Enforce());
+    // Recovery overlap phase: write dirty heap pages for touched tables only.
+    // This deliberately has no header, fdatasync, fault-injection, manifest, or
+    // WAL-reset side effects. flush_recovery_pages() remains the sole recovery
+    // durability barrier after index repair has completed.
+    bool preflush_recovery_heap_pages(const std::unordered_set<std::string>& table_names);
     bool flush_recovery_pages(const std::unordered_set<std::string>& table_names);
 
     TableDirtyPageStats table_dirty_page_stats();
@@ -619,8 +624,11 @@ public:
         }
     }
 
-    // MVCC: mark all slots modified by txn as committed with the given commit_ts
-    void mark_slots_committed(Transaction& txn, timestamp_t commit_ts) {
+    // MVCC: mark all slots modified by txn as committed with the given commit_ts.
+    // Cooperative commit publication retains the immutable slot list until its
+    // CSN is part of the contiguous visibility frontier, so SSI can still
+    // recognize a COMMITTING writer that has published its tuple metadata.
+    void mark_slots_committed(Transaction& txn, timestamp_t commit_ts, bool clear_modified_slots = true) {
         auto& modified_slots = txn.get_modified_slots();
 
         size_t offset = 0;
@@ -662,7 +670,9 @@ public:
             buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
             offset = next;
         }
-        txn.clear_modified_slots();
+        if (clear_modified_slots) {
+            txn.clear_modified_slots();
+        }
     }
 
     // Bulk-load a CSV file into an existing table. The path is relative to the

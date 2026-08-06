@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -505,107 +506,175 @@ lsn_t TransactionManager::CompletedCommitLsn(const LogManager* log_manager) cons
     return log_manager->get_persist_lsn();
 }
 
-void TransactionManager::RunCommitPublicationLeader(timestamp_t target_csn, LogManager* log_manager) {
+void TransactionManager::RunCommitPublicationWork(const std::shared_ptr<CommitPublicationRequest>& request,
+                                                  LogManager* log_manager) {
     for (;;) {
-        std::shared_ptr<CommitPublicationRequest> request;
+        std::shared_ptr<CommitPublicationRequest> slot_request;
+        std::shared_ptr<CommitPublicationRequest> lock_request;
+        std::vector<std::shared_ptr<CommitPublicationRequest>> frontier_requests;
+        std::shared_ptr<CommitPublicationRequest> waiting_for_wal;
+        timestamp_t waiting_for_csn = INVALID_TS;
+        uint64_t observed_epoch = 0;
         {
-            std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
-            for (;;) {
-                if (published_commit_csn_ >= target_csn) {
-                    commit_publication_leader_active_ = false;
-                    frontier_lock.unlock();
-                    commit_frontier_cv_.notify_all();
-                    return;
-                }
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            if (request->state == CommitPublicationRequest::State::DONE) {
+                return;
+            }
 
+            // Shorten lock hold and transaction overlap first. A ready
+            // contiguous prefix is the only visibility-critical serialized
+            // work, so consume it before starting another page publication.
+            while (true) {
                 auto next = pending_commit_publications_.find(published_commit_csn_ + 1);
-                if (next != pending_commit_publications_.end() && !next->second->publishing &&
-                    next->second->commit_lsn <= CompletedCommitLsn(log_manager)) {
-                    request = next->second;
-                    request->publishing = true;
+                if (next == pending_commit_publications_.end() ||
+                    next->second->state != CommitPublicationRequest::State::SLOT_READY) {
                     break;
                 }
+                auto& frontier_request = next->second;
+                frontier_request->state = CommitPublicationRequest::State::FRONTIER_ADVANCING;
+                FaultInjector::Point("before_published_csn_store");
+                last_commit_ts_.store(frontier_request->commit_ts, std::memory_order_release);
+                ++published_commit_csn_;
+                frontier_request->txn->set_state(TransactionState::COMMITTED);
+                frontier_requests.push_back(frontier_request);
+            }
 
-                std::shared_ptr<CommitPublicationRequest> waiting_for_wal;
-                if (next != pending_commit_publications_.end() && !next->second->publishing) {
+            if (frontier_requests.empty()) {
+                // A completed request's lock release is also independent of
+                // page publication and must not wait behind a steady stream of
+                // newly durable higher-CSN requests.
+                for (const auto& [_, candidate] : pending_commit_publications_) {
+                    if (candidate->state == CommitPublicationRequest::State::FRONTIER_PUBLISHED) {
+                        candidate->state = CommitPublicationRequest::State::LOCKS_RELEASING;
+                        lock_request = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (frontier_requests.empty() && lock_request == nullptr) {
+                const lsn_t completed_lsn = CompletedCommitLsn(log_manager);
+                for (const auto& [_, candidate] : pending_commit_publications_) {
+                    if (candidate->state == CommitPublicationRequest::State::REGISTERED &&
+                        candidate->commit_lsn <= completed_lsn) {
+                        candidate->state = CommitPublicationRequest::State::SLOT_PUBLISHING;
+                        slot_request = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (frontier_requests.empty() && lock_request == nullptr && slot_request == nullptr) {
+                const auto next = pending_commit_publications_.find(published_commit_csn_ + 1);
+                waiting_for_csn = published_commit_csn_ + 1;
+                if (next != pending_commit_publications_.end() &&
+                    next->second->state == CommitPublicationRequest::State::REGISTERED) {
                     waiting_for_wal = next->second;
                 }
-                const timestamp_t waiting_for_csn = published_commit_csn_ + 1;
-                const uint64_t observed_epoch = commit_publication_epoch_;
-                frontier_lock.unlock();
-                if (waiting_for_wal != nullptr) {
-                    InvokeCommitPublicationTestHook("leader_waiting_for_wal", waiting_for_wal->commit_csn,
-                                                    waiting_for_wal->commit_lsn);
-                } else {
-                    InvokeCommitPublicationTestHook("leader_waiting_for_request", waiting_for_csn, INVALID_LSN);
+                observed_epoch = commit_publication_epoch_;
+            }
+        }
+
+        if (slot_request != nullptr) {
+            FaultInjector::Point("before_tuple_publication");
+            InvokeCommitPublicationTestHook("before_tuple_publication", slot_request->commit_csn,
+                                            slot_request->commit_lsn);
+            // Keep the set intact until the contiguous frontier has advanced.
+            // SSI readers inspect it under latch_ while COMMITTING+SLOT_READY is
+            // an otherwise invisible writer state.
+            sm_manager_->mark_slots_committed(*slot_request->txn, slot_request->commit_ts, false);
+            FaultInjector::Point("after_tuple_publication");
+            InvokeCommitPublicationTestHook("after_tuple_publication", slot_request->commit_csn,
+                                            slot_request->commit_lsn);
+            {
+                std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                if (slot_request->state != CommitPublicationRequest::State::SLOT_PUBLISHING) {
+                    throw InternalError("commit publication slot claim was lost");
                 }
-                frontier_lock.lock();
-                commit_frontier_cv_.wait(frontier_lock, [&] { return commit_publication_epoch_ != observed_epoch; });
+                slot_request->state = CommitPublicationRequest::State::SLOT_READY;
+                ++commit_publication_epoch_;
             }
+            commit_frontier_cv_.notify_all();
+            continue;
         }
 
-        FaultInjector::Point("before_tuple_publication");
-        sm_manager_->mark_slots_committed(*request->txn, request->commit_ts);
-        FaultInjector::Point("after_tuple_publication");
-
-        request->txn->set_state(TransactionState::COMMITTED);
-        FaultInjector::Point("before_published_csn_store");
-        {
-            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
-            if (request->commit_csn != published_commit_csn_ + 1) {
-                throw InternalError("commit publication frontier lost contiguous order");
+        if (!frontier_requests.empty()) {
+            // CheckInvisibleWrites and CheckPredicateInvisibleWrites hold
+            // latch_ while reading modified_slots. Do not clear the retained
+            // publication set until the writer is committed, and serialize the
+            // clear with those SSI readers without nesting latch_ with the
+            // frontier mutex.
+            {
+                std::unique_lock<std::mutex> lock(latch_);
+                for (const auto& frontier_request : frontier_requests) {
+                    frontier_request->txn->clear_modified_slots();
+                }
             }
-            last_commit_ts_.store(request->commit_ts, std::memory_order_release);
-            ++published_commit_csn_;
-        }
-        FaultInjector::Point("after_commit_publication_frontier");
-        InvokeCommitPublicationTestHook("after_frontier", request->commit_csn, request->commit_lsn);
 
-        FaultInjector::Point("before_commit_helper_lock_release");
-        ReleaseLocks(request->txn, lock_manager_);
-        FaultInjector::Point("after_commit_helper_lock_release");
-        InvokeCommitPublicationTestHook("after_lock_release", request->commit_csn, request->commit_lsn);
-        {
-            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
-            request->locks_released = true;
-            request->done = true;
-            pending_commit_publications_.erase(request->commit_csn);
+            {
+                std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                for (const auto& frontier_request : frontier_requests) {
+                    if (frontier_request->state != CommitPublicationRequest::State::FRONTIER_ADVANCING) {
+                        throw InternalError("commit publication frontier state was lost");
+                    }
+                    frontier_request->state = CommitPublicationRequest::State::FRONTIER_PUBLISHED;
+                }
+                ++commit_publication_epoch_;
+            }
+            FaultInjector::Point("after_commit_publication_frontier");
+            for (const auto& frontier_request : frontier_requests) {
+                InvokeCommitPublicationTestHook("after_frontier", frontier_request->commit_csn,
+                                                frontier_request->commit_lsn);
+            }
+            commit_frontier_cv_.notify_all();
+            continue;
         }
-        commit_frontier_cv_.notify_all();
+
+        if (lock_request != nullptr) {
+            FaultInjector::Point("before_commit_helper_lock_release");
+            ReleaseLocks(lock_request->txn, lock_manager_);
+            FaultInjector::Point("after_commit_helper_lock_release");
+            InvokeCommitPublicationTestHook("after_lock_release", lock_request->commit_csn, lock_request->commit_lsn);
+            {
+                std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                if (lock_request->state != CommitPublicationRequest::State::LOCKS_RELEASING) {
+                    throw InternalError("commit publication lock claim was lost");
+                }
+                lock_request->state = CommitPublicationRequest::State::DONE;
+                pending_commit_publications_.erase(lock_request->commit_csn);
+                ++commit_publication_epoch_;
+            }
+            commit_frontier_cv_.notify_all();
+            continue;
+        }
+
+        if (waiting_for_wal != nullptr) {
+            InvokeCommitPublicationTestHook("leader_waiting_for_wal", waiting_for_wal->commit_csn,
+                                            waiting_for_wal->commit_lsn);
+        } else {
+            InvokeCommitPublicationTestHook("leader_waiting_for_request", waiting_for_csn, INVALID_LSN);
+        }
+
+        // The owner normally notifies after its WAL wait. Only a registered
+        // lower request needs a bounded poll: its WAL can become durable while
+        // its owner is descheduled before that notification. Missing requests
+        // and in-flight slot claims have no independently observable progress.
+        std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+        const auto progressed = [&] {
+            return request->state == CommitPublicationRequest::State::DONE ||
+                   commit_publication_epoch_ != observed_epoch;
+        };
+        if (waiting_for_wal != nullptr) {
+            commit_frontier_cv_.wait_for(frontier_lock, std::chrono::milliseconds(1), progressed);
+        } else {
+            commit_frontier_cv_.wait(frontier_lock, progressed);
+        }
     }
 }
 
 void TransactionManager::PublishOrWaitForCommit(const std::shared_ptr<CommitPublicationRequest>& request,
                                                 LogManager* log_manager) {
-    {
-        std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
-        ++commit_publication_epoch_;
-    }
-    commit_frontier_cv_.notify_all();
-
-    while (true) {
-        timestamp_t target_csn = INVALID_TS;
-        {
-            std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
-            if (request->done) {
-                return;
-            }
-            if (commit_publication_leader_active_) {
-                commit_frontier_cv_.wait(frontier_lock,
-                                         [&] { return request->done || !commit_publication_leader_active_; });
-                if (request->done) {
-                    return;
-                }
-            }
-            if (!commit_publication_leader_active_) {
-                commit_publication_leader_active_ = true;
-                target_csn = request->commit_csn;
-            }
-        }
-        if (target_csn != INVALID_TS) {
-            RunCommitPublicationLeader(target_csn, log_manager);
-        }
-    }
+    RunCommitPublicationWork(request, log_manager);
 }
 
 /**
@@ -695,7 +764,9 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             FaultInjector::Point("after_commit_wal_sync");
             InvokeCommitPublicationTestHook("after_wal_wait", commit_csn, publication_request->commit_lsn);
             PublishOrWaitForCommit(publication_request, log_manager);
-            locks_released_by_helper = publication_request->locks_released;
+            // PublishOrWaitForCommit returns only after this request has moved
+            // through DONE, whose final transition releases its locks.
+            locks_released_by_helper = true;
         } else {
             WriteCommitLog(txn, log_manager, commit_ts);
             FaultInjector::Point("after_commit_wal_sync");
@@ -1873,7 +1944,6 @@ bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, cons
 }
 
 bool TransactionManager::CheckInvisibleWrites(txn_id_t reader, Rid rid, const std::string& tab_name) {
-    (void)tab_name;
     std::unique_lock<std::mutex> lock(latch_);
     bool danger = false;
     auto reader_it = txn_map.find(reader);
@@ -1889,16 +1959,17 @@ bool TransactionManager::CheckInvisibleWrites(txn_id_t reader, Rid rid, const st
         if (txn->get_state() == TransactionState::ABORTED)
             continue;
 
-        bool invisible_to_reader =
-            txn->get_state() == TransactionState::GROWING ||
-            (txn->get_state() == TransactionState::COMMITTED && txn->get_commit_ts() > reader_txn->get_read_ts());
+        bool invisible_to_reader = txn->get_state() == TransactionState::GROWING ||
+                                   txn->get_state() == TransactionState::COMMITTING ||
+                                   (txn->get_state() == TransactionState::COMMITTED &&
+                                    txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)
             continue;
 
         // Check if this transaction has modified the given RID
         bool modified_this_rid = false;
         for (const auto& [tab, slot_rid] : txn->get_modified_slots()) {
-            if (slot_rid.page_no == rid.page_no && slot_rid.slot_no == rid.slot_no) {
+            if (tab == tab_name && slot_rid.page_no == rid.page_no && slot_rid.slot_no == rid.slot_no) {
                 modified_this_rid = true;
                 break;
             }
@@ -1967,6 +2038,7 @@ bool TransactionManager::CheckPredicateInvisibleWrites(txn_id_t reader, const st
             continue;
 
         bool invisible_to_reader = writer_txn->get_state() == TransactionState::GROWING ||
+                                   writer_txn->get_state() == TransactionState::COMMITTING ||
                                    (writer_txn->get_state() == TransactionState::COMMITTED &&
                                     writer_txn->get_commit_ts() > reader_txn->get_read_ts());
         if (!invisible_to_reader)

@@ -320,7 +320,7 @@ private:
     void undo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
     void repair_touched_file_headers();
     void reset_touched_tuple_meta();
-    void repair_touched_indexes();
+    std::unordered_set<std::string> repair_touched_indexes();
     // Names the indexes a touched table owns, without reading any key yet, and
     // resolves each one's IndexMeta and handle so no later phase has to.
     void plan_touched_indexes(std::map<std::string, IndexRepairPlan>* plans);

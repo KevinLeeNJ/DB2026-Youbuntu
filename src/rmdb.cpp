@@ -10,7 +10,6 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
-#include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
 #include <algorithm>
@@ -25,11 +24,13 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "errors.h"
@@ -48,7 +49,8 @@ See the Mulan PSL v2 for more details. */
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 128
 
-static bool should_exit = false;
+static volatile sig_atomic_t should_exit = 0;
+static volatile sig_atomic_t listener_fd = -1;
 
 // 构建全局所需的管理器对象
 static constexpr size_t SERVER_BUFFER_POOL_PAGES = (size_t{3} << 30) / PAGE_SIZE;
@@ -71,13 +73,13 @@ auto log_manager = std::make_unique<LogManager>(disk_manager.get(), DurabilityMo
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 
-static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
     (void)signo;
-    should_exit = true;
-    log_manager->flush_log_to_disk_with_sync();
-    LOG_INFO("the server received Ctrl+C and will close");
-    longjmp(jmpbuf, 1);
+    should_exit = 1;
+    const int fd = listener_fd;
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+    }
 }
 
 namespace {
@@ -1070,14 +1072,64 @@ void client_handler(int fd) {
         abort_session(session, nullptr);
     }
     abort_session(session, nullptr);
-    close(fd);
 }
 } // namespace
 
 void start_server(std::uint16_t port) {
+    struct ClientThread {
+        std::shared_ptr<std::atomic<bool>> done;
+        std::thread thread;
+
+        ClientThread(std::shared_ptr<std::atomic<bool>> completion, int fd, std::mutex* active_latch,
+                     std::unordered_set<int>* active_fds)
+            : done(std::move(completion)), thread([fd, completion = done, active_latch, active_fds] {
+                  try {
+                      client_handler(fd);
+                  } catch (const std::exception& exception) {
+                      LOG_WARN("client handler failed: %s", exception.what());
+                  } catch (...) {
+                      LOG_WARN("client handler failed with an unknown exception");
+                  }
+                  // Erase before close: a newly accepted connection can reuse
+                  // the descriptor immediately after close(), so a late erase
+                  // must never remove that new connection from the registry.
+                  {
+                      std::lock_guard<std::mutex> lock(*active_latch);
+                      active_fds->erase(fd);
+                  }
+                  close(fd);
+                  completion->store(true, std::memory_order_release);
+              }) {}
+    };
+
     int sockfd_server;
     int fd_temp;
     struct sockaddr_in s_addr_in {};
+    std::mutex active_client_latch;
+    std::unordered_set<int> active_client_fds;
+    std::vector<ClientThread> client_threads;
+    client_threads.reserve(MAX_CONN_LIMIT);
+
+    const auto reap_finished_clients = [&] {
+        auto it = client_threads.begin();
+        while (it != client_threads.end()) {
+            if (!it->done->load(std::memory_order_acquire)) {
+                ++it;
+                continue;
+            }
+            if (it->thread.joinable()) {
+                it->thread.join();
+            }
+            it = client_threads.erase(it);
+        }
+    };
+
+    const auto shutdown_active_clients = [&] {
+        std::lock_guard<std::mutex> lock(active_client_latch);
+        for (const int fd : active_client_fds) {
+            shutdown(fd, SHUT_RDWR);
+        }
+    };
 
     // 初始化连接
     sockfd_server = socket(AF_INET, SOCK_STREAM, 0); // ipv4,TCP
@@ -1103,34 +1155,71 @@ void start_server(std::uint16_t port) {
         minilog::Logger::get().stop();
         exit(1);
     }
+    listener_fd = sockfd_server;
 
     while (!should_exit) {
+        reap_finished_clients();
         LOG_DEBUG("waiting for new connection");
         struct sockaddr_in s_addr_client {};
         int client_length = sizeof(s_addr_client);
 
-        if (setjmp(jmpbuf)) {
-            LOG_INFO("break from server listen loop");
-            break;
-        }
-
         // Block here. Until server accepts a new connection.
         int sockfd = accept(sockfd_server, (struct sockaddr*)(&s_addr_client), (socklen_t*)(&client_length));
         if (sockfd == -1) {
+            if (should_exit) {
+                LOG_INFO("break from server listen loop");
+                break;
+            }
             LOG_WARN("accept failed: %s", strerror(errno));
             continue; // ignore current socket ,continue while loop.
         }
 
-        // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        std::thread(client_handler, sockfd).detach();
+        reap_finished_clients();
+        try {
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            {
+                std::lock_guard<std::mutex> lock(active_client_latch);
+                active_client_fds.insert(sockfd);
+            }
+            client_threads.emplace_back(std::move(done), sockfd, &active_client_latch, &active_client_fds);
+        } catch (const std::exception& exception) {
+            {
+                std::lock_guard<std::mutex> lock(active_client_latch);
+                active_client_fds.erase(sockfd);
+            }
+            close(sockfd);
+            LOG_ERROR("unable to register client handler: %s", exception.what());
+            should_exit = 1;
+            break;
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(active_client_latch);
+                active_client_fds.erase(sockfd);
+            }
+            close(sockfd);
+            LOG_ERROR("unable to register client handler");
+            should_exit = 1;
+            break;
+        }
     }
 
     // Clear
     LOG_INFO("try to close all client connections");
-    int ret = shutdown(sockfd_server, SHUT_WR); // shut down the all or part of a full-duplex connection.
+    listener_fd = -1;
+    int ret = shutdown(sockfd_server, SHUT_RDWR); // shut down the all or part of a full-duplex connection.
     if (ret == -1) {
         LOG_ERROR("shutdown server socket failed: %s", strerror(errno));
     }
+    if (close(sockfd_server) == -1) {
+        LOG_ERROR("close server socket failed: %s", strerror(errno));
+    }
+    shutdown_active_clients();
+    for (auto& client : client_threads) {
+        if (client.thread.joinable()) {
+            client.thread.join();
+        }
+    }
+    client_threads.clear();
     //    assert(ret != -1);
     LOG_INFO("server shuts down");
 }
@@ -1252,6 +1341,9 @@ int main(int argc, char** argv) {
             if (checkpoint_thread.joinable()) {
                 checkpoint_thread.join();
             }
+            // Signal handling only wakes the listener. Finish WAL durability
+            // here after all handlers and checkpoint activity have stopped.
+            log_manager->flush_log_to_disk_with_sync();
         }
 
         {

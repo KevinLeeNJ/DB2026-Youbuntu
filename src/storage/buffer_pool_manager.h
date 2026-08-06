@@ -229,6 +229,12 @@ public:
     // Flush a stable checkpoint image under an explicit dependency policy.
     bool flush_all_pages(const std::vector<int>& fds, FlushDependencyPolicy policy);
 
+    // Recovery has a closed set of repaired files and no foreground workload.
+    // Scan and sort the dirty candidates once, then drain contiguous page runs
+    // with a bounded worker set before recovery writes file headers or resets
+    // WAL. The normal checkpoint path intentionally remains single-caller.
+    bool flush_all_pages_for_recovery(const std::vector<int>& fds);
+
     struct FlushBatchResult {
         // Pages whose image actually reached the file. A named page that is no
         // longer resident, or resident but clean, contributes nothing: both mean
@@ -340,5 +346,7 @@ private:
     static void run_flush_batch_before_write_test_hook(PageId page_id, Page* page);
     void clear_checkpoint_cohort_marker_locked(Page* page);
     void finish_checkpoint_cohort_if_complete_locked();
+    FlushBatchResult flush_sorted_pages(const std::vector<PageId>& candidates, size_t candidate_begin,
+                                        size_t candidate_end, FlushDependencyPolicy policy, std::vector<char>& image);
     bool flush_page_impl(PageId page_id, bool dirty_only);
 };

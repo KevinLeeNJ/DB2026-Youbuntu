@@ -242,6 +242,50 @@ TEST_F(CommitPublicationHelpingTest, LaterOwnerPublishesDurablePrefixAndReleases
     txn_mgr_->abort(waiter, log_mgr_.get());
 }
 
+TEST_F(CommitPublicationHelpingTest, DurableHigherCsnPublishesSlotsBeforeLowerFrontierIsReady) {
+    BlockingPoint first_before_tuple_publication;
+    std::mutex observation_latch;
+    std::condition_variable observation_cv;
+    bool second_slots_published = false;
+
+    MakeManager([&](std::string_view event, timestamp_t csn, lsn_t) {
+        if (event == "before_tuple_publication" && csn == 1) {
+            first_before_tuple_publication.Block();
+        }
+        if (event == "after_tuple_publication" && csn == 2) {
+            std::lock_guard<std::mutex> lock(observation_latch);
+            second_slots_published = true;
+            observation_cv.notify_all();
+        }
+    });
+
+    Transaction* first = txn_mgr_->begin(nullptr, log_mgr_.get(), IsolationLevel::SNAPSHOT_ISOLATION);
+    InsertRow(first, 1, 10);
+    std::thread first_thread([&] { txn_mgr_->commit(first, log_mgr_.get()); });
+    ASSERT_TRUE(first_before_tuple_publication.WaitUntilEntered());
+
+    Transaction* second = txn_mgr_->begin(nullptr, log_mgr_.get(), IsolationLevel::SNAPSHOT_ISOLATION);
+    InsertRow(second, 2, 20);
+    std::thread second_thread([&] { txn_mgr_->commit(second, log_mgr_.get()); });
+    {
+        std::unique_lock<std::mutex> lock(observation_latch);
+        ASSERT_TRUE(observation_cv.wait_for(lock, 2s, [&] { return second_slots_published; }));
+    }
+
+    // The first CSN still owns the visibility frontier, so neither tuple can
+    // become externally committed even though the second tuple was published
+    // by a concurrent helper.
+    EXPECT_EQ(first->get_state(), TransactionState::COMMITTING);
+    EXPECT_EQ(second->get_state(), TransactionState::COMMITTING);
+
+    first_before_tuple_publication.Release();
+    first_thread.join();
+    second_thread.join();
+
+    EXPECT_EQ(first->get_state(), TransactionState::COMMITTED);
+    EXPECT_EQ(second->get_state(), TransactionState::COMMITTED);
+}
+
 TEST_F(CommitPublicationHelpingTest, MissingLowerCsnAndInvertedLsnsDoNotAdvanceOrMissWakeup) {
     BlockingPoint first_after_csn;
     std::mutex observation_latch;
@@ -395,12 +439,19 @@ TEST_F(CommitPublicationHelpingTest, WaiterTakesOverAfterBoundedLeaderStops) {
     std::thread second_thread([&] {
         txn_mgr_->commit(second, log_mgr_.get());
         second_done.store(true, std::memory_order_release);
+        observation_cv.notify_all();
     });
     {
         std::unique_lock<std::mutex> lock(observation_latch);
         ASSERT_TRUE(observation_cv.wait_for(lock, 2s, [&] { return second_wal_durable; }));
     }
-    EXPECT_FALSE(second_done.load(std::memory_order_acquire));
+    // The second request may finish after it reaches its own contiguous
+    // frontier even while the first helper is paused after releasing the
+    // first request's locks.
+    {
+        std::unique_lock<std::mutex> lock(observation_latch);
+        EXPECT_TRUE(observation_cv.wait_for(lock, 2s, [&] { return second_done.load(std::memory_order_acquire); }));
+    }
 
     first_after_lock_release.Release();
     first_thread.join();
