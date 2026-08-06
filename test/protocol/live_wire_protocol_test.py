@@ -7,6 +7,7 @@ server's network/result-sink path are observable by CTest.
 """
 
 import os
+import re
 import shutil
 import signal
 import socket
@@ -276,15 +277,17 @@ class WireClient:
 
 
 class Server:
-    def __init__(self, binary):
+    def __init__(self, binary, extra_env=None):
         self.binary = os.path.abspath(binary)
         self.root = tempfile.mkdtemp(prefix="rmdb-live-wire-")
         self.port = find_free_port()
         self.process = None
+        self.extra_env = dict(extra_env or {})
 
     def start(self):
         env = os.environ.copy()
         env["RMDB_PORT"] = str(self.port)
+        env.update(self.extra_env)
         self.process = subprocess.Popen(
             [self.binary, "db"],
             cwd=self.root,
@@ -323,6 +326,65 @@ class Server:
     def cleanup(self):
         self.stop()
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+def decode_base62(encoded):
+    digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    require(encoded, "base62 value must not be empty")
+    value = 0
+    for digit in encoded:
+        position = digits.find(digit)
+        require(position >= 0, "invalid base62 digit: " + digit)
+        value = value * len(digits) + position
+    return value
+
+
+def final_abort_metric_rows(log_path):
+    with open(log_path, "r", encoding="utf-8") as log_file:
+        lines = log_file.readlines()
+
+    global_rows = []
+    table_rows = []
+    global_pattern = re.compile(
+        r"abort-metric seq=([0-9A-Za-z]+) final=1 "
+        r"(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+):([0-9A-Za-z]+)"
+    )
+    table_pattern = re.compile(
+        r"abort-metric-table seq=([0-9A-Za-z]+) final=1 "
+        r"bucket=(table|unknown|overflow) id=([0-9A-Za-z]+) r=(\d+) d=(\d+) c=([0-9A-Za-z]+)"
+    )
+    for line in lines:
+        for match in global_pattern.finditer(line):
+            global_rows.append(
+                (
+                    tuple(int(match.group(index)) for index in range(2, 8)),
+                    decode_base62(match.group(8)),
+                )
+            )
+        for match in table_pattern.finditer(line):
+            table_rows.append(
+                (
+                    match.group(2),
+                    decode_base62(match.group(3)),
+                    int(match.group(4)),
+                    int(match.group(5)),
+                    decode_base62(match.group(6)),
+                )
+            )
+    return global_rows, table_rows
+
+
+def ww_conflict_transaction_id(diagnostic):
+    if isinstance(diagnostic, bytes):
+        diagnostic = diagnostic.decode("utf-8", "replace")
+    match = re.fullmatch(
+        r"Transaction ([0-9]+) aborted because of write-write conflict", diagnostic
+    )
+    require(
+        match is not None,
+        "SI WW abort diagnostic changed from its exact transaction-id/message shape",
+    )
+    return int(match.group(1))
 
 
 def test_stream_prepare_float_and_auto_abort(port):
@@ -1336,6 +1398,117 @@ def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
         verifier.close()
 
 
+def test_abort_metrics_exact_once(binary):
+    server = Server(binary, extra_env={"RMDB_ABORT_METRICS": "1"})
+    try:
+        server.start()
+        setup = WireClient(server.port)
+        try:
+            setup.command("CREATE TABLE abort_metric_target (id INT, value INT);")
+            setup.command("INSERT INTO abort_metric_target VALUES (1, 10);")
+        finally:
+            setup.close()
+
+        winner = WireClient(server.port)
+        victim = WireClient(server.port)
+        try:
+            winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+            victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+            winner.command("BEGIN;")
+            victim.command("BEGIN;")
+            winner.command(
+                "UPDATE abort_metric_target SET value = value + 1 WHERE id = 1;"
+            )
+            winner.command("COMMIT;")
+            tag, stream_diagnostic = victim.stream_raw(
+                "UPDATE abort_metric_target SET value = value + 1 WHERE id = 1;"
+            )
+            require(
+                tag == TRANSACTION_ABORT,
+                "stale explicit SI stream UPDATE must return TRANSACTION_ABORT",
+            )
+            stream_victim_id = ww_conflict_transaction_id(stream_diagnostic)
+        finally:
+            winner.close()
+            victim.close()
+
+        winner = WireClient(server.port)
+        victim = WireClient(server.port)
+        try:
+            statements = [
+                (
+                    240,
+                    True,
+                    [INT32],
+                    "SELECT value FROM abort_metric_target WHERE id = $1;",
+                ),
+                (
+                    241,
+                    False,
+                    [INT32, INT32],
+                    "UPDATE abort_metric_target SET value = value + $1 WHERE id = $2;",
+                ),
+            ]
+            parameter_types = {240: [INT32], 241: [INT32, INT32]}
+            winner.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+            victim.command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+            victim_schemas = victim.prepare(statements)
+            winner.command("BEGIN;")
+            victim.command("BEGIN;")
+            winner.command(
+                "UPDATE abort_metric_target SET value = value + 1 WHERE id = 1;"
+            )
+            winner.command("COMMIT;")
+            executed, status, failed, batch_diagnostic, results = victim.batch(
+                [(240, [1]), (241, [1, 1])], parameter_types, victim_schemas
+            )
+            require(
+                (executed, status, failed, results) == (1, 1, 1, []),
+                "stale explicit SI batch must discard its successful SELECT result",
+            )
+            require(
+                ww_conflict_transaction_id(batch_diagnostic) != stream_victim_id,
+                "stream and batch WW diagnostics must identify their distinct victim transactions",
+            )
+        finally:
+            winner.close()
+            victim.close()
+
+        server.stop()
+        log_path = os.path.join(server.root, "rmdb.log")
+        require(os.path.exists(log_path), "isolated abort-metrics server did not write rmdb.log")
+        global_rows, table_rows = final_abort_metric_rows(log_path)
+        expected_stream = (0, 1, 3, 2, 4, 3)
+        expected_batch = (1, 1, 3, 2, 4, 3)
+        require(
+            [count for fields, count in global_rows if fields == expected_stream] == [1],
+            "final abort metrics must contain exactly one stream explicit-SI UPDATE WW stale cell",
+        )
+        require(
+            [count for fields, count in global_rows if fields == expected_batch] == [1],
+            "final abort metrics must contain exactly one batch explicit-SI UPDATE WW stale cell",
+        )
+        projected = [
+            (runtime_id, count)
+            for bucket, runtime_id, reason, detail, count in table_rows
+            if bucket == "table" and reason == 4 and detail == 3
+        ]
+        require(
+            len(projected) == 1 and projected[0][0] != 0 and projected[0][1] == 2,
+            "final abort table projection must count both WW aborts under one nonzero runtime id",
+        )
+        require(
+            not any(bucket == "unknown" and count != 0 for bucket, _, _, _, count in table_rows),
+            "final abort table projection reported an unknown-table abort",
+        )
+        require(
+            not any(bucket == "overflow" and count != 0 for bucket, _, _, _, count in table_rows),
+            "final abort table projection reported an overflow-table abort",
+        )
+    finally:
+        server.cleanup()
+
+
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
     server = Server(sys.argv[1])
@@ -1361,6 +1534,8 @@ def main():
         test_abort_ack_then_sigkill_recovers_indexed_undo(server)
     finally:
         server.cleanup()
+
+    test_abort_metrics_exact_once(sys.argv[1])
 
     print("live Wire v3 server baseline: PASS")
     return 0

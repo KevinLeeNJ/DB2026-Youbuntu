@@ -23,6 +23,13 @@ namespace {
 
 RowMutationEngine::DeletePublicationTestHook delete_publication_test_hook;
 
+uint64_t AbortTableRuntimeId(const RowMutationRuntimeInfo& info, const Context* context) noexcept {
+    if (context == nullptr || !context->abort_metrics_enabled_ || info.sm_manager == nullptr || info.tab_name == nullptr) {
+        return 0;
+    }
+    return info.sm_manager->try_get_table_runtime_id_under_catalog_guard(*info.tab_name);
+}
+
 void InvokeDeletePublicationTestHook() {
     if (delete_publication_test_hook) {
         delete_publication_test_hook();
@@ -189,6 +196,7 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
     }
 
     auto* txn = context->txn_;
+    bool waited_for_row_lock = false;
     if (context->lock_mgr_ != nullptr) {
         const LockAcquireResult lock_result = context->lock_mgr_->lock_exclusive_on_record(txn, rid, info.fh->GetFd());
         if (!lock_result) {
@@ -198,13 +206,20 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
             } else if (lock_result.value() == LockAcquireResult::Value::WriteConflict) {
                 reason = AbortReason::WW_CONFLICT;
             }
-            throw TransactionAbortException(txn->get_transaction_id(), reason);
+            const uint64_t table_runtime_id = AbortTableRuntimeId(info, context);
+            const AbortDetail detail = reason == AbortReason::WW_CONFLICT
+                                           ? (lock_result.waited() ? AbortDetail::WAITED_THEN_STALE
+                                                                   : AbortDetail::IMMEDIATE_ACTIVE_OWNER)
+                                           : AbortDetail::UNKNOWN;
+            throw TransactionAbortException(txn->get_transaction_id(), reason, detail, table_runtime_id);
         }
+        waited_for_row_lock = lock_result.waited();
     }
     if (txn->is_lock_cancellation_requested()) {
         throw TransactionAbortException(txn->get_transaction_id(), txn->is_lock_deadlock_victim()
                                                                        ? AbortReason::DEADLOCK_PREVENTION
-                                                                       : AbortReason::LOCK_CANCELLED);
+                                                                       : AbortReason::LOCK_CANCELLED,
+                                        AbortDetail::UNKNOWN, AbortTableRuntimeId(info, context));
     }
     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED && context->txn_mgr_ != nullptr) {
         auto current_record = GetCurrentRecordForRcWrite(info.fh, rid, txn, context);
@@ -219,7 +234,10 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
 
     const TupleMeta meta = info.fh->get_tuple_meta(rid);
     if (!meta.is_committed_ && meta.writer_txn_id_ != txn->get_transaction_id()) {
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                        waited_for_row_lock ? AbortDetail::WAITED_THEN_STALE
+                                                            : AbortDetail::STALE_WITHOUT_WAIT,
+                                        AbortTableRuntimeId(info, context));
     }
     const IsolationLevel level = txn->get_isolation_level();
     const bool snapshot_conflict_check = level == IsolationLevel::SNAPSHOT_ISOLATION ||
@@ -227,7 +245,10 @@ bool PrepareWrite(const Rid& rid, RmRecord& visible_record, const RowMutationRun
                                          level == IsolationLevel::SERIALIZABLE;
     if (snapshot_conflict_check && meta.is_committed_ && meta.commit_ts_ > txn->get_read_ts() &&
         meta.writer_txn_id_ != txn->get_transaction_id()) {
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                        waited_for_row_lock ? AbortDetail::WAITED_THEN_STALE
+                                                            : AbortDetail::STALE_WITHOUT_WAIT,
+                                        AbortTableRuntimeId(info, context));
     }
     return true;
 }
@@ -377,7 +398,8 @@ void CheckHistoricalIndexConflicts(const RowMutationRuntimeInfo& info, const Row
     for (const auto& candidate_rid : info.sm_manager->get_historical_index_key_rids(*info.tab_name, index.name, key)) {
         if (candidate_rid != rid &&
             HistoricalIndexKeyConflictsWithTxn(info.fh, candidate_rid, *index.meta, key, context)) {
-            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT, AbortDetail::UNKNOWN,
+                                            AbortTableRuntimeId(info, context));
         }
     }
 }
@@ -477,7 +499,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         if (context->txn_mgr_->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, *info.tab_name,
                                                         std::optional<RmRecord>(visible_record),
                                                         std::optional<RmRecord>(*new_record), info.tab->cols)) {
-            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER, AbortDetail::UNKNOWN,
+                                            AbortTableRuntimeId(info, context));
         }
     }
 
@@ -497,8 +520,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         if (old_key == new_key) {
             continue;
         }
-        ReserveUniqueKey(context, index.handle->GetFd(), old_key);
-        ReserveUniqueKey(context, index.handle->GetFd(), new_key);
+        ReserveUniqueKey(context, info.sm_manager, *info.tab_name, index.handle->GetFd(), old_key);
+        ReserveUniqueKey(context, info.sm_manager, *info.tab_name, index.handle->GetFd(), new_key);
         std::vector<Rid> result;
         if (index.handle->get_value(new_key.data(), &result, txn) &&
             std::any_of(result.begin(), result.end(), [&](const Rid& found) { return found != rid; })) {
@@ -507,7 +530,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
             // statement, CREATE INDEX or LOAD is deterministic: retrying it
             // cannot help, so it stays a permanent SQL error.
             if (txn != nullptr && txn->get_txn_mode()) {
-                throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+                throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT,
+                                                AbortDetail::UNKNOWN, AbortTableRuntimeId(info, context));
             }
             throw IndexEntryExistsError();
         }
@@ -582,7 +606,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
         // The B+tree has no transaction context, so translate here.
         RollbackIndexUpdates(deleted, inserted, rid, *wal_context);
         if (txn != nullptr && txn->get_txn_mode()) {
-            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT,
+                                            AbortDetail::UNKNOWN, AbortTableRuntimeId(info, context));
         }
         throw;
     } catch (...) {
@@ -620,7 +645,8 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         context->txn_mgr_->CheckWriteAgainstReaders(txn->get_transaction_id(), rid, *info.tab_name,
                                                     std::optional<RmRecord>(visible_record), std::nullopt,
                                                     info.tab->cols)) {
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER, AbortDetail::UNKNOWN,
+                                        AbortTableRuntimeId(info, context));
     }
 
     struct IndexDelete {
@@ -634,7 +660,7 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
     // deliberately follows this same all-or-nothing transaction path.
     for (const auto& index : *info.indexes) {
         auto key = MakeIndexKey(*index.meta, visible_record.data);
-        ReserveUniqueKey(context, index.handle->GetFd(), key);
+        ReserveUniqueKey(context, info.sm_manager, *info.tab_name, index.handle->GetFd(), key);
         index_deletes.push_back(IndexDelete{&index, std::move(key)});
     }
 

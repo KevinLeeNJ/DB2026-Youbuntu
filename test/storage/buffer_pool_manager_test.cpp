@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/buffer_pool_manager.h"
 #undef private
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <cstdlib>
@@ -140,6 +141,17 @@ public:
         assert(disk_manager_->is_dir(TEST_DB_NAME));
     }
 };
+
+TEST_F(BufferPoolManagerTest, ResidentDirectoryShardMixesFileDescriptorWithPageNumber) {
+    BufferPoolManager bpm(1, disk_manager_.get());
+    std::array<bool, 64> covered{};
+    constexpr page_id_t kFixedPageNo = 41;
+    for (int fd = 0; fd < 256; ++fd) {
+        covered[bpm.resident_directory_shard_index(PageId{fd, kFixedPageNo})] = true;
+    }
+    const size_t distinct_shards = std::count(covered.begin(), covered.end(), true);
+    EXPECT_GE(distinct_shards, 48U);
+}
 
 TEST_F(BufferPoolManagerTest, FailedDirtyEvictionRetainsOriginalPage) {
     auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
@@ -1310,6 +1322,26 @@ TEST_F(BufferPoolManagerTest, CheckpointCohortPacingVisitsOnlyFixedPendingFrames
     EXPECT_LE(bpm->checkpoint_cohort_frames_visited_for_test_, 2u);
     EXPECT_TRUE(bpm->checkpoint_cohort_pending_frames_.empty());
     EXPECT_EQ(bpm->active_checkpoint_cohort_epoch_, 0u);
+}
+
+TEST_F(BufferPoolManagerTest, CheckpointCohortSeparatesVisitAndIoBudgets) {
+    auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
+    PageId first{fd_, INVALID_PAGE_ID};
+    PageId second{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm->new_page(&first), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(first, true));
+    ASSERT_NE(bpm->new_page(&second), nullptr);
+    ASSERT_TRUE(bpm->unpin_page(second, true));
+    const auto cohort = bpm->begin_checkpoint_cohort({fd_});
+    ASSERT_TRUE(cohort.success);
+    const auto bounded = bpm->flush_checkpoint_cohort(cohort.epoch, 8, 1);
+    EXPECT_TRUE(bounded.success);
+    EXPECT_EQ(bounded.pages_written, 1u);
+    EXPECT_EQ(bounded.pages_remaining, 1u);
+    EXPECT_EQ(bpm->checkpoint_cohort_frames_visited_for_test_, 1u);
+    const auto final = bpm->flush_checkpoint_cohort(cohort.epoch, 1, 1);
+    EXPECT_TRUE(final.success);
+    EXPECT_EQ(final.pages_remaining, 0u);
 }
 
 TEST_F(BufferPoolManagerTest, CheckpointCohortCompletesOldImageButKeepsRedirty) {

@@ -2932,9 +2932,170 @@ func monitorOfficialProgress(rounds, warmup, measure, interval int, start time.T
 	}
 }
 
+const walPhaseMarkerPayloadMax = 256
+
+type walPhaseMarker struct {
+	phase     string
+	window    int
+	planned   time.Time
+	actual    time.Time
+	lateness  time.Duration
+}
+
+type walPhaseMarkerSender func(walPhaseMarker) (walPhaseMarker, error)
+type walPhaseWaiter func(time.Time, <-chan struct{}) bool
+
+type walPhaseMarkerRunResult struct {
+	sent     int
+	canceled bool
+	err      error
+}
+
+func walPhaseMarkerDeadlines(start time.Time, warmup, measure time.Duration, rounds int) []walPhaseMarker {
+	warmupEnd := start.Add(warmup)
+	markers := make([]walPhaseMarker, 0, rounds+1)
+	markers = append(markers, walPhaseMarker{phase: "measure_start", window: 0, planned: warmupEnd})
+	for window := 1; window <= rounds; window++ {
+		markers = append(markers, walPhaseMarker{
+			phase: "window_end", window: window, planned: warmupEnd.Add(time.Duration(window) * measure),
+		})
+	}
+	return markers
+}
+
+func validateWalPhaseMarker(marker walPhaseMarker) error {
+	if marker.phase == "measure_start" {
+		if marker.window != 0 {
+			return errors.New("measure_start requires window 0")
+		}
+	} else if marker.phase == "window_end" {
+		if marker.window < 1 {
+			return errors.New("window_end requires a positive window")
+		}
+	} else {
+		return fmt.Errorf("unsupported phase %q", marker.phase)
+	}
+	if marker.planned.IsZero() || marker.actual.IsZero() {
+		return errors.New("planned and actual send times are required")
+	}
+	if marker.lateness < 0 {
+		return errors.New("monotonic lateness must be non-negative")
+	}
+	return nil
+}
+
+func encodeWalPhaseMarker(marker walPhaseMarker) ([]byte, error) {
+	if err := validateWalPhaseMarker(marker); err != nil {
+		return nil, err
+	}
+	payload := []byte(fmt.Sprintf("v1 phase=%s window=%d planned_unix_ns=%d actual_send_unix_ns=%d monotonic_lateness_ns=%d",
+		marker.phase, marker.window, marker.planned.UnixNano(), marker.actual.UnixNano(), marker.lateness.Nanoseconds()))
+	if len(payload) > walPhaseMarkerPayloadMax {
+		return nil, fmt.Errorf("WAL phase marker payload is %d bytes, limit %d", len(payload), walPhaseMarkerPayloadMax)
+	}
+	return payload, nil
+}
+
+func sendUnixWalPhaseMarker(socketName string, marker walPhaseMarker) (walPhaseMarker, error) {
+	address, err := net.ResolveUnixAddr("unixgram", socketName)
+	if err != nil {
+		return marker, err
+	}
+	conn, err := net.DialUnix("unixgram", nil, address)
+	if err != nil {
+		return marker, err
+	}
+	defer conn.Close()
+	if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return marker, err
+	}
+	marker.actual = time.Now()
+	marker.lateness = marker.actual.Sub(marker.planned)
+	payload, err := encodeWalPhaseMarker(marker)
+	if err != nil {
+		return marker, err
+	}
+	written, err := conn.Write(payload)
+	if err != nil {
+		return marker, err
+	}
+	if written != len(payload) {
+		return marker, io.ErrShortWrite
+	}
+	return marker, nil
+}
+
+func validateWalPhaseMarkerSocketName(socketName string) error {
+	if socketName == "" {
+		return errors.New("WAL phase marker socket name is empty")
+	}
+	if socketName[0] != '@' || len(socketName) == 1 {
+		return errors.New("WAL phase marker socket name must be a non-empty Linux abstract Unix name beginning with @")
+	}
+	if strings.IndexByte(socketName, 0) >= 0 || len(socketName) > 108 {
+		return errors.New("WAL phase marker socket name exceeds the Linux abstract sockaddr_un limit")
+	}
+	return nil
+}
+
+func validateWalPhaseMarkerFlagScope(command, backend, mode, socketName string) error {
+	if socketName == "" {
+		return nil
+	}
+	if command != "run" || backend != "rmdb" || mode != "official-equivalent" {
+		return errors.New("--wal-phase-marker-socket is supported only by command=run, backend=rmdb, mode=official-equivalent")
+	}
+	return nil
+}
+
+func waitUntilWalPhaseDeadline(deadline time.Time, cancel <-chan struct{}) bool {
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-cancel:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func runWalPhaseMarkers(start time.Time, warmup, measure time.Duration, rounds int, cancel <-chan struct{},
+	wait walPhaseWaiter, now func() time.Time, send walPhaseMarkerSender) <-chan walPhaseMarkerRunResult {
+	done := make(chan walPhaseMarkerRunResult, 1)
+	go func() {
+		defer close(done)
+		result := walPhaseMarkerRunResult{}
+		var sendErrors []error
+		for _, marker := range walPhaseMarkerDeadlines(start, warmup, measure, rounds) {
+			if !wait(marker.planned, cancel) {
+				result.canceled = true
+				result.err = errors.Join(sendErrors...)
+				done <- result
+				return
+			}
+			marker.actual = now()
+			marker.lateness = marker.actual.Sub(marker.planned)
+			marker, err := send(marker)
+			result.sent++
+			fmt.Printf("[wal-phase] phase=%s window=%d planned_unix_ns=%d actual_send_unix_ns=%d monotonic_lateness_ns=%d error=%v\n",
+				marker.phase, marker.window, marker.planned.UnixNano(), marker.actual.UnixNano(), marker.lateness.Nanoseconds(), err)
+			if err != nil {
+				sendErrors = append(sendErrors, fmt.Errorf("%s window %d: %w", marker.phase, marker.window, err))
+			}
+		}
+		result.err = errors.Join(sendErrors...)
+		done <- result
+	}()
+	return done
+}
+
 func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
 	maxConflictRetries int, reconnectEachTxn bool, roundOffset int, factory backendFactory,
-	ledger *txnLedger, edgeSinks ...paymentEdgeSink) ([]*result, error) {
+	ledger *txnLedger, walPhaseMarkerSocket string, edgeSinks ...paymentEdgeSink) ([]*result, error) {
 	var edgeSink paymentEdgeSink
 	if len(edgeSinks) > 0 {
 		edgeSink = edgeSinks[0]
@@ -2966,6 +3127,15 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	warmupEnd := start.Add(time.Duration(warmup) * time.Second)
 	measureDuration := time.Duration(measure) * time.Second
 	stop := make(chan struct{})
+	phaseMarkerCancel := make(chan struct{})
+	var phaseMarkerDone <-chan walPhaseMarkerRunResult
+	if walPhaseMarkerSocket != "" {
+		phaseMarkerDone = runWalPhaseMarkers(start, time.Duration(warmup)*time.Second, measureDuration, rounds,
+			phaseMarkerCancel, waitUntilWalPhaseDeadline, time.Now,
+			func(marker walPhaseMarker) (walPhaseMarker, error) {
+				return sendUnixWalPhaseMarker(walPhaseMarkerSocket, marker)
+			})
+	}
 	partials := make(chan officialWorkerReport, workers)
 	monitorStop := make(chan struct{})
 	monitorDone := make(chan struct{})
@@ -2992,10 +3162,17 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 		if partial.err != nil && runErr == nil {
 			runErr = partial.err
 			close(stop)
+			if phaseMarkerDone != nil {
+				close(phaseMarkerCancel)
+			}
 		}
 	}
 	close(monitorStop)
 	<-monitorDone
+	var phaseMarkerResult walPhaseMarkerRunResult
+	if phaseMarkerDone != nil {
+		phaseMarkerResult = <-phaseMarkerDone
+	}
 	if runErr != nil || warmupResult.hasBackendError() {
 		if runErr == nil {
 			runErr = errors.New("warmup contains a backend error")
@@ -3032,6 +3209,9 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 		fmt.Printf("[official window %d/%d] tpmC=%.2f attempted=%d committed=%d expected_rollback=%d abandoned=%d completion=%.2f%% abort_rate=%.2f%%\n",
 			round+1, rounds, window.NewOrderPerMin, attempted, committed, expectedRollback, abandoned,
 			completion*100, window.AbortRate*100)
+	}
+	if phaseMarkerResult.err != nil {
+		return windows, fmt.Errorf("WAL phase marker delivery failed after workload: %w", phaseMarkerResult.err)
 	}
 	return windows, nil
 }
@@ -3665,11 +3845,23 @@ func main() {
 			officialWorkers, officialWarmupSeconds, officialMeasureSeconds, officialWindows))
 	allowLegacyPrepareFlag := flag.Bool("allow-legacy-prepare", false,
 		"accept the legacy PREPARE_OK layout that echoes parameter types; the official evaluator does not")
+	walPhaseMarkerSocket := flag.String("wal-phase-marker-socket", "",
+		"Linux abstract Unix datagram address for diagnostic WAL phase markers during an official rmdb run")
 	flag.Parse()
 	allowLegacyPrepare = *allowLegacyPrepareFlag
 	if *backend != "rmdb" && *backend != "sqlite" {
 		fmt.Fprintln(os.Stderr, "--backend must be rmdb or sqlite")
 		os.Exit(2)
+	}
+	if *walPhaseMarkerSocket != "" {
+		if err := validateWalPhaseMarkerFlagScope(*command, *backend, *mode, *walPhaseMarkerSocket); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := validateWalPhaseMarkerSocketName(*walPhaseMarkerSocket); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 	}
 	if *command == "run" {
 		if err := validateMaxConflictRetries(*maxConflictRetries); err != nil {
@@ -4038,12 +4230,16 @@ func main() {
 	ledger := newTxnLedger()
 	edgeSink := newPaymentChainAccumulator()
 	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, MaxConflictRetries: *maxConflictRetries, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}, Baselines: baselines}
+	var postRunDiagnosticErr error
 	if *mode == "official-equivalent" {
 		windows, runErr := runOfficialWindows(*rounds, *workers, *seed, p, *warmup, *measure, *progress, *think,
-			*maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger, edgeSink)
+			*maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger, *walPhaseMarkerSocket, edgeSink)
 		if runErr != nil {
-			fmt.Fprintln(os.Stderr, runErr)
-			os.Exit(1)
+			if windows == nil {
+				fmt.Fprintln(os.Stderr, runErr)
+				os.Exit(1)
+			}
+			postRunDiagnosticErr = runErr
 		}
 		doc.Rounds = windows
 	} else {
@@ -4087,4 +4283,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("[benchmark] result=%s median_tpmC=%.2f\n", *jsonOut, doc.MedianTPMC)
+	if postRunDiagnosticErr != nil {
+		fmt.Fprintln(os.Stderr, postRunDiagnosticErr)
+		os.Exit(1)
+	}
 }

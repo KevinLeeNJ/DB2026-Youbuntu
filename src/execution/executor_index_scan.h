@@ -257,11 +257,15 @@ protected:
         }
         predicate_recorded_ = true;
         if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, tab_name_, fed_conds_)) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER,
+                                            AbortDetail::UNKNOWN,
+                                            ObservationTableRuntimeId(context_, sm_manager_, tab_name_));
         }
         if (context_->txn_mgr_->CheckPredicateInvisibleWrites(context_->txn_->get_transaction_id(), tab_name_,
                                                               fed_conds_, fh_, cols_)) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER,
+                                            AbortDetail::UNKNOWN,
+                                            ObservationTableRuntimeId(context_, sm_manager_, tab_name_));
         }
     }
 
@@ -280,7 +284,8 @@ protected:
         }
         bool invisible = !meta.is_committed_ || meta.commit_ts_ > context_->txn_->get_read_ts();
         if (invisible && txn_mgr->CheckInvisibleWriteEdge(reader_id, meta.writer_txn_id_)) {
-            throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER);
+            throw TransactionAbortException(reader_id, AbortReason::SSI_DANGER, AbortDetail::UNKNOWN,
+                                            ObservationTableRuntimeId(context_, sm_manager_, tab_name_));
         }
     }
 

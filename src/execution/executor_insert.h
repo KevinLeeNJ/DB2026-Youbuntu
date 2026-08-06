@@ -50,7 +50,9 @@ private:
 
         for (const auto& existing_rid : candidate_rids) {
             if (HistoricalIndexKeyConflictsWithTxn(fh_, existing_rid, *index.metadata, key, context_)) {
-                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                                AbortDetail::UNKNOWN,
+                                                ObservationTableRuntimeId(context_, sm_manager_, *tab_name_));
             }
         }
     }
@@ -123,14 +125,16 @@ public:
         if (context_ != nullptr && context_->txn_ != nullptr &&
             context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED &&
             DeletedTupleCandidatesConflictWithInsert(fh_, sm_manager_, *tab_name_, rec, context_)) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                            AbortDetail::UNKNOWN,
+                                            ObservationTableRuntimeId(context_, sm_manager_, *tab_name_));
         }
 
         std::vector<std::vector<char>> index_keys;
         index_keys.reserve(indexes_->size());
         for (const auto& index : *indexes_) {
             auto key = make_index_key(*index.metadata, rec.data);
-            ReserveUniqueKey(context_, index.handle->GetFd(), key);
+            ReserveUniqueKey(context_, sm_manager_, *tab_name_, index.handle->GetFd(), key);
             check_mvcc_unique_key_conflict(index, key);
             index_keys.push_back(std::move(key));
         }
@@ -188,7 +192,9 @@ public:
             // INDEX or LOAD is deterministic and stays a permanent SQL error.
             rollback_index_inserts();
             if (context_ != nullptr && context_->txn_ != nullptr && context_->txn_->get_txn_mode()) {
-                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+                throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT,
+                                                AbortDetail::UNKNOWN,
+                                                ObservationTableRuntimeId(context_, sm_manager_, *tab_name_));
             }
             throw;
         } catch (...) {
@@ -204,7 +210,8 @@ public:
                 txn_id_t writer_id = context_->txn_->get_transaction_id();
                 if (context_->txn_mgr_->CheckWriteAgainstReaders(writer_id, rid_, *tab_name_, std::nullopt,
                                                                  std::optional<RmRecord>(rec), tab_->cols)) {
-                    throw TransactionAbortException(writer_id, AbortReason::SSI_DANGER);
+                    throw TransactionAbortException(writer_id, AbortReason::SSI_DANGER, AbortDetail::UNKNOWN,
+                                                    ObservationTableRuntimeId(context_, sm_manager_, *tab_name_));
                 }
             }
         }

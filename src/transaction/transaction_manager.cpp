@@ -63,10 +63,11 @@ void ClearWriteSet(Transaction* txn) {
     txn->ClearSiLockedRowWorkspace();
 }
 
-void ReleaseLocks(Transaction* txn, LockManager* lock_manager) {
+void ReleaseLocks(Transaction* txn, LockManager* lock_manager, TransactionPhaseMetrics* metrics) {
     if (txn == nullptr || lock_manager == nullptr) {
         return;
     }
+    TransactionPhaseMetrics::Scope timer(metrics, TransactionPhaseMetrics::Phase::LockReleaseWork);
     auto lock_set = txn->get_lock_set();
     while (!lock_set->empty()) {
         auto lock = lock_set->extract(lock_set->begin());
@@ -277,18 +278,22 @@ lsn_t AppendCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t com
     return lsn;
 }
 
-void WaitForCommitLog(LogManager* log_manager, lsn_t lsn) {
+void WaitForCommitLog(LogManager* log_manager, lsn_t lsn, TransactionPhaseMetrics* metrics = nullptr) {
     if (log_manager == nullptr || lsn == INVALID_LSN) {
         return;
     }
     // Returning from COMMIT means the commit record survived an OS crash,
     // not merely that it reached the kernel page cache.
+    TransactionPhaseMetrics::Scope timer(metrics, TransactionPhaseMetrics::Phase::CommitWalWait);
     log_manager->flush_log_to_disk_up_to(lsn);
+    timer.Stop();
+    timer.Finish();
     FaultInjector::Point("after_commit_wal_write");
 }
 
-void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
-    WaitForCommitLog(log_manager, AppendCommitLog(txn, log_manager, commit_ts));
+void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts,
+                    TransactionPhaseMetrics* metrics) {
+    WaitForCommitLog(log_manager, AppendCommitLog(txn, log_manager, commit_ts), metrics);
 }
 
 lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
@@ -583,7 +588,10 @@ void TransactionManager::RunCommitPublicationWork(const std::shared_ptr<CommitPu
             // Keep the set intact until the contiguous frontier has advanced.
             // SSI readers inspect it under latch_ while COMMITTING+SLOT_READY is
             // an otherwise invisible writer state.
+            TransactionPhaseMetrics::Scope timer(phase_metrics_, TransactionPhaseMetrics::Phase::TuplePublicationWork);
             sm_manager_->mark_slots_committed(*slot_request->txn, slot_request->commit_ts, false);
+            timer.Stop();
+            timer.Finish();
             FaultInjector::Point("after_tuple_publication");
             InvokeCommitPublicationTestHook("after_tuple_publication", slot_request->commit_csn,
                                             slot_request->commit_lsn);
@@ -633,7 +641,7 @@ void TransactionManager::RunCommitPublicationWork(const std::shared_ptr<CommitPu
 
         if (lock_request != nullptr) {
             FaultInjector::Point("before_commit_helper_lock_release");
-            ReleaseLocks(lock_request->txn, lock_manager_);
+            ReleaseLocks(lock_request->txn, lock_manager_, phase_metrics_);
             FaultInjector::Point("after_commit_helper_lock_release");
             InvokeCommitPublicationTestHook("after_lock_release", lock_request->commit_csn, lock_request->commit_lsn);
             {
@@ -666,9 +674,17 @@ void TransactionManager::RunCommitPublicationWork(const std::shared_ptr<CommitPu
                    commit_publication_epoch_ != observed_epoch;
         };
         if (waiting_for_wal != nullptr) {
+            TransactionPhaseMetrics::Scope timer(phase_metrics_, TransactionPhaseMetrics::Phase::FrontierWait);
             commit_frontier_cv_.wait_for(frontier_lock, std::chrono::milliseconds(1), progressed);
+            timer.Stop();
+            frontier_lock.unlock();
+            timer.Finish();
         } else {
+            TransactionPhaseMetrics::Scope timer(phase_metrics_, TransactionPhaseMetrics::Phase::FrontierWait);
             commit_frontier_cv_.wait(frontier_lock, progressed);
+            timer.Stop();
+            frontier_lock.unlock();
+            timer.Finish();
         }
     }
 }
@@ -750,7 +766,7 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
                 commit_frontier_cv_.notify_all();
                 FaultInjector::Point("after_commit_publication_register");
                 InvokeCommitPublicationTestHook("after_registered", commit_csn, publication_request->commit_lsn);
-                WaitForCommitLog(log_manager, publication_request->commit_lsn);
+                WaitForCommitLog(log_manager, publication_request->commit_lsn, phase_metrics_);
             }
             // WAL completion is an independent publication prerequisite. Wake
             // a leader that may already be sleeping on this request before the
@@ -769,14 +785,18 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             // through DONE, whose final transition releases its locks.
             locks_released_by_helper = true;
         } else {
-            WriteCommitLog(txn, log_manager, commit_ts);
+            WriteCommitLog(txn, log_manager, commit_ts, phase_metrics_);
             FaultInjector::Point("after_commit_wal_sync");
 
             // Publish every modified slot outside the frontier mutex. A new RC
             // statement still cannot observe this commit until its CSN is part of
             // the contiguous completed frontier below.
             FaultInjector::Point("before_tuple_publication");
+            TransactionPhaseMetrics::Scope tuple_publication_timer(
+                phase_metrics_, TransactionPhaseMetrics::Phase::TuplePublicationWork);
             sm_manager_->mark_slots_committed(*txn, commit_ts);
+            tuple_publication_timer.Stop();
+            tuple_publication_timer.Finish();
             FaultInjector::Point("after_tuple_publication");
             txn->set_state(TransactionState::COMMITTED);
             FaultInjector::Point("before_published_csn_store");
@@ -799,7 +819,12 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             // publication frontier. This provides read-your-commit even when a
             // later CSN finished publishing first.
             std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
+            TransactionPhaseMetrics::Scope frontier_wait_timer(phase_metrics_,
+                                                                TransactionPhaseMetrics::Phase::FrontierWait);
             commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
+            frontier_wait_timer.Stop();
+            frontier_lock.unlock();
+            frontier_wait_timer.Finish();
         }
 
         // Keep the committing transaction in the watermark and checkpoint
@@ -815,7 +840,7 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
             ClearWriteSet(txn);
             if (!locks_released_by_helper) {
-                ReleaseLocks(txn, lock_manager_);
+                ReleaseLocks(txn, lock_manager_, phase_metrics_);
             }
             if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
                 CleanupTxnSsiState(txn->get_transaction_id());
@@ -910,7 +935,7 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     }
     // Abort WAL and all heap/index undo precede this handoff. Waiters can now
     // proceed without seeing this transaction as an SSI reader or writer.
-    ReleaseLocks(txn, lock_manager_);
+    ReleaseLocks(txn, lock_manager_, phase_metrics_);
     RetireTransactionIfSafe(txn);
     MaybeRunGarbageCollection();
 }
@@ -1807,10 +1832,11 @@ bool TransactionManager::RecordPredicateRead(Transaction* txn, const std::string
             }
         }
     }
-    if (dangerous) {
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::SSI_DANGER);
-    }
-    return false;
+    return dangerous;
+}
+
+uint64_t TransactionManager::TryGetTableRuntimeIdForObservation(const std::string& tab_name) const noexcept {
+    return sm_manager_ == nullptr ? 0 : sm_manager_->try_get_table_runtime_id_under_catalog_guard(tab_name);
 }
 
 bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, const std::string& tab_name) {

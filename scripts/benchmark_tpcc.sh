@@ -33,6 +33,7 @@ RECONNECT_EACH_TXN=0
 MAX_CONFLICT_RETRIES=1
 ISOLATION="snapshot-isolation"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
+WAL_PHASE_MARKERS=0
 # final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
 # COUNT, integrity, index-key relation sampling and cross-partition content
 # sampling) must fit in one 900 second SQL budget measured from a successful
@@ -59,6 +60,7 @@ Usage: $0 [options]
   --reconnect-each-txn 0|1 reconnect each worker after every transaction (default: 0)
   --max-conflict-retries N maximum retries after a conflict; -1 retries until phase end (default: 1)
   --isolation LEVEL        read-committed or snapshot-isolation (default: snapshot-isolation)
+  --wal-phase-markers 0|1 emit diagnostic WAL snapshots at measure boundaries (default: 0; requires RMDB_WAL_METRICS=1)
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
         --reconnect-each-txn) RECONNECT_EACH_TXN="$2"; shift 2 ;;
         --max-conflict-retries) MAX_CONFLICT_RETRIES="$2"; shift 2 ;;
         --isolation) ISOLATION="$2"; shift 2 ;;
+        --wal-phase-markers) WAL_PHASE_MARKERS="$2"; shift 2 ;;
         --go-binary) GO_BINARY="$2"; shift 2 ;;
         --regenerate-data|--overwrite-data-dir) REGENERATE_DATA=1; shift ;;
         --reuse-data-dir) shift ;;
@@ -108,6 +111,14 @@ if [[ ! "$MAX_CONFLICT_RETRIES" =~ ^-?[0-9]+$ ]] || (( MAX_CONFLICT_RETRIES < -1
 fi
 if [[ "$ISOLATION" != "read-committed" && "$ISOLATION" != "snapshot-isolation" ]]; then
     echo "--isolation must be read-committed or snapshot-isolation" >&2
+    exit 2
+fi
+if [[ "$WAL_PHASE_MARKERS" != "0" && "$WAL_PHASE_MARKERS" != "1" ]]; then
+    echo "--wal-phase-markers must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$WAL_PHASE_MARKERS" == "1" && "${RMDB_WAL_METRICS:-}" != "1" ]]; then
+    echo "--wal-phase-markers=1 requires inherited RMDB_WAL_METRICS=1" >&2
     exit 2
 fi
 if [[ ! -x "$GO_BINARY" ]]; then
@@ -149,6 +160,7 @@ fi
 rm -rf "$DB_DIR" "$SERVER_LOG"
 
 SERVER_PID=""
+WAL_PHASE_MARKER_SOCKET=""
 
 cleanup() {
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -157,6 +169,10 @@ cleanup() {
     fi
 }
 trap cleanup EXIT INT TERM
+
+if [[ "$WAL_PHASE_MARKERS" == "1" ]]; then
+    WAL_PHASE_MARKER_SOCKET="@rmdb-wal-phase-${BASHPID}-${RANDOM}-${RANDOM}"
+fi
 
 # final.md:33,52 require the service port to be owned by the expected rmdb
 # process tree; a successful TCP connect (or a stale listener left behind by
@@ -242,9 +258,19 @@ if [[ ${#GO_TIMING_ARGS[@]} -gt 0 ]]; then
 else
     echo "[benchmark] official-equivalent: one ${WARMUP}s warmup + $ROUNDS continuous ${MEASURE}s windows"
 fi
-RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+SERVER_ENV=(env -u RMDB_WAL_PHASE_MARKER_SOCKET "RMDB_PORT=$PORT")
+if [[ "$WAL_PHASE_MARKERS" == "1" ]]; then
+    SERVER_ENV+=("RMDB_WAL_PHASE_MARKER_SOCKET=$WAL_PHASE_MARKER_SOCKET")
+fi
+"${SERVER_ENV[@]}" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port 30
+# TCP readiness proves the initial server bound its abstract marker address;
+# the first scheduled Go marker send reports a missing receiver directly.
+GO_WAL_PHASE_MARKER_ARGS=()
+if [[ "$WAL_PHASE_MARKERS" == "1" ]]; then
+    GO_WAL_PHASE_MARKER_ARGS=(--wal-phase-marker-socket "$WAL_PHASE_MARKER_SOCKET")
+fi
 load_start=$SECONDS
 "$GO_BINARY" --command load \
     --port "$PORT" --isolation "$ISOLATION" \
@@ -261,7 +287,7 @@ fi
     --progress-interval "$PROGRESS_INTERVAL" --warehouse-policy official-terminal-home \
     --think "${THINK_MS}ms" --data-dir "$DATA_DIR" --json-out "$JSON_OUT" \
     --max-conflict-retries "$MAX_CONFLICT_RETRIES" \
-    "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}"
+    "${GO_RECONNECT_ARGS[@]}" "${GO_TIMING_ARGS[@]}" "${GO_WAL_PHASE_MARKER_ARGS[@]}"
 "$GO_BINARY" --command validate-result --result-json "$JSON_OUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --progress-interval "$PROGRESS_INTERVAL" \
@@ -274,7 +300,7 @@ fi
 kill -KILL "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
-RMDB_PORT="$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
+env -u RMDB_WAL_PHASE_MARKER_SOCKET "RMDB_PORT=$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_port "$RESTART_TIMEOUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \

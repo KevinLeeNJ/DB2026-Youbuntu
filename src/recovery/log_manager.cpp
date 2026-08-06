@@ -293,6 +293,8 @@ void LogManager::flush_log_to_disk_up_to_durable(lsn_t target_lsn) {
 }
 
 void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync) {
+    WalFlushMetrics* const metrics = wal_flush_metrics_;
+    const bool metrics_enabled = metrics != nullptr && metrics->enabled();
     if (target_lsn == INVALID_LSN) {
         return;
     }
@@ -314,6 +316,7 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
                             : persist_lsn_.load(std::memory_order_acquire);
     };
     if (completed_lsn() >= target_lsn) {
+        if (metrics_enabled) metrics->record_already_covered_fast_path();
         return;
     }
 
@@ -324,6 +327,7 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
     {
         std::unique_lock<std::mutex> group_lock(group_commit_latch_);
         if (completed_lsn() >= target_lsn) {
+            if (metrics_enabled) metrics->record_already_covered_fast_path();
             return;
         }
         group_commit_waiters_.push_back(waiter);
@@ -334,12 +338,22 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
         group_commit_cv_.notify_one();
 
         if (!become_leader) {
-            waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
+            if (metrics_enabled) {
+                metrics->record_follower_request();
+                const auto wait_begin = std::chrono::steady_clock::now();
+                waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
+                metrics->record_follower_wait(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
+                        .count()));
+            } else {
+                waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
+            }
             if (waiter->error != nullptr) {
                 std::rethrow_exception(waiter->error);
             }
             return;
         }
+        if (metrics_enabled) metrics->record_leader_request();
     }
 
     // A concurrent commit may have joined while the leader was writing or
@@ -367,6 +381,11 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
                 for (const auto& pending : group_commit_waiters_) {
                     sync_batch = sync_batch || pending->require_sync;
                 }
+            }
+            if (metrics_enabled) {
+                metrics->record_coalescing_wait(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - batch_wait_begin)
+                        .count()));
             }
             flush_buffer(sync_batch);
         } catch (...) {
@@ -409,6 +428,7 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
                 group_done = true;
             }
         }
+        if (metrics_enabled) metrics->record_completed_batch(notify.size());
         for (const auto& pending : notify) {
             pending->cv.notify_one();
         }
@@ -419,6 +439,8 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
 }
 
 void LogManager::flush_buffer(bool sync) {
+    WalFlushMetrics* const metrics = wal_flush_metrics_;
+    const bool metrics_enabled = metrics != nullptr && metrics->enabled();
     for (;;) {
         int bytes = 0;
         lsn_t target_lsn = INVALID_LSN;
@@ -442,11 +464,24 @@ void LogManager::flush_buffer(bool sync) {
                     // is released; that newer prefix belongs to a later sync.
                     target_lsn = persist_lsn_.load(std::memory_order_acquire);
                     lock.unlock();
+                    const lsn_t durable_before = durable_lsn_.load(std::memory_order_acquire);
+                    if (metrics_enabled) metrics->record_physical_flush_iteration();
+                    const auto fsync_begin = metrics_enabled ? std::chrono::steady_clock::now()
+                                                             : std::chrono::steady_clock::time_point{};
                     disk_manager_->fsync_log();
+                    if (metrics_enabled) {
+                        metrics->record_fdatasync(static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fsync_begin)
+                                .count()));
+                    }
                     lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
                     while (durable < target_lsn &&
                            !durable_lsn_.compare_exchange_weak(durable, target_lsn, std::memory_order_release,
                                                                std::memory_order_acquire)) {
+                    }
+                    if (metrics_enabled) {
+                        metrics->record_durable_lag(target_lsn, durable_before,
+                                                    durable_lsn_.load(std::memory_order_acquire));
                     }
                     return;
                 }
@@ -462,11 +497,28 @@ void LogManager::flush_buffer(bool sync) {
         // The active buffer is available to producers while this stable
         // buffer is written and synced.
         bool write_succeeded = false;
+        lsn_t durable_before = INVALID_LSN;
         try {
+            durable_before = durable_lsn_.load(std::memory_order_acquire);
+            if (metrics_enabled) metrics->record_physical_flush_iteration();
+            const auto pwrite_begin = metrics_enabled ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
             disk_manager_->write_log(flushing_buffer_->buffer_.data(), bytes);
             write_succeeded = true;
+            if (metrics_enabled) {
+                metrics->record_pwrite(static_cast<uint64_t>(bytes), static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pwrite_begin)
+                        .count()));
+            }
             if (sync) {
+                const auto fsync_begin = metrics_enabled ? std::chrono::steady_clock::now()
+                                                         : std::chrono::steady_clock::time_point{};
                 disk_manager_->fsync_log();
+                if (metrics_enabled) {
+                    metrics->record_fdatasync(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fsync_begin)
+                            .count()));
+                }
             }
         } catch (...) {
             std::lock_guard<std::mutex> lock(latch_);
@@ -499,6 +551,10 @@ void LogManager::flush_buffer(bool sync) {
                                                            std::memory_order_acquire)) {
                 }
             }
+            if (metrics_enabled) {
+                metrics->record_durable_lag(target_lsn, durable_before,
+                                            durable_lsn_.load(std::memory_order_acquire));
+            }
         }
         buffer_cv_.notify_all();
         return;
@@ -520,7 +576,7 @@ void LogManager::initialize_from_existing_log() {
 
     RestartManifest manifest = read_restart_manifest();
 
-    int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
+    const int64_t file_size = disk_manager_->get_log_file_size();
     if (file_size <= 0) {
         log_file_offset_ = 0;
         persist_lsn_ = INVALID_LSN;

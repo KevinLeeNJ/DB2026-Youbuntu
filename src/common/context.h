@@ -52,6 +52,9 @@ public:
     bool ellipsis_;
     IsolationLevel isolation_level_;
     bool enable_ssi_read_tracking_{false};
+    AbortOrigin abort_origin_{AbortOrigin::EXEC_STREAM};
+    AbortOperation abort_operation_{AbortOperation::OTHER};
+    bool abort_metrics_enabled_{false};
     // PREPARE_SET builds a reusable scan-backed descriptor. Point-program
     // caching is an execution-plan optimization and must not make descriptor
     // eligibility depend on whether an equivalent statement was seen earlier.

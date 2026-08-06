@@ -27,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 #include <utility>
 
 #include "transaction.h"
+#include "common/transaction_phase_metrics.h"
 #include "watermark.h"
 #include "recovery/log_manager.h"
 #include "concurrency/lock_manager.h"
@@ -78,15 +79,18 @@ public:
     };
 
     explicit TransactionManager(LockManager* lock_manager, SmManager* sm_manager,
-                                ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING)
-        : TransactionManager(lock_manager, sm_manager, concurrency_mode, CommitPublicationTestOptions{}) {}
+                                ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING,
+                                TransactionPhaseMetrics* phase_metrics = nullptr)
+        : TransactionManager(lock_manager, sm_manager, concurrency_mode, CommitPublicationTestOptions{},
+                             phase_metrics) {}
 
     // Test-only overload. Callers must opt in with the explicitly named
     // options type; normal server/runtime construction cannot disable helping.
     TransactionManager(LockManager* lock_manager, SmManager* sm_manager, ConcurrencyMode concurrency_mode,
-                       CommitPublicationTestOptions test_options) {
+                       CommitPublicationTestOptions test_options, TransactionPhaseMetrics* phase_metrics = nullptr) {
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
+        phase_metrics_ = phase_metrics;
         concurrency_mode_ = concurrency_mode;
         commit_publication_helping_enabled_ = test_options.helping;
         commit_publication_test_hook_ = std::move(test_options.hook);
@@ -96,9 +100,10 @@ public:
     // Test-only overload for deterministic checkpoint admission scheduling.
     // Production construction always leaves this hook empty.
     TransactionManager(LockManager* lock_manager, SmManager* sm_manager, ConcurrencyMode concurrency_mode,
-                       CheckpointAdmissionTestOptions test_options) {
+                       CheckpointAdmissionTestOptions test_options, TransactionPhaseMetrics* phase_metrics = nullptr) {
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
+        phase_metrics_ = phase_metrics;
         concurrency_mode_ = concurrency_mode;
         checkpoint_admission_test_hook_ = std::move(test_options.hook);
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
@@ -288,6 +293,7 @@ public:
      *  Checks ssi_writes_ for invisible writes that match the predicate, creating
      *  reader ->rw writer edges. Returns true if SSI danger structure formed. */
     bool RecordPredicateRead(Transaction* txn, const std::string& tab_name, const std::vector<Condition>& conds);
+    uint64_t TryGetTableRuntimeIdForObservation(const std::string& tab_name) const noexcept;
 
     /** @brief Check for SSI danger: two consecutive rw-edges (Tin->rw->Tpivot, Tpivot->rw->Tout)
      *  where intervals overlap and Tin==Tout or Tout committed before Tin. */
@@ -374,6 +380,7 @@ private:
     uint64_t commit_publication_epoch_{0};
     SmManager* sm_manager_;
     LockManager* lock_manager_;
+    TransactionPhaseMetrics* phase_metrics_{nullptr};
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC

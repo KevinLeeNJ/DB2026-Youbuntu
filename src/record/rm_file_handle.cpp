@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "rm_file_handle.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace {
 
@@ -31,6 +32,26 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     PageId page_id_;
 };
+
+int RecoveryDiskPageCount(DiskManager* disk_manager, int fd) {
+    const int64_t file_size = disk_manager->get_file_size(fd);
+    if (file_size < static_cast<int64_t>(sizeof(RmFileHdr))) {
+        throw InternalError("record file header is shorter than RmFileHdr during recovery");
+    }
+    if ((file_size < PAGE_SIZE && file_size != static_cast<int64_t>(sizeof(RmFileHdr))) ||
+        (file_size > PAGE_SIZE && file_size % PAGE_SIZE != 0)) {
+        throw InternalError("record file has an incomplete page during recovery");
+    }
+
+    if (file_size <= PAGE_SIZE) {
+        return 1;
+    }
+    const int64_t page_count = file_size / PAGE_SIZE;
+    if (page_count > std::numeric_limits<int>::max()) {
+        throw InternalError("record file is too large during recovery");
+    }
+    return static_cast<int>(page_count);
+}
 
 } // namespace
 
@@ -533,19 +554,10 @@ lsn_t RmFileHandle::get_page_lsn(const Rid& rid) const {
 }
 
 void RmFileHandle::rebuild_file_header_from_pages() {
-    const std::string& path = disk_manager_->get_file_name(fd_);
-    int64_t file_size = disk_manager_->get_file_size(path);
-    if (file_size < static_cast<int64_t>(sizeof(RmFileHdr))) {
-        throw InternalError("record file has an incomplete page during recovery");
-    }
-    if (file_size > PAGE_SIZE && file_size % PAGE_SIZE != 0) {
-        throw InternalError("record file has an incomplete page during recovery");
-    }
-
     // The file header is intentionally a short write at page 0. Pages created
     // by redo may still exist only in the buffer pool, so retain the current
     // in-memory allocation count and use the disk size as a lower bound.
-    int disk_page_count = file_size <= PAGE_SIZE ? 1 : static_cast<int>(file_size / PAGE_SIZE);
+    const int disk_page_count = RecoveryDiskPageCount(disk_manager_, fd_);
     int page_upper_bound = std::max(file_hdr_.num_pages, disk_page_count);
     file_hdr_.num_pages = page_upper_bound;
     file_hdr_.first_free_page_no = RM_NO_PAGE;
@@ -623,12 +635,7 @@ void RmFileHandle::repair_file_header_for_pages(const std::vector<page_id_t>& pa
         throw InternalError("recovery referenced an invalid record page");
     }
 
-    const std::string& path = disk_manager_->get_file_name(fd_);
-    const int64_t file_size = disk_manager_->get_file_size(path);
-    if (file_size < static_cast<int64_t>(sizeof(RmFileHdr)) || (file_size > PAGE_SIZE && file_size % PAGE_SIZE != 0)) {
-        throw InternalError("record file has an incomplete page during recovery");
-    }
-    const int disk_page_count = file_size <= PAGE_SIZE ? 1 : static_cast<int>(file_size / PAGE_SIZE);
+    const int disk_page_count = RecoveryDiskPageCount(disk_manager_, fd_);
 
     // A newly allocated page may only exist in the buffer pool when the
     // process crashed. Pages that are in neither place are intentionally left

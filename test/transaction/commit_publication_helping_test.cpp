@@ -130,12 +130,14 @@ protected:
         test_dir_.reset();
     }
 
-    void MakeManager(TransactionManager::CommitPublicationTestHook hook = {}, bool helping = true) {
+    void MakeManager(TransactionManager::CommitPublicationTestHook hook = {}, bool helping = true,
+                     TransactionPhaseMetrics* phase_metrics = nullptr) {
         TransactionManager::CommitPublicationTestOptions test_options;
         test_options.helping = helping;
         test_options.hook = std::move(hook);
         txn_mgr_ = std::make_unique<TransactionManager>(lock_mgr_.get(), sm_mgr_.get(),
-                                                        ConcurrencyMode::TWO_PHASE_LOCKING, std::move(test_options));
+                                                        ConcurrencyMode::TWO_PHASE_LOCKING, std::move(test_options),
+                                                        phase_metrics);
     }
 
     static Value IntValue(int value) {
@@ -591,6 +593,25 @@ TEST_F(CommitPublicationHelpingTest, ExplicitTestOnlyDisabledPathRetainsDirectPu
     txn_mgr_->commit(txn, log_mgr_.get());
 
     EXPECT_GE(log_mgr_->get_durable_lsn(), 0);
+}
+
+TEST_F(CommitPublicationHelpingTest, DirectPublicationPathReportsTransactionPhaseMetrics) {
+    TransactionPhaseMetrics metrics(true);
+    MakeManager({}, false, &metrics);
+
+    Transaction* committed = txn_mgr_->begin(nullptr, log_mgr_.get());
+    txn_mgr_->commit(committed, log_mgr_.get());
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitWalWait).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::TuplePublicationWork).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::FrontierWait).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::LockReleaseWork).count, 1);
+
+    Transaction* aborted = txn_mgr_->begin(nullptr, log_mgr_.get());
+    txn_mgr_->abort(aborted, log_mgr_.get());
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::LockReleaseWork).count, 2);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitWalWait).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::TuplePublicationWork).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::FrontierWait).count, 1);
 }
 
 TEST_F(CommitPublicationHelpingTest, ProcessCrashModePublishesThroughPersistLsn) {

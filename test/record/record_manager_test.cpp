@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -79,6 +80,87 @@ void check_equal(const RmFileHandle* file_handle,
     assert(num_records == mock.size());
 }
 
+std::string UniqueTestFileName(const std::string& prefix) {
+    static std::atomic<uint64_t> next_id{0};
+    return prefix + "_" + std::to_string(getpid()) + "_" + std::to_string(next_id.fetch_add(1));
+}
+
+class ScopedRecordFile {
+public:
+    ScopedRecordFile(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int record_size)
+        : disk_manager_(disk_manager), rm_manager_(disk_manager, buffer_pool_manager), filename_(UniqueTestFileName("recovery_fd")) {
+        rm_manager_.create_file(filename_, record_size);
+        file_handle_ = rm_manager_.open_file(filename_);
+    }
+
+    ~ScopedRecordFile() {
+        if (file_handle_ != nullptr) {
+            try {
+                rm_manager_.close_file(file_handle_.get());
+            } catch (...) {
+            }
+        }
+        if (disk_manager_->is_file(filename_)) {
+            try {
+                disk_manager_->destroy_file(filename_);
+            } catch (...) {
+            }
+        }
+    }
+
+    RmFileHandle* handle() const {
+        return file_handle_.get();
+    }
+
+    const std::string& filename() const {
+        return filename_;
+    }
+
+private:
+    DiskManager* disk_manager_;
+    RmManager rm_manager_;
+    std::string filename_;
+    std::unique_ptr<RmFileHandle> file_handle_;
+};
+
+class ScopedDiskFile {
+public:
+    explicit ScopedDiskFile(DiskManager* disk_manager)
+        : disk_manager_(disk_manager), filename_(UniqueTestFileName("closed_fd_size")) {
+        disk_manager_->create_file(filename_);
+        fd_ = disk_manager_->open_file(filename_);
+    }
+
+    ~ScopedDiskFile() {
+        if (fd_ >= 0) {
+            try {
+                disk_manager_->close_file(fd_);
+            } catch (...) {
+            }
+        }
+        if (disk_manager_->is_file(filename_)) {
+            try {
+                disk_manager_->destroy_file(filename_);
+            } catch (...) {
+            }
+        }
+    }
+
+    int fd() const {
+        return fd_;
+    }
+
+    void close() {
+        disk_manager_->close_file(fd_);
+        fd_ = -1;
+    }
+
+private:
+    DiskManager* disk_manager_;
+    std::string filename_;
+    int fd_{-1};
+};
+
 } // namespace
 
 class RecordManagerTest : public ::testing::Test {
@@ -110,6 +192,68 @@ public:
         assert(disk_manager_->is_dir(TEST_DB_NAME));
     }
 };
+
+TEST_F(RecordManagerTest, RecoverySizeChecksUseOpenFdAndKeepTailFailuresDistinct) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
+    ScopedRecordFile file(disk_manager_.get(), buffer_pool_manager.get(), 64);
+    RmFileHandle* const file_handle = file.handle();
+    const int fd = file_handle->GetFd();
+    EXPECT_EQ(disk_manager_->get_file_size(fd), disk_manager_->get_file_size(file.filename()));
+    EXPECT_EQ(disk_manager_->get_file_size(fd), static_cast<int64_t>(sizeof(RmFileHdr)));
+    EXPECT_NO_THROW(file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE}));
+
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(PAGE_SIZE)), 0);
+    EXPECT_NO_THROW(file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE}));
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(PAGE_SIZE * 2)), 0);
+    EXPECT_NO_THROW(file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE}));
+}
+
+TEST_F(RecordManagerTest, RecoverySizeChecksRejectShortAndSubPageTails) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
+    ScopedRecordFile file(disk_manager_.get(), buffer_pool_manager.get(), 64);
+    RmFileHandle* const file_handle = file.handle();
+    const int fd = file_handle->GetFd();
+
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(sizeof(RmFileHdr) - 1)), 0);
+    try {
+        file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE});
+        FAIL() << "short record-file header was accepted";
+    } catch (const RMDBError& error) {
+        EXPECT_NE(std::string(error.what()).find("header is shorter"), std::string::npos);
+    }
+
+    for (const int64_t size : {static_cast<int64_t>(sizeof(RmFileHdr)) + 1, static_cast<int64_t>(PAGE_SIZE) - 1,
+                               static_cast<int64_t>(PAGE_SIZE) + 1}) {
+        ASSERT_EQ(ftruncate(fd, static_cast<off_t>(size)), 0);
+        try {
+            file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE});
+            FAIL() << "unaligned record-file size " << size << " was accepted";
+        } catch (const RMDBError& error) {
+            EXPECT_NE(std::string(error.what()).find("incomplete page"), std::string::npos);
+            EXPECT_EQ(std::string(error.what()).find("header is shorter"), std::string::npos);
+        }
+    }
+}
+
+TEST_F(RecordManagerTest, OpenFdSizeSurvivesPathRemovalAndReportsClosedFd) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
+    ScopedRecordFile file(disk_manager_.get(), buffer_pool_manager.get(), 64);
+    RmFileHandle* const file_handle = file.handle();
+    ASSERT_EQ(unlink(file.filename().c_str()), 0);
+    EXPECT_NO_THROW(file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE}));
+
+    ScopedDiskFile closed_file(disk_manager_.get());
+    const int closed_fd = closed_file.fd();
+    closed_file.close();
+
+    try {
+        (void)disk_manager_->get_file_size(closed_fd);
+        FAIL() << "closed descriptor returned a size";
+    } catch (const RMDBError& error) {
+        EXPECT_NE(std::string(error.what()).find("get_file_size(fstat) failed"), std::string::npos);
+        EXPECT_EQ(std::string(error.what()).find("incomplete page"), std::string::npos);
+    }
+}
 
 TEST_F(RecordManagerTest, SimpleTest) {
     srand((unsigned)time(nullptr));

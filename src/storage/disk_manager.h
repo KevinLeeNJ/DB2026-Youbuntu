@@ -62,6 +62,15 @@ public:
 
     int64_t get_file_size(const std::string& file_name);
 
+    // Query the size of an already-open descriptor without resolving its path
+    // again. This is used by recovery so a transient pathname failure cannot be
+    // misclassified as a malformed record-file tail.
+    int64_t get_file_size(int fd);
+
+    // Return the size of the established WAL descriptor. Durable WAL callers
+    // must use this rather than resolving LOG_FILE_NAME again.
+    int64_t get_log_file_size();
+
     std::string get_file_name(int fd);
 
     int get_file_fd(const std::string& file_name);

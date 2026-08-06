@@ -30,6 +30,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "disk_manager.h"
+#include "common/shard_acquisition_metrics.h"
 #include "errors.h"
 #include "index_smo_wal.h"
 #include "page.h"
@@ -92,6 +93,8 @@ private:
     // page_table_ remains the sole authoritative resident-page map. This
     // sharded directory is a derived index containing only VALID mappings.
     std::array<ResidentDirectoryShard, RESIDENT_DIRECTORY_SHARD_COUNT> resident_directory_;
+    ShardAcquisitionMetrics shard_read_metrics_;
+    ShardAcquisitionMetrics shard_write_metrics_;
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
     std::vector<ResidencyClass> residency_classes_;
@@ -145,8 +148,12 @@ public:
         uint64_t generation_{0};
     };
 
-    BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
-        : pool_size_(pool_size), disk_manager_(disk_manager) {
+    BufferPoolManager(size_t pool_size, DiskManager* disk_manager,
+                      ShardAcquisitionMetrics::Config shard_metrics_config =
+                          ShardAcquisitionMetrics::Config::FromEnvironment("RMDB_BPM_SHARD_METRICS_SAMPLE_LOG2",
+                                                                             "RMDB_BPM_SHARD_SLOW_NS"))
+        : pool_size_(pool_size), shard_read_metrics_(shard_metrics_config),
+          shard_write_metrics_(shard_metrics_config), disk_manager_(disk_manager) {
         // 为buffer pool分配一块连续的内存空间
         pages_ = std::make_unique<Page[]>(pool_size_);
         residency_classes_.assign(pool_size_, ResidencyClass::Normal);
@@ -170,6 +177,9 @@ public:
     }
 
     ~BufferPoolManager() = default;
+
+    bool shard_metrics_enabled() const noexcept;
+    void log_shard_metrics(uint64_t sequence) const;
 
     /**
      * @description: 将目标页面标记为脏页
@@ -291,10 +301,12 @@ public:
     begin_checkpoint_cohort(const std::vector<int>& allowed_fds,
                             std::chrono::milliseconds settle_timeout = std::chrono::milliseconds(5000));
 
-    // Flush at most max_pages members of the named fixed cohort. Successful
+    // Flush at most max_io_pages members of the named fixed cohort, after
+    // visiting no more than max_frames_to_visit queued frames. Successful
     // writes discharge membership even when the page was re-dirtied after its
     // image was copied; that newer image remains dirty for a later checkpoint.
-    CheckpointCohortFlushResult flush_checkpoint_cohort(uint64_t epoch, size_t max_pages);
+    CheckpointCohortFlushResult flush_checkpoint_cohort(uint64_t epoch, size_t max_io_pages,
+                                                         size_t max_frames_to_visit = 64);
 
     // Abandon only the named cohort after a checkpoint-stage failure. This is
     // idempotent and does not make pages clean or weaken their WAL dependency.

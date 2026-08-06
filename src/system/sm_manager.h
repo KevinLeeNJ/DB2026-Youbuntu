@@ -329,6 +329,12 @@ public:
         }
         return it->second;
     }
+    // Observation-only lookup: callers already hold a catalog guard, and an
+    // absent table is represented as unknown rather than changing the abort.
+    uint64_t try_get_table_runtime_id_under_catalog_guard(const std::string& tab_name) const noexcept {
+        auto it = table_runtime_ids_.find(tab_name);
+        return it == table_runtime_ids_.end() ? 0 : it->second;
+    }
 
     bool is_dir(const std::string& db_name);
 

@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <assert.h>   // for assert
 #include <cerrno>     // for errno
+#include <limits>
 #include <sys/stat.h> // for stat
 #include <unistd.h>   // for lseek
 
@@ -229,6 +230,23 @@ int64_t DiskManager::get_file_size(const std::string& file_name) {
     return rc == 0 ? static_cast<int64_t>(stat_buf.st_size) : -1;
 }
 
+int64_t DiskManager::get_file_size(int fd) {
+    struct stat stat_buf;
+    while (fstat(fd, &stat_buf) != 0) {
+        const int fstat_errno = errno;
+        if (fstat_errno == EINTR) {
+            continue;
+        }
+        throw InternalError("DiskManager::get_file_size(fstat) failed for fd " + std::to_string(fd) + ": " +
+                            std::strerror(fstat_errno));
+    }
+    if (stat_buf.st_size < 0 ||
+        static_cast<uintmax_t>(stat_buf.st_size) > static_cast<uintmax_t>(std::numeric_limits<int64_t>::max())) {
+        throw InternalError("DiskManager::get_file_size(fstat) returned an invalid size for fd " + std::to_string(fd));
+    }
+    return static_cast<int64_t>(stat_buf.st_size);
+}
+
 /**
  * @description: 根据文件句柄获得文件名
  * @return {string} 文件句柄对应文件的文件名
@@ -257,11 +275,64 @@ void DiskManager::open_log_fd() {
     if (log_fd_ != -1) {
         return;
     }
-    log_fd_ = open_file(LOG_FILE_NAME);
-    log_offset_ = get_file_size(LOG_FILE_NAME);
-    if (log_offset_ < 0) {
-        log_offset_ = 0;
+
+    int local_fd = -1;
+    bool opened_here = false;
+    bool path_registered = false;
+    bool fd_registered = false;
+    try {
+        const auto existing = path2fd_.find(LOG_FILE_NAME);
+        if (existing != path2fd_.end()) {
+            local_fd = existing->second;
+        } else {
+            if (!is_file(LOG_FILE_NAME)) {
+                throw FileNotFoundError(LOG_FILE_NAME);
+            }
+            local_fd = open(LOG_FILE_NAME.c_str(), O_RDWR);
+            if (local_fd < 0) {
+                throw UnixError();
+            }
+            opened_here = true;
+        }
+
+        // Keep both published WAL fields and the fd bookkeeping untouched until
+        // the descriptor has yielded a valid append offset.
+        const int64_t local_offset = get_file_size(local_fd);
+        if (opened_here) {
+            if (!path2fd_.emplace(LOG_FILE_NAME, local_fd).second) {
+                throw InternalError("DiskManager::open_log_fd found duplicate WAL path bookkeeping");
+            }
+            path_registered = true;
+            if (!fd2path_.emplace(local_fd, LOG_FILE_NAME).second) {
+                throw InternalError("DiskManager::open_log_fd found duplicate WAL descriptor bookkeeping");
+            }
+            fd_registered = true;
+        }
+        log_fd_ = local_fd;
+        log_offset_ = local_offset;
+    } catch (...) {
+        if (fd_registered) {
+            fd2path_.erase(local_fd);
+        }
+        if (path_registered) {
+            path2fd_.erase(LOG_FILE_NAME);
+        }
+        if (opened_here) {
+            const int original_errno = errno;
+            (void)close(local_fd);
+            errno = original_errno;
+        }
+        throw;
     }
+}
+
+int64_t DiskManager::get_log_file_size() {
+    open_log_fd();
+    if (log_fd_ < 0) {
+        throw InternalError("DiskManager::get_log_file_size has an invalid WAL descriptor: " +
+                            std::to_string(log_fd_));
+    }
+    return get_file_size(log_fd_);
 }
 
 /**
@@ -274,7 +345,7 @@ void DiskManager::open_log_fd() {
 int DiskManager::read_log(char* log_data, int size, int64_t offset) {
     // read log file from the previous end
     open_log_fd();
-    int64_t file_size = get_file_size(LOG_FILE_NAME);
+    const int64_t file_size = get_log_file_size();
     if (offset > file_size) {
         return -1;
     }

@@ -25,6 +25,7 @@ TPCC_THINK_MS ?= 0
 TPCC_RECONNECT_EACH_TXN ?= 0
 TPCC_MAX_CONFLICT_RETRIES ?= 1
 TPCC_ISOLATION ?= snapshot-isolation
+TPCC_WAL_PHASE_MARKERS ?= 0
 TPCC_GO_BINARY := $(BUILD_DIR)/bin/tpcc-go
 TPCC_RANDOM_DB ?= tpcc_random_kill_db
 TPCC_RANDOM_WORKERS ?= 16
@@ -126,6 +127,7 @@ benchmark: build tpcc-go
 		--reconnect-each-txn $(TPCC_RECONNECT_EACH_TXN) \
 		--max-conflict-retries $(TPCC_MAX_CONFLICT_RETRIES) \
 		--isolation $(TPCC_ISOLATION) \
+		--wal-phase-markers $(TPCC_WAL_PHASE_MARKERS) \
 		--go-binary $(TPCC_GO_BINARY) \
 		$$( [ "$(TPCC_REGENERATE_DATA)" = "1" ] && echo "--regenerate-data" )
 

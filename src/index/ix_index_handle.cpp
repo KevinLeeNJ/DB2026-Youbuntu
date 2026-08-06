@@ -308,7 +308,7 @@ IxIndexHandle::IxIndexHandle(DiskManager* disk_manager, BufferPoolManager* buffe
     // live subtree with a fresh node. The file length is a safe upper bound: a
     // page number that has ever been written is inside the file, so starting
     // after the last written page can never reuse one.
-    const int64_t file_size = disk_manager_->get_file_size(disk_manager_->get_file_name(fd));
+    const int64_t file_size = disk_manager_->get_file_size(fd);
     if (file_size > 0) {
         const auto pages_on_disk = static_cast<page_id_t>((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
         // Keep num_pages_ equal to the allocation cursor: the page-number range

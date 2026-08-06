@@ -38,7 +38,12 @@ private:
         predicate_recorded_ = true;
         if (context_->txn_mgr_->RecordPredicateRead(context_->txn_, std::string(scan_table_name_view()),
                                                     scan_conditions_ref())) {
-            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER);
+            const std::string table_name(scan_table_name_view());
+            const uint64_t table_id = context_->abort_metrics_enabled_
+                                          ? context_->txn_mgr_->TryGetTableRuntimeIdForObservation(table_name)
+                                          : 0;
+            throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::SSI_DANGER,
+                                            AbortDetail::UNKNOWN, table_id);
         }
     }
 

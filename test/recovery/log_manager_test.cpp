@@ -105,6 +105,37 @@ private:
     std::filesystem::path dir_;
 };
 
+std::string UniqueWalTestDir(const std::string& prefix) {
+    static std::atomic<uint64_t> next_id{0};
+    return prefix + "_" + std::to_string(getpid()) + "_" + std::to_string(next_id.fetch_add(1));
+}
+
+class ScopedWalFile {
+public:
+    explicit ScopedWalFile(DiskManager* disk_manager) : disk_manager_(disk_manager) {
+        disk_manager_->create_file(LOG_FILE_NAME);
+    }
+
+    ~ScopedWalFile() {
+        const int fd = disk_manager_->GetLogFd();
+        if (fd >= 0) {
+            try {
+                disk_manager_->close_file(fd);
+            } catch (...) {
+            }
+        }
+        if (disk_manager_->is_file(LOG_FILE_NAME)) {
+            try {
+                disk_manager_->destroy_file(LOG_FILE_NAME);
+            } catch (...) {
+            }
+        }
+    }
+
+private:
+    DiskManager* disk_manager_;
+};
+
 class ScopedEnvVar {
 public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
@@ -536,6 +567,58 @@ TEST(LogRecordTest, DeserializeLogRecordConstructsDerivedTypeFromHeader) {
     ExpectRecordEq(insert->insert_value_, rec);
 }
 
+TEST(LogManagerTest, WalFdSizeSurvivesPathRemovalAndClosedFdFailsExplicitly) {
+    ScopedTestDir test_dir(UniqueWalTestDir("wal_fd_size_test"));
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+
+    EXPECT_EQ(disk.get_log_file_size(), 0);
+    char first = 'a';
+    ASSERT_NO_THROW(disk.write_log(&first, 1));
+    ASSERT_EQ(disk.get_log_file_size(), 1);
+
+    ASSERT_EQ(unlink(LOG_FILE_NAME.c_str()), 0);
+    EXPECT_EQ(disk.get_log_file_size(), 1);
+    char read_back = 0;
+    ASSERT_EQ(disk.read_log(&read_back, 1, 0), 1);
+    EXPECT_EQ(read_back, first);
+    char second = 'b';
+    ASSERT_NO_THROW(disk.write_log(&second, 1));
+    EXPECT_EQ(disk.get_log_file_size(), 2);
+    ASSERT_EQ(disk.read_log(&read_back, 1, 1), 1);
+    EXPECT_EQ(read_back, second);
+
+    const int closed_fd = disk.GetLogFd();
+    ASSERT_GE(closed_fd, 0);
+    ASSERT_NO_THROW(disk.close_file(closed_fd));
+    try {
+        (void)disk.get_log_file_size();
+        FAIL() << "closed WAL descriptor returned a size";
+    } catch (const RMDBError& error) {
+        EXPECT_NE(std::string(error.what()).find("get_file_size(fstat) failed"), std::string::npos);
+    }
+    disk.SetLogFd(-1);
+}
+
+TEST(LogManagerTest, WalFdReopenPreservesAppendOffset) {
+    ScopedTestDir test_dir(UniqueWalTestDir("wal_fd_reopen_test"));
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+
+    char first[] = {'a', 'b', 'c'};
+    ASSERT_NO_THROW(disk.write_log(first, static_cast<int>(sizeof(first))));
+    ASSERT_EQ(disk.get_log_file_size(), static_cast<int64_t>(sizeof(first)));
+    const int initial_fd = disk.GetLogFd();
+    ASSERT_GE(initial_fd, 0);
+    ASSERT_NO_THROW(disk.close_file(initial_fd));
+    disk.SetLogFd(-1);
+
+    EXPECT_EQ(disk.get_log_file_size(), static_cast<int64_t>(sizeof(first)));
+    char second[] = {'d', 'e'};
+    ASSERT_NO_THROW(disk.write_log(second, static_cast<int>(sizeof(second))));
+    EXPECT_EQ(disk.get_log_file_size(), static_cast<int64_t>(sizeof(first) + sizeof(second)));
+}
+
 TEST(LogManagerTest, AppendFlushAndReadBack) {
     ScopedTestDir test_dir("log_manager_test_db");
     DiskManager disk;
@@ -580,6 +663,35 @@ TEST(LogManagerTest, FlushDurableUpToHonorsPageLsnTarget) {
 
     EXPECT_EQ(log_mgr.get_durable_lsn(), begin_lsn);
     EXPECT_GE(log_mgr.get_persist_lsn(), begin_lsn);
+}
+
+TEST(LogManagerTest, WalFlushMetricsAreEnabledOnlyWhenSuppliedAndEnabled) {
+    ScopedTestDir test_dir("log_manager_wal_metrics_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+
+    WalFlushMetrics disabled(false);
+    LogManager disabled_log_mgr(&disk, DurabilityMode::STRICT, &disabled);
+    BeginLogRecord disabled_begin(201);
+    const lsn_t disabled_lsn = disabled_log_mgr.add_log_to_buffer(&disabled_begin);
+    disabled_log_mgr.flush_log_to_disk_up_to(disabled_lsn);
+    EXPECT_EQ(disabled.snapshot().pwrite.count, 0U);
+
+    WalFlushMetrics enabled(true);
+    LogManager enabled_log_mgr(&disk, DurabilityMode::STRICT, &enabled);
+    BeginLogRecord enabled_begin(202);
+    const lsn_t enabled_lsn = enabled_log_mgr.add_log_to_buffer(&enabled_begin);
+    enabled_log_mgr.flush_log_to_disk_up_to(enabled_lsn);
+    enabled_log_mgr.flush_log_to_disk_up_to(enabled_lsn);
+
+    const auto snapshot = enabled.snapshot();
+    EXPECT_EQ(snapshot.leader_requests, 1U);
+    EXPECT_EQ(snapshot.physical_flush_iterations, 1U);
+    EXPECT_EQ(snapshot.pwrite.count, 1U);
+    EXPECT_GT(snapshot.pwrite_bytes, 0U);
+    EXPECT_EQ(snapshot.fdatasync.count, 1U);
+    EXPECT_EQ(snapshot.completed_batch_histogram[1], 1U);
+    EXPECT_EQ(snapshot.already_covered_fast_paths, 1U);
 }
 
 TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {

@@ -19,6 +19,9 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+
+#include "common/shard_acquisition_metrics.h"
+#include "common/transaction_phase_metrics.h"
 #include <vector>
 #include <string>
 #include <atomic>
@@ -34,7 +37,7 @@ class LockAcquireResult {
 public:
     enum class Value { Granted, Cancelled, DeadlockVictim, WriteConflict };
 
-    constexpr LockAcquireResult(Value value) : value_(value) {}
+    constexpr LockAcquireResult(Value value, bool waited = false) : value_(value), waited_(waited) {}
     constexpr LockAcquireResult(bool granted) : value_(granted ? Value::Granted : Value::Cancelled) {}
 
     constexpr operator bool() const {
@@ -44,9 +47,11 @@ public:
     constexpr Value value() const {
         return value_;
     }
+    constexpr bool waited() const { return waited_; }
 
 private:
     Value value_;
+    bool waited_{false};
 };
 
 class LockManager {
@@ -86,7 +91,11 @@ class LockManager {
     };
 
 public:
-    LockManager() = default;
+    explicit LockManager(ShardAcquisitionMetrics::Config shard_metrics_config =
+                             ShardAcquisitionMetrics::Config::FromEnvironment("RMDB_LOCK_SHARD_METRICS_SAMPLE_LOG2",
+                                                                                "RMDB_LOCK_SHARD_SLOW_NS"),
+                         TransactionPhaseMetrics* phase_metrics = nullptr)
+        : shard_metrics_(shard_metrics_config), phase_metrics_(phase_metrics) {}
 
     ~LockManager() {}
 
@@ -140,6 +149,8 @@ public:
     void set_cycle_cancel_before_record_queue_test_hook(std::function<void()> hook);
     void set_cycle_cancel_before_flag_test_hook(std::function<void()> hook);
     void cancel_waiting_transaction_for_test(txn_id_t txn_id);
+    bool shard_metrics_enabled() const noexcept;
+    void log_shard_metrics(uint64_t sequence) const;
 
 private:
     static constexpr size_t LOCK_TABLE_SHARD_COUNT = 64;
@@ -155,7 +166,7 @@ private:
         size_t registrations{0};
     };
 
-    LockTableShard& get_shard(const LockDataId& lock_data_id);
+    size_t get_shard_index(const LockDataId& lock_data_id) const;
     std::shared_ptr<LockRequestQueue> get_or_create_queue(const LockDataId& lock_data_id);
     std::shared_ptr<LockRequestQueue> get_queue(const LockDataId& lock_data_id);
     void release_queue_user(const LockDataId& lock_data_id, const std::shared_ptr<LockRequestQueue>& request_queue);
@@ -182,6 +193,8 @@ private:
     void run_cycle_cancel_before_flag_test_hook();
 
     std::array<LockTableShard, LOCK_TABLE_SHARD_COUNT> lock_table_shards_;
+    ShardAcquisitionMetrics shard_metrics_;
+    TransactionPhaseMetrics* phase_metrics_{nullptr};
     std::mutex pending_latch_;
     std::condition_variable pending_cv_;
     std::unordered_map<txn_id_t, std::vector<PendingLock>> pending_locks_;

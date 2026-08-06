@@ -119,6 +119,7 @@ TEST(SnapshotIsolationConcurrencyTest, DefaultSiFirstLockReturnsWriteConflictImm
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
     const LockAcquireResult victim_result = lock_manager.lock_exclusive_on_record(&victim, rid, 42);
     EXPECT_EQ(victim_result.value(), LockAcquireResult::Value::WriteConflict);
+    EXPECT_FALSE(victim_result.waited());
     EXPECT_EQ(owner.get_lock_set()->count(lock_id), 1u);
     EXPECT_TRUE(victim.get_lock_set()->empty());
     EXPECT_FALSE(lock_manager.has_record_waiters_for_test());
@@ -135,9 +136,11 @@ TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) 
     EXPECT_TRUE(lock_manager.lock_exclusive_on_record(&t1, rid, 42));
     std::atomic<bool> started{false};
     std::atomic<bool> acquired{false};
+    LockAcquireResult waiter_result = LockAcquireResult::Value::Cancelled;
     std::thread waiter([&] {
         started.store(true);
-        acquired.store(lock_manager.lock_exclusive_on_record(&t2, rid, 42));
+        waiter_result = lock_manager.lock_exclusive_on_record(&t2, rid, 42);
+        acquired.store(waiter_result);
     });
     while (!started.load()) {
         std::this_thread::yield();
@@ -148,6 +151,7 @@ TEST(SnapshotIsolationConcurrencyTest, ExclusiveRecordLockWaitsForSecondWriter) 
     waiter.join();
 
     EXPECT_TRUE(acquired.load());
+    EXPECT_TRUE(waiter_result.waited());
     EXPECT_TRUE(lock_manager.unlock(&t2, lock_id));
 }
 
@@ -574,6 +578,7 @@ public:
 
         Context context(db_->lock(), db_->log(), nullptr, data_send, &offset, db_->txn());
         context.isolation_level_ = session_isolation_;
+        context.abort_metrics_enabled_ = true;
         setup_transaction(&context);
 
         auto parse_tree = ast::parse_sql(sql);
@@ -1243,6 +1248,7 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
     // Phase 1: Initialization
     ASSERT_TRUE(s->exec_sql_ok("create table account (id int, balance int);"));
     ASSERT_TRUE(s->exec_sql_ok("insert into account values (1, 100);"));
+    ASSERT_TRUE(s->exec_sql_ok("insert into account values (2, 100);"));
 
     // Two sessions for concurrent transactions
     auto t1 = create_session();
@@ -1253,6 +1259,8 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
     SimpleThreadBarrier barrier(2);
 
     std::string t1_output, t2_output, t3_output;
+    AbortDetail t2_abort_detail = AbortDetail::UNKNOWN;
+    uint64_t t2_abort_table_id = 0;
     bool t1_ok = true, t2_ok = true;
 
     // ---- Thread T1 ----
@@ -1266,9 +1274,12 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
 
         barrier.arrive_and_wait(); // barrier 1: both snapshots are established
 
-        // T2's first record-lock conflict waits through the existing FIFO
-        // handoff path; the stale snapshot check still decides the outcome.
-        t1_ok = t1_ok && t1->exec_sql_ok("commit;"); // step 7
+        // Do not publish the owner commit until T2 is a real registered waiter.
+        // This makes the later stale classification prove the CV wait path.
+        const bool waiter_enqueued =
+            WaitForLockEnqueued([&] { return db_->lock()->has_record_waiters_for_test(); }, [] {});
+        const bool owner_committed = t1->exec_sql_ok("commit;"); // step 7; also releases a timed-out waiter
+        t1_ok = t1_ok && waiter_enqueued && owner_committed;
 
         barrier.arrive_and_wait(); // barrier 2: after T2 observes stale WW conflict
 
@@ -1283,11 +1294,21 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
 
         t2_ok = t2_ok && t2->exec_sql_ok("begin;"); // step 5
 
+        // Hold an unrelated row first so the target acquisition takes the
+        // registered FIFO waiter path rather than SI's immediate first-lock conflict.
+        t2_ok = t2_ok && t2->exec_sql_ok("update account set balance = 101 where id = 2;");
+
         barrier.arrive_and_wait(); // barrier 1
 
-        // With no previously held record/unique lock, step 6 enters FIFO and
-        // then fails the SI stale-write check after T1 commits.
-        t2_output = t2->exec_sql_expect_abort("update account set balance = 90 where id = 1;");
+        // The unrelated lock makes step 6 enter FIFO and then fail the SI
+        // stale-write check after T1 commits.
+        try {
+            t2->exec_sql("update account set balance = 90 where id = 1;");
+        } catch (const TransactionAbortException& exception) {
+            t2_abort_detail = exception.GetAbortDetail();
+            t2_abort_table_id = exception.GetTriggeringTableRuntimeId();
+            t2_output = "abort\n";
+        }
 
         barrier.arrive_and_wait(); // barrier 2
 
@@ -1302,6 +1323,8 @@ TEST_F(SnapshotTest, Example1_WriteWriteConflict_SI) {
 
     ASSERT_TRUE(t1_ok) << "T1 should complete without errors";
     EXPECT_EQ(TestSession::trim_output(t2_output), "abort") << "T2 should abort at step 6";
+    EXPECT_EQ(t2_abort_detail, AbortDetail::WAITED_THEN_STALE);
+    EXPECT_NE(t2_abort_table_id, 0u);
 
     // ---- T3: verify final state (step 9) ----
     t3_output = t3->exec_sql("select * from account where id = 1;");

@@ -28,6 +28,8 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "common/wal_flush_metrics.h"
 #include "log_defs.h"
 #include "common/config.h"
 #include "record/rm_defs.h"
@@ -727,10 +729,12 @@ class LogManager {
 public:
     static constexpr const char* RESTART_FILE_NAME = "db.restart";
 
-    explicit LogManager(DiskManager* disk_manager, DurabilityMode durability_mode = DurabilityMode::STRICT)
+    explicit LogManager(DiskManager* disk_manager, DurabilityMode durability_mode = DurabilityMode::STRICT,
+                        WalFlushMetrics* wal_flush_metrics = nullptr)
         : log_buffer_(std::make_unique<LogBuffer>()), flushing_buffer_(std::make_unique<LogBuffer>()) {
         disk_manager_ = disk_manager;
         durability_mode_ = durability_mode;
+        wal_flush_metrics_ = wal_flush_metrics;
         persist_lsn_.store(INVALID_LSN);
         durable_lsn_ = INVALID_LSN;
     }
@@ -826,6 +830,7 @@ private:
     int64_t log_file_offset_{0};                  // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};
+    WalFlushMetrics* wal_flush_metrics_{nullptr};
     struct IndexBinding {
         uint64_t generation{0};
         uint64_t epoch{0};

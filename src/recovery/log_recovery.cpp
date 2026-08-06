@@ -258,8 +258,7 @@ void RecoveryManager::validate_touched_page_bounds() {
         if (table.file_handle == nullptr) {
             continue;
         }
-        const int64_t file_bytes =
-            disk_manager_->get_file_size(disk_manager_->get_file_name(table.file_handle->GetFd()));
+        const int64_t file_bytes = disk_manager_->get_file_size(table.file_handle->GetFd());
         const int64_t disk_pages = file_bytes > 0 ? file_bytes / PAGE_SIZE : 0;
         const int64_t header_pages = table.file_handle->get_file_hdr().num_pages;
         table.page_no_limit = static_cast<int32_t>(
@@ -367,7 +366,7 @@ void RecoveryManager::analyze() {
     persisted_next_timestamp_ = manifest.next_timestamp;
     persisted_next_txn_id_ = manifest.next_txn_id;
 
-    const int64_t file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
+    const int64_t file_size = disk_manager_->get_log_file_size();
     if (file_size <= 0) {
         return;
     }

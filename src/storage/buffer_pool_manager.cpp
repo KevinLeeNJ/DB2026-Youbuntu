@@ -23,12 +23,47 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_manager.h"
 
 namespace {
+constexpr size_t kShardLogLineShards = 4;
+constexpr size_t kBase62Uint64Chars = 11;
+constexpr size_t kShardEntryMaxChars = 1 + 3 + 4 * kBase62Uint64Chars;
+// The 128-byte fixed body allowance plus a <60-byte minilog header stays
+// below minilog's 510-byte line buffer even with four maximum-size entries.
+static_assert(kShardLogLineShards * kShardEntryMaxChars + 128 + 60 < 510);
+static_assert(sizeof("shard-acq bpm schema=base62 entries=a/s/e/m a=sampled_acquisitions "
+                     "s=slow_acquisitions e=observed_elapsed_ns m=max_ns "
+                     "slow=threshold_proxy_not_exact_contention") -
+                  1 +
+                  60 <
+              510);
+
+std::string CompactUnsigned(uint64_t value) {
+    constexpr char digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char buffer[11];
+    size_t size = 0;
+    do {
+        buffer[size++] = digits[value % 62];
+        value /= 62;
+    } while (value != 0);
+    std::string result;
+    result.reserve(size);
+    while (size != 0) {
+        result += buffer[--size];
+    }
+    return result;
+}
 
 bool IsValidPageId(const PageId& page_id) {
     return page_id.fd >= 0 && page_id.page_no != INVALID_PAGE_ID;
 }
 
 constexpr size_t kMinimumDirtyScanFrames = 4096;
+
+uint64_t SplitMix64(uint64_t value) noexcept {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
 
 size_t DirtyScanFrameBudget(size_t batch_pages) {
     constexpr size_t kMultiplier = 8;
@@ -45,6 +80,39 @@ std::mutex BufferPoolManager::flush_page_test_hook_latch_;
 BufferPoolManager::FlushPageTestHook BufferPoolManager::flush_page_test_hook_;
 BufferPoolManager::FlushPageTestHook BufferPoolManager::flush_page_after_write_test_hook_;
 BufferPoolManager::FlushPageTestHook BufferPoolManager::flush_batch_before_write_test_hook_;
+
+bool BufferPoolManager::shard_metrics_enabled() const noexcept {
+    return shard_read_metrics_.enabled() || shard_write_metrics_.enabled();
+}
+
+void BufferPoolManager::log_shard_metrics(uint64_t sequence) const {
+    const auto log_direction = [sequence](const char* direction, const ShardAcquisitionMetrics& metrics) {
+        if (!metrics.enabled()) {
+            return;
+        }
+        const auto& config = metrics.config();
+        LOG_WARN("shard-acq bpm schema=base62 entries=a/s/e/m a=sampled_acquisitions "
+                 "s=slow_acquisitions e=observed_elapsed_ns m=max_ns "
+                 "slow=threshold_proxy_not_exact_contention");
+        for (size_t begin = 0; begin < ShardAcquisitionMetrics::kShardCount; begin += kShardLogLineShards) {
+            // Each range has four base-62 a/s/e/m entries in shard order.
+            std::string entries;
+            for (size_t shard = begin; shard < begin + kShardLogLineShards; ++shard) {
+                const auto snapshot = metrics.snapshot(shard);
+                entries += " " + CompactUnsigned(snapshot.sampled_acquisitions) + "/" +
+                           CompactUnsigned(snapshot.slow_acquisitions) + "/" +
+                           CompactUnsigned(snapshot.sampled_elapsed_ns) + "/" +
+                           CompactUnsigned(snapshot.sampled_max_ns);
+            }
+            LOG_WARN("shard-acq bpm seq=%s sample_log2=%u slow_ns=%s direction=%s shard=%zu-%zu%s",
+                     CompactUnsigned(sequence).c_str(), static_cast<unsigned>(config.sample_log2),
+                     CompactUnsigned(config.slow_ns).c_str(), direction, begin,
+                     begin + kShardLogLineShards - 1, entries.c_str());
+        }
+    };
+    log_direction("shared", shard_read_metrics_);
+    log_direction("exclusive", shard_write_metrics_);
+}
 
 void BufferPoolManager::set_flush_page_test_hook(FlushPageTestHook hook) {
     std::scoped_lock lock{flush_page_test_hook_latch_};
@@ -173,8 +241,9 @@ BufferPoolManager::FrameOperationToken BufferPoolManager::acquire_frame_operatio
     // shard exclusively drains hits that observed the previous open gate but
     // had not completed their pin yet. Release each shard immediately so an
     // unpin can make a frame available while the reservation waits below.
-    for (ResidentDirectoryShard& shard : resident_directory_) {
-        std::unique_lock shard_lock{shard.latch};
+    for (size_t shard_index = 0; shard_index < resident_directory_.size(); ++shard_index) {
+        ResidentDirectoryShard& shard = resident_directory_[shard_index];
+        auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     }
     frame_operation_cv_.wait(lock, [&] { return available_frames_locked() >= minimum_available_frames; });
     return FrameOperationToken(this, generation);
@@ -195,7 +264,10 @@ void BufferPoolManager::release_frame_operation(uint64_t generation) noexcept {
 size_t BufferPoolManager::resident_directory_shard_index(PageId page_id) const noexcept {
     static_assert((RESIDENT_DIRECTORY_SHARD_COUNT & (RESIDENT_DIRECTORY_SHARD_COUNT - 1)) == 0,
                   "resident directory shard count must be a power of two");
-    return PageIdHash{}(page_id) & (RESIDENT_DIRECTORY_SHARD_COUNT - 1);
+    const uint64_t fd = static_cast<uint32_t>(page_id.fd);
+    const uint64_t page_no = static_cast<uint32_t>(page_id.page_no);
+    const uint64_t packed = (fd << 32) | page_no;
+    return static_cast<size_t>(SplitMix64(packed)) & (RESIDENT_DIRECTORY_SHARD_COUNT - 1);
 }
 
 void BufferPoolManager::install_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state) {
@@ -205,8 +277,9 @@ void BufferPoolManager::install_page_mapping_locked(PageId page_id, frame_id_t f
     Page* page = &pages_[frame_id];
     assert(page->id_ == page_id);
 
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::unique_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     auto resident = shard.entries.find(page_id);
     assert(resident == shard.entries.end() || resident->second == frame_id);
     page_table_.insert_or_assign(page_id, frame_id);
@@ -232,8 +305,9 @@ void BufferPoolManager::set_mapped_frame_state_locked(PageId page_id, frame_id_t
     Page* page = &pages_[frame_id];
     assert(page->id_ == page_id);
 
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::unique_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     auto resident = shard.entries.find(page_id);
     assert(resident == shard.entries.end() || resident->second == frame_id);
     if (state == FrameState::VALID) {
@@ -262,8 +336,9 @@ void BufferPoolManager::erase_page_mapping_locked(PageId page_id, frame_id_t fra
     assert(frame_id >= 0 && static_cast<size_t>(frame_id) < pool_size_);
     assert(state == FrameState::EVICTING || state == FrameState::FREE);
 
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::unique_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     auto resident = shard.entries.find(page_id);
     assert(resident == shard.entries.end() || resident->second == frame_id);
     if (resident != shard.entries.end()) {
@@ -285,8 +360,9 @@ bool BufferPoolManager::claim_page_for_eviction_locked(PageId page_id, frame_id_
         return false;
     }
 
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::unique_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     Page* page = &pages_[frame_id];
     auto resident = shard.entries.find(page_id);
     if (resident == shard.entries.end() || resident->second != frame_id || !(page->id_ == page_id) ||
@@ -319,8 +395,9 @@ void BufferPoolManager::restore_blocked_victims_locked(const std::vector<frame_i
             continue;
         }
 
-        ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-        std::unique_lock shard_lock{shard.latch};
+        const size_t shard_index = resident_directory_shard_index(page_id);
+        ResidentDirectoryShard& shard = resident_directory_[shard_index];
+        auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
         auto authoritative = page_table_.find(page_id);
         auto resident = shard.entries.find(page_id);
         std::scoped_lock pin_lock{page->pin_latch_};
@@ -340,8 +417,9 @@ Page* BufferPoolManager::fetch_resident_page_fast(PageId page_id, const FrameOpe
         return nullptr;
     }
 
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::shared_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_read_metrics_.acquire_shared(shard.latch, shard_index);
     const uint64_t generation_after = frame_operation_generation_.load(std::memory_order_acquire);
     const bool active_after = frame_operation_active_.load(std::memory_order_acquire);
     if (generation_before != generation_after || active_before != active_after ||
@@ -374,8 +452,9 @@ Page* BufferPoolManager::fetch_resident_page_fast(PageId page_id, const FrameOpe
 BufferPoolManager::FastUnpinResult BufferPoolManager::unpin_clean_page_fast(PageId page_id) {
     bool became_available = false;
     {
-        ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-        std::shared_lock shard_lock{shard.latch};
+        const size_t shard_index = resident_directory_shard_index(page_id);
+        ResidentDirectoryShard& shard = resident_directory_[shard_index];
+        auto shard_lock = shard_read_metrics_.acquire_shared(shard.latch, shard_index);
         auto resident = shard.entries.find(page_id);
         if (resident == shard.entries.end() || resident->second < 0 ||
             static_cast<size_t>(resident->second) >= pool_size_) {
@@ -821,8 +900,9 @@ bool BufferPoolManager::try_mark_resident(PageId page_id, ResidencyClass residen
     if (page->state_.load(std::memory_order_acquire) != FrameState::VALID) {
         return false;
     }
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::unique_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     ResidencyClass& current = residency_classes_[hit->second];
     if (current == residency_class) {
         return true;
@@ -855,8 +935,9 @@ void BufferPoolManager::unmark_resident(PageId page_id) {
         return;
     }
     Page* page = &pages_[hit->second];
-    ResidentDirectoryShard& shard = resident_directory_[resident_directory_shard_index(page_id)];
-    std::unique_lock shard_lock{shard.latch};
+    const size_t shard_index = resident_directory_shard_index(page_id);
+    ResidentDirectoryShard& shard = resident_directory_[shard_index];
+    auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
     ResidencyClass& current = residency_classes_[hit->second];
     if (current != ResidencyClass::IndexInternal) {
         return;
@@ -1694,14 +1775,14 @@ BufferPoolManager::begin_checkpoint_cohort(const std::vector<int>& allowed_fds,
 }
 
 BufferPoolManager::CheckpointCohortFlushResult BufferPoolManager::flush_checkpoint_cohort(uint64_t epoch,
-                                                                                          size_t max_pages) {
+                                                                                          size_t max_io_pages,
+                                                                                          size_t max_frames_to_visit) {
     CheckpointCohortFlushResult result;
     if (epoch == 0) {
         result.success = false;
         return result;
     }
 
-    constexpr size_t kMaxCheckpointFramesPerTick = 1024;
     std::vector<PageId> pages_to_flush;
     {
         std::unique_lock lock{latch_};
@@ -1714,13 +1795,13 @@ BufferPoolManager::CheckpointCohortFlushResult BufferPoolManager::flush_checkpoi
             result.success = false;
             return result;
         }
-        if (max_pages == 0) {
+        if (max_io_pages == 0 || max_frames_to_visit == 0) {
             result.pages_remaining = checkpoint_cohort_pages_remaining_;
             return result;
         }
 
-        const size_t frames_to_visit = std::min(checkpoint_cohort_pending_frames_.size(), kMaxCheckpointFramesPerTick);
-        const size_t pages_to_select = std::min(max_pages, kMaxCheckpointFramesPerTick);
+        const size_t frames_to_visit = std::min(checkpoint_cohort_pending_frames_.size(), max_frames_to_visit);
+        const size_t pages_to_select = std::min(max_io_pages, max_frames_to_visit);
         pages_to_flush.reserve(std::min(pages_to_select, frames_to_visit));
         for (size_t visited = 0; visited < frames_to_visit && pages_to_flush.size() < pages_to_select; ++visited) {
             ++checkpoint_cohort_frames_visited_for_test_;

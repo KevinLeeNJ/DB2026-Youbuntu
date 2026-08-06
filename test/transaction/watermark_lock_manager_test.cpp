@@ -8,9 +8,13 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -67,8 +71,43 @@ void JoinIfJoinable(std::thread& thread) {
 
 } // namespace
 
+TEST(LockDataIdHashTest, MixesAllIdentityFieldsAcrossLockShards) {
+    const LockDataId record_a(17, Rid{23, 5}, LockDataType::RECORD);
+    const LockDataId record_b(17, Rid{23, 5}, LockDataType::RECORD);
+    const LockDataId table(17, LockDataType::TABLE);
+    const LockDataId record_with_table_fd(17, Rid{-1, -1}, LockDataType::RECORD);
+    const LockDataId old_collision_a(1, Rid{0, 7}, LockDataType::RECORD);
+    const LockDataId old_collision_b(0, Rid{32768, 7}, LockDataType::RECORD);
+    const std::hash<LockDataId> hash;
+
+    EXPECT_TRUE(record_a == record_b);
+    EXPECT_EQ(hash(record_a), hash(record_b));
+    EXPECT_NE(hash(table), hash(record_with_table_fd));
+    const auto legacy_record_get = [](int fd, const Rid& rid) {
+        return (uint64_t{1} << 63) | (static_cast<uint64_t>(static_cast<uint32_t>(fd)) << 31) |
+               (static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 16) | static_cast<uint32_t>(rid.slot_no);
+    };
+    ASSERT_EQ(legacy_record_get(1, Rid{0, 7}), legacy_record_get(0, Rid{32768, 7}));
+    EXPECT_NE(hash(old_collision_a), hash(old_collision_b));
+
+    std::array<bool, 64> fd_covered{};
+    std::array<bool, 64> page_covered{};
+    constexpr int kFixedSlot = 5;
+    constexpr int kFixedPage = 11;
+    constexpr int kFixedFd = 17;
+    for (int value = 0; value < 256; ++value) {
+        fd_covered[hash(LockDataId(value, Rid{kFixedPage, kFixedSlot}, LockDataType::RECORD)) &
+                   (fd_covered.size() - 1)] = true;
+        page_covered[hash(LockDataId(kFixedFd, Rid{value, kFixedSlot}, LockDataType::RECORD)) &
+                     (page_covered.size() - 1)] = true;
+    }
+    EXPECT_GE(std::count(fd_covered.begin(), fd_covered.end(), true), 48U);
+    EXPECT_GE(std::count(page_covered.begin(), page_covered.end(), true), 48U);
+}
+
 TEST(LockManagerMetadataTest, DuplicateUnlockAfterOwnerHandoffDoesNotReleaseNewOwner) {
-    LockManager lock_manager;
+    TransactionPhaseMetrics metrics(true);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
     Transaction owner(1001, IsolationLevel::READ_COMMITTED);
     Transaction waiter(1002, IsolationLevel::READ_COMMITTED);
     waiter.set_txn_mode(true);
@@ -91,10 +130,12 @@ TEST(LockManagerMetadataTest, DuplicateUnlockAfterOwnerHandoffDoesNotReleaseNewO
     EXPECT_FALSE(lock_manager.unlock(&owner, lock_id));
     EXPECT_EQ(waiter.get_lock_set()->count(lock_id), 1u);
     EXPECT_TRUE(lock_manager.unlock(&waiter, lock_id));
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::RecordLockWait).count, 1);
 }
 
 TEST(LockManagerMetadataTest, CancellingWaitingRecordLockLeavesQueueUsable) {
-    LockManager lock_manager;
+    TransactionPhaseMetrics metrics(true);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
     Transaction owner(1011, IsolationLevel::READ_COMMITTED);
     Transaction cancelled(1012, IsolationLevel::READ_COMMITTED);
     Transaction next(1013, IsolationLevel::READ_COMMITTED);
@@ -121,6 +162,7 @@ TEST(LockManagerMetadataTest, CancellingWaitingRecordLockLeavesQueueUsable) {
     ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&next, rid, 42));
     EXPECT_TRUE(lock_manager.unlock(&next, lock_id));
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::RecordLockWait).count, 1);
 }
 
 TEST(LockManagerMetadataTest, CancellationDuringOwnerHandoffReleasesGrantedOwner) {
@@ -187,6 +229,7 @@ TEST(LockManagerMetadataTest, CancellationDuringOwnerHandoffReleasesGrantedOwner
     waiter_thread.join();
 
     EXPECT_EQ(waiter_result.value(), LockAcquireResult::Value::Cancelled);
+    EXPECT_TRUE(waiter_result.waited());
     EXPECT_TRUE(waiter.get_lock_set()->empty());
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&next, rid, 42));
     EXPECT_TRUE(lock_manager.unlock(&next, lock_id));
@@ -256,6 +299,7 @@ TEST(LockManagerMetadataTest, DeadlockVictimDuringOwnerHandoffReleasesGrantedOwn
     JoinIfJoinable(victim_thread);
 
     EXPECT_EQ(victim_result.value(), LockAcquireResult::Value::DeadlockVictim);
+    EXPECT_TRUE(victim_result.waited());
     EXPECT_TRUE(victim.is_lock_cancellation_requested());
     EXPECT_TRUE(victim.get_lock_set()->empty());
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&next, rid, 42));

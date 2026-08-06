@@ -28,16 +28,19 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 
 class Planner;
+class CheckpointPhaseMetrics;
 
 class QlManager {
 private:
     SmManager* sm_manager_;
     TransactionManager* txn_mgr_;
     Planner* planner_;
+    CheckpointPhaseMetrics* checkpoint_metrics_;
 
 public:
-    QlManager(SmManager* sm_manager, TransactionManager* txn_mgr, Planner* planner)
-        : sm_manager_(sm_manager), txn_mgr_(txn_mgr), planner_(planner) {}
+    QlManager(SmManager* sm_manager, TransactionManager* txn_mgr, Planner* planner,
+              CheckpointPhaseMetrics* checkpoint_metrics = nullptr)
+        : sm_manager_(sm_manager), txn_mgr_(txn_mgr), planner_(planner), checkpoint_metrics_(checkpoint_metrics) {}
 
     void run_mutli_query(Plan* plan, Context* context);
     void run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context);

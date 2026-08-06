@@ -15,7 +15,38 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <functional>
 
+#include "minilog.h"
+
 namespace {
+constexpr size_t kShardLogLineShards = 4;
+constexpr size_t kBase62Uint64Chars = 11;
+constexpr size_t kShardEntryMaxChars = 1 + 3 + 4 * kBase62Uint64Chars;
+// The 128-byte fixed body allowance plus a <60-byte minilog header stays
+// below minilog's 510-byte line buffer even with four maximum-size entries.
+static_assert(kShardLogLineShards * kShardEntryMaxChars + 128 + 60 < 510);
+static_assert(sizeof("shard-acq lock schema=base62 entries=a/s/e/m a=sampled_acquisitions "
+                     "s=slow_acquisitions e=observed_elapsed_ns m=max_ns "
+                     "slow=threshold_proxy_not_exact_contention") -
+                  1 +
+                  60 <
+              510);
+
+std::string CompactUnsigned(uint64_t value) {
+    constexpr char digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char buffer[11];
+    size_t size = 0;
+    do {
+        buffer[size++] = digits[value % 62];
+        value /= 62;
+    } while (value != 0);
+    std::string result;
+    result.reserve(size);
+    while (size != 0) {
+        result += buffer[--size];
+    }
+    return result;
+}
+
 class TransactionOperationPin {
 public:
     explicit TransactionOperationPin(Transaction* txn) : txn_(txn) {
@@ -36,13 +67,42 @@ private:
 };
 } // namespace
 
-LockManager::LockTableShard& LockManager::get_shard(const LockDataId& lock_data_id) {
-    return lock_table_shards_[std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT];
+size_t LockManager::get_shard_index(const LockDataId& lock_data_id) const {
+    return std::hash<LockDataId>{}(lock_data_id) % LOCK_TABLE_SHARD_COUNT;
+}
+
+bool LockManager::shard_metrics_enabled() const noexcept {
+    return shard_metrics_.enabled();
+}
+
+void LockManager::log_shard_metrics(uint64_t sequence) const {
+    if (!shard_metrics_.enabled()) {
+        return;
+    }
+    const auto& config = shard_metrics_.config();
+    LOG_WARN("shard-acq lock schema=base62 entries=a/s/e/m a=sampled_acquisitions "
+             "s=slow_acquisitions e=observed_elapsed_ns m=max_ns "
+             "slow=threshold_proxy_not_exact_contention");
+    for (size_t begin = 0; begin < LOCK_TABLE_SHARD_COUNT; begin += kShardLogLineShards) {
+        // Each range has four base-62 a/s/e/m entries in shard order.
+        std::string entries;
+        for (size_t shard = begin; shard < begin + kShardLogLineShards; ++shard) {
+            const auto snapshot = shard_metrics_.snapshot(shard);
+            entries += " " + CompactUnsigned(snapshot.sampled_acquisitions) + "/" +
+                       CompactUnsigned(snapshot.slow_acquisitions) + "/" +
+                       CompactUnsigned(snapshot.sampled_elapsed_ns) + "/" +
+                       CompactUnsigned(snapshot.sampled_max_ns);
+        }
+        LOG_WARN("shard-acq lock seq=%s sample_log2=%u slow_ns=%s direction=exclusive shard=%zu-%zu%s",
+                 CompactUnsigned(sequence).c_str(), static_cast<unsigned>(config.sample_log2),
+                 CompactUnsigned(config.slow_ns).c_str(), begin, begin + kShardLogLineShards - 1, entries.c_str());
+    }
 }
 
 std::shared_ptr<LockManager::LockRequestQueue> LockManager::get_or_create_queue(const LockDataId& lock_data_id) {
-    auto& shard = get_shard(lock_data_id);
-    std::scoped_lock<std::mutex> lock(shard.latch_);
+    const size_t shard_index = get_shard_index(lock_data_id);
+    auto& shard = lock_table_shards_[shard_index];
+    auto lock = shard_metrics_.acquire_exclusive(shard.latch_, shard_index);
     auto& request_queue = shard.lock_table_[lock_data_id];
     if (request_queue == nullptr) {
         request_queue = std::make_shared<LockRequestQueue>();
@@ -52,8 +112,9 @@ std::shared_ptr<LockManager::LockRequestQueue> LockManager::get_or_create_queue(
 }
 
 std::shared_ptr<LockManager::LockRequestQueue> LockManager::get_queue(const LockDataId& lock_data_id) {
-    auto& shard = get_shard(lock_data_id);
-    std::scoped_lock<std::mutex> lock(shard.latch_);
+    const size_t shard_index = get_shard_index(lock_data_id);
+    auto& shard = lock_table_shards_[shard_index];
+    auto lock = shard_metrics_.acquire_exclusive(shard.latch_, shard_index);
     auto queue_it = shard.lock_table_.find(lock_data_id);
     if (queue_it == shard.lock_table_.end()) {
         return nullptr;
@@ -64,15 +125,17 @@ std::shared_ptr<LockManager::LockRequestQueue> LockManager::get_queue(const Lock
 
 void LockManager::release_queue_user(const LockDataId& lock_data_id,
                                      const std::shared_ptr<LockRequestQueue>& request_queue) {
-    auto& shard = get_shard(lock_data_id);
-    std::scoped_lock<std::mutex> lock(shard.latch_);
+    const size_t shard_index = get_shard_index(lock_data_id);
+    auto& shard = lock_table_shards_[shard_index];
+    auto lock = shard_metrics_.acquire_exclusive(shard.latch_, shard_index);
     request_queue->active_users_--;
 }
 
 void LockManager::try_remove_empty_queue(const LockDataId& lock_data_id,
                                          const std::shared_ptr<LockRequestQueue>& request_queue) {
-    auto& shard = get_shard(lock_data_id);
-    std::scoped_lock<std::mutex> shard_lock(shard.latch_);
+    const size_t shard_index = get_shard_index(lock_data_id);
+    auto& shard = lock_table_shards_[shard_index];
+    auto shard_lock = shard_metrics_.acquire_exclusive(shard.latch_, shard_index);
     std::scoped_lock<std::mutex> queue_lock(request_queue->latch_);
     auto queue_it = shard.lock_table_.find(lock_data_id);
     if (queue_it != shard.lock_table_.end() && queue_it->second == request_queue &&
@@ -590,8 +653,9 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     // uses the FIFO handoff path. Once a transaction has already acquired a
     // record or unique-key lock, preserve the existing cycle path.
     const IsolationLevel isolation = txn->get_isolation_level();
-    const bool immediate_snapshot_conflict = !owns_other_lock && (isolation == IsolationLevel::SNAPSHOT_ISOLATION ||
-                                                                  isolation == IsolationLevel::SERIALIZABLE);
+    const bool immediate_snapshot_conflict = !owns_other_lock &&
+                                            (isolation == IsolationLevel::SNAPSHOT_ISOLATION ||
+                                             isolation == IsolationLevel::SERIALIZABLE);
     if (immediate_snapshot_conflict) {
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
@@ -611,6 +675,8 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
         try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
+    TransactionPhaseMetrics::Scope record_lock_wait(phase_metrics_,
+                                                     TransactionPhaseMetrics::Phase::RecordLockWait);
     lock.unlock();
     // A transaction with no granted record or unique-key lock cannot be the
     // predecessor of another wait-for edge, so this first wait cannot close a
@@ -622,6 +688,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     }
     lock.lock();
     request->cv_.wait(lock, [&request] { return request->state_ != LockRequest::State::Waiting; });
+    record_lock_wait.Stop();
     const bool owns_queue = request_queue->owner_txn_id_ == txn->get_transaction_id();
     const bool publishable = request->state_ == LockRequest::State::GrantedUnpublished && owns_queue;
     if (publishable) {
@@ -667,11 +734,14 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     }
     unregister_pending_lock(txn->get_transaction_id(), lock_data_id, request);
     release_queue_user(lock_data_id, request_queue);
+    record_lock_wait.Finish();
     if (cancelled) {
         try_remove_empty_queue(lock_data_id, request_queue);
-        return deadlock_victim ? LockAcquireResult::Value::DeadlockVictim : LockAcquireResult::Value::Cancelled;
+        return LockAcquireResult(deadlock_victim ? LockAcquireResult::Value::DeadlockVictim
+                                                 : LockAcquireResult::Value::Cancelled,
+                                 true);
     }
-    return true;
+    return LockAcquireResult(LockAcquireResult::Value::Granted, true);
 }
 
 std::string LockManager::make_unique_key_lock_id(int index_fd, const std::vector<char>& key) {

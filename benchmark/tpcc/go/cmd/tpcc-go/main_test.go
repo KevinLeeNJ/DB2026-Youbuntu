@@ -1295,7 +1295,7 @@ func TestOfficialWindowsRejectsReconnectEachTxnBeforeConnecting(t *testing.T) {
 		0, 1, 0, 0, defaultMaxConflictRetries, true, 0, func() (txnBackend, error) {
 			factoryCalls++
 			return &lifecycleBackend{}, nil
-		}, newTxnLedger())
+		}, newTxnLedger(), "")
 	if err == nil || !strings.Contains(err.Error(), "does not allow reconnect-each-txn") {
 		t.Fatalf("runOfficialWindows() error = %v, want reconnect rejection", err)
 	}

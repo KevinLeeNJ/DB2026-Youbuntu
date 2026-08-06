@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "index/ix.h"
+#include "common/checkpoint_phase_metrics.h"
 #include "record/rm.h"
 #include "recovery/checkpoint_manager.h"
 #include "recovery/log_manager.h"
@@ -21,8 +22,10 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,6 +37,28 @@ namespace {
 TEST(CheckpointOptionsTest, ProductionDefaultTargetIsFourGiB) {
     const CheckpointOptions options;
     EXPECT_EQ(options.auto_checkpoint_bytes, 4LL * 1024 * 1024 * 1024);
+    EXPECT_EQ(options.tick_bytes, 4ULL * 1024 * 1024);
+    EXPECT_EQ(options.tick_time_us, 5000u);
+    EXPECT_EQ(options.io_quantum_pages, 64u);
+}
+
+TEST(CheckpointOptionsTest, EnvironmentIsStrictAndClamped) {
+    const auto set = [](const char* key, const char* value) { ASSERT_EQ(setenv(key, value, 1), 0); };
+    set("RMDB_AUTO_CHECKPOINT_BYTES", "1");
+    set("RMDB_CHECKPOINT_TICK_BYTES", "9999999999999");
+    set("RMDB_CHECKPOINT_TICK_TIME_US", "1");
+    set("RMDB_CHECKPOINT_IO_QUANTUM_PAGES", "999");
+    const CheckpointOptions clamped = CheckpointOptions::FromEnvironment();
+    EXPECT_EQ(clamped.auto_checkpoint_bytes, 1LL * 1024 * 1024);
+    EXPECT_EQ(clamped.tick_bytes, 1024ULL * 1024 * 1024);
+    EXPECT_EQ(clamped.tick_time_us, 100u);
+    EXPECT_EQ(clamped.io_quantum_pages, 64u);
+    set("RMDB_CHECKPOINT_TICK_BYTES", "64k");
+    EXPECT_THROW((void)CheckpointOptions::FromEnvironment(), std::invalid_argument);
+    unsetenv("RMDB_AUTO_CHECKPOINT_BYTES");
+    unsetenv("RMDB_CHECKPOINT_TICK_BYTES");
+    unsetenv("RMDB_CHECKPOINT_TICK_TIME_US");
+    unsetenv("RMDB_CHECKPOINT_IO_QUANTUM_PAGES");
 }
 
 class ScopedDrainTestDir {
@@ -268,9 +293,14 @@ TEST(CheckpointDrainTest, ExceptionDuringDrainUnblocksAdmission) {
         }
     };
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_, ConcurrencyMode::TWO_PHASE_LOCKING, std::move(test_options));
-    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    CheckpointPhaseMetrics metrics(true);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_, &metrics);
 
     EXPECT_THROW(checkpoint_mgr.RunCleanCheckpoint(), std::runtime_error);
+    auto snapshot = metrics.snapshot();
+    EXPECT_EQ(snapshot.clean_attempts, 1U);
+    EXPECT_EQ(snapshot.clean_successes, 0U);
+    EXPECT_EQ(snapshot.clean_failures, 1U);
 
     auto begin_result = std::async(std::launch::async, [&] { return txn_mgr.begin(nullptr, &db.log_mgr_); });
     const auto begin_status = begin_result.wait_for(std::chrono::seconds(5));
@@ -284,6 +314,12 @@ TEST(CheckpointDrainTest, ExceptionDuringDrainUnblocksAdmission) {
     txn_mgr.abort(txn, &db.log_mgr_);
 
     EXPECT_TRUE(checkpoint_mgr.RunCleanCheckpoint()) << "exception left the global checkpoint running guard set";
+    snapshot = metrics.snapshot();
+    EXPECT_EQ(snapshot.clean_attempts, 2U);
+    EXPECT_EQ(snapshot.clean_successes, 1U);
+    EXPECT_EQ(snapshot.clean_failures, 1U);
+    EXPECT_EQ(snapshot.timing[static_cast<size_t>(CheckpointPhaseMetrics::Timing::CleanDataSync)].count, 1U);
+    EXPECT_EQ(snapshot.timing[static_cast<size_t>(CheckpointPhaseMetrics::Timing::CleanMetaFlush)].count, 1U);
 }
 
 // The abandoned round must leave no residual blocking: once the stuck
@@ -306,12 +342,33 @@ TEST(CheckpointDrainTest, CheckpointSucceedsAfterBlockedRoundIsAbandoned) {
     EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
 }
 
+TEST(CheckpointOptionsTest, SetOptionsClampsPacingButPreservesAutoThreshold) {
+    ScopedDrainTestDir test_dir("checkpoint_options_clamp_root");
+    DrainTestDb db("checkpoint_options_clamp_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = 1;
+    options.tick_bytes = 0;
+    options.tick_time_us = std::numeric_limits<uint64_t>::max();
+    options.io_quantum_pages = std::numeric_limits<size_t>::max();
+    checkpoint_mgr.SetOptions(options);
+    ASSERT_NE(MakeDirtyTablePage(&db).page_no, INVALID_PAGE_ID);
+    ASSERT_GT(AppendBegin(&db.log_mgr_, 201), 0);
+    // The small threshold remains effective while overflow-prone pacing values
+    // are normalized before Tick converts them into a signed duration.
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_TRUE(checkpoint_mgr.Tick());
+}
+
 TEST(CheckpointScheduleTest, TickPublishesNonzeroRestartCutWithoutTruncatingWal) {
     ScopedDrainTestDir test_dir("checkpoint_target_only_root");
     DrainTestDb db("checkpoint_target_only_db");
     LockManager lock_mgr;
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
-    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    CheckpointPhaseMetrics metrics(true);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_, &metrics);
 
     const PageId dirty_page = MakeDirtyTablePage(&db);
     ASSERT_NE(dirty_page.page_no, INVALID_PAGE_ID);
@@ -334,6 +391,68 @@ TEST(CheckpointScheduleTest, TickPublishesNonzeroRestartCutWithoutTruncatingWal)
     EXPECT_FALSE(IsDirty(&db.bpm_, dirty_page));
     EXPECT_EQ(db.log_mgr_.read_restart_manifest().checkpoint_offset, cut_offset);
     EXPECT_GT(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+    const auto snapshot = metrics.snapshot();
+    EXPECT_EQ(snapshot.fuzzy_attempts, 1U);
+    EXPECT_EQ(snapshot.fuzzy_successes, 1U);
+    EXPECT_EQ(snapshot.fuzzy_failures, 0U);
+    EXPECT_EQ(snapshot.fuzzy_cancels, 0U);
+    EXPECT_EQ(snapshot.page_write_calls, 1U);
+    EXPECT_EQ(snapshot.pages_remaining_max, 0U);
+    EXPECT_EQ(snapshot.timing[static_cast<size_t>(CheckpointPhaseMetrics::Timing::FuzzyFinalPublish)].count, 1U);
+    EXPECT_EQ(snapshot.timing[static_cast<size_t>(CheckpointPhaseMetrics::Timing::FuzzyLifetime)].count, 1U);
+}
+
+TEST(CheckpointScheduleTest, FuzzyPageWriteFailureIsFailureNotCancel) {
+    ScopedDrainTestDir test_dir("checkpoint_metrics_failure_root");
+    DrainTestDb db("checkpoint_metrics_failure_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointPhaseMetrics metrics(true);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_, &metrics);
+    ASSERT_NE(MakeDirtyTablePage(&db).page_no, INVALID_PAGE_ID);
+    const int64_t cut_offset = AppendBegin(&db.log_mgr_, 202);
+    ASSERT_GT(cut_offset, 0);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = cut_offset;
+    checkpoint_mgr.SetOptions(options);
+
+    BufferPoolManager::set_flush_batch_before_write_test_hook(
+        [](PageId, Page*) { throw std::runtime_error("injected fuzzy page-write failure"); });
+    struct HookReset {
+        ~HookReset() { BufferPoolManager::set_flush_batch_before_write_test_hook({}); }
+    } hook_reset;
+
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    const auto snapshot = metrics.snapshot();
+    EXPECT_EQ(snapshot.fuzzy_attempts, 1U);
+    EXPECT_EQ(snapshot.fuzzy_successes, 0U);
+    EXPECT_EQ(snapshot.fuzzy_failures, 1U);
+    EXPECT_EQ(snapshot.fuzzy_cancels, 0U);
+    EXPECT_EQ(snapshot.timing[static_cast<size_t>(CheckpointPhaseMetrics::Timing::FuzzyLifetime)].count, 1U);
+}
+
+TEST(CheckpointScheduleTest, DestroyingActiveFuzzyCheckpointRecordsCancelOnly) {
+    ScopedDrainTestDir test_dir("checkpoint_metrics_cancel_root");
+    DrainTestDb db("checkpoint_metrics_cancel_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointPhaseMetrics metrics(true);
+    const int64_t cut_offset = AppendBegin(&db.log_mgr_, 201);
+    ASSERT_GT(cut_offset, 0);
+    {
+        CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_, &metrics);
+        CheckpointOptions options;
+        options.auto_checkpoint_bytes = cut_offset;
+        checkpoint_mgr.SetOptions(options);
+        EXPECT_FALSE(checkpoint_mgr.Tick());
+    }
+    const auto snapshot = metrics.snapshot();
+    EXPECT_EQ(snapshot.fuzzy_attempts, 1U);
+    EXPECT_EQ(snapshot.fuzzy_successes, 0U);
+    EXPECT_EQ(snapshot.fuzzy_failures, 0U);
+    EXPECT_EQ(snapshot.fuzzy_cancels, 1U);
+    EXPECT_EQ(snapshot.timing[static_cast<size_t>(CheckpointPhaseMetrics::Timing::FuzzyLifetime)].count, 1U);
 }
 
 TEST(CheckpointScheduleTest, FixedCohortExcludesPagesDirtiedAfterCut) {
@@ -386,26 +505,59 @@ TEST(CheckpointScheduleTest, FixedCohortIncludesTableAndIndexPages) {
     EXPECT_GT(db.log_mgr_.read_restart_manifest().checkpoint_offset, 0);
 }
 
-TEST(CheckpointScheduleTest, TickFlushesAtMostOneThousandTwentyFourCohortPages) {
+TEST(CheckpointScheduleTest, TickHonorsByteBudgetAcrossBoundedQuanta) {
     ScopedDrainTestDir test_dir("checkpoint_fixed_cohort_batch_root");
     DrainTestDb db("checkpoint_fixed_cohort_batch_db", false, 1200);
     LockManager lock_mgr;
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
 
-    constexpr size_t kDirtyPages = 1100;
+    constexpr size_t kDirtyPages = 65;
     ASSERT_EQ(MakeDirtyTablePages(&db, kDirtyPages), kDirtyPages);
     const int64_t log_offset = AppendBegin(&db.log_mgr_, 300);
     ASSERT_GT(log_offset, 0);
     CheckpointOptions options;
     options.auto_checkpoint_bytes = log_offset;
+    options.tick_bytes = 64ULL * PAGE_SIZE;
+    options.tick_time_us = 1000000;
+    options.io_quantum_pages = 64;
     checkpoint_mgr.SetOptions(options);
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 1024);
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 64);
     EXPECT_TRUE(checkpoint_mgr.Tick());
     EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 0u);
+}
+
+TEST(CheckpointScheduleTest, TickDeadlineYieldsAfterOneQuantum) {
+    ScopedDrainTestDir test_dir("checkpoint_tick_deadline_root");
+    DrainTestDb db("checkpoint_tick_deadline_db");
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointPhaseMetrics metrics(true);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_, &metrics);
+    ASSERT_EQ(MakeDirtyTablePages(&db, 2), 2u);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = AppendBegin(&db.log_mgr_, 325);
+    options.tick_bytes = 2ULL * PAGE_SIZE;
+    options.tick_time_us = 100;
+    options.io_quantum_pages = 1;
+    checkpoint_mgr.SetOptions(options);
+    ASSERT_FALSE(checkpoint_mgr.Tick());
+
+    BufferPoolManager::set_flush_batch_before_write_test_hook([](PageId, Page*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    struct HookReset {
+        ~HookReset() {
+            BufferPoolManager::set_flush_batch_before_write_test_hook({});
+        }
+    } hook_reset;
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 1u);
+    EXPECT_EQ(metrics.snapshot().budget_yields_time, 1u);
+    EXPECT_TRUE(checkpoint_mgr.Tick());
 }
 
 TEST(CheckpointScheduleTest, TickLeavesPagesDirtyBelowRelativeTarget) {

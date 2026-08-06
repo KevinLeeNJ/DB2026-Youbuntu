@@ -27,12 +27,20 @@ auto ReconstructTuple(const TabMeta* schema, const RmRecord& base_tuple, const T
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction* txn) -> bool;
 
-inline void ReserveUniqueKey(Context* context, int index_fd, const std::vector<char>& key) {
+inline uint64_t ObservationTableRuntimeId(Context* context, SmManager* sm_manager, const std::string& tab_name) noexcept {
+    return context != nullptr && context->abort_metrics_enabled_ && sm_manager != nullptr
+               ? sm_manager->try_get_table_runtime_id_under_catalog_guard(tab_name)
+               : 0;
+}
+
+inline void ReserveUniqueKey(Context* context, SmManager* sm_manager, const std::string& tab_name, int index_fd,
+                             const std::vector<char>& key) {
     if (context == nullptr || context->txn_ == nullptr || context->lock_mgr_ == nullptr) {
         return;
     }
     if (!context->lock_mgr_->lock_exclusive_on_unique_key(context->txn_, index_fd, key)) {
-        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT);
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::UNIQUE_KEY_CONFLICT,
+                                        AbortDetail::UNKNOWN, ObservationTableRuntimeId(context, sm_manager, tab_name));
     }
 }
 
@@ -49,7 +57,8 @@ inline void CheckLogicalRowDeleteIntentForInsert(Context* context, SmManager* sm
     const uint64_t table_runtime_id = sm_manager->get_table_runtime_id_under_catalog_guard(tab_name);
     std::vector<char> record_bytes(record.data, record.data + record.size);
     if (context->lock_mgr_->logical_row_delete_intent_conflicts(context->txn_, table_runtime_id, record_bytes)) {
-        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                        AbortDetail::UNKNOWN, ObservationTableRuntimeId(context, sm_manager, tab_name));
     }
 }
 
@@ -62,7 +71,8 @@ inline void RegisterLogicalRowDeleteIntent(Context* context, SmManager* sm_manag
     const uint64_t table_runtime_id = sm_manager->get_table_runtime_id_under_catalog_guard(tab_name);
     std::vector<char> record_bytes(record.data, record.data + record.size);
     if (!context->lock_mgr_->register_logical_row_delete_intent(context->txn_, table_runtime_id, record_bytes)) {
-        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+        throw TransactionAbortException(context->txn_->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                        AbortDetail::UNKNOWN, ObservationTableRuntimeId(context, sm_manager, tab_name));
     }
 }
 

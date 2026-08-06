@@ -18,14 +18,25 @@ See the Mulan PSL v2 for more details. */
 class LogManager;
 class SmManager;
 class TransactionManager;
+class CheckpointPhaseMetrics;
 
 struct CheckpointOptions {
+    // These defaults bound each 100ms scheduler invocation instead of letting a
+    // large dirty cut turn into one foreground-visible I/O burst.
     int64_t auto_checkpoint_bytes = 4LL * 1024 * 1024 * 1024;
+    size_t tick_bytes = 4ULL * 1024 * 1024;
+    uint64_t tick_time_us = 5000;
+    size_t io_quantum_pages = 64;
+
+    // Environment values are strict unsigned decimal; valid out-of-range
+    // values are clamped to conservative scheduler limits.
+    static CheckpointOptions FromEnvironment();
 };
 
 class CheckpointManager {
 public:
-    CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr);
+    CheckpointManager(TransactionManager* txn_mgr, SmManager* sm_mgr, LogManager* log_mgr,
+                      CheckpointPhaseMetrics* metrics = nullptr);
     ~CheckpointManager();
 
     bool RunCleanCheckpoint();
@@ -38,13 +49,14 @@ private:
 
     bool StartFuzzyCheckpoint();
     bool AdvanceFuzzyCheckpoint();
-    void CancelFuzzyCheckpoint() noexcept;
+    void CancelFuzzyCheckpoint(bool record_cancel = true) noexcept;
     void DeferAutomaticRetry() noexcept;
     int64_t RetainedWalBytes(int64_t current_offset) noexcept;
 
     TransactionManager* txn_mgr_;
     SmManager* sm_mgr_;
     LogManager* log_mgr_;
+    CheckpointPhaseMetrics* metrics_;
     CheckpointOptions options_{};
     std::unique_ptr<FuzzyCheckpointState> fuzzy_checkpoint_;
     // Backoff state for automatic checkpoints after a failed or over-budget

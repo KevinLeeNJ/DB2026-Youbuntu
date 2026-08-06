@@ -134,7 +134,9 @@ public:
             if (rec == nullptr) {
                 if (context_ != nullptr && context_->txn_ != nullptr &&
                     context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-                    throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT,
+                                                    AbortDetail::UNKNOWN,
+                                                    ObservationTableRuntimeId(context_, sm_manager_, *tab_name_));
                 }
                 continue;
             }

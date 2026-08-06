@@ -10,15 +10,25 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -28,12 +38,18 @@ See the Mulan PSL v2 for more details. */
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "errors.h"
+#include "common/transaction_abort_metrics.h"
+#include "common/checkpoint_phase_metrics.h"
+#include "common/transaction_phase_metrics.h"
+#include "common/wal_flush_metrics.h"
 #include "index/ix_scan.h"
 #include "minilog.h"
 #include "optimizer/optimizer.h"
@@ -60,18 +76,276 @@ auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_ma
 auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
 auto sm_manager =
     std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
-auto lock_manager = std::make_unique<LockManager>();
-auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
+auto transaction_phase_metrics = std::make_unique<TransactionPhaseMetrics>();
+auto transaction_abort_metrics = std::make_unique<TransactionAbortMetrics>();
+auto wal_flush_metrics = std::make_unique<WalFlushMetrics>();
+auto checkpoint_phase_metrics = std::make_unique<CheckpointPhaseMetrics>();
+CheckpointOptions checkpoint_options{};
+auto lock_manager = std::make_unique<LockManager>(
+    ShardAcquisitionMetrics::Config::FromEnvironment("RMDB_LOCK_SHARD_METRICS_SAMPLE_LOG2", "RMDB_LOCK_SHARD_SLOW_NS"),
+    transaction_phase_metrics.get());
+auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get(),
+                                                        ConcurrencyMode::TWO_PHASE_LOCKING,
+                                                        transaction_phase_metrics.get());
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
-auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
+auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get(),
+                                              checkpoint_phase_metrics.get());
 // The server must not acknowledge a commit before the WAL is durable.  Keep
 // PROCESS_CRASH available to focused LogManager tests, but never let an
 // omitted or misspelled environment variable weaken the production path.
-auto log_manager = std::make_unique<LogManager>(disk_manager.get(), DurabilityMode::STRICT);
+auto log_manager = std::make_unique<LogManager>(disk_manager.get(), DurabilityMode::STRICT, wal_flush_metrics.get());
 
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
+
+namespace {
+constexpr char kTxnPhaseSchema[] =
+    "txn-phase schema=base62 cumulative=1 exec=inclusive_nonadditive wal=owner_latency tuple=actor_work "
+    "lock=actor_work frontier_count=cv_wait_call final=1:graceful_final_snapshot "
+    "entries=name:count/elapsed_ns/max_ns units=exec_batch_wall:batch,record_lock_wait:wait_request,"
+    "commit_wal_wait:commit_wait_call,tuple_publication_work:publication_request,frontier_wait:cv_wait_call,"
+    "lock_release_work:transaction_end";
+constexpr std::size_t kWarnHeaderMax = sizeof("WARN ") - 1 +
+                                        // TimeCache accepts a seven-digit year prefix plus milliseconds.
+                                        sizeof("0000000-00-00 00:00:00.000") - 1 +
+                                        sizeof(" [rmdb.cpp:") - 1 + 10 + sizeof("] ") - 1;
+constexpr char kTxnPhaseDataPrefix[] = "txn-phase seq=";
+constexpr char kTxnPhaseDataFinal[] = " final=1 ";
+constexpr char kTxnPhaseLongestName[] = "tuple_publication_work";
+constexpr char kWalFlushSchema[] =
+    "wal-flush-metric schema=base62 cumulative=1 leader_is_wal_flush_owner_not_transaction_owner "
+    "lag=target_minus_durable invalid_or_reset=excluded batch_buckets=0,1,2,3,4,5,6,7,8,9_16,17_32,33_64,65_plus";
+constexpr char kWalFlushCompletedPrefix[] = "wal-flush-metric seq=";
+constexpr char kCheckpointSchema[] =
+    "checkpoint-metric schema=base62 cumulative=1 clean=attempt/success/failure "
+    "fuzzy=attempt/success/failure/cancel pages=marked/write_calls/written/remaining_max "
+    "defer=retry/deadline budget_yield=io/time/zero_progress timing=count/sum_ns/max_ns timing_count_unit=phase_calls "
+    "counter_unit=events_or_pages config=auto_bytes/tick_bytes/tick_time_us/io_quantum_pages";
+constexpr char kCheckpointPhaseSchema[] =
+    "checkpoint-metric phase-schema "
+    "drain=admission_wait cut=headers_cohort_wal_cut page=cohort_flush clean_data=flush_all_data_index "
+    "clean_meta=flush_meta fuzzy_final=headers_files_dbmeta manifest=restart_manifest wal_reset=reset_log "
+    "lifetime=fuzzy_attempt_to_terminal terminal=exactly_one page_calls=returned remaining=max_returned";
+constexpr char kCheckpointCounterFixed[] =
+    "checkpoint-metric seq= final=1 clean=// fuzzy=/// pages=/// defer=/ budget_yield=//";
+constexpr char kCheckpointTimingAFixed[] =
+    "checkpoint-metric seq= final=1 drain=// cut=// page=// clean_data=// clean_meta=//";
+constexpr char kCheckpointTimingBFixed[] =
+    "checkpoint-metric seq= final=1 fuzzy_final=// manifest=// wal_reset=// lifetime=//";
+constexpr std::size_t kBase62Max = 11;
+static_assert(sizeof(kTxnPhaseSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kTxnPhaseDataPrefix) - 1 + kBase62Max + sizeof(kTxnPhaseDataFinal) - 1 +
+                  sizeof(kTxnPhaseLongestName) - 1 + 1 + 3 * kBase62Max + 2 + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kWalFlushSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointPhaseSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointCounterFixed) - 1 + 17 * kBase62Max + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointTimingAFixed) - 1 + 16 * kBase62Max + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointTimingBFixed) - 1 + 13 * kBase62Max + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kWalFlushCompletedPrefix) - 1 + kBase62Max + sizeof(" final=1 completed=") - 1 +
+                  13 * (kBase62Max + 1) + sizeof("lag=") - 1 + 5 * (kBase62Max + 1) + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
+std::string Base62(uint64_t value) {
+    constexpr char digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    char buffer[11];
+    size_t size = 0;
+    do {
+        buffer[size++] = digits[value % 62];
+        value /= 62;
+    } while (value != 0);
+    std::string result;
+    while (size != 0) {
+        result += buffer[--size];
+    }
+    return result;
+}
+void LogTransactionPhaseMetrics(uint64_t sequence) {
+    if (!transaction_phase_metrics->enabled()) {
+        return;
+    }
+    LOG_WARN("%s", kTxnPhaseSchema);
+    constexpr const char* names[] = {"exec_batch_wall", "record_lock_wait", "commit_wal_wait",
+                                     "tuple_publication_work", "frontier_wait", "lock_release_work"};
+    for (size_t index = 0; index < static_cast<size_t>(TransactionPhaseMetrics::Phase::Count); ++index) {
+        const auto snapshot = transaction_phase_metrics->snapshot(static_cast<TransactionPhaseMetrics::Phase>(index));
+        LOG_WARN("txn-phase seq=%s final=%d %s:%s/%s/%s", Base62(sequence).c_str(), sequence == UINT64_MAX,
+                 names[index],
+                 Base62(snapshot.count).c_str(), Base62(snapshot.elapsed_ns).c_str(), Base62(snapshot.max_ns).c_str());
+    }
+}
+AbortOperation AbortOperationFor(ast::AstType type) noexcept {
+    switch (type) {
+    case ast::AstType::SelectStmt:
+    case ast::AstType::SelectFromUnionStmt:
+    case ast::AstType::ExplainAnalyze: return AbortOperation::SELECT;
+    case ast::AstType::InsertStmt: return AbortOperation::INSERT;
+    case ast::AstType::UpdateStmt: return AbortOperation::UPDATE;
+    case ast::AstType::DeleteStmt: return AbortOperation::DELETE;
+    case ast::AstType::TxnBegin:
+    case ast::AstType::TxnCommit:
+    case ast::AstType::TxnAbort:
+    case ast::AstType::TxnRollback: return AbortOperation::TXN_CONTROL;
+    default: return AbortOperation::OTHER;
+    }
+}
+void CaptureAbortObservation(TransactionAbortException& exception, const Context& context) noexcept {
+    Transaction* txn = context.txn_;
+    exception.SetObservation(context.abort_origin_, txn != nullptr && txn->get_txn_mode() ? AbortTxnMode::EXPLICIT
+                                                                                           : AbortTxnMode::AUTOCOMMIT,
+                             txn != nullptr ? txn->get_isolation_level() : context.isolation_level_,
+                             context.abort_operation_);
+}
+void LogTransactionAbortMetrics(uint64_t sequence) {
+    if (!transaction_abort_metrics->enabled()) return;
+    LOG_WARN("abort-metric schema=base62 cumulative=1 table_slots=64 overflow_id=0 fields=o/m/i/p/r/d:count");
+    for (size_t o = 0; o < TransactionAbortMetrics::kOrigins; ++o)
+        for (size_t m = 0; m < TransactionAbortMetrics::kModes; ++m)
+            for (size_t i = 0; i < TransactionAbortMetrics::kIsolations; ++i)
+                for (size_t p = 0; p < TransactionAbortMetrics::kOperations; ++p)
+                    for (size_t r = 0; r < TransactionAbortMetrics::kReasons; ++r)
+                        for (size_t d = 0; d < TransactionAbortMetrics::kDetails; ++d) {
+                            const auto cell = transaction_abort_metrics->snapshot(
+                                static_cast<AbortOrigin>(o), static_cast<AbortTxnMode>(m), static_cast<IsolationLevel>(i),
+                                static_cast<AbortOperation>(p), static_cast<AbortReason>(r), static_cast<AbortDetail>(d));
+                            if (cell.count != 0)
+                                LOG_WARN("abort-metric seq=%s final=%d %zu/%zu/%zu/%zu/%zu/%zu:%s", Base62(sequence).c_str(),
+                                         sequence == UINT64_MAX, o, m, i, p, r, d, Base62(cell.count).c_str());
+                        }
+    for (size_t slot = 0; slot <= TransactionAbortMetrics::kOverflowSlot; ++slot)
+        for (size_t r = 0; r < TransactionAbortMetrics::kReasons; ++r)
+            for (size_t d = 0; d < TransactionAbortMetrics::kDetails; ++d) {
+                const auto cell = transaction_abort_metrics->table_snapshot(slot, static_cast<AbortReason>(r),
+                                                                             static_cast<AbortDetail>(d));
+                if (cell.count != 0)
+                    LOG_WARN("abort-metric-table seq=%s final=%d bucket=%s id=%s r=%zu d=%zu c=%s",
+                             Base62(sequence).c_str(), sequence == UINT64_MAX,
+                             slot == TransactionAbortMetrics::kUnknownSlot ? "unknown" :
+                             (slot == TransactionAbortMetrics::kOverflowSlot ? "overflow" : "table"),
+                             Base62(cell.runtime_id).c_str(), r, d, Base62(cell.count).c_str());
+            }
+}
+void LogWalFlushMetrics(uint64_t sequence) {
+    if (!wal_flush_metrics->enabled()) return;
+    const auto snapshot = wal_flush_metrics->snapshot();
+    LOG_WARN("%s", kWalFlushSchema);
+    LOG_WARN("wal-flush-metric seq=%s final=%d covered=%s leaders=%s followers=%s follower_wait=%s/%s/%s "
+             "coalescing_wait=%s/%s/%s physical=%s pwrite=%s/%s/%s/%s fdatasync=%s/%s/%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX, Base62(snapshot.already_covered_fast_paths).c_str(),
+             Base62(snapshot.leader_requests).c_str(), Base62(snapshot.follower_requests).c_str(),
+             Base62(snapshot.follower_wait.count).c_str(), Base62(snapshot.follower_wait.elapsed_ns).c_str(),
+             Base62(snapshot.follower_wait.max_ns).c_str(), Base62(snapshot.coalescing_wait.count).c_str(),
+             Base62(snapshot.coalescing_wait.elapsed_ns).c_str(), Base62(snapshot.coalescing_wait.max_ns).c_str(),
+             Base62(snapshot.physical_flush_iterations).c_str(), Base62(snapshot.pwrite.count).c_str(),
+             Base62(snapshot.pwrite_bytes).c_str(), Base62(snapshot.pwrite.elapsed_ns).c_str(),
+             Base62(snapshot.pwrite.max_ns).c_str(), Base62(snapshot.fdatasync.count).c_str(),
+             Base62(snapshot.fdatasync.elapsed_ns).c_str(), Base62(snapshot.fdatasync.max_ns).c_str());
+    LOG_WARN("wal-flush-metric seq=%s final=%d completed=%s/%s/%s/%s/%s/%s/%s/%s/%s/%s/%s/%s/%s "
+             "lag=%s/%s/%s/%s/%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX,
+             Base62(snapshot.completed_batch_histogram[0]).c_str(), Base62(snapshot.completed_batch_histogram[1]).c_str(),
+             Base62(snapshot.completed_batch_histogram[2]).c_str(), Base62(snapshot.completed_batch_histogram[3]).c_str(),
+             Base62(snapshot.completed_batch_histogram[4]).c_str(), Base62(snapshot.completed_batch_histogram[5]).c_str(),
+             Base62(snapshot.completed_batch_histogram[6]).c_str(), Base62(snapshot.completed_batch_histogram[7]).c_str(),
+             Base62(snapshot.completed_batch_histogram[8]).c_str(), Base62(snapshot.completed_batch_histogram[9]).c_str(),
+             Base62(snapshot.completed_batch_histogram[10]).c_str(), Base62(snapshot.completed_batch_histogram[11]).c_str(),
+             Base62(snapshot.completed_batch_histogram[12]).c_str(),
+             Base62(snapshot.durable_lag_samples).c_str(), Base62(snapshot.durable_lag_before_sum).c_str(),
+             Base62(snapshot.durable_lag_before_max).c_str(), Base62(snapshot.durable_lag_after_sum).c_str(),
+             Base62(snapshot.durable_lag_after_max).c_str());
+}
+void LogCheckpointMetrics(uint64_t sequence) {
+    if (!checkpoint_phase_metrics->enabled()) return;
+    const auto s = checkpoint_phase_metrics->snapshot();
+    LOG_WARN("%s", kCheckpointSchema);
+    LOG_WARN("%s", kCheckpointPhaseSchema);
+    LOG_WARN("checkpoint-metric config auto_bytes=%s tick_bytes=%s tick_time_us=%s io_quantum_pages=%s",
+             Base62(static_cast<uint64_t>(checkpoint_options.auto_checkpoint_bytes)).c_str(),
+             Base62(checkpoint_options.tick_bytes).c_str(), Base62(checkpoint_options.tick_time_us).c_str(),
+             Base62(checkpoint_options.io_quantum_pages).c_str());
+    LOG_WARN("checkpoint-metric seq=%s final=%d clean=%s/%s/%s fuzzy=%s/%s/%s/%s pages=%s/%s/%s/%s defer=%s/%s budget_yield=%s/%s/%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX, Base62(s.clean_attempts).c_str(),
+             Base62(s.clean_successes).c_str(), Base62(s.clean_failures).c_str(), Base62(s.fuzzy_attempts).c_str(),
+             Base62(s.fuzzy_successes).c_str(), Base62(s.fuzzy_failures).c_str(), Base62(s.fuzzy_cancels).c_str(),
+             Base62(s.pages_marked).c_str(), Base62(s.page_write_calls).c_str(), Base62(s.pages_written).c_str(),
+             Base62(s.pages_remaining_max).c_str(), Base62(s.retry_deferrals).c_str(), Base62(s.deadline_deferrals).c_str(),
+             Base62(s.budget_yields_io).c_str(), Base62(s.budget_yields_time).c_str(),
+             Base62(s.zero_progress_yields).c_str());
+    LOG_WARN("checkpoint-metric seq=%s final=%d drain=%s/%s/%s cut=%s/%s/%s page=%s/%s/%s "
+             "clean_data=%s/%s/%s clean_meta=%s/%s/%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX,
+             Base62(s.timing[0].count).c_str(), Base62(s.timing[0].elapsed_ns).c_str(), Base62(s.timing[0].max_ns).c_str(),
+             Base62(s.timing[1].count).c_str(), Base62(s.timing[1].elapsed_ns).c_str(), Base62(s.timing[1].max_ns).c_str(),
+             Base62(s.timing[2].count).c_str(), Base62(s.timing[2].elapsed_ns).c_str(), Base62(s.timing[2].max_ns).c_str(),
+             Base62(s.timing[3].count).c_str(), Base62(s.timing[3].elapsed_ns).c_str(), Base62(s.timing[3].max_ns).c_str(),
+             Base62(s.timing[4].count).c_str(), Base62(s.timing[4].elapsed_ns).c_str(), Base62(s.timing[4].max_ns).c_str());
+    LOG_WARN("checkpoint-metric seq=%s final=%d fuzzy_final=%s/%s/%s manifest=%s/%s/%s "
+             "wal_reset=%s/%s/%s lifetime=%s/%s/%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX,
+             Base62(s.timing[5].count).c_str(), Base62(s.timing[5].elapsed_ns).c_str(), Base62(s.timing[5].max_ns).c_str(),
+             Base62(s.timing[6].count).c_str(), Base62(s.timing[6].elapsed_ns).c_str(), Base62(s.timing[6].max_ns).c_str(),
+             Base62(s.timing[7].count).c_str(), Base62(s.timing[7].elapsed_ns).c_str(), Base62(s.timing[7].max_ns).c_str(),
+             Base62(s.timing[8].count).c_str(), Base62(s.timing[8].elapsed_ns).c_str(), Base62(s.timing[8].max_ns).c_str());
+}
+
+struct WalPhaseMarker {
+    std::string phase;
+    uint64_t window{};
+    uint64_t planned_unix_ns{};
+    uint64_t actual_send_unix_ns{};
+    uint64_t monotonic_lateness_ns{};
+};
+
+bool ParseWalPhaseMarker(const char* data, size_t size, WalPhaseMarker* marker) {
+    if (data == nullptr || marker == nullptr || size == 0 || size > 256) return false;
+    const std::string_view message(data, size);
+    constexpr std::string_view prefix = "v1 phase=";
+    if (message.size() < prefix.size() || message.substr(0, prefix.size()) != prefix) return false;
+    size_t offset = prefix.size();
+    const size_t phase_end = message.find(' ', offset);
+    if (phase_end == std::string_view::npos || phase_end == offset) return false;
+    marker->phase.assign(message.substr(offset, phase_end - offset));
+    offset = phase_end;
+    const auto parse_field = [&](std::string_view name, uint64_t* output, bool final) {
+        if (message.substr(offset, name.size()) != name) return false;
+        offset += name.size();
+        const size_t end = final ? message.size() : message.find(' ', offset);
+        if (end == std::string_view::npos || end == offset) return false;
+        const char* begin_ptr = message.data() + offset;
+        const char* end_ptr = message.data() + end;
+        const auto parsed = std::from_chars(begin_ptr, end_ptr, *output);
+        if (parsed.ec != std::errc{} || parsed.ptr != end_ptr) return false;
+        offset = end;
+        return true;
+    };
+    return parse_field(" window=", &marker->window, false) &&
+           parse_field(" planned_unix_ns=", &marker->planned_unix_ns, false) &&
+           parse_field(" actual_send_unix_ns=", &marker->actual_send_unix_ns, false) &&
+           parse_field(" monotonic_lateness_ns=", &marker->monotonic_lateness_ns, true) && offset == message.size();
+}
+
+uint64_t WallClockUnixNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+void LogWalPhaseSnapshot(uint64_t sequence, const WalPhaseMarker& marker, uint64_t receive_unix_ns) {
+    LOG_WARN("wal-phase valid=1 seq=%s phase=%s window=%llu planned_unix_ns=%llu actual_send_unix_ns=%llu "
+             "monotonic_lateness_ns=%llu receive_unix_ns=%llu",
+             Base62(sequence).c_str(), marker.phase.c_str(), static_cast<unsigned long long>(marker.window),
+             static_cast<unsigned long long>(marker.planned_unix_ns),
+             static_cast<unsigned long long>(marker.actual_send_unix_ns),
+             static_cast<unsigned long long>(marker.monotonic_lateness_ns),
+             static_cast<unsigned long long>(receive_unix_ns));
+    LogWalFlushMetrics(sequence);
+    LogCheckpointMetrics(sequence);
+}
+} // namespace
 
 void sigint_handler(int signo) {
     (void)signo;
@@ -312,6 +586,9 @@ struct BatchExecutionContext {
         context.ellipsis_ = false;
         context.isolation_level_ = session.isolation;
         context.enable_ssi_read_tracking_ = false;
+        context.abort_origin_ = AbortOrigin::EXEC_BATCH;
+        context.abort_operation_ = AbortOperation::OTHER;
+        context.abort_metrics_enabled_ = transaction_abort_metrics->enabled();
         context.result_sink_ = result_sink;
         context.output_file_enabled_ = &session.output_file_enabled;
     }
@@ -445,9 +722,11 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
     context.isolation_level_ = session.isolation;
     context.result_sink_ = result_sink;
     context.output_file_enabled_ = &session.output_file_enabled;
+    context.abort_metrics_enabled_ = transaction_abort_metrics->enabled();
     if (parse_tree == nullptr)
         return {};
     const auto parsed_type = parse_tree->type;
+    context.abort_operation_ = AbortOperationFor(parsed_type);
     const bool catalog_change = changes_catalog(parsed_type);
     if (catalog_change) {
         Transaction* active = session.running_transaction();
@@ -492,7 +771,8 @@ ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, Se
         }
         context.txn_ = nullptr;
         return {is_query, catalog_changed};
-    } catch (TransactionAbortException&) {
+    } catch (TransactionAbortException& exception) {
+        CaptureAbortObservation(exception, context);
         abort_session(session, &context);
         throw;
     } catch (...) {
@@ -594,7 +874,8 @@ ExecutionOutcome execute_prepared_operation(PreparedStatement& prepared_statemen
         }
         context.txn_ = nullptr;
         return {is_query, false};
-    } catch (TransactionAbortException&) {
+    } catch (TransactionAbortException& exception) {
+        CaptureAbortObservation(exception, context);
         abort_session(session, &context);
         throw;
     } catch (...) {
@@ -980,6 +1261,8 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         operations.push_back(std::move(operation));
     }
     reader.require_end();
+    TransactionPhaseMetrics::Scope batch_timer(transaction_phase_metrics.get(),
+                                                TransactionPhaseMetrics::Phase::ExecBatchWall);
 
     std::uint16_t failed = 0xffff;
     std::uint16_t executed = 0;
@@ -993,6 +1276,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             }
             const bool prepared_fast_path = descriptor_runtime_eligible(prepared_statement->descriptor.get());
             batch.reset_for_operation(session, &batch.result, prepared_fast_path);
+            batch.context.abort_operation_ = AbortOperationFor(prepared_statement->template_tree->type);
             batch.result.begin_operation(i);
             const auto make_bindings = [&]() {
                 std::vector<std::unique_ptr<ast::Value>> values;
@@ -1036,17 +1320,24 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         // TransactionAbortException does not override what(); use the same
         // diagnostic text the EXEC_STREAM path reports.
         const auto text = exception.GetInfo();
-        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.failure(executed, 1, failed, text));
+        transaction_abort_metrics->record(exception);
+        const auto payload = batch.result.failure(executed, 1, failed, text);
+        batch_timer.Finish();
+        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, payload);
         return;
     } catch (const std::exception& exception) {
         failed = executed;
         abort_session(session, &batch.context);
         const auto text = diagnostic(exception);
-        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.failure(executed, 2, failed, text));
+        const auto payload = batch.result.failure(executed, 2, failed, text);
+        batch_timer.Finish();
+        wire_protocol::write_frame(fd, Tag::BATCH_RESULT, payload);
         return;
     }
 
-    wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.success(executed));
+    const auto payload = batch.result.success(executed);
+    batch_timer.Finish();
+    wire_protocol::write_frame(fd, Tag::BATCH_RESULT, payload);
 }
 
 void client_handler(int fd) {
@@ -1061,6 +1352,7 @@ void client_handler(int fd) {
                 handle_client_frame(fd, frame, session, prepared);
             } catch (TransactionAbortException& exception) {
                 abort_session(session, nullptr);
+                transaction_abort_metrics->record(exception);
                 wire_protocol::write_frame(fd, Tag::TRANSACTION_ABORT, make_error_payload(exception.GetInfo()));
             } catch (const std::exception& exception) {
                 abort_session(session, nullptr);
@@ -1257,6 +1549,7 @@ int main(int argc, char** argv) {
             }
             server_port = static_cast<std::uint16_t>(parsed_port);
         }
+        checkpoint_options = CheckpointOptions::FromEnvironment();
         // Database name is passed by args
         std::string db_name = argv[1];
         LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
@@ -1323,27 +1616,240 @@ int main(int argc, char** argv) {
 
         {
             std::atomic<bool> checkpoint_thread_stop{false};
-            std::thread checkpoint_thread([&checkpoint_thread_stop] {
-                CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
-                while (!checkpoint_thread_stop.load()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    if (checkpoint_thread_stop.load()) {
+            std::atomic<bool> runtime_metrics_reporter_stop{false};
+            std::string wal_phase_marker_socket_name;
+            int wal_phase_marker_socket_fd = -1;
+            int wal_phase_marker_wake_fd = -1;
+            bool wal_phase_marker_socket_ready = false;
+            const char* configured_marker_socket = std::getenv("RMDB_WAL_PHASE_MARKER_SOCKET");
+            if (wal_flush_metrics->enabled() && configured_marker_socket != nullptr && *configured_marker_socket != '\0') {
+                wal_phase_marker_socket_name = configured_marker_socket;
+                sockaddr_un address{};
+                if (wal_phase_marker_socket_name.size() < 2 || wal_phase_marker_socket_name.front() != '@') {
+                    LOG_WARN("wal-phase invalid=1 reason=socket_name_not_abstract");
+                } else if (wal_phase_marker_socket_name.size() > sizeof(address.sun_path)) {
+                    LOG_WARN("wal-phase invalid=1 reason=socket_name_too_long length=%zu",
+                             wal_phase_marker_socket_name.size());
+                } else {
+                    wal_phase_marker_socket_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                    wal_phase_marker_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+                    if (wal_phase_marker_socket_fd < 0 || wal_phase_marker_wake_fd < 0) {
+                        LOG_WARN("wal-phase invalid=1 reason=socket_setup errno=%d", errno);
+                    } else {
+                        address.sun_family = AF_UNIX;
+                        address.sun_path[0] = '\0';
+                        const size_t abstract_name_length = wal_phase_marker_socket_name.size() - 1;
+                        std::memcpy(address.sun_path + 1, wal_phase_marker_socket_name.data() + 1,
+                                    abstract_name_length);
+                        const socklen_t address_size =
+                            static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + abstract_name_length);
+                        if (bind(wal_phase_marker_socket_fd, reinterpret_cast<sockaddr*>(&address), address_size) != 0) {
+                            LOG_WARN("wal-phase invalid=1 reason=socket_bind errno=%d", errno);
+                        } else {
+                            // Linux abstract Unix addresses disappear when this fd closes.
+                            wal_phase_marker_socket_ready = true;
+                        }
+                    }
+                }
+                if (!wal_phase_marker_socket_ready) {
+                    if (wal_phase_marker_socket_fd >= 0) close(wal_phase_marker_socket_fd);
+                    if (wal_phase_marker_wake_fd >= 0) close(wal_phase_marker_wake_fd);
+                    wal_phase_marker_socket_fd = -1;
+                    wal_phase_marker_wake_fd = -1;
+                }
+            }
+            const auto stop_runtime_metrics_reporter = [&] {
+                runtime_metrics_reporter_stop.store(true, std::memory_order_release);
+                if (wal_phase_marker_wake_fd >= 0) {
+                    const uint64_t wake = 1;
+                    (void)write(wal_phase_marker_wake_fd, &wake, sizeof(wake));
+                }
+            };
+            const auto cleanup_wal_phase_markers = [&] {
+                if (wal_phase_marker_socket_fd >= 0) close(wal_phase_marker_socket_fd);
+                if (wal_phase_marker_wake_fd >= 0) close(wal_phase_marker_wake_fd);
+                wal_phase_marker_socket_fd = -1;
+                wal_phase_marker_wake_fd = -1;
+            };
+            std::mutex checkpoint_thread_latch;
+            std::condition_variable checkpoint_thread_cv;
+            std::thread checkpoint_thread([&checkpoint_thread_stop, &checkpoint_thread_latch, &checkpoint_thread_cv] {
+                CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get(),
+                                                 checkpoint_phase_metrics.get());
+                checkpoint_mgr.SetOptions(checkpoint_options);
+                std::unique_lock<std::mutex> stop_lock(checkpoint_thread_latch);
+                while (!checkpoint_thread_stop.load(std::memory_order_acquire)) {
+                    if (checkpoint_thread_cv.wait_for(stop_lock, std::chrono::milliseconds(100), [&] {
+                            return checkpoint_thread_stop.load(std::memory_order_acquire);
+                        })) {
                         break;
                     }
+                    stop_lock.unlock();
                     checkpoint_mgr.Tick();
+                    stop_lock.lock();
                 }
             });
+            std::thread runtime_metrics_reporter;
+            try {
+                if (transaction_phase_metrics->enabled() || transaction_abort_metrics->enabled() ||
+                    wal_flush_metrics->enabled() || checkpoint_phase_metrics->enabled() || lock_manager->shard_metrics_enabled() ||
+                    buffer_pool_manager->shard_metrics_enabled()) {
+                    runtime_metrics_reporter = std::thread([&runtime_metrics_reporter_stop,
+                                                            marker_socket_fd = wal_phase_marker_socket_fd,
+                                                            marker_wake_fd = wal_phase_marker_wake_fd] {
+                        uint64_t sequence = 0;
+                        if (marker_socket_fd < 0) {
+                            while (!runtime_metrics_reporter_stop.load(std::memory_order_acquire)) {
+                                for (size_t elapsed = 0; elapsed < 50; ++elapsed) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                    if (runtime_metrics_reporter_stop.load(std::memory_order_acquire)) return;
+                                }
+                                ++sequence;
+                                LogTransactionPhaseMetrics(sequence);
+                                LogTransactionAbortMetrics(sequence);
+                                LogWalFlushMetrics(sequence);
+                                LogCheckpointMetrics(sequence);
+                                lock_manager->log_shard_metrics(sequence);
+                                buffer_pool_manager->log_shard_metrics(sequence);
+                                minilog::Logger::get().flush();
+                            }
+                            return;
+                        }
 
-            // 开启服务端，开始接受客户端连接
-            start_server(server_port);
+                        bool measure_start_seen = false;
+                        uint64_t next_window = 1;
+                        auto next_periodic = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                        while (!runtime_metrics_reporter_stop.load(std::memory_order_acquire)) {
+                            const auto before_poll = std::chrono::steady_clock::now();
+                            const auto remaining =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(next_periodic - before_poll);
+                            const int timeout_ms = remaining.count() <= 0 ? 0 : static_cast<int>(remaining.count() + 1);
+                            pollfd descriptors[2] = {{marker_socket_fd, POLLIN, 0}, {marker_wake_fd, POLLIN, 0}};
+                            const int poll_result = poll(descriptors, 2, timeout_ms);
+                            if (poll_result < 0) {
+                                if (errno != EINTR) LOG_WARN("wal-phase invalid=1 reason=poll errno=%d", errno);
+                                continue;
+                            }
+                            if ((descriptors[1].revents & POLLIN) != 0) {
+                                uint64_t wake = 0;
+                                (void)read(marker_wake_fd, &wake, sizeof(wake));
+                                if (runtime_metrics_reporter_stop.load(std::memory_order_acquire)) return;
+                            }
+                            if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                                LOG_WARN("wal-phase invalid=1 reason=socket_poll revents=%d", descriptors[0].revents);
+                            }
+                            if ((descriptors[0].revents & POLLIN) != 0) {
+                                for (;;) {
+                                    char data[256];
+                                    iovec payload{data, sizeof(data)};
+                                    msghdr message{};
+                                    message.msg_iov = &payload;
+                                    message.msg_iovlen = 1;
+                                    const ssize_t bytes = recvmsg(marker_socket_fd, &message, MSG_DONTWAIT);
+                                    if (bytes < 0) {
+                                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                                            LOG_WARN("wal-phase invalid=1 reason=recv errno=%d", errno);
+                                        }
+                                        break;
+                                    }
+                                    if ((message.msg_flags & MSG_TRUNC) != 0 || bytes > 256) {
+                                        LOG_WARN("wal-phase invalid=1 reason=oversized bytes=%lld",
+                                                 static_cast<long long>(bytes));
+                                        continue;
+                                    }
+                                    WalPhaseMarker marker;
+                                    if (!ParseWalPhaseMarker(data, static_cast<size_t>(bytes), &marker)) {
+                                        LOG_WARN("wal-phase invalid=1 reason=malformed bytes=%lld",
+                                                 static_cast<long long>(bytes));
+                                        continue;
+                                    }
+                                    const char* invalid_reason = nullptr;
+                                    if (marker.planned_unix_ns == 0 || marker.actual_send_unix_ns == 0) {
+                                        invalid_reason = "sender_time";
+                                    } else if (marker.phase == "measure_start") {
+                                        if (marker.window != 0) invalid_reason = "start_window";
+                                        else if (measure_start_seen) invalid_reason = "duplicate_start";
+                                    } else if (marker.phase == "window_end") {
+                                        if (!measure_start_seen) invalid_reason = "end_before_start";
+                                        else if (marker.window == 0) invalid_reason = "end_window_zero";
+                                        else if (marker.window < next_window) invalid_reason = "duplicate_or_out_of_order";
+                                        else if (marker.window > next_window) invalid_reason = "window_gap";
+                                    } else {
+                                        invalid_reason = "phase";
+                                    }
+                                    if (invalid_reason != nullptr) {
+                                        LOG_WARN("wal-phase invalid=1 reason=%s phase=%s window=%llu expected_window=%llu",
+                                                 invalid_reason, marker.phase.c_str(),
+                                                 static_cast<unsigned long long>(marker.window),
+                                                 static_cast<unsigned long long>(next_window));
+                                        continue;
+                                    }
+                                    if (marker.phase == "measure_start") {
+                                        measure_start_seen = true;
+                                    } else {
+                                        ++next_window;
+                                    }
+                                    LogWalPhaseSnapshot(++sequence, marker, WallClockUnixNs());
+                                    minilog::Logger::get().flush();
+                                }
+                            }
+                            const auto after_events = std::chrono::steady_clock::now();
+                            if (after_events >= next_periodic) {
+                                ++sequence;
+                                LogTransactionPhaseMetrics(sequence);
+                                LogTransactionAbortMetrics(sequence);
+                                LogWalFlushMetrics(sequence);
+                                LogCheckpointMetrics(sequence);
+                                lock_manager->log_shard_metrics(sequence);
+                                buffer_pool_manager->log_shard_metrics(sequence);
+                                minilog::Logger::get().flush();
+                                do {
+                                    next_periodic += std::chrono::seconds(5);
+                                } while (next_periodic <= after_events);
+                            }
+                        }
+                    });
+                }
 
-            checkpoint_thread_stop.store(true);
+                // 开启服务端，开始接受客户端连接
+                start_server(server_port);
+            } catch (...) {
+                checkpoint_thread_stop.store(true, std::memory_order_release);
+                checkpoint_thread_cv.notify_all();
+                stop_runtime_metrics_reporter();
+                if (checkpoint_thread.joinable()) {
+                    checkpoint_thread.join();
+                }
+                if (runtime_metrics_reporter.joinable()) {
+                    runtime_metrics_reporter.join();
+                }
+                cleanup_wal_phase_markers();
+                throw;
+            }
+
+            checkpoint_thread_stop.store(true, std::memory_order_release);
+            checkpoint_thread_cv.notify_all();
+            stop_runtime_metrics_reporter();
             if (checkpoint_thread.joinable()) {
                 checkpoint_thread.join();
             }
-            // Signal handling only wakes the listener. Finish WAL durability
-            // here after all handlers and checkpoint activity have stopped.
+            const bool runtime_metrics_reporter_started = runtime_metrics_reporter.joinable();
+            if (runtime_metrics_reporter_started) {
+                runtime_metrics_reporter.join();
+            }
+            cleanup_wal_phase_markers();
+            // SIGINT only wakes the listener. Finish WAL durability here after
+            // all client handlers, checkpoint activity, and reporting have stopped.
             log_manager->flush_log_to_disk_with_sync();
+            if (runtime_metrics_reporter_started) {
+                LogTransactionPhaseMetrics(UINT64_MAX);
+                LogTransactionAbortMetrics(UINT64_MAX);
+                LogWalFlushMetrics(UINT64_MAX);
+                LogCheckpointMetrics(UINT64_MAX);
+                lock_manager->log_shard_metrics(UINT64_MAX);
+                buffer_pool_manager->log_shard_metrics(UINT64_MAX);
+                minilog::Logger::get().flush();
+            }
         }
 
         {

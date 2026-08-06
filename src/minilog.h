@@ -35,6 +35,7 @@ enum class LogLevel { DEBUG, INFO, WARN, ERROR };
 
 class Logger {
 public:
+    static constexpr auto kLineBufferSize = std::size_t{510};
     static Logger& get() {
         static Logger instance;
         return instance;
@@ -163,7 +164,6 @@ private:
     using Clock = std::chrono::system_clock;
 
     static constexpr auto kFileBufferSize = std::size_t{1024 * 1024};
-    static constexpr auto kLineBufferSize = std::size_t{510};
     static constexpr auto kInitialQueueCapacity = std::size_t{1024};
     static constexpr auto kMaxQueueCapacity = std::size_t{2 * kInitialQueueCapacity};
 

@@ -183,7 +183,8 @@ void QlManager::run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context) 
                 throw RMDBError("static checkpoint cannot run inside an active transaction");
             }
         }
-        CheckpointManager checkpoint_mgr(txn_mgr_, sm_manager_, context == nullptr ? nullptr : context->log_mgr_);
+        CheckpointManager checkpoint_mgr(txn_mgr_, sm_manager_, context == nullptr ? nullptr : context->log_mgr_,
+                                         checkpoint_metrics_);
         checkpoint_mgr.RunCleanCheckpoint();
         break;
     }
