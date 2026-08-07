@@ -27,6 +27,10 @@ struct CheckpointOptions {
     size_t tick_bytes = 4ULL * 1024 * 1024;
     uint64_t tick_time_us = 5000;
     size_t io_quantum_pages = 64;
+    bool background_preclean_enabled = true;
+    uint8_t background_preclean_low_percent = 20;
+    uint8_t background_preclean_high_percent = 40;
+    size_t background_preclean_batch_pages = 128;
 
     // Environment values are strict unsigned decimal; valid out-of-range
     // values are clamped to conservative scheduler limits.
@@ -52,6 +56,7 @@ private:
     void CancelFuzzyCheckpoint(bool record_cancel = true) noexcept;
     void DeferAutomaticRetry() noexcept;
     int64_t RetainedWalBytes(int64_t current_offset) noexcept;
+    void MaybeRunBackgroundPreclean();
 
     TransactionManager* txn_mgr_;
     SmManager* sm_mgr_;
@@ -64,4 +69,6 @@ private:
     // between blocked and unblocked while the underlying condition persists.
     std::chrono::steady_clock::time_point drain_retry_time_{};
     int64_t drain_retry_log_offset_{0};
+    bool background_preclean_active_{false};
+    std::chrono::steady_clock::time_point background_preclean_next_sample_{};
 };

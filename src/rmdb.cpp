@@ -314,6 +314,23 @@ void LogCheckpointMetrics(uint64_t sequence) {
              Base62(s.timing[8].count).c_str(), Base62(s.timing[8].elapsed_ns).c_str(), Base62(s.timing[8].max_ns).c_str());
 }
 
+void LogBackgroundPrecleanMetrics(uint64_t sequence) {
+    const auto& metrics = buffer_pool_manager->background_preclean_metrics();
+    if (!metrics.enabled()) return;
+    const auto s = metrics.snapshot();
+    LOG_WARN("background-preclean-metric seq=%s final=%d fg_evict=%s/%s/%s dep_wait=%s/%s/%s pwrite=%s/%s/%s read=%s/%s/%s bg=%s/%s/%s/%s paused=%s wal_recent_fsync_ns=%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX, Base62(s.foreground_dirty_eviction.count).c_str(),
+             Base62(s.foreground_dirty_eviction.elapsed_ns).c_str(), Base62(s.foreground_dirty_eviction.max_ns).c_str(),
+             Base62(s.foreground_dependency_wait.count).c_str(), Base62(s.foreground_dependency_wait.elapsed_ns).c_str(),
+             Base62(s.foreground_dependency_wait.max_ns).c_str(), Base62(s.foreground_pwrite.count).c_str(),
+             Base62(s.foreground_pwrite.elapsed_ns).c_str(), Base62(s.foreground_pwrite.max_ns).c_str(),
+             Base62(s.foreground_read.count).c_str(), Base62(s.foreground_read.elapsed_ns).c_str(),
+             Base62(s.foreground_read.max_ns).c_str(), Base62(s.background_flush_calls).c_str(),
+             Base62(s.background_pages).c_str(), Base62(s.background_flush.count).c_str(),
+             Base62(s.background_flush.max_ns).c_str(), Base62(s.congestion_pauses).c_str(),
+             Base62(log_manager->recent_fdatasync_ns()).c_str());
+}
+
 struct WalPhaseMarker {
     std::string phase;
     uint64_t window{};
@@ -366,6 +383,7 @@ void LogWalPhaseSnapshot(uint64_t sequence, const WalPhaseMarker& marker, uint64
              static_cast<unsigned long long>(receive_unix_ns));
     LogWalFlushMetrics(sequence);
     LogCheckpointMetrics(sequence);
+    LogBackgroundPrecleanMetrics(sequence);
 }
 } // namespace
 
@@ -1745,7 +1763,7 @@ int main(int argc, char** argv) {
             std::thread runtime_metrics_reporter;
             try {
                 if (transaction_phase_metrics->enabled() || transaction_abort_metrics->enabled() ||
-                    wal_flush_metrics->enabled() || checkpoint_phase_metrics->enabled() || lock_manager->shard_metrics_enabled() ||
+                    wal_flush_metrics->enabled() || checkpoint_phase_metrics->enabled() || buffer_pool_manager->background_preclean_metrics().enabled() || lock_manager->shard_metrics_enabled() ||
                     buffer_pool_manager->shard_metrics_enabled() || txn_manager->read_view_shadow_enabled()) {
                     runtime_metrics_reporter = std::thread([&runtime_metrics_reporter_stop,
                                                             marker_socket_fd = wal_phase_marker_socket_fd,
@@ -1763,6 +1781,7 @@ int main(int argc, char** argv) {
                                 LogTransactionAbortMetrics(sequence);
                                 LogWalFlushMetrics(sequence);
                                 LogCheckpointMetrics(sequence);
+                                LogBackgroundPrecleanMetrics(sequence);
                                 lock_manager->log_shard_metrics(sequence);
                                 buffer_pool_manager->log_shard_metrics(sequence);
                                 minilog::Logger::get().flush();

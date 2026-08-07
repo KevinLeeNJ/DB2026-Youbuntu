@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -65,6 +66,17 @@ constexpr uint64_t kMinTickBytes = PAGE_SIZE;
 constexpr uint64_t kMaxTickBytes = 1024ULL * 1024 * 1024;
 constexpr uint64_t kMinTickTimeUs = 100;
 constexpr uint64_t kMaxTickTimeUs = 1000000;
+constexpr size_t kMinPrecleanBatchPages = 64;
+constexpr size_t kMaxPrecleanBatchPages = 256;
+constexpr uint64_t kSlowWalFdatasyncNs = 20ULL * 1000 * 1000;
+
+bool ReadCheckpointBoolEnv(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) return default_value;
+    if (std::strcmp(raw, "1") == 0) return true;
+    if (std::strcmp(raw, "0") == 0) return false;
+    throw std::invalid_argument(std::string("invalid ") + name + ": expected 0 or 1");
+}
 
 uint64_t NextCheckpointEventId() noexcept {
     return g_checkpoint_event_id.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -153,6 +165,11 @@ CheckpointOptions CheckpointOptions::FromEnvironment() {
     options.io_quantum_pages = static_cast<size_t>(ReadCheckpointEnv("RMDB_CHECKPOINT_IO_QUANTUM_PAGES",
                                                                        options.io_quantum_pages, 1,
                                                                        kMaxCheckpointQuantumPages));
+    options.background_preclean_enabled = ReadCheckpointBoolEnv("RMDB_BACKGROUND_PRECLEAN", options.background_preclean_enabled);
+    options.background_preclean_low_percent = static_cast<uint8_t>(ReadCheckpointEnv("RMDB_BACKGROUND_PRECLEAN_LOW_PERCENT", options.background_preclean_low_percent, 1, 98));
+    options.background_preclean_high_percent = static_cast<uint8_t>(ReadCheckpointEnv("RMDB_BACKGROUND_PRECLEAN_HIGH_PERCENT", options.background_preclean_high_percent, 2, 99));
+    if (options.background_preclean_low_percent >= options.background_preclean_high_percent) throw std::invalid_argument("RMDB_BACKGROUND_PRECLEAN_LOW_PERCENT must be below high percent");
+    options.background_preclean_batch_pages = static_cast<size_t>(ReadCheckpointEnv("RMDB_BACKGROUND_PRECLEAN_BATCH_PAGES", options.background_preclean_batch_pages, kMinPrecleanBatchPages, kMaxPrecleanBatchPages));
     return options;
 }
 
@@ -212,7 +229,32 @@ void CheckpointManager::SetOptions(CheckpointOptions options) {
     options.tick_time_us = std::clamp(options.tick_time_us, kMinTickTimeUs, kMaxTickTimeUs);
     options.io_quantum_pages = static_cast<size_t>(std::clamp<uint64_t>(
         static_cast<uint64_t>(options.io_quantum_pages), 1, kMaxCheckpointQuantumPages));
+    options.background_preclean_low_percent = std::clamp<uint8_t>(options.background_preclean_low_percent, 1, 98);
+    options.background_preclean_high_percent = std::clamp<uint8_t>(options.background_preclean_high_percent, 2, 99);
+    if (options.background_preclean_low_percent >= options.background_preclean_high_percent) { options.background_preclean_low_percent = 20; options.background_preclean_high_percent = 40; }
+    options.background_preclean_batch_pages = static_cast<size_t>(std::clamp<uint64_t>(static_cast<uint64_t>(options.background_preclean_batch_pages), kMinPrecleanBatchPages, kMaxPrecleanBatchPages));
     options_ = options;
+}
+
+void CheckpointManager::MaybeRunBackgroundPreclean() {
+    if (!options_.background_preclean_enabled || fuzzy_checkpoint_ != nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (background_preclean_next_sample_ == std::chrono::steady_clock::time_point{} || now >= background_preclean_next_sample_) {
+        const TableDirtyPageStats dirty = sm_mgr_->table_and_index_dirty_page_stats();
+        if (dirty.frame_capacity == 0) return;
+        const size_t high = (dirty.frame_capacity * options_.background_preclean_high_percent + 99) / 100;
+        const size_t low = (dirty.frame_capacity * options_.background_preclean_low_percent) / 100;
+        const bool was_active = background_preclean_active_;
+        if (!background_preclean_active_) background_preclean_active_ = dirty.dirty_pages >= high;
+        else if (dirty.dirty_pages <= low) background_preclean_active_ = false;
+        background_preclean_next_sample_ = now + std::chrono::seconds(1);
+        if (was_active != background_preclean_active_) LOG_WARN("background-preclean state=%s dirty_pages=%zu capacity=%zu low=%zu high=%zu", background_preclean_active_ ? "active" : "idle", dirty.dirty_pages, dirty.frame_capacity, low, high);
+    }
+    if (!background_preclean_active_) return;
+    if (log_mgr_->recent_fdatasync_ns() > kSlowWalFdatasyncNs) { if (BufferPoolManager* bpm = sm_mgr_->get_bpm()) bpm->background_preclean_metrics().congestion_pause(); return; }
+    const auto started = std::chrono::steady_clock::now();
+    const size_t pages = sm_mgr_->flush_dirty_table_and_index_pages(options_.background_preclean_batch_pages);
+    if (BufferPoolManager* bpm = sm_mgr_->get_bpm()) bpm->background_preclean_metrics().background_flush(pages, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
 }
 
 bool CheckpointManager::RunCleanCheckpoint() {
@@ -697,6 +739,7 @@ bool CheckpointManager::Tick() {
         if (fuzzy_checkpoint_ != nullptr) {
             return AdvanceFuzzyCheckpoint();
         }
+        MaybeRunBackgroundPreclean();
 
         const int64_t current_offset = log_mgr_->current_log_offset();
         const int64_t target = std::max<int64_t>(1, options_.auto_checkpoint_bytes);

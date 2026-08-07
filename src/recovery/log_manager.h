@@ -797,6 +797,9 @@ public:
     lsn_t get_durable_lsn() const {
         return durable_lsn_.load(std::memory_order_acquire);
     }
+    uint64_t recent_fdatasync_ns() const noexcept {
+        return recent_fdatasync_ns_.load(std::memory_order_acquire);
+    }
 
     lsn_t get_global_lsn() const {
         return global_lsn_.load();
@@ -869,7 +872,10 @@ private:
     int flushing_bytes_{0};
     std::atomic<lsn_t> persist_lsn_{INVALID_LSN}; // 最后一个已 pwrite 到 OS page cache 的日志号
     std::atomic<lsn_t> durable_lsn_{INVALID_LSN}; // 最后一个已通过 fdatasync 的日志号
-    int64_t log_file_offset_{0};                  // 日志文件当前追加偏移
+    // A best-effort congestion signal for optional background I/O only. It is
+    // never consulted by commit durability or WAL ordering.
+    std::atomic<uint64_t> recent_fdatasync_ns_{0};
+    int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};
     WalFlushMetrics* wal_flush_metrics_{nullptr};

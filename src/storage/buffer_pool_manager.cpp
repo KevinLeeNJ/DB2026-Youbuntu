@@ -32,8 +32,7 @@ static_assert(kShardLogLineShards * kShardEntryMaxChars + 128 + 60 < 510);
 static_assert(sizeof("shard-acq bpm schema=base62 entries=a/s/e/m a=sampled_acquisitions "
                      "s=slow_acquisitions e=observed_elapsed_ns m=max_ns "
                      "slow=threshold_proxy_not_exact_contention") -
-                  1 +
-                  60 <
+                  1 + 60 <
               510);
 
 std::string CompactUnsigned(uint64_t value) {
@@ -106,8 +105,8 @@ void BufferPoolManager::log_shard_metrics(uint64_t sequence) const {
             }
             LOG_WARN("shard-acq bpm seq=%s sample_log2=%u slow_ns=%s direction=%s shard=%zu-%zu%s",
                      CompactUnsigned(sequence).c_str(), static_cast<unsigned>(config.sample_log2),
-                     CompactUnsigned(config.slow_ns).c_str(), direction, begin,
-                     begin + kShardLogLineShards - 1, entries.c_str());
+                     CompactUnsigned(config.slow_ns).c_str(), direction, begin, begin + kShardLogLineShards - 1,
+                     entries.c_str());
         }
     };
     log_direction("shared", shard_read_metrics_);
@@ -817,15 +816,44 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
 
         bool loaded = false;
         bool old_page_write_succeeded = !old_page_dirty || !IsValidPageId(old_page_id);
+        const bool record_eviction = background_preclean_metrics_.enabled();
+        const auto eviction_started =
+            record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         try {
             std::unique_lock<std::shared_mutex> page_lock(target_page->latch_);
             if (old_page_dirty && IsValidPageId(old_page_id)) {
+                const auto dependency_started =
+                    record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 ensure_write_dependency(old_dependency);
+                if (record_eviction)
+                    background_preclean_metrics_.foreground_dependency_wait(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - dependency_started)
+                                                  .count()));
+                const auto pwrite_started =
+                    record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, target_page->data_, PAGE_SIZE);
+                if (record_eviction)
+                    background_preclean_metrics_.foreground_pwrite(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - pwrite_started)
+                                                  .count()));
                 old_page_write_succeeded = true;
             }
             target_page->reset_memory();
+            const auto read_started =
+                record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->read_page(page_id.fd, page_id.page_no, target_page->data_, PAGE_SIZE);
+            if (record_eviction)
+                background_preclean_metrics_.foreground_read(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - read_started)
+                                              .count()));
+            if (record_eviction && old_page_dirty && IsValidPageId(old_page_id))
+                background_preclean_metrics_.foreground_dirty_eviction(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - eviction_started)
+                                              .count()));
             loaded = true;
         } catch (...) {
             loaded = false;
@@ -1209,11 +1237,33 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
 
     bool initialized = false;
     bool old_page_write_succeeded = !old_page_dirty || !IsValidPageId(old_page_id);
+    const bool record_eviction = background_preclean_metrics_.enabled();
+    const auto eviction_started =
+        record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     try {
         std::unique_lock<std::shared_mutex> page_lock(page->latch_);
         if (old_page_dirty && IsValidPageId(old_page_id)) {
+            const auto dependency_started =
+                record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             ensure_write_dependency(old_dependency);
+            if (record_eviction)
+                background_preclean_metrics_.foreground_dependency_wait(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - dependency_started)
+                                              .count()));
+            const auto pwrite_started =
+                record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
+            if (record_eviction)
+                background_preclean_metrics_.foreground_pwrite(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - pwrite_started)
+                                              .count()));
+            if (record_eviction)
+                background_preclean_metrics_.foreground_dirty_eviction(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - eviction_started)
+                                              .count()));
             old_page_write_succeeded = true;
         }
         page->reset_memory();
@@ -1781,9 +1831,8 @@ BufferPoolManager::begin_checkpoint_cohort(const std::vector<int>& allowed_fds,
     return cohort;
 }
 
-BufferPoolManager::CheckpointCohortFlushResult BufferPoolManager::flush_checkpoint_cohort(uint64_t epoch,
-                                                                                          size_t max_io_pages,
-                                                                                          size_t max_frames_to_visit) {
+BufferPoolManager::CheckpointCohortFlushResult
+BufferPoolManager::flush_checkpoint_cohort(uint64_t epoch, size_t max_io_pages, size_t max_frames_to_visit) {
     CheckpointCohortFlushResult result;
     if (epoch == 0) {
         result.success = false;

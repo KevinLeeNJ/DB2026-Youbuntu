@@ -350,7 +350,8 @@ void SmManager::publish_fixed_checkpoint_meta(const FixedCheckpointHeaderSnapsho
 void SmManager::write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapshot& snapshot,
                                                const CatalogSharedGuard& catalog_guard) {
     write_fixed_checkpoint_headers_only(snapshot, catalog_guard);
-    for (const int fd : snapshot.data_and_index_fds) sync_fixed_checkpoint_file(fd, catalog_guard);
+    for (const int fd : snapshot.data_and_index_fds)
+        sync_fixed_checkpoint_file(fd, catalog_guard);
     publish_fixed_checkpoint_meta(snapshot, catalog_guard);
 }
 
@@ -1143,6 +1144,28 @@ size_t SmManager::flush_dirty_table_pages(size_t max_pages) {
     for (const auto& [_, fh] : fhs_) {
         fds.push_back(fh->GetFd());
     }
+    return buffer_pool_manager_->flush_dirty_pages(fds, max_pages).pages_written;
+}
+
+TableDirtyPageStats SmManager::table_and_index_dirty_page_stats() {
+    std::shared_lock catalog_guard{catalog_latch_};
+    std::vector<int> fds;
+    fds.reserve(fhs_.size() + ihs_.size());
+    for (const auto& [_, fh] : fhs_)
+        fds.push_back(fh->GetFd());
+    for (const auto& [_, ih] : ihs_)
+        fds.push_back(ih->GetFd());
+    return TableDirtyPageStats{buffer_pool_manager_->count_dirty_pages(fds), buffer_pool_manager_->frame_capacity()};
+}
+
+size_t SmManager::flush_dirty_table_and_index_pages(size_t max_pages) {
+    std::shared_lock catalog_guard{catalog_latch_};
+    std::vector<int> fds;
+    fds.reserve(fhs_.size() + ihs_.size());
+    for (const auto& [_, fh] : fhs_)
+        fds.push_back(fh->GetFd());
+    for (const auto& [_, ih] : ihs_)
+        fds.push_back(ih->GetFd());
     return buffer_pool_manager_->flush_dirty_pages(fds, max_pages).pages_written;
 }
 

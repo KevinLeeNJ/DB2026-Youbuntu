@@ -700,6 +700,10 @@ void LogManager::flush_buffer(bool sync) {
                     const auto fsync_begin = std::chrono::steady_clock::now();
                     disk_manager_->fsync_log();
                     const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
+                    recent_fdatasync_ns_.store(static_cast<uint64_t>(
+                                                  std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
+                                                      .count()),
+                                              std::memory_order_release);
                     LogSlowWalFdatasync(fsync_elapsed, 0, target_lsn, durable_before,
                                         durability_mode_ == DurabilityMode::STRICT);
                     if (metrics_enabled) {
@@ -752,6 +756,10 @@ void LogManager::flush_buffer(bool sync) {
                 const auto fsync_begin = std::chrono::steady_clock::now();
                 disk_manager_->fsync_log();
                 const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
+                recent_fdatasync_ns_.store(static_cast<uint64_t>(
+                                              std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
+                                                  .count()),
+                                          std::memory_order_release);
                 LogSlowWalFdatasync(fsync_elapsed, bytes, target_lsn, durable_before,
                                     durability_mode_ == DurabilityMode::STRICT);
                 if (metrics_enabled) {

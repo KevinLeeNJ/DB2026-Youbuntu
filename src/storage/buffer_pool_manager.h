@@ -29,6 +29,8 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 
+#include "common/background_preclean_metrics.h"
+
 #include "disk_manager.h"
 #include "common/shard_acquisition_metrics.h"
 #include "errors.h"
@@ -95,6 +97,7 @@ private:
     std::array<ResidentDirectoryShard, RESIDENT_DIRECTORY_SHARD_COUNT> resident_directory_;
     ShardAcquisitionMetrics shard_read_metrics_;
     ShardAcquisitionMetrics shard_write_metrics_;
+    BackgroundPrecleanMetrics background_preclean_metrics_;
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
     // Reused only while latch_ is held by take_unblocked_victim_locked().
@@ -155,9 +158,9 @@ public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager,
                       ShardAcquisitionMetrics::Config shard_metrics_config =
                           ShardAcquisitionMetrics::Config::FromEnvironment("RMDB_BPM_SHARD_METRICS_SAMPLE_LOG2",
-                                                                             "RMDB_BPM_SHARD_SLOW_NS"))
-        : pool_size_(pool_size), shard_read_metrics_(shard_metrics_config),
-          shard_write_metrics_(shard_metrics_config), disk_manager_(disk_manager) {
+                                                                           "RMDB_BPM_SHARD_SLOW_NS"))
+        : pool_size_(pool_size), shard_read_metrics_(shard_metrics_config), shard_write_metrics_(shard_metrics_config),
+          disk_manager_(disk_manager) {
         // 为buffer pool分配一块连续的内存空间
         pages_ = std::make_unique<Page[]>(pool_size_);
         residency_classes_.assign(pool_size_, ResidencyClass::Normal);
@@ -321,7 +324,7 @@ public:
     // writes discharge membership even when the page was re-dirtied after its
     // image was copied; that newer image remains dirty for a later checkpoint.
     CheckpointCohortFlushResult flush_checkpoint_cohort(uint64_t epoch, size_t max_io_pages,
-                                                         size_t max_frames_to_visit = 64);
+                                                        size_t max_frames_to_visit = 64);
 
     // Abandon only the named cohort after a checkpoint-stage failure. This is
     // idempotent and does not make pages clean or weaken their WAL dependency.
@@ -342,6 +345,13 @@ public:
     // lock-free read-only capacity query for checkpoint pacing.
     size_t frame_capacity() const noexcept {
         return pool_size_;
+    }
+
+    BackgroundPrecleanMetrics& background_preclean_metrics() noexcept {
+        return background_preclean_metrics_;
+    }
+    const BackgroundPrecleanMetrics& background_preclean_metrics() const noexcept {
+        return background_preclean_metrics_;
     }
 
 private:

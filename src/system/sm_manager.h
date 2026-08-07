@@ -599,6 +599,11 @@ public:
 
     TableDirtyPageStats table_dirty_page_stats();
     size_t flush_dirty_table_pages(size_t max_pages);
+    // Background preclean includes every catalog-owned data file, including
+    // index pages.  The catalog shared guard keeps those fds live throughout
+    // selection and writeback.
+    TableDirtyPageStats table_and_index_dirty_page_stats();
+    size_t flush_dirty_table_and_index_pages(size_t max_pages);
 
     // Compatibility wrapper for the recovery scale harness. This remains
     // table-only and is not part of automatic checkpoint scheduling.
