@@ -2696,16 +2696,28 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 		if phase == "warmup" {
 			phaseEnd = warmupEnd
 		}
+		latencyBackend, _ := c.(latencyTxnBackend)
+		if latencyBackend != nil {
+			latencyBackend.beginLatencyPhaseTxn()
+		}
 		start := time.Now()
+		attempts := 0
 		err, retryOutcome := runTxnWithConflictRetries(phaseEnd, maxConflictRetries, stop, time.Now, func() error {
+			attempts++
 			attempt.reset()
 			return runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
 		})
 		if retryOutcome == conflictRetryStopped {
+			if latencyBackend != nil {
+				latencyBackend.finishLatencyPhaseTxn(phase, false, attempts > 1)
+			}
 			report(nil)
 			return
 		}
 		if retryOutcome == conflictRetryDeadline || retryOutcome == conflictRetryExhausted {
+			if latencyBackend != nil {
+				latencyBackend.finishLatencyPhaseTxn(phase, false, attempts > 1)
+			}
 			latency := float64(time.Since(start).Microseconds()) / 1000.0
 			detail := "conflict retry budget exhausted"
 			if retryOutcome == conflictRetryDeadline {
@@ -2716,6 +2728,9 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			continue
 		}
 		latency := float64(time.Since(start).Microseconds()) / 1000.0
+		if latencyBackend != nil {
+			latencyBackend.finishLatencyPhaseTxn(phase, err == nil, attempts > 1)
+		}
 		if err == nil || errors.Is(err, errInvalidItem) {
 			if mergeErr := total.merge(attempt); mergeErr != nil {
 				c.rollback()
@@ -2848,16 +2863,28 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 		if now.Before(warmupEnd) {
 			phaseEnd = warmupEnd
 		}
+		latencyBackend, _ := c.(latencyTxnBackend)
+		if latencyBackend != nil {
+			latencyBackend.beginLatencyPhaseTxn()
+		}
 		start := time.Now()
+		attempts := 0
 		err, retryOutcome := runTxnWithConflictRetries(phaseEnd, maxConflictRetries, stop, time.Now, func() error {
+			attempts++
 			attempt.reset()
 			return runTxn(c, txnType, ctx, rand.New(rand.NewSource(attemptSeed)))
 		})
 		if retryOutcome == conflictRetryStopped {
+			if latencyBackend != nil {
+				latencyBackend.finishLatencyPhaseTxn("warmup", false, attempts > 1)
+			}
 			return
 		}
 		if retryOutcome == conflictRetryDeadline || retryOutcome == conflictRetryExhausted {
 			phase, local, window := report.attribute(start, warmupEnd, measure)
+			if latencyBackend != nil {
+				latencyBackend.finishLatencyPhaseTxn(phase, false, attempts > 1)
+			}
 			if local != nil {
 				latency := float64(time.Since(start).Microseconds()) / 1000.0
 				detail := "conflict retry budget exhausted"
@@ -2880,6 +2907,9 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 			}
 		}
 		phase, local, window := report.attribute(finish, warmupEnd, measure)
+		if latencyBackend != nil {
+			latencyBackend.finishLatencyPhaseTxn(phase, err == nil, attempts > 1)
+		}
 		if local == nil {
 			// Completed after the final window: it belongs to no measurement
 			// interval. A backend error still invalidates the run.
@@ -3818,6 +3848,7 @@ func verifyAtomicOracle(address string, timeout time.Duration, isolation, issued
 }
 
 func main() {
+	latencyPhaseSampleDefault, latencyPhaseSampleEnvErr := latencyPhaseSampleEveryFromEnv(os.Getenv("RMDB_CLIENT_LATENCY_PHASE_SAMPLE_EVERY"))
 	command := flag.String("command", "run", "run, feature-check, mixed-sql, data-ready, refresh-manifest, datagen, load, consistency, validate-result, compact-result, oracle-init, oracle-verify, atomic-verify, wait-port, wait-ready, or merge-results")
 	mode := flag.String("mode", "official-equivalent", "official-equivalent for rmdb or sqlite-reference for SQLite")
 	backend := flag.String("backend", "rmdb", "rmdb or sqlite")
@@ -3862,7 +3893,20 @@ func main() {
 		"accept the legacy PREPARE_OK layout that echoes parameter types; the official evaluator does not")
 	walPhaseMarkerSocket := flag.String("wal-phase-marker-socket", "",
 		"Linux abstract Unix datagram address for diagnostic WAL phase markers during an official rmdb run")
+	latencyPhaseObserve := flag.Bool("latency-phase-observe", latencyPhaseEnabledFromEnv(os.Getenv("RMDB_CLIENT_LATENCY_PHASES")),
+		"sample client-side EXEC_BATCH encode/write/read/decode phases; also enabled by RMDB_CLIENT_LATENCY_PHASES=1")
+	latencyPhaseSampleEvery := flag.Uint64("latency-phase-sample-every", latencyPhaseSampleDefault,
+		"sample every N final successful logical transactions per connection when --latency-phase-observe is set")
+	latencyPhaseOut := flag.String("latency-phase-out", "", "optional JSON sidecar for --latency-phase-observe; result JSON is unchanged")
 	flag.Parse()
+	if latencyPhaseSampleEnvErr != nil {
+		fmt.Fprintln(os.Stderr, latencyPhaseSampleEnvErr)
+		os.Exit(2)
+	}
+	if *latencyPhaseSampleEvery == 0 {
+		fmt.Fprintln(os.Stderr, "--latency-phase-sample-every must be positive")
+		os.Exit(2)
+	}
 	allowLegacyPrepare = *allowLegacyPrepareFlag
 	if *backend != "rmdb" && *backend != "sqlite" {
 		fmt.Fprintln(os.Stderr, "--backend must be rmdb or sqlite")
@@ -4158,6 +4202,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if *latencyPhaseObserve && *backend != "rmdb" {
+		fmt.Fprintln(os.Stderr, "--latency-phase-observe requires --backend rmdb")
+		os.Exit(2)
+	}
+	latencyObserver := newLatencyPhaseObserver(*latencyPhaseObserve, *latencyPhaseSampleEvery)
 	var factory backendFactory
 	if *backend == "sqlite" {
 		factory = func() (txnBackend, error) {
@@ -4165,7 +4214,12 @@ func main() {
 		}
 	} else {
 		factory = func() (txnBackend, error) {
-			return newRankingClient(address, *timeout, *isolation)
+			ranking, err := newRankingClient(address, *timeout, *isolation)
+			if err != nil {
+				return nil, err
+			}
+			ranking.latency = latencyObserver.newSampler()
+			return ranking, nil
 		}
 	}
 	var probe txnBackend
@@ -4294,6 +4348,10 @@ func main() {
 	doc.PaymentEdgeCount = edgeCount
 	doc.PaymentChainTerminals = terminals
 	if err := publishResultDocument(*jsonOut, doc); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := latencyObserver.emit(*latencyPhaseOut); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

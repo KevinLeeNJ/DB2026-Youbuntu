@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "buffer_pool_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -79,6 +80,7 @@ std::mutex BufferPoolManager::flush_page_test_hook_latch_;
 BufferPoolManager::FlushPageTestHook BufferPoolManager::flush_page_test_hook_;
 BufferPoolManager::FlushPageTestHook BufferPoolManager::flush_page_after_write_test_hook_;
 BufferPoolManager::FlushPageTestHook BufferPoolManager::flush_batch_before_write_test_hook_;
+BufferPoolManager::EnsureDependencyTestHook BufferPoolManager::ensure_dependency_test_hook_;
 
 bool BufferPoolManager::shard_metrics_enabled() const noexcept {
     return shard_read_metrics_.enabled() || shard_write_metrics_.enabled();
@@ -126,6 +128,11 @@ void BufferPoolManager::set_flush_page_after_write_test_hook(FlushPageTestHook h
 void BufferPoolManager::set_flush_batch_before_write_test_hook(FlushPageTestHook hook) {
     std::scoped_lock lock{flush_page_test_hook_latch_};
     flush_batch_before_write_test_hook_ = std::move(hook);
+}
+
+void BufferPoolManager::set_ensure_dependency_test_hook(EnsureDependencyTestHook hook) {
+    std::scoped_lock lock{flush_page_test_hook_latch_};
+    ensure_dependency_test_hook_ = std::move(hook);
 }
 
 void BufferPoolManager::run_flush_page_test_hook(PageId page_id, Page* page) {
@@ -571,6 +578,13 @@ void BufferPoolManager::finish_checkpoint_cohort_if_complete_locked() {
 }
 
 void BufferPoolManager::ensure_write_dependency(const PageWriteDependency& dependency) {
+    EnsureDependencyTestHook hook;
+    {
+        std::scoped_lock lock{flush_page_test_hook_latch_};
+        hook = ensure_dependency_test_hook_;
+    }
+    if (hook)
+        hook(dependency);
     if (dependency.kind() == PageWriteDependency::Kind::WalLsn && log_manager_ == nullptr) {
         throw InternalError("WAL-dependent page write has no LogManager");
     }
@@ -1571,6 +1585,12 @@ bool BufferPoolManager::flush_all_pages_for_recovery(const std::vector<int>& fds
 
 BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<PageId>& page_ids,
                                                                    FlushDependencyPolicy policy) {
+    return flush_pages_until(page_ids, policy, std::chrono::steady_clock::time_point::max());
+}
+
+BufferPoolManager::FlushBatchResult
+BufferPoolManager::flush_pages_until(std::vector<PageId>& page_ids, FlushDependencyPolicy policy,
+                                     std::chrono::steady_clock::time_point deadline) {
     if (page_ids.empty()) {
         return FlushBatchResult{};
     }
@@ -1587,13 +1607,13 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_pages(std::vector<P
     // this capacity after a claim, so it cannot allocate or throw there.
     std::vector<char> image;
     image.reserve(std::min(kClaimPages, page_ids.size()) * PAGE_SIZE);
-    return flush_sorted_pages(page_ids, 0, page_ids.size(), policy, image);
+    return flush_sorted_pages(page_ids, 0, page_ids.size(), policy, image, deadline);
 }
 
-BufferPoolManager::FlushBatchResult BufferPoolManager::flush_sorted_pages(const std::vector<PageId>& candidates,
-                                                                          size_t candidate_begin, size_t candidate_end,
-                                                                          FlushDependencyPolicy policy,
-                                                                          std::vector<char>& image) {
+BufferPoolManager::FlushBatchResult
+BufferPoolManager::flush_sorted_pages(const std::vector<PageId>& candidates, size_t candidate_begin,
+                                      size_t candidate_end, FlushDependencyPolicy policy, std::vector<char>& image,
+                                      std::chrono::steady_clock::time_point deadline) {
     FlushBatchResult result;
     if (candidate_begin >= candidate_end) {
         return result;
@@ -1615,6 +1635,8 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_sorted_pages(const 
     claimed.reserve(kClaimPages);
     bool success = true;
     for (; candidate_begin < candidate_end;) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
         claimed.clear();
         {
             std::unique_lock lock{latch_};
@@ -1637,93 +1659,83 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_sorted_pages(const 
             }
         }
 
-        size_t claimed_begin = 0;
-        // The caller reserved the largest possible claim for this range before
-        // any frame transition.
-        // char default construction within existing capacity cannot allocate or
-        // throw, while preserving the old small-batch initialization cost.
+        // Snapshot the entire claim before enforcing its merged dependency.
+        // This makes one WAL durability decision cover every contiguous run in
+        // the claim, while each run retains independent write/cleanup state.
         image.resize(claimed.size() * PAGE_SIZE);
-        while (claimed_begin < claimed.size()) {
-            size_t claimed_end = claimed_begin + 1;
-            while (claimed_end < claimed.size() &&
-                   claimed[claimed_end].page_id.fd == claimed[claimed_begin].page_id.fd &&
-                   claimed[claimed_end].page_id.page_no == claimed[claimed_end - 1].page_id.page_no + 1) {
-                ++claimed_end;
+        std::array<bool, kClaimPages> written{};
+        bool snapshot_complete = true;
+        PageWriteDependency dependency = PageWriteDependency::None();
+        try {
+            if (!claimed.empty()) {
+                run_flush_batch_before_write_test_hook(claimed.front().page_id, &pages_[claimed.front().frame_id]);
             }
-
-            const size_t page_count = claimed_end - claimed_begin;
-            bool copied = true;
-            PageWriteDependency dependency = PageWriteDependency::None();
-            try {
-                run_flush_batch_before_write_test_hook(claimed[claimed_begin].page_id,
-                                                       &pages_[claimed[claimed_begin].frame_id]);
-            } catch (...) {
-                copied = false;
-            }
-            for (size_t i = claimed_begin; copied && i < claimed_end; ++i) {
+            for (size_t i = 0; i < claimed.size(); ++i) {
                 Page* page = &pages_[claimed[i].frame_id];
-                try {
-                    std::shared_lock page_lock(page->latch_);
-                    std::memcpy(image.data() + (i - claimed_begin) * PAGE_SIZE, page->data_, PAGE_SIZE);
-                    {
-                        std::scoped_lock dirty_lock{page->dirty_latch_};
-                        claimed[i].dirty_epoch = page->dirty_epoch_.load(std::memory_order_acquire);
-                        claimed[i].dependency = page->write_dependency_;
-                    }
-                    dependency.merge(claimed[i].dependency);
-                } catch (...) {
-                    copied = false;
-                    break;
-                }
+                std::shared_lock page_lock(page->latch_);
+                std::memcpy(image.data() + i * PAGE_SIZE, page->data_, PAGE_SIZE);
+                std::scoped_lock dirty_lock{page->dirty_latch_};
+                claimed[i].dirty_epoch = page->dirty_epoch_.load(std::memory_order_acquire);
+                claimed[i].dependency = page->write_dependency_;
+                dependency.merge(claimed[i].dependency);
             }
-            if (copied) {
-                try {
-                    if (policy.kind() == FlushDependencyPolicy::Kind::Enforce) {
-                        ensure_write_dependency(dependency);
-                    }
-                    disk_manager_->write_page(claimed[claimed_begin].page_id.fd, claimed[claimed_begin].page_id.page_no,
-                                              image.data(), static_cast<int>(page_count * PAGE_SIZE));
-                    for (size_t i = claimed_begin; i < claimed_end; ++i) {
-                        run_flush_page_after_write_test_hook(claimed[i].page_id, &pages_[claimed[i].frame_id]);
-                    }
-                } catch (...) {
-                    copied = false;
-                }
+            if (policy.kind() == FlushDependencyPolicy::Kind::Enforce) {
+                ensure_write_dependency(dependency);
             }
-            success = copied && success;
-            if (copied) {
-                result.pages_written += page_count;
-            }
-
-            {
-                std::unique_lock lock{latch_};
-                for (size_t i = claimed_begin; i < claimed_end; ++i) {
-                    const auto& claimed_page = claimed[i];
-                    Page* page = &pages_[claimed_page.frame_id];
-                    auto hit = page_table_.find(claimed_page.page_id);
-                    if (hit == page_table_.end() || hit->second != claimed_page.frame_id ||
-                        page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
-                        release_index_file_write_locked(claimed_page.page_id.fd);
-                        continue;
-                    }
-                    if (copied) {
-                        {
-                            std::scoped_lock dirty_lock{page->dirty_latch_};
-                            clear_checkpoint_cohort_marker_locked(page);
-                            if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
-                                page->is_dirty_ = false;
-                                page->write_dependency_ = PageWriteDependency::None();
-                            }
-                        }
-                    }
-                    set_mapped_frame_state_locked(claimed_page.page_id, claimed_page.frame_id, FrameState::VALID);
-                    page->io_cv_.notify_all();
-                    release_index_file_write_locked(claimed_page.page_id.fd);
-                }
-            }
-            index_smo_cv_.notify_all();
-            claimed_begin = claimed_end;
+        } catch (...) {
+            snapshot_complete = false;
+            success = false;
         }
+
+        for (size_t run_begin = 0; snapshot_complete && run_begin < claimed.size();) {
+            size_t run_end = run_begin + 1;
+            while (run_end < claimed.size() && claimed[run_end].page_id.fd == claimed[run_begin].page_id.fd &&
+                   claimed[run_end].page_id.page_no == claimed[run_end - 1].page_id.page_no + 1) {
+                ++run_end;
+            }
+            try {
+                disk_manager_->write_page(claimed[run_begin].page_id.fd, claimed[run_begin].page_id.page_no,
+                                          image.data() + run_begin * PAGE_SIZE,
+                                          static_cast<int>((run_end - run_begin) * PAGE_SIZE));
+                for (size_t i = run_begin; i < run_end; ++i) {
+                    written[i] = true;
+                }
+                result.pages_written += run_end - run_begin;
+                for (size_t i = run_begin; i < run_end; ++i) {
+                    run_flush_page_after_write_test_hook(claimed[i].page_id, &pages_[claimed[i].frame_id]);
+                }
+            } catch (...) {
+                success = false;
+                break;
+            }
+            run_begin = run_end;
+        }
+
+        {
+            std::unique_lock lock{latch_};
+            for (size_t i = 0; i < claimed.size(); ++i) {
+                const auto& claimed_page = claimed[i];
+                Page* page = &pages_[claimed_page.frame_id];
+                auto hit = page_table_.find(claimed_page.page_id);
+                if (hit == page_table_.end() || hit->second != claimed_page.frame_id ||
+                    page->state_.load(std::memory_order_acquire) != FrameState::FLUSHING) {
+                    release_index_file_write_locked(claimed_page.page_id.fd);
+                    continue;
+                }
+                if (written[i]) {
+                    std::scoped_lock dirty_lock{page->dirty_latch_};
+                    clear_checkpoint_cohort_marker_locked(page);
+                    if (page->dirty_epoch_.load(std::memory_order_acquire) == claimed_page.dirty_epoch) {
+                        page->is_dirty_ = false;
+                        page->write_dependency_ = PageWriteDependency::None();
+                    }
+                }
+                set_mapped_frame_state_locked(claimed_page.page_id, claimed_page.frame_id, FrameState::VALID);
+                page->io_cv_.notify_all();
+                release_index_file_write_locked(claimed_page.page_id.fd);
+            }
+        }
+        index_smo_cv_.notify_all();
     }
     result.success = success;
     return result;
@@ -1759,7 +1771,8 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_dirty_pages(const s
     // Every frame carries a typed WAL dependency. Enforce it per batch while
     // foreground writers remain active, including for index pages whose payload
     // does not contain a table-page LSN.
-    return flush_pages(pages_to_flush, FlushDependencyPolicy::Enforce());
+    return flush_pages_until(pages_to_flush, FlushDependencyPolicy::Enforce(),
+                             std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
 }
 
 BufferPoolManager::CheckpointCohort

@@ -797,8 +797,19 @@ public:
     lsn_t get_durable_lsn() const {
         return durable_lsn_.load(std::memory_order_acquire);
     }
+    struct FdatasyncObservation {
+        uint64_t sequence{0}, elapsed_ns{0};
+    };
+    FdatasyncObservation recent_fdatasync_observation() const noexcept {
+        const uint64_t sequence = fdatasync_observation_sequence_.load(std::memory_order_acquire);
+        return {sequence, recent_fdatasync_ns_.load(std::memory_order_relaxed)};
+    }
     uint64_t recent_fdatasync_ns() const noexcept {
-        return recent_fdatasync_ns_.load(std::memory_order_acquire);
+        return recent_fdatasync_observation().elapsed_ns;
+    }
+    void set_fdatasync_observation_for_test(uint64_t sequence, uint64_t elapsed_ns) noexcept {
+        recent_fdatasync_ns_.store(elapsed_ns, std::memory_order_relaxed);
+        fdatasync_observation_sequence_.store(sequence, std::memory_order_release);
     }
 
     lsn_t get_global_lsn() const {
@@ -875,6 +886,7 @@ private:
     // A best-effort congestion signal for optional background I/O only. It is
     // never consulted by commit durability or WAL ordering.
     std::atomic<uint64_t> recent_fdatasync_ns_{0};
+    std::atomic<uint64_t> fdatasync_observation_sequence_{0};
     int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};

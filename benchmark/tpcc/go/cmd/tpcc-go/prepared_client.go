@@ -70,6 +70,7 @@ var allowLegacyPrepare bool
 type rankingClient struct {
 	*client
 	statements map[string]rankingStatement
+	latency    *latencyPhaseSampler
 }
 
 func newRankingClient(address string, timeout time.Duration, isolation string) (*rankingClient, error) {
@@ -582,15 +583,39 @@ func encodeBatchOperations(operations []batchOperation) ([]byte, error) {
 }
 
 func (c *rankingClient) execBatch(operations []batchOperation) (batchResult, error) {
+	encodeStart := time.Time{}
+	if c.latency != nil && c.latency.active {
+		encodeStart = time.Now()
+	}
 	payload, err := encodeBatchOperations(operations)
+	if !encodeStart.IsZero() {
+		c.latency.addEncode(time.Since(encodeStart))
+	}
 	if err != nil {
 		return batchResult{}, err
 	}
+	writeStart := time.Time{}
+	if c.latency != nil && c.latency.active {
+		writeStart = time.Now()
+	}
 	if err := c.writeRequest(wireTagExecBatch, 1, payload); err != nil {
+		if !writeStart.IsZero() {
+			c.latency.addSocketWrite(time.Since(writeStart))
+		}
 		c.close()
 		return batchResult{}, err
 	}
+	if !writeStart.IsZero() {
+		c.latency.addSocketWrite(time.Since(writeStart))
+	}
+	readStart := time.Time{}
+	if c.latency != nil && c.latency.active {
+		readStart = time.Now()
+	}
 	tag, body, err := c.readFrame()
+	if !readStart.IsZero() {
+		c.latency.addReadWait(time.Since(readStart))
+	}
 	if err != nil {
 		c.close()
 		return batchResult{}, err
@@ -602,7 +627,14 @@ func (c *rankingClient) execBatch(operations []batchOperation) (batchResult, err
 	if tag != wireTagBatchResult {
 		return batchResult{}, fmt.Errorf("EXEC_BATCH returned unexpected tag 0x%02x", tag)
 	}
+	decodeStart := time.Time{}
+	if c.latency != nil && c.latency.active {
+		decodeStart = time.Now()
+	}
 	result, err := decodeBatchResult(body, operations)
+	if !decodeStart.IsZero() {
+		c.latency.addDecode(time.Since(decodeStart))
+	}
 	if err != nil {
 		return batchResult{}, err
 	}

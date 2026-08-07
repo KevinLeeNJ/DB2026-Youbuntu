@@ -704,6 +704,7 @@ void LogManager::flush_buffer(bool sync) {
                                                   std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
                                                       .count()),
                                               std::memory_order_release);
+                    fdatasync_observation_sequence_.fetch_add(1, std::memory_order_release);
                     LogSlowWalFdatasync(fsync_elapsed, 0, target_lsn, durable_before,
                                         durability_mode_ == DurabilityMode::STRICT);
                     if (metrics_enabled) {
@@ -760,6 +761,7 @@ void LogManager::flush_buffer(bool sync) {
                                               std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
                                                   .count()),
                                           std::memory_order_release);
+                fdatasync_observation_sequence_.fetch_add(1, std::memory_order_release);
                 LogSlowWalFdatasync(fsync_elapsed, bytes, target_lsn, durable_before,
                                     durability_mode_ == DurabilityMode::STRICT);
                 if (metrics_enabled) {

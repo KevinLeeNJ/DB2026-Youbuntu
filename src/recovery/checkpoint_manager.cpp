@@ -66,9 +66,17 @@ constexpr uint64_t kMinTickBytes = PAGE_SIZE;
 constexpr uint64_t kMaxTickBytes = 1024ULL * 1024 * 1024;
 constexpr uint64_t kMinTickTimeUs = 100;
 constexpr uint64_t kMaxTickTimeUs = 1000000;
-constexpr size_t kMinPrecleanBatchPages = 64;
-constexpr size_t kMaxPrecleanBatchPages = 256;
-constexpr uint64_t kSlowWalFdatasyncNs = 20ULL * 1000 * 1000;
+constexpr size_t kMinPrecleanBatchPages = 32;
+constexpr size_t kMaxPrecleanBatchPages = 512;
+constexpr size_t kPrecleanHorizonTicks = 300;
+constexpr uint64_t kHealthyWalFdatasyncNs = 8ULL * 1000 * 1000;
+
+size_t PercentPages(size_t capacity, uint8_t percent, bool round_up) noexcept {
+    const size_t quotient = capacity / 100;
+    const size_t remainder = capacity % 100;
+    const size_t residual = remainder * percent;
+    return quotient * percent + (residual + (round_up ? 99 : 0)) / 100;
+}
 
 bool ReadCheckpointBoolEnv(const char* name, bool default_value) {
     const char* raw = std::getenv(name);
@@ -170,6 +178,9 @@ CheckpointOptions CheckpointOptions::FromEnvironment() {
     options.background_preclean_high_percent = static_cast<uint8_t>(ReadCheckpointEnv("RMDB_BACKGROUND_PRECLEAN_HIGH_PERCENT", options.background_preclean_high_percent, 2, 99));
     if (options.background_preclean_low_percent >= options.background_preclean_high_percent) throw std::invalid_argument("RMDB_BACKGROUND_PRECLEAN_LOW_PERCENT must be below high percent");
     options.background_preclean_batch_pages = static_cast<size_t>(ReadCheckpointEnv("RMDB_BACKGROUND_PRECLEAN_BATCH_PAGES", options.background_preclean_batch_pages, kMinPrecleanBatchPages, kMaxPrecleanBatchPages));
+    options.background_preclean_max_pages = static_cast<size_t>(
+        ReadCheckpointEnv("RMDB_BACKGROUND_PRECLEAN_MAX_PAGES", options.background_preclean_max_pages,
+                          kMinPrecleanBatchPages, kMaxPrecleanBatchPages));
     return options;
 }
 
@@ -231,8 +242,14 @@ void CheckpointManager::SetOptions(CheckpointOptions options) {
         static_cast<uint64_t>(options.io_quantum_pages), 1, kMaxCheckpointQuantumPages));
     options.background_preclean_low_percent = std::clamp<uint8_t>(options.background_preclean_low_percent, 1, 98);
     options.background_preclean_high_percent = std::clamp<uint8_t>(options.background_preclean_high_percent, 2, 99);
-    if (options.background_preclean_low_percent >= options.background_preclean_high_percent) { options.background_preclean_low_percent = 20; options.background_preclean_high_percent = 40; }
+    if (options.background_preclean_low_percent >= options.background_preclean_high_percent) {
+        options.background_preclean_low_percent = 20;
+        options.background_preclean_high_percent = 30;
+    }
     options.background_preclean_batch_pages = static_cast<size_t>(std::clamp<uint64_t>(static_cast<uint64_t>(options.background_preclean_batch_pages), kMinPrecleanBatchPages, kMaxPrecleanBatchPages));
+    options.background_preclean_max_pages =
+        static_cast<size_t>(std::clamp<uint64_t>(static_cast<uint64_t>(options.background_preclean_max_pages),
+                                                 options.background_preclean_batch_pages, kMaxPrecleanBatchPages));
     options_ = options;
 }
 
@@ -242,8 +259,10 @@ void CheckpointManager::MaybeRunBackgroundPreclean() {
     if (background_preclean_next_sample_ == std::chrono::steady_clock::time_point{} || now >= background_preclean_next_sample_) {
         const TableDirtyPageStats dirty = sm_mgr_->table_and_index_dirty_page_stats();
         if (dirty.frame_capacity == 0) return;
-        const size_t high = (dirty.frame_capacity * options_.background_preclean_high_percent + 99) / 100;
-        const size_t low = (dirty.frame_capacity * options_.background_preclean_low_percent) / 100;
+        background_preclean_dirty_pages_ = dirty.dirty_pages;
+        background_preclean_capacity_ = dirty.frame_capacity;
+        const size_t high = PercentPages(dirty.frame_capacity, options_.background_preclean_high_percent, true);
+        const size_t low = PercentPages(dirty.frame_capacity, options_.background_preclean_low_percent, false);
         const bool was_active = background_preclean_active_;
         if (!background_preclean_active_) background_preclean_active_ = dirty.dirty_pages >= high;
         else if (dirty.dirty_pages <= low) background_preclean_active_ = false;
@@ -251,10 +270,61 @@ void CheckpointManager::MaybeRunBackgroundPreclean() {
         if (was_active != background_preclean_active_) LOG_WARN("background-preclean state=%s dirty_pages=%zu capacity=%zu low=%zu high=%zu", background_preclean_active_ ? "active" : "idle", dirty.dirty_pages, dirty.frame_capacity, low, high);
     }
     if (!background_preclean_active_) return;
-    if (log_mgr_->recent_fdatasync_ns() > kSlowWalFdatasyncNs) { if (BufferPoolManager* bpm = sm_mgr_->get_bpm()) bpm->background_preclean_metrics().congestion_pause(); return; }
-    const auto started = std::chrono::steady_clock::now();
-    const size_t pages = sm_mgr_->flush_dirty_table_and_index_pages(options_.background_preclean_batch_pages);
-    if (BufferPoolManager* bpm = sm_mgr_->get_bpm()) bpm->background_preclean_metrics().background_flush(pages, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+
+    const LogManager::FdatasyncObservation wal = log_mgr_->recent_fdatasync_observation();
+    if (wal.sequence != 0 && wal.sequence != background_preclean_wal_sequence_) {
+        background_preclean_wal_sequence_ = wal.sequence;
+        if (background_preclean_wal_ewma_ns_ == 0)
+            background_preclean_wal_ewma_ns_ = wal.elapsed_ns;
+        else
+            background_preclean_wal_ewma_ns_ =
+                background_preclean_wal_ewma_ns_ - background_preclean_wal_ewma_ns_ / 4 + wal.elapsed_ns / 4;
+        if (wal.elapsed_ns <= kHealthyWalFdatasyncNs) {
+            background_preclean_healthy_samples_ = std::min<uint8_t>(5, background_preclean_healthy_samples_ + 1);
+            if (background_preclean_healthy_samples_ == 5)
+                background_preclean_wal_ewma_ns_ = wal.elapsed_ns;
+        } else {
+            background_preclean_healthy_samples_ = 0;
+        }
+    }
+
+    const size_t pages = compute_background_preclean_budget_for_test(
+        background_preclean_dirty_pages_, background_preclean_capacity_, options_.background_preclean_low_percent,
+        options_.background_preclean_batch_pages, options_.background_preclean_max_pages,
+        background_preclean_wal_ewma_ns_);
+    background_preclean_last_budget_ = pages;
+    if (background_preclean_wal_ewma_ns_ > kHealthyWalFdatasyncNs) {
+        if (BufferPoolManager* bpm = sm_mgr_->get_bpm())
+            bpm->background_preclean_metrics().congestion_pause();
+    }
+    BufferPoolManager* const bpm = sm_mgr_->get_bpm();
+    const bool metrics_enabled = bpm != nullptr && bpm->background_preclean_metrics().enabled();
+    const auto started = metrics_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const size_t flushed = sm_mgr_->flush_dirty_table_and_index_pages(pages);
+    if (metrics_enabled)
+        bpm->background_preclean_metrics().background_flush(
+            flushed, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - started)
+                                               .count()));
+}
+
+size_t CheckpointManager::compute_background_preclean_budget_for_test(size_t dirty_pages, size_t capacity,
+                                                                      uint8_t low_percent, size_t base_pages,
+                                                                      size_t max_pages, uint64_t wal_ewma_ns) noexcept {
+    const size_t low = PercentPages(capacity, low_percent, false);
+    const size_t debt = dirty_pages > low ? (dirty_pages - low + kPrecleanHorizonTicks - 1) / kPrecleanHorizonTicks : 0;
+    size_t pages = std::min(max_pages, std::max(base_pages, debt));
+    size_t divisor = 1;
+    if (wal_ewma_ns > 50ULL * 1000 * 1000)
+        divisor = 8;
+    else if (wal_ewma_ns > 20ULL * 1000 * 1000)
+        divisor = 4;
+    else if (wal_ewma_ns > 8ULL * 1000 * 1000)
+        divisor = 2;
+    pages = std::max(kMinPrecleanBatchPages, pages / divisor);
+    if (dirty_pages >= PercentPages(capacity, 70, true))
+        pages = std::max<size_t>(64, pages);
+    return std::min(max_pages, pages);
 }
 
 bool CheckpointManager::RunCleanCheckpoint() {

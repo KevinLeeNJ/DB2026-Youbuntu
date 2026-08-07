@@ -72,10 +72,12 @@ private:
 class BufferPoolManager {
 private:
     using FlushPageTestHook = std::function<void(PageId, Page*)>;
+    using EnsureDependencyTestHook = std::function<void(const PageWriteDependency&)>;
     static std::mutex flush_page_test_hook_latch_;
     static FlushPageTestHook flush_page_test_hook_;
     static FlushPageTestHook flush_page_after_write_test_hook_;
     static FlushPageTestHook flush_batch_before_write_test_hook_;
+    static EnsureDependencyTestHook ensure_dependency_test_hook_;
 
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
     std::unique_ptr<Page[]>
@@ -130,6 +132,7 @@ public:
     static void set_flush_page_test_hook(FlushPageTestHook hook);
     static void set_flush_page_after_write_test_hook(FlushPageTestHook hook);
     static void set_flush_batch_before_write_test_hook(FlushPageTestHook hook);
+    static void set_ensure_dependency_test_hook(EnsureDependencyTestHook hook);
 
     class FrameOperationToken {
         friend class BufferPoolManager;
@@ -383,7 +386,11 @@ private:
     static void run_flush_batch_before_write_test_hook(PageId page_id, Page* page);
     void clear_checkpoint_cohort_marker_locked(Page* page);
     void finish_checkpoint_cohort_if_complete_locked();
-    FlushBatchResult flush_sorted_pages(const std::vector<PageId>& candidates, size_t candidate_begin,
-                                        size_t candidate_end, FlushDependencyPolicy policy, std::vector<char>& image);
+    FlushBatchResult
+    flush_sorted_pages(const std::vector<PageId>& candidates, size_t candidate_begin, size_t candidate_end,
+                       FlushDependencyPolicy policy, std::vector<char>& image,
+                       std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
+    FlushBatchResult flush_pages_until(std::vector<PageId>& page_ids, FlushDependencyPolicy policy,
+                                       std::chrono::steady_clock::time_point deadline);
     bool flush_page_impl(PageId page_id, bool dirty_only);
 };

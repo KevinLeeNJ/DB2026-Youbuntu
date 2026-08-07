@@ -142,6 +142,13 @@ constexpr char kCheckpointTimingAFixed[] =
 constexpr char kCheckpointTimingBFixed[] =
     "checkpoint-metric seq= final=1 fuzzy_final=// manifest=// wal_reset=// lifetime=//";
 constexpr std::size_t kBase62Max = 11;
+
+bool plan_observability_enabled() noexcept {
+    const char* value = std::getenv("RMDB_PLAN_OBSERVABILITY");
+    return value != nullptr &&
+           (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0);
+}
+
 static_assert(sizeof(kTxnPhaseSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kReadViewShadowSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kTxnPhaseDataPrefix) - 1 + kBase62Max + sizeof(kTxnPhaseDataFinal) - 1 +
@@ -672,6 +679,39 @@ struct PreparedStatement {
     std::string database_identity;
     std::uint64_t catalog_generation = 0;
 };
+
+const char* prepared_plan_route(const PreparedStatement& statement) noexcept {
+    if (statement.descriptor == nullptr) {
+        return "descriptor_unavailable";
+    }
+    const PreparedPlanDescriptor& descriptor = *statement.descriptor;
+    const DMLPlan* dml = descriptor.dml_plan();
+    if (dml != nullptr && dml->compiled_point_program_ != nullptr) {
+        return "compiled_point";
+    }
+    if (descriptor.update_executable() != nullptr && descriptor.update_executable()->point_update.has_value()) {
+        return "prepared_point_update";
+    }
+    if (descriptor.select_executable() != nullptr) {
+        return "prepared_select";
+    }
+    return descriptor.eligible() ? "bound_plan" : "fallback";
+}
+
+void log_prepared_plan_observability(const PreparedStatement& statement) {
+    const PreparedPlanDescriptor* descriptor = statement.descriptor.get();
+    const Plan* plan = nullptr;
+    if (descriptor != nullptr && descriptor->dml_plan() != nullptr) {
+        plan = descriptor->dml_plan()->subplan_.get();
+    }
+    std::string summary = Portal::render_plan_observability(plan);
+    if (summary.empty()) {
+        summary = "unavailable";
+    }
+    LOG_WARN("plan-observability event=prepare statement_id=%u query=%d eligible=%d route=%s plan=%s", statement.id,
+             statement.query ? 1 : 0, descriptor != nullptr && descriptor->eligible() ? 1 : 0,
+             prepared_plan_route(statement), summary.c_str());
+}
 
 std::string diagnostic(const std::exception& exception) {
     std::string text = exception.what();
@@ -1263,10 +1303,18 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         const auto response = prepare_set(pending);
         std::unordered_map<std::uint16_t, PreparedStatement> replacement;
         replacement.reserve(pending.size());
+        std::vector<std::uint16_t> installed_ids;
+        installed_ids.reserve(pending.size());
         for (auto& statement : pending) {
+            installed_ids.push_back(statement.id);
             replacement.emplace(statement.id, std::move(statement));
         }
         prepared.swap(replacement);
+        if (plan_observability_enabled()) {
+            for (const std::uint16_t statement_id : installed_ids) {
+                log_prepared_plan_observability(prepared.at(statement_id));
+            }
+        }
         wire_protocol::write_frame(fd, Tag::PREPARE_OK, response);
         return;
     }

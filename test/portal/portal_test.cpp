@@ -199,6 +199,77 @@ TEST_F(PortalAggregateTest, get_plan_output_names_handles_aggregate_and_projecti
     EXPECT_EQ(aggregate_output_names, (std::vector<std::string>{"id", "MAX(score)"}));
 }
 
+TEST_F(PortalAggregateTest, plan_observability_renderer_reports_complete_access_and_operator_shape) {
+    Condition warehouse;
+    warehouse.lhs_col = {.tab_name = "grade", .col_name = "id"};
+    warehouse.op = OP_EQ;
+    warehouse.is_rhs_val = true;
+    warehouse.rhs_val.set_int(7);
+    Condition district;
+    district.lhs_col = {.tab_name = "grade", .col_name = "score"};
+    district.op = OP_GE;
+    district.is_rhs_val = true;
+    district.rhs_val.set_int(80);
+
+    auto outer =
+        std::make_unique<ScanPlan>(T_IndexScan, sm_manager_.get(), "grade", std::vector<Condition>{warehouse, district},
+                                   std::vector<std::string>{"id", "score"});
+    auto inner = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_.get(), "grade", std::vector<Condition>{},
+                                            std::vector<std::string>{"score", "id"});
+    auto join = std::make_unique<JoinPlan>(T_NestLoop, std::move(outer), std::move(inner), std::vector<Condition>{});
+    join->inlj_left_col_ = {.tab_name = "order_line", .col_name = "ol_i_id"};
+    join->inlj_right_col_ = {.tab_name = "stock", .col_name = "s_i_id"};
+    join->inlj_index_col_name_ = "s_i_id";
+
+    AggExpr count_distinct;
+    count_distinct.type = AggType::COUNT;
+    count_distinct.is_distinct = true;
+    count_distinct.col = {.tab_name = "grade", .col_name = "score"};
+    auto aggregate =
+        std::make_unique<AggregatePlan>(T_Aggregate, std::move(join), std::vector<TabCol>{},
+                                        std::vector<AggExpr>{count_distinct}, std::vector<HavingCondition>{});
+    OrderByItem order_by;
+    order_by.expr = make_col_expr("id");
+    order_by.is_desc = true;
+    auto sort = std::make_unique<SortPlan>(T_Sort, std::move(aggregate), std::vector<OrderByItem>{order_by}, 15);
+    auto limit = std::make_unique<LimitPlan>(T_Limit, std::move(sort), 10, 2);
+
+    const std::string summary = Portal::render_plan_observability(limit.get());
+    EXPECT_NE(summary.find("Limit(limit=10, offset=2"), std::string::npos);
+    EXPECT_NE(summary.find("Sort(keys=[grade.id DESC], top_k=15"), std::string::npos);
+    EXPECT_NE(summary.find("Aggregate(group_by=[], aggregates=[COUNT(DISTINCT grade.score)]"), std::string::npos);
+    EXPECT_NE(summary.find("Join(type=INLJ, parameterized_inner=true"), std::string::npos);
+    EXPECT_NE(summary.find("inner_lookup=stock.s_i_id"), std::string::npos);
+    EXPECT_NE(summary.find("using_index=(id, score), matched_prefix=(id, score), direction=forward"),
+              std::string::npos);
+}
+
+TEST_F(PortalAggregateTest, plan_observability_renderer_reports_latest_order_index_without_sort) {
+    Condition customer;
+    customer.lhs_col = {.tab_name = "grade", .col_name = "id"};
+    customer.op = OP_EQ;
+    customer.is_rhs_val = true;
+    customer.rhs_val.set_int(7);
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_.get(), "grade", std::vector<Condition>{customer},
+                                           std::vector<std::string>{"id", "score"});
+    scan->scan_backward_ = true;
+    auto limit = std::make_unique<LimitPlan>(T_Limit, std::move(scan), 1);
+
+    const std::string summary = Portal::render_plan_observability(limit.get());
+    EXPECT_NE(summary.find("type=IndexScan, using_index=(id, score), matched_prefix=(id), direction=backward"),
+              std::string::npos);
+    EXPECT_EQ(summary.find("Sort("), std::string::npos);
+}
+
+TEST_F(PortalAggregateTest, plan_observability_does_not_change_default_explain_scan_contract) {
+    auto scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_.get(), "grade", std::vector<Condition>{},
+                                           std::vector<std::string>{"id", "score"});
+    std::ostringstream explain;
+    Portal::render_explain_plan(scan.get(), 0, explain);
+
+    EXPECT_EQ(explain.str(), "Scan(table=grade, type=IndexScan, using_index=(id), rows=0)\n");
+}
+
 TEST_F(PortalAggregateTest, start_builds_limit_sort_projection_aggregate_executor_chain) {
     char buffer[256];
     int offset = 0;

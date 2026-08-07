@@ -989,21 +989,21 @@ private:
         return values;
     }
 
-    static void collect_tables(Plan* plan, std::set<std::string>& tables) {
+    static void collect_tables(const Plan* plan, std::set<std::string>& tables) {
         switch (plan->tag) {
         case T_SeqScan:
         case T_IndexSkipScan:
         case T_IndexScan:
-            tables.insert(static_cast<ScanPlan*>(plan)->tab_name_);
+            tables.insert(static_cast<const ScanPlan*>(plan)->tab_name_);
             break;
         case T_Filter:
-            collect_tables(static_cast<FilterPlan*>(plan)->subplan_.get(), tables);
+            collect_tables(static_cast<const FilterPlan*>(plan)->subplan_.get(), tables);
             break;
         case T_Projection:
-            collect_tables(static_cast<ProjectionPlan*>(plan)->subplan_.get(), tables);
+            collect_tables(static_cast<const ProjectionPlan*>(plan)->subplan_.get(), tables);
             break;
         case T_NestLoop: {
-            auto join = static_cast<JoinPlan*>(plan);
+            auto join = static_cast<const JoinPlan*>(plan);
             collect_tables(join->left_.get(), tables);
             collect_tables(join->right_.get(), tables);
             break;
@@ -1051,49 +1051,227 @@ private:
         return cols;
     }
 
-    static void render_explain_plan(Plan* plan, int depth, std::ostringstream& out) {
+    static std::string render_tab_col(const TabCol& col) {
+        return col.tab_name.empty() ? col.col_name : col.tab_name + "." + col.col_name;
+    }
+
+    static std::string render_index_columns(const std::vector<std::string>& columns) {
+        return "(" + join_strings(columns) + ")";
+    }
+
+    static bool condition_references_column(const Condition& condition, const ScanPlan& scan,
+                                            const std::string& column) {
+        const auto matches = [&](const TabCol& tab_col) {
+            return tab_col.tab_name == scan.tab_name_ && tab_col.col_name == column;
+        };
+        return matches(condition.lhs_col) || (!condition.is_rhs_val && matches(condition.rhs_col));
+    }
+
+    static std::vector<std::string> matched_index_prefix(const ScanPlan& scan) {
+        std::vector<std::string> prefix;
+        for (const auto& index_column : scan.index_col_names_) {
+            const bool matched = std::any_of(scan.conds_.begin(), scan.conds_.end(), [&](const Condition& condition) {
+                return condition_references_column(condition, scan, index_column);
+            });
+            if (!matched) {
+                break;
+            }
+            prefix.push_back(index_column);
+        }
+        return prefix;
+    }
+
+    static std::string render_query_expr(const QueryExpr& expr) {
+        switch (expr.type) {
+        case QueryExprType::COLUMN:
+            return render_tab_col(expr.col);
+        case QueryExprType::AGGREGATE: {
+            std::string result;
+            switch (expr.agg.type) {
+            case AggType::COUNT:
+                result = "COUNT";
+                break;
+            case AggType::MAX:
+                result = "MAX";
+                break;
+            case AggType::MIN:
+                result = "MIN";
+                break;
+            case AggType::SUM:
+                result = "SUM";
+                break;
+            case AggType::AVG:
+                result = "AVG";
+                break;
+            }
+            result += "(";
+            if (expr.agg.is_distinct) {
+                result += "DISTINCT ";
+            }
+            result += expr.agg.is_star ? "*" : render_tab_col(expr.agg.col);
+            return result + ")";
+        }
+        case QueryExprType::VALUE:
+            return "value";
+        }
+        return "unknown";
+    }
+
+    static bool plan_provides_min_order(const Plan* plan, const TabCol& column) {
+        if (plan == nullptr) {
+            return false;
+        }
+        switch (plan->tag) {
+        case T_IndexScan: {
+            const auto* scan = static_cast<const ScanPlan*>(plan);
+            return !scan->scan_backward_ && !scan->index_col_names_.empty() &&
+                   scan->index_col_names_.front() == column.col_name;
+        }
+        case T_Filter:
+            return plan_provides_min_order(static_cast<const FilterPlan*>(plan)->subplan_.get(), column);
+        case T_Projection:
+            return plan_provides_min_order(static_cast<const ProjectionPlan*>(plan)->subplan_.get(), column);
+        default:
+            return false;
+        }
+    }
+
+    static void render_explain_plan(const Plan* plan, int depth, std::ostringstream& out,
+                                    bool plan_observability = false) {
+        if (plan == nullptr) {
+            return;
+        }
         out << std::string(static_cast<size_t>(depth), '\t');
         switch (plan->tag) {
         case T_SeqScan: {
-            auto scan = static_cast<ScanPlan*>(plan);
+            auto scan = static_cast<const ScanPlan*>(plan);
             out << "Scan(table=" << scan->tab_name_ << ", type=SeqScan, rows=" << plan->runtime_rows_ << ")\n";
             break;
         }
         case T_IndexScan: {
-            auto scan = static_cast<ScanPlan*>(plan);
-            out << "Scan(table=" << scan->tab_name_ << ", type=IndexScan, using_index=(" << scan->index_col_names_[0]
-                << "), rows=" << plan->runtime_rows_ << ")\n";
+            auto scan = static_cast<const ScanPlan*>(plan);
+            if (!plan_observability) {
+                out << "Scan(table=" << scan->tab_name_ << ", type=IndexScan, using_index=("
+                    << scan->index_col_names_[0] << "), rows=" << plan->runtime_rows_ << ")\n";
+                break;
+            }
+            out << "Scan(table=" << scan->tab_name_
+                << ", type=IndexScan, using_index=" << render_index_columns(scan->index_col_names_)
+                << ", matched_prefix=" << render_index_columns(matched_index_prefix(*scan))
+                << ", direction=" << (scan->scan_backward_ ? "backward" : "forward") << ", rows=" << plan->runtime_rows_
+                << ")\n";
             break;
         }
         case T_IndexSkipScan: {
-            auto scan = static_cast<ScanPlan*>(plan);
-            out << "Scan(table=" << scan->tab_name_ << ", type=IndexSkipScan, using_index=("
-                << scan->index_col_names_[0] << "), rows=" << plan->runtime_rows_ << ")\n";
+            auto scan = static_cast<const ScanPlan*>(plan);
+            if (!plan_observability) {
+                out << "Scan(table=" << scan->tab_name_ << ", type=IndexSkipScan, using_index=("
+                    << scan->index_col_names_[0] << "), rows=" << plan->runtime_rows_ << ")\n";
+                break;
+            }
+            out << "Scan(table=" << scan->tab_name_
+                << ", type=IndexSkipScan, using_index=" << render_index_columns(scan->index_col_names_)
+                << ", matched_prefix=" << render_index_columns(matched_index_prefix(*scan))
+                << ", direction=forward, rows=" << plan->runtime_rows_ << ")\n";
             break;
         }
         case T_Filter: {
-            auto filter = static_cast<FilterPlan*>(plan);
+            auto filter = static_cast<const FilterPlan*>(plan);
             out << "Filter(condition=[" << join_strings(condition_strings(*plan, filter->conds_))
                 << "], rows=" << plan->runtime_rows_ << ")\n";
-            render_explain_plan(filter->subplan_.get(), depth + 1, out);
+            render_explain_plan(filter->subplan_.get(), depth + 1, out, plan_observability);
             break;
         }
         case T_Projection: {
-            auto projection = static_cast<ProjectionPlan*>(plan);
+            auto projection = static_cast<const ProjectionPlan*>(plan);
             out << "Project(columns=[" << join_strings(projection_columns(*projection))
                 << "], rows=" << plan->runtime_rows_ << ")\n";
-            render_explain_plan(projection->subplan_.get(), depth + 1, out);
+            render_explain_plan(projection->subplan_.get(), depth + 1, out, plan_observability);
             break;
         }
         case T_NestLoop: {
-            auto join = static_cast<JoinPlan*>(plan);
+            auto join = static_cast<const JoinPlan*>(plan);
             std::set<std::string> table_set;
             collect_tables(plan, table_set);
             std::vector<std::string> tables(table_set.begin(), table_set.end());
-            out << "Join(tables=[" << join_strings(std::move(tables)) << "], condition=["
-                << join_strings(condition_strings(*plan, join->conds_)) << "], rows=" << plan->runtime_rows_ << ")\n";
-            render_explain_plan(join->left_.get(), depth + 1, out);
-            render_explain_plan(join->right_.get(), depth + 1, out);
+            if (!plan_observability) {
+                out << "Join(tables=[" << join_strings(std::move(tables)) << "], condition=["
+                    << join_strings(condition_strings(*plan, join->conds_)) << "], rows=" << plan->runtime_rows_
+                    << ")\n";
+                render_explain_plan(join->left_.get(), depth + 1, out, false);
+                render_explain_plan(join->right_.get(), depth + 1, out, false);
+                break;
+            }
+            const bool inlj = !join->inlj_left_col_.tab_name.empty();
+            out << "Join(type=" << (inlj ? "INLJ" : "NestedLoop")
+                << ", parameterized_inner=" << (inlj ? "true" : "false") << ", tables=["
+                << join_strings(std::move(tables)) << "], condition=["
+                << join_strings(condition_strings(*plan, join->conds_)) << "]";
+            if (inlj) {
+                out << ", outer_key=" << render_tab_col(join->inlj_left_col_)
+                    << ", inner_lookup=" << render_tab_col(join->inlj_right_col_) << ", inner_index=("
+                    << join->inlj_index_col_name_ << ")";
+            }
+            out << ", rows=" << plan->runtime_rows_ << ")\n";
+            render_explain_plan(join->left_.get(), depth + 1, out, true);
+            render_explain_plan(join->right_.get(), depth + 1, out, true);
+            break;
+        }
+        case T_Sort: {
+            if (!plan_observability) {
+                break;
+            }
+            auto sort = static_cast<const SortPlan*>(plan);
+            std::vector<std::string> keys;
+            keys.reserve(sort->order_by_items_.size());
+            for (const auto& item : sort->order_by_items_) {
+                keys.push_back(render_query_expr(item.expr) + (item.is_desc ? " DESC" : " ASC"));
+            }
+            out << "Sort(keys=[" << join_strings(std::move(keys)) << "], top_k=" << sort->limit_
+                << ", rows=" << plan->runtime_rows_ << ")\n";
+            render_explain_plan(sort->subplan_.get(), depth + 1, out, true);
+            break;
+        }
+        case T_Aggregate: {
+            if (!plan_observability) {
+                break;
+            }
+            auto aggregate = static_cast<const AggregatePlan*>(plan);
+            std::vector<std::string> groups;
+            groups.reserve(aggregate->group_by_cols_.size());
+            for (const auto& group : aggregate->group_by_cols_) {
+                groups.push_back(render_tab_col(group));
+            }
+            std::vector<std::string> aggregates;
+            aggregates.reserve(aggregate->agg_exprs_.size());
+            bool min_candidate = false;
+            for (const auto& agg : aggregate->agg_exprs_) {
+                QueryExpr expr;
+                expr.type = QueryExprType::AGGREGATE;
+                expr.agg = agg;
+                aggregates.push_back(render_query_expr(expr));
+                min_candidate =
+                    min_candidate || (agg.type == AggType::MIN && !agg.is_star && aggregate->group_by_cols_.empty() &&
+                                      aggregate->having_conds_.empty() && aggregate->agg_exprs_.size() == 1 &&
+                                      plan_provides_min_order(aggregate->subplan_.get(), agg.col));
+            }
+            out << "Aggregate(group_by=[" << join_strings(std::move(groups)) << "], aggregates=["
+                << join_strings(std::move(aggregates))
+                << "], min_shortcut_plan_candidate=" << (min_candidate ? "true" : "false")
+                << ", rows=" << plan->runtime_rows_ << ")\n";
+            render_explain_plan(aggregate->subplan_.get(), depth + 1, out, true);
+            break;
+        }
+        case T_Limit: {
+            if (!plan_observability) {
+                break;
+            }
+            auto limit = static_cast<const LimitPlan*>(plan);
+            out << "Limit(limit=" << limit->limit_ << ", offset=" << limit->offset_
+                << ", limit_parameter=" << limit->limit_parameter_ordinal_
+                << ", offset_parameter=" << limit->offset_parameter_ordinal_ << ", rows=" << plan->runtime_rows_
+                << ")\n";
+            render_explain_plan(limit->subplan_.get(), depth + 1, out, true);
             break;
         }
         default:
@@ -1148,6 +1326,20 @@ private:
 public:
     Portal(SmManager* sm_manager) : sm_manager_(sm_manager) {}
     ~Portal() {}
+
+    // This deliberately shares the EXPLAIN renderer with the opt-in prepared
+    // statement evidence.  It is never called on EXEC_BATCH.
+    static std::string render_plan_observability(const Plan* plan) {
+        std::ostringstream out;
+        render_explain_plan(plan, 0, out, true);
+        std::string summary = out.str();
+        std::replace(summary.begin(), summary.end(), '\n', ' ');
+        std::replace(summary.begin(), summary.end(), '\t', ' ');
+        while (!summary.empty() && summary.back() == ' ') {
+            summary.pop_back();
+        }
+        return summary;
+    }
 
     std::pair<std::vector<std::string>, std::vector<ColMeta>> inspect_select_plan(Plan* plan, Context* context) {
         if (plan == nullptr || plan->tag != T_select) {

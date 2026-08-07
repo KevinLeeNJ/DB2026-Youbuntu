@@ -40,6 +40,10 @@ TEST(CheckpointOptionsTest, ProductionDefaultTargetIsFourGiB) {
     EXPECT_EQ(options.tick_bytes, 4ULL * 1024 * 1024);
     EXPECT_EQ(options.tick_time_us, 5000u);
     EXPECT_EQ(options.io_quantum_pages, 64u);
+    EXPECT_EQ(options.background_preclean_low_percent, 20u);
+    EXPECT_EQ(options.background_preclean_high_percent, 30u);
+    EXPECT_EQ(options.background_preclean_batch_pages, 32u);
+    EXPECT_EQ(options.background_preclean_max_pages, 512u);
 }
 
 TEST(CheckpointOptionsTest, EnvironmentIsStrictAndClamped) {
@@ -59,6 +63,16 @@ TEST(CheckpointOptionsTest, EnvironmentIsStrictAndClamped) {
     unsetenv("RMDB_CHECKPOINT_TICK_BYTES");
     unsetenv("RMDB_CHECKPOINT_TICK_TIME_US");
     unsetenv("RMDB_CHECKPOINT_IO_QUANTUM_PAGES");
+}
+
+TEST(CheckpointOptionsTest, PrecleanBudgetCapsDebtAndNeverStopsForSlowWal) {
+    EXPECT_EQ(CheckpointManager::compute_background_preclean_budget_for_test(200000, 200000, 20, 32, 512, 0), 512u);
+    EXPECT_EQ(CheckpointManager::compute_background_preclean_budget_for_test(60000, 200000, 20, 512, 512,
+                                                                             80ULL * 1000 * 1000),
+              64u);
+    EXPECT_EQ(CheckpointManager::compute_background_preclean_budget_for_test(150000, 200000, 20, 32, 512,
+                                                                             80ULL * 1000 * 1000),
+              64u);
 }
 
 class ScopedDrainTestDir {
@@ -149,6 +163,59 @@ int64_t AppendBegin(LogManager* log_manager, txn_id_t txn_id) {
     BeginLogRecord record(txn_id);
     log_manager->add_log_to_buffer(&record);
     return log_manager->current_log_offset();
+}
+
+TEST(CheckpointScheduleTest, PrecleanControllerUsesNewWalSamplesAndRecoversAfterFiveHealthySamples) {
+    ScopedDrainTestDir test_dir("checkpoint_preclean_controller_root");
+    DrainTestDb db("checkpoint_preclean_controller_db", false, 128);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    CheckpointOptions options;
+    options.background_preclean_batch_pages = 512;
+    options.background_preclean_max_pages = 512;
+    checkpoint_mgr.SetOptions(options);
+    ASSERT_EQ(MakeDirtyTablePages(&db, 40), 40u);
+
+    db.log_mgr_.set_fdatasync_observation_for_test(1, 80ULL * 1000 * 1000);
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    auto slow = checkpoint_mgr.background_preclean_controller_snapshot_for_test();
+    EXPECT_TRUE(slow.active);
+    EXPECT_EQ(slow.wal_sequence, 1u);
+    EXPECT_EQ(slow.last_budget, 64u);
+
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    auto duplicate = checkpoint_mgr.background_preclean_controller_snapshot_for_test();
+    EXPECT_EQ(duplicate.wal_sequence, 1u);
+    EXPECT_EQ(duplicate.wal_ewma_ns, slow.wal_ewma_ns);
+    EXPECT_EQ(duplicate.healthy_samples, 0u);
+
+    for (uint64_t sequence = 2; sequence <= 6; ++sequence) {
+        db.log_mgr_.set_fdatasync_observation_for_test(sequence, 4ULL * 1000 * 1000);
+        EXPECT_FALSE(checkpoint_mgr.Tick());
+    }
+    const auto recovered = checkpoint_mgr.background_preclean_controller_snapshot_for_test();
+    EXPECT_EQ(recovered.healthy_samples, 5u);
+    EXPECT_EQ(recovered.wal_ewma_ns, 4ULL * 1000 * 1000);
+    EXPECT_EQ(recovered.last_budget, 512u);
+}
+
+TEST(CheckpointScheduleTest, PrecleanControllerKeepsHysteresisUntilLowWatermark) {
+    ScopedDrainTestDir test_dir("checkpoint_preclean_hysteresis_root");
+    DrainTestDb db("checkpoint_preclean_hysteresis_db", false, 64);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    ASSERT_EQ(MakeDirtyTablePages(&db, 20), 20u);
+
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_TRUE(checkpoint_mgr.background_preclean_controller_snapshot_for_test().active);
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 0u);
+    EXPECT_TRUE(checkpoint_mgr.background_preclean_controller_snapshot_for_test().active);
+
+    checkpoint_mgr.force_background_preclean_sample_for_test();
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_FALSE(checkpoint_mgr.background_preclean_controller_snapshot_for_test().active);
 }
 
 } // namespace

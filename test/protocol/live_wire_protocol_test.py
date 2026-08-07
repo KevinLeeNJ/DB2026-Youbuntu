@@ -1509,6 +1509,48 @@ def test_abort_metrics_exact_once(binary):
         server.cleanup()
 
 
+def plan_observability_rows(log_path):
+    with open(log_path, "r", encoding="utf-8") as log_file:
+        return [line for line in log_file if "plan-observability event=prepare" in line]
+
+
+def test_plan_observability_is_prepare_only(binary):
+    server = Server(binary, extra_env={"RMDB_PLAN_OBSERVABILITY": "1"})
+    try:
+        server.start()
+        client = WireClient(server.port)
+        try:
+            client.command("CREATE TABLE plan_observe (id INT, score INT);")
+            client.command("CREATE INDEX plan_observe(id, score);")
+            schemas = client.prepare(
+                [
+                    (
+                        250,
+                        True,
+                        [INT32],
+                        "SELECT score FROM plan_observe WHERE id = $1 ORDER BY score DESC LIMIT 1;",
+                    )
+                ]
+            )
+            parameter_types = {250: [INT32]}
+            client.batch([(250, [1])], parameter_types, schemas)
+            client.batch([(250, [2])], parameter_types, schemas)
+        finally:
+            client.close()
+
+        server.stop()
+        rows = plan_observability_rows(os.path.join(server.root, "rmdb.log"))
+        require(len(rows) == 1, "plan observability must emit once per PREPARE_SET template, not per EXEC_BATCH")
+        row = rows[0]
+        require("statement_id=250" in row and "type=IndexScan" in row, "plan log omitted prepared index route")
+        require("using_index=(id, score)" in row and "direction=backward" in row,
+                "plan log omitted complete index columns or scan direction")
+        require("Limit(limit=1" in row and "Sort(" not in row,
+                "latest-order prepared route did not expose Limit-over-backward-index shape")
+    finally:
+        server.cleanup()
+
+
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
     server = Server(sys.argv[1])
@@ -1533,9 +1575,15 @@ def main():
         test_unique_index_auto_abort_then_sigkill_has_no_residue(server)
         test_abort_ack_then_sigkill_recovers_indexed_undo(server)
     finally:
+        server.stop()
+        require(
+            not plan_observability_rows(os.path.join(server.root, "rmdb.log")),
+            "plan observability must be disabled by default",
+        )
         server.cleanup()
 
     test_abort_metrics_exact_once(sys.argv[1])
+    test_plan_observability_is_prepare_only(sys.argv[1])
 
     print("live Wire v3 server baseline: PASS")
     return 0

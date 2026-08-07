@@ -29,8 +29,9 @@ struct CheckpointOptions {
     size_t io_quantum_pages = 64;
     bool background_preclean_enabled = true;
     uint8_t background_preclean_low_percent = 20;
-    uint8_t background_preclean_high_percent = 40;
-    size_t background_preclean_batch_pages = 128;
+    uint8_t background_preclean_high_percent = 30;
+    size_t background_preclean_batch_pages = 32;
+    size_t background_preclean_max_pages = 512;
 
     // Environment values are strict unsigned decimal; valid out-of-range
     // values are clamped to conservative scheduler limits.
@@ -47,6 +48,27 @@ public:
     bool Tick();
     bool RunIfNeeded();
     void SetOptions(CheckpointOptions options);
+    struct BackgroundPrecleanControllerSnapshot {
+        bool active{false};
+        size_t dirty_pages{0};
+        size_t capacity{0};
+        size_t last_budget{0};
+        uint64_t wal_sequence{0};
+        uint64_t wal_ewma_ns{0};
+        uint8_t healthy_samples{0};
+    };
+    BackgroundPrecleanControllerSnapshot background_preclean_controller_snapshot_for_test() const noexcept {
+        return {background_preclean_active_,         background_preclean_dirty_pages_,
+                background_preclean_capacity_,       background_preclean_last_budget_,
+                background_preclean_wal_sequence_,   background_preclean_wal_ewma_ns_,
+                background_preclean_healthy_samples_};
+    }
+    void force_background_preclean_sample_for_test() noexcept {
+        background_preclean_next_sample_ = {};
+    }
+    static size_t compute_background_preclean_budget_for_test(size_t dirty_pages, size_t capacity, uint8_t low_percent,
+                                                              size_t base_pages, size_t max_pages,
+                                                              uint64_t wal_ewma_ns) noexcept;
 
 private:
     struct FuzzyCheckpointState;
@@ -71,4 +93,10 @@ private:
     int64_t drain_retry_log_offset_{0};
     bool background_preclean_active_{false};
     std::chrono::steady_clock::time_point background_preclean_next_sample_{};
+    size_t background_preclean_dirty_pages_{0};
+    size_t background_preclean_capacity_{0};
+    uint64_t background_preclean_wal_sequence_{0};
+    uint64_t background_preclean_wal_ewma_ns_{0};
+    uint8_t background_preclean_healthy_samples_{0};
+    size_t background_preclean_last_budget_{0};
 };
