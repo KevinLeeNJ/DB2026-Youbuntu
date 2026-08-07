@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -27,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -746,6 +748,10 @@ public:
     // Production construction leaves it empty.
     struct GroupCommitTestOptions {
         std::function<void(std::string_view)> hook;
+        // Called by the fixed depth-two worker immediately before its
+        // fdatasync.  The slot argument makes adversarial ordering tests
+        // deterministic without adding production synchronization.
+        std::function<void(std::string_view, size_t)> sync_slot_hook;
     };
 
     explicit LogManager(DiskManager* disk_manager, DurabilityMode durability_mode = DurabilityMode::STRICT,
@@ -755,11 +761,16 @@ public:
         durability_mode_ = durability_mode;
         wal_flush_metrics_ = wal_flush_metrics;
         group_commit_test_hook_ = std::move(test_options.hook);
+        group_commit_sync_slot_test_hook_ = std::move(test_options.sync_slot_hook);
         const char* leader_rotation = std::getenv("RMDB_WAL_LEADER_ROTATION");
         leader_rotation_enabled_ = leader_rotation == nullptr || WalFlushMetrics::ParseEnabled(leader_rotation);
+        const char* sync_depth = std::getenv("RMDB_WAL_SYNC_DEPTH");
+        wal_sync_depth_two_enabled_ = sync_depth != nullptr && std::strcmp(sync_depth, "2") == 0;
         persist_lsn_.store(INVALID_LSN);
         durable_lsn_ = INVALID_LSN;
     }
+
+    ~LogManager();
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
     lsn_t append_index_smo(const IndexSmoWalData& data);
@@ -840,6 +851,12 @@ public:
     bool leader_rotation_enabled_for_test() const noexcept {
         return leader_rotation_enabled_;
     }
+    bool wal_sync_depth_two_enabled_for_test() const noexcept {
+        return wal_sync_depth_two_enabled_;
+    }
+    bool can_use_sync_pipeline_for_test() const noexcept {
+        return can_use_sync_pipeline();
+    }
 
     // 原子发布重启清单：tmp 文件 + fdatasync + rename + 目录 fsync。
     // checkpoint 必须在截断 WAL *之前* 调用它，见 CheckpointManager::RunCleanCheckpoint()。
@@ -856,6 +873,66 @@ public:
     }
 
 private:
+    // An admitted scheduler can dispatch the fixed fdatasync workers. Reset
+    // and startup truncation close this gate and drain schedulers before
+    // changing the physical WAL epoch.
+    class WalScheduleGuard {
+    public:
+        explicit WalScheduleGuard(LogManager* manager) : manager_(manager), active_(manager->wal_sync_depth_two_enabled_) {
+            if (active_) manager_->enter_wal_schedule();
+        }
+        ~WalScheduleGuard() {
+            if (active_) manager_->leave_wal_schedule();
+        }
+        WalScheduleGuard(const WalScheduleGuard&) = delete;
+        WalScheduleGuard& operator=(const WalScheduleGuard&) = delete;
+
+    private:
+        LogManager* manager_;
+        bool active_;
+    };
+    class WalEpochChangeGuard {
+    public:
+        explicit WalEpochChangeGuard(LogManager* manager)
+            : manager_(manager), active_(manager->wal_sync_depth_two_enabled_), lock_(manager_->wal_schedule_latch_, std::defer_lock) {
+            if (!active_) return;
+            lock_.lock();
+            manager_->wal_schedule_blocked_ = true;
+            manager_->wal_schedule_cv_.wait(lock_, [manager] { return manager->wal_schedulers_ == 0; });
+        }
+        ~WalEpochChangeGuard() {
+            if (!active_) return;
+            manager_->wal_schedule_blocked_ = false;
+            lock_.unlock();
+            manager_->wal_schedule_cv_.notify_all();
+        }
+        WalEpochChangeGuard(const WalEpochChangeGuard&) = delete;
+        WalEpochChangeGuard& operator=(const WalEpochChangeGuard&) = delete;
+
+    private:
+        LogManager* manager_;
+        bool active_;
+        std::unique_lock<std::mutex> lock_;
+    };
+    struct SyncSlot {
+        lsn_t target{INVALID_LSN};
+        std::exception_ptr error;
+        uint64_t elapsed_ns{0};
+        uint64_t requested{0};
+        uint64_t completed{0};
+        uint64_t retired{0};
+        bool pending{false};
+        bool running{false};
+        std::thread worker;
+    };
+    // Issuance order is WAL-prefix order.  A completed request is removed only
+    // after its result has been published, so a recycled slot can never leap
+    // over an older still-running fdatasync.
+    struct PipelineRequest {
+        size_t slot_index{0};
+        uint64_t request{0};
+        lsn_t target{INVALID_LSN};
+    };
     struct CommitWaiter {
         enum class State : uint8_t { Waiting, Promoted, Done };
         lsn_t target_lsn{INVALID_LSN};
@@ -872,7 +949,22 @@ private:
     void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync);
     void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync);
     void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync);
+    void flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& leader_waiter);
+    void notify_covered_followers(const std::shared_ptr<CommitWaiter>& leader_waiter);
+    void ensure_sync_workers();
+    void run_sync_worker(size_t slot_index) noexcept;
+    uint64_t dispatch_sync_slot(size_t slot_index, lsn_t target_lsn);
+    std::exception_ptr wait_sync_slot(size_t slot_index, uint64_t request, uint64_t* elapsed_ns);
+    bool sync_slot_idle(size_t slot_index);
+    void publish_completed_sync_prefix(const std::shared_ptr<CommitWaiter>& leader_waiter, bool wait_for_head);
+    std::exception_ptr drain_sync_pipeline();
+    void stop_sync_workers() noexcept;
+    bool can_use_sync_pipeline() const noexcept;
+    void enter_wal_schedule();
+    void leave_wal_schedule() noexcept;
     void run_group_commit_test_hook(std::string_view point) const;
+    void run_group_commit_sync_slot_test_hook(std::string_view point, size_t slot_index) const;
+    void record_sync_completion(uint64_t elapsed_ns, lsn_t target_lsn, lsn_t durable_before) noexcept;
     void publish_fdatasync_observation(uint64_t elapsed_ns) noexcept;
     uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch, bool durable = true);
 
@@ -883,6 +975,23 @@ private:
     std::condition_variable group_commit_cv_;
     bool group_commit_leader_active_{false};
     std::deque<std::shared_ptr<CommitWaiter>> group_commit_waiters_;
+
+    // Closed by reset/startup truncation. Persistent workers are stopped and
+    // joined by the destructor after the epoch gate has drained schedulers.
+    std::mutex wal_schedule_latch_;
+    std::condition_variable wal_schedule_cv_;
+    bool wal_schedule_blocked_{false};
+    size_t wal_schedulers_{0};
+    // A Linux writeback error can be reported by a later fdatasync.  Once a
+    // depth-two slot observes one, this manager is fail-closed for the WAL
+    // epoch; only construction/recovery creates a fresh epoch.
+    std::exception_ptr wal_sync_poison_;
+    std::mutex sync_slots_latch_;
+    std::condition_variable sync_slots_cv_;
+    std::array<SyncSlot, 2> sync_slots_;
+    std::deque<PipelineRequest> sync_pipeline_requests_;
+    bool sync_workers_started_{false};
+    bool sync_workers_stopping_{false};
 
     std::atomic<lsn_t> global_lsn_{0}; // 全局lsn，递增，用于为每条记录分发lsn
     mutable std::mutex latch_;         // protects active/flushing buffers and WAL metadata
@@ -911,7 +1020,11 @@ private:
     // value) opts into the established legacy group-commit implementation.
     // Cache this once so runtime flushing never reads process configuration.
     bool leader_rotation_enabled_{true};
+    // Exact opt-in only: unset, 1, and malformed values retain the established
+    // depth-one implementation. Segmented WAL always uses depth one.
+    bool wal_sync_depth_two_enabled_{false};
     std::function<void(std::string_view)> group_commit_test_hook_;
+    std::function<void(std::string_view, size_t)> group_commit_sync_slot_test_hook_;
     struct IndexBinding {
         uint64_t generation{0};
         uint64_t epoch{0};

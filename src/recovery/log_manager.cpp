@@ -53,6 +53,30 @@ constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 8;
 constexpr std::chrono::milliseconds GROUP_COMMIT_BATCH_WINDOW{2};
 constexpr std::chrono::milliseconds kSlowWalFdatasyncThreshold{20};
 
+void LogSlowWalWaiter(uint64_t elapsed_ns, const char* role, int slot, uint64_t wave) noexcept {
+    if (elapsed_ns <= 20'000'000) return;
+    struct Aggregate {
+        std::mutex latch;
+        std::chrono::steady_clock::time_point window{};
+        uint64_t count{}, max_ns{};
+    };
+    static Aggregate aggregate;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(aggregate.latch);
+    if (aggregate.window != std::chrono::steady_clock::time_point{} && now - aggregate.window >= std::chrono::seconds(1)) {
+        LOG_WARN("wal-sync-wait-slow count=%llu max_ms=%.3f role=%s wave=%llu slot=%d suppressed=%llu",
+                 static_cast<unsigned long long>(aggregate.count), static_cast<double>(aggregate.max_ns) / 1e6, role,
+                 static_cast<unsigned long long>(wave), slot,
+                 static_cast<unsigned long long>(aggregate.count - 1));
+        aggregate.count = 0;
+        aggregate.max_ns = 0;
+        aggregate.window = now;
+    }
+    if (aggregate.window == std::chrono::steady_clock::time_point{}) aggregate.window = now;
+    ++aggregate.count;
+    aggregate.max_ns = std::max(aggregate.max_ns, elapsed_ns);
+}
+
 void LogSlowWalFdatasync(std::chrono::steady_clock::duration elapsed, int bytes, lsn_t target_lsn,
                          lsn_t durable_before, bool mode_strict) noexcept {
     (void)durable_before;
@@ -213,6 +237,7 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
                 return lsn;
             }
         }
+        WalScheduleGuard schedule_guard(this);
         flush_buffer(false);
     }
 }
@@ -351,12 +376,14 @@ uint64_t LogManager::publish_index_binding_locked(const std::string& index_file_
  * @description: 把日志缓冲区的内容刷到磁盘中，由于目前只设置了一个缓冲区，因此需要阻塞其他日志操作
  */
 void LogManager::flush_log_to_disk() {
+    WalScheduleGuard schedule_guard(this);
     flush_buffer(false);
 }
 
 void LogManager::flush_log_to_disk_with_sync() {
     lsn_t target_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
     if (target_lsn == INVALID_LSN) {
+        WalScheduleGuard schedule_guard(this);
         flush_buffer(true);
         return;
     }
@@ -372,6 +399,7 @@ void LogManager::flush_log_to_disk_up_to_durable(lsn_t target_lsn) {
 }
 
 void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync) {
+    WalScheduleGuard schedule_guard(this);
     if (!leader_rotation_enabled_) {
         flush_log_to_disk_up_to_legacy(target_lsn, require_sync);
         return;
@@ -379,8 +407,341 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
     flush_log_to_disk_up_to_with_leader_rotation(target_lsn, require_sync);
 }
 
+bool LogManager::can_use_sync_pipeline() const noexcept {
+    return wal_sync_depth_two_enabled_ && leader_rotation_enabled_ && disk_manager_ != nullptr &&
+           !disk_manager_->wal_is_segmented();
+}
+
+LogManager::~LogManager() {
+    WalEpochChangeGuard schedule_guard(this);
+    drain_sync_pipeline();
+    stop_sync_workers();
+}
+
+void LogManager::ensure_sync_workers() {
+    std::unique_lock<std::mutex> lock(sync_slots_latch_);
+    if (sync_workers_started_) return;
+    sync_workers_stopping_ = false;
+    size_t started = 0;
+    try {
+        for (; started < sync_slots_.size(); ++started) {
+            sync_slots_[started].worker = std::thread([this, started] { run_sync_worker(started); });
+        }
+        sync_workers_started_ = true;
+    } catch (...) {
+        sync_workers_stopping_ = true;
+        lock.unlock();
+        sync_slots_cv_.notify_all();
+        for (size_t index = 0; index < started; ++index) {
+            if (sync_slots_[index].worker.joinable()) sync_slots_[index].worker.join();
+        }
+        throw;
+    }
+}
+
+void LogManager::run_sync_worker(size_t slot_index) noexcept {
+    for (;;) {
+        lsn_t target = INVALID_LSN;
+        uint64_t request = 0;
+        {
+            std::unique_lock<std::mutex> lock(sync_slots_latch_);
+            sync_slots_cv_.wait(lock, [this, slot_index] {
+                return sync_workers_stopping_ || sync_slots_[slot_index].pending;
+            });
+            if (sync_workers_stopping_) return;
+            SyncSlot& slot = sync_slots_[slot_index];
+            target = slot.target;
+            request = slot.requested;
+            slot.pending = false;
+            slot.running = true;
+        }
+        std::exception_ptr error;
+        const auto begin = std::chrono::steady_clock::now();
+        try {
+            run_group_commit_test_hook("sync_slot_before_fsync");
+            run_group_commit_sync_slot_test_hook("sync_slot_before_fsync", slot_index);
+            disk_manager_->fsync_log();
+            // Test-only observation point: it is reached only after the
+            // physical sync returned. An injected exception is intentionally
+            // handled as this slot's synchronization failure.
+            run_group_commit_sync_slot_test_hook("sync_slot_after_fsync", slot_index);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+        {
+            std::lock_guard<std::mutex> lock(sync_slots_latch_);
+            SyncSlot& slot = sync_slots_[slot_index];
+            // A request is never replaced until its waiter consumes it.
+            assert(slot.requested == request && slot.target == target);
+            slot.error = error;
+            slot.elapsed_ns = elapsed_ns;
+            slot.completed = request;
+            slot.running = false;
+        }
+        sync_slots_cv_.notify_all();
+    }
+}
+
+uint64_t LogManager::dispatch_sync_slot(size_t slot_index, lsn_t target_lsn) {
+    std::unique_lock<std::mutex> lock(sync_slots_latch_);
+    SyncSlot& slot = sync_slots_[slot_index];
+    sync_slots_cv_.wait(lock, [&slot] {
+        return !slot.pending && !slot.running && slot.completed == slot.requested && slot.retired == slot.requested;
+    });
+    slot.target = target_lsn;
+    slot.error = nullptr;
+    const uint64_t request = ++slot.requested;
+    slot.pending = true;
+    lock.unlock();
+    sync_slots_cv_.notify_all();
+    return request;
+}
+
+bool LogManager::sync_slot_idle(size_t slot_index) {
+    std::lock_guard<std::mutex> lock(sync_slots_latch_);
+    const SyncSlot& slot = sync_slots_[slot_index];
+    return !slot.pending && !slot.running && slot.completed == slot.requested && slot.retired == slot.requested;
+}
+
+std::exception_ptr LogManager::wait_sync_slot(size_t slot_index, uint64_t request, uint64_t* elapsed_ns) {
+    std::unique_lock<std::mutex> lock(sync_slots_latch_);
+    SyncSlot& slot = sync_slots_[slot_index];
+    sync_slots_cv_.wait(lock, [&slot, request] { return slot.completed >= request; });
+    if (elapsed_ns != nullptr) *elapsed_ns = slot.elapsed_ns;
+    return slot.error;
+}
+
+void LogManager::publish_completed_sync_prefix(const std::shared_ptr<CommitWaiter>& leader_waiter,
+                                               bool wait_for_head) {
+    for (;;) {
+        PipelineRequest head;
+        {
+            std::unique_lock<std::mutex> lock(sync_slots_latch_);
+            if (sync_pipeline_requests_.empty()) return;
+            head = sync_pipeline_requests_.front();
+            SyncSlot& slot = sync_slots_[head.slot_index];
+            if (!wait_for_head && slot.completed < head.request) return;
+            sync_slots_cv_.wait(lock, [&slot, &head] { return slot.completed >= head.request; });
+            // dispatch cannot reuse a slot while its request remains in this
+            // queue, so the copied result is stable until we pop it below.
+            if (slot.error != nullptr) {
+                const std::exception_ptr error = slot.error;
+                lock.unlock();
+                (void)drain_sync_pipeline();
+                {
+                    std::lock_guard<std::mutex> schedule_lock(wal_schedule_latch_);
+                    if (wal_sync_poison_ == nullptr) wal_sync_poison_ = error;
+                }
+                std::rethrow_exception(error);
+            }
+            const uint64_t elapsed_ns = slot.elapsed_ns;
+            slot.retired = head.request;
+            sync_pipeline_requests_.pop_front();
+            lock.unlock();
+            record_sync_completion(elapsed_ns, head.target, durable_lsn_.load(std::memory_order_acquire));
+        }
+        lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+        while (durable < head.target &&
+               !durable_lsn_.compare_exchange_weak(durable, head.target, std::memory_order_release,
+                                                   std::memory_order_acquire)) {
+        }
+        notify_covered_followers(leader_waiter);
+        // Continue without blocking: all already-completed prefix requests are
+        // published immediately, but an unfinished next request is the exact
+        // ordering boundary for a sliding two-slot pipeline.
+        wait_for_head = false;
+    }
+}
+
+std::exception_ptr LogManager::drain_sync_pipeline() {
+    std::exception_ptr first_error;
+    for (;;) {
+        PipelineRequest head;
+        {
+            std::lock_guard<std::mutex> lock(sync_slots_latch_);
+            if (sync_pipeline_requests_.empty()) return first_error;
+            head = sync_pipeline_requests_.front();
+        }
+        uint64_t elapsed_ns = 0;
+        const std::exception_ptr error = wait_sync_slot(head.slot_index, head.request, &elapsed_ns);
+        record_sync_completion(elapsed_ns, head.target, durable_lsn_.load(std::memory_order_acquire));
+        if (first_error == nullptr && error != nullptr) first_error = error;
+        std::lock_guard<std::mutex> lock(sync_slots_latch_);
+        if (!sync_pipeline_requests_.empty() && sync_pipeline_requests_.front().request == head.request &&
+            sync_pipeline_requests_.front().slot_index == head.slot_index) {
+            sync_slots_[head.slot_index].retired = head.request;
+            sync_pipeline_requests_.pop_front();
+        }
+    }
+}
+
+void LogManager::stop_sync_workers() noexcept {
+    std::unique_lock<std::mutex> lock(sync_slots_latch_);
+    if (!sync_workers_started_) return;
+    sync_workers_stopping_ = true;
+    lock.unlock();
+    sync_slots_cv_.notify_all();
+    for (auto& slot : sync_slots_) {
+        if (slot.worker.joinable()) slot.worker.join();
+    }
+}
+
+void LogManager::enter_wal_schedule() {
+    std::unique_lock<std::mutex> lock(wal_schedule_latch_);
+    wal_schedule_cv_.wait(lock, [this] { return !wal_schedule_blocked_; });
+    if (wal_sync_poison_ != nullptr) std::rethrow_exception(wal_sync_poison_);
+    ++wal_schedulers_;
+    lock.unlock();
+    // Test-only hook is deliberately outside wal_schedule_latch_: adversarial
+    // tests can hold a pre-admitted caller without extending the production
+    // scheduler critical section.
+    run_group_commit_test_hook("wal_schedule_entered");
+}
+
+void LogManager::leave_wal_schedule() noexcept {
+    std::lock_guard<std::mutex> lock(wal_schedule_latch_);
+    assert(wal_schedulers_ != 0);
+    --wal_schedulers_;
+    if (wal_schedulers_ == 0) wal_schedule_cv_.notify_all();
+}
+
 void LogManager::run_group_commit_test_hook(std::string_view point) const {
     if (group_commit_test_hook_) group_commit_test_hook_(point);
+}
+
+void LogManager::run_group_commit_sync_slot_test_hook(std::string_view point, size_t slot_index) const {
+    if (group_commit_sync_slot_test_hook_) group_commit_sync_slot_test_hook_(point, slot_index);
+}
+
+void LogManager::record_sync_completion(uint64_t elapsed_ns, lsn_t target_lsn, lsn_t durable_before) noexcept {
+    publish_fdatasync_observation(elapsed_ns);
+    if (wal_flush_metrics_ != nullptr && wal_flush_metrics_->enabled()) {
+        wal_flush_metrics_->record_fdatasync(elapsed_ns);
+    }
+    LogSlowWalFdatasync(std::chrono::nanoseconds(elapsed_ns), 0, target_lsn, durable_before, true);
+}
+
+void LogManager::notify_covered_followers(const std::shared_ptr<CommitWaiter>& leader_waiter) {
+    const lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+    std::vector<std::shared_ptr<CommitWaiter>> notify;
+    {
+        std::lock_guard<std::mutex> group_lock(group_commit_latch_);
+        for (auto it = group_commit_waiters_.begin(); it != group_commit_waiters_.end();) {
+            if (*it != leader_waiter && (*it)->require_sync && (*it)->target_lsn <= durable) {
+                (*it)->state = CommitWaiter::State::Done;
+                notify.push_back(*it);
+                it = group_commit_waiters_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (wal_flush_metrics_ != nullptr && wal_flush_metrics_->enabled() && !notify.empty()) {
+        wal_flush_metrics_->record_completed_batch(notify.size());
+    }
+    for (const auto& waiter : notify) waiter->cv.notify_one();
+}
+
+void LogManager::flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& leader_waiter) {
+    {
+        std::lock_guard<std::mutex> lock(wal_schedule_latch_);
+        if (wal_sync_poison_ != nullptr) std::rethrow_exception(wal_sync_poison_);
+    }
+    ensure_sync_workers();
+    size_t launched = 0;
+    try {
+        // First publish every completed contiguous prefix left by the prior
+        // owner.  This is what lets a slot be recycled immediately while its
+        // sibling is still in fdatasync.
+        publish_completed_sync_prefix(leader_waiter, false);
+        for (;;) {
+            size_t idle_slot = sync_slots_.size();
+            for (size_t index = 0; index < sync_slots_.size(); ++index) {
+                if (sync_slot_idle(index)) {
+                    idle_slot = index;
+                    break;
+                }
+            }
+            if (idle_slot == sync_slots_.size()) break;
+            flush_buffer(false);
+            const lsn_t target = persist_lsn_.load(std::memory_order_acquire);
+            lsn_t tail = durable_lsn_.load(std::memory_order_acquire);
+            {
+                std::lock_guard<std::mutex> lock(sync_slots_latch_);
+                if (!sync_pipeline_requests_.empty()) tail = sync_pipeline_requests_.back().target;
+            }
+            if (target == INVALID_LSN || target <= tail) break;
+            const uint64_t request = dispatch_sync_slot(idle_slot, target);
+            {
+                std::lock_guard<std::mutex> lock(sync_slots_latch_);
+                sync_pipeline_requests_.push_back({idle_slot, request, target});
+            }
+            ++launched;
+        }
+    } catch (...) {
+        const std::exception_ptr error = std::current_exception();
+        const std::exception_ptr sync_error = drain_sync_pipeline();
+        if (wal_flush_metrics_ != nullptr && wal_flush_metrics_->enabled()) {
+            wal_flush_metrics_->record_sync_depth_two_wave(launched);
+        }
+        if (sync_error != nullptr) {
+            std::lock_guard<std::mutex> lock(wal_schedule_latch_);
+            if (wal_sync_poison_ == nullptr) wal_sync_poison_ = sync_error;
+            std::rethrow_exception(sync_error);
+        }
+        std::rethrow_exception(error);
+    }
+    if (wal_flush_metrics_ != nullptr && wal_flush_metrics_->enabled()) {
+        wal_flush_metrics_->record_sync_depth_two_wave(launched);
+        static std::atomic<uint64_t> last_depth_two_report_ns{0};
+        const uint64_t now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t previous = last_depth_two_report_ns.load(std::memory_order_relaxed);
+        if (now_ns - previous >= 1'000'000'000 &&
+            last_depth_two_report_ns.compare_exchange_strong(previous, now_ns, std::memory_order_relaxed)) {
+            const auto snapshot = wal_flush_metrics_->snapshot();
+            LOG_INFO("wal-sync-depth2 waves=%llu max_inflight=%llu fdatasync_count=%llu",
+                     static_cast<unsigned long long>(snapshot.sync_depth_two_waves),
+                     static_cast<unsigned long long>(snapshot.sync_depth_two_max_inflight),
+                     static_cast<unsigned long long>(snapshot.fdatasync.count));
+        }
+    }
+
+    // Block only until this leader's target is in the successful prefix. The
+    // other slot may stay in flight; the promoted owner will continue from it.
+    while (durable_lsn_.load(std::memory_order_acquire) < leader_waiter->target_lsn) {
+        publish_completed_sync_prefix(leader_waiter, true);
+    }
+    // A physical owner may hand the unfinished tail to an already-enqueued
+    // uncovered waiter.  If there is no such baton, retain the established
+    // drain/error boundary: a latent slot failure must reach this caller
+    // before it returns.
+    bool has_baton = false;
+    {
+        std::lock_guard<std::mutex> lock(group_commit_latch_);
+        const lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+        for (const auto& pending : group_commit_waiters_) {
+            if (pending != leader_waiter && pending->require_sync && pending->target_lsn > durable) {
+                has_baton = true;
+                break;
+            }
+        }
+    }
+    if (!has_baton) {
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(sync_slots_latch_);
+                if (sync_pipeline_requests_.empty()) break;
+            }
+            publish_completed_sync_prefix(leader_waiter, true);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(wal_schedule_latch_);
+        if (wal_sync_poison_ != nullptr) std::rethrow_exception(wal_sync_poison_);
+    }
 }
 
 void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync) {
@@ -433,9 +794,11 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
                 metrics->record_follower_request();
                 const auto wait_begin = std::chrono::steady_clock::now();
                 waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
-                metrics->record_follower_wait(static_cast<uint64_t>(
+                const uint64_t elapsed_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
-                        .count()));
+                        .count());
+                metrics->record_follower_wait(elapsed_ns);
+                LogSlowWalWaiter(elapsed_ns, "follower", -1, 0);
             } else {
                 waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
             }
@@ -574,9 +937,11 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                 waiter->cv.wait(group_lock, [&waiter] {
                     return waiter->state == CommitWaiter::State::Done || waiter->state == CommitWaiter::State::Promoted;
                 });
-                metrics->record_follower_wait(static_cast<uint64_t>(
+                const uint64_t elapsed_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
-                        .count()));
+                        .count());
+                metrics->record_follower_wait(elapsed_ns);
+                LogSlowWalWaiter(elapsed_ns, "follower", -1, 0);
             } else {
                 waiter->cv.wait(group_lock, [&waiter] {
                     return waiter->state == CommitWaiter::State::Done || waiter->state == CommitWaiter::State::Promoted;
@@ -610,7 +975,13 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                         .count()));
             }
             run_group_commit_test_hook("rotation_before_flush");
-            flush_buffer(sync_batch);
+            if (sync_batch && can_use_sync_pipeline()) {
+                // Keep waiter batching and FIFO leader rotation intact.  Only
+                // this leader's physical stabilization wave changes depth.
+                flush_two_sync_batches(waiter);
+            } else {
+                flush_buffer(sync_batch);
+            }
             ++batches;
         } catch (...) {
             const auto error = std::current_exception();
@@ -840,6 +1211,8 @@ void LogManager::flush_buffer(bool sync) {
 
 void LogManager::prepare_existing_log() {
     std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
+    WalEpochChangeGuard schedule_guard(this);
+    drain_sync_pipeline();
     std::lock_guard<std::mutex> lock(latch_);
     log_buffer_->offset_ = 0;
     flushing_buffer_->offset_ = 0;
@@ -910,6 +1283,8 @@ bool LogManager::startup_is_prepared() const {
 void LogManager::finalize_existing_log(int64_t accepted_end_offset, lsn_t max_lsn,
                                        const std::vector<std::pair<std::string, uint64_t>>& index_bindings) {
     std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
+    WalEpochChangeGuard schedule_guard(this);
+    drain_sync_pipeline();
     std::lock_guard<std::mutex> lock(latch_);
     if (!startup_prepared_ || accepted_end_offset < 0 || accepted_end_offset > prepared_file_size_) {
         throw InternalError("invalid WAL startup finalization; WAL retained");
@@ -936,6 +1311,8 @@ void LogManager::initialize_from_existing_log() {
     // Match the binding-sensitive append order. Startup is normally
     // single-threaded, but keeping one order makes later reuse safe too.
     std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
+    WalEpochChangeGuard schedule_guard(this);
+    drain_sync_pipeline();
     std::lock_guard<std::mutex> lock(latch_);
     log_buffer_->offset_ = 0;
     flushing_buffer_->offset_ = 0;
@@ -1072,6 +1449,11 @@ void LogManager::initialize_from_existing_log() {
 void LogManager::reset_log(lsn_t next_lsn) {
     // Ensure active WAL is written and durable before truncation.
     flush_log_to_disk_with_sync();
+    // Close admission before observing empty buffers.  This gate remains held
+    // through truncate and epoch publication, so an old depth-two worker can
+    // neither survive the reset nor advance the new epoch afterwards.
+    WalEpochChangeGuard schedule_guard(this);
+    drain_sync_pipeline();
     std::unique_lock<std::mutex> lock(latch_);
     // flush_buffer releases latch_ before its pwrite/fsync, so holding latch_
     // is not enough. Truncating while a write is in flight would let that

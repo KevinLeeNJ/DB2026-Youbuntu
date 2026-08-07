@@ -78,6 +78,15 @@ RmRecord MakeWideTuple(int id, char fill) {
     return rec;
 }
 
+RmRecord MakeSegmentTuple(int id, char fill) {
+    constexpr int kPayloadBytes = 2000;
+    RmRecord rec(static_cast<int>(sizeof(int)) + kPayloadBytes + null_bitmap_bytes(2));
+    memset(rec.data, fill, static_cast<size_t>(rec.size));
+    memcpy(rec.data, &id, sizeof(int));
+    rec.data[rec.size - 1] = 0;
+    return rec;
+}
+
 std::vector<char> MakeIntKey(int value) {
     std::vector<char> key(sizeof(int));
     memcpy(key.data(), &value, sizeof(int));
@@ -113,6 +122,19 @@ void CreateWideRecoveryTestDb(const std::string& db_name) {
     sm_mgr.create_db(db_name);
     sm_mgr.open_db(db_name);
     sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"padding", TYPE_STRING, 128}}, nullptr);
+    sm_mgr.create_index("t", {"id"}, nullptr);
+    sm_mgr.close_db();
+}
+
+void CreateSegmentRecoveryTestDb(const std::string& db_name) {
+    DiskManager disk;
+    BufferPoolManager bpm(64, &disk);
+    RmManager rm_mgr(&disk, &bpm);
+    IxManager ix_mgr(&disk, &bpm);
+    SmManager sm_mgr(&disk, &bpm, &rm_mgr, &ix_mgr);
+    sm_mgr.create_db(db_name);
+    sm_mgr.open_db(db_name);
+    sm_mgr.create_table("t", {{"id", TYPE_INT, sizeof(int)}, {"payload", TYPE_STRING, 2000}}, nullptr);
     sm_mgr.create_index("t", {"id"}, nullptr);
     sm_mgr.close_db();
 }
@@ -487,6 +509,40 @@ TEST(RecoveryManagerTest, MultipleIndexSmoRecordsPrepareEachIndexOnlyOnce) {
 
     OpenRecoveryDb db(db_name);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 19, rid));
+}
+
+TEST(RecoveryManagerTest, InvalidWorkerConfigurationJoinsConcurrentIndexSmoBeforeThrowing) {
+    ScopedTestDir test_dir("recovery_invalid_workers_with_smo_root");
+    const std::string db_name = "recovery_invalid_workers_with_smo_db";
+    CreateRecoveryTestDb(db_name);
+    PrepareSinglePageIndexSmo(db_name, 29, Rid{1, 29}, false, true);
+
+    OpenRecoveryDb db(db_name);
+    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    ASSERT_GT(wal_size, 0);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    struct EnvGuard {
+        EnvGuard() {
+            const char* value = getenv("RMDB_RECOVERY_WORKERS");
+            if (value != nullptr) {
+                had_previous = true;
+                previous = value;
+            }
+        }
+        ~EnvGuard() {
+            if (had_previous) {
+                setenv("RMDB_RECOVERY_WORKERS", previous.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+        bool had_previous{false};
+        std::string previous;
+    } env_guard;
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "invalid", 1), 0);
+    EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
 }
 
 TEST(RecoveryManagerTest, InterleavedIndexSmoCoalescesEachIndexIndependently) {
@@ -1818,6 +1874,141 @@ TEST(RecoveryManagerTest, RedoRoutesEachRecordToTheTableItNames) {
     }
 }
 
+TEST(RecoveryManagerTest, RecoveryWorkersOneAndAutoKeepTableAndIndexResultsIdentical) {
+    ScopedTestDir test_dir("recovery_workers_deterministic_root");
+    const std::string single_worker_db = "recovery_workers_single";
+    const std::string auto_worker_db = "recovery_workers_auto";
+    CreateRecoveryTestDb(single_worker_db, {"t", "u"});
+    const Rid rid{1, 0};
+    auto t_rec = MakeTuple(101, 1001);
+    auto u_rec = MakeTuple(202, 2002);
+    {
+        OpenRecoveryDb db(single_worker_db);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, t_rec, "t");
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, u_rec, "u");
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+    std::filesystem::copy(single_worker_db, auto_worker_db, std::filesystem::copy_options::recursive);
+
+    struct EnvGuard {
+        ~EnvGuard() {
+            unsetenv("RMDB_RECOVERY_WORKERS");
+        }
+    } env_guard;
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "1", 1), 0);
+    RunRecovery(single_worker_db);
+    ASSERT_EQ(unsetenv("RMDB_RECOVERY_WORKERS"), 0);
+    RunRecovery(auto_worker_db);
+
+    for (const std::string& db_name : {single_worker_db, auto_worker_db}) {
+        OpenRecoveryDb db(db_name);
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid, "t"));
+        EXPECT_EQ(RecordId(db.sm_mgr_, rid, "t"), 101);
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid, "t"), 1001);
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 101, rid, "t"));
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid, "u"));
+        EXPECT_EQ(RecordId(db.sm_mgr_, rid, "u"), 202);
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid, "u"), 2002);
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 202, rid, "u"));
+    }
+}
+
+TEST(RecoveryManagerTest, CrossTaskRangeIndexKeyCollectionMatchesWorkersOneAndFour) {
+    ScopedTestDir test_dir("recovery_cross_segment_keys_root");
+    const std::string single_worker_db = "recovery_cross_segment_single";
+    const std::string four_worker_db = "recovery_cross_segment_four";
+    const std::string fallback_db = "recovery_cross_segment_fallback";
+    const std::string mutation_db = "recovery_cross_segment_mutation";
+    CreateSegmentRecoveryTestDb(single_worker_db);
+    const Rid rid{1, 0};
+    constexpr int kUpdates = 10000; // > 17 MiB of full-row UPDATE WAL.
+    {
+        OpenRecoveryDb db(single_worker_db);
+        auto initial = MakeSegmentTuple(1, 'a');
+        ASSERT_EQ(db.sm_mgr_.fhs_.at("t")->insert_record(initial.data, nullptr), rid);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 100);
+        auto before = initial;
+        for (int value = 2; value < kUpdates + 2; ++value) {
+            auto after = MakeSegmentTuple(value, static_cast<char>('a' + value % 19));
+            lsn = AppendUpdate(*db.log_mgr_, 100, lsn, rid, before, after);
+            before = std::move(after);
+        }
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+        ASSERT_GT(db.disk_.get_file_size(LOG_FILE_NAME), 17LL * 1024 * 1024);
+    }
+    std::filesystem::copy(single_worker_db, four_worker_db, std::filesystem::copy_options::recursive);
+    std::filesystem::copy(single_worker_db, fallback_db, std::filesystem::copy_options::recursive);
+    std::filesystem::copy(single_worker_db, mutation_db, std::filesystem::copy_options::recursive);
+
+    struct RecoveryStats {
+        uint64_t probes;
+        uint64_t mutations;
+        uint64_t unchanged;
+    };
+    const char* previous_workers_value = getenv("RMDB_RECOVERY_WORKERS");
+    const bool had_previous_workers = previous_workers_value != nullptr;
+    const std::string previous_workers = had_previous_workers ? previous_workers_value : "";
+    struct WorkersEnvGuard {
+        bool had_previous;
+        std::string previous;
+        ~WorkersEnvGuard() {
+            if (had_previous) {
+                setenv("RMDB_RECOVERY_WORKERS", previous.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+    } workers_env_guard{had_previous_workers, previous_workers};
+    const auto recover = [](const std::string& db_name, const char* workers, size_t scratch_limit = 0) {
+        if (setenv("RMDB_RECOVERY_WORKERS", workers, 1) != 0) {
+            throw std::runtime_error("setenv RMDB_RECOVERY_WORKERS failed");
+        }
+        OpenRecoveryDb db(db_name);
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.set_index_key_parallel_scratch_limit_for_test(scratch_limit);
+        recovery.analyze();
+        recovery.redo();
+        recovery.undo();
+        return RecoveryStats{recovery.get_index_probe_count(), recovery.get_index_mutation_count(),
+                             recovery.get_index_unchanged_key_count()};
+    };
+    const RecoveryStats single = recover(single_worker_db, "1");
+    const RecoveryStats four = recover(four_worker_db, "4");
+    const RecoveryStats fallback = recover(fallback_db, "4", 1);
+    ASSERT_EQ(unsetenv("RMDB_RECOVERY_WORKERS"), 0);
+
+    EXPECT_EQ(single.probes, four.probes);
+    EXPECT_EQ(single.mutations, four.mutations);
+    EXPECT_EQ(single.unchanged, four.unchanged);
+    EXPECT_EQ(single.probes, fallback.probes);
+    EXPECT_EQ(single.mutations, fallback.mutations);
+    EXPECT_EQ(single.unchanged, fallback.unchanged);
+    for (const std::string& db_name : {single_worker_db, four_worker_db, fallback_db}) {
+        OpenRecoveryDb db(db_name);
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+        EXPECT_EQ(RecordId(db.sm_mgr_, rid), kUpdates + 1);
+        EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, kUpdates + 1, rid));
+        EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+    }
+
+    OpenRecoveryDb mutated(mutation_db);
+    RecoveryManager recovery(&mutated.disk_, &mutated.bpm_, &mutated.sm_mgr_, mutated.log_mgr_.get());
+    recovery.analyze();
+    recovery.redo();
+    const auto update_offsets = WalRecordOffsets(mutated.disk_, LogType::UPDATE);
+    ASSERT_GT(update_offsets.size(), 9000u);
+    const auto offset = update_offsets[9000];
+    ASSERT_GT(offset, 16LL * 1024 * 1024);
+    const int replacement_id = -999;
+    PatchWalBytes(LOG_FILE_NAME, offset + OFFSET_LOG_DATA, &replacement_id, sizeof(replacement_id));
+    const int64_t wal_size = mutated.disk_.get_file_size(LOG_FILE_NAME);
+    EXPECT_THROW(recovery.undo(), InternalError);
+    EXPECT_EQ(mutated.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+}
+
 // The WAL file is immutable between analyze and redo in production. If it does
 // change, the descriptor must fail closed instead of shifting positional table
 // metadata onto a different DML record.
@@ -1840,10 +2031,13 @@ TEST(RecoveryManagerTest, WalMutationAfterAnalyzeFailsClosed) {
     recovery.analyze();
     const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
     ASSERT_EQ(dml_offsets.size(), 2u);
+    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    ASSERT_GT(wal_size, 0);
     const LogType retyped = LogType::CHECKPOINT;
     PatchWalBytes(LOG_FILE_NAME, dml_offsets[0] + OFFSET_LOG_TYPE, &retyped, sizeof(LogType));
 
     EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "t"));
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "u"));
 }

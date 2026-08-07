@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <atomic>
+
 #include <assert.h>
 
 #include <array>
@@ -180,6 +182,9 @@ private:
     int fd_;             // 打开文件后产生的文件句柄
     RmFileHdr file_hdr_; // 文件头，维护当前表文件的元数据
     std::mutex free_space_latch_;
+    std::mutex free_space_init_latch_;
+    enum class FreeSpaceInitState : uint8_t { Uninitialized, DurableHintLoaded, BitmapAuthoritative };
+    std::atomic<FreeSpaceInitState> free_space_init_state_{FreeSpaceInitState::Uninitialized};
     std::mutex extension_latch_;
     mutable std::mutex file_header_latch_;
     std::vector<page_id_t> free_page_candidates_;
@@ -288,6 +293,16 @@ public:
     // and advances the allocation boundary when a touched RID references a
     // page that was allocated before its file-header update reached disk.
     void repair_file_header_for_pages(const std::vector<page_id_t>& page_nos);
+
+    // Ignores persisted free-list hints and rebuilds the complete process-local
+    // candidate set from physical page bitmaps before recovery mutates pages.
+    void prepare_recovery_free_space();
+
+    // Final recovery pass for WAL-touched pages. It advances a stale file
+    // boundary, removes rolled-back tombstones, normalizes every surviving
+    // tuple's MVCC state, recounts the bitmap, and reconciles the free-page
+    // candidate exactly once while the page is exclusively latched.
+    void finalize_recovery_pages(const std::vector<page_id_t>& page_nos);
 
     // MVCC: get TupleMeta for a slot
     TupleMeta get_tuple_meta(const Rid& rid) const;
@@ -444,6 +459,7 @@ private:
     RmPageHandle create_new_page_handle_unlocked();
 
     void release_page_handle(RmPageHandle& page_handle);
+    void ensure_free_space_candidates();
     void add_free_page_candidate(page_id_t page_no);
     void remove_free_page_candidate(page_id_t page_no, page_id_t next_free_page_no);
     std::optional<page_id_t> select_free_page_candidate();

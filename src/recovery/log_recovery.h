@@ -82,6 +82,11 @@ public:
     void set_index_smo_redo_test_hook(IndexSmoRedoTestHook hook) {
         index_smo_redo_test_hook_ = std::move(hook);
     }
+    // Test-only bounded-output override for exercising the verified-stream
+    // fallback; zero keeps the production limit.
+    void set_index_key_parallel_scratch_limit_for_test(size_t bytes) noexcept {
+        index_key_parallel_scratch_limit_for_test_ = bytes;
+    }
 
     // Record-level counters for the recovery report. Recovery is single
     // threaded, so plain integers are enough. Heap redo deliberately contains
@@ -292,7 +297,18 @@ private:
         lsn_t lsn{INVALID_LSN};
         txn_id_t txn_id{INVALID_TXN_ID};
         lsn_t prev_lsn{INVALID_LSN};
+        // The prefix checksum excludes INDEX_SMO's stored trailing CRC. It
+        // binds the complete analyzed record while still detecting a payload
+        // rewrite whose trailing CRC was recomputed.
         uint32_t record_checksum{0};
+        uint32_t payload_checksum{0}; // stored INDEX_SMO trailing CRC accepted by analyze()
+        // analyze() has already parsed and validated this immutable metadata.
+        // Keeping the compact page-number catalogue avoids parsing every large
+        // SMO image a second time just to decide latest-wins during redo.
+        std::string index_name;
+        uint64_t index_generation{0};
+        uint32_t page_catalog_begin{0};
+        uint32_t page_count{0};
     };
 
     // One (key, rid) pair the index repair has to reconcile. `key_slot` indexes
@@ -301,6 +317,15 @@ private:
         uint32_t key_slot{0};
         Rid rid{};
         bool from_heap{false}; // true: must be present afterwards
+    };
+
+    // Analyze records immutable WAL-aligned ranges for the later key scan.
+    // They hold only record boundaries and DML identity, never WAL payloads.
+    struct IndexKeyStreamSegment {
+        int64_t begin{0};
+        int64_t end{0};
+        uint64_t identity{0};
+        uint32_t dml_records{0};
     };
 
     // Reconciliation plan for all keys of one index. index_meta and index are
@@ -313,6 +338,17 @@ private:
         int key_len{0};
         std::vector<char> key_arena;
         std::vector<IndexRepairEntry> entries;
+    };
+
+    // Index repair phases run independently per index. Keep their counters
+    // worker-local and merge after every worker has joined; recovery metrics
+    // are otherwise ordinary integers rather than synchronization primitives.
+    struct IndexRepairMetrics {
+        uint64_t probes{0};
+        uint64_t mutations{0};
+        uint64_t unchanged_keys{0};
+        uint64_t duplicate_entries{0};
+        uint64_t parent_pointer_repairs{0};
     };
 
     // Everything the apply phases need about one table, resolved once per
@@ -340,6 +376,7 @@ private:
     }
     const WalRecordLocation* location_of_lsn(lsn_t lsn) const;
     void build_touched_index();
+    void finalize_touched_pages();
     WalRecordView mapped_heap_redo_record(const HeapRedoRecord& location, const char* record_bytes) const;
 
     // Guards against a corrupt RID reaching the record layer. The WAL carries
@@ -403,10 +440,10 @@ private:
     // root->leaf descent path of every distinct repair key, repairing parent back
     // pointers in place. Returns false when the index must be rebuilt from the
     // heap. Requires sort_index_repair_entries() to have run on the plan.
-    bool gate_index_change_set(IndexRepairPlan* plan, RecoveryIndexGate::Stats* totals);
+    bool gate_index_change_set(IndexRepairPlan* plan, RecoveryIndexGate::Stats* totals, IndexRepairMetrics* metrics);
     // Applies one index's plan; returns false when the index must be rebuilt.
     // Requires sort_index_repair_entries() to have run on the plan.
-    bool apply_index_repair_plan(IndexRepairPlan* plan);
+    bool apply_index_repair_plan(IndexRepairPlan* plan, IndexRepairMetrics* metrics);
     void rebuild_indexes(const std::unordered_set<std::string>& index_names);
     void reset_wal_if_needed();
 
@@ -425,10 +462,14 @@ private:
     // so the streaming fallback cannot silently use a changed/truncated WAL.
     uint64_t index_key_stream_identity_{0};
     uint64_t index_key_stream_records_{0};
+    std::vector<IndexKeyStreamSegment> index_key_stream_segments_;
+    bool index_key_stream_segments_complete_{true};
+    size_t index_key_parallel_scratch_limit_for_test_{0};
     // txn id -> most recent descriptor index plus one. Descriptor links carry
     // the rest of each transaction's chain in 24 bytes per DML.
     std::unordered_map<txn_id_t, uint32_t> heap_redo_txn_heads_;
     std::vector<IndexSmoRecord> index_smo_records_; // WAL order, no third full scan
+    std::vector<page_id_t> index_smo_page_catalog_; // flat, descriptor-addressed SMO page numbers
     // A delta cannot safely patch a tuple still owned by any active loser: the
     // page does not identify which WAL version supplied its unchanged bytes.
     // Keep the committed delta descriptors in WAL order until loser undo. A

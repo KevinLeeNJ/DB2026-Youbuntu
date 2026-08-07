@@ -167,6 +167,7 @@ void RmFileHandle::copy_records_with_meta_batch(const std::vector<RmBatchReadReq
  * @return {Rid} 插入的记录的记录号（位置）
  */
 Rid RmFileHandle::insert_record(char* buf, Context* context) {
+    ensure_free_space_candidates();
     (void)context;
     auto prepared = prepare_insert_record();
     Rid rid = prepared.rid;
@@ -175,6 +176,7 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
 }
 
 RmPinnedInsert RmFileHandle::prepare_insert_record() {
+    ensure_free_space_candidates();
     for (;;) {
         RmPageHandle page_handle;
         auto candidate = select_free_page_candidate();
@@ -276,6 +278,7 @@ void RmFileHandle::abort_prepared_insert(RmPinnedInsert& insert) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn, const TupleMeta* tuple_meta) {
+    ensure_free_space_candidates();
     // This overload takes the slot from the caller, and its callers include redo
     // and undo, where the Rid comes straight out of a WAL record — i.e. from
     // unvalidated bytes on disk.  Recovery validates on its side, but fail loudly
@@ -358,6 +361,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn, cons
  * @param {Context*} context
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_lsn) {
+    ensure_free_space_candidates();
     (void)context;
     // Todo:
     // 1. 获取指定记录所在的page handle
@@ -452,6 +456,7 @@ RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
  * @return {RmPageHandle} 新的PageHandle
  */
 RmPageHandle RmFileHandle::create_new_page_handle() {
+    ensure_free_space_candidates();
     std::lock_guard<std::mutex> extension_lock(extension_latch_);
     return create_new_page_handle_unlocked();
 }
@@ -493,6 +498,7 @@ RmPageHandle RmFileHandle::create_new_page_handle_unlocked() {
  * 复用 prepare_insert_record() 的候选机制，并在候选已满时把它剔除后重试。
  */
 RmPageHandle RmFileHandle::create_page_handle() {
+    ensure_free_space_candidates();
     for (;;) {
         RmPageHandle page_handle;
         auto candidate = select_free_page_candidate();
@@ -630,10 +636,58 @@ void RmFileHandle::rebuild_file_header_from_pages() {
     }
 }
 
+void RmFileHandle::prepare_recovery_free_space() {
+    if (free_space_init_state_.load(std::memory_order_acquire) == FreeSpaceInitState::BitmapAuthoritative) {
+        return;
+    }
+    std::lock_guard<std::mutex> init_lock(free_space_init_latch_);
+    if (free_space_init_state_.load(std::memory_order_relaxed) == FreeSpaceInitState::BitmapAuthoritative) {
+        return;
+    }
+    const int disk_page_count = RecoveryDiskPageCount(disk_manager_, fd_);
+    std::vector<page_id_t> free_pages;
+    free_pages.reserve(static_cast<size_t>(std::max(0, disk_page_count - RM_FIRST_RECORD_PAGE)));
+    // Bitmap is the only recovery authority. Ignore first_free_page_no and
+    // every persisted next pointer: either can be torn at the crash boundary.
+    for (page_id_t page_no = RM_FIRST_RECORD_PAGE; page_no < disk_page_count; ++page_no) {
+        RmPageHandle page_handle = fetch_page_handle(page_no);
+        int num_records = 0;
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            for (int slot_no = 0; slot_no < page_handle.file_hdr->num_records_per_page; ++slot_no) {
+                if (Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                    ++num_records;
+                }
+            }
+            if (page_handle.page_hdr->num_records != num_records) {
+                page_handle.page_hdr->num_records = num_records;
+                BufferPoolManager::mark_dirty_locked(page_handle.page);
+            }
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        if (num_records < file_hdr_.num_records_per_page) {
+            free_pages.push_back(page_no);
+        }
+    }
+    {
+        std::scoped_lock metadata_lock(free_space_latch_, file_header_latch_);
+        free_page_candidates_ = std::move(free_pages);
+        free_page_candidate_set_.clear();
+        free_page_candidate_set_.insert(free_page_candidates_.begin(), free_page_candidates_.end());
+        free_page_cursor_ = 0;
+        file_hdr_.num_pages = disk_page_count;
+        file_hdr_.first_free_page_no = free_page_candidates_.empty() ? RM_NO_PAGE : free_page_candidates_.front();
+        disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
+    }
+    free_space_init_state_.store(FreeSpaceInitState::BitmapAuthoritative, std::memory_order_release);
+}
+
 void RmFileHandle::repair_file_header_for_pages(const std::vector<page_id_t>& page_nos) {
     if (page_nos.empty()) {
         return;
     }
+
+    prepare_recovery_free_space();
 
     std::vector<page_id_t> pages = page_nos;
     std::sort(pages.begin(), pages.end());
@@ -715,6 +769,135 @@ void RmFileHandle::repair_file_header_for_pages(const std::vector<page_id_t>& pa
     }
 }
 
+void RmFileHandle::finalize_recovery_pages(const std::vector<page_id_t>& page_nos) {
+    if (page_nos.empty()) {
+        return;
+    }
+    prepare_recovery_free_space();
+
+    std::vector<page_id_t> pages = page_nos;
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    if (pages.front() < RM_FIRST_RECORD_PAGE) {
+        throw InternalError("recovery referenced an invalid record page");
+    }
+
+    const int disk_page_count = RecoveryDiskPageCount(disk_manager_, fd_);
+    std::vector<page_id_t> existing_pages;
+    existing_pages.reserve(pages.size());
+    for (const page_id_t page_no : pages) {
+        const PageId page_id{fd_, page_no};
+        if (page_no < disk_page_count || buffer_pool_manager_->is_page_resident(page_id)) {
+            existing_pages.push_back(page_no);
+        }
+    }
+    if (!existing_pages.empty()) {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        file_hdr_.num_pages = std::max(file_hdr_.num_pages, existing_pages.back() + 1);
+        disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
+    }
+
+    // Do not route tombstones through delete_record(): that would drop this
+    // page latch, re-pin it for each slot, and settle free-space metadata many
+    // times. The bitmap is authoritative after redo/undo, so one exclusive
+    // visit can make every page internally self-consistent and publish exactly
+    // one free-list transition.
+    for (const page_id_t page_no : existing_pages) {
+        auto page_handle = fetch_page_handle(page_no);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            int num_records = 0;
+            for (int slot_no = 0; slot_no < file_hdr_.num_records_per_page; ++slot_no) {
+                if (!Bitmap::is_set(page_handle.bitmap, slot_no)) {
+                    continue;
+                }
+                TupleMeta& meta = page_handle.get_meta(slot_no);
+                if (meta.is_deleted_) {
+                    Bitmap::reset(page_handle.bitmap, slot_no);
+                    meta = TupleMeta{};
+                    continue;
+                }
+                meta.commit_ts_ = 0;
+                meta.writer_txn_id_ = INVALID_TXN_ID;
+                meta.is_committed_ = true;
+                meta.is_deleted_ = false;
+                meta.version_chain_head_ = UndoLink{};
+                ++num_records;
+            }
+            page_handle.page_hdr->num_records = num_records;
+
+            std::scoped_lock metadata_lock(free_space_latch_, file_header_latch_);
+            const bool page_is_full = num_records >= file_hdr_.num_records_per_page;
+            if (page_is_full) {
+                const bool was_candidate = free_page_candidate_set_.erase(page_no) != 0;
+                if (was_candidate) {
+                    free_page_candidates_.erase(
+                        std::remove(free_page_candidates_.begin(), free_page_candidates_.end(), page_no),
+                        free_page_candidates_.end());
+                    if (free_page_cursor_ >= free_page_candidates_.size()) {
+                        free_page_cursor_ = 0;
+                    }
+                }
+                if (file_hdr_.first_free_page_no == page_no) {
+                    file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+                }
+                page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
+                if (file_hdr_.first_free_page_no == page_no) {
+                    file_hdr_.first_free_page_no = RM_NO_PAGE;
+                }
+            } else if (free_page_candidate_set_.insert(page_no).second) {
+                free_page_candidates_.push_back(page_no);
+                page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+                file_hdr_.first_free_page_no = page_no;
+            } else if (file_hdr_.first_free_page_no == RM_NO_PAGE) {
+                page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
+                file_hdr_.first_free_page_no = page_no;
+            }
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    }
+
+    // A touched full page can be in the *middle* of the durable free chain.
+    // Removing only its candidate entry leaves its predecessor pointing at a
+    // full page (for example B -> A becomes B -> A when A fills). Recovery is
+    // single-threaded, so rebuild the bounded authoritative candidate chain
+    // once after all page-local finalization rather than trying to repair an
+    // unknown predecessor while A is latched.
+    std::vector<page_id_t> free_pages;
+    {
+        std::scoped_lock metadata_lock(free_space_latch_, file_header_latch_);
+        free_pages = free_page_candidates_;
+        free_pages.erase(std::remove_if(free_pages.begin(), free_pages.end(),
+                                        [&](page_id_t page_no) {
+                                            return free_page_candidate_set_.count(page_no) == 0;
+                                        }),
+                         free_pages.end());
+        free_page_candidates_ = free_pages;
+        free_page_candidate_set_.clear();
+        free_page_candidate_set_.insert(free_pages.begin(), free_pages.end());
+        free_page_cursor_ = 0;
+    }
+    for (size_t index = 0; index < free_pages.size(); ++index) {
+        auto page_handle = fetch_page_handle(free_pages[index]);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            page_handle.page_hdr->next_free_page_no =
+                index + 1 < free_pages.size() ? free_pages[index + 1] : RM_NO_PAGE;
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
+        }
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+    }
+    // Publish the head only after every link has been installed. A crash in
+    // either order is harmless because next startup rebuilds candidates from
+    // bitmaps, but this ordering avoids publishing a chain whose suffix has
+    // not even been prepared yet.
+    {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        file_hdr_.first_free_page_no = free_pages.empty() ? RM_NO_PAGE : free_pages.front();
+    }
+}
+
 TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
     auto page_handle = fetch_page_handle(rid.page_no);
     TupleMeta meta;
@@ -763,6 +946,97 @@ std::vector<RmTupleMetaProbe> RmFileHandle::probe_tuple_meta_batch(page_id_t pag
     return probes;
 }
 
+void RmFileHandle::ensure_free_space_candidates() {
+    if (free_space_init_state_.load(std::memory_order_acquire) != FreeSpaceInitState::Uninitialized) {
+        return;
+    }
+    std::lock_guard<std::mutex> init_lock(free_space_init_latch_);
+    if (free_space_init_state_.load(std::memory_order_relaxed) != FreeSpaceInitState::Uninitialized) {
+        return;
+    }
+    const int disk_pages = RecoveryDiskPageCount(disk_manager_, fd_);
+    std::vector<page_id_t> candidates;
+    std::unordered_set<page_id_t> seen;
+    page_id_t current;
+    {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        current = file_hdr_.first_free_page_no;
+    }
+    bool invalid = current == RM_NO_PAGE && disk_pages > RM_FIRST_RECORD_PAGE;
+    while (current != RM_NO_PAGE) {
+        if (current < RM_FIRST_RECORD_PAGE || current >= disk_pages || !seen.insert(current).second) {
+            invalid = true;
+            break;
+        }
+        RmPageHandle page = fetch_page_handle(current);
+        const page_id_t page_no = page.page->get_page_id().page_no;
+        bool full = true;
+        {
+            std::shared_lock<std::shared_mutex> lock(page.page->latch());
+            current = page.page_hdr->next_free_page_no;
+            for (int slot_no = 0; slot_no < page.file_hdr->num_records_per_page; ++slot_no) {
+                if (!Bitmap::is_set(page.bitmap, slot_no)) {
+                    full = false;
+                    break;
+                }
+            }
+        }
+        buffer_pool_manager_->unpin_page(page.page->get_page_id(), false);
+        if (full) {
+            invalid = true;
+            break;
+        }
+        candidates.push_back(page_no);
+    }
+    if (invalid) {
+        candidates.clear();
+        for (page_id_t page_no = RM_FIRST_RECORD_PAGE; page_no < disk_pages; ++page_no) {
+            RmPageHandle page = fetch_page_handle(page_no);
+            int num_records = 0;
+            {
+                std::unique_lock<std::shared_mutex> lock(page.page->latch());
+                for (int slot_no = 0; slot_no < page.file_hdr->num_records_per_page; ++slot_no) {
+                    if (Bitmap::is_set(page.bitmap, slot_no)) {
+                        ++num_records;
+                    }
+                }
+                if (page.page_hdr->num_records != num_records) {
+                    page.page_hdr->num_records = num_records;
+                    BufferPoolManager::mark_dirty_locked(page.page);
+                }
+            }
+            buffer_pool_manager_->unpin_page(page.page->get_page_id(), false);
+            if (num_records < file_hdr_.num_records_per_page) {
+                candidates.push_back(page_no);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock(free_space_latch_, file_header_latch_);
+        free_page_candidates_ = candidates;
+        free_page_candidate_set_.clear();
+        free_page_candidate_set_.insert(free_page_candidates_.begin(), free_page_candidates_.end());
+        free_page_cursor_ = 0;
+    }
+    if (invalid) {
+        for (size_t index = 0; index < candidates.size(); ++index) {
+            RmPageHandle page = fetch_page_handle(candidates[index]);
+            {
+                std::unique_lock<std::shared_mutex> lock(page.page->latch());
+                page.page_hdr->next_free_page_no =
+                    index + 1 < candidates.size() ? candidates[index + 1] : RM_NO_PAGE;
+                BufferPoolManager::mark_dirty_locked(page.page);
+            }
+            buffer_pool_manager_->unpin_page(page.page->get_page_id(), false);
+        }
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        file_hdr_.first_free_page_no = candidates.empty() ? RM_NO_PAGE : candidates.front();
+    }
+    free_space_init_state_.store(invalid ? FreeSpaceInitState::BitmapAuthoritative
+                                        : FreeSpaceInitState::DurableHintLoaded,
+                                 std::memory_order_release);
+}
+
 void RmFileHandle::release_page_handle(RmPageHandle& page_handle) {
     // Todo:
     // 当page从已满变成未满，考虑如何更新：
@@ -809,11 +1083,8 @@ void RmFileHandle::remove_free_page_candidate(page_id_t page_no, page_id_t next_
 }
 
 std::optional<page_id_t> RmFileHandle::select_free_page_candidate() {
+    ensure_free_space_candidates();
     std::scoped_lock lock(free_space_latch_, file_header_latch_);
-    if (free_page_candidates_.empty() && file_hdr_.first_free_page_no != RM_NO_PAGE) {
-        free_page_candidates_.push_back(file_hdr_.first_free_page_no);
-        free_page_candidate_set_.insert(file_hdr_.first_free_page_no);
-    }
     if (free_page_candidates_.empty()) {
         return std::nullopt;
     }

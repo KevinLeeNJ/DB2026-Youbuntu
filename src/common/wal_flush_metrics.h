@@ -36,6 +36,8 @@ public:
         uint64_t durable_lag_before_max{};
         uint64_t durable_lag_after_sum{};
         uint64_t durable_lag_after_max{};
+        uint64_t sync_depth_two_waves{};
+        uint64_t sync_depth_two_max_inflight{};
     };
 
     static bool ParseEnabled(const char* value) noexcept {
@@ -67,6 +69,8 @@ public:
         result.durable_lag_before_max = durable_lag_before_max_.load(std::memory_order_relaxed);
         result.durable_lag_after_sum = durable_lag_after_sum_.load(std::memory_order_relaxed);
         result.durable_lag_after_max = durable_lag_after_max_.load(std::memory_order_relaxed);
+        result.sync_depth_two_waves = sync_depth_two_waves_.load(std::memory_order_relaxed);
+        result.sync_depth_two_max_inflight = sync_depth_two_max_inflight_.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -97,6 +101,10 @@ public:
         increment(durable_lag_after_sum_, after);
         update_max(durable_lag_before_max_, before);
         update_max(durable_lag_after_max_, after);
+    }
+    void record_sync_depth_two_wave(size_t inflight) noexcept {
+        increment(sync_depth_two_waves_);
+        update_max(sync_depth_two_max_inflight_, inflight);
     }
 
 private:
@@ -150,4 +158,6 @@ private:
     std::atomic<uint64_t> durable_lag_before_max_{0};
     std::atomic<uint64_t> durable_lag_after_sum_{0};
     std::atomic<uint64_t> durable_lag_after_max_{0};
+    std::atomic<uint64_t> sync_depth_two_waves_{0};
+    std::atomic<uint64_t> sync_depth_two_max_inflight_{0};
 };

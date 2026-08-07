@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #undef private
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdio>
@@ -83,6 +84,29 @@ void check_equal(const RmFileHandle* file_handle,
 std::string UniqueTestFileName(const std::string& prefix) {
     static std::atomic<uint64_t> next_id{0};
     return prefix + "_" + std::to_string(getpid()) + "_" + std::to_string(next_id.fetch_add(1));
+}
+
+void PersistRecordFileAndClose(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager,
+                               std::unique_ptr<RmFileHandle>* file_handle) {
+    ASSERT_NE(file_handle, nullptr);
+    ASSERT_NE(file_handle->get(), nullptr);
+    RmFileHandle* handle = file_handle->get();
+    const RmFileHdr header = handle->get_file_hdr();
+    const int fd = handle->GetFd();
+    for (page_id_t page_no = RM_FIRST_RECORD_PAGE; page_no < header.num_pages; ++page_no) {
+        RmPageHandle page = handle->fetch_page_handle(page_no);
+        std::array<char, PAGE_SIZE> image{};
+        {
+            std::shared_lock<std::shared_mutex> page_lock(page.page->latch());
+            std::memcpy(image.data(), page.page->get_data(), PAGE_SIZE);
+        }
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(page.page->get_page_id(), false));
+        disk_manager->write_page(fd, page_no, image.data(), PAGE_SIZE);
+    }
+    disk_manager->write_page(fd, RM_FILE_HDR_PAGE, reinterpret_cast<const char*>(&header), sizeof(header));
+    buffer_pool_manager->delete_all_pages(fd);
+    disk_manager->close_file(fd);
+    file_handle->reset();
 }
 
 class ScopedRecordFile {
@@ -206,6 +230,147 @@ TEST_F(RecordManagerTest, RecoverySizeChecksUseOpenFdAndKeepTailFailuresDistinct
     EXPECT_NO_THROW(file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE}));
     ASSERT_EQ(ftruncate(fd, static_cast<off_t>(PAGE_SIZE * 2)), 0);
     EXPECT_NO_THROW(file_handle->repair_file_header_for_pages({RM_FIRST_RECORD_PAGE}));
+}
+
+TEST_F(RecordManagerTest, RecoveryFinalizeRemovesAnInteriorFullPageFromDurableFreeChain) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
+    ScopedRecordFile file(disk_manager_.get(), buffer_pool_manager.get(), 64);
+    RmFileHandle* const file_handle = file.handle();
+
+    RmPageHandle first = file_handle->create_new_page_handle();
+    const page_id_t first_page = first.page->get_page_id().page_no;
+    buffer_pool_manager->unpin_page(first.page->get_page_id(), true);
+    RmPageHandle second = file_handle->create_new_page_handle();
+    const page_id_t second_page = second.page->get_page_id().page_no;
+    buffer_pool_manager->unpin_page(second.page->get_page_id(), true);
+
+    // Establish a durable two-page chain, discard the process-local cache as
+    // a reopen would, then make the tail full without repairing its untouched
+    // predecessor. This is the exact B -> A(full) stale-link shape recovery
+    // finalization must eliminate while retaining B.
+    file_handle->finalize_recovery_pages({first_page, second_page});
+    file_handle->free_page_candidates_.clear();
+    file_handle->free_page_candidate_set_.clear();
+    {
+        RmPageHandle page = file_handle->fetch_page_handle(second_page);
+        {
+            std::unique_lock<std::shared_mutex> lock(page.page->latch());
+            for (int slot = 0; slot < page.file_hdr->num_records_per_page; ++slot) {
+                Bitmap::set(page.bitmap, slot);
+                page.get_meta(slot).is_deleted_ = false;
+            }
+            page.page_hdr->num_records = page.file_hdr->num_records_per_page;
+            BufferPoolManager::mark_dirty_locked(page.page);
+        }
+        buffer_pool_manager->unpin_page(page.page->get_page_id(), false);
+    }
+
+    file_handle->finalize_recovery_pages({first_page, second_page});
+    EXPECT_EQ(file_handle->file_hdr_.first_free_page_no, first_page);
+    RmPageHandle remaining = file_handle->fetch_page_handle(first_page);
+    EXPECT_EQ(remaining.page_hdr->next_free_page_no, RM_NO_PAGE);
+    buffer_pool_manager->unpin_page(remaining.page->get_page_id(), false);
+}
+
+TEST_F(RecordManagerTest, CleanReopenLoadsTheWholeDurableFreeChainBeforeFillingItsHead) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    RmManager rm_manager(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = UniqueTestFileName("clean_reopen_free_chain");
+    rm_manager.create_file(filename, 1000);
+    auto file_handle = rm_manager.open_file(filename);
+    for (int page = 0; page < 3; ++page) {
+        RmPageHandle created = file_handle->create_new_page_handle();
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(created.page->get_page_id(), true));
+    }
+    file_handle->finalize_recovery_pages({1, 2, 3});
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+
+    file_handle = rm_manager.open_file(filename);
+    const RmFileHdr before = file_handle->get_file_hdr();
+    ASSERT_EQ(before.num_pages, 4);
+    const page_id_t old_head = before.first_free_page_no;
+    ASSERT_NE(old_head, RM_NO_PAGE);
+    RmPageHandle head_page = file_handle->fetch_page_handle(old_head);
+    const page_id_t old_tail = head_page.page_hdr->next_free_page_no;
+    ASSERT_TRUE(buffer_pool_manager->unpin_page(head_page.page->get_page_id(), false));
+    ASSERT_NE(old_tail, RM_NO_PAGE);
+
+    std::vector<char> record(1000, 0);
+    for (int slot = 0; slot < before.num_records_per_page; ++slot) {
+        file_handle->insert_record(Rid{old_head, slot}, record.data());
+    }
+    const Rid reused = file_handle->insert_record(record.data(), nullptr);
+    EXPECT_NE(reused.page_no, old_head);
+    EXPECT_LT(reused.page_no, before.num_pages);
+    EXPECT_EQ(file_handle->get_file_hdr().num_pages, before.num_pages);
+
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    rm_manager.destroy_file(filename);
+}
+
+TEST_F(RecordManagerTest, RecoveryBitmapScanRepairsPartiallyPersistedFreeLinksAndSubsetHead) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    RmManager rm_manager(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = UniqueTestFileName("partial_free_chain");
+    rm_manager.create_file(filename, 1000);
+    auto file_handle = rm_manager.open_file(filename);
+    for (int page = 0; page < 3; ++page) {
+        RmPageHandle created = file_handle->create_new_page_handle();
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(created.page->get_page_id(), true));
+    }
+    file_handle->finalize_recovery_pages({1, 2, 3});
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+
+    const auto persist_corruption = [&](page_id_t head, page_id_t next) {
+        auto handle = rm_manager.open_file(filename);
+        RmPageHandle page = handle->fetch_page_handle(head);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page.page->latch());
+            page.page_hdr->next_free_page_no = next;
+            BufferPoolManager::mark_dirty_locked(page.page);
+        }
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(page.page->get_page_id(), false));
+        handle->file_hdr_.first_free_page_no = head;
+        PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &handle);
+    };
+    const auto verify_complete_chain = [&] {
+        auto handle = rm_manager.open_file(filename);
+        const RmFileHdr header = handle->get_file_hdr();
+        std::set<page_id_t> chain;
+        page_id_t page_no = header.first_free_page_no;
+        while (page_no != RM_NO_PAGE) {
+            ASSERT_GE(page_no, RM_FIRST_RECORD_PAGE);
+            ASSERT_LT(page_no, header.num_pages);
+            ASSERT_TRUE(chain.insert(page_no).second) << "free-list contains a cycle";
+            RmPageHandle page = handle->fetch_page_handle(page_no);
+            page_no = page.page_hdr->next_free_page_no;
+            ASSERT_TRUE(buffer_pool_manager->unpin_page(page.page->get_page_id(), false));
+        }
+        EXPECT_EQ(chain, (std::set<page_id_t>{1, 2, 3}));
+        PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &handle);
+    };
+
+    // Old header plus one newly persisted, self-referential link.
+    persist_corruption(1, 1);
+    file_handle = rm_manager.open_file(filename);
+    file_handle->prepare_recovery_free_space();
+    file_handle->finalize_recovery_pages({1});
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    verify_complete_chain();
+
+    // A structurally valid but incomplete new head/link first loads as a
+    // durable hint; recovery must still upgrade it to a complete bitmap view.
+    persist_corruption(2, RM_NO_PAGE);
+    file_handle = rm_manager.open_file(filename);
+    file_handle->ensure_free_space_candidates();
+    ASSERT_EQ(file_handle->free_space_init_state_, RmFileHandle::FreeSpaceInitState::DurableHintLoaded);
+    file_handle->prepare_recovery_free_space();
+    ASSERT_EQ(file_handle->free_space_init_state_, RmFileHandle::FreeSpaceInitState::BitmapAuthoritative);
+    file_handle->finalize_recovery_pages({2});
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    verify_complete_chain();
+
+    rm_manager.destroy_file(filename);
 }
 
 TEST_F(RecordManagerTest, RecoverySizeChecksRejectShortAndSubPageTails) {

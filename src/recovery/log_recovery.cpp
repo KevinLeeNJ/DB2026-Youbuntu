@@ -46,6 +46,67 @@ constexpr size_t kRepairSpotCheckLimit = 64;
 constexpr size_t kDefaultRecoveryWorkers = 8;
 constexpr size_t kMaxRecoveryWorkers = 12;
 constexpr size_t kRunClaimBatch = 8;
+constexpr int64_t kIndexKeySegmentBytes = 16LL * 1024 * 1024;
+constexpr size_t kIndexKeySegmentDescriptorLimitBytes = 256ULL * 1024 * 1024;
+// A 50-warehouse recovery can name roughly 8.96M keys. At 16 bytes per
+// IndexRepairEntry plus a typical 8-16 byte key, 256 MiB can force a fallback
+// at the tail. 512 MiB caps local parallel output while leaving the final plan
+// arena unchanged. Local and final vector capacities coexist during merge, so
+// the logged conservative vector peak is four times this logical limit.
+constexpr size_t kIndexKeyParallelScratchLimitBytes = 512ULL * 1024 * 1024;
+
+class IndexKeyParallelScratchLimit final : public std::exception {};
+
+template <typename Work> size_t RunRecoveryTasks(size_t task_count, size_t worker_limit, Work&& work) {
+    const size_t worker_count = std::min(worker_limit, task_count);
+    if (worker_count == 0) {
+        return 0;
+    }
+
+    std::atomic<size_t> next_task{0};
+    std::atomic<bool> stop{false};
+    std::mutex exception_latch;
+    std::exception_ptr first_exception;
+    std::vector<std::thread> threads;
+    threads.reserve(worker_count);
+    try {
+        for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+            threads.emplace_back([&, worker_index] {
+                try {
+                    while (!stop.load(std::memory_order_acquire)) {
+                        const size_t task_index = next_task.fetch_add(1, std::memory_order_relaxed);
+                        if (task_index >= task_count) {
+                            return;
+                        }
+                        work(worker_index, task_index);
+                    }
+                } catch (...) {
+                    stop.store(true, std::memory_order_release);
+                    std::lock_guard<std::mutex> lock(exception_latch);
+                    if (first_exception == nullptr) {
+                        first_exception = std::current_exception();
+                    }
+                }
+            });
+        }
+    } catch (...) {
+        stop.store(true, std::memory_order_release);
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        throw;
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    if (first_exception != nullptr) {
+        std::rethrow_exception(first_exception);
+    }
+    return worker_count;
+}
+
 uint64_t MixDmlIdentity(uint64_t state, int64_t offset, uint32_t length, uint32_t checksum) {
     // FNV-1a over fixed-width identity fields. The CRC covers exact serialized
     // bytes; offset and length make record reordering/substitution visible too.
@@ -295,8 +356,11 @@ void RecoveryManager::analyze() {
     heap_redo_records_.clear();
     index_key_stream_identity_ = 0;
     index_key_stream_records_ = 0;
+    index_key_stream_segments_.clear();
+    index_key_stream_segments_complete_ = true;
     heap_redo_txn_heads_.clear();
     index_smo_records_.clear();
+    index_smo_page_catalog_.clear();
     deferred_committed_deltas_.clear();
     record_locations_.clear();
     record_locations_sorted_ = true;
@@ -381,7 +445,24 @@ void RecoveryManager::analyze() {
     WalRecordView record;
     WalDmlView dml;
     lsn_t previous_lsn = INVALID_LSN;
+    IndexKeyStreamSegment index_key_segment;
+    index_key_segment.begin = scan_begin_offset_;
     while (reader.next(&record)) {
+        if (index_key_stream_segments_complete_ && record.offset > index_key_segment.begin &&
+            record.offset - index_key_segment.begin >= kIndexKeySegmentBytes) {
+            index_key_segment.end = record.offset;
+            if (index_key_stream_segments_.size() >=
+                kIndexKeySegmentDescriptorLimitBytes / sizeof(IndexKeyStreamSegment)) {
+                // The old sequential verified-stream scan remains authoritative
+                // when descriptor metadata itself would become material.
+                index_key_stream_segments_.clear();
+                index_key_stream_segments_complete_ = false;
+            } else {
+                index_key_stream_segments_.push_back(index_key_segment);
+            }
+            index_key_segment = IndexKeyStreamSegment{};
+            index_key_segment.begin = record.offset;
+        }
         ++scanned_record_count_;
         const size_t log_type_index = static_cast<size_t>(record.log_type);
         ++log_type_record_counts_[log_type_index];
@@ -441,6 +522,11 @@ void RecoveryManager::analyze() {
             index_key_stream_identity_ =
                 MixDmlIdentity(index_key_stream_identity_, record.offset, record.total_len, redo_record.record_checksum);
             ++index_key_stream_records_;
+            if (index_key_stream_segments_complete_) {
+                index_key_segment.identity = MixDmlIdentity(index_key_segment.identity, record.offset, record.total_len,
+                                                            redo_record.record_checksum);
+                ++index_key_segment.dml_records;
+            }
             constexpr uint32_t kDescriptorIndexLimit = 1U << 31;
             if (heap_redo_records_.size() >= kDescriptorIndexLimit) {
                 throw InternalError("recovery heap-redo descriptor count exceeds intrusive chain limit; WAL retained");
@@ -504,10 +590,26 @@ void RecoveryManager::analyze() {
             index_smo_logical_image_count_ += static_cast<uint64_t>(smo.page_count) + 1;
             index_smo_logical_image_bytes_ +=
                 (static_cast<uint64_t>(smo.page_count) + 1) * static_cast<uint64_t>(PAGE_SIZE);
-            index_smo_records_.push_back(IndexSmoRecord{record.offset, record.total_len, record.lsn, record.txn_id,
-                                                         record.prev_lsn,
-                                                         IndexSmoCrc32(record.bytes,
-                                                                       record.total_len - sizeof(uint32_t))});
+            if (smo.page_count > std::numeric_limits<uint32_t>::max() - index_smo_page_catalog_.size()) {
+                throw InternalError("recovery INDEX_SMO page catalogue exceeds addressable range; WAL retained");
+            }
+            const uint32_t page_catalog_begin = static_cast<uint32_t>(index_smo_page_catalog_.size());
+            for (uint32_t page = 0; page < smo.page_count; ++page) {
+                index_smo_page_catalog_.push_back(smo.page_no(page));
+            }
+            index_smo_records_.push_back(IndexSmoRecord{
+                record.offset,
+                record.total_len,
+                record.lsn,
+                record.txn_id,
+                record.prev_lsn,
+                IndexSmoCrc32(record.bytes, record.total_len - sizeof(uint32_t)),
+                read_unaligned<uint32_t>(record.bytes + record.total_len - sizeof(uint32_t)),
+                std::string(smo.index_file_name),
+                smo.index_generation,
+                page_catalog_begin,
+                smo.page_count,
+            });
             break;
         }
         }
@@ -515,12 +617,21 @@ void RecoveryManager::analyze() {
         if (record.txn_id != INVALID_TXN_ID && (max_wal_txn_id_ == INVALID_TXN_ID || record.txn_id > max_wal_txn_id_)) {
             max_wal_txn_id_ = record.txn_id;
         }
-        record_locations_.push_back(
-            WalRecordLocation{record.lsn, record.offset, record.total_len, IndexSmoCrc32(record.bytes, record.total_len)});
-        if (record.lsn != INVALID_LSN && previous_lsn != INVALID_LSN && record.lsn <= previous_lsn) {
-            record_locations_sorted_ = false;
+        // Only a live loser's prev_lsn chain can query this catalogue. COMMIT
+        // removes that transaction from the loser set, while INDEX_* and
+        // CHECKPOINT records have no transactional prev_lsn chain. Retaining
+        // just BEGIN/DML/ABORT therefore saves one 24-byte descriptor for the
+        // high-frequency committed records without weakening fail-closed undo.
+        if (record.txn_id != INVALID_TXN_ID &&
+            (record.log_type == LogType::BEGIN || record.log_type == LogType::INSERT ||
+             record.log_type == LogType::DELETE || record.log_type == LogType::UPDATE || record.log_type == LogType::ABORT)) {
+            record_locations_.push_back(WalRecordLocation{record.lsn, record.offset, record.total_len,
+                                                           IndexSmoCrc32(record.bytes, record.total_len)});
+            if (record.lsn != INVALID_LSN && previous_lsn != INVALID_LSN && record.lsn <= previous_lsn) {
+                record_locations_sorted_ = false;
+            }
+            previous_lsn = record.lsn;
         }
-        previous_lsn = record.lsn;
         if (record.lsn != INVALID_LSN && (max_lsn_ == INVALID_LSN || record.lsn > max_lsn_)) {
             max_lsn_ = record.lsn;
         }
@@ -530,6 +641,16 @@ void RecoveryManager::analyze() {
     // rejected in the switch above. Defer truncation until finalize(), after
     // this entire semantic pass has succeeded.
     scan_end_offset_ = reader.next_offset();
+    if (index_key_stream_segments_complete_ && scan_end_offset_ > index_key_segment.begin) {
+        index_key_segment.end = scan_end_offset_;
+        if (index_key_stream_segments_.size() >=
+            kIndexKeySegmentDescriptorLimitBytes / sizeof(IndexKeyStreamSegment)) {
+            index_key_stream_segments_.clear();
+            index_key_stream_segments_complete_ = false;
+        } else {
+            index_key_stream_segments_.push_back(index_key_segment);
+        }
+    }
 
     // BEGIN, COMMIT, ABORT and CHECKPOINT carry no physical operation for undo.
     // A transaction first observed in this scan whose chain contains none of
@@ -705,6 +826,13 @@ void RecoveryManager::redo() {
     if (has_index_smo_records_ || !heap_redo_records_.empty()) {
         wal_snapshot = disk_manager_->create_wal_read_snapshot(scan_begin_offset_, scan_end_offset_);
     }
+    std::chrono::steady_clock::time_point validate_select_begin;
+    std::chrono::steady_clock::time_point validate_select_end;
+    std::chrono::steady_clock::time_point smo_end;
+    std::chrono::nanoseconds smo_reparse_time{0};
+    std::chrono::nanoseconds smo_page_write_time{0};
+    std::chrono::nanoseconds smo_header_write_time{0};
+    const auto redo_smo = [&] {
     const auto mapped_smo_record = [&](const IndexSmoRecord& location, const char* bytes) {
         if (bytes == nullptr || location.wal_offset < scan_begin_offset_ || location.wal_offset > scan_end_offset_ ||
             location.wal_length < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
@@ -716,6 +844,9 @@ void RecoveryManager::redo() {
         // rewrite whose tail CRC was recomputed.
         if (IndexSmoCrc32(bytes, location.wal_length - sizeof(uint32_t)) != location.record_checksum) {
             throw InternalError("recovery INDEX_SMO WAL bytes changed after analyze; WAL retained");
+        }
+        if (read_unaligned<uint32_t>(bytes + location.wal_length - sizeof(uint32_t)) != location.payload_checksum) {
+            throw InternalError("recovery INDEX_SMO stored checksum changed after analyze; WAL retained");
         }
         WalRecordView record;
         record.log_type = read_unaligned<LogType>(bytes + OFFSET_LOG_TYPE);
@@ -731,14 +862,12 @@ void RecoveryManager::redo() {
         }
         return record;
     };
-    const auto smo_record_checksum = [](const WalRecordView& record) {
-        return read_unaligned<uint32_t>(record.bytes + record.total_len - static_cast<uint32_t>(sizeof(uint32_t)));
-    };
-    const auto validate_select_begin = std::chrono::steady_clock::now();
+    validate_select_begin = std::chrono::steady_clock::now();
     // Validate every descriptor, including records from superseded generations.
-    // Reverse order makes the first image for a (index,page) the only image
-    // that needs physical redo, while an earlier record can still contribute a
-    // page that later records did not touch.
+    // analyze() already parsed the immutable name/generation/page catalogue;
+    // this pass only rebinds it to the same WAL bytes before reverse
+    // latest-wins selection. ParseIndexSmoWal stays on the selected-record
+    // path below, immediately before bytes are installed.
     for (size_t index = index_smo_records_.size(); index > 0; --index) {
         const size_t descriptor_index = index - 1;
         const IndexSmoRecord& location = index_smo_records_[descriptor_index];
@@ -750,54 +879,51 @@ void RecoveryManager::redo() {
         } else {
             ++smo_validation_mapped_hits;
         }
-        const WalRecordView record = mapped_smo_record(location, bytes);
-        IndexSmoWalView smo;
-        if (!ParseIndexSmoWal(record, &smo)) {
-            throw InternalError("recovery failed to re-parse INDEX_SMO at WAL offset " + std::to_string(record.offset) +
-                                "; WAL retained");
-        }
+        (void)mapped_smo_record(location, bytes);
         ++smo_validated_records;
-        smo_validated_pages += smo.page_count;
+        smo_validated_pages += location.page_count;
         ++smo_validated_headers;
-        const std::string index_name(smo.index_file_name);
+        const std::string& index_name = location.index_name;
         auto binding = latest_index_bindings_.find(index_name);
-        if (binding == latest_index_bindings_.end() || binding->second != smo.index_generation) {
+        if (binding == latest_index_bindings_.end() || binding->second != location.index_generation) {
             ++smo_old_generation_records;
-            smo_old_generation_pages += smo.page_count;
+            smo_old_generation_pages += location.page_count;
             continue;
         }
         ++smo_eligible_records;
-        smo_eligible_pages += smo.page_count;
+        smo_eligible_pages += location.page_count;
         ++smo_eligible_headers;
-        const uint32_t record_checksum = smo_record_checksum(record);
         final_smo_headers.emplace(
-            index_name, SelectedSmoHeader{descriptor_index, index_name, smo.index_generation, record_checksum});
+            index_name, SelectedSmoHeader{descriptor_index, index_name, location.index_generation, location.record_checksum});
         auto& seen_pages = seen_smo_pages[index_name];
-        for (uint32_t page = 0; page < smo.page_count; ++page) {
-            if (seen_pages.insert(smo.page_no(page)).second) {
+        if (location.page_catalog_begin > index_smo_page_catalog_.size() ||
+            location.page_count > index_smo_page_catalog_.size() - location.page_catalog_begin) {
+            throw InternalError("recovery INDEX_SMO page catalogue is corrupt; WAL retained");
+        }
+        for (uint32_t page = 0; page < location.page_count; ++page) {
+            const page_id_t page_no = index_smo_page_catalog_[location.page_catalog_begin + page];
+            if (seen_pages.insert(page_no).second) {
                 size_t& selected_position = selected_smo_record_positions[descriptor_index];
                 if (selected_position == std::numeric_limits<size_t>::max()) {
                     selected_position = selected_smo_records.size();
                     selected_smo_records.push_back(
-                        SelectedSmoRecord{descriptor_index, index_name, smo.index_generation, record_checksum, {}, {}});
+                        SelectedSmoRecord{descriptor_index, index_name, location.index_generation, location.record_checksum,
+                                          {}, {}});
                 }
                 selected_smo_records[selected_position].page_indices.push_back(page);
-                selected_smo_records[selected_position].page_numbers.push_back(smo.page_no(page));
+                selected_smo_records[selected_position].page_numbers.push_back(page_no);
                 ++smo_selected_pages;
             } else {
                 ++smo_superseded_current_pages;
             }
         }
     }
-    const auto validate_select_end = std::chrono::steady_clock::now();
+    validate_select_end = std::chrono::steady_clock::now();
     if (index_smo_redo_test_hook_) {
         index_smo_redo_test_hook_("after_validate_select");
     }
     // Write all selected pages before any header. The header can make a new
     // root reachable, so installing it first could publish an incomplete tree.
-    std::chrono::nanoseconds smo_reparse_time{0};
-    std::chrono::nanoseconds smo_page_write_time{0};
-    std::chrono::nanoseconds smo_header_write_time{0};
     for (const SelectedSmoRecord& selected : selected_smo_records) {
         const auto reparse_begin = std::chrono::steady_clock::now();
         const IndexSmoRecord& location = index_smo_records_[selected.descriptor_index];
@@ -812,8 +938,8 @@ void RecoveryManager::redo() {
         const WalRecordView record = mapped_smo_record(location, bytes);
         IndexSmoWalView smo;
         if (!ParseIndexSmoWal(record, &smo) || smo.index_file_name != selected.index_name ||
-            smo.index_generation != selected.index_generation ||
-            smo_record_checksum(record) != selected.record_checksum || smo.page_count < selected.page_indices.size()) {
+            smo.index_generation != selected.index_generation || location.record_checksum != selected.record_checksum ||
+            smo.page_count < selected.page_indices.size()) {
             throw InternalError("recovery INDEX_SMO selected record changed after validation; WAL retained");
         }
         for (size_t page = 0; page < selected.page_indices.size(); ++page) {
@@ -857,8 +983,7 @@ void RecoveryManager::redo() {
         const WalRecordView record = mapped_smo_record(location, bytes);
         IndexSmoWalView smo;
         if (!ParseIndexSmoWal(record, &smo) || smo.index_file_name != selected.index_name ||
-            smo.index_generation != selected.index_generation ||
-            smo_record_checksum(record) != selected.record_checksum) {
+            smo.index_generation != selected.index_generation || location.record_checksum != selected.record_checksum) {
             throw InternalError("recovery INDEX_SMO final header changed after validation; WAL retained");
         }
         smo_reparse_time +=
@@ -873,7 +998,8 @@ void RecoveryManager::redo() {
         smo_header_write_time +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - header_write_begin);
     }
-    const auto smo_end = std::chrono::steady_clock::now();
+    smo_end = std::chrono::steady_clock::now();
+    };
 
     const auto sort_begin = std::chrono::steady_clock::now();
     std::sort(heap_redo_records_.begin(), heap_redo_records_.end());
@@ -911,6 +1037,36 @@ void RecoveryManager::redo() {
         (extension_capable ? extension_runs : parallel_runs).push_back(run);
     }
     const auto run_build_end = std::chrono::steady_clock::now();
+
+    // SMO replay uses direct index-file writes while heap redo reaches record
+    // pages through the buffer pool. Both consume the immutable WAL snapshot,
+    // but they share no pages, fd maps, or recovery descriptors. Keep the
+    // mutation hook serial: tests intentionally alter WAL at that boundary.
+    std::exception_ptr smo_exception;
+    std::thread smo_thread;
+    struct SmoJoinGuard {
+        std::thread* thread;
+        ~SmoJoinGuard() {
+            if (thread->joinable()) {
+                thread->join();
+            }
+        }
+    } smo_join_guard{&smo_thread};
+    const auto run_smo = [&] {
+        try {
+            redo_smo();
+        } catch (...) {
+            smo_exception = std::current_exception();
+        }
+    };
+    if (has_index_smo_records_ && !index_smo_redo_test_hook_) {
+        smo_thread = std::thread(run_smo);
+    } else {
+        run_smo();
+        if (smo_exception != nullptr) {
+            std::rethrow_exception(smo_exception);
+        }
+    }
 
     struct alignas(64) HeapRedoWorker {
         std::vector<char> scratch;
@@ -1028,9 +1184,21 @@ void RecoveryManager::redo() {
     } catch (...) {
         stop.store(true, std::memory_order_release);
         join_workers();
+        if (smo_thread.joinable()) {
+            smo_thread.join();
+        }
+        if (smo_exception != nullptr) {
+            std::rethrow_exception(smo_exception);
+        }
         throw;
     }
     join_workers();
+    if (smo_thread.joinable()) {
+        smo_thread.join();
+    }
+    if (smo_exception != nullptr) {
+        std::rethrow_exception(smo_exception);
+    }
     if (first_exception != nullptr) {
         std::rethrow_exception(first_exception);
     }
@@ -1220,16 +1388,9 @@ void RecoveryManager::undo() {
              static_cast<unsigned long long>(undo_chain_record_read_count_),
              static_cast<unsigned long long>(pruned_no_undo_transaction_count_));
 
-    // Headers first: reset_touched_tuple_meta() skips any page at or beyond
-    // num_pages, so a touched page still outside the header's page count would
-    // keep a loser's writer_txn_id_ and is_committed_=false on disk forever.
-    // The window is not constructible today, but the order costs nothing.
-    LOG_INFO("recovery undo phase: second-header begin");
-    repair_touched_file_headers();
-    LOG_INFO("recovery undo phase: second-header end");
-    LOG_INFO("recovery undo phase: meta-reset begin");
-    reset_touched_tuple_meta();
-    LOG_INFO("recovery undo phase: meta-reset end");
+    LOG_INFO("recovery undo phase: page-finalize begin");
+    finalize_touched_pages();
+    LOG_INFO("recovery undo phase: page-finalize end");
     // Repair only keys named by the WAL. Rebuilding every index from every heap
     // row makes recovery proportional to the whole database even when the
     // crash affected a handful of records. The repair is idempotent and
@@ -1260,25 +1421,68 @@ void RecoveryManager::undo() {
 }
 
 void RecoveryManager::repair_touched_file_headers() {
-    std::vector<page_id_t> touched_pages;
     for (size_t begin = 0; begin < touched_sorted_.size();) {
         const uint16_t table_id = touched_sorted_[begin].table_id;
         size_t end = begin;
-        touched_pages.clear();
-        int32_t previous_page = -1;
         while (end < touched_sorted_.size() && touched_sorted_[end].table_id == table_id) {
-            if (touched_sorted_[end].page_no != previous_page) {
-                previous_page = touched_sorted_[end].page_no;
-                touched_pages.push_back(previous_page);
-            }
             ++end;
         }
         RmFileHandle* file_handle = tables_[table_id].file_handle;
         if (file_handle != nullptr) {
-            file_handle->repair_file_header_for_pages(touched_pages);
+            file_handle->prepare_recovery_free_space();
         }
         begin = end;
     }
+}
+
+void RecoveryManager::finalize_touched_pages() {
+    struct TablePages {
+        uint16_t table_id;
+        size_t begin;
+        size_t end;
+    };
+    std::vector<TablePages> table_pages;
+    for (size_t begin = 0; begin < touched_sorted_.size();) {
+        const uint16_t table_id = touched_sorted_[begin].table_id;
+        size_t end = begin;
+        while (end < touched_sorted_.size() && touched_sorted_[end].table_id == table_id) {
+            ++end;
+        }
+        table_pages.push_back(TablePages{table_id, begin, end});
+        begin = end;
+    }
+    const auto phase_begin = std::chrono::steady_clock::now();
+    std::vector<int64_t> table_wall_ms(table_pages.size(), 0);
+    const size_t configured_workers = RecoveryWorkerLimit();
+    const size_t workers = RunRecoveryTasks(table_pages.size(), configured_workers, [&](size_t, size_t task_index) {
+        const TablePages& task = table_pages[task_index];
+        const auto table_begin = std::chrono::steady_clock::now();
+        std::vector<page_id_t> touched_pages;
+        touched_pages.reserve(task.end - task.begin);
+        int32_t previous_page = -1;
+        for (size_t index = task.begin; index < task.end; ++index) {
+            const int32_t page_no = touched_sorted_[index].page_no;
+            if (page_no != previous_page) {
+                previous_page = page_no;
+                touched_pages.push_back(page_no);
+            }
+        }
+        RmFileHandle* file_handle = tables_[task.table_id].file_handle;
+        if (file_handle != nullptr) {
+            file_handle->finalize_recovery_pages(touched_pages);
+        }
+        table_wall_ms[task_index] =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - table_begin)
+                .count();
+    });
+    const int64_t max_table_ms =
+        table_wall_ms.empty() ? 0 : *std::max_element(table_wall_ms.begin(), table_wall_ms.end());
+    const int64_t wall_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_begin).count();
+    LOG_INFO(
+        "recovery page-finalize: tables=%zu configured-workers=%zu active-workers=%zu wall=%lld ms max-table=%lld ms",
+        table_pages.size(), configured_workers, workers, static_cast<long long>(wall_ms),
+        static_cast<long long>(max_table_ms));
 }
 
 void RecoveryManager::reset_touched_tuple_meta() {
@@ -1363,11 +1567,13 @@ void RecoveryManager::collect_wal_index_keys() {
         // index_plans was resolved once per table; this loop runs once per WAL
         // record, and rebuilding the index name here used to cost a string
         // concatenation plus a map lookup per record per index.
-        const uint16_t table_id = intern_table(dml.table_name);
-        if ((expected_table_id != std::numeric_limits<uint16_t>::max() && table_id != expected_table_id) ||
-            table_id >= tables_.size()) {
+        const auto table_it = table_ids_.find(std::string(dml.table_name));
+        if (table_it == table_ids_.end() ||
+            (expected_table_id != std::numeric_limits<uint16_t>::max() && table_it->second != expected_table_id) ||
+            table_it->second >= tables_.size()) {
             throw InternalError("recovery index-key descriptor target disagrees with analyze; WAL retained");
         }
+        const uint16_t table_id = table_it->second;
         const RecoveryTable& table = tables_[table_id];
         for (IndexRepairPlan* plan : table.index_plans) {
             for (const char* image : {dml.before_image, dml.after_image}) {
@@ -1383,6 +1589,172 @@ void RecoveryManager::collect_wal_index_keys() {
             }
         }
     };
+
+    // Each descriptor begins and ends on an analyzed record boundary. The
+    // workers read only the finalized WAL snapshot and write only their local
+    // key arenas; plans are merged in descriptor order after every worker has
+    // joined. This preserves the old per-index WAL order exactly.
+    if (index_key_stream_segments_complete_ && index_key_stream_segments_.size() > 1) {
+        struct LocalPlanKeys {
+            std::vector<char> key_arena;
+            std::vector<IndexRepairEntry> entries;
+        };
+        struct SegmentResult {
+            uint64_t records{0};
+            uint64_t bytes{0};
+            uint64_t keys{0};
+            uint64_t identity{0};
+            std::vector<LocalPlanKeys> plans;
+        };
+        if (index_key_stream_segments_.front().begin != scan_begin_offset_ ||
+            index_key_stream_segments_.back().end != scan_end_offset_) {
+            throw InternalError("recovery index-key segment coverage disagrees with analyze; WAL retained");
+        }
+        for (size_t index = 0; index < index_key_stream_segments_.size(); ++index) {
+            const IndexKeyStreamSegment& segment = index_key_stream_segments_[index];
+            if (segment.begin >= segment.end || (index != 0 && segment.begin != index_key_stream_segments_[index - 1].end)) {
+                throw InternalError("recovery index-key segment has a boundary gap; WAL retained");
+            }
+        }
+        std::vector<IndexRepairPlan*> plan_order;
+        for (const auto& table : tables_) {
+            for (IndexRepairPlan* plan : table.index_plans) {
+                if (std::find(plan_order.begin(), plan_order.end(), plan) == plan_order.end()) {
+                    plan_order.push_back(plan);
+                }
+            }
+        }
+        std::unordered_map<IndexRepairPlan*, size_t> plan_slots;
+        for (size_t index = 0; index < plan_order.size(); ++index) {
+            plan_slots.emplace(plan_order[index], index);
+        }
+        std::vector<SegmentResult> results(index_key_stream_segments_.size());
+        for (auto& result : results) {
+            result.plans.resize(plan_order.size());
+        }
+        std::atomic<size_t> scratch_bytes{0};
+        auto wal_snapshot = disk_manager_->create_wal_read_snapshot(scan_begin_offset_, scan_end_offset_);
+        const size_t scratch_limit = index_key_parallel_scratch_limit_for_test_ != 0
+                                         ? index_key_parallel_scratch_limit_for_test_
+                                         : kIndexKeyParallelScratchLimitBytes;
+        const auto reserve_scratch = [&](size_t bytes) {
+            size_t current = scratch_bytes.load(std::memory_order_relaxed);
+            while (true) {
+                if (bytes > scratch_limit - current) {
+                    throw IndexKeyParallelScratchLimit();
+                }
+                if (scratch_bytes.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed,
+                                                        std::memory_order_relaxed)) {
+                    return;
+                }
+            }
+        };
+        const auto parallel_begin = std::chrono::steady_clock::now();
+        try {
+            const size_t configured_workers = RecoveryWorkerLimit();
+            const size_t workers = RunRecoveryTasks(index_key_stream_segments_.size(), configured_workers,
+                                                    [&](size_t, size_t segment_index) {
+                const IndexKeyStreamSegment& segment = index_key_stream_segments_[segment_index];
+                SegmentResult& result = results[segment_index];
+                std::vector<char> scratch;
+                WalDmlView local_dml;
+                std::string table_name;
+                int64_t offset = segment.begin;
+                while (offset < segment.end) {
+                    WalSnapshotAccess access;
+                    const char* header = wal_snapshot->record_bytes(offset, LOG_HEADER_SIZE, &scratch, &access);
+                    const uint32_t length = read_unaligned<uint32_t>(header + OFFSET_LOG_TOT_LEN);
+                    const LogType type = read_unaligned<LogType>(header + OFFSET_LOG_TYPE);
+                    if (length < static_cast<uint32_t>(LOG_HEADER_SIZE) || length > MAX_INDEX_SMO_RECORD_BYTES ||
+                        offset > segment.end - static_cast<int64_t>(length) || type < LogType::UPDATE ||
+                        type > LogType::INDEX_SMO) {
+                        throw InternalError("recovery index-key segment no longer has analyzed record boundaries; WAL retained");
+                    }
+                    const char* bytes = wal_snapshot->record_bytes(offset, length, &scratch, &access);
+                    if (type == LogType::INSERT || type == LogType::DELETE || type == LogType::UPDATE) {
+                        WalRecordView record;
+                        record.log_type = type;
+                        record.lsn = read_unaligned<lsn_t>(bytes + OFFSET_LSN);
+                        record.total_len = length;
+                        record.txn_id = read_unaligned<txn_id_t>(bytes + OFFSET_LOG_TID);
+                        record.prev_lsn = read_unaligned<lsn_t>(bytes + OFFSET_PREV_LSN);
+                        record.offset = offset;
+                        record.bytes = bytes;
+                        const uint32_t checksum = IndexSmoCrc32(bytes, length);
+                        result.identity = MixDmlIdentity(result.identity, offset, length, checksum);
+                        ++result.records;
+                        result.bytes += length;
+                        if (!ParseWalDml(record, &local_dml)) {
+                            throw InternalError("recovery failed to re-parse a DML payload that analyze accepted; WAL retained");
+                        }
+                        if (!local_dml.update_delta.present()) {
+                            table_name.assign(local_dml.table_name.data(), local_dml.table_name.size());
+                            const auto table_it = table_ids_.find(table_name);
+                            if (table_it == table_ids_.end() || table_it->second >= tables_.size()) {
+                                throw InternalError("recovery index-key segment table disagrees with analyze; WAL retained");
+                            }
+                            const RecoveryTable& table = tables_[table_it->second];
+                            for (IndexRepairPlan* plan : table.index_plans) {
+                                LocalPlanKeys& local = results[segment_index].plans[plan_slots.at(plan)];
+                                for (const char* image : {local_dml.before_image, local_dml.after_image}) {
+                                    if (image == nullptr) {
+                                        continue;
+                                    }
+                                    reserve_scratch(static_cast<size_t>(plan->key_len) + sizeof(IndexRepairEntry));
+                                    const uint32_t key_slot = static_cast<uint32_t>(local.key_arena.size() / plan->key_len);
+                                    local.key_arena.resize(local.key_arena.size() + static_cast<size_t>(plan->key_len));
+                                    BuildIndexKey(*plan->index_meta, image,
+                                                  local.key_arena.data() + static_cast<size_t>(key_slot) * plan->key_len);
+                                    local.entries.push_back(IndexRepairEntry{key_slot, local_dml.rid, false});
+                                    ++result.keys;
+                                }
+                            }
+                        }
+                    }
+                    offset += length;
+                }
+                if (offset != segment.end || result.records != segment.dml_records ||
+                    result.identity != segment.identity) {
+                    throw InternalError("recovery index-key segment identity changed after analyze; WAL retained");
+                }
+            });
+            uint64_t records = 0;
+            uint64_t bytes = 0;
+            uint64_t keys = 0;
+            for (size_t segment_index = 0; segment_index < results.size(); ++segment_index) {
+                SegmentResult& result = results[segment_index];
+                records += result.records;
+                bytes += result.bytes;
+                keys += result.keys;
+                for (size_t plan_index = 0; plan_index < plan_order.size(); ++plan_index) {
+                    LocalPlanKeys& local = result.plans[plan_index];
+                    IndexRepairPlan* plan = plan_order[plan_index];
+                    const uint32_t base = static_cast<uint32_t>(plan->key_arena.size() / plan->key_len);
+                    plan->key_arena.insert(plan->key_arena.end(), local.key_arena.begin(), local.key_arena.end());
+                    for (IndexRepairEntry entry : local.entries) {
+                        entry.key_slot += base;
+                        plan->entries.push_back(entry);
+                    }
+                }
+            }
+            if (records != index_key_stream_records_) {
+                throw InternalError("recovery index-key stream WAL no longer matches analyze prefix; WAL retained");
+            }
+            const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - parallel_begin)
+                                     .count();
+            const size_t logical_output_bytes = scratch_bytes.load(std::memory_order_relaxed);
+            LOG_INFO("recovery undo phase: wal-key-collect end source=verified-segments segments=%zu workers=%zu "
+                     "bytes=%llu records=%llu keys=%llu logical-output=%zu estimated-vector-peak<=%zu wall=%lld ms",
+                     results.size(), workers, static_cast<unsigned long long>(bytes),
+                     static_cast<unsigned long long>(records), static_cast<unsigned long long>(keys), logical_output_bytes,
+                     logical_output_bytes * 4, static_cast<long long>(wall_ms));
+            return;
+        } catch (const IndexKeyParallelScratchLimit&) {
+            LOG_WARN("recovery index-key parallel scratch reached %zu bytes; falling back to verified stream",
+                     scratch_limit);
+        }
+    }
 
     LOG_INFO("recovery undo phase: wal-key-collect begin source=verified-stream scan_end=%lld",
              static_cast<long long>(scan_end_offset_));
@@ -1423,16 +1795,36 @@ void RecoveryManager::collect_heap_index_keys() {
     // Read the final tuple of every touched RID one page at a time. The RIDs
     // are already ordered by page, so this is a sequential sweep and the keys
     // of every index on the table come out of the same page pin.
+    struct TableRange {
+        uint16_t table_id;
+        size_t begin;
+        size_t end;
+    };
+    std::vector<TableRange> ranges;
     for (size_t begin = 0; begin < touched_sorted_.size();) {
         const uint16_t table_id = touched_sorted_[begin].table_id;
         size_t end = begin;
         while (end < touched_sorted_.size() && touched_sorted_[end].table_id == table_id) {
             ++end;
         }
+        ranges.push_back(TableRange{table_id, begin, end});
+        begin = end;
+    }
+    const auto phase_begin = std::chrono::steady_clock::now();
+    std::vector<int64_t> table_wall_ms(ranges.size(), 0);
+    const size_t configured_workers = RecoveryWorkerLimit();
+    const size_t workers = RunRecoveryTasks(ranges.size(), configured_workers, [&](size_t, size_t task_index) {
+        const TableRange& range = ranges[task_index];
+        const auto table_begin = std::chrono::steady_clock::now();
+        const size_t begin = range.begin;
+        const size_t end = range.end;
+        const uint16_t table_id = range.table_id;
         RecoveryTable& table = tables_[table_id];
         if (table.file_handle == nullptr || table.index_plans.empty()) {
-            begin = end;
-            continue;
+            table_wall_ms[task_index] =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - table_begin)
+                    .count();
+            return;
         }
         const auto& table_plans = table.index_plans;
 
@@ -1473,8 +1865,18 @@ void RecoveryManager::collect_heap_index_keys() {
             buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
             i = page_end;
         }
-        begin = end;
-    }
+        table_wall_ms[task_index] =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - table_begin)
+                .count();
+    });
+    const int64_t max_table_ms =
+        table_wall_ms.empty() ? 0 : *std::max_element(table_wall_ms.begin(), table_wall_ms.end());
+    const int64_t wall_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_begin).count();
+    LOG_INFO("recovery heap-key-collect: tables=%zu configured-workers=%zu active-workers=%zu wall=%lld ms "
+             "max-table=%lld ms",
+             ranges.size(), configured_workers, workers, static_cast<long long>(wall_ms),
+             static_cast<long long>(max_table_ms));
 }
 
 void RecoveryManager::plan_touched_indexes(std::map<std::string, IndexRepairPlan>* plans) {
@@ -1565,7 +1967,8 @@ void RecoveryManager::sort_index_repair_entries(IndexRepairPlan* plan) {
         });
 }
 
-bool RecoveryManager::gate_index_change_set(IndexRepairPlan* plan, RecoveryIndexGate::Stats* totals) {
+bool RecoveryManager::gate_index_change_set(IndexRepairPlan* plan, RecoveryIndexGate::Stats* totals,
+                                            IndexRepairMetrics* metrics) {
     IxIndexHandle* index = plan->index;
     const int key_len = plan->key_len;
     const char* arena = plan->key_arena.data();
@@ -1573,10 +1976,10 @@ bool RecoveryManager::gate_index_change_set(IndexRepairPlan* plan, RecoveryIndex
     bool valid = true;
     bool gate_declined = false;
     {
-        // Recovery is single threaded and runs before the listener opens, so the
-        // latch is documentation rather than mutual exclusion - but the gate does
-        // write to index pages, and taking the same latch every writer takes keeps
-        // that from becoming an exception to the rule. It is released before
+        // Recovery runs before the listener opens and assigns at most one worker
+        // to each index. The gate still writes index pages, so taking the same
+        // latch every writer takes keeps it from becoming an exception to the
+        // rule. It is released before
         // validate_structure() runs below: index_latch_ is a plain shared_mutex,
         // so re-entering it for a shared hold would deadlock.
         auto structure_guard = index->lock_exclusive();
@@ -1606,7 +2009,7 @@ bool RecoveryManager::gate_index_change_set(IndexRepairPlan* plan, RecoveryIndex
         totals->page_fetches += stats.page_fetches;
         totals->parent_pointers_repaired += stats.parent_pointers_repaired;
         totals->chain_bounds_unknown += stats.chain_bounds_unknown;
-        index_parent_pointer_repair_count_ += stats.parent_pointers_repaired;
+        metrics->parent_pointer_repairs += stats.parent_pointers_repaired;
         // Unusable is not a verdict on the tree: the gate is saying it cannot
         // trust its own inputs (an unreadable or outdated page 0). Rebuilding on
         // that would turn a gate limitation into a table-sized recovery.
@@ -1620,7 +2023,7 @@ bool RecoveryManager::gate_index_change_set(IndexRepairPlan* plan, RecoveryIndex
     return valid;
 }
 
-bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
+bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan, IndexRepairMetrics* metrics) {
     IxIndexHandle* index = plan->index;
     const int key_len = plan->key_len;
     const char* arena = plan->key_arena.data();
@@ -1652,7 +2055,7 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
         }
 
         existing.clear();
-        ++index_probe_count_;
+        ++metrics->probes;
         index->get_value(key, &existing, nullptr);
 
         // `existing` is a multiset, not a set: lookup_equal() pushes back every
@@ -1675,7 +2078,7 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
             if (multiplicity(existing, existing[i]) > 1 &&
                 std::find(existing.begin(), existing.begin() + static_cast<std::ptrdiff_t>(i), existing[i]) ==
                     existing.begin() + static_cast<std::ptrdiff_t>(i)) {
-                ++index_duplicate_entry_count_;
+                ++metrics->duplicate_entries;
             }
         }
 
@@ -1699,7 +2102,7 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
             }
         }
         if (already_correct) {
-            ++index_unchanged_key_count_;
+            ++metrics->unchanged_keys;
             begin = end;
             continue;
         }
@@ -1712,7 +2115,7 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
                 if (!index->delete_entry(key, rid, IndexWriteWalContext::RecoveryDurable())) {
                     break;
                 }
-                ++index_mutation_count_;
+                ++metrics->mutations;
             }
         };
         for (const Rid& rid : candidates) {
@@ -1722,10 +2125,10 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan) {
             if (contains(candidates, rid)) {
                 // Drained to zero above, so exactly one copy has to go back.
                 index->insert_entry(key, rid, IndexWriteWalContext::RecoveryDurable(), true);
-                ++index_mutation_count_;
+                ++metrics->mutations;
             } else if (multiplicity(existing, rid) == 0) {
                 index->insert_entry(key, rid, IndexWriteWalContext::RecoveryDurable(), true);
-                ++index_mutation_count_;
+                ++metrics->mutations;
             } else {
                 // Present and never deleted; only the surplus copies have to go.
                 drain(rid, 1);
@@ -1816,69 +2219,137 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
     std::exception_ptr repair_exception;
     try {
 
-    // Stage 2: the structure gate proper, over the change set rather than over
-    // the tree. See src/recovery/index_structure_gate.h for why the distinct
-    // repair keys are a sufficient cover for everything an interrupted SMO can
-    // damage. It runs before any mutation, so a tree the repair cannot fix key
-    // by key never gets written to.
-    LOG_INFO("recovery undo phase: gate begin");
-    const auto gate_begin = std::chrono::steady_clock::now();
-    RecoveryIndexGate::Stats gate_totals;
-    for (auto& [index_name, plan] : plans) {
-        sort_index_repair_entries(&plan);
-        try {
-            if (!gate_index_change_set(&plan, &gate_totals)) {
-                LOG_ERROR("recovery found structurally invalid index %s", index_name.c_str());
-                indexes_to_rebuild.insert(index_name);
-            }
-        } catch (const std::exception& error) {
-            LOG_ERROR("recovery could not validate the structure of index %s: %s", index_name.c_str(), error.what());
-            indexes_to_rebuild.insert(index_name);
+        // Stage 2: the structure gate proper, over the change set rather than over
+        // the tree. See src/recovery/index_structure_gate.h for why the distinct
+        // repair keys are a sufficient cover for everything an interrupted SMO can
+        // damage. It runs before any mutation, so a tree the repair cannot fix key
+        // by key never gets written to.
+        LOG_INFO("recovery undo phase: gate begin");
+        const auto gate_begin = std::chrono::steady_clock::now();
+        struct GateResult {
+            bool rebuild{false};
+            RecoveryIndexGate::Stats stats;
+            IndexRepairMetrics metrics;
+            int64_t wall_ms{0};
+        };
+        std::vector<IndexRepairPlan*> gate_plans;
+        gate_plans.reserve(plans.size());
+        for (auto& [_, plan] : plans) {
+            gate_plans.push_back(&plan);
         }
-    }
-    LOG_INFO("recovery index structure gate: %zu indexes, spine: %zu leaf endpoints refreshed, %lld ms; "
-             "change set: %llu descents, "
-             "%llu keys covered, %llu pages validated, %llu page fetches, "
-             "%llu parent pointers repaired, %llu leaves with an empty successor, %zu to rebuild, %lld ms",
-             total_indexes, repaired_endpoints, static_cast<long long>(spine_ms),
-             static_cast<unsigned long long>(gate_totals.descents),
-             static_cast<unsigned long long>(gate_totals.keys_covered),
-             static_cast<unsigned long long>(gate_totals.pages_validated),
-             static_cast<unsigned long long>(gate_totals.page_fetches),
-             static_cast<unsigned long long>(gate_totals.parent_pointers_repaired),
-             static_cast<unsigned long long>(gate_totals.chain_bounds_unknown), indexes_to_rebuild.size(),
-             static_cast<long long>(
-                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - gate_begin)
-                     .count()));
-    LOG_INFO("recovery undo phase: gate end");
-
-    for (auto it = plans.begin(); it != plans.end();) {
-        it = indexes_to_rebuild.count(it->first) != 0 ? plans.erase(it) : std::next(it);
-    }
-
-    LOG_INFO("recovery undo phase: apply begin");
-    for (auto& [index_name, plan] : plans) {
-        try {
-            if (!apply_index_repair_plan(&plan)) {
-                indexes_to_rebuild.insert(index_name);
+        std::vector<GateResult> gate_results(gate_plans.size());
+        const size_t gate_configured_workers = RecoveryWorkerLimit();
+        const size_t gate_workers =
+            RunRecoveryTasks(gate_plans.size(), gate_configured_workers, [&](size_t, size_t task_index) {
+                IndexRepairPlan* plan = gate_plans[task_index];
+                GateResult& result = gate_results[task_index];
+                const auto index_begin = std::chrono::steady_clock::now();
+                sort_index_repair_entries(plan);
+                try {
+                    if (!gate_index_change_set(plan, &result.stats, &result.metrics)) {
+                        LOG_ERROR("recovery found structurally invalid index %s", plan->index_name.c_str());
+                        result.rebuild = true;
+                    }
+                } catch (const std::exception& error) {
+                    LOG_ERROR("recovery could not validate the structure of index %s: %s", plan->index_name.c_str(),
+                              error.what());
+                    result.rebuild = true;
+                }
+                result.wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - index_begin)
+                                     .count();
+            });
+        RecoveryIndexGate::Stats gate_totals;
+        int64_t gate_max_index_ms = 0;
+        for (size_t index = 0; index < gate_results.size(); ++index) {
+            const GateResult& result = gate_results[index];
+            gate_totals.descents += result.stats.descents;
+            gate_totals.keys_covered += result.stats.keys_covered;
+            gate_totals.pages_validated += result.stats.pages_validated;
+            gate_totals.page_fetches += result.stats.page_fetches;
+            gate_totals.parent_pointers_repaired += result.stats.parent_pointers_repaired;
+            gate_totals.chain_bounds_unknown += result.stats.chain_bounds_unknown;
+            index_parent_pointer_repair_count_ += result.metrics.parent_pointer_repairs;
+            gate_max_index_ms = std::max(gate_max_index_ms, result.wall_ms);
+            if (result.rebuild) {
+                indexes_to_rebuild.insert(gate_plans[index]->index_name);
             }
-        } catch (const std::exception& error) {
-            LOG_ERROR("recovery found structurally inconsistent index %s: %s", index_name.c_str(), error.what());
-            indexes_to_rebuild.insert(index_name);
         }
-    }
+        LOG_INFO("recovery index structure gate: %zu indexes, spine: %zu leaf endpoints refreshed, %lld ms; "
+                 "change set: %llu descents, "
+                 "%llu keys covered, %llu pages validated, %llu page fetches, "
+                 "%llu parent pointers repaired, %llu leaves with an empty successor, %zu to rebuild, %lld ms",
+                 total_indexes, repaired_endpoints, static_cast<long long>(spine_ms),
+                 static_cast<unsigned long long>(gate_totals.descents),
+                 static_cast<unsigned long long>(gate_totals.keys_covered),
+                 static_cast<unsigned long long>(gate_totals.pages_validated),
+                 static_cast<unsigned long long>(gate_totals.page_fetches),
+                 static_cast<unsigned long long>(gate_totals.parent_pointers_repaired),
+                 static_cast<unsigned long long>(gate_totals.chain_bounds_unknown), indexes_to_rebuild.size(),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - gate_begin)
+                                            .count()));
+        LOG_INFO("recovery undo phase: gate end");
+        LOG_INFO("recovery index structure gate workers: configured=%zu active=%zu max-index=%lld ms",
+                 gate_configured_workers, gate_workers, static_cast<long long>(gate_max_index_ms));
 
-    LOG_INFO("recovery index repair: %llu probes, %llu mutations, %llu keys already correct, %llu duplicated entries",
-             static_cast<unsigned long long>(index_probe_count_),
-             static_cast<unsigned long long>(index_mutation_count_),
-             static_cast<unsigned long long>(index_unchanged_key_count_),
-             static_cast<unsigned long long>(index_duplicate_entry_count_));
-    LOG_INFO("recovery undo phase: apply end");
+        for (auto it = plans.begin(); it != plans.end();) {
+            it = indexes_to_rebuild.count(it->first) != 0 ? plans.erase(it) : std::next(it);
+        }
 
-    // index_plans points into `plans`, which dies with this function.
-    for (auto& table : tables_) {
-        table.index_plans.clear();
-    }
+        LOG_INFO("recovery undo phase: apply begin");
+        struct ApplyResult {
+            bool rebuild{false};
+            IndexRepairMetrics metrics;
+            int64_t wall_ms{0};
+        };
+        std::vector<IndexRepairPlan*> apply_plans;
+        apply_plans.reserve(plans.size());
+        for (auto& [_, plan] : plans) {
+            apply_plans.push_back(&plan);
+        }
+        std::vector<ApplyResult> apply_results(apply_plans.size());
+        const size_t apply_configured_workers = RecoveryWorkerLimit();
+        const size_t apply_workers =
+            RunRecoveryTasks(apply_plans.size(), apply_configured_workers, [&](size_t, size_t task_index) {
+                IndexRepairPlan* plan = apply_plans[task_index];
+                ApplyResult& result = apply_results[task_index];
+                const auto index_begin = std::chrono::steady_clock::now();
+                try {
+                    if (!apply_index_repair_plan(plan, &result.metrics)) {
+                        result.rebuild = true;
+                    }
+                } catch (const std::exception& error) {
+                    LOG_ERROR("recovery found structurally inconsistent index %s: %s", plan->index_name.c_str(),
+                              error.what());
+                    result.rebuild = true;
+                }
+                result.wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - index_begin)
+                                     .count();
+            });
+        int64_t apply_max_index_ms = 0;
+        for (size_t index = 0; index < apply_results.size(); ++index) {
+            const ApplyResult& result = apply_results[index];
+            index_probe_count_ += result.metrics.probes;
+            index_mutation_count_ += result.metrics.mutations;
+            index_unchanged_key_count_ += result.metrics.unchanged_keys;
+            index_duplicate_entry_count_ += result.metrics.duplicate_entries;
+            apply_max_index_ms = std::max(apply_max_index_ms, result.wall_ms);
+            if (result.rebuild) {
+                indexes_to_rebuild.insert(apply_plans[index]->index_name);
+            }
+        }
+
+        LOG_INFO(
+            "recovery index repair: %llu probes, %llu mutations, %llu keys already correct, %llu duplicated entries",
+            static_cast<unsigned long long>(index_probe_count_), static_cast<unsigned long long>(index_mutation_count_),
+            static_cast<unsigned long long>(index_unchanged_key_count_),
+            static_cast<unsigned long long>(index_duplicate_entry_count_));
+        LOG_INFO("recovery index repair workers: configured=%zu active=%zu max-index=%lld ms", apply_configured_workers,
+                 apply_workers, static_cast<long long>(apply_max_index_ms));
+        LOG_INFO("recovery undo phase: apply end");
+
     } catch (...) {
         repair_exception = std::current_exception();
     }
@@ -1889,6 +2360,11 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
     const auto preflush_join_begin = std::chrono::steady_clock::now();
     heap_preflush.join();
     const auto preflush_end = std::chrono::steady_clock::now();
+    // index_plans points into `plans`, which dies with this function. Clear the
+    // borrowed pointers on success and every exception path before rethrowing.
+    for (auto& table : tables_) {
+        table.index_plans.clear();
+    }
     const auto elapsed_ms = [](std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
     };
