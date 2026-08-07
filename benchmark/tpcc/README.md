@@ -29,4 +29,5 @@ read-then-write TPC-C transactions into `database is locked` failures. Use
 `--sqlite-begin deferred` to measure SQLite's deferred-lock behavior explicitly.
 It writes `benchmark/tpcc/result-sqlite.json`; each result also contains
 `txn_tpm` and `latency_ms` entries for `new_order`, `payment`, `order_status`,
-`delivery`, and `stock_level`.
+`delivery`, and `stock_level`; `latency_ms.global` summarizes all committed
+measurement transactions with p50, p95, p99, and max latency in milliseconds.

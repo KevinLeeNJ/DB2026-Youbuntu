@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,58 @@ constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 8;
 // no other committer is competing for the disk. PostgreSQL's commit_delay plays
 // the same role and is likewise capped in the millisecond range.
 constexpr std::chrono::milliseconds GROUP_COMMIT_BATCH_WINDOW{2};
+constexpr std::chrono::milliseconds kSlowWalFdatasyncThreshold{20};
+
+void LogSlowWalFdatasync(std::chrono::steady_clock::duration elapsed, int bytes, lsn_t target_lsn,
+                         lsn_t durable_before, bool mode_strict) noexcept {
+    (void)durable_before;
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+    if (elapsed_ms <= kSlowWalFdatasyncThreshold) return;
+    // Keep slow-storage diagnosis from becoming a competing source of tail
+    // latency. The formatting/logging itself is intentionally outside the
+    // measured fdatasync interval.
+    struct Aggregate {
+        std::mutex latch;
+        std::chrono::steady_clock::time_point window{};
+        uint64_t count{};
+        uint64_t total_ms{};
+        uint64_t max_ms{};
+        int min_bytes{};
+        int max_bytes{};
+        lsn_t min_target{INVALID_LSN};
+        lsn_t max_target{INVALID_LSN};
+    };
+    static Aggregate aggregate;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(aggregate.latch);
+    if (aggregate.window == std::chrono::steady_clock::time_point{} ||
+        now - aggregate.window >= std::chrono::seconds(1)) {
+        if (aggregate.count != 0) {
+            LOG_WARN("wal-fdatasync-slow count=%llu total_ms=%llu max_ms=%llu bytes_range=%d:%d "
+                     "target_lsn_range=%d:%d suppressed=%llu mode_strict=%d",
+                     static_cast<unsigned long long>(aggregate.count),
+                     static_cast<unsigned long long>(aggregate.total_ms),
+                     static_cast<unsigned long long>(aggregate.max_ms), aggregate.min_bytes, aggregate.max_bytes,
+                     static_cast<int>(aggregate.min_target), static_cast<int>(aggregate.max_target),
+                     static_cast<unsigned long long>(aggregate.count - 1), mode_strict);
+        }
+        aggregate.window = now;
+        aggregate.count = 0;
+        aggregate.total_ms = 0;
+        aggregate.max_ms = 0;
+        aggregate.min_bytes = bytes;
+        aggregate.max_bytes = bytes;
+        aggregate.min_target = target_lsn;
+        aggregate.max_target = target_lsn;
+    }
+    ++aggregate.count;
+    aggregate.total_ms += static_cast<uint64_t>(elapsed_ms.count());
+    aggregate.max_ms = std::max(aggregate.max_ms, static_cast<uint64_t>(elapsed_ms.count()));
+    aggregate.min_bytes = std::min(aggregate.min_bytes, bytes);
+    aggregate.max_bytes = std::max(aggregate.max_bytes, bytes);
+    aggregate.min_target = std::min(aggregate.min_target, target_lsn);
+    aggregate.max_target = std::max(aggregate.max_target, target_lsn);
+}
 
 bool IsLegalEmptyCheckpoint(const char* bytes, size_t bytes_size) {
     constexpr size_t kEmptyCheckpointBytes = LOG_HEADER_SIZE + sizeof(size_t);
@@ -213,9 +266,9 @@ CheckpointWalCut LogManager::create_checkpoint_wal_cut(const std::vector<std::st
         cut.index_bindings.emplace_back(index_file_name, 0);
     }
 
-    // Global lock order for binding-sensitive WAL is binding_latch -> latch.
-    // append_index_smo() follows the same order. The durable flush never needs
-    // index_binding_latch_, so retaining it across the sync cannot form a cycle.
+    // Global lock order for this append batch is binding_latch_ -> latch_.
+    // append_index_smo() follows the same order. The later durable-prefix sync
+    // holds neither latch, so it cannot prolong checkpoint admission.
     std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
     const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
     std::vector<IndexBindLogRecord> binding_records;
@@ -227,7 +280,7 @@ CheckpointWalCut LogManager::create_checkpoint_wal_cut(const std::vector<std::st
             // Establish a normal V1 generation durably before the cut. If this
             // fails, no checkpoint record has been appended and the caller can
             // safely abandon the round.
-            const uint64_t generation = publish_index_binding_locked(index_file_name, epoch);
+            const uint64_t generation = publish_index_binding_locked(index_file_name, epoch, false);
             binding = index_bindings_.find(index_file_name);
             assert(binding != index_bindings_.end() && binding->second.generation == generation);
         }
@@ -273,17 +326,22 @@ CheckpointWalCut LogManager::create_checkpoint_wal_cut(const std::vector<std::st
         }
     }
 
-    // One durable prefix operation covers the complete contiguous batch. Keep
-    // binding_latch_ until it succeeds so no INDEX_SMO can cross the cut before
-    // the same-generation binding context itself reaches stable storage.
-    flush_log_to_disk_up_to_impl(cut.last_lsn, true);
     return cut;
 }
 
-uint64_t LogManager::publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch) {
+void LogManager::sync_checkpoint_wal_cut(const CheckpointWalCut& cut) {
+    if (cut.last_lsn == INVALID_LSN) {
+        throw std::invalid_argument("checkpoint WAL cut has no last LSN");
+    }
+    // The durable prefix contains the cut and every preceding record. Later
+    // appends may be coalesced, but never make the cut appear after them.
+    flush_log_to_disk_up_to_impl(cut.last_lsn, true);
+}
+
+uint64_t LogManager::publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch, bool durable) {
     IndexBindLogRecord record(index_file_name);
     const lsn_t lsn = add_log_to_buffer(&record);
-    flush_log_to_disk_up_to_impl(lsn, true);
+    if (durable) flush_log_to_disk_up_to_impl(lsn, true);
     const uint64_t generation = static_cast<uint64_t>(lsn) + 1U;
     index_bindings_[index_file_name] = IndexBinding{generation, epoch};
     return generation;
@@ -639,12 +697,14 @@ void LogManager::flush_buffer(bool sync) {
                     lock.unlock();
                     const lsn_t durable_before = durable_lsn_.load(std::memory_order_acquire);
                     if (metrics_enabled) metrics->record_physical_flush_iteration();
-                    const auto fsync_begin = metrics_enabled ? std::chrono::steady_clock::now()
-                                                             : std::chrono::steady_clock::time_point{};
+                    const auto fsync_begin = std::chrono::steady_clock::now();
                     disk_manager_->fsync_log();
+                    const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
+                    LogSlowWalFdatasync(fsync_elapsed, 0, target_lsn, durable_before,
+                                        durability_mode_ == DurabilityMode::STRICT);
                     if (metrics_enabled) {
                         metrics->record_fdatasync(static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fsync_begin)
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
                                 .count()));
                     }
                     lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
@@ -689,12 +749,14 @@ void LogManager::flush_buffer(bool sync) {
                         .count()));
             }
             if (sync) {
-                const auto fsync_begin = metrics_enabled ? std::chrono::steady_clock::now()
-                                                         : std::chrono::steady_clock::time_point{};
+                const auto fsync_begin = std::chrono::steady_clock::now();
                 disk_manager_->fsync_log();
+                const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
+                LogSlowWalFdatasync(fsync_elapsed, bytes, target_lsn, durable_before,
+                                    durability_mode_ == DurabilityMode::STRICT);
                 if (metrics_enabled) {
                     metrics->record_fdatasync(static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fsync_begin)
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
                             .count()));
                 }
             }
@@ -739,6 +801,100 @@ void LogManager::flush_buffer(bool sync) {
     }
 }
 
+void LogManager::prepare_existing_log() {
+    std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
+    std::lock_guard<std::mutex> lock(latch_);
+    log_buffer_->offset_ = 0;
+    flushing_buffer_->offset_ = 0;
+    flushing_in_progress_ = false;
+    log_buffer_->shrink_after_flush();
+    flushing_buffer_->shrink_after_flush();
+    std::fill(log_buffer_->buffer_.begin(), log_buffer_->buffer_.end(), 0);
+    index_bindings_.clear();
+
+    prepared_manifest_ = read_restart_manifest();
+    if (prepared_manifest_.malformed) {
+        throw InternalError("malformed segmented WAL restart manifest");
+    }
+    if (prepared_manifest_.segmented_wal) {
+        disk_manager_->configure_segmented_wal(prepared_manifest_.wal_generation, prepared_manifest_.restart_segment,
+                                               static_cast<int64_t>(prepared_manifest_.wal_segment_bytes));
+        if (!disk_manager_->is_file(disk_manager_->wal_segment_name(prepared_manifest_.restart_segment))) {
+            throw InternalError("segmented WAL manifest root segment is missing");
+        }
+        disk_manager_->sync_segmented_wal_directory();
+    } else {
+        disk_manager_->configure_legacy_wal();
+    }
+    prepared_file_size_ = disk_manager_->get_log_file_size();
+    const char* segmented_override = std::getenv("RMDB_WAL_SEGMENTED");
+    const bool default_segmented = segmented_override != nullptr && std::strcmp(segmented_override, "1") == 0;
+    if (!prepared_manifest_.segmented_wal && prepared_file_size_ == 0 && prepared_manifest_.checkpoint_offset == 0 &&
+        default_segmented) {
+        disk_manager_->configure_segmented_wal(0, 0);
+        disk_manager_->ensure_segmented_wal_root();
+        prepared_manifest_.segmented_wal = true;
+        prepared_manifest_.wal_generation = 0;
+        prepared_manifest_.wal_segment_bytes = DiskManager::kWalSegmentBytes;
+        prepared_manifest_.restart_segment = 0;
+        prepared_manifest_.restart_offset = 0;
+        prepared_manifest_.next_lsn = 0;
+        write_restart_manifest(prepared_manifest_);
+        prepared_file_size_ = disk_manager_->get_log_file_size();
+    }
+    prepared_restart_offset_ = 0;
+    prepared_restart_rejected_ = false;
+    if (prepared_manifest_.checkpoint_offset > 0) {
+        constexpr size_t kEmptyCheckpointBytes = LOG_HEADER_SIZE + sizeof(size_t);
+        std::vector<char> bytes(kEmptyCheckpointBytes);
+        const int64_t offset = prepared_manifest_.checkpoint_offset;
+        if (offset <= prepared_file_size_ - static_cast<int64_t>(kEmptyCheckpointBytes) &&
+            disk_manager_->read_log_chunk(bytes.data(), static_cast<int>(bytes.size()), offset) ==
+                static_cast<int>(bytes.size()) &&
+            IsLegalEmptyCheckpoint(bytes.data(), bytes.size())) {
+            prepared_restart_offset_ = offset;
+        } else {
+            prepared_restart_rejected_ = true;
+        }
+    }
+    startup_prepared_ = true;
+}
+
+int64_t LogManager::prepared_restart_offset() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    return startup_prepared_ ? prepared_restart_offset_ : 0;
+}
+
+bool LogManager::startup_is_prepared() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    return startup_prepared_;
+}
+
+void LogManager::finalize_existing_log(int64_t accepted_end_offset, lsn_t max_lsn,
+                                       const std::vector<std::pair<std::string, uint64_t>>& index_bindings) {
+    std::unique_lock<std::mutex> binding_lock(index_binding_latch_);
+    std::lock_guard<std::mutex> lock(latch_);
+    if (!startup_prepared_ || accepted_end_offset < 0 || accepted_end_offset > prepared_file_size_) {
+        throw InternalError("invalid WAL startup finalization; WAL retained");
+    }
+    // This is the sole truncation point: analyze has already semantically
+    // validated every complete record up to accepted_end_offset.
+    if (accepted_end_offset < prepared_file_size_) disk_manager_->truncate_log_to(accepted_end_offset);
+    log_file_offset_ = accepted_end_offset;
+    persist_lsn_ = max_lsn;
+    durable_lsn_.store(max_lsn, std::memory_order_release);
+    global_lsn_.store(std::max(max_lsn == INVALID_LSN ? 0 : max_lsn + 1, prepared_manifest_.next_lsn));
+    index_bindings_.clear();
+    const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
+    for (const auto& [name, generation] : index_bindings) index_bindings_[name] = IndexBinding{generation, epoch};
+    disk_manager_->SetLogOffset(accepted_end_offset);
+    if (prepared_restart_rejected_) {
+        prepared_manifest_.checkpoint_offset = 0;
+        write_restart_manifest(prepared_manifest_);
+    }
+    startup_prepared_ = false;
+}
+
 void LogManager::initialize_from_existing_log() {
     // Match the binding-sensitive append order. Startup is normally
     // single-threaded, but keeping one order makes later reuse safe too.
@@ -751,6 +907,13 @@ void LogManager::initialize_from_existing_log() {
     flushing_buffer_->shrink_after_flush();
     std::fill(log_buffer_->buffer_.begin(), log_buffer_->buffer_.end(), 0);
     index_bindings_.clear();
+    // The legacy compatibility wrapper performs its own complete startup
+    // scan. Do not let a prior prepare_existing_log() leak its checkpoint
+    // decision into a later direct RecoveryManager user of this same object.
+    startup_prepared_ = false;
+    prepared_restart_offset_ = 0;
+    prepared_restart_rejected_ = false;
+    prepared_file_size_ = 0;
 
     RestartManifest manifest = read_restart_manifest();
     if (manifest.malformed) {

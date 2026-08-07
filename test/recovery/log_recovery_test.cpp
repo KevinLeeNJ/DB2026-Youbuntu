@@ -189,11 +189,9 @@ void FlushLogs(LogManager& log_mgr) {
     log_mgr.flush_log_to_disk();
 }
 
-// Mirrors what rmdb.cpp does at startup. Note that production calls
-// LogManager::initialize_from_existing_log() first, which truncates the WAL to
-// its intact prefix; RecoveryManager documents that as a precondition. Every WAL
-// these tests build is complete, so analyze()'s "the file ends where the scan
-// ended" check holds either way.
+// Mirrors the direct RecoveryManager test contract. Production uses the
+// prepare/analyze/finalize sequence in rmdb.cpp; these fixtures deliberately
+// retain their explicitly constructed restart-manifest semantics.
 void RunRecovery(const std::string& db_name) {
     OpenRecoveryDb db(db_name);
     db.bpm_.set_log_manager(db.log_mgr_.get());
@@ -405,6 +403,7 @@ TEST(RecoveryManagerTest, UnpublishedCheckpointCutDoesNotInvalidateEarlierIndexS
         db.log_mgr_->initialize_from_existing_log();
         const std::string index_name = db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"});
         const CheckpointWalCut cut = db.log_mgr_->create_checkpoint_wal_cut({index_name});
+        db.log_mgr_->sync_checkpoint_wal_cut(cut);
         ASSERT_EQ(cut.index_bindings.size(), 1U);
         // Deliberately do not publish cut.checkpoint_offset. Recovery must use
         // the old boundary and still accept the earlier same-generation SMO.
@@ -439,6 +438,102 @@ TEST(RecoveryManagerTest, MultipleIndexSmoRecordsPrepareEachIndexOnlyOnce) {
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 19, rid));
 }
 
+TEST(RecoveryManagerTest, IndexSmoKeepsOlderUniquePageWhenNewerRecordOverridesAnotherPage) {
+    ScopedTestDir test_dir("recovery_index_smo_partial_overlap_root");
+    const std::string db_name = "recovery_index_smo_partial_overlap_db";
+    CreateRecoveryTestDb(db_name);
+
+    OpenRecoveryDb db(db_name);
+    const std::string index_name = db.sm_mgr_.get_ix_manager()->get_index_name("t", {"id"});
+    IxIndexHandle* index = db.sm_mgr_.ihs_.at(index_name).get();
+    const int fd = index->GetFd();
+    constexpr page_id_t root_page_no = IX_INIT_ROOT_PAGE;
+    constexpr page_id_t older_only_page_no = IX_INIT_ROOT_PAGE + 1;
+    std::array<char, PAGE_SIZE> root{};
+    std::array<char, PAGE_SIZE> header{};
+    db.disk_.read_page(fd, root_page_no, root.data(), PAGE_SIZE);
+    db.disk_.read_page(fd, IX_FILE_HDR_PAGE, header.data(), PAGE_SIZE);
+
+    IndexSmoWalData older;
+    older.index_file_name = index_name;
+    older.pages.resize(2);
+    older.pages[0].page_no = root_page_no;
+    older.pages[0].bytes = root;
+    older.pages[0].bytes.back() = 'a';
+    older.pages[1].page_no = older_only_page_no;
+    older.pages[1].bytes = root;
+    older.pages[1].bytes.back() = 'b';
+    older.header = header;
+    older.header.back() = 'c';
+
+    IndexSmoWalData newer;
+    newer.index_file_name = index_name;
+    newer.pages.resize(1);
+    newer.pages[0].page_no = root_page_no;
+    newer.pages[0].bytes = root;
+    newer.pages[0].bytes.back() = 'd';
+    newer.header = header;
+    newer.header.back() = 'e';
+
+    const lsn_t older_lsn = db.log_mgr_->append_index_smo(older);
+    const lsn_t newer_lsn = db.log_mgr_->append_index_smo(newer);
+    ASSERT_GT(newer_lsn, older_lsn);
+    db.log_mgr_->flush_log_to_disk_up_to_durable(newer_lsn);
+    db.disk_.write_page(fd, root_page_no, root.data(), PAGE_SIZE);
+    db.disk_.write_page(fd, older_only_page_no, root.data(), PAGE_SIZE);
+    db.disk_.write_page(fd, IX_FILE_HDR_PAGE, header.data(), PAGE_SIZE);
+
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.redo();
+
+    std::array<char, PAGE_SIZE> recovered_root{};
+    std::array<char, PAGE_SIZE> recovered_older_only{};
+    std::array<char, PAGE_SIZE> recovered_header{};
+    db.disk_.read_page(fd, root_page_no, recovered_root.data(), PAGE_SIZE);
+    db.disk_.read_page(fd, older_only_page_no, recovered_older_only.data(), PAGE_SIZE);
+    db.disk_.read_page(fd, IX_FILE_HDR_PAGE, recovered_header.data(), PAGE_SIZE);
+    EXPECT_EQ(recovered_root.back(), 'd');
+    EXPECT_EQ(recovered_older_only.back(), 'b');
+    EXPECT_EQ(recovered_header.back(), 'e');
+}
+
+TEST(RecoveryManagerTest, AnalyzeReportsWalCompositionWithoutExtraScan) {
+    ScopedTestDir test_dir("recovery_wal_composition_root");
+    const std::string db_name = "recovery_wal_composition_db";
+    CreateRecoveryTestDb(db_name);
+    PrepareSinglePageIndexSmo(db_name, 61, Rid{1, 61}, false, false, 3);
+
+    OpenRecoveryDb db(db_name);
+    const txn_id_t txn_id = 717;
+    auto tuple = MakeTuple(61, 610);
+    const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, txn_id);
+    const lsn_t insert_lsn = AppendInsert(*db.log_mgr_, txn_id, begin_lsn, Rid{1, 61}, tuple);
+    AppendCommit(*db.log_mgr_, txn_id, insert_lsn);
+    FlushLogs(*db.log_mgr_);
+
+    std::array<uint64_t, RecoveryManager::kLogTypeCount> expected_counts{};
+    std::array<uint64_t, RecoveryManager::kLogTypeCount> expected_bytes{};
+    WalReader reader(&db.disk_, 0, db.disk_.get_log_file_size());
+    WalRecordView record;
+    while (reader.next(&record)) {
+        const size_t type = static_cast<size_t>(record.log_type);
+        ++expected_counts[type];
+        expected_bytes[type] += record.total_len;
+    }
+
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+
+    for (size_t type = 0; type < RecoveryManager::kLogTypeCount; ++type) {
+        const auto log_type = static_cast<LogType>(type);
+        EXPECT_EQ(recovery.get_log_type_record_count(log_type), expected_counts[type]);
+        EXPECT_EQ(recovery.get_log_type_serialized_bytes(log_type), expected_bytes[type]);
+    }
+    EXPECT_EQ(recovery.get_index_smo_logical_image_count(), 6u);
+    EXPECT_EQ(recovery.get_index_smo_logical_image_bytes(), 6u * PAGE_SIZE);
+}
+
 TEST(RecoveryManagerTest, NewBindingSkipsOldSameNameIndexSmo) {
     ScopedTestDir test_dir("recovery_index_smo_generation_root");
     const std::string db_name = "recovery_index_smo_generation_db";
@@ -450,6 +545,30 @@ TEST(RecoveryManagerTest, NewBindingSkipsOldSameNameIndexSmo) {
 
     OpenRecoveryDb db(db_name);
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 23, rid));
+}
+
+// SMO redo validates the compact descriptor again after analyze. The mapped
+// snapshot must preserve that fail-closed boundary just like the old pread
+// path did, rather than replaying a retyped record or resetting its WAL.
+TEST(RecoveryManagerTest, IndexSmoWalMutationAfterAnalyzeFailsClosed) {
+    ScopedTestDir test_dir("recovery_index_smo_wal_mutation_root");
+    const std::string db_name = "recovery_index_smo_wal_mutation_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 27};
+    PrepareSinglePageIndexSmo(db_name, 27, rid, false);
+
+    OpenRecoveryDb db(db_name);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
+    ASSERT_EQ(smo_offsets.size(), 1u);
+    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    const LogType retyped = LogType::CHECKPOINT;
+    PatchWalBytes(LOG_FILE_NAME, smo_offsets[0] + OFFSET_LOG_TYPE, &retyped, sizeof(LogType));
+
+    EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 27, rid));
 }
 
 TEST(RecoveryManagerTest, LoserIndexSmoIsRedoneBeforeTheLoserKeyIsUndone) {
@@ -643,7 +762,9 @@ TEST(RecoveryManagerTest, BeginOnlyTransactionsDoNotExpandLoserUndoWork) {
 
         EXPECT_EQ(recovery.get_dml_record_count(), 3u);
         EXPECT_EQ(recovery.get_redo_applied_count(), 1u);
-        EXPECT_EQ(recovery.get_redo_skipped_count(), 2u);
+        // Loser descriptors are compacted out before heap redo. They remain
+        // represented by touched_/the LSN index and are applied by undo().
+        EXPECT_EQ(recovery.get_redo_skipped_count(), 0u);
         EXPECT_EQ(recovery.get_undo_applied_count(), 2u);
         EXPECT_EQ(recovery.get_undo_chain_record_read_count(), 5u);
         EXPECT_FALSE(RecordExists(db.sm_mgr_, active_rid));
@@ -1662,13 +1783,56 @@ TEST(RecoveryManagerTest, CorruptDmlPayloadFailsRecoveryInsteadOfEndingTheScan) 
         wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
     }
 
-    EXPECT_THROW(RunRecovery(db_name), InternalError);
+    {
+        OpenRecoveryDb db(db_name);
+        db.log_mgr_->prepare_existing_log();
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        EXPECT_THROW(recovery.analyze(), InternalError);
+        // finalize is not reached, so a complete semantic corruption cannot
+        // be silently converted into a physical-tail truncation.
+        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    }
 
     OpenRecoveryDb db(db_name);
     // Retained in full, so the next process retries from the same input rather
     // than starting up on a database missing a committed row.
     EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+}
+
+TEST(RecoveryManagerTest, ProductionPrepareAnalyzeFinalizeDefersTornTailTruncation) {
+    ScopedTestDir test_dir("recovery_prepare_finalize_torn_tail_root");
+    const std::string db_name = "recovery_prepare_finalize_torn_tail_db";
+    CreateRecoveryTestDb(db_name);
+    int64_t physical_torn_size = 0;
+
+    {
+        OpenRecoveryDb db(db_name);
+        AppendBegin(*db.log_mgr_, 100);
+        AppendBegin(*db.log_mgr_, 101);
+        FlushLogs(*db.log_mgr_);
+        const int64_t complete_size = db.disk_.get_file_size(LOG_FILE_NAME);
+        ASSERT_GT(complete_size, 1);
+        physical_torn_size = complete_size - 1;
+        ASSERT_EQ(::truncate(LOG_FILE_NAME.c_str(), physical_torn_size), 0);
+    }
+
+    OpenRecoveryDb db(db_name);
+    db.log_mgr_->prepare_existing_log();
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    ASSERT_NO_THROW(recovery.analyze());
+    const int64_t accepted_end = recovery.get_scan_end_offset();
+    EXPECT_LT(accepted_end, physical_torn_size);
+    // prepare/analyze never alter the physical WAL, so a failed semantic pass
+    // would still have the exact original bytes to retry.
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), physical_torn_size);
+
+    ASSERT_NO_THROW(
+        db.log_mgr_->finalize_existing_log(accepted_end, recovery.get_max_lsn(), recovery.get_latest_index_bindings()));
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), accepted_end);
+    EXPECT_EQ(db.log_mgr_->current_log_offset(), accepted_end);
+    BeginLogRecord after_finalize(102);
+    EXPECT_EQ(db.log_mgr_->add_log_to_buffer(&after_finalize), recovery.get_max_lsn() + 1);
 }
 
 // A loser whose prev_lsn chain reaches back before the scan's start offset must

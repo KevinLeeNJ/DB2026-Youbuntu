@@ -25,6 +25,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/fault_injection.h"
 #include "common/checkpoint_phase_metrics.h"
+#include "minilog.h"
 #include "recovery/log_manager.h"
 #include "storage/buffer_pool_manager.h"
 #include "system/sm_manager.h"
@@ -36,6 +37,7 @@ namespace {
 // complete lifetime of an automatic fuzzy checkpoint. This flag only elects
 // one automatic owner because shared-lock holders do not exclude each other.
 std::atomic<bool> g_fuzzy_checkpoint_running{false};
+std::atomic<uint64_t> g_checkpoint_event_id{0};
 // STATIC_CHECKPOINT is created through a separate manager instance. Keeping
 // the process's published boundary here lets the persistent background manager
 // observe its manifest-zero/WAL-reset transition without polling db.restart on
@@ -63,6 +65,15 @@ constexpr uint64_t kMinTickBytes = PAGE_SIZE;
 constexpr uint64_t kMaxTickBytes = 1024ULL * 1024 * 1024;
 constexpr uint64_t kMinTickTimeUs = 100;
 constexpr uint64_t kMaxTickTimeUs = 1000000;
+
+uint64_t NextCheckpointEventId() noexcept {
+    return g_checkpoint_event_id.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t ElapsedMs(std::chrono::steady_clock::time_point started) noexcept {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+}
 
 uint64_t ReadCheckpointEnv(const char* name, uint64_t default_value, uint64_t minimum, uint64_t maximum) {
     const char* raw = std::getenv(name);
@@ -163,6 +174,19 @@ struct CheckpointManager::FuzzyCheckpointState {
     BufferPoolManager::CheckpointCohort cohort;
     CheckpointWalCut wal_cut;
     RestartManifest manifest;
+    uint64_t event_id{};
+    std::chrono::steady_clock::time_point event_started{};
+    std::chrono::steady_clock::time_point cohort_flush_started{};
+    size_t cohort_pages_written{};
+    bool cohort_flush_logged{false};
+    bool cohort_flush_complete{false};
+    bool wal_cut_synced{false};
+    bool headers_written{false};
+    size_t next_file_sync{};
+    std::chrono::steady_clock::time_point file_sync_started{};
+    uint64_t file_sync_total_ms{};
+    uint64_t file_sync_max_ms{};
+    const char* phase{"start"};
     std::chrono::steady_clock::time_point metrics_started{};
 };
 
@@ -192,9 +216,17 @@ void CheckpointManager::SetOptions(CheckpointOptions options) {
 }
 
 bool CheckpointManager::RunCleanCheckpoint() {
+    const uint64_t event_id = NextCheckpointEventId();
+    const auto event_started = std::chrono::steady_clock::now();
     if (txn_mgr_ == nullptr || sm_mgr_ == nullptr || log_mgr_ == nullptr) {
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=failure reason=precondition elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
+
+    const int64_t start_offset = log_mgr_->current_log_offset();
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=start log_offset=%lld",
+             static_cast<unsigned long long>(event_id), static_cast<long long>(start_offset));
 
     CleanAttemptMetric attempt(metrics_);
     // Lock order for every checkpoint path is coordination -> catalog ->
@@ -224,31 +256,48 @@ bool CheckpointManager::RunCleanCheckpoint() {
         }
     } block_guard(txn_mgr_);
     bool drained = false;
+    const auto drain_started = std::chrono::steady_clock::now();
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=drain-begin", static_cast<unsigned long long>(event_id));
     {
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::DrainAdmissionWait);
         drained = txn_mgr_->wait_active_transactions_drained_for_checkpoint(kDrainTimeout);
     }
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=drain-finished success=%d elapsed_ms=%llu",
+             static_cast<unsigned long long>(event_id), drained,
+             static_cast<unsigned long long>(ElapsedMs(drain_started)));
     if (!drained) {
         // Abandon this round. ~BlockGuard releases the block immediately, so a
         // stuck transaction can never freeze every other transaction. The WAL
         // keeps growing, which only makes the next recovery slower.
         defer_automatic_retry();
         if (metrics_ != nullptr) metrics_->retry_deferral(false);
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=failure reason=drain elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
     if (deadline_expired()) {
         defer_automatic_retry();
         if (metrics_ != nullptr) metrics_->retry_deferral(true);
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=failure reason=deadline-before-wal elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
+    const auto wal_started = std::chrono::steady_clock::now();
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=wal-sync-begin", static_cast<unsigned long long>(event_id));
     log_mgr_->flush_log_to_disk_with_sync();
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=wal-sync-finished elapsed_ms=%llu",
+             static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(wal_started)));
     if (deadline_expired()) {
         defer_automatic_retry();
         if (metrics_ != nullptr) metrics_->retry_deferral(true);
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=failure reason=deadline-after-wal elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
     FaultInjector::Point("before_checkpoint_data_sync");
     bool final_data_stable = false;
+    const auto flush_all_started = std::chrono::steady_clock::now();
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=flush-all-begin", static_cast<unsigned long long>(event_id));
     try {
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::CleanDataSync);
         final_data_stable = sm_mgr_->flush_all_table_and_index_pages(FlushDependencyPolicy::AlreadyDurable());
@@ -256,15 +305,25 @@ bool CheckpointManager::RunCleanCheckpoint() {
         // A failed table/index fdatasync must leave the complete WAL and old
         // restart manifest intact so this checkpoint can be retried.
     }
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=flush-all-end success=%d elapsed_ms=%llu",
+             static_cast<unsigned long long>(event_id), final_data_stable,
+             static_cast<unsigned long long>(ElapsedMs(flush_all_started)));
     if (!final_data_stable) {
         defer_automatic_retry();
         if (metrics_ != nullptr) metrics_->retry_deferral(false);
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=failure reason=flush-all elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
     FaultInjector::Point("after_checkpoint_data_sync");
     {
+        const auto meta_started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=flush-meta-begin",
+                 static_cast<unsigned long long>(event_id));
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::CleanMetaFlush);
         sm_mgr_->flush_meta();
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=flush-meta-end elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(meta_started)));
     }
     // Once the non-interruptible final data sync has succeeded, finish the
     // manifest/truncate sequence even if that sync crossed the admission
@@ -284,18 +343,30 @@ bool CheckpointManager::RunCleanCheckpoint() {
     manifest.next_timestamp = txn_mgr_->peek_next_timestamp();
     manifest.next_txn_id = txn_mgr_->peek_next_txn_id();
     {
+        const auto manifest_started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=manifest-begin", static_cast<unsigned long long>(event_id));
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::ManifestPublish);
         log_mgr_->write_restart_manifest(manifest);
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=manifest-end elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id),
+                 static_cast<unsigned long long>(ElapsedMs(manifest_started)));
     }
     FaultInjector::Point("before_wal_truncate");
     {
+        const auto reset_started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=reset-wal-begin",
+                 static_cast<unsigned long long>(event_id));
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::WalResetReclaim);
         log_mgr_->reset_log(log_mgr_->get_global_lsn());
+        LOG_WARN("checkpoint-event kind=clean id=%llu phase=reset-wal-end elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(reset_started)));
     }
     g_published_restart_offset.store(0, std::memory_order_release);
     drain_retry_time_ = {};
     drain_retry_log_offset_ = 0;
     attempt.Succeed();
+    LOG_WARN("checkpoint-event kind=clean id=%llu phase=finish elapsed_ms=%llu",
+             static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
     return true;
 }
 
@@ -329,6 +400,9 @@ void CheckpointManager::CancelFuzzyCheckpoint(bool record_cancel) noexcept {
 
     if (metrics_ != nullptr && record_cancel) metrics_->fuzzy_cancel();
     auto checkpoint = std::move(fuzzy_checkpoint_);
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=cancel prior_phase=%s elapsed_ms=%llu",
+             static_cast<unsigned long long>(checkpoint->event_id), checkpoint->phase,
+             static_cast<unsigned long long>(ElapsedMs(checkpoint->event_started)));
     FuzzyAttemptMetric::RecordLifetime(metrics_, checkpoint->metrics_started);
     try {
         if (sm_mgr_ != nullptr && sm_mgr_->get_bpm() != nullptr && checkpoint->cohort.epoch != 0) {
@@ -360,6 +434,11 @@ bool CheckpointManager::StartFuzzyCheckpoint() {
         return false;
     }
     FuzzyAttemptMetric attempt(metrics_);
+    const uint64_t event_id = NextCheckpointEventId();
+    const auto event_started = std::chrono::steady_clock::now();
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=start log_offset=%lld retained_bytes=%lld target_bytes=%lld",
+             static_cast<unsigned long long>(event_id), static_cast<long long>(current_offset),
+             static_cast<long long>(RetainedWalBytes(current_offset)), static_cast<long long>(target));
     struct ReservationGuard {
         bool armed{true};
 
@@ -384,12 +463,19 @@ bool CheckpointManager::StartFuzzyCheckpoint() {
     } block_guard(txn_mgr_);
 
     bool drained = false;
+    const auto drain_started = std::chrono::steady_clock::now();
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=drain-begin", static_cast<unsigned long long>(event_id));
     {
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::DrainAdmissionWait);
         drained = txn_mgr_->wait_active_transactions_drained_for_checkpoint(kDrainTimeout);
     }
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=drain-finished success=%d elapsed_ms=%llu",
+             static_cast<unsigned long long>(event_id), drained,
+             static_cast<unsigned long long>(ElapsedMs(drain_started)));
     if (!drained) {
         DeferAutomaticRetry();
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=backoff reason=drain elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
 
@@ -406,6 +492,8 @@ bool CheckpointManager::StartFuzzyCheckpoint() {
     const auto cohort = bpm->begin_checkpoint_cohort(headers.data_and_index_fds, kDrainTimeout);
     if (!cohort.success) {
         DeferAutomaticRetry();
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=backoff reason=cohort-begin elapsed_ms=%llu",
+                 static_cast<unsigned long long>(event_id), static_cast<unsigned long long>(ElapsedMs(event_started)));
         return false;
     }
     try {
@@ -415,20 +503,27 @@ bool CheckpointManager::StartFuzzyCheckpoint() {
         CheckpointWalCut wal_cut = log_mgr_->create_checkpoint_wal_cut(headers.index_file_names);
         cut_timer.Finish();
         manifest.checkpoint_offset = wal_cut.checkpoint_offset;
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=wal-cut-append-end checkpoint_offset=%lld last_lsn=%d",
+                 static_cast<unsigned long long>(event_id), static_cast<long long>(wal_cut.checkpoint_offset),
+                 static_cast<int>(wal_cut.last_lsn));
 
         if (metrics_ != nullptr) metrics_->pages_marked(cohort.pages_marked);
         fuzzy_checkpoint_ =
             std::make_unique<FuzzyCheckpointState>(std::move(checkpoint_guard), std::move(catalog_guard),
                                                    std::move(headers), cohort, std::move(wal_cut), manifest,
                                                    attempt.started());
+        fuzzy_checkpoint_->event_id = event_id;
+        fuzzy_checkpoint_->event_started = event_started;
+        fuzzy_checkpoint_->phase = "wal-cut-sync-pending";
         attempt.Transfer();
     } catch (...) {
         bpm->cancel_checkpoint_cohort(cohort.epoch);
         throw;
     }
 
-    // BlockGuard reopens admission as this function returns. The durable WAL
-    // cut and all state needed by later Ticks are already owned by the state.
+    // BlockGuard reopens admission as this function returns. The cut is only
+    // appended here; its durable prefix sync intentionally happens in a later
+    // tick, and no cohort page is flushed before that succeeds.
     reservation.armed = false;
     return true;
 }
@@ -439,68 +534,152 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
         throw InternalError("invalid fuzzy checkpoint state");
     }
 
-    FaultInjector::Point("before_fuzzy_checkpoint_data_sync");
-    const size_t quantum_pages = options_.io_quantum_pages;
-    const size_t byte_budget_pages = std::max<size_t>(size_t{1}, options_.tick_bytes / PAGE_SIZE);
-    const size_t io_budget_pages = byte_budget_pages;
-    // SetOptions clamps the unsigned input before this signed duration
-    // conversion, so neither conversion nor now()+duration can overflow.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(options_.tick_time_us);
-    size_t pages_written = 0;
-    size_t pages_remaining = 0;
-    bool first_quantum = true;
-    for (;;) {
-        const size_t remaining_budget = io_budget_pages > pages_written ? io_budget_pages - pages_written : 0;
-        if (!first_quantum && (remaining_budget == 0 || std::chrono::steady_clock::now() >= deadline)) {
-            if (metrics_ != nullptr) {
-                if (remaining_budget == 0) {
-                    metrics_->budget_yield_io();
-                } else {
-                    metrics_->budget_yield_time();
-                }
-            }
-            return false;
-        }
-        const size_t quantum = std::min(quantum_pages, std::max<size_t>(size_t{1}, remaining_budget));
-        const size_t visit_budget = std::max<size_t>(64, quantum * 4);
-        BufferPoolManager::CheckpointCohortFlushResult result;
-        {
-            auto page_timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::PageWrite);
-            result = bpm->flush_checkpoint_cohort(fuzzy_checkpoint_->cohort.epoch, quantum, visit_budget);
-        }
-        if (metrics_ != nullptr) metrics_->page_write(result.pages_written, result.pages_remaining);
-        if (!result.success) throw UnixError();
-        pages_written += result.pages_written;
-        pages_remaining = result.pages_remaining;
-        if (pages_remaining == 0) break;
-        // No successful write and no remaining obligation change would spin on
-        // a transient FLUSHING frame; yield to the next scheduler tick.
-        if (result.pages_written == 0) {
-            if (metrics_ != nullptr) metrics_->zero_progress_yield();
-            return false;
-        }
-        first_quantum = false;
+    if (!fuzzy_checkpoint_->wal_cut_synced) {
+        fuzzy_checkpoint_->phase = "wal-cut-sync";
+        const auto started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=wal-cut-sync-begin last_lsn=%d",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+                 static_cast<int>(fuzzy_checkpoint_->wal_cut.last_lsn));
+        log_mgr_->sync_checkpoint_wal_cut(fuzzy_checkpoint_->wal_cut);
+        fuzzy_checkpoint_->wal_cut_synced = true;
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=wal-cut-sync-end elapsed_ms=%llu",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+                 static_cast<unsigned long long>(ElapsedMs(started)));
+        return false;
     }
 
-    // The detached images and descriptor set were captured at the same cut as
-    // the cohort. This call writes headers, fdatasyncs every captured data/index
-    // fd, and atomically replaces db.meta while the original catalog guard is
-    // still held.
+    if (!fuzzy_checkpoint_->cohort_flush_complete) {
+        FaultInjector::Point("before_fuzzy_checkpoint_data_sync");
+        fuzzy_checkpoint_->phase = "cohort-flush";
+        if (!fuzzy_checkpoint_->cohort_flush_logged) {
+            fuzzy_checkpoint_->cohort_flush_started = std::chrono::steady_clock::now();
+            fuzzy_checkpoint_->cohort_flush_logged = true;
+            LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=cohort-flush-begin epoch=%llu",
+                     static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+                     static_cast<unsigned long long>(fuzzy_checkpoint_->cohort.epoch));
+        }
+        const size_t quantum_pages = options_.io_quantum_pages;
+        const size_t byte_budget_pages = std::max<size_t>(size_t{1}, options_.tick_bytes / PAGE_SIZE);
+        const size_t io_budget_pages = byte_budget_pages;
+        // SetOptions clamps the unsigned input before this signed duration
+        // conversion, so neither conversion nor now()+duration can overflow.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(options_.tick_time_us);
+        size_t pages_written = 0;
+        size_t pages_remaining = 0;
+        bool first_quantum = true;
+        for (;;) {
+            const size_t remaining_budget = io_budget_pages > pages_written ? io_budget_pages - pages_written : 0;
+            if (!first_quantum && (remaining_budget == 0 || std::chrono::steady_clock::now() >= deadline)) {
+                if (metrics_ != nullptr) {
+                    if (remaining_budget == 0) {
+                        metrics_->budget_yield_io();
+                    } else {
+                        metrics_->budget_yield_time();
+                    }
+                }
+                return false;
+            }
+            const size_t quantum = std::min(quantum_pages, std::max<size_t>(size_t{1}, remaining_budget));
+            const size_t visit_budget = std::max<size_t>(64, quantum * 4);
+            BufferPoolManager::CheckpointCohortFlushResult result;
+            {
+                auto page_timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::PageWrite);
+                result = bpm->flush_checkpoint_cohort(fuzzy_checkpoint_->cohort.epoch, quantum, visit_budget);
+            }
+            if (metrics_ != nullptr) metrics_->page_write(result.pages_written, result.pages_remaining);
+            if (!result.success) throw UnixError();
+            pages_written += result.pages_written;
+            fuzzy_checkpoint_->cohort_pages_written += result.pages_written;
+            pages_remaining = result.pages_remaining;
+            if (pages_remaining == 0) break;
+            // No successful write and no remaining obligation change would spin on
+            // a transient FLUSHING frame; yield to the next scheduler tick.
+            if (result.pages_written == 0) {
+                if (metrics_ != nullptr) metrics_->zero_progress_yield();
+                return false;
+            }
+            first_quantum = false;
+        }
+
+        // The detached images and descriptor set were captured at the same cut.
+        // Pace final publication just like page writeback: headers once, one data
+        // fd per tick, then db.meta and finally the restart manifest.
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=cohort-flush-end pages=%zu remaining=0 elapsed_ms=%llu "
+                 "lifetime_ms=%llu",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id), fuzzy_checkpoint_->cohort_pages_written,
+                 static_cast<unsigned long long>(ElapsedMs(fuzzy_checkpoint_->cohort_flush_started)),
+                 static_cast<unsigned long long>(ElapsedMs(fuzzy_checkpoint_->event_started)));
+        fuzzy_checkpoint_->cohort_flush_complete = true;
+    }
+    if (!fuzzy_checkpoint_->headers_written) {
+        fuzzy_checkpoint_->phase = "header-write";
+        const auto started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=header-write-begin",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id));
+        sm_mgr_->write_fixed_checkpoint_headers_only(fuzzy_checkpoint_->headers, fuzzy_checkpoint_->catalog_guard);
+        fuzzy_checkpoint_->headers_written = true;
+        fuzzy_checkpoint_->file_sync_started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=header-write-end elapsed_ms=%llu",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+                 static_cast<unsigned long long>(ElapsedMs(started)));
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=file-sync-begin files=%zu",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+                 fuzzy_checkpoint_->headers.data_and_index_fds.size());
+        return false;
+    }
+    if (fuzzy_checkpoint_->next_file_sync < fuzzy_checkpoint_->headers.data_and_index_fds.size()) {
+        fuzzy_checkpoint_->phase = "file-sync";
+        const int fd = fuzzy_checkpoint_->headers.data_and_index_fds[fuzzy_checkpoint_->next_file_sync];
+        const auto started = std::chrono::steady_clock::now();
+        sm_mgr_->sync_fixed_checkpoint_file(fd, fuzzy_checkpoint_->catalog_guard);
+        const uint64_t elapsed = ElapsedMs(started);
+        fuzzy_checkpoint_->file_sync_total_ms += elapsed;
+        fuzzy_checkpoint_->file_sync_max_ms = std::max(fuzzy_checkpoint_->file_sync_max_ms, elapsed);
+        ++fuzzy_checkpoint_->next_file_sync;
+        if (elapsed > 20) LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=file-sync-slow fd=%d elapsed_ms=%llu",
+                                   static_cast<unsigned long long>(fuzzy_checkpoint_->event_id), fd,
+                                   static_cast<unsigned long long>(elapsed));
+        return false;
+    }
     FaultInjector::Point("after_fuzzy_checkpoint_data_sync");
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=file-sync-end files=%zu total_ms=%llu max_ms=%llu "
+             "elapsed_ms=%llu",
+             static_cast<unsigned long long>(fuzzy_checkpoint_->event_id), fuzzy_checkpoint_->next_file_sync,
+             static_cast<unsigned long long>(fuzzy_checkpoint_->file_sync_total_ms),
+             static_cast<unsigned long long>(fuzzy_checkpoint_->file_sync_max_ms),
+             static_cast<unsigned long long>(ElapsedMs(fuzzy_checkpoint_->file_sync_started)));
+    fuzzy_checkpoint_->phase = "db-meta";
+    const auto meta_started = std::chrono::steady_clock::now();
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=db-meta-begin",
+             static_cast<unsigned long long>(fuzzy_checkpoint_->event_id));
     {
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::FuzzyFinalPublish);
-        sm_mgr_->write_fixed_checkpoint_headers(fuzzy_checkpoint_->headers, fuzzy_checkpoint_->catalog_guard);
+        sm_mgr_->publish_fixed_checkpoint_meta(fuzzy_checkpoint_->headers, fuzzy_checkpoint_->catalog_guard);
     }
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=db-meta-end elapsed_ms=%llu",
+             static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+             static_cast<unsigned long long>(ElapsedMs(meta_started)));
     FaultInjector::Point("before_fuzzy_checkpoint_manifest_publish");
     {
+        fuzzy_checkpoint_->phase = "manifest-publish";
+        const auto manifest_started = std::chrono::steady_clock::now();
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=manifest-begin",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id));
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::ManifestPublish);
         log_mgr_->write_restart_manifest(fuzzy_checkpoint_->manifest);
+        LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=manifest-end elapsed_ms=%llu",
+                 static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
+                 static_cast<unsigned long long>(ElapsedMs(manifest_started)));
     }
 
     g_published_restart_offset.store(fuzzy_checkpoint_->wal_cut.checkpoint_offset, std::memory_order_release);
     fuzzy_checkpoint_->cohort.epoch = 0;
     auto completed = std::move(fuzzy_checkpoint_);
     FuzzyAttemptMetric::RecordLifetime(metrics_, completed->metrics_started);
+    LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=finish checkpoint_offset=%lld elapsed_ms=%llu",
+             static_cast<unsigned long long>(completed->event_id),
+             static_cast<long long>(completed->wal_cut.checkpoint_offset),
+             static_cast<unsigned long long>(ElapsedMs(completed->event_started)));
     completed.reset();
     g_fuzzy_checkpoint_running.store(false, std::memory_order_release);
     drain_retry_time_ = {};
@@ -536,6 +715,11 @@ bool CheckpointManager::Tick() {
         StartFuzzyCheckpoint();
         return false;
     } catch (...) {
+        if (fuzzy_checkpoint_ != nullptr) {
+            LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=failure prior_phase=%s elapsed_ms=%llu",
+                     static_cast<unsigned long long>(fuzzy_checkpoint_->event_id), fuzzy_checkpoint_->phase,
+                     static_cast<unsigned long long>(ElapsedMs(fuzzy_checkpoint_->event_started)));
+        }
         if (metrics_ != nullptr && fuzzy_checkpoint_ != nullptr) metrics_->fuzzy_failure();
         CancelFuzzyCheckpoint(false);
         DeferAutomaticRetry();

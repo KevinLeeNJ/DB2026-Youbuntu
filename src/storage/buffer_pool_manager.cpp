@@ -654,30 +654,37 @@ void BufferPoolManager::release_index_file_write_locked(int fd) {
 }
 
 frame_id_t BufferPoolManager::take_unblocked_victim_locked() {
-    std::vector<frame_id_t> blocked;
-    blocked.reserve(pool_size_);
+    auto& blocked = blocked_victims_scratch_;
+    blocked.clear();
     frame_id_t candidate = INVALID_FRAME_ID;
     frame_id_t claimed = INVALID_FRAME_ID;
-    size_t examined = 0;
-    while (examined++ < pool_size_ && replacer_->victim(&candidate)) {
-        if (candidate < 0 || static_cast<size_t>(candidate) >= pool_size_) {
-            continue;
+    try {
+        size_t examined = 0;
+        while (examined++ < pool_size_ && replacer_->victim(&candidate)) {
+            if (candidate < 0 || static_cast<size_t>(candidate) >= pool_size_) {
+                continue;
+            }
+            const Page& page = pages_[candidate];
+            const PageId page_id = page.id_;
+            if (IsValidPageId(page_id) && page.is_dirty_.load(std::memory_order_acquire) &&
+                index_smo_blocked_locked(page_id.fd)) {
+                // The candidate remains VALID. Reinsert it only after rechecking
+                // that a fast hit did not pin it while it was outside CLOCK.
+                blocked.push_back(candidate);
+                continue;
+            }
+            if (claim_page_for_eviction_locked(page_id, candidate, true, true)) {
+                claimed = candidate;
+                break;
+            }
         }
-        const Page& page = pages_[candidate];
-        const PageId page_id = page.id_;
-        if (IsValidPageId(page_id) && page.is_dirty_.load(std::memory_order_acquire) &&
-            index_smo_blocked_locked(page_id.fd)) {
-            // The candidate remains VALID. Reinsert it only after rechecking
-            // that a fast hit did not pin it while it was outside CLOCK.
-            blocked.push_back(candidate);
-            continue;
-        }
-        if (claim_page_for_eviction_locked(page_id, candidate, true, true)) {
-            claimed = candidate;
-            break;
-        }
+    } catch (...) {
+        restore_blocked_victims_locked(blocked);
+        blocked.clear();
+        throw;
     }
     restore_blocked_victims_locked(blocked);
+    blocked.clear();
     return claimed;
 }
 

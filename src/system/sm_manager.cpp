@@ -316,8 +316,8 @@ SmManager::capture_fixed_checkpoint_headers(const CatalogSharedGuard& catalog_gu
     return snapshot;
 }
 
-void SmManager::write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapshot& snapshot,
-                                               const CatalogSharedGuard& catalog_guard) {
+void SmManager::write_fixed_checkpoint_headers_only(const FixedCheckpointHeaderSnapshot& snapshot,
+                                                    const CatalogSharedGuard& catalog_guard) {
     ValidateCatalogSharedGuard(catalog_guard, &catalog_latch_);
     if (snapshot.database_identity != db_.name_ ||
         snapshot.catalog_generation != catalog_generation_.load(std::memory_order_acquire)) {
@@ -330,10 +330,28 @@ void SmManager::write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapsh
     for (const auto& header : snapshot.index_headers) {
         ix_manager_->write_detached_index_header(header);
     }
-    for (const int fd : snapshot.data_and_index_fds) {
-        disk_manager_->sync_file(fd);
+}
+
+void SmManager::sync_fixed_checkpoint_file(int fd, const CatalogSharedGuard& catalog_guard) {
+    ValidateCatalogSharedGuard(catalog_guard, &catalog_latch_);
+    disk_manager_->sync_file(fd);
+}
+
+void SmManager::publish_fixed_checkpoint_meta(const FixedCheckpointHeaderSnapshot& snapshot,
+                                              const CatalogSharedGuard& catalog_guard) {
+    ValidateCatalogSharedGuard(catalog_guard, &catalog_latch_);
+    if (snapshot.database_identity != db_.name_ ||
+        snapshot.catalog_generation != catalog_generation_.load(std::memory_order_acquire)) {
+        throw InternalError("fixed checkpoint snapshot belongs to a different catalog generation");
     }
     FlushMetaImageAtomically(disk_manager_, snapshot.db_meta_image);
+}
+
+void SmManager::write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapshot& snapshot,
+                                               const CatalogSharedGuard& catalog_guard) {
+    write_fixed_checkpoint_headers_only(snapshot, catalog_guard);
+    for (const int fd : snapshot.data_and_index_fds) sync_fixed_checkpoint_file(fd, catalog_guard);
+    publish_fixed_checkpoint_meta(snapshot, catalog_guard);
 }
 
 /**

@@ -22,6 +22,8 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 PORT = 8765
+FUZZY_CHECKPOINT_BYTES = 1024 * 1024
+FUZZY_WRITE_COUNT = 12000
 
 sys.path.insert(0, str(ROOT_DIR / "test" / "protocol"))
 from live_wire_protocol_test import COMMAND_OK, ERROR, TRANSACTION_ABORT, WireClient
@@ -63,6 +65,7 @@ class Server:
         point: str | None = None,
         action: str = "abort",
         skip: int = 0,
+        fuzzy_checkpoint: bool = False,
     ) -> None:
         self._assert_port_free()
         env = os.environ.copy()
@@ -80,6 +83,18 @@ class Server:
             # The fault matrix validates the strongest WAL boundary. The
             # regular benchmark remains PROCESS_CRASH by default.
             env["RMDB_DURABILITY_MODE"] = "strict"
+        if fuzzy_checkpoint:
+            # RMDB_AUTO_CHECKPOINT_BYTES is the current scheduler knob. Keep
+            # RMDB_CHECKPOINT_BYTES too so invocations and logs retain the
+            # fault-test contract's name if that alias is added later.
+            env["RMDB_AUTO_CHECKPOINT_BYTES"] = str(FUZZY_CHECKPOINT_BYTES)
+            env["RMDB_CHECKPOINT_BYTES"] = str(FUZZY_CHECKPOINT_BYTES)
+            # Four pages per tick keeps the cohort work intentionally
+            # multi-tick without turning a fault test into a minute-long I/O
+            # wait on a slow local filesystem.
+            env["RMDB_CHECKPOINT_TICK_BYTES"] = "16384"
+            env["RMDB_CHECKPOINT_IO_QUANTUM_PAGES"] = "4"
+            env["RMDB_CHECKPOINT_TICK_TIME_US"] = "100000"
         out = open(self.work_dir / f"{log_name}.out", "wb")
         err = open(self.work_dir / f"{log_name}.err", "wb")
         self.proc = subprocess.Popen(
@@ -89,12 +104,12 @@ class Server:
             stderr=err,
             env=env,
         )
-        self._wait_for_port()
+        self._wait_for_sql_ready()
 
-    def wait_exit(self) -> int:
+    def wait_exit(self, timeout: int = 10) -> int:
         if self.proc is None:
             raise RuntimeError("server 尚未启动")
-        return self.proc.wait(timeout=10)
+        return self.proc.wait(timeout=timeout)
 
     def kill(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -124,21 +139,21 @@ class Server:
         raise RuntimeError(f"端口 {PORT} 已被占用")
 
     @staticmethod
-    def _wait_for_port() -> None:
+    def _wait_for_sql_ready() -> None:
         deadline = time.monotonic() + 10
-        last_error: OSError | None = None
+        last_error: Exception | None = None
         while time.monotonic() < deadline:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.2)
             try:
-                sock.connect(("127.0.0.1", PORT))
+                client = SqlClient()
+                try:
+                    client.wire.readiness_probe()
+                finally:
+                    client.close()
                 return
-            except OSError as exc:
+            except (EOFError, OSError, RuntimeError) as exc:
                 last_error = exc
                 time.sleep(0.01)
-            finally:
-                sock.close()
-        raise RuntimeError(f"server 未在端口 {PORT} 就绪: {last_error}")
+        raise RuntimeError(f"server 未通过 SQL-ready 探针: {last_error}")
 
 
 def prepare_db(server: Server) -> None:
@@ -260,6 +275,65 @@ def checkpoint_truncate_case(server: Server) -> None:
         )
 
 
+def fuzzy_checkpoint_case(server: Server, point: str) -> None:
+    """Crash a scheduler-driven fuzzy checkpoint and prove restart semantics.
+
+    Each INSERT is an acknowledged autocommit.  The expected map therefore
+    represents precisely the durable client-visible prefix when the injected
+    _exit kills the server.  The id index is checked after restart, followed by
+    one further commit to cover append after an old/unfinished manifest.
+    """
+    prepare_db(server)
+    server.start("fuzzy_fault", point, action="_exit", fuzzy_checkpoint=True)
+    client = SqlClient()
+    expected = {1: 10, 2: 10}
+    next_id = 3
+    try:
+        for _ in range(FUZZY_WRITE_COUNT):
+            if server.proc is not None and server.proc.poll() is not None:
+                break
+            try:
+                client.ok(f"insert into kv values ({next_id}, {next_id * 7});")
+            except (EOFError, OSError, RuntimeError):
+                break
+            expected[next_id] = next_id * 7
+            next_id += 1
+    finally:
+        client.close()
+
+    exit_code = server.wait_exit(timeout=45)
+    if exit_code != 137:
+        raise RuntimeError(f"{point}: fault process exited {exit_code}, expected 137")
+
+    server.start("fuzzy_verify")
+    client = SqlClient()
+    append_id = next_id + 1
+    try:
+        rows = client.query("select id, v from kv order by id;")
+        actual = {int(row[0]): int(row[1]) for row in rows}
+        if actual != expected:
+            raise RuntimeError(f"{point}: restart rows differ: got {actual}, expected {expected}")
+        # The ordered full-table result above detects a lost/extra row across
+        # the entire committed prefix. Exercise the independent index access
+        # path at the beginning, middle, and end of that prefix without making
+        # a fault test's duration proportional to every inserted row.
+        index_ids = sorted({min(expected), max(expected), sorted(expected)[len(expected) // 2]})
+        for row_id in index_ids:
+            value = expected[row_id]
+            indexed = client.query(f"select id, v from kv where id = {row_id};")
+            if indexed != [[row_id, value]]:
+                raise RuntimeError(f"{point}: index lookup for {row_id} returned {indexed}")
+        client.ok("begin;")
+        client.ok(f"insert into kv values ({append_id}, {append_id * 7});")
+        client.ok("commit;")
+        appended = client.query(f"select id, v from kv where id = {append_id};")
+        if appended != [[append_id, append_id * 7]]:
+            raise RuntimeError(f"{point}: post-restart append was not visible: {appended}")
+    finally:
+        client.close()
+        server.stop()
+
+
 def recovery_case(server: Server, point: str) -> None:
     prepare_db(server)
     server.start("dirty")
@@ -329,6 +403,12 @@ def run_case(name: str, binary: Path, root: Path) -> None:
     elif name == "before_checkpoint_data_sync_throw":
         checkpoint_case(server, "before_checkpoint_data_sync", "throw")
     elif name in {
+        "before_fuzzy_checkpoint_data_sync",
+        "after_fuzzy_checkpoint_data_sync",
+        "before_fuzzy_checkpoint_manifest_publish",
+    }:
+        fuzzy_checkpoint_case(server, name)
+    elif name in {
         "mid_recovery_redo",
         "mid_recovery_undo",
         "mid_index_rebuild",
@@ -356,6 +436,9 @@ CASES = [
     "before_wal_truncate",
     "after_wal_ftruncate",
     "before_checkpoint_data_sync_throw",
+    "before_fuzzy_checkpoint_data_sync",
+    "after_fuzzy_checkpoint_data_sync",
+    "before_fuzzy_checkpoint_manifest_publish",
     "mid_recovery_redo",
     "mid_recovery_undo",
     "mid_index_rebuild",

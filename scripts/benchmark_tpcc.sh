@@ -34,6 +34,9 @@ MAX_CONFLICT_RETRIES=1
 ISOLATION="snapshot-isolation"
 GO_BINARY="$ROOT_DIR/build/bin/tpcc-go"
 WAL_PHASE_MARKERS=0
+OBSERVE_DIR=""
+OBSERVE_CSV=""
+OBSERVER_PID=""
 # final.md:243-247: the whole load stage (CREATE TABLE, CREATE INDEX, LOAD,
 # COUNT, integrity, index-key relation sampling and cross-partition content
 # sampling) must fit in one 900 second SQL budget measured from a successful
@@ -61,6 +64,7 @@ Usage: $0 [options]
   --max-conflict-retries N maximum retries after a conflict; -1 retries until phase end (default: 1)
   --isolation LEVEL        read-committed or snapshot-isolation (default: snapshot-isolation)
   --wal-phase-markers 0|1 emit diagnostic WAL snapshots at measure boundaries (default: 0; requires RMDB_WAL_METRICS=1)
+  --observe-dir PATH      opt in to one-second procfs/sysfs observations at PATH/system_observation.csv
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate
@@ -89,6 +93,7 @@ while [[ $# -gt 0 ]]; do
         --max-conflict-retries) MAX_CONFLICT_RETRIES="$2"; shift 2 ;;
         --isolation) ISOLATION="$2"; shift 2 ;;
         --wal-phase-markers) WAL_PHASE_MARKERS="$2"; shift 2 ;;
+        --observe-dir) OBSERVE_DIR="$2"; shift 2 ;;
         --go-binary) GO_BINARY="$2"; shift 2 ;;
         --regenerate-data|--overwrite-data-dir) REGENERATE_DATA=1; shift ;;
         --reuse-data-dir) shift ;;
@@ -120,6 +125,12 @@ fi
 if [[ "$WAL_PHASE_MARKERS" == "1" && "${RMDB_WAL_METRICS:-}" != "1" ]]; then
     echo "--wal-phase-markers=1 requires inherited RMDB_WAL_METRICS=1" >&2
     exit 2
+fi
+if [[ -n "$OBSERVE_DIR" ]]; then
+    mkdir -p "$OBSERVE_DIR"
+    OBSERVE_DIR="$(cd "$OBSERVE_DIR" && pwd)"
+    OBSERVE_CSV="$OBSERVE_DIR/system_observation.csv"
+    rm -f "$OBSERVE_CSV"
 fi
 if [[ ! -x "$GO_BINARY" ]]; then
     echo "missing Go benchmark binary: $GO_BINARY" >&2
@@ -163,12 +174,29 @@ SERVER_PID=""
 WAL_PHASE_MARKER_SOCKET=""
 
 cleanup() {
+    stop_observer
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill -KILL "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
+
+stop_observer() {
+    if [[ -n "$OBSERVER_PID" ]] && kill -0 "$OBSERVER_PID" 2>/dev/null; then
+        kill -TERM "$OBSERVER_PID" 2>/dev/null || true
+        wait "$OBSERVER_PID" 2>/dev/null || true
+    fi
+    OBSERVER_PID=""
+}
+
+start_observer() {
+    local phase="$1"
+    [[ -n "$OBSERVE_CSV" ]] || return 0
+    "$ROOT_DIR/scripts/observe_rmdb.sh" --pid "$SERVER_PID" --phase "$phase" --output "$OBSERVE_CSV" \
+        --db-dir "$DB_DIR" &
+    OBSERVER_PID=$!
+}
 
 if [[ "$WAL_PHASE_MARKERS" == "1" ]]; then
     WAL_PHASE_MARKER_SOCKET="@rmdb-wal-phase-${BASHPID}-${RANDOM}-${RANDOM}"
@@ -264,6 +292,7 @@ if [[ "$WAL_PHASE_MARKERS" == "1" ]]; then
 fi
 "${SERVER_ENV[@]}" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
+start_observer run
 wait_port 30
 # TCP readiness proves the initial server bound its abstract marker address;
 # the first scheduled Go marker send reports a missing receiver directly.
@@ -300,8 +329,10 @@ fi
 kill -KILL "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
+stop_observer
 env -u RMDB_WAL_PHASE_MARKER_SOCKET "RMDB_PORT=$PORT" "$BINARY" "$DB_DIR" >> "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
+start_observer recovery
 wait_port "$RESTART_TIMEOUT"
 "$GO_BINARY" --command consistency --port "$PORT" --isolation "$ISOLATION" \
     --progress-interval "$PROGRESS_INTERVAL" \

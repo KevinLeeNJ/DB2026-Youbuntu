@@ -14,11 +14,13 @@ See the Mulan PSL v2 for more details. */
 #include <assert.h>   // for assert
 #include <algorithm>
 #include <cerrno>     // for errno
+#include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
 #include <functional>
 #include <limits>
 #include <set>
+#include <sys/mman.h>
 #include <sys/stat.h> // for stat
 #include <unistd.h>   // for lseek
 
@@ -87,6 +89,49 @@ void ReadPageAt(int fd, page_id_t page_no, char* data, int num_bytes) {
 }
 
 } // namespace
+
+WalReadSnapshot::~WalReadSnapshot() {
+    for (Span& span : spans_) {
+        if (span.mapping != nullptr && span.mapping != MAP_FAILED) munmap(span.mapping, span.mapping_length);
+        if (span.fd >= 0) close(span.fd);
+    }
+}
+
+const char* WalReadSnapshot::record_bytes(int64_t offset, uint32_t length, std::vector<char>* scratch,
+                                          WalSnapshotAccess* access) const {
+    if (access != nullptr) *access = WalSnapshotAccess{};
+    const int64_t bytes = static_cast<int64_t>(length);
+    if (scratch == nullptr || length == 0 || offset < begin_offset_ || offset > end_offset_ - bytes) {
+        throw InternalError("WAL snapshot access leaves the accepted recovery prefix; WAL retained");
+    }
+    const int64_t record_end = offset + bytes;
+    for (const Span& span : spans_) {
+        if (offset >= span.range_begin && record_end <= span.range_end) {
+            return static_cast<const char*>(span.mapping) + (offset - span.mapping_logical_begin);
+        }
+    }
+
+    scratch->resize(length);
+    int64_t cursor = offset;
+    size_t copied = 0;
+    for (const Span& span : spans_) {
+        if (cursor < span.range_begin || cursor >= span.range_end) continue;
+        const int64_t chunk_end = std::min(record_end, span.range_end);
+        const size_t chunk = static_cast<size_t>(chunk_end - cursor);
+        std::memcpy(scratch->data() + copied,
+                    static_cast<const char*>(span.mapping) + (cursor - span.mapping_logical_begin), chunk);
+        copied += chunk;
+        cursor = chunk_end;
+        if (cursor == record_end) {
+            if (access != nullptr) {
+                access->copied = true;
+                access->copied_bytes = length;
+            }
+            return scratch->data();
+        }
+    }
+    throw InternalError("WAL snapshot spans do not continuously cover a recovery record; WAL retained");
+}
 
 DiskManager::DiskManager() = default;
 
@@ -643,6 +688,84 @@ int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
     log_read_count_.fetch_add(1, std::memory_order_relaxed);
     log_read_bytes_.fetch_add(static_cast<uint64_t>(bytes_read), std::memory_order_relaxed);
     return bytes_read;
+}
+
+std::unique_ptr<WalReadSnapshot> DiskManager::create_wal_read_snapshot(int64_t begin_offset, int64_t end_offset) {
+    if (begin_offset < 0 || end_offset <= begin_offset) {
+        throw InternalError("invalid WAL snapshot range; WAL retained");
+    }
+    std::lock_guard<std::mutex> lock(wal_segment_latch_);
+    auto snapshot = std::unique_ptr<WalReadSnapshot>(new WalReadSnapshot(begin_offset, end_offset));
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) throw InternalError("could not determine mmap page size; WAL retained");
+    const int64_t page_size = page_size_long;
+
+    auto map_span = [&](int fd, int64_t physical_begin, int64_t logical_base, int64_t range_begin,
+                        int64_t range_end) {
+        const int64_t aligned_physical = physical_begin - physical_begin % page_size;
+        const int64_t mapping_logical_begin = logical_base + aligned_physical;
+        const int64_t mapping_bytes = range_end - mapping_logical_begin;
+        if (mapping_bytes <= 0 || static_cast<uint64_t>(mapping_bytes) > std::numeric_limits<size_t>::max()) {
+            close(fd);
+            throw InternalError("WAL snapshot mapping length overflow; WAL retained");
+        }
+        void* mapping = mmap(nullptr, static_cast<size_t>(mapping_bytes), PROT_READ, MAP_SHARED, fd, aligned_physical);
+        if (mapping == MAP_FAILED) {
+            const int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            throw UnixError();
+        }
+        snapshot->add_span(WalReadSnapshot::Span{fd, mapping, static_cast<size_t>(mapping_bytes),
+                                                 mapping_logical_begin, range_begin, range_end});
+    };
+
+    if (!wal_segmented_) {
+        const int fd = open(LOG_FILE_NAME.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) throw UnixError();
+        struct stat st {};
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < end_offset) {
+            const int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            throw InternalError("legacy WAL snapshot is not a regular complete file; WAL retained");
+        }
+        map_span(fd, begin_offset, 0, begin_offset, end_offset);
+        return snapshot;
+    }
+
+    validate_segmented_layout_locked();
+    if (end_offset > log_offset_ || wal_segment_bytes_ <= 0) {
+        throw InternalError("segmented WAL snapshot exceeds the finalized logical range; WAL retained");
+    }
+    const uint64_t generation = wal_generation_;
+    const int64_t segment_bytes = wal_segment_bytes_;
+    const uint64_t first_segment = static_cast<uint64_t>(begin_offset / segment_bytes);
+    const uint64_t last_segment = static_cast<uint64_t>((end_offset - 1) / segment_bytes);
+    for (uint64_t segment = first_segment;; ++segment) {
+        if (segment > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                          static_cast<uint64_t>(segment_bytes)) {
+            throw InternalError("segmented WAL snapshot logical offset overflow; WAL retained");
+        }
+        const int64_t logical_base = static_cast<int64_t>(segment * static_cast<uint64_t>(segment_bytes));
+        const int64_t range_begin = std::max(begin_offset, logical_base);
+        const int64_t range_end = std::min(end_offset, logical_base + segment_bytes);
+        const std::string name = SegmentedWalName(generation, segment);
+        const int fd = open(name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) throw UnixError();
+        struct stat st {};
+        const int64_t required_bytes = range_end - logical_base;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < required_bytes || st.st_size > segment_bytes ||
+            (segment != last_segment && st.st_size != segment_bytes)) {
+            const int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            throw InternalError("segmented WAL snapshot has a missing, short, or invalid span; WAL retained");
+        }
+        map_span(fd, range_begin - logical_base, logical_base, range_begin, range_end);
+        if (segment == last_segment) break;
+    }
+    return snapshot;
 }
 
 /**

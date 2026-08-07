@@ -352,9 +352,15 @@ public:
     // transactions have drained. The same guard must stay locked continuously
     // through write_fixed_checkpoint_headers(); it pins the database and all
     // fds while foreground transactions may resume between the two calls. The
-    // write step publishes only the captured headers, fdatasyncs every captured
-    // data/index fd, then atomically replaces db.meta with its captured image.
+    // write/sync/publish steps are split for fuzzy checkpoint pacing. The
+    // caller keeps the same catalog guard across all of them.
     FixedCheckpointHeaderSnapshot capture_fixed_checkpoint_headers(const CatalogSharedGuard& catalog_guard) const;
+    void write_fixed_checkpoint_headers_only(const FixedCheckpointHeaderSnapshot& snapshot,
+                                             const CatalogSharedGuard& catalog_guard);
+    void sync_fixed_checkpoint_file(int fd, const CatalogSharedGuard& catalog_guard);
+    void publish_fixed_checkpoint_meta(const FixedCheckpointHeaderSnapshot& snapshot,
+                                       const CatalogSharedGuard& catalog_guard);
+    // Compatibility helper for the clean path: preserve its all-at-once order.
     void write_fixed_checkpoint_headers(const FixedCheckpointHeaderSnapshot& snapshot,
                                         const CatalogSharedGuard& catalog_guard);
 

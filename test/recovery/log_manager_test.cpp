@@ -430,7 +430,7 @@ int RunLeaderRotationThreeFifo(const std::filesystem::path& test_dir) {
                ? 1 : 0;
 }
 
-int RunLeaderRotationDefaultOff(const std::filesystem::path& test_dir) {
+int RunLeaderRotationOptOutKeepsLegacyDrainAndBoundedWaiters(const std::filesystem::path& test_dir) {
     ScopedTestDir dir(test_dir.string());
     DiskManager disk;
     ScopedWalFile wal(&disk);
@@ -465,14 +465,24 @@ TEST(LogManagerTest, DefaultsToStrictDurability) {
     EXPECT_EQ(log_mgr.durability_mode(), DurabilityMode::STRICT);
 }
 
-TEST(LogManagerTest, LeaderRotationConfigurationIsExactAndCachedAtConstruction) {
+TEST(LogManagerTest, LeaderRotationDefaultsOnAndOptOutIsExactAndCachedAtConstruction) {
     ScopedTestDir test_dir("log_manager_rotation_config_test_db");
     DiskManager disk;
     disk.create_file(LOG_FILE_NAME);
 
-    ScopedEnvVar disabled("RMDB_WAL_LEADER_ROTATION", "true");
+    {
+        ScopedEnvVar default_enabled("RMDB_WAL_LEADER_ROTATION", nullptr);
+        LogManager default_manager(&disk);
+        EXPECT_TRUE(default_manager.leader_rotation_enabled_for_test());
+    }
+
+    ScopedEnvVar disabled("RMDB_WAL_LEADER_ROTATION", "0");
     LogManager disabled_manager(&disk);
     EXPECT_FALSE(disabled_manager.leader_rotation_enabled_for_test());
+
+    ScopedEnvVar invalid("RMDB_WAL_LEADER_ROTATION", "true");
+    LogManager invalid_manager(&disk);
+    EXPECT_FALSE(invalid_manager.leader_rotation_enabled_for_test());
 
     ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
     LogManager enabled_manager(&disk);
@@ -495,8 +505,9 @@ TEST(LogManagerTest, LeaderRotationPromotesOneFifoOwnerForThreeFollowers) {
     EXPECT_TRUE(RunInWatchdog("log_manager_rotation_fifo_test_db", RunLeaderRotationThreeFifo));
 }
 
-TEST(LogManagerTest, LeaderRotationDefaultOffKeepsLegacyDrainAndBoundedWaiters) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_default_off_test_db", RunLeaderRotationDefaultOff));
+TEST(LogManagerTest, LeaderRotationOptOutKeepsLegacyDrainAndBoundedWaiters) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_opt_out_test_db",
+                              RunLeaderRotationOptOutKeepsLegacyDrainAndBoundedWaiters));
 }
 
 TEST(LogManagerTest, SegmentedWalReadsRecordsAcrossPhysicalBoundary) {
@@ -521,6 +532,74 @@ TEST(LogManagerTest, SegmentedWalReadsRecordsAcrossPhysicalBoundary) {
         ++count;
     }
     EXPECT_EQ(count, records.size());
+}
+
+TEST(LogManagerTest, LegacyWalReadSnapshotMapsAcceptedPrefixWithoutPageBoundaryCopies) {
+    ScopedTestDir test_dir("legacy_wal_snapshot_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    std::vector<char> bytes(static_cast<size_t>(page_size) * 2 + 37);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>((i * 17) & 0x7f);
+    {
+        std::ofstream wal(LOG_FILE_NAME, std::ios::binary | std::ios::trunc);
+        wal.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        ASSERT_TRUE(static_cast<bool>(wal));
+    }
+
+    auto snapshot = disk.create_wal_read_snapshot(7, static_cast<int64_t>(bytes.size() - 3));
+    std::vector<char> scratch;
+    WalSnapshotAccess access;
+    const char* first = snapshot->record_bytes(7, 19, &scratch, &access);
+    EXPECT_FALSE(access.copied);
+    EXPECT_EQ(std::memcmp(first, bytes.data() + 7, 19), 0);
+    const int64_t crossing = page_size - 5;
+    const char* across_page = snapshot->record_bytes(crossing, 23, &scratch, &access);
+    EXPECT_FALSE(access.copied);
+    EXPECT_EQ(std::memcmp(across_page, bytes.data() + crossing, 23), 0);
+    const int64_t tail = static_cast<int64_t>(bytes.size() - 11);
+    EXPECT_EQ(std::memcmp(snapshot->record_bytes(tail, 8, &scratch), bytes.data() + tail, 8), 0);
+    EXPECT_THROW(snapshot->record_bytes(6, 8, &scratch), InternalError);
+    EXPECT_THROW(snapshot->record_bytes(static_cast<int64_t>(bytes.size() - 8), 8, &scratch), InternalError);
+}
+
+TEST(LogManagerTest, SegmentedWalReadSnapshotCopiesOnlyCrossSegmentRecords) {
+    ScopedTestDir test_dir("segmented_wal_snapshot_crossing_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(31, 0, 64);
+    disk.ensure_segmented_wal_root();
+    std::vector<char> bytes(141);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>((i * 29) & 0x7f);
+    disk.write_log(bytes.data(), static_cast<int>(bytes.size()));
+
+    auto snapshot = disk.create_wal_read_snapshot(3, static_cast<int64_t>(bytes.size()));
+    std::vector<char> scratch;
+    WalSnapshotAccess access;
+    EXPECT_EQ(std::memcmp(snapshot->record_bytes(12, 16, &scratch, &access), bytes.data() + 12, 16), 0);
+    EXPECT_FALSE(access.copied);
+    EXPECT_EQ(std::memcmp(snapshot->record_bytes(60, 12, &scratch, &access), bytes.data() + 60, 12), 0);
+    EXPECT_TRUE(access.copied);
+    EXPECT_EQ(access.copied_bytes, 12U);
+}
+
+TEST(LogManagerTest, SegmentedWalReadSnapshotRejectsShortMissingAndSymlinkSpans) {
+    const auto expect_rejected = [](const std::string& test_name, const std::function<void()>& damage) {
+        ScopedTestDir test_dir(test_name);
+        DiskManager disk;
+        disk.configure_segmented_wal(32, 0, 64);
+        disk.ensure_segmented_wal_root();
+        std::vector<char> bytes(130, 'x');
+        disk.write_log(bytes.data(), static_cast<int>(bytes.size()));
+        damage();
+        EXPECT_THROW(disk.create_wal_read_snapshot(0, static_cast<int64_t>(bytes.size())), RMDBError);
+    };
+    expect_rejected("segmented_wal_snapshot_short_test_db", [] { ASSERT_EQ(::truncate("db.log.32.0", 63), 0); });
+    expect_rejected("segmented_wal_snapshot_missing_test_db", [] { ASSERT_EQ(::unlink("db.log.32.1"), 0); });
+    expect_rejected("segmented_wal_snapshot_symlink_test_db", [] {
+        ASSERT_EQ(::unlink("db.log.32.1"), 0);
+        ASSERT_EQ(::symlink("/dev/null", "db.log.32.1"), 0);
+    });
 }
 
 TEST(LogManagerTest, SegmentedRestartManifestRoundTripsAndRejectsCorruption) {
@@ -1541,6 +1620,7 @@ TEST(LogManagerTest, CheckpointWalCutIsContiguousDurableAndReissuesBindings) {
     ASSERT_EQ(log_mgr.add_log_to_buffer(&begin), 2);
     const int64_t expected_cut_offset = log_mgr.current_log_offset();
     const CheckpointWalCut cut = log_mgr.create_checkpoint_wal_cut({"a.idx", "b.idx"});
+    log_mgr.sync_checkpoint_wal_cut(cut);
 
     EXPECT_EQ(cut.checkpoint_offset, expected_cut_offset);
     EXPECT_EQ(cut.checkpoint_lsn, 3);
@@ -1609,7 +1689,8 @@ TEST(LogManagerTest, FailedCheckpointWalCutKeepsTheCurrentBindingUsable) {
     const int valid_log_fd = disk.GetLogFd();
     ASSERT_GE(valid_log_fd, 0);
     disk.SetLogFd(-2);
-    EXPECT_THROW(log_mgr.create_checkpoint_wal_cut({"a.idx"}), UnixError);
+    const CheckpointWalCut failed_cut = log_mgr.create_checkpoint_wal_cut({"a.idx"});
+    EXPECT_THROW(log_mgr.sync_checkpoint_wal_cut(failed_cut), UnixError);
     disk.SetLogFd(valid_log_fd);
 
     IndexSmoWalData smo;
@@ -1653,6 +1734,7 @@ TEST(LogManagerTest, ValidCheckpointWalCutSkipsAnObsoletePrefixAtStartup) {
         BeginLogRecord obsolete(201);
         ASSERT_EQ(writer.add_log_to_buffer(&obsolete), 0);
         cut = writer.create_checkpoint_wal_cut({"a.idx"});
+        writer.sync_checkpoint_wal_cut(cut);
         writer.write_restart_offset(cut.checkpoint_offset);
         wal_bytes = disk.get_file_size(LOG_FILE_NAME);
     }
@@ -1778,6 +1860,7 @@ TEST(LogManagerTest, CheckpointWalCutStartupTruncatesATornTailAtIntactEof) {
         BeginLogRecord obsolete(207);
         writer.add_log_to_buffer(&obsolete);
         cut = writer.create_checkpoint_wal_cut({"a.idx"});
+        writer.sync_checkpoint_wal_cut(cut);
         cut_end = disk.get_file_size(LOG_FILE_NAME);
         writer.write_restart_offset(cut.checkpoint_offset);
         BeginLogRecord torn(208);

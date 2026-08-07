@@ -729,7 +729,8 @@ struct RestartManifest {
  * `checkpoint_offset` is the exact byte offset of the empty CHECKPOINT record.
  * Every binding in `index_bindings` is serialized contiguously immediately
  * after that record, in caller order. `last_lsn` covers the complete batch and
- * is durable before create_checkpoint_wal_cut() returns.
+ * is appended before create_checkpoint_wal_cut() returns. Callers must make
+ * last_lsn durable before publishing checkpointed data or a restart manifest.
  */
 struct CheckpointWalCut {
     int64_t checkpoint_offset{0};
@@ -754,7 +755,8 @@ public:
         durability_mode_ = durability_mode;
         wal_flush_metrics_ = wal_flush_metrics;
         group_commit_test_hook_ = std::move(test_options.hook);
-        leader_rotation_enabled_ = WalFlushMetrics::ParseEnabled(std::getenv("RMDB_WAL_LEADER_ROTATION"));
+        const char* leader_rotation = std::getenv("RMDB_WAL_LEADER_ROTATION");
+        leader_rotation_enabled_ = leader_rotation == nullptr || WalFlushMetrics::ParseEnabled(leader_rotation);
         persist_lsn_.store(INVALID_LSN);
         durable_lsn_ = INVALID_LSN;
     }
@@ -764,12 +766,22 @@ public:
     uint64_t ensure_index_binding(const std::string& index_file_name);
     uint64_t renew_index_binding(const std::string& index_file_name);
     CheckpointWalCut create_checkpoint_wal_cut(const std::vector<std::string>& index_file_names);
+    void sync_checkpoint_wal_cut(const CheckpointWalCut& cut);
     void flush_log_to_disk();
     void flush_log_to_disk_with_sync();
     void flush_log_to_disk_up_to(lsn_t target_lsn);
     // Physical page/header publication always needs a stable WAL prefix,
     // independently of the transaction commit durability mode.
     void flush_log_to_disk_up_to_durable(lsn_t target_lsn);
+    // Production startup is deliberately split around RecoveryManager::analyze().
+    // prepare only selects the WAL layout and a safe checkpoint boundary; it
+    // must not scan or truncate the retained WAL.  finalize is called only
+    // after analyze has accepted every complete record.
+    void prepare_existing_log();
+    void finalize_existing_log(int64_t accepted_end_offset, lsn_t max_lsn,
+                               const std::vector<std::pair<std::string, uint64_t>>& index_bindings);
+    int64_t prepared_restart_offset() const;
+    bool startup_is_prepared() const;
     void initialize_from_existing_log();
 
     // recovery/checkpoint 成功落盘表页与元数据后调用：先把缓冲区残留日志刷盘，
@@ -837,7 +849,7 @@ private:
     void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync);
     void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync);
     void run_group_commit_test_hook(std::string_view point) const;
-    uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch);
+    uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch, bool durable = true);
 
     // One leader performs the durable flush for all waiters that arrive
     // before it finishes. Waiters are released only after durable_lsn_ moves
@@ -861,9 +873,10 @@ private:
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};
     WalFlushMetrics* wal_flush_metrics_{nullptr};
-    // Cached at construction so the disabled path is exactly the established
-    // group-commit implementation and never reads process configuration.
-    bool leader_rotation_enabled_{false};
+    // Production defaults to rotation. An exact "0" (or any other non-"1"
+    // value) opts into the established legacy group-commit implementation.
+    // Cache this once so runtime flushing never reads process configuration.
+    bool leader_rotation_enabled_{true};
     std::function<void(std::string_view)> group_commit_test_hook_;
     struct IndexBinding {
         uint64_t generation{0};
@@ -872,4 +885,9 @@ private:
     std::mutex index_binding_latch_;
     std::unordered_map<std::string, IndexBinding> index_bindings_;
     std::atomic<uint64_t> wal_epoch_{1};
+    RestartManifest prepared_manifest_;
+    int64_t prepared_file_size_{0};
+    int64_t prepared_restart_offset_{0};
+    bool prepared_restart_rejected_{false};
+    bool startup_prepared_{false};
 };

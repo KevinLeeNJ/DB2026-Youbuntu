@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -28,6 +29,47 @@ See the Mulan PSL v2 for more details. */
 
 #include "common/config.h"
 #include "errors.h"
+
+class DiskManager;
+
+struct WalSnapshotAccess {
+    bool copied{false};
+    uint32_t copied_bytes{0};
+};
+
+// Recovery-lifetime immutable view of one finalized logical WAL prefix. The
+// mappings are shared read-only; only records crossing physical segments copy
+// into caller-owned scratch space.
+class WalReadSnapshot {
+public:
+    ~WalReadSnapshot();
+    WalReadSnapshot(const WalReadSnapshot&) = delete;
+    WalReadSnapshot& operator=(const WalReadSnapshot&) = delete;
+
+    const char* record_bytes(int64_t offset, uint32_t length, std::vector<char>* scratch,
+                             WalSnapshotAccess* access = nullptr) const;
+    int64_t begin_offset() const noexcept { return begin_offset_; }
+    int64_t end_offset() const noexcept { return end_offset_; }
+
+private:
+    friend class DiskManager;
+    struct Span {
+        int fd{-1};
+        void* mapping{nullptr};
+        size_t mapping_length{0};
+        int64_t mapping_logical_begin{0};
+        int64_t range_begin{0};
+        int64_t range_end{0};
+    };
+
+    WalReadSnapshot(int64_t begin_offset, int64_t end_offset)
+        : begin_offset_(begin_offset), end_offset_(end_offset) {}
+    void add_span(Span span) { spans_.push_back(span); }
+
+    int64_t begin_offset_{0};
+    int64_t end_offset_{0};
+    std::vector<Span> spans_;
+};
 
 /**
  * @description: DiskManager的作用主要是根据上层的需要对磁盘文件进行操作
@@ -104,6 +146,11 @@ public:
     // caller owns the scan bound. Returns the number of bytes read, which is
     // short only at end of file.
     int read_log_chunk(char* log_data, int size, int64_t offset);
+
+    // Must be created after recovery analyze succeeded and startup finalize
+    // truncated any physical tail. The returned object pins read-only inode
+    // mappings until every consumer has joined.
+    std::unique_ptr<WalReadSnapshot> create_wal_read_snapshot(int64_t begin_offset, int64_t end_offset);
 
     void write_log(char* log_data, int size);
 

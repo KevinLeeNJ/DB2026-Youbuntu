@@ -1092,13 +1092,28 @@ func (r *result) finalize() {
 		// parsing; it is also a failed logical attempt if encountered.
 		r.AbortRate = float64(abortTotal) / float64(attemptedTotal)
 	}
+	allLatencyCount := 0
+	for _, values := range r.latencies {
+		allLatencyCount += len(values)
+	}
+	// latencies contains committed measurement attempts only. Build the global
+	// view at finalization so recording an individual transaction stays unchanged.
+	allLatencies := make([]float64, 0, allLatencyCount)
 	for txnType, values := range r.latencies {
 		if len(values) == 0 {
 			continue
 		}
+		allLatencies = append(allLatencies, values...)
 		sort.Float64s(values)
 		r.LatencyMS[txnType] = latencySummary{
 			P50: percentile(values, 50), P95: percentile(values, 95), P99: percentile(values, 99), Max: values[len(values)-1],
+		}
+	}
+	if len(allLatencies) > 0 {
+		sort.Float64s(allLatencies)
+		r.LatencyMS["global"] = latencySummary{
+			P50: percentile(allLatencies, 50), P95: percentile(allLatencies, 95), P99: percentile(allLatencies, 99),
+			Max: allLatencies[len(allLatencies)-1],
 		}
 	}
 	r.Coverage.Warehouses = r.Coverage.Warehouses[:0]

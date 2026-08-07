@@ -265,6 +265,36 @@ TEST_F(BufferPoolManagerTest, IndexSmoBarrierDrainsAnAlreadyClaimedDirectHeaderW
     EXPECT_TRUE(acquired.load(std::memory_order_acquire));
 }
 
+TEST_F(BufferPoolManagerTest, BlockedVictimScratchIsReusedAcrossFullPoolMisses) {
+    constexpr size_t pool_size = 8;
+    BufferPoolManager bpm(pool_size, disk_manager_.get());
+    ASSERT_EQ(bpm.blocked_victims_scratch_.capacity(), pool_size);
+    const frame_id_t* const scratch_data = bpm.blocked_victims_scratch_.data();
+
+    for (size_t i = 0; i < pool_size; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        Page* page = bpm.new_page(&page_id);
+        ASSERT_NE(page, nullptr);
+        ASSERT_TRUE(bpm.unpin_page(page_id, true));
+    }
+
+    bpm.begin_index_smo(fd_);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        PageId missing{fd_, INVALID_PAGE_ID};
+        EXPECT_EQ(bpm.new_page(&missing), nullptr);
+        EXPECT_TRUE(bpm.blocked_victims_scratch_.empty());
+        EXPECT_EQ(bpm.blocked_victims_scratch_.capacity(), pool_size);
+        EXPECT_EQ(bpm.blocked_victims_scratch_.data(), scratch_data);
+        EXPECT_EQ(bpm.replacer_->Size(), pool_size);
+    }
+    bpm.end_index_smo(fd_);
+
+    PageId replacement{fd_, INVALID_PAGE_ID};
+    Page* page = bpm.new_page(&replacement);
+    ASSERT_NE(page, nullptr);
+    EXPECT_TRUE(bpm.unpin_page(replacement, false));
+}
+
 TEST_F(BufferPoolManagerTest, SampleTest) {
     // create BufferPoolManager
     const size_t buffer_pool_size = 10;

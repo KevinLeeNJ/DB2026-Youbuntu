@@ -546,6 +546,32 @@ func TestResultFinalizeIncludesPerTransactionTPM(t *testing.T) {
 	}
 }
 
+func TestResultFinalizeReportsGlobalAndPerTransactionLatencies(t *testing.T) {
+	result := newResult(60)
+	latencies := map[string]float64{
+		"new_order":    1,
+		"payment":      2,
+		"order_status": 3,
+		"delivery":     4,
+		"stock_level":  100,
+	}
+	for txnType, latency := range latencies {
+		result.record("measure", txnType, "commit", latency, "")
+	}
+	result.finalize()
+
+	global := result.LatencyMS["global"]
+	if global.P50 != 3 || global.P99 != 100 || global.Max != 100 {
+		t.Fatalf("global latency = %#v, want p50=3 p99=100 max=100", global)
+	}
+	for txnType, latency := range latencies {
+		got, ok := result.LatencyMS[txnType]
+		if !ok || got.P50 != latency || got.P99 != latency || got.Max != latency {
+			t.Fatalf("%s latency = %#v, want p50=p99=max=%v", txnType, got, latency)
+		}
+	}
+}
+
 func TestResultFinalizeReportsLogicalAttemptOutcomes(t *testing.T) {
 	result := newResult(60)
 	result.record("measure", "new_order", "commit", 1, "")

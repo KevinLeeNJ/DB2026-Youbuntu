@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -40,13 +41,13 @@ See the Mulan PSL v2 for more details. */
  * record map, so recovery memory remains proportional to record metadata rather
  * than to the WAL payload.
  *
- * Precondition: LogManager::initialize_from_existing_log() must have run on the
- * same WAL file first. It applies exactly the record-header validation this
- * class applies and truncates the file to the end of the intact prefix, which
- * is what lets analyze() treat every remaining anomaly as real corruption
- * instead of as a torn tail. See the comment on analyze() for why that
- * distinction is the difference between refusing to start and silently
- * discarding committed data.
+ * Production order is LogManager::prepare_existing_log(), analyze(),
+ * LogManager::finalize_existing_log(), prepare_pages_for_redo(), redo(), undo().
+ * analyze is the only authoritative WAL scan. It distinguishes complete
+ * semantic corruption (fail closed) from a physically incomplete tail, which
+ * finalize truncates only after analyze has succeeded. The older
+ * initialize_from_existing_log() remains a compatibility wrapper for fixtures
+ * that do not run RecoveryManager.
  *
  * Failure policy: anything recovery cannot explain throws. The WAL is only
  * truncated on the success path, so a throw leaves the complete WAL on disk and
@@ -56,6 +57,7 @@ See the Mulan PSL v2 for more details. */
  */
 class RecoveryManager {
 public:
+    static constexpr size_t kLogTypeCount = static_cast<size_t>(LogType::INDEX_SMO) + 1;
     RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager,
                     LogManager* log_manager = nullptr) {
         disk_manager_ = disk_manager;
@@ -65,15 +67,36 @@ public:
     }
 
     void analyze();
+    // May only repair file headers after analyze has accepted the complete WAL
+    // prefix and LogManager has made that prefix the append frontier.
+    void prepare_pages_for_redo();
     void redo();
     void undo();
 
     // Record-level counters for the recovery report. Recovery is single
-    // threaded, so plain integers are enough. get_redo_applied_count() plus
-    // get_redo_skipped_count() always equals the number of DML records the WAL
-    // holds, which is what makes the report usable as a cross-check.
+    // threaded, so plain integers are enough. Heap redo deliberately contains
+    // committed DML only; applied plus skipped therefore equals the committed
+    // descriptor count, while get_dml_record_count() includes loser DML kept
+    // for undo and touched-tuple normalization.
     uint64_t get_scanned_record_count() const {
         return scanned_record_count_;
+    }
+    // Composition of the single authoritative analyze() WAL scan. The byte
+    // count is the record's serialized length, including its common header.
+    uint64_t get_log_type_record_count(LogType type) const {
+        return log_type_record_counts_[static_cast<size_t>(type)];
+    }
+    uint64_t get_log_type_serialized_bytes(LogType type) const {
+        return log_type_serialized_bytes_[static_cast<size_t>(type)];
+    }
+    // INDEX_SMO carries one logical full-page image per data page plus its
+    // index-file header image. This intentionally reports logical bytes, so
+    // V2 compressed records remain comparable with V1 records.
+    uint64_t get_index_smo_logical_image_count() const {
+        return index_smo_logical_image_count_;
+    }
+    uint64_t get_index_smo_logical_image_bytes() const {
+        return index_smo_logical_image_bytes_;
     }
     uint64_t get_dml_record_count() const {
         return touched_.size();
@@ -127,6 +150,13 @@ public:
     uint64_t get_index_smo_prepare_count() const {
         return index_smo_prepare_count_;
     }
+    int64_t get_scan_end_offset() const {
+        return scan_end_offset_;
+    }
+    lsn_t get_max_lsn() const {
+        return max_lsn_;
+    }
+    std::vector<std::pair<std::string, uint64_t>> get_latest_index_bindings() const;
 
     /**
      * 重启后 TransactionManager::next_timestamp_ 必须取的值。analyze() 之后可用。
@@ -221,6 +251,11 @@ private:
         uint16_t table_id{0};
         int16_t slot_no{0};
         int32_t page_no{0};
+        // Low 31 bits are the previous descriptor index plus one for this
+        // transaction; zero ends the intrusive chain. The high bit records
+        // that COMMIT visited this descriptor. This keeps the committed-only
+        // catalogue compact without a vector<size_t> allocation per txn.
+        uint32_t txn_prev_plus_one{0};
 
         bool operator<(const HeapRedoRecord& other) const {
             if (table_id != other.table_id) {
@@ -233,6 +268,14 @@ private:
         }
     };
     static_assert(sizeof(HeapRedoRecord) <= 24, "heap redo descriptors must remain compact");
+
+    struct IndexSmoRecord {
+        int64_t wal_offset{0};
+        uint32_t wal_length{0};
+        lsn_t lsn{INVALID_LSN};
+        txn_id_t txn_id{INVALID_TXN_ID};
+        lsn_t prev_lsn{INVALID_LSN};
+    };
 
     // One (key, rid) pair the index repair has to reconcile. `key_slot` indexes
     // the fixed-stride key arena of the index being repaired.
@@ -358,6 +401,10 @@ private:
     std::vector<TouchedTuple> touched_;        // one entry per DML record, WAL order
     std::vector<TouchedTuple> touched_sorted_; // distinct, ordered by table and page
     std::vector<HeapRedoRecord> heap_redo_records_;
+    // txn id -> most recent descriptor index plus one. Descriptor links carry
+    // the rest of each transaction's chain in 24 bytes per DML.
+    std::unordered_map<txn_id_t, uint32_t> heap_redo_txn_heads_;
+    std::vector<IndexSmoRecord> index_smo_records_; // WAL order, no third full scan
     // A delta cannot safely patch a tuple still owned by any active loser: the
     // page does not identify which WAL version supplied its unchanged bytes.
     // Keep the committed delta descriptors in WAL order until loser undo. A
@@ -368,6 +415,7 @@ private:
     std::unordered_set<std::string> touched_tables_;
     bool has_dml_records_{false};
     bool has_index_smo_records_{false};
+    bool pages_prepared_for_redo_{false};
     std::unordered_map<std::string, uint64_t> latest_index_bindings_;
     lsn_t max_lsn_{INVALID_LSN}; // analyze 扫描到的最大 lsn，用于 recovery 后推进 global_lsn
     int64_t checkpoint_offset_{0};
@@ -375,9 +423,15 @@ private:
     int64_t scan_end_offset_{0};   // end of the intact WAL prefix
 
     uint64_t scanned_record_count_{0};
+    std::array<uint64_t, kLogTypeCount> log_type_record_counts_{};
+    std::array<uint64_t, kLogTypeCount> log_type_serialized_bytes_{};
+    uint64_t index_smo_logical_image_count_{0};
+    uint64_t index_smo_logical_image_bytes_{0};
     uint64_t redo_applied_count_{0};
-    uint64_t redo_skipped_count_{0};       // losers plus records with no open table
+    uint64_t redo_skipped_count_{0};       // committed records with no open table
     uint64_t redo_missing_table_count_{0}; // subset of the above whose table is not open
+    uint64_t redo_candidate_count_{0};     // committed descriptors after compaction
+    uint64_t redo_loser_count_{0};         // DML retained for undo, not heap redo
     uint64_t undo_applied_count_{0};
     uint64_t pruned_no_undo_transaction_count_{0};
     uint64_t undo_chain_record_read_count_{0};

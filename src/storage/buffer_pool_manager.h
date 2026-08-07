@@ -97,6 +97,10 @@ private:
     ShardAcquisitionMetrics shard_write_metrics_;
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
+    // Reused only while latch_ is held by take_unblocked_victim_locked().
+    // Reserving it with the fixed pool size keeps blocked SMO victims from
+    // allocating while a full buffer pool holds the global latch.
+    std::vector<frame_id_t> blocked_victims_scratch_;
     std::vector<ResidencyClass> residency_classes_;
     size_t index_internal_resident_count_{0};
     // Background preflush walks frames instead of the unordered page table.
@@ -163,6 +167,7 @@ public:
             replacer_ = std::make_unique<LRUReplacer>(pool_size_);
         }
         recycled_frames_.reserve(pool_size_);
+        blocked_victims_scratch_.reserve(pool_size_);
         // Set the load factor before reserve so the reserved capacity remains
         // sufficient for the complete pool without an intermediate rehash.
         page_table_.max_load_factor(0.7F);
