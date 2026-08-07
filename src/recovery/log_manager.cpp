@@ -17,8 +17,10 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <unistd.h>
 #include <vector>
 #include "index_smo_log.h"
@@ -58,6 +60,25 @@ bool IsLegalEmptyCheckpoint(const char* bytes, size_t bytes_size) {
            read_unaligned<txn_id_t>(bytes + OFFSET_LOG_TID) == INVALID_TXN_ID &&
            read_unaligned<lsn_t>(bytes + OFFSET_PREV_LSN) == INVALID_LSN &&
            read_unaligned<size_t>(bytes + OFFSET_LOG_DATA) == 0;
+}
+
+std::string RestartManifestV2Payload(const RestartManifest& manifest) {
+    return "wal_format=segmented-v2\nwal_generation=" + std::to_string(manifest.wal_generation) +
+           "\nsegment_bytes=" + std::to_string(manifest.wal_segment_bytes) +
+           "\nrestart_segment=" + std::to_string(manifest.restart_segment) +
+           "\nrestart_offset=" + std::to_string(manifest.restart_offset) +
+           "\nnext_lsn=" + std::to_string(manifest.next_lsn) +
+           "\nnext_timestamp=" + std::to_string(manifest.next_timestamp) +
+           "\nnext_txn_id=" + std::to_string(manifest.next_txn_id) + "\n";
+}
+
+uint64_t RestartManifestV2Checksum(const RestartManifest& manifest) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char byte : RestartManifestV2Payload(manifest)) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
 
 } // namespace
@@ -293,6 +314,18 @@ void LogManager::flush_log_to_disk_up_to_durable(lsn_t target_lsn) {
 }
 
 void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync) {
+    if (!leader_rotation_enabled_) {
+        flush_log_to_disk_up_to_legacy(target_lsn, require_sync);
+        return;
+    }
+    flush_log_to_disk_up_to_with_leader_rotation(target_lsn, require_sync);
+}
+
+void LogManager::run_group_commit_test_hook(std::string_view point) const {
+    if (group_commit_test_hook_) group_commit_test_hook_(point);
+}
+
+void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync) {
     WalFlushMetrics* const metrics = wal_flush_metrics_;
     const bool metrics_enabled = metrics != nullptr && metrics->enabled();
     if (target_lsn == INVALID_LSN) {
@@ -438,6 +471,146 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
     }
 }
 
+void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync) {
+    WalFlushMetrics* const metrics = wal_flush_metrics_;
+    const bool metrics_enabled = metrics != nullptr && metrics->enabled();
+    if (target_lsn == INVALID_LSN) return;
+
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        const lsn_t latest_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
+        if (latest_lsn == INVALID_LSN) return;
+        target_lsn = std::min(target_lsn, latest_lsn);
+    }
+    const auto completed_lsn = [&] {
+        return require_sync ? durable_lsn_.load(std::memory_order_acquire)
+                            : persist_lsn_.load(std::memory_order_acquire);
+    };
+    if (completed_lsn() >= target_lsn) {
+        if (metrics_enabled) metrics->record_already_covered_fast_path();
+        return;
+    }
+
+    auto waiter = std::make_shared<CommitWaiter>();
+    waiter->target_lsn = target_lsn;
+    waiter->require_sync = require_sync;
+    bool leader = false;
+    {
+        std::unique_lock<std::mutex> group_lock(group_commit_latch_);
+        if (completed_lsn() >= target_lsn) {
+            if (metrics_enabled) metrics->record_already_covered_fast_path();
+            return;
+        }
+        group_commit_waiters_.push_back(waiter);
+        if (!group_commit_leader_active_) {
+            group_commit_leader_active_ = true;
+            waiter->state = CommitWaiter::State::Promoted;
+            leader = true;
+        }
+        group_commit_cv_.notify_one();
+        if (!leader) {
+            run_group_commit_test_hook("rotation_follower_enqueued");
+            if (metrics_enabled) {
+                metrics->record_follower_request();
+                const auto wait_begin = std::chrono::steady_clock::now();
+                waiter->cv.wait(group_lock, [&waiter] {
+                    return waiter->state == CommitWaiter::State::Done || waiter->state == CommitWaiter::State::Promoted;
+                });
+                metrics->record_follower_wait(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
+                        .count()));
+            } else {
+                waiter->cv.wait(group_lock, [&waiter] {
+                    return waiter->state == CommitWaiter::State::Done || waiter->state == CommitWaiter::State::Promoted;
+                });
+            }
+            if (waiter->state == CommitWaiter::State::Done) {
+                if (waiter->error != nullptr) std::rethrow_exception(waiter->error);
+                return;
+            }
+            leader = true;
+        }
+        if (metrics_enabled) metrics->record_leader_request();
+    }
+
+    uint64_t batches = 0;
+    for (;;) {
+        try {
+            bool sync_batch = false;
+            const auto batch_wait_begin = std::chrono::steady_clock::now();
+            {
+                std::unique_lock<std::mutex> group_lock(group_commit_latch_);
+                const auto deadline = batch_wait_begin + GROUP_COMMIT_BATCH_WINDOW;
+                group_commit_cv_.wait_until(group_lock, deadline, [this] {
+                    return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
+                });
+                for (const auto& pending : group_commit_waiters_) sync_batch = sync_batch || pending->require_sync;
+            }
+            if (metrics_enabled) {
+                metrics->record_coalescing_wait(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - batch_wait_begin)
+                        .count()));
+            }
+            run_group_commit_test_hook("rotation_before_flush");
+            flush_buffer(sync_batch);
+            ++batches;
+        } catch (...) {
+            const auto error = std::current_exception();
+            std::vector<std::shared_ptr<CommitWaiter>> notify;
+            {
+                std::lock_guard<std::mutex> group_lock(group_commit_latch_);
+                for (const auto& pending : group_commit_waiters_) {
+                    pending->error = error;
+                    pending->state = CommitWaiter::State::Done;
+                    notify.push_back(pending);
+                }
+                group_commit_waiters_.clear();
+                group_commit_leader_active_ = false;
+            }
+            for (const auto& pending : notify) pending->cv.notify_one();
+            if (metrics_enabled) metrics->record_leader_tenure(batches);
+            std::rethrow_exception(error);
+        }
+
+        std::vector<std::shared_ptr<CommitWaiter>> notify;
+        std::shared_ptr<CommitWaiter> promoted;
+        bool own_done = false;
+        const lsn_t written_lsn = persist_lsn_.load(std::memory_order_acquire);
+        const lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+        {
+            std::lock_guard<std::mutex> group_lock(group_commit_latch_);
+            for (auto it = group_commit_waiters_.begin(); it != group_commit_waiters_.end();) {
+                const lsn_t completion_lsn = (*it)->require_sync ? durable : written_lsn;
+                if ((*it)->target_lsn <= completion_lsn) {
+                    if (*it == waiter) own_done = true;
+                    (*it)->state = CommitWaiter::State::Done;
+                    notify.push_back(*it);
+                    it = group_commit_waiters_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            // Rotate only after this leader's original target is covered. This
+            // bounds a single commit call's disk tenure while FIFO chooses the
+            // next owner among every still-uncovered durability obligation.
+            if (own_done && !group_commit_waiters_.empty()) {
+                promoted = group_commit_waiters_.front();
+                promoted->state = CommitWaiter::State::Promoted;
+                notify.push_back(promoted);
+                if (metrics_enabled) metrics->record_leader_rotation();
+            } else if (group_commit_waiters_.empty()) {
+                group_commit_leader_active_ = false;
+            }
+        }
+        if (metrics_enabled) metrics->record_completed_batch(notify.size() - (promoted ? 1 : 0));
+        for (const auto& pending : notify) pending->cv.notify_one();
+        if (own_done) {
+            if (metrics_enabled) metrics->record_leader_tenure(batches);
+            return;
+        }
+    }
+}
+
 void LogManager::flush_buffer(bool sync) {
     WalFlushMetrics* const metrics = wal_flush_metrics_;
     const bool metrics_enabled = metrics != nullptr && metrics->enabled();
@@ -496,11 +669,16 @@ void LogManager::flush_buffer(bool sync) {
 
         // The active buffer is available to producers while this stable
         // buffer is written and synced.
+        run_group_commit_test_hook("flush_buffer_after_swap");
         bool write_succeeded = false;
         lsn_t durable_before = INVALID_LSN;
         try {
             durable_before = durable_lsn_.load(std::memory_order_acquire);
             if (metrics_enabled) metrics->record_physical_flush_iteration();
+            // This point is inside the write failure cleanup region: a
+            // test-injected pwrite failure therefore exercises the same
+            // waiter fanout and retry semantics as DiskManager::write_log.
+            run_group_commit_test_hook("flush_buffer_before_pwrite");
             const auto pwrite_begin = metrics_enabled ? std::chrono::steady_clock::now()
                                                        : std::chrono::steady_clock::time_point{};
             disk_manager_->write_log(flushing_buffer_->buffer_.data(), bytes);
@@ -575,13 +753,45 @@ void LogManager::initialize_from_existing_log() {
     index_bindings_.clear();
 
     RestartManifest manifest = read_restart_manifest();
+    if (manifest.malformed) {
+        throw InternalError("malformed segmented WAL restart manifest");
+    }
+    if (manifest.segmented_wal) {
+        disk_manager_->configure_segmented_wal(manifest.wal_generation, manifest.restart_segment,
+                                               static_cast<int64_t>(manifest.wal_segment_bytes));
+        if (!disk_manager_->is_file(disk_manager_->wal_segment_name(manifest.restart_segment))) {
+            throw InternalError("segmented WAL manifest root segment is missing");
+        }
+        disk_manager_->sync_segmented_wal_directory();
+    } else {
+        disk_manager_->configure_legacy_wal();
+    }
 
-    const int64_t file_size = disk_manager_->get_log_file_size();
+    int64_t file_size = disk_manager_->get_log_file_size();
+    // A newly created, empty legacy db.log may opt into v2 at first open. A
+    // non-empty legacy WAL is never migrated in this batch.
+    const char* segmented_override = std::getenv("RMDB_WAL_SEGMENTED");
+    // Batch 1 has no clean-checkpoint generation switch yet, so production
+    // remains legacy until the complete manifest/reclaim protocol lands.
+    const bool default_segmented = segmented_override != nullptr && std::strcmp(segmented_override, "1") == 0;
+    if (!manifest.segmented_wal && file_size == 0 && manifest.checkpoint_offset == 0 && default_segmented) {
+        disk_manager_->configure_segmented_wal(0, 0);
+        disk_manager_->ensure_segmented_wal_root();
+        manifest.segmented_wal = true;
+        manifest.wal_generation = 0;
+        manifest.wal_segment_bytes = DiskManager::kWalSegmentBytes;
+        manifest.restart_segment = 0;
+        manifest.restart_offset = 0;
+        manifest.checkpoint_offset = 0;
+        manifest.next_lsn = 0;
+        write_restart_manifest(manifest);
+        file_size = disk_manager_->get_log_file_size();
+    }
     if (file_size <= 0) {
         log_file_offset_ = 0;
         persist_lsn_ = INVALID_LSN;
         durable_lsn_.store(INVALID_LSN, std::memory_order_release);
-        global_lsn_.store(0);
+        global_lsn_.store(manifest.segmented_wal ? manifest.next_lsn : 0);
         if (manifest.checkpoint_offset != 0) {
             manifest.checkpoint_offset = 0;
             write_restart_manifest(manifest);
@@ -643,7 +853,8 @@ void LogManager::initialize_from_existing_log() {
     log_file_offset_ = offset;
     persist_lsn_ = max_lsn;
     durable_lsn_.store(max_lsn, std::memory_order_release);
-    global_lsn_.store(max_lsn == INVALID_LSN ? 0 : max_lsn + 1);
+    const lsn_t scanned_next_lsn = max_lsn == INVALID_LSN ? 0 : max_lsn + 1;
+    global_lsn_.store(std::max(scanned_next_lsn, manifest.next_lsn));
     index_bindings_.swap(scanned_bindings);
     if (offset < file_size) {
         disk_manager_->truncate_log_to(offset);
@@ -683,15 +894,33 @@ void LogManager::reset_log(lsn_t next_lsn) {
 }
 
 void LogManager::write_restart_manifest(const RestartManifest& manifest) {
+    RestartManifest effective = manifest;
+    if (disk_manager_ != nullptr && disk_manager_->wal_is_segmented()) {
+        effective.segmented_wal = true;
+        effective.wal_generation = disk_manager_->wal_generation();
+        effective.wal_segment_bytes = static_cast<uint64_t>(disk_manager_->wal_segment_bytes());
+        if (effective.checkpoint_offset < 0) throw InternalError("negative segmented WAL restart offset");
+        effective.restart_segment = static_cast<uint64_t>(effective.checkpoint_offset / disk_manager_->wal_segment_bytes());
+        effective.restart_offset = static_cast<uint64_t>(effective.checkpoint_offset % disk_manager_->wal_segment_bytes());
+        effective.next_lsn = std::max(effective.next_lsn, global_lsn_.load(std::memory_order_acquire));
+    }
     const std::string temp_name = std::string(RESTART_FILE_NAME) + ".tmp";
     std::ofstream restart_file(temp_name, std::ios::trunc);
     if (!restart_file.is_open()) {
         throw UnixError();
     }
     // 第一行保持裸偏移，只为让旧读者（`>> offset`）继续可读。
-    restart_file << manifest.checkpoint_offset << '\n'
-                 << "next_timestamp=" << manifest.next_timestamp << '\n'
-                 << "next_txn_id=" << manifest.next_txn_id << '\n';
+    restart_file << effective.checkpoint_offset << '\n';
+    if (effective.segmented_wal) {
+        RestartManifest v2 = effective;
+        if (v2.wal_segment_bytes != static_cast<uint64_t>(DiskManager::kWalSegmentBytes)) {
+            throw InternalError("segmented WAL manifest has unsupported segment size");
+        }
+        restart_file << RestartManifestV2Payload(v2) << "checksum=" << RestartManifestV2Checksum(v2) << '\n';
+    } else {
+        restart_file << "next_timestamp=" << effective.next_timestamp << '\n'
+                     << "next_txn_id=" << effective.next_txn_id << '\n';
+    }
     restart_file.flush();
     if (!restart_file) {
         throw UnixError();
@@ -718,12 +947,14 @@ RestartManifest LogManager::read_restart_manifest() const {
     if (!(restart_file >> checkpoint_offset) || checkpoint_offset < 0) {
         // 无法解析出偏移的清单整体不可信：偏移错了会让恢复从错误的位置开始扫描，
         // 所以此时连计数器也不采纳，全部退回“字段缺失”的安全默认值。
+        manifest.malformed = true;
         return manifest;
     }
     manifest.checkpoint_offset = checkpoint_offset;
 
-    // 每一项都独立解析：将来新增的键不会让旧字段读不出来，无法识别的键被忽略。
+    // 每一项都独立解析：将来新增的 legacy 键不会让旧字段读不出来，无法识别的键被忽略。
     // 负值一律当作缺失——计数器只可能单调增长，负数只能来自损坏的文件。
+    std::unordered_map<std::string, std::string> entries;
     std::string entry;
     while (restart_file >> entry) {
         const size_t separator = entry.find('=');
@@ -731,15 +962,88 @@ RestartManifest LogManager::read_restart_manifest() const {
             continue;
         }
         const std::string key = entry.substr(0, separator);
+        if (!entries.emplace(key, entry.substr(separator + 1)).second) {
+            manifest.malformed = true;
+            return manifest;
+        }
+    }
+    const auto format = entries.find("wal_format");
+    static const std::unordered_set<std::string> kV2OnlyKeys = {
+        "wal_generation", "segment_bytes", "restart_segment", "restart_offset", "next_lsn", "checksum"};
+    if (format == entries.end()) {
+        for (const auto& [key, value] : entries) {
+            (void)value;
+            if (kV2OnlyKeys.count(key) != 0) {
+                manifest.malformed = true;
+                return manifest;
+            }
+        }
+    }
+    if (format != entries.end()) {
+        manifest.segmented_wal = true;
+        if (format->second != "segmented-v2") {
+            manifest.malformed = true;
+            return manifest;
+        }
+        const auto parse_unsigned = [&](const char* key, uint64_t* out) {
+            const auto found = entries.find(key);
+            if (found == entries.end() || found->second.empty() ||
+                found->second.find_first_not_of("0123456789") != std::string::npos) {
+                return false;
+            }
+            try {
+                *out = std::stoull(found->second);
+                return true;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        uint64_t checksum = 0;
+        uint64_t next_lsn = 0;
+        uint64_t next_timestamp = 0;
+        uint64_t next_txn_id = 0;
+        if (!parse_unsigned("wal_generation", &manifest.wal_generation) ||
+            !parse_unsigned("segment_bytes", &manifest.wal_segment_bytes) ||
+            !parse_unsigned("restart_segment", &manifest.restart_segment) ||
+            !parse_unsigned("restart_offset", &manifest.restart_offset) || !parse_unsigned("next_timestamp", &next_timestamp) ||
+            !parse_unsigned("next_txn_id", &next_txn_id) || !parse_unsigned("next_lsn", &next_lsn) ||
+            !parse_unsigned("checksum", &checksum) ||
+            manifest.wal_segment_bytes != static_cast<uint64_t>(DiskManager::kWalSegmentBytes) ||
+            next_timestamp > static_cast<uint64_t>(std::numeric_limits<timestamp_t>::max()) ||
+            next_txn_id > static_cast<uint64_t>(std::numeric_limits<txn_id_t>::max()) ||
+            next_lsn > static_cast<uint64_t>(std::numeric_limits<lsn_t>::max()) ||
+            manifest.restart_offset >= manifest.wal_segment_bytes) {
+            manifest.malformed = true;
+            return manifest;
+        }
+        manifest.next_timestamp = static_cast<timestamp_t>(next_timestamp);
+        manifest.next_txn_id = static_cast<txn_id_t>(next_txn_id);
+        manifest.next_lsn = static_cast<lsn_t>(next_lsn);
+        if (manifest.restart_segment > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                                           manifest.wal_segment_bytes ||
+            manifest.checkpoint_offset != static_cast<int64_t>(manifest.restart_segment * manifest.wal_segment_bytes +
+                                                                manifest.restart_offset) ||
+            checksum != RestartManifestV2Checksum(manifest)) {
+            manifest.malformed = true;
+            return manifest;
+        }
+        // V2 is deliberately closed: unknown fields make the versioned format
+        // invalid rather than letting a typo select a different recovery root.
+        static const std::unordered_set<std::string> kV2Keys = {
+            "wal_format", "wal_generation", "segment_bytes", "restart_segment", "restart_offset", "next_lsn", "next_timestamp",
+            "next_txn_id", "checksum"};
+        for (const auto& [key, value] : entries) {
+            (void)value;
+            if (kV2Keys.count(key) == 0) {
+                manifest.malformed = true;
+                return manifest;
+            }
+        }
+    }
+    for (const auto& [key, text] : entries) {
         int64_t value = 0;
-        try {
-            value = std::stoll(entry.substr(separator + 1));
-        } catch (const std::exception&) {
-            continue;
-        }
-        if (value < 0) {
-            continue;
-        }
+        try { value = std::stoll(text); } catch (const std::exception&) { continue; }
+        if (value < 0) continue;
         if (key == "next_timestamp") {
             manifest.next_timestamp = static_cast<timestamp_t>(value);
         } else if (key == "next_txn_id") {

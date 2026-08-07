@@ -16,11 +16,15 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
+#include <vector>
 
 #include "common/config.h"
 #include "errors.h"
@@ -30,6 +34,7 @@ See the Mulan PSL v2 for more details. */
  */
 class DiskManager {
 public:
+    static constexpr int64_t kWalSegmentBytes = 64LL * 1024 * 1024;
     explicit DiskManager();
 
     ~DiskManager() = default;
@@ -70,6 +75,22 @@ public:
     // Return the size of the established WAL descriptor. Durable WAL callers
     // must use this rather than resolving LOG_FILE_NAME again.
     int64_t get_log_file_size();
+
+    // The segmented layout exposes one continuous logical WAL byte stream.
+    // Segment names are generation-scoped (`db.log.<generation>.<segment>`),
+    // while callers continue to use logical offsets exactly as they did for
+    // legacy db.log.  The test-only size parameter must divide neither record
+    // semantics nor production layout; production always uses kWalSegmentBytes.
+    void configure_segmented_wal(uint64_t generation, uint64_t restart_segment = 0,
+                                 int64_t segment_bytes = kWalSegmentBytes);
+    void configure_legacy_wal();
+    bool wal_is_segmented() const noexcept { return wal_segmented_; }
+    uint64_t wal_generation() const noexcept { return wal_generation_; }
+    int64_t wal_segment_bytes() const noexcept { return wal_segment_bytes_; }
+    std::string wal_segment_name(uint64_t segment) const;
+    void ensure_segmented_wal_root();
+    void sync_segmented_wal_directory();
+    size_t pending_segment_directory_sync_for_test() const;
 
     std::string get_file_name(int fd);
 
@@ -146,6 +167,10 @@ private:
     // every call, which left correctness depending on the order in which
     // readers and writers happened to run.
     void open_log_fd();
+    int64_t segmented_log_size_locked() const;
+    int open_wal_segment_locked(uint64_t segment, bool create);
+    void validate_segmented_layout_locked() const;
+    void sync_pending_segment_directory_locked();
 
     // 文件打开列表，用于记录文件是否被打开
     std::unordered_map<std::string, int> path2fd_; //<Page文件磁盘路径,Page fd>哈希表
@@ -153,6 +178,16 @@ private:
 
     int log_fd_ = -1;        // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
     int64_t log_offset_ = 0; // 日志文件追加偏移
+    mutable std::mutex wal_segment_latch_;
+    bool wal_segmented_{false};
+    uint64_t wal_generation_{0};
+    uint64_t wal_restart_segment_{0};
+    int64_t wal_segment_bytes_{kWalSegmentBytes};
+    std::unordered_set<uint64_t> dirty_wal_segments_;
+    // A successful O_CREAT is not durable until its parent directory is
+    // synced. Keep this obligation across write/close/fsync failures so a
+    // retry cannot mistake an existing pathname for a durable one.
+    std::unordered_set<uint64_t> pending_segment_directory_sync_;
     std::atomic<uint64_t> log_read_count_{0};
     std::atomic<uint64_t> log_read_bytes_{0};
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0

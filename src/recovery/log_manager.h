@@ -16,15 +16,18 @@ See the Mulan PSL v2 for more details. */
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -708,6 +711,16 @@ struct RestartManifest {
     timestamp_t next_timestamp{0};
     // 同上，但针对 next_txn_id_。
     txn_id_t next_txn_id{0};
+    lsn_t next_lsn{0};
+    // Version 2 makes the physical WAL layout explicit. A v2 marker is never
+    // allowed to fall back to db.log: malformed layout metadata is a recovery
+    // failure, not an invitation to scan a different byte stream.
+    bool segmented_wal{false};
+    bool malformed{false};
+    uint64_t wal_generation{0};
+    uint64_t wal_segment_bytes{0};
+    uint64_t restart_segment{0};
+    uint64_t restart_offset{0};
 };
 
 /**
@@ -728,13 +741,20 @@ struct CheckpointWalCut {
 class LogManager {
 public:
     static constexpr const char* RESTART_FILE_NAME = "db.restart";
+    // Test-only bounded scheduling point for group-commit ownership tests.
+    // Production construction leaves it empty.
+    struct GroupCommitTestOptions {
+        std::function<void(std::string_view)> hook;
+    };
 
     explicit LogManager(DiskManager* disk_manager, DurabilityMode durability_mode = DurabilityMode::STRICT,
-                        WalFlushMetrics* wal_flush_metrics = nullptr)
+                        WalFlushMetrics* wal_flush_metrics = nullptr, GroupCommitTestOptions test_options = {})
         : log_buffer_(std::make_unique<LogBuffer>()), flushing_buffer_(std::make_unique<LogBuffer>()) {
         disk_manager_ = disk_manager;
         durability_mode_ = durability_mode;
         wal_flush_metrics_ = wal_flush_metrics;
+        group_commit_test_hook_ = std::move(test_options.hook);
+        leader_rotation_enabled_ = WalFlushMetrics::ParseEnabled(std::getenv("RMDB_WAL_LEADER_ROTATION"));
         persist_lsn_.store(INVALID_LSN);
         durable_lsn_ = INVALID_LSN;
     }
@@ -781,6 +801,9 @@ public:
     DurabilityMode durability_mode() const {
         return durability_mode_;
     }
+    bool leader_rotation_enabled_for_test() const noexcept {
+        return leader_rotation_enabled_;
+    }
 
     // 原子发布重启清单：tmp 文件 + fdatasync + rename + 目录 fsync。
     // checkpoint 必须在截断 WAL *之前* 调用它，见 CheckpointManager::RunCleanCheckpoint()。
@@ -798,15 +821,22 @@ public:
 
 private:
     struct CommitWaiter {
+        enum class State : uint8_t { Waiting, Promoted, Done };
         lsn_t target_lsn{INVALID_LSN};
         bool require_sync{true};
+        // Kept for the default-off path so its waiter protocol stays byte-for-
+        // byte equivalent to the established implementation.
         bool done{false};
+        State state{State::Waiting};
         std::exception_ptr error;
         std::condition_variable cv;
     };
 
     void flush_buffer(bool sync);
     void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync);
+    void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync);
+    void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync);
+    void run_group_commit_test_hook(std::string_view point) const;
     uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch);
 
     // One leader performs the durable flush for all waiters that arrive
@@ -831,6 +861,10 @@ private:
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};
     WalFlushMetrics* wal_flush_metrics_{nullptr};
+    // Cached at construction so the disabled path is exactly the established
+    // group-commit implementation and never reads process configuration.
+    bool leader_rotation_enabled_{false};
+    std::function<void(std::string_view)> group_commit_test_hook_;
     struct IndexBinding {
         uint64_t generation{0};
         uint64_t epoch{0};

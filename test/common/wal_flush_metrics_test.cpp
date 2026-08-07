@@ -21,6 +21,10 @@ TEST(WalFlushMetricsTest, CountsTimingsAndMaximumsAreCumulative) {
     WalFlushMetrics metrics(true);
     metrics.record_already_covered_fast_path();
     metrics.record_leader_request();
+    metrics.record_leader_rotation();
+    metrics.record_leader_rotation();
+    metrics.record_leader_tenure(1);
+    metrics.record_leader_tenure(3);
     metrics.record_follower_request();
     metrics.record_follower_wait(3);
     metrics.record_follower_wait(7);
@@ -34,6 +38,8 @@ TEST(WalFlushMetricsTest, CountsTimingsAndMaximumsAreCumulative) {
     const auto snapshot = metrics.snapshot();
     EXPECT_EQ(snapshot.already_covered_fast_paths, 1U);
     EXPECT_EQ(snapshot.leader_requests, 1U);
+    EXPECT_EQ(snapshot.leader_rotations, 2U);
+    EXPECT_EQ(snapshot.max_batches_per_leader, 3U);
     EXPECT_EQ(snapshot.follower_requests, 1U);
     EXPECT_EQ(snapshot.follower_wait.count, 2U);
     EXPECT_EQ(snapshot.follower_wait.elapsed_ns, 10U);

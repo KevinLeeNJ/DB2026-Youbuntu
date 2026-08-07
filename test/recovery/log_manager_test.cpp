@@ -21,18 +21,26 @@ See the Mulan PSL v2 for more details. */
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <poll.h>
 #include <memory>
+#include <mutex>
+#include <limits>
+#include <signal.h>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -162,12 +170,540 @@ private:
     std::optional<std::string> previous_;
 };
 
+// Every concurrency scenario runs in a child: a broken waiter protocol can
+// therefore be killed and reaped rather than turning a test timeout into an
+// unbounded task-destructor wait in the test runner.
+using RotationScenario = int (*)(const std::filesystem::path&);
+
+bool RunInWatchdog(const std::string& name, RotationScenario scenario) {
+    const std::filesystem::path test_dir = CurrentPath() / UniqueWalTestDir(name);
+    std::filesystem::remove_all(test_dir);
+    int report[2];
+    if (pipe(report) != 0) return false;
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(report[0]);
+        close(report[1]);
+        std::filesystem::remove_all(test_dir);
+        return false;
+    }
+    if (pid == 0) {
+        close(report[0]);
+        unsigned char result = 255;
+        try {
+            result = static_cast<unsigned char>(scenario(test_dir));
+        } catch (...) {
+        }
+        (void)write(report[1], &result, sizeof(result));
+        close(report[1]);
+        _exit(result == 0 ? 0 : 1);
+    }
+    close(report[1]);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    int status = 0;
+    while (waitpid(pid, &status, WNOHANG) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            kill(pid, SIGKILL);
+            (void)waitpid(pid, &status, 0);
+            close(report[0]);
+            std::filesystem::remove_all(test_dir);
+            return false;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        pollfd fd{report[0], POLLIN, 0};
+        (void)poll(&fd, 1, static_cast<int>(std::max<int64_t>(1, remaining)));
+    }
+    unsigned char result = 0;
+    const ssize_t bytes = read(report[0], &result, sizeof(result));
+    close(report[0]);
+    std::filesystem::remove_all(test_dir);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 && bytes == sizeof(result) && result == 0;
+}
+
+template <typename Flush>
+std::thread StartFlush(Flush&& flush, std::atomic<bool>* threw) {
+    return std::thread([flush = std::forward<Flush>(flush), threw] {
+        try {
+            flush();
+        } catch (...) {
+            threw->store(true, std::memory_order_release);
+        }
+    });
+}
+
+int RunLeaderRotationHandoff(const std::filesystem::path& test_dir) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
+    WalFlushMetrics metrics(true);
+    std::mutex latch;
+    std::condition_variable cv;
+    bool swapped = false, follower = false, release = false, first_swap = true;
+    LogManager::GroupCommitTestOptions options;
+    options.hook = [&](std::string_view point) {
+        std::unique_lock<std::mutex> lock(latch);
+        if (point == "rotation_follower_enqueued") {
+            follower = true;
+            cv.notify_all();
+        } else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false;
+            swapped = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        }
+    };
+    LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
+    BeginLogRecord first(300);
+    const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
+    std::atomic<bool> first_threw{false}, second_threw{false};
+    std::thread first_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &first_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return swapped; });
+    }
+    BeginLogRecord second(301);
+    const lsn_t second_lsn = log_mgr.add_log_to_buffer(&second);
+    std::thread second_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(second_lsn); }, &second_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return follower; });
+        release = true;
+    }
+    cv.notify_all();
+    first_flush.join();
+    second_flush.join();
+    const auto snapshot = metrics.snapshot();
+    return first_threw.load() || second_threw.load() || log_mgr.get_durable_lsn() != second_lsn ||
+                   snapshot.leader_rotations < 1 ||
+                   snapshot.leader_requests < 2 || snapshot.max_batches_per_leader < 1
+               ? 1
+               : 0;
+}
+
+int RunLeaderRotationFailureRecovery(const std::filesystem::path& test_dir) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
+    WalFlushMetrics metrics(true);
+    std::mutex latch;
+    std::condition_variable cv;
+    bool swapped = false, follower = false, release = false, first_swap = true;
+    std::atomic<unsigned> pwrite_attempts{0};
+    std::atomic<bool> fail_second_write{true};
+    LogManager::GroupCommitTestOptions options;
+    options.hook = [&](std::string_view point) {
+        if (point == "flush_buffer_before_pwrite") {
+            if (pwrite_attempts.fetch_add(1, std::memory_order_relaxed) == 1 && fail_second_write.load()) {
+                throw std::runtime_error("injected second pwrite failure");
+            }
+            return;
+        }
+        std::unique_lock<std::mutex> lock(latch);
+        if (point == "rotation_follower_enqueued") {
+            follower = true;
+            cv.notify_all();
+        } else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false;
+            swapped = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        }
+    };
+    LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
+    BeginLogRecord first(310);
+    const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
+    std::atomic<bool> first_threw{false}, second_threw{false}, third_threw{false};
+    std::thread first_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &first_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return swapped; });
+    }
+    BeginLogRecord second(311), third(312);
+    const lsn_t second_lsn = log_mgr.add_log_to_buffer(&second);
+    const lsn_t third_lsn = log_mgr.add_log_to_buffer(&third);
+    std::thread second_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(second_lsn); }, &second_threw);
+    std::thread third_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(third_lsn); }, &third_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return follower; });
+        release = true;
+    }
+    cv.notify_all();
+    first_flush.join();
+    second_flush.join();
+    third_flush.join();
+    if (first_threw.load() || !second_threw.load() || !third_threw.load()) return 2;
+    fail_second_write.store(false, std::memory_order_relaxed);
+    BeginLogRecord fourth(313);
+    const lsn_t fourth_lsn = log_mgr.add_log_to_buffer(&fourth);
+    try {
+        log_mgr.flush_log_to_disk_up_to(fourth_lsn);
+    } catch (...) {
+        return 3;
+    }
+    return log_mgr.get_durable_lsn() == fourth_lsn && metrics.snapshot().leader_rotations >= 1 ? 0 : 4;
+}
+
+int RunLeaderRotationStrictRelaxed(const std::filesystem::path& test_dir) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
+    WalFlushMetrics metrics(true);
+    std::mutex latch;
+    std::condition_variable cv;
+    bool swapped = false, follower = false, release = false, first_swap = true;
+    LogManager::GroupCommitTestOptions options;
+    options.hook = [&](std::string_view point) {
+        std::unique_lock<std::mutex> lock(latch);
+        if (point == "rotation_follower_enqueued") { follower = true; cv.notify_all(); }
+        else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false; swapped = true; cv.notify_all(); cv.wait(lock, [&] { return release; });
+        }
+    };
+    LogManager log_mgr(&disk, DurabilityMode::PROCESS_CRASH, &metrics, std::move(options));
+    BeginLogRecord relaxed(320);
+    const lsn_t relaxed_lsn = log_mgr.add_log_to_buffer(&relaxed);
+    std::atomic<bool> relaxed_threw{false}, strict_threw{false};
+    std::thread relaxed_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(relaxed_lsn); }, &relaxed_threw);
+    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return swapped; }); }
+    BeginLogRecord strict(321);
+    const lsn_t strict_lsn = log_mgr.add_log_to_buffer(&strict);
+    std::thread strict_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to_durable(strict_lsn); }, &strict_threw);
+    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return follower; }); release = true; }
+    cv.notify_all();
+    relaxed_flush.join();
+    strict_flush.join();
+    const auto snapshot = metrics.snapshot();
+    return relaxed_threw.load() || strict_threw.load() || log_mgr.get_persist_lsn() != strict_lsn ||
+                   log_mgr.get_durable_lsn() != strict_lsn || snapshot.fdatasync.count != 1 || snapshot.leader_rotations < 1
+               ? 1 : 0;
+}
+
+int RunLeaderRotationThreeFifo(const std::filesystem::path& test_dir) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
+    WalFlushMetrics metrics(true);
+    std::mutex latch;
+    std::condition_variable cv;
+    bool swapped = false, release = false, first_swap = true;
+    unsigned followers = 0, leader_batches = 0;
+    LogManager::GroupCommitTestOptions options;
+    options.hook = [&](std::string_view point) {
+        std::unique_lock<std::mutex> lock(latch);
+        if (point == "rotation_follower_enqueued") { ++followers; cv.notify_all(); }
+        else if (point == "rotation_before_flush") { ++leader_batches; }
+        else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false; swapped = true; cv.notify_all(); cv.wait(lock, [&] { return release; });
+        }
+    };
+    LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
+    BeginLogRecord first(330);
+    const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
+    std::atomic<bool> first_threw{false};
+    std::thread first_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &first_threw);
+    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return swapped; }); }
+    std::array<std::atomic<bool>, 3> follower_threw{};
+    std::array<std::thread, 3> follower_flushes;
+    lsn_t last_lsn = first_lsn;
+    for (size_t i = 0; i < follower_flushes.size(); ++i) {
+        BeginLogRecord record(static_cast<txn_id_t>(331 + i));
+        last_lsn = log_mgr.add_log_to_buffer(&record);
+        const lsn_t target = last_lsn;
+        follower_flushes[i] = StartFlush([&log_mgr, target] { log_mgr.flush_log_to_disk_up_to(target); }, &follower_threw[i]);
+    }
+    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return followers == 3; }); release = true; }
+    cv.notify_all();
+    first_flush.join();
+    for (auto& flush : follower_flushes) flush.join();
+    bool threw = first_threw.load();
+    for (const auto& item : follower_threw) threw = threw || item.load();
+    const auto snapshot = metrics.snapshot();
+    std::lock_guard<std::mutex> lock(latch);
+    return threw || log_mgr.get_durable_lsn() != last_lsn || snapshot.leader_rotations != 1 ||
+                   snapshot.leader_requests != 2 || snapshot.max_batches_per_leader != 1 || leader_batches != 2
+               ? 1 : 0;
+}
+
+int RunLeaderRotationDefaultOff(const std::filesystem::path& test_dir) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar disabled("RMDB_WAL_LEADER_ROTATION", "0");
+    WalFlushMetrics metrics(true);
+    LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics);
+    if (log_mgr.leader_rotation_enabled_for_test()) return 1;
+    std::array<lsn_t, 4> targets{};
+    for (size_t i = 0; i < targets.size(); ++i) {
+        BeginLogRecord record(static_cast<txn_id_t>(340 + i));
+        targets[i] = log_mgr.add_log_to_buffer(&record);
+    }
+    std::array<std::atomic<bool>, 4> threw{};
+    std::array<std::thread, 4> flushes;
+    for (size_t i = 0; i < flushes.size(); ++i) {
+        flushes[i] = StartFlush([&log_mgr, target = targets[i]] { log_mgr.flush_log_to_disk_up_to(target); }, &threw[i]);
+    }
+    for (auto& flush : flushes) flush.join();
+    bool any_threw = false;
+    for (const auto& item : threw) any_threw = any_threw || item.load();
+    const auto snapshot = metrics.snapshot();
+    return any_threw || log_mgr.get_durable_lsn() != targets.back() || snapshot.leader_rotations != 0 ||
+                   snapshot.leader_requests < 1
+               ? 2 : 0;
+}
+
 } // namespace
 
 TEST(LogManagerTest, DefaultsToStrictDurability) {
     DiskManager disk;
     LogManager log_mgr(&disk);
     EXPECT_EQ(log_mgr.durability_mode(), DurabilityMode::STRICT);
+}
+
+TEST(LogManagerTest, LeaderRotationConfigurationIsExactAndCachedAtConstruction) {
+    ScopedTestDir test_dir("log_manager_rotation_config_test_db");
+    DiskManager disk;
+    disk.create_file(LOG_FILE_NAME);
+
+    ScopedEnvVar disabled("RMDB_WAL_LEADER_ROTATION", "true");
+    LogManager disabled_manager(&disk);
+    EXPECT_FALSE(disabled_manager.leader_rotation_enabled_for_test());
+
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
+    LogManager enabled_manager(&disk);
+    EXPECT_TRUE(enabled_manager.leader_rotation_enabled_for_test());
+}
+
+TEST(LogManagerTest, LeaderRotationHandsOffUncoveredFollowerAfterFirstBatch) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_handoff_test_db", RunLeaderRotationHandoff));
+}
+
+TEST(LogManagerTest, LeaderRotationFailureOnlyFailsUncoveredWaitersAndRecovers) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_failure_test_db", RunLeaderRotationFailureRecovery));
+}
+
+TEST(LogManagerTest, LeaderRotationSeparatesProcessCrashAndStrictCoverage) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_durability_modes_test_db", RunLeaderRotationStrictRelaxed));
+}
+
+TEST(LogManagerTest, LeaderRotationPromotesOneFifoOwnerForThreeFollowers) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_fifo_test_db", RunLeaderRotationThreeFifo));
+}
+
+TEST(LogManagerTest, LeaderRotationDefaultOffKeepsLegacyDrainAndBoundedWaiters) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_default_off_test_db", RunLeaderRotationDefaultOff));
+}
+
+TEST(LogManagerTest, SegmentedWalReadsRecordsAcrossPhysicalBoundary) {
+    ScopedTestDir test_dir("segmented_wal_cross_boundary_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(7, 0, 64);
+    disk.ensure_segmented_wal_root();
+    LogManager log_mgr(&disk);
+    std::array<BeginLogRecord, 4> records = {BeginLogRecord(1), BeginLogRecord(2), BeginLogRecord(3),
+                                              BeginLogRecord(4)};
+    for (auto& record : records) {
+        EXPECT_NE(log_mgr.add_log_to_buffer(&record), INVALID_LSN);
+    }
+    log_mgr.flush_log_to_disk_with_sync();
+    ASSERT_TRUE(disk.is_file("db.log.7.0"));
+    ASSERT_TRUE(disk.is_file("db.log.7.1"));
+    WalReader reader(&disk, 0, disk.get_log_file_size(), 16);
+    WalRecordView view;
+    unsigned count = 0;
+    while (reader.next(&view)) {
+        EXPECT_EQ(view.log_type, LogType::BEGIN);
+        ++count;
+    }
+    EXPECT_EQ(count, records.size());
+}
+
+TEST(LogManagerTest, SegmentedRestartManifestRoundTripsAndRejectsCorruption) {
+    ScopedTestDir test_dir("segmented_wal_manifest_v2_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(9);
+    disk.ensure_segmented_wal_root();
+    LogManager log_mgr(&disk);
+    RestartManifest written;
+    written.checkpoint_offset = 0;
+    written.next_lsn = 29;
+    written.next_timestamp = 41;
+    written.next_txn_id = 73;
+    log_mgr.write_restart_manifest(written);
+    const RestartManifest read = log_mgr.read_restart_manifest();
+    EXPECT_TRUE(read.segmented_wal);
+    EXPECT_FALSE(read.malformed);
+    EXPECT_EQ(read.wal_generation, 9U);
+    EXPECT_EQ(read.wal_segment_bytes, static_cast<uint64_t>(DiskManager::kWalSegmentBytes));
+    EXPECT_EQ(read.next_lsn, 29);
+    EXPECT_EQ(read.next_timestamp, 41);
+    EXPECT_EQ(read.next_txn_id, 73);
+    LogManager restarted(&disk);
+    restarted.initialize_from_existing_log();
+    EXPECT_EQ(restarted.get_global_lsn(), 29);
+    {
+        std::ofstream corrupt(LogManager::RESTART_FILE_NAME, std::ios::app);
+        corrupt << "unknown_key=1\n";
+    }
+    EXPECT_TRUE(log_mgr.read_restart_manifest().malformed);
+}
+
+TEST(LogManagerTest, SegmentedManifestRejectsMissingRootSegment) {
+    ScopedTestDir test_dir("segmented_wal_missing_root_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(10);
+    disk.ensure_segmented_wal_root();
+    LogManager writer(&disk);
+    RestartManifest manifest;
+    manifest.next_lsn = 5;
+    writer.write_restart_manifest(manifest);
+    ASSERT_EQ(unlink("db.log.10.0"), 0);
+    LogManager restarted(&disk);
+    EXPECT_THROW(restarted.initialize_from_existing_log(), InternalError);
+}
+
+TEST(LogManagerTest, RestartManifestRejectsBadFirstLineAndOrphanedV2Fields) {
+    ScopedTestDir test_dir("segmented_wal_manifest_rejection_test_db");
+    DiskManager disk;
+    LogManager log_mgr(&disk);
+    {
+        std::ofstream broken(LogManager::RESTART_FILE_NAME, std::ios::trunc);
+        broken << "not-an-offset\n";
+    }
+    EXPECT_TRUE(log_mgr.read_restart_manifest().malformed);
+    {
+        std::ofstream broken(LogManager::RESTART_FILE_NAME, std::ios::trunc);
+        broken << "0\nwal_generation=4\n";
+    }
+    EXPECT_TRUE(log_mgr.read_restart_manifest().malformed);
+}
+
+TEST(LogManagerTest, SegmentedStartupTornTailTruncatesBoundaryAndLaterSegments) {
+    ScopedTestDir test_dir("segmented_wal_torn_tail_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(13, 0, 64);
+    disk.ensure_segmented_wal_root();
+    std::array<char, 130> bytes{};
+    disk.write_log(bytes.data(), static_cast<int>(bytes.size()));
+    disk.fsync_log();
+    ASSERT_TRUE(disk.is_file("db.log.13.2"));
+    disk.truncate_log_to(64);
+    EXPECT_EQ(disk.get_log_file_size(), 64);
+    EXPECT_FALSE(disk.is_file("db.log.13.1"));
+    EXPECT_FALSE(disk.is_file("db.log.13.2"));
+    const char one = 1;
+    disk.write_log(const_cast<char*>(&one), 1);
+    EXPECT_TRUE(disk.is_file("db.log.13.1"));
+    EXPECT_NO_THROW(disk.configure_segmented_wal(13, 0, 64));
+}
+
+TEST(LogManagerTest, SegmentedTornTailAtRootKeepsManifestRootRestartable) {
+    ScopedTestDir test_dir("segmented_wal_root_torn_tail_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(14, 0, 64);
+    disk.ensure_segmented_wal_root();
+    std::array<char, 65> bytes{};
+    disk.write_log(bytes.data(), static_cast<int>(bytes.size()));
+    disk.fsync_log();
+    disk.truncate_log_to(0);
+    EXPECT_TRUE(disk.is_file("db.log.14.0"));
+    EXPECT_EQ(disk.get_file_size("db.log.14.0"), 0);
+    EXPECT_FALSE(disk.is_file("db.log.14.1"));
+    EXPECT_NO_THROW(disk.configure_segmented_wal(14, 0, 64));
+    const char one = 1;
+    EXPECT_NO_THROW(disk.write_log(const_cast<char*>(&one), 1));
+    EXPECT_EQ(disk.get_log_file_size(), 1);
+}
+
+TEST(LogManagerTest, SegmentCreateFailureRetainsDirectorySyncObligationForRetry) {
+#ifdef RMDB_ENABLE_FAULT_INJECTION
+    ScopedTestDir test_dir("segmented_wal_directory_retry_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(15, 0, 64);
+    disk.ensure_segmented_wal_root();
+    std::array<char, 64> full{};
+    disk.write_log(full.data(), static_cast<int>(full.size()));
+    {
+        ScopedEnvVar point("RMDB_FAULT_POINT", "before_wal_segment_directory_sync");
+        ScopedEnvVar action("RMDB_FAULT_ACTION", "throw");
+        EXPECT_THROW(disk.write_log(full.data(), 1), std::runtime_error);
+    }
+    EXPECT_EQ(disk.pending_segment_directory_sync_for_test(), 1U);
+    disk.write_log(full.data(), 1);
+    EXPECT_EQ(disk.pending_segment_directory_sync_for_test(), 0U);
+#endif
+}
+
+TEST(LogManagerTest, SegmentedWalIsExactOptInUntilGenerationSwitchExists) {
+    ScopedTestDir test_dir("segmented_wal_opt_in_test_db");
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    {
+        ScopedEnvVar disabled("RMDB_WAL_SEGMENTED", "0");
+        LogManager legacy(&disk);
+        legacy.initialize_from_existing_log();
+        EXPECT_FALSE(disk.wal_is_segmented());
+    }
+    {
+        ScopedEnvVar enabled("RMDB_WAL_SEGMENTED", "1");
+        LogManager segmented(&disk);
+        segmented.initialize_from_existing_log();
+        EXPECT_TRUE(disk.wal_is_segmented());
+        EXPECT_TRUE(disk.is_file("db.log.0.0"));
+    }
+    {
+        ScopedEnvVar invalid("RMDB_WAL_SEGMENTED", "true");
+        DiskManager invalid_disk;
+        ScopedWalFile invalid_wal(&invalid_disk);
+        LogManager invalid_manager(&invalid_disk);
+        invalid_manager.initialize_from_existing_log();
+        EXPECT_FALSE(invalid_disk.wal_is_segmented());
+    }
+}
+
+TEST(LogManagerTest, SegmentedWalRejectsSymlinkAndLogicalOffsetOverflow) {
+    ScopedTestDir test_dir("segmented_wal_symlink_overflow_test_db");
+    DiskManager disk;
+    ASSERT_EQ(symlink("/dev/null", "db.log.21.0"), 0);
+    EXPECT_THROW(disk.configure_segmented_wal(21, 0, 64), InternalError);
+    EXPECT_THROW(disk.configure_segmented_wal(22,
+                                              static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 64) + 1,
+                                              64),
+                 InternalError);
+}
+
+TEST(LogManagerTest, NonemptyLegacyWalRemainsLegacyAtStartup) {
+    ScopedTestDir test_dir("segmented_wal_legacy_preservation_test_db");
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    LogManager writer(&disk);
+    BeginLogRecord record(17);
+    writer.add_log_to_buffer(&record);
+    writer.flush_log_to_disk_with_sync();
+    const int64_t legacy_size = disk.get_file_size(LOG_FILE_NAME);
+    LogManager restarted(&disk);
+    restarted.initialize_from_existing_log();
+    EXPECT_FALSE(disk.wal_is_segmented());
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), legacy_size);
+    EXPECT_FALSE(disk.is_file("db.log.0.0"));
+}
+
+TEST(LogManagerTest, SegmentedLayoutRejectsMissingOrShortPrefixSegment) {
+    ScopedTestDir test_dir("segmented_wal_layout_validation_test_db");
+    DiskManager disk;
+    disk.configure_segmented_wal(12, 0, 64);
+    disk.ensure_segmented_wal_root();
+    std::array<char, 65> bytes{};
+    disk.write_log(bytes.data(), static_cast<int>(bytes.size()));
+    disk.fsync_log();
+    ASSERT_TRUE(disk.is_file("db.log.12.1"));
+    ASSERT_EQ(::truncate("db.log.12.0", 63), 0);
+    EXPECT_THROW(disk.configure_segmented_wal(12, 0, 64), InternalError);
 }
 
 TEST(IndexSmoWalTest, Crc32MatchesIeeeKnownAnswers) {

@@ -21,6 +21,8 @@ public:
     struct Snapshot {
         uint64_t already_covered_fast_paths{};
         uint64_t leader_requests{};
+        uint64_t leader_rotations{};
+        uint64_t max_batches_per_leader{};
         uint64_t follower_requests{};
         TimingSnapshot follower_wait{};
         TimingSnapshot coalescing_wait{};
@@ -48,6 +50,8 @@ public:
         Snapshot result;
         result.already_covered_fast_paths = already_covered_fast_paths_.load(std::memory_order_relaxed);
         result.leader_requests = leader_requests_.load(std::memory_order_relaxed);
+        result.leader_rotations = leader_rotations_.load(std::memory_order_relaxed);
+        result.max_batches_per_leader = max_batches_per_leader_.load(std::memory_order_relaxed);
         result.follower_requests = follower_requests_.load(std::memory_order_relaxed);
         result.follower_wait = snapshot_timing(follower_wait_);
         result.coalescing_wait = snapshot_timing(coalescing_wait_);
@@ -68,6 +72,8 @@ public:
 
     void record_already_covered_fast_path() noexcept { increment(already_covered_fast_paths_); }
     void record_leader_request() noexcept { increment(leader_requests_); }
+    void record_leader_rotation() noexcept { increment(leader_rotations_); }
+    void record_leader_tenure(uint64_t batches) noexcept { update_max(max_batches_per_leader_, batches); }
     void record_follower_request() noexcept { increment(follower_requests_); }
     void record_follower_wait(uint64_t elapsed_ns) noexcept { record_timing(follower_wait_, elapsed_ns); }
     void record_coalescing_wait(uint64_t elapsed_ns) noexcept { record_timing(coalescing_wait_, elapsed_ns); }
@@ -129,6 +135,8 @@ private:
     bool enabled_{false};
     std::atomic<uint64_t> already_covered_fast_paths_{0};
     std::atomic<uint64_t> leader_requests_{0};
+    std::atomic<uint64_t> leader_rotations_{0};
+    std::atomic<uint64_t> max_batches_per_leader_{0};
     std::atomic<uint64_t> follower_requests_{0};
     Timing follower_wait_;
     Timing coalescing_wait_;

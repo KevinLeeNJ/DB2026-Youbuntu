@@ -119,8 +119,12 @@ constexpr char kReadViewShadowSchema[] =
 constexpr char kTxnPhaseLongestName[] = "tuple_publication_work";
 constexpr char kWalFlushSchema[] =
     "wal-flush-metric schema=base62 cumulative=1 leader_is_wal_flush_owner_not_transaction_owner "
-    "lag=target_minus_durable invalid_or_reset=excluded batch_buckets=0,1,2,3,4,5,6,7,8,9_16,17_32,33_64,65_plus";
+    "lag=target_minus_durable invalid_or_reset=excluded rotation=handoff_after_owner_covered "
+    "batch_buckets=0,1,2,3,4,5,6,7,8,9_16,17_32,33_64,65_plus";
 constexpr char kWalFlushCompletedPrefix[] = "wal-flush-metric seq=";
+constexpr char kWalFlushTimingFixed[] =
+    "wal-flush-metric seq= final=1 covered= leaders= rotations= max_batches_per_leader= followers= "
+    "follower_wait=// coalescing_wait=// physical= pwrite=/// fdatasync=//";
 constexpr char kCheckpointSchema[] =
     "checkpoint-metric schema=base62 cumulative=1 clean=attempt/success/failure "
     "fuzzy=attempt/success/failure/cancel pages=marked/write_calls/written/remaining_max "
@@ -144,6 +148,8 @@ static_assert(sizeof(kTxnPhaseDataPrefix) - 1 + kBase62Max + sizeof(kTxnPhaseDat
                   sizeof(kTxnPhaseLongestName) - 1 + 1 + 3 * kBase62Max + 2 + kWarnHeaderMax + 2 <=
               minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kWalFlushSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kWalFlushTimingFixed) - 1 + 20 * kBase62Max + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointPhaseSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointCounterFixed) - 1 + 17 * kBase62Max + kWarnHeaderMax + 2 <=
@@ -248,10 +254,11 @@ void LogWalFlushMetrics(uint64_t sequence) {
     if (!wal_flush_metrics->enabled()) return;
     const auto snapshot = wal_flush_metrics->snapshot();
     LOG_WARN("%s", kWalFlushSchema);
-    LOG_WARN("wal-flush-metric seq=%s final=%d covered=%s leaders=%s followers=%s follower_wait=%s/%s/%s "
+    LOG_WARN("wal-flush-metric seq=%s final=%d covered=%s leaders=%s rotations=%s max_batches_per_leader=%s followers=%s follower_wait=%s/%s/%s "
              "coalescing_wait=%s/%s/%s physical=%s pwrite=%s/%s/%s/%s fdatasync=%s/%s/%s",
              Base62(sequence).c_str(), sequence == UINT64_MAX, Base62(snapshot.already_covered_fast_paths).c_str(),
-             Base62(snapshot.leader_requests).c_str(), Base62(snapshot.follower_requests).c_str(),
+             Base62(snapshot.leader_requests).c_str(), Base62(snapshot.leader_rotations).c_str(),
+             Base62(snapshot.max_batches_per_leader).c_str(), Base62(snapshot.follower_requests).c_str(),
              Base62(snapshot.follower_wait.count).c_str(), Base62(snapshot.follower_wait.elapsed_ns).c_str(),
              Base62(snapshot.follower_wait.max_ns).c_str(), Base62(snapshot.coalescing_wait.count).c_str(),
              Base62(snapshot.coalescing_wait.elapsed_ns).c_str(), Base62(snapshot.coalescing_wait.max_ns).c_str(),

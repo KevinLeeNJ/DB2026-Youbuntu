@@ -12,8 +12,13 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 
 #include <assert.h>   // for assert
+#include <algorithm>
 #include <cerrno>     // for errno
+#include <dirent.h>
+#include <fcntl.h>
+#include <functional>
 #include <limits>
+#include <set>
 #include <sys/stat.h> // for stat
 #include <unistd.h>   // for lseek
 
@@ -21,6 +26,40 @@ See the Mulan PSL v2 for more details. */
 #include "common/fault_injection.h"
 
 namespace {
+
+std::string SegmentedWalName(uint64_t generation, uint64_t segment) {
+    return "db.log." + std::to_string(generation) + "." + std::to_string(segment);
+}
+
+bool IsRegularSegment(const std::string& name) {
+    struct stat st {};
+    if (lstat(name.c_str(), &st) != 0) {
+        if (errno == ENOENT) return false;
+        throw UnixError();
+    }
+    if (!S_ISREG(st.st_mode)) throw InternalError("segmented WAL entry is not a regular file: " + name);
+    return true;
+}
+
+int OpenRegularSegment(const std::string& name, bool create, bool* created = nullptr) {
+    if (created != nullptr) *created = false;
+    constexpr int kFlags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
+    int fd = open(name.c_str(), kFlags);
+    if (fd < 0 && errno == ENOENT && create) {
+        fd = open(name.c_str(), kFlags | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0 && created != nullptr) *created = true;
+        if (fd < 0 && errno == EEXIST) fd = open(name.c_str(), kFlags);
+    }
+    if (fd < 0) throw UnixError();
+    struct stat st {};
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        const int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        throw InternalError("segmented WAL descriptor is not a regular file: " + name);
+    }
+    return fd;
+}
 
 void WritePageAt(int fd, page_id_t page_no, const char* data, int num_bytes) {
     int written = 0;
@@ -50,6 +89,155 @@ void ReadPageAt(int fd, page_id_t page_no, char* data, int num_bytes) {
 } // namespace
 
 DiskManager::DiskManager() = default;
+
+std::string DiskManager::wal_segment_name(uint64_t segment) const {
+    return SegmentedWalName(wal_generation_, segment);
+}
+
+void DiskManager::configure_legacy_wal() {
+    std::lock_guard<std::mutex> lock(wal_segment_latch_);
+    sync_pending_segment_directory_locked();
+    wal_segmented_ = false;
+    dirty_wal_segments_.clear();
+}
+
+void DiskManager::sync_pending_segment_directory_locked() {
+    if (pending_segment_directory_sync_.empty()) return;
+    FaultInjector::Point("before_wal_segment_directory_sync");
+    sync_directory(".");
+    pending_segment_directory_sync_.clear();
+}
+
+void DiskManager::sync_segmented_wal_directory() {
+    std::lock_guard<std::mutex> lock(wal_segment_latch_);
+    if (!wal_segmented_) return;
+    // Startup has no in-memory evidence about a prior process's O_CREAT, so
+    // sync the directory once after validating a v2 root.
+    FaultInjector::Point("before_wal_segment_directory_sync");
+    sync_directory(".");
+    pending_segment_directory_sync_.clear();
+}
+
+size_t DiskManager::pending_segment_directory_sync_for_test() const {
+    std::lock_guard<std::mutex> lock(wal_segment_latch_);
+    return pending_segment_directory_sync_.size();
+}
+
+int DiskManager::open_wal_segment_locked(uint64_t segment, bool create) {
+    return OpenRegularSegment(wal_segment_name(segment), create);
+}
+
+void DiskManager::validate_segmented_layout_locked() const {
+    const std::string prefix = "db.log." + std::to_string(wal_generation_) + ".";
+    DIR* dir = opendir(".");
+    if (dir == nullptr) throw UnixError();
+    std::set<uint64_t> segments;
+    try {
+        while (dirent* entry = readdir(dir)) {
+            const std::string name(entry->d_name);
+            if (name.rfind(prefix, 0) != 0) continue;
+            const std::string suffix = name.substr(prefix.size());
+            if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) {
+                throw InternalError("malformed segmented WAL filename: " + name);
+            }
+            const uint64_t number = std::stoull(suffix);
+            if (wal_segment_name(number) != name || !segments.insert(number).second) {
+                throw InternalError("ambiguous segmented WAL filename: " + name);
+            }
+        }
+        if (closedir(dir) != 0) throw UnixError();
+        dir = nullptr;
+    } catch (...) {
+        if (dir != nullptr) closedir(dir);
+        throw;
+    }
+    if (segments.empty()) return;
+    const uint64_t first = *segments.begin();
+    if (first > wal_restart_segment_) {
+        throw InternalError("segmented WAL is missing its manifest restart prefix");
+    }
+    uint64_t expected = first;
+    for (uint64_t segment : segments) {
+        if (segment != expected++) throw InternalError("segmented WAL has a missing segment");
+        struct stat st {};
+        const std::string name = wal_segment_name(segment);
+        if (lstat(name.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) throw InternalError("invalid segmented WAL entry");
+        const bool last = segment == *segments.rbegin();
+        if (st.st_size < 0 || (!last && st.st_size != wal_segment_bytes_) ||
+            (last && st.st_size > wal_segment_bytes_)) {
+            throw InternalError("segmented WAL has an invalid segment length");
+        }
+    }
+}
+
+int64_t DiskManager::segmented_log_size_locked() const {
+    validate_segmented_layout_locked();
+    uint64_t highest = wal_restart_segment_;
+    bool found = false;
+    DIR* dir = opendir(".");
+    if (dir == nullptr) throw UnixError();
+    const std::string prefix = "db.log." + std::to_string(wal_generation_) + ".";
+    try {
+        while (dirent* entry = readdir(dir)) {
+            const std::string name(entry->d_name);
+            if (name.rfind(prefix, 0) != 0) continue;
+            const std::string suffix = name.substr(prefix.size());
+            if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) continue;
+            const uint64_t segment = static_cast<uint64_t>(std::stoull(suffix));
+            highest = std::max(highest, segment);
+            found = true;
+        }
+        if (closedir(dir) != 0) throw UnixError();
+        dir = nullptr;
+    } catch (...) {
+        if (dir != nullptr) closedir(dir);
+        throw;
+    }
+    if (!found) return static_cast<int64_t>(wal_restart_segment_) * wal_segment_bytes_;
+    const std::string name = wal_segment_name(highest);
+    struct stat st {};
+    if (lstat(name.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) throw InternalError("invalid segmented WAL entry");
+    if (highest > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                      static_cast<uint64_t>(wal_segment_bytes_) ||
+        st.st_size > std::numeric_limits<int64_t>::max() -
+                         static_cast<int64_t>(highest * static_cast<uint64_t>(wal_segment_bytes_))) {
+        throw InternalError("segmented WAL logical offset overflow");
+    }
+    return static_cast<int64_t>(highest * static_cast<uint64_t>(wal_segment_bytes_)) + st.st_size;
+}
+
+void DiskManager::configure_segmented_wal(uint64_t generation, uint64_t restart_segment, int64_t segment_bytes) {
+    if (segment_bytes <= 0 || segment_bytes > kWalSegmentBytes) {
+        throw InternalError("invalid segmented WAL size");
+    }
+    if (restart_segment > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                              static_cast<uint64_t>(segment_bytes)) {
+        throw InternalError("segmented WAL restart offset overflow");
+    }
+    std::lock_guard<std::mutex> lock(wal_segment_latch_);
+    wal_segmented_ = true;
+    wal_generation_ = generation;
+    wal_restart_segment_ = restart_segment;
+    wal_segment_bytes_ = segment_bytes;
+    dirty_wal_segments_.clear();
+    sync_pending_segment_directory_locked();
+    log_offset_ = segmented_log_size_locked();
+}
+
+void DiskManager::ensure_segmented_wal_root() {
+    std::lock_guard<std::mutex> lock(wal_segment_latch_);
+    if (!wal_segmented_) throw InternalError("cannot create a legacy WAL segment");
+    const std::string name = wal_segment_name(wal_restart_segment_);
+    if (IsRegularSegment(name)) {
+        sync_pending_segment_directory_locked();
+        return;
+    }
+    bool created = false;
+    const int fd = OpenRegularSegment(name, true, &created);
+    if (created) pending_segment_directory_sync_.insert(wal_restart_segment_);
+    if (close(fd) != 0) throw UnixError();
+    sync_pending_segment_directory_locked();
+}
 
 /**
  * @description: 将数据写入文件的指定磁盘页面中
@@ -327,6 +515,10 @@ void DiskManager::open_log_fd() {
 }
 
 int64_t DiskManager::get_log_file_size() {
+    std::lock_guard<std::mutex> segmented_lock(wal_segment_latch_);
+    if (wal_segmented_) {
+        return log_offset_;
+    }
     open_log_fd();
     if (log_fd_ < 0) {
         throw InternalError("DiskManager::get_log_file_size has an invalid WAL descriptor: " +
@@ -343,6 +535,9 @@ int64_t DiskManager::get_log_file_size() {
  * @param {int64_t} offset 读取的内容在文件中的位置
  */
 int DiskManager::read_log(char* log_data, int size, int64_t offset) {
+    if (wal_is_segmented()) {
+        return read_log_chunk(log_data, size, offset);
+    }
     // read log file from the previous end
     open_log_fd();
     const int64_t file_size = get_log_file_size();
@@ -382,6 +577,51 @@ int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
     if (size <= 0 || offset < 0) {
         return 0;
     }
+    uint64_t generation = 0;
+    int64_t segment_bytes = 0;
+    int64_t file_size = 0;
+    {
+        std::lock_guard<std::mutex> segmented_lock(wal_segment_latch_);
+        if (wal_segmented_) {
+            generation = wal_generation_;
+            segment_bytes = wal_segment_bytes_;
+            file_size = log_offset_;
+        }
+    }
+    if (segment_bytes != 0) {
+        if (offset >= file_size) return 0;
+        const int wanted = static_cast<int>(std::min<int64_t>(size, file_size - offset));
+        int bytes_read = 0;
+        while (bytes_read < wanted) {
+            const int64_t logical = offset + bytes_read;
+            const uint64_t segment = static_cast<uint64_t>(logical / segment_bytes);
+            const off_t segment_offset = static_cast<off_t>(logical % segment_bytes);
+            const int chunk = static_cast<int>(std::min<int64_t>(wanted - bytes_read, segment_bytes - segment_offset));
+            const int fd = OpenRegularSegment(SegmentedWalName(generation, segment), false);
+            int chunk_read = 0;
+            while (chunk_read < chunk) {
+                const ssize_t got = pread(fd, log_data + bytes_read + chunk_read,
+                                          static_cast<size_t>(chunk - chunk_read), segment_offset + chunk_read);
+                if (got < 0 && errno == EINTR) continue;
+                if (got < 0) {
+                    const int saved_errno = errno;
+                    close(fd);
+                    errno = saved_errno;
+                    throw UnixError();
+                }
+                if (got == 0) {
+                    close(fd);
+                    throw InternalError("unexpected EOF inside segmented WAL");
+                }
+                chunk_read += static_cast<int>(got);
+            }
+            if (close(fd) != 0) throw UnixError();
+            bytes_read += chunk;
+        }
+        log_read_count_.fetch_add(1, std::memory_order_relaxed);
+        log_read_bytes_.fetch_add(static_cast<uint64_t>(bytes_read), std::memory_order_relaxed);
+        return bytes_read;
+    }
     open_log_fd();
     int bytes_read = 0;
     while (bytes_read < size) {
@@ -411,6 +651,58 @@ int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
  * @param {int} size 要写入的内容大小
  */
 void DiskManager::write_log(char* log_data, int size) {
+    std::unique_lock<std::mutex> segmented_lock(wal_segment_latch_);
+    if (wal_segmented_) {
+        if (size < 0) throw InternalError("negative WAL write size");
+        FaultInjector::Point("during_wal_pwrite");
+        const int64_t begin_offset = log_offset_;
+        if (size > std::numeric_limits<int64_t>::max() - begin_offset) {
+            throw InternalError("segmented WAL append offset overflow");
+        }
+        int written = 0;
+        while (written < size) {
+            const int64_t logical = begin_offset + written;
+            const uint64_t segment = static_cast<uint64_t>(logical / wal_segment_bytes_);
+            const off_t segment_offset = static_cast<off_t>(logical % wal_segment_bytes_);
+            const int chunk = static_cast<int>(std::min<int64_t>(size - written, wal_segment_bytes_ - segment_offset));
+            const std::string name = wal_segment_name(segment);
+            bool created = false;
+            const int fd = OpenRegularSegment(name, true, &created);
+            if (created) pending_segment_directory_sync_.insert(segment);
+            if (created) {
+                try {
+                    FaultInjector::Point("after_wal_segment_create");
+                } catch (...) {
+                    close(fd);
+                    throw;
+                }
+            }
+            int chunk_written = 0;
+            while (chunk_written < chunk) {
+                const ssize_t count = pwrite(fd, log_data + written + chunk_written,
+                                             static_cast<size_t>(chunk - chunk_written), segment_offset + chunk_written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0) {
+                    const int saved_errno = errno;
+                    close(fd);
+                    errno = saved_errno;
+                    throw UnixError();
+                }
+                chunk_written += static_cast<int>(count);
+            }
+            if (close(fd) != 0) throw UnixError();
+            // A segment's directory entry must be durable before any COMMIT
+            // can rely on bytes written to it. If a previous attempt created
+            // it but failed later, the pending obligation survives and is
+            // discharged here even though this retry did not create it.
+            sync_pending_segment_directory_locked();
+            dirty_wal_segments_.insert(segment);
+            written += chunk;
+        }
+        log_offset_ = begin_offset + size;
+        return;
+    }
+    segmented_lock.unlock();
     open_log_fd();
 
     // write from the file_end
@@ -435,6 +727,22 @@ void DiskManager::write_log(char* log_data, int size) {
 }
 
 void DiskManager::fsync_log() {
+    std::unique_lock<std::mutex> segmented_lock(wal_segment_latch_);
+    if (wal_segmented_) {
+        FaultInjector::Point("before_wal_fsync");
+        for (uint64_t segment : dirty_wal_segments_) {
+            const int fd = open_wal_segment_locked(segment, false);
+            const int result = fdatasync(fd);
+            const int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            if (result != 0) throw UnixError();
+        }
+        dirty_wal_segments_.clear();
+        FaultInjector::Point("after_wal_fsync");
+        return;
+    }
+    segmented_lock.unlock();
     FaultInjector::Point("before_wal_fsync");
     if (log_fd_ != -1 && fdatasync(log_fd_) != 0) {
         throw UnixError();
@@ -491,6 +799,12 @@ void DiskManager::sync_directory(const std::string& path) {
 }
 
 void DiskManager::truncate_log() {
+    if (wal_is_segmented()) {
+        // Batch 1 deliberately does not reclaim or switch generations. A
+        // segmented clean-reset must publish a new v2 manifest before any old
+        // segment can be removed, which is Batch 2's responsibility.
+        throw InternalError("segmented WAL reset requires manifest-backed generation switch");
+    }
     open_log_fd();
     if (log_fd_ != -1) {
         if (ftruncate(log_fd_, 0) != 0) {
@@ -510,6 +824,64 @@ void DiskManager::truncate_log() {
 void DiskManager::truncate_log_to(int64_t offset) {
     if (offset < 0) {
         throw InternalError("negative WAL truncation offset");
+    }
+    if (wal_is_segmented()) {
+        std::lock_guard<std::mutex> lock(wal_segment_latch_);
+        const int64_t end = log_offset_;
+        if (offset > end) throw InternalError("segmented WAL truncation past end");
+        if (offset == end) return;
+        // Validate the complete pre-crash layout before deleting or truncating
+        // anything. This path is only for discarding a torn tail discovered by
+        // startup, never for checkpoint reclaim.
+        validate_segmented_layout_locked();
+        const uint64_t segment = static_cast<uint64_t>(offset / wal_segment_bytes_);
+        const off_t segment_offset = static_cast<off_t>(offset % wal_segment_bytes_);
+        // At an exact boundary the next segment belongs entirely to the torn
+        // tail. Delete it (and successors), retain the preceding full segment,
+        // and let the next append create a fresh boundary segment.
+        const bool boundary_is_manifest_root = segment_offset == 0 && segment == wal_restart_segment_;
+        const uint64_t first_deleted = segment_offset == 0 && !boundary_is_manifest_root ? segment : segment + 1;
+        std::vector<uint64_t> later_segments;
+        const std::string prefix = "db.log." + std::to_string(wal_generation_) + ".";
+        DIR* dir = opendir(".");
+        if (dir == nullptr) throw UnixError();
+        try {
+            while (dirent* entry = readdir(dir)) {
+                const std::string name(entry->d_name);
+                if (name.rfind(prefix, 0) != 0) continue;
+                const std::string suffix = name.substr(prefix.size());
+                if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) {
+                    throw InternalError("malformed segmented WAL filename: " + name);
+                }
+                const uint64_t candidate = static_cast<uint64_t>(std::stoull(suffix));
+                if (candidate >= first_deleted) later_segments.push_back(candidate);
+            }
+            if (closedir(dir) != 0) throw UnixError();
+            dir = nullptr;
+        } catch (...) {
+            if (dir != nullptr) closedir(dir);
+            throw;
+        }
+        std::sort(later_segments.begin(), later_segments.end(), std::greater<uint64_t>());
+        for (uint64_t later : later_segments) {
+            if (unlink(wal_segment_name(later).c_str()) != 0) throw UnixError();
+            dirty_wal_segments_.erase(later);
+        }
+        if (!later_segments.empty()) sync_directory(".");
+        if (segment_offset != 0 || boundary_is_manifest_root) {
+            const int fd = open_wal_segment_locked(segment, false);
+            if (ftruncate(fd, segment_offset) != 0 || fdatasync(fd) != 0) {
+                const int saved_errno = errno;
+                close(fd);
+                errno = saved_errno;
+                throw UnixError();
+            }
+            if (close(fd) != 0) throw UnixError();
+            dirty_wal_segments_.erase(segment);
+            FaultInjector::Point("after_wal_ftruncate");
+        }
+        log_offset_ = offset;
+        return;
     }
     open_log_fd();
     if (ftruncate(log_fd_, static_cast<off_t>(offset)) != 0) {

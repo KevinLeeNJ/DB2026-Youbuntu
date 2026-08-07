@@ -21,7 +21,6 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <queue>
 #include <string>
-#include <sys/mman.h>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -41,93 +40,62 @@ constexpr int kMaxDuplicateDrain = 16;
 // has to be rebuilt.
 constexpr size_t kRepairSpotCheckLimit = 64;
 
-// Keep the redo WAL view bounded. Heap redo records are sorted by table/page,
-// so their WAL offsets are not necessarily sequential; retaining the whole WAL
-// mapping would make every touched file page resident during recovery. A
-// single 64 MiB window is enough for normal records, while the bounded scratch
-// path below handles the (rare) record that straddles a window boundary.
-constexpr size_t kWalMappingWindowBytes = size_t{64} * 1024 * 1024;
+// Heap redo records are sorted by table/page rather than WAL order. A bounded
+// logical window retains the old amortized I/O shape while read_log_chunk makes
+// the window safe across physical segment boundaries.
+constexpr size_t kWalMappingWindowBytes = size_t{4} * 1024 * 1024;
 constexpr uint32_t kMaxRedoRecordBytes = MAX_INDEX_SMO_RECORD_BYTES;
 constexpr size_t kHeapRedoWorkerCount = 4;
 
 class ReadOnlyWalMapping {
 public:
-    ReadOnlyWalMapping(DiskManager* disk_manager, int fd, int64_t length) : disk_manager_(disk_manager), fd_(fd) {
-        if (fd < 0 || length <= 0 ||
-            static_cast<uint64_t>(length) > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    ReadOnlyWalMapping(DiskManager* disk_manager, int64_t length) : disk_manager_(disk_manager), length_(length) {
+        if (disk_manager_ == nullptr || length_ <= 0) {
             throw InternalError("recovery cannot read an invalid WAL range");
         }
-        length_ = length;
     }
-
-    ~ReadOnlyWalMapping() {
-        unmap();
-    }
-
-    ReadOnlyWalMapping(const ReadOnlyWalMapping&) = delete;
-    ReadOnlyWalMapping& operator=(const ReadOnlyWalMapping&) = delete;
 
     const char* record_bytes(int64_t offset, uint32_t length, std::vector<char>* scratch) {
         const int64_t record_length = static_cast<int64_t>(length);
-        if (offset < 0 || length < static_cast<uint32_t>(LOG_HEADER_SIZE) || length > kMaxRedoRecordBytes ||
-            offset > length_ - record_length) {
+        if (scratch == nullptr || offset < 0 || length < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
+            length > kMaxRedoRecordBytes || offset > length_ - record_length) {
             throw InternalError("recovery heap-redo descriptor leaves the WAL range; WAL retained");
         }
         const int64_t record_end = offset + record_length;
-        if (mapped_bytes_ != nullptr && offset >= mapped_offset_ &&
-            record_end <= mapped_offset_ + static_cast<int64_t>(mapped_length_)) {
-            return mapped_bytes_ + (offset - mapped_offset_);
+        if (window_valid_ && offset >= window_offset_ && record_end <= window_offset_ + window_size_) {
+            return window_.data() + (offset - window_offset_);
         }
-
         const int64_t window_offset =
             (offset / static_cast<int64_t>(kWalMappingWindowBytes)) * static_cast<int64_t>(kWalMappingWindowBytes);
         const int64_t window_end = std::min<int64_t>(length_, window_offset + kWalMappingWindowBytes);
         if (record_end <= window_end) {
-            map_window(window_offset, window_end - window_offset);
-            return mapped_bytes_ + (offset - mapped_offset_);
+            window_.resize(static_cast<size_t>(window_end - window_offset));
+            if (disk_manager_->read_log_chunk(window_.data(), static_cast<int>(window_.size()), window_offset) !=
+                static_cast<int>(window_.size())) {
+                throw InternalError("recovery could not fill WAL window; WAL retained");
+            }
+            window_offset_ = window_offset;
+            window_size_ = static_cast<int64_t>(window_.size());
+            window_valid_ = true;
+            return window_.data() + (offset - window_offset_);
         }
-
-        // A WAL record is bounded by kMaxRedoRecordBytes, so this allocation is
-        // bounded and only occurs at a window boundary. The record header and
-        // length are revalidated by mapped_heap_redo_record() after copying.
-        if (scratch == nullptr || disk_manager_ == nullptr) {
-            throw InternalError("recovery cannot buffer a WAL record crossing its mapping window; WAL retained");
-        }
+        // A record crossing the logical window boundary is bounded by
+        // kMaxRedoRecordBytes, so use a per-record scratch only for that case.
         scratch->resize(length);
         if (disk_manager_->read_log_chunk(scratch->data(), static_cast<int>(length), offset) !=
             static_cast<int>(length)) {
-            throw InternalError("recovery could not read a WAL record crossing its mapping window; WAL retained");
+            throw InternalError("recovery could not read WAL record; WAL retained");
         }
         return scratch->data();
     }
 
 private:
-    void map_window(int64_t offset, int64_t length) {
-        unmap();
-        mapped_length_ = static_cast<size_t>(length);
-        void* mapped = mmap(nullptr, mapped_length_, PROT_READ, MAP_PRIVATE, fd_, offset);
-        if (mapped == MAP_FAILED) {
-            throw UnixError();
-        }
-        mapped_bytes_ = static_cast<const char*>(mapped);
-        mapped_offset_ = offset;
-    }
-
-    void unmap() {
-        if (mapped_bytes_ != nullptr) {
-            (void)munmap(const_cast<char*>(mapped_bytes_), mapped_length_);
-            mapped_bytes_ = nullptr;
-            mapped_offset_ = 0;
-            mapped_length_ = 0;
-        }
-    }
-
     DiskManager* disk_manager_{nullptr};
-    int fd_{-1};
     int64_t length_{0};
-    const char* mapped_bytes_{nullptr};
-    int64_t mapped_offset_{0};
-    size_t mapped_length_{0};
+    std::vector<char> window_;
+    int64_t window_offset_{0};
+    int64_t window_size_{0};
+    bool window_valid_{false};
 };
 
 TupleMeta MakeCommittedMeta(txn_id_t writer) {
@@ -776,8 +744,7 @@ void RecoveryManager::redo() {
             threads.emplace_back([&, worker_index] {
                 auto& worker = workers[worker_index];
                 try {
-                    worker.wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_, disk_manager_->GetLogFd(),
-                                                                              scan_end_offset_);
+                    worker.wal_mapping = std::make_unique<ReadOnlyWalMapping>(disk_manager_, scan_end_offset_);
                     while (!stop.load(std::memory_order_acquire)) {
                         const size_t run_index = next_run.fetch_add(1, std::memory_order_relaxed);
                         if (run_index >= parallel_runs.size()) {
@@ -1847,7 +1814,7 @@ void RecoveryManager::replay_deferred_committed_deltas() {
     // The remaining descriptors therefore form the suffix of committed v2
     // assignments after the last full anchor and can be applied directly in
     // their original per-RID WAL order once all loser effects are undone.
-    ReadOnlyWalMapping wal_mapping(disk_manager_, disk_manager_->GetLogFd(), scan_end_offset_);
+    ReadOnlyWalMapping wal_mapping(disk_manager_, scan_end_offset_);
     std::vector<char> scratch;
     WalDmlView dml;
     for (const auto& [target, records] : deferred_committed_deltas_) {
