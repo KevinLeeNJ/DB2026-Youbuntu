@@ -105,7 +105,14 @@ const char* WalReadSnapshot::record_bytes(int64_t offset, uint32_t length, std::
         throw InternalError("WAL snapshot access leaves the accepted recovery prefix; WAL retained");
     }
     const int64_t record_end = offset + bytes;
-    for (const Span& span : spans_) {
+    // Spans are installed in logical offset order. Recovery can have many WAL
+    // segments, so a descriptor lookup must not become a linear scan over all
+    // segments. lower_bound selects the first span after offset; its predecessor
+    // is the only span that can contain offset.
+    const auto after = std::upper_bound(spans_.begin(), spans_.end(), offset,
+                                        [](int64_t value, const Span& span) { return value < span.range_begin; });
+    if (after != spans_.begin()) {
+        const Span& span = *std::prev(after);
         if (offset >= span.range_begin && record_end <= span.range_end) {
             return static_cast<const char*>(span.mapping) + (offset - span.mapping_logical_begin);
         }
@@ -114,12 +121,16 @@ const char* WalReadSnapshot::record_bytes(int64_t offset, uint32_t length, std::
     scratch->resize(length);
     int64_t cursor = offset;
     size_t copied = 0;
-    for (const Span& span : spans_) {
-        if (cursor < span.range_begin || cursor >= span.range_end) continue;
-        const int64_t chunk_end = std::min(record_end, span.range_end);
+    auto span = after == spans_.begin() ? after : std::prev(after);
+    for (; span != spans_.end() && cursor < record_end; ++span) {
+        if (cursor < span->range_begin) {
+            break;
+        }
+        if (cursor >= span->range_end) continue;
+        const int64_t chunk_end = std::min(record_end, span->range_end);
         const size_t chunk = static_cast<size_t>(chunk_end - cursor);
         std::memcpy(scratch->data() + copied,
-                    static_cast<const char*>(span.mapping) + (cursor - span.mapping_logical_begin), chunk);
+                    static_cast<const char*>(span->mapping) + (cursor - span->mapping_logical_begin), chunk);
         copied += chunk;
         cursor = chunk_end;
         if (cursor == record_end) {

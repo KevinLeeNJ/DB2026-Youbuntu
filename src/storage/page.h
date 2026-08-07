@@ -26,10 +26,10 @@ struct PageId {
     int fd = -1; //  Page所在的磁盘文件开启后的文件描述符, 来定位打开的文件在内存中的位置
     page_id_t page_no = INVALID_PAGE_ID;
 
-    friend bool operator==(const PageId& x, const PageId& y) {
+    friend bool operator==(const PageId& x, const PageId& y) noexcept {
         return x.fd == y.fd && x.page_no == y.page_no;
     }
-    bool operator<(const PageId& x) const {
+    bool operator<(const PageId& x) const noexcept {
         if (fd < x.fd)
             return true;
         return page_no < x.page_no;
@@ -39,7 +39,7 @@ struct PageId {
         return "{fd: " + std::to_string(fd) + " page_no: " + std::to_string(page_no) + "}";
     }
 
-    inline int64_t Get() const {
+    inline int64_t Get() const noexcept {
         uint64_t fd_part = static_cast<uint32_t>(fd);
         uint64_t page_part = static_cast<uint32_t>(page_no);
         return static_cast<int64_t>((fd_part << 32) | page_part);
@@ -48,13 +48,13 @@ struct PageId {
 
 // PageId的自定义哈希算法, 用于构建unordered_map<PageId, frame_id_t, PageIdHash>
 struct PageIdHash {
-    size_t operator()(const PageId& x) const {
+    size_t operator()(const PageId& x) const noexcept {
         return std::hash<int64_t>()(x.Get());
     }
 };
 
 template <> struct std::hash<PageId> {
-    size_t operator()(const PageId& obj) const {
+    size_t operator()(const PageId& obj) const noexcept {
         return std::hash<int64_t>()(obj.Get());
     }
 };

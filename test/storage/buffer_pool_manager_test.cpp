@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -143,6 +144,7 @@ public:
         BufferPoolManager::set_flush_page_after_write_test_hook({});
         BufferPoolManager::set_flush_batch_before_write_test_hook({});
         BufferPoolManager::set_ensure_dependency_test_hook({});
+        BufferPoolManager::set_flush_claim_test_hook({});
         if (!fd_closed_) {
             disk_manager_->close_file(fd_);
         }
@@ -215,18 +217,35 @@ TEST_F(BufferPoolManagerTest, IndexSmoBarrierDrainsAnAlreadyClaimedFlush) {
     bool release_flush = false;
     bool begin_started = false;
     bool barrier_acquired = false;
-    BufferPoolManager::set_flush_page_test_hook([&](PageId, Page*) {
+    bool hook_timed_out = false;
+    BufferPoolManager::set_flush_batch_before_write_test_hook([&](PageId, Page*) {
         std::unique_lock lock{mutex};
         flush_claimed = true;
         cv.notify_all();
-        cv.wait(lock, [&] { return release_flush; });
+        if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_flush; })) hook_timed_out = true;
     });
 
-    std::thread flusher([&] { EXPECT_TRUE(bpm.flush_page(page_id)); });
+    std::vector<PageId> pages{page_id};
+    std::promise<void> flush_done_promise;
+    auto flush_done = flush_done_promise.get_future();
+    std::thread flusher([&] {
+        EXPECT_TRUE(bpm.flush_pages(pages, FlushDependencyPolicy::Enforce()).success);
+        flush_done_promise.set_value();
+    });
     {
         std::unique_lock lock{mutex};
-        cv.wait(lock, [&] { return flush_claimed; });
+        if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return flush_claimed; })) {
+            release_flush = true;
+            lock.unlock();
+            cv.notify_all();
+            const auto rescued = flush_done.wait_for(std::chrono::seconds(2));
+            EXPECT_EQ(rescued, std::future_status::ready);
+            flusher.join();
+            FAIL() << "batch flush never reached its claimed-frame hook";
+        }
     }
+    std::promise<void> smo_done_promise;
+    auto smo_done = smo_done_promise.get_future();
     std::thread smo([&] {
         {
             std::lock_guard lock{mutex};
@@ -240,17 +259,26 @@ TEST_F(BufferPoolManagerTest, IndexSmoBarrierDrainsAnAlreadyClaimedFlush) {
             cv.notify_all();
         }
         bpm.end_index_smo(fd_);
+        smo_done_promise.set_value();
     });
     {
         std::unique_lock lock{mutex};
-        cv.wait(lock, [&] { return begin_started; });
-        EXPECT_FALSE(barrier_acquired);
+        const bool observed_begin = cv.wait_for(lock, std::chrono::seconds(1), [&] { return begin_started; });
+        const bool acquired_while_claimed = barrier_acquired;
         release_flush = true;
+        lock.unlock();
         cv.notify_all();
+        const auto flush_status = flush_done.wait_for(std::chrono::seconds(2));
+        const auto smo_status = smo_done.wait_for(std::chrono::seconds(2));
+        EXPECT_EQ(flush_status, std::future_status::ready);
+        EXPECT_EQ(smo_status, std::future_status::ready);
+        flusher.join();
+        smo.join();
+        EXPECT_TRUE(observed_begin);
+        EXPECT_FALSE(acquired_while_claimed);
     }
-    flusher.join();
-    smo.join();
     EXPECT_TRUE(barrier_acquired);
+    EXPECT_FALSE(hook_timed_out);
 }
 
 TEST_F(BufferPoolManagerTest, IndexSmoBarrierDrainsAnAlreadyClaimedDirectHeaderWrite) {
@@ -271,6 +299,197 @@ TEST_F(BufferPoolManagerTest, IndexSmoBarrierDrainsAnAlreadyClaimedDirectHeaderW
     bpm.end_index_file_write(fd_);
     smo.join();
     EXPECT_TRUE(acquired.load(std::memory_order_acquire));
+}
+
+TEST_F(BufferPoolManagerTest, FlushCleanupWakesFrameReservation) {
+    BufferPoolManager bpm(1, disk_manager_.get());
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&page_id), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(page_id, true));
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool claimed = false;
+    bool release = false;
+    bool hook_timed_out = false;
+    BufferPoolManager::set_flush_batch_before_write_test_hook([&](PageId, Page*) {
+        std::unique_lock lock{mutex};
+        claimed = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return release; })) hook_timed_out = true;
+    });
+
+    std::vector<PageId> pages{page_id};
+    std::thread flusher([&] { EXPECT_TRUE(bpm.flush_pages(pages, FlushDependencyPolicy::Enforce()).success); });
+    {
+        std::unique_lock lock{mutex};
+        if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return claimed; })) {
+            release = true;
+            lock.unlock();
+            cv.notify_all();
+            flusher.join();
+            FAIL() << "flush never claimed its frame";
+        }
+    }
+    auto reservation = std::async(std::launch::async, [&] { return bpm.acquire_frame_operation(1); });
+    EXPECT_EQ(reservation.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    {
+        std::lock_guard lock{mutex};
+        release = true;
+    }
+    cv.notify_all();
+    if (reservation.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        // Failure cleanup must not leave an async future blocked during
+        // assertion unwinding; explicitly wake it before reporting.
+        bpm.notify_frame_operation_waiters_for_test();
+        flusher.join();
+        const auto rescued = reservation.wait_for(std::chrono::seconds(1));
+        EXPECT_EQ(rescued, std::future_status::ready);
+        FAIL() << "frame reservation was not notified by batch cleanup";
+    }
+    auto token = reservation.get();
+    flusher.join();
+    EXPECT_FALSE(hook_timed_out);
+}
+
+TEST_F(BufferPoolManagerTest, FiniteFlushDrainsFirstFdBeforeBlockedSecondFd) {
+    ScopedOpenTestFile second_file(disk_manager_.get(), "second_flush_fd");
+    BufferPoolManager bpm(2, disk_manager_.get());
+    PageId first{fd_, INVALID_PAGE_ID};
+    PageId second{second_file.fd(), INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&first), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(first, true));
+    ASSERT_NE(bpm.new_page(&second), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(second, true));
+
+    bpm.begin_index_smo(second.fd);
+    std::vector<PageId> pages{first, second};
+    auto flushed = std::async(std::launch::async, [&] {
+        return bpm.flush_pages_until(pages, FlushDependencyPolicy::Enforce(),
+                                     std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+    });
+    if (flushed.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        bpm.end_index_smo(second.fd);
+        const auto rescued = flushed.wait_for(std::chrono::seconds(1));
+        EXPECT_EQ(rescued, std::future_status::ready);
+        FAIL() << "finite flush did not honor its SMO deadline";
+    }
+    const auto result = flushed.get();
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.pages_written, 1u);
+
+    // The first fd was cleaned before waiting on the SMO barrier, so an
+    // independent frame reservation cannot form a FLUSHING/SMO lock ring.
+    auto reservation = std::async(std::launch::async, [&] { return bpm.acquire_frame_operation(1); });
+    if (reservation.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        bpm.end_index_smo(second.fd);
+        bpm.notify_frame_operation_waiters_for_test();
+        const auto rescued = reservation.wait_for(std::chrono::seconds(1));
+        EXPECT_EQ(rescued, std::future_status::ready);
+        FAIL() << "frame reservation did not complete after first-fd cleanup";
+    }
+    auto token = reservation.get();
+    bpm.end_index_smo(second.fd);
+}
+
+TEST_F(BufferPoolManagerTest, FiniteFlushRetainsBlockedCursorAndContinuesAfterBarrierRelease) {
+    ScopedOpenTestFile second_file(disk_manager_.get(), "second_flush_release_fd");
+    BufferPoolManager bpm(2, disk_manager_.get());
+    PageId first{fd_, INVALID_PAGE_ID};
+    PageId second{second_file.fd(), INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&first), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(first, true));
+    ASSERT_NE(bpm.new_page(&second), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(second, true));
+
+    bpm.begin_index_smo(second.fd);
+    std::thread release_barrier([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        bpm.end_index_smo(second.fd);
+    });
+    std::vector<PageId> pages{first, second};
+    const auto result = bpm.flush_pages_until(pages, FlushDependencyPolicy::Enforce(),
+                                              std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    release_barrier.join();
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.pages_written, 2u);
+    EXPECT_EQ(bpm.count_dirty_pages({fd_, second.fd}), 0u);
+}
+
+TEST_F(BufferPoolManagerTest, FlushClaimFaultsRestoreEveryOwnedStateAndRemainRetryable) {
+    constexpr std::array<std::string_view, 4> fault_points{
+        "after_inflight_claim", "after_resident_extract", "after_flushing", "cleanup_first"};
+    for (const std::string_view fault_point : fault_points) {
+        SCOPED_TRACE(fault_point);
+        BufferPoolManager bpm(2, disk_manager_.get());
+        auto log_manager = InstallTestWal(&bpm, disk_manager_.get(), 1);
+        PageId first{fd_, INVALID_PAGE_ID};
+        PageId second{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm.new_page(&first), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(first, PageWriteDependency::Wal(0)));
+        ASSERT_NE(bpm.new_page(&second), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(second, PageWriteDependency::Wal(1)));
+
+        bool injected = false;
+        BufferPoolManager::set_flush_claim_test_hook([&](std::string_view point, PageId) {
+            if (!injected && point == fault_point) {
+                injected = true;
+                throw InternalError("injected flush claim fault");
+            }
+        });
+        const auto failed = bpm.flush_dirty_pages({fd_}, 2);
+        EXPECT_FALSE(failed.success);
+        EXPECT_TRUE(injected);
+        EXPECT_TRUE(bpm.index_writes_inflight_.empty());
+        EXPECT_EQ(bpm.replacer_->Size(), 2u);
+        EXPECT_TRUE(bpm.resident_directory_is_consistent_for_test());
+        for (const auto [page_id, lsn] : {std::pair{first, lsn_t{0}}, std::pair{second, lsn_t{1}}}) {
+            const auto hit = bpm.page_table_.find(page_id);
+            ASSERT_NE(hit, bpm.page_table_.end());
+            Page* page = &bpm.pages_[hit->second];
+            EXPECT_EQ(page->state_.load(std::memory_order_acquire), FrameState::VALID);
+            EXPECT_TRUE(page->is_dirty_.load(std::memory_order_acquire));
+            EXPECT_EQ(page->write_dependency_.kind(), PageWriteDependency::Kind::WalLsn);
+            EXPECT_EQ(page->write_dependency_.wal_lsn(), lsn);
+        }
+
+        BufferPoolManager::set_flush_claim_test_hook({});
+        const auto retried = bpm.flush_dirty_pages({fd_}, 2);
+        EXPECT_TRUE(retried.success);
+        EXPECT_EQ(retried.pages_written, 2u);
+        EXPECT_TRUE(bpm.index_writes_inflight_.empty());
+        EXPECT_EQ(bpm.replacer_->Size(), 2u);
+        EXPECT_TRUE(bpm.resident_directory_is_consistent_for_test());
+    }
+}
+
+TEST_F(BufferPoolManagerTest, FlushClaimScopeGuardRestoresClaimsDuringExceptionUnwind) {
+    BufferPoolManager bpm(2, disk_manager_.get());
+    std::vector<PageId> pages;
+    for (int i = 0; i < 2; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm.new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(page_id, true));
+        pages.push_back(page_id);
+    }
+    BufferPoolManager::set_flush_claim_test_hook([](std::string_view point, PageId) {
+        if (point == "scope_unwind") throw std::bad_alloc();
+    });
+    EXPECT_THROW((void)bpm.flush_pages(pages, FlushDependencyPolicy::Enforce()), std::bad_alloc);
+    BufferPoolManager::set_flush_claim_test_hook({});
+
+    EXPECT_TRUE(bpm.index_writes_inflight_.empty());
+    EXPECT_EQ(bpm.replacer_->Size(), 2u);
+    EXPECT_TRUE(bpm.resident_directory_is_consistent_for_test());
+    for (const PageId page_id : pages) {
+        const auto hit = bpm.page_table_.find(page_id);
+        ASSERT_NE(hit, bpm.page_table_.end());
+        EXPECT_EQ(bpm.pages_[hit->second].state_.load(std::memory_order_acquire), FrameState::VALID);
+        EXPECT_TRUE(bpm.pages_[hit->second].is_dirty_.load(std::memory_order_acquire));
+    }
+    const auto retry = bpm.flush_pages(pages, FlushDependencyPolicy::Enforce());
+    EXPECT_TRUE(retry.success);
+    EXPECT_EQ(retry.pages_written, 2u);
 }
 
 TEST_F(BufferPoolManagerTest, BlockedVictimScratchIsReusedAcrossFullPoolMisses) {
@@ -655,11 +874,12 @@ TEST_F(BufferPoolManagerTest, FlushClaimEnsuresMergedDependencyOnceAcrossRuns) {
 }
 
 TEST_F(BufferPoolManagerTest, FlushClaimDependencyFailureWritesNothingAndRestoresFrames) {
+    ScopedOpenTestFile other_file(disk_manager_.get(), "dependency-failure-other");
     auto bpm = std::make_unique<BufferPoolManager>(2, disk_manager_.get());
     auto log_manager = InstallTestWal(bpm.get(), disk_manager_.get(), 9);
     std::vector<PageId> pages;
     for (int i = 0; i < 2; ++i) {
-        PageId id{fd_, INVALID_PAGE_ID};
+        PageId id{i == 0 ? fd_ : other_file.fd(), INVALID_PAGE_ID};
         Page* page = bpm->new_page(&id);
         ASSERT_NE(page, nullptr);
         std::strcpy(page->get_data(), "not-written");
@@ -727,7 +947,7 @@ TEST_F(BufferPoolManagerTest, BackgroundFlushChecksSoftDeadlineAtClaimBoundary) 
     EXPECT_GT(bpm->count_dirty_pages({fd_}), 0u);
 }
 
-TEST_F(BufferPoolManagerTest, FlushKeepsDependencyWhenPageIsRedirtiedAfterWrite) {
+TEST_F(BufferPoolManagerTest, FlushBatchKeepsDependencyWhenPageIsRedirtiedAfterWrite) {
     auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
     auto log_manager = InstallTestWal(bpm.get(), disk_manager_.get(), 73);
     PageId page_id{fd_, INVALID_PAGE_ID};
@@ -748,7 +968,8 @@ TEST_F(BufferPoolManagerTest, FlushKeepsDependencyWhenPageIsRedirtiedAfterWrite)
         std::strcpy(flushed_page->get_data(), "second");
         BufferPoolManager::mark_dirty(flushed_page, PageWriteDependency::Wal(73));
     });
-    ASSERT_TRUE(bpm->flush_page(page_id));
+    std::vector<PageId> pages{page_id};
+    ASSERT_TRUE(bpm->flush_pages(pages, FlushDependencyPolicy::Enforce()).success);
     BufferPoolManager::set_flush_page_after_write_test_hook({});
 
     page = bpm->fetch_page(page_id);
@@ -765,7 +986,7 @@ TEST_F(BufferPoolManagerTest, FlushKeepsDependencyWhenPageIsRedirtiedAfterWrite)
     disk_manager_->read_page(fd_, page_id.page_no, disk_image.data(), PAGE_SIZE);
     EXPECT_STREQ(disk_image.data(), "first");
 
-    ASSERT_TRUE(bpm->flush_page(page_id));
+    ASSERT_TRUE(bpm->flush_pages(pages, FlushDependencyPolicy::Enforce()).success);
     page = bpm->fetch_page(page_id);
     ASSERT_NE(page, nullptr);
     EXPECT_FALSE(page->is_dirty());

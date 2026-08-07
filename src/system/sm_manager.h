@@ -594,7 +594,8 @@ public:
     // This deliberately has no header, fdatasync, fault-injection, manifest, or
     // WAL-reset side effects. flush_recovery_pages() remains the sole recovery
     // durability barrier after index repair has completed.
-    bool preflush_recovery_heap_pages(const std::unordered_set<std::string>& table_names);
+    bool preflush_recovery_heap_pages(const std::unordered_set<std::string>& table_names,
+                                      BufferPoolManager::FlushBatchResult* stats = nullptr);
     bool flush_recovery_pages(const std::unordered_set<std::string>& table_names);
 
     TableDirtyPageStats table_dirty_page_stats();

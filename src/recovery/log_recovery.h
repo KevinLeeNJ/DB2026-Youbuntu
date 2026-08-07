@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -21,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "index_structure_gate.h"
 #include "index_smo_log.h"
@@ -58,6 +60,7 @@ See the Mulan PSL v2 for more details. */
 class RecoveryManager {
 public:
     static constexpr size_t kLogTypeCount = static_cast<size_t>(LogType::INDEX_SMO) + 1;
+    using IndexSmoRedoTestHook = std::function<void(std::string_view)>;
     RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager,
                     LogManager* log_manager = nullptr) {
         disk_manager_ = disk_manager;
@@ -72,6 +75,13 @@ public:
     void prepare_pages_for_redo();
     void redo();
     void undo();
+
+    // Tests use this boundary to prove the selected SMO descriptor is checked
+    // again immediately before its after-images are installed. It is per
+    // RecoveryManager instance and is never configured in production.
+    void set_index_smo_redo_test_hook(IndexSmoRedoTestHook hook) {
+        index_smo_redo_test_hook_ = std::move(hook);
+    }
 
     // Record-level counters for the recovery report. Recovery is single
     // threaded, so plain integers are enough. Heap redo deliberately contains
@@ -239,6 +249,8 @@ private:
     struct WalRecordLocation {
         lsn_t lsn{INVALID_LSN};
         int64_t offset{0};
+        uint32_t length{0};
+        uint32_t record_checksum{0};
     };
 
     // Location and target of one heap DML record. Sorting these by table/page
@@ -251,6 +263,11 @@ private:
         uint16_t table_id{0};
         int16_t slot_no{0};
         int32_t page_no{0};
+        // Checksum of the complete serialized WAL record accepted by analyze.
+        // Header identity alone is not enough: a same-length payload can name
+        // the same RID while changing the row image (and, for INDEX_SMO, its
+        // own CRC can be recomputed by a hostile/corrupt writer).
+        uint32_t record_checksum{0};
         // Low 31 bits are the previous descriptor index plus one for this
         // transaction; zero ends the intrusive chain. The high bit records
         // that COMMIT visited this descriptor. This keeps the committed-only
@@ -267,7 +284,7 @@ private:
             return wal_offset < other.wal_offset;
         }
     };
-    static_assert(sizeof(HeapRedoRecord) <= 24, "heap redo descriptors must remain compact");
+    static_assert(sizeof(HeapRedoRecord) <= 32, "heap redo descriptors must remain compact");
 
     struct IndexSmoRecord {
         int64_t wal_offset{0};
@@ -275,6 +292,7 @@ private:
         lsn_t lsn{INVALID_LSN};
         txn_id_t txn_id{INVALID_TXN_ID};
         lsn_t prev_lsn{INVALID_LSN};
+        uint32_t record_checksum{0};
     };
 
     // One (key, rid) pair the index repair has to reconcile. `key_slot` indexes
@@ -320,7 +338,7 @@ private:
     RecoveryTable* table_at(uint16_t table_id) {
         return &tables_[table_id];
     }
-    int64_t offset_of_lsn(lsn_t lsn) const;
+    const WalRecordLocation* location_of_lsn(lsn_t lsn) const;
     void build_touched_index();
     WalRecordView mapped_heap_redo_record(const HeapRedoRecord& location, const char* record_bytes) const;
 
@@ -371,9 +389,10 @@ private:
     // collection walks pointers instead of rebuilding index names.
     void bind_index_plans(std::map<std::string, IndexRepairPlan>* plans);
     // Collects, per index, every key the WAL mentions for a touched RID plus
-    // the key its final live tuple carries. Costs one WAL pass and one sweep of
-    // the touched heap pages, so it runs after the structure gate has dropped
-    // the indexes that are going to be rebuilt.
+    // the key its final live tuple carries. This is a complete sequential walk
+    // of the accepted WAL prefix: retaining an all-DML catalogue for this
+    // optional phase made recovery RSS scale with the WAL rather than the work
+    // needed by redo/undo.
     void collect_index_repair_keys(std::map<std::string, IndexRepairPlan>* plans);
     void collect_wal_index_keys();
     void collect_heap_index_keys();
@@ -401,6 +420,11 @@ private:
     std::vector<TouchedTuple> touched_;        // one entry per DML record, WAL order
     std::vector<TouchedTuple> touched_sorted_; // distinct, ordered by table and page
     std::vector<HeapRedoRecord> heap_redo_records_;
+    // Exact DML stream identity accepted by analyze. It remains available when
+    // the optional index-key descriptor catalogue reaches its hard byte cap,
+    // so the streaming fallback cannot silently use a changed/truncated WAL.
+    uint64_t index_key_stream_identity_{0};
+    uint64_t index_key_stream_records_{0};
     // txn id -> most recent descriptor index plus one. Descriptor links carry
     // the rest of each transaction's chain in 24 bytes per DML.
     std::unordered_map<txn_id_t, uint32_t> heap_redo_txn_heads_;
@@ -410,6 +434,8 @@ private:
     // Keep the committed delta descriptors in WAL order until loser undo. A
     // later full-image DML erases the entry because it is a complete anchor.
     std::map<TouchedTuple, std::vector<HeapRedoRecord>> deferred_committed_deltas_;
+    // Every analyzed record gets an identity entry because loser undo follows
+    // prev_lsn links after analyze has released the streaming reader.
     std::vector<WalRecordLocation> record_locations_;
     bool record_locations_sorted_{true};
     std::unordered_set<std::string> touched_tables_;
@@ -448,6 +474,8 @@ private:
     txn_id_t persisted_next_txn_id_{0};
     timestamp_t max_wal_commit_ts_{INVALID_TS};
     txn_id_t max_wal_txn_id_{INVALID_TXN_ID};
+
+    IndexSmoRedoTestHook index_smo_redo_test_hook_;
 
     DiskManager* disk_manager_;              // 用来读写文件
     BufferPoolManager* buffer_pool_manager_; // 对页面进行读写

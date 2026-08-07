@@ -800,6 +800,15 @@ public:
     struct FdatasyncObservation {
         uint64_t sequence{0}, elapsed_ns{0};
     };
+    // A consume-once window for optional background-I/O control.  Unlike the
+    // legacy atomics above, this cannot pair a new sequence with an older (or
+    // newer) duration when several group-commit leaders publish concurrently.
+    struct FdatasyncObservationWindow {
+        uint64_t sequence{0};
+        uint64_t last_elapsed_ns{0};
+        uint64_t max_elapsed_ns{0};
+        uint64_t count{0};
+    };
     FdatasyncObservation recent_fdatasync_observation() const noexcept {
         const uint64_t sequence = fdatasync_observation_sequence_.load(std::memory_order_acquire);
         return {sequence, recent_fdatasync_ns_.load(std::memory_order_relaxed)};
@@ -807,9 +816,10 @@ public:
     uint64_t recent_fdatasync_ns() const noexcept {
         return recent_fdatasync_observation().elapsed_ns;
     }
-    void set_fdatasync_observation_for_test(uint64_t sequence, uint64_t elapsed_ns) noexcept {
-        recent_fdatasync_ns_.store(elapsed_ns, std::memory_order_relaxed);
-        fdatasync_observation_sequence_.store(sequence, std::memory_order_release);
+    FdatasyncObservationWindow consume_fdatasync_observations() noexcept;
+    void set_fdatasync_observation_for_test(uint64_t sequence, uint64_t elapsed_ns) noexcept;
+    void publish_fdatasync_observation_for_test(uint64_t elapsed_ns) noexcept {
+        publish_fdatasync_observation(elapsed_ns);
     }
 
     lsn_t get_global_lsn() const {
@@ -863,6 +873,7 @@ private:
     void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync);
     void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync);
     void run_group_commit_test_hook(std::string_view point) const;
+    void publish_fdatasync_observation(uint64_t elapsed_ns) noexcept;
     uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch, bool durable = true);
 
     // One leader performs the durable flush for all waiters that arrive
@@ -887,6 +898,11 @@ private:
     // never consulted by commit durability or WAL ordering.
     std::atomic<uint64_t> recent_fdatasync_ns_{0};
     std::atomic<uint64_t> fdatasync_observation_sequence_{0};
+    std::mutex fdatasync_observation_latch_;
+    uint64_t fdatasync_window_sequence_{0};
+    uint64_t fdatasync_window_last_ns_{0};
+    uint64_t fdatasync_window_max_ns_{0};
+    uint64_t fdatasync_window_count_{0};
     int64_t log_file_offset_{0}; // 日志文件当前追加偏移
     DiskManager* disk_manager_;
     DurabilityMode durability_mode_{DurabilityMode::STRICT};

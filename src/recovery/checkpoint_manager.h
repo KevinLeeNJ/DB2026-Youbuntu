@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
+#include <string_view>
 
 class LogManager;
 class SmManager;
@@ -24,14 +26,14 @@ struct CheckpointOptions {
     // These defaults bound each 100ms scheduler invocation instead of letting a
     // large dirty cut turn into one foreground-visible I/O burst.
     int64_t auto_checkpoint_bytes = 4LL * 1024 * 1024 * 1024;
-    size_t tick_bytes = 4ULL * 1024 * 1024;
+    size_t tick_bytes = 1ULL * 1024 * 1024;
     uint64_t tick_time_us = 5000;
     size_t io_quantum_pages = 64;
     bool background_preclean_enabled = true;
-    uint8_t background_preclean_low_percent = 20;
-    uint8_t background_preclean_high_percent = 30;
-    size_t background_preclean_batch_pages = 32;
-    size_t background_preclean_max_pages = 512;
+    uint8_t background_preclean_low_percent = 10;
+    uint8_t background_preclean_high_percent = 15;
+    size_t background_preclean_batch_pages = 160;
+    size_t background_preclean_max_pages = 160;
 
     // Environment values are strict unsigned decimal; valid out-of-range
     // values are clamped to conservative scheduler limits.
@@ -56,12 +58,13 @@ public:
         uint64_t wal_sequence{0};
         uint64_t wal_ewma_ns{0};
         uint8_t healthy_samples{0};
+        uint8_t ramp_level{0};
     };
     BackgroundPrecleanControllerSnapshot background_preclean_controller_snapshot_for_test() const noexcept {
         return {background_preclean_active_,         background_preclean_dirty_pages_,
                 background_preclean_capacity_,       background_preclean_last_budget_,
                 background_preclean_wal_sequence_,   background_preclean_wal_ewma_ns_,
-                background_preclean_healthy_samples_};
+                background_preclean_healthy_samples_, background_preclean_ramp_level_};
     }
     void force_background_preclean_sample_for_test() noexcept {
         background_preclean_next_sample_ = {};
@@ -69,6 +72,9 @@ public:
     static size_t compute_background_preclean_budget_for_test(size_t dirty_pages, size_t capacity, uint8_t low_percent,
                                                               size_t base_pages, size_t max_pages,
                                                               uint64_t wal_ewma_ns) noexcept;
+    static uint8_t saturate_healthy_observations_for_test(uint8_t current, uint64_t count) noexcept;
+    static uint8_t saturate_ramp_level_for_test(uint8_t current) noexcept;
+    static void set_phase_test_hook(std::function<void(std::string_view)> hook);
 
 private:
     struct FuzzyCheckpointState;
@@ -79,6 +85,10 @@ private:
     void DeferAutomaticRetry() noexcept;
     int64_t RetainedWalBytes(int64_t current_offset) noexcept;
     void MaybeRunBackgroundPreclean();
+    void ObserveBackgroundIoWal();
+    bool BackgroundIoPaused() const noexcept;
+    size_t BackgroundPrecleanBudget() const noexcept;
+    size_t FuzzyCohortBudget(size_t configured_budget_pages) noexcept;
 
     TransactionManager* txn_mgr_;
     SmManager* sm_mgr_;
@@ -98,5 +108,9 @@ private:
     uint64_t background_preclean_wal_sequence_{0};
     uint64_t background_preclean_wal_ewma_ns_{0};
     uint8_t background_preclean_healthy_samples_{0};
+    uint8_t background_preclean_ramp_level_{0};
+    uint64_t background_preclean_wal_window_max_ns_{0};
+    bool background_preclean_congestion_latched_{false};
+    uint64_t background_io_ticks_without_wal_{0};
     size_t background_preclean_last_budget_{0};
 };

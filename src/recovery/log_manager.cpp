@@ -669,6 +669,39 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
     }
 }
 
+void LogManager::publish_fdatasync_observation(uint64_t elapsed_ns) noexcept {
+    std::scoped_lock lock{fdatasync_observation_latch_};
+    const uint64_t sequence = fdatasync_window_sequence_ + 1;
+    fdatasync_window_sequence_ = sequence;
+    fdatasync_window_last_ns_ = elapsed_ns;
+    fdatasync_window_max_ns_ = std::max(fdatasync_window_max_ns_, elapsed_ns);
+    ++fdatasync_window_count_;
+    // Publish the legacy best-effort pair only after the coherent window has
+    // assigned its sequence.  Writers therefore cannot reorder sequence
+    // allocation relative to max/count aggregation.
+    recent_fdatasync_ns_.store(elapsed_ns, std::memory_order_relaxed);
+    fdatasync_observation_sequence_.store(sequence, std::memory_order_release);
+}
+
+LogManager::FdatasyncObservationWindow LogManager::consume_fdatasync_observations() noexcept {
+    std::scoped_lock lock{fdatasync_observation_latch_};
+    FdatasyncObservationWindow result{fdatasync_window_sequence_, fdatasync_window_last_ns_,
+                                      fdatasync_window_max_ns_, fdatasync_window_count_};
+    fdatasync_window_max_ns_ = 0;
+    fdatasync_window_count_ = 0;
+    return result;
+}
+
+void LogManager::set_fdatasync_observation_for_test(uint64_t sequence, uint64_t elapsed_ns) noexcept {
+    std::scoped_lock lock{fdatasync_observation_latch_};
+    fdatasync_window_sequence_ = sequence;
+    fdatasync_window_last_ns_ = elapsed_ns;
+    fdatasync_window_max_ns_ = std::max(fdatasync_window_max_ns_, elapsed_ns);
+    ++fdatasync_window_count_;
+    recent_fdatasync_ns_.store(elapsed_ns, std::memory_order_relaxed);
+    fdatasync_observation_sequence_.store(sequence, std::memory_order_release);
+}
+
 void LogManager::flush_buffer(bool sync) {
     WalFlushMetrics* const metrics = wal_flush_metrics_;
     const bool metrics_enabled = metrics != nullptr && metrics->enabled();
@@ -700,11 +733,8 @@ void LogManager::flush_buffer(bool sync) {
                     const auto fsync_begin = std::chrono::steady_clock::now();
                     disk_manager_->fsync_log();
                     const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
-                    recent_fdatasync_ns_.store(static_cast<uint64_t>(
-                                                  std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
-                                                      .count()),
-                                              std::memory_order_release);
-                    fdatasync_observation_sequence_.fetch_add(1, std::memory_order_release);
+                    publish_fdatasync_observation(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed).count()));
                     LogSlowWalFdatasync(fsync_elapsed, 0, target_lsn, durable_before,
                                         durability_mode_ == DurabilityMode::STRICT);
                     if (metrics_enabled) {
@@ -757,11 +787,8 @@ void LogManager::flush_buffer(bool sync) {
                 const auto fsync_begin = std::chrono::steady_clock::now();
                 disk_manager_->fsync_log();
                 const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
-                recent_fdatasync_ns_.store(static_cast<uint64_t>(
-                                              std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
-                                                  .count()),
-                                          std::memory_order_release);
-                fdatasync_observation_sequence_.fetch_add(1, std::memory_order_release);
+                publish_fdatasync_observation(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed).count()));
                 LogSlowWalFdatasync(fsync_elapsed, bytes, target_lsn, durable_before,
                                     durability_mode_ == DurabilityMode::STRICT);
                 if (metrics_enabled) {

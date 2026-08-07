@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -73,11 +74,15 @@ class BufferPoolManager {
 private:
     using FlushPageTestHook = std::function<void(PageId, Page*)>;
     using EnsureDependencyTestHook = std::function<void(const PageWriteDependency&)>;
+    using FlushClaimTestHook = std::function<void(std::string_view, PageId)>;
     static std::mutex flush_page_test_hook_latch_;
     static FlushPageTestHook flush_page_test_hook_;
     static FlushPageTestHook flush_page_after_write_test_hook_;
     static FlushPageTestHook flush_batch_before_write_test_hook_;
     static EnsureDependencyTestHook ensure_dependency_test_hook_;
+    static std::atomic<bool> ensure_dependency_test_hook_enabled_;
+    static FlushClaimTestHook flush_claim_test_hook_;
+    static std::atomic<bool> flush_claim_test_hook_enabled_;
 
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
     std::unique_ptr<Page[]>
@@ -133,6 +138,8 @@ public:
     static void set_flush_page_after_write_test_hook(FlushPageTestHook hook);
     static void set_flush_batch_before_write_test_hook(FlushPageTestHook hook);
     static void set_ensure_dependency_test_hook(EnsureDependencyTestHook hook);
+    static void set_flush_claim_test_hook(FlushClaimTestHook hook);
+    void notify_frame_operation_waiters_for_test() noexcept { frame_operation_cv_.notify_all(); }
 
     class FrameOperationToken {
         friend class BufferPoolManager;
@@ -260,19 +267,24 @@ public:
     // Flush a stable checkpoint image under an explicit dependency policy.
     bool flush_all_pages(const std::vector<int>& fds, FlushDependencyPolicy policy);
 
-    // Recovery has a closed set of repaired files and no foreground workload.
-    // Scan and sort the dirty candidates once, then drain contiguous page runs
-    // with a bounded worker set before recovery writes file headers or resets
-    // WAL. The normal checkpoint path intentionally remains single-caller.
-    bool flush_all_pages_for_recovery(const std::vector<int>& fds);
-
     struct FlushBatchResult {
+        // Candidates named by the caller before frame state is rechecked.
+        size_t candidate_count = 0;
         // Pages whose image actually reached the file. A named page that is no
         // longer resident, or resident but clean, contributes nothing: both mean
         // its current image is already on disk.
         size_t pages_written = 0;
+        size_t write_calls = 0;
         bool success = true;
     };
+
+    // Recovery has a closed set of repaired files and no foreground workload.
+    // Scan and sort the dirty candidates once, then drain contiguous page runs
+    // with a bounded worker set before recovery writes file headers or resets
+    // WAL. The normal checkpoint path intentionally remains single-caller.
+    // When supplied, stats describe this invocation only; they are diagnostic
+    // and never affect the recovery durability decision.
+    bool flush_all_pages_for_recovery(const std::vector<int>& fds, FlushBatchResult* stats = nullptr);
 
     // Write the current image of every named page that is still resident and
     // dirty, coalescing runs of adjacent page numbers in one file into single
@@ -382,6 +394,7 @@ private:
     void clear_residency(frame_id_t frame_id);
     bool unpin_page_impl(PageId page_id, bool is_dirty, const PageWriteDependency& dependency);
     static void run_flush_page_test_hook(PageId page_id, Page* page);
+    static void run_flush_claim_test_hook(std::string_view point, PageId page_id);
     static void run_flush_page_after_write_test_hook(PageId page_id, Page* page);
     static void run_flush_batch_before_write_test_hook(PageId page_id, Page* page);
     void clear_checkpoint_cohort_marker_locked(Page* page);

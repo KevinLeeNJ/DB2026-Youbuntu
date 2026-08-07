@@ -48,6 +48,9 @@ std::atomic<int64_t> g_published_restart_offset{0};
 // CheckpointManager instances. Coordinate their preflush/final-flush phases at
 // process scope so a clean checkpoint cannot skip an in-flight FLUSHING page.
 std::shared_mutex g_checkpoint_coordination;
+std::mutex g_checkpoint_phase_test_hook_latch;
+std::function<void(std::string_view)> g_checkpoint_phase_test_hook;
+std::atomic<bool> g_checkpoint_phase_test_hook_enabled{false};
 
 // Longest the checkpoint may keep new transactions blocked while waiting for
 // active ones to finish. Saturated connections drain well inside this window,
@@ -70,6 +73,9 @@ constexpr size_t kMinPrecleanBatchPages = 32;
 constexpr size_t kMaxPrecleanBatchPages = 512;
 constexpr size_t kPrecleanHorizonTicks = 300;
 constexpr uint64_t kHealthyWalFdatasyncNs = 8ULL * 1000 * 1000;
+constexpr uint8_t kHealthyWalObservationsToResume = 5;
+constexpr size_t kFuzzyEmergencyProgressPages = 64;
+constexpr uint64_t kFuzzyIdleProbeTicks = 50;
 
 size_t PercentPages(size_t capacity, uint8_t percent, bool round_up) noexcept {
     const size_t quotient = capacity / 100;
@@ -106,6 +112,16 @@ uint64_t ReadCheckpointEnv(const char* name, uint64_t default_value, uint64_t mi
         throw std::invalid_argument(std::string("invalid ") + name + ": expected unsigned decimal");
     }
     return std::clamp(parsed, minimum, maximum);
+}
+
+void RunCheckpointPhaseTestHook(std::string_view phase) {
+    if (!g_checkpoint_phase_test_hook_enabled.load(std::memory_order_acquire)) return;
+    std::function<void(std::string_view)> hook;
+    {
+        std::scoped_lock lock{g_checkpoint_phase_test_hook_latch};
+        hook = g_checkpoint_phase_test_hook;
+    }
+    if (hook) hook(phase);
 }
 
 int64_t RetryLogOffset(int64_t current_offset) {
@@ -231,6 +247,14 @@ CheckpointManager::~CheckpointManager() {
     CancelFuzzyCheckpoint();
 }
 
+void CheckpointManager::set_phase_test_hook(std::function<void(std::string_view)> hook) {
+    std::scoped_lock lock{g_checkpoint_phase_test_hook_latch};
+    g_checkpoint_phase_test_hook_enabled.store(false, std::memory_order_release);
+    g_checkpoint_phase_test_hook = std::move(hook);
+    g_checkpoint_phase_test_hook_enabled.store(static_cast<bool>(g_checkpoint_phase_test_hook),
+                                               std::memory_order_release);
+}
+
 void CheckpointManager::SetOptions(CheckpointOptions options) {
     // Programmatic callers share the same pacing safety envelope as the
     // environment path. Keep auto_checkpoint_bytes untouched: focused tests
@@ -243,8 +267,8 @@ void CheckpointManager::SetOptions(CheckpointOptions options) {
     options.background_preclean_low_percent = std::clamp<uint8_t>(options.background_preclean_low_percent, 1, 98);
     options.background_preclean_high_percent = std::clamp<uint8_t>(options.background_preclean_high_percent, 2, 99);
     if (options.background_preclean_low_percent >= options.background_preclean_high_percent) {
-        options.background_preclean_low_percent = 20;
-        options.background_preclean_high_percent = 30;
+        options.background_preclean_low_percent = 10;
+        options.background_preclean_high_percent = 15;
     }
     options.background_preclean_batch_pages = static_cast<size_t>(std::clamp<uint64_t>(static_cast<uint64_t>(options.background_preclean_batch_pages), kMinPrecleanBatchPages, kMaxPrecleanBatchPages));
     options.background_preclean_max_pages =
@@ -253,8 +277,75 @@ void CheckpointManager::SetOptions(CheckpointOptions options) {
     options_ = options;
 }
 
+void CheckpointManager::ObserveBackgroundIoWal() {
+    const LogManager::FdatasyncObservationWindow wal = log_mgr_->consume_fdatasync_observations();
+    if (wal.count == 0) {
+        if (background_io_ticks_without_wal_ != std::numeric_limits<uint64_t>::max()) ++background_io_ticks_without_wal_;
+        return;
+    }
+    background_io_ticks_without_wal_ = 0;
+    background_preclean_wal_sequence_ = wal.sequence;
+    background_preclean_wal_window_max_ns_ = wal.max_elapsed_ns;
+    background_preclean_wal_ewma_ns_ = background_preclean_wal_ewma_ns_ == 0 ? wal.max_elapsed_ns : background_preclean_wal_ewma_ns_ - background_preclean_wal_ewma_ns_ / 4 + wal.max_elapsed_ns / 4;
+    if (wal.max_elapsed_ns > kHealthyWalFdatasyncNs) {
+        background_preclean_congestion_latched_ = true;
+        background_preclean_healthy_samples_ = 0;
+        background_preclean_ramp_level_ = 0;
+        return;
+    }
+    background_preclean_healthy_samples_ =
+        saturate_healthy_observations_for_test(background_preclean_healthy_samples_, wal.count);
+    if (background_preclean_healthy_samples_ == kHealthyWalObservationsToResume) {
+        background_preclean_wal_ewma_ns_ = wal.last_elapsed_ns;
+        background_preclean_congestion_latched_ = false;
+        background_preclean_ramp_level_ = saturate_ramp_level_for_test(background_preclean_ramp_level_);
+    }
+}
+
+uint8_t CheckpointManager::saturate_healthy_observations_for_test(uint8_t current, uint64_t count) noexcept {
+    const uint8_t bounded = std::min<uint8_t>(current, kHealthyWalObservationsToResume);
+    const uint8_t remaining = kHealthyWalObservationsToResume - bounded;
+    if (count >= remaining) return kHealthyWalObservationsToResume;
+    return static_cast<uint8_t>(bounded + static_cast<uint8_t>(count));
+}
+
+uint8_t CheckpointManager::saturate_ramp_level_for_test(uint8_t current) noexcept {
+    if (current == std::numeric_limits<uint8_t>::max()) return current;
+    return static_cast<uint8_t>(current + 1);
+}
+
+bool CheckpointManager::BackgroundIoPaused() const noexcept {
+    return background_preclean_congestion_latched_ || background_preclean_wal_window_max_ns_ > kHealthyWalFdatasyncNs || background_preclean_wal_ewma_ns_ > kHealthyWalFdatasyncNs;
+}
+
+size_t CheckpointManager::BackgroundPrecleanBudget() const noexcept {
+    if (BackgroundIoPaused()) return 0;
+    size_t pages = compute_background_preclean_budget_for_test(background_preclean_dirty_pages_, background_preclean_capacity_, options_.background_preclean_low_percent, options_.background_preclean_batch_pages, options_.background_preclean_max_pages, 0);
+    if (background_preclean_ramp_level_ != 0) pages = std::min(options_.background_preclean_max_pages, std::max(pages, options_.background_preclean_batch_pages * background_preclean_ramp_level_));
+    return pages;
+}
+
+size_t CheckpointManager::FuzzyCohortBudget(size_t configured_budget_pages) noexcept {
+    if (!BackgroundIoPaused()) return background_preclean_ramp_level_ == 0 ? configured_budget_pages : std::min(configured_budget_pages, kFuzzyEmergencyProgressPages * background_preclean_ramp_level_);
+    const int64_t target = std::max<int64_t>(1, options_.auto_checkpoint_bytes);
+    if (RetainedWalBytes(log_mgr_->current_log_offset()) >= target + target / 2)
+        return std::min(configured_budget_pages, kFuzzyEmergencyProgressPages);
+    if (background_io_ticks_without_wal_ >= kFuzzyIdleProbeTicks) {
+        background_io_ticks_without_wal_ = 0;
+        return std::min(configured_budget_pages, kFuzzyEmergencyProgressPages);
+    }
+    return 0;
+}
+
 void CheckpointManager::MaybeRunBackgroundPreclean() {
     if (!options_.background_preclean_enabled || fuzzy_checkpoint_ != nullptr) return;
+    // Keep the whole discovery/claim/write/cleanup interval inside the same
+    // coordination domain as a fuzzy checkpoint.  In particular, an explicit
+    // clean checkpoint cannot publish its manifest or reset WAL while a
+    // preclean frame is still FLUSHING.  Lock order is coordination -> catalog
+    // -> BPM, matching every other checkpoint path.
+    std::shared_lock<std::shared_mutex> checkpoint_guard{g_checkpoint_coordination};
+    if (fuzzy_checkpoint_ != nullptr) return;
     const auto now = std::chrono::steady_clock::now();
     if (background_preclean_next_sample_ == std::chrono::steady_clock::time_point{} || now >= background_preclean_next_sample_) {
         const TableDirtyPageStats dirty = sm_mgr_->table_and_index_dirty_page_stats();
@@ -271,33 +362,13 @@ void CheckpointManager::MaybeRunBackgroundPreclean() {
     }
     if (!background_preclean_active_) return;
 
-    const LogManager::FdatasyncObservation wal = log_mgr_->recent_fdatasync_observation();
-    if (wal.sequence != 0 && wal.sequence != background_preclean_wal_sequence_) {
-        background_preclean_wal_sequence_ = wal.sequence;
-        if (background_preclean_wal_ewma_ns_ == 0)
-            background_preclean_wal_ewma_ns_ = wal.elapsed_ns;
-        else
-            background_preclean_wal_ewma_ns_ =
-                background_preclean_wal_ewma_ns_ - background_preclean_wal_ewma_ns_ / 4 + wal.elapsed_ns / 4;
-        if (wal.elapsed_ns <= kHealthyWalFdatasyncNs) {
-            background_preclean_healthy_samples_ = std::min<uint8_t>(5, background_preclean_healthy_samples_ + 1);
-            if (background_preclean_healthy_samples_ == 5)
-                background_preclean_wal_ewma_ns_ = wal.elapsed_ns;
-        } else {
-            background_preclean_healthy_samples_ = 0;
-        }
-    }
-
-    const size_t pages = compute_background_preclean_budget_for_test(
-        background_preclean_dirty_pages_, background_preclean_capacity_, options_.background_preclean_low_percent,
-        options_.background_preclean_batch_pages, options_.background_preclean_max_pages,
-        background_preclean_wal_ewma_ns_);
+    ObserveBackgroundIoWal();
+    const size_t pages = BackgroundPrecleanBudget();
     background_preclean_last_budget_ = pages;
-    if (background_preclean_wal_ewma_ns_ > kHealthyWalFdatasyncNs) {
-        if (BufferPoolManager* bpm = sm_mgr_->get_bpm())
-            bpm->background_preclean_metrics().congestion_pause();
-    }
     BufferPoolManager* const bpm = sm_mgr_->get_bpm();
+    if (bpm != nullptr && pages == 0) bpm->background_preclean_metrics().congestion_pause();
+    if (bpm != nullptr && pages != 0 && background_preclean_ramp_level_ != 0) bpm->background_preclean_metrics().congestion_ramp();
+    if (pages == 0) return;
     const bool metrics_enabled = bpm != nullptr && bpm->background_preclean_metrics().enabled();
     const auto started = metrics_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const size_t flushed = sm_mgr_->flush_dirty_table_and_index_pages(pages);
@@ -313,18 +384,8 @@ size_t CheckpointManager::compute_background_preclean_budget_for_test(size_t dir
                                                                       size_t max_pages, uint64_t wal_ewma_ns) noexcept {
     const size_t low = PercentPages(capacity, low_percent, false);
     const size_t debt = dirty_pages > low ? (dirty_pages - low + kPrecleanHorizonTicks - 1) / kPrecleanHorizonTicks : 0;
-    size_t pages = std::min(max_pages, std::max(base_pages, debt));
-    size_t divisor = 1;
-    if (wal_ewma_ns > 50ULL * 1000 * 1000)
-        divisor = 8;
-    else if (wal_ewma_ns > 20ULL * 1000 * 1000)
-        divisor = 4;
-    else if (wal_ewma_ns > 8ULL * 1000 * 1000)
-        divisor = 2;
-    pages = std::max(kMinPrecleanBatchPages, pages / divisor);
-    if (dirty_pages >= PercentPages(capacity, 70, true))
-        pages = std::max<size_t>(64, pages);
-    return std::min(max_pages, pages);
+    if (wal_ewma_ns > kHealthyWalFdatasyncNs) return 0;
+    return std::min(max_pages, std::max(base_pages, debt));
 }
 
 bool CheckpointManager::RunCleanCheckpoint() {
@@ -420,6 +481,7 @@ bool CheckpointManager::RunCleanCheckpoint() {
     LOG_WARN("checkpoint-event kind=clean id=%llu phase=flush-all-end success=%d elapsed_ms=%llu",
              static_cast<unsigned long long>(event_id), final_data_stable,
              static_cast<unsigned long long>(ElapsedMs(flush_all_started)));
+    RunCheckpointPhaseTestHook("clean_data_sync_end");
     if (!final_data_stable) {
         defer_automatic_retry();
         if (metrics_ != nullptr) metrics_->retry_deferral(false);
@@ -468,6 +530,7 @@ bool CheckpointManager::RunCleanCheckpoint() {
         const auto reset_started = std::chrono::steady_clock::now();
         LOG_WARN("checkpoint-event kind=clean id=%llu phase=reset-wal-begin",
                  static_cast<unsigned long long>(event_id));
+        RunCheckpointPhaseTestHook("reset_wal_begin");
         auto timer = CheckpointPhaseMetrics::Scope(metrics_, CheckpointPhaseMetrics::Timing::WalResetReclaim);
         log_mgr_->reset_log(log_mgr_->get_global_lsn());
         LOG_WARN("checkpoint-event kind=clean id=%llu phase=reset-wal-end elapsed_ms=%llu",
@@ -670,9 +733,25 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
                      static_cast<unsigned long long>(fuzzy_checkpoint_->event_id),
                      static_cast<unsigned long long>(fuzzy_checkpoint_->cohort.epoch));
         }
+        ObserveBackgroundIoWal();
+        // A zero-I/O probe lets an empty or already-discharged cohort complete
+        // even while optional page writeback is paused by WAL congestion.
+        const auto completion_probe =
+            bpm->flush_checkpoint_cohort(fuzzy_checkpoint_->cohort.epoch, 0, 1);
+        if (!completion_probe.success) throw UnixError();
+        if (completion_probe.pages_remaining == 0) {
+            fuzzy_checkpoint_->cohort_flush_complete = true;
+        }
+        if (!fuzzy_checkpoint_->cohort_flush_complete) {
         const size_t quantum_pages = options_.io_quantum_pages;
         const size_t byte_budget_pages = std::max<size_t>(size_t{1}, options_.tick_bytes / PAGE_SIZE);
-        const size_t io_budget_pages = byte_budget_pages;
+        const size_t io_budget_pages = FuzzyCohortBudget(byte_budget_pages);
+        if (io_budget_pages == 0) {
+            bpm->background_preclean_metrics().congestion_pause();
+            return false;
+        }
+        if (io_budget_pages < byte_budget_pages) bpm->background_preclean_metrics().congestion_throttle();
+        else if (background_preclean_ramp_level_ != 0) bpm->background_preclean_metrics().congestion_ramp();
         // SetOptions clamps the unsigned input before this signed duration
         // conversion, so neither conversion nor now()+duration can overflow.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(options_.tick_time_us);
@@ -712,6 +791,8 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
             }
             first_quantum = false;
         }
+        fuzzy_checkpoint_->cohort_flush_complete = true;
+        }
 
         // The detached images and descriptor set were captured at the same cut.
         // Pace final publication just like page writeback: headers once, one data
@@ -721,7 +802,6 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
                  static_cast<unsigned long long>(fuzzy_checkpoint_->event_id), fuzzy_checkpoint_->cohort_pages_written,
                  static_cast<unsigned long long>(ElapsedMs(fuzzy_checkpoint_->cohort_flush_started)),
                  static_cast<unsigned long long>(ElapsedMs(fuzzy_checkpoint_->event_started)));
-        fuzzy_checkpoint_->cohort_flush_complete = true;
     }
     if (!fuzzy_checkpoint_->headers_written) {
         fuzzy_checkpoint_->phase = "header-write";

@@ -84,7 +84,8 @@ std::vector<char> MakeIntKey(int value) {
     return key;
 }
 
-void CreateRecoveryTestDb(const std::string& db_name, const std::vector<std::string>& table_names = {"t"}) {
+void CreateRecoveryTestDb(const std::string& db_name, const std::vector<std::string>& table_names = {"t"},
+                          bool create_indexes = true) {
     DiskManager disk;
     BufferPoolManager bpm(64, &disk);
     RmManager rm_mgr(&disk, &bpm);
@@ -95,7 +96,9 @@ void CreateRecoveryTestDb(const std::string& db_name, const std::vector<std::str
     sm_mgr.open_db(db_name);
     for (const auto& table_name : table_names) {
         sm_mgr.create_table(table_name, {{"id", TYPE_INT, sizeof(int)}, {"v", TYPE_INT, sizeof(int)}}, nullptr);
-        sm_mgr.create_index(table_name, {"id"}, nullptr);
+        if (create_indexes) {
+            sm_mgr.create_index(table_name, {"id"}, nullptr);
+        }
     }
     sm_mgr.close_db();
 }
@@ -376,6 +379,54 @@ void PatchWalBytes(const std::string& log_path, int64_t offset, const void* byte
     ASSERT_TRUE(static_cast<bool>(file));
 }
 
+void PatchLogicalWalBytes(DiskManager& disk, int64_t offset, const void* bytes, size_t size) {
+    if (!disk.wal_is_segmented()) {
+        PatchWalBytes(LOG_FILE_NAME, offset, bytes, size);
+        return;
+    }
+    const int64_t segment_bytes = disk.wal_segment_bytes();
+    ASSERT_GT(segment_bytes, 0);
+    const auto* source = static_cast<const char*>(bytes);
+    size_t written = 0;
+    while (written < size) {
+        const int64_t logical = offset + static_cast<int64_t>(written);
+        const uint64_t segment = static_cast<uint64_t>(logical / segment_bytes);
+        const int64_t segment_offset = logical % segment_bytes;
+        const size_t chunk = std::min<size_t>(size - written, static_cast<size_t>(segment_bytes - segment_offset));
+        PatchWalBytes(disk.wal_segment_name(segment), segment_offset, source + written, chunk);
+        written += chunk;
+    }
+}
+
+void PatchIndexSmoGenerationWithValidChecksum(DiskManager& disk, int64_t record_offset, uint64_t generation) {
+    constexpr uint32_t kGenerationOffset =
+        OFFSET_LOG_DATA + sizeof(uint32_t) + sizeof(uint16_t) * 2 + sizeof(uint32_t) * 4;
+    std::array<char, LOG_HEADER_SIZE> header{};
+    ASSERT_EQ(disk.read_log_chunk(header.data(), LOG_HEADER_SIZE, record_offset), LOG_HEADER_SIZE);
+    const uint32_t total_length = read_unaligned<uint32_t>(header.data() + OFFSET_LOG_TOT_LEN);
+    ASSERT_GT(total_length, kGenerationOffset + sizeof(uint64_t) + sizeof(uint32_t));
+    std::vector<char> record(total_length);
+    ASSERT_EQ(disk.read_log_chunk(record.data(), total_length, record_offset), static_cast<int>(total_length));
+    ASSERT_EQ(read_unaligned<LogType>(record.data() + OFFSET_LOG_TYPE), LogType::INDEX_SMO);
+    memcpy(record.data() + kGenerationOffset, &generation, sizeof(generation));
+    const uint32_t checksum = IndexSmoCrc32(record.data(), record.size() - sizeof(uint32_t));
+    memcpy(record.data() + record.size() - sizeof(uint32_t), &checksum, sizeof(checksum));
+    PatchLogicalWalBytes(disk, record_offset + kGenerationOffset, record.data() + kGenerationOffset,
+                         sizeof(generation));
+    PatchLogicalWalBytes(disk, record_offset + static_cast<int64_t>(record.size() - sizeof(uint32_t)), &checksum,
+                         sizeof(checksum));
+}
+
+void CorruptIndexSmoChecksum(DiskManager& disk, int64_t record_offset) {
+    std::array<char, LOG_HEADER_SIZE> header{};
+    ASSERT_EQ(disk.read_log_chunk(header.data(), LOG_HEADER_SIZE, record_offset), LOG_HEADER_SIZE);
+    const uint32_t total_length = read_unaligned<uint32_t>(header.data() + OFFSET_LOG_TOT_LEN);
+    ASSERT_GT(total_length, LOG_HEADER_SIZE + sizeof(uint32_t));
+    const uint32_t corrupt_checksum = 0;
+    PatchWalBytes(LOG_FILE_NAME, record_offset + total_length - static_cast<int64_t>(sizeof(uint32_t)),
+                  &corrupt_checksum, sizeof(corrupt_checksum));
+}
+
 } // namespace
 
 TEST(RecoveryManagerTest, IndexSmoOnlyWalRestoresTheAfterImage) {
@@ -436,6 +487,79 @@ TEST(RecoveryManagerTest, MultipleIndexSmoRecordsPrepareEachIndexOnlyOnce) {
 
     OpenRecoveryDb db(db_name);
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 19, rid));
+}
+
+TEST(RecoveryManagerTest, InterleavedIndexSmoCoalescesEachIndexIndependently) {
+    ScopedTestDir test_dir("recovery_index_smo_interleaved_root");
+    const std::string db_name = "recovery_index_smo_interleaved_db";
+    CreateRecoveryTestDb(db_name, {"t", "u"});
+
+    {
+        OpenRecoveryDb db(db_name);
+        struct IndexBeforeImage {
+            int fd;
+            std::array<char, PAGE_SIZE> root;
+        };
+        std::vector<IndexBeforeImage> before_images;
+        const auto append_root_smo = [&](const std::string& table_name, int key, const Rid& rid) {
+            const std::string index_name = db.sm_mgr_.get_ix_manager()->get_index_name(table_name, {"id"});
+            IxIndexHandle* index = db.sm_mgr_.ihs_.at(index_name).get();
+            const int fd = index->GetFd();
+            std::array<char, PAGE_SIZE> before{};
+            std::array<char, PAGE_SIZE> header{};
+            db.disk_.read_page(fd, IX_INIT_ROOT_PAGE, before.data(), PAGE_SIZE);
+            db.disk_.read_page(fd, IX_FILE_HDR_PAGE, header.data(), PAGE_SIZE);
+            before_images.push_back(IndexBeforeImage{fd, before});
+            index->insert_entry(MakeIntKey(key).data(), rid, IndexWriteWalContext::TestNoWal());
+            Page* root = db.bpm_.fetch_page(PageId{fd, IX_INIT_ROOT_PAGE});
+            if (root == nullptr) {
+                ADD_FAILURE() << "could not fetch root while preparing interleaved INDEX_SMO";
+                return INVALID_LSN;
+            }
+            IndexSmoWalData smo;
+            smo.index_file_name = index_name;
+            smo.pages.resize(1);
+            smo.pages[0].page_no = IX_INIT_ROOT_PAGE;
+            {
+                std::shared_lock page_lock{root->latch()};
+                memcpy(smo.pages[0].bytes.data(), root->get_data(), PAGE_SIZE);
+            }
+            if (!db.bpm_.unpin_page(PageId{fd, IX_INIT_ROOT_PAGE}, false)) {
+                ADD_FAILURE() << "could not unpin root while preparing interleaved INDEX_SMO";
+                return INVALID_LSN;
+            }
+            smo.header = header;
+            return db.log_mgr_->append_index_smo(smo);
+        };
+
+        const Rid t_first{1, 71};
+        const Rid u_first{1, 72};
+        const Rid t_second{1, 73};
+        const Rid u_second{1, 74};
+        const lsn_t t_first_lsn = append_root_smo("t", 71, t_first);
+        const lsn_t u_first_lsn = append_root_smo("u", 72, u_first);
+        const lsn_t t_second_lsn = append_root_smo("t", 73, t_second);
+        const lsn_t u_second_lsn = append_root_smo("u", 74, u_second);
+        ASSERT_LT(t_first_lsn, u_first_lsn);
+        ASSERT_LT(u_first_lsn, t_second_lsn);
+        ASSERT_LT(t_second_lsn, u_second_lsn);
+        db.log_mgr_->flush_log_to_disk_up_to_durable(u_second_lsn);
+        for (const IndexBeforeImage& before : before_images) {
+            ASSERT_TRUE(db.bpm_.flush_page(PageId{before.fd, IX_INIT_ROOT_PAGE}));
+            db.disk_.write_page(before.fd, IX_INIT_ROOT_PAGE, before.root.data(), PAGE_SIZE);
+        }
+
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        recovery.redo();
+        EXPECT_EQ(recovery.get_index_smo_prepare_count(), 2u);
+    }
+
+    OpenRecoveryDb verified(db_name);
+    EXPECT_TRUE(IndexPointsTo(verified.sm_mgr_, 71, Rid{1, 71}, "t"));
+    EXPECT_TRUE(IndexPointsTo(verified.sm_mgr_, 73, Rid{1, 73}, "t"));
+    EXPECT_TRUE(IndexPointsTo(verified.sm_mgr_, 72, Rid{1, 72}, "u"));
+    EXPECT_TRUE(IndexPointsTo(verified.sm_mgr_, 74, Rid{1, 74}, "u"));
 }
 
 TEST(RecoveryManagerTest, IndexSmoKeepsOlderUniquePageWhenNewerRecordOverridesAnotherPage) {
@@ -547,6 +671,22 @@ TEST(RecoveryManagerTest, NewBindingSkipsOldSameNameIndexSmo) {
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 23, rid));
 }
 
+TEST(RecoveryManagerTest, CorruptOldGenerationIndexSmoStillFailsClosed) {
+    ScopedTestDir test_dir("recovery_index_smo_corrupt_old_generation_root");
+    const std::string db_name = "recovery_index_smo_corrupt_old_generation_db";
+    CreateRecoveryTestDb(db_name);
+    PrepareSinglePageIndexSmo(db_name, 24, Rid{1, 24}, true);
+
+    OpenRecoveryDb db(db_name);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
+    ASSERT_EQ(smo_offsets.size(), 1u);
+    CorruptIndexSmoChecksum(db.disk_, smo_offsets.front());
+
+    EXPECT_THROW(recovery.redo(), InternalError);
+}
+
 // SMO redo validates the compact descriptor again after analyze. The mapped
 // snapshot must preserve that fail-closed boundary just like the old pread
 // path did, rather than replaying a retyped record or resetting its WAL.
@@ -569,6 +709,62 @@ TEST(RecoveryManagerTest, IndexSmoWalMutationAfterAnalyzeFailsClosed) {
     EXPECT_THROW(recovery.redo(), InternalError);
     EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 27, rid));
+}
+
+TEST(RecoveryManagerTest, IndexSmoValidChecksumMutationBeforeRedoValidationFailsClosed) {
+    ScopedTestDir test_dir("recovery_index_smo_prevalidate_identity_root");
+    const std::string db_name = "recovery_index_smo_prevalidate_identity_db";
+    CreateRecoveryTestDb(db_name);
+    PrepareSinglePageIndexSmo(db_name, 29, Rid{1, 29}, false);
+
+    OpenRecoveryDb db(db_name);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
+    ASSERT_EQ(smo_offsets.size(), 1u);
+    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    std::vector<char> original_bytes;
+    WalRecordView original;
+    ASSERT_TRUE(ReadWalRecordAt(&db.disk_, smo_offsets.front(), wal_size, &original_bytes, &original));
+    const uint32_t original_whole_record_crc = IndexSmoCrc32(original.bytes, original.total_len);
+    const uint32_t original_payload_crc = IndexSmoCrc32(original.bytes, original.total_len - sizeof(uint32_t));
+    PatchIndexSmoGenerationWithValidChecksum(db.disk_, smo_offsets.front(), 999999);
+
+    std::vector<char> mutated_bytes;
+    WalRecordView mutated;
+    ASSERT_TRUE(ReadWalRecordAt(&db.disk_, smo_offsets.front(), wal_size, &mutated_bytes, &mutated));
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(mutated, &parsed));
+    EXPECT_EQ(parsed.index_generation, 999999u);
+    // Prove the former identity was blind: a valid CRC-appended record has the
+    // same whole-record residue after payload mutation and CRC recomputation.
+    EXPECT_EQ(IndexSmoCrc32(mutated.bytes, mutated.total_len), original_whole_record_crc);
+    EXPECT_NE(IndexSmoCrc32(mutated.bytes, mutated.total_len - sizeof(uint32_t)), original_payload_crc);
+
+    EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+}
+
+TEST(RecoveryManagerTest, SelectedIndexSmoIdentityIsRecheckedAfterSelection) {
+    ScopedTestDir test_dir("recovery_index_smo_selected_identity_root");
+    const std::string db_name = "recovery_index_smo_selected_identity_db";
+    CreateRecoveryTestDb(db_name);
+    PrepareSinglePageIndexSmo(db_name, 28, Rid{1, 28}, false);
+
+    OpenRecoveryDb db(db_name);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
+    ASSERT_EQ(smo_offsets.size(), 1u);
+    bool hook_called = false;
+    recovery.set_index_smo_redo_test_hook([&](std::string_view point) {
+        ASSERT_EQ(point, "after_validate_select");
+        hook_called = true;
+        PatchIndexSmoGenerationWithValidChecksum(db.disk_, smo_offsets.front(), 999999);
+    });
+
+    EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_TRUE(hook_called);
 }
 
 TEST(RecoveryManagerTest, LoserIndexSmoIsRedoneBeforeTheLoserKeyIsUndone) {
@@ -1650,6 +1846,62 @@ TEST(RecoveryManagerTest, WalMutationAfterAnalyzeFailsClosed) {
     EXPECT_THROW(recovery.redo(), InternalError);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "t"));
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid, "u"));
+}
+
+// A compact heap descriptor must bind the complete serialized DML record, not
+// just its offset, header and RID. This keeps a same-length row-image rewrite
+// from being replayed after analyze (the INDEX_SMO companion test below covers
+// the stronger case where the mutated record's own CRC is recomputed).
+TEST(RecoveryManagerTest, WalPayloadMutationAfterAnalyzeFailsClosed) {
+    ScopedTestDir test_dir("recovery_redo_wal_payload_mutation_root");
+    const std::string db_name = "recovery_redo_wal_payload_mutation_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto tuple = MakeTuple(1, 10);
+
+    OpenRecoveryDb db(db_name);
+    auto lsn = AppendBegin(*db.log_mgr_, 100);
+    lsn = AppendInsert(*db.log_mgr_, 100, lsn, rid, tuple, "t");
+    AppendCommit(*db.log_mgr_, 100, lsn);
+    FlushLogs(*db.log_mgr_);
+
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+    ASSERT_EQ(dml_offsets.size(), 1u);
+    const int replacement = 11;
+    PatchWalBytes(LOG_FILE_NAME, dml_offsets.front() + OFFSET_LOG_DATA + static_cast<int64_t>(sizeof(int)),
+                  &replacement, sizeof(replacement));
+
+    EXPECT_THROW(recovery.redo(), InternalError);
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+}
+
+TEST(RecoveryManagerTest, LoserNoIndexPayloadMutationAfterAnalyzeRetainsWal) {
+    ScopedTestDir test_dir("recovery_loser_no_index_identity_root");
+    const std::string db_name = "recovery_loser_no_index_identity_db";
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    const Rid rid{1, 0};
+    auto tuple = MakeTuple(1, 10);
+
+    OpenRecoveryDb db(db_name);
+    const txn_id_t txn_id = 100;
+    const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, txn_id);
+    const lsn_t insert_lsn = AppendInsert(*db.log_mgr_, txn_id, begin_lsn, rid, tuple, "t");
+    AppendAbort(*db.log_mgr_, txn_id, insert_lsn);
+    FlushLogs(*db.log_mgr_);
+
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    const auto dml_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+    ASSERT_EQ(dml_offsets.size(), 1u);
+    const int replacement = 11;
+    PatchWalBytes(LOG_FILE_NAME, dml_offsets.front() + OFFSET_LOG_DATA + static_cast<int64_t>(sizeof(int)),
+                  &replacement, sizeof(replacement));
+    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+
+    EXPECT_THROW(recovery.undo(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
 }
 
 // The WAL intentionally alternates page 2 and page 1. Grouped redo must process

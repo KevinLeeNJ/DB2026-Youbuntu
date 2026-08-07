@@ -1231,7 +1231,8 @@ bool SmManager::flush_recovery_pages(const std::unordered_set<std::string>& tabl
     return true;
 }
 
-bool SmManager::preflush_recovery_heap_pages(const std::unordered_set<std::string>& table_names) {
+bool SmManager::preflush_recovery_heap_pages(const std::unordered_set<std::string>& table_names,
+                                             BufferPoolManager::FlushBatchResult* stats) {
     std::vector<int> heap_fds;
     heap_fds.reserve(table_names.size());
     for (const auto& tab_name : table_names) {
@@ -1242,7 +1243,7 @@ bool SmManager::preflush_recovery_heap_pages(const std::unordered_set<std::strin
     }
     std::sort(heap_fds.begin(), heap_fds.end());
     heap_fds.erase(std::unique(heap_fds.begin(), heap_fds.end()), heap_fds.end());
-    return buffer_pool_manager_->flush_all_pages_for_recovery(heap_fds);
+    return buffer_pool_manager_->flush_all_pages_for_recovery(heap_fds, stats);
 }
 
 void SmManager::rebuild_all_indexes() {

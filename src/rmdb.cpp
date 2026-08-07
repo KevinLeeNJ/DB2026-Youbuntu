@@ -325,7 +325,7 @@ void LogBackgroundPrecleanMetrics(uint64_t sequence) {
     const auto& metrics = buffer_pool_manager->background_preclean_metrics();
     if (!metrics.enabled()) return;
     const auto s = metrics.snapshot();
-    LOG_WARN("background-preclean-metric seq=%s final=%d fg_evict=%s/%s/%s dep_wait=%s/%s/%s pwrite=%s/%s/%s read=%s/%s/%s bg=%s/%s/%s/%s paused=%s wal_recent_fsync_ns=%s",
+    LOG_WARN("background-preclean-metric seq=%s final=%d fg_evict=%s/%s/%s dep_wait=%s/%s/%s pwrite=%s/%s/%s read=%s/%s/%s bg=%s/%s/%s/%s paused=%s throttled=%s ramped=%s wal_recent_fsync_ns=%s",
              Base62(sequence).c_str(), sequence == UINT64_MAX, Base62(s.foreground_dirty_eviction.count).c_str(),
              Base62(s.foreground_dirty_eviction.elapsed_ns).c_str(), Base62(s.foreground_dirty_eviction.max_ns).c_str(),
              Base62(s.foreground_dependency_wait.count).c_str(), Base62(s.foreground_dependency_wait.elapsed_ns).c_str(),
@@ -335,6 +335,7 @@ void LogBackgroundPrecleanMetrics(uint64_t sequence) {
              Base62(s.foreground_read.max_ns).c_str(), Base62(s.background_flush_calls).c_str(),
              Base62(s.background_pages).c_str(), Base62(s.background_flush.count).c_str(),
              Base62(s.background_flush.max_ns).c_str(), Base62(s.congestion_pauses).c_str(),
+             Base62(s.congestion_throttles).c_str(), Base62(s.congestion_ramps).c_str(),
              Base62(log_manager->recent_fdatasync_ns()).c_str());
 }
 
