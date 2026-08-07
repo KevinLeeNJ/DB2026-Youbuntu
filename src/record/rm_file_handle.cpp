@@ -250,9 +250,10 @@ void RmFileHandle::finish_insert_record(RmPinnedInsert& insert, char* buf, const
     if (page_lsn != INVALID_LSN && page_handle.page->get_page_lsn() < page_lsn) {
         page_handle.page->set_page_lsn(page_lsn);
     }
+    BufferPoolManager::mark_dirty_locked(page_handle.page);
     insert.page_lock->unlock();
     insert.page_lock.reset();
-    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
     insert.reserved = false;
 }
 
@@ -328,6 +329,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn, cons
         if (page_lsn != INVALID_LSN && pageHandle.page->get_page_lsn() < page_lsn) {
             pageHandle.page->set_page_lsn(page_lsn);
         }
+        BufferPoolManager::mark_dirty_locked(pageHandle.page);
     }
 
     // Keep the free-space bookkeeping consistent.  This path is reached by redo
@@ -347,7 +349,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn, cons
         add_free_page_candidate(rid.page_no);
     }
 
-    buffer_pool_manager_->unpin_page(pageHandle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(pageHandle.page->get_page_id(), false);
 }
 
 /**
@@ -362,7 +364,6 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_ls
     // 2. 更新page_handle.page_hdr中的数据结构
     // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
     RmPageHandle deletepage_handle = fetch_page_handle(rid.page_no);
-    bool deleted = false;
     {
         std::unique_lock<std::shared_mutex> page_lock(deletepage_handle.page->latch());
         if (Bitmap::is_set(deletepage_handle.bitmap, rid.slot_no)) {
@@ -374,10 +375,10 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_ls
             if (page_lsn != INVALID_LSN && deletepage_handle.page->get_page_lsn() < page_lsn) {
                 deletepage_handle.page->set_page_lsn(page_lsn);
             }
-            deleted = true;
+            BufferPoolManager::mark_dirty_locked(deletepage_handle.page);
         }
     }
-    buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), deleted);
+    buffer_pool_manager_->unpin_page(deletepage_handle.page->get_page_id(), false);
 }
 
 /**
@@ -398,8 +399,9 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context, ls
         if (page_lsn != INVALID_LSN && updatepage_handle.page->get_page_lsn() < page_lsn) {
             updatepage_handle.page->set_page_lsn(page_lsn);
         }
+        BufferPoolManager::mark_dirty_locked(updatepage_handle.page);
     }
-    buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(updatepage_handle.page->get_page_id(), false);
 }
 
 void RmFileHandle::apply_tuple_update(const Rid& rid, const char* buf, const TupleMeta& meta, lsn_t page_lsn) {
@@ -416,8 +418,9 @@ void RmFileHandle::apply_tuple_update(const Rid& rid, const char* buf, const Tup
         if (page_lsn != INVALID_LSN && page_handle.page->get_page_lsn() < page_lsn) {
             page_handle.page->set_page_lsn(page_lsn);
         }
+        BufferPoolManager::mark_dirty_locked(page_handle.page);
     }
-    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
 }
 
 /**
@@ -524,8 +527,9 @@ void RmFileHandle::set_tuple_meta(const Rid& rid, const TupleMeta& meta, lsn_t p
         if (page_lsn != INVALID_LSN && page_handle.page->get_page_lsn() < page_lsn) {
             page_handle.page->set_page_lsn(page_lsn);
         }
+        BufferPoolManager::mark_dirty_locked(page_handle.page);
     }
-    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
 }
 
 void RmFileHandle::set_page_lsn(const Rid& rid, lsn_t lsn) {
@@ -537,9 +541,10 @@ void RmFileHandle::set_page_lsn(const Rid& rid, lsn_t lsn) {
         std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
         if (page_handle.page->get_page_lsn() < lsn) {
             page_handle.page->set_page_lsn(lsn);
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
         }
     }
-    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
 }
 
 lsn_t RmFileHandle::get_page_lsn(const Rid& rid) const {
@@ -588,8 +593,9 @@ void RmFileHandle::rebuild_file_header_from_pages() {
             if (num_records == file_hdr_.num_records_per_page) {
                 page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
             }
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
         }
-        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
         if (num_records < file_hdr_.num_records_per_page) {
             free_pages.push_back(page_no);
         }
@@ -602,8 +608,9 @@ void RmFileHandle::rebuild_file_header_from_pages() {
         {
             std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
             page_handle.page_hdr->next_free_page_no = next_page_no;
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
         }
-        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
     }
     if (!free_pages.empty()) {
         file_hdr_.first_free_page_no = free_pages.front();
@@ -702,8 +709,9 @@ void RmFileHandle::repair_file_header_for_pages(const std::vector<page_id_t>& pa
                 page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
                 file_hdr_.first_free_page_no = page_no;
             }
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
         }
-        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+        buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
     }
 }
 

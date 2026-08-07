@@ -98,7 +98,10 @@ void IxIndexHandle::publish_smo_pages_impl(bool* wal_barrier_released) const {
             if (page == nullptr) {
                 throw InternalError("INDEX_SMO could not install page WAL dependency");
             }
-            BufferPoolManager::mark_dirty(page, dependency);
+            {
+                std::unique_lock page_lock{page->latch()};
+                BufferPoolManager::mark_dirty_locked(page, dependency);
+            }
             unpin_if_not_cached(page_id);
         }
         header_dependency_.merge(dependency);
@@ -794,6 +797,7 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
         allocation_started = true;
         PageId page_id{fd_, INVALID_PAGE_ID};
         Page* page = nullptr;
+        bool page_marked_dirty = false;
         if (!split_spare_pages_.empty()) {
             page_id.page_no = split_spare_pages_.back();
             split_spare_pages_.pop_back();
@@ -801,6 +805,8 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
             if (page != nullptr) {
                 std::unique_lock page_lock{page->latch()};
                 std::memset(page->get_data(), 0, PAGE_SIZE);
+                BufferPoolManager::mark_dirty_locked(page, wal_context.dependency());
+                page_marked_dirty = true;
             }
         } else {
             page = frame_operation.new_page(&page_id);
@@ -812,6 +818,12 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
             }
             throw InternalError("index split preflight could not allocate page");
         }
+        if (!page_marked_dirty) {
+            // A freshly allocated frame is still LOADING and owned by this
+            // operation pin, so no concurrent capture can observe it before
+            // this initial dependency publication.
+            BufferPoolManager::mark_dirty(page, wal_context.dependency());
+        }
         file_hdr_->num_pages_ = std::max(file_hdr_->num_pages_, page_id.page_no + 1);
         acquired_new_pages.push_back(page_id.page_no);
         {
@@ -821,7 +833,7 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
         // A preallocated page may be evicted before commit. Marking its zero
         // image dirty makes that eviction materialize a readable page rather
         // than leaving a short-file hole that cannot be fetched again.
-        buffer_pool_manager_->unpin_page(page_id, wal_context.dependency());
+        buffer_pool_manager_->unpin_page(page_id, false);
         return page_id.page_no;
     };
 
@@ -1066,7 +1078,7 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
             }
             {
                 std::unique_lock page_lock{page->latch()};
-                BufferPoolManager::mark_dirty(page, wal_context.dependency());
+                BufferPoolManager::mark_dirty_locked(page, wal_context.dependency());
                 note_image_locked(InsertSplitStage::RollbackBeforeImageRestore, planned.id, page);
                 std::memcpy(page->get_data(), planned.before.data(), PAGE_SIZE);
                 note_image_locked(InsertSplitStage::RollbackImageRestored, planned.id, page);
@@ -1089,7 +1101,7 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
                 PlannedPage& current = pages[current_index];
                 if (current.existed) {
                     std::unique_lock page_lock{current_page->latch()};
-                    BufferPoolManager::mark_dirty(current_page, wal_context.dependency());
+                    BufferPoolManager::mark_dirty_locked(current_page, wal_context.dependency());
                     note_image_locked(InsertSplitStage::RollbackBeforeImageRestore, current.id, current_page);
                     std::memcpy(current_page->get_data(), current.before.data(), PAGE_SIZE);
                     note_image_locked(InsertSplitStage::RollbackImageRestored, current.id, current_page);
@@ -1108,7 +1120,7 @@ page_id_t IxIndexHandle::insert_entry_with_split(page_id_t leaf_page_no, const c
         }
         {
             std::unique_lock page_lock{next_page->latch()};
-            BufferPoolManager::mark_dirty(next_page, wal_context.dependency());
+            BufferPoolManager::mark_dirty_locked(next_page, wal_context.dependency());
             note_image_locked(InsertSplitStage::CommitBeforeImageApply, next.id, next_page);
             std::memcpy(next_page->get_data(), next.after->get_data(), PAGE_SIZE);
             note_image_locked(InsertSplitStage::CommitImageApplied, next.id, next_page);
@@ -1184,7 +1196,7 @@ page_id_t IxIndexHandle::insert_entry(const char* key, const Rid& value, const I
         const bool needs_structure_change = pos == 0 || leaf.get_size() + 1 >= leaf.get_max_size();
         if (!needs_structure_change) {
             const page_id_t inserted_page_no = leaf.get_page_no();
-            BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+            BufferPoolManager::mark_dirty_locked(leaf.page, wal_context.dependency());
             leaf.insert_pair(pos, key, value);
             if (pos == leaf.get_size() - 1 && leaf.get_next_leaf() == IX_LEAF_HEADER_PAGE) {
                 remember_append_hint(inserted_page_no);
@@ -1242,7 +1254,7 @@ page_id_t IxIndexHandle::insert_entry_unlocked(const char* key, const Rid& value
 
     {
         std::unique_lock leaf_guard{leaf.page->latch()};
-        BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+        BufferPoolManager::mark_dirty_locked(leaf.page, wal_context.dependency());
         leaf.insert_pair(pos, key, value);
     }
     if (right_edge_append) {
@@ -1339,7 +1351,7 @@ void IxIndexHandle::PinnedInserter::insert(const char* key, const Rid& value, bo
     ih->note_smo_page(leaf.get_page_no());
     {
         std::unique_lock leaf_guard{leaf.page->latch()};
-        BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+        BufferPoolManager::mark_dirty_locked(leaf.page, wal_context.dependency());
         leaf.insert_pair(pos, key, value);
     }
     if (right_edge_append) {
@@ -1378,7 +1390,7 @@ bool IxIndexHandle::delete_entry(const char* key, const IndexWriteWalContext& wa
 
         const bool needs_structure_change = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
         if (!needs_structure_change) {
-            BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+            BufferPoolManager::mark_dirty_locked(leaf.page, wal_context.dependency());
             leaf.erase_pair(pos);
             leaf_guard.unlock();
             unpin_if_not_cached(leaf.get_page_id());
@@ -1406,7 +1418,7 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, const IndexWriteWalCo
 
     {
         std::unique_lock leaf_guard{leaf->page->latch()};
-        BufferPoolManager::mark_dirty(leaf->page, wal_context.dependency());
+        BufferPoolManager::mark_dirty_locked(leaf->page, wal_context.dependency());
         leaf->erase_pair(pos);
     }
     if (leaf->get_size() > 0) {
@@ -1450,7 +1462,7 @@ bool IxIndexHandle::delete_entry(const char* key, const Rid& value, const IndexW
                 if (*leaf.get_rid(pos) == value) {
                     needs_structure_fallback = pos == 0 || leaf.get_size() - 1 < leaf.get_min_size();
                     if (!needs_structure_fallback) {
-                        BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+                        BufferPoolManager::mark_dirty_locked(leaf.page, wal_context.dependency());
                         leaf.erase_pair(pos);
                         leaf_guard.unlock();
                         unpin_if_not_cached(leaf.get_page_id());
@@ -1507,7 +1519,7 @@ bool IxIndexHandle::delete_entry_unlocked(const char* key, const Rid& value, con
                     break;
                 }
                 if (*leaf.get_rid(pos) == value) {
-                    BufferPoolManager::mark_dirty(leaf.page, wal_context.dependency());
+                    BufferPoolManager::mark_dirty_locked(leaf.page, wal_context.dependency());
                     leaf.erase_pair(pos);
                     found = true;
                     break;
@@ -1595,7 +1607,7 @@ bool IxIndexHandle::adjust_root(IxNodeHandle* old_root_node) {
         fetch_node_into(child_page_no, child);
         {
             std::unique_lock child_guard{child.page->latch()};
-            BufferPoolManager::mark_dirty(child.page, active_smo_wal_context().dependency());
+            BufferPoolManager::mark_dirty_locked(child.page, active_smo_wal_context().dependency());
             child.set_parent_page_no(IX_NO_PAGE);
         }
         update_root_page_no(child_page_no);
@@ -2214,7 +2226,7 @@ void IxIndexHandle::maintain_parent(IxNodeHandle* node) {
                 // pointer. Publish the dependency and epoch under the same page
                 // latch as the image change so a concurrent flush cannot observe
                 // the new separator with the old WAL dependency.
-                BufferPoolManager::mark_dirty(next->page, active_smo_wal_context().dependency());
+                BufferPoolManager::mark_dirty_locked(next->page, active_smo_wal_context().dependency());
                 topology_epoch_.fetch_add(1, std::memory_order_relaxed);
                 note_structure_change();
                 memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_);

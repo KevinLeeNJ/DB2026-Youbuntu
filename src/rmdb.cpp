@@ -112,6 +112,10 @@ constexpr std::size_t kWarnHeaderMax = sizeof("WARN ") - 1 +
                                         sizeof(" [rmdb.cpp:") - 1 + 10 + sizeof("] ") - 1;
 constexpr char kTxnPhaseDataPrefix[] = "txn-phase seq=";
 constexpr char kTxnPhaseDataFinal[] = " final=1 ";
+constexpr char kReadViewShadowSchema[] =
+    "readview-shadow schema=base62 cumulative=1 authority=legacy visibility=full_undo_chain "
+    "scope=active_writer_read_shadow excluded=write_conflict,ssi_dependency "
+    "classes=match/undo_missing/version_mismatch/delete_mismatch/payload_mismatch";
 constexpr char kTxnPhaseLongestName[] = "tuple_publication_work";
 constexpr char kWalFlushSchema[] =
     "wal-flush-metric schema=base62 cumulative=1 leader_is_wal_flush_owner_not_transaction_owner "
@@ -135,6 +139,7 @@ constexpr char kCheckpointTimingBFixed[] =
     "checkpoint-metric seq= final=1 fuzzy_final=// manifest=// wal_reset=// lifetime=//";
 constexpr std::size_t kBase62Max = 11;
 static_assert(sizeof(kTxnPhaseSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kReadViewShadowSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kTxnPhaseDataPrefix) - 1 + kBase62Max + sizeof(kTxnPhaseDataFinal) - 1 +
                   sizeof(kTxnPhaseLongestName) - 1 + 1 + 3 * kBase62Max + 2 + kWarnHeaderMax + 2 <=
               minilog::Logger::kLineBufferSize);
@@ -177,6 +182,16 @@ void LogTransactionPhaseMetrics(uint64_t sequence) {
                  names[index],
                  Base62(snapshot.count).c_str(), Base62(snapshot.elapsed_ns).c_str(), Base62(snapshot.max_ns).c_str());
     }
+}
+void LogReadViewShadowMetrics(uint64_t sequence) {
+    if (!txn_manager->read_view_shadow_enabled()) return;
+    const auto snapshot = txn_manager->read_view_shadow_snapshot();
+    LOG_WARN("%s", kReadViewShadowSchema);
+    LOG_WARN("readview-shadow seq=%s final=%d capture=%s rc_replace=%s class=%s/%s/%s/%s/%s",
+             Base62(sequence).c_str(), sequence == UINT64_MAX, Base62(snapshot.captures).c_str(),
+             Base62(snapshot.rc_replacements).c_str(), Base62(snapshot.classification[0]).c_str(),
+             Base62(snapshot.classification[1]).c_str(), Base62(snapshot.classification[2]).c_str(),
+             Base62(snapshot.classification[3]).c_str(), Base62(snapshot.classification[4]).c_str());
 }
 AbortOperation AbortOperationFor(ast::AstType type) noexcept {
     switch (type) {
@@ -1693,7 +1708,7 @@ int main(int argc, char** argv) {
             try {
                 if (transaction_phase_metrics->enabled() || transaction_abort_metrics->enabled() ||
                     wal_flush_metrics->enabled() || checkpoint_phase_metrics->enabled() || lock_manager->shard_metrics_enabled() ||
-                    buffer_pool_manager->shard_metrics_enabled()) {
+                    buffer_pool_manager->shard_metrics_enabled() || txn_manager->read_view_shadow_enabled()) {
                     runtime_metrics_reporter = std::thread([&runtime_metrics_reporter_stop,
                                                             marker_socket_fd = wal_phase_marker_socket_fd,
                                                             marker_wake_fd = wal_phase_marker_wake_fd] {
@@ -1706,6 +1721,7 @@ int main(int argc, char** argv) {
                                 }
                                 ++sequence;
                                 LogTransactionPhaseMetrics(sequence);
+                                LogReadViewShadowMetrics(sequence);
                                 LogTransactionAbortMetrics(sequence);
                                 LogWalFlushMetrics(sequence);
                                 LogCheckpointMetrics(sequence);
@@ -1797,6 +1813,7 @@ int main(int argc, char** argv) {
                             if (after_events >= next_periodic) {
                                 ++sequence;
                                 LogTransactionPhaseMetrics(sequence);
+                                LogReadViewShadowMetrics(sequence);
                                 LogTransactionAbortMetrics(sequence);
                                 LogWalFlushMetrics(sequence);
                                 LogCheckpointMetrics(sequence);
@@ -1843,6 +1860,7 @@ int main(int argc, char** argv) {
             log_manager->flush_log_to_disk_with_sync();
             if (runtime_metrics_reporter_started) {
                 LogTransactionPhaseMetrics(UINT64_MAX);
+                LogReadViewShadowMetrics(UINT64_MAX);
                 LogTransactionAbortMetrics(UINT64_MAX);
                 LogWalFlushMetrics(UINT64_MAX);
                 LogCheckpointMetrics(UINT64_MAX);

@@ -16,10 +16,13 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <string>
@@ -630,6 +633,70 @@ TEST_F(BufferPoolManagerTest, FlushKeepsDependencyWhenPageIsRedirtiedAfterWrite)
     ASSERT_TRUE(bpm->unpin_page(page_id, false));
     disk_manager_->read_page(fd_, page_id.page_no, disk_image.data(), PAGE_SIZE);
     EXPECT_STREQ(disk_image.data(), "second");
+}
+
+TEST_F(BufferPoolManagerTest, FlushUsesPayloadAndWalDependencyPublishedUnderWriterLatch) {
+    constexpr lsn_t kOldLsn = 41;
+    constexpr lsn_t kLatestLsn = 73;
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    auto log_manager = InstallTestWal(bpm.get(), disk_manager_.get(), kLatestLsn);
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    Page* page = bpm->new_page(&page_id);
+    ASSERT_NE(page, nullptr);
+    {
+        std::unique_lock page_lock{page->latch()};
+        std::strcpy(page->get_data(), "old-wal-image");
+        page->set_page_lsn(kOldLsn);
+        BufferPoolManager::mark_dirty_locked(page, PageWriteDependency::Wal(kOldLsn));
+    }
+    ASSERT_TRUE(bpm->unpin_page(page_id, false));
+
+    page = bpm->fetch_page(page_id);
+    ASSERT_NE(page, nullptr);
+    std::unique_lock writer_lock{page->latch()};
+
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool flush_waiting_for_writer = false;
+    BufferPoolManager::set_flush_page_test_hook([&](PageId flushed_id, Page*) {
+        if (!(flushed_id == page_id)) {
+            return;
+        }
+        std::lock_guard lock{hook_mutex};
+        flush_waiting_for_writer = true;
+        hook_cv.notify_all();
+    });
+
+    std::atomic<bool> flush_ok{false};
+    std::thread flusher([&] { flush_ok.store(bpm->flush_page(page_id), std::memory_order_release); });
+    {
+        std::unique_lock hook_lock{hook_mutex};
+        EXPECT_TRUE(hook_cv.wait_for(hook_lock, std::chrono::seconds(2), [&] { return flush_waiting_for_writer; }));
+    }
+
+    // The flush thread has claimed the frame but cannot copy it until this
+    // writer releases the payload latch. Publish the bytes and its matching
+    // WAL dependency as one writer epoch.
+    std::strcpy(page->get_data(), "latest-wal-image");
+    page->set_page_lsn(kLatestLsn);
+    BufferPoolManager::mark_dirty_locked(page, PageWriteDependency::Wal(kLatestLsn));
+    writer_lock.unlock();
+    EXPECT_TRUE(bpm->unpin_page(page_id, false));
+    flusher.join();
+    BufferPoolManager::set_flush_page_test_hook({});
+
+    EXPECT_TRUE(flush_ok.load(std::memory_order_acquire));
+    EXPECT_GE(log_manager->get_durable_lsn(), kLatestLsn);
+
+    std::array<char, PAGE_SIZE> disk_image{};
+    disk_manager_->read_page(fd_, page_id.page_no, disk_image.data(), PAGE_SIZE);
+    EXPECT_STREQ(disk_image.data(), "latest-wal-image");
+
+    BufferPoolManager reopened_bpm(1, disk_manager_.get());
+    Page* reopened_page = reopened_bpm.fetch_page(page_id);
+    ASSERT_NE(reopened_page, nullptr);
+    EXPECT_STREQ(reopened_page->get_data(), "latest-wal-image");
+    EXPECT_TRUE(reopened_bpm.unpin_page(page_id, false));
 }
 
 TEST_F(BufferPoolManagerTest, VictimReuseClearsExternalWriteDependency) {

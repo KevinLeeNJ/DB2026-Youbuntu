@@ -192,6 +192,16 @@ public:
         page->is_dirty_.store(true, std::memory_order_release);
     }
 
+    // The caller must hold page->latch() exclusively so the page bytes and
+    // write dependency are published as one writer epoch.
+    static void mark_dirty_locked(Page* page, const PageWriteDependency& dependency) {
+        mark_dirty(page, dependency);
+    }
+
+    static void mark_dirty_locked(Page* page) {
+        mark_dirty_locked(page, PageWriteDependency::Wal(page->get_page_lsn()));
+    }
+
     // Transitional table-page adapter. Index code must use the typed overload
     // because byte zero of an index page is IxPageHdr, not an LSN.
     static void mark_dirty(Page* page) {

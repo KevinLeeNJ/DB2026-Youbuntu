@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -438,12 +439,47 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
  * @param {LogManager*} log_manager 日志管理器指针
  */
 Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager, IsolationLevel isolation_level) {
-    std::unique_ptr<Transaction> created;
-    if (txn == nullptr) {
-        txn_id_t txn_id = next_txn_id_.fetch_add(1);
-        created = std::make_unique<Transaction>(txn_id, isolation_level);
-        txn = created.get();
+    // Keep the production-off path byte-for-byte equivalent in ordering: no
+    // shadow allocation, lifecycle lock, or status-table work is introduced.
+    if (status_table_ == nullptr) {
+        std::unique_ptr<Transaction> created;
+        if (txn == nullptr) {
+            created = std::make_unique<Transaction>(next_txn_id_.fetch_add(1), isolation_level);
+            txn = created.get();
+        }
+        {
+            std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
+            const bool blocked = checkpoint_blocking_new_txns_;
+            if (blocked) InvokeCheckpointAdmissionTestHook("begin_waiting");
+            checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
+            active_txn_ids_.insert(txn->get_transaction_id());
+            active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+            InvokeCheckpointAdmissionTestHook("begin_admitted");
+        }
+        txn->set_state(TransactionState::GROWING);
+        txn->set_start_ts(next_timestamp_.fetch_add(1));
+        {
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            txn->set_read_ts(last_commit_ts_.load(std::memory_order_acquire));
+            txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
+        }
+        WriteBeginLog(txn, log_manager);
+        std::unique_lock<std::mutex> lock(latch_);
+        if (created) txn_map[txn->get_transaction_id()] = std::move(created);
+        if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE)
+            active_serializable_txns_.insert(txn->get_transaction_id());
+        return txn;
     }
+
+    std::unique_ptr<Transaction> created;
+    const bool create_transaction = txn == nullptr;
+    const TransactionState original_state = create_transaction ? TransactionState::DEFAULT : txn->get_state();
+    const timestamp_t original_read_ts = create_transaction ? INVALID_TS : txn->get_read_ts();
+    const timestamp_t original_start_ts = create_transaction ? INVALID_TS : txn->get_start_ts();
+    const size_t original_watermark_slot = create_transaction ? std::numeric_limits<size_t>::max()
+                                                               : txn->get_watermark_slot();
+    const auto original_read_view = create_transaction ? std::shared_ptr<const ActiveWriterReadView>{}
+                                                       : txn->get_read_view();
 
     {
         std::unique_lock<std::mutex> checkpoint_lock(checkpoint_latch_);
@@ -452,26 +488,47 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
             InvokeCheckpointAdmissionTestHook("begin_waiting");
         }
         checkpoint_cv_.wait(checkpoint_lock, [&] { return !checkpoint_blocking_new_txns_; });
+        std::lock_guard<std::mutex> lifecycle_lock(shadow_lifecycle_latch_);
+        if (create_transaction) {
+            created = std::make_unique<Transaction>(next_txn_id_.fetch_add(1), isolation_level);
+            txn = created.get();
+        } else {
+            txn_id_t expected = next_txn_id_.load(std::memory_order_relaxed);
+            while (expected <= txn->get_transaction_id() &&
+                   !next_txn_id_.compare_exchange_weak(expected, txn->get_transaction_id() + 1,
+                                                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+            }
+        }
         active_txn_ids_.insert(txn->get_transaction_id());
         active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+        try {
+            status_table_->RegisterAndCapture(txn->get_transaction_id(), next_txn_id_.load(std::memory_order_relaxed));
+            txn->set_state(TransactionState::GROWING);
+            txn->set_start_ts(next_timestamp_.fetch_add(1));
+            {
+                std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+                txn->set_read_ts(last_commit_ts_.load(std::memory_order_acquire));
+                txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
+            }
+            if (read_view_capture_test_hook_) read_view_capture_test_hook_("begin");
+            txn->set_read_view(
+                status_table_->Capture(txn->get_transaction_id(), next_txn_id_.load(std::memory_order_relaxed)));
+            read_view_shadow_metrics_->capture();
+        } catch (...) {
+            if (txn->get_watermark_slot() != std::numeric_limits<size_t>::max()) {
+                running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
+            }
+            txn->set_state(original_state);
+            txn->set_read_ts(original_read_ts);
+            txn->set_start_ts(original_start_ts);
+            txn->set_watermark_slot(original_watermark_slot);
+            txn->set_read_view(original_read_view);
+            status_table_->RemoveActive(txn->get_transaction_id());
+            active_txn_ids_.erase(txn->get_transaction_id());
+            active_txn_count_ = static_cast<int>(active_txn_ids_.size());
+            throw;
+        }
         InvokeCheckpointAdmissionTestHook("begin_admitted");
-    }
-
-    txn->set_state(TransactionState::GROWING);
-    txn->set_start_ts(next_timestamp_.fetch_add(1));
-    {
-        // Snapshot selection and its GC pin are one publication-frontier
-        // operation. Without this guard, GC could sample a newer watermark in
-        // the gap between reading last_commit_ts_ and installing the slot, then
-        // reclaim version history still needed by this transaction.
-        std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
-        txn->set_read_ts(last_commit_ts_.load(std::memory_order_acquire));
-        // start_ts orders transaction lifecycle events, but a committer may already
-        // have reserved a smaller commit_ts without publishing it. read_ts is the
-        // published snapshot frontier and therefore drives visibility and SSI.
-        // 用读时间戳维护水位线：RC 下每条语句的 read_ts 可能大于 start_ts，
-        // 水位线必须反映当前真实 read_ts 才能安全驱动垃圾回收。
-        txn->set_watermark_slot(running_txns_.AddTxnSlot(txn->get_read_ts()));
     }
     WriteBeginLog(txn, log_manager);
 
@@ -490,14 +547,38 @@ void TransactionManager::BeginStatement(Transaction* txn) {
         return;
     }
     if (txn->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+        if (status_table_ == nullptr) {
+            timestamp_t old_read_ts = txn->get_read_ts();
+            timestamp_t new_read_ts = last_commit_ts_.load();
+            if (new_read_ts != old_read_ts) {
+                running_txns_.UpdateTxnReadTsSlot(txn->get_watermark_slot(), new_read_ts);
+                txn->set_read_ts(new_read_ts);
+            }
+            return;
+        }
+        std::unique_lock<std::mutex> lifecycle_lock(shadow_lifecycle_latch_, std::defer_lock);
+        lifecycle_lock.lock();
         // Atomically refresh the statement snapshot in the watermark. A
         // remove/add pair would briefly make an active RC transaction vanish
         // and allow concurrent GC to reclaim its visible version chain.
-        timestamp_t old_read_ts = txn->get_read_ts();
-        timestamp_t new_read_ts = last_commit_ts_.load();
-        if (new_read_ts != old_read_ts) {
-            running_txns_.UpdateTxnReadTsSlot(txn->get_watermark_slot(), new_read_ts);
-            txn->set_read_ts(new_read_ts);
+        {
+            std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
+            timestamp_t old_read_ts = txn->get_read_ts();
+            timestamp_t new_read_ts = last_commit_ts_.load(std::memory_order_acquire);
+            if (new_read_ts != old_read_ts) {
+                running_txns_.UpdateTxnReadTsSlot(txn->get_watermark_slot(), new_read_ts);
+                txn->set_read_ts(new_read_ts);
+            }
+        }
+        try {
+            if (read_view_capture_test_hook_) read_view_capture_test_hook_("statement");
+            txn->set_read_view(status_table_->Capture(txn->get_transaction_id(), next_txn_id_.load()));
+            read_view_shadow_metrics_->rc_replacement();
+        } catch (...) {
+            // RC legacy timestamp/watermark is authoritative. A diagnostic
+            // capture failure keeps the previous immutable view and cannot
+            // abort or alter the statement.
+            txn->set_read_view(nullptr);
         }
     }
 }
@@ -592,6 +673,14 @@ void TransactionManager::RunCommitPublicationWork(const std::shared_ptr<CommitPu
             sm_manager_->mark_slots_committed(*slot_request->txn, slot_request->commit_ts, false);
             timer.Stop();
             timer.Finish();
+            if (status_table_ != nullptr) {
+                // Tuple finalize and durable WAL now precede terminal TST
+                // publication. This may intentionally precede the contiguous
+                // legacy frontier; a shadow reader then uses its captured
+                // read_ts to preserve the legacy result.
+                std::lock_guard<std::mutex> lifecycle_lock(shadow_lifecycle_latch_);
+                status_table_->SetCommitted(slot_request->txn->get_transaction_id(), slot_request->commit_ts);
+            }
             FaultInjector::Point("after_tuple_publication");
             InvokeCommitPublicationTestHook("after_tuple_publication", slot_request->commit_csn,
                                             slot_request->commit_lsn);
@@ -721,6 +810,10 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
         }
         throw InternalError("transaction is not ready to commit");
     }
+    if (status_table_ != nullptr) {
+        std::lock_guard<std::mutex> lifecycle_lock(shadow_lifecycle_latch_);
+        status_table_->SetCommitting(txn->get_transaction_id());
+    }
 
     FaultInjector::Point("before_commit_wal");
     std::shared_ptr<CommitPublicationRequest> publication_request;
@@ -797,6 +890,10 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             sm_manager_->mark_slots_committed(*txn, commit_ts);
             tuple_publication_timer.Stop();
             tuple_publication_timer.Finish();
+            if (status_table_ != nullptr) {
+                std::lock_guard<std::mutex> lifecycle_lock(shadow_lifecycle_latch_);
+                status_table_->SetCommitted(txn->get_transaction_id(), commit_ts);
+            }
             FaultInjector::Point("after_tuple_publication");
             txn->set_state(TransactionState::COMMITTED);
             FaultInjector::Point("before_published_csn_store");
@@ -911,6 +1008,11 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     }
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
         UndoWriteRecord(this, sm_manager_, it->get(), abort_lsn, abort_delete_undo_publication_test_hook_);
+    }
+    if (status_table_ != nullptr) {
+        // Never expose ABORTED before physical undo is complete.
+        std::lock_guard<std::mutex> lifecycle_lock(shadow_lifecycle_latch_);
+        status_table_->SetAborted(txn->get_transaction_id());
     }
     running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
     ClearWriteSet(txn);

@@ -76,6 +76,79 @@ inline void RegisterLogicalRowDeleteIntent(Context* context, SmManager* sm_manag
     }
 }
 
+// Fully independent, non-authoritative resolver used only by explicit shadow
+// mode. It follows the same in-memory UndoLink chain as legacy visibility but
+// applies the immutable active-writer ReadView plus TST status at every
+// version. No record returned to the executor is moved into this path.
+inline TransactionManager::ShadowVisibilityResult ResolveReadViewShadowCandidate(
+    TransactionManager* txn_mgr, const Transaction& txn, const TupleMeta& initial_meta, const char* base_data,
+    uint32_t base_size) {
+    TransactionManager::ShadowVisibilityResult result;
+    TupleMeta meta = initial_meta;
+    std::optional<UndoLog> current_undo;
+    constexpr int MAX_DEPTH = 100;
+    for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+        if (txn_mgr->ShadowVersionVisible(txn, meta)) {
+            result.visible = !meta.is_deleted_;
+            result.deleted = meta.is_deleted_;
+            result.meta = meta;
+            result.depth = depth;
+            if (result.visible) {
+                if (current_undo.has_value())
+                    result.payload = current_undo->old_tuple_data_;
+                else if (base_data != nullptr && base_size != 0)
+                    result.payload.assign(base_data, base_data + base_size);
+            }
+            return result;
+        }
+        if (!meta.version_chain_head_.IsValid()) {
+            result.meta = meta;
+            result.depth = depth;
+            return result;
+        }
+        current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
+        if (!current_undo.has_value()) {
+            result.undo_missing = true;
+            result.meta = meta;
+            result.depth = depth;
+            return result;
+        }
+        meta = current_undo->old_meta_;
+    }
+    result.meta = meta;
+    result.depth = MAX_DEPTH;
+    return result;
+}
+
+inline std::optional<TransactionManager::ShadowVisibilityResult>
+PrepareReadViewShadowCandidate(TransactionManager* txn_mgr, const Transaction& txn, const TupleMeta& meta,
+                               const char* base_data, uint32_t base_size) {
+    if (!txn_mgr->read_view_shadow_enabled()) return std::nullopt;
+    if (!txn.get_read_view()) return std::nullopt;
+    try {
+        return ResolveReadViewShadowCandidate(txn_mgr, txn, meta, base_data, base_size);
+    } catch (...) {
+        TransactionManager::ShadowVisibilityResult failed;
+        failed.undo_missing = true;
+        return failed;
+    }
+}
+
+inline void FinishReadViewShadowCandidate(TransactionManager* txn_mgr,
+                                          const std::optional<TransactionManager::ShadowVisibilityResult>& candidate,
+                                          const RmRecordViewWithMeta& legacy, bool legacy_deleted, int legacy_depth) {
+    if (!candidate.has_value()) return;
+    try {
+        std::vector<char> payload;
+        if (legacy.view.data != nullptr) payload.assign(legacy.view.data, legacy.view.data + legacy.view.size);
+        txn_mgr->ObserveReadViewShadow(*candidate, legacy.view.data != nullptr, legacy_deleted, legacy.meta,
+                                       legacy_depth, legacy.view.data == nullptr ? nullptr : &payload);
+    } catch (...) {
+        // A diagnostic allocation/copy failure must not affect the selected
+        // legacy tuple or its retry behavior.
+    }
+}
+
 inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& rid, Context* context) {
     if (context == nullptr || context->txn_ == nullptr || context->txn_mgr_ == nullptr) {
         return fh->get_record(rid, context);
@@ -87,6 +160,8 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
     const txn_id_t self_id = txn->get_transaction_id();
 
     constexpr int MAX_DEPTH = 100;
+    std::optional<TransactionManager::ShadowVisibilityResult> final_shadow_candidate;
+    TupleMeta final_shadow_meta{};
 
     // A lock-free reader can observe an uncommitted tuple just as its writer
     // rolls back and retires its undo buffer. Re-read the tuple in that narrow
@@ -97,21 +172,35 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
             return nullptr;
         }
         TupleMeta meta = record_with_meta.meta;
+        auto shadow_candidate = PrepareReadViewShadowCandidate(txn_mgr, *txn, meta, record_with_meta.record->data,
+                                                                static_cast<uint32_t>(record_with_meta.record->size));
+        final_shadow_candidate = shadow_candidate;
+        final_shadow_meta = meta;
         auto base_record = std::move(record_with_meta.record);
         std::optional<UndoLog> current_undo;
         bool retry = false;
+        auto finish = [&](std::unique_ptr<RmRecord> result, const TupleMeta& legacy_meta, int legacy_depth,
+                          bool legacy_deleted) {
+            // Shadow observation is deliberately after the legacy answer has
+            // been chosen. It has no authority over visibility or retries.
+            RmRecordViewWithMeta view;
+            view.meta = legacy_meta;
+            if (result != nullptr) view.view = RmRecordView{result->data, static_cast<uint32_t>(result->size)};
+            FinishReadViewShadowCandidate(txn_mgr, shadow_candidate, view, legacy_deleted, legacy_depth);
+            return result;
+        };
 
         for (int depth = 0; depth < MAX_DEPTH; ++depth) {
             if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
                 if (meta.is_deleted_) {
-                    return nullptr;
+                    return finish(nullptr, meta, depth, true);
                 }
-                return base_record;
+                return finish(std::move(base_record), meta, depth, false);
             }
 
             if (!meta.is_committed_) {
                 if (!meta.version_chain_head_.IsValid()) {
-                    return nullptr;
+                    return finish(nullptr, meta, depth, false);
                 }
                 current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
                 if (!current_undo.has_value()) {
@@ -123,21 +212,21 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
             }
 
             if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-                return nullptr;
+                return finish(nullptr, meta, depth, true);
             }
 
             if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
                 if (!current_undo.has_value()) {
-                    return base_record;
+                    return finish(std::move(base_record), meta, depth, false);
                 }
                 const auto& log = *current_undo;
                 auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));
                 memcpy(rec->data, log.old_tuple_data_.data(), log.old_tuple_data_.size());
-                return rec;
+                return finish(std::move(rec), meta, depth, false);
             }
 
             if (!meta.version_chain_head_.IsValid()) {
-                return nullptr;
+                return finish(nullptr, meta, depth, false);
             }
             current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
             if (!current_undo.has_value()) {
@@ -148,9 +237,12 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
         }
 
         if (!retry) {
-            return nullptr;
+            return finish(nullptr, meta, MAX_DEPTH, false);
         }
     }
+    RmRecordViewWithMeta empty;
+    empty.meta = final_shadow_meta;
+    FinishReadViewShadowCandidate(txn_mgr, final_shadow_candidate, empty, false, MAX_DEPTH);
     return nullptr;
 }
 
@@ -168,24 +260,34 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
     const txn_id_t self_id = txn->get_transaction_id();
 
     constexpr int MAX_DEPTH = 100;
+    std::optional<TransactionManager::ShadowVisibilityResult> final_shadow_candidate;
+    TupleMeta final_shadow_meta{};
     for (int attempt = 0; attempt < 2; ++attempt) {
         auto base = fh->get_record_view_with_meta(rid);
         TupleMeta meta = base.meta;
+        auto shadow_candidate = PrepareReadViewShadowCandidate(txn_mgr, *txn, meta, base.view.data, base.view.size);
+        final_shadow_candidate = shadow_candidate;
+        final_shadow_meta = meta;
         std::optional<UndoLog> current_undo;
         bool retry = false;
+        auto finish = [&](RmRecordViewWithMeta result, const TupleMeta& legacy_meta, int depth, bool deleted) {
+            result.meta = legacy_meta;
+            FinishReadViewShadowCandidate(txn_mgr, shadow_candidate, result, deleted, depth);
+            return result;
+        };
 
         for (int depth = 0; depth < MAX_DEPTH; ++depth) {
             if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
                 if (meta.is_deleted_) {
-                    return {};
+                    return finish({}, meta, depth, true);
                 }
                 base.meta = meta;
-                return base;
+                return finish(std::move(base), meta, depth, false);
             }
 
             if (!meta.is_committed_) {
                 if (!meta.version_chain_head_.IsValid()) {
-                    return {};
+                    return finish({}, meta, depth, false);
                 }
                 current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
                 if (!current_undo.has_value()) {
@@ -197,13 +299,13 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
             }
 
             if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-                return {};
+                return finish({}, meta, depth, true);
             }
 
             if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
                 if (!current_undo.has_value()) {
                     base.meta = meta;
-                    return base;
+                    return finish(std::move(base), meta, depth, false);
                 }
                 auto owned = std::make_unique<RmRecord>(static_cast<int>(current_undo->old_tuple_data_.size()));
                 memcpy(owned->data, current_undo->old_tuple_data_.data(), current_undo->old_tuple_data_.size());
@@ -211,11 +313,11 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
                 result.meta = meta;
                 result.view = RmRecordView{owned->data, static_cast<uint32_t>(owned->size)};
                 result.owned = std::move(owned);
-                return result;
+                return finish(std::move(result), meta, depth, false);
             }
 
             if (!meta.version_chain_head_.IsValid()) {
-                return {};
+                return finish({}, meta, depth, false);
             }
             current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
             if (!current_undo.has_value()) {
@@ -226,10 +328,13 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
         }
 
         if (!retry) {
-            return {};
+            return finish({}, meta, MAX_DEPTH, false);
         }
     }
-    return {};
+    RmRecordViewWithMeta empty;
+    empty.meta = final_shadow_meta;
+    FinishReadViewShadowCandidate(txn_mgr, final_shadow_candidate, empty, false, MAX_DEPTH);
+    return empty;
 }
 
 // Resolve visibility from a coherent page-latched copy of the current base
@@ -254,26 +359,33 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
     const timestamp_t read_ts = txn->get_read_ts();
     const txn_id_t self_id = txn->get_transaction_id();
     TupleMeta meta = base_meta;
+    auto shadow_candidate = PrepareReadViewShadowCandidate(txn_mgr, *txn, base_meta, base_data, base_size);
     std::optional<UndoLog> current_undo;
+    auto finish = [&](RmRecordViewWithMeta result, const TupleMeta& legacy_meta, int depth, bool deleted) {
+        result.meta = legacy_meta;
+        FinishReadViewShadowCandidate(txn_mgr, shadow_candidate, result, deleted, depth);
+        return result;
+    };
 
     constexpr int MAX_DEPTH = 100;
     for (int depth = 0; depth < MAX_DEPTH; ++depth) {
         if (!meta.is_committed_ && meta.writer_txn_id_ == self_id) {
             if (meta.is_deleted_) {
-                return {};
+                return finish({}, meta, depth, true);
             }
             auto result = copied_base();
             result.meta = meta;
-            return result;
+            return finish(std::move(result), meta, depth, false);
         }
 
         if (!meta.is_committed_) {
             if (!meta.version_chain_head_.IsValid()) {
-                return {};
+                return finish({}, meta, depth, false);
             }
             current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
             if (!current_undo.has_value()) {
                 *needs_heap_reread = true;
+                // The heap reread owns the sole final shadow observation.
                 return {};
             }
             meta = current_undo->old_meta_;
@@ -281,14 +393,14 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
         }
 
         if (meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-            return {};
+            return finish({}, meta, depth, true);
         }
 
         if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
             if (!current_undo.has_value()) {
                 auto result = copied_base();
                 result.meta = meta;
-                return result;
+                return finish(std::move(result), meta, depth, false);
             }
             auto owned = std::make_unique<RmRecord>(static_cast<int>(current_undo->old_tuple_data_.size()));
             memcpy(owned->data, current_undo->old_tuple_data_.data(), current_undo->old_tuple_data_.size());
@@ -296,20 +408,21 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
             result.meta = meta;
             result.view = RmRecordView{owned->data, static_cast<uint32_t>(owned->size)};
             result.owned = std::move(owned);
-            return result;
+            return finish(std::move(result), meta, depth, false);
         }
 
         if (!meta.version_chain_head_.IsValid()) {
-            return {};
+            return finish({}, meta, depth, false);
         }
         current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
         if (!current_undo.has_value()) {
             *needs_heap_reread = true;
+            // The heap reread owns the sole final shadow observation.
             return {};
         }
         meta = current_undo->old_meta_;
     }
-    return {};
+    return finish({}, meta, MAX_DEPTH, false);
 }
 
 /* The caller must already hold this transaction's record X lock. */

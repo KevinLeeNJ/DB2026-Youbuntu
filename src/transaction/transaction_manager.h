@@ -28,6 +28,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction.h"
 #include "common/transaction_phase_metrics.h"
+#include "common/read_view_shadow_metrics.h"
 #include "watermark.h"
 #include "recovery/log_manager.h"
 #include "concurrency/lock_manager.h"
@@ -65,6 +66,7 @@ public:
     using CheckpointAdmissionTestHook = std::function<void(std::string_view)>;
     using AbortBeforeLockReleaseTestHook = std::function<void(txn_id_t)>;
     using AbortDeleteUndoPublicationTestHook = std::function<void()>;
+    using ReadViewCaptureTestHook = std::function<void(std::string_view)>;
 
     // Test-only injection for deterministic publication scheduling and the
     // direct-publication negative oracle. Production construction does not
@@ -94,6 +96,7 @@ public:
         concurrency_mode_ = concurrency_mode;
         commit_publication_helping_enabled_ = test_options.helping;
         commit_publication_test_hook_ = std::move(test_options.hook);
+        InitializeReadViewShadow();
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
 
@@ -106,6 +109,7 @@ public:
         phase_metrics_ = phase_metrics;
         concurrency_mode_ = concurrency_mode;
         checkpoint_admission_test_hook_ = std::move(test_options.hook);
+        InitializeReadViewShadow();
         gc_thread_ = std::thread(&TransactionManager::GarbageCollectionLoop, this);
     }
 
@@ -113,6 +117,72 @@ public:
 
     bool commit_publication_helping_enabled_for_test() const noexcept {
         return commit_publication_helping_enabled_;
+    }
+    bool read_view_shadow_enabled() const noexcept { return read_view_mode_ == ReadViewMode::Shadow; }
+    ReadViewShadowMetrics::Snapshot read_view_shadow_snapshot() const noexcept {
+        return read_view_shadow_metrics_ == nullptr ? ReadViewShadowMetrics::Snapshot{} : read_view_shadow_metrics_->snapshot();
+    }
+    struct ShadowVisibilityResult {
+        bool visible{false};
+        bool deleted{false};
+        bool undo_missing{false};
+        TupleMeta meta{};
+        int depth{-1};
+        std::vector<char> payload;
+    };
+
+    // Resolves one metadata version under the immutable shadow ReadView. The
+    // caller owns undo traversal; this method never changes legacy state.
+    bool ShadowVersionVisible(const Transaction& txn, const TupleMeta& meta) noexcept {
+        if (status_table_ == nullptr) return meta.is_committed_ && meta.commit_ts_ <= txn.get_read_ts();
+        const auto view = txn.get_read_view();
+        if (!view) return meta.is_committed_ && meta.commit_ts_ <= txn.get_read_ts();
+        if (meta.writer_txn_id_ == txn.get_transaction_id() && !meta.is_committed_) {
+            return true;
+        }
+        // All state needed for ordinary tuple classification is captured in
+        // the immutable view. Do not take the global status-table mutex here:
+        // retired writers intentionally fall back to durable TupleMeta.
+        if ((meta.writer_txn_id_ >= view->upper_limit) || view->contains(meta.writer_txn_id_)) {
+            return false;
+        }
+        return meta.is_committed_ && meta.commit_ts_ <= txn.get_read_ts();
+    }
+
+    // Legacy visibility remains authoritative. This is intentionally a
+    // non-throwing shadow observation; it never changes a reader's result,
+    // retry, lock, or publication control flow.
+    void ObserveReadViewShadow(const ShadowVisibilityResult& candidate, bool legacy_visible, bool legacy_deleted,
+                               const TupleMeta& legacy_meta, int legacy_depth,
+                               const std::vector<char>* legacy_payload) noexcept {
+        if (read_view_shadow_metrics_ == nullptr) return;
+        bool match = true;
+        if (candidate.undo_missing) {
+            read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::UndoMissing);
+            match = false;
+        }
+        if (candidate.visible != legacy_visible) {
+            if (candidate.deleted != legacy_deleted)
+                read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::DeleteMismatch);
+            else
+                read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::VersionMismatch);
+            match = false;
+        } else if (candidate.visible) {
+            if (candidate.depth != legacy_depth || candidate.meta != legacy_meta) {
+                read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::VersionMismatch);
+                match = false;
+            }
+            if (legacy_payload == nullptr || candidate.payload != *legacy_payload) {
+                read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::PayloadMismatch);
+                match = false;
+            }
+        } else if (candidate.depth != legacy_depth || candidate.meta != legacy_meta) {
+            // An absent result still has a terminal version decision. Do not
+            // hide divergent invisible/tombstone identities behind Match.
+            read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::VersionMismatch);
+            match = false;
+        }
+        if (match) read_view_shadow_metrics_->classify(ReadViewShadowMetrics::Classification::Match);
     }
 
     Transaction* begin(Transaction* txn, LogManager* log_manager,
@@ -135,6 +205,9 @@ public:
     // published. Callers must install and clear it outside the abort thread.
     void set_abort_delete_undo_publication_test_hook(AbortDeleteUndoPublicationTestHook hook) {
         abort_delete_undo_publication_test_hook_ = std::move(hook);
+    }
+    void set_read_view_capture_test_hook(ReadViewCaptureTestHook hook) {
+        read_view_capture_test_hook_ = std::move(hook);
     }
 
     void block_new_transactions_for_checkpoint();
@@ -329,6 +402,13 @@ public:
     std::unordered_map<page_id_t, std::unique_ptr<PageVersionInfo>> version_info_;
 
 private:
+    void InitializeReadViewShadow() {
+        read_view_mode_ = ReadViewModeFromEnvironment();
+        if (read_view_mode_ == ReadViewMode::Shadow) {
+            status_table_ = std::make_unique<TransactionStatusTable>();
+            read_view_shadow_metrics_ = std::make_unique<ReadViewShadowMetrics>();
+        }
+    }
     struct CommitPublicationRequest {
         enum class State {
             REGISTERED,
@@ -381,6 +461,14 @@ private:
     SmManager* sm_manager_;
     LockManager* lock_manager_;
     TransactionPhaseMetrics* phase_metrics_{nullptr};
+    ReadViewMode read_view_mode_{ReadViewMode::Off};
+    std::unique_ptr<TransactionStatusTable> status_table_;
+    std::unique_ptr<ReadViewShadowMetrics> read_view_shadow_metrics_;
+    ReadViewCaptureTestHook read_view_capture_test_hook_;
+    // Shadow-only lock order: checkpoint_latch_ -> shadow_lifecycle_latch_ ->
+    // commit_frontier_latch_ -> TransactionStatusTable. Commit/abort take only
+    // the lifecycle lock after their frontier work has completed.
+    std::mutex shadow_lifecycle_latch_;
 
     std::atomic<timestamp_t> last_commit_ts_{0}; // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0}; // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC

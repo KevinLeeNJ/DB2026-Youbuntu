@@ -26,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 #include "common/common.h"
+#include "transaction/read_view.h"
 #include "transaction/txn_defs.h"
 #include "record/rm_defs.h"
 
@@ -112,7 +113,7 @@ public:
 
     ~Transaction() = default;
 
-    inline txn_id_t get_transaction_id() {
+    inline txn_id_t get_transaction_id() const {
         return txn_id_;
     }
 
@@ -279,6 +280,8 @@ public:
     inline void set_read_ts(timestamp_t ts) {
         read_ts_ = ts;
     }
+    inline std::shared_ptr<const ActiveWriterReadView> get_read_view() const { return read_view_; }
+    inline void set_read_view(std::shared_ptr<const ActiveWriterReadView> read_view) { read_view_ = std::move(read_view); }
     inline size_t get_watermark_slot() const {
         return watermark_slot_;
     }
@@ -493,6 +496,7 @@ private:
     size_t si_locked_row_workspace_bytes_{0};
 
     std::atomic<timestamp_t> read_ts_{0};
+    std::shared_ptr<const ActiveWriterReadView> read_view_;
     size_t watermark_slot_{std::numeric_limits<size_t>::max()};
     /**
      * @brief 存储撤销日志。

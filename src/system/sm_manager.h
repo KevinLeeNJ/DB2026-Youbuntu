@@ -672,8 +672,9 @@ public:
                     page_handle.page->set_page_lsn(txn.get_prev_lsn());
                 }
                 FaultInjector::Point("mid_tuple_publication");
+                BufferPoolManager::mark_dirty_locked(page_handle.page);
             }
-            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
             offset = next;
         }
         if (clear_modified_slots) {

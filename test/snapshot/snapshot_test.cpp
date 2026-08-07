@@ -32,6 +32,7 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -42,6 +43,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 #include "errors.h"
 #include "execution/execution_manager.h"
+#include "execution/execution_common.h"
 #include "execution/row_mutation.h"
 #include "gtest/gtest.h"
 #include "index/ix_manager.h"
@@ -57,6 +59,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "transaction/concurrency/lock_manager.h"
 #include "transaction/transaction_manager.h"
+#include "transaction/read_view.h"
 
 // =============================================================================
 // SimpleThreadBarrier — reusable thread barrier (C++17 compatible)
@@ -696,6 +699,98 @@ private:
     txn_id_t txn_id_{INVALID_TXN_ID};
     IsolationLevel session_isolation_{DEFAULT_ISOLATION_LEVEL};
 };
+
+class ScopedReadViewShadowMode {
+public:
+    ScopedReadViewShadowMode() {
+        const char* current = std::getenv("RMDB_SI_READVIEW_MODE");
+        present_ = current != nullptr;
+        if (present_) value_ = current;
+        set_result_ = setenv("RMDB_SI_READVIEW_MODE", "shadow", 1);
+    }
+    ~ScopedReadViewShadowMode() {
+        if (present_) (void)setenv("RMDB_SI_READVIEW_MODE", value_.c_str(), 1);
+        else (void)unsetenv("RMDB_SI_READVIEW_MODE");
+    }
+    int set_result() const { return set_result_; }
+private:
+    std::string value_;
+    bool present_{false};
+    int set_result_{-1};
+};
+
+TEST(ReadViewShadowIntegrationTest, SnapshotReaderUsesLegacyUndoResultWithShadowEnabled) {
+    ScopedReadViewShadowMode env;
+    ASSERT_EQ(env.set_result(), 0);
+    SharedTestDB db("readview_shadow_real_undo_visible_record");
+    ASSERT_TRUE(db.txn()->read_view_shadow_enabled());
+    TestSession setup(&db);
+    ASSERT_TRUE(setup.exec_sql_ok("create table rv_shadow (id int, val int);"));
+    ASSERT_TRUE(setup.exec_sql_ok("insert into rv_shadow values (1, 10);"));
+    TestSession reader(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    TestSession writer(&db, IsolationLevel::SNAPSHOT_ISOLATION);
+    ASSERT_TRUE(reader.exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer.exec_sql_ok("begin;"));
+    ASSERT_TRUE(writer.exec_sql_ok("update rv_shadow set val = 20 where id = 1;"));
+    ASSERT_TRUE(writer.exec_sql_ok("commit;"));
+    const auto before = db.txn()->read_view_shadow_snapshot();
+    const std::string out = reader.exec_sql("select val from rv_shadow where id = 1;");
+    const auto after = db.txn()->read_view_shadow_snapshot();
+    EXPECT_NE(TestSession::trim_output(out).find("10"), std::string::npos);
+    EXPECT_GE(after.captures, before.captures);
+    EXPECT_GT(after.classification[static_cast<size_t>(ReadViewShadowMetrics::Classification::Match)],
+              before.classification[static_cast<size_t>(ReadViewShadowMetrics::Classification::Match)]);
+    for (size_t index = 1; index < static_cast<size_t>(ReadViewShadowMetrics::Classification::Count); ++index) {
+        EXPECT_EQ(after.classification[index], 0U);
+    }
+    ASSERT_TRUE(reader.exec_sql_ok("commit;"));
+}
+
+TEST(ReadViewShadowIntegrationTest, ExternalBeginCaptureFailureRestoresTransactionFields) {
+    ScopedReadViewShadowMode env;
+    ASSERT_EQ(env.set_result(), 0);
+    {
+        SharedTestDB db("readview_shadow_external_begin_failure");
+        ASSERT_TRUE(db.txn()->read_view_shadow_enabled());
+        Transaction external(5000, IsolationLevel::SNAPSHOT_ISOLATION);
+        external.set_state(TransactionState::DEFAULT);
+        external.set_start_ts(17);
+        external.set_read_ts(19);
+        auto original_view = std::make_shared<ActiveWriterReadView>();
+        original_view->self_id = 5000;
+        original_view->upper_limit = 5001;
+        external.set_read_view(original_view);
+        db.txn()->set_read_view_capture_test_hook([](std::string_view event) {
+            if (event == "begin") throw std::runtime_error("injected read-view capture failure");
+        });
+        EXPECT_THROW(db.txn()->begin(&external, db.log(), IsolationLevel::SNAPSHOT_ISOLATION), std::runtime_error);
+        EXPECT_EQ(external.get_state(), TransactionState::DEFAULT);
+        EXPECT_EQ(external.get_start_ts(), 17);
+        EXPECT_EQ(external.get_read_ts(), 19);
+        EXPECT_EQ(external.get_read_view(), original_view);
+        db.txn()->set_read_view_capture_test_hook({});
+    }
+}
+
+TEST(ReadViewShadowIntegrationTest, RcCaptureFailureContinuesLegacyAndSkipsShadowObservation) {
+    ScopedReadViewShadowMode env;
+    ASSERT_EQ(env.set_result(), 0);
+    {
+        SharedTestDB db("readview_shadow_rc_capture_failure");
+        TestSession setup(&db);
+        ASSERT_TRUE(setup.exec_sql_ok("create table rv_rc_fail (id int);"));
+        ASSERT_TRUE(setup.exec_sql_ok("insert into rv_rc_fail values (1);"));
+        db.txn()->set_read_view_capture_test_hook([](std::string_view event) {
+            if (event == "statement") throw std::runtime_error("injected RC capture failure");
+        });
+        const auto before = db.txn()->read_view_shadow_snapshot();
+        TestSession reader(&db, IsolationLevel::READ_COMMITTED);
+        EXPECT_NE(TestSession::trim_output(reader.exec_sql("select * from rv_rc_fail;")).find("1"), std::string::npos);
+        const auto after = db.txn()->read_view_shadow_snapshot();
+        EXPECT_EQ(after.classification, before.classification);
+        db.txn()->set_read_view_capture_test_hook({});
+    }
+}
 
 TEST(SnapshotIsolationConcurrencyTest, SiFirstLockAbortsWhileOwnerRemainsActive) {
     SharedTestDB db("snapshot_si_first_lock_immediate_conflict");
@@ -4091,4 +4186,77 @@ TEST_F(SnapshotTest, Syntax_SetTransaction_CaseInsensitive) {
     // Keywords should be case-insensitive (like all SQL in RMDB)
     EXPECT_TRUE(s->exec_sql_ok("SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;"));
     EXPECT_TRUE(s->exec_sql_ok("set transaction isolation level serializable;"));
+}
+
+TEST(ReadViewShadowTest, CaptureIncludesActiveAndIsImmutable) {
+    TransactionStatusTable table;
+    std::atomic<txn_id_t> next{0};
+    auto first = table.AllocateRegisterAndCapture(next);
+    auto second = table.AllocateRegisterAndCapture(next);
+    EXPECT_EQ(first->self_id, 0);
+    EXPECT_EQ(first->upper_limit, 1);
+    ASSERT_EQ(first->active_txn_ids.size(), 1U);
+    EXPECT_TRUE(first->contains(0));
+    EXPECT_EQ(second->upper_limit, 2);
+    EXPECT_TRUE(second->contains(0));
+    EXPECT_TRUE(second->contains(1));
+    table.SetCommitted(0, 7);
+    // The first view is a captured value, not a live active-set alias.
+    EXPECT_TRUE(first->contains(0));
+    EXPECT_FALSE(table.Capture(1, 2)->contains(0));
+}
+
+TEST(ReadViewShadowTest, StatusOrderingAndRcReplacementCapture) {
+    TransactionStatusTable table;
+    std::atomic<txn_id_t> next{0};
+    auto initial = table.AllocateRegisterAndCapture(next);
+    table.SetCommitting(initial->self_id);
+    table.SetAborted(initial->self_id);
+    EXPECT_FALSE(table.Capture(1, next.load())->contains(initial->self_id));
+    auto replacement = table.Capture(9, next.load());
+    EXPECT_EQ(replacement->self_id, 9);
+    EXPECT_EQ(replacement->upper_limit, 1);
+    EXPECT_FALSE(replacement->contains(initial->self_id));
+}
+
+TEST(ReadViewShadowTest, ExistingTransactionRegistersBeforeItsViewIsCaptured) {
+    TransactionStatusTable table;
+    auto existing = table.RegisterAndCapture(41, 42);
+    EXPECT_EQ(existing->self_id, 41);
+    EXPECT_EQ(existing->upper_limit, 42);
+    EXPECT_TRUE(existing->contains(41));
+}
+
+TEST(ReadViewShadowTest, StrictModeParsingRejectsUnsupportedImplementations) {
+    const char* previous = std::getenv("RMDB_SI_READVIEW_MODE");
+    const std::string saved = previous == nullptr ? "" : previous;
+    const bool had_previous = previous != nullptr;
+    unsetenv("RMDB_SI_READVIEW_MODE");
+    EXPECT_EQ(ReadViewModeFromEnvironment(), ReadViewMode::Off);
+    ASSERT_EQ(setenv("RMDB_SI_READVIEW_MODE", "shadow", 1), 0);
+    EXPECT_EQ(ReadViewModeFromEnvironment(), ReadViewMode::Shadow);
+    ASSERT_EQ(setenv("RMDB_SI_READVIEW_MODE", "sync", 1), 0);
+    EXPECT_THROW(ReadViewModeFromEnvironment(), std::invalid_argument);
+    if (had_previous) {
+        ASSERT_EQ(setenv("RMDB_SI_READVIEW_MODE", saved.c_str(), 1), 0);
+    } else {
+        unsetenv("RMDB_SI_READVIEW_MODE");
+    }
+}
+
+TEST(ReadViewShadowTest, ActiveCaptureCostTracksOnlyActiveTransactions) {
+    TransactionStatusTable table;
+    constexpr txn_id_t kFirst = 100;
+    constexpr txn_id_t kActive = 8;
+    for (txn_id_t id = kFirst; id < kFirst + 128; ++id) {
+        table.RegisterAndCapture(id, id + 1);
+        table.SetCommitted(id, id);
+    }
+    for (txn_id_t id = kFirst + 128; id < kFirst + 128 + kActive; ++id) {
+        table.RegisterAndCapture(id, id + 1);
+    }
+    auto view = table.Capture(kFirst + 128, kFirst + 128 + kActive);
+    EXPECT_EQ(view->active_txn_ids.size(), static_cast<size_t>(kActive));
+    EXPECT_TRUE(view->contains(kFirst + 128));
+    EXPECT_FALSE(view->contains(kFirst));
 }
