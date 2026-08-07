@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/buffer_pool_manager.h"
 #include "system/sm.h"
 #include "transaction/transaction_manager.h"
+#include "minilog.h"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -770,6 +772,29 @@ TEST(LogManagerTest, NonemptyLegacyWalRemainsLegacyAtStartup) {
     EXPECT_FALSE(disk.wal_is_segmented());
     EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), legacy_size);
     EXPECT_FALSE(disk.is_file("db.log.0.0"));
+}
+
+TEST(LogManagerTest, WarnLogIsVisibleAtWarnLevel) {
+    FILE* file = std::tmpfile();
+    ASSERT_NE(file, nullptr);
+    auto& logger = minilog::Logger::get();
+    const minilog::LogLevel previous_level = logger.get_level();
+    logger.init(file, false);
+    logger.set_level(minilog::LogLevel::WARN);
+
+    LOG_INFO("minilog-level-test-info");
+    LOG_WARN("minilog-level-test-warn");
+    logger.flush();
+    ASSERT_EQ(std::fseek(file, 0, SEEK_SET), 0);
+    std::array<char, 1024> bytes{};
+    const size_t count = std::fread(bytes.data(), 1, bytes.size() - 1, file);
+    const std::string output(bytes.data(), count);
+    EXPECT_EQ(output.find("minilog-level-test-info"), std::string::npos);
+    EXPECT_NE(output.find("minilog-level-test-warn"), std::string::npos);
+
+    logger.stop();
+    logger.set_level(previous_level);
+    std::fclose(file);
 }
 
 TEST(LogManagerTest, SegmentedLayoutRejectsMissingOrShortPrefixSegment) {

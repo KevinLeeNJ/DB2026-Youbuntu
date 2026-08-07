@@ -15,7 +15,9 @@ public:
     struct Snapshot {
         TimingSnapshot foreground_dirty_eviction{}, foreground_dependency_wait{}, foreground_pwrite{},
             foreground_read{};
-        uint64_t background_flush_calls{}, background_pages{}, congestion_pauses{}, congestion_throttles{}, congestion_ramps{};
+        uint64_t background_flush_calls{}, background_pages{}, congestion_pauses{}, congestion_throttles{},
+            congestion_ramps{};
+        uint64_t clean_victims{}, dirty_victim_fallbacks{}, victim_search_scanned{};
         TimingSnapshot background_flush{};
     };
     static bool ParseEnabled(const char* value) noexcept {
@@ -36,7 +38,11 @@ public:
                 background_flush_calls_.load(std::memory_order_relaxed),
                 background_pages_.load(std::memory_order_relaxed),
                 congestion_pauses_.load(std::memory_order_relaxed),
-                congestion_throttles_.load(std::memory_order_relaxed), congestion_ramps_.load(std::memory_order_relaxed),
+                congestion_throttles_.load(std::memory_order_relaxed),
+                congestion_ramps_.load(std::memory_order_relaxed),
+                clean_victims_.load(std::memory_order_relaxed),
+                dirty_victim_fallbacks_.load(std::memory_order_relaxed),
+                victim_search_scanned_.load(std::memory_order_relaxed),
                 read(background_flush_)};
     }
     void foreground_dirty_eviction(uint64_t ns) noexcept {
@@ -62,8 +68,26 @@ public:
         if (enabled_)
             congestion_pauses_.fetch_add(1, std::memory_order_relaxed);
     }
-    void congestion_throttle() noexcept { if (enabled_) congestion_throttles_.fetch_add(1, std::memory_order_relaxed); }
-    void congestion_ramp() noexcept { if (enabled_) congestion_ramps_.fetch_add(1, std::memory_order_relaxed); }
+    void congestion_throttle() noexcept {
+        if (enabled_)
+            congestion_throttles_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void congestion_ramp() noexcept {
+        if (enabled_)
+            congestion_ramps_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void clean_victim() noexcept {
+        if (enabled_)
+            clean_victims_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void dirty_victim_fallback() noexcept {
+        if (enabled_)
+            dirty_victim_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void victim_search_scanned(uint64_t count) noexcept {
+        if (enabled_)
+            victim_search_scanned_.fetch_add(count, std::memory_order_relaxed);
+    }
 
 private:
     struct alignas(64) Timing {
@@ -85,6 +109,8 @@ private:
     }
     bool enabled_{false};
     Timing foreground_dirty_eviction_, foreground_dependency_wait_, foreground_pwrite_, foreground_read_;
-    std::atomic<uint64_t> background_flush_calls_{0}, background_pages_{0}, congestion_pauses_{0}, congestion_throttles_{0}, congestion_ramps_{0};
+    std::atomic<uint64_t> background_flush_calls_{0}, background_pages_{0}, congestion_pauses_{0},
+        congestion_throttles_{0}, congestion_ramps_{0};
+    std::atomic<uint64_t> clean_victims_{0}, dirty_victim_fallbacks_{0}, victim_search_scanned_{0};
     Timing background_flush_;
 };

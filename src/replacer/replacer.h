@@ -39,6 +39,13 @@ public:
      */
     virtual void unpin(frame_id_t frame_id) = 0;
 
+    // Put back a candidate removed by victim() without treating it as a new
+    // access. CLOCK preserves its zero reference count so a bounded caller
+    // can inspect several candidates without perturbing replacement state.
+    virtual void restore(frame_id_t frame_id) {
+        unpin(frame_id);
+    }
+
     /** @return the number of elements in the replacer that can be victimized */
     virtual size_t Size() = 0;
 };

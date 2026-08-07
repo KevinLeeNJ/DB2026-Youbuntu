@@ -24,6 +24,7 @@ static constexpr uint32_t INDEX_SMO_MAGIC = 0x4958534dU;  // "IXSM"
 static constexpr uint32_t INDEX_BIND_MAGIC = 0x49584244U; // "IXBD"
 static constexpr uint16_t INDEX_SMO_VERSION_V1 = 1;
 static constexpr uint16_t INDEX_SMO_VERSION_V2 = 2;
+static constexpr uint16_t INDEX_SMO_VERSION_V3 = 3;
 static constexpr uint16_t INDEX_BIND_VERSION_V1 = 1;
 static constexpr uint16_t INDEX_BIND_VERSION_V2 = 2;
 // Kept as an alias for code that emits the original renew-binding format.

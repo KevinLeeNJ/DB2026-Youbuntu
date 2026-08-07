@@ -2655,6 +2655,14 @@ func (r *officialWorkerReport) attribute(finish, warmupEnd time.Time, measure ti
 func runWorker(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
 	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
 	stop <-chan struct{}, output chan<- workerReport, factory backendFactory, edgeSinks ...paymentEdgeSink) {
+	runWorkerWithMaxProvenance(workerID, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think,
+		reconnectEachTxn, maxConflictRetries, stats, stop, output, factory, nil, edgeSinks...)
+}
+
+func runWorkerWithMaxProvenance(workerID, round int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
+	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
+	stop <-chan struct{}, output chan<- workerReport, factory backendFactory, maxProvenance *maxProvenanceObserver,
+	edgeSinks ...paymentEdgeSink) {
 	var edgeSink paymentEdgeSink
 	if len(edgeSinks) > 0 {
 		edgeSink = edgeSinks[0]
@@ -2727,7 +2735,8 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 			stats.record(phase, txnType, "abandoned")
 			continue
 		}
-		latency := float64(time.Since(start).Microseconds()) / 1000.0
+		finish := time.Now()
+		latency := float64(finish.Sub(start).Microseconds()) / 1000.0
 		if latencyBackend != nil {
 			latencyBackend.finishLatencyPhaseTxn(phase, err == nil, attempts > 1)
 		}
@@ -2742,6 +2751,9 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 		}
 
 		if err == nil {
+			if phase == "measure" && maxProvenance != nil {
+				maxProvenance.recordMeasureCommit(finish, txnType, latency, attempts)
+			}
 			local.record(phase, txnType, "commit", latency, "")
 			stats.record(phase, txnType, "commit")
 		} else if errors.Is(err, errInvalidItem) {
@@ -2781,6 +2793,14 @@ func runWorker(workerID, round int, seed int64, p profile, policy string, warmup
 func runRound(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
 	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
 	factory backendFactory, ledger *txnLedger, edgeSinks ...paymentEdgeSink) (*result, error) {
+	return runRoundWithMaxProvenance(round, workers, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think,
+		reconnectEachTxn, maxConflictRetries, stats, factory, ledger, nil, edgeSinks...)
+}
+
+func runRoundWithMaxProvenance(round, workers int, seed int64, p profile, policy string, warmupEnd, measureEnd time.Time,
+	measureSeconds int, think time.Duration, reconnectEachTxn bool, maxConflictRetries int, stats *liveStats,
+	factory backendFactory, ledger *txnLedger, maxProvenance *maxProvenanceObserver,
+	edgeSinks ...paymentEdgeSink) (*result, error) {
 	var edgeSink paymentEdgeSink
 	if len(edgeSinks) > 0 {
 		edgeSink = edgeSinks[0]
@@ -2793,8 +2813,8 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			runWorker(id, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think, reconnectEachTxn,
-				maxConflictRetries, stats, stop, partials, factory, edgeSink)
+			runWorkerWithMaxProvenance(id, round, seed, p, policy, warmupEnd, measureEnd, measureSeconds, think,
+				reconnectEachTxn, maxConflictRetries, stats, stop, partials, factory, maxProvenance, edgeSink)
 		}(workerID)
 	}
 	go func() {
@@ -2824,6 +2844,14 @@ func runRound(round, workers int, seed int64, p profile, policy string, warmupEn
 func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officialRoutingPlan, warmupEnd time.Time,
 	measure time.Duration, windows int, think time.Duration, maxConflictRetries int, stats []*liveStats, stop <-chan struct{},
 	output chan<- officialWorkerReport, c txnBackend, edgeSinks ...paymentEdgeSink) {
+	runOfficialWorkerWithMaxProvenance(workerID, round, seed, p, plan, warmupEnd, measure, windows, think,
+		maxConflictRetries, stats, stop, output, c, nil, edgeSinks...)
+}
+
+func runOfficialWorkerWithMaxProvenance(workerID, round int, seed int64, p profile, plan *officialRoutingPlan,
+	warmupEnd time.Time, measure time.Duration, windows int, think time.Duration, maxConflictRetries int,
+	stats []*liveStats, stop <-chan struct{}, output chan<- officialWorkerReport, c txnBackend,
+	maxProvenance *maxProvenanceObserver, edgeSinks ...paymentEdgeSink) {
 	var edgeSink paymentEdgeSink
 	if len(edgeSinks) > 0 {
 		edgeSink = edgeSinks[0]
@@ -2922,6 +2950,9 @@ func runOfficialWorker(workerID, round int, seed int64, p profile, plan *officia
 		phaseStats := stats[window+1]
 
 		if err == nil {
+			if phase == "measure" && maxProvenance != nil {
+				maxProvenance.recordMeasureCommit(finish, txnType, latency, attempts)
+			}
 			local.record(phase, txnType, "commit", latency, "")
 			local.recordCompletion(ctx.wID, int(attempt.values[ledgerDeliveryOrders]))
 			phaseStats.record(phase, txnType, "commit")
@@ -3141,6 +3172,14 @@ func runWalPhaseMarkers(start time.Time, warmup, measure time.Duration, rounds i
 func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, measure, progress int, think time.Duration,
 	maxConflictRetries int, reconnectEachTxn bool, roundOffset int, factory backendFactory,
 	ledger *txnLedger, walPhaseMarkerSocket string, edgeSinks ...paymentEdgeSink) ([]*result, error) {
+	return runOfficialWindowsWithMaxProvenance(rounds, workers, seed, p, warmup, measure, progress, think,
+		maxConflictRetries, reconnectEachTxn, roundOffset, factory, ledger, walPhaseMarkerSocket, nil, edgeSinks...)
+}
+
+func runOfficialWindowsWithMaxProvenance(rounds, workers int, seed int64, p profile, warmup, measure, progress int,
+	think time.Duration, maxConflictRetries int, reconnectEachTxn bool, roundOffset int, factory backendFactory,
+	ledger *txnLedger, walPhaseMarkerSocket string, maxProvenance *maxProvenanceObserver,
+	edgeSinks ...paymentEdgeSink) ([]*result, error) {
 	var edgeSink paymentEdgeSink
 	if len(edgeSinks) > 0 {
 		edgeSink = edgeSinks[0]
@@ -3187,8 +3226,8 @@ func runOfficialWindows(rounds, workers int, seed int64, p profile, warmup, meas
 	printProgress(0, rounds, "warmup", 0, warmup, stats[0])
 	go monitorOfficialProgress(rounds, warmup, measure, progress, start, stats, monitorStop, monitorDone)
 	for workerID, backend := range backends {
-		go runOfficialWorker(workerID, roundOffset+1, seed, p, plan, warmupEnd, measureDuration, rounds, think,
-			maxConflictRetries, stats, stop, partials, backend, edgeSink)
+		go runOfficialWorkerWithMaxProvenance(workerID, roundOffset+1, seed, p, plan, warmupEnd, measureDuration,
+			rounds, think, maxConflictRetries, stats, stop, partials, backend, maxProvenance, edgeSink)
 	}
 
 	warmupResult := newResult(0)
@@ -3898,6 +3937,9 @@ func main() {
 	latencyPhaseSampleEvery := flag.Uint64("latency-phase-sample-every", latencyPhaseSampleDefault,
 		"sample every N final successful logical transactions per connection when --latency-phase-observe is set")
 	latencyPhaseOut := flag.String("latency-phase-out", "", "optional JSON sidecar for --latency-phase-observe; result JSON is unchanged")
+	maxProvenance := flag.Bool("max-provenance", maxProvenanceEnabledFromEnv(os.Getenv("RMDB_CLIENT_MAX_PROVENANCE")),
+		"record sparse measurement-success max-latency provenance; also enabled by RMDB_CLIENT_MAX_PROVENANCE=1")
+	maxProvenanceOut := flag.String("max-provenance-out", "", "JSONL sidecar for --max-provenance; defaults to <json-out>.max.jsonl")
 	flag.Parse()
 	if latencyPhaseSampleEnvErr != nil {
 		fmt.Fprintln(os.Stderr, latencyPhaseSampleEnvErr)
@@ -4207,6 +4249,19 @@ func main() {
 		os.Exit(2)
 	}
 	latencyObserver := newLatencyPhaseObserver(*latencyPhaseObserve, *latencyPhaseSampleEvery)
+	maxProvenanceEnabled := *maxProvenance || *maxProvenanceOut != ""
+	maxProvenancePath := *maxProvenanceOut
+	if maxProvenanceEnabled && maxProvenancePath == "" {
+		maxProvenancePath = *jsonOut + ".max.jsonl"
+	}
+	maxObserver, maxObserverErr := newMaxProvenanceObserver(maxProvenanceEnabled, maxProvenancePath, time.Now())
+	if maxObserverErr != nil {
+		fmt.Fprintln(os.Stderr, maxObserverErr)
+		os.Exit(1)
+	}
+	if maxObserver != nil {
+		fmt.Printf("[max-provenance] sidecar=%s\n", maxProvenancePath)
+	}
 	var factory backendFactory
 	if *backend == "sqlite" {
 		factory = func() (txnBackend, error) {
@@ -4301,8 +4356,9 @@ func main() {
 	doc := document{Config: config{Mode: *mode, Backend: *backend, Isolation: *isolation, SQLitePath: *sqlitePath, SQLiteBegin: *sqliteBegin, Warehouses: p.warehouses, Workers: *workers, Warmup: *warmup, Measure: *measure, Rounds: *rounds, ProgressInterval: *progress, Seed: *seed, Think: think.String(), ReconnectEachTxn: *reconnectEachTxn, MaxConflictRetries: *maxConflictRetries, WarehousePolicy: *policy, BaselineWarehouseTotal: p.warehouses, BaselineDistrictTotal: p.warehouses * p.districtsPerWarehouse, BaselineCustomerTotal: p.warehouses * p.districtsPerWarehouse * p.customersPerDistrict, BaselineItemTotal: p.itemCount, BaselineStockTotal: p.warehouses * p.itemCount, BaselineOrdersTotal: baseOrders}, Baselines: baselines}
 	var postRunDiagnosticErr error
 	if *mode == "official-equivalent" {
-		windows, runErr := runOfficialWindows(*rounds, *workers, *seed, p, *warmup, *measure, *progress, *think,
-			*maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger, *walPhaseMarkerSocket, edgeSink)
+		windows, runErr := runOfficialWindowsWithMaxProvenance(*rounds, *workers, *seed, p, *warmup, *measure, *progress,
+			*think, *maxConflictRetries, *reconnectEachTxn, *roundOffset, factory, ledger, *walPhaseMarkerSocket,
+			maxObserver, edgeSink)
 		if runErr != nil {
 			if windows == nil {
 				fmt.Fprintln(os.Stderr, runErr)
@@ -4320,8 +4376,8 @@ func main() {
 			monitorStop := make(chan struct{})
 			monitorDone := make(chan struct{})
 			go monitorProgress(round, *rounds, *warmup, *measure, *progress, warmupEnd, measureEnd, stats, monitorStop, monitorDone)
-			combined, roundErr := runRound(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd, measureEnd,
-				*measure, *think, *reconnectEachTxn, *maxConflictRetries, stats, factory, ledger, edgeSink)
+			combined, roundErr := runRoundWithMaxProvenance(*roundOffset+round, *workers, *seed, p, *policy, warmupEnd,
+				measureEnd, *measure, *think, *reconnectEachTxn, *maxConflictRetries, stats, factory, ledger, maxObserver, edgeSink)
 			close(monitorStop)
 			<-monitorDone
 			if roundErr != nil {
@@ -4352,6 +4408,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := latencyObserver.emit(*latencyPhaseOut); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := maxObserver.close(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

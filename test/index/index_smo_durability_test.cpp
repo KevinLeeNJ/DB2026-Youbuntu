@@ -29,12 +29,15 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "gtest/gtest.h"
 #include "recovery/index_smo_log.h"
@@ -126,6 +129,17 @@ IxFileHdr WalImageLayout(int col_len = 13, int btree_order = 11) {
     file_hdr.btree_order_ = btree_order;
     file_hdr.keys_size_ = IxKeysSize(btree_order + 1, col_len);
     return file_hdr;
+}
+
+std::array<char, PAGE_SIZE> WalImageHeader(const IxFileHdr& layout) {
+    IxFileHdr header(IX_NO_PAGE, 32, IX_INIT_ROOT_PAGE, 1, layout.col_tot_len_, layout.btree_order_, layout.keys_size_,
+                     IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
+    header.col_types_.push_back(TYPE_STRING);
+    header.col_lens_.push_back(layout.col_tot_len_);
+    header.update_tot_len();
+    std::array<char, PAGE_SIZE> image{};
+    header.serialize(image.data());
+    return image;
 }
 
 std::array<char, PAGE_SIZE> WalImagePage(const IxFileHdr& file_hdr, int num_key, char fill = 'x') {
@@ -574,6 +588,148 @@ TEST(IndexSmoWalV2Test, RoundTripsMixedRawAndRleImagesWithMaterialSizeReduction)
     RecordProperty("v1_raw_bytes", static_cast<int>(legacy_bytes));
     EXPECT_LT(bytes.size() * 100, legacy_bytes * 45)
         << "the sparse page/header sample should encode to less than 45% of the v1 full-image record";
+}
+
+TEST(IndexSmoWalV3Test, RoundTripsStructuredCanonicalPageAndRejectsLayoutMismatch) {
+    const IxFileHdr layout = WalImageLayout(16, 32);
+    IndexSmoWalData data;
+    data.index_file_name = "v3_structured.idx";
+    data.index_generation = 73;
+    data.pages.resize(1);
+    data.pages[0].page_no = IX_INIT_ROOT_PAGE;
+    data.pages[0].bytes = WalImagePage(layout, 20);
+    data.header = WalImageHeader(layout);
+
+    const std::vector<char> bytes = SerializeIndexSmo(data);
+    ASSERT_EQ(read_unaligned<uint16_t>(bytes.data() + OFFSET_LOG_DATA + sizeof(uint32_t)), INDEX_SMO_VERSION_V3);
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &parsed));
+    for (uint32_t index = 0; index < parsed.page_count; ++index) {
+        EXPECT_EQ(std::memcmp(parsed.page_image(index), data.pages[index].bytes.data(), PAGE_SIZE), 0);
+    }
+
+    std::vector<char> corrupt = bytes;
+    const uint32_t layout_offset = OFFSET_LOG_DATA + kIndexSmoFixedPayloadBytes;
+    const int bad_order = layout.btree_order_ + 1;
+    std::memcpy(corrupt.data() + layout_offset + sizeof(int) * 1, &bad_order, sizeof(bad_order));
+    RefreshIndexSmoChecksum(&corrupt);
+    EXPECT_FALSE(ParseIndexSmoWal(IndexSmoViewOf(corrupt), &parsed));
+}
+
+TEST(IndexSmoWalV3Test, WordBitmapWinsForOfficialLikeCanonicalPageAndFailsClosed) {
+    const IxFileHdr layout = WalImageLayout(4, 300);
+    IndexSmoWalData data;
+    data.index_file_name = "v3_bitmap.idx";
+    data.index_generation = 79;
+    data.pages.resize(4);
+    data.pages[0].page_no = IX_INIT_ROOT_PAGE;
+    data.pages[0].bytes.fill(0);
+    const IxPageHdr page_hdr{.next_free_page_no = IX_NO_PAGE,
+                             .parent = 7,
+                             .num_key = 300,
+                             .is_leaf = true,
+                             .prev_leaf = 3,
+                             .next_leaf = 9};
+    std::memcpy(data.pages[0].bytes.data(), &page_hdr, sizeof(page_hdr));
+    for (int key = 0; key < 300; ++key) {
+        char* bytes = data.pages[0].bytes.data() + sizeof(IxPageHdr) + key * layout.col_tot_len_;
+        const char value = (key / 2) % 2 == 0 ? 'K' : 'J';
+        std::memset(bytes, value, layout.col_tot_len_);
+        char* rid_bytes = data.pages[0].bytes.data() + sizeof(IxPageHdr) + layout.keys_size_ + key * sizeof(Rid);
+        std::memset(rid_bytes, value, sizeof(Rid));
+    }
+    for (size_t index = 1; index < data.pages.size(); ++index) {
+        data.pages[index].page_no = IX_INIT_ROOT_PAGE + static_cast<page_id_t>(index);
+        data.pages[index].bytes = data.pages[0].bytes;
+        for (int key = 0; key < 300; ++key) {
+            char* bytes = data.pages[index].bytes.data() + sizeof(IxPageHdr) + key * layout.col_tot_len_;
+            std::memset(bytes, 'K', layout.col_tot_len_);
+            const Rid rid{123, 456};
+            std::memcpy(data.pages[index].bytes.data() + sizeof(IxPageHdr) + layout.keys_size_ + key * sizeof(Rid), &rid,
+                        sizeof(rid));
+        }
+    }
+    data.header = WalImageHeader(layout);
+    const std::vector<char> bytes = SerializeIndexSmo(data);
+    const uint32_t image_offset = OFFSET_LOG_DATA + kIndexSmoFixedPayloadBytes + sizeof(int) * 3 +
+                                  data.index_file_name.size() + sizeof(page_id_t);
+    ASSERT_EQ(static_cast<uint8_t>(bytes[image_offset]), 4U);
+    const size_t v2_baseline = LOG_HEADER_SIZE + kIndexSmoFixedPayloadBytes + data.index_file_name.size() +
+                               data.pages.size() * (sizeof(page_id_t) + kIndexSmoImageEnvelopeBytes + PAGE_SIZE) +
+                               kIndexSmoImageEnvelopeBytes + PAGE_SIZE + sizeof(uint32_t);
+    EXPECT_LE(bytes.size() * 100U, v2_baseline * 32U);
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &parsed));
+    EXPECT_EQ(std::memcmp(parsed.page_image(0), data.pages[0].bytes.data(), PAGE_SIZE), 0);
+
+    auto reject = [&](std::vector<char> corrupt) {
+        RefreshIndexSmoChecksum(&corrupt);
+        EXPECT_FALSE(ParseIndexSmoWal(IndexSmoViewOf(corrupt), &parsed));
+    };
+    {
+        auto corrupt = bytes;
+        corrupt[image_offset + sizeof(uint8_t)] = 1;
+        reject(std::move(corrupt));
+    }
+    {
+        auto corrupt = bytes;
+        corrupt[image_offset + sizeof(uint8_t) * 2] = 1;
+        reject(std::move(corrupt));
+    }
+    {
+        auto corrupt = bytes;
+        const uint32_t short_length = 127;
+        std::memcpy(corrupt.data() + image_offset + kIndexSmoImageEnvelopeBytes - sizeof(uint32_t), &short_length,
+                    sizeof(short_length));
+        reject(std::move(corrupt));
+    }
+    {
+        auto corrupt = bytes;
+        const uint32_t misaligned_length = 129;
+        std::memcpy(corrupt.data() + image_offset + kIndexSmoImageEnvelopeBytes - sizeof(uint32_t), &misaligned_length,
+                    sizeof(misaligned_length));
+        reject(std::move(corrupt));
+    }
+    {
+        auto corrupt = bytes;
+        corrupt[image_offset + kIndexSmoImageEnvelopeBytes] ^= 1;
+        reject(std::move(corrupt));
+    }
+    {
+        IndexSmoWalData invalid = data;
+        const int bad_num_key = layout.btree_order_ + 2;
+        std::memcpy(invalid.pages[1].bytes.data() + offsetof(IxPageHdr, num_key), &bad_num_key, sizeof(bad_num_key));
+        EXPECT_FALSE(ParseIndexSmoWal(IndexSmoViewOf(SerializeIndexSmo(invalid)), &parsed));
+    }
+    {
+        IndexSmoWalData invalid = data;
+        invalid.pages[1].bytes[offsetof(IxPageHdr, is_leaf)] = 2;
+        EXPECT_FALSE(ParseIndexSmoWal(IndexSmoViewOf(SerializeIndexSmo(invalid)), &parsed));
+    }
+}
+
+TEST(IndexSmoWalV3Test, EnvOptOutUsesV2InFreshProcess) {
+    const char* opt_out = std::getenv("RMDB_INDEX_SMO_V3");
+    if (opt_out == nullptr || std::strcmp(opt_out, "0") != 0) {
+        const std::string command = "RMDB_INDEX_SMO_V3=0 /proc/" + std::to_string(getpid()) +
+                                    "/exe --gtest_filter=IndexSmoWalV3Test.EnvOptOutUsesV2InFreshProcess";
+        EXPECT_EQ(std::system(command.c_str()), 0);
+        return;
+    }
+
+    const IxFileHdr layout = WalImageLayout(16, 32);
+    IndexSmoWalData data;
+    data.index_file_name = "v3_opt_out.idx";
+    data.index_generation = 83;
+    data.pages.resize(1);
+    data.pages[0].page_no = IX_INIT_ROOT_PAGE;
+    data.pages[0].bytes = WalImagePage(layout, 20);
+    data.header = WalImageHeader(layout);
+    const std::vector<char> bytes = SerializeIndexSmo(data);
+    ASSERT_EQ(read_unaligned<uint16_t>(bytes.data() + OFFSET_LOG_DATA + sizeof(uint32_t)), INDEX_SMO_VERSION_V2);
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &parsed));
+    EXPECT_EQ(std::memcmp(parsed.page_image(0), data.pages[0].bytes.data(), PAGE_SIZE), 0);
 }
 
 TEST(IndexSmoWalV2Test, ParsesLegacyV1AlongsideV2) {

@@ -54,6 +54,59 @@ private:
     std::filesystem::path old_path_;
 };
 
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name, const char* value) : name_(name) {
+        const char* previous = std::getenv(name);
+        if (previous != nullptr) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        setenv(name, value, 1);
+    }
+    ~ScopedEnvironmentVariable() {
+        if (had_previous_) setenv(name_.c_str(), previous_.c_str(), 1);
+        else unsetenv(name_.c_str());
+    }
+
+private:
+    std::string name_;
+    std::string previous_;
+    bool had_previous_{false};
+};
+
+class ThrowOnceRestoreReplacer final : public Replacer {
+public:
+    explicit ThrowOnceRestoreReplacer(size_t capacity) : clock_(capacity) {}
+
+    bool victim(frame_id_t* frame_id) override {
+        return clock_.victim(frame_id);
+    }
+    void pin(frame_id_t frame_id) override {
+        clock_.pin(frame_id);
+    }
+    void unpin(frame_id_t frame_id) override {
+        clock_.unpin(frame_id);
+    }
+    void restore(frame_id_t frame_id) override {
+        if (throw_once_) {
+            throw_once_ = false;
+            throw std::runtime_error("injected replacer restore failure");
+        }
+        clock_.restore(frame_id);
+    }
+    size_t Size() override {
+        return clock_.Size();
+    }
+    void set_usage_zero(frame_id_t frame_id) {
+        clock_.usage_count_[frame_id].store(0, std::memory_order_release);
+    }
+
+private:
+    ClockReplacer clock_;
+    bool throw_once_{true};
+};
+
 std::unique_ptr<LogManager> InstallTestWal(BufferPoolManager* bpm, DiskManager* disk_manager, lsn_t max_lsn) {
     if (!disk_manager->is_file(LOG_FILE_NAME)) {
         disk_manager->create_file(LOG_FILE_NAME);
@@ -173,6 +226,10 @@ TEST_F(BufferPoolManagerTest, FailedDirtyEvictionRetainsOriginalPage) {
     ASSERT_NE(old_page, nullptr);
     std::memcpy(old_page->get_data(), "dirty-page", 11);
     ASSERT_TRUE(bpm->unpin_page(old_page_id, true));
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm->replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    const frame_id_t old_frame = bpm->page_table_.at(old_page_id);
+    clock->usage_count_[old_frame].store(0, std::memory_order_release);
 
     // Closing the file makes the victim write fail deterministically while the
     // frame still contains the only copy of the dirty page.
@@ -182,10 +239,247 @@ TEST_F(BufferPoolManagerTest, FailedDirtyEvictionRetainsOriginalPage) {
     PageId missing_page{fd_, 99};
     EXPECT_EQ(bpm->fetch_page(missing_page), nullptr);
     EXPECT_TRUE(bpm->is_page_resident(old_page_id));
+    EXPECT_TRUE(clock->in_replacer_[old_frame].load(std::memory_order_acquire));
+    EXPECT_EQ(clock->usage_count_[old_frame].load(std::memory_order_acquire), 0u);
     Page* retained_page = bpm->fetch_page(old_page_id);
     ASSERT_NE(retained_page, nullptr);
     EXPECT_EQ(std::memcmp(retained_page->get_data(), "dirty-page", 11), 0);
     EXPECT_TRUE(bpm->unpin_page(old_page_id, true));
+    EXPECT_EQ(bpm->replacer_->Size(), 1u);
+}
+
+TEST_F(BufferPoolManagerTest, RestoreExceptionRollsBackClaimedVictimWithoutLeakingEvictingState) {
+    BufferPoolManager bpm(2, disk_manager_.get());
+    auto replacer = std::make_unique<ThrowOnceRestoreReplacer>(2);
+    auto* throwing_replacer = replacer.get();
+    bpm.replacer_ = std::move(replacer);
+
+    std::array<PageId, 2> pages{PageId{fd_, INVALID_PAGE_ID}, PageId{fd_, INVALID_PAGE_ID}};
+    ASSERT_NE(bpm.new_page(&pages[0]), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(pages[0], true));
+    ASSERT_NE(bpm.new_page(&pages[1]), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(pages[1], false));
+    for (const PageId page_id : pages) {
+        throwing_replacer->set_usage_zero(bpm.page_table_.at(page_id));
+    }
+
+    PageId replacement{fd_, INVALID_PAGE_ID};
+    EXPECT_EQ(bpm.new_page(&replacement), nullptr);
+    EXPECT_EQ(throwing_replacer->Size(), 2u);
+    EXPECT_TRUE(bpm.resident_directory_is_consistent_for_test());
+    for (const PageId page_id : pages) {
+        const frame_id_t frame_id = bpm.page_table_.at(page_id);
+        EXPECT_EQ(bpm.pages_[frame_id].state_.load(std::memory_order_acquire), FrameState::VALID);
+        EXPECT_TRUE(bpm.is_page_resident(page_id));
+    }
+}
+
+TEST_F(BufferPoolManagerTest, BoundedCleanFirstVictimAvoidsDirtyPwrite) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    BufferPoolManager bpm(2, disk_manager_.get());
+    PageId dirty_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&dirty_id), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(dirty_id, true));
+    PageId clean_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&clean_id), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(clean_id, false));
+
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm.replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    for (const PageId page_id : {dirty_id, clean_id}) {
+        clock->usage_count_[bpm.page_table_.at(page_id)].store(0, std::memory_order_release);
+    }
+
+    PageId replacement{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&replacement), nullptr);
+    EXPECT_TRUE(bpm.is_page_resident(dirty_id));
+    EXPECT_FALSE(bpm.is_page_resident(clean_id));
+    const auto metrics = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(metrics.clean_victims, 1u);
+    EXPECT_EQ(metrics.dirty_victim_fallbacks, 0u);
+    EXPECT_EQ(metrics.victim_search_scanned, 2u);
+    EXPECT_EQ(metrics.foreground_pwrite.count, 0u);
+    EXPECT_TRUE(bpm.unpin_page(replacement, false));
+}
+
+TEST_F(BufferPoolManagerTest, BoundedCleanFirstVictimSkipsSmoBlockedCleanCandidate) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    ScopedOpenTestFile other_file(disk_manager_.get(), "clean_first_other");
+    BufferPoolManager bpm(2, disk_manager_.get());
+    PageId blocked_clean{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&blocked_clean), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(blocked_clean, false));
+    PageId dirty_id{other_file.fd(), INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&dirty_id), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(dirty_id, true));
+
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm.replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    for (const PageId page_id : {blocked_clean, dirty_id}) {
+        clock->usage_count_[bpm.page_table_.at(page_id)].store(0, std::memory_order_release);
+    }
+    bpm.begin_index_smo(fd_);
+    PageId replacement{other_file.fd(), INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&replacement), nullptr);
+    bpm.end_index_smo(fd_);
+
+    EXPECT_TRUE(bpm.is_page_resident(blocked_clean));
+    EXPECT_FALSE(bpm.is_page_resident(dirty_id));
+    EXPECT_EQ(clock->Size(), 1u);
+    const auto metrics = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(metrics.clean_victims, 0u);
+    EXPECT_EQ(metrics.dirty_victim_fallbacks, 1u);
+    EXPECT_EQ(metrics.victim_search_scanned, 2u);
+    EXPECT_EQ(metrics.foreground_pwrite.count, 1u);
+    EXPECT_TRUE(bpm.unpin_page(replacement, false));
+}
+
+TEST_F(BufferPoolManagerTest, BoundedCleanFirstVictimFallsBackAndRestoresDeferredClockCandidates) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    constexpr size_t kFrames = BufferPoolManager::kCleanVictimSearchLimit + 1;
+    BufferPoolManager bpm(kFrames, disk_manager_.get());
+    std::vector<PageId> page_ids;
+    page_ids.reserve(kFrames);
+    for (size_t i = 0; i < kFrames; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm.new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(page_id, i + 1 != kFrames));
+        page_ids.push_back(page_id);
+    }
+
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm.replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    for (const PageId page_id : page_ids) {
+        clock->usage_count_[bpm.page_table_.at(page_id)].store(0, std::memory_order_release);
+    }
+
+    PageId replacement{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&replacement), nullptr);
+    EXPECT_FALSE(bpm.is_page_resident(page_ids.front()));
+    EXPECT_TRUE(bpm.is_page_resident(page_ids.back()));
+    EXPECT_EQ(clock->Size(), kFrames - 1);
+    for (size_t i = 1; i < kFrames; ++i) {
+        const frame_id_t frame_id = bpm.page_table_.at(page_ids[i]);
+        EXPECT_TRUE(clock->in_replacer_[frame_id].load(std::memory_order_acquire));
+        EXPECT_EQ(clock->usage_count_[frame_id].load(std::memory_order_acquire), 0u);
+    }
+    const auto metrics = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(metrics.clean_victims, 0u);
+    EXPECT_EQ(metrics.dirty_victim_fallbacks, 1u);
+    EXPECT_EQ(metrics.victim_search_scanned, BufferPoolManager::kCleanVictimSearchLimit);
+    EXPECT_EQ(metrics.foreground_pwrite.count, 1u);
+    EXPECT_TRUE(bpm.unpin_page(replacement, false));
+}
+
+TEST_F(BufferPoolManagerTest, BlockedCandidatesDoNotConsumeCleanSearchBudget) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    constexpr size_t kBlocked = BufferPoolManager::kCleanVictimSearchLimit;
+    ScopedOpenTestFile other_file(disk_manager_.get(), "clean_first_after_blocked");
+    BufferPoolManager bpm(kBlocked + 1, disk_manager_.get());
+    std::vector<PageId> blocked_pages;
+    blocked_pages.reserve(kBlocked);
+    for (size_t i = 0; i < kBlocked; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm.new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(page_id, false));
+        blocked_pages.push_back(page_id);
+    }
+    PageId eligible_clean{other_file.fd(), INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&eligible_clean), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(eligible_clean, false));
+
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm.replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    for (const PageId page_id : blocked_pages) {
+        clock->usage_count_[bpm.page_table_.at(page_id)].store(0, std::memory_order_release);
+    }
+    clock->usage_count_[bpm.page_table_.at(eligible_clean)].store(0, std::memory_order_release);
+
+    bpm.begin_index_smo(fd_);
+    PageId replacement{other_file.fd(), INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&replacement), nullptr);
+    bpm.end_index_smo(fd_);
+
+    EXPECT_FALSE(bpm.is_page_resident(eligible_clean));
+    EXPECT_EQ(clock->Size(), kBlocked);
+    for (const PageId page_id : blocked_pages) {
+        const frame_id_t frame_id = bpm.page_table_.at(page_id);
+        EXPECT_TRUE(clock->in_replacer_[frame_id].load(std::memory_order_acquire));
+        EXPECT_EQ(clock->usage_count_[frame_id].load(std::memory_order_acquire), 0u);
+    }
+    const auto metrics = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(metrics.clean_victims, 1u);
+    EXPECT_EQ(metrics.dirty_victim_fallbacks, 0u);
+    EXPECT_EQ(metrics.victim_search_scanned, kBlocked + 1);
+    EXPECT_TRUE(bpm.unpin_page(replacement, false));
+}
+
+TEST_F(BufferPoolManagerTest, AllBlockedCandidatesReturnInvalidAndRestoreClockState) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    constexpr size_t kFrames = BufferPoolManager::kCleanVictimSearchLimit + 1;
+    BufferPoolManager bpm(kFrames, disk_manager_.get());
+    std::vector<PageId> page_ids;
+    page_ids.reserve(kFrames);
+    for (size_t i = 0; i < kFrames; ++i) {
+        PageId page_id{fd_, INVALID_PAGE_ID};
+        ASSERT_NE(bpm.new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(page_id, false));
+        page_ids.push_back(page_id);
+    }
+
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm.replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    for (const PageId page_id : page_ids) {
+        clock->usage_count_[bpm.page_table_.at(page_id)].store(0, std::memory_order_release);
+    }
+
+    bpm.begin_index_smo(fd_);
+    PageId missing{fd_, INVALID_PAGE_ID};
+    EXPECT_EQ(bpm.new_page(&missing), nullptr);
+    bpm.end_index_smo(fd_);
+
+    EXPECT_EQ(clock->Size(), kFrames);
+    for (const PageId page_id : page_ids) {
+        const frame_id_t frame_id = bpm.page_table_.at(page_id);
+        EXPECT_TRUE(clock->in_replacer_[frame_id].load(std::memory_order_acquire));
+        EXPECT_EQ(clock->usage_count_[frame_id].load(std::memory_order_acquire), 0u);
+    }
+    const auto metrics = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(metrics.clean_victims, 0u);
+    EXPECT_EQ(metrics.dirty_victim_fallbacks, 0u);
+    EXPECT_EQ(metrics.victim_search_scanned, kFrames);
+}
+
+TEST_F(BufferPoolManagerTest, DirtyFallbackContinuesAfterFirstCandidateBecomesPinned) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    BufferPoolManager bpm(2, disk_manager_.get());
+    std::array<PageId, 2> dirty_pages{PageId{fd_, INVALID_PAGE_ID}, PageId{fd_, INVALID_PAGE_ID}};
+    for (PageId& page_id : dirty_pages) {
+        ASSERT_NE(bpm.new_page(&page_id), nullptr);
+        ASSERT_TRUE(bpm.unpin_page(page_id, true));
+    }
+
+    auto* clock = dynamic_cast<ClockReplacer*>(bpm.replacer_.get());
+    ASSERT_NE(clock, nullptr);
+    for (const PageId page_id : dirty_pages) {
+        clock->usage_count_[bpm.page_table_.at(page_id)].store(0, std::memory_order_release);
+    }
+    const frame_id_t first_frame = bpm.page_table_.at(dirty_pages.front());
+    bpm.pages_[first_frame].pin_count_ = 1;
+
+    PageId replacement{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&replacement), nullptr);
+    EXPECT_TRUE(bpm.is_page_resident(dirty_pages.front()));
+    EXPECT_FALSE(bpm.is_page_resident(dirty_pages.back()));
+    EXPECT_FALSE(clock->in_replacer_[first_frame].load(std::memory_order_acquire));
+    const auto metrics = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(metrics.clean_victims, 0u);
+    EXPECT_EQ(metrics.dirty_victim_fallbacks, 1u);
+    EXPECT_EQ(metrics.victim_search_scanned, 2u);
+
+    EXPECT_TRUE(bpm.unpin_page(dirty_pages.front(), false));
+    EXPECT_TRUE(bpm.unpin_page(replacement, false));
+    EXPECT_EQ(clock->Size(), 2u);
 }
 
 TEST_F(BufferPoolManagerTest, WalDependentFlushFailsClosedWithoutLogManager) {

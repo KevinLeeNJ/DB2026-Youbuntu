@@ -29,7 +29,7 @@ struct CheckpointOptions {
     size_t tick_bytes = 1ULL * 1024 * 1024;
     uint64_t tick_time_us = 5000;
     size_t io_quantum_pages = 64;
-    bool background_preclean_enabled = true;
+    bool background_preclean_enabled = false;
     uint8_t background_preclean_low_percent = 10;
     uint8_t background_preclean_high_percent = 15;
     size_t background_preclean_batch_pages = 160;
@@ -61,9 +61,9 @@ public:
         uint8_t ramp_level{0};
     };
     BackgroundPrecleanControllerSnapshot background_preclean_controller_snapshot_for_test() const noexcept {
-        return {background_preclean_active_,         background_preclean_dirty_pages_,
-                background_preclean_capacity_,       background_preclean_last_budget_,
-                background_preclean_wal_sequence_,   background_preclean_wal_ewma_ns_,
+        return {background_preclean_active_,          background_preclean_dirty_pages_,
+                background_preclean_capacity_,        background_preclean_last_budget_,
+                background_preclean_wal_sequence_,    background_preclean_wal_ewma_ns_,
                 background_preclean_healthy_samples_, background_preclean_ramp_level_};
     }
     void force_background_preclean_sample_for_test() noexcept {

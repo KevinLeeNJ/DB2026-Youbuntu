@@ -61,10 +61,16 @@ TEST(CheckpointOptionsTest, ProductionDefaultTargetIsFourGiB) {
     EXPECT_EQ(options.tick_bytes, 1ULL * 1024 * 1024);
     EXPECT_EQ(options.tick_time_us, 5000u);
     EXPECT_EQ(options.io_quantum_pages, 64u);
+    EXPECT_FALSE(options.background_preclean_enabled);
     EXPECT_EQ(options.background_preclean_low_percent, 10u);
     EXPECT_EQ(options.background_preclean_high_percent, 15u);
     EXPECT_EQ(options.background_preclean_batch_pages, 160u);
     EXPECT_EQ(options.background_preclean_max_pages, 160u);
+}
+
+TEST(CheckpointOptionsTest, BackgroundPrecleanDefaultsOffAndEnvironmentCanOptIn) {
+    ScopedEnvironmentVariable opt_in("RMDB_BACKGROUND_PRECLEAN", "1");
+    EXPECT_TRUE(CheckpointOptions::FromEnvironment().background_preclean_enabled);
 }
 
 TEST(CheckpointOptionsTest, EnvironmentIsStrictAndClamped) {
@@ -249,6 +255,7 @@ TEST(CheckpointScheduleTest, PrecleanControllerUsesNewWalSamplesAndRecoversAfter
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
     CheckpointOptions options;
+    options.background_preclean_enabled = true;
     options.background_preclean_batch_pages = 512;
     options.background_preclean_max_pages = 512;
     checkpoint_mgr.SetOptions(options);
@@ -287,6 +294,7 @@ TEST(CheckpointScheduleTest, PrecleanControllerKeepsSlowSampleWhenFastSampleShar
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
     CheckpointOptions options;
+    options.background_preclean_enabled = true;
     options.background_preclean_batch_pages = 512;
     options.background_preclean_max_pages = 512;
     checkpoint_mgr.SetOptions(options);
@@ -310,6 +318,7 @@ TEST(CheckpointScheduleTest, PrecleanRampsOnlyAfterFiveHealthyObservations) {
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
     CheckpointOptions options;
+    options.background_preclean_enabled = true;
     options.background_preclean_batch_pages = 32;
     options.background_preclean_max_pages = 160;
     checkpoint_mgr.SetOptions(options);
@@ -335,6 +344,9 @@ TEST(CheckpointScheduleTest, CleanCheckpointWaitsForInFlightPrecleanFlush) {
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager preclean_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
     CheckpointManager clean_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    CheckpointOptions preclean_options;
+    preclean_options.background_preclean_enabled = true;
+    preclean_mgr.SetOptions(preclean_options);
     const PageId durable_page = MakeDirtyTablePage(&db);
     ASSERT_NE(durable_page.page_no, INVALID_PAGE_ID);
     Page* page = db.bpm_.fetch_page(durable_page);
@@ -475,6 +487,9 @@ TEST(CheckpointScheduleTest, PrecleanControllerKeepsHysteresisUntilLowWatermark)
     LockManager lock_mgr;
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    CheckpointOptions options;
+    options.background_preclean_enabled = true;
+    checkpoint_mgr.SetOptions(options);
     ASSERT_EQ(MakeDirtyTablePages(&db, 20), 20u);
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
@@ -1085,6 +1100,7 @@ TEST(CheckpointScheduleTest, HealthyObservationCountSaturatesAtFiveWithoutNarrow
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
     CheckpointOptions options;
+    options.background_preclean_enabled = true;
     options.background_preclean_batch_pages = 32;
     options.background_preclean_max_pages = 160;
     checkpoint_mgr.SetOptions(options);

@@ -93,6 +93,16 @@ public:
         }
     }
 
+    void restore(frame_id_t frame_id) override {
+        if (!is_valid_frame(frame_id)) {
+            return;
+        }
+        bool expected = false;
+        if (in_replacer_[frame_id].compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            size_.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
     size_t Size() override {
         return size_.load(std::memory_order_acquire);
     }

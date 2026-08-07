@@ -108,9 +108,13 @@ private:
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
     // Reused only while latch_ is held by take_unblocked_victim_locked().
-    // Reserving it with the fixed pool size keeps blocked SMO victims from
-    // allocating while a full buffer pool holds the global latch.
+    // A probe may skip every SMO-blocked frame before finding an eligible
+    // candidate, so reserve the whole pool and never allocate under latch_.
     std::vector<frame_id_t> blocked_victims_scratch_;
+    // At most kCleanVictimSearchLimit eligible dirty candidates are retained
+    // in CLOCK order for fallback if the bounded clean search finds no clean
+    // victim. This also avoids allocation under latch_.
+    std::vector<frame_id_t> dirty_victims_scratch_;
     std::vector<ResidencyClass> residency_classes_;
     size_t index_internal_resident_count_{0};
     // Background preflush walks frames instead of the unordered page table.
@@ -139,7 +143,9 @@ public:
     static void set_flush_batch_before_write_test_hook(FlushPageTestHook hook);
     static void set_ensure_dependency_test_hook(EnsureDependencyTestHook hook);
     static void set_flush_claim_test_hook(FlushClaimTestHook hook);
-    void notify_frame_operation_waiters_for_test() noexcept { frame_operation_cv_.notify_all(); }
+    void notify_frame_operation_waiters_for_test() noexcept {
+        frame_operation_cv_.notify_all();
+    }
 
     class FrameOperationToken {
         friend class BufferPoolManager;
@@ -181,6 +187,7 @@ public:
         }
         recycled_frames_.reserve(pool_size_);
         blocked_victims_scratch_.reserve(pool_size_);
+        dirty_victims_scratch_.reserve(std::min(pool_size_, kCleanVictimSearchLimit));
         // Set the load factor before reserve so the reserved capacity remains
         // sufficient for the complete pool without an intermediate rehash.
         page_table_.max_load_factor(0.7F);
@@ -370,6 +377,7 @@ public:
     }
 
 private:
+    static constexpr size_t kCleanVictimSearchLimit = 128;
     frame_id_t take_free_frame();
     frame_id_t take_unblocked_victim_locked();
     bool index_smo_blocked_locked(int fd) const;
@@ -380,12 +388,14 @@ private:
     bool operation_authorized(const FrameOperationToken* operation, uint64_t generation) const;
     void release_frame_operation(uint64_t generation) noexcept;
     size_t resident_directory_shard_index(PageId page_id) const noexcept;
-    void install_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state);
+    void install_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state,
+                                     bool restore_without_access = false);
     void set_mapped_frame_state_locked(PageId page_id, frame_id_t frame_id, FrameState state);
     void erase_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state);
     bool claim_page_for_eviction_locked(PageId page_id, frame_id_t frame_id, bool removed_from_replacer,
                                         bool require_normal_residency);
-    void restore_blocked_victims_locked(const std::vector<frame_id_t>& blocked);
+    bool restore_deferred_victims_locked(const std::vector<frame_id_t>& deferred) noexcept;
+    bool rollback_claimed_victim_locked(PageId page_id, frame_id_t frame_id) noexcept;
     bool resident_directory_is_consistent_for_test();
     Page* fetch_resident_page_fast(PageId page_id, const FrameOperationToken* operation);
     FastUnpinResult unpin_clean_page_fast(PageId page_id);
