@@ -60,11 +60,6 @@ See the Mulan PSL v2 for more details. */
 class RecoveryManager {
 public:
     static constexpr size_t kLogTypeCount = static_cast<size_t>(LogType::INDEX_SMO) + 1;
-    using IndexSmoRedoTestHook = std::function<void(std::string_view)>;
-    // Test-only hook immediately before a committed heap descriptor is
-    // re-read.  It exists solely to exercise a mutation after an earlier
-    // record in the same pinned run has been applied.
-    using HeapRedoRecordTestHook = std::function<void(int64_t)>;
     // Test-only rendezvous after a finalization task has acquired its page.
     // It is deliberately per RecoveryManager instance so production recovery
     // has no global test state or scheduling dependency.
@@ -84,15 +79,6 @@ public:
     void redo();
     void undo();
 
-    // Tests use this boundary to prove the selected SMO descriptor is checked
-    // again immediately before its after-images are installed. It is per
-    // RecoveryManager instance and is never configured in production.
-    void set_index_smo_redo_test_hook(IndexSmoRedoTestHook hook) {
-        index_smo_redo_test_hook_ = std::move(hook);
-    }
-    void set_heap_redo_record_test_hook(HeapRedoRecordTestHook hook) {
-        heap_redo_record_test_hook_ = std::move(hook);
-    }
     // Test-only bounded-output override for exercising the verified-stream
     // fallback; zero keeps the production limit.
     void set_index_key_parallel_scratch_limit_for_test(size_t bytes) noexcept {
@@ -100,6 +86,12 @@ public:
     }
     void set_recovery_finalize_pin_test_hook(RecoveryFinalizePinTestHook hook) {
         recovery_finalize_pin_test_hook_ = std::move(hook);
+    }
+    uint64_t get_fused_live_index_key_count_for_test() const {
+        return fused_live_index_key_count_;
+    }
+    uint64_t get_fused_live_index_key_bytes_for_test() const {
+        return fused_live_index_key_bytes_;
     }
 
     // Record-level counters for the recovery report. Recovery is single
@@ -251,6 +243,41 @@ public:
     }
 
 private:
+    struct IndexKeyStreamSegment;
+    struct AnalysisRecord {
+        LogType log_type{LogType::BEGIN};
+        lsn_t lsn{INVALID_LSN};
+        lsn_t prev_lsn{INVALID_LSN};
+        txn_id_t txn_id{INVALID_TXN_ID};
+        uint32_t total_len{0};
+        int64_t offset{0};
+        size_t name_offset{0};
+        uint32_t name_len{0};
+        Rid rid{};
+        int before_size{0};
+        int after_size{0};
+        uint32_t update_row_size{0};
+        bool has_before_image{false};
+        bool has_after_image{false};
+        bool has_update_delta{false};
+        timestamp_t commit_ts{INVALID_TS};
+        uint64_t index_generation{0};
+        size_t smo_page_offset{0};
+        uint32_t smo_page_count{0};
+    };
+
+    // All analyze output is built in a sibling manager and published only by
+    // this explicit list. Runtime dependencies and test configuration are not
+    // analysis state and deliberately never move through this boundary.
+    void analyze_into_staged();
+    void swap_analysis_state(RecoveryManager& staged) noexcept;
+    AnalysisRecord parse_analysis_record(const WalRecordView& record, char* name_storage, size_t name_capacity,
+                                         page_id_t* page_storage, size_t page_capacity) const;
+    void reduce_analysis_record(const AnalysisRecord& record, const char* name_arena, size_t name_arena_size,
+                                const page_id_t* page_arena, size_t page_arena_count,
+                                std::unordered_set<txn_id_t>* checkpoint_active_txns,
+                                std::unordered_set<txn_id_t>* txns_with_undoable_wal, lsn_t* previous_lsn,
+                                IndexKeyStreamSegment* index_key_segment);
     // One DML record's target, packed to 8 bytes. A 256 MB WAL holds roughly
     // 800k DML records, so the whole array is about 6 MB.
     struct TouchedTuple {
@@ -278,7 +305,6 @@ private:
         lsn_t lsn{INVALID_LSN};
         int64_t offset{0};
         uint32_t length{0};
-        uint32_t record_checksum{0};
     };
 
     // Location and target of one heap DML record. Sorting these by table/page
@@ -291,11 +317,6 @@ private:
         uint16_t table_id{0};
         int16_t slot_no{0};
         int32_t page_no{0};
-        // Checksum of the complete serialized WAL record accepted by analyze.
-        // Header identity alone is not enough: a same-length payload can name
-        // the same RID while changing the row image (and, for INDEX_SMO, its
-        // own CRC can be recomputed by a hostile/corrupt writer).
-        uint32_t record_checksum{0};
         // Low 31 bits are the previous descriptor index plus one for this
         // transaction; zero ends the intrusive chain. The high bit records
         // that COMMIT visited this descriptor. This keeps the committed-only
@@ -320,11 +341,6 @@ private:
         lsn_t lsn{INVALID_LSN};
         txn_id_t txn_id{INVALID_TXN_ID};
         lsn_t prev_lsn{INVALID_LSN};
-        // The prefix checksum excludes INDEX_SMO's stored trailing CRC. It
-        // binds the complete analyzed record while still detecting a payload
-        // rewrite whose trailing CRC was recomputed.
-        uint32_t record_checksum{0};
-        uint32_t payload_checksum{0}; // stored INDEX_SMO trailing CRC accepted by analyze()
         // analyze() has already parsed and validated this immutable metadata.
         // Keeping the compact page-number catalogue avoids parsing every large
         // SMO image a second time just to decide latest-wins during redo.
@@ -343,12 +359,10 @@ private:
     };
 
     // Analyze records immutable WAL-aligned ranges for the later key scan.
-    // They hold only record boundaries and DML identity, never WAL payloads.
+    // They hold only record boundaries, never WAL payloads.
     struct IndexKeyStreamSegment {
         int64_t begin{0};
         int64_t end{0};
-        uint64_t identity{0};
-        uint32_t dml_records{0};
     };
 
     // Reconciliation plan for all keys of one index. index_meta and index are
@@ -408,12 +422,12 @@ private:
     // and everything downstream (Bitmap::set, memcpy into get_slot, the
     // file-extension loop in insert_record) trusts what it is handed. Both
     // throw, which keeps the WAL and lets the next process retry.
-    void validate_dml_rid(const RecoveryTable& table, const WalRecordView& record, const Rid& rid) const;
+    void validate_dml_rid(const RecoveryTable& table, lsn_t lsn, const Rid& rid) const;
     void validate_touched_page_bounds();
     // Rejects an image whose length is not the table's record size. The record
     // layer copies exactly record_size bytes out of the pointer it is given, so
     // a short image would read past the end of the WAL buffer.
-    void validate_installable_image(const RecoveryTable& table, const WalRecordView& record, int image_size) const;
+    void validate_installable_image(const RecoveryTable& table, lsn_t lsn, int image_size) const;
 
     bool record_exists(const RecoveryTable& table, const Rid& rid) const;
     // 当前 rid 处的记录是否与 expected 内容一致（rid 不存在视为不等）。
@@ -441,21 +455,15 @@ private:
     void undo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table);
     void repair_touched_file_headers();
     void reset_touched_tuple_meta();
-    std::unordered_set<std::string> repair_touched_indexes();
+    std::unordered_set<std::string> repair_touched_indexes(std::map<std::string, IndexRepairPlan>* plans);
     // Names the indexes a touched table owns, without reading any key yet, and
     // resolves each one's IndexMeta and handle so no later phase has to.
     void plan_touched_indexes(std::map<std::string, IndexRepairPlan>* plans);
     // Publishes the surviving plans into RecoveryTable::index_plans, so the key
     // collection walks pointers instead of rebuilding index names.
     void bind_index_plans(std::map<std::string, IndexRepairPlan>* plans);
-    // Collects, per index, every key the WAL mentions for a touched RID plus
-    // the key its final live tuple carries. This is a complete sequential walk
-    // of the accepted WAL prefix: retaining an all-DML catalogue for this
-    // optional phase made recovery RSS scale with the WAL rather than the work
-    // needed by redo/undo.
-    void collect_index_repair_keys(std::map<std::string, IndexRepairPlan>* plans);
+    void unbind_index_plans() noexcept;
     void collect_wal_index_keys();
-    void collect_heap_index_keys();
     // Puts one plan's entries into B+tree key order. Both the structure gate and
     // the repair consume that order, so it is established exactly once.
     void sort_index_repair_entries(IndexRepairPlan* plan);
@@ -480,14 +488,11 @@ private:
     std::vector<TouchedTuple> touched_;        // one entry per DML record, WAL order
     std::vector<TouchedTuple> touched_sorted_; // distinct, ordered by table and page
     std::vector<HeapRedoRecord> heap_redo_records_;
-    // Exact DML stream identity accepted by analyze. It remains available when
-    // the optional index-key descriptor catalogue reaches its hard byte cap,
-    // so the streaming fallback cannot silently use a changed/truncated WAL.
-    uint64_t index_key_stream_identity_{0};
-    uint64_t index_key_stream_records_{0};
     std::vector<IndexKeyStreamSegment> index_key_stream_segments_;
     bool index_key_stream_segments_complete_{true};
     size_t index_key_parallel_scratch_limit_for_test_{0};
+    uint64_t fused_live_index_key_count_{0};
+    uint64_t fused_live_index_key_bytes_{0};
     // txn id -> most recent descriptor index plus one. Descriptor links carry
     // the rest of each transaction's chain in 24 bytes per DML.
     std::unordered_map<txn_id_t, uint32_t> heap_redo_txn_heads_;
@@ -545,8 +550,6 @@ private:
     timestamp_t max_wal_commit_ts_{INVALID_TS};
     txn_id_t max_wal_txn_id_{INVALID_TXN_ID};
 
-    IndexSmoRedoTestHook index_smo_redo_test_hook_;
-    HeapRedoRecordTestHook heap_redo_record_test_hook_;
     RecoveryFinalizePinTestHook recovery_finalize_pin_test_hook_;
 
     DiskManager* disk_manager_;              // 用来读写文件

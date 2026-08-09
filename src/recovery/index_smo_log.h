@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -22,9 +23,15 @@ See the Mulan PSL v2 for more details. */
 
 static constexpr uint32_t INDEX_SMO_MAGIC = 0x4958534dU;  // "IXSM"
 static constexpr uint32_t INDEX_BIND_MAGIC = 0x49584244U; // "IXBD"
-static constexpr uint16_t INDEX_SMO_VERSION_V1 = 1;
-static constexpr uint16_t INDEX_SMO_VERSION_V2 = 2;
-static constexpr uint16_t INDEX_SMO_VERSION_V3 = 3;
+// Frozen on-disk format tags. The compatibility aliases below remain for
+// external code compiled against the earlier version-numbered names; new code
+// uses the semantic names and does not infer ordering from the numeric tags.
+static constexpr uint16_t INDEX_SMO_FORMAT_LEGACY_RAW = 1;
+static constexpr uint16_t INDEX_SMO_FORMAT_COMPRESSED = 2;
+static constexpr uint16_t INDEX_SMO_FORMAT_STRUCTURED = 3;
+static constexpr uint16_t INDEX_SMO_VERSION_V1 = INDEX_SMO_FORMAT_LEGACY_RAW;
+static constexpr uint16_t INDEX_SMO_VERSION_V2 = INDEX_SMO_FORMAT_COMPRESSED;
+static constexpr uint16_t INDEX_SMO_VERSION_V3 = INDEX_SMO_FORMAT_STRUCTURED;
 static constexpr uint16_t INDEX_BIND_VERSION_V1 = 1;
 static constexpr uint16_t INDEX_BIND_VERSION_V2 = 2;
 // Kept as an alias for code that emits the original renew-binding format.
@@ -84,13 +91,16 @@ private:
 
 struct IndexSmoWalDecodeStorage;
 struct IndexSmoWalDecodedView;
+struct IndexSmoWalAnalysisStorage;
+struct IndexSmoWalAnalysis;
 
 // An allocation-free, read-only inspection result. Its private fields are an
 // opaque capability: callers may use its counts for arena budgeting but cannot
 // forge or alter the offsets trusted by Parse's same-lifetime fast path.
 class IndexSmoWalLayout {
 public:
-    uint16_t version() const noexcept { return version_; }
+    uint16_t format_tag() const noexcept { return format_tag_; }
+    uint16_t version() const noexcept { return format_tag_; } // compatibility alias
     uint32_t total_len() const noexcept { return total_len_; }
     uint32_t page_count() const noexcept { return page_count_; }
     uint32_t decoded_count() const noexcept { return decoded_count_; }
@@ -103,9 +113,11 @@ private:
                                   IndexSmoWalDecodedView* out) noexcept;
     friend bool CopyIndexSmoPageCatalog(const WalRecordView& record, IndexSmoWalView::Page* pages,
                                         size_t page_capacity) noexcept;
+    friend bool AnalyzeIndexSmoWal(const WalRecordView& record, const IndexSmoWalAnalysisStorage& storage,
+                                   IndexSmoWalAnalysis* out) noexcept;
     friend bool ParseIndexSmoWal(const WalRecordView& record, IndexSmoWalView* out);
 
-    uint16_t version_{0};
+    uint16_t format_tag_{0};
     uint32_t total_len_{0};
     uint32_t payload_limit_{0};
     uint32_t name_offset_{0};
@@ -142,6 +154,26 @@ struct IndexSmoWalDecodedView {
     const IndexSmoWalView::Page* pages{nullptr};
 };
 
+// Caller-owned, pre-budgeted storage for the recovery-analysis catalogue.
+// The helper below performs no heap allocation and never publishes pointers
+// into the WAL record. The two arenas must be disjoint from each other, from
+// |out|, and from the immutable record bytes for the duration of the call.
+struct IndexSmoWalAnalysisStorage {
+    char* index_name{nullptr};
+    size_t index_name_capacity{0};
+    page_id_t* page_numbers{nullptr};
+    size_t page_capacity{0};
+};
+
+// Scalar description of the bytes copied into IndexSmoWalAnalysisStorage.
+// index_name_bytes bytes start at storage.index_name and page_count entries
+// start at storage.page_numbers. No trusted cursor/layout capability escapes.
+struct IndexSmoWalAnalysis {
+    uint32_t index_name_bytes{0};
+    uint32_t page_count{0};
+    uint64_t index_generation{0};
+};
+
 // Inspect performs all validation (including every compressed image) with no
 // heap allocation. It leaves |out| unchanged on failure. Its result is solely
 // for caller-owned arena budgeting; safe Decode/Copy always inspect again.
@@ -153,6 +185,14 @@ bool DecodeIndexSmoWal(const WalRecordView& record, const IndexSmoWalDecodeStora
                        IndexSmoWalDecodedView* out) noexcept;
 bool CopyIndexSmoPageCatalog(const WalRecordView& record, IndexSmoWalView::Page* pages,
                              size_t page_capacity) noexcept;
+
+// Fully validates one immutable INDEX_SMO record exactly once, then copies
+// only recovery analysis metadata into caller-owned arenas. Capacity, alias,
+// checksum, codec, page/layout, or header failure leaves both arenas and |out|
+// untouched. Compressed images are validated through the private inspection
+// cursor's single PAGE_SIZE scratch image; no decoded-page arena is created.
+bool AnalyzeIndexSmoWal(const WalRecordView& record, const IndexSmoWalAnalysisStorage& storage,
+                        IndexSmoWalAnalysis* out) noexcept;
 
 uint64_t IndexSmoCrc32CallCountForTest() noexcept;
 void ResetIndexSmoCrc32CallCountForTest() noexcept;

@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <chrono>
 #include <charconv>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -56,6 +57,217 @@ constexpr size_t kIndexKeySegmentDescriptorLimitBytes = 256ULL * 1024 * 1024;
 constexpr size_t kIndexKeyParallelScratchLimitBytes = 512ULL * 1024 * 1024;
 
 class IndexKeyParallelScratchLimit final : public std::exception {};
+
+// Owns one record-aligned analysis batch. WalReader views are borrowed and
+// expire on its next read, so the batch copies each validated record before
+// parsing it. Normal batches stop at WalFramer's soft limits; a legal oversize
+// record is exclusive. Reusing these vectors bounds retained capacity by that
+// normal target plus the largest legal record encountered in this one scan.
+class WalAnalysisBatch {
+public:
+    struct RecordSlice {
+        size_t byte_offset{0};
+        uint32_t total_len{0};
+        int64_t wal_offset{0};
+    };
+
+    bool empty() const { return records_.empty(); }
+    size_t byte_size() const { return bytes_.size(); }
+    size_t record_count() const { return records_.size(); }
+
+    bool append(const WalRecordView& record) {
+        if (record.bytes == nullptr || record.total_len < LOG_HEADER_SIZE || record.offset < 0 ||
+            record.offset > std::numeric_limits<int64_t>::max() - static_cast<int64_t>(record.total_len) ||
+            bytes_.size() > std::numeric_limits<size_t>::max() - record.total_len) {
+            return false;
+        }
+        const size_t byte_offset = bytes_.size();
+        bytes_.insert(bytes_.end(), record.bytes, record.bytes + record.total_len);
+        records_.push_back(RecordSlice{byte_offset, record.total_len, record.offset});
+        return true;
+    }
+
+    bool view_at(size_t index, WalRecordView* out) const {
+        if (out == nullptr || index >= records_.size()) {
+            return false;
+        }
+        const RecordSlice& slice = records_[index];
+        if (slice.total_len < LOG_HEADER_SIZE || slice.byte_offset > bytes_.size() ||
+            slice.total_len > bytes_.size() - slice.byte_offset ||
+            slice.wal_offset > std::numeric_limits<int64_t>::max() - static_cast<int64_t>(slice.total_len)) {
+            return false;
+        }
+        const char* bytes = bytes_.data() + slice.byte_offset;
+        if (read_unaligned<uint32_t>(bytes + OFFSET_LOG_TOT_LEN) != slice.total_len) {
+            return false;
+        }
+        out->log_type = read_unaligned<LogType>(bytes + OFFSET_LOG_TYPE);
+        out->lsn = read_unaligned<lsn_t>(bytes + OFFSET_LSN);
+        out->prev_lsn = read_unaligned<lsn_t>(bytes + OFFSET_PREV_LSN);
+        out->txn_id = read_unaligned<txn_id_t>(bytes + OFFSET_LOG_TID);
+        out->total_len = slice.total_len;
+        out->offset = slice.wal_offset;
+        out->bytes = bytes;
+        return true;
+    }
+
+    int64_t offset_at(size_t index) const {
+        return records_.at(index).wal_offset;
+    }
+
+    size_t byte_offset_at(size_t index) const {
+        return index == records_.size() ? bytes_.size() : records_.at(index).byte_offset;
+    }
+
+    void clear() {
+        bytes_.clear();
+        records_.clear();
+    }
+
+private:
+    std::vector<char> bytes_;
+    std::vector<RecordSlice> records_;
+};
+
+// Recovery analysis owns exactly one immutable batch at a time. The caller is
+// its only reader and reducer; these fixed workers only parse disjoint,
+// contiguous record-index shards. P2c replaces the temporary vector result
+// storage with a prebudgeted arena.
+class RecoveryAnalysisWorkerPool {
+public:
+    struct Failure {
+        size_t record_index{0};
+        std::exception_ptr exception;
+    };
+    struct RecordFailure {
+        size_t record_index{0};
+        std::exception_ptr exception;
+    };
+    using Task = std::function<void(size_t, size_t)>;
+
+    explicit RecoveryAnalysisWorkerPool(size_t worker_count) {
+        threads_.reserve(worker_count);
+        try {
+            for (size_t worker = 0; worker < worker_count; ++worker) {
+                threads_.emplace_back([this, worker] { worker_main(worker); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            work_ready_.notify_all();
+            for (std::thread& thread : threads_) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+            throw;
+        }
+    }
+
+    ~RecoveryAnalysisWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        work_ready_.notify_all();
+        for (std::thread& thread : threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+    RecoveryAnalysisWorkerPool(const RecoveryAnalysisWorkerPool&) = delete;
+    RecoveryAnalysisWorkerPool& operator=(const RecoveryAnalysisWorkerPool&) = delete;
+
+    void run(size_t record_count, const Task& task, Failure* failure) {
+        const size_t active_workers = std::min(record_count, threads_.size());
+        if (active_workers == 0) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            task_ = &task;
+            record_count_ = record_count;
+            active_workers_ = active_workers;
+            remaining_workers_ = active_workers;
+            failures_.assign(active_workers, Failure{});
+            ++generation_;
+        }
+        work_ready_.notify_all();
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        finished_.wait(lock, [this] { return remaining_workers_ == 0; });
+        for (const Failure& candidate : failures_) {
+            if (candidate.exception != nullptr &&
+                (failure->exception == nullptr || candidate.record_index < failure->record_index)) {
+                *failure = candidate;
+            }
+        }
+    }
+
+private:
+    void worker_main(size_t worker_index) {
+        size_t seen_generation = 0;
+        while (true) {
+            const Task* task = nullptr;
+            size_t begin = 0;
+            size_t end = 0;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_ready_.wait(lock, [this, &seen_generation] {
+                    return stopping_ || generation_ != seen_generation;
+                });
+                if (stopping_) {
+                    return;
+                }
+                seen_generation = generation_;
+                if (worker_index >= active_workers_) {
+                    continue;
+                }
+                task = task_;
+                begin = record_count_ * worker_index / active_workers_;
+                end = record_count_ * (worker_index + 1) / active_workers_;
+            }
+
+            Failure failure;
+            failure.record_index = begin;
+            try {
+                (*task)(begin, end);
+            } catch (const RecordFailure& record_failure) {
+                failure.record_index = record_failure.record_index;
+                failure.exception = record_failure.exception;
+            } catch (...) {
+                failure.exception = std::current_exception();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                failures_[worker_index] = std::move(failure);
+                if (--remaining_workers_ == 0) {
+                    finished_.notify_one();
+                }
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable work_ready_;
+    std::condition_variable finished_;
+    std::vector<std::thread> threads_;
+    std::vector<Failure> failures_;
+    // run() waits for every active worker before returning, so this pointer
+    // refers to a stable caller task for the entire generation. Avoid copying
+    // a std::function into every worker on every batch.
+    const Task* task_{nullptr};
+    size_t record_count_{0};
+    size_t active_workers_{0};
+    size_t remaining_workers_{0};
+    size_t generation_{0};
+    bool stopping_{false};
+};
 
 class RecoveryPagePinGuard {
 public:
@@ -139,24 +351,6 @@ size_t RunRecoveryTasks(size_t task_count, size_t worker_limit, Work&& work, siz
         std::rethrow_exception(first_exception);
     }
     return worker_count;
-}
-
-uint64_t MixDmlIdentity(uint64_t state, int64_t offset, uint32_t length, uint32_t checksum) {
-    // FNV-1a over fixed-width identity fields. The CRC covers exact serialized
-    // bytes; offset and length make record reordering/substitution visible too.
-    constexpr uint64_t kOffset = 1469598103934665603ULL;
-    constexpr uint64_t kPrime = 1099511628211ULL;
-    if (state == 0) state = kOffset;
-    const auto mix = [&](uint64_t value, size_t bytes) {
-        for (size_t index = 0; index < bytes; ++index) {
-            state ^= static_cast<uint8_t>(value >> (index * 8));
-            state *= kPrime;
-        }
-    };
-    mix(static_cast<uint64_t>(offset), sizeof(offset));
-    mix(length, sizeof(length));
-    mix(checksum, sizeof(checksum));
-    return state;
 }
 
 size_t RecoveryWorkerLimit() {
@@ -275,9 +469,6 @@ WalRecordView RecoveryManager::mapped_heap_redo_record(const HeapRedoRecord& loc
                             std::to_string(location.wal_offset) + "; WAL retained");
     }
 
-    if (IndexSmoCrc32(record_bytes, location.wal_length) != location.record_checksum) {
-        throw InternalError("recovery heap-redo WAL bytes changed after analyze; WAL retained");
-    }
     WalRecordView record;
     record.log_type = log_type;
     record.lsn = read_unaligned<lsn_t>(header + OFFSET_LSN);
@@ -289,11 +480,11 @@ WalRecordView RecoveryManager::mapped_heap_redo_record(const HeapRedoRecord& loc
     return record;
 }
 
-void RecoveryManager::validate_dml_rid(const RecoveryTable& table, const WalRecordView& record, const Rid& rid) const {
+void RecoveryManager::validate_dml_rid(const RecoveryTable& table, lsn_t lsn, const Rid& rid) const {
     // Page 0 holds the file header, never a record.
     if (rid.page_no < RM_FIRST_RECORD_PAGE) {
         throw InternalError("recovery found a WAL record naming page " + std::to_string(rid.page_no) + " of table " +
-                            table.name + " at LSN " + std::to_string(record.lsn) + "; WAL retained");
+                            table.name + " at LSN " + std::to_string(lsn) + "; WAL retained");
     }
     // A table that is not open cannot supply its slot count. Such records are
     // skipped by every later phase, so the only thing still needed is that the
@@ -302,7 +493,7 @@ void RecoveryManager::validate_dml_rid(const RecoveryTable& table, const WalReco
     if (rid.slot_no < 0 || rid.slot_no >= slot_limit) {
         throw InternalError("recovery found a WAL record naming slot " + std::to_string(rid.slot_no) + " of table " +
                             table.name + ", which holds " + std::to_string(slot_limit) + " slots per page, at LSN " +
-                            std::to_string(record.lsn) + "; WAL retained");
+                            std::to_string(lsn) + "; WAL retained");
     }
 }
 
@@ -337,12 +528,11 @@ void RecoveryManager::validate_touched_page_bounds() {
     }
 }
 
-void RecoveryManager::validate_installable_image(const RecoveryTable& table, const WalRecordView& record,
-                                                 int image_size) const {
+void RecoveryManager::validate_installable_image(const RecoveryTable& table, lsn_t lsn, int image_size) const {
     if (image_size != table.record_size) {
         throw InternalError("recovery found a WAL image of " + std::to_string(image_size) + " bytes for table " +
                             table.name + ", whose records are " + std::to_string(table.record_size) +
-                            " bytes, at LSN " + std::to_string(record.lsn) + "; WAL retained");
+                            " bytes, at LSN " + std::to_string(lsn) + "; WAL retained");
     }
 }
 
@@ -381,6 +571,301 @@ void RecoveryManager::validate_installable_image(const RecoveryTable& table, con
  * becomes the right answer.
  */
 void RecoveryManager::analyze() {
+    RecoveryManager staged(disk_manager_, buffer_pool_manager_, sm_manager_, log_manager_);
+    staged.index_key_parallel_scratch_limit_for_test_ = index_key_parallel_scratch_limit_for_test_;
+    staged.analyze_into_staged();
+    swap_analysis_state(staged);
+}
+
+void RecoveryManager::swap_analysis_state(RecoveryManager& staged) noexcept {
+    using std::swap;
+    swap(committed_txns_, staged.committed_txns_);
+    swap(active_txn_last_lsn_, staged.active_txn_last_lsn_);
+    swap(tables_, staged.tables_);
+    swap(table_ids_, staged.table_ids_);
+    swap(table_name_scratch_, staged.table_name_scratch_);
+    swap(touched_, staged.touched_);
+    swap(touched_sorted_, staged.touched_sorted_);
+    swap(heap_redo_records_, staged.heap_redo_records_);
+    swap(index_key_stream_segments_, staged.index_key_stream_segments_);
+    swap(index_key_stream_segments_complete_, staged.index_key_stream_segments_complete_);
+    swap(heap_redo_txn_heads_, staged.heap_redo_txn_heads_);
+    swap(index_smo_records_, staged.index_smo_records_);
+    swap(index_smo_page_catalog_, staged.index_smo_page_catalog_);
+    swap(deferred_committed_deltas_, staged.deferred_committed_deltas_);
+    swap(record_locations_, staged.record_locations_);
+    swap(touched_tables_, staged.touched_tables_);
+    swap(has_dml_records_, staged.has_dml_records_);
+    swap(has_index_smo_records_, staged.has_index_smo_records_);
+    swap(pages_prepared_for_redo_, staged.pages_prepared_for_redo_);
+    swap(latest_index_bindings_, staged.latest_index_bindings_);
+    swap(max_lsn_, staged.max_lsn_);
+    swap(checkpoint_offset_, staged.checkpoint_offset_);
+    swap(scan_begin_offset_, staged.scan_begin_offset_);
+    swap(scan_end_offset_, staged.scan_end_offset_);
+    swap(framed_segments_, staged.framed_segments_);
+    swap(scanned_record_count_, staged.scanned_record_count_);
+    swap(log_type_record_counts_, staged.log_type_record_counts_);
+    swap(log_type_serialized_bytes_, staged.log_type_serialized_bytes_);
+    swap(index_smo_logical_image_count_, staged.index_smo_logical_image_count_);
+    swap(index_smo_logical_image_bytes_, staged.index_smo_logical_image_bytes_);
+    swap(redo_applied_count_, staged.redo_applied_count_);
+    swap(redo_skipped_count_, staged.redo_skipped_count_);
+    swap(redo_missing_table_count_, staged.redo_missing_table_count_);
+    swap(redo_candidate_count_, staged.redo_candidate_count_);
+    swap(redo_loser_count_, staged.redo_loser_count_);
+    swap(redo_resident_page_run_count_, staged.redo_resident_page_run_count_);
+    swap(redo_resident_page_pin_count_, staged.redo_resident_page_pin_count_);
+    swap(undo_applied_count_, staged.undo_applied_count_);
+    swap(pruned_no_undo_transaction_count_, staged.pruned_no_undo_transaction_count_);
+    swap(undo_chain_record_read_count_, staged.undo_chain_record_read_count_);
+    swap(index_probe_count_, staged.index_probe_count_);
+    swap(index_mutation_count_, staged.index_mutation_count_);
+    swap(index_unchanged_key_count_, staged.index_unchanged_key_count_);
+    swap(index_duplicate_entry_count_, staged.index_duplicate_entry_count_);
+    swap(index_rebuild_count_, staged.index_rebuild_count_);
+    swap(index_parent_pointer_repair_count_, staged.index_parent_pointer_repair_count_);
+    swap(index_smo_prepare_count_, staged.index_smo_prepare_count_);
+    swap(persisted_next_timestamp_, staged.persisted_next_timestamp_);
+    swap(persisted_next_txn_id_, staged.persisted_next_txn_id_);
+    swap(max_wal_commit_ts_, staged.max_wal_commit_ts_);
+    swap(max_wal_txn_id_, staged.max_wal_txn_id_);
+}
+
+RecoveryManager::AnalysisRecord RecoveryManager::parse_analysis_record(const WalRecordView& record, char* name_storage,
+                                                                       size_t name_capacity, page_id_t* page_storage,
+                                                                       size_t page_capacity) const {
+    AnalysisRecord result;
+    result.log_type = record.log_type;
+    result.lsn = record.lsn;
+    result.prev_lsn = record.prev_lsn;
+    result.txn_id = record.txn_id;
+    result.total_len = record.total_len;
+    result.offset = record.offset;
+
+    switch (record.log_type) {
+    case LogType::INSERT:
+    case LogType::DELETE:
+    case LogType::UPDATE: {
+        WalDmlView dml;
+        if (!ParseWalDmlForRedo(record, &dml) || dml.table_name.size() > name_capacity ||
+            (dml.table_name.size() != 0 && name_storage == nullptr)) {
+            throw InternalError("recovery found a corrupt DML payload at WAL offset " +
+                                std::to_string(record.offset) + " (LSN " + std::to_string(record.lsn) +
+                                "); WAL retained");
+        }
+        if (!dml.table_name.empty()) {
+            std::memcpy(name_storage, dml.table_name.data(), dml.table_name.size());
+        }
+        result.name_len = static_cast<uint32_t>(dml.table_name.size());
+        result.rid = dml.rid;
+        result.before_size = dml.before_size;
+        result.after_size = dml.after_size;
+        result.has_before_image = dml.before_image != nullptr;
+        result.has_after_image = dml.after_image != nullptr;
+        result.has_update_delta = dml.update_delta.present();
+        result.update_row_size = dml.update_delta.row_size;
+        break;
+    }
+    case LogType::COMMIT:
+        if (CommitLogRecord::HasCommitTs(record.total_len)) {
+            result.commit_ts = read_unaligned<timestamp_t>(record.bytes + OFFSET_LOG_DATA);
+        }
+        break;
+    case LogType::INDEX_BIND: {
+        std::string_view index_name;
+        if (!ParseIndexBindWal(record, &index_name, &result.index_generation)) {
+            throw InternalError("recovery found a corrupt INDEX_BIND payload at WAL offset " +
+                                std::to_string(record.offset) + "; WAL retained");
+        }
+        if (index_name.size() > name_capacity || (index_name.size() != 0 && name_storage == nullptr)) {
+            throw InternalError("recovery INDEX_BIND name exceeds its WAL analysis arena at offset " +
+                                std::to_string(record.offset) + "; WAL retained");
+        }
+        if (!index_name.empty()) {
+            std::memcpy(name_storage, index_name.data(), index_name.size());
+        }
+        result.name_len = static_cast<uint32_t>(index_name.size());
+        break;
+    }
+    case LogType::INDEX_SMO: {
+        if (record.txn_id != INVALID_TXN_ID || record.prev_lsn != INVALID_LSN) {
+            throw InternalError("recovery found a corrupt INDEX_SMO payload at WAL offset " +
+                                std::to_string(record.offset) + "; WAL retained");
+        }
+        IndexSmoWalAnalysis smo;
+        if (!AnalyzeIndexSmoWal(record, IndexSmoWalAnalysisStorage{name_storage, name_capacity, page_storage,
+                                                                    page_capacity},
+                                &smo)) {
+            throw InternalError("recovery found a corrupt INDEX_SMO payload at WAL offset " +
+                                std::to_string(record.offset) + "; WAL retained");
+        }
+        result.name_len = smo.index_name_bytes;
+        result.index_generation = smo.index_generation;
+        result.smo_page_count = smo.page_count;
+        break;
+    }
+    default:
+        break;
+    }
+    return result;
+}
+
+void RecoveryManager::reduce_analysis_record(const AnalysisRecord& record, const char* name_arena,
+                                             size_t name_arena_size, const page_id_t* page_arena,
+                                             size_t page_arena_count,
+                                             std::unordered_set<txn_id_t>* checkpoint_active_txns,
+                                             std::unordered_set<txn_id_t>* txns_with_undoable_wal,
+                                             lsn_t* previous_lsn, IndexKeyStreamSegment* index_key_segment) {
+    if (record.lsn == INVALID_LSN || (*previous_lsn != INVALID_LSN && record.lsn <= *previous_lsn)) {
+        throw InternalError("recovery found non-increasing WAL LSN at offset " + std::to_string(record.offset) +
+                            "; WAL retained");
+    }
+    *previous_lsn = record.lsn;
+    if (index_key_stream_segments_complete_ && record.offset > index_key_segment->begin &&
+        record.offset - index_key_segment->begin >= kIndexKeySegmentBytes) {
+        index_key_segment->end = record.offset;
+        if (index_key_stream_segments_.size() >= kIndexKeySegmentDescriptorLimitBytes / sizeof(IndexKeyStreamSegment)) {
+            index_key_stream_segments_.clear();
+            index_key_stream_segments_complete_ = false;
+        } else {
+            index_key_stream_segments_.push_back(*index_key_segment);
+        }
+        *index_key_segment = IndexKeyStreamSegment{};
+        index_key_segment->begin = record.offset;
+    }
+    ++scanned_record_count_;
+    const size_t log_type_index = static_cast<size_t>(record.log_type);
+    ++log_type_record_counts_[log_type_index];
+    log_type_serialized_bytes_[log_type_index] += record.total_len;
+
+    switch (record.log_type) {
+    case LogType::BEGIN:
+        active_txn_last_lsn_[record.txn_id] = record.lsn;
+        break;
+    case LogType::INSERT:
+    case LogType::DELETE:
+    case LogType::UPDATE: {
+        if (record.name_offset > name_arena_size || record.name_len > name_arena_size - record.name_offset) {
+            throw InternalError("recovery DML name leaves the WAL analysis arena; WAL retained");
+        }
+        const std::string_view table_name(name_arena + record.name_offset, record.name_len);
+        active_txn_last_lsn_[record.txn_id] = record.lsn;
+        txns_with_undoable_wal->insert(record.txn_id);
+        has_dml_records_ = true;
+        const uint16_t table_id = intern_table(table_name);
+        const RecoveryTable& table = tables_[table_id];
+        validate_dml_rid(table, record.lsn, record.rid);
+        if (table.file_handle != nullptr) {
+            if (record.has_update_delta) {
+                validate_installable_image(table, record.lsn, static_cast<int>(record.update_row_size));
+            }
+            if (record.has_before_image) {
+                validate_installable_image(table, record.lsn, record.before_size);
+            }
+            if (record.has_after_image) {
+                validate_installable_image(table, record.lsn, record.after_size);
+            }
+        }
+        touched_tables_.insert(table.name);
+        touched_.push_back(TouchedTuple{table_id, static_cast<int16_t>(record.rid.slot_no), record.rid.page_no});
+        if (heap_redo_records_.size() >= (1U << 31)) {
+            throw InternalError("recovery heap-redo descriptor count exceeds intrusive chain limit; WAL retained");
+        }
+        HeapRedoRecord redo_record;
+        redo_record.wal_offset = record.offset;
+        redo_record.wal_length = record.total_len;
+        redo_record.table_id = table_id;
+        redo_record.page_no = record.rid.page_no;
+        redo_record.slot_no = static_cast<int16_t>(record.rid.slot_no);
+        const uint32_t descriptor_index_plus_one = static_cast<uint32_t>(heap_redo_records_.size() + 1);
+        redo_record.txn_prev_plus_one = heap_redo_txn_heads_[record.txn_id];
+        heap_redo_records_.push_back(redo_record);
+        heap_redo_txn_heads_[record.txn_id] = descriptor_index_plus_one;
+        break;
+    }
+    case LogType::COMMIT: {
+        committed_txns_.insert(record.txn_id);
+        auto redo_head = heap_redo_txn_heads_.find(record.txn_id);
+        if (redo_head != heap_redo_txn_heads_.end()) {
+            constexpr uint32_t kCommittedBit = 1U << 31;
+            constexpr uint32_t kPreviousMask = kCommittedBit - 1;
+            for (uint32_t current = redo_head->second; current != 0;) {
+                HeapRedoRecord& descriptor = heap_redo_records_[current - 1];
+                const uint32_t previous = descriptor.txn_prev_plus_one & kPreviousMask;
+                descriptor.txn_prev_plus_one = previous | kCommittedBit;
+                current = previous;
+            }
+            heap_redo_txn_heads_.erase(redo_head);
+        }
+        active_txn_last_lsn_.erase(record.txn_id);
+        checkpoint_active_txns->erase(record.txn_id);
+        txns_with_undoable_wal->erase(record.txn_id);
+        if (record.commit_ts != INVALID_TS &&
+            (max_wal_commit_ts_ == INVALID_TS || record.commit_ts > max_wal_commit_ts_)) {
+            max_wal_commit_ts_ = record.commit_ts;
+        }
+        break;
+    }
+    case LogType::ABORT:
+        active_txn_last_lsn_[record.txn_id] = record.lsn;
+        break;
+    case LogType::CHECKPOINT:
+        break;
+    case LogType::INDEX_BIND: {
+        if (record.name_offset > name_arena_size || record.name_len > name_arena_size - record.name_offset) {
+            throw InternalError("recovery INDEX_BIND name leaves the WAL analysis arena; WAL retained");
+        }
+        latest_index_bindings_[std::string(name_arena + record.name_offset, record.name_len)] =
+            record.index_generation;
+        break;
+    }
+    case LogType::INDEX_SMO: {
+        if (record.name_offset > name_arena_size || record.name_len > name_arena_size - record.name_offset ||
+            record.smo_page_offset > page_arena_count ||
+            record.smo_page_count > page_arena_count - record.smo_page_offset) {
+            throw InternalError("recovery INDEX_SMO metadata leaves the WAL analysis arena; WAL retained");
+        }
+        const std::string_view index_name(name_arena + record.name_offset, record.name_len);
+        has_index_smo_records_ = true;
+        index_smo_logical_image_count_ += static_cast<uint64_t>(record.smo_page_count) + 1;
+        index_smo_logical_image_bytes_ +=
+            (static_cast<uint64_t>(record.smo_page_count) + 1) * static_cast<uint64_t>(PAGE_SIZE);
+        if (record.smo_page_count > std::numeric_limits<uint32_t>::max() - index_smo_page_catalog_.size()) {
+            throw InternalError("recovery INDEX_SMO page catalogue exceeds addressable range; WAL retained");
+        }
+        const uint32_t page_catalog_begin = static_cast<uint32_t>(index_smo_page_catalog_.size());
+        index_smo_page_catalog_.insert(index_smo_page_catalog_.end(), page_arena + record.smo_page_offset,
+                                       page_arena + record.smo_page_offset + record.smo_page_count);
+        index_smo_records_.push_back(IndexSmoRecord{record.offset,
+                                                    record.total_len,
+                                                    record.lsn,
+                                                    record.txn_id,
+                                                    record.prev_lsn,
+                                                    std::string(index_name),
+                                                    record.index_generation,
+                                                    page_catalog_begin,
+                                                    record.smo_page_count});
+        break;
+    }
+    }
+
+    if (record.txn_id != INVALID_TXN_ID &&
+        (max_wal_txn_id_ == INVALID_TXN_ID || record.txn_id > max_wal_txn_id_)) {
+        max_wal_txn_id_ = record.txn_id;
+    }
+    if (record.txn_id != INVALID_TXN_ID &&
+        (record.log_type == LogType::BEGIN || record.log_type == LogType::INSERT ||
+         record.log_type == LogType::DELETE || record.log_type == LogType::UPDATE ||
+         record.log_type == LogType::ABORT)) {
+        record_locations_.push_back(WalRecordLocation{record.lsn, record.offset, record.total_len});
+    }
+    if (max_lsn_ == INVALID_LSN || record.lsn > max_lsn_) {
+        max_lsn_ = record.lsn;
+    }
+}
+
+void RecoveryManager::analyze_into_staged() {
     active_txn_last_lsn_.clear();
     committed_txns_.clear();
     tables_.clear();
@@ -388,8 +873,6 @@ void RecoveryManager::analyze() {
     touched_.clear();
     touched_sorted_.clear();
     heap_redo_records_.clear();
-    index_key_stream_identity_ = 0;
-    index_key_stream_records_ = 0;
     index_key_stream_segments_.clear();
     index_key_stream_segments_complete_ = true;
     heap_redo_txn_heads_.clear();
@@ -457,6 +940,8 @@ void RecoveryManager::analyze() {
     // A published restart offset lets the scan start at the last checkpoint
     // instead of at the beginning of the file.
     {
+        // This isolated random read validates the restart checkpoint only; it
+        // is not part of the sequential scanned-prefix pipeline below.
         std::vector<char> scratch;
         WalRecordView checkpoint;
         const int64_t restart_offset = log_manager_ != nullptr && log_manager_->startup_is_prepared()
@@ -479,200 +964,93 @@ void RecoveryManager::analyze() {
 
     WalFramer reader(disk_manager_, scan_begin_offset_, file_size);
     WalRecordView record;
-    WalDmlView dml;
     lsn_t previous_lsn = INVALID_LSN;
     IndexKeyStreamSegment index_key_segment;
     index_key_segment.begin = scan_begin_offset_;
+    WalAnalysisBatch batch;
+    std::unique_ptr<RecoveryAnalysisWorkerPool> analysis_workers;
+    std::vector<AnalysisRecord> parsed_records;
+    std::vector<char> name_arena;
+    std::vector<page_id_t> page_arena;
+    auto flush_batch = [&] {
+        if (batch.empty()) {
+            return;
+        }
+        if (analysis_workers == nullptr) {
+            analysis_workers = std::make_unique<RecoveryAnalysisWorkerPool>(RecoveryWorkerLimit());
+        }
+        const size_t bytes = batch.byte_size();
+        if (bytes > std::numeric_limits<size_t>::max() - (sizeof(page_id_t) - 1)) {
+            throw InternalError("recovery WAL analysis arena size overflows; WAL retained");
+        }
+        const size_t page_count = (bytes + sizeof(page_id_t) - 1) / sizeof(page_id_t);
+        try {
+            parsed_records.resize(batch.record_count());
+            name_arena.resize(bytes);
+            page_arena.resize(page_count);
+        } catch (const std::bad_alloc&) {
+            throw InternalError("recovery could not allocate the bounded WAL analysis arena; WAL retained");
+        }
+        RecoveryAnalysisWorkerPool::Failure failure;
+        analysis_workers->run(batch.record_count(), [&](size_t begin, size_t end) {
+            for (size_t index = begin; index < end; ++index) {
+                try {
+                    WalRecordView owned_record;
+                    if (!batch.view_at(index, &owned_record)) {
+                        throw InternalError("recovery found an invalid owned WAL analysis record; WAL retained");
+                    }
+                    const size_t record_name_begin = batch.byte_offset_at(index);
+                    const size_t record_name_end = batch.byte_offset_at(index + 1);
+                    const size_t record_page_begin =
+                        (record_name_begin + sizeof(page_id_t) - 1) / sizeof(page_id_t);
+                    const size_t record_page_end =
+                        (record_name_end + sizeof(page_id_t) - 1) / sizeof(page_id_t);
+                    AnalysisRecord parsed = parse_analysis_record(
+                        owned_record, name_arena.data() + record_name_begin, record_name_end - record_name_begin,
+                        page_arena.data() + record_page_begin, record_page_end - record_page_begin);
+                    parsed.name_offset = record_name_begin;
+                    parsed.smo_page_offset = record_page_begin;
+                    parsed_records[index] = parsed;
+                } catch (...) {
+                    throw RecoveryAnalysisWorkerPool::RecordFailure{index, std::current_exception()};
+                }
+            }
+        }, &failure);
+        const size_t reduce_count = failure.exception == nullptr ? parsed_records.size() : failure.record_index;
+        for (size_t index = 0; index < reduce_count; ++index) {
+            reduce_analysis_record(parsed_records[index], name_arena.data(), name_arena.size(), page_arena.data(),
+                                   page_arena.size(), &checkpoint_active_txns, &txns_with_undoable_wal, &previous_lsn,
+                                   &index_key_segment);
+        }
+        if (failure.exception != nullptr) {
+            const int64_t offset = batch.offset_at(failure.record_index);
+            try {
+                std::rethrow_exception(failure.exception);
+            } catch (...) {
+                std::throw_with_nested(InternalError("recovery worker failed at WAL offset " + std::to_string(offset) +
+                                                     "; WAL retained"));
+            }
+        }
+        batch.clear();
+    };
     while (reader.next(&record)) {
-        if (record.lsn == INVALID_LSN || (previous_lsn != INVALID_LSN && record.lsn <= previous_lsn)) {
-            throw InternalError("recovery found non-increasing WAL LSN at offset " + std::to_string(record.offset) +
-                                "; WAL retained");
+        const bool oversize = record.total_len > WalFramer::kTargetBytes;
+        // Normal batches stay within both caps. A legal oversize record is
+        // exclusive, so its one-batch memory cost remains explicitly bounded.
+        if (!batch.empty() &&
+            (oversize || batch.record_count() >= WalFramer::kTargetRecords ||
+             (!oversize && batch.byte_size() > static_cast<size_t>(WalFramer::kTargetBytes - record.total_len)))) {
+            flush_batch();
         }
-        previous_lsn = record.lsn;
-        if (index_key_stream_segments_complete_ && record.offset > index_key_segment.begin &&
-            record.offset - index_key_segment.begin >= kIndexKeySegmentBytes) {
-            index_key_segment.end = record.offset;
-            if (index_key_stream_segments_.size() >=
-                kIndexKeySegmentDescriptorLimitBytes / sizeof(IndexKeyStreamSegment)) {
-                // The old sequential verified-stream scan remains authoritative
-                // when descriptor metadata itself would become material.
-                index_key_stream_segments_.clear();
-                index_key_stream_segments_complete_ = false;
-            } else {
-                index_key_stream_segments_.push_back(index_key_segment);
-            }
-            index_key_segment = IndexKeyStreamSegment{};
-            index_key_segment.begin = record.offset;
+        if (!batch.append(record)) {
+            throw InternalError("recovery could not own a validated WAL analysis record; WAL retained");
         }
-        ++scanned_record_count_;
-        const size_t log_type_index = static_cast<size_t>(record.log_type);
-        ++log_type_record_counts_[log_type_index];
-        log_type_serialized_bytes_[log_type_index] += record.total_len;
-        switch (record.log_type) {
-        case LogType::BEGIN:
-            active_txn_last_lsn_[record.txn_id] = record.lsn;
-            break;
-        case LogType::INSERT:
-        case LogType::DELETE:
-        case LogType::UPDATE: {
-            if (!ParseWalDml(record, &dml)) {
-                // Point 3 of the comment on this function: the header already
-                // proved the whole payload is inside the file, so this is
-                // corruption, not the end of the log. Stopping here would drop
-                // every committed record that follows.
-                throw InternalError("recovery found a corrupt DML payload at WAL offset " +
-                                    std::to_string(record.offset) + " (LSN " + std::to_string(record.lsn) +
-                                    "); WAL retained");
-            }
-            active_txn_last_lsn_[record.txn_id] = record.lsn;
-            txns_with_undoable_wal.insert(record.txn_id);
-            has_dml_records_ = true;
-            const uint16_t table_id = intern_table(dml.table_name);
-            const RecoveryTable& table = tables_[table_id];
-            // Before the narrowing cast below and before any later phase can
-            // hand this RID to the record layer.
-            validate_dml_rid(table, record, dml.rid);
-            // Sparse UPDATE parsing materializes a complete before image, so
-            // every later consumer keeps the same full-row contract. Check
-            // that contract here, before redo, undo, or index-key extraction
-            // can read a column offset from either image.
-            if (table.file_handle != nullptr) {
-                if (dml.update_delta.present()) {
-                    validate_installable_image(table, record, static_cast<int>(dml.update_delta.row_size));
-                }
-                if (dml.before_image != nullptr) {
-                    validate_installable_image(table, record, dml.before_size);
-                }
-                if (dml.after_image != nullptr) {
-                    validate_installable_image(table, record, dml.after_size);
-                }
-            }
-            touched_tables_.insert(table.name);
-            TouchedTuple touched;
-            touched.table_id = table_id;
-            touched.page_no = dml.rid.page_no;
-            touched.slot_no = static_cast<int16_t>(dml.rid.slot_no);
-            touched_.push_back(touched);
-            HeapRedoRecord redo_record;
-            redo_record.wal_offset = record.offset;
-            redo_record.wal_length = record.total_len;
-            redo_record.table_id = table_id;
-            redo_record.page_no = dml.rid.page_no;
-            redo_record.slot_no = static_cast<int16_t>(dml.rid.slot_no);
-            redo_record.record_checksum = IndexSmoCrc32(record.bytes, record.total_len);
-            index_key_stream_identity_ =
-                MixDmlIdentity(index_key_stream_identity_, record.offset, record.total_len, redo_record.record_checksum);
-            ++index_key_stream_records_;
-            if (index_key_stream_segments_complete_) {
-                index_key_segment.identity = MixDmlIdentity(index_key_segment.identity, record.offset, record.total_len,
-                                                            redo_record.record_checksum);
-                ++index_key_segment.dml_records;
-            }
-            constexpr uint32_t kDescriptorIndexLimit = 1U << 31;
-            if (heap_redo_records_.size() >= kDescriptorIndexLimit) {
-                throw InternalError("recovery heap-redo descriptor count exceeds intrusive chain limit; WAL retained");
-            }
-            const uint32_t descriptor_index_plus_one = static_cast<uint32_t>(heap_redo_records_.size() + 1);
-            redo_record.txn_prev_plus_one = heap_redo_txn_heads_[record.txn_id];
-            heap_redo_records_.push_back(redo_record);
-            heap_redo_txn_heads_[record.txn_id] = descriptor_index_plus_one;
-            break;
-        }
-        case LogType::COMMIT: {
-            committed_txns_.insert(record.txn_id);
-            auto redo_head = heap_redo_txn_heads_.find(record.txn_id);
-            if (redo_head != heap_redo_txn_heads_.end()) {
-                constexpr uint32_t kCommittedBit = 1U << 31;
-                constexpr uint32_t kPreviousMask = kCommittedBit - 1;
-                for (uint32_t current = redo_head->second; current != 0;) {
-                    HeapRedoRecord& descriptor = heap_redo_records_[current - 1];
-                    const uint32_t previous = descriptor.txn_prev_plus_one & kPreviousMask;
-                    descriptor.txn_prev_plus_one = previous | kCommittedBit;
-                    current = previous;
-                }
-                heap_redo_txn_heads_.erase(redo_head);
-            }
-            active_txn_last_lsn_.erase(record.txn_id);
-            checkpoint_active_txns.erase(record.txn_id);
-            txns_with_undoable_wal.erase(record.txn_id);
-            // 8 字节载荷；旧 WAL 的 COMMIT 记录没有它，此时保持 INVALID_TS 并跳过。
-            if (CommitLogRecord::HasCommitTs(record.total_len)) {
-                const timestamp_t commit_ts = read_unaligned<timestamp_t>(record.bytes + OFFSET_LOG_DATA);
-                if (commit_ts != INVALID_TS && (max_wal_commit_ts_ == INVALID_TS || commit_ts > max_wal_commit_ts_)) {
-                    max_wal_commit_ts_ = commit_ts;
-                }
-            }
-            break;
-        }
-        case LogType::ABORT:
-            // ABORT only records that rollback was requested. This system does not write CLRs,
-            // so recovery must still idempotently undo the transaction's original DML records.
-            active_txn_last_lsn_[record.txn_id] = record.lsn;
-            break;
-        case LogType::CHECKPOINT:
-            break;
-        case LogType::INDEX_BIND: {
-            std::string_view index_name;
-            uint64_t generation = 0;
-            if (!ParseIndexBindWal(record, &index_name, &generation)) {
-                throw InternalError("recovery found a corrupt INDEX_BIND payload at WAL offset " +
-                                    std::to_string(record.offset) + "; WAL retained");
-            }
-            latest_index_bindings_[std::string(index_name)] = generation;
-            break;
-        }
-        case LogType::INDEX_SMO: {
-            IndexSmoWalView smo;
-            if (!ParseIndexSmoWal(record, &smo) || record.txn_id != INVALID_TXN_ID || record.prev_lsn != INVALID_LSN) {
-                throw InternalError("recovery found a corrupt INDEX_SMO payload at WAL offset " +
-                                    std::to_string(record.offset) + "; WAL retained");
-            }
-            has_index_smo_records_ = true;
-            index_smo_logical_image_count_ += static_cast<uint64_t>(smo.page_count) + 1;
-            index_smo_logical_image_bytes_ +=
-                (static_cast<uint64_t>(smo.page_count) + 1) * static_cast<uint64_t>(PAGE_SIZE);
-            if (smo.page_count > std::numeric_limits<uint32_t>::max() - index_smo_page_catalog_.size()) {
-                throw InternalError("recovery INDEX_SMO page catalogue exceeds addressable range; WAL retained");
-            }
-            const uint32_t page_catalog_begin = static_cast<uint32_t>(index_smo_page_catalog_.size());
-            for (uint32_t page = 0; page < smo.page_count; ++page) {
-                index_smo_page_catalog_.push_back(smo.page_no(page));
-            }
-            index_smo_records_.push_back(IndexSmoRecord{
-                record.offset,
-                record.total_len,
-                record.lsn,
-                record.txn_id,
-                record.prev_lsn,
-                IndexSmoCrc32(record.bytes, record.total_len - sizeof(uint32_t)),
-                read_unaligned<uint32_t>(record.bytes + record.total_len - sizeof(uint32_t)),
-                std::string(smo.index_file_name),
-                smo.index_generation,
-                page_catalog_begin,
-                smo.page_count,
-            });
-            break;
-        }
-        }
-
-        if (record.txn_id != INVALID_TXN_ID && (max_wal_txn_id_ == INVALID_TXN_ID || record.txn_id > max_wal_txn_id_)) {
-            max_wal_txn_id_ = record.txn_id;
-        }
-        // Only a live loser's prev_lsn chain can query this catalogue. COMMIT
-        // removes that transaction from the loser set, while INDEX_* and
-        // CHECKPOINT records have no transactional prev_lsn chain. Retaining
-        // just BEGIN/DML/ABORT therefore saves one 24-byte descriptor for the
-        // high-frequency committed records without weakening fail-closed undo.
-        if (record.txn_id != INVALID_TXN_ID &&
-            (record.log_type == LogType::BEGIN || record.log_type == LogType::INSERT ||
-             record.log_type == LogType::DELETE || record.log_type == LogType::UPDATE || record.log_type == LogType::ABORT)) {
-            record_locations_.push_back(WalRecordLocation{record.lsn, record.offset, record.total_len,
-                                                           IndexSmoCrc32(record.bytes, record.total_len)});
-        }
-        if (record.lsn != INVALID_LSN && (max_lsn_ == INVALID_LSN || record.lsn > max_lsn_)) {
-            max_lsn_ = record.lsn;
+        if (oversize || batch.record_count() >= WalFramer::kTargetRecords ||
+            batch.byte_size() >= static_cast<size_t>(WalFramer::kTargetBytes)) {
+            flush_batch();
         }
     }
+    flush_batch();
     if (reader.status() == WalReadStatus::kCorruption) {
         throw InternalError("recovery found a corrupt WAL header/control payload at offset " +
                             std::to_string(reader.next_offset()) + "; WAL retained");
@@ -843,7 +1221,6 @@ void RecoveryManager::redo() {
         size_t descriptor_index;
         std::string index_name;
         uint64_t index_generation;
-        uint32_t record_checksum;
         std::vector<uint32_t> page_indices;
         std::vector<page_id_t> page_numbers;
     };
@@ -851,7 +1228,6 @@ void RecoveryManager::redo() {
         size_t descriptor_index;
         std::string index_name;
         uint64_t index_generation;
-        uint32_t record_checksum;
     };
     std::vector<SelectedSmoRecord> selected_smo_records;
     std::vector<size_t> selected_smo_record_positions(index_smo_records_.size(), std::numeric_limits<size_t>::max());
@@ -873,15 +1249,6 @@ void RecoveryManager::redo() {
             location.wal_length < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
             static_cast<int64_t>(location.wal_length) > scan_end_offset_ - location.wal_offset) {
             throw InternalError("recovery INDEX_SMO descriptor leaves the WAL range; WAL retained");
-        }
-        // Do not include the stored CRC itself: CRC32(message || CRC(message))
-        // is the fixed IEEE residue and therefore cannot distinguish a payload
-        // rewrite whose tail CRC was recomputed.
-        if (IndexSmoCrc32(bytes, location.wal_length - sizeof(uint32_t)) != location.record_checksum) {
-            throw InternalError("recovery INDEX_SMO WAL bytes changed after analyze; WAL retained");
-        }
-        if (read_unaligned<uint32_t>(bytes + location.wal_length - sizeof(uint32_t)) != location.payload_checksum) {
-            throw InternalError("recovery INDEX_SMO stored checksum changed after analyze; WAL retained");
         }
         WalRecordView record;
         record.log_type = read_unaligned<LogType>(bytes + OFFSET_LOG_TYPE);
@@ -928,8 +1295,7 @@ void RecoveryManager::redo() {
         ++smo_eligible_records;
         smo_eligible_pages += location.page_count;
         ++smo_eligible_headers;
-        final_smo_headers.emplace(
-            index_name, SelectedSmoHeader{descriptor_index, index_name, location.index_generation, location.record_checksum});
+        final_smo_headers.emplace(index_name, SelectedSmoHeader{descriptor_index, index_name, location.index_generation});
         auto& seen_pages = seen_smo_pages[index_name];
         if (location.page_catalog_begin > index_smo_page_catalog_.size() ||
             location.page_count > index_smo_page_catalog_.size() - location.page_catalog_begin) {
@@ -942,8 +1308,7 @@ void RecoveryManager::redo() {
                 if (selected_position == std::numeric_limits<size_t>::max()) {
                     selected_position = selected_smo_records.size();
                     selected_smo_records.push_back(
-                        SelectedSmoRecord{descriptor_index, index_name, location.index_generation, location.record_checksum,
-                                          {}, {}});
+                        SelectedSmoRecord{descriptor_index, index_name, location.index_generation, {}, {}});
                 }
                 selected_smo_records[selected_position].page_indices.push_back(page);
                 selected_smo_records[selected_position].page_numbers.push_back(page_no);
@@ -954,9 +1319,6 @@ void RecoveryManager::redo() {
         }
     }
     validate_select_end = std::chrono::steady_clock::now();
-    if (index_smo_redo_test_hook_) {
-        index_smo_redo_test_hook_("after_validate_select");
-    }
     // Write all selected pages before any header. The header can make a new
     // root reachable, so installing it first could publish an incomplete tree.
     for (const SelectedSmoRecord& selected : selected_smo_records) {
@@ -973,8 +1335,7 @@ void RecoveryManager::redo() {
         const WalRecordView record = mapped_smo_record(location, bytes);
         IndexSmoWalView smo;
         if (!ParseIndexSmoWal(record, &smo) || smo.index_file_name != selected.index_name ||
-            smo.index_generation != selected.index_generation || location.record_checksum != selected.record_checksum ||
-            smo.page_count < selected.page_indices.size()) {
+            smo.index_generation != selected.index_generation || smo.page_count < selected.page_indices.size()) {
             throw InternalError("recovery INDEX_SMO selected record changed after validation; WAL retained");
         }
         for (size_t page = 0; page < selected.page_indices.size(); ++page) {
@@ -1018,7 +1379,7 @@ void RecoveryManager::redo() {
         const WalRecordView record = mapped_smo_record(location, bytes);
         IndexSmoWalView smo;
         if (!ParseIndexSmoWal(record, &smo) || smo.index_file_name != selected.index_name ||
-            smo.index_generation != selected.index_generation || location.record_checksum != selected.record_checksum) {
+            smo.index_generation != selected.index_generation) {
             throw InternalError("recovery INDEX_SMO final header changed after validation; WAL retained");
         }
         smo_reparse_time +=
@@ -1094,7 +1455,7 @@ void RecoveryManager::redo() {
             smo_exception = std::current_exception();
         }
     };
-    if (has_index_smo_records_ && !index_smo_redo_test_hook_) {
+    if (has_index_smo_records_) {
         smo_thread = std::thread(run_smo);
     } else {
         run_smo();
@@ -1163,9 +1524,6 @@ void RecoveryManager::redo() {
                 if (location.table_id != first.table_id || location.page_no != first.page_no) {
                     throw InternalError("recovery heap-redo page run is not homogeneous; WAL retained");
                 }
-                if (heap_redo_record_test_hook_) {
-                    heap_redo_record_test_hook_(location.wal_offset);
-                }
                 WalSnapshotAccess access;
                 const char* bytes =
                     wal_snapshot->record_bytes(location.wal_offset, location.wal_length, &worker.scratch, &access);
@@ -1191,7 +1549,8 @@ void RecoveryManager::redo() {
                 bool applied = false;
                 const bool occupied = Bitmap::is_set(page_handle.bitmap, location.slot_no);
                 if (mapped.log_type == LogType::UPDATE && worker.dml.update_delta.present()) {
-                    validate_installable_image(*table, mapped, static_cast<int>(worker.dml.update_delta.row_size));
+                    validate_installable_image(*table, mapped.lsn,
+                                               static_cast<int>(worker.dml.update_delta.row_size));
                     uint32_t cursor = 0;
                     for (uint32_t span_index = 0; span_index < worker.dml.update_delta.span_count; ++span_index) {
                         WalUpdateDeltaSpan span;
@@ -1249,7 +1608,7 @@ void RecoveryManager::redo() {
                     } else {
                         throw InternalError("recovery non-DML record in heap redo run; WAL retained");
                     }
-                    validate_installable_image(*table, mapped, image_size);
+                    validate_installable_image(*table, mapped.lsn, image_size);
                     if (!occupied) {
                         Bitmap::set(page_handle.bitmap, location.slot_no);
                         ++page_handle.page_hdr->num_records;
@@ -1562,10 +1921,9 @@ void RecoveryManager::undo() {
                                 " at offset " + std::to_string(offset) + "; WAL retained");
         }
         ++undo_chain_record_read_count_;
-        if (record.lsn != analyzed_location->lsn || record.total_len != analyzed_location->length ||
-            IndexSmoCrc32(record.bytes, record.total_len) != analyzed_location->record_checksum) {
-            throw InternalError("recovery loser WAL bytes changed after analyze at offset " + std::to_string(offset) +
-                                "; WAL retained");
+        if (record.lsn != analyzed_location->lsn || record.total_len != analyzed_location->length) {
+            throw InternalError("recovery loser WAL record no longer matches its analyzed location at offset " +
+                                std::to_string(offset) + "; WAL retained");
         }
         if (record.log_type == LogType::BEGIN) {
             continue;
@@ -1607,9 +1965,18 @@ void RecoveryManager::undo() {
              static_cast<unsigned long long>(undo_chain_record_read_count_),
              static_cast<unsigned long long>(pruned_no_undo_transaction_count_));
 
+    std::map<std::string, IndexRepairPlan> index_repair_plans;
+    plan_touched_indexes(&index_repair_plans);
+    const auto unbind_on_exit = [this](void*) { unbind_index_plans(); };
+    std::unique_ptr<void, decltype(unbind_on_exit)> index_plan_binding_guard(reinterpret_cast<void*>(1),
+                                                                              unbind_on_exit);
+    bind_index_plans(&index_repair_plans);
     LOG_INFO("recovery undo phase: page-finalize begin");
     finalize_touched_pages();
     LOG_INFO("recovery undo phase: page-finalize end");
+    // Finalization extracted live heap keys while its pages were pinned. The
+    // spine phase needs no table-local plan pointers.
+    unbind_index_plans();
     // Repair only keys named by the WAL. Rebuilding every index from every heap
     // row makes recovery proportional to the whole database even when the
     // crash affected a handful of records. The repair is idempotent and
@@ -1617,8 +1984,8 @@ void RecoveryManager::undo() {
     // affected index; if that also fails, recovery stops with WAL retained.
     if (!touched_sorted_.empty()) {
         FaultInjector::Point("mid_index_rebuild");
-
-        const std::unordered_set<std::string> indexes_to_rebuild = repair_touched_indexes();
+        const std::unordered_set<std::string> indexes_to_rebuild =
+            repair_touched_indexes(&index_repair_plans);
         // Rebuilding creates, opens, closes, and renames index files. Keep it
         // outside the overlap window because DiskManager's fd maps are not
         // synchronized for concurrent mutation and heap writeback lookup.
@@ -1655,14 +2022,22 @@ void RecoveryManager::repair_touched_file_headers() {
 }
 
 void RecoveryManager::finalize_touched_pages() {
+    fused_live_index_key_count_ = 0;
+    fused_live_index_key_bytes_ = 0;
     const auto phase_begin = std::chrono::steady_clock::now();
     struct TablePages {
         uint16_t table_id;
         size_t task_begin;
         size_t task_end;
         int physical_frontier;
+        RmFileHdr file_hdr;
     };
-    struct PageTask { size_t table_index; page_id_t page_no; };
+    struct PageTask {
+        size_t table_index;
+        page_id_t page_no;
+        size_t touched_begin;
+        size_t touched_end;
+    };
     struct PhysicalTask {
         size_t task_index;
         RmFileHandle* file_handle;
@@ -1699,10 +2074,16 @@ void RecoveryManager::finalize_touched_pages() {
             const int32_t page_no = touched_sorted_[index].page_no;
             if (page_no != previous_page) {
                 previous_page = page_no;
-                tasks.push_back({table_index, page_no});
+                const size_t page_begin = index;
+                while (index + 1 < end && touched_sorted_[index + 1].page_no == page_no) {
+                    ++index;
+                }
+                tasks.push_back({table_index, page_no, page_begin, index + 1});
             }
         }
-        table_pages.push_back(TablePages{table_id, task_begin, tasks.size(), 0});
+        RmFileHandle* file_handle = tables_[table_id].file_handle;
+        table_pages.push_back(TablePages{table_id, task_begin, tasks.size(), 0,
+                                         file_handle == nullptr ? RmFileHdr{} : file_handle->get_file_hdr()});
         begin = end;
     }
     const auto task_build_end = std::chrono::steady_clock::now();
@@ -1719,6 +2100,33 @@ void RecoveryManager::finalize_touched_pages() {
     size_t physical_task_count = 0;
     size_t requested_workers = 0;
     size_t launched_workers = 0;
+
+    // Workers never write the shared plans while a page is pinned. The serial
+    // extension prepass owns buffer zero; physical workers own buffers 1..N.
+    // This keeps key extraction lock-free and makes the caller's merge order
+    // deterministic after every worker has joined.
+    struct LocalPlanKeys {
+        std::vector<char> key_arena;
+        std::vector<IndexRepairEntry> entries;
+    };
+    std::vector<IndexRepairPlan*> plan_order;
+    for (const auto& table : tables_) {
+        for (IndexRepairPlan* plan : table.index_plans) {
+            if (std::find(plan_order.begin(), plan_order.end(), plan) == plan_order.end()) {
+                plan_order.push_back(plan);
+            }
+        }
+    }
+    std::unordered_map<IndexRepairPlan*, size_t> plan_slots;
+    for (size_t plan_index = 0; plan_index < plan_order.size(); ++plan_index) {
+        plan_slots.emplace(plan_order[plan_index], plan_index);
+    }
+    std::vector<std::vector<LocalPlanKeys>> local_keys(configured_workers + 1);
+    for (auto& worker_keys : local_keys) {
+        worker_keys.resize(plan_order.size());
+    }
+    uint64_t fused_live_key_count = 0;
+    uint64_t fused_live_key_bytes = 0;
     auto gate_end = task_build_end;
     auto prepass_end = task_build_end;
     auto workers_end = task_build_end;
@@ -1766,7 +2174,7 @@ void RecoveryManager::finalize_touched_pages() {
                  "extension-resident=%llu absent=%llu pin-failed=%llu frontier-queries=%llu "
                  "normalized-records=%llu tombstones=%llu publish-candidates=%llu publish-links=%llu "
                  "publish-candidate=%llu us "
-                 "publish-link=%llu us publish-wall=%llu us unpin-failed=%llu",
+                 "publish-link=%llu us publish-wall=%llu us unpin-failed=%llu fused-live-keys=%llu fused-live-bytes=%llu",
                  status, table_pages.size(), tasks.size(), configured_workers, reserved_frames, physical_task_count,
                  requested_workers, launched_workers, micros(task_build_end - phase_begin),
                  micros(gate_end - gate_begin), micros(prepass_end - gate_end), micros(workers_end - prepass_end),
@@ -1779,7 +2187,8 @@ void RecoveryManager::finalize_touched_pages() {
                  static_cast<unsigned long long>(publish_stats.candidate_ns / 1000),
                  static_cast<unsigned long long>(publish_stats.link_ns / 1000),
                  static_cast<unsigned long long>(publish_stats.wall_ns / 1000),
-                 static_cast<unsigned long long>(unpin_failed));
+                 static_cast<unsigned long long>(unpin_failed), static_cast<unsigned long long>(fused_live_key_count),
+                 static_cast<unsigned long long>(fused_live_key_bytes));
         LOG_INFO("recovery page-finalize attribution: status=%s actor-time-overlap=1 "
                  "path=extension-prepass+physical-workers "
                  "frontier-refresh=%llu us physical-fetch=%llu us extension-fetch=%llu us "
@@ -1796,7 +2205,7 @@ void RecoveryManager::finalize_touched_pages() {
             operation = buffer_pool_manager_->acquire_frame_operation(reserved_frames);
         gate_end = std::chrono::steady_clock::now();
 
-        const auto finalize_pinned = [&](size_t task_index, RmFileHandle* file_handle,
+        const auto finalize_pinned = [&](size_t task_index, size_t key_buffer_index, RmFileHandle* file_handle,
                                          const RecoveryPinnedFinalizePage& pinned, bool physical) {
             const PageTask& task = tasks[task_index];
             RecoveryPagePinGuard pin_guard(buffer_pool_manager_, pinned.page);
@@ -1813,6 +2222,35 @@ void RecoveryManager::finalize_touched_pages() {
                 task_stats[task_index].physical_normalize_ns = normalize_ns;
             } else {
                 task_stats[task_index].extension_normalize_ns = normalize_ns;
+            }
+            // finalize_recovery_pinned_page drops its exclusive page latch but
+            // not our pin. Read exactly this task's touched slots under a
+            // shared latch, after tombstone removal and MVCC normalization.
+            // No record-layer recovery types escape through this narrow,
+            // already-pinned access.
+            const auto& table_plans = tables_[table_pages[task.table_index].table_id].index_plans;
+            if (!table_plans.empty()) {
+                const PageTask& key_task = tasks[task_index];
+                RmPageHandle page_handle(&table_pages[key_task.table_index].file_hdr, pinned.page);
+                std::shared_lock<std::shared_mutex> page_lock(pinned.page->latch());
+                for (size_t touched_index = key_task.touched_begin; touched_index < key_task.touched_end;
+                     ++touched_index) {
+                    const int slot_no = touched_sorted_[touched_index].slot_no;
+                    if (slot_no < 0 || slot_no >= page_handle.file_hdr->num_records_per_page ||
+                        !Bitmap::is_set(page_handle.bitmap, slot_no) || page_handle.get_meta(slot_no).is_deleted_) {
+                        continue;
+                    }
+                    const char* row = page_handle.get_slot(slot_no);
+                    const Rid rid{key_task.page_no, slot_no};
+                    for (IndexRepairPlan* plan : table_plans) {
+                        LocalPlanKeys& local = local_keys[key_buffer_index][plan_slots.at(plan)];
+                        const uint32_t key_slot = static_cast<uint32_t>(local.key_arena.size() / plan->key_len);
+                        local.key_arena.resize(local.key_arena.size() + static_cast<size_t>(plan->key_len));
+                        BuildIndexKey(*plan->index_meta, row,
+                                      local.key_arena.data() + static_cast<size_t>(key_slot) * plan->key_len);
+                        local.entries.push_back(IndexRepairEntry{key_slot, rid, true});
+                    }
+                }
             }
             FaultInjector::Point("post_recovery_page_finalize");
             if (!pin_guard.release()) {
@@ -1868,7 +2306,7 @@ void RecoveryManager::finalize_touched_pages() {
                     continue;
                 }
                 task_stats[task_index].extension_resident = 1;
-                finalize_pinned(task_index, file_handle, *pinned, false);
+                finalize_pinned(task_index, 0, file_handle, *pinned, false);
             }
         }
 
@@ -1881,7 +2319,7 @@ void RecoveryManager::finalize_touched_pages() {
         prepass_complete = true;
         RunRecoveryTasks(
             physical_tasks.size(), requested_workers,
-            [&](size_t, size_t physical_task_index) {
+            [&](size_t worker_index, size_t physical_task_index) {
                 const PhysicalTask& physical_task = physical_tasks[physical_task_index];
                 const PageTask& task = tasks[physical_task.task_index];
                 std::optional<RecoveryPinnedFinalizePage> pinned;
@@ -1900,10 +2338,30 @@ void RecoveryManager::finalize_touched_pages() {
                     task_stats[physical_task.task_index].pin_failed = 1;
                     throw InternalError("recovery could not pin an existing record page");
                 }
-                finalize_pinned(physical_task.task_index, physical_task.file_handle, *pinned, true);
+                finalize_pinned(physical_task.task_index, worker_index + 1, physical_task.file_handle, *pinned, true);
             },
             &launched_workers);
         workers_end = physical_tasks.empty() ? prepass_end : std::chrono::steady_clock::now();
+        // Only this thread touches the shared plans. Merge worker buffers in
+        // stable buffer/plan order and release each consumed local allocation
+        // before proceeding, bounding the transient recovery peak.
+        for (auto& worker_keys : local_keys) {
+            for (size_t plan_index = 0; plan_index < plan_order.size(); ++plan_index) {
+                LocalPlanKeys& local = worker_keys[plan_index];
+                IndexRepairPlan* plan = plan_order[plan_index];
+                const uint32_t base = static_cast<uint32_t>(plan->key_arena.size() / plan->key_len);
+                plan->key_arena.insert(plan->key_arena.end(), local.key_arena.begin(), local.key_arena.end());
+                for (IndexRepairEntry entry : local.entries) {
+                    entry.key_slot += base;
+                    plan->entries.push_back(entry);
+                }
+                fused_live_key_count += local.entries.size();
+                fused_live_key_bytes += local.key_arena.size();
+                local = LocalPlanKeys{};
+            }
+        }
+        fused_live_index_key_count_ = fused_live_key_count;
+        fused_live_index_key_bytes_ = fused_live_key_bytes;
     } catch (...) {
         if (gate_end < gate_begin) gate_end = std::chrono::steady_clock::now();
         if (!prepass_complete)
@@ -2074,7 +2532,6 @@ void RecoveryManager::collect_wal_index_keys() {
             uint64_t records{0};
             uint64_t bytes{0};
             uint64_t keys{0};
-            uint64_t identity{0};
             std::vector<LocalPlanKeys> plans;
         };
         if (index_key_stream_segments_.front().begin != scan_begin_offset_ ||
@@ -2151,8 +2608,6 @@ void RecoveryManager::collect_wal_index_keys() {
                         record.prev_lsn = read_unaligned<lsn_t>(bytes + OFFSET_PREV_LSN);
                         record.offset = offset;
                         record.bytes = bytes;
-                        const uint32_t checksum = IndexSmoCrc32(bytes, length);
-                        result.identity = MixDmlIdentity(result.identity, offset, length, checksum);
                         ++result.records;
                         result.bytes += length;
                         if (!ParseWalDml(record, &local_dml)) {
@@ -2184,8 +2639,7 @@ void RecoveryManager::collect_wal_index_keys() {
                     }
                     offset += length;
                 }
-                if (offset != segment.end || result.records != segment.dml_records ||
-                    result.identity != segment.identity) {
+                if (offset != segment.end) {
                     throw InternalError("recovery index-key segment identity changed after analyze; WAL retained");
                 }
             });
@@ -2208,9 +2662,6 @@ void RecoveryManager::collect_wal_index_keys() {
                     }
                 }
             }
-            if (records != index_key_stream_records_) {
-                throw InternalError("recovery index-key stream WAL no longer matches analyze prefix; WAL retained");
-            }
             const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::steady_clock::now() - parallel_begin)
                                      .count();
@@ -2231,15 +2682,10 @@ void RecoveryManager::collect_wal_index_keys() {
              static_cast<long long>(scan_end_offset_));
     WalReader reader(disk_manager_, scan_begin_offset_, scan_end_offset_);
     WalRecordView record;
-    uint64_t fallback_identity = 0;
-    uint64_t fallback_records = 0;
     int64_t next_progress_offset = scan_begin_offset_ + 256LL * 1024LL * 1024LL;
     auto last_progress = begin;
     while (reader.next(&record)) {
         if (record.log_type == LogType::INSERT || record.log_type == LogType::DELETE || record.log_type == LogType::UPDATE) {
-            fallback_identity = MixDmlIdentity(fallback_identity, record.offset, record.total_len,
-                                               IndexSmoCrc32(record.bytes, record.total_len));
-            ++fallback_records;
             collect_record(record, std::numeric_limits<uint16_t>::max());
             ++records;
             bytes += record.total_len;
@@ -2253,101 +2699,12 @@ void RecoveryManager::collect_wal_index_keys() {
             last_progress = now;
         }
     }
-    if (reader.next_offset() != scan_end_offset_ || fallback_records != index_key_stream_records_ ||
-        fallback_identity != index_key_stream_identity_) {
+    if (reader.next_offset() != scan_end_offset_) {
         throw InternalError("recovery index-key stream WAL no longer matches analyze prefix; WAL retained");
     }
     LOG_INFO("recovery undo phase: wal-key-collect end source=verified-stream bytes=%llu records=%llu keys=%llu",
              static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(records),
              static_cast<unsigned long long>(keys));
-}
-
-void RecoveryManager::collect_heap_index_keys() {
-    // Read the final tuple of every touched RID one page at a time. The RIDs
-    // are already ordered by page, so this is a sequential sweep and the keys
-    // of every index on the table come out of the same page pin.
-    struct TableRange {
-        uint16_t table_id;
-        size_t begin;
-        size_t end;
-    };
-    std::vector<TableRange> ranges;
-    for (size_t begin = 0; begin < touched_sorted_.size();) {
-        const uint16_t table_id = touched_sorted_[begin].table_id;
-        size_t end = begin;
-        while (end < touched_sorted_.size() && touched_sorted_[end].table_id == table_id) {
-            ++end;
-        }
-        ranges.push_back(TableRange{table_id, begin, end});
-        begin = end;
-    }
-    const auto phase_begin = std::chrono::steady_clock::now();
-    std::vector<int64_t> table_wall_ms(ranges.size(), 0);
-    const size_t configured_workers = RecoveryWorkerLimit();
-    const size_t workers = RunRecoveryTasks(ranges.size(), configured_workers, [&](size_t, size_t task_index) {
-        const TableRange& range = ranges[task_index];
-        const auto table_begin = std::chrono::steady_clock::now();
-        const size_t begin = range.begin;
-        const size_t end = range.end;
-        const uint16_t table_id = range.table_id;
-        RecoveryTable& table = tables_[table_id];
-        if (table.file_handle == nullptr || table.index_plans.empty()) {
-            table_wall_ms[task_index] =
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - table_begin)
-                    .count();
-            return;
-        }
-        const auto& table_plans = table.index_plans;
-
-        const int num_pages = table.file_handle->get_file_hdr().num_pages;
-        for (size_t i = begin; i < end;) {
-            const int32_t page_no = touched_sorted_[i].page_no;
-            size_t page_end = i;
-            while (page_end < end && touched_sorted_[page_end].page_no == page_no) {
-                ++page_end;
-            }
-            if (page_no < 0 || page_no >= num_pages) {
-                i = page_end;
-                continue;
-            }
-
-            RmPageHandle page_handle = table.file_handle->fetch_page_handle(page_no);
-            {
-                std::shared_lock<std::shared_mutex> page_lock(page_handle.page->latch());
-                for (size_t j = i; j < page_end; ++j) {
-                    const int slot_no = touched_sorted_[j].slot_no;
-                    if (slot_no < 0 || slot_no >= page_handle.file_hdr->num_records_per_page) {
-                        continue;
-                    }
-                    if (!Bitmap::is_set(page_handle.bitmap, slot_no) || page_handle.get_meta(slot_no).is_deleted_) {
-                        continue;
-                    }
-                    const char* row = page_handle.get_slot(slot_no);
-                    const Rid rid{page_no, slot_no};
-                    for (IndexRepairPlan* plan : table_plans) {
-                        const auto key_slot = static_cast<uint32_t>(plan->key_arena.size() / plan->key_len);
-                        plan->key_arena.resize(plan->key_arena.size() + static_cast<size_t>(plan->key_len));
-                        BuildIndexKey(*plan->index_meta, row,
-                                      plan->key_arena.data() + static_cast<size_t>(key_slot) * plan->key_len);
-                        plan->entries.push_back(IndexRepairEntry{key_slot, rid, true});
-                    }
-                }
-            }
-            buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
-            i = page_end;
-        }
-        table_wall_ms[task_index] =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - table_begin)
-                .count();
-    });
-    const int64_t max_table_ms =
-        table_wall_ms.empty() ? 0 : *std::max_element(table_wall_ms.begin(), table_wall_ms.end());
-    const int64_t wall_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_begin).count();
-    LOG_INFO("recovery heap-key-collect: tables=%zu configured-workers=%zu active-workers=%zu wall=%lld ms "
-             "max-table=%lld ms",
-             ranges.size(), configured_workers, workers, static_cast<long long>(wall_ms),
-             static_cast<long long>(max_table_ms));
 }
 
 void RecoveryManager::plan_touched_indexes(std::map<std::string, IndexRepairPlan>* plans) {
@@ -2393,22 +2750,10 @@ void RecoveryManager::bind_index_plans(std::map<std::string, IndexRepairPlan>* p
     }
 }
 
-void RecoveryManager::collect_index_repair_keys(std::map<std::string, IndexRepairPlan>* plans) {
-    // Always replay the accepted DML stream identity before deciding whether
-    // any index needs keys. A no-index database is still allowed to contain a
-    // loser whose before image was changed after analyze; skipping this pass
-    // would let it reach WAL reset without the stream verification.
-    bind_index_plans(plans);
-    if (plans->empty()) {
-        collect_wal_index_keys();
-        LOG_INFO("recovery undo phase: heap-key-collect begin plans=0");
-        LOG_INFO("recovery undo phase: heap-key-collect end plans=0");
-        return;
+void RecoveryManager::unbind_index_plans() noexcept {
+    for (auto& table : tables_) {
+        table.index_plans.clear();
     }
-    collect_wal_index_keys();
-    LOG_INFO("recovery undo phase: heap-key-collect begin plans=%zu", plans->size());
-    collect_heap_index_keys();
-    LOG_INFO("recovery undo phase: heap-key-collect end plans=%zu", plans->size());
 }
 
 void RecoveryManager::sort_index_repair_entries(IndexRepairPlan* plan) {
@@ -2625,13 +2970,9 @@ bool RecoveryManager::apply_index_repair_plan(IndexRepairPlan* plan, IndexRepair
     return true;
 }
 
-std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
-    std::map<std::string, IndexRepairPlan> plans;
-    // Only names and key widths at this point. Collecting the keys costs a WAL
-    // pass and a heap sweep, so it waits until the spine check below has dropped
-    // the indexes that cannot be repaired in place at all.
-    plan_touched_indexes(&plans);
-    const size_t total_indexes = plans.size();
+std::unordered_set<std::string> RecoveryManager::repair_touched_indexes(
+    std::map<std::string, IndexRepairPlan>* plans) {
+    const size_t total_indexes = plans->size();
 
     std::unordered_set<std::string> indexes_to_rebuild;
 
@@ -2644,7 +2985,7 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
     // is unusable.
     const auto spine_begin = std::chrono::steady_clock::now();
     size_t repaired_endpoints = 0;
-    for (const auto& [index_name, plan] : plans) {
+    for (const auto& [index_name, plan] : *plans) {
         if (!plan.index->refresh_leaf_chain_endpoint()) {
             LOG_ERROR("recovery could not follow the leaf chain of index %s", index_name.c_str());
             indexes_to_rebuild.insert(index_name);
@@ -2657,13 +2998,24 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
 
     // Drop the plans for indexes that are going to be rebuilt anyway, then pay
     // for the key collection only for the rest.
-    for (auto it = plans.begin(); it != plans.end();) {
-        it = indexes_to_rebuild.count(it->first) != 0 ? plans.erase(it) : std::next(it);
+    for (auto it = plans->begin(); it != plans->end();) {
+        it = indexes_to_rebuild.count(it->first) != 0 ? plans->erase(it) : std::next(it);
     }
-    collect_index_repair_keys(&plans);
+    if (!plans->empty()) {
+        bind_index_plans(plans);
+        try {
+            // Heap keys were extracted during page finalization. Only replay
+            // WAL images for plans that survived the spine check.
+            collect_wal_index_keys();
+        } catch (...) {
+            unbind_index_plans();
+            throw;
+        }
+        unbind_index_plans();
+    }
 
-    // The key collectors may walk the full WAL and then touch heap pages. Do
-    // not compete with either operation: on a saturated device doing so turned
+    // WAL key collection may walk the full accepted prefix. Do not compete
+    // with it: on a saturated device doing so turned
     // a writeback overlap into the 90-second readiness critical path. From here
     // on, sorting/gating/applying are independent index work, so heap-only
     // writeback can overlap them safely. It remains advisory; final flush and
@@ -2704,8 +3056,8 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
             int64_t wall_ms{0};
         };
         std::vector<IndexRepairPlan*> gate_plans;
-        gate_plans.reserve(plans.size());
-        for (auto& [_, plan] : plans) {
+        gate_plans.reserve(plans->size());
+        for (auto& [_, plan] : *plans) {
             gate_plans.push_back(&plan);
         }
         std::vector<GateResult> gate_results(gate_plans.size());
@@ -2764,8 +3116,8 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
         LOG_INFO("recovery index structure gate workers: configured=%zu active=%zu max-index=%lld ms",
                  gate_configured_workers, gate_workers, static_cast<long long>(gate_max_index_ms));
 
-        for (auto it = plans.begin(); it != plans.end();) {
-            it = indexes_to_rebuild.count(it->first) != 0 ? plans.erase(it) : std::next(it);
+        for (auto it = plans->begin(); it != plans->end();) {
+            it = indexes_to_rebuild.count(it->first) != 0 ? plans->erase(it) : std::next(it);
         }
 
         LOG_INFO("recovery undo phase: apply begin");
@@ -2775,8 +3127,8 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
             int64_t wall_ms{0};
         };
         std::vector<IndexRepairPlan*> apply_plans;
-        apply_plans.reserve(plans.size());
-        for (auto& [_, plan] : plans) {
+        apply_plans.reserve(plans->size());
+        for (auto& [_, plan] : *plans) {
             apply_plans.push_back(&plan);
         }
         std::vector<ApplyResult> apply_results(apply_plans.size());
@@ -2833,9 +3185,7 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes() {
     const auto preflush_end = std::chrono::steady_clock::now();
     // index_plans points into `plans`, which dies with this function. Clear the
     // borrowed pointers on success and every exception path before rethrowing.
-    for (auto& table : tables_) {
-        table.index_plans.clear();
-    }
+    unbind_index_plans();
     const auto elapsed_ms = [](std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
     };
@@ -2990,7 +3340,7 @@ bool RecoveryManager::redo_existing_slot(RecoveryTable& table, const Rid& rid, c
 // analyze() already bounded the RID; only the length is left.
 
 void RecoveryManager::redo_insert(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
-    validate_installable_image(table, record, dml.after_size);
+    validate_installable_image(table, record.lsn, dml.after_size);
     // The committed metadata is installed even when the tuple body was already
     // present: a page LSN can be ahead because the same page also holds a loser
     // operation, so it must not be used to skip this redo.
@@ -3005,7 +3355,7 @@ void RecoveryManager::redo_insert(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::redo_delete(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
-    validate_installable_image(table, record, dml.before_size);
+    validate_installable_image(table, record.lsn, dml.before_size);
     TupleMeta meta = MakeCommittedMeta(record.txn_id);
     meta.is_deleted_ = true;
     if (redo_existing_slot(table, dml.rid, dml.before_image, dml.before_size, meta, record.lsn)) {
@@ -3022,7 +3372,7 @@ bool RecoveryManager::redo_update(const WalRecordView& record, const WalDmlView&
     if (dml.update_delta.present()) {
         return redo_update_delta(record, dml, table, defer_on_active_loser);
     }
-    validate_installable_image(table, record, dml.after_size);
+    validate_installable_image(table, record.lsn, dml.after_size);
     const TupleMeta meta = MakeCommittedMeta(record.txn_id);
     if (redo_existing_slot(table, dml.rid, dml.after_image, dml.after_size, meta, record.lsn)) {
         return true;
@@ -3036,7 +3386,7 @@ bool RecoveryManager::redo_update(const WalRecordView& record, const WalDmlView&
 
 bool RecoveryManager::redo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table,
                                         bool defer_on_active_loser) {
-    validate_installable_image(table, record, static_cast<int>(dml.update_delta.row_size));
+    validate_installable_image(table, record.lsn, static_cast<int>(dml.update_delta.row_size));
     uint32_t validation_cursor = 0;
     for (uint32_t i = 0; i < dml.update_delta.span_count; ++i) {
         WalUpdateDeltaSpan span;
@@ -3200,7 +3550,7 @@ void RecoveryManager::undo_insert(const WalRecordView& record, const WalDmlView&
 void RecoveryManager::undo_delete(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
     // Both paths below copy record_size bytes out of before_image; see the note
     // above redo_insert().
-    validate_installable_image(table, record, dml.before_size);
+    validate_installable_image(table, record.lsn, dml.before_size);
     // 幂等守卫：仅当该 slot 当前为空，或仍是本 loser 写下的 MVCC tombstone 时才恢复。
     // 若 slot 已被后续 committed 事务重新写入为 live tuple，跳过，避免覆盖 committed 数据。
     const TupleMeta restored_meta = MakeLoserMeta(record.txn_id);
@@ -3222,7 +3572,7 @@ void RecoveryManager::undo_update(const WalRecordView& record, const WalDmlView&
     }
     // apply_tuple_update() copies record_size bytes out of before_image; see the
     // note above redo_insert().
-    validate_installable_image(table, record, dml.before_size);
+    validate_installable_image(table, record.lsn, dml.before_size);
     // 幂等守卫：仅当该 rid 仍持有本 loser 事务写入的 new_value 时才回滚到 old_value。
     // 若 rid 已被后续 committed 事务覆盖为其他值，跳过，避免覆盖 committed 数据。
     if (!record_exists(table, dml.rid)) {
@@ -3239,7 +3589,7 @@ void RecoveryManager::undo_update(const WalRecordView& record, const WalDmlView&
 }
 
 void RecoveryManager::undo_update_delta(const WalRecordView& record, const WalDmlView& dml, RecoveryTable& table) {
-    validate_installable_image(table, record, static_cast<int>(dml.update_delta.row_size));
+    validate_installable_image(table, record.lsn, static_cast<int>(dml.update_delta.row_size));
     if (table.file_handle == nullptr || dml.rid.page_no < 0 ||
         dml.rid.page_no >= table.file_handle->get_file_hdr().num_pages) {
         // The loser's page may never have reached disk (notably for an INSERT

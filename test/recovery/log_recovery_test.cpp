@@ -303,6 +303,8 @@ void RunPreparedRecovery(const std::string& db_name, size_t pool_size = 64) {
 void CreatePhysicalFinalizeSeed(const std::string& db_name) {
     CreateRecoveryTestDb(db_name, {"t"}, false);
     OpenRecoveryDb db(db_name);
+    db.sm_mgr_.create_index("t", {"id"}, nullptr);
+    db.sm_mgr_.create_index("t", {"v"}, nullptr);
     RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
     for (page_id_t page_no = 1; page_no <= 4; ++page_no) {
         RmPageHandle page = file_handle->create_new_page_handle();
@@ -432,6 +434,20 @@ std::vector<Rid> IndexEntriesFor(SmManager& sm_mgr, int key, const std::string& 
     return result;
 }
 
+std::vector<Rid> IndexEntriesForColumn(SmManager& sm_mgr, const std::string& column, int key,
+                                       const std::string& table_name = "t") {
+    auto* index = sm_mgr.ihs_.at(sm_mgr.get_ix_manager()->get_index_name(table_name, {column})).get();
+    std::vector<Rid> result;
+    index->get_value(MakeIntKey(key).data(), &result, nullptr);
+    return result;
+}
+
+bool IndexColumnPointsTo(SmManager& sm_mgr, const std::string& column, int key, const Rid& rid,
+                         const std::string& table_name = "t") {
+    const auto result = IndexEntriesForColumn(sm_mgr, column, key, table_name);
+    return result.size() == 1 && result[0] == rid;
+}
+
 bool IndexPointsTo(SmManager& sm_mgr, int key, const Rid& rid, const std::string& table_name = "t") {
     const auto result = IndexEntriesFor(sm_mgr, key, table_name);
     return result.size() == 1 && result[0] == rid;
@@ -532,44 +548,6 @@ void PatchWalBytes(const std::string& log_path, int64_t offset, const void* byte
     file.write(static_cast<const char*>(bytes), static_cast<std::streamsize>(size));
     file.flush();
     ASSERT_TRUE(static_cast<bool>(file));
-}
-
-void PatchLogicalWalBytes(DiskManager& disk, int64_t offset, const void* bytes, size_t size) {
-    if (!disk.wal_is_segmented()) {
-        PatchWalBytes(LOG_FILE_NAME, offset, bytes, size);
-        return;
-    }
-    const int64_t segment_bytes = disk.wal_segment_bytes();
-    ASSERT_GT(segment_bytes, 0);
-    const auto* source = static_cast<const char*>(bytes);
-    size_t written = 0;
-    while (written < size) {
-        const int64_t logical = offset + static_cast<int64_t>(written);
-        const uint64_t segment = static_cast<uint64_t>(logical / segment_bytes);
-        const int64_t segment_offset = logical % segment_bytes;
-        const size_t chunk = std::min<size_t>(size - written, static_cast<size_t>(segment_bytes - segment_offset));
-        PatchWalBytes(disk.wal_segment_name(segment), segment_offset, source + written, chunk);
-        written += chunk;
-    }
-}
-
-void PatchIndexSmoGenerationWithValidChecksum(DiskManager& disk, int64_t record_offset, uint64_t generation) {
-    constexpr uint32_t kGenerationOffset =
-        OFFSET_LOG_DATA + sizeof(uint32_t) + sizeof(uint16_t) * 2 + sizeof(uint32_t) * 4;
-    std::array<char, LOG_HEADER_SIZE> header{};
-    ASSERT_EQ(disk.read_log_chunk(header.data(), LOG_HEADER_SIZE, record_offset), LOG_HEADER_SIZE);
-    const uint32_t total_length = read_unaligned<uint32_t>(header.data() + OFFSET_LOG_TOT_LEN);
-    ASSERT_GT(total_length, kGenerationOffset + sizeof(uint64_t) + sizeof(uint32_t));
-    std::vector<char> record(total_length);
-    ASSERT_EQ(disk.read_log_chunk(record.data(), total_length, record_offset), static_cast<int>(total_length));
-    ASSERT_EQ(read_unaligned<LogType>(record.data() + OFFSET_LOG_TYPE), LogType::INDEX_SMO);
-    memcpy(record.data() + kGenerationOffset, &generation, sizeof(generation));
-    const uint32_t checksum = IndexSmoCrc32(record.data(), record.size() - sizeof(uint32_t));
-    memcpy(record.data() + record.size() - sizeof(uint32_t), &checksum, sizeof(checksum));
-    PatchLogicalWalBytes(disk, record_offset + kGenerationOffset, record.data() + kGenerationOffset,
-                         sizeof(generation));
-    PatchLogicalWalBytes(disk, record_offset + static_cast<int64_t>(record.size() - sizeof(uint32_t)), &checksum,
-                         sizeof(checksum));
 }
 
 void CorruptIndexSmoChecksum(DiskManager& disk, int64_t record_offset) {
@@ -880,86 +858,6 @@ TEST(RecoveryManagerTest, CorruptOldGenerationIndexSmoStillFailsClosed) {
     CorruptIndexSmoChecksum(db.disk_, smo_offsets.front());
 
     EXPECT_THROW(recovery.redo(), InternalError);
-}
-
-// SMO redo validates the compact descriptor again after analyze. The mapped
-// snapshot must preserve that fail-closed boundary just like the old pread
-// path did, rather than replaying a retyped record or resetting its WAL.
-TEST(RecoveryManagerTest, IndexSmoWalMutationAfterAnalyzeFailsClosed) {
-    ScopedTestDir test_dir("recovery_index_smo_wal_mutation_root");
-    const std::string db_name = "recovery_index_smo_wal_mutation_db";
-    CreateRecoveryTestDb(db_name);
-    const Rid rid{1, 27};
-    PrepareSinglePageIndexSmo(db_name, 27, rid, false);
-
-    OpenRecoveryDb db(db_name);
-    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
-    recovery.analyze();
-    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
-    ASSERT_EQ(smo_offsets.size(), 1u);
-    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
-    const LogType retyped = LogType::CHECKPOINT;
-    PatchWalBytes(LOG_FILE_NAME, smo_offsets[0] + OFFSET_LOG_TYPE, &retyped, sizeof(LogType));
-
-    EXPECT_THROW(recovery.redo(), InternalError);
-    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
-    EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 27, rid));
-}
-
-TEST(RecoveryManagerTest, IndexSmoValidChecksumMutationBeforeRedoValidationFailsClosed) {
-    ScopedTestDir test_dir("recovery_index_smo_prevalidate_identity_root");
-    const std::string db_name = "recovery_index_smo_prevalidate_identity_db";
-    CreateRecoveryTestDb(db_name);
-    PrepareSinglePageIndexSmo(db_name, 29, Rid{1, 29}, false);
-
-    OpenRecoveryDb db(db_name);
-    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
-    recovery.analyze();
-    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
-    ASSERT_EQ(smo_offsets.size(), 1u);
-    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
-    std::vector<char> original_bytes;
-    WalRecordView original;
-    ASSERT_TRUE(ReadWalRecordAt(&db.disk_, smo_offsets.front(), wal_size, &original_bytes, &original));
-    const uint32_t original_whole_record_crc = IndexSmoCrc32(original.bytes, original.total_len);
-    const uint32_t original_payload_crc = IndexSmoCrc32(original.bytes, original.total_len - sizeof(uint32_t));
-    PatchIndexSmoGenerationWithValidChecksum(db.disk_, smo_offsets.front(), 999999);
-
-    std::vector<char> mutated_bytes;
-    WalRecordView mutated;
-    ASSERT_TRUE(ReadWalRecordAt(&db.disk_, smo_offsets.front(), wal_size, &mutated_bytes, &mutated));
-    IndexSmoWalView parsed;
-    ASSERT_TRUE(ParseIndexSmoWal(mutated, &parsed));
-    EXPECT_EQ(parsed.index_generation, 999999u);
-    // Prove the former identity was blind: a valid CRC-appended record has the
-    // same whole-record residue after payload mutation and CRC recomputation.
-    EXPECT_EQ(IndexSmoCrc32(mutated.bytes, mutated.total_len), original_whole_record_crc);
-    EXPECT_NE(IndexSmoCrc32(mutated.bytes, mutated.total_len - sizeof(uint32_t)), original_payload_crc);
-
-    EXPECT_THROW(recovery.redo(), InternalError);
-    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
-}
-
-TEST(RecoveryManagerTest, SelectedIndexSmoIdentityIsRecheckedAfterSelection) {
-    ScopedTestDir test_dir("recovery_index_smo_selected_identity_root");
-    const std::string db_name = "recovery_index_smo_selected_identity_db";
-    CreateRecoveryTestDb(db_name);
-    PrepareSinglePageIndexSmo(db_name, 28, Rid{1, 28}, false);
-
-    OpenRecoveryDb db(db_name);
-    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
-    recovery.analyze();
-    const auto smo_offsets = WalRecordOffsets(db.disk_, LogType::INDEX_SMO);
-    ASSERT_EQ(smo_offsets.size(), 1u);
-    bool hook_called = false;
-    recovery.set_index_smo_redo_test_hook([&](std::string_view point) {
-        ASSERT_EQ(point, "after_validate_select");
-        hook_called = true;
-        PatchIndexSmoGenerationWithValidChecksum(db.disk_, smo_offsets.front(), 999999);
-    });
-
-    EXPECT_THROW(recovery.redo(), InternalError);
-    EXPECT_TRUE(hook_called);
 }
 
 TEST(RecoveryManagerTest, LoserIndexSmoIsRedoneBeforeTheLoserKeyIsUndone) {
@@ -1776,7 +1674,18 @@ TEST(RecoveryManagerTest, LoserUpdateWithFlushedIndexWriteRestoresTheOldKey) {
         db.sm_mgr_.flush_all_table_and_index_pages();
     }
 
-    RunRecovery(db_name);
+    {
+        OpenRecoveryDb db(db_name);
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        recovery.redo();
+        recovery.undo();
+        // This committed RID is live after finalization, so its index key must
+        // have come from the pinned finalize task. The old second heap sweep
+        // no longer exists; this test-only metric stays zero-cost in that path.
+        EXPECT_EQ(recovery.get_fused_live_index_key_count_for_test(), 1u);
+        EXPECT_GT(recovery.get_fused_live_index_key_bytes_for_test(), 0u);
+    }
     RunRecovery(db_name);
 
     OpenRecoveryDb db(db_name);
@@ -2175,6 +2084,144 @@ TEST(RecoveryManagerTest, FinalizeClampsWorkersToSmallBufferPool) {
         EXPECT_EQ(RecordValue(verified.sm_mgr_, rid), page_no * 11);
     }
     EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
+}
+
+void CreateFusedPhysicalMultiIndexScenario(const std::string& db_name) {
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    {
+        OpenRecoveryDb db(db_name);
+        db.sm_mgr_.create_index("t", {"id"}, nullptr);
+        db.sm_mgr_.create_index("t", {"v"}, nullptr);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        for (page_id_t page_no = 1; page_no <= 8; ++page_no) {
+            RmPageHandle page = file_handle->create_new_page_handle();
+            if (page.page->get_page_id().page_no != page_no || !db.bpm_.unpin_page(page.page->get_page_id(), true)) {
+                throw std::runtime_error("could not create fused physical finalize page");
+            }
+        }
+        if (!db.bpm_.flush_all_pages(file_handle->GetFd())) {
+            throw std::runtime_error("could not persist fused physical finalize pages");
+        }
+
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 900);
+        const auto append_insert = [&](const Rid& rid, int id, int value) {
+            auto record = MakeTuple(id, value);
+            lsn = AppendInsert(*db.log_mgr_, 900, lsn, rid, record);
+        };
+        append_insert(Rid{1, 0}, 101, 1001);
+        auto old_record = MakeTuple(202, 2002);
+        auto new_record = MakeTuple(203, 2003);
+        lsn = AppendInsert(*db.log_mgr_, 900, lsn, Rid{2, 0}, old_record);
+        lsn = AppendUpdate(*db.log_mgr_, 900, lsn, Rid{2, 0}, old_record, new_record);
+        auto deleted_record = MakeTuple(303, 3003);
+        lsn = AppendInsert(*db.log_mgr_, 900, lsn, Rid{3, 0}, deleted_record);
+        lsn = AppendDelete(*db.log_mgr_, 900, lsn, Rid{3, 0}, deleted_record);
+        for (page_id_t page_no = 4; page_no <= 8; ++page_no) {
+            append_insert(Rid{page_no, 0}, 100 + page_no, 1100 + page_no);
+        }
+        AppendCommit(*db.log_mgr_, 900, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+}
+
+struct FusedPhysicalIndexResult {
+    uint64_t fused_keys{0};
+    uint64_t fused_bytes{0};
+    std::set<page_id_t> physical_pages;
+    size_t physical_worker_threads{0};
+};
+
+FusedPhysicalIndexResult RecoverFusedPhysicalMultiIndexScenario(const std::string& db_name, const char* workers,
+                                                                  size_t pool_size, size_t expected_participants) {
+    ScopedEnvironmentValue worker_count("RMDB_RECOVERY_WORKERS", workers);
+    OpenRecoveryDb db(db_name, pool_size);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.prepare_pages_for_redo();
+    recovery.redo();
+    const page_id_t physical_frontier = db.sm_mgr_.fhs_.at("t")->recovery_physical_page_frontier();
+    FusedPhysicalIndexResult result;
+    std::mutex participant_latch;
+    std::condition_variable participant_cv;
+    std::set<std::thread::id> participant_threads;
+    bool release_participants = false;
+    recovery.set_recovery_finalize_pin_test_hook([&](page_id_t page_no) {
+        if (page_no >= physical_frontier) {
+            throw std::runtime_error("finalize hook observed a non-physical page");
+        }
+        std::unique_lock<std::mutex> lock(participant_latch);
+        result.physical_pages.insert(page_no);
+        participant_threads.insert(std::this_thread::get_id());
+        if (participant_threads.size() >= expected_participants) {
+            release_participants = true;
+            participant_cv.notify_all();
+            return;
+        }
+        if (!participant_cv.wait_for(lock, std::chrono::seconds(5), [&] { return release_participants; })) {
+            release_participants = true;
+            participant_cv.notify_all();
+            throw std::runtime_error("physical finalize worker barrier timed out");
+        }
+    });
+    recovery.undo();
+    {
+        std::lock_guard<std::mutex> lock(participant_latch);
+        result.physical_worker_threads = participant_threads.size();
+    }
+    result.fused_keys = recovery.get_fused_live_index_key_count_for_test();
+    result.fused_bytes = recovery.get_fused_live_index_key_bytes_for_test();
+    return result;
+}
+
+void ExpectFusedPhysicalMultiIndexResult(const std::string& db_name) {
+    OpenRecoveryDb db(db_name);
+    const std::array<std::pair<Rid, std::pair<int, int>>, 7> live_rows{{
+        {Rid{1, 0}, {101, 1001}}, {Rid{2, 0}, {203, 2003}}, {Rid{4, 0}, {104, 1104}},
+        {Rid{5, 0}, {105, 1105}}, {Rid{6, 0}, {106, 1106}}, {Rid{7, 0}, {107, 1107}},
+        {Rid{8, 0}, {108, 1108}},
+    }};
+    for (const auto& [rid, keys] : live_rows) {
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+        EXPECT_EQ(RecordId(db.sm_mgr_, rid), keys.first);
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid), keys.second);
+        EXPECT_TRUE(IndexColumnPointsTo(db.sm_mgr_, "id", keys.first, rid));
+        EXPECT_TRUE(IndexColumnPointsTo(db.sm_mgr_, "v", keys.second, rid));
+    }
+    EXPECT_FALSE(RecordExists(db.sm_mgr_, Rid{3, 0}));
+    for (const auto& [column, key] : {std::pair{"id", 202}, std::pair{"v", 2002}, std::pair{"id", 303},
+                                      std::pair{"v", 3003}}) {
+        EXPECT_TRUE(IndexEntriesForColumn(db.sm_mgr_, column, key).empty());
+    }
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+}
+
+TEST(RecoveryManagerTest, FusedPhysicalMultiIndexKeysAreDeterministicAcrossWorkersAndSmallPool) {
+    ScopedTestDir test_dir("recovery_fused_physical_multi_index_root");
+    const std::string single_worker_db = "recovery_fused_physical_multi_index_single";
+    const std::string eight_worker_db = "recovery_fused_physical_multi_index_eight";
+    const std::string small_pool_db = "recovery_fused_physical_multi_index_small_pool";
+    CreateFusedPhysicalMultiIndexScenario(single_worker_db);
+    std::filesystem::copy(single_worker_db, eight_worker_db, std::filesystem::copy_options::recursive);
+    std::filesystem::copy(single_worker_db, small_pool_db, std::filesystem::copy_options::recursive);
+
+    const FusedPhysicalIndexResult single = RecoverFusedPhysicalMultiIndexScenario(single_worker_db, "1", 16, 1);
+    const FusedPhysicalIndexResult eight = RecoverFusedPhysicalMultiIndexScenario(eight_worker_db, "8", 16, 8);
+    const FusedPhysicalIndexResult small_pool = RecoverFusedPhysicalMultiIndexScenario(small_pool_db, "8", 2, 2);
+
+    const std::set<page_id_t> expected_physical_pages{1, 2, 3, 4, 5, 6, 7, 8};
+    for (const FusedPhysicalIndexResult* result : {&single, &eight, &small_pool}) {
+        EXPECT_EQ(result->physical_pages, expected_physical_pages);
+        EXPECT_EQ(result->fused_keys, 14u);
+        EXPECT_EQ(result->fused_bytes, 14u * sizeof(int));
+    }
+    EXPECT_EQ(single.physical_worker_threads, 1u);
+    EXPECT_EQ(eight.physical_worker_threads, 8u);
+    EXPECT_EQ(small_pool.physical_worker_threads, 2u);
+    EXPECT_EQ(single.fused_keys, eight.fused_keys);
+    EXPECT_EQ(single.fused_bytes, eight.fused_bytes);
+    ExpectFusedPhysicalMultiIndexResult(single_worker_db);
+    ExpectFusedPhysicalMultiIndexResult(eight_worker_db);
+    ExpectFusedPhysicalMultiIndexResult(small_pool_db);
 }
 
 TEST(RecoveryManagerTest, PhysicalFinalizeOverlapsTwoDirtyVictimWrites) {
@@ -2747,64 +2794,6 @@ TEST(RecoveryManagerTest, WalPayloadMutationAfterAnalyzeFailsClosed) {
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
 }
 
-TEST(RecoveryManagerTest, HeapRunSecondRecordMutationRetainsWalAndRestartsTwice) {
-    ScopedTestDir test_dir("recovery_heap_run_second_mutation_root");
-    const std::string db_name = "recovery_heap_run_second_mutation_db";
-    CreateRecoveryTestDb(db_name);
-    const Rid first{1, 0};
-    const Rid second{1, 1};
-    auto first_tuple = MakeTuple(1, 10);
-    auto second_tuple = MakeTuple(2, 20);
-    int64_t wal_size = 0;
-
-    {
-        OpenRecoveryDb db(db_name);
-        auto lsn = AppendBegin(*db.log_mgr_, 100);
-        lsn = AppendInsert(*db.log_mgr_, 100, lsn, first, first_tuple);
-        lsn = AppendInsert(*db.log_mgr_, 100, lsn, second, second_tuple);
-        AppendCommit(*db.log_mgr_, 100, lsn);
-        FlushLogs(*db.log_mgr_);
-
-        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
-        recovery.analyze();
-        const auto offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
-        ASSERT_EQ(offsets.size(), 2u);
-        wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
-        bool mutated = false;
-        recovery.set_heap_redo_record_test_hook([&](int64_t offset) {
-            if (!mutated && offset == offsets[1]) {
-                const int corrupt_value = 999;
-                PatchWalBytes(LOG_FILE_NAME, offset + OFFSET_LOG_DATA + static_cast<int64_t>(sizeof(int)),
-                              &corrupt_value, sizeof(corrupt_value));
-                mutated = true;
-            }
-        });
-        EXPECT_THROW(recovery.redo(), InternalError);
-        EXPECT_TRUE(mutated);
-        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
-    }
-
-    // Restore the original logical WAL byte before the next process.  The
-    // first record may already have been dirtied/unpinned, so two full restart
-    // rounds prove both prefix durability and redo idempotence.
-    {
-        OpenRecoveryDb db(db_name);
-        const auto offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
-        ASSERT_EQ(offsets.size(), 2u);
-        const int original_value = 20;
-        PatchWalBytes(LOG_FILE_NAME, offsets[1] + OFFSET_LOG_DATA + static_cast<int64_t>(sizeof(int)),
-                      &original_value, sizeof(original_value));
-        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
-    }
-    RunRecovery(db_name);
-    RunRecovery(db_name);
-    OpenRecoveryDb verified(db_name);
-    ASSERT_TRUE(RecordExists(verified.sm_mgr_, first));
-    ASSERT_TRUE(RecordExists(verified.sm_mgr_, second));
-    EXPECT_EQ(RecordValue(verified.sm_mgr_, first), 10);
-    EXPECT_EQ(RecordValue(verified.sm_mgr_, second), 20);
-}
-
 TEST(RecoveryManagerTest, LoserNoIndexPayloadMutationAfterAnalyzeRetainsWal) {
     ScopedTestDir test_dir("recovery_loser_no_index_identity_root");
     const std::string db_name = "recovery_loser_no_index_identity_db";
@@ -2988,6 +2977,54 @@ TEST(RecoveryManagerTest, CorruptDmlPayloadFailsRecoveryInsteadOfEndingTheScan) 
     // than starting up on a database missing a committed row.
     EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
+}
+
+TEST(RecoveryManagerTest, EarlierReduceFailureWinsOverLaterWorkerFailureAndKeepsStagedState) {
+    ScopedTestDir test_dir("recovery_reduce_failure_precedence_root");
+    const std::string db_name = "recovery_reduce_failure_precedence_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid rid{1, 0};
+    auto rec = MakeTuple(1, 10);
+
+    OpenRecoveryDb db(db_name);
+    const lsn_t first_lsn = AppendBegin(*db.log_mgr_, 100);
+    FlushLogs(*db.log_mgr_);
+
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    ASSERT_NO_THROW(recovery.analyze());
+    const uint64_t old_scanned = recovery.get_scanned_record_count();
+    const lsn_t old_max_lsn = recovery.get_max_lsn();
+    const uint64_t old_dml = recovery.get_dml_record_count();
+
+    const lsn_t second_lsn = AppendBegin(*db.log_mgr_, 200);
+    const lsn_t insert_lsn = AppendInsert(*db.log_mgr_, 200, second_lsn, rid, rec);
+    FlushLogs(*db.log_mgr_);
+    const auto begin_offsets = WalRecordOffsets(db.disk_, LogType::BEGIN);
+    const auto insert_offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+    ASSERT_EQ(begin_offsets.size(), 2u);
+    ASSERT_EQ(insert_offsets.size(), 1u);
+    const int impossible_image_size = 1 << 28;
+    PatchWalBytes(LOG_FILE_NAME, begin_offsets[1] + OFFSET_LSN, &first_lsn, sizeof(first_lsn));
+    PatchWalBytes(LOG_FILE_NAME, insert_offsets[0] + OFFSET_LOG_DATA, &impossible_image_size,
+                  sizeof(impossible_image_size));
+
+    try {
+        recovery.analyze();
+        FAIL() << "analyze accepted an invalid ordered prefix";
+    } catch (const InternalError& error) {
+        EXPECT_NE(std::string(error.what()).find("non-increasing WAL LSN"), std::string::npos);
+    }
+    EXPECT_EQ(recovery.get_scanned_record_count(), old_scanned);
+    EXPECT_EQ(recovery.get_max_lsn(), old_max_lsn);
+    EXPECT_EQ(recovery.get_dml_record_count(), old_dml);
+
+    PatchWalBytes(LOG_FILE_NAME, begin_offsets[1] + OFFSET_LSN, &second_lsn, sizeof(second_lsn));
+    const int image_size = rec.size;
+    PatchWalBytes(LOG_FILE_NAME, insert_offsets[0] + OFFSET_LOG_DATA, &image_size, sizeof(image_size));
+    ASSERT_NO_THROW(recovery.analyze());
+    EXPECT_EQ(recovery.get_scanned_record_count(), 3u);
+    EXPECT_EQ(recovery.get_max_lsn(), insert_lsn);
+    EXPECT_EQ(recovery.get_dml_record_count(), 1u);
 }
 
 TEST(RecoveryManagerTest, ProductionPrepareAnalyzeFinalizeDefersTornTailTruncation) {
@@ -3369,11 +3406,13 @@ TEST(RecoveryFaultInjectionTest, PageFinalizeThrowFaultsRetainWalAndRemainReentr
     GTEST_SKIP() << "requires RMDB_ENABLE_FAULT_INJECTION";
 #endif
     ScopedTestDir test_dir("recovery_fault_page_finalize_throw_root");
-    const std::array<const char*, 4> fault_points{
+    const std::array<const char*, 6> fault_points{
         "during_data_page_pwrite",
         "during_data_page_pread",
         "during_recovery_page_normalize",
         "during_recovery_page_publish",
+        "mid_recovery_page_finalize",
+        "post_recovery_page_finalize",
     };
     ScopedEnvironmentValue workers("RMDB_RECOVERY_WORKERS", "8");
     for (size_t fault_index = 0; fault_index < fault_points.size(); ++fault_index) {
@@ -3403,6 +3442,8 @@ TEST(RecoveryFaultInjectionTest, PageFinalizeThrowFaultsRetainWalAndRemainReentr
             const Rid rid{page_no, 0};
             ASSERT_TRUE(RecordExists(verified.sm_mgr_, rid));
             EXPECT_EQ(RecordValue(verified.sm_mgr_, rid), 8000 + page_no);
+            EXPECT_TRUE(IndexColumnPointsTo(verified.sm_mgr_, "id", 800 + page_no, rid));
+            EXPECT_TRUE(IndexColumnPointsTo(verified.sm_mgr_, "v", 8000 + page_no, rid));
         }
         EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
     }

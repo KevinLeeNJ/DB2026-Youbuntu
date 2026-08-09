@@ -29,10 +29,10 @@ constexpr uint32_t kFixedPayloadBytes =
     sizeof(uint32_t) + sizeof(uint16_t) * 2 + sizeof(uint32_t) * 4 + sizeof(uint64_t);
 constexpr uint32_t kBindFixedPayloadBytes =
     sizeof(uint32_t) + sizeof(uint16_t) * 2 + sizeof(uint32_t) + sizeof(uint64_t);
-constexpr uint32_t kV1PageEntryBytes = sizeof(page_id_t) + PAGE_SIZE;
+constexpr uint32_t kLegacyRawPageEntryBytes = sizeof(page_id_t) + PAGE_SIZE;
 constexpr uint32_t kChecksumBytes = sizeof(uint32_t);
 constexpr uint32_t kImageEnvelopeBytes = sizeof(uint8_t) * 2 + sizeof(uint16_t) + sizeof(uint32_t) * 2;
-constexpr uint32_t kV3LayoutBytes = sizeof(int32_t) * 3;
+constexpr uint32_t kStructuredLayoutBytes = sizeof(int32_t) * 3;
 constexpr size_t kMaxRleBytes = PAGE_SIZE + (PAGE_SIZE + 127) / 128;
 constexpr size_t kBitmapBytes = PAGE_SIZE / 8;
 constexpr size_t kMaxBitmapBytes = kBitmapBytes + PAGE_SIZE;
@@ -72,25 +72,25 @@ struct IndexLayout {
     int keys_size{0};
 };
 
-struct V3Config {
+struct StructuredFormatConfig {
     bool enabled;
     bool metrics_enabled;
 };
 
-const V3Config& GetV3Config() {
-    static const V3Config config = [] {
+const StructuredFormatConfig& GetStructuredFormatConfig() {
+    static const StructuredFormatConfig config = [] {
         const char* enabled = std::getenv("RMDB_INDEX_SMO_V3");
         if (enabled == nullptr) {
             enabled = std::getenv("INDEX_SMO_V3");
         }
         const char* metrics = std::getenv("RMDB_INDEX_SMO_V3_METRICS");
-        return V3Config{enabled == nullptr || std::strcmp(enabled, "0") != 0,
-                        metrics != nullptr && std::strcmp(metrics, "1") == 0};
+        return StructuredFormatConfig{enabled == nullptr || std::strcmp(enabled, "0") != 0,
+                                      metrics != nullptr && std::strcmp(metrics, "1") == 0};
     }();
     return config;
 }
 
-struct V3Metrics {
+struct StructuredFormatMetrics {
     std::atomic<uint64_t> old_bytes{0}, new_bytes{0}, raw{0}, rle{0}, xor_rle{0}, bitmap{0}, word_bitmap{0},
         encode_ns{0}, max_ns{0};
     // Monotonic timestamp of the last aggregate report. This is diagnostic-only
@@ -98,8 +98,8 @@ struct V3Metrics {
     std::atomic<int64_t> last_report_ns{0};
 };
 
-V3Metrics& GetV3Metrics() {
-    static V3Metrics metrics;
+StructuredFormatMetrics& GetStructuredFormatMetrics() {
+    static StructuredFormatMetrics metrics;
     return metrics;
 }
 
@@ -179,7 +179,7 @@ void AppendBytes(std::vector<char>* dest, const char* bytes, size_t length) {
     dest->insert(dest->end(), bytes, bytes + length);
 }
 
-bool CheckedExpectedV1Length(uint32_t name_bytes, uint32_t page_count, uint32_t* result) {
+bool CheckedExpectedLegacyRawLength(uint32_t name_bytes, uint32_t page_count, uint32_t* result) {
     if (name_bytes == 0 || name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES || page_count == 0 ||
         page_count > MAX_INDEX_SMO_PAGE_COUNT) {
         return false;
@@ -187,7 +187,7 @@ bool CheckedExpectedV1Length(uint32_t name_bytes, uint32_t page_count, uint32_t*
     uint64_t total = LOG_HEADER_SIZE;
     total += kFixedPayloadBytes;
     total += name_bytes;
-    total += static_cast<uint64_t>(page_count) * kV1PageEntryBytes;
+    total += static_cast<uint64_t>(page_count) * kLegacyRawPageEntryBytes;
     total += PAGE_SIZE;
     total += kChecksumBytes;
     if (total > MAX_INDEX_SMO_RECORD_BYTES || total > std::numeric_limits<uint32_t>::max()) {
@@ -333,7 +333,7 @@ bool UntransformIxPage(const IndexLayout& layout, std::array<char, PAGE_SIZE>* i
     return true;
 }
 
-ImageCodec AppendV3PageImage(std::vector<char>* dest, const char* raw, const IndexLayout& layout) {
+ImageCodec AppendStructuredPageImage(std::vector<char>* dest, const char* raw, const IndexLayout& layout) {
     std::array<char, kMaxRleBytes> rle{};
     const uint32_t rle_length = EncodeZeroLiteralRleInto(raw, &rle);
     std::array<char, PAGE_SIZE> transformed{};
@@ -383,8 +383,8 @@ ImageCodec AppendV3PageImage(std::vector<char>* dest, const char* raw, const Ind
                                         : use_rle ? ImageCodec::ZERO_LITERAL_RLE : ImageCodec::RAW;
 }
 
-void RecordV3Metrics(uint64_t old_bytes, uint64_t new_bytes, uint64_t encode_ns, ImageCodec codec) {
-    V3Metrics& metrics = GetV3Metrics();
+void RecordStructuredFormatMetrics(uint64_t old_bytes, uint64_t new_bytes, uint64_t encode_ns, ImageCodec codec) {
+    StructuredFormatMetrics& metrics = GetStructuredFormatMetrics();
     metrics.old_bytes.fetch_add(old_bytes, std::memory_order_relaxed);
     metrics.new_bytes.fetch_add(new_bytes, std::memory_order_relaxed);
     (codec == ImageCodec::RAW   ? metrics.raw
@@ -410,7 +410,7 @@ void RecordV3Metrics(uint64_t old_bytes, uint64_t new_bytes, uint64_t encode_ns,
             // This is a best-effort aggregate snapshot: concurrent encodes can
             // land on either side of it, but no individual page is logged.
             LOG_WARN(
-                "index-smo-v3-metrics old_bytes=%llu new_bytes=%llu codec_raw=%llu codec_rle=%llu "
+                "index-smo-structured-metrics old_bytes=%llu new_bytes=%llu codec_raw=%llu codec_rle=%llu "
                 "codec_xor_rle=%llu codec_bitmap=%llu codec_word_bitmap=%llu encode_total_ns=%llu encode_max_ns=%llu",
                 static_cast<unsigned long long>(metrics.old_bytes.load(std::memory_order_relaxed)),
                 static_cast<unsigned long long>(metrics.new_bytes.load(std::memory_order_relaxed)),
@@ -529,8 +529,8 @@ struct ImageToken {
 
 class IndexSmoLayoutCursor {
 public:
-    IndexSmoLayoutCursor(const char* bytes, uint32_t limit, uint32_t offset, uint16_t version) noexcept
-        : bytes_(bytes), limit_(limit), offset_(offset), version_(version) {}
+    IndexSmoLayoutCursor(const char* bytes, uint32_t limit, uint32_t offset, uint16_t format_tag) noexcept
+        : bytes_(bytes), limit_(limit), offset_(offset), format_tag_(format_tag) {}
 
     bool NextPage(page_id_t* page_no, ImageToken* image) noexcept {
         return ReadScalar(bytes_, limit_, &offset_, page_no) && *page_no > 0 && NextImage(image, false);
@@ -545,7 +545,7 @@ public:
 
 private:
     bool NextImage(ImageToken* image, bool header) noexcept {
-        if (version_ == INDEX_SMO_VERSION_V1) {
+        if (format_tag_ == INDEX_SMO_FORMAT_LEGACY_RAW) {
             if (offset_ > limit_ || PAGE_SIZE > limit_ - offset_) {
                 return false;
             }
@@ -566,8 +566,8 @@ private:
         const bool transformed = codec == ImageCodec::STRUCTURED_XOR_RLE ||
                                  codec == ImageCodec::STRUCTURED_XOR_BITMAP ||
                                  codec == ImageCodec::STRUCTURED_XOR_WORD_BITMAP;
-        const bool v2_codec = codec == ImageCodec::RAW || codec == ImageCodec::ZERO_LITERAL_RLE;
-        if (!(v2_codec || (version_ == INDEX_SMO_VERSION_V3 && !header && transformed)) ||
+        const bool compressed_codec = codec == ImageCodec::RAW || codec == ImageCodec::ZERO_LITERAL_RLE;
+        if (!(compressed_codec || (format_tag_ == INDEX_SMO_FORMAT_STRUCTURED && !header && transformed)) ||
             (codec == ImageCodec::RAW && encoded_length != PAGE_SIZE) ||
             (codec != ImageCodec::RAW && encoded_length >= PAGE_SIZE)) {
             return false;
@@ -580,7 +580,7 @@ private:
     const char* bytes_;
     uint32_t limit_;
     uint32_t offset_;
-    uint16_t version_;
+    uint16_t format_tag_;
 };
 
 bool DecodeImageToken(const ImageToken& token, std::array<char, PAGE_SIZE>* decoded) noexcept {
@@ -605,6 +605,27 @@ bool ImagePointer(const ImageToken& token, std::array<char, PAGE_SIZE>* decoded,
     }
     *image = decoded->data();
     return true;
+}
+
+bool CheckedAddressRange(const void* pointer, size_t bytes, uintptr_t* begin, uintptr_t* end) noexcept {
+    if (bytes == 0) {
+        *begin = 0;
+        *end = 0;
+        return true;
+    }
+    if (pointer == nullptr)
+        return false;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(pointer);
+    if (bytes > std::numeric_limits<uintptr_t>::max() - first)
+        return false;
+    *begin = first;
+    *end = first + bytes;
+    return true;
+}
+
+bool AddressRangesOverlap(uintptr_t left_begin, uintptr_t left_end, uintptr_t right_begin,
+                          uintptr_t right_end) noexcept {
+    return left_begin != left_end && right_begin != right_end && left_begin < right_end && right_begin < left_end;
 }
 
 } // namespace
@@ -656,20 +677,20 @@ IndexSmoLogRecord::IndexSmoLogRecord(const IndexSmoWalData& data) {
     }
 
     IndexLayout layout;
-    const V3Config& config = GetV3Config();
-    const bool use_v3 = config.enabled && ReadHeaderLayout(data.header.data(), &layout);
-    payload_.reserve(kFixedPayloadBytes + (use_v3 ? kV3LayoutBytes : 0) + data.index_file_name.size() +
+    const StructuredFormatConfig& config = GetStructuredFormatConfig();
+    const bool use_structured = config.enabled && ReadHeaderLayout(data.header.data(), &layout);
+    payload_.reserve(kFixedPayloadBytes + (use_structured ? kStructuredLayoutBytes : 0) + data.index_file_name.size() +
                      data.pages.size() * (sizeof(page_id_t) + kImageEnvelopeBytes + PAGE_SIZE) + kImageEnvelopeBytes +
                      PAGE_SIZE);
     AppendScalar(&payload_, INDEX_SMO_MAGIC);
-    AppendScalar(&payload_, use_v3 ? INDEX_SMO_VERSION_V3 : INDEX_SMO_VERSION_V2);
+    AppendScalar(&payload_, use_structured ? INDEX_SMO_FORMAT_STRUCTURED : INDEX_SMO_FORMAT_COMPRESSED);
     AppendScalar(&payload_, INDEX_SMO_FLAG_HEADER_IMAGE);
     AppendScalar(&payload_, static_cast<uint32_t>(data.index_file_name.size()));
     AppendScalar(&payload_, static_cast<uint32_t>(data.pages.size()));
     AppendScalar(&payload_, static_cast<uint32_t>(PAGE_SIZE));
     AppendScalar(&payload_, static_cast<uint32_t>(PAGE_SIZE));
     AppendScalar(&payload_, data.index_generation);
-    if (use_v3) {
+    if (use_structured) {
         AppendScalar(&payload_, static_cast<int32_t>(layout.col_tot_len));
         AppendScalar(&payload_, static_cast<int32_t>(layout.btree_order));
         AppendScalar(&payload_, static_cast<int32_t>(layout.keys_size));
@@ -677,16 +698,17 @@ IndexSmoLogRecord::IndexSmoLogRecord(const IndexSmoWalData& data) {
     AppendBytes(&payload_, data.index_file_name.data(), data.index_file_name.size());
     for (const auto& page : data.pages) {
         AppendScalar(&payload_, page.page_no);
-        if (use_v3) {
+        if (use_structured) {
             const size_t before = payload_.size();
             const auto image_start =
                 config.metrics_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const ImageCodec codec = AppendV3PageImage(&payload_, page.bytes.data(), layout);
+            const ImageCodec codec = AppendStructuredPageImage(&payload_, page.bytes.data(), layout);
             if (config.metrics_enabled) {
                 const uint64_t elapsed = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - image_start)
                         .count());
-                RecordV3Metrics(PAGE_SIZE + kImageEnvelopeBytes, payload_.size() - before, elapsed, codec);
+                RecordStructuredFormatMetrics(PAGE_SIZE + kImageEnvelopeBytes, payload_.size() - before, elapsed,
+                                              codec);
             }
         } else {
             AppendImage(&payload_, page.bytes.data());
@@ -734,30 +756,33 @@ bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noe
     if (stored_crc != prefix_crc)
         return false;
     uint32_t offset = OFFSET_LOG_DATA, magic = 0, name_bytes = 0, page_count = 0, page_size = 0, header_size = 0;
-    uint16_t version = 0, flags = 0;
+    uint16_t format_tag = 0, flags = 0;
     uint64_t generation = 0;
     if (!ReadScalar(record.bytes, payload_limit, &offset, &magic) ||
-        !ReadScalar(record.bytes, payload_limit, &offset, &version) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &format_tag) ||
         !ReadScalar(record.bytes, payload_limit, &offset, &flags) ||
         !ReadScalar(record.bytes, payload_limit, &offset, &name_bytes) ||
         !ReadScalar(record.bytes, payload_limit, &offset, &page_count) ||
         !ReadScalar(record.bytes, payload_limit, &offset, &page_size) ||
         !ReadScalar(record.bytes, payload_limit, &offset, &header_size) ||
         !ReadScalar(record.bytes, payload_limit, &offset, &generation) || magic != INDEX_SMO_MAGIC ||
-        (version != 1 && version != 2 && version != 3) || flags != INDEX_SMO_FLAG_HEADER_IMAGE || name_bytes == 0 ||
+        (format_tag != INDEX_SMO_FORMAT_LEGACY_RAW && format_tag != INDEX_SMO_FORMAT_COMPRESSED &&
+         format_tag != INDEX_SMO_FORMAT_STRUCTURED) ||
+        flags != INDEX_SMO_FLAG_HEADER_IMAGE || name_bytes == 0 ||
         name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES || page_count == 0 || page_count > MAX_INDEX_SMO_PAGE_COUNT ||
         page_size != PAGE_SIZE || header_size != PAGE_SIZE || generation == 0)
         return false;
-    if (version == 1) {
+    if (format_tag == INDEX_SMO_FORMAT_LEGACY_RAW) {
         uint32_t expected = 0;
-        if (!CheckedExpectedV1Length(name_bytes, page_count, &expected) || expected != record.total_len)
+        if (!CheckedExpectedLegacyRawLength(name_bytes, page_count, &expected) || expected != record.total_len)
             return false;
     }
-    IndexLayout v3_layout;
-    if (version == 3 &&
-        (!ReadScalar(record.bytes, payload_limit, &offset, &v3_layout.col_tot_len) ||
-         !ReadScalar(record.bytes, payload_limit, &offset, &v3_layout.btree_order) ||
-         !ReadScalar(record.bytes, payload_limit, &offset, &v3_layout.keys_size) || !ValidateLayout(v3_layout)))
+    IndexLayout structured_layout;
+    if (format_tag == INDEX_SMO_FORMAT_STRUCTURED &&
+        (!ReadScalar(record.bytes, payload_limit, &offset, &structured_layout.col_tot_len) ||
+         !ReadScalar(record.bytes, payload_limit, &offset, &structured_layout.btree_order) ||
+         !ReadScalar(record.bytes, payload_limit, &offset, &structured_layout.keys_size) ||
+         !ValidateLayout(structured_layout)))
         return false;
     if (offset > payload_limit || name_bytes > payload_limit - offset)
         return false;
@@ -768,7 +793,7 @@ bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noe
         return false;
     offset += name_bytes;
     const uint32_t page_stream_offset = offset;
-    IndexSmoLayoutCursor cursor(record.bytes, payload_limit, offset, version);
+    IndexSmoLayoutCursor cursor(record.bytes, payload_limit, offset, format_tag);
     page_id_t previous = INVALID_PAGE_ID;
     uint32_t decoded_count = 0, transformed_count = 0;
     std::array<char, PAGE_SIZE> scratch{};
@@ -784,8 +809,9 @@ bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noe
             ++transformed_count;
         const char* image = nullptr;
         if (!ImagePointer(token, &scratch, &image) ||
-            (version == 3 && token.transformed && !UntransformIxPage(v3_layout, &scratch)) ||
-            (version == 3 && !ValidateIxPageImage(v3_layout, image)))
+            (format_tag == INDEX_SMO_FORMAT_STRUCTURED && token.transformed &&
+             !UntransformIxPage(structured_layout, &scratch)) ||
+            (format_tag == INDEX_SMO_FORMAT_STRUCTURED && !ValidateIxPageImage(structured_layout, image)))
             return false;
     }
     ImageToken header;
@@ -797,13 +823,13 @@ bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noe
     const char* header_image = nullptr;
     if (!ImagePointer(header, &scratch, &header_image))
         return false;
-    if (version == 3) {
+    if (format_tag == INDEX_SMO_FORMAT_STRUCTURED) {
         IndexLayout header_layout;
-        if (!ReadHeaderLayout(header_image, &header_layout) || !SameLayout(v3_layout, header_layout))
+        if (!ReadHeaderLayout(header_image, &header_layout) || !SameLayout(structured_layout, header_layout))
             return false;
     }
     IndexSmoWalLayout layout;
-    layout.version_ = version;
+    layout.format_tag_ = format_tag;
     layout.total_len_ = record.total_len;
     layout.payload_limit_ = payload_limit;
     layout.name_offset_ = name_offset;
@@ -814,9 +840,9 @@ bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noe
     layout.decoded_count_ = decoded_count;
     layout.transformed_count_ = transformed_count;
     layout.generation_ = generation;
-    layout.col_tot_len_ = v3_layout.col_tot_len;
-    layout.btree_order_ = v3_layout.btree_order;
-    layout.keys_size_ = v3_layout.keys_size;
+    layout.col_tot_len_ = structured_layout.col_tot_len;
+    layout.btree_order_ = structured_layout.btree_order;
+    layout.keys_size_ = structured_layout.keys_size;
     *out = layout;
     return true;
 }
@@ -826,7 +852,7 @@ bool IndexSmoWalLayout::copy_catalog(const WalRecordView& record, IndexSmoWalVie
     if (record.bytes == nullptr || record.total_len != total_len_ || pages == nullptr || page_capacity < page_count_ ||
         payload_limit_ > record.total_len || page_stream_offset_ > payload_limit_)
         return false;
-    IndexSmoLayoutCursor cursor(record.bytes, payload_limit_, page_stream_offset_, version_);
+    IndexSmoLayoutCursor cursor(record.bytes, payload_limit_, page_stream_offset_, format_tag_);
     // First pass makes the no-partial-publish guarantee independent of an
     // arena's previous contents. The second pass is safe under the immutable
     // binding above and only publishes fully validated identities.
@@ -839,7 +865,7 @@ bool IndexSmoWalLayout::copy_catalog(const WalRecordView& record, IndexSmoWalVie
     ImageToken header;
     if (!cursor.NextHeader(&header) || cursor.offset() != payload_limit_)
         return false;
-    cursor = IndexSmoLayoutCursor(record.bytes, payload_limit_, page_stream_offset_, version_);
+    cursor = IndexSmoLayoutCursor(record.bytes, payload_limit_, page_stream_offset_, format_tag_);
     for (uint32_t i = 0; i < page_count_; ++i) {
         ImageToken token;
         if (!cursor.NextPage(&pages[i].page_no, &token))
@@ -854,6 +880,67 @@ bool CopyIndexSmoPageCatalog(const WalRecordView& record, IndexSmoWalView::Page*
     return InspectIndexSmoWal(record, &fresh) && fresh.copy_catalog(record, pages, page_capacity);
 }
 
+bool AnalyzeIndexSmoWal(const WalRecordView& record, const IndexSmoWalAnalysisStorage& storage,
+                        IndexSmoWalAnalysis* out) noexcept {
+    if (out == nullptr)
+        return false;
+    IndexSmoWalLayout layout;
+    if (!InspectIndexSmoWal(record, &layout) || storage.index_name_capacity < layout.name_bytes_ ||
+        storage.page_capacity < layout.page_count_ || storage.index_name == nullptr || storage.page_numbers == nullptr ||
+        layout.page_count_ > MAX_INDEX_SMO_PAGE_COUNT ||
+        layout.page_count_ > std::numeric_limits<size_t>::max() / sizeof(page_id_t)) {
+        return false;
+    }
+
+    const size_t name_bytes = layout.name_bytes_;
+    const size_t page_bytes = static_cast<size_t>(layout.page_count_) * sizeof(page_id_t);
+    uintptr_t source_begin = 0, source_end = 0, name_begin = 0, name_end = 0, pages_begin = 0, pages_end = 0;
+    uintptr_t out_begin = 0, out_end = 0;
+    if (!CheckedAddressRange(record.bytes, record.total_len, &source_begin, &source_end) ||
+        !CheckedAddressRange(storage.index_name, name_bytes, &name_begin, &name_end) ||
+        !CheckedAddressRange(storage.page_numbers, page_bytes, &pages_begin, &pages_end) ||
+        !CheckedAddressRange(out, sizeof(*out), &out_begin, &out_end) ||
+        AddressRangesOverlap(source_begin, source_end, name_begin, name_end) ||
+        AddressRangesOverlap(source_begin, source_end, pages_begin, pages_end) ||
+        AddressRangesOverlap(source_begin, source_end, out_begin, out_end) ||
+        AddressRangesOverlap(name_begin, name_end, pages_begin, pages_end) ||
+        AddressRangesOverlap(name_begin, name_end, out_begin, out_end) ||
+        AddressRangesOverlap(pages_begin, pages_end, out_begin, out_end)) {
+        return false;
+    }
+
+    // Inspect has already decoded and validated every image. Keep its private
+    // capability inside this immutable call. A cursor-only preflight performs
+    // no codec or checksum work and guarantees that capacity/malformed failure
+    // happens before either caller arena is touched.
+    IndexSmoLayoutCursor cursor(record.bytes, layout.payload_limit_, layout.page_stream_offset_, layout.format_tag_);
+    for (uint32_t index = 0; index < layout.page_count_; ++index) {
+        page_id_t page_no = INVALID_PAGE_ID;
+        ImageToken image;
+        if (!cursor.NextPage(&page_no, &image))
+            return false;
+    }
+    ImageToken header;
+    if (!cursor.NextHeader(&header) || cursor.offset() != layout.payload_limit_)
+        return false;
+
+    cursor = IndexSmoLayoutCursor(record.bytes, layout.payload_limit_, layout.page_stream_offset_, layout.format_tag_);
+    for (uint32_t index = 0; index < layout.page_count_; ++index) {
+        ImageToken image;
+        const bool copied = cursor.NextPage(&storage.page_numbers[index], &image);
+        assert(copied);
+        (void)copied;
+    }
+
+    IndexSmoWalAnalysis analysis;
+    analysis.index_name_bytes = layout.name_bytes_;
+    analysis.page_count = layout.page_count_;
+    analysis.index_generation = layout.generation_;
+    std::memcpy(storage.index_name, record.bytes + layout.name_offset_, name_bytes);
+    *out = analysis;
+    return true;
+}
+
 bool IndexSmoWalLayout::decode_materialized(const WalRecordView& record, const IndexSmoWalDecodeStorage& storage,
                                             IndexSmoWalDecodedView* out) const noexcept {
     if (out == nullptr || record.bytes == nullptr || record.total_len != total_len_ || storage.pages == nullptr ||
@@ -862,7 +949,7 @@ bool IndexSmoWalLayout::decode_materialized(const WalRecordView& record, const I
         return false;
     // Inspect just decoded and validated these immutable bytes. Materializing
     // each compressed image below is therefore its only additional codec pass.
-    IndexSmoLayoutCursor cursor(record.bytes, payload_limit_, page_stream_offset_, version_);
+    IndexSmoLayoutCursor cursor(record.bytes, payload_limit_, page_stream_offset_, format_tag_);
     size_t decoded = 0;
     for (uint32_t i = 0; i < page_count_; ++i) {
         ImageToken token;
