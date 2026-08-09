@@ -50,7 +50,7 @@ enum class ResidencyClass : uint8_t {
 
 class FlushDependencyPolicy {
 public:
-    enum class Kind : uint8_t { Enforce, CheckpointEnforce, AlreadyDurable };
+    enum class Kind : uint8_t { Enforce, BackgroundEnforce, CheckpointEnforce, AlreadyDurable };
 
     static FlushDependencyPolicy Enforce() {
         return FlushDependencyPolicy(Kind::Enforce);
@@ -58,6 +58,10 @@ public:
 
     static FlushDependencyPolicy CheckpointEnforce() {
         return FlushDependencyPolicy(Kind::CheckpointEnforce);
+    }
+
+    static FlushDependencyPolicy BackgroundEnforce() {
+        return FlushDependencyPolicy(Kind::BackgroundEnforce);
     }
 
     static FlushDependencyPolicy AlreadyDurable() {
@@ -76,7 +80,7 @@ private:
 
 class BufferPoolManager {
 private:
-    enum class DependencyWriteOrigin : uint8_t { Foreground, Checkpoint };
+    enum class DependencyWriteOrigin : uint8_t { Foreground, Background, Checkpoint };
     using FlushPageTestHook = std::function<void(PageId, Page*)>;
     using EnsureDependencyTestHook = std::function<void(const PageWriteDependency&)>;
     using FlushClaimTestHook = std::function<void(std::string_view, PageId)>;
@@ -202,8 +206,12 @@ public:
     static void set_replacement_transition_test_hook(ReplacementTransitionTestHook hook);
     // Per-manager rendezvous immediately before the old dirty image is
     // written. It is test-only and unset in production.
-    void set_replacement_io_test_hook(ReplacementIoTestHook hook) { replacement_io_test_hook_ = std::move(hook); }
-    void set_load_io_test_hook(LoadIoTestHook hook) { load_io_test_hook_ = std::move(hook); }
+    void set_replacement_io_test_hook(ReplacementIoTestHook hook) {
+        replacement_io_test_hook_ = std::move(hook);
+    }
+    void set_load_io_test_hook(LoadIoTestHook hook) {
+        load_io_test_hook_ = std::move(hook);
+    }
     // Install/remove only while this manager has no concurrent operations.
     // The callback runs after a transition waiter owns the frame io_latch_.
     void set_transition_wait_test_hook(TransitionWaitTestHook hook) {
@@ -315,7 +323,9 @@ public:
     FrameOperationToken acquire_frame_operation(size_t minimum_available_frames = 2);
 
     bool is_page_resident(PageId page_id);
-    size_t pool_size() const noexcept { return pool_size_; }
+    size_t pool_size() const noexcept {
+        return pool_size_;
+    }
 
     // Returns the replacement classification of a valid resident page. A
     // missing or in-flight page has no observable residency classification.

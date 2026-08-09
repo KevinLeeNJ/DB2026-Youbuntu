@@ -45,8 +45,10 @@ public:
         setenv(name, value, 1);
     }
     ~ScopedEnvironmentVariable() {
-        if (had_previous_) setenv(name_.c_str(), previous_.c_str(), 1);
-        else unsetenv(name_.c_str());
+        if (had_previous_)
+            setenv(name_.c_str(), previous_.c_str(), 1);
+        else
+            unsetenv(name_.c_str());
     }
 
 private:
@@ -119,10 +121,43 @@ TEST(CheckpointOptionsTest, PrecleanMetricsSeparatePauseThrottleAndRamp) {
     metrics.congestion_pause();
     metrics.congestion_throttle();
     metrics.congestion_ramp();
+    metrics.foreground_dirty_pwrite(4096, 7, true);
+    metrics.background_dirty_pwrite(8192, 11, false);
+    metrics.checkpoint_dirty_pwrite(4096, 13, true);
     const auto snapshot = metrics.snapshot();
     EXPECT_EQ(snapshot.congestion_pauses, 1u);
     EXPECT_EQ(snapshot.congestion_throttles, 1u);
     EXPECT_EQ(snapshot.congestion_ramps, 1u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.bytes, 4096u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.timing.elapsed_ns, 7u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.runs_with_wal_dependency, 1u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.bytes, 8192u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.timing.elapsed_ns, 11u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.runs_with_wal_dependency, 0u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.bytes, 4096u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.timing.elapsed_ns, 13u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.runs_with_wal_dependency, 1u);
+}
+
+TEST(CheckpointOptionsTest, DisabledPrecleanMetricsDoNotRecordDirtyPwrites) {
+    BackgroundPrecleanMetrics metrics(false);
+    metrics.foreground_dirty_pwrite(4096, 7, true);
+    metrics.background_dirty_pwrite(8192, 11, true);
+    metrics.checkpoint_dirty_pwrite(4096, 13, true);
+
+    const auto snapshot = metrics.snapshot();
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.timing.count, 0u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.bytes, 0u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.runs_with_wal_dependency, 0u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.timing.count, 0u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.bytes, 0u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.runs_with_wal_dependency, 0u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.timing.count, 0u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.bytes, 0u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.runs_with_wal_dependency, 0u);
 }
 
 TEST(CheckpointOptionsTest, ControllerCountersSaturateWithoutUnsignedWrap) {
@@ -828,7 +863,7 @@ TEST(CheckpointScheduleTest, FinalPublishSyncsOneDescriptorPerTick) {
     EXPECT_EQ(db.log_mgr_.read_restart_manifest().checkpoint_offset, 0);
     EXPECT_FALSE(checkpoint_mgr.Tick()); // second fdatasync
     EXPECT_EQ(db.log_mgr_.read_restart_manifest().checkpoint_offset, 0);
-    EXPECT_TRUE(checkpoint_mgr.Tick());  // db.meta then manifest
+    EXPECT_TRUE(checkpoint_mgr.Tick()); // db.meta then manifest
     EXPECT_GT(db.log_mgr_.read_restart_manifest().checkpoint_offset, 0);
 }
 
@@ -1120,7 +1155,8 @@ TEST(CheckpointScheduleTest, FuzzyCohortWithoutNewWalObservationKeepsMakingProgr
     constexpr size_t kDirtyPages = 3;
     ASSERT_EQ(MakeDirtyTablePages(&db, kDirtyPages), kDirtyPages);
     int64_t target = 0;
-    for (txn_id_t id = 0; id < 8; ++id) target = AppendBegin(&db.log_mgr_, 5000 + id);
+    for (txn_id_t id = 0; id < 8; ++id)
+        target = AppendBegin(&db.log_mgr_, 5000 + id);
     CheckpointOptions options;
     options.auto_checkpoint_bytes = target;
     options.background_preclean_enabled = false;
@@ -1279,9 +1315,7 @@ TEST(CheckpointScheduleTest, ExplicitCleanWaitsForInFlightFuzzyCohort) {
         }
     } hook_reset;
 
-    auto cohort_tick = std::async(std::launch::async, [&] {
-        return checkpoint_mgr.Tick();
-    });
+    auto cohort_tick = std::async(std::launch::async, [&] { return checkpoint_mgr.Tick(); });
     const auto cohort_status = cohort_flush_entered.wait_for(std::chrono::seconds(1));
     if (cohort_status != std::future_status::ready) {
         release_cohort_flush_signal.set_value();

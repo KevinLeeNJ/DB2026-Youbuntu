@@ -135,9 +135,8 @@ protected:
         TransactionManager::CommitPublicationTestOptions test_options;
         test_options.helping = helping;
         test_options.hook = std::move(hook);
-        txn_mgr_ = std::make_unique<TransactionManager>(lock_mgr_.get(), sm_mgr_.get(),
-                                                        ConcurrencyMode::TWO_PHASE_LOCKING, std::move(test_options),
-                                                        phase_metrics);
+        txn_mgr_ = std::make_unique<TransactionManager>(
+            lock_mgr_.get(), sm_mgr_.get(), ConcurrencyMode::TWO_PHASE_LOCKING, std::move(test_options), phase_metrics);
     }
 
     static Value IntValue(int value) {
@@ -601,17 +600,62 @@ TEST_F(CommitPublicationHelpingTest, DirectPublicationPathReportsTransactionPhas
 
     Transaction* committed = txn_mgr_->begin(nullptr, log_mgr_.get());
     txn_mgr_->commit(committed, log_mgr_.get());
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitWalWait).count, 1);
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::TuplePublicationWork).count, 1);
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::FrontierWait).count, 1);
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::LockReleaseWork).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitPrepareSortValidate).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitWalEnqueue).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitWalCoverageWait).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitTupleFinalize).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitFrontierWait).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitRelease).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitOwnerCleanup).count, 1);
+    EXPECT_EQ(metrics.read_only_wal_snapshot().inferred_successful_begin_commit_pairs, 1);
 
     Transaction* aborted = txn_mgr_->begin(nullptr, log_mgr_.get());
     txn_mgr_->abort(aborted, log_mgr_.get());
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::LockReleaseWork).count, 2);
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::CommitWalWait).count, 1);
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::TuplePublicationWork).count, 1);
-    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::FrontierWait).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::AbortRelease).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::AbortWal).count, 0);
+    EXPECT_EQ(metrics.read_only_wal_snapshot().inferred_successful_begin_commit_pairs, 1);
+
+    Transaction* mutation_committed = txn_mgr_->begin(nullptr, log_mgr_.get());
+    InsertRow(mutation_committed, 93, 94);
+    txn_mgr_->commit(mutation_committed, log_mgr_.get());
+    EXPECT_EQ(metrics.read_only_wal_snapshot().inferred_successful_begin_commit_pairs, 1);
+
+    Transaction* write_aborted = txn_mgr_->begin(nullptr, log_mgr_.get());
+    InsertRow(write_aborted, 91, 92);
+    txn_mgr_->abort(write_aborted, log_mgr_.get());
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::AbortWal).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::AbortHeapUndo).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::AbortIndexUndo).count, 1);
+    EXPECT_EQ(metrics.snapshot(TransactionPhaseMetrics::Phase::AbortRelease).count, 2);
+}
+
+TEST_F(CommitPublicationHelpingTest, ActiveOwnerConflictAggregatesAtCommitAndAbortTerminal) {
+    TransactionPhaseMetrics metrics(true);
+    lock_mgr_ = std::make_unique<LockManager>(ShardAcquisitionMetrics::Config{}, &metrics);
+    MakeManager({}, true, &metrics);
+    const int table_fd = sm_mgr_->fhs_.at("t")->GetFd();
+
+    Transaction* committed_owner = txn_mgr_->begin(nullptr, log_mgr_.get(), IsolationLevel::SNAPSHOT_ISOLATION);
+    const Rid commit_rid{31, 0};
+    ASSERT_TRUE(lock_mgr_->lock_exclusive_on_record(committed_owner, commit_rid, table_fd));
+    Transaction commit_observer(8101, IsolationLevel::SNAPSHOT_ISOLATION);
+    EXPECT_EQ(lock_mgr_->lock_exclusive_on_record(&commit_observer, commit_rid, table_fd).value(),
+              LockAcquireResult::Value::WriteConflict);
+    txn_mgr_->commit(committed_owner, log_mgr_.get());
+
+    Transaction* aborted_owner = txn_mgr_->begin(nullptr, log_mgr_.get(), IsolationLevel::SNAPSHOT_ISOLATION);
+    const Rid abort_rid{31, 1};
+    ASSERT_TRUE(lock_mgr_->lock_exclusive_on_record(aborted_owner, abort_rid, table_fd));
+    Transaction abort_observer(8102, IsolationLevel::SERIALIZABLE);
+    EXPECT_EQ(lock_mgr_->lock_exclusive_on_record(&abort_observer, abort_rid, table_fd).value(),
+              LockAcquireResult::Value::WriteConflict);
+    txn_mgr_->abort(aborted_owner, log_mgr_.get());
+
+    const auto owner = metrics.owner_conflict_snapshot();
+    EXPECT_EQ(owner.commit_cleanup_terminals, 1U);
+    EXPECT_EQ(owner.abort_cleanup_terminals, 1U);
+    EXPECT_EQ(owner.observer_count, 2U);
+    EXPECT_EQ(owner.observation_to_cleanup_terminal.count, 2U);
 }
 
 TEST_F(CommitPublicationHelpingTest, ProcessCrashModePublishesThroughPersistLsn) {

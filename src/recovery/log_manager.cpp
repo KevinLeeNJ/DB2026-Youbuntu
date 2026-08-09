@@ -54,7 +54,8 @@ constexpr std::chrono::milliseconds GROUP_COMMIT_BATCH_WINDOW{2};
 constexpr std::chrono::milliseconds kSlowWalFdatasyncThreshold{20};
 
 void LogSlowWalWaiter(uint64_t elapsed_ns, const char* role, int slot, uint64_t wave) noexcept {
-    if (elapsed_ns <= 20'000'000) return;
+    if (elapsed_ns <= 20'000'000)
+        return;
     struct Aggregate {
         std::mutex latch;
         std::chrono::steady_clock::time_point window{};
@@ -63,25 +64,27 @@ void LogSlowWalWaiter(uint64_t elapsed_ns, const char* role, int slot, uint64_t 
     static Aggregate aggregate;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(aggregate.latch);
-    if (aggregate.window != std::chrono::steady_clock::time_point{} && now - aggregate.window >= std::chrono::seconds(1)) {
+    if (aggregate.window != std::chrono::steady_clock::time_point{} &&
+        now - aggregate.window >= std::chrono::seconds(1)) {
         LOG_WARN("wal-sync-wait-slow count=%llu max_ms=%.3f role=%s wave=%llu slot=%d suppressed=%llu",
                  static_cast<unsigned long long>(aggregate.count), static_cast<double>(aggregate.max_ns) / 1e6, role,
-                 static_cast<unsigned long long>(wave), slot,
-                 static_cast<unsigned long long>(aggregate.count - 1));
+                 static_cast<unsigned long long>(wave), slot, static_cast<unsigned long long>(aggregate.count - 1));
         aggregate.count = 0;
         aggregate.max_ns = 0;
         aggregate.window = now;
     }
-    if (aggregate.window == std::chrono::steady_clock::time_point{}) aggregate.window = now;
+    if (aggregate.window == std::chrono::steady_clock::time_point{})
+        aggregate.window = now;
     ++aggregate.count;
     aggregate.max_ns = std::max(aggregate.max_ns, elapsed_ns);
 }
 
-void LogSlowWalFdatasync(std::chrono::steady_clock::duration elapsed, int bytes, lsn_t target_lsn,
-                         lsn_t durable_before, bool mode_strict) noexcept {
+void LogSlowWalFdatasync(std::chrono::steady_clock::duration elapsed, int bytes, lsn_t target_lsn, lsn_t durable_before,
+                         bool mode_strict) noexcept {
     (void)durable_before;
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
-    if (elapsed_ms <= kSlowWalFdatasyncThreshold) return;
+    if (elapsed_ms <= kSlowWalFdatasyncThreshold)
+        return;
     // Keep slow-storage diagnosis from becoming a competing source of tail
     // latency. The formatting/logging itself is intentionally outside the
     // measured fdatasync interval.
@@ -368,7 +371,8 @@ void LogManager::sync_checkpoint_wal_cut(const CheckpointWalCut& cut) {
 uint64_t LogManager::publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch, bool durable) {
     IndexBindLogRecord record(index_file_name);
     const lsn_t lsn = add_log_to_buffer(&record);
-    if (durable) flush_log_to_disk_up_to_impl(lsn, true);
+    if (durable)
+        flush_log_to_disk_up_to_impl(lsn, true);
     const uint64_t generation = static_cast<uint64_t>(lsn) + 1U;
     index_bindings_[index_file_name] = IndexBinding{generation, epoch};
     return generation;
@@ -396,17 +400,21 @@ void LogManager::flush_log_to_disk_up_to(lsn_t target_lsn) {
     flush_log_to_disk_up_to_impl(target_lsn, durability_mode_ == DurabilityMode::STRICT);
 }
 
+void LogManager::flush_commit_log_to_disk_up_to(lsn_t target_lsn) {
+    flush_log_to_disk_up_to_impl(target_lsn, durability_mode_ == DurabilityMode::STRICT, true);
+}
+
 void LogManager::flush_log_to_disk_up_to_durable(lsn_t target_lsn) {
     flush_log_to_disk_up_to_impl(target_lsn, true);
 }
 
-void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync) {
+void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync, bool commit_request) {
     WalScheduleGuard schedule_guard(this);
     if (!leader_rotation_enabled_) {
-        flush_log_to_disk_up_to_legacy(target_lsn, require_sync);
+        flush_log_to_disk_up_to_legacy(target_lsn, require_sync, commit_request);
         return;
     }
-    flush_log_to_disk_up_to_with_leader_rotation(target_lsn, require_sync);
+    flush_log_to_disk_up_to_with_leader_rotation(target_lsn, require_sync, commit_request);
 }
 
 bool LogManager::can_use_sync_pipeline() const noexcept {
@@ -422,7 +430,8 @@ LogManager::~LogManager() {
 
 void LogManager::ensure_sync_workers() {
     std::unique_lock<std::mutex> lock(sync_slots_latch_);
-    if (sync_workers_started_) return;
+    if (sync_workers_started_)
+        return;
     sync_workers_stopping_ = false;
     size_t started = 0;
     try {
@@ -435,7 +444,8 @@ void LogManager::ensure_sync_workers() {
         lock.unlock();
         sync_slots_cv_.notify_all();
         for (size_t index = 0; index < started; ++index) {
-            if (sync_slots_[index].worker.joinable()) sync_slots_[index].worker.join();
+            if (sync_slots_[index].worker.joinable())
+                sync_slots_[index].worker.join();
         }
         throw;
     }
@@ -447,10 +457,10 @@ void LogManager::run_sync_worker(size_t slot_index) noexcept {
         uint64_t request = 0;
         {
             std::unique_lock<std::mutex> lock(sync_slots_latch_);
-            sync_slots_cv_.wait(lock, [this, slot_index] {
-                return sync_workers_stopping_ || sync_slots_[slot_index].pending;
-            });
-            if (sync_workers_stopping_) return;
+            sync_slots_cv_.wait(
+                lock, [this, slot_index] { return sync_workers_stopping_ || sync_slots_[slot_index].pending; });
+            if (sync_workers_stopping_)
+                return;
             SyncSlot& slot = sync_slots_[slot_index];
             target = slot.target;
             request = slot.requested;
@@ -511,20 +521,22 @@ std::exception_ptr LogManager::wait_sync_slot(size_t slot_index, uint64_t reques
     std::unique_lock<std::mutex> lock(sync_slots_latch_);
     SyncSlot& slot = sync_slots_[slot_index];
     sync_slots_cv_.wait(lock, [&slot, request] { return slot.completed >= request; });
-    if (elapsed_ns != nullptr) *elapsed_ns = slot.elapsed_ns;
+    if (elapsed_ns != nullptr)
+        *elapsed_ns = slot.elapsed_ns;
     return slot.error;
 }
 
-void LogManager::publish_completed_sync_prefix(const std::shared_ptr<CommitWaiter>& leader_waiter,
-                                               bool wait_for_head) {
+void LogManager::publish_completed_sync_prefix(const std::shared_ptr<CommitWaiter>& leader_waiter, bool wait_for_head) {
     for (;;) {
         PipelineRequest head;
         {
             std::unique_lock<std::mutex> lock(sync_slots_latch_);
-            if (sync_pipeline_requests_.empty()) return;
+            if (sync_pipeline_requests_.empty())
+                return;
             head = sync_pipeline_requests_.front();
             SyncSlot& slot = sync_slots_[head.slot_index];
-            if (!wait_for_head && slot.completed < head.request) return;
+            if (!wait_for_head && slot.completed < head.request)
+                return;
             sync_slots_cv_.wait(lock, [&slot, &head] { return slot.completed >= head.request; });
             // dispatch cannot reuse a slot while its request remains in this
             // queue, so the copied result is stable until we pop it below.
@@ -534,7 +546,8 @@ void LogManager::publish_completed_sync_prefix(const std::shared_ptr<CommitWaite
                 (void)drain_sync_pipeline();
                 {
                     std::lock_guard<std::mutex> schedule_lock(wal_schedule_latch_);
-                    if (wal_sync_poison_ == nullptr) wal_sync_poison_ = error;
+                    if (wal_sync_poison_ == nullptr)
+                        wal_sync_poison_ = error;
                 }
                 std::rethrow_exception(error);
             }
@@ -563,13 +576,15 @@ std::exception_ptr LogManager::drain_sync_pipeline() {
         PipelineRequest head;
         {
             std::lock_guard<std::mutex> lock(sync_slots_latch_);
-            if (sync_pipeline_requests_.empty()) return first_error;
+            if (sync_pipeline_requests_.empty())
+                return first_error;
             head = sync_pipeline_requests_.front();
         }
         uint64_t elapsed_ns = 0;
         const std::exception_ptr error = wait_sync_slot(head.slot_index, head.request, &elapsed_ns);
         record_sync_completion(elapsed_ns, head.target, durable_lsn_.load(std::memory_order_acquire));
-        if (first_error == nullptr && error != nullptr) first_error = error;
+        if (first_error == nullptr && error != nullptr)
+            first_error = error;
         std::lock_guard<std::mutex> lock(sync_slots_latch_);
         if (!sync_pipeline_requests_.empty() && sync_pipeline_requests_.front().request == head.request &&
             sync_pipeline_requests_.front().slot_index == head.slot_index) {
@@ -581,19 +596,22 @@ std::exception_ptr LogManager::drain_sync_pipeline() {
 
 void LogManager::stop_sync_workers() noexcept {
     std::unique_lock<std::mutex> lock(sync_slots_latch_);
-    if (!sync_workers_started_) return;
+    if (!sync_workers_started_)
+        return;
     sync_workers_stopping_ = true;
     lock.unlock();
     sync_slots_cv_.notify_all();
     for (auto& slot : sync_slots_) {
-        if (slot.worker.joinable()) slot.worker.join();
+        if (slot.worker.joinable())
+            slot.worker.join();
     }
 }
 
 void LogManager::enter_wal_schedule() {
     std::unique_lock<std::mutex> lock(wal_schedule_latch_);
     wal_schedule_cv_.wait(lock, [this] { return !wal_schedule_blocked_; });
-    if (wal_sync_poison_ != nullptr) std::rethrow_exception(wal_sync_poison_);
+    if (wal_sync_poison_ != nullptr)
+        std::rethrow_exception(wal_sync_poison_);
     ++wal_schedulers_;
     lock.unlock();
     // Test-only hook is deliberately outside wal_schedule_latch_: adversarial
@@ -606,15 +624,29 @@ void LogManager::leave_wal_schedule() noexcept {
     std::lock_guard<std::mutex> lock(wal_schedule_latch_);
     assert(wal_schedulers_ != 0);
     --wal_schedulers_;
-    if (wal_schedulers_ == 0) wal_schedule_cv_.notify_all();
+    if (wal_schedulers_ == 0)
+        wal_schedule_cv_.notify_all();
 }
 
 void LogManager::run_group_commit_test_hook(std::string_view point) const {
-    if (group_commit_test_hook_) group_commit_test_hook_(point);
+    if (group_commit_test_hook_)
+        group_commit_test_hook_(point);
 }
 
 void LogManager::run_group_commit_sync_slot_test_hook(std::string_view point, size_t slot_index) const {
-    if (group_commit_sync_slot_test_hook_) group_commit_sync_slot_test_hook_(point, slot_index);
+    if (group_commit_sync_slot_test_hook_)
+        group_commit_sync_slot_test_hook_(point, slot_index);
+}
+
+void LogManager::report_slow_wal_waiter(uint64_t elapsed_ns, std::string_view role, int slot, uint64_t wave) noexcept {
+    if (slow_waiter_reporter_test_hook_) {
+        try {
+            slow_waiter_reporter_test_hook_(elapsed_ns, role, slot, wave);
+        } catch (...) {
+            // Diagnostics must never change WAL durability or waiter release.
+        }
+    }
+    LogSlowWalWaiter(elapsed_ns, role.data(), slot, wave);
 }
 
 void LogManager::record_sync_completion(uint64_t elapsed_ns, lsn_t target_lsn, lsn_t durable_before) noexcept {
@@ -643,13 +675,15 @@ void LogManager::notify_covered_followers(const std::shared_ptr<CommitWaiter>& l
     if (wal_flush_metrics_ != nullptr && wal_flush_metrics_->enabled() && !notify.empty()) {
         wal_flush_metrics_->record_completed_batch(notify.size());
     }
-    for (const auto& waiter : notify) waiter->cv.notify_one();
+    for (const auto& waiter : notify)
+        waiter->cv.notify_one();
 }
 
 void LogManager::flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& leader_waiter) {
     {
         std::lock_guard<std::mutex> lock(wal_schedule_latch_);
-        if (wal_sync_poison_ != nullptr) std::rethrow_exception(wal_sync_poison_);
+        if (wal_sync_poison_ != nullptr)
+            std::rethrow_exception(wal_sync_poison_);
     }
     ensure_sync_workers();
     size_t launched = 0;
@@ -666,15 +700,18 @@ void LogManager::flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& lea
                     break;
                 }
             }
-            if (idle_slot == sync_slots_.size()) break;
+            if (idle_slot == sync_slots_.size())
+                break;
             flush_buffer(false);
             const lsn_t target = persist_lsn_.load(std::memory_order_acquire);
             lsn_t tail = durable_lsn_.load(std::memory_order_acquire);
             {
                 std::lock_guard<std::mutex> lock(sync_slots_latch_);
-                if (!sync_pipeline_requests_.empty()) tail = sync_pipeline_requests_.back().target;
+                if (!sync_pipeline_requests_.empty())
+                    tail = sync_pipeline_requests_.back().target;
             }
-            if (target == INVALID_LSN || target <= tail) break;
+            if (target == INVALID_LSN || target <= tail)
+                break;
             const uint64_t request = dispatch_sync_slot(idle_slot, target);
             {
                 std::lock_guard<std::mutex> lock(sync_slots_latch_);
@@ -690,7 +727,8 @@ void LogManager::flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& lea
         }
         if (sync_error != nullptr) {
             std::lock_guard<std::mutex> lock(wal_schedule_latch_);
-            if (wal_sync_poison_ == nullptr) wal_sync_poison_ = sync_error;
+            if (wal_sync_poison_ == nullptr)
+                wal_sync_poison_ = sync_error;
             std::rethrow_exception(sync_error);
         }
         std::rethrow_exception(error);
@@ -698,8 +736,9 @@ void LogManager::flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& lea
     if (wal_flush_metrics_ != nullptr && wal_flush_metrics_->enabled()) {
         wal_flush_metrics_->record_sync_depth_two_wave(launched);
         static std::atomic<uint64_t> last_depth_two_report_ns{0};
-        const uint64_t now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
         uint64_t previous = last_depth_two_report_ns.load(std::memory_order_relaxed);
         if (now_ns - previous >= 1'000'000'000 &&
             last_depth_two_report_ns.compare_exchange_strong(previous, now_ns, std::memory_order_relaxed)) {
@@ -735,18 +774,20 @@ void LogManager::flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& lea
         for (;;) {
             {
                 std::lock_guard<std::mutex> lock(sync_slots_latch_);
-                if (sync_pipeline_requests_.empty()) break;
+                if (sync_pipeline_requests_.empty())
+                    break;
             }
             publish_completed_sync_prefix(leader_waiter, true);
         }
     }
     {
         std::lock_guard<std::mutex> lock(wal_schedule_latch_);
-        if (wal_sync_poison_ != nullptr) std::rethrow_exception(wal_sync_poison_);
+        if (wal_sync_poison_ != nullptr)
+            std::rethrow_exception(wal_sync_poison_);
     }
 }
 
-void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync) {
+void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync, bool commit_request) {
     WalFlushMetrics* const metrics = wal_flush_metrics_;
     const bool metrics_enabled = metrics != nullptr && metrics->enabled();
     if (target_lsn == INVALID_LSN) {
@@ -770,7 +811,11 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
                             : persist_lsn_.load(std::memory_order_acquire);
     };
     if (completed_lsn() >= target_lsn) {
-        if (metrics_enabled) metrics->record_already_covered_fast_path();
+        if (metrics_enabled) {
+            metrics->record_already_covered_fast_path();
+            if (commit_request)
+                metrics->record_commit_already_covered();
+        }
         return;
     }
 
@@ -781,7 +826,11 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
     {
         std::unique_lock<std::mutex> group_lock(group_commit_latch_);
         if (completed_lsn() >= target_lsn) {
-            if (metrics_enabled) metrics->record_already_covered_fast_path();
+            if (metrics_enabled) {
+                metrics->record_already_covered_fast_path();
+                if (commit_request)
+                    metrics->record_commit_already_covered();
+            }
             return;
         }
         group_commit_waiters_.push_back(waiter);
@@ -794,13 +843,24 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
         if (!become_leader) {
             if (metrics_enabled) {
                 metrics->record_follower_request();
+                if (commit_request)
+                    metrics->record_commit_follower_request();
+            }
+            run_group_commit_test_hook("legacy_follower_enqueued");
+            if (metrics_enabled) {
                 const auto wait_begin = std::chrono::steady_clock::now();
                 waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
                 const uint64_t elapsed_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
                         .count());
+                const std::exception_ptr error = waiter->error;
+                group_lock.unlock();
                 metrics->record_follower_wait(elapsed_ns);
-                LogSlowWalWaiter(elapsed_ns, "follower", -1, 0);
+                report_slow_wal_waiter(elapsed_ns, "follower", -1, 0);
+                if (error != nullptr) {
+                    std::rethrow_exception(error);
+                }
+                return;
             } else {
                 waiter->cv.wait(group_lock, [&waiter] { return waiter->done; });
             }
@@ -809,7 +869,11 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
             }
             return;
         }
-        if (metrics_enabled) metrics->record_leader_request();
+        if (metrics_enabled) {
+            metrics->record_leader_request();
+            if (commit_request)
+                metrics->record_commit_leader_request();
+        }
     }
 
     // A concurrent commit may have joined while the leader was writing or
@@ -839,9 +903,10 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
                 }
             }
             if (metrics_enabled) {
-                metrics->record_coalescing_wait(static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - batch_wait_begin)
-                        .count()));
+                metrics->record_coalescing_wait(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - batch_wait_begin)
+                                              .count()));
             }
             flush_buffer(sync_batch);
         } catch (...) {
@@ -884,7 +949,8 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
                 group_done = true;
             }
         }
-        if (metrics_enabled) metrics->record_completed_batch(notify.size());
+        if (metrics_enabled)
+            metrics->record_completed_batch(notify.size());
         for (const auto& pending : notify) {
             pending->cv.notify_one();
         }
@@ -894,15 +960,18 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
     }
 }
 
-void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync) {
+void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync,
+                                                              bool commit_request) {
     WalFlushMetrics* const metrics = wal_flush_metrics_;
     const bool metrics_enabled = metrics != nullptr && metrics->enabled();
-    if (target_lsn == INVALID_LSN) return;
+    if (target_lsn == INVALID_LSN)
+        return;
 
     {
         std::lock_guard<std::mutex> lock(latch_);
         const lsn_t latest_lsn = global_lsn_.load(std::memory_order_acquire) - 1;
-        if (latest_lsn == INVALID_LSN) return;
+        if (latest_lsn == INVALID_LSN)
+            return;
         target_lsn = std::min(target_lsn, latest_lsn);
     }
     const auto completed_lsn = [&] {
@@ -910,7 +979,11 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                             : persist_lsn_.load(std::memory_order_acquire);
     };
     if (completed_lsn() >= target_lsn) {
-        if (metrics_enabled) metrics->record_already_covered_fast_path();
+        if (metrics_enabled) {
+            metrics->record_already_covered_fast_path();
+            if (commit_request)
+                metrics->record_commit_already_covered();
+        }
         return;
     }
 
@@ -918,10 +991,17 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
     waiter->target_lsn = target_lsn;
     waiter->require_sync = require_sync;
     bool leader = false;
+    bool entered_as_follower = false;
+    bool deferred_follower_diagnostics = false;
+    uint64_t deferred_follower_elapsed_ns = 0;
     {
         std::unique_lock<std::mutex> group_lock(group_commit_latch_);
         if (completed_lsn() >= target_lsn) {
-            if (metrics_enabled) metrics->record_already_covered_fast_path();
+            if (metrics_enabled) {
+                metrics->record_already_covered_fast_path();
+                if (commit_request)
+                    metrics->record_commit_already_covered();
+            }
             return;
         }
         group_commit_waiters_.push_back(waiter);
@@ -932,9 +1012,14 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
         }
         group_commit_cv_.notify_one();
         if (!leader) {
-            run_group_commit_test_hook("rotation_follower_enqueued");
+            entered_as_follower = true;
             if (metrics_enabled) {
                 metrics->record_follower_request();
+                if (commit_request)
+                    metrics->record_commit_follower_request();
+            }
+            run_group_commit_test_hook("rotation_follower_enqueued");
+            if (metrics_enabled) {
                 const auto wait_begin = std::chrono::steady_clock::now();
                 waiter->cv.wait(group_lock, [&waiter] {
                     return waiter->state == CommitWaiter::State::Done || waiter->state == CommitWaiter::State::Promoted;
@@ -942,21 +1027,49 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                 const uint64_t elapsed_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
                         .count());
-                metrics->record_follower_wait(elapsed_ns);
-                LogSlowWalWaiter(elapsed_ns, "follower", -1, 0);
+                const CommitWaiter::State state = waiter->state;
+                const std::exception_ptr error = waiter->error;
+                group_lock.unlock();
+                if (state == CommitWaiter::State::Done) {
+                    metrics->record_follower_wait(elapsed_ns);
+                    report_slow_wal_waiter(elapsed_ns, "follower", -1, 0);
+                    if (error != nullptr)
+                        std::rethrow_exception(error);
+                    return;
+                }
+                deferred_follower_diagnostics = true;
+                deferred_follower_elapsed_ns = elapsed_ns;
+                leader = true;
             } else {
                 waiter->cv.wait(group_lock, [&waiter] {
                     return waiter->state == CommitWaiter::State::Done || waiter->state == CommitWaiter::State::Promoted;
                 });
+                if (waiter->state == CommitWaiter::State::Done) {
+                    if (waiter->error != nullptr)
+                        std::rethrow_exception(waiter->error);
+                    return;
+                }
+                leader = true;
             }
-            if (waiter->state == CommitWaiter::State::Done) {
-                if (waiter->error != nullptr) std::rethrow_exception(waiter->error);
-                return;
-            }
-            leader = true;
         }
-        if (metrics_enabled) metrics->record_leader_request();
+        if (metrics_enabled && !entered_as_follower) {
+            metrics->record_leader_request();
+            if (commit_request)
+                metrics->record_commit_leader_request();
+        }
     }
+
+    const auto flush_deferred_follower_diagnostics = [&]() noexcept {
+        if (!deferred_follower_diagnostics)
+            return;
+        // This path owns the WAL baton. Diagnostics are permitted only after
+        // the tenure has ended and group_commit_leader_active_ has either been
+        // cleared or handed to the next waiter.
+        metrics->record_leader_request();
+        metrics->record_follower_wait(deferred_follower_elapsed_ns);
+        report_slow_wal_waiter(deferred_follower_elapsed_ns, "follower", -1, 0);
+        deferred_follower_diagnostics = false;
+    };
 
     uint64_t batches = 0;
     for (;;) {
@@ -969,14 +1082,16 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                 group_commit_cv_.wait_until(group_lock, deadline, [this] {
                     return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
                 });
-                for (const auto& pending : group_commit_waiters_) sync_batch = sync_batch || pending->require_sync;
-            }
-            if (metrics_enabled) {
-                metrics->record_coalescing_wait(static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - batch_wait_begin)
-                        .count()));
+                for (const auto& pending : group_commit_waiters_)
+                    sync_batch = sync_batch || pending->require_sync;
             }
             run_group_commit_test_hook("rotation_before_flush");
+            if (metrics_enabled) {
+                metrics->record_coalescing_wait(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - batch_wait_begin)
+                                              .count()));
+            }
             if (sync_batch && can_use_sync_pipeline()) {
                 // Keep waiter batching and FIFO leader rotation intact.  Only
                 // this leader's physical stabilization wave changes depth.
@@ -998,8 +1113,11 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                 group_commit_waiters_.clear();
                 group_commit_leader_active_ = false;
             }
-            for (const auto& pending : notify) pending->cv.notify_one();
-            if (metrics_enabled) metrics->record_leader_tenure(batches);
+            for (const auto& pending : notify)
+                pending->cv.notify_one();
+            if (metrics_enabled)
+                metrics->record_leader_tenure(batches);
+            flush_deferred_follower_diagnostics();
             std::rethrow_exception(error);
         }
 
@@ -1013,7 +1131,8 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
             for (auto it = group_commit_waiters_.begin(); it != group_commit_waiters_.end();) {
                 const lsn_t completion_lsn = (*it)->require_sync ? durable : written_lsn;
                 if ((*it)->target_lsn <= completion_lsn) {
-                    if (*it == waiter) own_done = true;
+                    if (*it == waiter)
+                        own_done = true;
                     (*it)->state = CommitWaiter::State::Done;
                     notify.push_back(*it);
                     it = group_commit_waiters_.erase(it);
@@ -1028,15 +1147,20 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
                 promoted = group_commit_waiters_.front();
                 promoted->state = CommitWaiter::State::Promoted;
                 notify.push_back(promoted);
-                if (metrics_enabled) metrics->record_leader_rotation();
+                if (metrics_enabled)
+                    metrics->record_leader_rotation();
             } else if (group_commit_waiters_.empty()) {
                 group_commit_leader_active_ = false;
             }
         }
-        if (metrics_enabled) metrics->record_completed_batch(notify.size() - (promoted ? 1 : 0));
-        for (const auto& pending : notify) pending->cv.notify_one();
+        if (metrics_enabled)
+            metrics->record_completed_batch(notify.size() - (promoted ? 1 : 0));
+        for (const auto& pending : notify)
+            pending->cv.notify_one();
         if (own_done) {
-            if (metrics_enabled) metrics->record_leader_tenure(batches);
+            if (metrics_enabled)
+                metrics->record_leader_tenure(batches);
+            flush_deferred_follower_diagnostics();
             return;
         }
     }
@@ -1058,8 +1182,8 @@ void LogManager::publish_fdatasync_observation(uint64_t elapsed_ns) noexcept {
 
 LogManager::FdatasyncObservationWindow LogManager::consume_fdatasync_observations() noexcept {
     std::scoped_lock lock{fdatasync_observation_latch_};
-    FdatasyncObservationWindow result{fdatasync_window_sequence_, fdatasync_window_last_ns_,
-                                      fdatasync_window_max_ns_, fdatasync_window_count_};
+    FdatasyncObservationWindow result{fdatasync_window_sequence_, fdatasync_window_last_ns_, fdatasync_window_max_ns_,
+                                      fdatasync_window_count_};
     fdatasync_window_max_ns_ = 0;
     fdatasync_window_count_ = 0;
     return result;
@@ -1102,7 +1226,8 @@ void LogManager::flush_buffer(bool sync) {
                     target_lsn = persist_lsn_.load(std::memory_order_acquire);
                     lock.unlock();
                     const lsn_t durable_before = durable_lsn_.load(std::memory_order_acquire);
-                    if (metrics_enabled) metrics->record_physical_flush_iteration();
+                    if (metrics_enabled)
+                        metrics->record_physical_flush_iteration();
                     const auto fsync_begin = std::chrono::steady_clock::now();
                     disk_manager_->fsync_log();
                     const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
@@ -1112,8 +1237,7 @@ void LogManager::flush_buffer(bool sync) {
                                         durability_mode_ == DurabilityMode::STRICT);
                     if (metrics_enabled) {
                         metrics->record_fdatasync(static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
-                                .count()));
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed).count()));
                     }
                     lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
                     while (durable < target_lsn &&
@@ -1142,32 +1266,33 @@ void LogManager::flush_buffer(bool sync) {
         lsn_t durable_before = INVALID_LSN;
         try {
             durable_before = durable_lsn_.load(std::memory_order_acquire);
-            if (metrics_enabled) metrics->record_physical_flush_iteration();
+            if (metrics_enabled)
+                metrics->record_physical_flush_iteration();
             // This point is inside the write failure cleanup region: a
             // test-injected pwrite failure therefore exercises the same
             // waiter fanout and retry semantics as DiskManager::write_log.
             run_group_commit_test_hook("flush_buffer_before_pwrite");
-            const auto pwrite_begin = metrics_enabled ? std::chrono::steady_clock::now()
-                                                       : std::chrono::steady_clock::time_point{};
+            const auto pwrite_begin =
+                metrics_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->write_log(flushing_buffer_->buffer_.data(), bytes);
             write_succeeded = true;
             if (metrics_enabled) {
-                metrics->record_pwrite(static_cast<uint64_t>(bytes), static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pwrite_begin)
-                        .count()));
+                metrics->record_pwrite(static_cast<uint64_t>(bytes),
+                                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 std::chrono::steady_clock::now() - pwrite_begin)
+                                                                 .count()));
             }
             if (sync) {
                 const auto fsync_begin = std::chrono::steady_clock::now();
                 disk_manager_->fsync_log();
                 const auto fsync_elapsed = std::chrono::steady_clock::now() - fsync_begin;
-                publish_fdatasync_observation(static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed).count()));
+                publish_fdatasync_observation(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed).count()));
                 LogSlowWalFdatasync(fsync_elapsed, bytes, target_lsn, durable_before,
                                     durability_mode_ == DurabilityMode::STRICT);
                 if (metrics_enabled) {
                     metrics->record_fdatasync(static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed)
-                            .count()));
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(fsync_elapsed).count()));
                 }
             }
         } catch (...) {
@@ -1202,8 +1327,7 @@ void LogManager::flush_buffer(bool sync) {
                 }
             }
             if (metrics_enabled) {
-                metrics->record_durable_lag(target_lsn, durable_before,
-                                            durable_lsn_.load(std::memory_order_acquire));
+                metrics->record_durable_lag(target_lsn, durable_before, durable_lsn_.load(std::memory_order_acquire));
             }
         }
         buffer_cv_.notify_all();
@@ -1293,14 +1417,16 @@ void LogManager::finalize_existing_log(int64_t accepted_end_offset, lsn_t max_ls
     }
     // This is the sole truncation point: analyze has already semantically
     // validated every complete record up to accepted_end_offset.
-    if (accepted_end_offset < prepared_file_size_) disk_manager_->truncate_log_to(accepted_end_offset);
+    if (accepted_end_offset < prepared_file_size_)
+        disk_manager_->truncate_log_to(accepted_end_offset);
     log_file_offset_ = accepted_end_offset;
     persist_lsn_ = max_lsn;
     durable_lsn_.store(max_lsn, std::memory_order_release);
     global_lsn_.store(std::max(max_lsn == INVALID_LSN ? 0 : max_lsn + 1, prepared_manifest_.next_lsn));
     index_bindings_.clear();
     const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
-    for (const auto& [name, generation] : index_bindings) index_bindings_[name] = IndexBinding{generation, epoch};
+    for (const auto& [name, generation] : index_bindings)
+        index_bindings_[name] = IndexBinding{generation, epoch};
     disk_manager_->SetLogOffset(accepted_end_offset);
     if (prepared_restart_rejected_) {
         prepared_manifest_.checkpoint_offset = 0;
@@ -1491,9 +1617,12 @@ void LogManager::write_restart_manifest(const RestartManifest& manifest) {
         effective.segmented_wal = true;
         effective.wal_generation = disk_manager_->wal_generation();
         effective.wal_segment_bytes = static_cast<uint64_t>(disk_manager_->wal_segment_bytes());
-        if (effective.checkpoint_offset < 0) throw InternalError("negative segmented WAL restart offset");
-        effective.restart_segment = static_cast<uint64_t>(effective.checkpoint_offset / disk_manager_->wal_segment_bytes());
-        effective.restart_offset = static_cast<uint64_t>(effective.checkpoint_offset % disk_manager_->wal_segment_bytes());
+        if (effective.checkpoint_offset < 0)
+            throw InternalError("negative segmented WAL restart offset");
+        effective.restart_segment =
+            static_cast<uint64_t>(effective.checkpoint_offset / disk_manager_->wal_segment_bytes());
+        effective.restart_offset =
+            static_cast<uint64_t>(effective.checkpoint_offset % disk_manager_->wal_segment_bytes());
         effective.next_lsn = std::max(effective.next_lsn, global_lsn_.load(std::memory_order_acquire));
     }
     const std::string temp_name = std::string(RESTART_FILE_NAME) + ".tmp";
@@ -1560,8 +1689,8 @@ RestartManifest LogManager::read_restart_manifest() const {
         }
     }
     const auto format = entries.find("wal_format");
-    static const std::unordered_set<std::string> kV2OnlyKeys = {
-        "wal_generation", "segment_bytes", "restart_segment", "restart_offset", "next_lsn", "checksum"};
+    static const std::unordered_set<std::string> kV2OnlyKeys = {"wal_generation", "segment_bytes", "restart_segment",
+                                                                "restart_offset", "next_lsn",      "checksum"};
     if (format == entries.end()) {
         for (const auto& [key, value] : entries) {
             (void)value;
@@ -1597,9 +1726,9 @@ RestartManifest LogManager::read_restart_manifest() const {
         if (!parse_unsigned("wal_generation", &manifest.wal_generation) ||
             !parse_unsigned("segment_bytes", &manifest.wal_segment_bytes) ||
             !parse_unsigned("restart_segment", &manifest.restart_segment) ||
-            !parse_unsigned("restart_offset", &manifest.restart_offset) || !parse_unsigned("next_timestamp", &next_timestamp) ||
-            !parse_unsigned("next_txn_id", &next_txn_id) || !parse_unsigned("next_lsn", &next_lsn) ||
-            !parse_unsigned("checksum", &checksum) ||
+            !parse_unsigned("restart_offset", &manifest.restart_offset) ||
+            !parse_unsigned("next_timestamp", &next_timestamp) || !parse_unsigned("next_txn_id", &next_txn_id) ||
+            !parse_unsigned("next_lsn", &next_lsn) || !parse_unsigned("checksum", &checksum) ||
             manifest.wal_segment_bytes != static_cast<uint64_t>(DiskManager::kWalSegmentBytes) ||
             next_timestamp > static_cast<uint64_t>(std::numeric_limits<timestamp_t>::max()) ||
             next_txn_id > static_cast<uint64_t>(std::numeric_limits<txn_id_t>::max()) ||
@@ -1611,19 +1740,19 @@ RestartManifest LogManager::read_restart_manifest() const {
         manifest.next_timestamp = static_cast<timestamp_t>(next_timestamp);
         manifest.next_txn_id = static_cast<txn_id_t>(next_txn_id);
         manifest.next_lsn = static_cast<lsn_t>(next_lsn);
-        if (manifest.restart_segment > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
-                                           manifest.wal_segment_bytes ||
-            manifest.checkpoint_offset != static_cast<int64_t>(manifest.restart_segment * manifest.wal_segment_bytes +
-                                                                manifest.restart_offset) ||
+        if (manifest.restart_segment >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / manifest.wal_segment_bytes ||
+            manifest.checkpoint_offset !=
+                static_cast<int64_t>(manifest.restart_segment * manifest.wal_segment_bytes + manifest.restart_offset) ||
             checksum != RestartManifestV2Checksum(manifest)) {
             manifest.malformed = true;
             return manifest;
         }
         // V2 is deliberately closed: unknown fields make the versioned format
         // invalid rather than letting a typo select a different recovery root.
-        static const std::unordered_set<std::string> kV2Keys = {
-            "wal_format", "wal_generation", "segment_bytes", "restart_segment", "restart_offset", "next_lsn", "next_timestamp",
-            "next_txn_id", "checksum"};
+        static const std::unordered_set<std::string> kV2Keys = {"wal_format",      "wal_generation", "segment_bytes",
+                                                                "restart_segment", "restart_offset", "next_lsn",
+                                                                "next_timestamp",  "next_txn_id",    "checksum"};
         for (const auto& [key, value] : entries) {
             (void)value;
             if (kV2Keys.count(key) == 0) {
@@ -1634,8 +1763,13 @@ RestartManifest LogManager::read_restart_manifest() const {
     }
     for (const auto& [key, text] : entries) {
         int64_t value = 0;
-        try { value = std::stoll(text); } catch (const std::exception&) { continue; }
-        if (value < 0) continue;
+        try {
+            value = std::stoll(text);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (value < 0)
+            continue;
         if (key == "next_timestamp") {
             manifest.next_timestamp = static_cast<timestamp_t>(value);
         } else if (key == "next_txn_id") {

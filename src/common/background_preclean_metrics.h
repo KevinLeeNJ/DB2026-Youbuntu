@@ -12,6 +12,11 @@ public:
     struct TimingSnapshot {
         uint64_t count{}, elapsed_ns{}, max_ns{};
     };
+    struct DirtyPwriteSnapshot {
+        TimingSnapshot timing{};
+        uint64_t bytes{};
+        uint64_t runs_with_wal_dependency{};
+    };
     struct Snapshot {
         TimingSnapshot foreground_dirty_eviction{}, foreground_dependency_wait{}, foreground_pwrite{},
             foreground_read{};
@@ -19,6 +24,7 @@ public:
             congestion_ramps{};
         uint64_t clean_victims{}, dirty_victim_fallbacks{}, victim_search_scanned{};
         TimingSnapshot background_flush{};
+        DirtyPwriteSnapshot foreground_dirty_pwrite{}, background_dirty_pwrite{}, checkpoint_dirty_pwrite{};
     };
     static bool ParseEnabled(const char* value) noexcept {
         return value != nullptr && std::strcmp(value, "1") == 0;
@@ -43,7 +49,10 @@ public:
                 clean_victims_.load(std::memory_order_relaxed),
                 dirty_victim_fallbacks_.load(std::memory_order_relaxed),
                 victim_search_scanned_.load(std::memory_order_relaxed),
-                read(background_flush_)};
+                read(background_flush_),
+                dirty_pwrite_snapshot(foreground_dirty_pwrite_),
+                dirty_pwrite_snapshot(background_dirty_pwrite_),
+                dirty_pwrite_snapshot(checkpoint_dirty_pwrite_)};
     }
     void foreground_dirty_eviction(uint64_t ns) noexcept {
         record(foreground_dirty_eviction_, ns);
@@ -53,6 +62,15 @@ public:
     }
     void foreground_pwrite(uint64_t ns) noexcept {
         record(foreground_pwrite_, ns);
+    }
+    void foreground_dirty_pwrite(uint64_t bytes, uint64_t ns, bool wal_intent) noexcept {
+        record_dirty_pwrite(foreground_dirty_pwrite_, bytes, ns, wal_intent);
+    }
+    void background_dirty_pwrite(uint64_t bytes, uint64_t ns, bool has_wal_dependency) noexcept {
+        record_dirty_pwrite(background_dirty_pwrite_, bytes, ns, has_wal_dependency);
+    }
+    void checkpoint_dirty_pwrite(uint64_t bytes, uint64_t ns, bool has_wal_dependency) noexcept {
+        record_dirty_pwrite(checkpoint_dirty_pwrite_, bytes, ns, has_wal_dependency);
     }
     void foreground_read(uint64_t ns) noexcept {
         record(foreground_read_, ns);
@@ -93,6 +111,11 @@ private:
     struct alignas(64) Timing {
         std::atomic<uint64_t> count{0}, elapsed_ns{0}, max_ns{0};
     };
+    struct alignas(64) DirtyPwrite {
+        Timing timing;
+        std::atomic<uint64_t> bytes{0};
+        std::atomic<uint64_t> runs_with_wal_dependency{0};
+    };
     static TimingSnapshot read(const Timing& timing) noexcept {
         return {timing.count.load(std::memory_order_relaxed), timing.elapsed_ns.load(std::memory_order_relaxed),
                 timing.max_ns.load(std::memory_order_relaxed)};
@@ -107,10 +130,23 @@ private:
                !timing.max_ns.compare_exchange_weak(old, ns, std::memory_order_relaxed, std::memory_order_relaxed)) {
         }
     }
+    DirtyPwriteSnapshot dirty_pwrite_snapshot(const DirtyPwrite& pwrite) const noexcept {
+        return {read(pwrite.timing), pwrite.bytes.load(std::memory_order_relaxed),
+                pwrite.runs_with_wal_dependency.load(std::memory_order_relaxed)};
+    }
+    void record_dirty_pwrite(DirtyPwrite& pwrite, uint64_t bytes, uint64_t ns, bool wal_intent) noexcept {
+        if (!enabled_)
+            return;
+        pwrite.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (wal_intent)
+            pwrite.runs_with_wal_dependency.fetch_add(1, std::memory_order_relaxed);
+        record(pwrite.timing, ns);
+    }
     bool enabled_{false};
     Timing foreground_dirty_eviction_, foreground_dependency_wait_, foreground_pwrite_, foreground_read_;
     std::atomic<uint64_t> background_flush_calls_{0}, background_pages_{0}, congestion_pauses_{0},
         congestion_throttles_{0}, congestion_ramps_{0};
     std::atomic<uint64_t> clean_victims_{0}, dirty_victim_fallbacks_{0}, victim_search_scanned_{0};
     Timing background_flush_;
+    DirtyPwrite foreground_dirty_pwrite_, background_dirty_pwrite_, checkpoint_dirty_pwrite_;
 };

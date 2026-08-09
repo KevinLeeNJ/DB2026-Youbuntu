@@ -203,6 +203,32 @@ public:
         lock_operation_cv_.wait(lock, [&] { return lock_operation_pins_ == 0; });
     }
 
+    struct ActiveOwnerObservation {
+        uint64_t first_observation_ns{0};
+        uint64_t observer_count{0};
+    };
+
+    // LockManager transfers queue-local observations while releasing this
+    // transaction's lock. No queue retains a Transaction pointer for metrics.
+    void merge_active_owner_observation(uint64_t first_observation_ns, uint64_t observer_count) noexcept {
+        if (observer_count == 0) {
+            return;
+        }
+        active_owner_observer_count_.fetch_add(observer_count, std::memory_order_relaxed);
+        uint64_t observed = active_owner_first_observation_ns_.load(std::memory_order_relaxed);
+        while ((observed == 0 || first_observation_ns < observed) &&
+               !active_owner_first_observation_ns_.compare_exchange_weak(
+                   observed, first_observation_ns, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    ActiveOwnerObservation take_active_owner_observation() noexcept {
+        const uint64_t observer_count = active_owner_observer_count_.exchange(0, std::memory_order_relaxed);
+        const uint64_t first_observation_ns =
+            active_owner_first_observation_ns_.exchange(0, std::memory_order_relaxed);
+        return {first_observation_ns, observer_count};
+    }
+
     inline lsn_t get_prev_lsn() {
         return prev_lsn_;
     }
@@ -473,6 +499,8 @@ private:
     std::atomic<uint32_t> commit_publication_pins_{0};
     std::atomic<bool> lock_cancellation_requested_{false};
     std::atomic<bool> lock_deadlock_victim_{false};
+    std::atomic<uint64_t> active_owner_first_observation_ns_{0};
+    std::atomic<uint64_t> active_owner_observer_count_{0};
     std::mutex lock_operation_latch_;
     std::condition_variable lock_operation_cv_;
     uint32_t lock_operation_pins_{0};

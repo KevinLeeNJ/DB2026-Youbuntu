@@ -174,7 +174,8 @@ void BufferPoolManager::set_replacement_transition_test_hook(ReplacementTransiti
     std::scoped_lock lock{flush_page_test_hook_latch_};
     replacement_transition_test_hook_enabled_.store(false, std::memory_order_release);
     replacement_transition_test_hook_ = std::move(hook);
-    replacement_transition_test_hook_enabled_.store(static_cast<bool>(replacement_transition_test_hook_), std::memory_order_release);
+    replacement_transition_test_hook_enabled_.store(static_cast<bool>(replacement_transition_test_hook_),
+                                                    std::memory_order_release);
 }
 
 void BufferPoolManager::run_flush_claim_test_hook(std::string_view point, PageId page_id) {
@@ -192,11 +193,16 @@ void BufferPoolManager::run_flush_claim_test_hook(std::string_view point, PageId
 }
 
 void BufferPoolManager::run_replacement_transition_test_hook(PageId page_id) noexcept {
-    if (!replacement_transition_test_hook_enabled_.load(std::memory_order_acquire)) return;
+    if (!replacement_transition_test_hook_enabled_.load(std::memory_order_acquire))
+        return;
     try {
         ReplacementTransitionTestHook hook;
-        { std::scoped_lock lock{flush_page_test_hook_latch_}; hook = replacement_transition_test_hook_; }
-        if (hook) hook(page_id);
+        {
+            std::scoped_lock lock{flush_page_test_hook_latch_};
+            hook = replacement_transition_test_hook_;
+        }
+        if (hook)
+            hook(page_id);
     } catch (...) {
         // A test observer must never alter replacement ownership or liveness.
     }
@@ -204,7 +210,8 @@ void BufferPoolManager::run_replacement_transition_test_hook(PageId page_id) noe
 
 void BufferPoolManager::run_replacement_io_test_hook(PageId page_id) noexcept {
     try {
-        if (replacement_io_test_hook_) replacement_io_test_hook_(page_id);
+        if (replacement_io_test_hook_)
+            replacement_io_test_hook_(page_id);
     } catch (...) {
         // Test observers must not compromise a replacement completion.
     }
@@ -212,13 +219,15 @@ void BufferPoolManager::run_replacement_io_test_hook(PageId page_id) noexcept {
 
 void BufferPoolManager::run_load_io_test_hook(PageId page_id) noexcept {
     try {
-        if (load_io_test_hook_) load_io_test_hook_(page_id);
+        if (load_io_test_hook_)
+            load_io_test_hook_(page_id);
     } catch (...) {
     }
 }
 
 BufferPoolManager::ReplacementTransitionGuard::~ReplacementTransitionGuard() {
-    if (!active_) return;
+    if (!active_)
+        return;
     {
         std::unique_lock lock{manager_->latch_};
         manager_->finish_replacement_transition_locked();
@@ -227,7 +236,8 @@ BufferPoolManager::ReplacementTransitionGuard::~ReplacementTransitionGuard() {
 }
 
 void BufferPoolManager::ReplacementTransitionGuard::finish_locked() noexcept {
-    if (!active_) return;
+    if (!active_)
+        return;
     manager_->finish_replacement_transition_locked();
     active_ = false;
 }
@@ -254,7 +264,8 @@ uint64_t BufferPoolManager::register_old_image_transition_locked(PageId page_id,
 
 void BufferPoolManager::complete_old_image_transition_locked(PageId page_id, frame_id_t frame_id,
                                                              uint64_t generation) noexcept {
-    if (generation == 0) return;
+    if (generation == 0)
+        return;
     // Lock order is BPM latch_ -> frame io_latch_. A waiter never acquires the
     // BPM latch while retaining io_latch_: condition_variable::wait releases
     // it atomically and the fetch loop drops it before retrying page_table_.
@@ -536,7 +547,8 @@ bool BufferPoolManager::claim_page_for_eviction_locked(PageId page_id, frame_id_
     if (!removed_from_replacer) {
         replacer_->pin(frame_id);
     }
-    if (!retain_resident_entry) shard.entries.erase(resident);
+    if (!retain_resident_entry)
+        shard.entries.erase(resident);
     page->state_.store(FrameState::EVICTING, std::memory_order_release);
     return true;
 }
@@ -1022,7 +1034,8 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
         if (wait_page != nullptr) {
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             if (wait_transition_generation != 0) {
-                if (transition_wait_test_hook_) transition_wait_test_hook_(page_id, wait_transition_generation);
+                if (transition_wait_test_hook_)
+                    transition_wait_test_hook_(page_id, wait_transition_generation);
                 wait_page->io_cv_.wait(wait_lock, [wait_page, wait_transition_generation] {
                     return wait_page->completed_transition_generation_.load(std::memory_order_acquire) >=
                            wait_transition_generation;
@@ -1082,23 +1095,32 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                 bool index_write_claimed = false;
                 bool target_mapping_prepared = false;
                 try {
-                    if (replacement_setup_test_hook_) replacement_setup_test_hook_("register");
+                    if (replacement_setup_test_hook_)
+                        replacement_setup_test_hook_("register");
                     if (old_page_dirty && IsValidPageId(old_page_id)) {
                         old_transition_generation = register_old_image_transition_locked(old_page_id, fid);
-                        if (replacement_setup_test_hook_) replacement_setup_test_hook_("index-claim");
+                        if (replacement_setup_test_hook_)
+                            replacement_setup_test_hook_("index-claim");
                         claim_index_file_write_locked(old_page_id.fd);
                         index_write_claimed = true;
                     }
-                    if (replacement_setup_test_hook_) replacement_setup_test_hook_("install");
+                    if (replacement_setup_test_hook_)
+                        replacement_setup_test_hook_("install");
                     const auto [prepared, inserted] = page_table_.emplace(page_id, fid);
-                    if (!inserted) throw InternalError("buffer pool duplicate prepared target mapping");
+                    if (!inserted)
+                        throw InternalError("buffer pool duplicate prepared target mapping");
                     target_mapping_prepared = true;
                 } catch (...) {
-                    if (target_mapping_prepared) page_table_.erase(page_id);
-                    if (index_write_claimed) release_index_file_write_locked(old_page_id.fd);
-                    if (old_transition_generation != 0) old_image_transitions_.erase(old_page_id);
-                    if (IsValidPageId(old_page_id)) rollback_claimed_victim_locked(old_page_id, fid);
-                    else recycle_frame(fid);
+                    if (target_mapping_prepared)
+                        page_table_.erase(page_id);
+                    if (index_write_claimed)
+                        release_index_file_write_locked(old_page_id.fd);
+                    if (old_transition_generation != 0)
+                        old_image_transitions_.erase(old_page_id);
+                    if (IsValidPageId(old_page_id))
+                        rollback_claimed_victim_locked(old_page_id, fid);
+                    else
+                        recycle_frame(fid);
                     throw;
                 }
                 {
@@ -1117,8 +1139,7 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                     assert(!old_authoritative_node.empty() && old_authoritative_node.mapped() == fid);
                     const size_t old_shard_index = resident_directory_shard_index(old_page_id);
                     ResidentDirectoryShard& old_shard = resident_directory_[old_shard_index];
-                    auto old_shard_lock =
-                        shard_write_metrics_.acquire_exclusive(old_shard.latch, old_shard_index);
+                    auto old_shard_lock = shard_write_metrics_.acquire_exclusive(old_shard.latch, old_shard_index);
                     old_resident_node = old_shard.entries.extract(old_page_id);
                     assert(!old_resident_node.empty() && old_resident_node.mapped() == fid);
                     target_page->state_.store(FrameState::EVICTING, std::memory_order_release);
@@ -1160,11 +1181,15 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                 const auto pwrite_started =
                     record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, target_page->data_, PAGE_SIZE);
-                if (record_eviction)
-                    background_preclean_metrics_.foreground_pwrite(
+                if (record_eviction) {
+                    const uint64_t elapsed_ns =
                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                   std::chrono::steady_clock::now() - pwrite_started)
-                                                  .count()));
+                                                  .count());
+                    background_preclean_metrics_.foreground_pwrite(elapsed_ns);
+                    background_preclean_metrics_.foreground_dirty_pwrite(
+                        PAGE_SIZE, elapsed_ns, old_dependency.kind() == PageWriteDependency::Kind::WalLsn);
+                }
                 old_page_write_succeeded = true;
             }
             target_page->reset_memory();
@@ -1497,6 +1522,7 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
     bool flushed = false;
     PageWriteDependency flushed_dependency = PageWriteDependency::None();
     uint64_t flushed_dirty_epoch = 0;
+    bool flushed_was_dirty = false;
     try {
         run_flush_page_test_hook(page_id, page);
         {
@@ -1505,9 +1531,20 @@ bool BufferPoolManager::flush_page_impl(PageId page_id, bool dirty_only) {
                 std::scoped_lock dirty_lock{page->dirty_latch_};
                 flushed_dependency = page->write_dependency_;
                 flushed_dirty_epoch = page->dirty_epoch_.load(std::memory_order_acquire);
+                flushed_was_dirty = page->is_dirty_.load(std::memory_order_acquire);
             }
             ensure_write_dependency(flushed_dependency);
+            const bool record_pwrite = flushed_was_dirty && background_preclean_metrics_.enabled();
+            const auto pwrite_started =
+                record_pwrite ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+            if (record_pwrite) {
+                const uint64_t elapsed_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                      std::chrono::steady_clock::now() - pwrite_started)
+                                                                      .count());
+                background_preclean_metrics_.foreground_dirty_pwrite(
+                    PAGE_SIZE, elapsed_ns, flushed_dependency.kind() == PageWriteDependency::Kind::WalLsn);
+            }
         }
         run_flush_page_after_write_test_hook(page_id, page);
         flushed = true;
@@ -1578,8 +1615,10 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
         try {
             page_id->page_no = disk_manager_->allocate_page(page_id->fd);
         } catch (...) {
-            if (IsValidPageId(old_page_id)) rollback_claimed_victim_locked(old_page_id, fid);
-            else recycle_frame(fid);
+            if (IsValidPageId(old_page_id))
+                rollback_claimed_victim_locked(old_page_id, fid);
+            else
+                recycle_frame(fid);
             throw;
         }
         {
@@ -1591,23 +1630,32 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
         bool index_write_claimed = false;
         bool target_mapping_prepared = false;
         try {
-            if (replacement_setup_test_hook_) replacement_setup_test_hook_("register");
+            if (replacement_setup_test_hook_)
+                replacement_setup_test_hook_("register");
             if (old_page_dirty && IsValidPageId(old_page_id)) {
                 old_transition_generation = register_old_image_transition_locked(old_page_id, fid);
-                if (replacement_setup_test_hook_) replacement_setup_test_hook_("index-claim");
+                if (replacement_setup_test_hook_)
+                    replacement_setup_test_hook_("index-claim");
                 claim_index_file_write_locked(old_page_id.fd);
                 index_write_claimed = true;
             }
-            if (replacement_setup_test_hook_) replacement_setup_test_hook_("install");
+            if (replacement_setup_test_hook_)
+                replacement_setup_test_hook_("install");
             const auto [prepared, inserted] = page_table_.emplace(*page_id, fid);
-            if (!inserted) throw InternalError("buffer pool duplicate prepared target mapping");
+            if (!inserted)
+                throw InternalError("buffer pool duplicate prepared target mapping");
             target_mapping_prepared = true;
         } catch (...) {
-            if (target_mapping_prepared) page_table_.erase(*page_id);
-            if (index_write_claimed) release_index_file_write_locked(old_page_id.fd);
-            if (old_transition_generation != 0) old_image_transitions_.erase(old_page_id);
-            if (IsValidPageId(old_page_id)) rollback_claimed_victim_locked(old_page_id, fid);
-            else recycle_frame(fid);
+            if (target_mapping_prepared)
+                page_table_.erase(*page_id);
+            if (index_write_claimed)
+                release_index_file_write_locked(old_page_id.fd);
+            if (old_transition_generation != 0)
+                old_image_transitions_.erase(old_page_id);
+            if (IsValidPageId(old_page_id))
+                rollback_claimed_victim_locked(old_page_id, fid);
+            else
+                recycle_frame(fid);
             throw;
         }
         {
@@ -1658,11 +1706,14 @@ Page* BufferPoolManager::new_page_impl(PageId* page_id, const FrameOperationToke
             const auto pwrite_started =
                 record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
-            if (record_eviction)
-                background_preclean_metrics_.foreground_pwrite(
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              std::chrono::steady_clock::now() - pwrite_started)
-                                              .count()));
+            if (record_eviction) {
+                const uint64_t elapsed_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                      std::chrono::steady_clock::now() - pwrite_started)
+                                                                      .count());
+                background_preclean_metrics_.foreground_pwrite(elapsed_ns);
+                background_preclean_metrics_.foreground_dirty_pwrite(
+                    PAGE_SIZE, elapsed_ns, old_dependency.kind() == PageWriteDependency::Kind::WalLsn);
+            }
             if (record_eviction)
                 background_preclean_metrics_.foreground_dirty_eviction(
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1798,14 +1849,26 @@ bool BufferPoolManager::delete_page(PageId page_id) {
 
         bool deleted = false;
         PageWriteDependency dependency = PageWriteDependency::None();
+        bool page_was_dirty = false;
         try {
             std::unique_lock<std::shared_mutex> page_lock(page->latch_);
             {
                 std::scoped_lock dirty_lock{page->dirty_latch_};
                 dependency = page->write_dependency_;
+                page_was_dirty = page->is_dirty_.load(std::memory_order_acquire);
             }
             ensure_write_dependency(dependency);
+            const bool record_pwrite = page_was_dirty && background_preclean_metrics_.enabled();
+            const auto pwrite_started =
+                record_pwrite ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+            if (record_pwrite) {
+                const uint64_t elapsed_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                      std::chrono::steady_clock::now() - pwrite_started)
+                                                                      .count());
+                background_preclean_metrics_.foreground_dirty_pwrite(
+                    PAGE_SIZE, elapsed_ns, dependency.kind() == PageWriteDependency::Kind::WalLsn);
+            }
             deleted = true;
         } catch (...) {
             deleted = false;
@@ -1981,8 +2044,9 @@ bool BufferPoolManager::flush_all_pages_for_recovery(const std::vector<int>& fds
                     return;
                 }
                 const RecoveryTask task = tasks[task_index];
-                const FlushBatchResult result = flush_sorted_pages(
-                    candidates, task.begin, task.end, FlushDependencyPolicy::Enforce(), worker_images[worker_index]);
+                const FlushBatchResult result =
+                    flush_sorted_pages(candidates, task.begin, task.end, FlushDependencyPolicy::BackgroundEnforce(),
+                                       worker_images[worker_index]);
                 pages_written.fetch_add(result.pages_written, std::memory_order_relaxed);
                 write_calls.fetch_add(result.write_calls, std::memory_order_relaxed);
                 if (!result.success) {
@@ -2294,9 +2358,13 @@ BufferPoolManager::flush_sorted_pages(const std::vector<PageId>& candidates, siz
                 dependency.merge(claimed[i].dependency);
             }
             if (policy.kind() != FlushDependencyPolicy::Kind::AlreadyDurable) {
-                ensure_write_dependency(dependency, policy.kind() == FlushDependencyPolicy::Kind::CheckpointEnforce
-                                                        ? DependencyWriteOrigin::Checkpoint
-                                                        : DependencyWriteOrigin::Foreground);
+                const DependencyWriteOrigin dependency_origin =
+                    policy.kind() == FlushDependencyPolicy::Kind::CheckpointEnforce
+                        ? DependencyWriteOrigin::Checkpoint
+                        : (policy.kind() == FlushDependencyPolicy::Kind::BackgroundEnforce
+                               ? DependencyWriteOrigin::Background
+                               : DependencyWriteOrigin::Foreground);
+                ensure_write_dependency(dependency, dependency_origin);
             }
         } catch (...) {
             snapshot_complete = false;
@@ -2310,9 +2378,31 @@ BufferPoolManager::flush_sorted_pages(const std::vector<PageId>& candidates, siz
                 ++run_end;
             }
             try {
+                const bool record_pwrite = background_preclean_metrics_.enabled();
+                const auto pwrite_started =
+                    record_pwrite ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 disk_manager_->write_page(claimed[run_begin].page_id.fd, claimed[run_begin].page_id.page_no,
                                           image.data() + run_begin * PAGE_SIZE,
                                           static_cast<int>((run_end - run_begin) * PAGE_SIZE));
+                if (record_pwrite) {
+                    bool wal_intent = false;
+                    for (size_t index = run_begin; index < run_end; ++index) {
+                        wal_intent =
+                            wal_intent || claimed[index].dependency.kind() == PageWriteDependency::Kind::WalLsn;
+                    }
+                    const uint64_t elapsed_ns =
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - pwrite_started)
+                                                  .count());
+                    const uint64_t bytes = static_cast<uint64_t>((run_end - run_begin) * PAGE_SIZE);
+                    if (policy.kind() == FlushDependencyPolicy::Kind::Enforce) {
+                        background_preclean_metrics_.foreground_dirty_pwrite(bytes, elapsed_ns, wal_intent);
+                    } else if (policy.kind() == FlushDependencyPolicy::Kind::BackgroundEnforce) {
+                        background_preclean_metrics_.background_dirty_pwrite(bytes, elapsed_ns, wal_intent);
+                    } else {
+                        background_preclean_metrics_.checkpoint_dirty_pwrite(bytes, elapsed_ns, wal_intent);
+                    }
+                }
                 for (size_t i = run_begin; i < run_end; ++i) {
                     written[i] = true;
                 }
@@ -2366,7 +2456,7 @@ BufferPoolManager::FlushBatchResult BufferPoolManager::flush_dirty_pages(const s
     // Every frame carries a typed WAL dependency. Enforce it per batch while
     // foreground writers remain active, including for index pages whose payload
     // does not contain a table-page LSN.
-    return flush_pages_until(pages_to_flush, FlushDependencyPolicy::Enforce(),
+    return flush_pages_until(pages_to_flush, FlushDependencyPolicy::BackgroundEnforce(),
                              std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
 }
 

@@ -756,6 +756,10 @@ public:
         // fdatasync.  The slot argument makes adversarial ordering tests
         // deterministic without adding production synchronization.
         std::function<void(std::string_view, size_t)> sync_slot_hook;
+        // Construction-only test seam. Production leaves it empty. The hook
+        // runs at the same call site as slow-wait aggregation, so tests can
+        // prove that reporting never inherits the group-commit mutex.
+        std::function<void(uint64_t, std::string_view, int, uint64_t)> slow_waiter_reporter_hook;
     };
 
     explicit LogManager(DiskManager* disk_manager, DurabilityMode durability_mode = DurabilityMode::STRICT,
@@ -766,6 +770,7 @@ public:
         wal_flush_metrics_ = wal_flush_metrics;
         group_commit_test_hook_ = std::move(test_options.hook);
         group_commit_sync_slot_test_hook_ = std::move(test_options.sync_slot_hook);
+        slow_waiter_reporter_test_hook_ = std::move(test_options.slow_waiter_reporter_hook);
         const char* leader_rotation = std::getenv("RMDB_WAL_LEADER_ROTATION");
         leader_rotation_enabled_ = leader_rotation == nullptr || WalFlushMetrics::ParseEnabled(leader_rotation);
         const char* sync_depth = std::getenv("RMDB_WAL_SYNC_DEPTH");
@@ -785,6 +790,9 @@ public:
     void flush_log_to_disk();
     void flush_log_to_disk_with_sync();
     void flush_log_to_disk_up_to(lsn_t target_lsn);
+    // Same durability contract as flush_log_to_disk_up_to, with metrics-only
+    // classification of the caller as a transaction COMMIT request.
+    void flush_commit_log_to_disk_up_to(lsn_t target_lsn);
     // Physical page/header publication always needs a stable WAL prefix,
     // independently of the transaction commit durability mode.
     void flush_log_to_disk_up_to_durable(lsn_t target_lsn);
@@ -861,6 +869,10 @@ public:
     bool can_use_sync_pipeline_for_test() const noexcept {
         return can_use_sync_pipeline();
     }
+    bool group_commit_latch_available_for_test() {
+        std::unique_lock<std::mutex> lock(group_commit_latch_, std::try_to_lock);
+        return lock.owns_lock();
+    }
 
     // 原子发布重启清单：tmp 文件 + fdatasync + rename + 目录 fsync。
     // checkpoint 必须在截断 WAL *之前* 调用它，见 CheckpointManager::RunCleanCheckpoint()。
@@ -882,11 +894,14 @@ private:
     // changing the physical WAL epoch.
     class WalScheduleGuard {
     public:
-        explicit WalScheduleGuard(LogManager* manager) : manager_(manager), active_(manager->wal_sync_depth_two_enabled_) {
-            if (active_) manager_->enter_wal_schedule();
+        explicit WalScheduleGuard(LogManager* manager)
+            : manager_(manager), active_(manager->wal_sync_depth_two_enabled_) {
+            if (active_)
+                manager_->enter_wal_schedule();
         }
         ~WalScheduleGuard() {
-            if (active_) manager_->leave_wal_schedule();
+            if (active_)
+                manager_->leave_wal_schedule();
         }
         WalScheduleGuard(const WalScheduleGuard&) = delete;
         WalScheduleGuard& operator=(const WalScheduleGuard&) = delete;
@@ -898,14 +913,17 @@ private:
     class WalEpochChangeGuard {
     public:
         explicit WalEpochChangeGuard(LogManager* manager)
-            : manager_(manager), active_(manager->wal_sync_depth_two_enabled_), lock_(manager_->wal_schedule_latch_, std::defer_lock) {
-            if (!active_) return;
+            : manager_(manager), active_(manager->wal_sync_depth_two_enabled_),
+              lock_(manager_->wal_schedule_latch_, std::defer_lock) {
+            if (!active_)
+                return;
             lock_.lock();
             manager_->wal_schedule_blocked_ = true;
             manager_->wal_schedule_cv_.wait(lock_, [manager] { return manager->wal_schedulers_ == 0; });
         }
         ~WalEpochChangeGuard() {
-            if (!active_) return;
+            if (!active_)
+                return;
             manager_->wal_schedule_blocked_ = false;
             lock_.unlock();
             manager_->wal_schedule_cv_.notify_all();
@@ -950,9 +968,9 @@ private:
     };
 
     void flush_buffer(bool sync);
-    void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync);
-    void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync);
-    void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync);
+    void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync, bool commit_request = false);
+    void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync, bool commit_request);
+    void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync, bool commit_request);
     void flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& leader_waiter);
     void notify_covered_followers(const std::shared_ptr<CommitWaiter>& leader_waiter);
     void ensure_sync_workers();
@@ -968,6 +986,7 @@ private:
     void leave_wal_schedule() noexcept;
     void run_group_commit_test_hook(std::string_view point) const;
     void run_group_commit_sync_slot_test_hook(std::string_view point, size_t slot_index) const;
+    void report_slow_wal_waiter(uint64_t elapsed_ns, std::string_view role, int slot, uint64_t wave) noexcept;
     void record_sync_completion(uint64_t elapsed_ns, lsn_t target_lsn, lsn_t durable_before) noexcept;
     void publish_fdatasync_observation(uint64_t elapsed_ns) noexcept;
     uint64_t publish_index_binding_locked(const std::string& index_file_name, uint64_t epoch, bool durable = true);
@@ -1029,6 +1048,7 @@ private:
     bool wal_sync_depth_two_enabled_{false};
     std::function<void(std::string_view)> group_commit_test_hook_;
     std::function<void(std::string_view, size_t)> group_commit_sync_slot_test_hook_;
+    std::function<void(uint64_t, std::string_view, int, uint64_t)> slow_waiter_reporter_test_hook_;
     struct IndexBinding {
         uint64_t generation{0};
         uint64_t epoch{0};

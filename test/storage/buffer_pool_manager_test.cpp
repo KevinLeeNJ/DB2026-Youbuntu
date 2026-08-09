@@ -65,8 +65,10 @@ public:
         setenv(name, value, 1);
     }
     ~ScopedEnvironmentVariable() {
-        if (had_previous_) setenv(name_.c_str(), previous_.c_str(), 1);
-        else unsetenv(name_.c_str());
+        if (had_previous_)
+            setenv(name_.c_str(), previous_.c_str(), 1);
+        else
+            unsetenv(name_.c_str());
     }
 
 private:
@@ -242,18 +244,38 @@ TEST_F(BufferPoolManagerTest, FrameOperationWaitsForPreGateDirtyReplacement) {
         std::condition_variable cv;
         bool paused = false, release = false, acquired = false;
         BufferPoolManager::set_replacement_transition_test_hook([&](PageId page_id) {
-            if (!(page_id == old)) return;
+            if (!(page_id == old))
+                return;
             std::unique_lock lock(latch);
             paused = true;
             cv.notify_all();
             cv.wait(lock, [&] { return release; });
         });
         std::thread evictor([&] { (void)bpm.fetch_page(PageId{fd_, 999 + iteration}); });
-        { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
-        std::thread acquirer([&] { auto token = bpm.acquire_frame_operation(1); { std::lock_guard lock(latch); acquired = true; } cv.notify_all(); Page* page = token.fetch_page(old); ASSERT_NE(page, nullptr); EXPECT_EQ(0, std::memcmp(page->get_data(), "new-dirty-bytes", 16)); EXPECT_TRUE(bpm.unpin_page(old, false)); });
-        { std::lock_guard lock(latch); EXPECT_FALSE(acquired); release = true; }
+        {
+            std::unique_lock lock(latch);
+            cv.wait(lock, [&] { return paused; });
+        }
+        std::thread acquirer([&] {
+            auto token = bpm.acquire_frame_operation(1);
+            {
+                std::lock_guard lock(latch);
+                acquired = true;
+            }
+            cv.notify_all();
+            Page* page = token.fetch_page(old);
+            ASSERT_NE(page, nullptr);
+            EXPECT_EQ(0, std::memcmp(page->get_data(), "new-dirty-bytes", 16));
+            EXPECT_TRUE(bpm.unpin_page(old, false));
+        });
+        {
+            std::lock_guard lock(latch);
+            EXPECT_FALSE(acquired);
+            release = true;
+        }
         cv.notify_all();
-        evictor.join(); acquirer.join();
+        evictor.join();
+        acquirer.join();
         EXPECT_EQ(bpm.pre_gate_replacement_transitions_, 0u);
         BufferPoolManager::set_replacement_transition_test_hook({});
     }
@@ -286,7 +308,8 @@ TEST_F(BufferPoolManagerTest, FrameOperationWaitsForPreGateDirtyNewPageReplaceme
             }
         } hook_guard;
         BufferPoolManager::set_replacement_transition_test_hook([&](PageId page_id) {
-            if (!(page_id == old)) return;
+            if (!(page_id == old))
+                return;
             std::unique_lock lock(latch);
             paused = true;
             cv.notify_all();
@@ -374,14 +397,16 @@ TEST_F(BufferPoolManagerTest, RefetchWaitsForDirtyOldImageFetchReplacement) {
     bool release_waiter = false;
     int returned = 0;
     bpm.set_replacement_io_test_hook([&](PageId id) {
-        if (!(id == old)) return;
+        if (!(id == old))
+            return;
         std::unique_lock lock(latch);
         paused = true;
         cv.notify_all();
         cv.wait(lock, [&] { return release; });
     });
     bpm.set_transition_wait_test_hook([&](PageId id, uint64_t) {
-        if (!(id == old)) return;
+        if (!(id == old))
+            return;
         std::unique_lock lock(latch);
         if (!waiter_at_check) {
             waiter_at_check = true;
@@ -397,23 +422,35 @@ TEST_F(BufferPoolManagerTest, RefetchWaitsForDirtyOldImageFetchReplacement) {
         dynamic_cast<ClockReplacer*>(bpm.replacer_.get())->usage_count_[bpm.page_table_.at(replacement)].store(0);
         EXPECT_TRUE(bpm.unpin_page(replacement, false));
     });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     ASSERT_TRUE(bpm.unpin_page(blocker, false));
     std::thread refetcher([&] {
         Page* page = bpm.fetch_page(old);
         ASSERT_NE(page, nullptr);
         EXPECT_EQ(0, std::memcmp(page->get_data(), "old-image-after-write", 22));
         EXPECT_TRUE(bpm.unpin_page(old, false));
-        { std::lock_guard lock(latch); ++returned; }
+        {
+            std::lock_guard lock(latch);
+            ++returned;
+        }
         cv.notify_all();
     });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return waiter_at_check; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return waiter_at_check; });
+    }
     std::thread second_refetcher([&] {
         Page* page = bpm.fetch_page(old);
         ASSERT_NE(page, nullptr);
         EXPECT_EQ(0, std::memcmp(page->get_data(), "old-image-after-write", 22));
         EXPECT_TRUE(bpm.unpin_page(old, false));
-        { std::lock_guard lock(latch); ++returned; }
+        {
+            std::lock_guard lock(latch);
+            ++returned;
+        }
         cv.notify_all();
     });
     {
@@ -445,7 +482,8 @@ TEST_F(BufferPoolManagerTest, RefetchWaitsForDirtyOldImageNewPageReplacement) {
     bool paused = false;
     bool release = false;
     bpm.set_replacement_io_test_hook([&](PageId id) {
-        if (!(id == old)) return;
+        if (!(id == old))
+            return;
         std::unique_lock lock(latch);
         paused = true;
         cv.notify_all();
@@ -456,14 +494,20 @@ TEST_F(BufferPoolManagerTest, RefetchWaitsForDirtyOldImageNewPageReplacement) {
         ASSERT_NE(bpm.new_page(&id), nullptr);
         EXPECT_TRUE(bpm.unpin_page(id, false));
     });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     std::thread refetcher([&] {
         Page* page = bpm.fetch_page(old);
         ASSERT_NE(page, nullptr);
         EXPECT_EQ(0, std::memcmp(page->get_data(), "old-image-new-page", 19));
         EXPECT_TRUE(bpm.unpin_page(old, false));
     });
-    { std::lock_guard lock(latch); release = true; }
+    {
+        std::lock_guard lock(latch);
+        release = true;
+    }
     cv.notify_all();
     allocator.join();
     refetcher.join();
@@ -487,14 +531,18 @@ TEST_F(BufferPoolManagerTest, FailedDirtyWriteRestoresOldImageBeforeRefetch) {
     std::condition_variable cv;
     bool paused = false, release = false;
     bpm->set_replacement_io_test_hook([&](PageId id) {
-        if (!(id == old)) return;
+        if (!(id == old))
+            return;
         std::unique_lock lock(latch);
         paused = true;
         cv.notify_all();
         cv.wait(lock, [&] { return release; });
     });
     std::thread evictor([&] { EXPECT_EQ(bpm->fetch_page(PageId{fd_, 123}), nullptr); });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     std::thread waiter([&] {
         Page* page = bpm->fetch_page(old);
         ASSERT_NE(page, nullptr);
@@ -507,7 +555,10 @@ TEST_F(BufferPoolManagerTest, FailedDirtyWriteRestoresOldImageBeforeRefetch) {
     // mapping and wake the old-page waiter rather than leave it stranded.
     disk_manager_->close_file(fd_);
     fd_closed_ = true;
-    { std::lock_guard lock(latch); release = true; }
+    {
+        std::lock_guard lock(latch);
+        release = true;
+    }
     cv.notify_all();
     evictor.join();
     waiter.join();
@@ -527,7 +578,8 @@ TEST_F(BufferPoolManagerTest, FailedTargetReadLetsOldRefetchUsePersistedImage) {
     std::condition_variable cv;
     bool paused = false, release = false;
     bpm.set_replacement_io_test_hook([&](PageId id) {
-        if (!(id == old)) return;
+        if (!(id == old))
+            return;
         std::unique_lock lock(latch);
         paused = true;
         cv.notify_all();
@@ -536,14 +588,20 @@ TEST_F(BufferPoolManagerTest, FailedTargetReadLetsOldRefetchUsePersistedImage) {
     // This page was never materialized on disk: pwrite(old) succeeds, then
     // target pread fails and the old-page waiter must reload that new old image.
     std::thread evictor([&] { EXPECT_EQ(bpm.fetch_page(PageId{fd_, 987}), nullptr); });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     std::thread waiter([&] {
         Page* page = bpm.fetch_page(old);
         ASSERT_NE(page, nullptr);
         EXPECT_EQ(0, std::memcmp(page->get_data(), "persisted-before-read-fail", 27));
         EXPECT_TRUE(bpm.unpin_page(old, false));
     });
-    { std::lock_guard lock(latch); release = true; }
+    {
+        std::lock_guard lock(latch);
+        release = true;
+    }
     cv.notify_all();
     evictor.join();
     waiter.join();
@@ -573,7 +631,8 @@ TEST_F(BufferPoolManagerTest, FailedDirtyWriteDuringNewPageRestoresOldNodesAndWa
     std::condition_variable cv;
     bool paused = false, release = false;
     bpm->set_replacement_io_test_hook([&](PageId id) {
-        if (!(id == old)) return;
+        if (!(id == old))
+            return;
         std::unique_lock lock(latch);
         paused = true;
         cv.notify_all();
@@ -583,7 +642,10 @@ TEST_F(BufferPoolManagerTest, FailedDirtyWriteDuringNewPageRestoresOldNodesAndWa
         PageId target{fd_, INVALID_PAGE_ID};
         EXPECT_EQ(bpm->new_page(&target), nullptr);
     });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     std::thread waiter([&] {
         Page* page = bpm->fetch_page(old);
         ASSERT_NE(page, nullptr);
@@ -595,7 +657,10 @@ TEST_F(BufferPoolManagerTest, FailedDirtyWriteDuringNewPageRestoresOldNodesAndWa
     });
     disk_manager_->close_file(fd_);
     fd_closed_ = true;
-    { std::lock_guard lock(latch); release = true; }
+    {
+        std::lock_guard lock(latch);
+        release = true;
+    }
     cv.notify_all();
     allocator.join();
     waiter.join();
@@ -697,7 +762,8 @@ TEST_F(BufferPoolManagerTest, SameTargetLoadingIssuesOneRead) {
     bool paused = false, release = false;
     int reads = 0;
     bpm.set_load_io_test_hook([&](PageId id) {
-        if (!(id == target)) return;
+        if (!(id == target))
+            return;
         std::unique_lock lock(latch);
         ++reads;
         paused = true;
@@ -705,14 +771,20 @@ TEST_F(BufferPoolManagerTest, SameTargetLoadingIssuesOneRead) {
         cv.wait(lock, [&] { return release; });
     });
     std::thread first([&] { ASSERT_NE(bpm.fetch_page(target), nullptr); });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     std::thread second([&] {
         Page* page = bpm.fetch_page(target);
         ASSERT_NE(page, nullptr);
         EXPECT_EQ(0, std::memcmp(page->get_data(), "one-read", 9));
         EXPECT_TRUE(bpm.unpin_page(target, false));
     });
-    { std::lock_guard lock(latch); release = true; }
+    {
+        std::lock_guard lock(latch);
+        release = true;
+    }
     cv.notify_all();
     first.join();
     second.join();
@@ -743,20 +815,27 @@ TEST_F(BufferPoolManagerTest, FlushingPageNeverEntersOldImageRegistry) {
     std::condition_variable cv;
     bool paused = false, release = false;
     BufferPoolManager::set_flush_page_test_hook([&](PageId hooked, Page*) {
-        if (!(hooked == id)) return;
+        if (!(hooked == id))
+            return;
         std::unique_lock lock(latch);
         paused = true;
         cv.notify_all();
         cv.wait(lock, [&] { return release; });
     });
     std::thread flusher([&] { EXPECT_TRUE(bpm.flush_page(id)); });
-    { std::unique_lock lock(latch); cv.wait(lock, [&] { return paused; }); }
+    {
+        std::unique_lock lock(latch);
+        cv.wait(lock, [&] { return paused; });
+    }
     {
         std::shared_lock lock(bpm.latch_);
         EXPECT_TRUE(bpm.old_image_transitions_.empty());
         EXPECT_EQ(bpm.pages_[bpm.page_table_.at(id)].state_.load(std::memory_order_acquire), FrameState::FLUSHING);
     }
-    { std::lock_guard lock(latch); release = true; }
+    {
+        std::lock_guard lock(latch);
+        release = true;
+    }
     cv.notify_all();
     flusher.join();
     BufferPoolManager::set_flush_page_test_hook({});
@@ -772,7 +851,8 @@ TEST_F(BufferPoolManagerTest, ReplacementSetupAllocationFailuresRestoreVictim) {
         ASSERT_TRUE(bpm.unpin_page(old, true));
         dynamic_cast<ClockReplacer*>(bpm.replacer_.get())->usage_count_[bpm.page_table_.at(old)].store(0);
         bpm.set_replacement_setup_test_hook([point](std::string_view current) {
-            if (current == point) throw std::bad_alloc{};
+            if (current == point)
+                throw std::bad_alloc{};
         });
         PageId target{fd_, 700};
         if (point == "resident-insert") {
@@ -804,11 +884,14 @@ TEST_F(BufferPoolManagerTest, NewPageSetupAllocationFailuresRestoreVictim) {
         ASSERT_TRUE(bpm.unpin_page(old, true));
         dynamic_cast<ClockReplacer*>(bpm.replacer_.get())->usage_count_[bpm.page_table_.at(old)].store(0);
         bpm.set_replacement_setup_test_hook([point](std::string_view current) {
-            if (current == point) throw std::bad_alloc{};
+            if (current == point)
+                throw std::bad_alloc{};
         });
         PageId target{fd_, INVALID_PAGE_ID};
-        if (point == "resident-insert") EXPECT_EQ(bpm.new_page(&target), nullptr);
-        else EXPECT_THROW((void)bpm.new_page(&target), std::bad_alloc);
+        if (point == "resident-insert")
+            EXPECT_EQ(bpm.new_page(&target), nullptr);
+        else
+            EXPECT_THROW((void)bpm.new_page(&target), std::bad_alloc);
         bpm.set_replacement_setup_test_hook({});
         EXPECT_TRUE(bpm.old_image_transitions_.empty());
         EXPECT_EQ(bpm.pre_gate_replacement_transitions_, 0u);
@@ -926,6 +1009,8 @@ TEST_F(BufferPoolManagerTest, BoundedCleanFirstVictimSkipsSmoBlockedCleanCandida
     EXPECT_EQ(metrics.dirty_victim_fallbacks, 1u);
     EXPECT_EQ(metrics.victim_search_scanned, 2u);
     EXPECT_EQ(metrics.foreground_pwrite.count, 1u);
+    EXPECT_EQ(metrics.foreground_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(metrics.foreground_dirty_pwrite.bytes, PAGE_SIZE);
     EXPECT_TRUE(bpm.unpin_page(replacement, false));
 }
 
@@ -1093,6 +1178,45 @@ TEST_F(BufferPoolManagerTest, WalDependentFlushFailsClosedWithoutLogManager) {
     EXPECT_TRUE(bpm.unpin_page(page_id, false));
 }
 
+TEST_F(BufferPoolManagerTest, DirtyPwriteMetricsSeparateForegroundBackgroundAndCheckpointOrigins) {
+    ScopedEnvironmentVariable metrics_env("RMDB_BACKGROUND_PRECLEAN_METRICS", "1");
+    BufferPoolManager bpm(2, disk_manager_.get());
+    auto log_manager = InstallTestWal(&bpm, disk_manager_.get(), 0);
+
+    PageId page_id{fd_, INVALID_PAGE_ID};
+    ASSERT_NE(bpm.new_page(&page_id), nullptr);
+    ASSERT_TRUE(bpm.unpin_page(page_id, PageWriteDependency::Wal(0)));
+    const auto background = bpm.flush_dirty_pages({fd_}, 1);
+    ASSERT_TRUE(background.success);
+    ASSERT_EQ(background.pages_written, 1u);
+
+    Page* page = bpm.fetch_page(page_id);
+    ASSERT_NE(page, nullptr);
+    ASSERT_TRUE(bpm.unpin_page(page_id, PageWriteDependency::Wal(0)));
+    ASSERT_TRUE(bpm.flush_page(page_id));
+
+    page = bpm.fetch_page(page_id);
+    ASSERT_NE(page, nullptr);
+    ASSERT_TRUE(bpm.unpin_page(page_id, PageWriteDependency::Wal(0)));
+    const auto cohort = bpm.begin_checkpoint_cohort({fd_});
+    ASSERT_NE(cohort.epoch, 0U);
+    ASSERT_EQ(cohort.pages_marked, 1U);
+    const auto checkpoint = bpm.flush_checkpoint_cohort(cohort.epoch, 1);
+    ASSERT_TRUE(checkpoint.success);
+    ASSERT_EQ(checkpoint.pages_written, 1U);
+
+    const auto snapshot = bpm.background_preclean_metrics().snapshot();
+    EXPECT_EQ(snapshot.background_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.bytes, PAGE_SIZE);
+    EXPECT_EQ(snapshot.background_dirty_pwrite.runs_with_wal_dependency, 1u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.bytes, PAGE_SIZE);
+    EXPECT_EQ(snapshot.checkpoint_dirty_pwrite.runs_with_wal_dependency, 1u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.timing.count, 1u);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.bytes, PAGE_SIZE);
+    EXPECT_EQ(snapshot.foreground_dirty_pwrite.runs_with_wal_dependency, 1u);
+}
+
 TEST_F(BufferPoolManagerTest, FreshDirtyPageWithoutWalManagerPersistsInvalidLsn) {
     BufferPoolManager bpm(1, disk_manager_.get());
     PageId page_id{fd_, INVALID_PAGE_ID};
@@ -1161,7 +1285,8 @@ TEST_F(BufferPoolManagerTest, IndexSmoBarrierDrainsAnAlreadyClaimedFlush) {
         std::unique_lock lock{mutex};
         flush_claimed = true;
         cv.notify_all();
-        if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_flush; })) hook_timed_out = true;
+        if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_flush; }))
+            hook_timed_out = true;
     });
 
     std::vector<PageId> pages{page_id};
@@ -1255,7 +1380,8 @@ TEST_F(BufferPoolManagerTest, FlushCleanupWakesFrameReservation) {
         std::unique_lock lock{mutex};
         claimed = true;
         cv.notify_all();
-        if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return release; })) hook_timed_out = true;
+        if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return release; }))
+            hook_timed_out = true;
     });
 
     std::vector<PageId> pages{page_id};
@@ -1356,8 +1482,8 @@ TEST_F(BufferPoolManagerTest, FiniteFlushRetainsBlockedCursorAndContinuesAfterBa
 }
 
 TEST_F(BufferPoolManagerTest, FlushClaimFaultsRestoreEveryOwnedStateAndRemainRetryable) {
-    constexpr std::array<std::string_view, 4> fault_points{
-        "after_inflight_claim", "after_resident_extract", "after_flushing", "cleanup_first"};
+    constexpr std::array<std::string_view, 4> fault_points{"after_inflight_claim", "after_resident_extract",
+                                                           "after_flushing", "cleanup_first"};
     for (const std::string_view fault_point : fault_points) {
         SCOPED_TRACE(fault_point);
         BufferPoolManager bpm(2, disk_manager_.get());
@@ -1412,7 +1538,8 @@ TEST_F(BufferPoolManagerTest, FlushClaimScopeGuardRestoresClaimsDuringExceptionU
         pages.push_back(page_id);
     }
     BufferPoolManager::set_flush_claim_test_hook([](std::string_view point, PageId) {
-        if (point == "scope_unwind") throw std::bad_alloc();
+        if (point == "scope_unwind")
+            throw std::bad_alloc();
     });
     EXPECT_THROW((void)bpm.flush_pages(pages, FlushDependencyPolicy::Enforce()), std::bad_alloc);
     BufferPoolManager::set_flush_claim_test_hook({});

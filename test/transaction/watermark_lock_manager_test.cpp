@@ -235,8 +235,69 @@ TEST(LockManagerMetadataTest, CancellationDuringOwnerHandoffReleasesGrantedOwner
     EXPECT_TRUE(lock_manager.unlock(&next, lock_id));
 }
 
+TEST(LockManagerMetadataTest, AbortDuringUnpublishedHandoffTransfersOwnerObservation) {
+    TransactionPhaseMetrics metrics(true);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
+    Transaction owner(1024, IsolationLevel::READ_COMMITTED);
+    Transaction waiter(1025, IsolationLevel::READ_COMMITTED);
+    Transaction observer(1026, IsolationLevel::SNAPSHOT_ISOLATION);
+    const Rid rid{3, 1};
+    const LockDataId lock_id(42, rid, LockDataType::RECORD);
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+
+    std::mutex hook_latch;
+    std::condition_variable hook_cv;
+    bool handoff_ready = false;
+    bool release_notify = false;
+    lock_manager.set_record_handoff_pre_notify_test_hook([&] {
+        std::unique_lock<std::mutex> lock(hook_latch);
+        handoff_ready = true;
+        hook_cv.notify_all();
+        hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return release_notify; });
+    });
+
+    LockAcquireResult waiter_result = LockAcquireResult::Value::Granted;
+    std::thread waiter_thread([&] { waiter_result = lock_manager.lock_exclusive_on_record(&waiter, rid, 42); });
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&waiter);
+                                        lock_manager.unlock(&owner, lock_id);
+                                        JoinIfJoinable(waiter_thread);
+                                    }));
+    std::thread owner_release([&] { EXPECT_TRUE(lock_manager.unlock(&owner, lock_id)); });
+    ASSERT_TRUE(WaitForNotification(
+        hook_cv, hook_latch, [&] { return handoff_ready; },
+        [&] {
+            {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                release_notify = true;
+            }
+            hook_cv.notify_all();
+            lock_manager.cancel_transaction(&waiter);
+            JoinIfJoinable(owner_release);
+            JoinIfJoinable(waiter_thread);
+        }));
+
+    EXPECT_EQ(lock_manager.lock_exclusive_on_record(&observer, rid, 42).value(),
+              LockAcquireResult::Value::WriteConflict);
+    lock_manager.cancel_transaction(&waiter);
+    {
+        std::lock_guard<std::mutex> lock(hook_latch);
+        release_notify = true;
+    }
+    hook_cv.notify_all();
+    JoinIfJoinable(owner_release);
+    JoinIfJoinable(waiter_thread);
+
+    EXPECT_EQ(waiter_result.value(), LockAcquireResult::Value::Cancelled);
+    const auto observation = waiter.take_active_owner_observation();
+    EXPECT_EQ(observation.observer_count, 1U);
+    EXPECT_NE(observation.first_observation_ns, 0U);
+}
+
 TEST(LockManagerMetadataTest, DeadlockVictimDuringOwnerHandoffReleasesGrantedOwner) {
-    LockManager lock_manager;
+    TransactionPhaseMetrics metrics(true);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
     Transaction owner(1031, IsolationLevel::READ_COMMITTED);
     Transaction victim(1032, IsolationLevel::READ_COMMITTED);
     Transaction next(1033, IsolationLevel::READ_COMMITTED);
@@ -280,6 +341,9 @@ TEST(LockManagerMetadataTest, DeadlockVictimDuringOwnerHandoffReleasesGrantedOwn
             JoinIfJoinable(owner_release);
             JoinIfJoinable(victim_thread);
         }));
+    Transaction handoff_observer(1034, IsolationLevel::SNAPSHOT_ISOLATION);
+    EXPECT_EQ(lock_manager.lock_exclusive_on_record(&handoff_observer, rid, 42).value(),
+              LockAcquireResult::Value::WriteConflict);
     std::atomic<bool> detector_done{false};
     std::thread detector([&] {
         lock_manager.cancel_waiting_transaction_for_test(victim.get_transaction_id());
@@ -302,6 +366,9 @@ TEST(LockManagerMetadataTest, DeadlockVictimDuringOwnerHandoffReleasesGrantedOwn
     EXPECT_TRUE(victim_result.waited());
     EXPECT_TRUE(victim.is_lock_cancellation_requested());
     EXPECT_TRUE(victim.get_lock_set()->empty());
+    const auto victim_observation = victim.take_active_owner_observation();
+    EXPECT_EQ(victim_observation.observer_count, 1U);
+    EXPECT_NE(victim_observation.first_observation_ns, 0U);
     ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&next, rid, 42));
     EXPECT_TRUE(lock_manager.unlock(&next, lock_id));
 }
@@ -547,6 +614,88 @@ TEST(LockManagerMetadataTest, SerializableFirstRecordConflictReturnsWriteConflic
     EXPECT_EQ(owner.get_lock_set()->count(lock_id), 1u);
     EXPECT_TRUE(lock_manager.unlock(&owner, lock_id));
     EXPECT_TRUE(contender.get_lock_set()->empty());
+}
+
+TEST(LockManagerMetadataTest, ActiveOwnerObservationsFollowOwnerEpochWithoutGlobalRegistry) {
+    TransactionPhaseMetrics metrics(true);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
+    Transaction owner(1065, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction first_observer(1066, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction second_observer(1067, IsolationLevel::SERIALIZABLE);
+    const Rid rid{7, 1};
+    const LockDataId lock_id(42, rid, LockDataType::RECORD);
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+
+    EXPECT_EQ(lock_manager.lock_exclusive_on_record(&first_observer, rid, 42).value(),
+              LockAcquireResult::Value::WriteConflict);
+    EXPECT_EQ(lock_manager.lock_exclusive_on_record(&second_observer, rid, 42).value(),
+              LockAcquireResult::Value::WriteConflict);
+    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
+
+    const auto observation = owner.take_active_owner_observation();
+    EXPECT_EQ(observation.observer_count, 2U);
+    EXPECT_NE(observation.first_observation_ns, 0U);
+    metrics.record_owner_cleanup_terminal(true, observation.observer_count, observation.first_observation_ns);
+    const auto snapshot = metrics.owner_conflict_snapshot();
+    EXPECT_EQ(snapshot.commit_cleanup_terminals, 1U);
+    EXPECT_EQ(snapshot.abort_cleanup_terminals, 0U);
+    EXPECT_EQ(snapshot.observer_count, 2U);
+    EXPECT_EQ(snapshot.observation_to_cleanup_terminal.count, 1U);
+}
+
+TEST(LockManagerMetadataTest, DisabledMetricsDoNotPopulateOwnerObservationState) {
+    TransactionPhaseMetrics metrics(false);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
+    Transaction owner(1070, IsolationLevel::SNAPSHOT_ISOLATION);
+    Transaction observer(1071, IsolationLevel::SNAPSHOT_ISOLATION);
+    const Rid rid{7, 4};
+    const LockDataId lock_id(42, rid, LockDataType::RECORD);
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&owner, rid, 42));
+    EXPECT_EQ(lock_manager.lock_exclusive_on_record(&observer, rid, 42).value(),
+              LockAcquireResult::Value::WriteConflict);
+    ASSERT_TRUE(lock_manager.unlock(&owner, lock_id));
+
+    const auto observation = owner.take_active_owner_observation();
+    EXPECT_EQ(observation.observer_count, 0U);
+    EXPECT_EQ(observation.first_observation_ns, 0U);
+}
+
+TEST(LockManagerMetadataTest, WaitForGraphMetricsCountStableBuildShape) {
+    TransactionPhaseMetrics metrics(true);
+    LockManager lock_manager(ShardAcquisitionMetrics::Config{}, &metrics);
+    Transaction older(1068, IsolationLevel::READ_COMMITTED);
+    Transaction younger(1069, IsolationLevel::READ_COMMITTED);
+    const Rid first_rid{7, 2};
+    const Rid second_rid{7, 3};
+    const LockDataId first_lock(42, first_rid, LockDataType::RECORD);
+    const LockDataId second_lock(42, second_rid, LockDataType::RECORD);
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&older, first_rid, 42));
+    ASSERT_TRUE(lock_manager.lock_exclusive_on_record(&younger, second_rid, 42));
+
+    LockAcquireResult older_wait = LockAcquireResult::Value::Cancelled;
+    std::thread older_thread([&] { older_wait = lock_manager.lock_exclusive_on_record(&older, second_rid, 42); });
+    ASSERT_TRUE(WaitForLockEnqueued([&] { return lock_manager.has_record_waiters_for_test(); },
+                                    [&] {
+                                        lock_manager.cancel_transaction(&older);
+                                        lock_manager.unlock(&younger, second_lock);
+                                        JoinIfJoinable(older_thread);
+                                        lock_manager.unlock(&older, first_lock);
+                                    }));
+
+    const LockAcquireResult younger_wait = lock_manager.lock_exclusive_on_record(&younger, first_rid, 42);
+    EXPECT_EQ(younger_wait.value(), LockAcquireResult::Value::DeadlockVictim);
+    ASSERT_TRUE(lock_manager.unlock(&younger, second_lock));
+    JoinIfJoinable(older_thread);
+    EXPECT_TRUE(older_wait);
+    EXPECT_TRUE(lock_manager.unlock(&older, second_lock));
+    EXPECT_TRUE(lock_manager.unlock(&older, first_lock));
+
+    const auto graph = metrics.wait_for_graph_snapshot();
+    EXPECT_GE(graph.build.count, 2U);
+    EXPECT_GE(graph.shards.sum, 2U * 128U);
+    EXPECT_EQ(graph.shards.max, 128U);
+    EXPECT_GE(graph.queues.max, 2U);
+    EXPECT_GE(graph.edges.max, 1U);
 }
 
 TEST(LockManagerMetadataTest, SiFirstRecordConflictReturnsWriteConflictImmediately) {

@@ -18,6 +18,11 @@ public:
         uint64_t elapsed_ns{};
         uint64_t max_ns{};
     };
+    struct CommitRequestSnapshot {
+        uint64_t already_covered{};
+        uint64_t leader_requests{};
+        uint64_t follower_requests{};
+    };
     struct Snapshot {
         uint64_t already_covered_fast_paths{};
         uint64_t leader_requests{};
@@ -38,15 +43,20 @@ public:
         uint64_t durable_lag_after_max{};
         uint64_t sync_depth_two_waves{};
         uint64_t sync_depth_two_max_inflight{};
+        CommitRequestSnapshot commit_requests{};
     };
 
     static bool ParseEnabled(const char* value) noexcept {
         return value != nullptr && std::strcmp(value, "1") == 0;
     }
-    static bool EnabledFromEnvironment() noexcept { return ParseEnabled(std::getenv("RMDB_WAL_METRICS")); }
+    static bool EnabledFromEnvironment() noexcept {
+        return ParseEnabled(std::getenv("RMDB_WAL_METRICS"));
+    }
 
     explicit WalFlushMetrics(bool enabled = EnabledFromEnvironment()) noexcept : enabled_(enabled) {}
-    bool enabled() const noexcept { return enabled_; }
+    bool enabled() const noexcept {
+        return enabled_;
+    }
 
     Snapshot snapshot() const noexcept {
         Snapshot result;
@@ -71,22 +81,52 @@ public:
         result.durable_lag_after_max = durable_lag_after_max_.load(std::memory_order_relaxed);
         result.sync_depth_two_waves = sync_depth_two_waves_.load(std::memory_order_relaxed);
         result.sync_depth_two_max_inflight = sync_depth_two_max_inflight_.load(std::memory_order_relaxed);
+        result.commit_requests = {commit_already_covered_.load(std::memory_order_relaxed),
+                                  commit_leader_requests_.load(std::memory_order_relaxed),
+                                  commit_follower_requests_.load(std::memory_order_relaxed)};
         return result;
     }
 
-    void record_already_covered_fast_path() noexcept { increment(already_covered_fast_paths_); }
-    void record_leader_request() noexcept { increment(leader_requests_); }
-    void record_leader_rotation() noexcept { increment(leader_rotations_); }
-    void record_leader_tenure(uint64_t batches) noexcept { update_max(max_batches_per_leader_, batches); }
-    void record_follower_request() noexcept { increment(follower_requests_); }
-    void record_follower_wait(uint64_t elapsed_ns) noexcept { record_timing(follower_wait_, elapsed_ns); }
-    void record_coalescing_wait(uint64_t elapsed_ns) noexcept { record_timing(coalescing_wait_, elapsed_ns); }
-    void record_physical_flush_iteration() noexcept { increment(physical_flush_iterations_); }
+    void record_already_covered_fast_path() noexcept {
+        increment(already_covered_fast_paths_);
+    }
+    void record_leader_request() noexcept {
+        increment(leader_requests_);
+    }
+    void record_leader_rotation() noexcept {
+        increment(leader_rotations_);
+    }
+    void record_leader_tenure(uint64_t batches) noexcept {
+        update_max(max_batches_per_leader_, batches);
+    }
+    void record_follower_request() noexcept {
+        increment(follower_requests_);
+    }
+    void record_commit_already_covered() noexcept {
+        increment(commit_already_covered_);
+    }
+    void record_commit_leader_request() noexcept {
+        increment(commit_leader_requests_);
+    }
+    void record_commit_follower_request() noexcept {
+        increment(commit_follower_requests_);
+    }
+    void record_follower_wait(uint64_t elapsed_ns) noexcept {
+        record_timing(follower_wait_, elapsed_ns);
+    }
+    void record_coalescing_wait(uint64_t elapsed_ns) noexcept {
+        record_timing(coalescing_wait_, elapsed_ns);
+    }
+    void record_physical_flush_iteration() noexcept {
+        increment(physical_flush_iterations_);
+    }
     void record_pwrite(uint64_t bytes, uint64_t elapsed_ns) noexcept {
         increment(pwrite_bytes_, bytes);
         record_timing(pwrite_, elapsed_ns);
     }
-    void record_fdatasync(uint64_t elapsed_ns) noexcept { record_timing(fdatasync_, elapsed_ns); }
+    void record_fdatasync(uint64_t elapsed_ns) noexcept {
+        record_timing(fdatasync_, elapsed_ns);
+    }
     void record_completed_batch(size_t completed) noexcept {
         increment(completed_batch_histogram_[completed_batch_bucket(completed)]);
     }
@@ -132,11 +172,16 @@ private:
                 timing.max_ns.load(std::memory_order_relaxed)};
     }
     static size_t completed_batch_bucket(size_t completed) noexcept {
-        if (completed == 0) return 0;
-        if (completed <= 8) return completed;
-        if (completed <= 16) return 9;
-        if (completed <= 32) return 10;
-        if (completed <= 64) return 11;
+        if (completed == 0)
+            return 0;
+        if (completed <= 8)
+            return completed;
+        if (completed <= 16)
+            return 9;
+        if (completed <= 32)
+            return 10;
+        if (completed <= 64)
+            return 11;
         return 12;
     }
 
@@ -160,4 +205,7 @@ private:
     std::atomic<uint64_t> durable_lag_after_max_{0};
     std::atomic<uint64_t> sync_depth_two_waves_{0};
     std::atomic<uint64_t> sync_depth_two_max_inflight_{0};
+    std::atomic<uint64_t> commit_already_covered_{0};
+    std::atomic<uint64_t> commit_leader_requests_{0};
+    std::atomic<uint64_t> commit_follower_requests_{0};
 };

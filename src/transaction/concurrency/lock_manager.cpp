@@ -27,8 +27,7 @@ static_assert(kShardLogLineShards * kShardEntryMaxChars + 128 + 60 < 510);
 static_assert(sizeof("shard-acq lock schema=base62 entries=a/s/e/m a=sampled_acquisitions "
                      "s=slow_acquisitions e=observed_elapsed_ns m=max_ns "
                      "slow=threshold_proxy_not_exact_contention") -
-                  1 +
-                  60 <
+                  1 + 60 <
               510);
 
 std::string CompactUnsigned(uint64_t value) {
@@ -90,8 +89,7 @@ void LockManager::log_shard_metrics(uint64_t sequence) const {
             const auto snapshot = shard_metrics_.snapshot(shard);
             entries += " " + CompactUnsigned(snapshot.sampled_acquisitions) + "/" +
                        CompactUnsigned(snapshot.slow_acquisitions) + "/" +
-                       CompactUnsigned(snapshot.sampled_elapsed_ns) + "/" +
-                       CompactUnsigned(snapshot.sampled_max_ns);
+                       CompactUnsigned(snapshot.sampled_elapsed_ns) + "/" + CompactUnsigned(snapshot.sampled_max_ns);
         }
         LOG_WARN("shard-acq lock seq=%s sample_log2=%u slow_ns=%s direction=exclusive shard=%zu-%zu%s",
                  CompactUnsigned(sequence).c_str(), static_cast<unsigned>(config.sample_log2),
@@ -217,6 +215,27 @@ void LockManager::unregister_waiting_txn_locked(txn_id_t txn_id) {
 
 void LockManager::note_wait_topology_change() {
     wait_topology_epoch_.fetch_add(1, std::memory_order_release);
+}
+
+bool LockManager::owner_conflict_metrics_enabled() const noexcept {
+    return phase_metrics_ != nullptr && phase_metrics_->enabled();
+}
+
+void LockManager::reset_owner_observation(LockRequestQueue& request_queue) noexcept {
+    if (!owner_conflict_metrics_enabled()) {
+        return;
+    }
+    request_queue.owner_first_observation_ns_ = 0;
+    request_queue.owner_observer_count_ = 0;
+}
+
+void LockManager::transfer_owner_observation(Transaction* txn, LockRequestQueue& request_queue) noexcept {
+    if (!owner_conflict_metrics_enabled()) {
+        return;
+    }
+    txn->merge_active_owner_observation(request_queue.owner_first_observation_ns_, request_queue.owner_observer_count_);
+    request_queue.owner_first_observation_ns_ = 0;
+    request_queue.owner_observer_count_ = 0;
 }
 
 bool LockManager::has_record_waiters_for_test() {
@@ -396,12 +415,18 @@ void LockManager::cancel_waiting_transaction_for_test(txn_id_t txn_id) {
 }
 
 LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
+    const bool measure = phase_metrics_ != nullptr && phase_metrics_->enabled();
+    const auto started = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (;;) {
         const uint64_t start_epoch = wait_topology_epoch_.load(std::memory_order_acquire);
         WaitForGraph graph;
+        uint64_t shards_scanned = 0;
+        uint64_t queues_scanned = 0;
+        uint64_t edges = 0;
 
         std::vector<std::shared_ptr<LockRequestQueue>> record_queues;
         for (auto& shard : lock_table_shards_) {
+            ++shards_scanned;
             std::lock_guard<std::mutex> shard_lock(shard.latch_);
             record_queues.reserve(record_queues.size() + shard.lock_table_.size());
             for (const auto& [_, queue] : shard.lock_table_) {
@@ -411,6 +436,7 @@ LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
             }
         }
         for (const auto& queue : record_queues) {
+            ++queues_scanned;
             std::lock_guard<std::mutex> queue_lock(queue->latch_);
             txn_id_t predecessor = queue->owner_txn_id_;
             for (const auto& waiter : queue->waiters_) {
@@ -419,21 +445,25 @@ LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
                 }
                 if (predecessor != INVALID_TXN_ID) {
                     graph[waiter->txn_id_].push_back(predecessor);
+                    ++edges;
                 }
                 predecessor = waiter->txn_id_;
             }
         }
 
         for (auto& shard : unique_key_shards_) {
+            ++shards_scanned;
             std::lock_guard<std::mutex> shard_lock(shard.latch);
             for (const auto& [_, queue] : shard.queues) {
                 if (queue == nullptr) {
                     continue;
                 }
+                ++queues_scanned;
                 txn_id_t predecessor = queue->owner;
                 for (txn_id_t waiter : queue->waiters) {
                     if (predecessor != INVALID_TXN_ID) {
                         graph[waiter].push_back(predecessor);
+                        ++edges;
                     }
                     predecessor = waiter;
                 }
@@ -441,6 +471,12 @@ LockManager::WaitForGraph LockManager::build_wait_for_graph_snapshot() {
         }
 
         if (start_epoch == wait_topology_epoch_.load(std::memory_order_acquire)) {
+            if (measure) {
+                const uint64_t elapsed_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started)
+                        .count());
+                phase_metrics_->record_wait_for_graph(elapsed_ns, shards_scanned, queues_scanned, edges);
+            }
             return graph;
         }
     }
@@ -521,6 +557,7 @@ bool LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
                         item.queue->waiters_.pop_front();
                         next_request->state_ = LockRequest::State::GrantedUnpublished;
                         item.queue->owner_txn_id_ = next_request->txn_id_;
+                        reset_owner_observation(*item.queue);
                         item.queue->group_lock_mode_ = GroupLockMode::X;
                         note_wait_topology_change();
                     }
@@ -631,6 +668,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
 
     if (request_queue->owner_txn_id_ == INVALID_TXN_ID) {
         request_queue->owner_txn_id_ = txn->get_transaction_id();
+        reset_owner_observation(*request_queue);
         request_queue->group_lock_mode_ = GroupLockMode::X;
         note_wait_topology_change();
         txn->get_lock_set()->insert(lock_data_id);
@@ -653,10 +691,18 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     // uses the FIFO handoff path. Once a transaction has already acquired a
     // record or unique-key lock, preserve the existing cycle path.
     const IsolationLevel isolation = txn->get_isolation_level();
-    const bool immediate_snapshot_conflict = !owns_other_lock &&
-                                            (isolation == IsolationLevel::SNAPSHOT_ISOLATION ||
-                                             isolation == IsolationLevel::SERIALIZABLE);
+    const bool immediate_snapshot_conflict = !owns_other_lock && (isolation == IsolationLevel::SNAPSHOT_ISOLATION ||
+                                                                  isolation == IsolationLevel::SERIALIZABLE);
     if (immediate_snapshot_conflict) {
+        if (owner_conflict_metrics_enabled()) {
+            const uint64_t observed_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                                   .count());
+            if (request_queue->owner_observer_count_ == 0) {
+                request_queue->owner_first_observation_ns_ = observed_ns;
+            }
+            ++request_queue->owner_observer_count_;
+        }
         lock.unlock();
         release_queue_user(lock_data_id, request_queue);
         try_remove_empty_queue(lock_data_id, request_queue);
@@ -675,8 +721,10 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
         try_remove_empty_queue(lock_data_id, request_queue);
         return false;
     }
-    TransactionPhaseMetrics::Scope record_lock_wait(phase_metrics_,
-                                                     TransactionPhaseMetrics::Phase::RecordLockWait);
+    // This request-lifetime scope deliberately contains the optional graph
+    // build below. The reporter declares RecordLockWait inclusive/nested and
+    // the selected phase counters non-additive.
+    TransactionPhaseMetrics::Scope record_lock_wait(phase_metrics_, TransactionPhaseMetrics::Phase::RecordLockWait);
     lock.unlock();
     // A transaction with no granted record or unique-key lock cannot be the
     // predecessor of another wait-for edge, so this first wait cannot close a
@@ -706,6 +754,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
         // unlock() grants ownership before the waiter can publish it in its
         // lock set. If cancellation wins this interval, relinquish the owner
         // while still holding the queue latch and continue FIFO handoff.
+        transfer_owner_observation(txn, *request_queue);
         request_queue->owner_txn_id_ = INVALID_TXN_ID;
         note_wait_topology_change();
         txn->get_lock_set()->erase(lock_data_id);
@@ -714,6 +763,7 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
             request_queue->waiters_.pop_front();
             next_request->state_ = LockRequest::State::GrantedUnpublished;
             request_queue->owner_txn_id_ = next_request->txn_id_;
+            reset_owner_observation(*request_queue);
             request_queue->group_lock_mode_ = GroupLockMode::X;
             note_wait_topology_change();
             run_record_handoff_test_hook();
@@ -737,9 +787,8 @@ LockAcquireResult LockManager::lock_exclusive_on_record(Transaction* txn, const 
     record_lock_wait.Finish();
     if (cancelled) {
         try_remove_empty_queue(lock_data_id, request_queue);
-        return LockAcquireResult(deadlock_victim ? LockAcquireResult::Value::DeadlockVictim
-                                                 : LockAcquireResult::Value::Cancelled,
-                                 true);
+        return LockAcquireResult(
+            deadlock_victim ? LockAcquireResult::Value::DeadlockVictim : LockAcquireResult::Value::Cancelled, true);
     }
     return LockAcquireResult(LockAcquireResult::Value::Granted, true);
 }
@@ -970,6 +1019,7 @@ void LockManager::cancel_transaction(Transaction* txn) {
                     item.queue->waiters_.pop_front();
                     next_request->state_ = LockRequest::State::GrantedUnpublished;
                     item.queue->owner_txn_id_ = next_request->txn_id_;
+                    reset_owner_observation(*item.queue);
                     item.queue->group_lock_mode_ = GroupLockMode::X;
                     note_wait_topology_change();
                 }
@@ -1070,6 +1120,7 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
         return false;
     }
 
+    transfer_owner_observation(txn, *request_queue);
     request_queue->owner_txn_id_ = INVALID_TXN_ID;
     note_wait_topology_change();
     txn->get_lock_set()->erase(lock_data_id);
@@ -1081,6 +1132,7 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
         request_queue->waiters_.pop_front();
         next_request->state_ = LockRequest::State::GrantedUnpublished;
         request_queue->owner_txn_id_ = next_request->txn_id_;
+        reset_owner_observation(*request_queue);
         request_queue->group_lock_mode_ = GroupLockMode::X;
         note_wait_topology_change();
         run_record_handoff_test_hook();

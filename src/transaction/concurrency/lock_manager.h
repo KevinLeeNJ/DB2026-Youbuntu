@@ -47,7 +47,9 @@ public:
     constexpr Value value() const {
         return value_;
     }
-    constexpr bool waited() const { return waited_; }
+    constexpr bool waited() const {
+        return waited_;
+    }
 
 private:
     Value value_;
@@ -82,6 +84,10 @@ class LockManager {
         std::mutex latch_;
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;
         size_t active_users_ = 0; // 在分片锁外持有并访问该队列的线程数
+        // Protected by latch_. The values belong to the current owner epoch and
+        // are transferred into Transaction atomics before ownership changes.
+        uint64_t owner_first_observation_ns_{0};
+        uint64_t owner_observer_count_{0};
     };
 
     class LockTableShard {
@@ -93,7 +99,7 @@ class LockManager {
 public:
     explicit LockManager(ShardAcquisitionMetrics::Config shard_metrics_config =
                              ShardAcquisitionMetrics::Config::FromEnvironment("RMDB_LOCK_SHARD_METRICS_SAMPLE_LOG2",
-                                                                                "RMDB_LOCK_SHARD_SLOW_NS"),
+                                                                              "RMDB_LOCK_SHARD_SLOW_NS"),
                          TransactionPhaseMetrics* phase_metrics = nullptr)
         : shard_metrics_(shard_metrics_config), phase_metrics_(phase_metrics) {}
 
@@ -184,6 +190,9 @@ private:
     void unregister_waiting_txn(txn_id_t txn_id);
     void unregister_waiting_txn_locked(txn_id_t txn_id);
     bool cancel_waiting_transaction(txn_id_t txn_id);
+    bool owner_conflict_metrics_enabled() const noexcept;
+    void reset_owner_observation(LockRequestQueue& request_queue) noexcept;
+    void transfer_owner_observation(Transaction* txn, LockRequestQueue& request_queue) noexcept;
     void run_record_handoff_test_hook();
     void run_record_handoff_published_test_hook();
     void run_record_handoff_checked_test_hook();

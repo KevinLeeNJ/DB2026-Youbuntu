@@ -182,7 +182,8 @@ bool RunInWatchdog(const std::string& name, RotationScenario scenario) {
     const std::filesystem::path test_dir = CurrentPath() / UniqueWalTestDir(name);
     std::filesystem::remove_all(test_dir);
     int report[2];
-    if (pipe(report) != 0) return false;
+    if (pipe(report) != 0)
+        return false;
     const pid_t pid = fork();
     if (pid < 0) {
         close(report[0]);
@@ -224,8 +225,7 @@ bool RunInWatchdog(const std::string& name, RotationScenario scenario) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 && bytes == sizeof(result) && result == 0;
 }
 
-template <typename Flush>
-std::thread StartFlush(Flush&& flush, std::atomic<bool>* threw) {
+template <typename Flush> std::thread StartFlush(Flush&& flush, std::atomic<bool>* threw) {
     return std::thread([flush = std::forward<Flush>(flush), threw] {
         try {
             flush();
@@ -261,14 +261,14 @@ int RunLeaderRotationHandoff(const std::filesystem::path& test_dir) {
     BeginLogRecord first(300);
     const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
     std::atomic<bool> first_threw{false}, second_threw{false};
-    std::thread first_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &first_threw);
+    std::thread first_flush = StartFlush([&] { log_mgr.flush_commit_log_to_disk_up_to(first_lsn); }, &first_threw);
     {
         std::unique_lock<std::mutex> lock(latch);
         cv.wait(lock, [&] { return swapped; });
     }
     BeginLogRecord second(301);
     const lsn_t second_lsn = log_mgr.add_log_to_buffer(&second);
-    std::thread second_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(second_lsn); }, &second_threw);
+    std::thread second_flush = StartFlush([&] { log_mgr.flush_commit_log_to_disk_up_to(second_lsn); }, &second_threw);
     {
         std::unique_lock<std::mutex> lock(latch);
         cv.wait(lock, [&] { return follower; });
@@ -279,8 +279,149 @@ int RunLeaderRotationHandoff(const std::filesystem::path& test_dir) {
     second_flush.join();
     const auto snapshot = metrics.snapshot();
     return first_threw.load() || second_threw.load() || log_mgr.get_durable_lsn() != second_lsn ||
-                   snapshot.leader_rotations < 1 ||
-                   snapshot.leader_requests < 2 || snapshot.max_batches_per_leader < 1
+                   snapshot.leader_rotations < 1 || snapshot.leader_requests < 2 ||
+                   snapshot.max_batches_per_leader < 1 || snapshot.commit_requests.leader_requests != 1 ||
+                   snapshot.commit_requests.follower_requests != 1 || snapshot.commit_requests.already_covered != 0
+               ? 1
+               : 0;
+}
+
+int RunSlowWaiterReporterOutsideGroupLatch(const std::filesystem::path& test_dir, bool rotation) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", rotation ? "1" : "0");
+    WalFlushMetrics metrics(true);
+    std::mutex latch;
+    std::condition_variable cv;
+    bool swapped = false, follower = false, release = false, first_swap = true;
+    std::atomic<bool> reporter_called{false}, latch_available{false};
+    LogManager* manager = nullptr;
+    LogManager::GroupCommitTestOptions options;
+    options.hook = [&](std::string_view point) {
+        std::unique_lock<std::mutex> lock(latch);
+        if (point == (rotation ? "rotation_follower_enqueued" : "legacy_follower_enqueued")) {
+            follower = true;
+            cv.notify_all();
+        } else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false;
+            swapped = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        }
+    };
+    options.slow_waiter_reporter_hook = [&](uint64_t, std::string_view, int, uint64_t) {
+        std::thread checker([&] {
+            latch_available.store(manager->group_commit_latch_available_for_test(), std::memory_order_release);
+        });
+        checker.join();
+        reporter_called.store(true, std::memory_order_release);
+    };
+    LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
+    manager = &log_mgr;
+
+    BeginLogRecord first(305);
+    const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
+    std::atomic<bool> first_threw{false}, second_threw{false};
+    std::thread first_flush = StartFlush([&] { log_mgr.flush_commit_log_to_disk_up_to(first_lsn); }, &first_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return swapped; });
+    }
+    BeginLogRecord second(306);
+    const lsn_t second_lsn = log_mgr.add_log_to_buffer(&second);
+    std::thread second_flush = StartFlush([&] { log_mgr.flush_commit_log_to_disk_up_to(second_lsn); }, &second_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return follower; });
+        release = true;
+    }
+    cv.notify_all();
+    first_flush.join();
+    second_flush.join();
+    return first_threw.load() || second_threw.load() || !reporter_called.load(std::memory_order_acquire) ||
+                   !latch_available.load(std::memory_order_acquire) || metrics.snapshot().follower_wait.count != 1
+               ? 1
+               : 0;
+}
+
+int RunLegacySlowWaiterReporterOutsideGroupLatch(const std::filesystem::path& test_dir) {
+    return RunSlowWaiterReporterOutsideGroupLatch(test_dir, false);
+}
+
+int RunRotationSlowWaiterReporterOutsideGroupLatch(const std::filesystem::path& test_dir) {
+    return RunSlowWaiterReporterOutsideGroupLatch(test_dir, true);
+}
+
+int RunPromotedWaiterReportsOnlyAfterLeaderTenure(const std::filesystem::path& test_dir) {
+    ScopedTestDir dir(test_dir.string());
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    ScopedEnvVar enabled("RMDB_WAL_LEADER_ROTATION", "1");
+    WalFlushMetrics metrics(true);
+    std::mutex latch;
+    std::condition_variable cv;
+    bool swapped = false, follower = false, release_leader = false, reporter_entered = false;
+    bool release_reporter = false, first_swap = true;
+    unsigned rotation_before_flush = 0;
+    LogManager::GroupCommitTestOptions options;
+    options.hook = [&](std::string_view point) {
+        std::unique_lock<std::mutex> lock(latch);
+        if (point == "rotation_before_flush") {
+            ++rotation_before_flush;
+            cv.notify_all();
+        } else if (point == "rotation_follower_enqueued") {
+            follower = true;
+            cv.notify_all();
+        } else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false;
+            swapped = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_leader; });
+        }
+    };
+    options.slow_waiter_reporter_hook = [&](uint64_t, std::string_view, int, uint64_t) {
+        std::unique_lock<std::mutex> lock(latch);
+        reporter_entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_reporter; });
+    };
+    LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
+    BeginLogRecord first(307);
+    const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
+    std::atomic<bool> first_threw{false}, second_threw{false};
+    std::thread first_flush = StartFlush([&] { log_mgr.flush_commit_log_to_disk_up_to(first_lsn); }, &first_threw);
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return swapped; });
+    }
+    BeginLogRecord second(308);
+    const lsn_t second_lsn = log_mgr.add_log_to_buffer(&second);
+    std::thread second_flush = StartFlush([&] { log_mgr.flush_commit_log_to_disk_up_to(second_lsn); }, &second_threw);
+
+    bool role_recorded_at_decision = false;
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return follower; });
+        const auto decision = metrics.snapshot();
+        role_recorded_at_decision = decision.follower_requests == 1 && decision.commit_requests.follower_requests == 1;
+        release_leader = true;
+    }
+    cv.notify_all();
+
+    bool reporter_seen = false;
+    bool promoted_reached_flush = false;
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        reporter_seen = cv.wait_for(lock, std::chrono::seconds(1), [&] { return reporter_entered; });
+        promoted_reached_flush = rotation_before_flush >= 2;
+        release_reporter = true;
+    }
+    cv.notify_all();
+    first_flush.join();
+    second_flush.join();
+    return first_threw.load() || second_threw.load() || !role_recorded_at_decision || !reporter_seen ||
+                   !promoted_reached_flush || log_mgr.get_durable_lsn() != second_lsn
                ? 1
                : 0;
 }
@@ -338,7 +479,8 @@ int RunLeaderRotationFailureRecovery(const std::filesystem::path& test_dir) {
     first_flush.join();
     second_flush.join();
     third_flush.join();
-    if (first_threw.load() || !second_threw.load() || !third_threw.load()) return 2;
+    if (first_threw.load() || !second_threw.load() || !third_threw.load())
+        return 2;
     fail_second_write.store(false, std::memory_order_relaxed);
     BeginLogRecord fourth(313);
     const lsn_t fourth_lsn = log_mgr.add_log_to_buffer(&fourth);
@@ -362,9 +504,14 @@ int RunLeaderRotationStrictRelaxed(const std::filesystem::path& test_dir) {
     LogManager::GroupCommitTestOptions options;
     options.hook = [&](std::string_view point) {
         std::unique_lock<std::mutex> lock(latch);
-        if (point == "rotation_follower_enqueued") { follower = true; cv.notify_all(); }
-        else if (point == "flush_buffer_after_swap" && first_swap) {
-            first_swap = false; swapped = true; cv.notify_all(); cv.wait(lock, [&] { return release; });
+        if (point == "rotation_follower_enqueued") {
+            follower = true;
+            cv.notify_all();
+        } else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false;
+            swapped = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
         }
     };
     LogManager log_mgr(&disk, DurabilityMode::PROCESS_CRASH, &metrics, std::move(options));
@@ -372,18 +519,27 @@ int RunLeaderRotationStrictRelaxed(const std::filesystem::path& test_dir) {
     const lsn_t relaxed_lsn = log_mgr.add_log_to_buffer(&relaxed);
     std::atomic<bool> relaxed_threw{false}, strict_threw{false};
     std::thread relaxed_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(relaxed_lsn); }, &relaxed_threw);
-    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return swapped; }); }
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return swapped; });
+    }
     BeginLogRecord strict(321);
     const lsn_t strict_lsn = log_mgr.add_log_to_buffer(&strict);
     std::thread strict_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to_durable(strict_lsn); }, &strict_threw);
-    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return follower; }); release = true; }
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return follower; });
+        release = true;
+    }
     cv.notify_all();
     relaxed_flush.join();
     strict_flush.join();
     const auto snapshot = metrics.snapshot();
     return relaxed_threw.load() || strict_threw.load() || log_mgr.get_persist_lsn() != strict_lsn ||
-                   log_mgr.get_durable_lsn() != strict_lsn || snapshot.fdatasync.count != 1 || snapshot.leader_rotations < 1
-               ? 1 : 0;
+                   log_mgr.get_durable_lsn() != strict_lsn || snapshot.fdatasync.count != 1 ||
+                   snapshot.leader_rotations < 1
+               ? 1
+               : 0;
 }
 
 int RunLeaderRotationThreeFifo(const std::filesystem::path& test_dir) {
@@ -399,10 +555,16 @@ int RunLeaderRotationThreeFifo(const std::filesystem::path& test_dir) {
     LogManager::GroupCommitTestOptions options;
     options.hook = [&](std::string_view point) {
         std::unique_lock<std::mutex> lock(latch);
-        if (point == "rotation_follower_enqueued") { ++followers; cv.notify_all(); }
-        else if (point == "rotation_before_flush") { ++leader_batches; }
-        else if (point == "flush_buffer_after_swap" && first_swap) {
-            first_swap = false; swapped = true; cv.notify_all(); cv.wait(lock, [&] { return release; });
+        if (point == "rotation_follower_enqueued") {
+            ++followers;
+            cv.notify_all();
+        } else if (point == "rotation_before_flush") {
+            ++leader_batches;
+        } else if (point == "flush_buffer_after_swap" && first_swap) {
+            first_swap = false;
+            swapped = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
         }
     };
     LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
@@ -410,7 +572,10 @@ int RunLeaderRotationThreeFifo(const std::filesystem::path& test_dir) {
     const lsn_t first_lsn = log_mgr.add_log_to_buffer(&first);
     std::atomic<bool> first_threw{false};
     std::thread first_flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &first_threw);
-    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return swapped; }); }
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return swapped; });
+    }
     std::array<std::atomic<bool>, 3> follower_threw{};
     std::array<std::thread, 3> follower_flushes;
     lsn_t last_lsn = first_lsn;
@@ -418,19 +583,27 @@ int RunLeaderRotationThreeFifo(const std::filesystem::path& test_dir) {
         BeginLogRecord record(static_cast<txn_id_t>(331 + i));
         last_lsn = log_mgr.add_log_to_buffer(&record);
         const lsn_t target = last_lsn;
-        follower_flushes[i] = StartFlush([&log_mgr, target] { log_mgr.flush_log_to_disk_up_to(target); }, &follower_threw[i]);
+        follower_flushes[i] =
+            StartFlush([&log_mgr, target] { log_mgr.flush_log_to_disk_up_to(target); }, &follower_threw[i]);
     }
-    { std::unique_lock<std::mutex> lock(latch); cv.wait(lock, [&] { return followers == 3; }); release = true; }
+    {
+        std::unique_lock<std::mutex> lock(latch);
+        cv.wait(lock, [&] { return followers == 3; });
+        release = true;
+    }
     cv.notify_all();
     first_flush.join();
-    for (auto& flush : follower_flushes) flush.join();
+    for (auto& flush : follower_flushes)
+        flush.join();
     bool threw = first_threw.load();
-    for (const auto& item : follower_threw) threw = threw || item.load();
+    for (const auto& item : follower_threw)
+        threw = threw || item.load();
     const auto snapshot = metrics.snapshot();
     std::lock_guard<std::mutex> lock(latch);
     return threw || log_mgr.get_durable_lsn() != last_lsn || snapshot.leader_rotations != 1 ||
                    snapshot.leader_requests != 2 || snapshot.max_batches_per_leader != 1 || leader_batches != 2
-               ? 1 : 0;
+               ? 1
+               : 0;
 }
 
 int RunLeaderRotationOptOutKeepsLegacyDrainAndBoundedWaiters(const std::filesystem::path& test_dir) {
@@ -440,7 +613,8 @@ int RunLeaderRotationOptOutKeepsLegacyDrainAndBoundedWaiters(const std::filesyst
     ScopedEnvVar disabled("RMDB_WAL_LEADER_ROTATION", "0");
     WalFlushMetrics metrics(true);
     LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics);
-    if (log_mgr.leader_rotation_enabled_for_test()) return 1;
+    if (log_mgr.leader_rotation_enabled_for_test())
+        return 1;
     std::array<lsn_t, 4> targets{};
     for (size_t i = 0; i < targets.size(); ++i) {
         BeginLogRecord record(static_cast<txn_id_t>(340 + i));
@@ -449,15 +623,19 @@ int RunLeaderRotationOptOutKeepsLegacyDrainAndBoundedWaiters(const std::filesyst
     std::array<std::atomic<bool>, 4> threw{};
     std::array<std::thread, 4> flushes;
     for (size_t i = 0; i < flushes.size(); ++i) {
-        flushes[i] = StartFlush([&log_mgr, target = targets[i]] { log_mgr.flush_log_to_disk_up_to(target); }, &threw[i]);
+        flushes[i] =
+            StartFlush([&log_mgr, target = targets[i]] { log_mgr.flush_log_to_disk_up_to(target); }, &threw[i]);
     }
-    for (auto& flush : flushes) flush.join();
+    for (auto& flush : flushes)
+        flush.join();
     bool any_threw = false;
-    for (const auto& item : threw) any_threw = any_threw || item.load();
+    for (const auto& item : threw)
+        any_threw = any_threw || item.load();
     const auto snapshot = metrics.snapshot();
     return any_threw || log_mgr.get_durable_lsn() != targets.back() || snapshot.leader_rotations != 0 ||
                    snapshot.leader_requests < 1
-               ? 2 : 0;
+               ? 2
+               : 0;
 }
 
 int RunDepthTwoSlotOrderAndCoveredFollower(const std::filesystem::path& test_dir) {
@@ -481,7 +659,8 @@ int RunDepthTwoSlotOrderAndCoveredFollower(const std::filesystem::path& test_dir
     options.sync_slot_hook = [&](std::string_view point, size_t slot) {
         std::unique_lock<std::mutex> lock(latch);
         if (slot == 0) {
-            if (point != "sync_slot_before_fsync") return;
+            if (point != "sync_slot_before_fsync")
+                return;
             slot0_entered = true;
             cv.notify_all();
             cv.wait(lock, [&] { return release_slot0; });
@@ -592,9 +771,8 @@ int RunDepthTwoSlotFailurePoisonsAllWaiters(const std::filesystem::path& test_di
     } catch (...) {
         later_threw = true;
     }
-    return !leader_threw.load() || !follower_threw.load() || !later_threw || log_mgr.get_durable_lsn() >= first_lsn
-               ? 2
-               : 0;
+    return !leader_threw.load() || !follower_threw.load() || !later_threw || log_mgr.get_durable_lsn() >= first_lsn ? 2
+                                                                                                                    : 0;
 }
 
 int RunDepthTwoSlotOneFailureReleasesCoveredPrefix(const std::filesystem::path& test_dir) {
@@ -616,7 +794,8 @@ int RunDepthTwoSlotOneFailureReleasesCoveredPrefix(const std::filesystem::path& 
         }
     };
     options.sync_slot_hook = [&](std::string_view, size_t slot) {
-        if (slot != 1) return;
+        if (slot != 1)
+            return;
         std::unique_lock<std::mutex> lock(latch);
         slot1_entered = true;
         cv.notify_all();
@@ -680,14 +859,16 @@ int RunPreAdmittedLateCallerCannotAckAfterPoison(const std::filesystem::path& te
     std::atomic<bool> arm_late{false};
     LogManager::GroupCommitTestOptions options;
     options.hook = [&](std::string_view point) {
-        if (point != "wal_schedule_entered" || !arm_late.load(std::memory_order_acquire)) return;
+        if (point != "wal_schedule_entered" || !arm_late.load(std::memory_order_acquire))
+            return;
         std::unique_lock<std::mutex> lock(latch);
         late_admitted = true;
         cv.notify_all();
         cv.wait(lock, [&] { return release_late; });
     };
     options.sync_slot_hook = [&](std::string_view, size_t slot) {
-        if (slot != 0) return;
+        if (slot != 0)
+            return;
         std::unique_lock<std::mutex> lock(latch);
         slot_entered = true;
         cv.notify_all();
@@ -748,7 +929,8 @@ int RunDepthTwoResetWaitsForBlockedWorker(const std::filesystem::path& test_dir)
     bool entered = false, release = false;
     LogManager::GroupCommitTestOptions options;
     options.sync_slot_hook = [&](std::string_view, size_t slot) {
-        if (slot != 0) return;
+        if (slot != 0)
+            return;
         std::unique_lock<std::mutex> lock(latch);
         entered = true;
         cv.notify_all();
@@ -798,7 +980,8 @@ int RunDepthTwoDestructorWaitsForBlockedWorker(const std::filesystem::path& test
     bool entered = false, release = false;
     LogManager::GroupCommitTestOptions options;
     options.sync_slot_hook = [&](std::string_view, size_t slot) {
-        if (slot != 0) return;
+        if (slot != 0)
+            return;
         std::unique_lock<std::mutex> lock(latch);
         entered = true;
         cv.notify_all();
@@ -845,7 +1028,8 @@ int RunCheckpointCutWaitsForTargetSlot(const std::filesystem::path& test_dir) {
     bool entered = false, release = false;
     LogManager::GroupCommitTestOptions options;
     options.sync_slot_hook = [&](std::string_view, size_t slot) {
-        if (slot != 0) return;
+        if (slot != 0)
+            return;
         std::unique_lock<std::mutex> lock(latch);
         entered = true;
         cv.notify_all();
@@ -918,7 +1102,8 @@ int RunDepthTwoSlidingBatonReusesCompletedSlot(const std::filesystem::path& test
         }
     };
     options.sync_slot_hook = [&](std::string_view point, size_t slot) {
-        if (point != "sync_slot_before_fsync") return;
+        if (point != "sync_slot_before_fsync")
+            return;
         std::unique_lock<std::mutex> lock(latch);
         if (slot == 0 && slot0_calls.fetch_add(1) == 0) {
             slot0_entered = true;
@@ -941,9 +1126,13 @@ int RunDepthTwoSlidingBatonReusesCompletedSlot(const std::filesystem::path& test
     std::thread first = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &first_threw);
     {
         std::unique_lock<std::mutex> lock(latch);
-        if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return slot0_entered && slot1_entered && second_lsn != INVALID_LSN; })) {
+        if (!cv.wait_for(lock, std::chrono::seconds(1),
+                         [&] { return slot0_entered && slot1_entered && second_lsn != INVALID_LSN; })) {
             release_slot0 = release_slot1 = true;
-            lock.unlock(); cv.notify_all(); first.join(); return 1;
+            lock.unlock();
+            cv.notify_all();
+            first.join();
+            return 1;
         }
     }
     std::thread second = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(second_lsn); }, &second_threw);
@@ -951,7 +1140,11 @@ int RunDepthTwoSlidingBatonReusesCompletedSlot(const std::filesystem::path& test
         std::unique_lock<std::mutex> lock(latch);
         if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return follower_enqueued; })) {
             release_slot0 = release_slot1 = true;
-            lock.unlock(); cv.notify_all(); first.join(); second.join(); return 2;
+            lock.unlock();
+            cv.notify_all();
+            first.join();
+            second.join();
+            return 2;
         }
         release_slot0 = true;
     }
@@ -960,7 +1153,11 @@ int RunDepthTwoSlidingBatonReusesCompletedSlot(const std::filesystem::path& test
         std::unique_lock<std::mutex> lock(latch);
         if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return slot0_second_entered; })) {
             release_slot1 = true;
-            lock.unlock(); cv.notify_all(); first.join(); second.join(); return 3;
+            lock.unlock();
+            cv.notify_all();
+            first.join();
+            second.join();
+            return 3;
         }
     }
     {
@@ -968,7 +1165,8 @@ int RunDepthTwoSlidingBatonReusesCompletedSlot(const std::filesystem::path& test
         release_slot1 = true;
     }
     cv.notify_all();
-    first.join(); second.join();
+    first.join();
+    second.join();
     return first_threw.load() || second_threw.load() ? 4 : 0;
 }
 
@@ -983,7 +1181,8 @@ int RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix(const std::filesystem::p
     std::mutex latch;
     std::condition_variable cv;
     bool added_second = false, added_third = false, added_fourth = false, slot0_entered = false;
-    bool slot1_entered = false, slot1_failed = false, follower_enqueued = false, release_slot0 = false, release_slot1 = false;
+    bool slot1_entered = false, slot1_failed = false, follower_enqueued = false, release_slot0 = false,
+         release_slot1 = false;
     std::atomic<unsigned> slot1_calls{0};
     lsn_t second_lsn = INVALID_LSN;
     LogManager* manager = nullptr;
@@ -995,13 +1194,16 @@ int RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix(const std::filesystem::p
             cv.notify_all();
             return;
         }
-        if (point != "flush_buffer_after_swap") return;
+        if (point != "flush_buffer_after_swap")
+            return;
         if (!added_second) {
             added_second = true;
-            BeginLogRecord second(441); second_lsn = manager->add_log_to_buffer(&second);
+            BeginLogRecord second(441);
+            second_lsn = manager->add_log_to_buffer(&second);
         } else if (!added_third) {
             added_third = true;
-            BeginLogRecord third(442); manager->add_log_to_buffer(&third);
+            BeginLogRecord third(442);
+            manager->add_log_to_buffer(&third);
         } else if (!added_fourth) {
             // This hook runs inside B's third-batch flush.  Completing the
             // old slot-one failure before it returns recreates the historical
@@ -1014,11 +1216,13 @@ int RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix(const std::filesystem::p
             cv.notify_all();
             std::unique_lock<std::mutex> lock(latch);
             cv.wait(lock, [&] { return slot1_failed; });
-            BeginLogRecord fourth(443); manager->add_log_to_buffer(&fourth);
+            BeginLogRecord fourth(443);
+            manager->add_log_to_buffer(&fourth);
         }
     };
     options.sync_slot_hook = [&](std::string_view point, size_t slot) {
-        if (point != "sync_slot_before_fsync") return;
+        if (point != "sync_slot_before_fsync")
+            return;
         std::unique_lock<std::mutex> lock(latch);
         if (slot == 0) {
             slot0_entered = true;
@@ -1042,9 +1246,13 @@ int RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix(const std::filesystem::p
     std::thread flush = StartFlush([&] { log_mgr.flush_log_to_disk_up_to(first_lsn); }, &threw);
     {
         std::unique_lock<std::mutex> lock(latch);
-        if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return slot0_entered && slot1_entered && second_lsn != INVALID_LSN; })) {
+        if (!cv.wait_for(lock, std::chrono::seconds(1),
+                         [&] { return slot0_entered && slot1_entered && second_lsn != INVALID_LSN; })) {
             release_slot0 = release_slot1 = true;
-            lock.unlock(); cv.notify_all(); flush.join(); return 1;
+            lock.unlock();
+            cv.notify_all();
+            flush.join();
+            return 1;
         }
     }
     std::atomic<bool> follower_threw{false};
@@ -1053,7 +1261,11 @@ int RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix(const std::filesystem::p
         std::unique_lock<std::mutex> lock(latch);
         if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return follower_enqueued; })) {
             release_slot0 = release_slot1 = true;
-            lock.unlock(); cv.notify_all(); flush.join(); follower.join(); return 2;
+            lock.unlock();
+            cv.notify_all();
+            flush.join();
+            follower.join();
+            return 2;
         }
         release_slot0 = true;
     }
@@ -1062,17 +1274,29 @@ int RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix(const std::filesystem::p
         std::unique_lock<std::mutex> lock(latch);
         if (!cv.wait_for(lock, std::chrono::seconds(1), [&] { return slot1_failed && added_fourth; })) {
             release_slot1 = true;
-            lock.unlock(); cv.notify_all(); flush.join(); follower.join(); return 3;
+            lock.unlock();
+            cv.notify_all();
+            flush.join();
+            follower.join();
+            return 3;
         }
     }
     if (slot1_calls.load(std::memory_order_relaxed) != 1) {
         std::lock_guard<std::mutex> lock(latch);
         release_slot1 = true;
-        cv.notify_all(); flush.join(); follower.join(); return 4;
+        cv.notify_all();
+        flush.join();
+        follower.join();
+        return 4;
     }
-    flush.join(); follower.join();
+    flush.join();
+    follower.join();
     bool future_threw = false;
-    try { log_mgr.flush_log_to_disk_up_to(first_lsn); } catch (...) { future_threw = true; }
+    try {
+        log_mgr.flush_log_to_disk_up_to(first_lsn);
+    } catch (...) {
+        future_threw = true;
+    }
     return threw.load() || !follower_threw.load() || !future_threw || second_lsn == INVALID_LSN ||
                    log_mgr.get_durable_lsn() >= second_lsn
                ? 5
@@ -1147,7 +1371,8 @@ TEST(LogManagerTest, WalScheduleGateIsNoOpUnlessDepthTwoIsExact) {
     std::atomic<unsigned> schedule_entries{0};
     LogManager::GroupCommitTestOptions options;
     options.hook = [&](std::string_view point) {
-        if (point == "wal_schedule_entered") schedule_entries.fetch_add(1, std::memory_order_relaxed);
+        if (point == "wal_schedule_entered")
+            schedule_entries.fetch_add(1, std::memory_order_relaxed);
     };
     LogManager log_mgr(&disk, DurabilityMode::STRICT, nullptr, std::move(options));
     log_mgr.flush_log_to_disk();
@@ -1163,7 +1388,8 @@ TEST(LogManagerTest, WalSyncDepthTwoEmptyPrefixSyncEntersScheduleGate) {
     std::atomic<unsigned> schedule_entries{0};
     LogManager::GroupCommitTestOptions options;
     options.hook = [&](std::string_view point) {
-        if (point == "wal_schedule_entered") schedule_entries.fetch_add(1, std::memory_order_relaxed);
+        if (point == "wal_schedule_entered")
+            schedule_entries.fetch_add(1, std::memory_order_relaxed);
     };
     LogManager log_mgr(&disk, DurabilityMode::STRICT, nullptr, std::move(options));
     log_mgr.flush_log_to_disk_with_sync();
@@ -1214,11 +1440,13 @@ TEST(LogManagerTest, WalSyncDepthTwoPublishesSlotsInOrderAndReleasesCoveredFollo
 }
 
 TEST(LogManagerTest, WalSyncDepthTwoSlidingBatonReusesOnlyRetiredPrefixSlot) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_depth_two_sliding_baton_test_db", RunDepthTwoSlidingBatonReusesCompletedSlot));
+    EXPECT_TRUE(
+        RunInWatchdog("log_manager_depth_two_sliding_baton_test_db", RunDepthTwoSlidingBatonReusesCompletedSlot));
 }
 
 TEST(LogManagerTest, WalSyncDepthTwoSlotOneFailureCannotBeReusedBeforePrefix) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_depth_two_slot1_aba_test_db", RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix));
+    EXPECT_TRUE(
+        RunInWatchdog("log_manager_depth_two_slot1_aba_test_db", RunDepthTwoSlotOneFailureCannotBeReusedBeforePrefix));
 }
 
 TEST(LogManagerTest, WalSyncDepthTwoSlotFailureFansOutAndPoisonsEpoch) {
@@ -1226,11 +1454,13 @@ TEST(LogManagerTest, WalSyncDepthTwoSlotFailureFansOutAndPoisonsEpoch) {
 }
 
 TEST(LogManagerTest, WalSyncDepthTwoSlotOneFailureReleasesCoveredPrefixThenPoisonsUncovered) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_depth_two_slot_one_failure_test_db", RunDepthTwoSlotOneFailureReleasesCoveredPrefix));
+    EXPECT_TRUE(RunInWatchdog("log_manager_depth_two_slot_one_failure_test_db",
+                              RunDepthTwoSlotOneFailureReleasesCoveredPrefix));
 }
 
 TEST(LogManagerTest, WalSyncDepthTwoPreAdmittedLateCallerCannotAckAfterPoison) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_depth_two_late_poison_test_db", RunPreAdmittedLateCallerCannotAckAfterPoison));
+    EXPECT_TRUE(
+        RunInWatchdog("log_manager_depth_two_late_poison_test_db", RunPreAdmittedLateCallerCannotAckAfterPoison));
 }
 
 TEST(LogManagerTest, WalSyncDepthTwoResetWaitsForBlockedWorkerAndPublishesNewEpoch) {
@@ -1304,7 +1534,8 @@ TEST(LogManagerTest, WalSyncDepthTwoSyncFailureWinsWhenSecondPwriteAlsoFails) {
         }
     };
     options.sync_slot_hook = [](std::string_view, size_t slot) {
-        if (slot == 0) throw std::runtime_error("slot zero sync failure");
+        if (slot == 0)
+            throw std::runtime_error("slot zero sync failure");
     };
     LogManager log_mgr(&disk, DurabilityMode::STRICT, &metrics, std::move(options));
     manager = &log_mgr;
@@ -1323,6 +1554,18 @@ TEST(LogManagerTest, WalSyncDepthTwoSyncFailureWinsWhenSecondPwriteAlsoFails) {
 
 TEST(LogManagerTest, LeaderRotationHandsOffUncoveredFollowerAfterFirstBatch) {
     EXPECT_TRUE(RunInWatchdog("log_manager_rotation_handoff_test_db", RunLeaderRotationHandoff));
+}
+
+TEST(LogManagerTest, SlowWaiterReportingRunsOutsideLegacyAndRotationGroupLatch) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_legacy_reporter_lock_test_db",
+                              RunLegacySlowWaiterReporterOutsideGroupLatch));
+    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_reporter_lock_test_db",
+                              RunRotationSlowWaiterReporterOutsideGroupLatch));
+}
+
+TEST(LogManagerTest, PromotedWaiterDefersReportingUntilAfterItsLeaderTenure) {
+    EXPECT_TRUE(RunInWatchdog("log_manager_promoted_reporter_order_test_db",
+                              RunPromotedWaiterReportsOnlyAfterLeaderTenure));
 }
 
 TEST(LogManagerTest, LeaderRotationFailureOnlyFailsUncoveredWaitersAndRecovers) {
@@ -1349,7 +1592,7 @@ TEST(LogManagerTest, SegmentedWalReadsRecordsAcrossPhysicalBoundary) {
     disk.ensure_segmented_wal_root();
     LogManager log_mgr(&disk);
     std::array<BeginLogRecord, 4> records = {BeginLogRecord(1), BeginLogRecord(2), BeginLogRecord(3),
-                                              BeginLogRecord(4)};
+                                             BeginLogRecord(4)};
     for (auto& record : records) {
         EXPECT_NE(log_mgr.add_log_to_buffer(&record), INVALID_LSN);
     }
@@ -1373,7 +1616,8 @@ TEST(LogManagerTest, LegacyWalReadSnapshotMapsAcceptedPrefixWithoutPageBoundaryC
     const long page_size = sysconf(_SC_PAGESIZE);
     ASSERT_GT(page_size, 0);
     std::vector<char> bytes(static_cast<size_t>(page_size) * 2 + 37);
-    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>((i * 17) & 0x7f);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = static_cast<char>((i * 17) & 0x7f);
     {
         std::ofstream wal(LOG_FILE_NAME, std::ios::binary | std::ios::trunc);
         wal.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -1402,7 +1646,8 @@ TEST(LogManagerTest, SegmentedWalReadSnapshotCopiesOnlyCrossSegmentRecords) {
     disk.configure_segmented_wal(31, 0, 64);
     disk.ensure_segmented_wal_root();
     std::vector<char> bytes(141);
-    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>((i * 29) & 0x7f);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = static_cast<char>((i * 29) & 0x7f);
     disk.write_log(bytes.data(), static_cast<int>(bytes.size()));
 
     auto snapshot = disk.create_wal_read_snapshot(3, static_cast<int64_t>(bytes.size()));
@@ -1585,10 +1830,9 @@ TEST(LogManagerTest, SegmentedWalRejectsSymlinkAndLogicalOffsetOverflow) {
     DiskManager disk;
     ASSERT_EQ(symlink("/dev/null", "db.log.21.0"), 0);
     EXPECT_THROW(disk.configure_segmented_wal(21, 0, 64), InternalError);
-    EXPECT_THROW(disk.configure_segmented_wal(22,
-                                              static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 64) + 1,
-                                              64),
-                 InternalError);
+    EXPECT_THROW(
+        disk.configure_segmented_wal(22, static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 64) + 1, 64),
+        InternalError);
 }
 
 TEST(LogManagerTest, NonemptyLegacyWalRemainsLegacyAtStartup) {
@@ -2184,8 +2428,8 @@ TEST(LogManagerTest, WalFlushMetricsAreEnabledOnlyWhenSuppliedAndEnabled) {
     LogManager enabled_log_mgr(&disk, DurabilityMode::STRICT, &enabled);
     BeginLogRecord enabled_begin(202);
     const lsn_t enabled_lsn = enabled_log_mgr.add_log_to_buffer(&enabled_begin);
-    enabled_log_mgr.flush_log_to_disk_up_to(enabled_lsn);
-    enabled_log_mgr.flush_log_to_disk_up_to(enabled_lsn);
+    enabled_log_mgr.flush_commit_log_to_disk_up_to(enabled_lsn);
+    enabled_log_mgr.flush_commit_log_to_disk_up_to(enabled_lsn);
 
     const auto snapshot = enabled.snapshot();
     EXPECT_EQ(snapshot.leader_requests, 1U);
@@ -2195,6 +2439,9 @@ TEST(LogManagerTest, WalFlushMetricsAreEnabledOnlyWhenSuppliedAndEnabled) {
     EXPECT_EQ(snapshot.fdatasync.count, 1U);
     EXPECT_EQ(snapshot.completed_batch_histogram[1], 1U);
     EXPECT_EQ(snapshot.already_covered_fast_paths, 1U);
+    EXPECT_EQ(snapshot.commit_requests.leader_requests, 1U);
+    EXPECT_EQ(snapshot.commit_requests.already_covered, 1U);
+    EXPECT_EQ(snapshot.commit_requests.follower_requests, 0U);
 }
 
 TEST(LogManagerTest, CurrentOffsetIncludesBufferedWal) {
@@ -2717,7 +2964,7 @@ TEST(LogManagerTest, NonEmptyCheckpointRestartOffsetFallsBackToZero) {
     // corruption: startup must retain the WAL rather than sort/max past it.
     EXPECT_THROW(restarted.initialize_from_existing_log(), InternalError);
     EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), checkpoint_offset + LOG_HEADER_SIZE + sizeof(size_t) +
-                                                    sizeof(txn_id_t) + sizeof(lsn_t) + LOG_HEADER_SIZE);
+                                                     sizeof(txn_id_t) + sizeof(lsn_t) + LOG_HEADER_SIZE);
 }
 
 TEST(LogManagerTest, OutOfRangeRestartOffsetFallsBackToZero) {

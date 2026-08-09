@@ -64,11 +64,13 @@ void ClearWriteSet(Transaction* txn) {
     txn->ClearSiLockedRowWorkspace();
 }
 
-void ReleaseLocks(Transaction* txn, LockManager* lock_manager, TransactionPhaseMetrics* metrics) {
+uint64_t ReleaseLocks(Transaction* txn, LockManager* lock_manager, TransactionPhaseMetrics* metrics,
+                      TransactionPhaseMetrics::Phase phase) {
     if (txn == nullptr || lock_manager == nullptr) {
-        return;
+        return 0;
     }
-    TransactionPhaseMetrics::Scope timer(metrics, TransactionPhaseMetrics::Phase::LockReleaseWork);
+    const bool measure = metrics != nullptr && metrics->enabled();
+    const auto started = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto lock_set = txn->get_lock_set();
     while (!lock_set->empty()) {
         auto lock = lock_set->extract(lock_set->begin());
@@ -89,7 +91,36 @@ void ReleaseLocks(Transaction* txn, LockManager* lock_manager, TransactionPhaseM
         auto intent = logical_row_delete_intents->extract(logical_row_delete_intents->begin());
         lock_manager->unregister_logical_row_delete_intent(txn, intent.value());
     }
+    if (!measure) {
+        return 0;
+    }
+    const uint64_t elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+    metrics->record(phase, elapsed_ns);
+    return elapsed_ns;
 }
+
+class AccumulatedTimer {
+public:
+    explicit AccumulatedTimer(uint64_t* accumulator) noexcept : accumulator_(accumulator) {
+        if (accumulator_ != nullptr) {
+            started_ = std::chrono::steady_clock::now();
+        }
+    }
+    ~AccumulatedTimer() noexcept {
+        if (accumulator_ != nullptr) {
+            *accumulator_ += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started_)
+                    .count());
+        }
+    }
+    AccumulatedTimer(const AccumulatedTimer&) = delete;
+    AccumulatedTimer& operator=(const AccumulatedTimer&) = delete;
+
+private:
+    uint64_t* accumulator_;
+    std::chrono::steady_clock::time_point started_{};
+};
 
 std::vector<char> MakeIndexKey(const IndexMeta& index, const char* rec_data) {
     std::vector<char> key(index.col_tot_len);
@@ -261,7 +292,8 @@ void WriteBeginLog(Transaction* txn, LogManager* log_manager) {
     txn->set_prev_lsn(lsn);
 }
 
-lsn_t AppendCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts) {
+lsn_t AppendCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts,
+                      TransactionPhaseMetrics* metrics) {
     if (txn == nullptr || log_manager == nullptr) {
         return INVALID_LSN;
     }
@@ -271,6 +303,7 @@ lsn_t AppendCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t com
     // 所以“db.restart 快照”与“保留 WAL 里 COMMIT 的最大 commit_ts”取 max 覆盖
     // 一切已持久化的 commit_ts_。完整论证见
     // RecoveryManager::get_recovered_next_timestamp()。
+    TransactionPhaseMetrics::Scope timer(metrics, TransactionPhaseMetrics::Phase::CommitWalEnqueue);
     CommitLogRecord record(txn->get_transaction_id(), commit_ts);
     record.prev_lsn_ = txn->get_prev_lsn();
     lsn_t lsn = log_manager->add_log_to_buffer(&record);
@@ -285,8 +318,8 @@ void WaitForCommitLog(LogManager* log_manager, lsn_t lsn, TransactionPhaseMetric
     }
     // Returning from COMMIT means the commit record survived an OS crash,
     // not merely that it reached the kernel page cache.
-    TransactionPhaseMetrics::Scope timer(metrics, TransactionPhaseMetrics::Phase::CommitWalWait);
-    log_manager->flush_log_to_disk_up_to(lsn);
+    TransactionPhaseMetrics::Scope timer(metrics, TransactionPhaseMetrics::Phase::CommitWalCoverageWait);
+    log_manager->flush_commit_log_to_disk_up_to(lsn);
     timer.Stop();
     timer.Finish();
     FaultInjector::Point("after_commit_wal_write");
@@ -294,7 +327,7 @@ void WaitForCommitLog(LogManager* log_manager, lsn_t lsn, TransactionPhaseMetric
 
 void WriteCommitLog(Transaction* txn, LogManager* log_manager, timestamp_t commit_ts,
                     TransactionPhaseMetrics* metrics) {
-    WaitForCommitLog(log_manager, AppendCommitLog(txn, log_manager, commit_ts), metrics);
+    WaitForCommitLog(log_manager, AppendCommitLog(txn, log_manager, commit_ts, metrics), metrics);
 }
 
 lsn_t WriteAbortLog(Transaction* txn, LogManager* log_manager) {
@@ -332,7 +365,8 @@ TupleMeta FallbackCommittedMeta() {
 }
 
 void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRecord* write_record, lsn_t page_lsn,
-                     const TransactionManager::AbortDeleteUndoPublicationTestHook& delete_undo_publication_hook) {
+                     const TransactionManager::AbortDeleteUndoPublicationTestHook& delete_undo_publication_hook,
+                     uint64_t* heap_undo_ns, uint64_t* index_undo_ns, bool* performed_index_undo) {
     const std::string tab_name = write_record->GetTableName();
     auto& tab = sm_manager->db_.get_table(tab_name);
     auto* fh = sm_manager->fhs_.at(tab_name).get();
@@ -352,20 +386,38 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         // that DeleteIndexEntries has nothing to do; this is the hot RC
         // rollback path for heap-only tables.
         if (tab.indexes.empty()) {
+            AccumulatedTimer heap_timer(heap_undo_ns);
             fh->delete_record(rid, nullptr, page_lsn);
             break;
         }
         if (fh->is_record(rid)) {
-            auto rec = fh->get_record(rid, nullptr);
-            DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, *index_wal_context);
-            fh->delete_record(rid, nullptr, page_lsn);
+            std::unique_ptr<RmRecord> rec;
+            {
+                AccumulatedTimer heap_timer(heap_undo_ns);
+                rec = fh->get_record(rid, nullptr);
+            }
+            {
+                if (performed_index_undo != nullptr)
+                    *performed_index_undo = true;
+                AccumulatedTimer index_timer(index_undo_ns);
+                DeleteIndexEntries(sm_manager, tab, tab_name, *rec, rid, *index_wal_context);
+            }
+            {
+                AccumulatedTimer heap_timer(heap_undo_ns);
+                fh->delete_record(rid, nullptr, page_lsn);
+            }
         }
         break;
     }
     case WType::DELETE_TUPLE: {
         const RmRecord& old_rec = write_record->GetRecord();
-        const TupleMeta current_meta = fh->get_tuple_meta(rid);
-        auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
+        TupleMeta current_meta;
+        std::optional<UndoLog> undo;
+        {
+            AccumulatedTimer heap_timer(heap_undo_ns);
+            current_meta = fh->get_tuple_meta(rid);
+            undo = GetCurrentUndoLog(txn_mgr, fh, rid);
+        }
         const TupleMeta old_meta = undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta();
 
         // A normal transactional delete leaves the record allocated under an
@@ -375,15 +427,21 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         // Recovery/legacy undo may find an absent bitmap slot. Recreate that
         // slot under the same unpublished tombstone, never under the default
         // committed meta supplied by insert_record().
-        if (fh->is_record(rid)) {
-            // The current heap record is already the delete tombstone.
-        } else {
-            TupleMeta unpublished_tombstone = current_meta;
-            unpublished_tombstone.is_committed_ = false;
-            unpublished_tombstone.is_deleted_ = true;
-            fh->insert_record(rid, old_rec.data, page_lsn, &unpublished_tombstone);
+        {
+            AccumulatedTimer heap_timer(heap_undo_ns);
+            if (fh->is_record(rid)) {
+                // The current heap record is already the delete tombstone.
+            } else {
+                TupleMeta unpublished_tombstone = current_meta;
+                unpublished_tombstone.is_committed_ = false;
+                unpublished_tombstone.is_deleted_ = true;
+                fh->insert_record(rid, old_rec.data, page_lsn, &unpublished_tombstone);
+            }
         }
         if (index_wal_context.has_value()) {
+            if (performed_index_undo != nullptr)
+                *performed_index_undo = true;
+            AccumulatedTimer index_timer(index_undo_ns);
             InsertIndexEntries(sm_manager, tab, tab_name, old_rec, rid, *index_wal_context);
         }
         // InsertIndexEntries has released all index latches. This test-only
@@ -391,14 +449,25 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
         if (delete_undo_publication_hook) {
             delete_undo_publication_hook();
         }
-        fh->apply_tuple_update(rid, old_rec.data, old_meta, page_lsn);
+        {
+            AccumulatedTimer heap_timer(heap_undo_ns);
+            fh->apply_tuple_update(rid, old_rec.data, old_meta, page_lsn);
+        }
         break;
     }
     case WType::UPDATE_TUPLE: {
         const RmRecord& old_rec = write_record->GetRecord();
         std::unique_ptr<RmRecord> current_rec;
-        if (fh->is_record(rid)) {
-            current_rec = fh->get_record(rid, nullptr);
+        {
+            AccumulatedTimer heap_timer(heap_undo_ns);
+            if (fh->is_record(rid)) {
+                current_rec = fh->get_record(rid, nullptr);
+            }
+        }
+        if (current_rec != nullptr) {
+            if (performed_index_undo != nullptr && !tab.indexes.empty())
+                *performed_index_undo = true;
+            AccumulatedTimer index_timer(index_undo_ns);
             for (const auto& index : tab.indexes) {
                 auto current_key = MakeIndexKey(index, current_rec->data);
                 auto old_key = MakeIndexKey(index, old_rec.data);
@@ -409,12 +478,18 @@ void UndoWriteRecord(TransactionManager* txn_mgr, SmManager* sm_manager, WriteRe
                 ih->delete_entry(current_key.data(), rid, *index_wal_context);
             }
         }
-        auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
-        if (fh->is_record(rid)) {
-            fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
-                                   page_lsn);
+        {
+            AccumulatedTimer heap_timer(heap_undo_ns);
+            auto undo = GetCurrentUndoLog(txn_mgr, fh, rid);
+            if (fh->is_record(rid)) {
+                fh->apply_tuple_update(rid, old_rec.data, undo.has_value() ? undo->old_meta_ : FallbackCommittedMeta(),
+                                       page_lsn);
+            }
         }
         if (current_rec != nullptr) {
+            if (performed_index_undo != nullptr && !tab.indexes.empty())
+                *performed_index_undo = true;
+            AccumulatedTimer index_timer(index_undo_ns);
             for (const auto& index : tab.indexes) {
                 auto current_key = MakeIndexKey(index, current_rec->data);
                 auto old_key = MakeIndexKey(index, old_rec.data);
@@ -730,7 +805,8 @@ void TransactionManager::RunCommitPublicationWork(const std::shared_ptr<CommitPu
 
         if (lock_request != nullptr) {
             FaultInjector::Point("before_commit_helper_lock_release");
-            ReleaseLocks(lock_request->txn, lock_manager_, phase_metrics_);
+            ReleaseLocks(lock_request->txn, lock_manager_, phase_metrics_,
+                         TransactionPhaseMetrics::Phase::CommitRelease);
             FaultInjector::Point("after_commit_helper_lock_release");
             InvokeCommitPublicationTestHook("after_lock_release", lock_request->commit_csn, lock_request->commit_lsn);
             {
@@ -801,7 +877,11 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
         return;
     }
 
-    sm_manager_->prepare_commit_publication(*txn);
+    {
+        TransactionPhaseMetrics::Scope prepare_timer(phase_metrics_,
+                                                     TransactionPhaseMetrics::Phase::CommitPrepareSortValidate);
+        sm_manager_->prepare_commit_publication(*txn);
+    }
     TransactionState expected_state = TransactionState::GROWING;
     if (!txn->compare_exchange_state(expected_state, TransactionState::COMMITTING)) {
         if (expected_state == TransactionState::COMMITTED || expected_state == TransactionState::ABORTED) {
@@ -818,6 +898,8 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
     FaultInjector::Point("before_commit_wal");
     std::shared_ptr<CommitPublicationRequest> publication_request;
     bool locks_released_by_helper = false;
+    const bool read_only_wal_pair = log_manager != nullptr && txn->get_begin_lsn() != INVALID_LSN &&
+                                    txn->get_write_set().empty() && txn->get_prev_lsn() == txn->get_begin_lsn();
     try {
         timestamp_t commit_csn;
         timestamp_t commit_ts;
@@ -847,7 +929,7 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             publication_request->commit_ts = commit_ts;
             txn->pin_commit_publication();
             {
-                publication_request->commit_lsn = AppendCommitLog(txn, log_manager, commit_ts);
+                publication_request->commit_lsn = AppendCommitLog(txn, log_manager, commit_ts, phase_metrics_);
                 {
                     std::lock_guard<std::mutex> frontier_lock(commit_frontier_latch_);
                     auto [_, inserted] = pending_commit_publications_.emplace(commit_csn, publication_request);
@@ -917,7 +999,7 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             // later CSN finished publishing first.
             std::unique_lock<std::mutex> frontier_lock(commit_frontier_latch_);
             TransactionPhaseMetrics::Scope frontier_wait_timer(phase_metrics_,
-                                                                TransactionPhaseMetrics::Phase::FrontierWait);
+                                                               TransactionPhaseMetrics::Phase::FrontierWait);
             commit_frontier_cv_.wait(frontier_lock, [&] { return published_commit_csn_ >= commit_csn; });
             frontier_wait_timer.Stop();
             frontier_lock.unlock();
@@ -932,12 +1014,18 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
         InvokeCommitPublicationTestHook("before_owner_cleanup", commit_csn,
                                         publication_request == nullptr ? txn->get_prev_lsn()
                                                                        : publication_request->commit_lsn);
+        const bool measure_owner_cleanup = phase_metrics_ != nullptr && phase_metrics_->enabled();
+        const auto owner_cleanup_started =
+            measure_owner_cleanup ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        uint64_t owner_cleanup_release_ns = 0;
+        Transaction::ActiveOwnerObservation owner_observation;
         {
             running_txns_.UpdateCommitTs(txn->get_commit_ts());
             running_txns_.RemoveTxnSlot(txn->get_watermark_slot());
             ClearWriteSet(txn);
             if (!locks_released_by_helper) {
-                ReleaseLocks(txn, lock_manager_, phase_metrics_);
+                owner_cleanup_release_ns =
+                    ReleaseLocks(txn, lock_manager_, phase_metrics_, TransactionPhaseMetrics::Phase::CommitRelease);
             }
             if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
                 CleanupTxnSsiState(txn->get_transaction_id());
@@ -954,8 +1042,24 @@ void TransactionManager::commit_impl(Transaction* txn, LogManager* log_manager) 
             if (publication_request != nullptr) {
                 txn->unpin_commit_publication();
             }
+            owner_observation = txn->take_active_owner_observation();
             RetireTransactionIfSafe(txn);
             MaybeRunGarbageCollection();
+        }
+        if (measure_owner_cleanup) {
+            const uint64_t total_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - owner_cleanup_started)
+                                          .count());
+            phase_metrics_->record(TransactionPhaseMetrics::Phase::CommitOwnerCleanup,
+                                   total_ns >= owner_cleanup_release_ns ? total_ns - owner_cleanup_release_ns : 0);
+        }
+        if (read_only_wal_pair && phase_metrics_ != nullptr) {
+            phase_metrics_->record_inferred_successful_begin_commit_pair();
+        }
+        if (phase_metrics_ != nullptr) {
+            phase_metrics_->record_owner_cleanup_terminal(true, owner_observation.observer_count,
+                                                          owner_observation.first_observation_ns);
         }
     } catch (...) {
         // Once COMMITTING is visible, the COMMIT record may be persistent and
@@ -1004,10 +1108,23 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
         // page modified by rollback a WAL record that can be used as its page
         // LSN. Transactions with no writes and no WAL after BEGIN have no
         // persistent state to undo and do not need to force an ABORT record.
+        TransactionPhaseMetrics::Scope abort_wal_timer(phase_metrics_, TransactionPhaseMetrics::Phase::AbortWal);
         abort_lsn = WriteAbortLog(txn, log_manager);
     }
+    const bool measure_abort_undo = phase_metrics_ != nullptr && phase_metrics_->enabled();
+    uint64_t heap_undo_ns = 0;
+    uint64_t index_undo_ns = 0;
+    bool performed_index_undo = false;
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
-        UndoWriteRecord(this, sm_manager_, it->get(), abort_lsn, abort_delete_undo_publication_test_hook_);
+        UndoWriteRecord(this, sm_manager_, it->get(), abort_lsn, abort_delete_undo_publication_test_hook_,
+                        measure_abort_undo ? &heap_undo_ns : nullptr, measure_abort_undo ? &index_undo_ns : nullptr,
+                        measure_abort_undo ? &performed_index_undo : nullptr);
+    }
+    if (measure_abort_undo && !write_set.empty()) {
+        phase_metrics_->record(TransactionPhaseMetrics::Phase::AbortHeapUndo, heap_undo_ns);
+        if (performed_index_undo) {
+            phase_metrics_->record(TransactionPhaseMetrics::Phase::AbortIndexUndo, index_undo_ns);
+        }
     }
     if (status_table_ != nullptr) {
         // Never expose ABORTED before physical undo is complete.
@@ -1022,6 +1139,8 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     // GROWING reader and manufacture a false dangerous structure.
     txn->set_state(TransactionState::ABORTED);
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+        TransactionPhaseMetrics::Scope ssi_cleanup_timer(phase_metrics_,
+                                                         TransactionPhaseMetrics::Phase::AbortSsiCleanup);
         CleanupTxnSsiState(txn->get_transaction_id());
         bool run_full_prune = false;
         {
@@ -1037,9 +1156,14 @@ void TransactionManager::abort(Transaction* txn, LogManager* log_manager) {
     }
     // Abort WAL and all heap/index undo precede this handoff. Waiters can now
     // proceed without seeing this transaction as an SSI reader or writer.
-    ReleaseLocks(txn, lock_manager_, phase_metrics_);
+    ReleaseLocks(txn, lock_manager_, phase_metrics_, TransactionPhaseMetrics::Phase::AbortRelease);
+    const Transaction::ActiveOwnerObservation owner_observation = txn->take_active_owner_observation();
     RetireTransactionIfSafe(txn);
     MaybeRunGarbageCollection();
+    if (phase_metrics_ != nullptr) {
+        phase_metrics_->record_owner_cleanup_terminal(false, owner_observation.observer_count,
+                                                      owner_observation.first_observation_ns);
+    }
 }
 
 void TransactionManager::block_new_transactions_for_checkpoint() {

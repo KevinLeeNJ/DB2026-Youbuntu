@@ -34,6 +34,9 @@ TEST(WalFlushMetricsTest, CountsTimingsAndMaximumsAreCumulative) {
     metrics.record_pwrite(64, 9);
     metrics.record_fdatasync(4);
     metrics.record_fdatasync(6);
+    metrics.record_commit_already_covered();
+    metrics.record_commit_leader_request();
+    metrics.record_commit_follower_request();
 
     const auto snapshot = metrics.snapshot();
     EXPECT_EQ(snapshot.already_covered_fast_paths, 1U);
@@ -54,12 +57,14 @@ TEST(WalFlushMetricsTest, CountsTimingsAndMaximumsAreCumulative) {
     EXPECT_EQ(snapshot.fdatasync.count, 2U);
     EXPECT_EQ(snapshot.fdatasync.elapsed_ns, 10U);
     EXPECT_EQ(snapshot.fdatasync.max_ns, 6U);
+    EXPECT_EQ(snapshot.commit_requests.already_covered, 1U);
+    EXPECT_EQ(snapshot.commit_requests.leader_requests, 1U);
+    EXPECT_EQ(snapshot.commit_requests.follower_requests, 1U);
 }
 
 TEST(WalFlushMetricsTest, CompletedBatchHistogramUsesDocumentedBoundaries) {
     WalFlushMetrics metrics(true);
-    for (const size_t value : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U,
-                               17U, 32U, 33U, 64U, 65U, 512U}) {
+    for (const size_t value : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 17U, 32U, 33U, 64U, 65U, 512U}) {
         metrics.record_completed_batch(value);
     }
 
