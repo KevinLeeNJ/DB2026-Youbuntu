@@ -64,7 +64,7 @@ Usage: $0 [options]
   --max-conflict-retries N maximum retries after a conflict; -1 retries until phase end (default: 1)
   --isolation LEVEL        read-committed or snapshot-isolation (default: snapshot-isolation)
   --wal-phase-markers 0|1 emit diagnostic WAL snapshots at measure boundaries (default: 0; requires RMDB_WAL_METRICS=1)
-  --observe-dir PATH      opt in to one-second procfs/sysfs observations at PATH/system_observation.csv
+  --observe-dir PATH      write 250 ms procfs/sysfs observations at PATH/system_observation.csv
   --go-binary PATH         Go runner binary (default: build/bin/tpcc-go)
   --regenerate-data        rebuild CSV data instead of reusing
   --overwrite-data-dir     alias for regenerate
@@ -126,12 +126,17 @@ if [[ "$WAL_PHASE_MARKERS" == "1" && "${RMDB_WAL_METRICS:-}" != "1" ]]; then
     echo "--wal-phase-markers=1 requires inherited RMDB_WAL_METRICS=1" >&2
     exit 2
 fi
-if [[ -n "$OBSERVE_DIR" ]]; then
-    mkdir -p "$OBSERVE_DIR"
-    OBSERVE_DIR="$(cd "$OBSERVE_DIR" && pwd)"
-    OBSERVE_CSV="$OBSERVE_DIR/system_observation.csv"
-    rm -f "$OBSERVE_CSV"
+# Every exact benchmark must retain a bounded, phase-labelled process-tree RSS
+# record. Keep it beside the requested result so an explicit --json-out keeps
+# its diagnostics separate as well. The observer samples every 250 ms and is
+# stopped by the existing EXIT trap on every failure path.
+if [[ -z "$OBSERVE_DIR" ]]; then
+    OBSERVE_DIR="${JSON_OUT}.observation"
 fi
+mkdir -p "$OBSERVE_DIR"
+OBSERVE_DIR="$(cd "$OBSERVE_DIR" && pwd)"
+OBSERVE_CSV="$OBSERVE_DIR/system_observation.csv"
+rm -f "$OBSERVE_CSV"
 if [[ ! -x "$GO_BINARY" ]]; then
     echo "missing Go benchmark binary: $GO_BINARY" >&2
     exit 1
