@@ -55,6 +55,19 @@ void Append(std::vector<char>* bytes, LogRecord& record, lsn_t lsn) {
     record.serialize(bytes->data() + begin);
 }
 
+void AppendRaw(std::vector<char>* bytes, LogType type, uint32_t total_len, lsn_t lsn) {
+    ASSERT_GE(total_len, static_cast<uint32_t>(LOG_HEADER_SIZE));
+    const size_t begin = bytes->size();
+    bytes->resize(begin + total_len, 0);
+    const txn_id_t txn_id = lsn + 1;
+    const lsn_t prev_lsn = INVALID_LSN;
+    memcpy(bytes->data() + begin + OFFSET_LOG_TYPE, &type, sizeof(type));
+    memcpy(bytes->data() + begin + OFFSET_LSN, &lsn, sizeof(lsn));
+    memcpy(bytes->data() + begin + OFFSET_LOG_TOT_LEN, &total_len, sizeof(total_len));
+    memcpy(bytes->data() + begin + OFFSET_LOG_TID, &txn_id, sizeof(txn_id));
+    memcpy(bytes->data() + begin + OFFSET_PREV_LSN, &prev_lsn, sizeof(prev_lsn));
+}
+
 WalRecordView BorrowRecord(std::vector<char>* bytes) {
     WalRecordView view;
     view.bytes = bytes->data();
@@ -224,17 +237,18 @@ TEST(WalReaderTest, TruncatedTailStopsAtTheIntactPrefix) {
     ScopedWalDir dir("wal_reader_tail_root");
     const auto bytes = BuildMixedWal();
 
-    // Cutting the file anywhere inside the last record must yield the six
-    // records before it and report their exact end as the intact prefix.
-    const auto full = [&] {
-        WriteWal(bytes);
-        DiskManager disk;
-        return ScanAll(&disk, static_cast<int64_t>(bytes.size()), WalReader::kDefaultBufferBytes);
-    }();
-    ASSERT_EQ(full.size(), 7u);
-    const int64_t last_offset = full.back().offset;
+    // Every physical cut that leaves a partial final header or body accepts
+    // exactly the complete-record prefix before it; no other cut is silently
+    // accepted as a torn tail.
+    WriteWal(bytes);
+    DiskManager full_disk;
+    WalReader full_reader(&full_disk, 0, static_cast<int64_t>(bytes.size()));
+    WalRecordView full_view;
+    std::vector<int64_t> record_ends{0};
+    while (full_reader.next(&full_view)) record_ends.push_back(full_reader.next_offset());
+    ASSERT_EQ(record_ends.size(), 8u);
 
-    for (size_t cut = static_cast<size_t>(last_offset) + 1; cut < bytes.size(); ++cut) {
+    for (size_t cut = 1; cut < bytes.size(); ++cut) {
         std::vector<char> truncated(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(cut));
         WriteWal(truncated);
         DiskManager disk;
@@ -244,12 +258,21 @@ TEST(WalReaderTest, TruncatedTailStopsAtTheIntactPrefix) {
         while (reader.next(&view)) {
             ++count;
         }
-        EXPECT_EQ(count, 6u) << "cut=" << cut;
-        EXPECT_EQ(reader.next_offset(), last_offset) << "cut=" << cut;
+        size_t expected_count = 0;
+        while (expected_count + 1 < record_ends.size() &&
+               record_ends[expected_count + 1] <= static_cast<int64_t>(cut)) {
+            ++expected_count;
+        }
+        EXPECT_EQ(count, expected_count) << "cut=" << cut;
+        EXPECT_EQ(reader.next_offset(), record_ends[expected_count]) << "cut=" << cut;
+        EXPECT_EQ(reader.status(), record_ends[expected_count] == static_cast<int64_t>(cut)
+                                       ? WalReadStatus::kCleanEnd
+                                       : WalReadStatus::kTornTail)
+            << "cut=" << cut;
     }
 }
 
-TEST(WalReaderTest, GarbageLengthAndUnknownTypeAreTreatedAsEndOfLog) {
+TEST(WalReaderTest, CompleteGarbageHeadersFailClosedInsteadOfEndingTheLog) {
     ScopedWalDir dir("wal_reader_garbage_root");
     auto bytes = BuildMixedWal();
     const int64_t second_offset = static_cast<int64_t>(LOG_HEADER_SIZE);
@@ -269,6 +292,7 @@ TEST(WalReaderTest, GarbageLengthAndUnknownTypeAreTreatedAsEndOfLog) {
         }
         EXPECT_EQ(count, 1u);
         EXPECT_EQ(reader.next_offset(), second_offset);
+        EXPECT_EQ(reader.status(), WalReadStatus::kCorruption);
     }
 
     {
@@ -286,6 +310,7 @@ TEST(WalReaderTest, GarbageLengthAndUnknownTypeAreTreatedAsEndOfLog) {
         }
         EXPECT_EQ(count, 1u);
         EXPECT_EQ(reader.next_offset(), second_offset);
+        EXPECT_EQ(reader.status(), WalReadStatus::kCorruption);
     }
 
     {
@@ -303,7 +328,163 @@ TEST(WalReaderTest, GarbageLengthAndUnknownTypeAreTreatedAsEndOfLog) {
         }
         EXPECT_EQ(count, 1u);
         EXPECT_EQ(reader.next_offset(), second_offset);
+        EXPECT_EQ(reader.status(), WalReadStatus::kCorruption);
     }
+}
+
+TEST(WalReaderTest, HeaderValidationPrecedesTornBodyClassification) {
+    ScopedWalDir dir("wal_reader_header_before_torn_root");
+    for (LogType type : {static_cast<LogType>(42), LogType::BEGIN, LogType::COMMIT}) {
+        std::vector<char> bytes;
+        AppendRaw(&bytes, LogType::INSERT, LOG_HEADER_SIZE + 10, 1);
+        bytes.resize(LOG_HEADER_SIZE);
+        const uint32_t declared = LOG_HEADER_SIZE + 10;
+        memcpy(bytes.data() + OFFSET_LOG_TYPE, &type, sizeof(type));
+        memcpy(bytes.data() + OFFSET_LOG_TOT_LEN, &declared, sizeof(declared));
+        WriteWal(bytes);
+        DiskManager disk;
+        WalReader reader(&disk, 0, static_cast<int64_t>(bytes.size()));
+        WalRecordView view;
+        EXPECT_FALSE(reader.next(&view));
+        EXPECT_EQ(reader.status(), WalReadStatus::kCorruption) << static_cast<int>(type);
+    }
+
+    std::vector<char> valid_variable_header;
+    AppendRaw(&valid_variable_header, LogType::INSERT, LOG_HEADER_SIZE + 10, 1);
+    valid_variable_header.resize(LOG_HEADER_SIZE);
+    WriteWal(valid_variable_header);
+    DiskManager disk;
+    WalReader reader(&disk, 0, static_cast<int64_t>(valid_variable_header.size()));
+    WalRecordView view;
+    EXPECT_FALSE(reader.next(&view));
+    EXPECT_EQ(reader.status(), WalReadStatus::kTornTail);
+}
+
+TEST(WalReaderTest, Int64BoundaryRangesDoNotOverflow) {
+    ScopedWalDir dir("wal_reader_int64_boundary_root");
+    WriteWal({});
+    DiskManager disk;
+    WalRecordView view;
+    WalReader empty_at_limit(&disk, INT64_MAX, INT64_MAX);
+    EXPECT_FALSE(empty_at_limit.next(&view));
+    EXPECT_EQ(empty_at_limit.next_offset(), INT64_MAX);
+    EXPECT_EQ(empty_at_limit.status(), WalReadStatus::kCleanEnd);
+
+    std::vector<char> scratch;
+    EXPECT_FALSE(ReadWalRecordAt(&disk, INT64_MAX - LOG_HEADER_SIZE + 1, INT64_MAX, &scratch, &view));
+    EXPECT_FALSE(ReadWalRecordAt(&disk, INT64_MAX, INT64_MAX, &scratch, &view));
+}
+
+TEST(WalReaderTest, MalformedCheckpointCountAndTrailingBytesFailClosed) {
+    ScopedWalDir dir("wal_reader_checkpoint_malformed_root");
+    auto bytes = BuildMixedWal();
+    const auto checkpoint_offset = bytes.size() - (LOG_HEADER_SIZE + sizeof(size_t) + sizeof(txn_id_t) + sizeof(lsn_t));
+
+    for (bool trailing : {false, true}) {
+        auto corrupted = bytes;
+        if (trailing) {
+            const uint32_t longer = read_unaligned<uint32_t>(corrupted.data() + checkpoint_offset + OFFSET_LOG_TOT_LEN) + 1;
+            corrupted.insert(corrupted.end(), 'x');
+            memcpy(corrupted.data() + checkpoint_offset + OFFSET_LOG_TOT_LEN, &longer, sizeof(longer));
+        } else {
+            const size_t impossible = 2;
+            memcpy(corrupted.data() + checkpoint_offset + OFFSET_LOG_DATA, &impossible, sizeof(impossible));
+        }
+        WriteWal(corrupted);
+        DiskManager disk;
+        WalReader reader(&disk, 0, static_cast<int64_t>(corrupted.size()));
+        WalRecordView view;
+        while (reader.next(&view)) {
+        }
+        EXPECT_EQ(reader.next_offset(), static_cast<int64_t>(checkpoint_offset));
+        EXPECT_EQ(reader.status(), WalReadStatus::kCorruption);
+        std::vector<char> scratch;
+        EXPECT_FALSE(ReadWalRecordAt(&disk, static_cast<int64_t>(checkpoint_offset),
+                                     static_cast<int64_t>(corrupted.size()), &scratch, &view));
+    }
+}
+
+TEST(WalReaderTest, FramerCatalogueIsContiguousAndNeverSplitsRecords) {
+    ScopedWalDir dir("wal_framer_catalogue_root");
+    const auto bytes = BuildMixedWal();
+    WriteWal(bytes);
+    DiskManager disk;
+    WalFramer framer(&disk, 0, static_cast<int64_t>(bytes.size()), 17);
+    WalRecordView view;
+    while (framer.next(&view)) {
+    }
+    ASSERT_EQ(framer.status(), WalReadStatus::kCleanEnd);
+    int64_t covered = 0;
+    uint32_t records = 0;
+    for (const FramedSegment& segment : framer.segments()) {
+        EXPECT_EQ(segment.begin, covered);
+        EXPECT_GT(segment.end, segment.begin);
+        covered = segment.end;
+        records += segment.record_count;
+    }
+    EXPECT_EQ(covered, static_cast<int64_t>(bytes.size()));
+    EXPECT_EQ(records, 7u);
+}
+
+TEST(WalReaderTest, FramerHonorsProductionByteAndLargeRecordBoundaries) {
+    ScopedWalDir dir("wal_framer_byte_targets_root");
+    {
+        std::vector<char> bytes;
+        constexpr uint32_t kRecordBytes = 1024 * 1024;
+        for (lsn_t lsn = 0; lsn < 17; ++lsn) AppendRaw(&bytes, LogType::INSERT, kRecordBytes, lsn);
+        WriteWal(bytes);
+        DiskManager disk;
+        WalFramer framer(&disk, 0, static_cast<int64_t>(bytes.size()));
+        WalRecordView view;
+        while (framer.next(&view)) {
+        }
+        ASSERT_EQ(framer.segments().size(), 2u);
+        EXPECT_EQ(framer.segments()[0].end - framer.segments()[0].begin, WalFramer::kTargetBytes);
+        EXPECT_EQ(framer.segments()[0].record_count, 16u);
+        EXPECT_EQ(framer.segments()[1].record_count, 1u);
+    }
+    {
+        std::vector<char> bytes;
+        BeginLogRecord before(1);
+        Append(&bytes, before, 0);
+        AppendRaw(&bytes, LogType::INSERT, static_cast<uint32_t>(WalFramer::kTargetBytes + 1), 1);
+        BeginLogRecord after(3);
+        Append(&bytes, after, 2);
+        WriteWal(bytes);
+        DiskManager disk;
+        WalFramer framer(&disk, 0, static_cast<int64_t>(bytes.size()));
+        WalRecordView view;
+        while (framer.next(&view)) {
+        }
+        ASSERT_EQ(framer.segments().size(), 3u);
+        EXPECT_EQ(framer.segments()[0].record_count, 1u);
+        EXPECT_EQ(framer.segments()[1].record_count, 1u);
+        EXPECT_EQ(framer.segments()[1].end - framer.segments()[1].begin, WalFramer::kTargetBytes + 1);
+        EXPECT_EQ(framer.segments()[0].end, framer.segments()[1].begin);
+        EXPECT_EQ(framer.segments()[1].end, framer.segments()[2].begin);
+        EXPECT_EQ(framer.segments()[2].record_count, 1u);
+    }
+}
+
+TEST(WalReaderTest, FramerHonorsProductionRecordCountBoundary) {
+    ScopedWalDir dir("wal_framer_record_target_root");
+    std::vector<char> bytes;
+    bytes.reserve(static_cast<size_t>(WalFramer::kTargetRecords + 1) * LOG_HEADER_SIZE);
+    for (uint32_t i = 0; i <= WalFramer::kTargetRecords; ++i) {
+        BeginLogRecord begin(static_cast<txn_id_t>(i + 1));
+        Append(&bytes, begin, static_cast<lsn_t>(i));
+    }
+    WriteWal(bytes);
+    DiskManager disk;
+    WalFramer framer(&disk, 0, static_cast<int64_t>(bytes.size()));
+    WalRecordView view;
+    while (framer.next(&view)) {
+    }
+    ASSERT_EQ(framer.segments().size(), 2u);
+    EXPECT_EQ(framer.segments()[0].record_count, WalFramer::kTargetRecords);
+    EXPECT_EQ(framer.segments()[1].record_count, 1u);
+    EXPECT_EQ(framer.segments()[0].end, framer.segments()[1].begin);
+    EXPECT_EQ(framer.segments()[1].end, static_cast<int64_t>(bytes.size()));
 }
 
 TEST(WalReaderTest, ParseWalDmlRejectsAPayloadCutShortByItsOwnLength) {
@@ -478,7 +659,8 @@ TEST(WalReaderTest, ReadWalRecordAtMatchesTheStreamingScan) {
     std::vector<char> scratch;
     for (const auto& expected : scanned) {
         WalRecordView view;
-        ASSERT_TRUE(ReadWalRecordAt(&disk, expected.offset, static_cast<int64_t>(bytes.size()), &scratch, &view));
+        ASSERT_TRUE(ReadWalRecordAt(&disk, expected.offset, static_cast<int64_t>(bytes.size()), &scratch, &view))
+            << "offset=" << expected.offset << " type=" << static_cast<int>(expected.log_type);
         EXPECT_EQ(view.log_type, expected.log_type);
         EXPECT_EQ(view.lsn, expected.lsn);
         EXPECT_EQ(view.prev_lsn, expected.prev_lsn);

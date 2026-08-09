@@ -16,9 +16,11 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -76,10 +78,28 @@ private:
  */
 class DiskManager {
 public:
+    enum class FileOperationForTest { Read, Write, Sync, Claim, CloseAfterSyscall };
+    struct FileIdentityForTest { int fd; uint64_t generation; };
+    class FileLease;
+    class FileWriteClaim;
     static constexpr int64_t kWalSegmentBytes = 64LL * 1024 * 1024;
     explicit DiskManager();
 
-    ~DiskManager() = default;
+    ~DiskManager();
+
+    FileWriteClaim acquire_file_write_claim(int fd);
+    // Test-only lifecycle barriers are stored in RegistryState, so a token
+    // released after its manager has gone away cannot dereference the manager.
+    void set_file_lifecycle_test_hooks(std::function<void()> before_open, std::function<void()> before_close);
+    void set_file_operation_test_hook(std::function<void(FileOperationForTest)> hook);
+    void set_file_operation_entry_test_hook(std::function<void(FileOperationForTest)> hook);
+    // Test-only segmented-WAL read barrier. The caller must install or clear
+    // it only while this manager has no concurrent operations.
+    using SegmentedReadTestHook = void (*)(void*);
+    void set_segmented_read_test_hook(SegmentedReadTestHook hook, void* context);
+    void set_wal_lease_test_hook(std::function<void()> hook);
+    FileIdentityForTest capture_file_identity_for_test(int fd);
+    bool stale_file_identity_rejected_for_test(FileIdentityForTest identity);
 
     void write_page(int fd, page_id_t page_no, const char* offset, int num_bytes);
 
@@ -168,26 +188,17 @@ public:
     // Drop an incomplete WAL tail while preserving the complete prefix.
     void truncate_log_to(int64_t offset);
 
-    void SetLogOffset(int64_t log_offset) {
-        log_offset_ = log_offset;
-    }
+    void SetLogOffset(int64_t log_offset);
 
-    void SetLogFd(int log_fd) {
-        log_fd_ = log_fd;
-    }
-
-    int GetLogFd() {
-        return log_fd_;
-    }
+    void SetLogFd(int log_fd);
+    int GetLogFd();
 
     /**
      * @description: 设置文件已经分配的页面个数
      * @param {int} fd 文件对应的文件句柄
      * @param {int} start_page_no 已经分配的页面个数，即文件接下来从start_page_no开始分配页面编号
      */
-    void set_fd2pageno(int fd, int start_page_no) {
-        fd2pageno_[fd] = start_page_no;
-    }
+    void set_fd2pageno(int fd, int start_page_no);
 
     uint64_t get_log_read_count() const {
         return log_read_count_.load(std::memory_order_relaxed);
@@ -201,29 +212,94 @@ public:
      * @return {page_id_t} 已分配的页面个数
      * @param {int} fd 文件对应的句柄
      */
-    page_id_t get_fd2pageno(int fd) {
-        return fd2pageno_[fd];
-    }
+    page_id_t get_fd2pageno(int fd);
 
     static constexpr int MAX_FD = 8192;
 
 private:
+    enum class FileStateKind { Opening, Open, Closing, Deleting, Closed };
+    struct FileState {
+        int fd{-1};
+        uint64_t generation{0};
+        std::string path;
+        FileStateKind state{FileStateKind::Opening};
+        page_id_t next_page_no{0};
+        size_t claims{0};
+        size_t leases{0};
+    };
+    struct RegistryState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool shutting_down{false};
+        size_t active_operations{0};
+        uint64_t next_generation{1};
+        std::unordered_map<std::string, std::shared_ptr<FileState>> paths;
+        std::unordered_map<int, std::shared_ptr<FileState>> fds;
+        std::function<void()> before_open;
+        std::function<void()> before_close;
+        std::function<void(FileOperationForTest)> before_operation_entry;
+        std::function<void(FileOperationForTest)> before_operation;
+        std::function<void()> before_wal_lease;
+        std::atomic<SegmentedReadTestHook> before_segmented_read{nullptr};
+        std::atomic<void*> before_segmented_read_context{nullptr};
+    };
+    struct RegistryIdentity {
+        int fd{-1};
+        uint64_t generation{0};
+    };
+    class RegistryOperation {
+    public:
+        RegistryOperation() = default;
+        explicit RegistryOperation(std::shared_ptr<RegistryState> registry);
+        RegistryOperation(std::shared_ptr<RegistryState> registry, FileOperationForTest entry_operation);
+        ~RegistryOperation();
+        RegistryOperation(RegistryOperation&& other) noexcept;
+        RegistryOperation& operator=(RegistryOperation&& other) noexcept;
+        RegistryOperation(const RegistryOperation&) = delete;
+        RegistryOperation& operator=(const RegistryOperation&) = delete;
+
+        const std::shared_ptr<RegistryState>& registry() const noexcept { return registry_; }
+
+    private:
+        std::shared_ptr<RegistryState> registry_;
+    };
+    struct LogHandle {
+        RegistryIdentity identity;
+        int raw_fd{-1};
+        bool raw_override{false};
+    };
+    FileLease acquire_file_lease(int fd);
+    static FileLease acquire_file_lease(const std::shared_ptr<RegistryState>& registry, int fd,
+                                        bool admitted_before_shutdown = false);
+    FileLease acquire_file_lease(RegistryIdentity identity, bool admitted_before_shutdown = false);
+    static FileLease claim_to_lease(const std::shared_ptr<RegistryState>& registry,
+                                    const std::shared_ptr<FileState>& state, uint64_t generation);
+    static void release_claim(const std::shared_ptr<RegistryState>& registry,
+                              const std::shared_ptr<FileState>& state, uint64_t generation) noexcept;
+    static void release_lease(const std::shared_ptr<RegistryState>& registry,
+                              const std::shared_ptr<FileState>& state, uint64_t generation) noexcept;
+    static std::shared_ptr<FileState> find_open_file_locked(const std::shared_ptr<RegistryState>& registry, int fd);
+    static void remove_state_locked(const std::shared_ptr<RegistryState>& registry,
+                                    const std::shared_ptr<FileState>& state) noexcept;
     // Opens the WAL lazily. The append offset is initialized here, together
     // with the descriptor, so that "log_fd_ != -1" always implies "log_offset_
     // is the real append offset". read_log used to reassign log_offset_ on
     // every call, which left correctness depending on the order in which
     // readers and writers happened to run.
-    void open_log_fd();
+    int open_file_admitted(const std::string& path, const RegistryOperation& operation);
+    void open_log_fd(const RegistryOperation& operation);
+    int read_log_chunk_admitted(char* log_data, int size, int64_t offset, const RegistryOperation& operation);
+    void sync_file_admitted(int fd, const RegistryOperation& operation);
+    LogHandle snapshot_log_handle_locked() const;
     int64_t segmented_log_size_locked() const;
     int open_wal_segment_locked(uint64_t segment, bool create);
     void validate_segmented_layout_locked() const;
     void sync_pending_segment_directory_locked();
 
-    // 文件打开列表，用于记录文件是否被打开
-    std::unordered_map<std::string, int> path2fd_; //<Page文件磁盘路径,Page fd>哈希表
-    std::unordered_map<int, std::string> fd2path_; //<Page fd,Page文件磁盘路径>哈希表
+    std::shared_ptr<RegistryState> registry_{std::make_shared<RegistryState>()};
 
-    int log_fd_ = -1;        // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    mutable std::mutex legacy_wal_latch_;
+    LogHandle log_handle_;
     int64_t log_offset_ = 0; // 日志文件追加偏移
     mutable std::mutex wal_segment_latch_;
     bool wal_segmented_{false};
@@ -237,5 +313,42 @@ private:
     std::unordered_set<uint64_t> pending_segment_directory_sync_;
     std::atomic<uint64_t> log_read_count_{0};
     std::atomic<uint64_t> log_read_bytes_{0};
-    std::atomic<page_id_t> fd2pageno_[MAX_FD]{}; // 文件中已经分配的页面个数，初始值为0
+};
+
+class DiskManager::FileLease {
+public:
+    FileLease() = default;
+    ~FileLease();
+    FileLease(FileLease&&) noexcept;
+    FileLease& operator=(FileLease&&) noexcept;
+    FileLease(const FileLease&) = delete;
+    FileLease& operator=(const FileLease&) = delete;
+    int fd() const noexcept { return state_ ? state_->fd : -1; }
+private:
+    friend class DiskManager;
+    FileLease(std::shared_ptr<RegistryState> registry, std::shared_ptr<FileState> state, uint64_t generation)
+        : registry_(std::move(registry)), state_(std::move(state)), generation_(generation) {}
+    void reset() noexcept;
+    std::shared_ptr<RegistryState> registry_;
+    std::shared_ptr<FileState> state_;
+    uint64_t generation_{0};
+};
+
+class DiskManager::FileWriteClaim {
+public:
+    FileWriteClaim() = default;
+    ~FileWriteClaim();
+    FileWriteClaim(FileWriteClaim&&) noexcept;
+    FileWriteClaim& operator=(FileWriteClaim&&) noexcept;
+    FileWriteClaim(const FileWriteClaim&) = delete;
+    FileWriteClaim& operator=(const FileWriteClaim&) = delete;
+    FileLease acquire_lease();
+private:
+    friend class DiskManager;
+    FileWriteClaim(std::shared_ptr<RegistryState> registry, std::shared_ptr<FileState> state, uint64_t generation)
+        : registry_(std::move(registry)), state_(std::move(state)), generation_(generation) {}
+    void reset() noexcept;
+    std::shared_ptr<RegistryState> registry_;
+    std::shared_ptr<FileState> state_;
+    uint64_t generation_{0};
 };

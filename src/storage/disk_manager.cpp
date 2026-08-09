@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <cerrno>     // for errno
 #include <cstring>
 #include <dirent.h>
+#include <exception>
 #include <fcntl.h>
 #include <functional>
 #include <limits>
@@ -145,6 +146,242 @@ const char* WalReadSnapshot::record_bytes(int64_t offset, uint32_t length, std::
 }
 
 DiskManager::DiskManager() = default;
+
+DiskManager::~DiskManager() {
+    std::unique_lock<std::mutex> lock(registry_->mutex);
+    registry_->shutting_down = true;
+    registry_->cv.wait(lock, [&] {
+        if (registry_->active_operations != 0) return false;
+        for (const auto& entry : registry_->fds) {
+            if (entry.second->claims != 0 || entry.second->leases != 0) return false;
+        }
+        return true;
+    });
+    std::vector<std::shared_ptr<FileState>> files;
+    for (const auto& entry : registry_->fds) {
+        entry.second->state = FileStateKind::Closing;
+        files.push_back(entry.second);
+    }
+    lock.unlock();
+    for (const auto& state : files) (void)close(state->fd);
+    lock.lock();
+    for (const auto& state : files) {
+        remove_state_locked(registry_, state);
+        state->state = FileStateKind::Closed;
+    }
+    registry_->cv.notify_all();
+}
+
+DiskManager::RegistryOperation::RegistryOperation(std::shared_ptr<RegistryState> registry)
+    : registry_(std::move(registry)) {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    if (registry_->shutting_down) throw FileNotOpenError(-1);
+    if (registry_->active_operations == std::numeric_limits<size_t>::max()) {
+        throw InternalError("file registry operation counter overflow");
+    }
+    ++registry_->active_operations;
+}
+DiskManager::RegistryOperation::RegistryOperation(std::shared_ptr<RegistryState> registry,
+                                                  FileOperationForTest entry_operation)
+    : registry_(std::move(registry)) {
+    std::function<void(FileOperationForTest)> hook;
+    bool admitted = false;
+    try {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->shutting_down) throw FileNotOpenError(-1);
+        if (registry_->active_operations == std::numeric_limits<size_t>::max()) {
+            throw InternalError("file registry operation counter overflow");
+        }
+        ++registry_->active_operations;
+        admitted = true;
+        hook = registry_->before_operation_entry;
+    } catch (...) {
+        if (admitted) {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            if (registry_->active_operations != 0) {
+                --registry_->active_operations;
+                registry_->cv.notify_all();
+            }
+        }
+        throw;
+    }
+    try {
+        if (hook) hook(entry_operation);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->active_operations == 0) std::terminate();
+        --registry_->active_operations;
+        registry_->cv.notify_all();
+        throw;
+    }
+}
+DiskManager::RegistryOperation::~RegistryOperation() {
+    if (!registry_) return;
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    if (registry_->active_operations == 0) std::terminate();
+    --registry_->active_operations;
+    registry_->cv.notify_all();
+}
+DiskManager::RegistryOperation::RegistryOperation(RegistryOperation&& other) noexcept = default;
+DiskManager::RegistryOperation& DiskManager::RegistryOperation::operator=(RegistryOperation&& other) noexcept {
+    if (this != &other) {
+        if (registry_) {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            if (registry_->active_operations == 0) std::terminate();
+            --registry_->active_operations;
+            registry_->cv.notify_all();
+        }
+        registry_ = std::move(other.registry_);
+    }
+    return *this;
+}
+
+DiskManager::FileLease::~FileLease() { reset(); }
+DiskManager::FileLease::FileLease(FileLease&& other) noexcept = default;
+DiskManager::FileLease& DiskManager::FileLease::operator=(FileLease&& other) noexcept {
+    if (this != &other) {
+        reset();
+        registry_ = std::move(other.registry_);
+        state_ = std::move(other.state_);
+        generation_ = other.generation_;
+    }
+    return *this;
+}
+void DiskManager::FileLease::reset() noexcept {
+    if (registry_ && state_) DiskManager::release_lease(registry_, state_, generation_);
+    registry_.reset(); state_.reset();
+}
+DiskManager::FileWriteClaim::~FileWriteClaim() { reset(); }
+DiskManager::FileWriteClaim::FileWriteClaim(FileWriteClaim&& other) noexcept = default;
+DiskManager::FileWriteClaim& DiskManager::FileWriteClaim::operator=(FileWriteClaim&& other) noexcept {
+    if (this != &other) {
+        reset();
+        registry_ = std::move(other.registry_);
+        state_ = std::move(other.state_);
+        generation_ = other.generation_;
+    }
+    return *this;
+}
+void DiskManager::FileWriteClaim::reset() noexcept {
+    if (registry_ && state_) DiskManager::release_claim(registry_, state_, generation_);
+    registry_.reset(); state_.reset();
+}
+DiskManager::FileLease DiskManager::FileWriteClaim::acquire_lease() {
+    if (!registry_ || !state_) throw FileNotOpenError(-1);
+    FileLease result = DiskManager::claim_to_lease(registry_, state_, generation_);
+    registry_.reset(); state_.reset();
+    return result;
+}
+
+std::shared_ptr<DiskManager::FileState> DiskManager::find_open_file_locked(
+    const std::shared_ptr<RegistryState>& registry, int fd) {
+    const auto it = registry->fds.find(fd);
+    if (it == registry->fds.end() || it->second->state != FileStateKind::Open) throw FileNotOpenError(fd);
+    return it->second;
+}
+DiskManager::FileLease DiskManager::acquire_file_lease(int fd) {
+    return acquire_file_lease(registry_, fd);
+}
+DiskManager::FileLease DiskManager::acquire_file_lease(const std::shared_ptr<RegistryState>& registry, int fd,
+                                                        bool admitted_before_shutdown) {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (registry->shutting_down && !admitted_before_shutdown) throw FileNotOpenError(fd);
+    auto state = find_open_file_locked(registry, fd);
+    if (state->leases == std::numeric_limits<size_t>::max()) throw InternalError("file lease counter overflow");
+    ++state->leases;
+    const uint64_t generation = state->generation;
+    return FileLease(registry, std::move(state), generation);
+}
+DiskManager::FileLease DiskManager::acquire_file_lease(RegistryIdentity identity, bool admitted_before_shutdown) {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    if (registry_->shutting_down && !admitted_before_shutdown) throw FileNotOpenError(identity.fd);
+    const auto it = registry_->fds.find(identity.fd);
+    if (it == registry_->fds.end() || it->second->generation != identity.generation ||
+        it->second->state != FileStateKind::Open) {
+        throw FileNotOpenError(identity.fd);
+    }
+    auto state = it->second;
+    if (state->leases == std::numeric_limits<size_t>::max()) throw InternalError("file lease counter overflow");
+    ++state->leases;
+    return FileLease(registry_, std::move(state), identity.generation);
+}
+DiskManager::FileWriteClaim DiskManager::acquire_file_write_claim(int fd) {
+    RegistryOperation operation(registry_, FileOperationForTest::Claim);
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    auto state = find_open_file_locked(registry_, fd);
+    if (state->claims == std::numeric_limits<size_t>::max()) throw InternalError("file claim counter overflow");
+    ++state->claims;
+    const uint64_t generation = state->generation;
+    return FileWriteClaim(registry_, std::move(state), generation);
+}
+void DiskManager::set_file_lifecycle_test_hooks(std::function<void()> before_open, std::function<void()> before_close) {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->before_open = std::move(before_open);
+    registry_->before_close = std::move(before_close);
+}
+void DiskManager::set_file_operation_test_hook(std::function<void(FileOperationForTest)> hook) {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->before_operation = std::move(hook);
+}
+void DiskManager::set_file_operation_entry_test_hook(std::function<void(FileOperationForTest)> hook) {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->before_operation_entry = std::move(hook);
+}
+void DiskManager::set_segmented_read_test_hook(SegmentedReadTestHook hook, void* context) {
+    // This is a quiescent-manager test seam: publishing the context before the
+    // callback keeps the read path to one cold atomic callback check.
+    registry_->before_segmented_read_context.store(context, std::memory_order_relaxed);
+    registry_->before_segmented_read.store(hook, std::memory_order_release);
+}
+void DiskManager::set_wal_lease_test_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->before_wal_lease = std::move(hook);
+}
+DiskManager::FileIdentityForTest DiskManager::capture_file_identity_for_test(int fd) {
+    RegistryOperation operation(registry_);
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    const auto state = find_open_file_locked(registry_, fd);
+    return FileIdentityForTest{fd, state->generation};
+}
+bool DiskManager::stale_file_identity_rejected_for_test(FileIdentityForTest identity) {
+    try {
+        auto lease = acquire_file_lease(RegistryIdentity{identity.fd, identity.generation});
+        return false;
+    } catch (const FileNotOpenError&) {
+        return true;
+    }
+}
+DiskManager::FileLease DiskManager::claim_to_lease(const std::shared_ptr<RegistryState>& registry,
+                                                   const std::shared_ptr<FileState>& state, uint64_t generation) {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    const auto it = registry->fds.find(state->fd);
+    if (it == registry->fds.end() || it->second != state || state->generation != generation ||
+        (state->state != FileStateKind::Open && state->state != FileStateKind::Closing) || state->claims == 0 ||
+        state->leases == std::numeric_limits<size_t>::max())
+        throw FileNotOpenError(state->fd);
+    --state->claims; ++state->leases;
+    return FileLease(registry, state, generation);
+}
+void DiskManager::release_claim(const std::shared_ptr<RegistryState>& registry, const std::shared_ptr<FileState>& state,
+                                uint64_t generation) noexcept {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (state->generation != generation || state->claims == 0) std::terminate();
+    --state->claims; registry->cv.notify_all();
+}
+void DiskManager::release_lease(const std::shared_ptr<RegistryState>& registry, const std::shared_ptr<FileState>& state,
+                                uint64_t generation) noexcept {
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (state->generation != generation || state->leases == 0) std::terminate();
+    --state->leases; registry->cv.notify_all();
+}
+
+void DiskManager::remove_state_locked(const std::shared_ptr<RegistryState>& registry,
+                                      const std::shared_ptr<FileState>& state) noexcept {
+    const auto fd_it = registry->fds.find(state->fd);
+    if (fd_it != registry->fds.end() && fd_it->second == state) registry->fds.erase(fd_it);
+    const auto path_it = registry->paths.find(state->path);
+    if (path_it != registry->paths.end() && path_it->second == state) registry->paths.erase(path_it);
+}
 
 std::string DiskManager::wal_segment_name(uint64_t segment) const {
     return SegmentedWalName(wal_generation_, segment);
@@ -303,14 +540,17 @@ void DiskManager::ensure_segmented_wal_root() {
  * @param {int} num_bytes 要写入磁盘的数据大小
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int num_bytes) {
+    RegistryOperation operation(registry_, FileOperationForTest::Write);
     // Todo:
     // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
     // 2.调用write()函数
     // 注意write返回值与num_bytes不等时 throw InternalError("DiskManager::write_page Error");
-    if (fd2path_.count(fd) == 0) {
-        throw FileNotOpenError(fd);
-    }
-    WritePageAt(fd, page_no, offset, num_bytes);
+    const FileLease lease = acquire_file_lease(operation.registry(), fd, true);
+    std::function<void(FileOperationForTest)> hook;
+    { std::lock_guard<std::mutex> lock(operation.registry()->mutex); hook = operation.registry()->before_operation; }
+    if (hook) hook(FileOperationForTest::Write);
+    FaultInjector::Point("during_data_page_pwrite");
+    WritePageAt(lease.fd(), page_no, offset, num_bytes);
 }
 
 /**
@@ -321,14 +561,17 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
  * @param {int} num_bytes 读取的数据量大小
  */
 void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_bytes) {
+    RegistryOperation operation(registry_, FileOperationForTest::Read);
     // Todo:
     // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
     // 2.调用read()函数
     // 注意read返回值与num_bytes不等时，throw InternalError("DiskManager::read_page Error");
-    if (fd2path_.count(fd) == 0) {
-        throw FileNotOpenError(fd);
-    }
-    ReadPageAt(fd, page_no, offset, num_bytes);
+    const FileLease lease = acquire_file_lease(operation.registry(), fd, true);
+    std::function<void(FileOperationForTest)> hook;
+    { std::lock_guard<std::mutex> lock(operation.registry()->mutex); hook = operation.registry()->before_operation; }
+    if (hook) hook(FileOperationForTest::Read);
+    FaultInjector::Point("during_data_page_pread");
+    ReadPageAt(lease.fd(), page_no, offset, num_bytes);
 }
 
 /**
@@ -337,9 +580,10 @@ void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_byt
  * @param {int} fd 指定文件的文件句柄
  */
 page_id_t DiskManager::allocate_page(int fd) {
+    RegistryOperation operation(registry_);
     // 简单的自增分配策略，指定文件的页面编号加1
-    assert(fd >= 0 && fd < MAX_FD);
-    return fd2pageno_[fd]++;
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    return find_open_file_locked(registry_, fd)->next_page_no++;
 }
 
 void DiskManager::deallocate_page(__attribute__((unused)) page_id_t page_id) {}
@@ -404,22 +648,31 @@ void DiskManager::create_file(const std::string& path) {
  * @param {string} &path 文件所在路径
  */
 void DiskManager::destroy_file(const std::string& path) {
-    // Todo:
-    // 调用unlink()函数
-    // 注意不能删除未关闭的文件
-    if (path2fd_.count(path)) {
-        throw FileNotClosedError(path);
+    RegistryOperation operation(registry_);
+    std::shared_ptr<FileState> state;
+    {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->paths.count(path)) throw FileNotClosedError(path);
+        state = std::make_shared<FileState>();
+        state->path = path; state->state = FileStateKind::Deleting;
+        if (registry_->next_generation == std::numeric_limits<uint64_t>::max())
+            throw InternalError("file generation overflow");
+        state->generation = registry_->next_generation++;
+        registry_->paths.emplace(path, state);
     }
     if (is_file(path) == 0) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        remove_state_locked(registry_, state);
         throw FileNotFoundError(path);
     }
     if (unlink(path.c_str()) < 0) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        remove_state_locked(registry_, state);
         throw UnixError();
     }
-    int fd = path2fd_[path];
-    path2fd_.erase(path);
-    fd2path_.erase(fd);
-    fd2pageno_[fd] = 0;
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    remove_state_locked(registry_, state);
+    registry_->cv.notify_all();
 }
 
 /**
@@ -428,19 +681,62 @@ void DiskManager::destroy_file(const std::string& path) {
  * @param {string} &path 文件所在路径
  */
 int DiskManager::open_file(const std::string& path) {
-    // Todo:
-    // 调用open()函数，使用O_RDWR模式
-    // 注意不能重复打开相同文件，并且需要更新文件打开列表
-    if (is_file(path) == 0) {
-        throw FileNotFoundError(path);
+    RegistryOperation operation(registry_);
+    return open_file_admitted(path, operation);
+}
+
+int DiskManager::open_file_admitted(const std::string& path, const RegistryOperation& operation) {
+    const auto& registry = operation.registry();
+    std::shared_ptr<FileState> state;
+    {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        const auto it = registry->paths.find(path);
+        if (it != registry->paths.end()) {
+            if (it->second->state == FileStateKind::Open) return it->second->fd;
+            throw FileNotOpenError(it->second->fd);
+        }
+        if (registry->next_generation == std::numeric_limits<uint64_t>::max()) {
+            throw InternalError("file generation overflow");
+        }
+        state = std::make_shared<FileState>();
+        state->path = path; state->generation = registry->next_generation++;
+        registry->paths.emplace(path, state);
     }
-    int fd = -1;
-    if (path2fd_.find(path) == path2fd_.end()) {
-        fd = open(path.c_str(), O_RDWR);
-        path2fd_[path] = fd;
-        fd2path_[fd] = path;
-    } else {
-        return path2fd_[path];
+    auto rollback = [&]() noexcept {
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        remove_state_locked(registry, state);
+        registry->cv.notify_all();
+    };
+    if (!is_file(path)) { rollback(); throw FileNotFoundError(path); }
+    std::function<void()> before_open;
+    try { std::lock_guard<std::mutex> lock(registry->mutex); before_open = registry->before_open; }
+    catch (...) { rollback(); throw; }
+    try { if (before_open) before_open(); }
+    catch (...) { rollback(); throw; }
+    const int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0 || fd >= MAX_FD) {
+        if (fd >= MAX_FD) close(fd);
+        rollback();
+        if (fd >= MAX_FD) throw InternalError("DiskManager::open_file fd exceeds MAX_FD");
+        throw UnixError();
+    }
+    bool abandon = false;
+    try {
+        std::unique_lock<std::mutex> lock(registry->mutex);
+        while (registry->fds.find(fd) != registry->fds.end()) {
+            registry->cv.wait(lock, [&] {
+                return registry->fds.find(fd) == registry->fds.end();
+            });
+        }
+        abandon = registry->paths.find(path) == registry->paths.end() || registry->paths.find(path)->second != state;
+        if (!abandon) { state->fd = fd; state->state = FileStateKind::Open; registry->fds.emplace(fd, state); }
+    } catch (...) { const int saved_errno = errno; close(fd); errno = saved_errno; rollback(); throw; }
+    if (abandon) {
+        const int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        rollback();
+        throw FileNotOpenError(fd);
     }
     return fd;
 }
@@ -450,17 +746,37 @@ int DiskManager::open_file(const std::string& path) {
  * @param {int} fd 打开的文件的文件句柄
  */
 void DiskManager::close_file(int fd) {
-    // Todo:
-    // 调用close()函数
-    // 注意不能关闭未打开的文件，并且需要更新文件打开列表
-    if (fd2path_.find(fd) != fd2path_.end()) {
-        close(fd);
-        const std::string path = fd2path_[fd];
-        path2fd_.erase(path);
-        fd2path_.erase(fd);
-    } else {
-        throw FileNotOpenError(fd);
+    RegistryOperation operation(registry_);
+    std::shared_ptr<FileState> state;
+    { std::unique_lock<std::mutex> lock(registry_->mutex); state = find_open_file_locked(registry_, fd);
+      state->state = FileStateKind::Closing;
+      registry_->cv.wait(lock, [&] { return state->claims == 0 && state->leases == 0; }); }
+    std::function<void()> before_close;
+    try { std::lock_guard<std::mutex> lock(registry_->mutex); before_close = registry_->before_close; }
+    catch (...) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        state->state = FileStateKind::Open;
+        registry_->cv.notify_all();
+        throw;
     }
+    try { if (before_close) before_close(); }
+    catch (...) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        state->state = FileStateKind::Open;
+        registry_->cv.notify_all();
+        throw;
+    }
+    const int result = close(fd); const int saved_errno = errno;
+    std::exception_ptr hook_failure;
+    try {
+        std::function<void(FileOperationForTest)> hook;
+        { std::lock_guard<std::mutex> lock(registry_->mutex); hook = registry_->before_operation; }
+        if (hook) hook(FileOperationForTest::CloseAfterSyscall);
+    } catch (...) { hook_failure = std::current_exception(); }
+    { std::lock_guard<std::mutex> lock(registry_->mutex);
+      remove_state_locked(registry_, state); state->state = FileStateKind::Closed; registry_->cv.notify_all(); }
+    if (hook_failure) std::rethrow_exception(hook_failure);
+    if (result != 0) { errno = saved_errno; throw UnixError(); }
 }
 
 /**
@@ -497,10 +813,9 @@ int64_t DiskManager::get_file_size(int fd) {
  * @param {int} fd 文件句柄
  */
 std::string DiskManager::get_file_name(int fd) {
-    if (!fd2path_.count(fd)) {
-        throw FileNotOpenError(fd);
-    }
-    return fd2path_[fd];
+    RegistryOperation operation(registry_);
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    return find_open_file_locked(registry_, fd)->path;
 }
 
 /**
@@ -509,78 +824,97 @@ std::string DiskManager::get_file_name(int fd) {
  * @param {string} &file_name 文件名
  */
 int DiskManager::get_file_fd(const std::string& file_name) {
-    if (!path2fd_.count(file_name)) {
-        return open_file(file_name);
-    }
-    return path2fd_[file_name];
+    RegistryOperation operation(registry_);
+    { std::lock_guard<std::mutex> lock(registry_->mutex);
+      const auto it = registry_->paths.find(file_name);
+      if (it != registry_->paths.end() && it->second->state == FileStateKind::Open) return it->second->fd; }
+    return open_file_admitted(file_name, operation);
 }
 
-void DiskManager::open_log_fd() {
-    if (log_fd_ != -1) {
+void DiskManager::open_log_fd(const RegistryOperation& operation) {
+    std::lock_guard<std::mutex> log_lock(legacy_wal_latch_);
+    if (log_handle_.raw_override && log_handle_.raw_fd != -1) {
         return;
     }
-
-    int local_fd = -1;
-    bool opened_here = false;
-    bool path_registered = false;
-    bool fd_registered = false;
-    try {
-        const auto existing = path2fd_.find(LOG_FILE_NAME);
-        if (existing != path2fd_.end()) {
-            local_fd = existing->second;
-        } else {
-            if (!is_file(LOG_FILE_NAME)) {
-                throw FileNotFoundError(LOG_FILE_NAME);
-            }
-            local_fd = open(LOG_FILE_NAME.c_str(), O_RDWR);
-            if (local_fd < 0) {
-                throw UnixError();
-            }
-            opened_here = true;
-        }
-
-        // Keep both published WAL fields and the fd bookkeeping untouched until
-        // the descriptor has yielded a valid append offset.
-        const int64_t local_offset = get_file_size(local_fd);
-        if (opened_here) {
-            if (!path2fd_.emplace(LOG_FILE_NAME, local_fd).second) {
-                throw InternalError("DiskManager::open_log_fd found duplicate WAL path bookkeeping");
-            }
-            path_registered = true;
-            if (!fd2path_.emplace(local_fd, LOG_FILE_NAME).second) {
-                throw InternalError("DiskManager::open_log_fd found duplicate WAL descriptor bookkeeping");
-            }
-            fd_registered = true;
-        }
-        log_fd_ = local_fd;
-        log_offset_ = local_offset;
-    } catch (...) {
-        if (fd_registered) {
-            fd2path_.erase(local_fd);
-        }
-        if (path_registered) {
-            path2fd_.erase(LOG_FILE_NAME);
-        }
-        if (opened_here) {
-            const int original_errno = errno;
-            (void)close(local_fd);
-            errno = original_errno;
-        }
-        throw;
+    if (!log_handle_.raw_override && log_handle_.identity.fd >= 0) return;
+    const int local_fd = open_file_admitted(LOG_FILE_NAME, operation);
+    FileLease lease = acquire_file_lease(operation.registry(), local_fd, true);
+    const int64_t local_offset = get_file_size(lease.fd());
+    {
+        std::lock_guard<std::mutex> registry_lock(operation.registry()->mutex);
+        const auto state = find_open_file_locked(operation.registry(), local_fd);
+        log_handle_.identity = RegistryIdentity{local_fd, state->generation};
     }
+    log_handle_.raw_override = false;
+    log_handle_.raw_fd = -1;
+    log_offset_ = local_offset;
+}
+
+DiskManager::LogHandle DiskManager::snapshot_log_handle_locked() const { return log_handle_; }
+
+void DiskManager::SetLogOffset(int64_t log_offset) {
+    std::lock_guard<std::mutex> log_lock(legacy_wal_latch_);
+    log_offset_ = log_offset;
+}
+
+void DiskManager::SetLogFd(int log_fd) {
+    RegistryOperation operation(registry_);
+    std::lock_guard<std::mutex> log_lock(legacy_wal_latch_);
+    if (log_fd >= 0) {
+        std::lock_guard<std::mutex> registry_lock(registry_->mutex);
+        const auto state = find_open_file_locked(registry_, log_fd);
+        log_handle_.identity = RegistryIdentity{log_fd, state->generation};
+        log_handle_.raw_override = false;
+        log_handle_.raw_fd = -1;
+        return;
+    }
+    log_handle_ = LogHandle{};
+    log_handle_.raw_override = true;
+    log_handle_.raw_fd = log_fd;
+}
+int DiskManager::GetLogFd() {
+    std::lock_guard<std::mutex> log_lock(legacy_wal_latch_);
+    return log_handle_.raw_override ? log_handle_.raw_fd : log_handle_.identity.fd;
+}
+void DiskManager::set_fd2pageno(int fd, int start_page_no) {
+    RegistryOperation operation(registry_);
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    find_open_file_locked(registry_, fd)->next_page_no = start_page_no;
+}
+page_id_t DiskManager::get_fd2pageno(int fd) {
+    RegistryOperation operation(registry_);
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    return find_open_file_locked(registry_, fd)->next_page_no;
 }
 
 int64_t DiskManager::get_log_file_size() {
+    RegistryOperation operation(registry_);
     std::lock_guard<std::mutex> segmented_lock(wal_segment_latch_);
     if (wal_segmented_) {
         return log_offset_;
     }
-    open_log_fd();
-    if (log_fd_ < 0) {
-        throw InternalError("DiskManager::get_log_file_size has an invalid WAL descriptor: " +
-                            std::to_string(log_fd_));
+    open_log_fd(operation);
+    std::lock_guard<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    std::function<void()> before_wal_lease;
+    { std::lock_guard<std::mutex> registry_lock(registry_->mutex); before_wal_lease = registry_->before_wal_lease; }
+    if (before_wal_lease) before_wal_lease();
+    FileLease lease;
+    int fd = handle.raw_override ? handle.raw_fd : -1;
+    if (!handle.raw_override) {
+        try {
+            lease = acquire_file_lease(handle.identity, true);
+            fd = lease.fd();
+        } catch (const FileNotOpenError&) {
+            throw InternalError("DiskManager::get_file_size(fstat) failed for closed WAL descriptor " +
+                                std::to_string(handle.identity.fd));
+        }
     }
-    return get_file_size(log_fd_);
+    if (fd < 0) {
+        throw InternalError("DiskManager::get_log_file_size has an invalid WAL descriptor: " +
+                            std::to_string(fd));
+    }
+    return get_file_size(fd);
 }
 
 /**
@@ -591,12 +925,17 @@ int64_t DiskManager::get_log_file_size() {
  * @param {int64_t} offset 读取的内容在文件中的位置
  */
 int DiskManager::read_log(char* log_data, int size, int64_t offset) {
+    RegistryOperation operation(registry_);
     if (wal_is_segmented()) {
-        return read_log_chunk(log_data, size, offset);
+        return read_log_chunk_admitted(log_data, size, offset, operation);
     }
     // read log file from the previous end
-    open_log_fd();
-    const int64_t file_size = get_log_file_size();
+    open_log_fd(operation);
+    std::unique_lock<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    FileLease lease;
+    const int fd = handle.raw_override ? handle.raw_fd : (lease = acquire_file_lease(handle.identity, true)).fd();
+    const int64_t file_size = get_file_size(fd);
     if (offset > file_size) {
         return -1;
     }
@@ -612,7 +951,7 @@ int DiskManager::read_log(char* log_data, int size, int64_t offset) {
     int bytes_read = 0;
     while (bytes_read < size) {
         const ssize_t count =
-            pread(log_fd_, log_data + bytes_read, static_cast<size_t>(size - bytes_read), offset + bytes_read);
+            pread(fd, log_data + bytes_read, static_cast<size_t>(size - bytes_read), offset + bytes_read);
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
@@ -630,6 +969,12 @@ int DiskManager::read_log(char* log_data, int size, int64_t offset) {
 }
 
 int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
+    RegistryOperation operation(registry_);
+    return read_log_chunk_admitted(log_data, size, offset, operation);
+}
+
+int DiskManager::read_log_chunk_admitted(char* log_data, int size, int64_t offset,
+                                         const RegistryOperation& operation) {
     if (size <= 0 || offset < 0) {
         return 0;
     }
@@ -646,6 +991,9 @@ int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
     }
     if (segment_bytes != 0) {
         if (offset >= file_size) return 0;
+        if (const auto hook = operation.registry()->before_segmented_read.load(std::memory_order_acquire)) {
+            hook(operation.registry()->before_segmented_read_context.load(std::memory_order_relaxed));
+        }
         const int wanted = static_cast<int>(std::min<int64_t>(size, file_size - offset));
         int bytes_read = 0;
         while (bytes_read < wanted) {
@@ -678,11 +1026,15 @@ int DiskManager::read_log_chunk(char* log_data, int size, int64_t offset) {
         log_read_bytes_.fetch_add(static_cast<uint64_t>(bytes_read), std::memory_order_relaxed);
         return bytes_read;
     }
-    open_log_fd();
+    open_log_fd(operation);
+    std::unique_lock<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    FileLease lease;
+    const int fd = handle.raw_override ? handle.raw_fd : (lease = acquire_file_lease(handle.identity, true)).fd();
     int bytes_read = 0;
     while (bytes_read < size) {
         const ssize_t count =
-            pread(log_fd_, log_data + bytes_read, static_cast<size_t>(size - bytes_read), offset + bytes_read);
+            pread(fd, log_data + bytes_read, static_cast<size_t>(size - bytes_read), offset + bytes_read);
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
@@ -785,6 +1137,7 @@ std::unique_ptr<WalReadSnapshot> DiskManager::create_wal_read_snapshot(int64_t b
  * @param {int} size 要写入的内容大小
  */
 void DiskManager::write_log(char* log_data, int size) {
+    RegistryOperation operation(registry_);
     std::unique_lock<std::mutex> segmented_lock(wal_segment_latch_);
     if (wal_segmented_) {
         if (size < 0) throw InternalError("negative WAL write size");
@@ -837,14 +1190,18 @@ void DiskManager::write_log(char* log_data, int size) {
         return;
     }
     segmented_lock.unlock();
-    open_log_fd();
+    open_log_fd(operation);
+    std::unique_lock<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    FileLease lease;
+    const int fd = handle.raw_override ? handle.raw_fd : (lease = acquire_file_lease(handle.identity, true)).fd();
 
     // write from the file_end
     FaultInjector::Point("during_wal_pwrite");
     const int64_t begin_offset = log_offset_;
     int bytes_write = 0;
     while (bytes_write < size) {
-        const ssize_t count = pwrite(log_fd_, log_data + bytes_write, static_cast<size_t>(size - bytes_write),
+        const ssize_t count = pwrite(fd, log_data + bytes_write, static_cast<size_t>(size - bytes_write),
                                      static_cast<off_t>(begin_offset + bytes_write));
         if (count < 0 && errno == EINTR) {
             continue;
@@ -861,6 +1218,7 @@ void DiskManager::write_log(char* log_data, int size) {
 }
 
 void DiskManager::fsync_log() {
+    RegistryOperation operation(registry_);
     std::unique_lock<std::mutex> segmented_lock(wal_segment_latch_);
     if (wal_segmented_) {
         FaultInjector::Point("before_wal_fsync");
@@ -878,18 +1236,41 @@ void DiskManager::fsync_log() {
     }
     segmented_lock.unlock();
     FaultInjector::Point("before_wal_fsync");
-    if (log_fd_ != -1 && fdatasync(log_fd_) != 0) {
+    open_log_fd(operation);
+    std::unique_lock<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    FileLease lease;
+    const int fd = handle.raw_override ? handle.raw_fd : (lease = acquire_file_lease(handle.identity, true)).fd();
+    if (fd != -1 && fdatasync(fd) != 0) {
         throw UnixError();
     }
     FaultInjector::Point("after_wal_fsync");
 }
 
 void DiskManager::sync_file(int fd) {
+    RegistryOperation operation(registry_, FileOperationForTest::Sync);
+    sync_file_admitted(fd, operation);
+}
+
+void DiskManager::sync_file_admitted(int fd, const RegistryOperation& operation) {
     FaultInjector::Point("before_data_fsync");
     if (fd < 0) {
         errno = EBADF;
         throw UnixError();
     }
+    FileLease lease;
+    try {
+        lease = acquire_file_lease(operation.registry(), fd, true);
+        fd = lease.fd();
+    } catch (const FileNotOpenError&) {
+        // Raw descriptors are accepted only when the registry has no entry:
+        // a Closing entry may have released its OS number already.
+        std::lock_guard<std::mutex> lock(operation.registry()->mutex);
+        if (operation.registry()->fds.find(fd) != operation.registry()->fds.end()) throw;
+    }
+    std::function<void(FileOperationForTest)> hook;
+    { std::lock_guard<std::mutex> lock(operation.registry()->mutex); hook = operation.registry()->before_operation; }
+    if (hook) hook(FileOperationForTest::Sync);
     for (;;) {
         const int result = fdatasync(fd);
         if (result == 0) {
@@ -902,12 +1283,13 @@ void DiskManager::sync_file(int fd) {
 }
 
 void DiskManager::sync_path(const std::string& path) {
+    RegistryOperation operation(registry_);
     int fd = open(path.c_str(), O_RDWR);
     if (fd < 0) {
         throw UnixError();
     }
     try {
-        sync_file(fd);
+        sync_file_admitted(fd, operation);
     } catch (...) {
         close(fd);
         throw;
@@ -933,22 +1315,27 @@ void DiskManager::sync_directory(const std::string& path) {
 }
 
 void DiskManager::truncate_log() {
+    RegistryOperation operation(registry_);
     if (wal_is_segmented()) {
         // Batch 1 deliberately does not reclaim or switch generations. A
         // segmented clean-reset must publish a new v2 manifest before any old
         // segment can be removed, which is Batch 2's responsibility.
         throw InternalError("segmented WAL reset requires manifest-backed generation switch");
     }
-    open_log_fd();
-    if (log_fd_ != -1) {
-        if (ftruncate(log_fd_, 0) != 0) {
+    open_log_fd(operation);
+    std::unique_lock<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    FileLease lease;
+    const int fd = handle.raw_override ? handle.raw_fd : (lease = acquire_file_lease(handle.identity, true)).fd();
+    if (fd != -1) {
+        if (ftruncate(fd, 0) != 0) {
             throw UnixError();
         }
         FaultInjector::Point("after_wal_ftruncate");
         // final.md tests same-machine SIGKILL, which preserves the in-kernel
         // zero length. The first post-checkpoint WAL fdatasync also persists
         // this size change before acknowledging its COMMIT.
-        if (lseek(log_fd_, 0, SEEK_SET) < 0) {
+        if (lseek(fd, 0, SEEK_SET) < 0) {
             throw UnixError();
         }
     }
@@ -956,6 +1343,7 @@ void DiskManager::truncate_log() {
 }
 
 void DiskManager::truncate_log_to(int64_t offset) {
+    RegistryOperation operation(registry_);
     if (offset < 0) {
         throw InternalError("negative WAL truncation offset");
     }
@@ -1017,14 +1405,18 @@ void DiskManager::truncate_log_to(int64_t offset) {
         log_offset_ = offset;
         return;
     }
-    open_log_fd();
-    if (ftruncate(log_fd_, static_cast<off_t>(offset)) != 0) {
+    open_log_fd(operation);
+    std::unique_lock<std::mutex> log_lock(legacy_wal_latch_);
+    const LogHandle handle = snapshot_log_handle_locked();
+    FileLease lease;
+    const int fd = handle.raw_override ? handle.raw_fd : (lease = acquire_file_lease(handle.identity, true)).fd();
+    if (ftruncate(fd, static_cast<off_t>(offset)) != 0) {
         throw UnixError();
     }
-    if (fdatasync(log_fd_) != 0) {
+    if (fdatasync(fd) != 0) {
         throw UnixError();
     }
-    if (lseek(log_fd_, static_cast<off_t>(offset), SEEK_SET) < 0) {
+    if (lseek(fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
         throw UnixError();
     }
     log_offset_ = offset;

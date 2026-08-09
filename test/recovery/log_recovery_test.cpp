@@ -24,13 +24,19 @@ See the Mulan PSL v2 for more details. */
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sys/wait.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -141,9 +147,9 @@ void CreateSegmentRecoveryTestDb(const std::string& db_name) {
 
 class OpenRecoveryDb {
 public:
-    explicit OpenRecoveryDb(const std::string& db_name)
-        : bpm_(64, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_), sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_),
-          log_mgr_(std::make_unique<LogManager>(&disk_)) {
+    explicit OpenRecoveryDb(const std::string& db_name, size_t pool_size = 64)
+        : bpm_(pool_size, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_),
+          sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_), log_mgr_(std::make_unique<LogManager>(&disk_)) {
         sm_mgr_.open_db(db_name);
         bpm_.set_log_manager(log_mgr_.get());
     }
@@ -161,6 +167,65 @@ public:
     SmManager sm_mgr_;
     std::unique_ptr<LogManager> log_mgr_;
     bool opened_{true};
+};
+
+class ScopedEnvironmentValue {
+public:
+    ScopedEnvironmentValue(const char* name, const char* value) : name_(name) {
+        const char* previous = getenv(name_);
+        had_previous_ = previous != nullptr;
+        if (had_previous_)
+            previous_ = previous;
+        const int result = value == nullptr ? unsetenv(name_) : setenv(name_, value, 1);
+        if (result != 0)
+            throw std::runtime_error("could not set test environment value");
+    }
+
+    ~ScopedEnvironmentValue() {
+        if (had_previous_) {
+            (void)setenv(name_, previous_.c_str(), 1);
+        } else {
+            (void)unsetenv(name_);
+        }
+    }
+
+    ScopedEnvironmentValue(const ScopedEnvironmentValue&) = delete;
+    ScopedEnvironmentValue& operator=(const ScopedEnvironmentValue&) = delete;
+
+private:
+    const char* name_;
+    bool had_previous_{false};
+    std::string previous_;
+};
+
+class ScopedThrowFaultPoint {
+public:
+    explicit ScopedThrowFaultPoint(const char* point)
+        : point_("RMDB_FAULT_POINT", point), action_("RMDB_FAULT_ACTION", "throw"), skip_("RMDB_FAULT_SKIP", nullptr) {
+        FaultInjector::ResetForTest();
+    }
+
+    ~ScopedThrowFaultPoint() {
+        FaultInjector::ResetForTest();
+    }
+
+private:
+    ScopedEnvironmentValue point_;
+    ScopedEnvironmentValue action_;
+    ScopedEnvironmentValue skip_;
+};
+
+class ScopedBpmFinalizeHooks {
+public:
+    explicit ScopedBpmFinalizeHooks(BufferPoolManager* bpm) : bpm_(bpm) {}
+    ~ScopedBpmFinalizeHooks() {
+        bpm_->set_replacement_io_test_hook({});
+        bpm_->set_load_io_test_hook({});
+        bpm_->set_frame_operation_gate_test_hook({});
+    }
+
+private:
+    BufferPoolManager* bpm_;
 };
 
 lsn_t AppendBegin(LogManager& log_mgr, txn_id_t txn_id) {
@@ -226,20 +291,84 @@ void RunRecovery(const std::string& db_name) {
     recovery->undo();
 }
 
-int RunRecoveryAfterInjectedProcessDeath(const std::string& db_name, const char* point) {
+void RunPreparedRecovery(const std::string& db_name, size_t pool_size = 64) {
+    OpenRecoveryDb db(db_name, pool_size);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.prepare_pages_for_redo();
+    recovery.redo();
+    recovery.undo();
+}
+
+void CreatePhysicalFinalizeSeed(const std::string& db_name) {
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    OpenRecoveryDb db(db_name);
+    RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+    for (page_id_t page_no = 1; page_no <= 4; ++page_no) {
+        RmPageHandle page = file_handle->create_new_page_handle();
+        if (page.page->get_page_id().page_no != page_no || !db.bpm_.unpin_page(page.page->get_page_id(), true)) {
+            throw std::runtime_error("could not create physical page-finalize seed page");
+        }
+    }
+    if (!db.bpm_.flush_all_pages(file_handle->GetFd())) {
+        throw std::runtime_error("could not flush physical page-finalize seed pages");
+    }
+    lsn_t lsn = AppendBegin(*db.log_mgr_, 800);
+    for (page_id_t page_no = 1; page_no <= 2; ++page_no) {
+        auto record = MakeTuple(800 + page_no, 8000 + page_no);
+        lsn = AppendInsert(*db.log_mgr_, 800, lsn, Rid{page_no, 0}, record);
+    }
+    AppendCommit(*db.log_mgr_, 800, lsn);
+    FlushLogs(*db.log_mgr_);
+}
+
+void InstallDirtyFinalizeVictims(OpenRecoveryDb& db) {
+    RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+    if (!db.bpm_.flush_all_pages(file_handle->GetFd())) {
+        throw std::runtime_error("could not flush physical finalize targets");
+    }
+    Page* first = db.bpm_.fetch_page(PageId{file_handle->GetFd(), 3});
+    if (first == nullptr)
+        throw std::runtime_error("could not pin first dirty finalize victim");
+    Page* second = db.bpm_.fetch_page(PageId{file_handle->GetFd(), 4});
+    if (second == nullptr) {
+        (void)db.bpm_.unpin_page(first->get_page_id(), false);
+        throw std::runtime_error("could not pin second dirty finalize victim");
+    }
+    {
+        std::unique_lock first_lock(first->latch());
+        BufferPoolManager::mark_dirty_locked(first);
+    }
+    {
+        std::unique_lock second_lock(second->latch());
+        BufferPoolManager::mark_dirty_locked(second);
+    }
+    if (!db.bpm_.unpin_page(first->get_page_id(), false) || !db.bpm_.unpin_page(second->get_page_id(), false)) {
+        throw std::runtime_error("could not release dirty finalize victims");
+    }
+}
+
+int RunRecoveryAfterInjectedProcessDeath(const std::string& db_name, const char* point,
+                                         bool prepare_pages_for_redo = false, int skip_count = 0,
+                                         size_t pool_size = 64) {
 #ifndef RMDB_ENABLE_FAULT_INJECTION
     (void)db_name;
     (void)point;
+    (void)prepare_pages_for_redo;
+    (void)skip_count;
+    (void)pool_size;
     return -1;
 #else
     // _exit(137) is the FaultInjector's deterministic crash action. Using it
     // avoids racing a SIGKILL against the block action, which has no
     // ready-at-point notification. The child still disappears without running
     // recovery cleanup, so the following process exercises the same replay.
+    const std::string skip = std::to_string(skip_count);
     if (setenv("RMDB_FAULT_POINT", point, 1) != 0 || setenv("RMDB_FAULT_ACTION", "_exit", 1) != 0 ||
-        unsetenv("RMDB_FAULT_SKIP") != 0) {
+        (skip_count > 0 ? setenv("RMDB_FAULT_SKIP", skip.c_str(), 1) : unsetenv("RMDB_FAULT_SKIP")) != 0) {
         return -1;
     }
+    FaultInjector::ResetForTest();
 
     const pid_t child = fork();
     if (child == -1) {
@@ -248,7 +377,11 @@ int RunRecoveryAfterInjectedProcessDeath(const std::string& db_name, const char*
         return -1;
     }
     if (child == 0) {
-        RunRecovery(db_name);
+        if (prepare_pages_for_redo) {
+            RunPreparedRecovery(db_name, pool_size);
+        } else {
+            RunRecovery(db_name);
+        }
         _exit(0);
     }
 
@@ -685,6 +818,9 @@ TEST(RecoveryManagerTest, AnalyzeReportsWalCompositionWithoutExtraScan) {
     PrepareSinglePageIndexSmo(db_name, 61, Rid{1, 61}, false, false, 3);
 
     OpenRecoveryDb db(db_name);
+    // A new process must establish the WAL append frontier before appending;
+    // otherwise a fresh LogManager would reuse LSN 0 after the SMO fixture.
+    db.log_mgr_->initialize_from_existing_log();
     const txn_id_t txn_id = 717;
     auto tuple = MakeTuple(61, 610);
     const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, txn_id);
@@ -701,9 +837,12 @@ TEST(RecoveryManagerTest, AnalyzeReportsWalCompositionWithoutExtraScan) {
         ++expected_counts[type];
         expected_bytes[type] += record.total_len;
     }
+    const uint64_t expected_analyze_reads = reader.read_count();
+    const uint64_t reads_before_analyze = db.disk_.get_log_read_count();
 
     RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
     recovery.analyze();
+    EXPECT_EQ(db.disk_.get_log_read_count() - reads_before_analyze, expected_analyze_reads);
 
     for (size_t type = 0; type < RecoveryManager::kLogTypeCount; ++type) {
         const auto log_type = static_cast<LogType>(type);
@@ -1874,10 +2013,10 @@ TEST(RecoveryManagerTest, RedoRoutesEachRecordToTheTableItNames) {
     }
 }
 
-TEST(RecoveryManagerTest, RecoveryWorkersOneAndAutoKeepTableAndIndexResultsIdentical) {
+TEST(RecoveryManagerTest, RecoveryWorkersOneAndEightKeepTableAndIndexResultsIdentical) {
     ScopedTestDir test_dir("recovery_workers_deterministic_root");
     const std::string single_worker_db = "recovery_workers_single";
-    const std::string auto_worker_db = "recovery_workers_auto";
+    const std::string auto_worker_db = "recovery_workers_eight";
     CreateRecoveryTestDb(single_worker_db, {"t", "u"});
     const Rid rid{1, 0};
     auto t_rec = MakeTuple(101, 1001);
@@ -1899,8 +2038,9 @@ TEST(RecoveryManagerTest, RecoveryWorkersOneAndAutoKeepTableAndIndexResultsIdent
     } env_guard;
     ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "1", 1), 0);
     RunRecovery(single_worker_db);
-    ASSERT_EQ(unsetenv("RMDB_RECOVERY_WORKERS"), 0);
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "8", 1), 0);
     RunRecovery(auto_worker_db);
+    ASSERT_EQ(unsetenv("RMDB_RECOVERY_WORKERS"), 0);
 
     for (const std::string& db_name : {single_worker_db, auto_worker_db}) {
         OpenRecoveryDb db(db_name);
@@ -1913,6 +2053,542 @@ TEST(RecoveryManagerTest, RecoveryWorkersOneAndAutoKeepTableAndIndexResultsIdent
         EXPECT_EQ(RecordValue(db.sm_mgr_, rid, "u"), 2002);
         EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 202, rid, "u"));
     }
+}
+
+TEST(RecoveryManagerTest, LargeTableNinePageFinalizeMatchesWorkersOneAndEight) {
+    ScopedTestDir test_dir("recovery_finalize_nine_page_workers_root");
+    const std::string single_worker_db = "recovery_finalize_nine_page_single";
+    const std::string eight_worker_db = "recovery_finalize_nine_page_eight";
+    CreateRecoveryTestDb(single_worker_db, {"t"}, false);
+    {
+        OpenRecoveryDb db(single_worker_db);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 100);
+        for (page_id_t page_no = 1; page_no <= 9; ++page_no) {
+            auto record = MakeTuple(page_no, page_no * 101);
+            lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{page_no, page_no % 3}, record);
+        }
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+    std::filesystem::copy(single_worker_db, eight_worker_db, std::filesystem::copy_options::recursive);
+
+    const char* previous_workers_value = getenv("RMDB_RECOVERY_WORKERS");
+    const bool had_previous_workers = previous_workers_value != nullptr;
+    const std::string previous_workers = had_previous_workers ? previous_workers_value : "";
+    struct WorkersEnvGuard {
+        bool had_previous;
+        std::string previous;
+        ~WorkersEnvGuard() {
+            if (had_previous) {
+                setenv("RMDB_RECOVERY_WORKERS", previous.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+    } workers_guard{had_previous_workers, previous_workers};
+
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "1", 1), 0);
+    RunPreparedRecovery(single_worker_db, 16);
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "8", 1), 0);
+    RunPreparedRecovery(eight_worker_db, 16);
+
+    struct Snapshot {
+        RmFileHdr header{};
+        std::vector<std::array<char, PAGE_SIZE>> pages;
+        std::vector<page_id_t> free_chain;
+    };
+    const auto snapshot = [](const std::string& db_name) {
+        OpenRecoveryDb db(db_name, 16);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        Snapshot result;
+        result.header = file_handle->get_file_hdr();
+        for (page_id_t page_no = 1; page_no < result.header.num_pages; ++page_no) {
+            RmPageHandle page = file_handle->fetch_page_handle(page_no);
+            std::array<char, PAGE_SIZE> bytes{};
+            std::memcpy(bytes.data(), page.page->get_data(), PAGE_SIZE);
+            result.pages.push_back(bytes);
+            if (!db.bpm_.unpin_page(page.page->get_page_id(), false)) {
+                throw std::runtime_error("snapshot could not release record page pin");
+            }
+        }
+        std::set<page_id_t> seen;
+        for (page_id_t page_no = result.header.first_free_page_no; page_no != RM_NO_PAGE;) {
+            if (!seen.insert(page_no).second) throw std::runtime_error("snapshot found a free-chain cycle");
+            result.free_chain.push_back(page_no);
+            RmPageHandle page = file_handle->fetch_page_handle(page_no);
+            page_no = page.page_hdr->next_free_page_no;
+            if (!db.bpm_.unpin_page(page.page->get_page_id(), false)) {
+                throw std::runtime_error("snapshot could not release free-chain page pin");
+            }
+        }
+        return result;
+    };
+    const Snapshot single = snapshot(single_worker_db);
+    const Snapshot eight = snapshot(eight_worker_db);
+    ASSERT_EQ(single.header.num_pages, 10);
+    ASSERT_EQ(0, std::memcmp(&single.header, &eight.header, sizeof(RmFileHdr)));
+    ASSERT_EQ(single.pages.size(), 9u);
+    ASSERT_EQ(single.pages.size(), eight.pages.size());
+    for (size_t page = 0; page < single.pages.size(); ++page) {
+        EXPECT_EQ(single.pages[page], eight.pages[page]);
+    }
+    EXPECT_EQ(single.free_chain, eight.free_chain);
+    EXPECT_EQ(single.free_chain.size(), 9u);
+}
+
+TEST(RecoveryManagerTest, FinalizeClampsWorkersToSmallBufferPool) {
+    ScopedTestDir test_dir("recovery_finalize_small_pool_root");
+    const std::string db_name = "recovery_finalize_small_pool_db";
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    {
+        OpenRecoveryDb db(db_name);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 100);
+        for (page_id_t page_no = 1; page_no <= 6; ++page_no) {
+            auto record = MakeTuple(page_no, page_no * 11);
+            lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{page_no, 0}, record);
+        }
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+    const char* previous_workers_value = getenv("RMDB_RECOVERY_WORKERS");
+    const bool had_previous_workers = previous_workers_value != nullptr;
+    const std::string previous_workers = had_previous_workers ? previous_workers_value : "";
+    struct WorkersEnvGuard {
+        bool had_previous;
+        std::string previous;
+        ~WorkersEnvGuard() {
+            if (had_previous) {
+                setenv("RMDB_RECOVERY_WORKERS", previous.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+    } workers_guard{had_previous_workers, previous_workers};
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "8", 1), 0);
+    EXPECT_NO_THROW(RunPreparedRecovery(db_name, 2));
+
+    OpenRecoveryDb verified(db_name, 2);
+    EXPECT_EQ(verified.sm_mgr_.fhs_.at("t")->get_file_hdr().num_pages, 7);
+    for (page_id_t page_no = 1; page_no <= 6; ++page_no) {
+        const Rid rid{page_no, 0};
+        ASSERT_TRUE(RecordExists(verified.sm_mgr_, rid));
+        EXPECT_EQ(RecordValue(verified.sm_mgr_, rid), page_no * 11);
+    }
+    EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
+}
+
+TEST(RecoveryManagerTest, PhysicalFinalizeOverlapsTwoDirtyVictimWrites) {
+    ScopedTestDir test_dir("recovery_finalize_parallel_dirty_io_root");
+    const std::string db_name = "recovery_finalize_parallel_dirty_io_db";
+    CreatePhysicalFinalizeSeed(db_name);
+    ScopedEnvironmentValue workers("RMDB_RECOVERY_WORKERS", "8");
+
+    OpenRecoveryDb db(db_name, 2);
+    RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.prepare_pages_for_redo();
+    recovery.redo();
+    InstallDirtyFinalizeVictims(db);
+
+    std::mutex hook_latch;
+    std::condition_variable hook_cv;
+    size_t arrivals = 0;
+    size_t inflight = 0;
+    size_t peak_inflight = 0;
+    bool cancel_barrier = false;
+    ScopedBpmFinalizeHooks hook_guard(&db.bpm_);
+    db.bpm_.set_replacement_io_test_hook([&](PageId page_id) {
+        if (page_id.fd != file_handle->GetFd() || (page_id.page_no != 3 && page_id.page_no != 4))
+            return;
+        std::unique_lock lock(hook_latch);
+        ++arrivals;
+        ++inflight;
+        peak_inflight = std::max(peak_inflight, inflight);
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return arrivals == 2 || cancel_barrier; });
+        --inflight;
+    });
+
+    std::exception_ptr recovery_failure;
+    std::thread recovery_thread([&] {
+        try {
+            recovery.undo();
+        } catch (...) {
+            recovery_failure = std::current_exception();
+        }
+    });
+    bool overlapped = false;
+    {
+        std::unique_lock lock(hook_latch);
+        overlapped = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return arrivals == 2; });
+        if (!overlapped)
+            cancel_barrier = true;
+    }
+    hook_cv.notify_all();
+    recovery_thread.join();
+    if (recovery_failure)
+        std::rethrow_exception(recovery_failure);
+    EXPECT_TRUE(overlapped);
+    EXPECT_EQ(arrivals, 2u);
+    EXPECT_EQ(peak_inflight, 2u);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+    for (page_id_t page_no = 1; page_no <= 2; ++page_no) {
+        const Rid rid{page_no, 0};
+        ASSERT_TRUE(RecordExists(db.sm_mgr_, rid));
+        EXPECT_EQ(RecordValue(db.sm_mgr_, rid), 8000 + page_no);
+    }
+}
+
+TEST(RecoveryManagerTest, PostGateFrontierPromotesCompletedDirtyExtensionWrite) {
+    ScopedTestDir test_dir("recovery_finalize_post_gate_promotion_root");
+    const std::string db_name = "recovery_finalize_post_gate_promotion_db";
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    {
+        OpenRecoveryDb db(db_name);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        RmPageHandle page = file_handle->create_new_page_handle();
+        ASSERT_EQ(page.page->get_page_id().page_no, 1);
+        ASSERT_TRUE(db.bpm_.unpin_page(page.page->get_page_id(), true));
+        ASSERT_TRUE(db.bpm_.flush_all_pages(file_handle->GetFd()));
+        auto record = MakeTuple(902, 9020);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 902);
+        lsn = AppendInsert(*db.log_mgr_, 902, lsn, Rid{2, 0}, record);
+        AppendCommit(*db.log_mgr_, 902, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+    ScopedEnvironmentValue workers("RMDB_RECOVERY_WORKERS", "8");
+
+    OpenRecoveryDb db(db_name, 1);
+    RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+    const PageId extension{file_handle->GetFd(), 2};
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.prepare_pages_for_redo();
+    recovery.redo();
+    ASSERT_TRUE(db.bpm_.is_page_resident(extension));
+    ASSERT_EQ(db.disk_.get_file_size(file_handle->GetFd()) / PAGE_SIZE, 2);
+
+    std::mutex hook_latch;
+    std::condition_variable hook_cv;
+    bool pwrite_blocked = false;
+    bool gate_published = false;
+    bool release_pwrite = false;
+    size_t extension_reads = 0;
+    bool extension_finalize_seen = false;
+    size_t extension_reads_before_finalize = 0;
+    ScopedBpmFinalizeHooks hook_guard(&db.bpm_);
+    db.bpm_.set_replacement_io_test_hook([&](PageId page_id) {
+        if (!(page_id == extension))
+            return;
+        std::unique_lock lock(hook_latch);
+        pwrite_blocked = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_pwrite; });
+    });
+    db.bpm_.set_frame_operation_gate_test_hook([&] {
+        // This callback owns the BPM global latch. Signal only: waiting here
+        // would prevent the old-image completion that the gate must drain.
+        std::lock_guard lock(hook_latch);
+        gate_published = true;
+        hook_cv.notify_all();
+    });
+    db.bpm_.set_load_io_test_hook([&](PageId page_id) {
+        if (page_id == extension) {
+            std::lock_guard lock(hook_latch);
+            ++extension_reads;
+        }
+    });
+    recovery.set_recovery_finalize_pin_test_hook([&](page_id_t page_no) {
+        if (page_no == extension.page_no) {
+            std::lock_guard lock(hook_latch);
+            extension_finalize_seen = true;
+            extension_reads_before_finalize = extension_reads;
+        }
+    });
+
+    std::exception_ptr evictor_failure;
+    std::thread evictor([&] {
+        try {
+            Page* page = db.bpm_.fetch_page(PageId{file_handle->GetFd(), 1});
+            if (page == nullptr || !db.bpm_.unpin_page(page->get_page_id(), false)) {
+                throw std::runtime_error("promotion evictor could not fetch physical page");
+            }
+        } catch (...) {
+            evictor_failure = std::current_exception();
+        }
+    });
+    bool saw_blocked_pwrite = false;
+    {
+        std::unique_lock lock(hook_latch);
+        saw_blocked_pwrite = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return pwrite_blocked; });
+        if (!saw_blocked_pwrite)
+            release_pwrite = true;
+    }
+    hook_cv.notify_all();
+
+    if (!saw_blocked_pwrite) {
+        evictor.join();
+        if (evictor_failure)
+            std::rethrow_exception(evictor_failure);
+        FAIL() << "extension replacement did not reach the pre-pwrite rendezvous";
+    }
+
+    std::exception_ptr recovery_failure;
+    std::thread recovery_thread([&] {
+        try {
+            recovery.undo();
+        } catch (...) {
+            recovery_failure = std::current_exception();
+        }
+    });
+    bool saw_published_gate = false;
+    {
+        std::unique_lock lock(hook_latch);
+        saw_published_gate = hook_cv.wait_for(lock, std::chrono::seconds(2), [&] { return gate_published; });
+        release_pwrite = true;
+    }
+    hook_cv.notify_all();
+    evictor.join();
+    recovery_thread.join();
+    db.bpm_.set_replacement_io_test_hook({});
+    db.bpm_.set_frame_operation_gate_test_hook({});
+    db.bpm_.set_load_io_test_hook({});
+    if (evictor_failure)
+        std::rethrow_exception(evictor_failure);
+    if (recovery_failure)
+        std::rethrow_exception(recovery_failure);
+
+    EXPECT_TRUE(saw_published_gate);
+    EXPECT_TRUE(extension_finalize_seen);
+    EXPECT_EQ(extension_reads_before_finalize, 1u);
+    EXPECT_EQ(db.disk_.get_file_size(file_handle->GetFd()) / PAGE_SIZE, 3);
+    ASSERT_TRUE(RecordExists(db.sm_mgr_, Rid{2, 0}));
+    EXPECT_EQ(RecordValue(db.sm_mgr_, Rid{2, 0}), 9020);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), 0);
+}
+
+TEST(RecoveryManagerTest, AbsentLoserExtensionDoesNotExpandHeaderWithNoPhysicalWorkers) {
+    ScopedTestDir test_dir("recovery_finalize_absent_extension_root");
+    const std::string db_name = "recovery_finalize_absent_extension_db";
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    {
+        OpenRecoveryDb db(db_name);
+        auto record = MakeTuple(903, 9030);
+        const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, 903);
+        (void)AppendInsert(*db.log_mgr_, 903, begin_lsn, Rid{1, 0}, record);
+        FlushLogs(*db.log_mgr_);
+    }
+    ScopedEnvironmentValue workers("RMDB_RECOVERY_WORKERS", "8");
+    EXPECT_NO_THROW(RunPreparedRecovery(db_name, 1));
+
+    OpenRecoveryDb verified(db_name, 1);
+    RmFileHandle* file_handle = verified.sm_mgr_.fhs_.at("t").get();
+    EXPECT_EQ(file_handle->get_file_hdr().num_pages, 1);
+    EXPECT_LE(verified.disk_.get_file_size(file_handle->GetFd()), PAGE_SIZE);
+    EXPECT_FALSE(RecordExists(verified.sm_mgr_, Rid{1, 0}));
+    EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
+}
+
+TEST(RecoveryManagerTest, PhysicalFinalizePinFailureRetainsWalAndFailsClosed) {
+    ScopedTestDir test_dir("recovery_finalize_physical_pin_fail_root");
+    const std::string db_name = "recovery_finalize_physical_pin_fail_db";
+    CreateRecoveryTestDb(db_name);
+    Rid rid;
+    {
+        OpenRecoveryDb db(db_name);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        RmPageHandle page = file_handle->create_new_page_handle();
+        rid = Rid{page.page->get_page_id().page_no, 0};
+        ASSERT_TRUE(db.bpm_.unpin_page(page.page->get_page_id(), true));
+        auto rec = MakeTuple(71, 710);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 71);
+        lsn = AppendInsert(*db.log_mgr_, 71, lsn, rid, rec);
+        AppendCommit(*db.log_mgr_, 71, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+    OpenRecoveryDb db(db_name);
+    const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    recovery.analyze();
+    recovery.redo();
+    db.sm_mgr_.fhs_.at("t")->set_fail_recovery_physical_pin_for_test(true);
+    EXPECT_THROW(recovery.undo(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    Page* page = db.bpm_.fetch_page(PageId{db.sm_mgr_.fhs_.at("t")->GetFd(), rid.page_no});
+    ASSERT_NE(page, nullptr);
+    EXPECT_TRUE(db.bpm_.unpin_page(page->get_page_id(), false));
+}
+
+TEST(RecoveryManagerTest, FinalizeRechecksResidentOnlyExtensionAfterConcurrentPhysicalEviction) {
+    ScopedTestDir test_dir("recovery_finalize_extension_eviction_root");
+    const std::string db_name = "recovery_finalize_extension_eviction_db";
+    constexpr page_id_t kLastPhysicalPage = 8;
+    constexpr page_id_t kExtensionPage = kLastPhysicalPage + 1;
+    const Rid deleted_extension{kExtensionPage, 0};
+    const Rid live_extension{kExtensionPage, 1};
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+
+    // Persist eight ordinary record pages first. The ninth page is deliberately
+    // absent from the file and will be created by redo, matching the crash
+    // window where a committed extension is resident-only.
+    {
+        OpenRecoveryDb db(db_name);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        for (page_id_t page_no = RM_FIRST_RECORD_PAGE; page_no <= kLastPhysicalPage; ++page_no) {
+            RmPageHandle page = file_handle->create_new_page_handle();
+            ASSERT_EQ(page.page->get_page_id().page_no, page_no);
+            ASSERT_TRUE(db.bpm_.unpin_page(page.page->get_page_id(), true));
+        }
+        ASSERT_TRUE(db.bpm_.flush_all_pages(file_handle->GetFd()));
+    }
+    {
+        OpenRecoveryDb db(db_name);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 100);
+        for (page_id_t page_no = RM_FIRST_RECORD_PAGE; page_no <= kLastPhysicalPage; ++page_no) {
+            auto record = MakeTuple(page_no, page_no * 10);
+            lsn = AppendInsert(*db.log_mgr_, 100, lsn, Rid{page_no, 0}, record);
+        }
+        auto deleted = MakeTuple(901, 9010);
+        auto live = MakeTuple(902, 9020);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, deleted_extension, deleted);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, live_extension, live);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    const char* previous_workers_value = getenv("RMDB_RECOVERY_WORKERS");
+    const bool had_previous_workers = previous_workers_value != nullptr;
+    const std::string previous_workers = had_previous_workers ? previous_workers_value : "";
+    struct WorkersEnvGuard {
+        bool had_previous;
+        std::string previous;
+        ~WorkersEnvGuard() {
+            if (had_previous) {
+                setenv("RMDB_RECOVERY_WORKERS", previous.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+    } workers_env_guard{had_previous_workers, previous_workers};
+
+    {
+        // Eight frames admit all eight physical finalize tasks, but not those
+        // pages plus the resident-only extension. Redo itself stays serial so
+        // page nine is reliably the last resident page before finalization.
+        OpenRecoveryDb db(db_name, 8);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "1", 1), 0);
+        recovery.analyze();
+        recovery.prepare_pages_for_redo();
+        recovery.redo();
+        ASSERT_EQ(db.disk_.get_file_size(file_handle->GetFd()) / PAGE_SIZE, kExtensionPage);
+
+        // Model stale surviving/deleted metadata after redo. The task must
+        // reload this exact image after its first physical write and normalize
+        // both bitmap and tuple metadata, rather than treating page nine as a
+        // permanently resident-only page based on an earlier file-size view.
+        RmPageHandle extension = file_handle->fetch_page_handle(kExtensionPage);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(extension.page->latch());
+            ASSERT_TRUE(Bitmap::is_set(extension.bitmap, deleted_extension.slot_no));
+            ASSERT_TRUE(Bitmap::is_set(extension.bitmap, live_extension.slot_no));
+            TupleMeta& tombstone = extension.get_meta(deleted_extension.slot_no);
+            tombstone.is_deleted_ = true;
+            tombstone.is_committed_ = false;
+            tombstone.writer_txn_id_ = 701;
+            tombstone.commit_ts_ = 71;
+            tombstone.version_chain_head_ = UndoLink{7, 70, 701};
+            TupleMeta& survivor = extension.get_meta(live_extension.slot_no);
+            survivor.is_deleted_ = false;
+            survivor.is_committed_ = false;
+            survivor.writer_txn_id_ = 702;
+            survivor.commit_ts_ = 72;
+            survivor.version_chain_head_ = UndoLink{7, 71, 702};
+            extension.page_hdr->num_records = 99;
+            BufferPoolManager::mark_dirty_locked(extension.page);
+        }
+        ASSERT_TRUE(db.bpm_.unpin_page(extension.page->get_page_id(), false));
+
+        std::mutex hook_latch;
+        std::condition_variable hook_cv;
+        size_t physical_pins = 0;
+        bool extension_evicted = false;
+        bool extension_prepass_seen = false;
+        size_t extension_disk_reads = 0;
+        size_t extension_reads_before_finalize = 0;
+        ScopedBpmFinalizeHooks bpm_hook_guard(&db.bpm_);
+        struct ReplacementHookGuard {
+            ~ReplacementHookGuard() {
+                BufferPoolManager::set_replacement_transition_test_hook({});
+            }
+        } replacement_hook_guard;
+        BufferPoolManager::set_replacement_transition_test_hook([&](PageId page_id) {
+            if (page_id == PageId{file_handle->GetFd(), kExtensionPage}) {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                extension_evicted = true;
+                hook_cv.notify_all();
+            }
+        });
+        db.bpm_.set_load_io_test_hook([&](PageId page_id) {
+            if (page_id == PageId{file_handle->GetFd(), kExtensionPage}) {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                ++extension_disk_reads;
+            }
+        });
+        recovery.set_recovery_finalize_pin_test_hook([&](page_id_t page_no) {
+            if (page_no > kLastPhysicalPage) {
+                std::lock_guard<std::mutex> lock(hook_latch);
+                extension_prepass_seen = true;
+                extension_reads_before_finalize = extension_disk_reads;
+                return;
+            }
+            std::unique_lock<std::mutex> lock(hook_latch);
+            ++physical_pins;
+            hook_cv.notify_all();
+            hook_cv.wait(lock, [&] { return physical_pins == kLastPhysicalPage; });
+        });
+        ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "8", 1), 0);
+        recovery.undo();
+        EXPECT_TRUE(extension_evicted);
+        EXPECT_TRUE(extension_prepass_seen);
+        EXPECT_EQ(extension_reads_before_finalize, 0u);
+        EXPECT_EQ(physical_pins, static_cast<size_t>(kLastPhysicalPage));
+    }
+
+    OpenRecoveryDb verified(db_name);
+    RmFileHandle* file_handle = verified.sm_mgr_.fhs_.at("t").get();
+    const RmFileHdr file_hdr = file_handle->get_file_hdr();
+    ASSERT_EQ(file_hdr.num_pages, kExtensionPage + 1);
+    EXPECT_FALSE(RecordExists(verified.sm_mgr_, deleted_extension));
+    ASSERT_TRUE(RecordExists(verified.sm_mgr_, live_extension));
+    EXPECT_EQ(RecordValue(verified.sm_mgr_, live_extension), 9020);
+    const TupleMeta meta = file_handle->get_tuple_meta(live_extension);
+    EXPECT_EQ(meta.commit_ts_, 0);
+    EXPECT_EQ(meta.writer_txn_id_, INVALID_TXN_ID);
+    EXPECT_TRUE(meta.is_committed_);
+    EXPECT_FALSE(meta.is_deleted_);
+    EXPECT_EQ(meta.version_chain_head_, UndoLink{});
+    RmPageHandle extension = file_handle->fetch_page_handle(kExtensionPage);
+    {
+        std::shared_lock<std::shared_mutex> page_lock(extension.page->latch());
+        EXPECT_EQ(extension.page_hdr->num_records, 1);
+    }
+    ASSERT_TRUE(verified.bpm_.unpin_page(extension.page->get_page_id(), false));
+
+    std::set<page_id_t> free_pages;
+    page_id_t page_no = file_hdr.first_free_page_no;
+    while (page_no != RM_NO_PAGE) {
+        ASSERT_GE(page_no, RM_FIRST_RECORD_PAGE);
+        ASSERT_LT(page_no, file_hdr.num_pages);
+        ASSERT_TRUE(free_pages.insert(page_no).second) << "free-list contains a cycle";
+        RmPageHandle page = file_handle->fetch_page_handle(page_no);
+        page_no = page.page_hdr->next_free_page_no;
+        ASSERT_TRUE(verified.bpm_.unpin_page(page.page->get_page_id(), false));
+    }
+    EXPECT_EQ(free_pages.size(), static_cast<size_t>(kExtensionPage));
+    EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
 }
 
 TEST(RecoveryManagerTest, CrossTaskRangeIndexKeyCollectionMatchesWorkersOneAndFour) {
@@ -2071,6 +2747,64 @@ TEST(RecoveryManagerTest, WalPayloadMutationAfterAnalyzeFailsClosed) {
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
 }
 
+TEST(RecoveryManagerTest, HeapRunSecondRecordMutationRetainsWalAndRestartsTwice) {
+    ScopedTestDir test_dir("recovery_heap_run_second_mutation_root");
+    const std::string db_name = "recovery_heap_run_second_mutation_db";
+    CreateRecoveryTestDb(db_name);
+    const Rid first{1, 0};
+    const Rid second{1, 1};
+    auto first_tuple = MakeTuple(1, 10);
+    auto second_tuple = MakeTuple(2, 20);
+    int64_t wal_size = 0;
+
+    {
+        OpenRecoveryDb db(db_name);
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, first, first_tuple);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, second, second_tuple);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        const auto offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+        ASSERT_EQ(offsets.size(), 2u);
+        wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+        bool mutated = false;
+        recovery.set_heap_redo_record_test_hook([&](int64_t offset) {
+            if (!mutated && offset == offsets[1]) {
+                const int corrupt_value = 999;
+                PatchWalBytes(LOG_FILE_NAME, offset + OFFSET_LOG_DATA + static_cast<int64_t>(sizeof(int)),
+                              &corrupt_value, sizeof(corrupt_value));
+                mutated = true;
+            }
+        });
+        EXPECT_THROW(recovery.redo(), InternalError);
+        EXPECT_TRUE(mutated);
+        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    }
+
+    // Restore the original logical WAL byte before the next process.  The
+    // first record may already have been dirtied/unpinned, so two full restart
+    // rounds prove both prefix durability and redo idempotence.
+    {
+        OpenRecoveryDb db(db_name);
+        const auto offsets = WalRecordOffsets(db.disk_, LogType::INSERT);
+        ASSERT_EQ(offsets.size(), 2u);
+        const int original_value = 20;
+        PatchWalBytes(LOG_FILE_NAME, offsets[1] + OFFSET_LOG_DATA + static_cast<int64_t>(sizeof(int)),
+                      &original_value, sizeof(original_value));
+        EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    }
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+    OpenRecoveryDb verified(db_name);
+    ASSERT_TRUE(RecordExists(verified.sm_mgr_, first));
+    ASSERT_TRUE(RecordExists(verified.sm_mgr_, second));
+    EXPECT_EQ(RecordValue(verified.sm_mgr_, first), 10);
+    EXPECT_EQ(RecordValue(verified.sm_mgr_, second), 20);
+}
+
 TEST(RecoveryManagerTest, LoserNoIndexPayloadMutationAfterAnalyzeRetainsWal) {
     ScopedTestDir test_dir("recovery_loser_no_index_identity_root");
     const std::string db_name = "recovery_loser_no_index_identity_db";
@@ -2130,7 +2864,17 @@ TEST(RecoveryManagerTest, HeapRedoGroupsPagesAndPreservesWalOrderWithinEachPage)
         FlushLogs(*db.log_mgr_);
     }
 
-    RunRecovery(db_name);
+    {
+        OpenRecoveryDb db(db_name);
+        db.bpm_.set_log_manager(db.log_mgr_.get());
+        RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+        recovery.analyze();
+        recovery.redo();
+        EXPECT_EQ(recovery.get_redo_applied_count(), 4u);
+        EXPECT_EQ(recovery.get_redo_resident_page_run_count(), 2u);
+        EXPECT_EQ(recovery.get_redo_resident_page_pin_count(), 2u);
+        recovery.undo();
+    }
 
     OpenRecoveryDb db(db_name);
     ASSERT_TRUE(RecordExists(db.sm_mgr_, page_one));
@@ -2254,11 +2998,12 @@ TEST(RecoveryManagerTest, ProductionPrepareAnalyzeFinalizeDefersTornTailTruncati
 
     {
         OpenRecoveryDb db(db_name);
-        AppendBegin(*db.log_mgr_, 100);
-        AppendBegin(*db.log_mgr_, 101);
+        const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        CheckpointLogRecord checkpoint(std::unordered_map<txn_id_t, lsn_t>{{100, begin_lsn}});
+        db.log_mgr_->add_log_to_buffer(&checkpoint);
         FlushLogs(*db.log_mgr_);
         const int64_t complete_size = db.disk_.get_file_size(LOG_FILE_NAME);
-        ASSERT_GT(complete_size, 1);
+        ASSERT_GT(complete_size, LOG_HEADER_SIZE + 1);
         physical_torn_size = complete_size - 1;
         ASSERT_EQ(::truncate(LOG_FILE_NAME.c_str(), physical_torn_size), 0);
     }
@@ -2279,6 +3024,34 @@ TEST(RecoveryManagerTest, ProductionPrepareAnalyzeFinalizeDefersTornTailTruncati
     EXPECT_EQ(db.log_mgr_->current_log_offset(), accepted_end);
     BeginLogRecord after_finalize(102);
     EXPECT_EQ(db.log_mgr_->add_log_to_buffer(&after_finalize), recovery.get_max_lsn() + 1);
+}
+
+TEST(RecoveryManagerTest, CheckpointInvalidLengthModuloPastEofFailsClosed) {
+    ScopedTestDir test_dir("recovery_checkpoint_invalid_modulo_root");
+    const std::string db_name = "recovery_checkpoint_invalid_modulo_db";
+    CreateRecoveryTestDb(db_name);
+    int64_t checkpoint_offset = 0;
+    int64_t physical_size = 0;
+
+    {
+        OpenRecoveryDb db(db_name);
+        const lsn_t begin_lsn = AppendBegin(*db.log_mgr_, 100);
+        CheckpointLogRecord checkpoint(std::unordered_map<txn_id_t, lsn_t>{{100, begin_lsn}});
+        checkpoint_offset = db.log_mgr_->current_log_offset();
+        db.log_mgr_->add_log_to_buffer(&checkpoint);
+        FlushLogs(*db.log_mgr_);
+        const uint32_t invalid_length = checkpoint.log_tot_len_ + 1;
+        PatchWalBytes(LOG_FILE_NAME, checkpoint_offset + OFFSET_LOG_TOT_LEN, &invalid_length,
+                      sizeof(invalid_length));
+        physical_size = checkpoint_offset + LOG_HEADER_SIZE;
+        ASSERT_EQ(::truncate(LOG_FILE_NAME.c_str(), physical_size), 0);
+    }
+
+    OpenRecoveryDb db(db_name);
+    db.log_mgr_->prepare_existing_log();
+    RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+    EXPECT_THROW(recovery.analyze(), InternalError);
+    EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), physical_size);
 }
 
 // A loser whose prev_lsn chain reaches back before the scan's start offset must
@@ -2476,6 +3249,84 @@ TEST(RecoveryFaultInjectionTest, RedoProcessDeathIsRecoverable) {
     EXPECT_TRUE(IndexPointsTo(db.sm_mgr_, 1, rid));
 }
 
+TEST(RecoveryFaultInjectionTest, HeapRunEveryRecordProcessDeathIsRecoverable) {
+#ifndef RMDB_ENABLE_FAULT_INJECTION
+    GTEST_SKIP() << "requires RMDB_ENABLE_FAULT_INJECTION";
+#else
+    ScopedTestDir test_dir("recovery_fault_heap_run_partial_pwrite_root");
+    const std::string db_name = "recovery_fault_heap_run_partial_pwrite_db";
+    CreateRecoveryTestDb(db_name, {"t"}, false);
+    const Rid first{1, 0};
+    const Rid second{2, 0};
+    auto first_tuple = MakeTuple(1, 10);
+    auto second_tuple = MakeTuple(2, 20);
+    int64_t wal_size = 0;
+    {
+        OpenRecoveryDb db(db_name);
+        RmFileHandle* file_handle = db.sm_mgr_.fhs_.at("t").get();
+        for (page_id_t page_no = 1; page_no <= 2; ++page_no) {
+            RmPageHandle page = file_handle->create_new_page_handle();
+            ASSERT_EQ(page.page->get_page_id().page_no, page_no);
+            ASSERT_TRUE(db.bpm_.unpin_page(page.page->get_page_id(), true));
+        }
+        ASSERT_TRUE(db.bpm_.flush_all_pages(file_handle->GetFd()));
+        auto lsn = AppendBegin(*db.log_mgr_, 100);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, first, first_tuple);
+        lsn = AppendInsert(*db.log_mgr_, 100, lsn, second, second_tuple);
+        AppendCommit(*db.log_mgr_, 100, lsn);
+        FlushLogs(*db.log_mgr_);
+        wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+    }
+
+    const char* old_workers_value = getenv("RMDB_RECOVERY_WORKERS");
+    const bool had_old_workers = old_workers_value != nullptr;
+    const std::string old_workers = had_old_workers ? old_workers_value : "";
+    struct HeapRunWorkersGuard {
+        bool had_old;
+        std::string old;
+        ~HeapRunWorkersGuard() {
+            if (had_old) {
+                setenv("RMDB_RECOVERY_WORKERS", old.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+    } workers_guard{had_old_workers, old_workers};
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "1", 1), 0);
+
+    // One frame makes the second page-run fetch synchronously pwrite the first
+    // run's dirty page.  Crash after applying the second run but before its
+    // run-final dirty publication: exactly one committed page is durable.
+    const int status = RunRecoveryAfterInjectedProcessDeath(db_name, "mid_recovery_redo", true, 1, 1);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 137);
+    {
+        OpenRecoveryDb interrupted(db_name, 1);
+        RmFileHandle* file_handle = interrupted.sm_mgr_.fhs_.at("t").get();
+        const RmFileHdr file_header = file_handle->get_file_hdr();
+        const size_t bitmap_offset = RM_PAGE_META_OFFSET +
+                                     static_cast<size_t>(file_header.num_records_per_page) * sizeof(TupleMeta);
+        size_t committed_pages = 0;
+        for (page_id_t page_no = 1; page_no <= 2; ++page_no) {
+            std::array<char, PAGE_SIZE> bytes{};
+            interrupted.disk_.read_page(file_handle->GetFd(), page_no, bytes.data(), PAGE_SIZE);
+            if (Bitmap::is_set(bytes.data() + bitmap_offset, 0)) {
+                ++committed_pages;
+            }
+        }
+        EXPECT_EQ(committed_pages, 1u);
+        EXPECT_EQ(interrupted.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+    }
+    RunRecovery(db_name);
+    RunRecovery(db_name);
+    OpenRecoveryDb verified(db_name);
+    ASSERT_TRUE(RecordExists(verified.sm_mgr_, first));
+    ASSERT_TRUE(RecordExists(verified.sm_mgr_, second));
+    EXPECT_EQ(RecordValue(verified.sm_mgr_, first), 10);
+    EXPECT_EQ(RecordValue(verified.sm_mgr_, second), 20);
+#endif
+}
+
 TEST(RecoveryFaultInjectionTest, UndoProcessDeathIsRecoverable) {
     ScopedTestDir test_dir("recovery_fault_undo_root");
     const std::string db_name = "recovery_fault_undo_db";
@@ -2511,6 +3362,147 @@ TEST(RecoveryFaultInjectionTest, UndoProcessDeathIsRecoverable) {
     OpenRecoveryDb db(db_name);
     EXPECT_FALSE(RecordExists(db.sm_mgr_, rid));
     EXPECT_FALSE(IndexPointsTo(db.sm_mgr_, 1, rid));
+}
+
+TEST(RecoveryFaultInjectionTest, PageFinalizeThrowFaultsRetainWalAndRemainReentrant) {
+#ifndef RMDB_ENABLE_FAULT_INJECTION
+    GTEST_SKIP() << "requires RMDB_ENABLE_FAULT_INJECTION";
+#endif
+    ScopedTestDir test_dir("recovery_fault_page_finalize_throw_root");
+    const std::array<const char*, 4> fault_points{
+        "during_data_page_pwrite",
+        "during_data_page_pread",
+        "during_recovery_page_normalize",
+        "during_recovery_page_publish",
+    };
+    ScopedEnvironmentValue workers("RMDB_RECOVERY_WORKERS", "8");
+    for (size_t fault_index = 0; fault_index < fault_points.size(); ++fault_index) {
+        SCOPED_TRACE(fault_points[fault_index]);
+        const std::string db_name = "recovery_fault_page_finalize_throw_" + std::to_string(fault_index);
+        CreatePhysicalFinalizeSeed(db_name);
+        {
+            OpenRecoveryDb db(db_name, 2);
+            RecoveryManager recovery(&db.disk_, &db.bpm_, &db.sm_mgr_, db.log_mgr_.get());
+            recovery.analyze();
+            recovery.prepare_pages_for_redo();
+            recovery.redo();
+            InstallDirtyFinalizeVictims(db);
+            const int64_t wal_size = db.disk_.get_file_size(LOG_FILE_NAME);
+            ASSERT_GT(wal_size, 0);
+            {
+                ScopedThrowFaultPoint fault(fault_points[fault_index]);
+                EXPECT_ANY_THROW(recovery.undo());
+            }
+            EXPECT_EQ(db.disk_.get_file_size(LOG_FILE_NAME), wal_size);
+        }
+
+        EXPECT_NO_THROW(RunPreparedRecovery(db_name, 2));
+        EXPECT_NO_THROW(RunPreparedRecovery(db_name, 2));
+        OpenRecoveryDb verified(db_name, 2);
+        for (page_id_t page_no = 1; page_no <= 2; ++page_no) {
+            const Rid rid{page_no, 0};
+            ASSERT_TRUE(RecordExists(verified.sm_mgr_, rid));
+            EXPECT_EQ(RecordValue(verified.sm_mgr_, rid), 8000 + page_no);
+        }
+        EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
+    }
+}
+
+TEST(RecoveryFaultInjectionTest, FinalizeProcessDeathRetainsWalAndRecoveryIsReentrant) {
+#ifndef RMDB_ENABLE_FAULT_INJECTION
+    GTEST_SKIP() << "requires RMDB_ENABLE_FAULT_INJECTION";
+#endif
+    ScopedTestDir test_dir("recovery_fault_finalize_root");
+    const std::string db_name = "recovery_fault_finalize_db";
+    CreateRecoveryTestDb(db_name);
+    {
+        OpenRecoveryDb db(db_name);
+        lsn_t lsn = AppendBegin(*db.log_mgr_, 300);
+        for (page_id_t page_no = 1; page_no <= 9; ++page_no) {
+            auto record = MakeTuple(300 + page_no, 3000 + page_no);
+            lsn = AppendInsert(*db.log_mgr_, 300, lsn, Rid{page_no, page_no % 2}, record);
+        }
+        AppendCommit(*db.log_mgr_, 300, lsn);
+        FlushLogs(*db.log_mgr_);
+    }
+
+    const char* previous_workers_value = getenv("RMDB_RECOVERY_WORKERS");
+    const bool had_previous_workers = previous_workers_value != nullptr;
+    const std::string previous_workers = had_previous_workers ? previous_workers_value : "";
+    struct WorkersEnvGuard {
+        bool had_previous;
+        std::string previous;
+        ~WorkersEnvGuard() {
+            if (had_previous) {
+                setenv("RMDB_RECOVERY_WORKERS", previous.c_str(), 1);
+            } else {
+                unsetenv("RMDB_RECOVERY_WORKERS");
+            }
+        }
+    } workers_guard{had_previous_workers, previous_workers};
+    ASSERT_EQ(setenv("RMDB_RECOVERY_WORKERS", "1", 1), 0);
+
+    // With one worker and one frame, fetching the second page must evict and
+    // pwrite the first dirty, normalized page. Crash after normalizing page two
+    // but before it is unpinned or any table metadata is published. This makes
+    // page one the uniquely provable durable victim instead of depending on a
+    // replacer's choice between two eligible frames.
+    const int status =
+        RunRecoveryAfterInjectedProcessDeath(db_name, "post_recovery_page_finalize", true, 1, 1);
+#ifdef RMDB_ENABLE_FAULT_INJECTION
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 137);
+#else
+    (void)status;
+#endif
+    {
+        OpenRecoveryDb interrupted(db_name);
+        EXPECT_GT(interrupted.disk_.get_file_size(LOG_FILE_NAME), 0);
+        RmFileHandle* file_handle = interrupted.sm_mgr_.fhs_.at("t").get();
+        size_t normalized_on_disk = 0;
+        for (page_id_t page_no = 1; page_no <= 9; ++page_no) {
+            std::array<char, PAGE_SIZE> page{};
+            interrupted.disk_.read_page(file_handle->GetFd(), page_no, page.data(), PAGE_SIZE);
+            TupleMeta meta;
+            const int slot_no = page_no % 2;
+            std::memcpy(&meta, page.data() + RM_PAGE_META_OFFSET + slot_no * sizeof(TupleMeta), sizeof(meta));
+            if (meta.writer_txn_id_ == INVALID_TXN_ID && meta.is_committed_ && !meta.is_deleted_ &&
+                meta.version_chain_head_ == UndoLink{}) {
+                ++normalized_on_disk;
+            }
+        }
+        EXPECT_EQ(normalized_on_disk, 1u);
+    }
+
+    RunPreparedRecovery(db_name);
+    RunPreparedRecovery(db_name);
+
+    OpenRecoveryDb verified(db_name);
+    RmFileHandle* file_handle = verified.sm_mgr_.fhs_.at("t").get();
+    const RmFileHdr header = file_handle->get_file_hdr();
+    ASSERT_EQ(header.num_pages, 10);
+    std::set<page_id_t> free_pages;
+    for (page_id_t page_no = header.first_free_page_no; page_no != RM_NO_PAGE;) {
+        ASSERT_TRUE(free_pages.insert(page_no).second) << "free-list contains a cycle";
+        RmPageHandle page = file_handle->fetch_page_handle(page_no);
+        page_no = page.page_hdr->next_free_page_no;
+        ASSERT_TRUE(verified.bpm_.unpin_page(page.page->get_page_id(), false));
+    }
+    EXPECT_EQ(free_pages.size(), 9u);
+    for (page_id_t page_no = 1; page_no <= 9; ++page_no) {
+        const Rid rid{page_no, page_no % 2};
+        ASSERT_TRUE(RecordExists(verified.sm_mgr_, rid));
+        EXPECT_EQ(RecordId(verified.sm_mgr_, rid), 300 + page_no);
+        EXPECT_EQ(RecordValue(verified.sm_mgr_, rid), 3000 + page_no);
+        EXPECT_TRUE(IndexPointsTo(verified.sm_mgr_, 300 + page_no, rid));
+        const TupleMeta meta = file_handle->get_tuple_meta(rid);
+        EXPECT_EQ(meta.commit_ts_, 0);
+        EXPECT_EQ(meta.writer_txn_id_, INVALID_TXN_ID);
+        EXPECT_TRUE(meta.is_committed_);
+        EXPECT_FALSE(meta.is_deleted_);
+        EXPECT_EQ(meta.version_chain_head_, UndoLink{});
+    }
+    EXPECT_EQ(verified.disk_.get_file_size(LOG_FILE_NAME), 0);
 }
 
 TEST(RecoveryFaultInjectionTest, IndexRepairIsIdempotentAcrossRepeatedRecovery) {

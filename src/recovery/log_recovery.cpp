@@ -57,8 +57,41 @@ constexpr size_t kIndexKeyParallelScratchLimitBytes = 512ULL * 1024 * 1024;
 
 class IndexKeyParallelScratchLimit final : public std::exception {};
 
-template <typename Work> size_t RunRecoveryTasks(size_t task_count, size_t worker_limit, Work&& work) {
+class RecoveryPagePinGuard {
+public:
+    RecoveryPagePinGuard(BufferPoolManager* buffer_pool_manager, Page* page)
+        : buffer_pool_manager_(buffer_pool_manager), page_id_(page->get_page_id()) {}
+
+    ~RecoveryPagePinGuard() {
+        if (active_) {
+            try {
+                (void)buffer_pool_manager_->unpin_page(page_id_, false);
+            } catch (...) {
+                // Recovery is already unwinding; preserve the original failure.
+            }
+        }
+    }
+
+    RecoveryPagePinGuard(const RecoveryPagePinGuard&) = delete;
+    RecoveryPagePinGuard& operator=(const RecoveryPagePinGuard&) = delete;
+
+    bool release() {
+        if (!active_) return true;
+        const bool released = buffer_pool_manager_->unpin_page(page_id_, false);
+        active_ = false;
+        return released;
+    }
+
+private:
+    BufferPoolManager* buffer_pool_manager_;
+    PageId page_id_;
+    bool active_{true};
+};
+
+template <typename Work>
+size_t RunRecoveryTasks(size_t task_count, size_t worker_limit, Work&& work, size_t* launched_workers = nullptr) {
     const size_t worker_count = std::min(worker_limit, task_count);
+    if (launched_workers != nullptr) *launched_workers = 0;
     if (worker_count == 0) {
         return 0;
     }
@@ -88,6 +121,7 @@ template <typename Work> size_t RunRecoveryTasks(size_t task_count, size_t worke
                     }
                 }
             });
+            if (launched_workers != nullptr) *launched_workers = threads.size();
         }
     } catch (...) {
         stop.store(true, std::memory_order_release);
@@ -363,7 +397,6 @@ void RecoveryManager::analyze() {
     index_smo_page_catalog_.clear();
     deferred_committed_deltas_.clear();
     record_locations_.clear();
-    record_locations_sorted_ = true;
     touched_tables_.clear();
     has_dml_records_ = false;
     has_index_smo_records_ = false;
@@ -373,6 +406,7 @@ void RecoveryManager::analyze() {
     checkpoint_offset_ = 0;
     scan_begin_offset_ = 0;
     scan_end_offset_ = 0;
+    framed_segments_.clear();
     scanned_record_count_ = 0;
     log_type_record_counts_.fill(0);
     log_type_serialized_bytes_.fill(0);
@@ -383,6 +417,8 @@ void RecoveryManager::analyze() {
     redo_missing_table_count_ = 0;
     redo_candidate_count_ = 0;
     redo_loser_count_ = 0;
+    redo_resident_page_run_count_ = 0;
+    redo_resident_page_pin_count_ = 0;
     undo_applied_count_ = 0;
     pruned_no_undo_transaction_count_ = 0;
     undo_chain_record_read_count_ = 0;
@@ -441,13 +477,18 @@ void RecoveryManager::analyze() {
         }
     }
 
-    WalReader reader(disk_manager_, scan_begin_offset_, file_size);
+    WalFramer reader(disk_manager_, scan_begin_offset_, file_size);
     WalRecordView record;
     WalDmlView dml;
     lsn_t previous_lsn = INVALID_LSN;
     IndexKeyStreamSegment index_key_segment;
     index_key_segment.begin = scan_begin_offset_;
     while (reader.next(&record)) {
+        if (record.lsn == INVALID_LSN || (previous_lsn != INVALID_LSN && record.lsn <= previous_lsn)) {
+            throw InternalError("recovery found non-increasing WAL LSN at offset " + std::to_string(record.offset) +
+                                "; WAL retained");
+        }
+        previous_lsn = record.lsn;
         if (index_key_stream_segments_complete_ && record.offset > index_key_segment.begin &&
             record.offset - index_key_segment.begin >= kIndexKeySegmentBytes) {
             index_key_segment.end = record.offset;
@@ -627,20 +668,20 @@ void RecoveryManager::analyze() {
              record.log_type == LogType::DELETE || record.log_type == LogType::UPDATE || record.log_type == LogType::ABORT)) {
             record_locations_.push_back(WalRecordLocation{record.lsn, record.offset, record.total_len,
                                                            IndexSmoCrc32(record.bytes, record.total_len)});
-            if (record.lsn != INVALID_LSN && previous_lsn != INVALID_LSN && record.lsn <= previous_lsn) {
-                record_locations_sorted_ = false;
-            }
-            previous_lsn = record.lsn;
         }
         if (record.lsn != INVALID_LSN && (max_lsn_ == INVALID_LSN || record.lsn > max_lsn_)) {
             max_lsn_ = record.lsn;
         }
     }
-    // WalReader only stops short for a physically incomplete final record (or
-    // an invalid tail header). Payload corruption of a complete record was
-    // rejected in the switch above. Defer truncation until finalize(), after
-    // this entire semantic pass has succeeded.
+    if (reader.status() == WalReadStatus::kCorruption) {
+        throw InternalError("recovery found a corrupt WAL header/control payload at offset " +
+                            std::to_string(reader.next_offset()) + "; WAL retained");
+    }
+    // Only an EOF-short header/body is a torn tail. Complete malformed
+    // headers, control payloads, and semantic payloads all fail closed above.
+    // Truncation remains deferred until finalize(), after this pass succeeds.
     scan_end_offset_ = reader.next_offset();
+    framed_segments_ = reader.segments();
     if (index_key_stream_segments_complete_ && scan_end_offset_ > index_key_segment.begin) {
         index_key_segment.end = scan_end_offset_;
         if (index_key_stream_segments_.size() >=
@@ -680,12 +721,6 @@ void RecoveryManager::analyze() {
     redo_candidate_count_ = heap_redo_records_.size();
     heap_redo_txn_heads_.clear();
 
-    if (!record_locations_sorted_) {
-        // LSNs are handed out under the append latch, so the file is normally
-        // already ordered. Sort defensively so the undo lookup stays valid.
-        std::sort(record_locations_.begin(), record_locations_.end(),
-                  [](const WalRecordLocation& left, const WalRecordLocation& right) { return left.lsn < right.lsn; });
-    }
     build_touched_index();
     validate_touched_page_bounds();
 
@@ -1077,6 +1112,8 @@ void RecoveryManager::redo() {
         uint64_t mapped_hits{0};
         uint64_t cross_segment_records{0};
         uint64_t cross_segment_copy_bytes{0};
+        uint64_t page_pins{0};
+        uint64_t page_runs{0};
         std::map<TouchedTuple, std::vector<HeapRedoRecord>> deferred;
     };
 
@@ -1087,6 +1124,169 @@ void RecoveryManager::redo() {
     std::atomic<bool> stop{false};
     std::mutex exception_latch;
     std::exception_ptr first_exception;
+    // Heap records are already grouped by (table,page) and ordered by WAL
+    // offset.  Do not turn that catalogue back into one buffer-pool trip per
+    // record: a page can be evicted between those trips, and the repeated pin
+    // and latch operations dominated redo on a database larger than the pool.
+    // The run owns exactly one pin and one exclusive latch.  It deliberately
+    // does not use page-LSN skipping: a later loser may have advanced that LSN
+    // while the committed record's row image still needs to be installed.
+    auto process_resident_run = [&](HeapRedoWorker& worker, const HeapRedoRun& run) {
+        const HeapRedoRecord& first = heap_redo_records_[run.begin];
+        if (first.table_id >= tables_.size()) {
+            throw InternalError("recovery heap-redo descriptor has an invalid table id; WAL retained");
+        }
+        RecoveryTable* table = table_at(first.table_id);
+        if (table->file_handle == nullptr) {
+            const uint64_t count = static_cast<uint64_t>(run.end - run.begin);
+            worker.skipped += count;
+            worker.missing += count;
+            return;
+        }
+
+        RmPageHandle page_handle;
+        try {
+            page_handle = table->file_handle->fetch_page_handle(first.page_no);
+        } catch (const std::exception&) {
+            throw InternalError("recovery heap redo could not fetch page " + std::to_string(first.page_no) +
+                                " at WAL offset " + std::to_string(first.wal_offset) + "; WAL retained");
+        }
+        ++worker.page_pins;
+        ++worker.page_runs;
+
+        bool dirtied = false;
+        lsn_t max_applied_lsn = INVALID_LSN;
+        try {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            for (size_t index = run.begin; index < run.end; ++index) {
+                const HeapRedoRecord& location = heap_redo_records_[index];
+                if (location.table_id != first.table_id || location.page_no != first.page_no) {
+                    throw InternalError("recovery heap-redo page run is not homogeneous; WAL retained");
+                }
+                if (heap_redo_record_test_hook_) {
+                    heap_redo_record_test_hook_(location.wal_offset);
+                }
+                WalSnapshotAccess access;
+                const char* bytes =
+                    wal_snapshot->record_bytes(location.wal_offset, location.wal_length, &worker.scratch, &access);
+                if (access.copied) {
+                    ++worker.cross_segment_records;
+                    worker.cross_segment_copy_bytes += access.copied_bytes;
+                } else {
+                    ++worker.mapped_hits;
+                }
+                const WalRecordView mapped = mapped_heap_redo_record(location, bytes);
+                if (!ParseWalDmlForRedo(mapped, &worker.dml)) {
+                    throw InternalError("recovery failed to parse mapped DML at WAL offset " +
+                                        std::to_string(mapped.offset) + " that analyze accepted; WAL retained");
+                }
+                if (worker.dml.table_name != table->name || worker.dml.rid.page_no != location.page_no ||
+                    worker.dml.rid.slot_no != location.slot_no || worker.dml.rid.slot_no < 0 ||
+                    worker.dml.rid.slot_no >= page_handle.file_hdr->num_records_per_page) {
+                    throw InternalError("recovery mapped DML target disagrees with analyze at WAL offset " +
+                                        std::to_string(mapped.offset) + "; WAL retained");
+                }
+
+                const TouchedTuple target{location.table_id, location.slot_no, location.page_no};
+                bool applied = false;
+                const bool occupied = Bitmap::is_set(page_handle.bitmap, location.slot_no);
+                if (mapped.log_type == LogType::UPDATE && worker.dml.update_delta.present()) {
+                    validate_installable_image(*table, mapped, static_cast<int>(worker.dml.update_delta.row_size));
+                    uint32_t cursor = 0;
+                    for (uint32_t span_index = 0; span_index < worker.dml.update_delta.span_count; ++span_index) {
+                        WalUpdateDeltaSpan span;
+                        if (!ReadWalUpdateDeltaSpan(worker.dml.update_delta, &cursor, &span)) {
+                            throw InternalError("recovery UPDATE delta changed after analyze at LSN " +
+                                                std::to_string(mapped.lsn) + "; WAL retained");
+                        }
+                    }
+                    if (cursor != worker.dml.update_delta.span_bytes_length) {
+                        throw InternalError("recovery UPDATE delta has trailing span bytes at LSN " +
+                                            std::to_string(mapped.lsn) + "; WAL retained");
+                    }
+                    if (!occupied) {
+                        throw InternalError("recovery UPDATE delta has no base tuple at LSN " +
+                                            std::to_string(mapped.lsn) + "; WAL retained");
+                    }
+                    TupleMeta& current_meta = page_handle.get_meta(location.slot_no);
+                    const bool active_loser = !current_meta.is_committed_ &&
+                                              active_txn_last_lsn_.count(current_meta.writer_txn_id_) != 0;
+                    const bool known_committed = committed_txns_.count(current_meta.writer_txn_id_) != 0;
+                    if (!active_loser && !current_meta.is_committed_ && !known_committed) {
+                        throw InternalError("recovery UPDATE delta found an uncommitted base without an active WAL "
+                                            "owner at LSN " + std::to_string(mapped.lsn) + "; WAL retained");
+                    }
+                    if (active_loser) {
+                        worker.deferred[target].push_back(location);
+                    } else {
+                        cursor = 0;
+                        char* row = page_handle.get_slot(location.slot_no);
+                        for (uint32_t span_index = 0; span_index < worker.dml.update_delta.span_count; ++span_index) {
+                            WalUpdateDeltaSpan span;
+                            if (!ReadWalUpdateDeltaSpan(worker.dml.update_delta, &cursor, &span)) {
+                                throw InternalError("recovery UPDATE delta changed during committed redo at LSN " +
+                                                    std::to_string(mapped.lsn) + "; WAL retained");
+                            }
+                            memcpy(row + span.offset, span.after_bytes, span.length);
+                        }
+                        current_meta = MakeCommittedMeta(mapped.txn_id);
+                        applied = true;
+                    }
+                } else {
+                    const char* image = nullptr;
+                    int image_size = 0;
+                    TupleMeta meta = MakeCommittedMeta(mapped.txn_id);
+                    if (mapped.log_type == LogType::INSERT) {
+                        image = worker.dml.after_image;
+                        image_size = worker.dml.after_size;
+                    } else if (mapped.log_type == LogType::DELETE) {
+                        image = worker.dml.before_image;
+                        image_size = worker.dml.before_size;
+                        meta.is_deleted_ = true;
+                    } else if (mapped.log_type == LogType::UPDATE) {
+                        image = worker.dml.after_image;
+                        image_size = worker.dml.after_size;
+                    } else {
+                        throw InternalError("recovery non-DML record in heap redo run; WAL retained");
+                    }
+                    validate_installable_image(*table, mapped, image_size);
+                    if (!occupied) {
+                        Bitmap::set(page_handle.bitmap, location.slot_no);
+                        ++page_handle.page_hdr->num_records;
+                    }
+                    memcpy(page_handle.get_slot(location.slot_no), image, static_cast<size_t>(image_size));
+                    page_handle.get_meta(location.slot_no) = meta;
+                    worker.deferred.erase(target);
+                    applied = true;
+                }
+                ++worker.applied;
+                if (applied) {
+                    dirtied = true;
+                    max_applied_lsn = std::max(max_applied_lsn, mapped.lsn);
+                }
+                FaultInjector::Point("mid_recovery_redo");
+            }
+            if (dirtied) {
+                if (max_applied_lsn != INVALID_LSN && page_handle.page->get_page_lsn() < max_applied_lsn) {
+                    page_handle.page->set_page_lsn(max_applied_lsn);
+                }
+                BufferPoolManager::mark_dirty_locked(page_handle.page,
+                                                     PageWriteDependency::Wal(page_handle.page->get_page_lsn()));
+            }
+        } catch (...) {
+            // Prefix mutations are durable only through the buffer manager; a
+            // failed later record must therefore release this pin as dirty so
+            // the next recovery starts from a safe idempotent prefix.
+            const bool released = buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), dirtied);
+            if (!released) {
+                throw InternalError("recovery heap redo could not unpin failed page run; WAL retained");
+            }
+            throw;
+        }
+        if (!buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), dirtied)) {
+            throw InternalError("recovery heap redo could not unpin page run; WAL retained");
+        }
+    };
     auto process_run = [&](HeapRedoWorker& worker, const HeapRedoRun& run) {
         for (size_t index = run.begin; index < run.end; ++index) {
             const HeapRedoRecord& location = heap_redo_records_[index];
@@ -1144,6 +1344,18 @@ void RecoveryManager::redo() {
             }
         }
     };
+    auto process_extension_run = [&](HeapRedoWorker& worker, const HeapRedoRun& run) {
+        // File growth also publishes the file-header/free-space structures, so
+        // retain RmFileHandle's established extension path for the first full
+        // image.  Once that anchor has materialized the page, the remaining
+        // WAL records use the same single-pin run path as an existing page.
+        // A delta without that anchor intentionally fails in process_run().
+        const HeapRedoRun anchor{run.begin, std::min(run.begin + 1, run.end)};
+        process_run(worker, anchor);
+        if (anchor.end < run.end) {
+            process_resident_run(worker, HeapRedoRun{anchor.end, run.end});
+        }
+    };
     std::vector<std::thread> threads;
     threads.reserve(worker_count);
     const auto join_workers = [&] {
@@ -1169,7 +1381,7 @@ void RecoveryManager::redo() {
                             // replayed state before joining the failure path.
                             if (stop.load(std::memory_order_acquire))
                                 break;
-                            process_run(worker, parallel_runs[run_index]);
+                            process_resident_run(worker, parallel_runs[run_index]);
                         }
                     }
                 } catch (...) {
@@ -1204,12 +1416,14 @@ void RecoveryManager::redo() {
     }
     const auto parallel_end = std::chrono::steady_clock::now();
     for (const HeapRedoRun& run : extension_runs) {
-        process_run(workers.front(), run);
+        process_extension_run(workers.front(), run);
     }
     const auto extension_end = std::chrono::steady_clock::now();
     uint64_t mapped_hits = 0;
     uint64_t cross_segment_records = 0;
     uint64_t cross_segment_copy_bytes = 0;
+    uint64_t heap_page_pins = 0;
+    uint64_t heap_runs_applied = 0;
     for (auto& worker : workers) {
         redo_applied_count_ += worker.applied;
         redo_skipped_count_ += worker.skipped;
@@ -1217,6 +1431,8 @@ void RecoveryManager::redo() {
         mapped_hits += worker.mapped_hits;
         cross_segment_records += worker.cross_segment_records;
         cross_segment_copy_bytes += worker.cross_segment_copy_bytes;
+        heap_page_pins += worker.page_pins;
+        heap_runs_applied += worker.page_runs;
         for (auto& [target, records] : worker.deferred) {
             auto [_, inserted] = deferred_committed_deltas_.emplace(target, std::move(records));
             if (!inserted) {
@@ -1227,6 +1443,8 @@ void RecoveryManager::redo() {
     if (redo_applied_count_ + redo_skipped_count_ != redo_candidate_count_) {
         throw InternalError("recovery heap-redo counters do not cover every committed DML record; WAL retained");
     }
+    redo_resident_page_run_count_ = heap_runs_applied;
+    redo_resident_page_pin_count_ = heap_page_pins;
     // No later recovery phase consults heap_redo_records_; undo follows the
     // LSN index and touched_sorted_ owns the page-repair work.
     std::vector<HeapRedoRecord>().swap(heap_redo_records_);
@@ -1244,7 +1462,7 @@ void RecoveryManager::redo() {
         "selected records/pages/headers %zu/%llu/%zu, old-generation records/pages %llu/%llu, "
         "superseded current pages %llu, smo validation mapped/copies/bytes %llu/%llu/%llu, "
         "smo reparse mapped/copies/bytes %llu/%llu/%llu, selected workers %zu, active workers %zu, "
-        "page runs %zu, mapped hits %llu, "
+        "page runs %zu, resident page runs/pins %llu/%llu, mapped hits %llu, "
         "cross-segment records %llu (%llu bytes)",
         static_cast<unsigned long long>(redo_applied_count_), static_cast<unsigned long long>(redo_skipped_count_),
         static_cast<unsigned long long>(redo_missing_table_count_),
@@ -1262,6 +1480,7 @@ void RecoveryManager::redo() {
         static_cast<unsigned long long>(smo_validation_copy_bytes),
         static_cast<unsigned long long>(smo_reparse_mapped_hits), static_cast<unsigned long long>(smo_reparse_copies),
         static_cast<unsigned long long>(smo_reparse_copy_bytes), selected_worker_limit, worker_count, page_runs.size(),
+        static_cast<unsigned long long>(heap_runs_applied), static_cast<unsigned long long>(heap_page_pins),
         static_cast<unsigned long long>(mapped_hits), static_cast<unsigned long long>(cross_segment_records),
         static_cast<unsigned long long>(cross_segment_copy_bytes));
     LOG_INFO(
@@ -1436,53 +1655,305 @@ void RecoveryManager::repair_touched_file_headers() {
 }
 
 void RecoveryManager::finalize_touched_pages() {
+    const auto phase_begin = std::chrono::steady_clock::now();
     struct TablePages {
         uint16_t table_id;
-        size_t begin;
-        size_t end;
+        size_t task_begin;
+        size_t task_end;
+        int physical_frontier;
+    };
+    struct PageTask { size_t table_index; page_id_t page_no; };
+    struct PhysicalTask {
+        size_t task_index;
+        RmFileHandle* file_handle;
+    };
+    struct TaskStats {
+        uint8_t physical{0};
+        uint8_t extension_resident{0};
+        uint8_t absent{0};
+        uint8_t pin_failed{0};
+        uint8_t unpin_failed{0};
+        // Extension tasks are written by the single-threaded prepass; physical
+        // tasks are written by exactly one worker. Reduction happens only after
+        // every worker joins. These actor-times may overlap.
+        uint64_t normalize_ns{0};
+        uint64_t frontier_refresh_ns{0};
+        uint64_t physical_fetch_ns{0};
+        uint64_t extension_fetch_ns{0};
+        uint64_t physical_normalize_ns{0};
+        uint64_t extension_normalize_ns{0};
     };
     std::vector<TablePages> table_pages;
+    std::vector<PageTask> tasks;
+    tasks.reserve(touched_sorted_.size());
     for (size_t begin = 0; begin < touched_sorted_.size();) {
         const uint16_t table_id = touched_sorted_[begin].table_id;
         size_t end = begin;
         while (end < touched_sorted_.size() && touched_sorted_[end].table_id == table_id) {
             ++end;
         }
-        table_pages.push_back(TablePages{table_id, begin, end});
-        begin = end;
-    }
-    const auto phase_begin = std::chrono::steady_clock::now();
-    std::vector<int64_t> table_wall_ms(table_pages.size(), 0);
-    const size_t configured_workers = RecoveryWorkerLimit();
-    const size_t workers = RunRecoveryTasks(table_pages.size(), configured_workers, [&](size_t, size_t task_index) {
-        const TablePages& task = table_pages[task_index];
-        const auto table_begin = std::chrono::steady_clock::now();
-        std::vector<page_id_t> touched_pages;
-        touched_pages.reserve(task.end - task.begin);
+        const size_t table_index = table_pages.size();
+        const size_t task_begin = tasks.size();
         int32_t previous_page = -1;
-        for (size_t index = task.begin; index < task.end; ++index) {
+        for (size_t index = begin; index < end; ++index) {
             const int32_t page_no = touched_sorted_[index].page_no;
             if (page_no != previous_page) {
                 previous_page = page_no;
-                touched_pages.push_back(page_no);
+                tasks.push_back({table_index, page_no});
             }
         }
-        RmFileHandle* file_handle = tables_[task.table_id].file_handle;
-        if (file_handle != nullptr) {
-            file_handle->finalize_recovery_pages(touched_pages);
+        table_pages.push_back(TablePages{table_id, task_begin, tasks.size(), 0});
+        begin = end;
+    }
+    const auto task_build_end = std::chrono::steady_clock::now();
+    const size_t configured_workers = RecoveryWorkerLimit();
+    const size_t reserved_frames = std::min({configured_workers, tasks.size(), buffer_pool_manager_->pool_size()});
+    if (!tasks.empty() && reserved_frames == 0) {
+        throw InternalError("recovery page finalization requires a non-empty buffer pool");
+    }
+    std::vector<std::optional<RecoveryPageFinalizeResult>> task_results(tasks.size());
+    std::vector<TaskStats> task_stats(tasks.size());
+    BufferPoolManager::FrameOperationToken operation;
+    RecoveryPagePublishStats publish_stats;
+    uint64_t post_gate_frontier_queries = 0;
+    size_t physical_task_count = 0;
+    size_t requested_workers = 0;
+    size_t launched_workers = 0;
+    auto gate_end = task_build_end;
+    auto prepass_end = task_build_end;
+    auto workers_end = task_build_end;
+    bool prepass_complete = false;
+    const auto gate_begin = std::chrono::steady_clock::now();
+    const auto log_phase = [&](const char* status) {
+        uint64_t physical = 0;
+        uint64_t extension_resident = 0;
+        uint64_t absent = 0;
+        uint64_t pin_failed = 0;
+        const uint64_t frontier_queries = post_gate_frontier_queries;
+        uint64_t unpin_failed = publish_stats.unpin_failures;
+        uint64_t normalized = 0;
+        uint64_t tombstones = 0;
+        uint64_t normalize_ns = 0;
+        uint64_t frontier_refresh_ns = 0;
+        uint64_t physical_fetch_ns = 0;
+        uint64_t extension_fetch_ns = 0;
+        uint64_t physical_normalize_ns = 0;
+        uint64_t extension_normalize_ns = 0;
+        for (size_t task_index = 0; task_index < task_stats.size(); ++task_index) {
+            physical += task_stats[task_index].physical;
+            extension_resident += task_stats[task_index].extension_resident;
+            absent += task_stats[task_index].absent;
+            pin_failed += task_stats[task_index].pin_failed;
+            unpin_failed += task_stats[task_index].unpin_failed;
+            normalize_ns += task_stats[task_index].normalize_ns;
+            frontier_refresh_ns += task_stats[task_index].frontier_refresh_ns;
+            physical_fetch_ns += task_stats[task_index].physical_fetch_ns;
+            extension_fetch_ns += task_stats[task_index].extension_fetch_ns;
+            physical_normalize_ns += task_stats[task_index].physical_normalize_ns;
+            extension_normalize_ns += task_stats[task_index].extension_normalize_ns;
+            if (task_results[task_index]) {
+                normalized += task_results[task_index]->normalized_records;
+                tombstones += task_results[task_index]->tombstones_removed;
+            }
         }
-        table_wall_ms[task_index] =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - table_begin)
-                .count();
-    });
-    const int64_t max_table_ms =
-        table_wall_ms.empty() ? 0 : *std::max_element(table_wall_ms.begin(), table_wall_ms.end());
-    const int64_t wall_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_begin).count();
-    LOG_INFO(
-        "recovery page-finalize: tables=%zu configured-workers=%zu active-workers=%zu wall=%lld ms max-table=%lld ms",
-        table_pages.size(), configured_workers, workers, static_cast<long long>(wall_ms),
-        static_cast<long long>(max_table_ms));
+        const auto phase_end = std::chrono::steady_clock::now();
+        const auto micros = [](auto duration) {
+            return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
+        };
+        LOG_INFO("recovery page-finalize: status=%s tables=%zu pages=%zu configured-workers=%zu reserved-frames=%zu "
+                 "physical-queued=%zu requested-workers=%zu launched-workers=%zu task-build=%lld us gate-wait=%lld us "
+                 "prepass-wall=%lld us worker-wall=%lld us total=%lld us physical=%llu "
+                 "extension-resident=%llu absent=%llu pin-failed=%llu frontier-queries=%llu "
+                 "normalized-records=%llu tombstones=%llu publish-candidates=%llu publish-links=%llu "
+                 "publish-candidate=%llu us "
+                 "publish-link=%llu us publish-wall=%llu us unpin-failed=%llu",
+                 status, table_pages.size(), tasks.size(), configured_workers, reserved_frames, physical_task_count,
+                 requested_workers, launched_workers, micros(task_build_end - phase_begin),
+                 micros(gate_end - gate_begin), micros(prepass_end - gate_end), micros(workers_end - prepass_end),
+                 micros(phase_end - phase_begin), static_cast<unsigned long long>(physical),
+                 static_cast<unsigned long long>(extension_resident), static_cast<unsigned long long>(absent),
+                 static_cast<unsigned long long>(pin_failed), static_cast<unsigned long long>(frontier_queries),
+                 static_cast<unsigned long long>(normalized), static_cast<unsigned long long>(tombstones),
+                 static_cast<unsigned long long>(publish_stats.candidates),
+                 static_cast<unsigned long long>(publish_stats.links),
+                 static_cast<unsigned long long>(publish_stats.candidate_ns / 1000),
+                 static_cast<unsigned long long>(publish_stats.link_ns / 1000),
+                 static_cast<unsigned long long>(publish_stats.wall_ns / 1000),
+                 static_cast<unsigned long long>(unpin_failed));
+        LOG_INFO("recovery page-finalize attribution: status=%s actor-time-overlap=1 "
+                 "path=extension-prepass+physical-workers "
+                 "frontier-refresh=%llu us physical-fetch=%llu us extension-fetch=%llu us "
+                 "normalize=%llu us physical-normalize=%llu us extension-normalize=%llu us",
+                 status, static_cast<unsigned long long>(frontier_refresh_ns / 1000),
+                 static_cast<unsigned long long>(physical_fetch_ns / 1000),
+                 static_cast<unsigned long long>(extension_fetch_ns / 1000),
+                 static_cast<unsigned long long>(normalize_ns / 1000),
+                 static_cast<unsigned long long>(physical_normalize_ns / 1000),
+                 static_cast<unsigned long long>(extension_normalize_ns / 1000));
+    };
+    try {
+        if (reserved_frames != 0)
+            operation = buffer_pool_manager_->acquire_frame_operation(reserved_frames);
+        gate_end = std::chrono::steady_clock::now();
+
+        const auto finalize_pinned = [&](size_t task_index, RmFileHandle* file_handle,
+                                         const RecoveryPinnedFinalizePage& pinned, bool physical) {
+            const PageTask& task = tasks[task_index];
+            RecoveryPagePinGuard pin_guard(buffer_pool_manager_, pinned.page);
+            if (recovery_finalize_pin_test_hook_)
+                recovery_finalize_pin_test_hook_(task.page_no);
+            FaultInjector::Point("mid_recovery_page_finalize");
+            const auto normalize_begin = std::chrono::steady_clock::now();
+            task_results[task_index] = file_handle->finalize_recovery_pinned_page(pinned);
+            const uint64_t normalize_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - normalize_begin)
+                    .count());
+            task_stats[task_index].normalize_ns = normalize_ns;
+            if (physical) {
+                task_stats[task_index].physical_normalize_ns = normalize_ns;
+            } else {
+                task_stats[task_index].extension_normalize_ns = normalize_ns;
+            }
+            FaultInjector::Point("post_recovery_page_finalize");
+            if (!pin_guard.release()) {
+                task_stats[task_index].unpin_failed = 1;
+                throw InternalError("recovery could not release a finalized page pin");
+            }
+        };
+
+        std::vector<PhysicalTask> physical_task_builder;
+        physical_task_builder.reserve(tasks.size());
+        // The token is active and all pre-gate replacements have drained before
+        // this refresh. Therefore a dirty extension written while the gate was
+        // closing is classified from the complete on-disk image. Task build
+        // deliberately performs no pre-gate file-size query.
+        for (TablePages& table : table_pages) {
+            RmFileHandle* file_handle = tables_[table.table_id].file_handle;
+            if (file_handle == nullptr)
+                continue;
+            const auto frontier_refresh_begin = std::chrono::steady_clock::now();
+            table.physical_frontier = file_handle->recovery_physical_page_frontier();
+            ++post_gate_frontier_queries;
+            if (table.task_begin != table.task_end) {
+                task_stats[table.task_begin].frontier_refresh_ns =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - frontier_refresh_begin)
+                                              .count());
+            }
+            for (size_t task_index = table.task_begin; task_index < table.task_end; ++task_index) {
+                const PageTask& task = tasks[task_index];
+                if (task.page_no < table.physical_frontier) {
+                    task_stats[task_index].physical = 1;
+                    physical_task_builder.push_back(PhysicalTask{task_index, file_handle});
+                    continue;
+                }
+
+                std::optional<RecoveryPinnedFinalizePage> pinned;
+                try {
+                    const auto fetch_begin = std::chrono::steady_clock::now();
+                    pinned = file_handle->pin_recovery_finalize_page(task.page_no, false, operation);
+                    task_stats[task_index].extension_fetch_ns =
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - fetch_begin)
+                                                  .count());
+                } catch (...) {
+                    task_stats[task_index].pin_failed = 1;
+                    throw;
+                }
+                if (!pinned) {
+                    // Recovery runs before sessions are admitted and the frame
+                    // gate excludes unrelated fetch/new operations. An absent
+                    // extension therefore cannot appear after this prepass.
+                    task_stats[task_index].absent = 1;
+                    continue;
+                }
+                task_stats[task_index].extension_resident = 1;
+                finalize_pinned(task_index, file_handle, *pinned, false);
+            }
+        }
+
+        // No frontier or queue state changes after this move. Workers read only
+        // immutable task descriptors and write disjoint result/stat slots.
+        const std::vector<PhysicalTask> physical_tasks = std::move(physical_task_builder);
+        physical_task_count = physical_tasks.size();
+        requested_workers = std::min({configured_workers, physical_tasks.size(), buffer_pool_manager_->pool_size()});
+        prepass_end = std::chrono::steady_clock::now();
+        prepass_complete = true;
+        RunRecoveryTasks(
+            physical_tasks.size(), requested_workers,
+            [&](size_t, size_t physical_task_index) {
+                const PhysicalTask& physical_task = physical_tasks[physical_task_index];
+                const PageTask& task = tasks[physical_task.task_index];
+                std::optional<RecoveryPinnedFinalizePage> pinned;
+                try {
+                    const auto fetch_begin = std::chrono::steady_clock::now();
+                    pinned = physical_task.file_handle->pin_recovery_finalize_page(task.page_no, true, operation);
+                    task_stats[physical_task.task_index].physical_fetch_ns =
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - fetch_begin)
+                                                  .count());
+                } catch (...) {
+                    task_stats[physical_task.task_index].pin_failed = 1;
+                    throw;
+                }
+                if (!pinned) {
+                    task_stats[physical_task.task_index].pin_failed = 1;
+                    throw InternalError("recovery could not pin an existing record page");
+                }
+                finalize_pinned(physical_task.task_index, physical_task.file_handle, *pinned, true);
+            },
+            &launched_workers);
+        workers_end = physical_tasks.empty() ? prepass_end : std::chrono::steady_clock::now();
+    } catch (...) {
+        if (gate_end < gate_begin) gate_end = std::chrono::steady_clock::now();
+        if (!prepass_complete)
+            prepass_end = std::chrono::steady_clock::now();
+        workers_end = std::chrono::steady_clock::now();
+        operation = BufferPoolManager::FrameOperationToken{};
+        log_phase("failed");
+        throw;
+    }
+    // Startup has not admitted sessions yet, and the frame-operation token
+    // quiesces replacement while workers acquire their disjoint page pins.
+    // Release it before publish: free-chain canonicalization uses ordinary BPM
+    // fetches and must not wait behind its own operation gate.
+    operation = BufferPoolManager::FrameOperationToken{};
+    // A failed task makes RunRecoveryTasks join and throw before this point;
+    // table-wide metadata is therefore published only from complete results.
+    try {
+        for (size_t table_index = 0; table_index < table_pages.size(); ++table_index) {
+            RmFileHandle* file_handle = tables_[table_pages[table_index].table_id].file_handle;
+            if (file_handle == nullptr) continue;
+            std::vector<RecoveryPageFinalizeResult> results;
+            results.reserve(table_pages[table_index].task_end - table_pages[table_index].task_begin);
+            for (size_t task_index = table_pages[table_index].task_begin;
+                 task_index < table_pages[table_index].task_end; ++task_index) {
+                if (task_results[task_index]) results.push_back(*task_results[task_index]);
+            }
+            RecoveryPagePublishStats table_stats;
+            try {
+                file_handle->publish_recovery_page_finalization(results, &table_stats);
+            } catch (...) {
+                publish_stats.candidates += table_stats.candidates;
+                publish_stats.links += table_stats.links;
+                publish_stats.candidate_ns += table_stats.candidate_ns;
+                publish_stats.link_ns += table_stats.link_ns;
+                publish_stats.wall_ns += table_stats.wall_ns;
+                publish_stats.unpin_failures += table_stats.unpin_failures;
+                throw;
+            }
+            publish_stats.candidates += table_stats.candidates;
+            publish_stats.links += table_stats.links;
+            publish_stats.candidate_ns += table_stats.candidate_ns;
+            publish_stats.link_ns += table_stats.link_ns;
+            publish_stats.wall_ns += table_stats.wall_ns;
+            publish_stats.unpin_failures += table_stats.unpin_failures;
+        }
+    } catch (...) {
+        log_phase("failed");
+        throw;
+    }
+    log_phase("ok");
 }
 
 void RecoveryManager::reset_touched_tuple_meta() {

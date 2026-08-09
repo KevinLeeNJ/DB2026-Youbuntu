@@ -55,6 +55,8 @@ constexpr std::array<uint32_t, 256> MakeCrc32Table() {
 }
 
 constexpr std::array<uint32_t, 256> kCrc32Table = MakeCrc32Table();
+std::atomic<uint64_t> g_index_smo_crc32_calls{0};
+std::atomic<uint64_t> g_index_smo_image_decode_calls{0};
 
 enum class ImageCodec : uint8_t {
     RAW = 0,
@@ -518,91 +520,119 @@ bool DecodeWordBitmap(const char* encoded, uint32_t encoded_length, std::array<c
     return input == encoded_length;
 }
 
-bool ParseV2Image(const char* bytes, uint32_t limit, uint32_t* offset,
-                  std::vector<std::array<char, PAGE_SIZE>>* decoded_images, const char** image) {
-    uint8_t codec_value = 0;
-    uint8_t flags = 0;
-    uint16_t reserved = 0;
-    uint32_t raw_length = 0;
-    uint32_t encoded_length = 0;
-    if (!ReadScalar(bytes, limit, offset, &codec_value) || !ReadScalar(bytes, limit, offset, &flags) ||
-        !ReadScalar(bytes, limit, offset, &reserved) || !ReadScalar(bytes, limit, offset, &raw_length) ||
-        !ReadScalar(bytes, limit, offset, &encoded_length) || flags != 0 || reserved != 0 || raw_length != PAGE_SIZE ||
-        encoded_length == 0 || encoded_length > limit - *offset) {
-        return false;
+struct ImageToken {
+    ImageCodec codec{ImageCodec::RAW};
+    const char* encoded{nullptr};
+    uint32_t encoded_length{0};
+    bool transformed{false};
+};
+
+class IndexSmoLayoutCursor {
+public:
+    IndexSmoLayoutCursor(const char* bytes, uint32_t limit, uint32_t offset, uint16_t version) noexcept
+        : bytes_(bytes), limit_(limit), offset_(offset), version_(version) {}
+
+    bool NextPage(page_id_t* page_no, ImageToken* image) noexcept {
+        return ReadScalar(bytes_, limit_, &offset_, page_no) && *page_no > 0 && NextImage(image, false);
     }
 
-    const auto codec = static_cast<ImageCodec>(codec_value);
-    if (codec == ImageCodec::RAW) {
-        if (encoded_length != PAGE_SIZE) {
-            return false;
-        }
-        *image = bytes + *offset;
-    } else if (codec == ImageCodec::ZERO_LITERAL_RLE) {
-        if (encoded_length >= PAGE_SIZE) {
-            return false;
-        }
-        decoded_images->emplace_back();
-        if (!DecodeZeroLiteralRle(bytes + *offset, encoded_length, &decoded_images->back())) {
-            decoded_images->pop_back();
-            return false;
-        }
-        *image = decoded_images->back().data();
-    } else {
-        return false;
+    bool NextHeader(ImageToken* image) noexcept {
+        return NextImage(image, true);
     }
-    *offset += encoded_length;
-    return true;
-}
+    uint32_t offset() const noexcept {
+        return offset_;
+    }
 
-bool ParseV3PageImage(const char* bytes, uint32_t limit, uint32_t* offset,
-                      std::vector<std::array<char, PAGE_SIZE>>* decoded_images, const char** image,
-                      bool* is_transformed) {
-    const uint32_t start = *offset;
-    if (!ParseV2Image(bytes, limit, offset, decoded_images, image)) {
-        // V2's parser deliberately rejects the new codec; decode that envelope here.
-        *offset = start;
-        uint8_t codec = 0, flags = 0;
+private:
+    bool NextImage(ImageToken* image, bool header) noexcept {
+        if (version_ == INDEX_SMO_VERSION_V1) {
+            if (offset_ > limit_ || PAGE_SIZE > limit_ - offset_) {
+                return false;
+            }
+            *image = {ImageCodec::RAW, bytes_ + offset_, PAGE_SIZE, false};
+            offset_ += PAGE_SIZE;
+            return true;
+        }
+        uint8_t codec_value = 0, flags = 0;
         uint16_t reserved = 0;
         uint32_t raw_length = 0, encoded_length = 0;
-        if (!ReadScalar(bytes, limit, offset, &codec) || !ReadScalar(bytes, limit, offset, &flags) ||
-            !ReadScalar(bytes, limit, offset, &reserved) || !ReadScalar(bytes, limit, offset, &raw_length) ||
-            !ReadScalar(bytes, limit, offset, &encoded_length) ||
-            (codec != static_cast<uint8_t>(ImageCodec::STRUCTURED_XOR_RLE) &&
-             codec != static_cast<uint8_t>(ImageCodec::STRUCTURED_XOR_BITMAP) &&
-             codec != static_cast<uint8_t>(ImageCodec::STRUCTURED_XOR_WORD_BITMAP)) ||
-            flags != 0 || reserved != 0 || raw_length != PAGE_SIZE || encoded_length == 0 || encoded_length >= PAGE_SIZE ||
-            encoded_length > limit - *offset) {
+        if (!ReadScalar(bytes_, limit_, &offset_, &codec_value) || !ReadScalar(bytes_, limit_, &offset_, &flags) ||
+            !ReadScalar(bytes_, limit_, &offset_, &reserved) || !ReadScalar(bytes_, limit_, &offset_, &raw_length) ||
+            !ReadScalar(bytes_, limit_, &offset_, &encoded_length) || flags != 0 || reserved != 0 ||
+            raw_length != PAGE_SIZE || encoded_length == 0 || encoded_length > limit_ - offset_) {
             return false;
         }
-        decoded_images->emplace_back();
-        const bool decoded = codec == static_cast<uint8_t>(ImageCodec::STRUCTURED_XOR_RLE)
-                                 ? DecodeZeroLiteralRle(bytes + *offset, encoded_length, &decoded_images->back())
-                             : codec == static_cast<uint8_t>(ImageCodec::STRUCTURED_XOR_BITMAP)
-                                 ? DecodeBitmap(bytes + *offset, encoded_length, &decoded_images->back())
-                                 : DecodeWordBitmap(bytes + *offset, encoded_length, &decoded_images->back());
-        if (!decoded) {
-            decoded_images->pop_back();
+        const ImageCodec codec = static_cast<ImageCodec>(codec_value);
+        const bool transformed = codec == ImageCodec::STRUCTURED_XOR_RLE ||
+                                 codec == ImageCodec::STRUCTURED_XOR_BITMAP ||
+                                 codec == ImageCodec::STRUCTURED_XOR_WORD_BITMAP;
+        const bool v2_codec = codec == ImageCodec::RAW || codec == ImageCodec::ZERO_LITERAL_RLE;
+        if (!(v2_codec || (version_ == INDEX_SMO_VERSION_V3 && !header && transformed)) ||
+            (codec == ImageCodec::RAW && encoded_length != PAGE_SIZE) ||
+            (codec != ImageCodec::RAW && encoded_length >= PAGE_SIZE)) {
             return false;
         }
-        *image = decoded_images->back().data();
-        *offset += encoded_length;
-        *is_transformed = true;
+        *image = {codec, bytes_ + offset_, encoded_length, transformed};
+        offset_ += encoded_length;
         return true;
     }
-    *is_transformed = false;
+
+    const char* bytes_;
+    uint32_t limit_;
+    uint32_t offset_;
+    uint16_t version_;
+};
+
+bool DecodeImageToken(const ImageToken& token, std::array<char, PAGE_SIZE>* decoded) noexcept {
+    g_index_smo_image_decode_calls.fetch_add(1, std::memory_order_relaxed);
+    if (decoded == nullptr || token.codec == ImageCodec::RAW) {
+        return false;
+    }
+    return token.codec == ImageCodec::ZERO_LITERAL_RLE || token.codec == ImageCodec::STRUCTURED_XOR_RLE
+               ? DecodeZeroLiteralRle(token.encoded, token.encoded_length, decoded)
+           : token.codec == ImageCodec::STRUCTURED_XOR_BITMAP
+               ? DecodeBitmap(token.encoded, token.encoded_length, decoded)
+               : DecodeWordBitmap(token.encoded, token.encoded_length, decoded);
+}
+
+bool ImagePointer(const ImageToken& token, std::array<char, PAGE_SIZE>* decoded, const char** image) noexcept {
+    if (token.codec == ImageCodec::RAW) {
+        *image = token.encoded;
+        return true;
+    }
+    if (!DecodeImageToken(token, decoded)) {
+        return false;
+    }
+    *image = decoded->data();
     return true;
 }
 
 } // namespace
 
 uint32_t IndexSmoCrc32(const char* bytes, size_t length) {
+    g_index_smo_crc32_calls.fetch_add(1, std::memory_order_relaxed);
     uint32_t crc = 0xffffffffU;
     for (size_t i = 0; i < length; ++i) {
         const uint8_t table_index = static_cast<uint8_t>(crc ^ static_cast<uint8_t>(bytes[i]));
         crc = (crc >> 8U) ^ kCrc32Table[table_index];
     }
     return ~crc;
+}
+
+uint64_t IndexSmoCrc32CallCountForTest() noexcept {
+    return g_index_smo_crc32_calls.load(std::memory_order_relaxed);
+}
+
+void ResetIndexSmoCrc32CallCountForTest() noexcept {
+    g_index_smo_crc32_calls.store(0, std::memory_order_relaxed);
+}
+
+uint64_t IndexSmoImageDecodeCallCountForTest() noexcept {
+    return g_index_smo_image_decode_calls.load(std::memory_order_relaxed);
+}
+
+void ResetIndexSmoImageDecodeCallCountForTest() noexcept {
+    g_index_smo_image_decode_calls.store(0, std::memory_order_relaxed);
 }
 
 IndexSmoLogRecord::IndexSmoLogRecord(const IndexSmoWalData& data) {
@@ -649,12 +679,13 @@ IndexSmoLogRecord::IndexSmoLogRecord(const IndexSmoWalData& data) {
         AppendScalar(&payload_, page.page_no);
         if (use_v3) {
             const size_t before = payload_.size();
-            const auto image_start = config.metrics_enabled ? std::chrono::steady_clock::now()
-                                                            : std::chrono::steady_clock::time_point{};
+            const auto image_start =
+                config.metrics_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const ImageCodec codec = AppendV3PageImage(&payload_, page.bytes.data(), layout);
             if (config.metrics_enabled) {
-                const uint64_t elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - image_start).count());
+                const uint64_t elapsed = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - image_start)
+                        .count());
                 RecordV3Metrics(PAGE_SIZE + kImageEnvelopeBytes, payload_.size() - before, elapsed, codec);
             }
         } else {
@@ -692,139 +723,203 @@ const char* IndexSmoWalView::page_image(uint32_t index) const {
     return pages_[index].image;
 }
 
-bool ParseIndexSmoWal(const WalRecordView& record, IndexSmoWalView* out) {
+bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noexcept {
     if (out == nullptr || record.log_type != LogType::INDEX_SMO || record.bytes == nullptr ||
         record.total_len > MAX_INDEX_SMO_RECORD_BYTES ||
-        record.total_len < LOG_HEADER_SIZE + kFixedPayloadBytes + 1 + kChecksumBytes) {
+        record.total_len < LOG_HEADER_SIZE + kFixedPayloadBytes + 1 + kChecksumBytes)
         return false;
-    }
-    const uint32_t stored_checksum =
-        read_unaligned<uint32_t>(record.bytes + record.total_len - static_cast<uint32_t>(kChecksumBytes));
-    if (stored_checksum != IndexSmoCrc32(record.bytes, record.total_len - kChecksumBytes)) {
-        return false;
-    }
-
-    uint32_t offset = OFFSET_LOG_DATA;
-    const uint32_t magic = read_unaligned<uint32_t>(record.bytes + offset);
-    offset += sizeof(uint32_t);
-    const uint16_t version = read_unaligned<uint16_t>(record.bytes + offset);
-    offset += sizeof(uint16_t);
-    const uint16_t flags = read_unaligned<uint16_t>(record.bytes + offset);
-    offset += sizeof(uint16_t);
-    const uint32_t name_bytes = read_unaligned<uint32_t>(record.bytes + offset);
-    offset += sizeof(uint32_t);
-    const uint32_t page_count = read_unaligned<uint32_t>(record.bytes + offset);
-    offset += sizeof(uint32_t);
-    const uint32_t page_size = read_unaligned<uint32_t>(record.bytes + offset);
-    offset += sizeof(uint32_t);
-    const uint32_t header_size = read_unaligned<uint32_t>(record.bytes + offset);
-    offset += sizeof(uint32_t);
-    const uint64_t generation = read_unaligned<uint64_t>(record.bytes + offset);
-    offset += sizeof(uint64_t);
-
-    if (magic != INDEX_SMO_MAGIC ||
-        (version != INDEX_SMO_VERSION_V1 && version != INDEX_SMO_VERSION_V2 && version != INDEX_SMO_VERSION_V3) ||
-        flags != INDEX_SMO_FLAG_HEADER_IMAGE || name_bytes == 0 || name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES ||
-        page_count == 0 || page_count > MAX_INDEX_SMO_PAGE_COUNT || page_size != PAGE_SIZE ||
-        header_size != PAGE_SIZE || generation == 0) {
-        return false;
-    }
-    if (version == INDEX_SMO_VERSION_V1) {
-        uint32_t expected_len = 0;
-        if (!CheckedExpectedV1Length(name_bytes, page_count, &expected_len) || expected_len != record.total_len) {
-            return false;
-        }
-    }
     const uint32_t payload_limit = record.total_len - kChecksumBytes;
-    IndexLayout layout;
-    if (version == INDEX_SMO_VERSION_V3) {
-        if (!ReadScalar(record.bytes, payload_limit, &offset, &layout.col_tot_len) ||
-            !ReadScalar(record.bytes, payload_limit, &offset, &layout.btree_order) ||
-            !ReadScalar(record.bytes, payload_limit, &offset, &layout.keys_size) || !ValidateLayout(layout)) {
+    const uint32_t stored_crc = read_unaligned<uint32_t>(record.bytes + payload_limit);
+    const uint32_t prefix_crc = IndexSmoCrc32(record.bytes, payload_limit);
+    if (stored_crc != prefix_crc)
+        return false;
+    uint32_t offset = OFFSET_LOG_DATA, magic = 0, name_bytes = 0, page_count = 0, page_size = 0, header_size = 0;
+    uint16_t version = 0, flags = 0;
+    uint64_t generation = 0;
+    if (!ReadScalar(record.bytes, payload_limit, &offset, &magic) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &version) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &flags) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &name_bytes) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &page_count) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &page_size) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &header_size) ||
+        !ReadScalar(record.bytes, payload_limit, &offset, &generation) || magic != INDEX_SMO_MAGIC ||
+        (version != 1 && version != 2 && version != 3) || flags != INDEX_SMO_FLAG_HEADER_IMAGE || name_bytes == 0 ||
+        name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES || page_count == 0 || page_count > MAX_INDEX_SMO_PAGE_COUNT ||
+        page_size != PAGE_SIZE || header_size != PAGE_SIZE || generation == 0)
+        return false;
+    if (version == 1) {
+        uint32_t expected = 0;
+        if (!CheckedExpectedV1Length(name_bytes, page_count, &expected) || expected != record.total_len)
             return false;
-        }
     }
-    if (offset > payload_limit || name_bytes > payload_limit - offset) {
+    IndexLayout v3_layout;
+    if (version == 3 &&
+        (!ReadScalar(record.bytes, payload_limit, &offset, &v3_layout.col_tot_len) ||
+         !ReadScalar(record.bytes, payload_limit, &offset, &v3_layout.btree_order) ||
+         !ReadScalar(record.bytes, payload_limit, &offset, &v3_layout.keys_size) || !ValidateLayout(v3_layout)))
         return false;
-    }
-    const std::string_view file_name(record.bytes + offset, name_bytes);
-    if (file_name.find('\0') != std::string_view::npos || file_name.find('/') != std::string_view::npos ||
-        file_name == "." || file_name == "..") {
+    if (offset > payload_limit || name_bytes > payload_limit - offset)
         return false;
-    }
+    const uint32_t name_offset = offset;
+    const std::string_view name(record.bytes + offset, name_bytes);
+    if (name.find('\0') != std::string_view::npos || name.find('/') != std::string_view::npos || name == "." ||
+        name == "..")
+        return false;
     offset += name_bytes;
-
-    IndexSmoWalView parsed;
-    parsed.index_file_name = file_name;
-    parsed.index_generation = generation;
-    parsed.page_count = page_count;
-    parsed.pages_.reserve(page_count);
-    parsed.decoded_pages_.reserve(static_cast<size_t>(page_count) + 1);
-
+    const uint32_t page_stream_offset = offset;
+    IndexSmoLayoutCursor cursor(record.bytes, payload_limit, offset, version);
     page_id_t previous = INVALID_PAGE_ID;
-    if (version == INDEX_SMO_VERSION_V1) {
-        for (uint32_t index = 0; index < page_count; ++index) {
-            const page_id_t current = read_unaligned<page_id_t>(record.bytes + offset);
-            if (current <= 0 || (previous != INVALID_PAGE_ID && current <= previous)) {
-                return false;
-            }
-            previous = current;
-            parsed.pages_.push_back({current, record.bytes + offset + sizeof(page_id_t)});
-            offset += kV1PageEntryBytes;
-        }
-        parsed.header_image = record.bytes + offset;
-        offset += PAGE_SIZE;
-    } else {
-        std::vector<int32_t> transformed_image_indices;
-        if (version == INDEX_SMO_VERSION_V3) {
-            transformed_image_indices.reserve(page_count);
-        }
-        for (uint32_t index = 0; index < page_count; ++index) {
-            page_id_t current = INVALID_PAGE_ID;
-            if (!ReadScalar(record.bytes, payload_limit, &offset, &current) || current <= 0 ||
-                (previous != INVALID_PAGE_ID && current <= previous)) {
-                return false;
-            }
-            previous = current;
-            const char* image = nullptr;
-            bool is_transformed = false;
-            const bool parsed_image = version == INDEX_SMO_VERSION_V3
-                                          ? ParseV3PageImage(record.bytes, payload_limit, &offset, &parsed.decoded_pages_,
-                                                             &image, &is_transformed)
-                                          : ParseV2Image(record.bytes, payload_limit, &offset, &parsed.decoded_pages_, &image);
-            if (!parsed_image) {
-                return false;
-            }
-            parsed.pages_.push_back({current, image});
-            if (version == INDEX_SMO_VERSION_V3) {
-                transformed_image_indices.push_back(is_transformed ? static_cast<int32_t>(parsed.decoded_pages_.size() - 1)
-                                                                  : -1);
-            }
-        }
-        if (!ParseV2Image(record.bytes, payload_limit, &offset, &parsed.decoded_pages_, &parsed.header_image)) {
+    uint32_t decoded_count = 0, transformed_count = 0;
+    std::array<char, PAGE_SIZE> scratch{};
+    for (uint32_t index = 0; index < page_count; ++index) {
+        page_id_t page = INVALID_PAGE_ID;
+        ImageToken token;
+        if (!cursor.NextPage(&page, &token) || (previous != INVALID_PAGE_ID && page <= previous))
             return false;
-        }
-        if (version == INDEX_SMO_VERSION_V3) {
-            IndexLayout header_layout;
-            if (!ReadHeaderLayout(parsed.header_image, &header_layout) || !SameLayout(layout, header_layout)) {
-                return false;
-            }
-            for (uint32_t index = 0; index < page_count; ++index) {
-                const int32_t image_index = transformed_image_indices[index];
-                if (image_index >= 0 &&
-                    (static_cast<size_t>(image_index) >= parsed.decoded_pages_.size() ||
-                     !UntransformIxPage(layout, &parsed.decoded_pages_[image_index]))) {
-                    return false;
-                }
-                if (!ValidateIxPageImage(layout, parsed.pages_[index].image)) {
-                    return false;
-                }
-            }
-        }
+        previous = page;
+        if (token.codec != ImageCodec::RAW)
+            ++decoded_count;
+        if (token.transformed)
+            ++transformed_count;
+        const char* image = nullptr;
+        if (!ImagePointer(token, &scratch, &image) ||
+            (version == 3 && token.transformed && !UntransformIxPage(v3_layout, &scratch)) ||
+            (version == 3 && !ValidateIxPageImage(v3_layout, image)))
+            return false;
     }
-    if (offset != payload_limit) {
+    ImageToken header;
+    if (!cursor.NextHeader(&header) || cursor.offset() != payload_limit)
         return false;
+    const uint32_t header_offset = header.encoded - record.bytes;
+    if (header.codec != ImageCodec::RAW)
+        ++decoded_count;
+    const char* header_image = nullptr;
+    if (!ImagePointer(header, &scratch, &header_image))
+        return false;
+    if (version == 3) {
+        IndexLayout header_layout;
+        if (!ReadHeaderLayout(header_image, &header_layout) || !SameLayout(v3_layout, header_layout))
+            return false;
     }
+    IndexSmoWalLayout layout;
+    layout.version_ = version;
+    layout.total_len_ = record.total_len;
+    layout.payload_limit_ = payload_limit;
+    layout.name_offset_ = name_offset;
+    layout.name_bytes_ = name_bytes;
+    layout.page_stream_offset_ = page_stream_offset;
+    layout.header_offset_ = header_offset;
+    layout.page_count_ = page_count;
+    layout.decoded_count_ = decoded_count;
+    layout.transformed_count_ = transformed_count;
+    layout.generation_ = generation;
+    layout.col_tot_len_ = v3_layout.col_tot_len;
+    layout.btree_order_ = v3_layout.btree_order;
+    layout.keys_size_ = v3_layout.keys_size;
+    *out = layout;
+    return true;
+}
+
+bool IndexSmoWalLayout::copy_catalog(const WalRecordView& record, IndexSmoWalView::Page* pages,
+                                     size_t page_capacity) const noexcept {
+    if (record.bytes == nullptr || record.total_len != total_len_ || pages == nullptr || page_capacity < page_count_ ||
+        payload_limit_ > record.total_len || page_stream_offset_ > payload_limit_)
+        return false;
+    IndexSmoLayoutCursor cursor(record.bytes, payload_limit_, page_stream_offset_, version_);
+    // First pass makes the no-partial-publish guarantee independent of an
+    // arena's previous contents. The second pass is safe under the immutable
+    // binding above and only publishes fully validated identities.
+    for (uint32_t i = 0; i < page_count_; ++i) {
+        page_id_t page = INVALID_PAGE_ID;
+        ImageToken token;
+        if (!cursor.NextPage(&page, &token))
+            return false;
+    }
+    ImageToken header;
+    if (!cursor.NextHeader(&header) || cursor.offset() != payload_limit_)
+        return false;
+    cursor = IndexSmoLayoutCursor(record.bytes, payload_limit_, page_stream_offset_, version_);
+    for (uint32_t i = 0; i < page_count_; ++i) {
+        ImageToken token;
+        if (!cursor.NextPage(&pages[i].page_no, &token))
+            return false;
+        pages[i].image = nullptr;
+    }
+    return true;
+}
+
+bool CopyIndexSmoPageCatalog(const WalRecordView& record, IndexSmoWalView::Page* pages, size_t page_capacity) noexcept {
+    IndexSmoWalLayout fresh;
+    return InspectIndexSmoWal(record, &fresh) && fresh.copy_catalog(record, pages, page_capacity);
+}
+
+bool IndexSmoWalLayout::decode_materialized(const WalRecordView& record, const IndexSmoWalDecodeStorage& storage,
+                                            IndexSmoWalDecodedView* out) const noexcept {
+    if (out == nullptr || record.bytes == nullptr || record.total_len != total_len_ || storage.pages == nullptr ||
+        storage.page_capacity < page_count_ ||
+        (decoded_count_ != 0 && (storage.decoded_pages == nullptr || storage.decoded_capacity < decoded_count_)))
+        return false;
+    // Inspect just decoded and validated these immutable bytes. Materializing
+    // each compressed image below is therefore its only additional codec pass.
+    IndexSmoLayoutCursor cursor(record.bytes, payload_limit_, page_stream_offset_, version_);
+    size_t decoded = 0;
+    for (uint32_t i = 0; i < page_count_; ++i) {
+        ImageToken token;
+        if (!cursor.NextPage(&storage.pages[i].page_no, &token))
+            return false;
+        if (token.codec == ImageCodec::RAW)
+            storage.pages[i].image = token.encoded;
+        else {
+            auto* image = &storage.decoded_pages[decoded++];
+            if (!DecodeImageToken(token, image) ||
+                (token.transformed && !UntransformIxPage({col_tot_len_, btree_order_, keys_size_}, image)))
+                return false;
+            storage.pages[i].image = image->data();
+        }
+    }
+    ImageToken header;
+    if (!cursor.NextHeader(&header))
+        return false;
+    const char* header_image = header.encoded;
+    if (header.codec != ImageCodec::RAW) {
+        auto* image = &storage.decoded_pages[decoded++];
+        if (!DecodeImageToken(header, image))
+            return false;
+        header_image = image->data();
+    }
+    if (decoded != decoded_count_ || cursor.offset() != payload_limit_)
+        return false;
+    IndexSmoWalDecodedView decoded_view{std::string_view(record.bytes + name_offset_, name_bytes_), generation_, page_count_,
+                                        header_image, storage.pages};
+    *out = decoded_view;
+    return true;
+}
+
+bool DecodeIndexSmoWal(const WalRecordView& record, const IndexSmoWalDecodeStorage& storage,
+                       IndexSmoWalDecodedView* out) noexcept {
+    IndexSmoWalLayout fresh;
+    return InspectIndexSmoWal(record, &fresh) && fresh.decode_materialized(record, storage, out);
+}
+
+bool ParseIndexSmoWal(const WalRecordView& record, IndexSmoWalView* out) {
+    if (out == nullptr)
+        return false;
+    IndexSmoWalLayout layout;
+    if (!InspectIndexSmoWal(record, &layout))
+        return false;
+    IndexSmoWalView parsed;
+    parsed.pages_.resize(layout.page_count_);
+    parsed.decoded_pages_.resize(layout.decoded_count_);
+    IndexSmoWalDecodeStorage storage{parsed.pages_.data(), parsed.pages_.size(), parsed.decoded_pages_.data(),
+                                     parsed.decoded_pages_.size()};
+    IndexSmoWalDecodedView view;
+    if (!layout.decode_materialized(record, storage, &view))
+        return false;
+    parsed.index_file_name = view.index_file_name;
+    parsed.index_generation = view.index_generation;
+    parsed.page_count = view.page_count;
+    parsed.header_image = view.header_image;
     *out = std::move(parsed);
     return true;
 }

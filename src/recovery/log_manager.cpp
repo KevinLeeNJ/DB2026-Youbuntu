@@ -349,6 +349,8 @@ CheckpointWalCut LogManager::create_checkpoint_wal_cut(const std::vector<std::st
         if (binding_records.empty()) {
             cut.last_lsn = cut.checkpoint_lsn;
         }
+        cut.tail_offset =
+            log_file_offset_ + static_cast<int64_t>(flushing_bytes_) + static_cast<int64_t>(log_buffer_->offset_);
     }
 
     return cut;
@@ -1400,7 +1402,12 @@ void LogManager::initialize_from_existing_log() {
     const uint64_t epoch = wal_epoch_.load(std::memory_order_acquire);
     WalReader reader(disk_manager_, scan_start_offset, file_size);
     WalRecordView record;
+    lsn_t previous_lsn = INVALID_LSN;
     while (reader.next(&record)) {
+        if (record.lsn == INVALID_LSN || (previous_lsn != INVALID_LSN && record.lsn <= previous_lsn)) {
+            throw InternalError("non-increasing WAL LSN during startup scan; WAL retained");
+        }
+        previous_lsn = record.lsn;
         if (record.log_type == LogType::INDEX_SMO) {
             IndexSmoWalView smo;
             if (!ParseIndexSmoWal(record, &smo)) {
@@ -1418,6 +1425,9 @@ void LogManager::initialize_from_existing_log() {
         }
         max_lsn = std::max(max_lsn, record.lsn);
         ++record_count;
+    }
+    if (reader.status() == WalReadStatus::kCorruption) {
+        throw InternalError("corrupt WAL header/control payload during startup scan; WAL retained");
     }
     const int64_t offset = reader.next_offset();
     LOG_INFO("wal startup scan: %llu records, [%lld,%lld), %llu preads, %lld ms",

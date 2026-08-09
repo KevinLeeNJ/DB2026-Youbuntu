@@ -736,6 +736,10 @@ struct RestartManifest {
  */
 struct CheckpointWalCut {
     int64_t checkpoint_offset{0};
+    // Exact logical WAL tail immediately after the contiguous checkpoint/binding
+    // batch, captured while LogManager::latch_ is held. It is in-memory
+    // scheduler bookkeeping, not a persisted format field.
+    int64_t tail_offset{0};
     lsn_t checkpoint_lsn{INVALID_LSN};
     lsn_t last_lsn{INVALID_LSN};
     std::vector<std::pair<std::string, uint64_t>> index_bindings;

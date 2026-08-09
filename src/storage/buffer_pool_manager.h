@@ -50,10 +50,14 @@ enum class ResidencyClass : uint8_t {
 
 class FlushDependencyPolicy {
 public:
-    enum class Kind : uint8_t { Enforce, AlreadyDurable };
+    enum class Kind : uint8_t { Enforce, CheckpointEnforce, AlreadyDurable };
 
     static FlushDependencyPolicy Enforce() {
         return FlushDependencyPolicy(Kind::Enforce);
+    }
+
+    static FlushDependencyPolicy CheckpointEnforce() {
+        return FlushDependencyPolicy(Kind::CheckpointEnforce);
     }
 
     static FlushDependencyPolicy AlreadyDurable() {
@@ -72,9 +76,16 @@ private:
 
 class BufferPoolManager {
 private:
+    enum class DependencyWriteOrigin : uint8_t { Foreground, Checkpoint };
     using FlushPageTestHook = std::function<void(PageId, Page*)>;
     using EnsureDependencyTestHook = std::function<void(const PageWriteDependency&)>;
     using FlushClaimTestHook = std::function<void(std::string_view, PageId)>;
+    using ReplacementTransitionTestHook = std::function<void(PageId)>;
+    using ReplacementIoTestHook = std::function<void(PageId)>;
+    using LoadIoTestHook = std::function<void(PageId)>;
+    using TransitionWaitTestHook = std::function<void(PageId, uint64_t)>;
+    using ReplacementSetupTestHook = std::function<void(std::string_view)>;
+    using FrameOperationGateTestHook = std::function<void()>;
     static std::mutex flush_page_test_hook_latch_;
     static FlushPageTestHook flush_page_test_hook_;
     static FlushPageTestHook flush_page_after_write_test_hook_;
@@ -82,6 +93,13 @@ private:
     static EnsureDependencyTestHook ensure_dependency_test_hook_;
     static std::atomic<bool> ensure_dependency_test_hook_enabled_;
     static FlushClaimTestHook flush_claim_test_hook_;
+    static ReplacementTransitionTestHook replacement_transition_test_hook_;
+    static std::atomic<bool> replacement_transition_test_hook_enabled_;
+    ReplacementIoTestHook replacement_io_test_hook_;
+    LoadIoTestHook load_io_test_hook_;
+    TransitionWaitTestHook transition_wait_test_hook_;
+    ReplacementSetupTestHook replacement_setup_test_hook_;
+    FrameOperationGateTestHook frame_operation_gate_test_hook_;
     static std::atomic<bool> flush_claim_test_hook_enabled_;
 
     size_t pool_size_; // buffer_pool中可容纳页面的个数，即帧的个数
@@ -89,6 +107,14 @@ private:
         pages_; // buffer_pool中的Page对象数组，在构造空间中申请内存空间，在析构函数中释放，大小为BUFFER_POOL_SIZE
     std::unordered_map<PageId, frame_id_t, PageIdHash>
         page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
+    struct OldImageTransition {
+        frame_id_t frame_id;
+        uint64_t generation;
+    };
+    // A dirty victim's bytes remain authoritative until its write completes.
+    // Keep this separate from page_table_: it is only a rendezvous for a
+    // refetch of the old PageId while the frame is being repurposed.
+    std::unordered_map<PageId, OldImageTransition, PageIdHash> old_image_transitions_;
     static constexpr size_t RESIDENT_DIRECTORY_SHARD_COUNT = 64;
     struct ResidentDirectoryShard {
         mutable std::shared_mutex latch;
@@ -105,6 +131,13 @@ private:
     ShardAcquisitionMetrics shard_read_metrics_;
     ShardAcquisitionMetrics shard_write_metrics_;
     BackgroundPrecleanMetrics background_preclean_metrics_;
+    // One count represents one merged WAL dependency claim from a checkpoint
+    // flush batch, classified immediately before its durable-flush attempt.
+    // A later flush/write failure remains counted; failures before this point
+    // (including the test hook or a missing LogManager) are not counted. These
+    // counters represent neither pages nor physical fdatasync operations.
+    std::atomic<uint64_t> checkpoint_dependency_already_durable_{0};
+    std::atomic<uint64_t> checkpoint_dependency_durable_advance_requested_{0};
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
     // Reused only while latch_ is held by take_unblocked_victim_locked().
@@ -131,6 +164,25 @@ private:
     std::unordered_map<int, size_t> index_writes_inflight_;
     std::atomic<bool> frame_operation_active_{false};
     std::atomic<uint64_t> frame_operation_generation_{0};
+    // Slow replacement has removed an old mapping but may not have persisted
+    // its dirty bytes yet. A newly acquired operation gate must drain these
+    // pre-gate transitions before it can issue stable reads.
+    size_t pre_gate_replacement_transitions_{0};
+    class ReplacementTransitionGuard {
+    public:
+        explicit ReplacementTransitionGuard(BufferPoolManager* manager) : manager_(manager) {}
+        ~ReplacementTransitionGuard();
+        ReplacementTransitionGuard(const ReplacementTransitionGuard&) = delete;
+        ReplacementTransitionGuard& operator=(const ReplacementTransitionGuard&) = delete;
+        void activate() noexcept {
+            active_ = true;
+        }
+        void finish_locked() noexcept;
+
+    private:
+        BufferPoolManager* manager_;
+        bool active_{false};
+    };
     uint64_t next_checkpoint_cohort_epoch_{1};
     uint64_t active_checkpoint_cohort_epoch_{0};
     size_t checkpoint_cohort_pages_remaining_{0};
@@ -138,11 +190,35 @@ private:
     size_t checkpoint_cohort_frames_visited_for_test_{0};
 
 public:
+    struct CheckpointDependencyMetricsSnapshot {
+        uint64_t already_covered{};
+        uint64_t coverage_requested{};
+    };
     static void set_flush_page_test_hook(FlushPageTestHook hook);
     static void set_flush_page_after_write_test_hook(FlushPageTestHook hook);
     static void set_flush_batch_before_write_test_hook(FlushPageTestHook hook);
     static void set_ensure_dependency_test_hook(EnsureDependencyTestHook hook);
     static void set_flush_claim_test_hook(FlushClaimTestHook hook);
+    static void set_replacement_transition_test_hook(ReplacementTransitionTestHook hook);
+    // Per-manager rendezvous immediately before the old dirty image is
+    // written. It is test-only and unset in production.
+    void set_replacement_io_test_hook(ReplacementIoTestHook hook) { replacement_io_test_hook_ = std::move(hook); }
+    void set_load_io_test_hook(LoadIoTestHook hook) { load_io_test_hook_ = std::move(hook); }
+    // Install/remove only while this manager has no concurrent operations.
+    // The callback runs after a transition waiter owns the frame io_latch_.
+    void set_transition_wait_test_hook(TransitionWaitTestHook hook) {
+        transition_wait_test_hook_ = std::move(hook);
+    }
+    void set_replacement_setup_test_hook(ReplacementSetupTestHook hook) {
+        replacement_setup_test_hook_ = std::move(hook);
+    }
+    // Install/remove only while this manager has no concurrent frame-operation
+    // acquisition. The observer runs under the BPM global latch after the gate
+    // is published: it may only signal a test rendezvous and must never wait
+    // for transition completion. Exceptions cannot alter production flow.
+    void set_frame_operation_gate_test_hook(FrameOperationGateTestHook hook) {
+        frame_operation_gate_test_hook_ = std::move(hook);
+    }
     void notify_frame_operation_waiters_for_test() noexcept {
         frame_operation_cv_.notify_all();
     }
@@ -159,6 +235,7 @@ public:
         FrameOperationToken& operator=(const FrameOperationToken&) = delete;
 
         Page* fetch_page(PageId page_id) const;
+        Page* fetch_resident_page(PageId page_id) const;
         Page* new_page(PageId* page_id) const;
 
     private:
@@ -238,6 +315,7 @@ public:
     FrameOperationToken acquire_frame_operation(size_t minimum_available_frames = 2);
 
     bool is_page_resident(PageId page_id);
+    size_t pool_size() const noexcept { return pool_size_; }
 
     // Returns the replacement classification of a valid resident page. A
     // missing or in-flight page has no observable residency classification.
@@ -303,7 +381,8 @@ public:
     FlushBatchResult flush_pages(std::vector<PageId>& page_ids, FlushDependencyPolicy policy);
 
     // Used by index-header writes, which do not pass through a buffer frame.
-    void ensure_write_dependency(const PageWriteDependency& dependency);
+    void ensure_write_dependency(const PageWriteDependency& dependency,
+                                 DependencyWriteOrigin origin = DependencyWriteOrigin::Foreground);
     void begin_index_smo(int fd);
     void end_index_smo(int fd) noexcept;
     void begin_index_file_write(int fd);
@@ -348,6 +427,11 @@ public:
     CheckpointCohortFlushResult flush_checkpoint_cohort(uint64_t epoch, size_t max_io_pages,
                                                         size_t max_frames_to_visit = 64);
 
+    CheckpointDependencyMetricsSnapshot checkpoint_dependency_metrics() const noexcept {
+        return {checkpoint_dependency_already_durable_.load(std::memory_order_relaxed),
+                checkpoint_dependency_durable_advance_requested_.load(std::memory_order_relaxed)};
+    }
+
     // Abandon only the named cohort after a checkpoint-stage failure. This is
     // idempotent and does not make pages clean or weaken their WAL dependency.
     size_t cancel_checkpoint_cohort(uint64_t epoch);
@@ -385,6 +469,11 @@ private:
     void release_index_file_write_locked(int fd);
     void recycle_frame(frame_id_t frame_id);
     size_t available_frames_locked() const;
+    void finish_replacement_transition_locked() noexcept;
+    uint64_t register_old_image_transition_locked(PageId page_id, frame_id_t frame_id);
+    void complete_old_image_transition_locked(PageId page_id, frame_id_t frame_id, uint64_t generation) noexcept;
+    void run_replacement_io_test_hook(PageId page_id) noexcept;
+    void run_load_io_test_hook(PageId page_id) noexcept;
     bool operation_authorized(const FrameOperationToken* operation, uint64_t generation) const;
     void release_frame_operation(uint64_t generation) noexcept;
     size_t resident_directory_shard_index(PageId page_id) const noexcept;
@@ -393,7 +482,7 @@ private:
     void set_mapped_frame_state_locked(PageId page_id, frame_id_t frame_id, FrameState state);
     void erase_page_mapping_locked(PageId page_id, frame_id_t frame_id, FrameState state);
     bool claim_page_for_eviction_locked(PageId page_id, frame_id_t frame_id, bool removed_from_replacer,
-                                        bool require_normal_residency);
+                                        bool require_normal_residency, bool retain_resident_entry = false);
     bool restore_deferred_victims_locked(const std::vector<frame_id_t>& deferred) noexcept;
     bool rollback_claimed_victim_locked(PageId page_id, frame_id_t frame_id) noexcept;
     bool resident_directory_is_consistent_for_test();
@@ -405,6 +494,7 @@ private:
     bool unpin_page_impl(PageId page_id, bool is_dirty, const PageWriteDependency& dependency);
     static void run_flush_page_test_hook(PageId page_id, Page* page);
     static void run_flush_claim_test_hook(std::string_view point, PageId page_id);
+    static void run_replacement_transition_test_hook(PageId page_id) noexcept;
     static void run_flush_page_after_write_test_hook(PageId page_id, Page* page);
     static void run_flush_batch_before_write_test_hook(PageId page_id, Page* page);
     void clear_checkpoint_cohort_marker_locked(Page* page);

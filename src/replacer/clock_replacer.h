@@ -103,6 +103,11 @@ public:
         }
     }
 
+    bool restore_claimed_noexcept(frame_id_t frame_id) noexcept override {
+        restore(frame_id);
+        return true;
+    }
+
     size_t Size() override {
         return size_.load(std::memory_order_acquire);
     }

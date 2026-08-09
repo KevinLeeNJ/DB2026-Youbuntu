@@ -351,7 +351,7 @@ TEST(CheckpointScheduleTest, CleanCheckpointWaitsForInFlightPrecleanFlush) {
     ASSERT_NE(durable_page.page_no, INVALID_PAGE_ID);
     Page* page = db.bpm_.fetch_page(durable_page);
     ASSERT_NE(page, nullptr);
-    std::strcpy(page->get_data(), "preclean-before-clean");
+    std::strcpy(page->get_data() + Page::OFFSET_PAGE_HDR, "preclean-before-clean");
     ASSERT_TRUE(db.bpm_.unpin_page(durable_page, true));
     ASSERT_EQ(MakeDirtyTablePages(&db, 39), 39u);
     ASSERT_GT(AppendBegin(&db.log_mgr_, 700), 0);
@@ -478,7 +478,7 @@ TEST(CheckpointScheduleTest, CleanCheckpointWaitsForInFlightPrecleanFlush) {
     EXPECT_FALSE(preclean_hook_timed_out);
     std::array<char, PAGE_SIZE> disk_image{};
     db.disk_.read_page(durable_page.fd, durable_page.page_no, disk_image.data(), PAGE_SIZE);
-    EXPECT_STREQ(disk_image.data(), "preclean-before-clean");
+    EXPECT_STREQ(disk_image.data() + Page::OFFSET_PAGE_HDR, "preclean-before-clean");
 }
 
 TEST(CheckpointScheduleTest, PrecleanControllerKeepsHysteresisUntilLowWatermark) {
@@ -967,7 +967,7 @@ TEST(CheckpointScheduleTest, TickHonorsByteBudgetAcrossBoundedQuanta) {
     EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 0u);
 }
 
-TEST(CheckpointScheduleTest, FuzzyCohortCongestionWritesZeroWithoutPreclean) {
+TEST(CheckpointScheduleTest, FuzzyCohortCongestionStillMakesMandatoryProgress) {
     ScopedDrainTestDir test_dir("checkpoint_fuzzy_congestion_pause_root");
     DrainTestDb db("checkpoint_fuzzy_congestion_pause_db", false, 128);
     LockManager lock_mgr;
@@ -987,11 +987,42 @@ TEST(CheckpointScheduleTest, FuzzyCohortCongestionWritesZeroWithoutPreclean) {
     EXPECT_FALSE(checkpoint_mgr.Tick()); // durable cut
     db.log_mgr_.set_fdatasync_observation_for_test(1, 9ULL * 1000 * 1000);
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages);
+    EXPECT_LT(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages);
     EXPECT_FALSE(checkpoint_mgr.background_preclean_controller_snapshot_for_test().active);
 }
 
-TEST(CheckpointScheduleTest, FuzzyCohortResumesAt64PagesAfterFiveHealthyObservations) {
+TEST(CheckpointScheduleTest, RepeatedSlowWalObservationsCannotStarveCohortDebt) {
+    ScopedDrainTestDir test_dir("checkpoint_fuzzy_repeated_slow_root");
+    DrainTestDb db("checkpoint_fuzzy_repeated_slow_db", false, 8);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    ASSERT_EQ(MakeDirtyTablePages(&db, 3), 3u);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = AppendBegin(&db.log_mgr_, 1123);
+    options.tick_bytes = PAGE_SIZE;
+    options.tick_time_us = 1000000;
+    options.io_quantum_pages = 1;
+    checkpoint_mgr.SetOptions(options);
+
+    EXPECT_FALSE(checkpoint_mgr.Tick()); // cut
+    EXPECT_FALSE(checkpoint_mgr.Tick()); // durable cut
+    for (uint64_t sequence = 1; sequence <= 5; ++sequence) {
+        db.log_mgr_.set_fdatasync_observation_for_test(sequence, 9ULL * 1000 * 1000);
+        EXPECT_FALSE(checkpoint_mgr.Tick());
+        EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 3u - (sequence + 1) / 2);
+    }
+}
+
+TEST(CheckpointScheduleTest, CohortServiceDebtSeparatesAheadFromBehind) {
+    EXPECT_FALSE(CheckpointManager::cohort_service_debt_for_test(8, 0, 0, 8, true));
+    EXPECT_TRUE(CheckpointManager::cohort_service_debt_for_test(8, 8, 0, 8, true));
+    EXPECT_FALSE(CheckpointManager::cohort_service_debt_for_test(8, 4, 0, 8, true));
+    EXPECT_TRUE(CheckpointManager::cohort_service_debt_for_test(8, 4, 4, 8, true));
+    EXPECT_TRUE(CheckpointManager::cohort_service_debt_for_test(8, 4, 0, 8, false));
+}
+
+TEST(CheckpointScheduleTest, FuzzyCohortDoesNotWaitForHealthySamples) {
     ScopedDrainTestDir test_dir("checkpoint_fuzzy_healthy_ramp_root");
     DrainTestDb db("checkpoint_fuzzy_healthy_ramp_db", false, 128);
     LockManager lock_mgr;
@@ -1012,15 +1043,10 @@ TEST(CheckpointScheduleTest, FuzzyCohortResumesAt64PagesAfterFiveHealthyObservat
     EXPECT_FALSE(checkpoint_mgr.Tick());
     db.log_mgr_.set_fdatasync_observation_for_test(1, 9ULL * 1000 * 1000);
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    for (uint64_t sequence = 2; sequence <= 6; ++sequence) {
-        db.log_mgr_.set_fdatasync_observation_for_test(sequence, 4ULL * 1000 * 1000);
-        EXPECT_FALSE(checkpoint_mgr.Tick());
-    }
-    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 64);
-    EXPECT_EQ(checkpoint_mgr.background_preclean_controller_snapshot_for_test().healthy_samples, 5u);
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 0u);
 }
 
-TEST(CheckpointScheduleTest, FuzzyCohortEmergencyMakes64PageProgress) {
+TEST(CheckpointScheduleTest, FuzzyCohortNoPostCutWalStillMakesInitialProgress) {
     ScopedDrainTestDir test_dir("checkpoint_fuzzy_emergency_progress_root");
     DrainTestDb db("checkpoint_fuzzy_emergency_progress_db", false, 128);
     LockManager lock_mgr;
@@ -1039,38 +1065,79 @@ TEST(CheckpointScheduleTest, FuzzyCohortEmergencyMakes64PageProgress) {
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    while (db.log_mgr_.current_log_offset() < target + target / 2) {
-        (void)AppendBegin(&db.log_mgr_, 4000);
-    }
     db.log_mgr_.set_fdatasync_observation_for_test(1, 9ULL * 1000 * 1000);
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 64);
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 0u);
 }
 
-TEST(CheckpointScheduleTest, FuzzyCohortIdleAfterSlowCutMakesBoundedProbeProgress) {
-    ScopedDrainTestDir test_dir("checkpoint_fuzzy_idle_probe_root");
-    DrainTestDb db("checkpoint_fuzzy_idle_probe_db", false, 128);
+TEST(CheckpointScheduleTest, CutTailCountsWalAppendedBeforeCutSync) {
+    ScopedDrainTestDir test_dir("checkpoint_cut_tail_growth_root");
+    DrainTestDb db("checkpoint_cut_tail_growth_db", false, 8);
     LockManager lock_mgr;
     TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
     CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
-    constexpr size_t kDirtyPages = 80;
+    ASSERT_EQ(MakeDirtyTablePages(&db, 3), 3u);
+    const int64_t target = AppendBegin(&db.log_mgr_, 9000);
+    CheckpointOptions options;
+    options.auto_checkpoint_bytes = target;
+    options.tick_bytes = PAGE_SIZE;
+    options.tick_time_us = 1000000;
+    options.io_quantum_pages = 1;
+    checkpoint_mgr.SetOptions(options);
+
+    bool appended_after_cut = false;
+    CheckpointManager::set_phase_test_hook([&](std::string_view phase) {
+        if (phase == "fuzzy_cut_appended" && !appended_after_cut) {
+            appended_after_cut = true;
+            (void)AppendBegin(&db.log_mgr_, 9001);
+        }
+    });
+    struct HookReset {
+        ~HookReset() {
+            CheckpointManager::set_phase_test_hook({});
+        }
+    } hook_reset;
+
+    EXPECT_FALSE(checkpoint_mgr.Tick()); // start and append after the cut
+    EXPECT_TRUE(appended_after_cut);
+    EXPECT_FALSE(checkpoint_mgr.Tick()); // durable cut
+    db.log_mgr_.set_fdatasync_observation_for_test(1, 9ULL * 1000 * 1000);
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 2u);
+    db.log_mgr_.set_fdatasync_observation_for_test(2, 9ULL * 1000 * 1000);
+    EXPECT_FALSE(checkpoint_mgr.Tick());
+    // The append is measured from tail_offset captured under the WAL latch,
+    // so its one-page growth debt is serviced rather than deferred.
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, 1u);
+}
+
+TEST(CheckpointScheduleTest, FuzzyCohortWithoutNewWalObservationKeepsMakingProgress) {
+    ScopedDrainTestDir test_dir("checkpoint_fuzzy_idle_progress_root");
+    DrainTestDb db("checkpoint_fuzzy_idle_progress_db", false, 8);
+    LockManager lock_mgr;
+    TransactionManager txn_mgr(&lock_mgr, &db.sm_mgr_);
+    CheckpointManager checkpoint_mgr(&txn_mgr, &db.sm_mgr_, &db.log_mgr_);
+    constexpr size_t kDirtyPages = 3;
     ASSERT_EQ(MakeDirtyTablePages(&db, kDirtyPages), kDirtyPages);
     int64_t target = 0;
-    for (txn_id_t id = 0; id < 128; ++id) target = AppendBegin(&db.log_mgr_, 5000 + id);
+    for (txn_id_t id = 0; id < 8; ++id) target = AppendBegin(&db.log_mgr_, 5000 + id);
     CheckpointOptions options;
     options.auto_checkpoint_bytes = target;
     options.background_preclean_enabled = false;
+    options.tick_bytes = PAGE_SIZE;
     options.tick_time_us = 1000000;
+    options.io_quantum_pages = 1;
     checkpoint_mgr.SetOptions(options);
 
     EXPECT_FALSE(checkpoint_mgr.Tick());
     EXPECT_FALSE(checkpoint_mgr.Tick());
     db.log_mgr_.set_fdatasync_observation_for_test(1, 9ULL * 1000 * 1000);
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    for (size_t tick = 1; tick < 50; ++tick) EXPECT_FALSE(checkpoint_mgr.Tick());
-    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages);
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 1);
+    // No new observation means no currently proven contention, so the active
+    // cohort must not inherit the old 50-tick congestion pause.
     EXPECT_FALSE(checkpoint_mgr.Tick());
-    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 64);
+    EXPECT_EQ(db.sm_mgr_.table_dirty_page_stats().dirty_pages, kDirtyPages - 2);
 }
 
 TEST(CheckpointScheduleTest, EmptyFuzzyCohortPublishesDespiteWalCongestion) {

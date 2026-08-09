@@ -35,6 +35,27 @@ struct RmFileHeaderSnapshot {
     std::array<char, sizeof(RmFileHdr)> bytes{};
 };
 
+struct RecoveryPageFinalizeResult {
+    page_id_t page_no{INVALID_PAGE_ID};
+    bool is_full{false};
+    uint32_t normalized_records{0};
+    uint32_t tombstones_removed{0};
+};
+
+struct RecoveryPagePublishStats {
+    uint64_t candidates{0};
+    uint64_t links{0};
+    uint64_t candidate_ns{0};
+    uint64_t link_ns{0};
+    uint64_t wall_ns{0};
+    uint64_t unpin_failures{0};
+};
+
+struct RecoveryPinnedFinalizePage {
+    page_id_t page_no{INVALID_PAGE_ID};
+    Page* page{nullptr};
+};
+
 /* 对表数据文件中的页面进行封装 */
 struct RmPageHandle {
     const RmFileHdr* file_hdr = nullptr; // 当前页面所在文件的文件头指针
@@ -190,6 +211,7 @@ private:
     std::vector<page_id_t> free_page_candidates_;
     std::unordered_set<page_id_t> free_page_candidate_set_;
     size_t free_page_cursor_{0};
+    std::atomic<bool> fail_recovery_physical_pin_for_test_{false};
 
 public:
     RmFileHandle(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int fd)
@@ -303,6 +325,19 @@ public:
     // tuple's MVCC state, recounts the bitmap, and reconciles the free-page
     // candidate exactly once while the page is exclusively latched.
     void finalize_recovery_pages(const std::vector<page_id_t>& page_nos);
+
+    // RecoveryManager workers normalize disjoint pinned pages, then publish a
+    // complete per-table result set after the frame-operation token is released.
+    void publish_recovery_page_finalization(const std::vector<RecoveryPageFinalizeResult>& page_results,
+                                             RecoveryPagePublishStats* stats = nullptr);
+    int recovery_physical_page_frontier() const;
+    std::optional<RecoveryPinnedFinalizePage>
+    pin_recovery_finalize_page(page_id_t page_no, bool physical,
+                               const BufferPoolManager::FrameOperationToken& operation);
+    RecoveryPageFinalizeResult finalize_recovery_pinned_page(const RecoveryPinnedFinalizePage& page);
+    void set_fail_recovery_physical_pin_for_test(bool enabled) {
+        fail_recovery_physical_pin_for_test_.store(enabled, std::memory_order_release);
+    }
 
     // MVCC: get TupleMeta for a slot
     TupleMeta get_tuple_meta(const Rid& rid) const;

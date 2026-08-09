@@ -35,6 +35,56 @@ bool IsKnownLogType(LogType type) {
     }
 }
 
+// Header-only validation runs as soon as LOG_HEADER_SIZE bytes exist. This
+// ordering is what keeps an unknown type or an impossible fixed-size control
+// record from masquerading as a torn body merely by claiming a longer length.
+bool HasValidWalHeader(const char* bytes, uint32_t* total_len_out) {
+    const LogType type = read_unaligned<LogType>(bytes + OFFSET_LOG_TYPE);
+    const lsn_t lsn = read_unaligned<lsn_t>(bytes + OFFSET_LSN);
+    const uint32_t total_len = read_unaligned<uint32_t>(bytes + OFFSET_LOG_TOT_LEN);
+    const txn_id_t txn_id = read_unaligned<txn_id_t>(bytes + OFFSET_LOG_TID);
+    const lsn_t prev_lsn = read_unaligned<lsn_t>(bytes + OFFSET_PREV_LSN);
+    if (!IsKnownLogType(type) || lsn == INVALID_LSN || total_len < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
+        total_len > kMaxRecordBytes) {
+        return false;
+    }
+    switch (type) {
+    case LogType::BEGIN:
+        if (total_len != LOG_HEADER_SIZE || txn_id == INVALID_TXN_ID || prev_lsn != INVALID_LSN) return false;
+        break;
+    case LogType::ABORT:
+        if (total_len != LOG_HEADER_SIZE || txn_id == INVALID_TXN_ID) return false;
+        break;
+    case LogType::COMMIT:
+        if ((total_len != LOG_HEADER_SIZE && total_len != LOG_HEADER_SIZE + sizeof(timestamp_t)) ||
+            txn_id == INVALID_TXN_ID)
+            return false;
+        break;
+    case LogType::CHECKPOINT: {
+        const uint32_t minimum = LOG_HEADER_SIZE + sizeof(size_t);
+        if (total_len < minimum || txn_id != INVALID_TXN_ID || prev_lsn != INVALID_LSN)
+            return false;
+        const uint32_t entry_bytes = sizeof(txn_id_t) + sizeof(lsn_t);
+        if ((total_len - minimum) % entry_bytes != 0) return false;
+        break;
+    }
+    default:
+        break;
+    }
+    *total_len_out = total_len;
+    return true;
+}
+
+// Runs only after the header's legal total_len bytes are present. DML and
+// index payloads remain owned by their existing semantic parsers/CRC checks.
+bool HasValidCompleteWalRecord(const char* bytes, uint32_t total_len) {
+    if (read_unaligned<LogType>(bytes + OFFSET_LOG_TYPE) != LogType::CHECKPOINT) return true;
+    const size_t count = read_unaligned<size_t>(bytes + OFFSET_LOG_DATA);
+    const size_t entry_bytes = sizeof(txn_id_t) + sizeof(lsn_t);
+    const size_t payload_entries = total_len - LOG_HEADER_SIZE - sizeof(size_t);
+    return count == payload_entries / entry_bytes;
+}
+
 // Reads one length-prefixed row image. Returns false if the prefix or the
 // image would leave the record.
 bool ReadImage(const char* bytes, uint32_t total_len, int* offset, const char** image, int* size) {
@@ -260,21 +310,29 @@ bool ParseWalDmlForRedo(const WalRecordView& record, WalDmlView* out) {
 WalReader::WalReader(DiskManager* disk_manager, int64_t begin_offset, int64_t end_offset, int buffer_bytes)
     : disk_manager_(disk_manager), end_offset_(std::max<int64_t>(end_offset, 0)),
       buffer_(static_cast<size_t>(std::max(buffer_bytes, LOG_HEADER_SIZE))),
-      buffer_offset_(std::max<int64_t>(begin_offset, 0)) {}
+      buffer_offset_(std::min(std::max<int64_t>(begin_offset, 0), end_offset_)) {}
 
 bool WalReader::refill() {
     const int carried = buffered();
     if (carried > 0 && cursor_ > 0) {
         std::memmove(buffer_.data(), buffer_.data() + cursor_, static_cast<size_t>(carried));
     }
-    buffer_offset_ += cursor_;
+    if (buffer_offset_ > end_offset_ || cursor_ < 0 || static_cast<int64_t>(cursor_) > end_offset_ - buffer_offset_) {
+        exhausted_ = true;
+        return false;
+    }
+    buffer_offset_ += static_cast<int64_t>(cursor_);
     buffer_size_ = carried;
     cursor_ = 0;
 
     if (exhausted_) {
         return false;
     }
-    const int64_t read_from = buffer_offset_ + buffer_size_;
+    if (buffer_size_ < 0 || static_cast<int64_t>(buffer_size_) > end_offset_ - buffer_offset_) {
+        exhausted_ = true;
+        return false;
+    }
+    const int64_t read_from = buffer_offset_ + static_cast<int64_t>(buffer_size_);
     const int64_t remaining = end_offset_ - read_from;
     if (remaining <= 0) {
         exhausted_ = true;
@@ -301,23 +359,24 @@ bool WalReader::refill() {
 
 bool WalReader::next(WalRecordView* out) {
     if (buffered() < LOG_HEADER_SIZE && !refill()) {
+        status_ = buffered() == 0 ? WalReadStatus::kCleanEnd : WalReadStatus::kTornTail;
         return false;
     }
     if (buffered() < LOG_HEADER_SIZE) {
+        status_ = WalReadStatus::kTornTail;
         return false;
     }
 
     const char* header = buffer_.data() + cursor_;
-    const uint32_t total_len = read_unaligned<uint32_t>(header + OFFSET_LOG_TOT_LEN);
-    if (total_len < static_cast<uint32_t>(LOG_HEADER_SIZE) || total_len > kMaxRecordBytes) {
+    uint32_t total_len = 0;
+    if (!HasValidWalHeader(header, &total_len)) {
+        status_ = WalReadStatus::kCorruption;
         return false;
     }
-    if (next_offset() + static_cast<int64_t>(total_len) > end_offset_) {
-        return false;
-    }
-    if (!IsKnownLogType(read_unaligned<LogType>(header + OFFSET_LOG_TYPE))) {
-        // These bytes are not a record this build wrote; treat them as the
-        // torn tail rather than following their length field.
+    const int64_t record_offset = next_offset();
+    if (record_offset < 0 || record_offset > end_offset_ ||
+        static_cast<int64_t>(total_len) > end_offset_ - record_offset) {
+        status_ = WalReadStatus::kTornTail;
         return false;
     }
     if (buffered() < static_cast<int>(total_len)) {
@@ -329,9 +388,15 @@ bool WalReader::next(WalRecordView* out) {
         }
         refill();
         if (buffered() < static_cast<int>(total_len)) {
+            status_ = WalReadStatus::kTornTail;
             return false;
         }
         header = buffer_.data() + cursor_;
+    }
+
+    if (!HasValidCompleteWalRecord(header, total_len)) {
+        status_ = WalReadStatus::kCorruption;
+        return false;
     }
 
     out->log_type = read_unaligned<LogType>(header + OFFSET_LOG_TYPE);
@@ -339,29 +404,53 @@ bool WalReader::next(WalRecordView* out) {
     out->total_len = total_len;
     out->txn_id = read_unaligned<txn_id_t>(header + OFFSET_LOG_TID);
     out->prev_lsn = read_unaligned<lsn_t>(header + OFFSET_PREV_LSN);
-    out->offset = next_offset();
+    out->offset = record_offset;
     out->bytes = header;
     cursor_ += static_cast<int>(total_len);
     return true;
 }
 
+void WalFramer::finish_segment(int64_t end) {
+    if (segment_records_ != 0) segments_.push_back(FramedSegment{segment_begin_, end, segment_records_});
+    segment_begin_ = end;
+    segment_records_ = 0;
+}
+
+bool WalFramer::next(WalRecordView* out) {
+    if (!reader_.next(out)) {
+        if (reader_.status() != WalReadStatus::kCorruption) finish_segment(reader_.next_offset());
+        return false;
+    }
+    // WalReader has already advanced across one validated record, so its
+    // frontier is the overflow-safe record end and the only boundary used by
+    // this catalogue.
+    const int64_t record_end = reader_.next_offset();
+    if (static_cast<int64_t>(out->total_len) > kTargetBytes) {
+        finish_segment(out->offset);
+        segment_records_ = 1;
+        finish_segment(record_end);
+        return true;
+    }
+    ++segment_records_;
+    const int64_t segment_bytes = record_end - segment_begin_;
+    if (segment_records_ >= kTargetRecords || segment_bytes >= kTargetBytes) finish_segment(record_end);
+    return true;
+}
+
 bool ReadWalRecordAt(DiskManager* disk_manager, int64_t offset, int64_t end_offset, std::vector<char>* scratch,
                      WalRecordView* out) {
-    if (offset < 0 || offset + LOG_HEADER_SIZE > end_offset) {
+    if (offset < 0 || end_offset < offset || end_offset - offset < LOG_HEADER_SIZE) {
         return false;
     }
     scratch->resize(LOG_HEADER_SIZE);
     if (disk_manager->read_log_chunk(scratch->data(), LOG_HEADER_SIZE, offset) != LOG_HEADER_SIZE) {
         return false;
     }
-    const uint32_t total_len = read_unaligned<uint32_t>(scratch->data() + OFFSET_LOG_TOT_LEN);
-    if (total_len < static_cast<uint32_t>(LOG_HEADER_SIZE) || total_len > kMaxRecordBytes ||
-        offset + static_cast<int64_t>(total_len) > end_offset) {
+    uint32_t total_len = 0;
+    if (!HasValidWalHeader(scratch->data(), &total_len) || static_cast<int64_t>(total_len) > end_offset - offset) {
         return false;
     }
-    if (!IsKnownLogType(read_unaligned<LogType>(scratch->data() + OFFSET_LOG_TYPE))) {
-        return false;
-    }
+
     if (total_len > static_cast<uint32_t>(LOG_HEADER_SIZE)) {
         scratch->resize(total_len);
         if (disk_manager->read_log_chunk(scratch->data(), static_cast<int>(total_len), offset) !=
@@ -369,6 +458,7 @@ bool ReadWalRecordAt(DiskManager* disk_manager, int64_t offset, int64_t end_offs
             return false;
         }
     }
+    if (!HasValidCompleteWalRecord(scratch->data(), total_len)) return false;
 
     const char* header = scratch->data();
     out->log_type = read_unaligned<LogType>(header + OFFSET_LOG_TYPE);

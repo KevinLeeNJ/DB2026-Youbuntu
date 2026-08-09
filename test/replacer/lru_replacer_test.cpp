@@ -76,3 +76,49 @@ TEST(LRUReplacerTest, SizeThreadSafe) {
     // 如果没有 data race，到这里不崩溃即为通过
     SUCCEED();
 }
+
+TEST(LRUReplacerTest, RestoreClaimedPreservesOldestVictimWithoutAllocation) {
+    LRUReplacer replacer(4);
+    replacer.unpin(0);
+    replacer.unpin(1);
+    replacer.unpin(2);
+
+    frame_id_t victim = INVALID_FRAME_ID;
+    ASSERT_TRUE(replacer.victim(&victim));
+    ASSERT_EQ(victim, 0);
+    ASSERT_TRUE(replacer.restore_claimed_noexcept(victim));
+    EXPECT_EQ(replacer.Size(), 3u);
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 0);
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 1);
+
+    // restore() has the same no-new-access ordering contract.
+    replacer.restore(1);
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 1);
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 2);
+}
+
+TEST(LRUReplacerTest, ReverseRestoreOfMultipleClaimsPreservesCompleteOrder) {
+    LRUReplacer replacer(4);
+    replacer.unpin(0);
+    replacer.unpin(1);
+    replacer.unpin(2);
+    frame_id_t first = INVALID_FRAME_ID;
+    frame_id_t second = INVALID_FRAME_ID;
+    ASSERT_TRUE(replacer.victim(&first));
+    ASSERT_TRUE(replacer.victim(&second));
+    ASSERT_EQ(first, 0);
+    ASSERT_EQ(second, 1);
+    ASSERT_TRUE(replacer.restore_claimed_noexcept(second));
+    ASSERT_TRUE(replacer.restore_claimed_noexcept(first));
+    frame_id_t victim = INVALID_FRAME_ID;
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 0);
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 1);
+    ASSERT_TRUE(replacer.victim(&victim));
+    EXPECT_EQ(victim, 2);
+}

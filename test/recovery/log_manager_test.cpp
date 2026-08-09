@@ -30,6 +30,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <poll.h>
 #include <memory>
@@ -1551,22 +1552,25 @@ TEST(LogManagerTest, SegmentCreateFailureRetainsDirectorySyncObligationForRetry)
 
 TEST(LogManagerTest, SegmentedWalIsExactOptInUntilGenerationSwitchExists) {
     ScopedTestDir test_dir("segmented_wal_opt_in_test_db");
-    DiskManager disk;
-    ScopedWalFile wal(&disk);
     {
-        ScopedEnvVar disabled("RMDB_WAL_SEGMENTED", "0");
-        LogManager legacy(&disk);
-        legacy.initialize_from_existing_log();
-        EXPECT_FALSE(disk.wal_is_segmented());
+        DiskManager disk;
+        ScopedWalFile wal(&disk);
+        {
+            ScopedEnvVar disabled("RMDB_WAL_SEGMENTED", "0");
+            LogManager legacy(&disk);
+            legacy.initialize_from_existing_log();
+            EXPECT_FALSE(disk.wal_is_segmented());
+        }
+        {
+            ScopedEnvVar enabled("RMDB_WAL_SEGMENTED", "1");
+            LogManager segmented(&disk);
+            segmented.initialize_from_existing_log();
+            EXPECT_TRUE(disk.wal_is_segmented());
+            EXPECT_TRUE(disk.is_file("db.log.0.0"));
+        }
     }
     {
-        ScopedEnvVar enabled("RMDB_WAL_SEGMENTED", "1");
-        LogManager segmented(&disk);
-        segmented.initialize_from_existing_log();
-        EXPECT_TRUE(disk.wal_is_segmented());
-        EXPECT_TRUE(disk.is_file("db.log.0.0"));
-    }
-    {
+        ScopedTestDir invalid_test_dir(UniqueWalTestDir("segmented_wal_invalid_opt_in"));
         ScopedEnvVar invalid("RMDB_WAL_SEGMENTED", "true");
         DiskManager invalid_disk;
         ScopedWalFile invalid_wal(&invalid_disk);
@@ -2086,6 +2090,36 @@ TEST(LogManagerTest, WalFdReopenPreservesAppendOffset) {
     char second[] = {'d', 'e'};
     ASSERT_NO_THROW(disk.write_log(second, static_cast<int>(sizeof(second))));
     EXPECT_EQ(disk.get_log_file_size(), static_cast<int64_t>(sizeof(first) + sizeof(second)));
+}
+
+TEST(LogManagerTest, LegacyWalSnapshotRejectsReusedDescriptorGeneration) {
+    ScopedTestDir test_dir(UniqueWalTestDir("wal_generation_aba"));
+    DiskManager disk;
+    ScopedWalFile wal(&disk);
+    char byte = 'x';
+    ASSERT_NO_THROW(disk.write_log(&byte, 1));
+    const int old_fd = disk.GetLogFd();
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool captured = false;
+    bool release = false;
+    disk.set_wal_lease_test_hook([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        captured = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+    });
+    auto old_size = std::async(std::launch::async, [&] { return disk.get_log_file_size(); });
+    { std::unique_lock<std::mutex> lock(mutex); ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(2), [&] { return captured; })); }
+    disk.close_file(old_fd);
+    const int reused = disk.open_file(LOG_FILE_NAME);
+    ASSERT_EQ(reused, old_fd);
+    { std::lock_guard<std::mutex> lock(mutex); release = true; }
+    cv.notify_all();
+    EXPECT_THROW(old_size.get(), InternalError);
+    disk.set_wal_lease_test_hook({});
+    disk.SetLogFd(reused);
+    EXPECT_EQ(disk.get_log_file_size(), 1);
 }
 
 TEST(LogManagerTest, AppendFlushAndReadBack) {
@@ -2678,9 +2712,12 @@ TEST(LogManagerTest, NonEmptyCheckpointRestartOffsetFallsBackToZero) {
     }
 
     LogManager restarted(&disk);
-    ASSERT_NO_THROW(restarted.initialize_from_existing_log());
-    EXPECT_EQ(restarted.get_global_lsn(), 101);
-    EXPECT_EQ(restarted.read_restart_offset(), 0);
+    // The formerly tolerated rewritten prefix makes the complete stream's
+    // LSNs go 100,1,2. A fallback restart boundary cannot excuse that
+    // corruption: startup must retain the WAL rather than sort/max past it.
+    EXPECT_THROW(restarted.initialize_from_existing_log(), InternalError);
+    EXPECT_EQ(disk.get_file_size(LOG_FILE_NAME), checkpoint_offset + LOG_HEADER_SIZE + sizeof(size_t) +
+                                                    sizeof(txn_id_t) + sizeof(lsn_t) + LOG_HEADER_SIZE);
 }
 
 TEST(LogManagerTest, OutOfRangeRestartOffsetFallsBackToZero) {

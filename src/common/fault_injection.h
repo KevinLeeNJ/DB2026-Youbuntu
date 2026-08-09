@@ -65,6 +65,14 @@ public:
         block_cv_.notify_all();
     }
 
+    // Fault-enabled tests may configure different points sequentially in one
+    // process. Occurrence counts are scoped to one injected run, not to the
+    // lifetime of the test binary.
+    static void ResetForTest() noexcept {
+        point_occurrences_.store(0, std::memory_order_relaxed);
+        block_released_.store(false, std::memory_order_release);
+    }
+
 private:
     inline static std::atomic<bool> block_released_{false};
     inline static std::atomic<int> point_occurrences_{0};

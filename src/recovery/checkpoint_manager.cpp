@@ -74,8 +74,6 @@ constexpr size_t kMaxPrecleanBatchPages = 512;
 constexpr size_t kPrecleanHorizonTicks = 300;
 constexpr uint64_t kHealthyWalFdatasyncNs = 8ULL * 1000 * 1000;
 constexpr uint8_t kHealthyWalObservationsToResume = 5;
-constexpr size_t kFuzzyEmergencyProgressPages = 64;
-constexpr uint64_t kFuzzyIdleProbeTicks = 50;
 
 size_t PercentPages(size_t capacity, uint8_t percent, bool round_up) noexcept {
     const size_t quotient = capacity / 100;
@@ -224,6 +222,7 @@ struct CheckpointManager::FuzzyCheckpointState {
     size_t cohort_pages_written{};
     bool cohort_flush_logged{false};
     bool cohort_flush_complete{false};
+    bool cohort_debt_yielded{false};
     bool wal_cut_synced{false};
     bool headers_written{false};
     size_t next_file_sync{};
@@ -278,12 +277,12 @@ void CheckpointManager::SetOptions(CheckpointOptions options) {
 }
 
 void CheckpointManager::ObserveBackgroundIoWal() {
+    background_io_observed_this_tick_ = false;
     const LogManager::FdatasyncObservationWindow wal = log_mgr_->consume_fdatasync_observations();
     if (wal.count == 0) {
-        if (background_io_ticks_without_wal_ != std::numeric_limits<uint64_t>::max()) ++background_io_ticks_without_wal_;
         return;
     }
-    background_io_ticks_without_wal_ = 0;
+    background_io_observed_this_tick_ = true;
     background_preclean_wal_sequence_ = wal.sequence;
     background_preclean_wal_window_max_ns_ = wal.max_elapsed_ns;
     background_preclean_wal_ewma_ns_ = background_preclean_wal_ewma_ns_ == 0 ? wal.max_elapsed_ns : background_preclean_wal_ewma_ns_ - background_preclean_wal_ewma_ns_ / 4 + wal.max_elapsed_ns / 4;
@@ -325,16 +324,23 @@ size_t CheckpointManager::BackgroundPrecleanBudget() const noexcept {
     return pages;
 }
 
-size_t CheckpointManager::FuzzyCohortBudget(size_t configured_budget_pages) noexcept {
-    if (!BackgroundIoPaused()) return background_preclean_ramp_level_ == 0 ? configured_budget_pages : std::min(configured_budget_pages, kFuzzyEmergencyProgressPages * background_preclean_ramp_level_);
-    const int64_t target = std::max<int64_t>(1, options_.auto_checkpoint_bytes);
-    if (RetainedWalBytes(log_mgr_->current_log_offset()) >= target + target / 2)
-        return std::min(configured_budget_pages, kFuzzyEmergencyProgressPages);
-    if (background_io_ticks_without_wal_ >= kFuzzyIdleProbeTicks) {
-        background_io_ticks_without_wal_ = 0;
-        return std::min(configured_budget_pages, kFuzzyEmergencyProgressPages);
-    }
-    return 0;
+bool CheckpointManager::cohort_service_debt_for_test(size_t total_pages, size_t remaining_pages,
+                                                      int64_t growth_since_cut, int64_t target_wal_bytes,
+                                                      bool congested_observation) noexcept {
+    if (remaining_pages == 0) return false;
+    if (!congested_observation || remaining_pages >= total_pages) return true;
+    const size_t completed_pages = total_pages - remaining_pages;
+    const uint64_t bounded_growth = static_cast<uint64_t>(std::max<int64_t>(0, growth_since_cut));
+    const uint64_t target = static_cast<uint64_t>(std::max<int64_t>(1, target_wal_bytes));
+    const uint64_t bounded_target_growth = std::min(bounded_growth, target);
+    // ceil(total_pages * bounded_growth / target), formed without a product
+    // overflow. This is service debt, not a calibrated recovery-time model.
+    const uint64_t remainder = bounded_target_growth % target;
+    const unsigned __int128 numerator = static_cast<unsigned __int128>(total_pages) * remainder;
+    const uint64_t growth_due = bounded_target_growth == target
+                                    ? static_cast<uint64_t>(total_pages)
+                                    : static_cast<uint64_t>((numerator + target - 1) / target);
+    return completed_pages <= growth_due;
 }
 
 void CheckpointManager::MaybeRunBackgroundPreclean() {
@@ -676,6 +682,7 @@ bool CheckpointManager::StartFuzzyCheckpoint() {
         manifest.next_timestamp = txn_mgr_->peek_next_timestamp();
         manifest.next_txn_id = txn_mgr_->peek_next_txn_id();
         CheckpointWalCut wal_cut = log_mgr_->create_checkpoint_wal_cut(headers.index_file_names);
+        RunCheckpointPhaseTestHook("fuzzy_cut_appended");
         cut_timer.Finish();
         manifest.checkpoint_offset = wal_cut.checkpoint_offset;
         LOG_WARN("checkpoint-event kind=fuzzy id=%llu phase=wal-cut-append-end checkpoint_offset=%lld last_lsn=%d",
@@ -734,8 +741,7 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
                      static_cast<unsigned long long>(fuzzy_checkpoint_->cohort.epoch));
         }
         ObserveBackgroundIoWal();
-        // A zero-I/O probe lets an empty or already-discharged cohort complete
-        // even while optional page writeback is paused by WAL congestion.
+        // A zero-I/O probe lets an empty or already-discharged cohort complete.
         const auto completion_probe =
             bpm->flush_checkpoint_cohort(fuzzy_checkpoint_->cohort.epoch, 0, 1);
         if (!completion_probe.success) throw UnixError();
@@ -745,13 +751,29 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
         if (!fuzzy_checkpoint_->cohort_flush_complete) {
         const size_t quantum_pages = options_.io_quantum_pages;
         const size_t byte_budget_pages = std::max<size_t>(size_t{1}, options_.tick_bytes / PAGE_SIZE);
-        const size_t io_budget_pages = FuzzyCohortBudget(byte_budget_pages);
-        if (io_budget_pages == 0) {
-            bpm->background_preclean_metrics().congestion_pause();
-            return false;
+        const int64_t current_offset = log_mgr_->current_log_offset();
+        const int64_t target_wal_bytes = std::max<int64_t>(1, options_.auto_checkpoint_bytes);
+        const int64_t wal_growth_since_cut =
+            std::max<int64_t>(0, current_offset - fuzzy_checkpoint_->wal_cut.tail_offset);
+        const bool congested_observation = background_io_observed_this_tick_ && BackgroundIoPaused();
+        bool service_debt = cohort_service_debt_for_test(
+            fuzzy_checkpoint_->cohort.pages_marked, completion_probe.pages_remaining, wal_growth_since_cut,
+            target_wal_bytes, congested_observation);
+        // Congestion may pause optional preclean, but not a cohort with
+        // outstanding service debt. Its quantum remains the per-tick latency
+        // bound rather than a controller tuning knob.
+        if (!service_debt) {
+            // An ahead congested cohort may defer once, but that defer itself
+            // becomes debt. Without a calibrated arrival/service model this
+            // alternating bound prevents a stale zero-growth window from
+            // extending the active checkpoint indefinitely.
+            if (!fuzzy_checkpoint_->cohort_debt_yielded) {
+                fuzzy_checkpoint_->cohort_debt_yielded = true;
+                return false;
+            }
+            service_debt = true;
         }
-        if (io_budget_pages < byte_budget_pages) bpm->background_preclean_metrics().congestion_throttle();
-        else if (background_preclean_ramp_level_ != 0) bpm->background_preclean_metrics().congestion_ramp();
+        const size_t io_budget_pages = byte_budget_pages;
         // SetOptions clamps the unsigned input before this signed duration
         // conversion, so neither conversion nor now()+duration can overflow.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(options_.tick_time_us);
@@ -781,6 +803,7 @@ bool CheckpointManager::AdvanceFuzzyCheckpoint() {
             if (!result.success) throw UnixError();
             pages_written += result.pages_written;
             fuzzy_checkpoint_->cohort_pages_written += result.pages_written;
+            if (result.pages_written != 0) fuzzy_checkpoint_->cohort_debt_yielded = false;
             pages_remaining = result.pages_remaining;
             if (pages_remaining == 0) break;
             // No successful write and no remaining obligation change would spin on

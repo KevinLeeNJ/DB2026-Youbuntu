@@ -31,6 +31,16 @@ struct WalRecordView {
     const char* bytes{nullptr}; // total_len bytes, starting at the record header
 };
 
+// A catalogue entry covers whole serialized records only.  It is deliberately
+// metadata-only: Phase A keeps analysis serial and does not change redo/undo.
+struct FramedSegment {
+    int64_t begin{0};
+    int64_t end{0};
+    uint32_t record_count{0};
+};
+
+enum class WalReadStatus { kReading, kCleanEnd, kTornTail, kCorruption };
+
 struct WalUpdateDeltaSpan {
     uint32_t offset{0};
     uint32_t length{0};
@@ -126,6 +136,10 @@ public:
     // already consumed. After next() returns false this is the end of the
     // intact WAL prefix.
     int64_t next_offset() const {
+        if (cursor_ < 0 || buffer_offset_ < 0 || buffer_offset_ > end_offset_ ||
+            static_cast<int64_t>(cursor_) > end_offset_ - buffer_offset_) {
+            return end_offset_;
+        }
         return buffer_offset_ + static_cast<int64_t>(cursor_);
     }
 
@@ -133,6 +147,8 @@ public:
     uint64_t read_count() const {
         return read_count_;
     }
+
+    WalReadStatus status() const { return status_; }
 
 private:
     int buffered() const {
@@ -151,4 +167,31 @@ private:
     int cursor_{0};            // next unconsumed byte in buffer_
     bool exhausted_{false};    // the scan bound has been reached
     uint64_t read_count_{0};
+    WalReadStatus status_{WalReadStatus::kReading};
+};
+
+// Serial record-boundary framer used by recovery analysis.  Segment targets
+// are soft limits: a record is never split, and a record already exceeding a
+// target occupies a segment by itself.
+class WalFramer {
+public:
+    static constexpr int64_t kTargetBytes = 16LL * 1024 * 1024;
+    static constexpr uint32_t kTargetRecords = 262144;
+
+    WalFramer(DiskManager* disk_manager, int64_t begin_offset, int64_t end_offset,
+              int buffer_bytes = WalReader::kDefaultBufferBytes)
+        : reader_(disk_manager, begin_offset, end_offset, buffer_bytes), segment_begin_(reader_.next_offset()) {}
+
+    bool next(WalRecordView* out);
+    int64_t next_offset() const { return reader_.next_offset(); }
+    uint64_t read_count() const { return reader_.read_count(); }
+    WalReadStatus status() const { return reader_.status(); }
+    const std::vector<FramedSegment>& segments() const { return segments_; }
+
+private:
+    void finish_segment(int64_t end);
+    WalReader reader_;
+    int64_t segment_begin_{0};
+    uint32_t segment_records_{0};
+    std::vector<FramedSegment> segments_;
 };

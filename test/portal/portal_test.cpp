@@ -866,6 +866,12 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     EXPECT_EQ(read_unaligned<int>(committed_after_own_abort->data + columns[1].offset), 77);
     EXPECT_FLOAT_EQ(read_float(committed_after_own_abort->data + columns[2].offset), 1.75F);
 
+    const TupleMeta committed_meta_before_first_conflict =
+        executable->scan.table_handle->get_tuple_meta(changed_lookup.rid);
+    const uint64_t prepared_update_table_runtime_id = [&] {
+        auto catalog_guard = sm_manager_->acquire_catalog_shared();
+        return sm_manager_->get_table_runtime_id_under_catalog_guard("prepared_update_rows");
+    }();
     Transaction* concurrent_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction* uncommitted_writer =
@@ -878,48 +884,51 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
 
     Context concurrent_context(&lock_manager, &log_manager, concurrent_transaction, buffer, &offset,
                                &transaction_manager);
+    concurrent_context.abort_metrics_enabled_ = true;
     auto concurrent_statement = portal_->start_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
         &concurrent_context);
 
-    auto waiter_result = std::async(std::launch::async, [&] { concurrent_statement->root->Next(); });
-    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    bool waiter_enqueued = false;
-    while (std::chrono::steady_clock::now() < enqueue_deadline) {
-        if (lock_manager.has_record_waiters_for_test()) {
-            waiter_enqueued = true;
-            break;
+    {
+        auto catalog_guard = sm_manager_->acquire_catalog_shared();
+        try {
+            concurrent_statement->root->Next();
+            FAIL() << "SI first point-write conflict must abort before enqueueing a waiter";
+        } catch (const TransactionAbortException& error) {
+            EXPECT_EQ(error.GetAbortReason(), AbortReason::WW_CONFLICT);
+            EXPECT_EQ(error.GetAbortDetail(), AbortDetail::IMMEDIATE_ACTIVE_OWNER);
+            EXPECT_EQ(error.GetTriggeringTableRuntimeId(), prepared_update_table_runtime_id);
         }
-        std::this_thread::yield();
     }
-    if (!waiter_enqueued) {
-        transaction_manager.abort(uncommitted_writer, &log_manager);
-        if (waiter_result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
-            transaction_manager.abort(concurrent_transaction, &log_manager);
-        }
-        ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
-            << "SI first-lock waiter was not enqueued before the deadline";
-        EXPECT_NO_THROW(waiter_result.get());
-        transaction_manager.abort(concurrent_transaction, &log_manager);
-        return;
-    }
-
-    transaction_manager.abort(uncommitted_writer, &log_manager);
-    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
-        << "SI first-lock waiter did not finish after owner abort";
-    EXPECT_NO_THROW(waiter_result.get());
+    EXPECT_FALSE(lock_manager.has_record_waiters_for_test());
+    EXPECT_TRUE(concurrent_transaction->get_lock_set()->empty());
+    EXPECT_TRUE(concurrent_transaction->get_write_set().empty());
+    EXPECT_EQ(concurrent_transaction->GetUndoLogNum(), 0U);
+    EXPECT_EQ(uncommitted_writer->get_state(), TransactionState::GROWING);
     transaction_manager.abort(concurrent_transaction, &log_manager);
+    transaction_manager.abort(uncommitted_writer, &log_manager);
 
     const int post_wait_id = 2;
     const auto post_wait_lookup =
         executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&post_wait_id));
     ASSERT_EQ(post_wait_lookup.status, UniqueLookupStatus::Unique);
     EXPECT_EQ(post_wait_lookup.rid, changed_lookup.rid);
+    std::vector<char> post_abort_code_key(executable->indexes[1].meta->col_tot_len);
+    std::memcpy(post_abort_code_key.data(), "new", 3);
+    const auto post_abort_code_lookup = executable->indexes[1].handle->lookup_unique(post_abort_code_key.data());
+    ASSERT_EQ(post_abort_code_lookup.status, UniqueLookupStatus::Unique);
+    EXPECT_EQ(post_abort_code_lookup.rid, changed_lookup.rid);
+    std::vector<char> aborted_code_key(executable->indexes[1].meta->col_tot_len);
+    std::memcpy(aborted_code_key.data(), "own", 3);
+    EXPECT_EQ(executable->indexes[1].handle->lookup_unique(aborted_code_key.data()).status,
+              UniqueLookupStatus::NotFound);
     auto post_wait_record = executable->scan.table_handle->get_record(post_wait_lookup.rid, nullptr);
     ASSERT_NE(post_wait_record, nullptr);
     EXPECT_EQ(read_unaligned<int>(post_wait_record->data + columns[0].offset), 2);
     EXPECT_EQ(read_unaligned<int>(post_wait_record->data + columns[1].offset), 77);
     EXPECT_FLOAT_EQ(read_float(post_wait_record->data + columns[2].offset), 1.75F);
+    EXPECT_EQ(executable->scan.table_handle->get_tuple_meta(post_wait_lookup.rid),
+              committed_meta_before_first_conflict);
 
     Transaction* stale_delete_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);

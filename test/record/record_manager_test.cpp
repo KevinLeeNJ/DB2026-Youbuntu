@@ -373,6 +373,46 @@ TEST_F(RecordManagerTest, RecoveryBitmapScanRepairsPartiallyPersistedFreeLinksAn
     rm_manager.destroy_file(filename);
 }
 
+TEST_F(RecordManagerTest, EmptyRecoveryFinalizeSummaryCanonicalizesSubsetFreeChain) {
+    auto buffer_pool_manager = std::make_unique<BufferPoolManager>(64, disk_manager_.get());
+    RmManager rm_manager(disk_manager_.get(), buffer_pool_manager.get());
+    const std::string filename = UniqueTestFileName("empty_finalize_subset_chain");
+    rm_manager.create_file(filename, 1000);
+    auto file_handle = rm_manager.open_file(filename);
+    for (int page = 0; page < 3; ++page) {
+        RmPageHandle created = file_handle->create_new_page_handle();
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(created.page->get_page_id(), true));
+    }
+    file_handle->finalize_recovery_pages({1, 2, 3});
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    file_handle = rm_manager.open_file(filename);
+    RmPageHandle subset_head = file_handle->fetch_page_handle(2);
+    { std::unique_lock<std::shared_mutex> lock(subset_head.page->latch()); subset_head.page_hdr->next_free_page_no = RM_NO_PAGE; BufferPoolManager::mark_dirty_locked(subset_head.page); }
+    ASSERT_TRUE(buffer_pool_manager->unpin_page(subset_head.page->get_page_id(), false));
+    file_handle->file_hdr_.first_free_page_no = 2;
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    for (int reopen = 0; reopen < 2; ++reopen) {
+        file_handle = rm_manager.open_file(filename);
+        file_handle->prepare_recovery_free_space();
+        file_handle->publish_recovery_page_finalization({});
+        PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    }
+    file_handle = rm_manager.open_file(filename);
+    std::set<page_id_t> chain;
+    for (page_id_t page_no = file_handle->get_file_hdr().first_free_page_no; page_no != RM_NO_PAGE;) {
+        ASSERT_TRUE(chain.insert(page_no).second);
+        RmPageHandle page = file_handle->fetch_page_handle(page_no);
+        page_no = page.page_hdr->next_free_page_no;
+        ASSERT_TRUE(buffer_pool_manager->unpin_page(page.page->get_page_id(), false));
+    }
+    EXPECT_EQ(chain, (std::set<page_id_t>{1, 2, 3}));
+    std::vector<char> record(1000, 0);
+    const Rid reused = file_handle->insert_record(record.data(), nullptr);
+    EXPECT_EQ(reused.page_no, 1);
+    PersistRecordFileAndClose(disk_manager_.get(), buffer_pool_manager.get(), &file_handle);
+    rm_manager.destroy_file(filename);
+}
+
 TEST_F(RecordManagerTest, RecoverySizeChecksRejectShortAndSubPageTails) {
     auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager_.get());
     ScopedRecordFile file(disk_manager_.get(), buffer_pool_manager.get(), 64);
@@ -537,6 +577,38 @@ TEST_F(RecordManagerTest, CloseFailsClosedWhenWalDependencyCannotFlush) {
     disk_manager_->destroy_file(filename);
 }
 
+TEST_F(RecordManagerTest, NewRecordPageFlushFailureThrowsWithoutDereferencingNull) {
+    auto bpm = std::make_unique<BufferPoolManager>(1, disk_manager_.get());
+    RmManager rm_manager(disk_manager_.get(), bpm.get());
+    const std::string filename = UniqueTestFileName("new_page_flush_failure");
+    rm_manager.create_file(filename, sizeof(int));
+    auto file = rm_manager.open_file(filename);
+    ScopedDiskFile blocker(disk_manager_.get());
+
+    PageId blocker_id{blocker.fd(), INVALID_PAGE_ID};
+    Page* blocker_page = bpm->new_page(&blocker_id);
+    ASSERT_NE(blocker_page, nullptr);
+    {
+        std::unique_lock page_lock{blocker_page->latch()};
+        blocker_page->set_page_lsn(0);
+        BufferPoolManager::mark_dirty_locked(blocker_page);
+    }
+    ASSERT_TRUE(bpm->unpin_page(blocker_id, false));
+
+    int value = 7;
+    EXPECT_THROW(file->insert_record(reinterpret_cast<char*>(&value), nullptr), InternalError);
+    EXPECT_TRUE(bpm->is_page_resident(blocker_id));
+    Page* retained = bpm->fetch_page(blocker_id);
+    ASSERT_NE(retained, nullptr);
+    EXPECT_TRUE(retained->is_dirty());
+    EXPECT_EQ(retained->get_page_lsn(), 0);
+    EXPECT_TRUE(bpm->unpin_page(blocker_id, false));
+
+    rm_manager.close_file(file.get());
+    rm_manager.destroy_file(filename);
+    bpm->delete_all_pages(blocker.fd());
+}
+
 TEST_F(RecordManagerTest, ApplyTupleUpdateInstallsTupleAndPageLsnTogether) {
     auto buffer_pool_manager = std::make_unique<BufferPoolManager>(8, disk_manager_.get());
     auto rm_manager = std::make_unique<RmManager>(disk_manager_.get(), buffer_pool_manager.get());
@@ -567,7 +639,13 @@ TEST_F(RecordManagerTest, ApplyTupleUpdateInstallsTupleAndPageLsnTogether) {
     EXPECT_FALSE(file_handle->get_tuple_meta(rid).is_committed_);
     EXPECT_EQ(file_handle->get_page_lsn(rid), 42);
 
-    rm_manager->close_file(file_handle.get());
+    // This unit test deliberately installs a synthetic WAL LSN without a
+    // LogManager. Discard its in-memory page after the atomicity assertions;
+    // close_file must not pretend that the synthetic dependency is durable.
+    const int fd = file_handle->GetFd();
+    buffer_pool_manager->delete_all_pages(fd);
+    disk_manager_->close_file(fd);
+    file_handle.reset();
     rm_manager->destroy_file(filename);
 }
 
@@ -599,7 +677,10 @@ TEST_F(RecordManagerTest, PreparedInsertInstallsTupleMetaAndPageLsnTogether) {
     EXPECT_FALSE(file_handle->get_tuple_meta(prepared.rid).is_committed_);
     EXPECT_EQ(file_handle->get_page_lsn(prepared.rid), 77);
 
-    rm_manager->close_file(file_handle.get());
+    const int fd = file_handle->GetFd();
+    buffer_pool_manager->delete_all_pages(fd);
+    disk_manager_->close_file(fd);
+    file_handle.reset();
     rm_manager->destroy_file(filename);
 }
 

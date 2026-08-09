@@ -72,6 +72,8 @@ public:
     static size_t compute_background_preclean_budget_for_test(size_t dirty_pages, size_t capacity, uint8_t low_percent,
                                                               size_t base_pages, size_t max_pages,
                                                               uint64_t wal_ewma_ns) noexcept;
+    static bool cohort_service_debt_for_test(size_t total_pages, size_t remaining_pages, int64_t growth_since_cut,
+                                             int64_t target_wal_bytes, bool congested_observation) noexcept;
     static uint8_t saturate_healthy_observations_for_test(uint8_t current, uint64_t count) noexcept;
     static uint8_t saturate_ramp_level_for_test(uint8_t current) noexcept;
     static void set_phase_test_hook(std::function<void(std::string_view)> hook);
@@ -88,7 +90,6 @@ private:
     void ObserveBackgroundIoWal();
     bool BackgroundIoPaused() const noexcept;
     size_t BackgroundPrecleanBudget() const noexcept;
-    size_t FuzzyCohortBudget(size_t configured_budget_pages) noexcept;
 
     TransactionManager* txn_mgr_;
     SmManager* sm_mgr_;
@@ -111,6 +112,6 @@ private:
     uint8_t background_preclean_ramp_level_{0};
     uint64_t background_preclean_wal_window_max_ns_{0};
     bool background_preclean_congestion_latched_{false};
-    uint64_t background_io_ticks_without_wal_{0};
+    bool background_io_observed_this_tick_{false};
     size_t background_preclean_last_budget_{0};
 };

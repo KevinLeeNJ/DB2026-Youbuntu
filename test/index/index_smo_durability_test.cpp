@@ -35,6 +35,7 @@ See the Mulan PSL v2 for more details. */
 #include <numeric>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <unistd.h>
@@ -48,6 +49,8 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
+static_assert(!std::is_assignable_v<decltype(std::declval<IndexSmoWalLayout&>().page_count()), uint32_t>);
+
 // Small enough that a few thousand keys force continuous eviction, which is what
 // makes the on-disk image of an in-flight SMO partial in the first place.
 constexpr size_t kSmallPoolFrames = 48;
@@ -57,6 +60,7 @@ constexpr int kKeyLen = 64;
 constexpr uint32_t kIndexSmoFixedPayloadBytes =
     sizeof(uint32_t) + sizeof(uint16_t) * 2 + sizeof(uint32_t) * 4 + sizeof(uint64_t);
 constexpr uint32_t kIndexSmoImageEnvelopeBytes = sizeof(uint8_t) * 2 + sizeof(uint16_t) + sizeof(uint32_t) * 2;
+constexpr uint32_t kIndexSmoV3LayoutBytes = sizeof(int32_t) * 3;
 
 template <typename T> void AppendTestScalar(std::vector<char>* bytes, T value) {
     const size_t offset = bytes->size();
@@ -163,6 +167,60 @@ std::array<char, PAGE_SIZE> WalImagePage(const IxFileHdr& file_hdr, int num_key,
     return image;
 }
 
+uint8_t FirstV3PageCodec(const std::vector<char>& bytes, size_t name_bytes) {
+    const uint32_t image_offset = OFFSET_LOG_DATA + kIndexSmoFixedPayloadBytes + kIndexSmoV3LayoutBytes +
+                                  static_cast<uint32_t>(name_bytes) + sizeof(page_id_t);
+    return static_cast<uint8_t>(bytes[image_offset]);
+}
+
+void ExpectV3CodecRoundTripAndFailClosed(const IndexSmoWalData& data, uint8_t expected_codec) {
+    std::vector<char> bytes = SerializeIndexSmo(data);
+    ASSERT_EQ(read_unaligned<uint16_t>(bytes.data() + OFFSET_LOG_DATA + sizeof(uint32_t)), INDEX_SMO_VERSION_V3);
+    ASSERT_EQ(FirstV3PageCodec(bytes, data.index_file_name.size()), expected_codec);
+
+    IndexSmoWalLayout layout;
+    ASSERT_TRUE(InspectIndexSmoWal(IndexSmoViewOf(bytes), &layout));
+    std::vector<IndexSmoWalView::Page> catalogue(layout.page_count());
+    ASSERT_TRUE(CopyIndexSmoPageCatalog(IndexSmoViewOf(bytes), catalogue.data(), catalogue.size()));
+    ASSERT_EQ(catalogue[0].page_no, data.pages[0].page_no);
+    ASSERT_EQ(catalogue[0].image, nullptr);
+
+    std::vector<IndexSmoWalView::Page> pages(layout.page_count());
+    std::vector<std::array<char, PAGE_SIZE>> decoded(layout.decoded_count());
+    IndexSmoWalDecodedView decoded_view;
+    ASSERT_TRUE(DecodeIndexSmoWal(IndexSmoViewOf(bytes), {pages.data(), pages.size(), decoded.data(), decoded.size()},
+                                  &decoded_view));
+    ASSERT_EQ(decoded_view.index_file_name, data.index_file_name);
+    ASSERT_EQ(std::memcmp(decoded_view.pages[0].image, data.pages[0].bytes.data(), PAGE_SIZE), 0);
+    ASSERT_EQ(std::memcmp(decoded_view.header_image, data.header.data(), PAGE_SIZE), 0);
+
+    IndexSmoWalView wrapped;
+    ASSERT_TRUE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &wrapped));
+    ASSERT_EQ(wrapped.index_file_name, decoded_view.index_file_name);
+    ASSERT_EQ(std::memcmp(wrapped.page_image(0), decoded_view.pages[0].image, PAGE_SIZE), 0);
+
+    std::array<IndexSmoWalView::Page, 1> untouched{{{999, reinterpret_cast<const char*>(0x7)}}};
+    EXPECT_FALSE(CopyIndexSmoPageCatalog(IndexSmoViewOf(bytes), untouched.data(), 0));
+    EXPECT_EQ(untouched[0].page_no, 999);
+    EXPECT_EQ(untouched[0].image, reinterpret_cast<const char*>(0x7));
+    IndexSmoWalDecodedView unchanged;
+    unchanged.index_file_name = "unchanged";
+    EXPECT_FALSE(DecodeIndexSmoWal(IndexSmoViewOf(bytes), {untouched.data(), 0, decoded.data(), decoded.size()}, &unchanged));
+    EXPECT_EQ(unchanged.index_file_name, "unchanged");
+
+    // Preserve the allocation and record length, then give the modified bytes
+    // a correct trailing CRC. Safe entry points do not accept the prior
+    // inspection token, so they must freshly inspect and decode these bytes.
+    const uint32_t page_id_offset = OFFSET_LOG_DATA + kIndexSmoFixedPayloadBytes + kIndexSmoV3LayoutBytes +
+                                    static_cast<uint32_t>(data.index_file_name.size());
+    const page_id_t mutated_page = data.pages[0].page_no + 17;
+    std::memcpy(bytes.data() + page_id_offset, &mutated_page, sizeof(mutated_page));
+    RefreshIndexSmoChecksum(&bytes);
+    EXPECT_TRUE(CopyIndexSmoPageCatalog(IndexSmoViewOf(bytes), untouched.data(), untouched.size()));
+    EXPECT_TRUE(DecodeIndexSmoWal(IndexSmoViewOf(bytes), {pages.data(), pages.size(), decoded.data(), decoded.size()},
+                                  &unchanged));
+}
+
 class IndexSmoDurabilityTest : public ::testing::Test {
 public:
     std::unique_ptr<DiskManager> disk_manager;
@@ -239,12 +297,11 @@ public:
         // Every test leaves its handle open on purpose - a crash does not close
         // files - so drop the descriptor here rather than through close_index(),
         // which would flush the very pages the test is checking never reached
-        // disk. Reaching into path2fd_ keeps this working when a test aborts
-        // early, so a teardown error can never mask the real failure.
-        if (auto it = disk_manager->path2fd_.find(index_name); it != disk_manager->path2fd_.end()) {
-            disk_manager->close_file(it->second);
-        }
+        // disk. get_file_fd returns the existing descriptor or temporarily
+        // opens the file, keeping cleanup within the public registry lifecycle.
         if (disk_manager->is_file(index_name)) {
+            const int fd = disk_manager->get_file_fd(index_name);
+            disk_manager->close_file(fd);
             disk_manager->destroy_file(index_name);
         }
     }
@@ -708,6 +765,45 @@ TEST(IndexSmoWalV3Test, WordBitmapWinsForOfficialLikeCanonicalPageAndFailsClosed
     }
 }
 
+TEST(IndexSmoWalV3Test, SelectsRawRleAndBitmapWithSafeCursorParity) {
+    const IxFileHdr layout = WalImageLayout(16, 32);
+    const std::array<char, PAGE_SIZE> header = WalImageHeader(layout);
+    const size_t used = sizeof(IxPageHdr) + static_cast<size_t>(layout.keys_size_) +
+                        static_cast<size_t>(layout.btree_order_ + 1) * sizeof(Rid);
+    ASSERT_LT(used + 1024, PAGE_SIZE);
+
+    auto make_data = [&](std::string_view name, const std::array<char, PAGE_SIZE>& page) {
+        IndexSmoWalData data;
+        data.index_file_name = name;
+        data.index_generation = 100 + static_cast<uint64_t>(name.size());
+        data.pages.resize(1);
+        data.pages[0].page_no = IX_INIT_ROOT_PAGE;
+        data.pages[0].bytes = page;
+        data.header = header;
+        return data;
+    };
+
+    std::array<char, PAGE_SIZE> raw = WalImagePage(layout, 1, 0);
+    uint32_t random = 0x12345678U;
+    for (size_t index = sizeof(IxPageHdr); index < raw.size(); ++index) {
+        random ^= random << 13U;
+        random ^= random >> 17U;
+        random ^= random << 5U;
+        raw[index] = static_cast<char>((random & 0xffU) | 1U);
+    }
+    ExpectV3CodecRoundTripAndFailClosed(make_data("v3_raw.idx", raw), 0);
+
+    // num_key=0 makes the structured transform identical to the raw page, so
+    // ordinary RLE wins its strict tie-break without weakening page validity.
+    ExpectV3CodecRoundTripAndFailClosed(make_data("v3_rle.idx", WalImagePage(layout, 0, 0)), 1);
+
+    std::array<char, PAGE_SIZE> bitmap = WalImagePage(layout, 1, 0);
+    for (size_t index = used + (4 - used % 4) % 4; index < bitmap.size(); index += 4) {
+        bitmap[index] = static_cast<char>('b');
+    }
+    ExpectV3CodecRoundTripAndFailClosed(make_data("v3_bitmap.idx", bitmap), 3);
+}
+
 TEST(IndexSmoWalV3Test, EnvOptOutUsesV2InFreshProcess) {
     const char* opt_out = std::getenv("RMDB_INDEX_SMO_V3");
     if (opt_out == nullptr || std::strcmp(opt_out, "0") != 0) {
@@ -754,6 +850,137 @@ TEST(IndexSmoWalV2Test, ParsesLegacyV1AlongsideV2) {
     EXPECT_EQ(std::memcmp(parsed.page_image(0), data.pages[0].bytes.data(), PAGE_SIZE), 0);
 }
 
+TEST(IndexSmoWalCursorTest, InspectDecodeCatalogAndExactArenasPreserveWrapperBytes) {
+    const IxFileHdr file_hdr = WalImageLayout(16, 32);
+    IndexSmoWalData data;
+    data.index_file_name = "cursor.idx";
+    data.index_generation = 91;
+    data.pages.resize(2);
+    data.pages[0].page_no = IX_INIT_ROOT_PAGE;
+    data.pages[0].bytes = WalImagePage(file_hdr, 12);
+    data.pages[1].page_no = IX_INIT_ROOT_PAGE + 1;
+    data.pages[1].bytes = WalImagePage(file_hdr, 8, 'q');
+    data.header = WalImageHeader(file_hdr);
+    const std::vector<char> bytes = SerializeIndexSmo(data);
+
+    IndexSmoWalLayout layout;
+    ASSERT_TRUE(InspectIndexSmoWal(IndexSmoViewOf(bytes), &layout));
+    EXPECT_EQ(layout.page_count(), data.pages.size());
+    EXPECT_EQ(layout.generation(), data.index_generation);
+    EXPECT_GT(layout.decoded_count(), 0U);
+
+    std::vector<IndexSmoWalView::Page> catalogue(layout.page_count());
+    ASSERT_TRUE(CopyIndexSmoPageCatalog(IndexSmoViewOf(bytes), catalogue.data(), catalogue.size()));
+    EXPECT_EQ(catalogue[0].page_no, data.pages[0].page_no);
+    EXPECT_EQ(catalogue[1].page_no, data.pages[1].page_no);
+    EXPECT_EQ(catalogue[0].image, nullptr);
+
+    std::vector<IndexSmoWalView::Page> pages(layout.page_count());
+    std::vector<std::array<char, PAGE_SIZE>> decoded(layout.decoded_count());
+    IndexSmoWalDecodedView view;
+    ASSERT_TRUE(DecodeIndexSmoWal(IndexSmoViewOf(bytes), {pages.data(), pages.size(), decoded.data(), decoded.size()},
+                                  &view));
+    EXPECT_EQ(view.index_file_name, data.index_file_name);
+    EXPECT_EQ(std::memcmp(view.pages[0].image, data.pages[0].bytes.data(), PAGE_SIZE), 0);
+    EXPECT_EQ(std::memcmp(view.header_image, data.header.data(), PAGE_SIZE), 0);
+
+    IndexSmoWalDecodedView unchanged;
+    unchanged.index_file_name = "unchanged";
+    ASSERT_FALSE(DecodeIndexSmoWal(IndexSmoViewOf(bytes),
+                                   {pages.data(), pages.size() - 1, decoded.data(), decoded.size()}, &unchanged));
+    EXPECT_EQ(unchanged.index_file_name, "unchanged");
+
+    IndexSmoWalView wrapped;
+    ASSERT_TRUE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &wrapped));
+    EXPECT_EQ(wrapped.index_file_name, view.index_file_name);
+    EXPECT_EQ(wrapped.index_generation, view.index_generation);
+    EXPECT_EQ(std::memcmp(wrapped.page_image(1), view.pages[1].image, PAGE_SIZE), 0);
+}
+
+TEST(IndexSmoWalCursorTest, SafeDecodeFreshlyInspectsMutatedBytesAndKeepsArenasUntouchedOnFailure) {
+    const IxFileHdr file_hdr = WalImageLayout(16, 32);
+    IndexSmoWalData data;
+    data.index_file_name = "cursor_rebind.idx";
+    data.index_generation = 94;
+    data.pages.resize(1);
+    data.pages[0].page_no = IX_INIT_ROOT_PAGE;
+    data.pages[0].bytes = WalImagePage(file_hdr, 12);
+    data.header = WalImageHeader(file_hdr);
+    std::vector<char> bytes = SerializeIndexSmo(data);
+    IndexSmoWalLayout layout;
+    ASSERT_TRUE(InspectIndexSmoWal(IndexSmoViewOf(bytes), &layout));
+
+    std::array<IndexSmoWalView::Page, 1> catalogue{{{777, reinterpret_cast<const char*>(0x1)}}};
+    EXPECT_FALSE(CopyIndexSmoPageCatalog(IndexSmoViewOf(bytes), catalogue.data(), 0));
+    EXPECT_EQ(catalogue[0].page_no, 777);
+    EXPECT_EQ(catalogue[0].image, reinterpret_cast<const char*>(0x1));
+
+    std::array<IndexSmoWalView::Page, 1> pages{{{778, reinterpret_cast<const char*>(0x2)}}};
+    std::array<std::array<char, PAGE_SIZE>, 2> decoded{};
+    decoded[0].fill('a');
+    IndexSmoWalDecodedView view;
+    view.index_file_name = "unchanged";
+    EXPECT_FALSE(DecodeIndexSmoWal(IndexSmoViewOf(bytes), {pages.data(), pages.size(), decoded.data(), 0},
+                                            &view));
+    EXPECT_EQ(pages[0].page_no, 778);
+    EXPECT_EQ(pages[0].image, reinterpret_cast<const char*>(0x2));
+    EXPECT_EQ(decoded[0][0], 'a');
+    EXPECT_EQ(view.index_file_name, "unchanged");
+
+    // Same allocation and length, but a different page identity and a valid
+    // new CRC: safe Copy performs a fresh inspection rather than consulting a
+    // caller-controlled previous layout.
+    const uint32_t page_offset = OFFSET_LOG_DATA + kIndexSmoFixedPayloadBytes + kIndexSmoV3LayoutBytes +
+                                 static_cast<uint32_t>(data.index_file_name.size());
+    const page_id_t changed_page = IX_INIT_ROOT_PAGE + 9;
+    std::memcpy(bytes.data() + page_offset, &changed_page, sizeof(changed_page));
+    RefreshIndexSmoChecksum(&bytes);
+    EXPECT_TRUE(CopyIndexSmoPageCatalog(IndexSmoViewOf(bytes), catalogue.data(), catalogue.size()));
+    EXPECT_EQ(catalogue[0].page_no, changed_page);
+
+    // A same-address legacy-header mutation is also decoded from the fresh
+    // record, never authorized by the earlier opaque inspection result.
+    bytes = SerializeLegacyIndexSmo(data);
+    ASSERT_TRUE(InspectIndexSmoWal(IndexSmoViewOf(bytes), &layout));
+    const uint32_t header_offset = OFFSET_LOG_DATA + kIndexSmoFixedPayloadBytes +
+                                   static_cast<uint32_t>(data.index_file_name.size()) + sizeof(page_id_t) + PAGE_SIZE;
+    bytes[header_offset + 64] ^= 1;
+    RefreshIndexSmoChecksum(&bytes);
+    EXPECT_TRUE(DecodeIndexSmoWal(IndexSmoViewOf(bytes), {pages.data(), pages.size(), decoded.data(), decoded.size()},
+                                  &view));
+}
+
+TEST(IndexSmoWalCursorTest, ParseInspectsOnceBeforeTrustedDecode) {
+    IndexSmoWalData data;
+    data.index_file_name = "crc_once.idx";
+    data.index_generation = 95;
+    data.pages.resize(1);
+    data.pages[0].page_no = 3;
+    data.pages[0].bytes.fill(0);
+    data.header.fill(0);
+    const std::vector<char> bytes = SerializeIndexSmo(data);
+    ResetIndexSmoCrc32CallCountForTest();
+    ResetIndexSmoImageDecodeCallCountForTest();
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &parsed));
+    EXPECT_EQ(IndexSmoCrc32CallCountForTest(), 1U);
+    EXPECT_EQ(IndexSmoImageDecodeCallCountForTest(), 4U);
+}
+
+TEST(IndexSmoWalCursorTest, InspectFailureLeavesLayoutUnchanged) {
+    IndexSmoWalData data;
+    data.index_file_name = "legacy_cursor.idx";
+    data.index_generation = 92;
+    data.pages.resize(1);
+    data.pages[0].page_no = 4;
+    data.header.fill('h');
+    std::vector<char> bytes = SerializeLegacyIndexSmo(data);
+    bytes.pop_back();
+    IndexSmoWalLayout layout;
+    EXPECT_FALSE(InspectIndexSmoWal(IndexSmoViewOf(bytes), &layout));
+    EXPECT_EQ(layout.generation(), 0U);
+}
+
 TEST(IndexSmoWalV2Test, RejectsInvalidEnvelopeAndMalformedRleAfterChecksumValidation) {
     IndexSmoWalData data;
     data.index_file_name = "corrupt_v2.idx";
@@ -768,6 +995,8 @@ TEST(IndexSmoWalV2Test, RejectsInvalidEnvelopeAndMalformedRleAfterChecksumValida
 
     auto expect_rejected = [](std::vector<char> bytes) {
         RefreshIndexSmoChecksum(&bytes);
+        IndexSmoWalLayout layout;
+        EXPECT_FALSE(InspectIndexSmoWal(IndexSmoViewOf(bytes), &layout));
         IndexSmoWalView parsed;
         EXPECT_FALSE(ParseIndexSmoWal(IndexSmoViewOf(bytes), &parsed));
     };
@@ -812,6 +1041,13 @@ TEST(IndexSmoWalV2Test, RejectsInvalidEnvelopeAndMalformedRleAfterChecksumValida
     {
         std::vector<char> bytes = valid;
         bytes[codec_offset + kIndexSmoImageEnvelopeBytes] = 0;
+        expect_rejected(std::move(bytes));
+    }
+    {
+        // A legal envelope whose RLE body overruns its declared input used to
+        // pass Inspect and fail only after Decode had begun writing an arena.
+        std::vector<char> bytes = valid;
+        bytes[codec_offset + kIndexSmoImageEnvelopeBytes] = 127;
         expect_rejected(std::move(bytes));
     }
 }

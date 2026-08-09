@@ -156,6 +156,9 @@ public:
 private:
     void reset_memory() {
         memset(data_, OFFSET_PAGE_START, PAGE_SIZE);
+        // Zero is a valid first WAL LSN. A fresh frame has no WAL identity
+        // until its owner explicitly installs one.
+        set_page_lsn(INVALID_LSN);
     } // 将data_的PAGE_SIZE个字节填充为0
 
     /** page的唯一标识符 */
@@ -188,6 +191,11 @@ private:
     std::atomic<FrameState> state_{FrameState::FREE};
     std::mutex io_latch_;
     std::condition_variable io_cv_;
+    // Generation hand-off for a dirty old-image replacement.  A fetch that
+    // observes the old PageId in BufferPoolManager's transition registry waits
+    // for this exact generation before retrying its normal lookup.
+    std::atomic<uint64_t> completed_transition_generation_{0};
+    uint64_t next_transition_generation_{0}; // protected by BPM latch_
 
     /** The pin count of this page. */
     int pin_count_{0};

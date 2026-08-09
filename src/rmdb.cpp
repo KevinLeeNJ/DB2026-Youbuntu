@@ -141,6 +141,12 @@ constexpr char kCheckpointTimingAFixed[] =
     "checkpoint-metric seq= final=1 drain=// cut=// page=// clean_data=// clean_meta=//";
 constexpr char kCheckpointTimingBFixed[] =
     "checkpoint-metric seq= final=1 fuzzy_final=// manifest=// wal_reset=// lifetime=//";
+constexpr char kCheckpointDependencySchema[] =
+    "checkpoint-dependency-metric schema=base62 cumulative=1 "
+    "unit=merged_checkpoint_dependency_claims classification=attempt_before_durable_flush "
+    "failure_after_classification=counted failure_before_classification=not_counted "
+    "counters_not=pages_or_fdatasyncs checkpoint_dependency=already_covered/coverage_requested";
+constexpr char kCheckpointDependencyFixed[] = "checkpoint-dependency-metric seq= final=1 checkpoint_dependency=/";
 constexpr std::size_t kBase62Max = 11;
 
 bool plan_observability_enabled() noexcept {
@@ -159,6 +165,9 @@ static_assert(sizeof(kWalFlushTimingFixed) - 1 + 20 * kBase62Max + kWarnHeaderMa
               minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointPhaseSchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointDependencySchema) - 1 + kWarnHeaderMax + 2 <= minilog::Logger::kLineBufferSize);
+static_assert(sizeof(kCheckpointDependencyFixed) - 1 + 2 * kBase62Max + kWarnHeaderMax + 2 <=
+              minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointCounterFixed) - 1 + 17 * kBase62Max + kWarnHeaderMax + 2 <=
               minilog::Logger::kLineBufferSize);
 static_assert(sizeof(kCheckpointTimingAFixed) - 1 + 16 * kBase62Max + kWarnHeaderMax + 2 <=
@@ -290,8 +299,10 @@ void LogWalFlushMetrics(uint64_t sequence) {
 void LogCheckpointMetrics(uint64_t sequence) {
     if (!checkpoint_phase_metrics->enabled()) return;
     const auto s = checkpoint_phase_metrics->snapshot();
+    const auto dependency = buffer_pool_manager->checkpoint_dependency_metrics();
     LOG_WARN("%s", kCheckpointSchema);
     LOG_WARN("%s", kCheckpointPhaseSchema);
+    LOG_WARN("%s", kCheckpointDependencySchema);
     LOG_WARN("checkpoint-metric config auto_bytes=%s tick_bytes=%s tick_time_us=%s io_quantum_pages=%s",
              Base62(static_cast<uint64_t>(checkpoint_options.auto_checkpoint_bytes)).c_str(),
              Base62(checkpoint_options.tick_bytes).c_str(), Base62(checkpoint_options.tick_time_us).c_str(),
@@ -319,6 +330,9 @@ void LogCheckpointMetrics(uint64_t sequence) {
              Base62(s.timing[6].count).c_str(), Base62(s.timing[6].elapsed_ns).c_str(), Base62(s.timing[6].max_ns).c_str(),
              Base62(s.timing[7].count).c_str(), Base62(s.timing[7].elapsed_ns).c_str(), Base62(s.timing[7].max_ns).c_str(),
              Base62(s.timing[8].count).c_str(), Base62(s.timing[8].elapsed_ns).c_str(), Base62(s.timing[8].max_ns).c_str());
+    LOG_WARN("checkpoint-dependency-metric seq=%s final=%d checkpoint_dependency=%s/%s", Base62(sequence).c_str(),
+             sequence == UINT64_MAX, Base62(dependency.already_covered).c_str(),
+             Base62(dependency.coverage_requested).c_str());
 }
 
 void LogBackgroundPrecleanMetrics(uint64_t sequence) {

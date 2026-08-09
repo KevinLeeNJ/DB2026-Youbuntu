@@ -58,7 +58,8 @@ TEST(TransactionAbortMetricsTest, SameIdRacersConvergeAndInvalidEnumsAreIgnored)
     TransactionAbortMetrics metrics({true});
     constexpr size_t kProducerCount = 32;
     std::mutex gate_latch;
-    std::condition_variable gate_cv;
+    std::condition_variable ready_cv;
+    std::condition_variable start_cv;
     size_t ready = 0;
     bool start = false;
     std::atomic<size_t> done{0};
@@ -69,7 +70,7 @@ TEST(TransactionAbortMetricsTest, SameIdRacersConvergeAndInvalidEnumsAreIgnored)
             std::lock_guard<std::mutex> lock(gate_latch);
             observer_ready.store(true, std::memory_order_release);
         }
-        gate_cv.notify_one();
+        ready_cv.notify_one();
         while (done.load(std::memory_order_acquire) != kProducerCount) {
             for (size_t slot = 0; slot < TransactionAbortMetrics::kTableSlots; ++slot) {
                 const auto cell =
@@ -90,21 +91,25 @@ TEST(TransactionAbortMetricsTest, SameIdRacersConvergeAndInvalidEnumsAreIgnored)
         {
             std::unique_lock<std::mutex> lock(gate_latch);
             ++ready;
-            gate_cv.notify_one();
-            gate_cv.wait(lock, [&] { return start; });
+            ready_cv.notify_one();
+            start_cv.wait(lock, [&] { return start; });
         }
         TransactionAbortException exception(1, AbortReason::WW_CONFLICT, AbortDetail::IMMEDIATE_ACTIVE_OWNER, 73);
         metrics.record(exception);
         done.fetch_add(1, std::memory_order_release);
     });
+    bool all_ready = false;
     {
         std::unique_lock<std::mutex> lock(gate_latch);
-        gate_cv.wait(lock, [&] { return ready == kProducerCount && observer_ready.load(std::memory_order_acquire); });
+        all_ready = ready_cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return ready == kProducerCount && observer_ready.load(std::memory_order_acquire);
+        });
         start = true;
     }
-    gate_cv.notify_all();
+    start_cv.notify_all();
     for (auto& thread : threads) thread.join();
     observer.join();
+    ASSERT_TRUE(all_ready);
     uint64_t precise = 0;
     size_t matching_slots = 0;
     for (size_t slot = 0; slot < TransactionAbortMetrics::kTableSlots; ++slot) {

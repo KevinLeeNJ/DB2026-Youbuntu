@@ -90,6 +90,7 @@ public:
         : bpm_(256, &disk_), rm_mgr_(&disk_, &bpm_), ix_mgr_(&disk_, &bpm_), sm_mgr_(&disk_, &bpm_, &rm_mgr_, &ix_mgr_),
           log_mgr_(std::make_unique<LogManager>(&disk_)) {
         sm_mgr_.open_db(db_name);
+        bpm_.set_log_manager(log_mgr_.get());
     }
 
     ~OpenDb() {

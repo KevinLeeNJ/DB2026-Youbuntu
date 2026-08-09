@@ -61,6 +61,14 @@ class RecoveryManager {
 public:
     static constexpr size_t kLogTypeCount = static_cast<size_t>(LogType::INDEX_SMO) + 1;
     using IndexSmoRedoTestHook = std::function<void(std::string_view)>;
+    // Test-only hook immediately before a committed heap descriptor is
+    // re-read.  It exists solely to exercise a mutation after an earlier
+    // record in the same pinned run has been applied.
+    using HeapRedoRecordTestHook = std::function<void(int64_t)>;
+    // Test-only rendezvous after a finalization task has acquired its page.
+    // It is deliberately per RecoveryManager instance so production recovery
+    // has no global test state or scheduling dependency.
+    using RecoveryFinalizePinTestHook = std::function<void(page_id_t)>;
     RecoveryManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, SmManager* sm_manager,
                     LogManager* log_manager = nullptr) {
         disk_manager_ = disk_manager;
@@ -82,10 +90,16 @@ public:
     void set_index_smo_redo_test_hook(IndexSmoRedoTestHook hook) {
         index_smo_redo_test_hook_ = std::move(hook);
     }
+    void set_heap_redo_record_test_hook(HeapRedoRecordTestHook hook) {
+        heap_redo_record_test_hook_ = std::move(hook);
+    }
     // Test-only bounded-output override for exercising the verified-stream
     // fallback; zero keeps the production limit.
     void set_index_key_parallel_scratch_limit_for_test(size_t bytes) noexcept {
         index_key_parallel_scratch_limit_for_test_ = bytes;
+    }
+    void set_recovery_finalize_pin_test_hook(RecoveryFinalizePinTestHook hook) {
+        recovery_finalize_pin_test_hook_ = std::move(hook);
     }
 
     // Record-level counters for the recovery report. Recovery is single
@@ -121,6 +135,15 @@ public:
     }
     uint64_t get_redo_skipped_count() const {
         return redo_skipped_count_;
+    }
+    // Number of existing-page runs and pins consumed by the grouped heap-redo
+    // path.  They are deliberately separate from extension anchors, whose
+    // file-header publication must use RmFileHandle's serialized path.
+    uint64_t get_redo_resident_page_run_count() const {
+        return redo_resident_page_run_count_;
+    }
+    uint64_t get_redo_resident_page_pin_count() const {
+        return redo_resident_page_pin_count_;
     }
     uint64_t get_undo_applied_count() const {
         return undo_applied_count_;
@@ -478,7 +501,6 @@ private:
     // Every analyzed record gets an identity entry because loser undo follows
     // prev_lsn links after analyze has released the streaming reader.
     std::vector<WalRecordLocation> record_locations_;
-    bool record_locations_sorted_{true};
     std::unordered_set<std::string> touched_tables_;
     bool has_dml_records_{false};
     bool has_index_smo_records_{false};
@@ -488,6 +510,11 @@ private:
     int64_t checkpoint_offset_{0};
     int64_t scan_begin_offset_{0}; // first record analyze/redo replay
     int64_t scan_end_offset_{0};   // end of the intact WAL prefix
+    // Complete, gap-free record-boundary catalogue over
+    // [scan_begin_offset_, scan_end_offset_). The immediately following
+    // recovery phase may consume it for parallel work; Phase A only produces
+    // it and keeps semantic analysis serial.
+    std::vector<FramedSegment> framed_segments_;
 
     uint64_t scanned_record_count_{0};
     std::array<uint64_t, kLogTypeCount> log_type_record_counts_{};
@@ -499,6 +526,8 @@ private:
     uint64_t redo_missing_table_count_{0}; // subset of the above whose table is not open
     uint64_t redo_candidate_count_{0};     // committed descriptors after compaction
     uint64_t redo_loser_count_{0};         // DML retained for undo, not heap redo
+    uint64_t redo_resident_page_run_count_{0};
+    uint64_t redo_resident_page_pin_count_{0};
     uint64_t undo_applied_count_{0};
     uint64_t pruned_no_undo_transaction_count_{0};
     uint64_t undo_chain_record_read_count_{0};
@@ -517,6 +546,8 @@ private:
     txn_id_t max_wal_txn_id_{INVALID_TXN_ID};
 
     IndexSmoRedoTestHook index_smo_redo_test_hook_;
+    HeapRedoRecordTestHook heap_redo_record_test_hook_;
+    RecoveryFinalizePinTestHook recovery_finalize_pin_test_hook_;
 
     DiskManager* disk_manager_;              // 用来读写文件
     BufferPoolManager* buffer_pool_manager_; // 对页面进行读写

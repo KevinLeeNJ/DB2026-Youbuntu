@@ -46,6 +46,10 @@ public:
         unpin(frame_id);
     }
 
+    // Restore a frame just removed by victim() on an exception-cleanup path.
+    // Implementations used by BufferPoolManager must make this allocation-free.
+    virtual bool restore_claimed_noexcept(frame_id_t frame_id) noexcept = 0;
+
     /** @return the number of elements in the replacer that can be victimized */
     virtual size_t Size() = 0;
 };

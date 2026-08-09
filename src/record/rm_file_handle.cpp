@@ -10,6 +10,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
+#include "common/fault_injection.h"
+#include "minilog.h"
 
 #include <algorithm>
 #include <limits>
@@ -469,6 +471,9 @@ RmPageHandle RmFileHandle::create_new_page_handle_unlocked() {
     PageId page_id;
     page_id.fd = fd_;
     Page* newpage = buffer_pool_manager_->new_page(&page_id);
+    if (newpage == nullptr) {
+        throw InternalError("failed to allocate record page");
+    }
     RmPageHandle newpage_handle;
     {
         std::lock_guard<std::mutex> header_lock(file_header_latch_);
@@ -896,6 +901,134 @@ void RmFileHandle::finalize_recovery_pages(const std::vector<page_id_t>& page_no
         std::lock_guard<std::mutex> header_lock(file_header_latch_);
         file_hdr_.first_free_page_no = free_pages.empty() ? RM_NO_PAGE : free_pages.front();
     }
+}
+
+void RmFileHandle::publish_recovery_page_finalization(const std::vector<RecoveryPageFinalizeResult>& page_results,
+                                                       RecoveryPagePublishStats* stats) {
+    const auto canonicalize_begin = std::chrono::steady_clock::now();
+    RecoveryPagePublishStats local_stats;
+    std::vector<RecoveryPageFinalizeResult> results = page_results;
+    std::sort(results.begin(), results.end(), [](const auto& left, const auto& right) {
+        return left.page_no < right.page_no;
+    });
+    for (size_t index = 0; index < results.size(); ++index) {
+        if (results[index].page_no < RM_FIRST_RECORD_PAGE ||
+            (index != 0 && results[index - 1].page_no == results[index].page_no)) {
+            throw InternalError("invalid recovery page-finalize result set");
+        }
+    }
+    FaultInjector::Point("during_recovery_page_publish");
+    // This is the only shared-metadata mutation. It runs after every worker
+    // succeeded, in page order, so worker scheduling cannot affect the output.
+    {
+        std::scoped_lock metadata_lock(free_space_latch_, file_header_latch_);
+        if (!results.empty()) {
+            file_hdr_.num_pages = std::max(file_hdr_.num_pages, results.back().page_no + 1);
+            disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
+        }
+        for (const auto& result : results) {
+            if (result.is_full) {
+                if (free_page_candidate_set_.erase(result.page_no) != 0) {
+                    free_page_candidates_.erase(std::remove(free_page_candidates_.begin(), free_page_candidates_.end(),
+                                                            result.page_no),
+                                                free_page_candidates_.end());
+                    if (free_page_cursor_ >= free_page_candidates_.size()) free_page_cursor_ = 0;
+                }
+            } else if (free_page_candidate_set_.insert(result.page_no).second) {
+                free_page_candidates_.push_back(result.page_no);
+            }
+        }
+    }
+    std::vector<page_id_t> free_pages;
+    {
+        std::scoped_lock metadata_lock(free_space_latch_, file_header_latch_);
+        free_pages = free_page_candidates_;
+        free_pages.erase(std::remove_if(free_pages.begin(), free_pages.end(), [&](page_id_t page_no) {
+                             return free_page_candidate_set_.count(page_no) == 0;
+                         }),
+                         free_pages.end());
+        free_page_candidates_ = free_pages;
+        free_page_candidate_set_.clear();
+        free_page_candidate_set_.insert(free_pages.begin(), free_pages.end());
+        free_page_cursor_ = 0;
+    }
+    const auto link_begin = std::chrono::steady_clock::now();
+    local_stats.candidates = free_pages.size();
+    local_stats.candidate_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(link_begin - canonicalize_begin).count());
+    for (size_t index = 0; index < free_pages.size(); ++index) {
+        auto page_handle = fetch_page_handle(free_pages[index]);
+        {
+            std::unique_lock<std::shared_mutex> page_lock(page_handle.page->latch());
+            page_handle.page_hdr->next_free_page_no =
+                index + 1 < free_pages.size() ? free_pages[index + 1] : RM_NO_PAGE;
+            BufferPoolManager::mark_dirty_locked(page_handle.page);
+        }
+        ++local_stats.links;
+        if (!buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false)) {
+            ++local_stats.unpin_failures;
+            const auto failed_at = std::chrono::steady_clock::now();
+            local_stats.link_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(failed_at - link_begin).count());
+            local_stats.wall_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(failed_at - canonicalize_begin).count());
+            if (stats != nullptr) *stats = local_stats;
+            throw InternalError("recovery could not release a free-chain page pin");
+        }
+    }
+    {
+        std::lock_guard<std::mutex> header_lock(file_header_latch_);
+        file_hdr_.first_free_page_no = free_pages.empty() ? RM_NO_PAGE : free_pages.front();
+    }
+    const auto canonicalize_end = std::chrono::steady_clock::now();
+    local_stats.link_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(canonicalize_end - link_begin).count());
+    local_stats.wall_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(canonicalize_end - canonicalize_begin).count());
+    if (stats != nullptr) *stats = local_stats;
+}
+
+int RmFileHandle::recovery_physical_page_frontier() const {
+    return RecoveryDiskPageCount(disk_manager_, fd_);
+}
+
+std::optional<RecoveryPinnedFinalizePage>
+RmFileHandle::pin_recovery_finalize_page(page_id_t page_no, bool physical,
+                                         const BufferPoolManager::FrameOperationToken& operation) {
+    bool fail_physical_pin = false;
+    if (physical && fail_recovery_physical_pin_for_test_.load(std::memory_order_relaxed)) {
+        fail_physical_pin = fail_recovery_physical_pin_for_test_.exchange(false, std::memory_order_acq_rel);
+    }
+    Page* page = fail_physical_pin ? nullptr
+                                   : physical ? operation.fetch_page(PageId{fd_, page_no})
+                                              : operation.fetch_resident_page(PageId{fd_, page_no});
+    if (page == nullptr && physical) throw InternalError("recovery could not pin an existing record page");
+    if (page == nullptr) return std::nullopt;
+    return RecoveryPinnedFinalizePage{page_no, page};
+}
+
+RecoveryPageFinalizeResult RmFileHandle::finalize_recovery_pinned_page(const RecoveryPinnedFinalizePage& pinned) {
+    RmPageHandle page_handle(&file_hdr_, pinned.page);
+    std::unique_lock<std::shared_mutex> page_lock(pinned.page->latch());
+    FaultInjector::Point("during_recovery_page_normalize");
+    int num_records = 0;
+    uint32_t tombstones_removed = 0;
+    for (int slot_no = 0; slot_no < file_hdr_.num_records_per_page; ++slot_no) {
+        if (!Bitmap::is_set(page_handle.bitmap, slot_no)) continue;
+        TupleMeta& meta = page_handle.get_meta(slot_no);
+        if (meta.is_deleted_) {
+            Bitmap::reset(page_handle.bitmap, slot_no);
+            meta = TupleMeta{};
+            ++tombstones_removed;
+            continue;
+        }
+        meta.commit_ts_ = 0; meta.writer_txn_id_ = INVALID_TXN_ID; meta.is_committed_ = true;
+        meta.is_deleted_ = false; meta.version_chain_head_ = UndoLink{}; ++num_records;
+    }
+    page_handle.page_hdr->num_records = num_records;
+    BufferPoolManager::mark_dirty_locked(pinned.page);
+    return {pinned.page_no, num_records >= file_hdr_.num_records_per_page, static_cast<uint32_t>(num_records),
+            tombstones_removed};
 }
 
 TupleMeta RmFileHandle::get_tuple_meta(const Rid& rid) const {
