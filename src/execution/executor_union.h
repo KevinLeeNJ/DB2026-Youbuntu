@@ -85,12 +85,8 @@ private:
             const auto& branch_cols = branch->cols();
             for (branch->beginTuple(); !branch->is_end(); branch->nextTuple()) {
                 TupleView view = branch->current();
-                std::unique_ptr<RmRecord> fallback;
                 if (!view) {
-                    fallback = branch->Next();
-                    if (fallback != nullptr) {
-                        view = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
-                    }
+                    throw InternalError("cursor returned an empty tuple");
                 }
                 if (!view) {
                     continue;
@@ -130,13 +126,6 @@ public:
 
     bool is_end() const override {
         return cursor_ >= tuples_.size();
-    }
-
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end()) {
-            return nullptr;
-        }
-        return std::make_unique<RmRecord>(tuples_[cursor_]);
     }
 
     TupleView current() const override {

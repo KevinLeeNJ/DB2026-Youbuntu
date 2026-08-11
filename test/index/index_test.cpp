@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "optimizer/planner.h"
 #undef private
+#include "execution/cursor_test_helper.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1151,7 +1152,7 @@ public:
         Transaction* txn = txn_manager->begin(nullptr, log_manager.get(), IsolationLevel::READ_COMMITTED);
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(lock_manager.get(), log_manager.get(), txn, data_send, &offset, txn_manager.get());
+        Context context(lock_manager.get(), log_manager.get(), txn, txn_manager.get());
         try {
             body(&context);
             txn_manager->commit(txn, log_manager.get());
@@ -1168,7 +1169,7 @@ public:
         name_val.set_str(name);
         run_logged_write([&](Context* context) {
             InsertExecutor executor(sm_manager.get(), "warehouse", {id, name_val}, context);
-            executor.Next();
+            CopyCurrentTuple(executor);
         });
     }
 
@@ -1179,7 +1180,7 @@ public:
         bv.set_int(b);
         run_logged_write([&](Context* context) {
             InsertExecutor executor(sm_manager.get(), tab_name, {av, bv}, context);
-            executor.Next();
+            CopyCurrentTuple(executor);
         });
     }
 
@@ -1192,7 +1193,7 @@ public:
         cv.set_int(c);
         run_logged_write([&](Context* context) {
             InsertExecutor executor(sm_manager.get(), tab_name, {av, bv, cv}, context);
-            executor.Next();
+            CopyCurrentTuple(executor);
         });
     }
 
@@ -1205,7 +1206,7 @@ public:
         score_val.set_float(score);
         run_logged_write([&](Context* context) {
             InsertExecutor executor(sm_manager.get(), "scores", {sid_val, cid_val, score_val}, context);
-            executor.Next();
+            CopyCurrentTuple(executor);
         });
     }
 
@@ -1254,11 +1255,11 @@ public:
     std::vector<int> scan_ids(const std::vector<Condition>& conds, const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        Context context(nullptr, nullptr, nullptr);
         IndexScanExecutor executor(sm_manager.get(), "warehouse", conds, index_cols, &context);
         std::vector<int> ids;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
-            auto rec = executor.Next();
+            auto rec = CopyCurrentTuple(executor);
             ids.push_back(*reinterpret_cast<int*>(rec->data));
         }
         return ids;
@@ -1268,11 +1269,11 @@ public:
                                      const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        Context context(nullptr, nullptr, nullptr);
         IndexScanExecutor executor(sm_manager.get(), tab_name, conds, index_cols, &context);
         std::vector<int> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
-            auto rec = executor.Next();
+            auto rec = CopyCurrentTuple(executor);
             values.push_back(*reinterpret_cast<int*>(rec->data));
         }
         return values;
@@ -1282,11 +1283,11 @@ public:
                                                      const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        Context context(nullptr, nullptr, nullptr);
         IndexScanExecutor executor(sm_manager.get(), "scores", conds, index_cols, &context);
         std::vector<std::pair<int, int>> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
-            auto rec = executor.Next();
+            auto rec = CopyCurrentTuple(executor);
             values.emplace_back(*reinterpret_cast<int*>(rec->data), *reinterpret_cast<int*>(rec->data + sizeof(int)));
         }
         return values;
@@ -1296,11 +1297,11 @@ public:
                                                   const std::vector<std::string>& index_cols) {
         char data_send[BUFFER_LENGTH] = {};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, data_send, &offset);
+        Context context(nullptr, nullptr, nullptr);
         IndexSkipScanExecutor executor(sm_manager.get(), "triples", conds, index_cols, &context);
         std::vector<int> values;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
-            auto rec = executor.Next();
+            auto rec = CopyCurrentTuple(executor);
             values.push_back(*reinterpret_cast<int*>(rec->data));
         }
         return values;
@@ -1324,14 +1325,14 @@ TEST_F(IndexScanFeatureTest, ReusesCompiledConstraintsAcrossInjectedLookups) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
     IndexScanExecutor executor(sm_manager.get(), "lookup_rows", {}, {"b"}, &context);
 
     auto scan_for_b = [&](int value) {
         executor.set_key_conditions({table_int_cond("lookup_rows", "b", OP_EQ, value)});
         std::vector<int> result;
         for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
-            auto rec = executor.Next();
+            auto rec = CopyCurrentTuple(executor);
             result.push_back(*reinterpret_cast<int*>(rec->data));
         }
         return result;
@@ -1350,7 +1351,7 @@ TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
     ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_direct", {}, {"b"}, &context);
     int lookup_value = 7;
     executor.set_lookup_key(TabCol{"lookup_direct", "b"}, reinterpret_cast<const char*>(&lookup_value),
@@ -1363,7 +1364,7 @@ TEST_F(IndexScanFeatureTest, DirectLookupKeyReturnsMatchingRows) {
 
     std::vector<int> result;
     for (; !executor.is_end(); executor.nextTuple()) {
-        auto rec = executor.Next();
+        auto rec = CopyCurrentTuple(executor);
         ASSERT_NE(rec, nullptr);
         result.push_back(*reinterpret_cast<int*>(rec->data));
     }
@@ -1377,7 +1378,7 @@ TEST_F(IndexScanFeatureTest, ExactLookupMissUsesEmptySingleRidCursor) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
     ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_miss", {}, {"b"}, &context);
     int lookup_value = 8;
     executor.set_lookup_key(TabCol{"lookup_miss", "b"}, reinterpret_cast<const char*>(&lookup_value),
@@ -1405,7 +1406,7 @@ TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
     ObservableIndexScanExecutor executor(sm_manager.get(), "lookup_duplicates", {}, {"b"}, &context);
     int lookup_value = 7;
     executor.set_lookup_key(TabCol{"lookup_duplicates", "b"}, reinterpret_cast<const char*>(&lookup_value),
@@ -1413,7 +1414,7 @@ TEST_F(IndexScanFeatureTest, ExactLookupFallsBackForDuplicateIndexKeys) {
 
     std::vector<int> result;
     for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
-        auto rec = executor.Next();
+        auto rec = CopyCurrentTuple(executor);
         ASSERT_NE(rec, nullptr);
         result.push_back(*reinterpret_cast<int*>(rec->data));
     }
@@ -1432,7 +1433,7 @@ TEST_F(IndexScanFeatureTest, InjectedLeadingKeyCompletesCompositeExactLookup) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
     ObservableIndexScanExecutor executor(
         sm_manager.get(), "composite_lookup",
         {table_int_cond("composite_lookup", "b", OP_EQ, 7), table_int_cond("composite_lookup", "c", OP_EQ, 9)},
@@ -1444,7 +1445,7 @@ TEST_F(IndexScanFeatureTest, InjectedLeadingKeyCompletesCompositeExactLookup) {
     executor.beginTuple();
     EXPECT_TRUE(executor.uses_single_rid_cursor());
     ASSERT_FALSE(executor.is_end());
-    auto rec = executor.Next();
+    auto rec = CopyCurrentTuple(executor);
     ASSERT_NE(rec, nullptr);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data), 2);
     EXPECT_EQ(*reinterpret_cast<int*>(rec->data + sizeof(int)), 7);
@@ -1534,27 +1535,25 @@ TEST_F(IndexScanFeatureTest, InsertDeleteAndUpdateMaintainSingleColumnIndex) {
     insert_row(700, "newdance");
     EXPECT_EQ(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}), std::vector<int>({700}));
 
-    std::vector<Rid> delete_rids;
     Context scan_context(nullptr, nullptr, nullptr);
-    IndexScanExecutor delete_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, {"w_id"}, &scan_context);
-    for (delete_scan.beginTuple(); !delete_scan.is_end(); delete_scan.nextTuple()) {
-        delete_rids.push_back(delete_scan.rid());
-    }
     run_logged_write([&](Context* context) {
-        DeleteExecutor delete_exec(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)}, delete_rids, context);
-        delete_exec.Next();
+        DeleteExecutor delete_exec(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 700)},
+                                   std::make_unique<IndexScanExecutor>(sm_manager.get(), "warehouse",
+                                                                       std::vector<Condition>{int_cond(OP_EQ, 700)},
+                                                                       std::vector<std::string>{"w_id"}, context),
+                                   std::nullopt, context);
+        CopyCurrentTuple(delete_exec);
     });
     EXPECT_TRUE(scan_ids({int_cond(OP_EQ, 700)}, {"w_id"}).empty());
 
-    std::vector<Rid> update_rids;
-    IndexScanExecutor update_scan(sm_manager.get(), "warehouse", {int_cond(OP_EQ, 534)}, {"w_id"}, &scan_context);
-    for (update_scan.beginTuple(); !update_scan.is_end(); update_scan.nextTuple()) {
-        update_rids.push_back(update_scan.rid());
-    }
     run_logged_write([&](Context* context) {
         UpdateExecutor update_exec(sm_manager.get(), "warehouse", {set_int_clause("warehouse", "w_id", 507)},
-                                   {int_cond(OP_EQ, 534)}, update_rids, context);
-        update_exec.Next();
+                                   {int_cond(OP_EQ, 534)},
+                                   std::make_unique<IndexScanExecutor>(sm_manager.get(), "warehouse",
+                                                                       std::vector<Condition>{int_cond(OP_EQ, 534)},
+                                                                       std::vector<std::string>{"w_id"}, context),
+                                   std::nullopt, UpdateExecutionMode::Mutating, context);
+        CopyCurrentTuple(update_exec);
     });
     EXPECT_EQ(scan_ids({int_cond(OP_GT, 100), int_cond(OP_LT, 534)}, {"w_id"}), std::vector<int>({500, 507}));
 }
@@ -1576,17 +1575,15 @@ TEST_F(IndexScanFeatureTest, UpdateConflictOnNonLeadingColumnIndexDoesNotCorrupt
     sm_manager->create_index("warehouse", {"name"}, nullptr);
 
     Context context(nullptr, nullptr, nullptr);
-    std::vector<Rid> rids;
-    IndexScanExecutor scan(sm_manager.get(), "warehouse", {string_cond(OP_EQ, "asdfhjkl")}, {"name"}, &context);
-    for (scan.beginTuple(); !scan.is_end(); scan.nextTuple()) {
-        rids.push_back(scan.rid());
-    }
-
     EXPECT_THROW(run_logged_write([&](Context* write_context) {
-                     UpdateExecutor update_exec(sm_manager.get(), "warehouse",
-                                                {set_string_clause("warehouse", "name", "qweruiop")},
-                                                {string_cond(OP_EQ, "asdfhjkl")}, rids, write_context);
-                     update_exec.Next();
+                     UpdateExecutor update_exec(
+                         sm_manager.get(), "warehouse", {set_string_clause("warehouse", "name", "qweruiop")},
+                         {string_cond(OP_EQ, "asdfhjkl")},
+                         std::make_unique<IndexScanExecutor>(sm_manager.get(), "warehouse",
+                                                             std::vector<Condition>{string_cond(OP_EQ, "asdfhjkl")},
+                                                             std::vector<std::string>{"name"}, write_context),
+                         std::nullopt, UpdateExecutionMode::Mutating, write_context);
+                     CopyCurrentTuple(update_exec);
                  }),
                  IndexEntryExistsError);
 
@@ -1673,9 +1670,10 @@ TEST_F(ShowIndexTest, PrintsFormattedIndexMetadataTable) {
 
     char data_send[BUFFER_LENGTH] = {};
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, data_send, &offset);
+    Context context(nullptr, nullptr, nullptr);
+    ExecutionOutput execution_output{data_send, &offset};
 
-    sm_manager->show_index("warehouse", &context);
+    sm_manager->show_index("warehouse", &execution_output);
 
     std::string output(data_send, offset);
     EXPECT_NE(output.find("+------------------+------------------+------------------+"), std::string::npos);

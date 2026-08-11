@@ -29,7 +29,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
-#include "portal.h"
+#include "record_printer.h"
 #include "record/rm_manager.h"
 #include "record/rm_scan.h"
 #include "recovery/log_manager.h"
@@ -70,12 +70,10 @@ public:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
-        ql_manager_ =
-            std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
+        ql_manager_ = std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get());
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
         analyze_ = std::make_unique<Analyze>(sm_manager_.get());
 
         // Create and open the database
@@ -121,8 +119,8 @@ public:
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
-        Context context(lock_manager_.get(), log_manager_.get(), nullptr, data_send, &offset, txn_manager_.get());
-        context.output_file_enabled_ = output_file_enabled;
+        Context context(lock_manager_.get(), log_manager_.get(), nullptr, txn_manager_.get());
+        ExecutionOutput output{data_send, &offset, false, nullptr, output_file_enabled};
 
         // Parse
         std::unique_ptr<ast::TreeNode> parse_tree;
@@ -142,13 +140,20 @@ public:
             set_transaction(&context);
         }
 
-        // Analyze → Optimize → Portal → Execute
+        // Analyze → Optimize → Execute
         try {
             std::unique_ptr<Query> query = analyze_->do_analyze(std::move(parse_tree));
             std::unique_ptr<Plan> plan = optimizer_->plan_query(std::move(query), &context);
-            std::unique_ptr<PortalStmt> portal_stmt = portal_->start(std::move(plan), &context);
-            portal_->run(std::move(portal_stmt), ql_manager_.get(), &txn_id_, &context);
-            portal_->drop();
+            const PlanTag tag = plan->tag;
+            if (tag == T_Transaction_commit && context.txn_ != nullptr) {
+                txn_manager_->commit(context.txn_, context.log_mgr_);
+                txn_id_ = INVALID_TXN_ID;
+            } else if ((tag == T_Transaction_abort || tag == T_Transaction_rollback) && context.txn_ != nullptr) {
+                txn_manager_->abort(context.txn_, context.log_mgr_);
+                txn_id_ = INVALID_TXN_ID;
+            } else {
+                ql_manager_->execute(std::move(plan), &txn_id_, &context, &output);
+            }
             finish_statement(&context);
         } catch (...) {
             abort_failed_statement(&context);
@@ -242,7 +247,6 @@ private:
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<RecoveryManager> recovery_;
-    std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };
 
@@ -625,8 +629,6 @@ TEST(CheckpointRecoveryTest, CheckpointRestartOffsetSurvivesRestartAndUndoRuns) 
     restart_file >> restart_offset;
     EXPECT_EQ(restart_offset, 0);
 
-    TransactionManager::txn_map.clear();
-
     {
         EmbeddedDB recovered(db_name, false, true);
         std::string output;
@@ -636,6 +638,22 @@ TEST(CheckpointRecoveryTest, CheckpointRestartOffsetSurvivesRestartAndUndoRuns) 
         }
         EXPECT_EQ(output, select_expected);
     }
+}
+
+TEST(TransactionManagerLifecycleTest, TransactionMapDoesNotOutliveItsManager) {
+    LockManager lock_manager;
+    {
+        TransactionManager first(&lock_manager, nullptr);
+        ASSERT_NE(first.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED), nullptr);
+        EXPECT_EQ(first.DebugTxnMapSize(), 1u);
+    }
+
+    TransactionManager second(&lock_manager, nullptr);
+    EXPECT_EQ(second.DebugTxnMapSize(), 0u);
+    auto* txn = second.begin(nullptr, nullptr, IsolationLevel::READ_COMMITTED);
+    ASSERT_NE(txn, nullptr);
+    second.abort(txn, nullptr);
+    EXPECT_EQ(second.DebugTxnMapSize(), 0u);
 }
 
 TEST(CheckpointRecoveryTest, CommittedDeleteBeforeCheckpointDoesNotReappearAfterRestart) {
@@ -657,8 +675,6 @@ TEST(CheckpointRecoveryTest, CommittedDeleteBeforeCheckpointDoesNotReappearAfter
         ASSERT_NO_THROW(db.exec_sql("commit;"));
         ASSERT_NO_THROW(db.exec_sql("create static_checkpoint;"));
     }
-
-    TransactionManager::txn_map.clear();
 
     {
         EmbeddedDB recovered(db_name, false, true);
@@ -1394,9 +1410,6 @@ TEST(LoadCrashRecoveryTest, LoadedDataSurvivesRestart) {
         // Destructor closes the DB (simulating a clean-ish exit); the batched
         // commits already flushed WAL, so recovery can redo them.
     }
-
-    // Simulate restart: clear in-memory txn state so recovery runs fresh.
-    TransactionManager::txn_map.clear();
 
     {
         EmbeddedDB recovered(db_name, false, true);

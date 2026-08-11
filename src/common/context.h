@@ -30,33 +30,25 @@ public:
     virtual void append_row(const std::vector<ColMeta>& columns, const char* data, std::size_t size) = 0;
 };
 
-// used for data_send
-static int const_offset = -1;
+struct ExecutionOutput {
+    char* data_send = nullptr;
+    int* offset = nullptr;
+    bool ellipsis = false;
+    QueryResultSink* result_sink = nullptr;
+    bool* output_file_enabled = nullptr;
+};
 
 class Context {
 public:
-    Context(LockManager* lock_mgr, LogManager* log_mgr, Transaction* txn, char* data_send = nullptr,
-            int* offset = &const_offset, TransactionManager* txn_mgr = nullptr)
-        : lock_mgr_(lock_mgr), log_mgr_(log_mgr), txn_(txn), txn_mgr_(txn_mgr), data_send_(data_send), offset_(offset),
-          isolation_level_(DEFAULT_ISOLATION_LEVEL) {
-        ellipsis_ = false;
-    }
+    Context(LockManager* lock_mgr, LogManager* log_mgr, Transaction* txn, TransactionManager* txn_mgr = nullptr)
+        : lock_mgr_(lock_mgr), log_mgr_(log_mgr), txn_(txn), txn_mgr_(txn_mgr),
+          isolation_level_(DEFAULT_ISOLATION_LEVEL) {}
 
     // TransactionManager *txn_mgr_;
     LockManager* lock_mgr_;
     LogManager* log_mgr_;
     Transaction* txn_;
     TransactionManager* txn_mgr_;
-    char* data_send_;
-    int* offset_;
-    bool ellipsis_;
     IsolationLevel isolation_level_;
     bool enable_ssi_read_tracking_{false};
-    // PREPARE_SET builds a reusable scan-backed descriptor. Point-program
-    // caching is an execution-plan optimization and must not make descriptor
-    // eligibility depend on whether an equivalent statement was seen earlier.
-    bool preparing_statement_{false};
-    QueryResultSink* result_sink_{nullptr};
-    // When set, overrides the legacy database-wide output.txt policy for this session.
-    bool* output_file_enabled_{nullptr};
 };

@@ -20,7 +20,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_defs.h"
 #include "execution_common.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "record/rm_scan.h"
@@ -356,7 +355,7 @@ protected:
         // after its indexed key was changed or deleted. Those old keys are
         // tracked by SmManager; non-index updates and post-snapshot inserts are
         // handled by GetVisibleRecord.
-        return sm_manager_->has_historical_index_keys(tab_name_, index_name_);
+        return sm_manager_->version_history().has_historical_index_keys(tab_name_, index_name_);
     }
 
 public:
@@ -518,7 +517,8 @@ public:
         bool use_rc_exact_historical_key = false;
         if (historical_candidates_available && context_ != nullptr && context_->txn_ != nullptr &&
             context_->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED && exact_key_lookup) {
-            historical_rids_ = sm_manager_->get_historical_index_key_rids(tab_name_, index_name_, lower_key_);
+            historical_rids_ =
+                sm_manager_->version_history().get_historical_index_key_rids(tab_name_, index_name_, lower_key_);
             use_rc_exact_historical_key = !historical_rids_.empty();
             // Exact RC probes only need history for the requested key. Range,
             // prefix and skip-scan paths retain the broad candidate set.
@@ -540,7 +540,7 @@ public:
         // merge of an empty set is the identity), not an approximation.
         historical_entries_.clear();
         if (use_historical_index_candidates_) {
-            sm_manager_->collect_historical_index_entries_in_range(
+            sm_manager_->version_history().collect_historical_index_entries_in_range(
                 tab_name_, index_name_, lower_key_, upper_key_, lower_exclusive, upper_inclusive, historical_entries_);
             if (historical_entries_.empty()) {
                 use_historical_index_candidates_ = false;
@@ -661,15 +661,6 @@ public:
             }
             scan_->next();
         }
-    }
-
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || buffered_tuple_.view.data == nullptr) {
-            return nullptr;
-        }
-        auto result = std::make_unique<RmRecord>(static_cast<int>(buffered_tuple_.view.size));
-        memcpy(result->data, buffered_tuple_.view.data, buffered_tuple_.view.size);
-        return result;
     }
 
     TupleView current() const override {

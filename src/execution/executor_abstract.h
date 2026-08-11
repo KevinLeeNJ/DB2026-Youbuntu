@@ -79,10 +79,7 @@ public:
 
     virtual Rid& rid() = 0;
 
-    virtual std::unique_ptr<RmRecord> Next() = 0;
-
     // The view is valid until the next beginTuple()/nextTuple() call.
-    // Executors without a borrowed representation keep the legacy Next API.
     virtual TupleView current() const {
         return {};
     }

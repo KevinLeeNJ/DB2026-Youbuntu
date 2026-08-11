@@ -11,27 +11,26 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include "execution_defs.h"
-#include "execution_common.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
-#include "prepared_execution_binding.h"
+#include "execution_common.h"
 #include "index/ix.h"
 #include "row_mutation.h"
 #include "system/sm.h"
+#include "optimizer/plan.h"
 #include <algorithm>
 
-class UpdateExecutor : public AbstractExecutor {
+class UpdateExecutor {
 private:
     TabMeta tab_storage_;
     const TabMeta* tab_;
     std::vector<Condition> conds_;
     RmFileHandle* fh_;
     std::vector<Rid> rids_;
-    std::optional<Rid> point_rid_;
-    bool point_lookup_{false};
-    bool point_consumed_{false};
+    std::unique_ptr<AbstractExecutor> fallback_scan_;
+    std::optional<PointAccessPath> point_access_;
+    bool targets_resolved_{false};
+    bool executed_{false};
     bool lock_only_{false};
-    std::unique_ptr<RmRecord> cached_point_record_;
     std::string tab_name_storage_;
     const std::string* tab_name_;
     std::vector<SetClause> set_clauses_;
@@ -45,10 +44,13 @@ private:
     const std::vector<RowMutationIndex>* indexes_;
     const std::vector<BoundMutationCondition>* bound_conditions_;
     const std::vector<BoundMutationSetClause>* bound_set_clauses_;
+    Context* context_{nullptr};
+    Rid abstract_rid_{};
 
 public:
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conds, std::vector<Rid> rids, Context* context) {
+                   std::vector<Condition> conds, std::unique_ptr<AbstractExecutor> fallback_scan,
+                   std::optional<PointAccessPath> point_access, UpdateExecutionMode execution_mode, Context* context) {
         sm_manager_ = sm_manager;
         tab_name_storage_ = tab_name;
         tab_name_ = &tab_name_storage_;
@@ -57,8 +59,12 @@ public:
         tab_ = &tab_storage_;
         fh_ = sm_manager_->fhs_.at(tab_name).get();
         conds_ = std::move(conds);
-        rids_ = std::move(rids);
+        fallback_scan_ = std::move(fallback_scan);
+        point_access_ = std::move(point_access);
         context_ = context;
+        lock_only_ = execution_mode == UpdateExecutionMode::LockOnlySelfAssignment && context != nullptr &&
+                     context->txn_ != nullptr && context->lock_mgr_ != nullptr && context->txn_mgr_ != nullptr &&
+                     context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
         owned_bound_conditions_ = BindMutationConditions(*tab_, conds_);
         owned_bound_set_clauses_ = BindMutationSetClauses(*tab_, set_clauses_);
         bound_conditions_ = &owned_bound_conditions_;
@@ -83,50 +89,25 @@ public:
         affected_index_bitmap_ = &owned_affected_index_bitmap_;
         indexes_ = &owned_indexes_;
     }
-    UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conds, PointMutationTarget target, Context* context, bool point_path)
-        : UpdateExecutor(sm_manager, tab_name, std::move(set_clauses), std::move(conds), std::vector<Rid>{}, context) {
-        point_rid_ = target.rid;
-        point_lookup_ = point_path;
-    }
-    UpdateExecutor(const PreparedUpdateExecutable& executable, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conditions, std::vector<Rid> rids, Context* context)
-        : tab_(executable.scan.table), conds_(std::move(conditions)), fh_(executable.scan.table_handle),
-          rids_(std::move(rids)), tab_name_(&executable.scan.table_name), set_clauses_(std::move(set_clauses)),
-          sm_manager_(executable.scan.sm_manager), affected_index_bitmap_(&executable.affected_index_bitmap),
-          indexes_(&executable.indexes), bound_conditions_(&executable.bound_conditions),
-          bound_set_clauses_(&executable.bound_set_clauses) {
-        if (tab_ == nullptr || fh_ == nullptr || sm_manager_ == nullptr) {
-            throw InternalError("bound UPDATE metadata is incomplete");
+    void Execute() {
+        if (executed_) {
+            return;
         }
-        context_ = context;
-    }
-    UpdateExecutor(const PreparedUpdateExecutable& executable, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conditions, PointMutationTarget target, Context* context)
-        : UpdateExecutor(executable, std::move(set_clauses), std::move(conditions), std::vector<Rid>{}, context) {
-        point_rid_ = target.rid;
-        point_lookup_ = true;
-        lock_only_ = executable.point_update.has_value() && executable.point_update->lock_only;
-    }
-    UpdateExecutor(const PreparedUpdateExecutable& executable, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conditions, PointMutationTarget target,
-                   std::unique_ptr<RmRecord> cached_record, Context* context)
-        : UpdateExecutor(executable, std::move(set_clauses), std::move(conditions), std::vector<Rid>{}, context) {
-        point_rid_ = target.rid;
-        point_lookup_ = true;
-        lock_only_ = executable.point_update.has_value() && executable.point_update->lock_only;
-        cached_point_record_ = std::move(cached_record);
-    }
-    std::unique_ptr<RmRecord> Next() override {
-        if (point_lookup_ && point_consumed_) {
-            return nullptr;
+        if (!targets_resolved_) {
+            const auto point = point_access_.has_value() ? ResolvePointMutationTarget(*sm_manager_, *tab_name_, conds_,
+                                                                                      *point_access_, context_)
+                                                         : PointTargetLookup{};
+            if (point.kind == PointTargetLookupKind::ExactRid) {
+                rids_.push_back(*point.rid);
+            } else if (point.kind == PointTargetLookupKind::UnsafeFallback && fallback_scan_ != nullptr) {
+                for (fallback_scan_->beginTuple(); !fallback_scan_->is_end(); fallback_scan_->nextTuple()) {
+                    rids_.push_back(fallback_scan_->rid());
+                }
+            }
+            targets_resolved_ = true;
         }
-        const size_t rid_count = point_lookup_ ? (point_rid_.has_value() ? 1 : 0) : rids_.size();
-        for (size_t rid_index = 0; rid_index < rid_count; ++rid_index) {
-            Rid& rid = point_lookup_ ? *point_rid_ : rids_[rid_index];
-            std::unique_ptr<RmRecord> rec = point_lookup_ && cached_point_record_ != nullptr
-                                                ? std::move(cached_point_record_)
-                                                : GetVisibleRecord(fh_, rid, context_);
+        for (const Rid& rid : rids_) {
+            std::unique_ptr<RmRecord> rec = GetVisibleRecord(fh_, rid, context_);
             if (rec == nullptr) {
                 if (context_ != nullptr && context_->txn_ != nullptr &&
                     context_->txn_->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
@@ -151,19 +132,16 @@ public:
                 RowMutationEngine::UpdateOne(rid, *rec, info, context_);
             }
         }
-        if (point_lookup_) {
-            point_consumed_ = true;
-        }
-        return nullptr;
+        executed_ = true;
     }
 
-    Rid& rid() override {
-        return _abstract_rid;
+    Rid& rid() {
+        return abstract_rid_;
     }
-    std::string getType() override {
+    std::string getType() {
         return "UpdateExecutor"; // 返回执行器的名称
     }
-    ColMeta get_col_offset(const TabCol& target) override {
+    ColMeta get_col_offset(const TabCol& target) {
         for (const auto& col : tab_->cols) {
             if (col.tab_name == target.tab_name && col.name == target.col_name) {
                 return col;

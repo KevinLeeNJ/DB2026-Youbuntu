@@ -73,19 +73,6 @@ private:
     std::atomic<std::uint64_t> physical_plan_cache_hits_{0};
     std::atomic<std::uint64_t> physical_plan_cache_misses_{0};
 
-    struct PointProgramCacheEntry {
-        CompiledPointProgramPtr program;
-        std::list<std::string>::iterator lru_position;
-    };
-
-    static constexpr size_t kCompiledPointProgramCacheCapacity = 256;
-    mutable std::shared_mutex point_program_cache_latch_;
-    std::list<std::string> point_program_cache_lru_;
-    std::unordered_map<std::string, PointProgramCacheEntry> point_program_cache_;
-    std::uint64_t point_program_cache_generation_ = 0;
-    std::atomic<std::uint64_t> point_program_cache_hits_{0};
-    std::atomic<std::uint64_t> point_program_cache_misses_{0};
-
 public:
     Planner(SmManager* sm_manager) : sm_manager_(sm_manager) {}
 
@@ -97,20 +84,6 @@ private:
     std::string make_physical_plan_cache_key(const Query& query, std::uint64_t catalog_generation) const;
     PhysicalPlanTemplate build_physical_plan_template(const Query& query);
     std::unique_ptr<Plan> instantiate_physical_plan(const Query& query, const PhysicalPlanTemplate& plan_template);
-    std::string make_point_program_cache_key(PointProgramKind kind, const std::string& tab_name,
-                                             const PointAccessPath& point_access,
-                                             const std::vector<Condition>& conditions,
-                                             const std::vector<SetClause>& set_clauses,
-                                             std::uint64_t catalog_generation) const;
-    CompiledPointProgramPtr build_compiled_point_program(PointProgramKind kind, const std::string& tab_name,
-                                                         const PointAccessPath& point_access,
-                                                         const std::vector<Condition>& conditions,
-                                                         const std::vector<SetClause>& set_clauses,
-                                                         std::uint64_t catalog_generation) const;
-    std::optional<CompiledPointProgramPtr> find_compiled_point_program(const std::string& key,
-                                                                       std::uint64_t catalog_generation);
-    void cache_compiled_point_program(std::string key, std::uint64_t catalog_generation,
-                                      CompiledPointProgramPtr program);
     std::optional<std::shared_ptr<const PhysicalPlanTemplate>>
     find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation);
     void cache_physical_plan_template(std::string key, std::uint64_t catalog_generation,

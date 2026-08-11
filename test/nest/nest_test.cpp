@@ -10,10 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #undef NDEBUG
 
-#define private public
-#include "portal.h"
-#undef private
-
 #include <chrono>
 #include <memory>
 #include <string>
@@ -21,6 +17,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "gtest/gtest.h"
 #include "common/config.h"
+#include "common/context.h"
+#include "execution/execution_manager.h"
 #include "index/ix.h"
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
@@ -46,7 +44,6 @@ protected:
     std::unique_ptr<TransactionManager> txn_manager_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Analyze> analyze_;
-    std::unique_ptr<Portal> portal_;
     bool db_opened_ = false;
 
     void SetUp() override {
@@ -60,7 +57,6 @@ protected:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
         analyze_ = std::make_unique<Analyze>(sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
 
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
@@ -89,48 +85,59 @@ protected:
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(std::move(query), nullptr);
-        auto portal_stmt = portal_->start(std::move(plan), nullptr);
-        QlManager ql_mgr(sm_manager_.get(), txn_manager_.get(), planner_.get());
+        QlManager ql_mgr(sm_manager_.get(), txn_manager_.get());
         txn_id_t txn = 0;
-        portal_->run(std::move(portal_stmt), &ql_mgr, &txn, nullptr);
+        Context context(lock_manager_.get(), nullptr, nullptr, txn_manager_.get());
+        ExecutionOutput output;
+        ql_mgr.execute(std::move(plan), &txn, &context, &output);
     }
 
     std::vector<std::vector<std::string>> select(const std::string& sql) {
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(std::move(query), nullptr);
-        auto portal_stmt = portal_->start(std::move(plan), nullptr);
+        class ResultSink final : public QueryResultSink {
+        public:
+            void begin_query(const std::vector<ColMeta>& result_columns, const std::vector<std::string>&) override {
+                columns = result_columns;
+            }
+            void append_row(const std::vector<ColMeta>& columns, const char* data, std::size_t size) override {
+                rows.emplace_back(data, data + size);
+                this->columns = columns;
+            }
+            std::vector<ColMeta> columns;
+            std::vector<std::vector<char>> rows;
+        } sink;
+        Context context(lock_manager_.get(), nullptr, nullptr, txn_manager_.get());
+        ExecutionOutput output{nullptr, nullptr, false, &sink};
+        QlManager ql_mgr(sm_manager_.get(), txn_manager_.get());
+        txn_id_t txn = 0;
+        ql_mgr.execute(std::move(plan), &txn, &context, &output);
 
         std::vector<std::vector<std::string>> rows;
-        if (portal_stmt->tag == PORTAL_ONE_SELECT) {
-            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
-                auto rec = portal_stmt->root->Next();
-                if (rec == nullptr)
+        for (const auto& record : sink.rows) {
+            std::vector<std::string> row;
+            for (const auto& col : sink.columns) {
+                std::string val;
+                const char* data = record.data() + col.offset;
+                switch (col.type) {
+                case TYPE_INT:
+                    val = std::to_string(*reinterpret_cast<const int*>(data));
                     break;
-                std::vector<std::string> row;
-                const auto& cols = portal_stmt->root->cols();
-                for (const auto& col : cols) {
-                    std::string val;
-                    const char* data = rec->data + col.offset;
-                    switch (col.type) {
-                    case TYPE_INT:
-                        val = std::to_string(*reinterpret_cast<const int*>(data));
-                        break;
-                    case TYPE_FLOAT: {
-                        std::ostringstream tmp;
-                        tmp << *reinterpret_cast<const float*>(data);
-                        val = tmp.str();
-                        break;
-                    }
-                    case TYPE_STRING:
-                    case TYPE_DATETIME:
-                        val = std::string(data, strnlen(data, col.len));
-                        break;
-                    }
-                    row.push_back(val);
+                case TYPE_FLOAT: {
+                    std::ostringstream tmp;
+                    tmp << *reinterpret_cast<const float*>(data);
+                    val = tmp.str();
+                    break;
                 }
-                rows.push_back(std::move(row));
+                case TYPE_STRING:
+                case TYPE_DATETIME:
+                    val = std::string(data, strnlen(data, col.len));
+                    break;
+                }
+                row.push_back(val);
             }
+            rows.push_back(std::move(row));
         }
         return rows;
     }
@@ -139,18 +146,14 @@ protected:
         auto parse = parse_sql(sql);
         auto query = analyze_->do_analyze(std::move(parse));
         auto plan = planner_->do_planner(std::move(query), nullptr);
-        auto portal_stmt = portal_->start(std::move(plan), nullptr);
-
-        if (portal_stmt->tag == PORTAL_EXPLAIN_ANALYZE) {
-            for (portal_stmt->root->beginTuple(); !portal_stmt->root->is_end(); portal_stmt->root->nextTuple()) {
-                (void)portal_stmt->root->Next();
-            }
-            auto* dml = static_cast<DMLPlan*>(portal_stmt->plan.get());
-            std::ostringstream out;
-            Portal::render_explain_plan(dml->subplan_.get(), 0, out);
-            return out.str();
-        }
-        return "";
+        char data_send[BUFFER_LENGTH] = {};
+        int offset = 0;
+        Context context(lock_manager_.get(), nullptr, nullptr, txn_manager_.get());
+        ExecutionOutput output{data_send, &offset};
+        QlManager ql_mgr(sm_manager_.get(), txn_manager_.get());
+        txn_id_t txn = 0;
+        ql_mgr.execute(std::move(plan), &txn, &context, &output);
+        return {data_send, static_cast<std::size_t>(offset)};
     }
 };
 

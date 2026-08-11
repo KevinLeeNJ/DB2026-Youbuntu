@@ -19,7 +19,6 @@ private:
     std::vector<Condition> conds_;
     std::vector<ConditionAddress> condition_addresses_;
     size_t len_;
-    std::unique_ptr<RmRecord> fallback_record_;
     TupleView current_view_;
     mutable std::vector<Condition> scan_conditions_cache_;
     bool isend_ = true;
@@ -56,15 +55,11 @@ private:
     }
 
     void advance_to_match() {
-        fallback_record_.reset();
         current_view_ = {};
         while (!prev_->is_end()) {
             TupleView tuple = prev_->current();
             if (!tuple) {
-                fallback_record_ = prev_->Next();
-                if (fallback_record_ != nullptr) {
-                    tuple = TupleView{fallback_record_->data, static_cast<uint32_t>(fallback_record_->size)};
-                }
+                throw InternalError("cursor returned an empty tuple");
             }
             if (tuple && matches(tuple)) {
                 current_view_ = tuple;
@@ -100,15 +95,6 @@ public:
             }
         });
         advance_to_match();
-    }
-
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || !current_view_) {
-            return nullptr;
-        }
-        auto copy = std::make_unique<RmRecord>(static_cast<int>(current_view_.size));
-        memcpy(copy->data, current_view_.data, current_view_.size);
-        return copy;
     }
 
     Rid& rid() override {

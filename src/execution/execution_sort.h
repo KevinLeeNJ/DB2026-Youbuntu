@@ -16,7 +16,6 @@ See the Mulan PSL v2 for more details. */
 #include <type_traits>
 
 #include "execution_defs.h"
-#include "execution_manager.h"
 #include "execution_scalar.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
@@ -183,7 +182,7 @@ private:
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = copy_view(prev_->current());
             if (rec == nullptr) {
-                rec = prev_->Next();
+                throw InternalError("cursor returned an empty tuple");
             }
             if (rec != nullptr) {
                 tuples_.emplace_back(*rec);
@@ -210,7 +209,7 @@ private:
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = copy_view(prev_->current());
             if (rec == nullptr) {
-                rec = prev_->Next();
+                throw InternalError("cursor returned an empty tuple");
             }
             if (rec == nullptr) {
                 continue;
@@ -328,13 +327,6 @@ public:
         if (!is_end()) {
             ++cursor_;
         }
-    }
-
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end()) {
-            return nullptr;
-        }
-        return std::make_unique<RmRecord>(tuples_[cursor_]);
     }
 
     TupleView current() const override {

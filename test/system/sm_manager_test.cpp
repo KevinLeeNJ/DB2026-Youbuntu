@@ -352,27 +352,35 @@ TEST_F(SmManagerTest, drop_table_clears_only_its_runtime_version_history) {
     RmRecord survivor_record(static_cast<int>(survivor_row.size()));
     std::memcpy(survivor_record.data, survivor_row.data(), survivor_row.size());
 
-    sm_manager_->remember_historical_index_key("reused_name", reused_index_name, reused_key, reused_rid, reused_index);
-    sm_manager_->remember_deleted_tuple_candidate_for_test("reused_name", reused_rid, reused_row, reused_tombstone);
-    sm_manager_->remember_historical_index_key("survivor", survivor_index_name, survivor_key, survivor_rid,
-                                               survivor_index);
-    sm_manager_->remember_deleted_tuple_candidate_for_test("survivor", survivor_rid, survivor_row, survivor_tombstone);
+    sm_manager_->version_history().remember_historical_index_key("reused_name", reused_index_name, reused_key,
+                                                                 reused_rid, reused_index);
+    sm_manager_->version_history().remember_deleted_tuple_candidate_for_test("reused_name", reused_rid, reused_row,
+                                                                             reused_tombstone);
+    sm_manager_->version_history().remember_historical_index_key("survivor", survivor_index_name, survivor_key,
+                                                                 survivor_rid, survivor_index);
+    sm_manager_->version_history().remember_deleted_tuple_candidate_for_test("survivor", survivor_rid, survivor_row,
+                                                                             survivor_tombstone);
 
     sm_manager_->drop_table("reused_name", nullptr);
-    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("reused_name", reused_index_name, reused_key).empty());
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("reused_name", reused_record).empty());
-    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("survivor", survivor_index_name, survivor_key),
-              std::vector<Rid>{survivor_rid});
-    auto survivor_candidates = sm_manager_->get_deleted_tuple_candidates("survivor", survivor_record);
+    EXPECT_TRUE(sm_manager_->version_history()
+                    .get_historical_index_key_rids("reused_name", reused_index_name, reused_key)
+                    .empty());
+    EXPECT_TRUE(sm_manager_->version_history().get_deleted_tuple_candidates("reused_name", reused_record).empty());
+    EXPECT_EQ(
+        sm_manager_->version_history().get_historical_index_key_rids("survivor", survivor_index_name, survivor_key),
+        std::vector<Rid>{survivor_rid});
+    auto survivor_candidates = sm_manager_->version_history().get_deleted_tuple_candidates("survivor", survivor_record);
     ASSERT_EQ(survivor_candidates.size(), 1u);
     EXPECT_EQ(survivor_candidates[0].rid, survivor_rid);
-    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
-    EXPECT_TRUE(sm_manager_->historical_bucket_belongs_to_table(
-        sm_manager_->historical_retire_queue_.front().bucket_key, "survivor"));
+    ASSERT_EQ(sm_manager_->version_history().historical_retire_queue_.size(), 1u);
+    EXPECT_TRUE(VersionHistory::historical_bucket_belongs_to_table(
+        sm_manager_->version_history().historical_retire_queue_.front().bucket_key, "survivor"));
 
     sm_manager_->create_table("reused_name", cols, nullptr);
     sm_manager_->create_index("reused_name", {"id"}, nullptr);
-    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("reused_name", reused_index_name, reused_key).empty());
+    EXPECT_TRUE(sm_manager_->version_history()
+                    .get_historical_index_key_rids("reused_name", reused_index_name, reused_key)
+                    .empty());
 }
 
 TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_unsafe_prefix) {
@@ -397,16 +405,16 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_
         tombstone.commit_ts_ = i == 0 ? INVALID_TS : 10;
         tombstone.version_chain_head_ = UndoLink{0, i + 1, 1000 + i};
         fh->set_tuple_meta(rid, tombstone);
-        sm_manager_->remember_deleted_tuple_candidate("candidate_gc", rid, record, tombstone);
+        sm_manager_->version_history().remember_deleted_tuple_candidate("candidate_gc", rid, record, tombstone);
         if (i == 0) {
             first_rid = rid;
         }
     }
 
-    sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 3u);
-    sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
+    sm_manager_->version_history().prune(11);
+    EXPECT_EQ(sm_manager_->version_history().get_deleted_tuple_candidates("candidate_gc", record).size(), 3u);
+    sm_manager_->version_history().prune(11);
+    EXPECT_EQ(sm_manager_->version_history().get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
 
     // Equality is not safe: exactly watermark must remain. Advancing the
     // watermark by one makes the same tombstone reclaimable.
@@ -414,13 +422,13 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_gc_is_strict_and_rotates_past_512_
     first_meta.is_committed_ = true;
     first_meta.commit_ts_ = 11;
     fh->set_tuple_meta(first_rid, first_meta);
-    sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
-    EXPECT_EQ(sm_manager_->deleted_tuple_retire_queue_.size(), 0u);
-    ASSERT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.size(), 1u);
-    EXPECT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.top().retry_after_watermark, 11);
-    sm_manager_->prune_version_history(12);
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("candidate_gc", record).empty());
+    sm_manager_->version_history().prune(11);
+    EXPECT_EQ(sm_manager_->version_history().get_deleted_tuple_candidates("candidate_gc", record).size(), 1u);
+    EXPECT_EQ(sm_manager_->version_history().deleted_tuple_retire_queue_.size(), 0u);
+    ASSERT_EQ(sm_manager_->version_history().deleted_tuple_deferred_retire_queue_.size(), 1u);
+    EXPECT_EQ(sm_manager_->version_history().deleted_tuple_deferred_retire_queue_.top().retry_after_watermark, 11);
+    sm_manager_->version_history().prune(12);
+    EXPECT_TRUE(sm_manager_->version_history().get_deleted_tuple_candidates("candidate_gc", record).empty());
 }
 
 TEST_F(SmManagerTest, historical_retire_generation_prevents_aba_and_keeps_equality) {
@@ -444,30 +452,35 @@ TEST_F(SmManagerTest, historical_retire_generation_prevents_aba_and_keeps_equali
 
     // A queued ticket is a logical identity. Repeated refreshes update the
     // Entry generation without appending more queue nodes.
-    sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
-    const auto bucket_key = sm_manager_->make_historical_index_key("historical_aba", index_name, {});
-    auto& entries = sm_manager_->historical_index_keys_.at(bucket_key).entries.at(std::string(key.data(), key.size()));
+    sm_manager_->version_history().remember_historical_index_key("historical_aba", index_name, key, rid, index);
+    const auto bucket_key = VersionHistory::make_historical_index_key("historical_aba", index_name, {});
+    auto& entries = sm_manager_->version_history()
+                        .historical_index_keys_.at(bucket_key)
+                        .entries.at(std::string(key.data(), key.size()));
     ASSERT_EQ(entries.size(), 1u);
     const uint64_t generation_a = entries.front().generation;
-    sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
+    sm_manager_->version_history().remember_historical_index_key("historical_aba", index_name, key, rid, index);
     const uint64_t generation_b = entries.front().generation;
     EXPECT_GT(generation_b, generation_a);
-    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
-    ASSERT_EQ(sm_manager_->historical_queued_generations_.size(), 1u);
-    sm_manager_->prune_version_history(10);
-    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
+    ASSERT_EQ(sm_manager_->version_history().historical_retire_queue_.size(), 1u);
+    ASSERT_EQ(sm_manager_->version_history().historical_queued_generations_.size(), 1u);
+    sm_manager_->version_history().prune(10);
+    EXPECT_EQ(sm_manager_->version_history().get_historical_index_key_rids("historical_aba", index_name, key),
+              std::vector<Rid>{rid});
 
-    sm_manager_->remember_historical_index_key("historical_aba", index_name, key, rid, index);
-    ASSERT_EQ(sm_manager_->historical_retire_queue_.size(), 0u);
-    ASSERT_EQ(sm_manager_->historical_deferred_retire_queue_.size(), 1u);
+    sm_manager_->version_history().remember_historical_index_key("historical_aba", index_name, key, rid, index);
+    ASSERT_EQ(sm_manager_->version_history().historical_retire_queue_.size(), 0u);
+    ASSERT_EQ(sm_manager_->version_history().historical_deferred_retire_queue_.size(), 1u);
     const uint64_t generation_c = entries.front().generation;
     EXPECT_GT(generation_c, generation_b);
-    ASSERT_EQ(sm_manager_->historical_queued_generations_.size(), 0u);
-    sm_manager_->prune_version_history(10);
-    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key), std::vector<Rid>{rid});
-    EXPECT_EQ(sm_manager_->historical_deferred_retire_queue_.size(), 1u);
-    sm_manager_->prune_version_history(11);
-    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("historical_aba", index_name, key).empty());
+    ASSERT_EQ(sm_manager_->version_history().historical_queued_generations_.size(), 0u);
+    sm_manager_->version_history().prune(10);
+    EXPECT_EQ(sm_manager_->version_history().get_historical_index_key_rids("historical_aba", index_name, key),
+              std::vector<Rid>{rid});
+    EXPECT_EQ(sm_manager_->version_history().historical_deferred_retire_queue_.size(), 1u);
+    sm_manager_->version_history().prune(11);
+    EXPECT_TRUE(
+        sm_manager_->version_history().get_historical_index_key_rids("historical_aba", index_name, key).empty());
 }
 
 TEST_F(SmManagerTest, deleted_tuple_candidate_aba_does_not_erase_current_generation) {
@@ -486,27 +499,27 @@ TEST_F(SmManagerTest, deleted_tuple_candidate_aba_does_not_erase_current_generat
     old_tombstone.is_committed_ = true;
     old_tombstone.commit_ts_ = 10;
     old_tombstone.version_chain_head_ = UndoLink{0, 1, 401};
-    sm_manager_->remember_deleted_tuple_candidate("deleted_aba", rid, record, old_tombstone);
+    sm_manager_->version_history().remember_deleted_tuple_candidate("deleted_aba", rid, record, old_tombstone);
 
     TupleMeta current_tombstone = old_tombstone;
     current_tombstone.writer_txn_id_ = 402;
     current_tombstone.commit_ts_ = 11;
     current_tombstone.version_chain_head_ = UndoLink{0, 2, 402};
     fh->set_tuple_meta(rid, current_tombstone);
-    sm_manager_->remember_deleted_tuple_candidate("deleted_aba", rid, record, current_tombstone);
+    sm_manager_->version_history().remember_deleted_tuple_candidate("deleted_aba", rid, record, current_tombstone);
 
     // Old candidate mismatches the current TupleMeta and must not delete the
     // current identity. The current item is equality-unsafe and requeues.
-    sm_manager_->prune_version_history(11);
-    const auto current = sm_manager_->get_deleted_tuple_candidates("deleted_aba", record);
+    sm_manager_->version_history().prune(11);
+    const auto current = sm_manager_->version_history().get_deleted_tuple_candidates("deleted_aba", record);
     ASSERT_EQ(current.size(), 1u);
     EXPECT_EQ(current.front().writer_txn_id, current_tombstone.writer_txn_id_);
     EXPECT_EQ(current.front().version_chain_head, current_tombstone.version_chain_head_);
-    EXPECT_EQ(sm_manager_->deleted_tuple_retire_queue_.size(), 0u);
-    ASSERT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.size(), 1u);
-    EXPECT_EQ(sm_manager_->deleted_tuple_deferred_retire_queue_.top().retry_after_watermark, 11);
-    sm_manager_->prune_version_history(12);
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("deleted_aba", record).empty());
+    EXPECT_EQ(sm_manager_->version_history().deleted_tuple_retire_queue_.size(), 0u);
+    ASSERT_EQ(sm_manager_->version_history().deleted_tuple_deferred_retire_queue_.size(), 1u);
+    EXPECT_EQ(sm_manager_->version_history().deleted_tuple_deferred_retire_queue_.top().retry_after_watermark, 11);
+    sm_manager_->version_history().prune(12);
+    EXPECT_TRUE(sm_manager_->version_history().get_deleted_tuple_candidates("deleted_aba", record).empty());
 }
 
 TEST_F(SmManagerTest, gc_requeues_candidates_when_tuple_probe_must_retry) {
@@ -552,21 +565,24 @@ TEST_F(SmManagerTest, gc_requeues_candidates_when_tuple_probe_must_retry) {
     std::memcpy(key.data(), &value, sizeof(value));
     RmRecord record(fh->get_file_hdr().record_size);
     std::memcpy(record.data, row.data(), row.size());
-    sm_manager_->remember_historical_index_key("gc_retry", "synthetic_index", key, first, synthetic_index);
-    sm_manager_->remember_deleted_tuple_candidate("gc_retry", first, record, tombstone);
+    sm_manager_->version_history().remember_historical_index_key("gc_retry", "synthetic_index", key, first,
+                                                                 synthetic_index);
+    sm_manager_->version_history().remember_deleted_tuple_candidate("gc_retry", first, record, tombstone);
 
     Page* held = buffer_pool_manager_->fetch_page(PageId{fh->GetFd(), second.page_no});
     ASSERT_NE(held, nullptr);
-    sm_manager_->prune_version_history(11);
-    EXPECT_EQ(sm_manager_->get_historical_index_key_rids("gc_retry", "synthetic_index", key), std::vector<Rid>{first});
-    EXPECT_EQ(sm_manager_->get_deleted_tuple_candidates("gc_retry", record).size(), 1u);
-    EXPECT_EQ(sm_manager_->historical_retire_queue_.size(), 1u);
-    EXPECT_EQ(sm_manager_->deleted_tuple_retire_queue_.size(), 1u);
+    sm_manager_->version_history().prune(11);
+    EXPECT_EQ(sm_manager_->version_history().get_historical_index_key_rids("gc_retry", "synthetic_index", key),
+              std::vector<Rid>{first});
+    EXPECT_EQ(sm_manager_->version_history().get_deleted_tuple_candidates("gc_retry", record).size(), 1u);
+    EXPECT_EQ(sm_manager_->version_history().historical_retire_queue_.size(), 1u);
+    EXPECT_EQ(sm_manager_->version_history().deleted_tuple_retire_queue_.size(), 1u);
 
     ASSERT_TRUE(buffer_pool_manager_->unpin_page(PageId{fh->GetFd(), second.page_no}, false));
-    sm_manager_->prune_version_history(11);
-    EXPECT_TRUE(sm_manager_->get_historical_index_key_rids("gc_retry", "synthetic_index", key).empty());
-    EXPECT_TRUE(sm_manager_->get_deleted_tuple_candidates("gc_retry", record).empty());
+    sm_manager_->version_history().prune(11);
+    EXPECT_TRUE(
+        sm_manager_->version_history().get_historical_index_key_rids("gc_retry", "synthetic_index", key).empty());
+    EXPECT_TRUE(sm_manager_->version_history().get_deleted_tuple_candidates("gc_retry", record).empty());
 }
 
 // =============================================================================
@@ -579,8 +595,8 @@ TEST_F(SmManagerTest, show_tables_empty) {
     std::remove("output.txt");
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_NO_THROW(sm_manager_->show_tables(&ctx));
+    ExecutionOutput output{buf, &offset};
+    EXPECT_NO_THROW(sm_manager_->show_tables(&output));
     EXPECT_GT(offset, 0);
 }
 
@@ -593,8 +609,8 @@ TEST_F(SmManagerTest, show_tables_with_data) {
 
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    sm_manager_->show_tables(&ctx);
+    ExecutionOutput output{buf, &offset};
+    sm_manager_->show_tables(&output);
     EXPECT_GT(offset, 0);
 
     // 验证output.txt包含表名
@@ -614,8 +630,8 @@ TEST_F(SmManagerTest, desc_table_success) {
 
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_NO_THROW(sm_manager_->desc_table("desc_tab", &ctx));
+    ExecutionOutput execution_output{buf, &offset};
+    EXPECT_NO_THROW(sm_manager_->desc_table("desc_tab", &execution_output));
     std::string output(buf);
     EXPECT_NE(output.find("id"), std::string::npos);
     EXPECT_NE(output.find("INT"), std::string::npos);
@@ -627,8 +643,8 @@ TEST_F(SmManagerTest, desc_table_not_found_throws) {
     setup_db();
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_THROW(sm_manager_->desc_table("no_such_table", &ctx), TableNotFoundError);
+    ExecutionOutput output{buf, &offset};
+    EXPECT_THROW(sm_manager_->desc_table("no_such_table", &output), TableNotFoundError);
 }
 
 // =============================================================================
@@ -815,8 +831,8 @@ TEST_F(SmManagerTest, full_lifecycle) {
     // desc 验证
     char buf[BUFFER_LENGTH] = {0};
     int offset = 0;
-    Context ctx(nullptr, nullptr, nullptr, buf, &offset);
-    EXPECT_NO_THROW(sm_manager_->desc_table("full_tab", &ctx));
+    ExecutionOutput output{buf, &offset};
+    EXPECT_NO_THROW(sm_manager_->desc_table("full_tab", &output));
 
     // 删一个索引
     sm_manager_->drop_index("full_tab", {"score"}, nullptr);

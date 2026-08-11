@@ -25,26 +25,26 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/plan.h"
 #include "executor_abstract.h"
 #include "transaction/transaction_manager.h"
-#include "optimizer/planner.h"
-
-class Planner;
+#include "execution/parameter_frame.h"
+#include "execution/prepared_plan_descriptor.h"
 
 class QlManager {
 private:
     SmManager* sm_manager_;
     TransactionManager* txn_mgr_;
-    Planner* planner_;
 
 public:
-    QlManager(SmManager* sm_manager, TransactionManager* txn_mgr, Planner* planner)
-        : sm_manager_(sm_manager), txn_mgr_(txn_mgr), planner_(planner) {}
+    QlManager(SmManager* sm_manager, TransactionManager* txn_mgr) : sm_manager_(sm_manager), txn_mgr_(txn_mgr) {}
 
     void run_mutli_query(Plan* plan, Context* context);
-    void run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context);
+    void run_cmd_utility(Plan* plan, txn_id_t* txn_id, Context* context, ExecutionOutput* output);
     void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<std::string> output_names,
-                     Context* context);
-    void select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols,
-                     Context* context);
+                     Context* context, ExecutionOutput* output);
+    void select_from(std::unique_ptr<AbstractExecutor> root, std::vector<TabCol> sel_cols, Context* context,
+                     ExecutionOutput* output);
 
-    void run_dml(std::unique_ptr<AbstractExecutor> exec);
+    bool execute(std::unique_ptr<Plan> plan, txn_id_t* txn_id, Context* context, ExecutionOutput* output);
+    bool execute_prepared(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters, Context* context,
+                          ExecutionOutput* output);
+    std::pair<std::vector<std::string>, std::vector<ColMeta>> inspect_select_plan(const Plan& plan, Context* context);
 };

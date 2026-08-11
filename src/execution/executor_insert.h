@@ -13,13 +13,12 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_common.h"
 #include "execution_defs.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
-#include "prepared_insert_binding.h"
+#include "row_mutation.h"
 #include "index/ix.h"
 #include "system/sm.h"
 
-class InsertExecutor : public AbstractExecutor {
+class InsertExecutor {
 private:
     const TabMeta* tab_;        // generation-scoped table metadata
     std::vector<Value> values_; // 需要插入的数据
@@ -28,8 +27,10 @@ private:
     const std::string* tab_name_;
     Rid rid_; // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
     SmManager* sm_manager_;
-    std::vector<PreparedInsertIndexBinding> owned_indexes_;
-    const std::vector<PreparedInsertIndexBinding>* indexes_;
+    std::vector<RowMutationIndex> owned_indexes_;
+    const std::vector<RowMutationIndex>* indexes_;
+    Context* context_{nullptr};
+    bool executed_{false};
 
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
         std::vector<char> key(index.col_tot_len);
@@ -41,15 +42,15 @@ private:
         return key;
     }
 
-    void check_mvcc_unique_key_conflict(const PreparedInsertIndexBinding& index, const std::vector<char>& key) {
+    void check_mvcc_unique_key_conflict(const RowMutationIndex& index, const std::vector<char>& key) {
         if (context_ == nullptr || context_->txn_ == nullptr || context_->txn_mgr_ == nullptr) {
             return;
         }
 
-        auto candidate_rids = sm_manager_->get_historical_index_key_rids(*tab_name_, index.name, key);
+        auto candidate_rids = sm_manager_->version_history().get_historical_index_key_rids(*tab_name_, index.name, key);
 
         for (const auto& existing_rid : candidate_rids) {
-            if (HistoricalIndexKeyConflictsWithTxn(fh_, existing_rid, *index.metadata, key, context_)) {
+            if (HistoricalIndexKeyConflictsWithTxn(fh_, existing_rid, *index.meta, key, context_)) {
                 throw TransactionAbortException(context_->txn_->get_transaction_id(), AbortReason::WW_CONFLICT);
             }
         }
@@ -71,21 +72,15 @@ public:
         for (const auto& index : tab_->indexes) {
             std::string index_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
             owned_indexes_.push_back(
-                PreparedInsertIndexBinding{&index, sm_manager_->ihs_.at(index_name).get(), std::move(index_name)});
+                RowMutationIndex{&index, sm_manager_->ihs_.at(index_name).get(), std::move(index_name)});
         }
         indexes_ = &owned_indexes_;
     };
 
-    InsertExecutor(const PreparedInsertExecutable& executable, std::vector<Value> values, Context* context)
-        : tab_(executable.table), values_(std::move(values)), fh_(executable.table_handle),
-          tab_name_(&executable.table_name), sm_manager_(executable.sm_manager), indexes_(&executable.indexes) {
-        if (tab_ == nullptr || fh_ == nullptr || sm_manager_ == nullptr || values_.size() != tab_->cols.size()) {
-            throw InvalidValueCountError();
+    void Execute() {
+        if (executed_) {
+            return;
         }
-        context_ = context;
-    }
-
-    std::unique_ptr<RmRecord> Next() override {
         // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
         // 尾部的 null bitmap 不在列循环的覆盖范围内，必须先清零
@@ -99,7 +94,11 @@ public:
                 continue;
             }
             if (col.type != val.type) {
-                if (!can_cast(col.type, val.type)) {
+                const bool compatible = (col.type == TYPE_INT && val.type == TYPE_FLOAT) ||
+                                        (col.type == TYPE_FLOAT && val.type == TYPE_INT) ||
+                                        ((col.type == TYPE_STRING || col.type == TYPE_DATETIME) &&
+                                         (val.type == TYPE_STRING || val.type == TYPE_DATETIME));
+                if (!compatible) {
                     throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
                 }
                 // Convert value type for storage (e.g., INT literal into FLOAT column)
@@ -129,7 +128,7 @@ public:
         std::vector<std::vector<char>> index_keys;
         index_keys.reserve(indexes_->size());
         for (const auto& index : *indexes_) {
-            auto key = make_index_key(*index.metadata, rec.data);
+            auto key = make_index_key(*index.meta, rec.data);
             ReserveUniqueKey(context_, index.handle->GetFd(), key);
             check_mvcc_unique_key_conflict(index, key);
             index_keys.push_back(std::move(key));
@@ -208,9 +207,9 @@ public:
                 }
             }
         }
-        return nullptr;
+        executed_ = true;
     }
-    Rid& rid() override {
+    Rid& rid() {
         return rid_;
     }
 };

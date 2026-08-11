@@ -10,8 +10,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
-#include <setjmp.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,8 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -40,45 +43,49 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
 #include "optimizer/planner.h"
-#include "portal.h"
 #include "analyze/analyze.h"
 #include "protocol/wire_protocol.h"
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 128
 
-static bool should_exit = false;
-
-// 构建全局所需的管理器对象
 static constexpr size_t SERVER_BUFFER_POOL_PAGES = (size_t{3} << 30) / PAGE_SIZE;
-auto disk_manager = std::make_unique<DiskManager>();
-auto buffer_pool_manager = std::make_unique<BufferPoolManager>(SERVER_BUFFER_POOL_PAGES, disk_manager.get());
-auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
-auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
-auto sm_manager =
-    std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
-auto lock_manager = std::make_unique<LockManager>();
-auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
-auto planner = std::make_unique<Planner>(sm_manager.get());
-auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
-auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
-// The server must not acknowledge a commit before the WAL is durable.  Keep
-// PROCESS_CRASH available to focused LogManager tests, but never let an
-// omitted or misspelled environment variable weaken the production path.
-auto log_manager = std::make_unique<LogManager>(disk_manager.get(), DurabilityMode::STRICT);
-auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get(),
-                                                  log_manager.get());
+static volatile sig_atomic_t should_exit = 0;
 
-auto portal = std::make_unique<Portal>(sm_manager.get());
-auto analyze = std::make_unique<Analyze>(sm_manager.get());
+// The concrete process composition root. Declaration order is dependency
+// order; C++ destroys it in reverse, so TransactionManager joins GC before
+// the catalog, buffer pool, and disk objects it uses are destroyed.
+struct DatabaseInstance {
+    DiskManager disk_manager;
+    BufferPoolManager buffer_pool_manager{SERVER_BUFFER_POOL_PAGES, &disk_manager};
+    RmManager rm_manager{&disk_manager, &buffer_pool_manager};
+    IxManager ix_manager{&disk_manager, &buffer_pool_manager};
+    SmManager sm_manager{&disk_manager, &buffer_pool_manager, &rm_manager, &ix_manager};
+    LockManager lock_manager;
+    LogManager log_manager{&disk_manager, DurabilityMode::STRICT};
+    TransactionManager txn_manager{&lock_manager, &sm_manager};
+    Planner planner{&sm_manager};
+    Optimizer optimizer{&sm_manager, &planner};
+    QlManager ql_manager{&sm_manager, &txn_manager};
+    Analyze analyze{&sm_manager};
+    RecoveryManager recovery{&disk_manager, &buffer_pool_manager, &sm_manager, &log_manager};
 
-static jmp_buf jmpbuf;
+    void open_and_recover(const std::string& db_name);
+    ~DatabaseInstance() {
+        try {
+            close();
+        } catch (...) {
+        }
+    }
+    void close();
+
+private:
+    bool open_{false};
+};
+
 void sigint_handler(int signo) {
     (void)signo;
-    should_exit = true;
-    log_manager->flush_log_to_disk_with_sync();
-    LOG_INFO("the server received Ctrl+C and will close");
-    longjmp(jmpbuf, 1);
+    should_exit = 1;
 }
 
 namespace {
@@ -103,7 +110,7 @@ bool descriptor_runtime_eligible(const PreparedPlanDescriptor* descriptor) {
     }
     if (descriptor->statement_kind() == PreparedStatementKind::Update) {
         const DMLPlan* dml = descriptor->dml_plan();
-        return dml != nullptr && dml->compiled_point_program_ == nullptr && dml->subplan_ != nullptr;
+        return dml != nullptr && dml->subplan_ != nullptr;
     }
     return true;
 }
@@ -289,47 +296,51 @@ struct SessionState {
 };
 
 struct BatchExecutionContext {
-    explicit BatchExecutionContext(SessionState& session)
-        : context(lock_manager.get(), log_manager.get(), nullptr, nullptr, nullptr, txn_manager.get()),
-          catalog_guard(sm_manager->acquire_catalog_shared()) {
-        reset_for_operation(session, nullptr, true);
+    BatchExecutionContext(DatabaseInstance& database, SessionState& session)
+        : context(&database.lock_manager, &database.log_manager, nullptr, &database.txn_manager),
+          catalog_guard(database.sm_manager.acquire_catalog_shared()) {
+        reset_for_operation(session, nullptr);
     }
 
-    void reset_for_operation(SessionState& session, QueryResultSink* result_sink, bool typed_fast_path) {
-        if (!typed_fast_path && legacy_response.empty()) {
-            legacy_response.assign(BUFFER_LENGTH, 0);
-        }
-        if (legacy_offset > 0) {
+    void reset_for_operation(SessionState& session, QueryResultSink* result_sink) {
+        if (!legacy_response.empty() && legacy_offset > 0) {
             const std::size_t used =
                 std::min(static_cast<std::size_t>(legacy_offset), static_cast<std::size_t>(legacy_response.size()));
             std::fill_n(legacy_response.data(), used, '\0');
         }
         legacy_offset = 0;
         context.txn_ = nullptr;
-        context.data_send_ = typed_fast_path ? nullptr : legacy_response.data();
-        context.offset_ = typed_fast_path ? nullptr : &legacy_offset;
-        context.ellipsis_ = false;
         context.isolation_level_ = session.isolation;
         context.enable_ssi_read_tracking_ = false;
-        context.result_sink_ = result_sink;
-        context.output_file_enabled_ = &session.output_file_enabled;
+        output.result_sink = result_sink;
+        output.output_file_enabled = &session.output_file_enabled;
+    }
+
+    void set_output_mode(bool typed_fast_path) {
+        if (!typed_fast_path && legacy_response.empty()) {
+            legacy_response.assign(BUFFER_LENGTH, 0);
+        }
+        output.data_send = typed_fast_path ? nullptr : legacy_response.data();
+        output.offset = typed_fast_path ? nullptr : &legacy_offset;
+        output.ellipsis = false;
     }
 
     std::vector<char> legacy_response;
     int legacy_offset{0};
     Context context;
+    ExecutionOutput output;
     SmManager::CatalogSharedGuard catalog_guard;
     BatchResultBuilder result;
 };
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(SessionState& session, Context* context) {
+void SetTransaction(DatabaseInstance& database, SessionState& session, Context* context) {
     Transaction* txn = session.running_transaction();
     if (txn == nullptr) {
-        txn = txn_manager->get_transaction(session.txn_id);
+        txn = database.txn_manager.get_transaction(session.txn_id);
         if (txn == nullptr || txn->get_state() == TransactionState::COMMITTED ||
             txn->get_state() == TransactionState::ABORTED) {
-            txn = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
+            txn = database.txn_manager.begin(nullptr, context->log_mgr_, context->isolation_level_);
             session.txn_id = txn->get_transaction_id();
             txn->set_txn_mode(false);
             txn->set_isolation_level(context->isolation_level_);
@@ -337,7 +348,7 @@ void SetTransaction(SessionState& session, Context* context) {
         session.remember_running_transaction(txn);
     }
     context->txn_ = txn;
-    txn_manager->BeginStatement(txn);
+    database.txn_manager.BeginStatement(txn);
 }
 
 struct PreparedStatement {
@@ -400,23 +411,24 @@ bool is_valid_utf8(const std::string& text) {
     return true;
 }
 
-void abort_session(SessionState& session, Context* context) {
+void abort_session(DatabaseInstance& database, SessionState& session, Context* context) {
     Transaction* txn = context == nullptr ? nullptr : context->txn_;
     if (txn == nullptr) {
         txn = session.running_transaction();
     }
     if (txn == nullptr && session.txn_id != INVALID_TXN_ID) {
-        txn = txn_manager->get_transaction(session.txn_id);
+        txn = database.txn_manager.get_transaction(session.txn_id);
     }
-    // The transaction is over either way, and abort may already have freed it.
+    // Clear every owner before physical undo: abort may throw after changing
+    // transaction state, and a later protocol cleanup must not retry it.
     session.forget_running_transaction();
-    if (txn != nullptr && txn->get_state() != TransactionState::ABORTED &&
-        txn->get_state() != TransactionState::COMMITTED) {
-        txn_manager->abort(txn, log_manager.get());
-    }
     session.txn_id = INVALID_TXN_ID;
     if (context != nullptr) {
         context->txn_ = nullptr;
+    }
+    if (txn != nullptr && txn->get_state() != TransactionState::ABORTED &&
+        txn->get_state() != TransactionState::COMMITTED) {
+        database.txn_manager.abort(txn, &database.log_manager);
     }
 }
 
@@ -425,84 +437,108 @@ struct ExecutionOutcome {
     bool catalog_changed = false;
 };
 
-ExecutionOutcome execute_tree_impl(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                   QueryResultSink* result_sink, bool catalog_guard_held = false,
-                                   Context* reusable_context = nullptr) {
-    std::vector<char> response;
-    int offset = 0;
-    std::optional<Context> owned_context;
-    if (reusable_context == nullptr) {
-        response.assign(BUFFER_LENGTH, 0);
-        owned_context.emplace(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset,
-                              txn_manager.get());
-        reusable_context = &*owned_context;
+bool end_explicit_transaction(DatabaseInstance& database, PlanTag tag, SessionState& session, Context& context) {
+    if (tag != T_Transaction_commit && tag != T_Transaction_rollback && tag != T_Transaction_abort) {
+        return false;
     }
-    Context& context = *reusable_context;
+    Transaction* txn = context.txn_;
+    if (tag == T_Transaction_commit) {
+        if (txn != nullptr) {
+            database.txn_manager.commit(txn, context.log_mgr_);
+        }
+        session.forget_running_transaction();
+        session.txn_id = INVALID_TXN_ID;
+        context.txn_ = nullptr;
+        return true;
+    }
+    session.forget_running_transaction();
+    session.txn_id = INVALID_TXN_ID;
+    context.txn_ = nullptr;
+    if (txn != nullptr) {
+        database.txn_manager.abort(txn, context.log_mgr_);
+    }
+    return true;
+}
+
+template <typename Execute>
+ExecutionOutcome execute_operation(DatabaseInstance& database, SessionState& session, Context& context,
+                                   ExecutionOutput& output, bool starts_transaction, Execute&& execute) {
     context.isolation_level_ = session.isolation;
-    context.result_sink_ = result_sink;
-    context.output_file_enabled_ = &session.output_file_enabled;
-    if (parse_tree == nullptr)
+    output.output_file_enabled = &session.output_file_enabled;
+    try {
+        if (starts_transaction) {
+            SetTransaction(database, session, &context);
+        }
+        const ExecutionOutcome outcome = execute();
+        session.isolation = context.isolation_level_;
+        if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
+            context.txn_->get_state() != TransactionState::COMMITTED &&
+            context.txn_->get_state() != TransactionState::ABORTED) {
+            database.txn_manager.commit(context.txn_, context.log_mgr_);
+            // commit may already have freed the transaction object.
+            session.forget_running_transaction();
+            session.txn_id = INVALID_TXN_ID;
+        }
+        if (context.txn_ == nullptr && session.txn_id == INVALID_TXN_ID) {
+            session.forget_running_transaction();
+        }
+        context.txn_ = nullptr;
+        return outcome;
+    } catch (TransactionAbortException&) {
+        abort_session(database, session, &context);
+        throw;
+    } catch (...) {
+        abort_session(database, session, &context);
+        throw;
+    }
+}
+
+ExecutionOutcome execute_plan(DatabaseInstance& database, std::unique_ptr<Plan> plan, SessionState& session,
+                              Context& context, ExecutionOutput& output) {
+    const bool catalog_changed = plan->tag == T_CreateTable || plan->tag == T_DropTable || plan->tag == T_CreateIndex ||
+                                 plan->tag == T_DropIndex || plan->tag == T_LoadData;
+    if (end_explicit_transaction(database, plan->tag, session, context)) {
+        return {false, catalog_changed};
+    }
+    return {database.ql_manager.execute(std::move(plan), &session.txn_id, &context, &output), catalog_changed};
+}
+
+ExecutionOutcome execute_tree_with_catalog_guard(DatabaseInstance& database, std::unique_ptr<ast::TreeNode> parse_tree,
+                                                 SessionState& session, ExecutionOutput& output, Context& context) {
+    if (parse_tree == nullptr) {
         return {};
+    }
     const auto parsed_type = parse_tree->type;
-    const bool catalog_change = changes_catalog(parsed_type);
+    const bool starts_transaction =
+        parsed_type != ast::AstType::StaticCheckpoint && parsed_type != ast::AstType::LoadStmt;
+    return execute_operation(database, session, context, output, starts_transaction, [&] {
+        std::unique_ptr<Query> query = database.analyze.do_analyze(std::move(parse_tree));
+        std::unique_ptr<Plan> plan = database.optimizer.plan_query(std::move(query), &context);
+        return execute_plan(database, std::move(plan), session, context, output);
+    });
+}
+
+ExecutionOutcome execute_tree(DatabaseInstance& database, std::unique_ptr<ast::TreeNode> parse_tree,
+                              SessionState& session, QueryResultSink* result_sink) {
+    std::vector<char> response(BUFFER_LENGTH, 0);
+    int offset = 0;
+    Context context(&database.lock_manager, &database.log_manager, nullptr, &database.txn_manager);
+    ExecutionOutput output{response.data(), &offset, false, result_sink, &session.output_file_enabled};
+    if (parse_tree == nullptr) {
+        return {};
+    }
+    const bool catalog_change = changes_catalog(parse_tree->type);
     if (catalog_change) {
         Transaction* active = session.running_transaction();
         if (active != nullptr && active->get_txn_mode() && active->get_state() != TransactionState::COMMITTED &&
             active->get_state() != TransactionState::ABORTED) {
             throw RMDBError("structural DDL and LOAD are not allowed inside an explicit transaction");
         }
+        auto guard = database.sm_manager.acquire_catalog_exclusive();
+        return execute_tree_with_catalog_guard(database, std::move(parse_tree), session, output, context);
     }
-    std::optional<SmManager::CatalogSharedGuard> catalog_shared_guard;
-    std::optional<SmManager::CatalogExclusiveGuard> catalog_exclusive_guard;
-    if (!catalog_guard_held) {
-        if (catalog_change) {
-            catalog_exclusive_guard.emplace(sm_manager->acquire_catalog_exclusive());
-        } else {
-            catalog_shared_guard.emplace(sm_manager->acquire_catalog_shared());
-        }
-    }
-    const bool is_checkpoint = parsed_type == ast::AstType::StaticCheckpoint;
-    const bool is_load = parsed_type == ast::AstType::LoadStmt;
-    if (!is_checkpoint && !is_load) {
-        SetTransaction(session, &context);
-    }
-    try {
-        std::unique_ptr<Query> query = analyze->do_analyze(std::move(parse_tree));
-        std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query), &context);
-        const bool catalog_changed = plan->tag == T_CreateTable || plan->tag == T_DropTable ||
-                                     plan->tag == T_CreateIndex || plan->tag == T_DropIndex || plan->tag == T_LoadData;
-        std::unique_ptr<PortalStmt> statement = portal->start(std::move(plan), &context);
-        const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        session.isolation = context.isolation_level_;
-        portal->drop();
-        if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
-            context.txn_->get_state() != TransactionState::COMMITTED &&
-            context.txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager->commit(context.txn_, context.log_mgr_);
-            // commit may already have freed the transaction object.
-            session.forget_running_transaction();
-            session.txn_id = INVALID_TXN_ID;
-        }
-        context.txn_ = nullptr;
-        return {is_query, catalog_changed};
-    } catch (TransactionAbortException&) {
-        abort_session(session, &context);
-        throw;
-    } catch (...) {
-        abort_session(session, &context);
-        throw;
-    }
-}
-
-ExecutionOutcome execute_tree(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                              QueryResultSink* result_sink) {
-    return execute_tree_impl(std::move(parse_tree), session, result_sink);
-}
-
-ExecutionOutcome execute_tree_under_catalog_guard(std::unique_ptr<ast::TreeNode> parse_tree, SessionState& session,
-                                                  QueryResultSink* result_sink, Context* reusable_context) {
-    return execute_tree_impl(std::move(parse_tree), session, result_sink, true, reusable_context);
+    auto guard = database.sm_manager.acquire_catalog_shared();
+    return execute_tree_with_catalog_guard(database, std::move(parse_tree), session, output, context);
 }
 
 ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
@@ -530,44 +566,10 @@ ParameterFrame make_parameter_frame(const std::vector<Value>& wire_values) {
     return ParameterFrame(std::move(values));
 }
 
-ExecutionOutcome execute_prepared_operation(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters,
-                                            SessionState& session, QueryResultSink* result_sink,
-                                            Context* reusable_context) {
-    if (reusable_context == nullptr) {
-        throw InternalError("prepared operation requires a reusable Context");
-    }
-    Context& context = *reusable_context;
-    context.isolation_level_ = session.isolation;
-    context.result_sink_ = result_sink;
-    context.output_file_enabled_ = &session.output_file_enabled;
-    SetTransaction(session, &context);
-    try {
-        std::unique_ptr<PortalStmt> statement = portal->start_prepared(descriptor, parameters, &context);
-        const bool is_query = statement->tag == PORTAL_ONE_SELECT;
-        portal->run(std::move(statement), ql_manager.get(), &session.txn_id, &context);
-        session.isolation = context.isolation_level_;
-        portal->drop();
-        if (context.txn_ != nullptr && !context.txn_->get_txn_mode() &&
-            context.txn_->get_state() != TransactionState::COMMITTED &&
-            context.txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager->commit(context.txn_, context.log_mgr_);
-            session.forget_running_transaction();
-            session.txn_id = INVALID_TXN_ID;
-        }
-        context.txn_ = nullptr;
-        return {is_query, false};
-    } catch (TransactionAbortException&) {
-        abort_session(session, &context);
-        throw;
-    } catch (...) {
-        abort_session(session, &context);
-        throw;
-    }
-}
-
-ExecutionOutcome execute_sql(const std::string& sql, SessionState& session, QueryResultSink* result_sink) {
+ExecutionOutcome execute_sql(DatabaseInstance& database, const std::string& sql, SessionState& session,
+                             QueryResultSink* result_sink) {
     auto parse_tree = ast::parse_sql(sql);
-    return execute_tree(std::move(parse_tree), session, result_sink);
+    return execute_tree(database, std::move(parse_tree), session, result_sink);
 }
 
 std::vector<std::unique_ptr<ast::Value>> make_typed_parameter_nodes(const std::vector<Type>& parameters) {
@@ -593,17 +595,15 @@ std::vector<std::unique_ptr<ast::Value>> make_typed_parameter_nodes(const std::v
     return typed_parameters;
 }
 
-PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Type> parameters,
-                                   std::unique_ptr<ast::TreeNode> template_tree, IsolationLevel isolation) {
-    std::vector<char> response(BUFFER_LENGTH, 0);
-    int offset = 0;
-    Context context(lock_manager.get(), log_manager.get(), nullptr, response.data(), &offset, txn_manager.get());
+PreparedStatement inspect_prepared(DatabaseInstance& database, std::uint16_t id, bool query,
+                                   std::vector<Type> parameters, std::unique_ptr<ast::TreeNode> template_tree,
+                                   IsolationLevel isolation) {
+    Context context(&database.lock_manager, &database.log_manager, nullptr, &database.txn_manager);
     context.isolation_level_ = isolation;
-    context.preparing_statement_ = true;
     auto typed_parameters = make_typed_parameter_nodes(parameters);
     auto bound = ast::clone_bound_tree(*template_tree, typed_parameters);
-    std::unique_ptr<Query> query_tree = analyze->do_analyze(std::move(bound));
-    std::unique_ptr<Plan> plan = optimizer->plan_query(std::move(query_tree), &context);
+    std::unique_ptr<Query> query_tree = database.analyze.do_analyze(std::move(bound));
+    std::unique_ptr<Plan> plan = database.optimizer.plan_query(std::move(query_tree), &context);
     const bool actual_query = plan->tag == T_select;
     if (actual_query != query)
         throw wire_protocol::ProtocolError("prepared result kind does not match SQL");
@@ -612,8 +612,8 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     result.query = query;
     result.template_tree = std::move(template_tree);
     result.parameters = std::move(parameters);
-    result.database_identity = sm_manager->get_database_identity_under_catalog_guard();
-    result.catalog_generation = sm_manager->get_catalog_generation();
+    result.database_identity = database.sm_manager.get_database_identity_under_catalog_guard();
+    result.catalog_generation = database.sm_manager.get_catalog_generation();
     PreparedStatementKind statement_kind = PreparedStatementKind::Unsupported;
     if (plan->tag == T_select) {
         statement_kind = PreparedStatementKind::Select;
@@ -623,7 +623,7 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
         statement_kind = PreparedStatementKind::Update;
     }
     if (actual_query) {
-        auto [output_names, result_schema] = portal->inspect_select_plan(plan.get(), &context);
+        auto [output_names, result_schema] = database.ql_manager.inspect_select_plan(*plan, &context);
         result.names = output_names;
         for (const auto& column : result_schema) {
             result.result_types.push_back(column.type == TYPE_INT     ? Type::INT32
@@ -636,17 +636,15 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
     } else if (statement_kind != PreparedStatementKind::Unsupported) {
         result.descriptor = PreparedPlanDescriptor::Build(std::move(plan), statement_kind, {}, {},
                                                           result.database_identity, result.catalog_generation);
-    } else {
-        (void)portal->start(std::move(plan), &context);
     }
     return result;
 }
 
-void revalidate_prepared(PreparedStatement& statement, IsolationLevel isolation) {
+void revalidate_prepared(DatabaseInstance& database, PreparedStatement& statement, IsolationLevel isolation) {
     auto typed_parameters = make_typed_parameter_nodes(statement.parameters);
     auto template_tree = ast::clone_bound_tree(*statement.template_tree, typed_parameters);
-    PreparedStatement refreshed =
-        inspect_prepared(statement.id, statement.query, statement.parameters, std::move(template_tree), isolation);
+    PreparedStatement refreshed = inspect_prepared(database, statement.id, statement.query, statement.parameters,
+                                                   std::move(template_tree), isolation);
     if (refreshed.query != statement.query || refreshed.names != statement.names ||
         refreshed.result_types != statement.result_types) {
         throw wire_protocol::ProtocolError("prepared result schema changed after catalog update");
@@ -737,7 +735,7 @@ std::vector<std::uint8_t> prepare_set(const std::vector<PreparedStatement>& stat
     return wire_protocol::encode_prepare_ok(schemas);
 }
 
-void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState& session,
+void handle_client_frame(DatabaseInstance& database, int fd, const wire_protocol::Frame& frame, SessionState& session,
                          std::unordered_map<std::uint16_t, PreparedStatement>& prepared) {
     Reader reader(frame.payload);
     if (frame.tag == Tag::EXEC_STREAM) {
@@ -750,7 +748,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             throw wire_protocol::ProtocolError("EXEC_STREAM SQL must be UTF-8 without NUL");
         }
         ProtocolStreamSink result(fd);
-        const ExecutionOutcome outcome = execute_sql(sql, session, &result);
+        const ExecutionOutcome outcome = execute_sql(database, sql, session, &result);
         if (outcome.query && result.query) {
             result.finish();
         } else {
@@ -770,7 +768,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         if (count == 0 || count > 256) {
             throw wire_protocol::ProtocolError("invalid prepared statement count");
         }
-        auto catalog_guard = sm_manager->acquire_catalog_shared();
+        auto catalog_guard = database.sm_manager.acquire_catalog_shared();
         std::vector<PreparedStatement> pending;
         std::unordered_map<std::uint16_t, bool> ids;
         for (std::uint16_t i = 0; i < count; ++i) {
@@ -889,13 +887,13 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
             for (bool marker_seen : seen)
                 if (!marker_seen)
                     throw wire_protocol::ProtocolError("parameter markers must be dense");
-            statement = inspect_prepared(statement.id, statement.query, std::move(statement.parameters),
+            statement = inspect_prepared(database, statement.id, statement.query, std::move(statement.parameters),
                                          std::move(template_tree), session.isolation);
             pending.push_back(std::move(statement));
         }
         reader.require_end();
-        if (sm_manager->get_catalog_generation() != pending.front().catalog_generation ||
-            sm_manager->get_database_identity_under_catalog_guard() != pending.front().database_identity) {
+        if (database.sm_manager.get_catalog_generation() != pending.front().catalog_generation ||
+            database.sm_manager.get_database_identity_under_catalog_guard() != pending.front().database_identity) {
             throw wire_protocol::ProtocolError("catalog changed during PREPARE_SET");
         }
         const auto response = prepare_set(pending);
@@ -941,56 +939,61 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
 
     std::uint16_t failed = 0xffff;
     std::uint16_t executed = 0;
-    BatchExecutionContext batch(session);
+    BatchExecutionContext batch(database, session);
     try {
         for (std::uint16_t i = 0; i < operation_count; ++i) {
             auto* prepared_statement = operations[i].statement;
-            if (prepared_statement->catalog_generation != sm_manager->get_catalog_generation() ||
-                    prepared_statement->database_identity != sm_manager->get_database_identity_under_catalog_guard()) {
-                    revalidate_prepared(*prepared_statement, session.isolation);
+            batch.reset_for_operation(session, &batch.result);
+            const auto make_bindings = [&]() {
+                std::vector<std::unique_ptr<ast::Value>> values;
+                values.reserve(operations[i].values.size());
+                for (const auto& value : operations[i].values) {
+                    if (value.type != prepared_statement->parameters[values.size()])
+                        throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
+                    if (!value.present) {
+                        // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
+                        values.push_back(std::make_unique<ast::NullLit>());
+                        continue;
+                    }
+                    if (value.type == Type::INT32)
+                        values.push_back(std::make_unique<ast::IntLit>(value.int32));
+                    else if (value.type == Type::FLOAT32) {
+                        float number;
+                        std::memcpy(&number, &value.float_bits, sizeof(number));
+                        values.push_back(std::make_unique<ast::FloatLit>(number));
+                    } else
+                        values.push_back(std::make_unique<ast::StringLit>(value.text));
+                }
+                return values;
+            };
+            execute_operation(database, session, batch.context, batch.output, true, [&] {
+                if (prepared_statement->catalog_generation != database.sm_manager.get_catalog_generation() ||
+                    prepared_statement->database_identity !=
+                        database.sm_manager.get_database_identity_under_catalog_guard()) {
+                    revalidate_prepared(database, *prepared_statement, session.isolation);
                 }
                 const bool prepared_fast_path = descriptor_runtime_eligible(prepared_statement->descriptor.get());
-                batch.reset_for_operation(session, &batch.result, prepared_fast_path);
+                batch.set_output_mode(prepared_fast_path);
                 batch.result.begin_operation(i);
-                const auto make_bindings = [&]() {
-                    std::vector<std::unique_ptr<ast::Value>> values;
-                    values.reserve(operations[i].values.size());
-                    for (const auto& value : operations[i].values) {
-                        if (value.type != prepared_statement->parameters[values.size()])
-                            throw wire_protocol::ProtocolError("typed parameter does not match prepared declaration");
-                        if (!value.present) {
-                            // present == 0 绑定为 SQL NULL，与内联的 NULL 字面量等价
-                            values.push_back(std::make_unique<ast::NullLit>());
-                            continue;
-                        }
-                        if (value.type == Type::INT32)
-                            values.push_back(std::make_unique<ast::IntLit>(value.int32));
-                        else if (value.type == Type::FLOAT32) {
-                            float number;
-                            std::memcpy(&number, &value.float_bits, sizeof(number));
-                            values.push_back(std::make_unique<ast::FloatLit>(number));
-                        } else
-                            values.push_back(std::make_unique<ast::StringLit>(value.text));
-                    }
-                    return values;
-                };
-                ExecutionOutcome outcome;
+                bool is_query;
                 if (prepared_fast_path) {
-                    const auto parameter_frame = make_parameter_frame(operations[i].values);
-                    outcome = execute_prepared_operation(*prepared_statement->descriptor, parameter_frame, session,
-                                                         &batch.result, &batch.context);
+                    is_query = database.ql_manager.execute_prepared(*prepared_statement->descriptor,
+                                                                    make_parameter_frame(operations[i].values),
+                                                                    &batch.context, &batch.output);
                 } else {
-                    auto values = make_bindings();
-                    outcome = execute_tree_under_catalog_guard(
-                        ast::clone_bound_tree(*prepared_statement->template_tree, values), session, &batch.result,
-                        &batch.context);
+                    auto query = database.analyze.do_analyze(
+                        ast::clone_bound_tree(*prepared_statement->template_tree, make_bindings()));
+                    auto plan = database.optimizer.plan_query(std::move(query), &batch.context);
+                    is_query = execute_plan(database, std::move(plan), session, batch.context, batch.output).query;
                 }
-                batch.result.finish_operation(outcome.query);
-                ++executed;
-                }
+                batch.result.finish_operation(is_query);
+                return ExecutionOutcome{is_query, false};
+            });
+            ++executed;
+        }
     } catch (TransactionAbortException& exception) {
         failed = executed;
-        abort_session(session, &batch.context);
+        abort_session(database, session, &batch.context);
         // TransactionAbortException does not override what(); use the same
         // diagnostic text the EXEC_STREAM path reports.
         const auto text = exception.GetInfo();
@@ -998,7 +1001,7 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
         return;
     } catch (const std::exception& exception) {
         failed = executed;
-        abort_session(session, &batch.context);
+        abort_session(database, session, &batch.context);
         const auto text = diagnostic(exception);
         wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.failure(executed, 2, failed, text));
         return;
@@ -1007,7 +1010,42 @@ void handle_client_frame(int fd, const wire_protocol::Frame& frame, SessionState
     wire_protocol::write_frame(fd, Tag::BATCH_RESULT, batch.result.success(executed));
 }
 
-void client_handler(int fd) {
+class ServerRuntime {
+public:
+    explicit ServerRuntime(DatabaseInstance& database) : database_(database) {}
+    ~ServerRuntime() {
+        stop();
+    }
+
+    void run(std::uint16_t port);
+
+private:
+    struct Worker {
+        Worker(int socket_fd, std::uint64_t worker_id) : fd(socket_fd), id(worker_id) {}
+
+        int fd;
+        std::uint64_t id;
+        std::thread thread;
+        bool complete{false};
+    };
+
+    void client_handler(int fd, std::uint64_t worker_id);
+    void finish_client(int fd, std::uint64_t worker_id);
+    void reap_completed_workers();
+    void start_checkpoint();
+    void stop();
+
+    DatabaseInstance& database_;
+    int listener_{-1};
+    std::mutex clients_mutex_;
+    std::vector<int> clients_;
+    std::vector<Worker> workers_;
+    std::uint64_t next_worker_id_{0};
+    std::atomic<bool> checkpoint_stop_{false};
+    std::thread checkpoint_thread_;
+};
+
+void ServerRuntime::client_handler(int fd, std::uint64_t worker_id) {
     SessionState session;
     std::unordered_map<std::uint16_t, PreparedStatement> prepared;
     LOG_INFO("establish protocol connection, sockfd: %d", fd);
@@ -1016,83 +1054,159 @@ void client_handler(int fd) {
         wire_protocol::Frame frame;
         while (wire_protocol::read_frame(fd, frame)) {
             try {
-                handle_client_frame(fd, frame, session, prepared);
+                handle_client_frame(database_, fd, frame, session, prepared);
             } catch (TransactionAbortException& exception) {
-                abort_session(session, nullptr);
+                abort_session(database_, session, nullptr);
                 wire_protocol::write_frame(fd, Tag::TRANSACTION_ABORT, make_error_payload(exception.GetInfo()));
             } catch (const std::exception& exception) {
-                abort_session(session, nullptr);
+                abort_session(database_, session, nullptr);
                 wire_protocol::write_frame(fd, Tag::ERROR, make_error_payload(diagnostic(exception)));
             }
         }
     } catch (const std::exception& exception) {
         LOG_WARN("protocol connection closed: %s", exception.what());
-        abort_session(session, nullptr);
+        abort_session(database_, session, nullptr);
     }
-    abort_session(session, nullptr);
-    close(fd);
+    abort_session(database_, session, nullptr);
+    finish_client(fd, worker_id);
+    ::close(fd);
 }
 } // namespace
 
-void start_server(std::uint16_t port) {
-    int sockfd_server;
-    int fd_temp;
+void ServerRuntime::start_checkpoint() {
+    checkpoint_stop_.store(false, std::memory_order_release);
+    checkpoint_thread_ = std::thread([this] {
+        CheckpointManager checkpoint_mgr(&database_.txn_manager, &database_.sm_manager, &database_.log_manager);
+        while (!checkpoint_stop_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!checkpoint_stop_.load(std::memory_order_acquire)) {
+                checkpoint_mgr.Tick();
+            }
+        }
+    });
+}
+
+void ServerRuntime::finish_client(int fd, std::uint64_t worker_id) {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    auto it = std::find(clients_.begin(), clients_.end(), fd);
+    if (it != clients_.end()) {
+        clients_.erase(it);
+    }
+    auto worker = std::find_if(workers_.begin(), workers_.end(),
+                               [worker_id](const Worker& item) { return item.id == worker_id; });
+    if (worker != workers_.end()) {
+        worker->complete = true;
+    }
+}
+
+void ServerRuntime::reap_completed_workers() {
+    std::vector<std::thread> completed;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (auto it = workers_.begin(); it != workers_.end();) {
+            if (!it->complete) {
+                ++it;
+                continue;
+            }
+            completed.push_back(std::move(it->thread));
+            it = workers_.erase(it);
+        }
+    }
+    for (auto& worker : completed) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+void ServerRuntime::run(std::uint16_t port) {
     struct sockaddr_in s_addr_in {};
 
-    // 初始化连接
-    sockfd_server = socket(AF_INET, SOCK_STREAM, 0); // ipv4,TCP
-    assert(sockfd_server != -1);
+    listener_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_ == -1) {
+        throw RMDBError("socket failed: " + std::string(strerror(errno)));
+    }
     int val = 1;
-    setsockopt(sockfd_server, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+    setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
     // before bind(), set the attr of structure sockaddr.
     memset(&s_addr_in, 0, sizeof(s_addr_in));
     s_addr_in.sin_family = AF_INET;
     s_addr_in.sin_addr.s_addr = htonl(INADDR_ANY);
     s_addr_in.sin_port = htons(port);
-    fd_temp = bind(sockfd_server, (struct sockaddr*)(&s_addr_in), sizeof(s_addr_in));
-    if (fd_temp == -1) {
-        LOG_ERROR("bind failed: %s", strerror(errno));
-        minilog::Logger::get().stop();
-        exit(1);
+    if (bind(listener_, reinterpret_cast<struct sockaddr*>(&s_addr_in), sizeof(s_addr_in)) == -1) {
+        throw RMDBError("bind failed: " + std::string(strerror(errno)));
     }
 
-    fd_temp = listen(sockfd_server, MAX_CONN_LIMIT);
-    if (fd_temp == -1) {
-        LOG_ERROR("listen failed: %s", strerror(errno));
-        minilog::Logger::get().stop();
-        exit(1);
+    if (listen(listener_, MAX_CONN_LIMIT) == -1) {
+        throw RMDBError("listen failed: " + std::string(strerror(errno)));
     }
+    start_checkpoint();
 
     while (!should_exit) {
-        LOG_DEBUG("waiting for new connection");
-        struct sockaddr_in s_addr_client {};
-        int client_length = sizeof(s_addr_client);
-
-        if (setjmp(jmpbuf)) {
-            LOG_INFO("break from server listen loop");
+        reap_completed_workers();
+        pollfd ready{listener_, POLLIN, 0};
+        const int poll_result = poll(&ready, 1, 100);
+        if (poll_result == 0 || (poll_result == -1 && errno == EINTR)) {
+            continue;
+        }
+        if (poll_result < 0) {
+            LOG_WARN("listener poll failed: %s", strerror(errno));
             break;
         }
-
-        // Block here. Until server accepts a new connection.
-        int sockfd = accept(sockfd_server, (struct sockaddr*)(&s_addr_client), (socklen_t*)(&client_length));
+        struct sockaddr_in s_addr_client {};
+        socklen_t client_length = sizeof(s_addr_client);
+        int sockfd = accept(listener_, reinterpret_cast<struct sockaddr*>(&s_addr_client), &client_length);
         if (sockfd == -1) {
-            LOG_WARN("accept failed: %s", strerror(errno));
-            continue; // ignore current socket ,continue while loop.
+            if (errno != EINTR) {
+                LOG_WARN("accept failed: %s", strerror(errno));
+            }
+            continue;
         }
-
-        // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        std::thread(client_handler, sockfd).detach();
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex_);
+            try {
+                clients_.push_back(sockfd);
+                const std::uint64_t worker_id = ++next_worker_id_;
+                workers_.emplace_back(sockfd, worker_id);
+                workers_.back().thread = std::thread(&ServerRuntime::client_handler, this, sockfd, worker_id);
+            } catch (...) {
+                if (!workers_.empty() && workers_.back().fd == sockfd && !workers_.back().thread.joinable()) {
+                    workers_.pop_back();
+                }
+                clients_.erase(std::remove(clients_.begin(), clients_.end(), sockfd), clients_.end());
+                ::close(sockfd);
+                throw;
+            }
+        }
     }
+    stop();
+}
 
-    // Clear
-    LOG_INFO("try to close all client connections");
-    int ret = shutdown(sockfd_server, SHUT_WR); // shut down the all or part of a full-duplex connection.
-    if (ret == -1) {
-        LOG_ERROR("shutdown server socket failed: %s", strerror(errno));
+void ServerRuntime::stop() {
+    if (listener_ != -1) {
+        ::close(listener_);
+        listener_ = -1;
     }
-    //    assert(ret != -1);
-    LOG_INFO("server shuts down");
+    std::vector<int> clients;
+    std::vector<Worker> workers;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        clients = clients_;
+        workers.swap(workers_);
+    }
+    for (int fd : clients) {
+        shutdown(fd, SHUT_RDWR);
+    }
+    for (auto& worker : workers) {
+        if (worker.thread.joinable()) {
+            worker.thread.join();
+        }
+    }
+    checkpoint_stop_.store(true, std::memory_order_release);
+    if (checkpoint_thread_.joinable()) {
+        checkpoint_thread_.join();
+    }
 }
 
 int main(int argc, char** argv) {
@@ -1107,6 +1221,7 @@ int main(int argc, char** argv) {
     }
 
     signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
     try {
         std::cout << "\n"
@@ -1129,99 +1244,89 @@ int main(int argc, char** argv) {
             server_port = static_cast<std::uint16_t>(parsed_port);
         }
         // Database name is passed by args
-        std::string db_name = argv[1];
-        LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
-        if (!sm_manager->is_dir(db_name)) {
-            // Database not found, create a new one
-            auto catalog_guard = sm_manager->acquire_catalog_exclusive();
-            sm_manager->create_db(db_name);
-            LOG_INFO("database created: %s", db_name.c_str());
-        }
-        // Open database
+        DatabaseInstance database;
+        database.open_and_recover(argv[1]);
         {
-            auto catalog_guard = sm_manager->acquire_catalog_exclusive();
-            sm_manager->open_db(db_name);
+            ServerRuntime server(database);
+            server.run(server_port);
         }
-        LOG_INFO("database opened: %s", db_name.c_str());
-
-        log_manager->initialize_from_existing_log();
-        buffer_pool_manager->set_log_manager(log_manager.get());
-
-        // recovery database
-        {
-            minilog::Logger::get().set_level(minilog::LogLevel::INFO);
-            const auto phase_elapsed_ms = [](std::chrono::steady_clock::time_point begin) {
-                return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
-                    .count();
-            };
-            const auto recovery_begin = std::chrono::steady_clock::now();
-
-            auto phase_begin = recovery_begin;
-            recovery->analyze();
-            LOG_INFO("recovery analyze: %lld ms, wal reads: %llu (%llu bytes)",
-                     static_cast<long long>(phase_elapsed_ms(phase_begin)),
-                     static_cast<unsigned long long>(disk_manager->get_log_read_count()),
-                     static_cast<unsigned long long>(disk_manager->get_log_read_bytes()));
-
-            phase_begin = std::chrono::steady_clock::now();
-            recovery->redo();
-            LOG_INFO("recovery redo: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
-
-            phase_begin = std::chrono::steady_clock::now();
-            recovery->undo();
-            LOG_INFO("recovery undo: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
-
-            // 必须在任何事务开始之前、恢复读完 WAL 与重启清单之后做：commit_ts_ 持久化
-            // 在数据页里，而计数器只活在内存里。计数器从 0 重启会让上一世提交的行被
-            // 判成“来自未来”而不可见（final.md:342 第 1 条）。取值的完整论证见
-            // RecoveryManager::get_recovered_next_timestamp()。
-            txn_manager->seed_counters_after_recovery(recovery->get_recovered_next_timestamp(),
-                                                      recovery->get_recovered_next_txn_id());
-            LOG_INFO("recovery seeded counters: next_timestamp %lld, next_txn_id %lld",
-                     static_cast<long long>(recovery->get_recovered_next_timestamp()),
-                     static_cast<long long>(recovery->get_recovered_next_txn_id()));
-
-            phase_begin = std::chrono::steady_clock::now();
-            sm_manager->refresh_index_residency();
-            LOG_INFO("recovery index residency refresh: %lld ms",
-                     static_cast<long long>(phase_elapsed_ms(phase_begin)));
-
-            LOG_INFO("database recovery finished in %lld ms", static_cast<long long>(phase_elapsed_ms(recovery_begin)));
-            minilog::Logger::get().set_level(minilog::LogLevel::WARN);
-        }
-
-        {
-            std::atomic<bool> checkpoint_thread_stop{false};
-            std::thread checkpoint_thread([&checkpoint_thread_stop] {
-                CheckpointManager checkpoint_mgr(txn_manager.get(), sm_manager.get(), log_manager.get());
-                while (!checkpoint_thread_stop.load()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    if (checkpoint_thread_stop.load()) {
-                        break;
-                    }
-                    checkpoint_mgr.Tick();
-                }
-            });
-
-            // 开启服务端，开始接受客户端连接
-            start_server(server_port);
-
-            checkpoint_thread_stop.store(true);
-            if (checkpoint_thread.joinable()) {
-                checkpoint_thread.join();
-            }
-        }
-
-        {
-            auto catalog_guard = sm_manager->acquire_catalog_exclusive();
-            sm_manager->close_db();
-        }
+        database.close();
         LOG_INFO("database has been closed");
     } catch (RMDBError& e) {
         LOG_ERROR("RMDB error: %s", e.what());
         minilog::Logger::get().stop();
-        exit(1);
+        return 1;
+    } catch (const std::exception& e) {
+        LOG_ERROR("server error: %s", e.what());
+        minilog::Logger::get().stop();
+        return 1;
     }
     minilog::Logger::get().stop();
     return 0;
+}
+
+void DatabaseInstance::open_and_recover(const std::string& db_name) {
+    LOG_INFO("RMDB server starting, database: %s", db_name.c_str());
+    if (!sm_manager.is_dir(db_name)) {
+        auto catalog_guard = sm_manager.acquire_catalog_exclusive();
+        sm_manager.create_db(db_name);
+        LOG_INFO("database created: %s", db_name.c_str());
+    }
+    {
+        auto catalog_guard = sm_manager.acquire_catalog_exclusive();
+        sm_manager.open_db(db_name);
+    }
+    open_ = true;
+    LOG_INFO("database opened: %s", db_name.c_str());
+    log_manager.initialize_from_existing_log();
+    buffer_pool_manager.set_log_manager(&log_manager);
+    {
+        minilog::Logger::get().set_level(minilog::LogLevel::INFO);
+        const auto phase_elapsed_ms = [](std::chrono::steady_clock::time_point begin) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
+                .count();
+        };
+        const auto recovery_begin = std::chrono::steady_clock::now();
+
+        auto phase_begin = recovery_begin;
+        recovery.analyze();
+        LOG_INFO("recovery analyze: %lld ms, wal reads: %llu (%llu bytes)",
+                 static_cast<long long>(phase_elapsed_ms(phase_begin)),
+                 static_cast<unsigned long long>(disk_manager.get_log_read_count()),
+                 static_cast<unsigned long long>(disk_manager.get_log_read_bytes()));
+
+        phase_begin = std::chrono::steady_clock::now();
+        recovery.redo();
+        LOG_INFO("recovery redo: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
+
+        phase_begin = std::chrono::steady_clock::now();
+        recovery.undo();
+        LOG_INFO("recovery undo: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
+
+        // 必须在任何事务开始之前、恢复读完 WAL 与重启清单之后做：commit_ts_ 持久化
+        // 在数据页里，而计数器只活在内存里。计数器从 0 重启会让上一世提交的行被
+        // 判成“来自未来”而不可见（final.md:342 第 1 条）。取值的完整论证见
+        // RecoveryManager::get_recovered_next_timestamp()。
+        txn_manager.seed_counters_after_recovery(recovery.get_recovered_next_timestamp(),
+                                                 recovery.get_recovered_next_txn_id());
+        LOG_INFO("recovery seeded counters: next_timestamp %lld, next_txn_id %lld",
+                 static_cast<long long>(recovery.get_recovered_next_timestamp()),
+                 static_cast<long long>(recovery.get_recovered_next_txn_id()));
+
+        phase_begin = std::chrono::steady_clock::now();
+        sm_manager.refresh_index_residency();
+        LOG_INFO("recovery index residency refresh: %lld ms", static_cast<long long>(phase_elapsed_ms(phase_begin)));
+
+        LOG_INFO("database recovery finished in %lld ms", static_cast<long long>(phase_elapsed_ms(recovery_begin)));
+        minilog::Logger::get().set_level(minilog::LogLevel::WARN);
+    }
+}
+
+void DatabaseInstance::close() {
+    if (!open_) {
+        return;
+    }
+    open_ = false;
+    auto catalog_guard = sm_manager.acquire_catalog_exclusive();
+    sm_manager.close_db();
 }

@@ -193,11 +193,11 @@ public:
         if (txn_id == INVALID_TXN_ID)
             return nullptr;
 
-        // Counts only the lookups that reach the global txn_map mutex, which is
+        // Counts only the lookups that reach this manager's txn_map mutex, which is
         // the cost a session avoids by caching the transaction it is running.
         std::unique_lock<std::mutex> lock(latch_);
-        auto it = TransactionManager::txn_map.find(txn_id);
-        if (it == TransactionManager::txn_map.end())
+        auto it = txn_map_.find(txn_id);
+        if (it == txn_map_.end())
             return nullptr;
         auto* res = it->second.get();
         lock.unlock();
@@ -207,9 +207,6 @@ public:
         return res;
     }
 
-    static std::unordered_map<txn_id_t, std::unique_ptr<Transaction>>
-        txn_map; // 全局事务表，存放事务ID与事务对象的映射关系
-    std::shared_mutex txn_map_mutex_;
     /** ------------------------以下函数仅可能在MVCC当中使用------------------------------------------*/
 
     /**
@@ -352,6 +349,7 @@ private:
     std::atomic<txn_id_t> next_txn_id_{0};       // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0}; // 用于分发事务时间戳
     std::mutex latch_;                           // 用于txn_map的并发
+    std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     // Commit publication is ordered by a small completion frontier rather
     // than by holding one mutex while touching every tuple page. A commit may
     // publish outside this mutex; readers advance only through contiguous

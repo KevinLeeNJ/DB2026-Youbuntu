@@ -11,16 +11,12 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <algorithm>
 #include <atomic>
-#include <cstdint>
-#include <mutex>
+#include <memory>
 #include <shared_mutex>
 #include <unordered_map>
-#include <unordered_set>
-#include <deque>
-#include <optional>
-#include <queue>
+
+#include "version_history.h"
 
 #include "common/context.h"
 #include "common/fault_injection.h"
@@ -45,123 +41,17 @@ struct ColDef {
 /* 系统管理器，负责元数据管理和DDL语句的执行 */
 class SmManager {
 public:
-    // A deleted tuple is indexed by its complete on-page record bytes.  The
-    // cached hash is an unordered_map accelerator only: equality always
-    // compares the complete byte string, including the NULL bitmap, CHAR
-    // padding and FLOAT32 representation.
-    struct DeletedTupleRowKey {
-        std::string bytes;
-        size_t hash{0};
-
-        friend bool operator==(const DeletedTupleRowKey& lhs, const DeletedTupleRowKey& rhs) {
-            return lhs.bytes == rhs.bytes;
-        }
-    };
-
-    struct DeletedTupleCandidate {
-        uint64_t candidate_id{0};
-        Rid rid;
-        txn_id_t writer_txn_id{INVALID_TXN_ID};
-        UndoLink version_chain_head;
-    };
-
     DbMeta db_; // 当前打开的数据库的元数据
     std::unordered_map<std::string, std::unique_ptr<RmFileHandle>>
         fhs_; // file name -> record file handle, 当前数据库中每张表的数据文件
     std::unordered_map<std::string, std::unique_ptr<IxIndexHandle>>
         ihs_; // file name -> index file handle, 当前数据库中每个索引的文件
 private:
-    struct DeletedTupleRowKeyHash {
-        size_t operator()(const DeletedTupleRowKey& key) const noexcept {
-            return key.hash;
-        }
-    };
-
-    struct DeletedTupleRetireCandidate {
-        std::string tab_name;
-        DeletedTupleRowKey row_key;
-        DeletedTupleCandidate candidate;
-        std::optional<timestamp_t> retry_after_watermark;
-    };
-
-    struct HistoricalKeyLess {
-        std::vector<ColType> col_types;
-        std::vector<int> col_lens;
-
-        bool operator()(const std::string& lhs, const std::string& rhs) const {
-            return ix_compare(lhs.data(), rhs.data(), col_types, col_lens) < 0;
-        }
-    };
-
-    struct HistoricalIndexBucket {
-        enum class RetireState : uint8_t { Queued, InFlight, Deferred };
-
-        struct Entry {
-            Rid rid;
-            uint64_t generation{0};
-            RetireState retire_state{RetireState::Queued};
-        };
-
-        std::map<std::string, std::vector<Entry>, HistoricalKeyLess> entries;
-
-        HistoricalIndexBucket() = default;
-        HistoricalIndexBucket(std::vector<ColType> types, std::vector<int> lens)
-            : entries(HistoricalKeyLess{std::move(types), std::move(lens)}) {}
-    };
-    struct HistoricalRetireCandidate {
-        std::string bucket_key;
-        std::string encoded_key;
-        Rid rid;
-        uint64_t generation{0};
-        std::optional<timestamp_t> retry_after_watermark;
-
-        friend bool operator==(const HistoricalRetireCandidate& a, const HistoricalRetireCandidate& b) {
-            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid &&
-                   a.generation == b.generation;
-        }
-    };
-
-    struct HistoricalRetireCandidateCompare {
-        bool operator()(const HistoricalRetireCandidate& lhs, const HistoricalRetireCandidate& rhs) const {
-            return lhs.retry_after_watermark > rhs.retry_after_watermark;
-        }
-    };
-
-    struct DeletedTupleRetireCandidateCompare {
-        bool operator()(const DeletedTupleRetireCandidate& lhs, const DeletedTupleRetireCandidate& rhs) const {
-            return lhs.retry_after_watermark > rhs.retry_after_watermark;
-        }
-    };
-
-    struct HistoricalRetireKey {
-        std::string bucket_key;
-        std::string encoded_key;
-        Rid rid;
-
-        friend bool operator==(const HistoricalRetireKey& a, const HistoricalRetireKey& b) {
-            return a.bucket_key == b.bucket_key && a.encoded_key == b.encoded_key && a.rid == b.rid;
-        }
-    };
-
-    struct HistoricalRetireKeyHash {
-        size_t operator()(const HistoricalRetireKey& key) const noexcept {
-            size_t hash = std::hash<std::string>{}(key.bucket_key);
-            hash ^=
-                std::hash<std::string>{}(key.encoded_key) + static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
-            hash ^= std::hash<int>{}(key.rid.page_no) + static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
-            hash ^= std::hash<int>{}(key.rid.slot_no) + static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
-            return hash;
-        }
-    };
-
-    static HistoricalRetireKey make_historical_retire_key(const HistoricalRetireCandidate& candidate) {
-        return HistoricalRetireKey{candidate.bucket_key, candidate.encoded_key, candidate.rid};
-    }
-
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
+    std::unique_ptr<VersionHistory> version_history_;
     // Catalog lifetime is guarded independently from data/index/page latches.
     // Callers must acquire this outermost, before starting work that can take
     // transaction, row, index, page, or WAL locks.
@@ -176,92 +66,6 @@ private:
     void bump_catalog_generation() noexcept {
         catalog_generation_.fetch_add(1, std::memory_order_release);
     }
-    static std::string make_historical_index_key(const std::string& tab_name, const std::string& index_name,
-                                                 const std::vector<char>& key) {
-        std::string combined;
-        combined.reserve(tab_name.size() + index_name.size() + key.size() + 2);
-        combined.append(tab_name);
-        combined.push_back('\0');
-        combined.append(index_name);
-        combined.push_back('\0');
-        combined.append(key.data(), key.size());
-        return combined;
-    }
-    static bool historical_bucket_belongs_to_table(const std::string& bucket_key, const std::string& tab_name) {
-        return bucket_key.size() > tab_name.size() && bucket_key.compare(0, tab_name.size(), tab_name) == 0 &&
-               bucket_key[tab_name.size()] == '\0';
-    }
-    void clear_table_runtime_history(const std::string& tab_name);
-
-    mutable std::shared_mutex historical_index_keys_latch_;
-    std::unordered_map<std::string, HistoricalIndexBucket> historical_index_keys_;
-    std::deque<HistoricalRetireCandidate> historical_retire_queue_;
-    std::priority_queue<HistoricalRetireCandidate, std::vector<HistoricalRetireCandidate>,
-                        HistoricalRetireCandidateCompare>
-        historical_deferred_retire_queue_;
-    // A queued ticket is a logical identity. The current generation remains
-    // in the Entry; this side index only records that one ready queue node
-    // exists. It is empty for entries owned by an in-flight or deferred GC
-    // ticket.
-    std::unordered_set<HistoricalRetireKey, HistoricalRetireKeyHash> historical_queued_generations_;
-    uint64_t next_historical_index_generation_{1};
-    mutable std::mutex deleted_tuple_candidates_latch_;
-    using DeletedTupleBucket =
-        std::unordered_map<DeletedTupleRowKey, std::vector<DeletedTupleCandidate>, DeletedTupleRowKeyHash>;
-    std::unordered_map<std::string, DeletedTupleBucket> deleted_tuple_candidates_;
-    std::deque<DeletedTupleRetireCandidate> deleted_tuple_retire_queue_;
-    std::priority_queue<DeletedTupleRetireCandidate, std::vector<DeletedTupleRetireCandidate>,
-                        DeletedTupleRetireCandidateCompare>
-        deleted_tuple_deferred_retire_queue_;
-    uint64_t next_deleted_tuple_candidate_id_{1};
-
-    std::optional<size_t> deleted_tuple_candidate_test_hash_override_;
-
-    DeletedTupleRowKey make_deleted_tuple_row_key(const char* data, size_t size) const {
-        DeletedTupleRowKey key;
-        key.bytes.assign(data, size);
-        key.hash = deleted_tuple_candidate_test_hash_override_.value_or(std::hash<std::string>{}(key.bytes));
-        return key;
-    }
-
-    static bool deleted_tuple_candidate_matches_meta(const DeletedTupleCandidate& candidate, const TupleMeta& meta) {
-        return meta.is_deleted_ && candidate.writer_txn_id == meta.writer_txn_id_ &&
-               candidate.version_chain_head == meta.version_chain_head_;
-    }
-
-    bool erase_deleted_tuple_candidate_locked(const std::string& tab_name, const DeletedTupleRowKey& row_key,
-                                              const DeletedTupleCandidate& candidate) {
-        auto table_it = deleted_tuple_candidates_.find(tab_name);
-        if (table_it == deleted_tuple_candidates_.end()) {
-            return false;
-        }
-        auto bucket_it = table_it->second.find(row_key);
-        if (bucket_it == table_it->second.end()) {
-            return false;
-        }
-        auto& candidates = bucket_it->second;
-        auto candidate_it = std::find_if(candidates.begin(), candidates.end(), [&](const auto& current) {
-            return current.candidate_id == candidate.candidate_id && current.writer_txn_id == candidate.writer_txn_id &&
-                   current.version_chain_head == candidate.version_chain_head;
-        });
-        if (candidate_it == candidates.end()) {
-            return false;
-        }
-        candidates.erase(candidate_it);
-        if (candidates.empty()) {
-            table_it->second.erase(bucket_it);
-        }
-        if (table_it->second.empty()) {
-            deleted_tuple_candidates_.erase(table_it);
-        }
-        return true;
-    }
-
-    void clear_deleted_tuple_candidates_locked() {
-        deleted_tuple_candidates_.clear();
-        deleted_tuple_retire_queue_.clear();
-        deleted_tuple_deferred_retire_queue_ = {};
-    }
 
 public:
     using CatalogSharedGuard = std::shared_lock<std::shared_mutex>;
@@ -270,7 +74,7 @@ public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
               IxManager* ix_manager)
         : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), rm_manager_(rm_manager),
-          ix_manager_(ix_manager) {}
+          ix_manager_(ix_manager), version_history_(std::make_unique<VersionHistory>(*this)) {}
 
     ~SmManager() {}
 
@@ -329,11 +133,11 @@ public:
 
     void flush_meta();
 
-    void show_tables(Context* context);
+    void show_tables(ExecutionOutput* output);
 
-    void show_index(const std::string& tab_name, Context* context);
+    void show_index(const std::string& tab_name, ExecutionOutput* output);
 
-    void desc_table(const std::string& tab_name, Context* context);
+    void desc_table(const std::string& tab_name, ExecutionOutput* output);
 
     void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context);
 
@@ -352,207 +156,12 @@ public:
     void update_record_with_indexes(const std::string& tab_name, const Rid& rid, const RmRecord& old_rec,
                                     const RmRecord& new_rec);
 
-    void remember_historical_index_key(const std::string& tab_name, const std::string& index_name,
-                                       const std::vector<char>& key, const Rid& rid, const IndexMeta& index) {
-        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        std::vector<ColType> col_types;
-        std::vector<int> col_lens;
-        col_types.reserve(index.cols.size());
-        col_lens.reserve(index.cols.size());
-        for (const auto& col : index.cols) {
-            col_types.push_back(col.type);
-            col_lens.push_back(col.len);
-        }
-        auto bucket_key = make_historical_index_key(tab_name, index_name, {});
-        auto bucket_it = historical_index_keys_.find(bucket_key);
-        if (bucket_it == historical_index_keys_.end()) {
-            bucket_it = historical_index_keys_
-                            .emplace(bucket_key, HistoricalIndexBucket(std::move(col_types), std::move(col_lens)))
-                            .first;
-        }
-        const std::string encoded_key(key.data(), key.size());
-        auto& entries = bucket_it->second.entries[encoded_key];
-        const auto current =
-            std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.rid == rid; });
-        const uint64_t generation = next_historical_index_generation_++;
-        const HistoricalRetireKey retire_key{bucket_key, encoded_key, rid};
-        if (current == entries.end()) {
-            entries.push_back(HistoricalIndexBucket::Entry{rid, generation});
-            historical_queued_generations_.insert(retire_key);
-            historical_retire_queue_.push_back(HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation, {}});
-        } else {
-            current->generation = generation;
-            // Keep one queue item per logical entry. A refresh while the item
-            // is queued updates the side index in place; a refresh while GC
-            // owns the item is observed during reconcile and causes one fresh
-            // item to be queued there.
-            if (current->retire_state == HistoricalIndexBucket::RetireState::Queued) {
-                const auto [queued_it, inserted] = historical_queued_generations_.insert(retire_key);
-                (void)queued_it;
-                if (inserted) {
-                    historical_retire_queue_.push_back(
-                        HistoricalRetireCandidate{bucket_key, encoded_key, rid, generation, {}});
-                }
-            }
-        }
+    VersionHistory& version_history() noexcept {
+        return *version_history_;
     }
-
-    std::vector<Rid> get_historical_index_key_rids(const std::string& tab_name, const std::string& index_name,
-                                                   const std::vector<char>& key) const {
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
-        if (it == historical_index_keys_.end()) {
-            return {};
-        }
-        auto key_it = it->second.entries.find(std::string(key.data(), key.size()));
-        std::vector<Rid> result;
-        if (key_it == it->second.entries.end()) {
-            return result;
-        }
-        result.reserve(key_it->second.size());
-        for (const auto& entry : key_it->second) {
-            result.push_back(entry.rid);
-        }
-        return result;
+    const VersionHistory& version_history() const noexcept {
+        return *version_history_;
     }
-
-    std::vector<Rid> get_historical_index_rids(const std::string& tab_name, const std::string& index_name) const {
-        std::vector<Rid> result;
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
-        if (it == historical_index_keys_.end()) {
-            return result;
-        }
-        for (const auto& [_, entries] : it->second.entries) {
-            for (const auto& entry : entries) {
-                result.push_back(entry.rid);
-            }
-        }
-        return result;
-    }
-
-    std::vector<Rid> get_historical_index_rids_in_range(const std::string& tab_name, const std::string& index_name,
-                                                        const std::vector<char>& lower, const std::vector<char>& upper,
-                                                        bool lower_exclusive, bool upper_inclusive) const {
-        std::vector<Rid> result;
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
-        if (it == historical_index_keys_.end()) {
-            return result;
-        }
-        const auto lower_key = std::string(lower.data(), lower.size());
-        const auto upper_key = std::string(upper.data(), upper.size());
-        auto begin =
-            lower_exclusive ? it->second.entries.upper_bound(lower_key) : it->second.entries.lower_bound(lower_key);
-        auto end =
-            upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
-        for (auto entry = begin; entry != end; ++entry) {
-            for (const auto& historical_entry : entry->second) {
-                result.push_back(historical_entry.rid);
-            }
-        }
-        return result;
-    }
-
-    /** @brief Historical (key, rid) candidates inside a key range, in index-key
-     *  order. The bucket is a std::map ordered by ix_compare, so the natural
-     *  iteration order is the index order the caller needs in order to merge
-     *  these candidates into an index range scan without destroying the scan's
-     *  ordering (which min(col) pushdown depends on).
-     *  Returning the key alongside the rid is what makes that merge possible;
-     *  get_historical_index_rids_in_range() throws the key away. */
-    void collect_historical_index_entries_in_range(const std::string& tab_name, const std::string& index_name,
-                                                   const std::vector<char>& lower, const std::vector<char>& upper,
-                                                   bool lower_exclusive, bool upper_inclusive,
-                                                   std::vector<std::pair<std::string, Rid>>& out) const {
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
-        if (it == historical_index_keys_.end()) {
-            return;
-        }
-        const auto lower_key = std::string(lower.data(), lower.size());
-        const auto upper_key = std::string(upper.data(), upper.size());
-        auto begin =
-            lower_exclusive ? it->second.entries.upper_bound(lower_key) : it->second.entries.lower_bound(lower_key);
-        auto end =
-            upper_inclusive ? it->second.entries.upper_bound(upper_key) : it->second.entries.lower_bound(upper_key);
-        for (auto entry = begin; entry != end; ++entry) {
-            for (const auto& historical_entry : entry->second) {
-                out.emplace_back(entry->first, historical_entry.rid);
-            }
-        }
-    }
-
-    bool has_historical_index_keys(const std::string& tab_name, const std::string& index_name) const {
-        std::shared_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        auto it = historical_index_keys_.find(make_historical_index_key(tab_name, index_name, {}));
-        return it != historical_index_keys_.end() && !it->second.entries.empty();
-    }
-
-    void remember_deleted_tuple_candidate(const std::string& tab_name, const Rid& rid, const RmRecord& record,
-                                          const TupleMeta& tombstone) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto row_key = make_deleted_tuple_row_key(record.data, record.size);
-        auto& buckets = deleted_tuple_candidates_[tab_name];
-        auto [bucket_it, inserted] = buckets.try_emplace(row_key);
-        (void)inserted;
-        DeletedTupleCandidate candidate{next_deleted_tuple_candidate_id_++, rid, tombstone.writer_txn_id_,
-                                        tombstone.version_chain_head_};
-        bucket_it->second.push_back(candidate);
-        deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate, {}});
-    }
-
-    // Test-only entry point. A forced hash exercises the guarantee that hash
-    // collisions cannot alter exact physical-row equality.
-    void remember_deleted_tuple_candidate_for_test(const std::string& tab_name, const Rid& rid,
-                                                   const std::string& record_bytes, const TupleMeta& tombstone) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto row_key = make_deleted_tuple_row_key(record_bytes.data(), record_bytes.size());
-        auto& buckets = deleted_tuple_candidates_[tab_name];
-        auto [bucket_it, inserted] = buckets.try_emplace(row_key);
-        (void)inserted;
-        DeletedTupleCandidate candidate{next_deleted_tuple_candidate_id_++, rid, tombstone.writer_txn_id_,
-                                        tombstone.version_chain_head_};
-        bucket_it->second.push_back(candidate);
-        deleted_tuple_retire_queue_.push_back(DeletedTupleRetireCandidate{tab_name, std::move(row_key), candidate, {}});
-    }
-
-    std::vector<DeletedTupleCandidate> get_deleted_tuple_candidates(const std::string& tab_name,
-                                                                    const RmRecord& record) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto row_key = make_deleted_tuple_row_key(record.data, record.size);
-        auto table_it = deleted_tuple_candidates_.find(tab_name);
-        if (table_it == deleted_tuple_candidates_.end()) {
-            return {};
-        }
-        auto bucket_it = table_it->second.find(row_key);
-        if (bucket_it == table_it->second.end()) {
-            return {};
-        }
-        return bucket_it->second;
-    }
-
-    void remove_deleted_tuple_candidate_if_current(const std::string& tab_name, const RmRecord& record,
-                                                   const DeletedTupleCandidate& candidate) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto row_key = make_deleted_tuple_row_key(record.data, record.size);
-        erase_deleted_tuple_candidate_locked(tab_name, row_key, candidate);
-    }
-
-    void set_deleted_tuple_candidate_test_hash_override(std::optional<size_t> forced_hash) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        if (!deleted_tuple_candidates_.empty()) {
-            throw InternalError("cannot change deleted tuple candidate hash while entries exist");
-        }
-        deleted_tuple_candidate_test_hash_override_ = forced_hash;
-    }
-
-    /** @brief 按水位线回收版本链相关历史结构。
-     *  移除当前 tuple 版本已提交且 commit_ts 严格小于水位线的 RID：
-     *  此时任何活跃事务（read_ts >= 水位线）都不会再回溯该 RID 的版本链，
-     *  对应的历史索引键/删除候选不再被冲突检测访问，可安全删除。
-     *  由 TransactionManager::GarbageCollection 在 txn_map 回收后调用。 */
-    void prune_version_history(timestamp_t watermark);
 
     bool flush_all_table_and_index_pages(FlushDependencyPolicy policy = FlushDependencyPolicy::Enforce());
     bool flush_recovery_pages(const std::unordered_set<std::string>& table_names);

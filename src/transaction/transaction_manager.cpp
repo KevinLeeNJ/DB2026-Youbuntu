@@ -23,8 +23,6 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 #include <vector>
 
-std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> TransactionManager::txn_map = {};
-
 TransactionManager::~TransactionManager() {
     {
         std::lock_guard<std::mutex> lock(latch_);
@@ -461,7 +459,7 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
 
     std::unique_lock<std::mutex> lock(latch_);
     if (created) {
-        txn_map[txn->get_transaction_id()] = std::move(created);
+        txn_map_[txn->get_transaction_id()] = std::move(created);
     }
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
         active_serializable_txns_.insert(txn->get_transaction_id());
@@ -872,8 +870,8 @@ std::unordered_map<txn_id_t, lsn_t> TransactionManager::get_active_txn_lsn_snaps
     std::unordered_map<txn_id_t, lsn_t> snapshot;
     std::unique_lock<std::mutex> lock(latch_);
     for (txn_id_t txn_id : active_ids) {
-        auto it = txn_map.find(txn_id);
-        if (it != txn_map.end() && it->second != nullptr) {
+        auto it = txn_map_.find(txn_id);
+        if (it != txn_map_.end() && it->second != nullptr) {
             snapshot.emplace(txn_id, it->second->get_prev_lsn());
         }
     }
@@ -905,8 +903,8 @@ void TransactionManager::seed_counters_after_recovery(timestamp_t next_timestamp
 
 UndoLog TransactionManager::GetUndoLog(UndoLink link) {
     std::unique_lock<std::mutex> lock(latch_);
-    auto it = txn_map.find(link.undo_txn_id_);
-    if (it == txn_map.end()) {
+    auto it = txn_map_.find(link.undo_txn_id_);
+    if (it == txn_map_.end()) {
         throw InternalError("GetUndoLog: transaction not found");
     }
     return it->second->GetUndoLog(link.undo_slot_offset_);
@@ -914,8 +912,8 @@ UndoLog TransactionManager::GetUndoLog(UndoLink link) {
 
 std::optional<UndoLog> TransactionManager::GetUndoLogOptional(UndoLink link) {
     std::unique_lock<std::mutex> lock(latch_);
-    auto it = txn_map.find(link.undo_txn_id_);
-    if (it == txn_map.end()) {
+    auto it = txn_map_.find(link.undo_txn_id_);
+    if (it == txn_map_.end()) {
         return std::nullopt;
     }
     return it->second->GetUndoLog(link.undo_slot_offset_);
@@ -1083,8 +1081,8 @@ bool TransactionManager::HasOtherActiveSerializableTxnUnlocked(txn_id_t writer) 
         if (txn_id == writer) {
             continue;
         }
-        auto txn_it = txn_map.find(txn_id);
-        if (txn_it == txn_map.end() || txn_it->second == nullptr) {
+        auto txn_it = txn_map_.find(txn_id);
+        if (txn_it == txn_map_.end() || txn_it->second == nullptr) {
             continue;
         }
         auto* txn = txn_it->second.get();
@@ -1121,8 +1119,8 @@ bool TransactionManager::HasActiveSerializableOverlapUnlocked(Transaction* txn) 
         if (other_id == txn_id) {
             continue;
         }
-        auto other_it = txn_map.find(other_id);
-        auto* other = other_it == txn_map.end() ? nullptr : other_it->second.get();
+        auto other_it = txn_map_.find(other_id);
+        auto* other = other_it == txn_map_.end() ? nullptr : other_it->second.get();
         if (other == nullptr) {
             continue;
         }
@@ -1174,26 +1172,26 @@ void TransactionManager::CleanupTxnReadIndexesUnlocked(txn_id_t txn_id) {
                                            [&](const auto& read) { return read.txn_id_ == txn_id; }),
                             ssi_record_reads_.end());
 
-    auto txn_it = txn_map.find(txn_id);
-    if (txn_it != txn_map.end() && txn_it->second != nullptr) {
+    auto txn_it = txn_map_.find(txn_id);
+    if (txn_it != txn_map_.end() && txn_it->second != nullptr) {
         txn_it->second->read_rids_.clear();
         txn_it->second->predicate_reads_.clear();
     }
 }
 
 void TransactionManager::CleanupTxnRwEdgesUnlocked(txn_id_t txn_id) {
-    auto txn_it = txn_map.find(txn_id);
-    if (txn_it != txn_map.end() && txn_it->second != nullptr) {
+    auto txn_it = txn_map_.find(txn_id);
+    if (txn_it != txn_map_.end() && txn_it->second != nullptr) {
         auto* txn = txn_it->second.get();
         for (auto in_id : txn->in_rw_) {
-            auto in_it = txn_map.find(in_id);
-            if (in_it != txn_map.end() && in_it->second != nullptr) {
+            auto in_it = txn_map_.find(in_id);
+            if (in_it != txn_map_.end() && in_it->second != nullptr) {
                 in_it->second->out_rw_.erase(txn_id);
             }
         }
         for (auto out_id : txn->out_rw_) {
-            auto out_it = txn_map.find(out_id);
-            if (out_it != txn_map.end() && out_it->second != nullptr) {
+            auto out_it = txn_map_.find(out_id);
+            if (out_it != txn_map_.end() && out_it->second != nullptr) {
                 out_it->second->in_rw_.erase(txn_id);
             }
         }
@@ -1232,8 +1230,8 @@ void TransactionManager::CleanupTxnRecentWritesUnlocked(txn_id_t txn_id) {
 
 void TransactionManager::CleanupTxnSsiState(txn_id_t txn_id) {
     std::unique_lock<std::mutex> lock(latch_);
-    auto txn_it = txn_map.find(txn_id);
-    if (txn_it == txn_map.end() || txn_it->second == nullptr) {
+    auto txn_it = txn_map_.find(txn_id);
+    if (txn_it == txn_map_.end() || txn_it->second == nullptr) {
         active_serializable_txns_.erase(txn_id);
         CleanupTxnReadIndexesUnlocked(txn_id);
         CleanupTxnRwEdgesUnlocked(txn_id);
@@ -1319,8 +1317,8 @@ bool TransactionManager::TransactionHasRetainedSsiStateUnlocked(txn_id_t txn_id)
             return true;
         }
     }
-    auto txn_it = txn_map.find(txn_id);
-    if (txn_it != txn_map.end() && txn_it->second != nullptr) {
+    auto txn_it = txn_map_.find(txn_id);
+    if (txn_it != txn_map_.end() && txn_it->second != nullptr) {
         return !txn_it->second->in_rw_.empty() || !txn_it->second->out_rw_.empty() ||
                !txn_it->second->read_rids_.empty() || !txn_it->second->predicate_reads_.empty();
     }
@@ -1375,9 +1373,9 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
 
         std::unique_lock<std::mutex> lock(latch_);
         if (CanRetireTransactionUnlocked(txn)) {
-            auto it = txn_map.find(txn->get_transaction_id());
-            if (it != txn_map.end() && it->second.get() == txn) {
-                txn_map.erase(it);
+            auto it = txn_map_.find(txn->get_transaction_id());
+            if (it != txn_map_.end() && it->second.get() == txn) {
+                txn_map_.erase(it);
             }
         }
     }
@@ -1396,7 +1394,7 @@ void TransactionManager::MaybeRunGarbageCollection() {
     {
         std::lock_guard<std::mutex> lock(latch_);
         ++commits_since_gc_;
-        if (!gc_requested_ && (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map.size() >= GC_TXN_MAP_THRESHOLD)) {
+        if (!gc_requested_ && (commits_since_gc_ >= GC_COMMIT_INTERVAL || txn_map_.size() >= GC_TXN_MAP_THRESHOLD)) {
             gc_requested_ = true;
             commits_since_gc_ = 0;
             notify_gc = true;
@@ -1464,7 +1462,7 @@ bool TransactionManager::GarbageCollectionBatch() {
     {
         std::unique_lock<std::mutex> lock(latch_);
         size_t scanned = 0;
-        for (auto it = txn_map.begin(); it != txn_map.end() && scanned < GC_SCAN_LIMIT; ++it, ++scanned) {
+        for (auto it = txn_map_.begin(); it != txn_map_.end() && scanned < GC_SCAN_LIMIT; ++it, ++scanned) {
             Transaction* txn = it->second.get();
             if (txn == nullptr) {
                 to_erase.push_back(it->first);
@@ -1502,7 +1500,7 @@ bool TransactionManager::GarbageCollectionBatch() {
             }
         }
         for (txn_id_t txn_id : to_erase) {
-            txn_map.erase(txn_id);
+            txn_map_.erase(txn_id);
         }
     }
     // 回收 SmManager 侧随写操作单调增长的历史索引键/删除候选（需访问 tuple meta，
@@ -1510,7 +1508,7 @@ bool TransactionManager::GarbageCollectionBatch() {
     // History/index candidates have the same watermark safety rule as txn_map
     // entries and must be pruned even when this batch found no transaction
     // object to erase.
-    sm_manager_->prune_version_history(watermark);
+    sm_manager_->version_history().prune(watermark);
     return to_erase.size() >= GC_BATCH_SIZE;
 }
 
@@ -1535,9 +1533,9 @@ bool TransactionManager::CommittedBefore(txn_id_t lhs, txn_id_t rhs) {
 }
 
 bool TransactionManager::CommittedBeforeUnlocked(txn_id_t lhs, txn_id_t rhs) {
-    auto lhs_it = txn_map.find(lhs);
-    auto rhs_it = txn_map.find(rhs);
-    if (lhs_it == txn_map.end() || rhs_it == txn_map.end()) {
+    auto lhs_it = txn_map_.find(lhs);
+    auto rhs_it = txn_map_.find(rhs);
+    if (lhs_it == txn_map_.end() || rhs_it == txn_map_.end()) {
         return false;
     }
     auto* lhs_txn = lhs_it->second.get();
@@ -1562,13 +1560,13 @@ bool TransactionManager::HasDangerousStructure(txn_id_t current_txn) {
 
 bool TransactionManager::HasDangerousStructureUnlocked(txn_id_t current_txn) {
     for (const auto& [tin, pivots] : rw_edges_) {
-        auto tin_it = txn_map.find(tin);
-        if (tin_it == txn_map.end() || tin_it->second->get_state() == TransactionState::ABORTED) {
+        auto tin_it = txn_map_.find(tin);
+        if (tin_it == txn_map_.end() || tin_it->second->get_state() == TransactionState::ABORTED) {
             continue;
         }
         for (txn_id_t pivot : pivots) {
-            auto pivot_it = txn_map.find(pivot);
-            if (pivot_it == txn_map.end() || pivot_it->second->get_state() == TransactionState::ABORTED) {
+            auto pivot_it = txn_map_.find(pivot);
+            if (pivot_it == txn_map_.end() || pivot_it->second->get_state() == TransactionState::ABORTED) {
                 continue;
             }
             auto pivot_out_it = rw_edges_.find(pivot);
@@ -1576,8 +1574,8 @@ bool TransactionManager::HasDangerousStructureUnlocked(txn_id_t current_txn) {
                 continue;
             }
             for (txn_id_t tout : pivot_out_it->second) {
-                auto tout_it = txn_map.find(tout);
-                if (tout_it == txn_map.end() || tout_it->second->get_state() == TransactionState::ABORTED) {
+                auto tout_it = txn_map_.find(tout);
+                if (tout_it == txn_map_.end() || tout_it->second->get_state() == TransactionState::ABORTED) {
                     continue;
                 }
                 // Only consider structures that involve current_txn
@@ -1618,7 +1616,7 @@ size_t TransactionManager::DebugActivePredicateTableCount() {
 
 size_t TransactionManager::DebugTxnMapSize() {
     std::unique_lock<std::mutex> lock(latch_);
-    return txn_map.size();
+    return txn_map_.size();
 }
 
 bool TransactionManager::AddRwEdge(txn_id_t from, txn_id_t to) {
@@ -1630,9 +1628,9 @@ bool TransactionManager::AddRwEdgeInternal(txn_id_t reader, txn_id_t writer, txn
     if (reader == writer) {
         return false;
     }
-    auto reader_it = txn_map.find(reader);
-    auto writer_it = txn_map.find(writer);
-    if (reader_it == txn_map.end() || writer_it == txn_map.end()) {
+    auto reader_it = txn_map_.find(reader);
+    auto writer_it = txn_map_.find(writer);
+    if (reader_it == txn_map_.end() || writer_it == txn_map_.end()) {
         return false;
     }
     auto* reader_txn = reader_it->second.get();
@@ -1658,8 +1656,8 @@ bool TransactionManager::AddRwEdgeInternal(txn_id_t reader, txn_id_t writer, txn
 
 void TransactionManager::RecordRead(txn_id_t reader, const std::string& tab_name, const Rid& rid) {
     std::unique_lock<std::mutex> lock(latch_);
-    auto it = txn_map.find(reader);
-    if (it == txn_map.end() || it->second == nullptr)
+    auto it = txn_map_.find(reader);
+    if (it == txn_map_.end() || it->second == nullptr)
         return;
     if (it->second->get_isolation_level() != IsolationLevel::SERIALIZABLE)
         return;
@@ -1696,8 +1694,8 @@ bool TransactionManager::RecordPredicateRead(Transaction* txn, const std::string
             if (write.txn_id_ == reader_id || write.tab_name_ != tab_name) {
                 continue;
             }
-            auto writer_it = txn_map.find(write.txn_id_);
-            if (writer_it == txn_map.end()) {
+            auto writer_it = txn_map_.find(write.txn_id_);
+            if (writer_it == txn_map_.end()) {
                 continue;
             }
             auto* writer_txn = writer_it->second.get();
@@ -1726,8 +1724,8 @@ bool TransactionManager::RecordPredicateRead(Transaction* txn, const std::string
 
 bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, const std::string& tab_name) {
     std::unique_lock<std::mutex> lock(latch_);
-    auto writer_it = txn_map.find(writer);
-    auto* writer_txn = (writer_it != txn_map.end()) ? writer_it->second.get() : nullptr;
+    auto writer_it = txn_map_.find(writer);
+    auto* writer_txn = (writer_it != txn_map_.end()) ? writer_it->second.get() : nullptr;
     if (writer_txn == nullptr || writer_txn->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
         return false;
     }
@@ -1744,8 +1742,8 @@ bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, cons
             if (tid == writer) {
                 continue;
             }
-            auto reader_it = txn_map.find(tid);
-            auto* reader_txn = reader_it == txn_map.end() ? nullptr : reader_it->second.get();
+            auto reader_it = txn_map_.find(tid);
+            auto* reader_txn = reader_it == txn_map_.end() ? nullptr : reader_it->second.get();
             if (!SsiTxnCanConflictWithWriter(reader_txn, writer_txn)) {
                 continue;
             }
@@ -1764,8 +1762,8 @@ bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, cons
         if (tid == writer) {
             continue;
         }
-        auto reader_it = txn_map.find(tid);
-        auto* reader_txn = reader_it == txn_map.end() ? nullptr : reader_it->second.get();
+        auto reader_it = txn_map_.find(tid);
+        auto* reader_txn = reader_it == txn_map_.end() ? nullptr : reader_it->second.get();
         if (!SsiTxnCanConflictWithWriter(reader_txn, writer_txn)) {
             continue;
         }
@@ -1782,8 +1780,8 @@ bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, cons
                                                   const std::vector<ColMeta>& cols) {
     (void)cols;
     std::unique_lock<std::mutex> lock(latch_);
-    auto writer_it = txn_map.find(writer);
-    auto* writer_txn = (writer_it != txn_map.end()) ? writer_it->second.get() : nullptr;
+    auto writer_it = txn_map_.find(writer);
+    auto* writer_txn = (writer_it != txn_map_.end()) ? writer_it->second.get() : nullptr;
     if (writer_txn == nullptr)
         return false;
     if (writer_txn->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
@@ -1807,8 +1805,8 @@ bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, cons
             if (tid == writer) {
                 continue;
             }
-            auto reader_it = txn_map.find(tid);
-            auto* reader_txn = reader_it == txn_map.end() ? nullptr : reader_it->second.get();
+            auto reader_it = txn_map_.find(tid);
+            auto* reader_txn = reader_it == txn_map_.end() ? nullptr : reader_it->second.get();
             if (!SsiTxnCanConflictWithWriter(reader_txn, writer_txn)) {
                 continue;
             }
@@ -1825,8 +1823,8 @@ bool TransactionManager::CheckWriteAgainstReaders(txn_id_t writer, Rid rid, cons
             if (tid == writer) {
                 continue;
             }
-            auto reader_it = txn_map.find(tid);
-            auto* reader_txn = reader_it == txn_map.end() ? nullptr : reader_it->second.get();
+            auto reader_it = txn_map_.find(tid);
+            auto* reader_txn = reader_it == txn_map_.end() ? nullptr : reader_it->second.get();
             if (!SsiTxnCanConflictWithWriter(reader_txn, writer_txn)) {
                 continue;
             }
@@ -1859,12 +1857,12 @@ bool TransactionManager::CheckInvisibleWrites(txn_id_t reader, Rid rid, const st
     (void)tab_name;
     std::unique_lock<std::mutex> lock(latch_);
     bool danger = false;
-    auto reader_it = txn_map.find(reader);
-    auto* reader_txn = (reader_it != txn_map.end()) ? reader_it->second.get() : nullptr;
+    auto reader_it = txn_map_.find(reader);
+    auto* reader_txn = (reader_it != txn_map_.end()) ? reader_it->second.get() : nullptr;
     if (reader_txn == nullptr || reader_txn->get_isolation_level() != IsolationLevel::SERIALIZABLE)
         return false;
 
-    for (auto& [tid, txn] : txn_map) {
+    for (auto& [tid, txn] : txn_map_) {
         if (tid == reader)
             continue;
         if (txn->get_isolation_level() != IsolationLevel::SERIALIZABLE)
@@ -1903,15 +1901,15 @@ bool TransactionManager::CheckInvisibleWriteEdge(txn_id_t reader, txn_id_t page_
         return false;
 
     std::unique_lock<std::mutex> lock(latch_);
-    auto reader_it = txn_map.find(reader);
-    if (reader_it == txn_map.end())
+    auto reader_it = txn_map_.find(reader);
+    if (reader_it == txn_map_.end())
         return false;
     auto* reader_txn = reader_it->second.get();
     if (reader_txn->get_isolation_level() != IsolationLevel::SERIALIZABLE)
         return false;
 
-    auto writer_it = txn_map.find(page_writer);
-    if (writer_it == txn_map.end())
+    auto writer_it = txn_map_.find(page_writer);
+    if (writer_it == txn_map_.end())
         return false;
     auto* writer_txn = writer_it->second.get();
     if (writer_txn == nullptr)
@@ -1932,8 +1930,8 @@ bool TransactionManager::CheckPredicateInvisibleWrites(txn_id_t reader, const st
     }
 
     std::unique_lock<std::mutex> lock(latch_);
-    auto reader_it = txn_map.find(reader);
-    if (reader_it == txn_map.end())
+    auto reader_it = txn_map_.find(reader);
+    if (reader_it == txn_map_.end())
         return false;
     auto* reader_txn = reader_it->second.get();
     if (reader_txn == nullptr || reader_txn->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
@@ -1941,7 +1939,7 @@ bool TransactionManager::CheckPredicateInvisibleWrites(txn_id_t reader, const st
     }
 
     bool danger = false;
-    for (auto& [tid, writer_txn] : txn_map) {
+    for (auto& [tid, writer_txn] : txn_map_) {
         if (tid == reader || writer_txn == nullptr)
             continue;
         if (writer_txn->get_isolation_level() != IsolationLevel::SERIALIZABLE)
@@ -2017,8 +2015,8 @@ void TransactionManager::PruneSsiState() {
     }
 
     for (txn_id_t txn_id : candidates) {
-        auto txn_it = txn_map.find(txn_id);
-        Transaction* txn = txn_it == txn_map.end() ? nullptr : txn_it->second.get();
+        auto txn_it = txn_map_.find(txn_id);
+        Transaction* txn = txn_it == txn_map_.end() ? nullptr : txn_it->second.get();
         if (txn == nullptr || txn->get_state() == TransactionState::ABORTED ||
             (txn->get_state() == TransactionState::COMMITTED && !HasActiveSerializableOverlapUnlocked(txn))) {
             active_serializable_txns_.erase(txn_id);
@@ -2028,10 +2026,10 @@ void TransactionManager::PruneSsiState() {
         }
     }
 
-    for (auto it = txn_map.begin(); it != txn_map.end();) {
+    for (auto it = txn_map_.begin(); it != txn_map_.end();) {
         Transaction* txn = it->second.get();
         if (CanRetireTransactionUnlocked(txn)) {
-            it = txn_map.erase(it);
+            it = txn_map_.erase(it);
         } else {
             ++it;
         }

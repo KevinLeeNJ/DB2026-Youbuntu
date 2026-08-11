@@ -1837,7 +1837,7 @@ TEST(RecoveryTimestampTest, CleanCheckpointPersistsTheTimestampCounterSoOldCommi
 
     Transaction* txn = txn_mgr.begin(nullptr, db.log_mgr_.get(), IsolationLevel::READ_COMMITTED);
     int send_offset = 0;
-    Context context(&lock_mgr, db.log_mgr_.get(), txn, nullptr, &send_offset, &txn_mgr);
+    Context context(&lock_mgr, db.log_mgr_.get(), txn, &txn_mgr);
     auto visible = GetVisibleRecord(db.sm_mgr_.fhs_.at("t").get(), rid, &context);
     ASSERT_NE(visible, nullptr) << "已提交的行在重启后必须仍然可见";
     int value = 0;

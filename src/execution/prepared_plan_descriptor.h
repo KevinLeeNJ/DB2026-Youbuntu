@@ -16,9 +16,6 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
-#include "execution/prepared_execution_binding.h"
-#include "execution/prepared_insert_binding.h"
-#include "system/sm.h"
 #include "optimizer/plan.h"
 
 enum class PreparedStatementKind {
@@ -85,18 +82,6 @@ public:
         return limit_offset_layout_;
     }
 
-    const PreparedInsertExecutable* insert_executable() const noexcept {
-        return insert_executable_ == nullptr ? nullptr : insert_executable_.get();
-    }
-
-    const PreparedSelectExecutable* select_executable() const noexcept {
-        return select_executable_ == nullptr ? nullptr : select_executable_.get();
-    }
-
-    const PreparedUpdateExecutable* update_executable() const noexcept {
-        return update_executable_ == nullptr ? nullptr : update_executable_.get();
-    }
-
     const std::string& database_identity() const noexcept {
         return database_identity_;
     }
@@ -124,9 +109,6 @@ private:
     const std::vector<ColMeta> result_schema_;
     std::vector<PreparedParameterSlot> parameter_layout_;
     PreparedLimitOffsetLayout limit_offset_layout_;
-    std::unique_ptr<const PreparedInsertExecutable> insert_executable_;
-    std::unique_ptr<const PreparedSelectExecutable> select_executable_;
-    std::unique_ptr<const PreparedUpdateExecutable> update_executable_;
     const std::string database_identity_;
     const std::uint64_t catalog_generation_;
     PreparedPlanFallbackReason fallback_reason_ = PreparedPlanFallbackReason::None;

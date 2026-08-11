@@ -10,9 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #undef NDEBUG
 
-#define private public
-#include "portal.h"
-#undef private
+#include "execution/execution_manager.h"
+#include "execution/row_mutation.h"
 
 #include <memory>
 #include <cmath>
@@ -54,6 +53,22 @@ QueryExpr make_agg_expr(AggType type, const std::string& col_name, const std::st
     return expr;
 }
 
+class CapturingResultSink final : public QueryResultSink {
+public:
+    void begin_query(const std::vector<ColMeta>& columns, const std::vector<std::string>& names) override {
+        columns_ = columns;
+        names_ = names;
+    }
+
+    void append_row(const std::vector<ColMeta>&, const char* data, std::size_t size) override {
+        rows_.emplace_back(data, data + size);
+    }
+
+    std::vector<ColMeta> columns_;
+    std::vector<std::string> names_;
+    std::vector<std::vector<char>> rows_;
+};
+
 } // namespace
 
 TEST(ParameterFrameTest, float_to_int_rejects_unrepresentable_boundaries_before_cast) {
@@ -79,7 +94,7 @@ protected:
     std::unique_ptr<RmManager> rm_manager_;
     std::unique_ptr<IxManager> ix_manager_;
     std::unique_ptr<SmManager> sm_manager_;
-    std::unique_ptr<Portal> portal_;
+    std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LockManager> lock_manager_;
     std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<TransactionManager> transaction_manager_;
@@ -92,7 +107,6 @@ protected:
         ix_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
         sm_manager_ = std::make_unique<SmManager>(disk_manager_.get(), buffer_pool_manager_.get(), rm_manager_.get(),
                                                   ix_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
         if (sm_manager_->is_dir(TEST_DB_NAME)) {
             sm_manager_->drop_db(TEST_DB_NAME);
         }
@@ -102,6 +116,7 @@ protected:
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         buffer_pool_manager_->set_log_manager(log_manager_.get());
         transaction_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
+        ql_manager_ = std::make_unique<QlManager>(sm_manager_.get(), transaction_manager_.get());
         db_opened_ = true;
         sm_manager_->create_table("grade", {{"id", TYPE_INT, 4}, {"score", TYPE_INT, 4}}, nullptr);
     }
@@ -125,8 +140,7 @@ protected:
             transaction_manager_->begin(nullptr, log_manager_.get(), IsolationLevel::READ_COMMITTED);
         char buffer[256]{};
         int offset = 0;
-        Context context(lock_manager_.get(), log_manager_.get(), transaction, buffer, &offset,
-                        transaction_manager_.get());
+        Context context(lock_manager_.get(), log_manager_.get(), transaction, transaction_manager_.get());
         try {
             body(&context);
             transaction_manager_->commit(transaction, log_manager_.get());
@@ -134,6 +148,29 @@ protected:
             transaction_manager_->abort(transaction, log_manager_.get());
             throw;
         }
+    }
+
+    bool execute(std::unique_ptr<Plan> plan, Context* context) {
+        txn_id_t txn_id = context->txn_ == nullptr ? INVALID_TXN_ID : context->txn_->get_transaction_id();
+        char buffer[BUFFER_LENGTH] = {};
+        int offset = 0;
+        ExecutionOutput output{buffer, &offset};
+        return ql_manager_->execute(std::move(plan), &txn_id, context, &output);
+    }
+
+    bool execute_prepared(const PreparedPlanDescriptor& descriptor, const ParameterFrame& parameters, Context* context,
+                          ExecutionOutput* output = nullptr) {
+        char buffer[BUFFER_LENGTH] = {};
+        int offset = 0;
+        ExecutionOutput default_output{buffer, &offset};
+        return ql_manager_->execute_prepared(descriptor, parameters, context,
+                                             output == nullptr ? &default_output : output);
+    }
+
+    void execute_insert(const std::string& table, std::vector<Value> values, Context* context) {
+        EXPECT_FALSE(execute(std::make_unique<DMLPlan>(T_Insert, nullptr, table, std::move(values),
+                                                       std::vector<Condition>{}, std::vector<SetClause>{}),
+                             context));
     }
 
     std::unique_ptr<Plan> make_select_subplan(bool with_limit) {
@@ -186,54 +223,20 @@ protected:
     }
 };
 
-TEST_F(PortalAggregateTest, get_plan_output_names_handles_aggregate_and_projection_aliases) {
-    auto plan = make_select_subplan(false);
-    auto* sort = static_cast<SortPlan*>(plan.get());
-
-    auto projection_output_names = portal_->get_plan_output_names(sort->subplan_.get());
-    auto aggregate_output_names = portal_->build_aggregate_output_names(
-        *static_cast<AggregatePlan*>(static_cast<ProjectionPlan*>(sort->subplan_.get())->subplan_.get()));
-
-    EXPECT_EQ(projection_output_names, (std::vector<std::string>{"id", "max_score"}));
-    EXPECT_EQ(aggregate_output_names, (std::vector<std::string>{"id", "MAX(score)"}));
-}
-
-TEST_F(PortalAggregateTest, start_builds_limit_sort_projection_aggregate_executor_chain) {
+TEST_F(PortalAggregateTest, inspect_select_plan_reports_aggregate_projection_output) {
     char buffer[256];
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, buffer, &offset);
+    Context context(nullptr, nullptr, nullptr);
 
     auto subplan = make_select_subplan(true);
     auto full_plan = std::make_unique<DMLPlan>(T_select, std::move(subplan), std::string(), std::vector<Value>{},
                                                std::vector<Condition>{}, std::vector<SetClause>{});
 
-    auto stmt = portal_->start(std::move(full_plan), &context);
-
-    ASSERT_NE(stmt, nullptr);
-    EXPECT_EQ(stmt->tag, PORTAL_ONE_SELECT);
-    EXPECT_EQ(stmt->output_names, (std::vector<std::string>{"id", "max_score"}));
-    ASSERT_NE(stmt->root, nullptr);
-    EXPECT_EQ(stmt->root->getType(), "LimitExecutor");
-
-    auto* limit = dynamic_cast<LimitExecutor*>(stmt->root.get());
-    ASSERT_NE(limit, nullptr);
-    ASSERT_NE(limit->prev_, nullptr);
-    EXPECT_EQ(limit->prev_->getType(), "SortExecutor");
-
-    auto* sort = dynamic_cast<SortExecutor*>(limit->prev_.get());
-    ASSERT_NE(sort, nullptr);
-    ASSERT_NE(sort->prev_, nullptr);
-    EXPECT_EQ(sort->prev_->getType(), "ProjectionExecutor");
-
-    auto* projection = dynamic_cast<ProjectionExecutor*>(sort->prev_.get());
-    ASSERT_NE(projection, nullptr);
-    ASSERT_NE(projection->prev_, nullptr);
-    EXPECT_EQ(projection->prev_->getType(), "AggregateExecutor");
-
-    auto* aggregate = dynamic_cast<AggregateExecutor*>(projection->prev_.get());
-    ASSERT_NE(aggregate, nullptr);
-    ASSERT_NE(aggregate->prev_, nullptr);
-    EXPECT_EQ(aggregate->prev_->getType(), "SeqScanExecutor");
+    const auto [output_names, result_schema] = ql_manager_->inspect_select_plan(*full_plan, &context);
+    EXPECT_EQ(output_names, (std::vector<std::string>{"id", "max_score"}));
+    ASSERT_EQ(result_schema.size(), 2U);
+    EXPECT_EQ(result_schema[0].name, "id");
+    EXPECT_EQ(result_schema[1].name, "max_score");
 }
 
 TEST_F(PortalAggregateTest, prepared_select_binds_request_local_conditions_and_limit_offset) {
@@ -271,24 +274,7 @@ TEST_F(PortalAggregateTest, prepared_select_binds_request_local_conditions_and_l
     ParameterFrame parameters({id, runtime_limit, runtime_offset});
     char buffer[256];
     int offset = 0;
-    Context context(nullptr, nullptr, nullptr, buffer, &offset);
-    auto statement = portal_->start_prepared(*descriptor, parameters, &context);
-
-    ASSERT_NE(statement, nullptr);
-    auto* runtime_limit_executor = dynamic_cast<LimitExecutor*>(statement->root.get());
-    ASSERT_NE(runtime_limit_executor, nullptr);
-    EXPECT_EQ(runtime_limit_executor->limit_, 5u);
-    EXPECT_EQ(runtime_limit_executor->offset_, 2u);
-    auto* runtime_projection = dynamic_cast<ProjectionExecutor*>(runtime_limit_executor->prev_.get());
-    ASSERT_NE(runtime_projection, nullptr);
-    auto* runtime_scan = dynamic_cast<SeqScanExecutor*>(runtime_projection->prev_.get());
-    ASSERT_NE(runtime_scan, nullptr);
-    ASSERT_EQ(runtime_scan->conds_.size(), 2u);
-    EXPECT_EQ(runtime_scan->conds_[0].rhs_val.int_val, 7);
-    EXPECT_EQ(runtime_scan->conds_[1].rhs_val.int_val, 7);
-    EXPECT_EQ(runtime_scan->conds_[0].rhs_val.parameter_ordinal, 0u);
-    EXPECT_NE(runtime_scan->conds_[0].rhs_val.raw, nullptr);
-
+    Context context(nullptr, nullptr, nullptr);
     const auto* immutable_select = static_cast<const DMLPlan*>(descriptor->plan());
     const auto* immutable_limit = static_cast<const LimitPlan*>(immutable_select->subplan_.get());
     const auto* immutable_projection = static_cast<const ProjectionPlan*>(immutable_limit->subplan_.get());
@@ -297,9 +283,7 @@ TEST_F(PortalAggregateTest, prepared_select_binds_request_local_conditions_and_l
     EXPECT_EQ(immutable_scan->conds_[1].rhs_val.parameter_ordinal, 1u);
     EXPECT_EQ(immutable_scan->conds_[0].rhs_val.raw, nullptr);
 
-    QlManager ql_manager(sm_manager_.get(), nullptr, nullptr);
-    txn_id_t txn_id = INVALID_TXN_ID;
-    EXPECT_NO_THROW(portal_->run(std::move(statement), &ql_manager, &txn_id, &context));
+    EXPECT_TRUE(execute_prepared(*descriptor, parameters, &context));
     EXPECT_TRUE(descriptor->eligible());
 }
 
@@ -327,21 +311,17 @@ TEST_F(PortalAggregateTest, prepared_insert_uses_bound_metadata_without_visiting
         std::make_unique<DMLPlan>(T_Insert, nullptr, "prepared_insert_rows",
                                   std::vector<Value>{id_slot, constant_text, runtime_text_slot, nullable_text_slot},
                                   std::vector<Condition>{}, std::vector<SetClause>{});
-    plan->sm_manager_ = sm_manager_.get();
     auto descriptor = PreparedPlanDescriptor::Build(std::move(plan), PreparedStatementKind::Insert, {}, {},
                                                     TEST_DB_NAME, sm_manager_->get_catalog_generation());
 
     ASSERT_TRUE(descriptor->eligible());
-    const auto* executable = descriptor->insert_executable();
-    ASSERT_NE(executable, nullptr);
-    EXPECT_EQ(executable->table, &sm_manager_->db_.get_table("prepared_insert_rows"));
-    EXPECT_EQ(executable->table_handle, sm_manager_->fhs_.at("prepared_insert_rows").get());
-    ASSERT_EQ(executable->indexes.size(), 1u);
-    ASSERT_EQ(executable->values.size(), 4u);
-    EXPECT_EQ(executable->values[0].parameter_ordinal, 1u);
-    EXPECT_EQ(executable->values[1].parameter_ordinal, 0u);
-    EXPECT_EQ(executable->values[2].parameter_ordinal, 2u);
-    EXPECT_EQ(executable->values[3].parameter_ordinal, 3u);
+    const auto* immutable_insert = descriptor->dml_plan();
+    ASSERT_NE(immutable_insert, nullptr);
+    ASSERT_EQ(immutable_insert->values_.size(), 4u);
+    EXPECT_EQ(immutable_insert->values_[0].parameter_ordinal, 1u);
+    EXPECT_EQ(immutable_insert->values_[1].parameter_ordinal, 0u);
+    EXPECT_EQ(immutable_insert->values_[2].parameter_ordinal, 2u);
+    EXPECT_EQ(immutable_insert->values_[3].parameter_ordinal, 3u);
 
     Value id;
     id.set_int(7);
@@ -354,33 +334,17 @@ TEST_F(PortalAggregateTest, prepared_insert_uses_bound_metadata_without_visiting
     char buffer[256];
     int offset = 0;
     Transaction* transaction = transaction_manager_->begin(nullptr, log_manager_.get(), IsolationLevel::READ_COMMITTED);
-    Context context(lock_manager_.get(), log_manager_.get(), transaction, buffer, &offset, transaction_manager_.get());
-    auto statement = portal_->start_prepared(*descriptor, parameters, &context);
-
-    ASSERT_NE(statement, nullptr);
-    EXPECT_EQ(statement->tag, PORTAL_DML_WITHOUT_SELECT);
-    auto* insert = dynamic_cast<InsertExecutor*>(statement->root.get());
-    ASSERT_NE(insert, nullptr);
-    EXPECT_EQ(insert->tab_, executable->table);
-    EXPECT_EQ(insert->fh_, executable->table_handle);
-    EXPECT_EQ(insert->indexes_, &executable->indexes);
-    ASSERT_EQ(insert->values_.size(), 4u);
-    EXPECT_EQ(insert->values_[0].int_val, 7);
-    EXPECT_EQ(insert->values_[1].str_val, "fixed");
-    EXPECT_EQ(insert->values_[2].str_val, "runtime");
-    EXPECT_TRUE(insert->values_[3].is_null);
-
-    QlManager ql_manager(sm_manager_.get(), transaction_manager_.get(), nullptr);
-    txn_id_t txn_id = transaction->get_transaction_id();
-    EXPECT_NO_THROW(portal_->run(std::move(statement), &ql_manager, &txn_id, &context));
+    Context context(lock_manager_.get(), log_manager_.get(), transaction, transaction_manager_.get());
+    EXPECT_FALSE(execute_prepared(*descriptor, parameters, &context));
     transaction_manager_->commit(transaction, log_manager_.get());
 
     int index_key = 7;
-    const auto lookup = executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&index_key));
+    const auto index_name = sm_manager_->get_ix_manager()->get_index_name("prepared_insert_rows", {"id"});
+    const auto lookup = sm_manager_->ihs_.at(index_name)->lookup_unique(reinterpret_cast<const char*>(&index_key));
     ASSERT_EQ(lookup.status, UniqueLookupStatus::Unique);
-    auto record = executable->table_handle->get_record(lookup.rid, &context);
+    auto record = sm_manager_->fhs_.at("prepared_insert_rows")->get_record(lookup.rid, &context);
     ASSERT_NE(record, nullptr);
-    const auto& columns = executable->table->cols;
+    const auto& columns = sm_manager_->db_.get_table("prepared_insert_rows").cols;
     ASSERT_EQ(columns.size(), 4u);
     EXPECT_EQ(read_unaligned<int>(record->data + columns[0].offset), 7);
     EXPECT_EQ(std::string(record->data + columns[1].offset,
@@ -409,10 +373,8 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
         } else {
             nullable_text.set_null();
         }
-        run_logged_write([&](Context* context) {
-            InsertExecutor insert(sm_manager_.get(), "prepared_select_rows", {id, code, nullable_text}, context);
-            insert.Next();
-        });
+        run_logged_write(
+            [&](Context* context) { execute_insert("prepared_select_rows", {id, code, nullable_text}, context); });
     };
     insert_row(1, "aa", "x");
     insert_row(2, "aa", "x");
@@ -459,8 +421,7 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
                                                     sm_manager_->db_.get_table("prepared_select_rows").cols,
                                                     TEST_DB_NAME, sm_manager_->get_catalog_generation());
     ASSERT_TRUE(descriptor->eligible());
-    ASSERT_NE(descriptor->select_executable(), nullptr);
-    ASSERT_FALSE(descriptor->select_executable()->scan.uses_index);
+    ASSERT_NE(descriptor->dml_plan(), nullptr);
 
     auto execute = [&](int lower_bound, const std::string& code_value,
                        std::optional<std::string> nullable) -> std::vector<int> {
@@ -478,17 +439,18 @@ TEST_F(PortalAggregateTest, prepared_select_bound_path_is_cold_hot_deterministic
         ParameterFrame parameters({lower_value, code, nullable_value});
         char buffer[256]{};
         int offset = 0;
-        Context context(nullptr, nullptr, nullptr, buffer, &offset);
-        auto statement = portal_->start_prepared(*descriptor, parameters, &context);
-
+        Context context(nullptr, nullptr, nullptr);
+        CapturingResultSink sink;
+        ExecutionOutput output{buffer, &offset, false, &sink};
+        EXPECT_TRUE(execute_prepared(*descriptor, parameters, &context, &output));
         std::vector<int> ids;
-        for (statement->root->beginTuple(); !statement->root->is_end(); statement->root->nextTuple()) {
-            auto record = statement->root->Next();
-            EXPECT_NE(record, nullptr);
-            if (record == nullptr) {
-                break;
-            }
-            ids.push_back(read_unaligned<int>(record->data + statement->root->cols()[0].offset));
+        EXPECT_EQ(sink.names_, (std::vector<std::string>{"id", "code"}));
+        EXPECT_EQ(sink.columns_.size(), 2U);
+        if (sink.columns_.empty()) {
+            return ids;
+        }
+        for (const auto& row : sink.rows_) {
+            ids.push_back(read_unaligned<int>(row.data() + sink.columns_[0].offset));
         }
         return ids;
     };
@@ -521,10 +483,8 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     Value original_nullable;
     original_nullable.set_str("kept");
     run_logged_write([&](Context* context) {
-        InsertExecutor insert(sm_manager_.get(), "prepared_update_rows",
-                              {original_id, original_payload, original_amount, original_code, original_nullable},
-                              context);
-        insert.Next();
+        execute_insert("prepared_update_rows",
+                       {original_id, original_payload, original_amount, original_code, original_nullable}, context);
     });
 
     Condition match;
@@ -574,16 +534,15 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     auto descriptor = PreparedPlanDescriptor::Build(std::move(plan), PreparedStatementKind::Update, {}, {},
                                                     TEST_DB_NAME, sm_manager_->get_catalog_generation());
     ASSERT_TRUE(descriptor->eligible());
-    const auto* executable = descriptor->update_executable();
-    ASSERT_NE(executable, nullptr);
-    ASSERT_EQ(executable->affected_index_bitmap.size(), 2U);
-    EXPECT_TRUE(executable->affected_index_bitmap[0]);
-    EXPECT_TRUE(executable->affected_index_bitmap[1]);
-    ASSERT_TRUE(executable->point_update.has_value());
-    EXPECT_FALSE(executable->point_update->lock_only);
+    auto& table = sm_manager_->db_.get_table("prepared_update_rows");
+    auto* fh = sm_manager_->fhs_.at("prepared_update_rows").get();
+    const auto id_index_name = sm_manager_->get_ix_manager()->get_index_name("prepared_update_rows", {"id"});
+    const auto code_index_name = sm_manager_->get_ix_manager()->get_index_name("prepared_update_rows", {"code"});
+    auto* id_index = sm_manager_->ihs_.at(id_index_name).get();
+    auto* code_index = sm_manager_->ihs_.at(code_index_name).get();
+    const auto* code_index_meta = &table.indexes[1];
     const int original_id_key = 1;
-    const auto original_lookup =
-        executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&original_id_key));
+    const auto original_lookup = id_index->lookup_unique(reinterpret_cast<const char*>(&original_id_key));
     ASSERT_EQ(original_lookup.status, UniqueLookupStatus::Unique);
     const Rid original_rid = original_lookup.rid;
 
@@ -593,11 +552,11 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     Transaction* transaction = transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     char buffer[256]{};
     int offset = 0;
-    Context context(&lock_manager, &log_manager, transaction, buffer, &offset, &transaction_manager);
+    Context context(&lock_manager, &log_manager, transaction, &transaction_manager);
     const lsn_t global_lsn_before = log_manager.get_global_lsn();
     const int64_t log_offset_before = log_manager.current_log_offset();
     const lsn_t txn_prev_lsn_before = transaction->get_prev_lsn();
-    const lsn_t page_lsn_before = executable->scan.table_handle->get_page_lsn(original_rid);
+    const lsn_t page_lsn_before = fh->get_page_lsn(original_rid);
     Value key;
     key.set_int(1);
     Value expected_payload;
@@ -614,26 +573,23 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     null_value.type = TYPE_STRING;
     null_value.set_null();
     ParameterFrame parameters({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value});
-    auto statement = portal_->start_prepared(*descriptor, parameters, &context);
-    QlManager ql_manager(sm_manager_.get(), &transaction_manager, nullptr);
-    txn_id_t txn_id = transaction->get_transaction_id();
-    portal_->run(std::move(statement), &ql_manager, &txn_id, &context);
+    EXPECT_FALSE(execute_prepared(*descriptor, parameters, &context));
     EXPECT_GT(log_manager.get_global_lsn(), global_lsn_before);
     EXPECT_GT(log_manager.current_log_offset(), log_offset_before);
     EXPECT_NE(transaction->get_prev_lsn(), txn_prev_lsn_before);
-    EXPECT_GT(executable->scan.table_handle->get_page_lsn(original_rid), page_lsn_before);
+    EXPECT_GT(fh->get_page_lsn(original_rid), page_lsn_before);
 
     const int changed_id = 2;
-    auto changed_lookup = executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&changed_id));
+    auto changed_lookup = id_index->lookup_unique(reinterpret_cast<const char*>(&changed_id));
     ASSERT_EQ(changed_lookup.status, UniqueLookupStatus::Unique);
-    std::vector<char> changed_code_key(executable->indexes[1].meta->col_tot_len);
+    std::vector<char> changed_code_key(code_index_meta->col_tot_len);
     std::memcpy(changed_code_key.data(), "new", 3);
-    const auto changed_code_lookup = executable->indexes[1].handle->lookup_unique(changed_code_key.data());
+    const auto changed_code_lookup = code_index->lookup_unique(changed_code_key.data());
     ASSERT_EQ(changed_code_lookup.status, UniqueLookupStatus::Unique);
     EXPECT_EQ(changed_code_lookup.rid, changed_lookup.rid);
-    auto visible = GetVisibleRecord(executable->scan.table_handle, changed_lookup.rid, &context);
+    auto visible = GetVisibleRecord(fh, changed_lookup.rid, &context);
     ASSERT_NE(visible, nullptr);
-    const auto& columns = executable->scan.table->cols;
+    const auto& columns = table.cols;
     EXPECT_EQ(read_unaligned<int>(visible->data + columns[0].offset), 2);
     EXPECT_EQ(read_unaligned<int>(visible->data + columns[1].offset), 77);
     EXPECT_FLOAT_EQ(read_float(visible->data + columns[2].offset), 1.75F);
@@ -645,19 +601,17 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     transaction_manager.abort(transaction, &log_manager);
 
     const int restored_id = 1;
-    auto restored_lookup = executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&restored_id));
+    auto restored_lookup = id_index->lookup_unique(reinterpret_cast<const char*>(&restored_id));
     EXPECT_EQ(restored_lookup.status, UniqueLookupStatus::Unique);
-    EXPECT_EQ(executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&changed_id)).status,
-              UniqueLookupStatus::NotFound);
-    std::vector<char> restored_code_key(executable->indexes[1].meta->col_tot_len);
+    EXPECT_EQ(id_index->lookup_unique(reinterpret_cast<const char*>(&changed_id)).status, UniqueLookupStatus::NotFound);
+    std::vector<char> restored_code_key(code_index_meta->col_tot_len);
     std::memcpy(restored_code_key.data(), "old", 3);
-    const auto restored_code_lookup = executable->indexes[1].handle->lookup_unique(restored_code_key.data());
+    const auto restored_code_lookup = code_index->lookup_unique(restored_code_key.data());
     ASSERT_EQ(restored_code_lookup.status, UniqueLookupStatus::Unique);
     EXPECT_EQ(restored_code_lookup.rid, restored_lookup.rid);
-    EXPECT_EQ(executable->indexes[1].handle->lookup_unique(changed_code_key.data()).status,
-              UniqueLookupStatus::NotFound);
+    EXPECT_EQ(code_index->lookup_unique(changed_code_key.data()).status, UniqueLookupStatus::NotFound);
     ASSERT_EQ(restored_lookup.status, UniqueLookupStatus::Unique);
-    auto restored = executable->scan.table_handle->get_record(restored_lookup.rid, nullptr);
+    auto restored = fh->get_record(restored_lookup.rid, nullptr);
     ASSERT_NE(restored, nullptr);
     EXPECT_EQ(read_unaligned<int>(restored->data + columns[0].offset), 1);
     EXPECT_EQ(read_unaligned<int>(restored->data + columns[1].offset), 10);
@@ -669,39 +623,35 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
 
     Transaction* miss_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context miss_context(&lock_manager, &log_manager, miss_transaction, buffer, &offset, &transaction_manager);
+    Context miss_context(&lock_manager, &log_manager, miss_transaction, &transaction_manager);
     Value missing_key;
     missing_key.set_int(999);
-    auto miss_statement = portal_->start_prepared(
+    EXPECT_FALSE(execute_prepared(
         *descriptor,
         ParameterFrame({missing_key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
-        &miss_context);
-    miss_statement->root->Next();
+        &miss_context));
     EXPECT_TRUE(miss_transaction->get_write_set().empty());
     EXPECT_EQ(miss_transaction->GetUndoLogNum(), 0U);
     transaction_manager.abort(miss_transaction, &log_manager);
 
     Transaction* residual_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context residual_context(&lock_manager, &log_manager, residual_transaction, buffer, &offset, &transaction_manager);
+    Context residual_context(&lock_manager, &log_manager, residual_transaction, &transaction_manager);
     Value false_residual;
     false_residual.set_int(999);
-    auto residual_statement = portal_->start_prepared(
+    EXPECT_FALSE(execute_prepared(
         *descriptor, ParameterFrame({key, false_residual, int_delta, float_delta, new_id, new_code, null_value}),
-        &residual_context);
-    residual_statement->root->Next();
+        &residual_context));
     EXPECT_TRUE(residual_transaction->get_write_set().empty());
     EXPECT_EQ(residual_transaction->GetUndoLogNum(), 0U);
     transaction_manager.abort(residual_transaction, &log_manager);
 
     for (IsolationLevel level : {IsolationLevel::READ_COMMITTED, IsolationLevel::SERIALIZABLE}) {
         Transaction* fallback_transaction = transaction_manager.begin(nullptr, &log_manager, level);
-        Context fallback_context(&lock_manager, &log_manager, fallback_transaction, buffer, &offset,
-                                 &transaction_manager);
-        auto fallback_statement = portal_->start_prepared(
+        Context fallback_context(&lock_manager, &log_manager, fallback_transaction, &transaction_manager);
+        EXPECT_FALSE(execute_prepared(
             *descriptor, ParameterFrame({key, false_residual, int_delta, float_delta, new_id, new_code, null_value}),
-            &fallback_context);
-        fallback_statement->root->Next();
+            &fallback_context));
         EXPECT_TRUE(fallback_transaction->get_write_set().empty());
         transaction_manager.abort(fallback_transaction, &log_manager);
     }
@@ -710,19 +660,17 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction* writer_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context writer_context(&lock_manager, &log_manager, writer_transaction, buffer, &offset, &transaction_manager);
-    auto writer_statement = portal_->start_prepared(
+    Context writer_context(&lock_manager, &log_manager, writer_transaction, &transaction_manager);
+    EXPECT_FALSE(execute_prepared(
         *descriptor, ParameterFrame({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
-        &writer_context);
-    writer_statement->root->Next();
+        &writer_context));
     transaction_manager.commit(writer_transaction, &log_manager);
 
-    Context stale_context(&lock_manager, &log_manager, stale_transaction, buffer, &offset, &transaction_manager);
-    auto stale_statement = portal_->start_prepared(
-        *descriptor, ParameterFrame({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
-        &stale_context);
+    Context stale_context(&lock_manager, &log_manager, stale_transaction, &transaction_manager);
     try {
-        stale_statement->root->Next();
+        execute_prepared(*descriptor,
+                         ParameterFrame({key, expected_payload, int_delta, float_delta, new_id, new_code, null_value}),
+                         &stale_context);
         FAIL() << "a newer committed point UPDATE must abort the stale writer";
     } catch (TransactionAbortException& error) {
         EXPECT_EQ(error.GetAbortReason(), AbortReason::WW_CONFLICT);
@@ -730,7 +678,7 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     transaction_manager.abort(stale_transaction, &log_manager);
 
     Transaction* own_transaction = transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context own_context(&lock_manager, &log_manager, own_transaction, buffer, &offset, &transaction_manager);
+    Context own_context(&lock_manager, &log_manager, own_transaction, &transaction_manager);
     Value current_key;
     current_key.set_int(2);
     Value current_payload;
@@ -741,24 +689,22 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
     quarter.set_float(0.25F);
     Value own_code;
     own_code.set_str("own");
-    auto own_first = portal_->start_prepared(
+    EXPECT_FALSE(execute_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &own_context);
-    own_first->root->Next();
+        &own_context));
 
     Value next_payload;
     next_payload.set_int(78);
-    auto own_second = portal_->start_prepared(
+    EXPECT_FALSE(execute_prepared(
         *descriptor, ParameterFrame({current_key, next_payload, one, quarter, current_key, own_code, null_value}),
-        &own_context);
-    own_second->root->Next();
-    auto own_visible = GetVisibleRecord(executable->scan.table_handle, changed_lookup.rid, &own_context);
+        &own_context));
+    auto own_visible = GetVisibleRecord(fh, changed_lookup.rid, &own_context);
     ASSERT_NE(own_visible, nullptr);
     EXPECT_EQ(read_unaligned<int>(own_visible->data + columns[1].offset), 79);
     EXPECT_FLOAT_EQ(read_float(own_visible->data + columns[2].offset), 2.25F);
     transaction_manager.abort(own_transaction, &log_manager);
 
-    auto committed_after_own_abort = executable->scan.table_handle->get_record(changed_lookup.rid, nullptr);
+    auto committed_after_own_abort = fh->get_record(changed_lookup.rid, nullptr);
     ASSERT_NE(committed_after_own_abort, nullptr);
     EXPECT_EQ(read_unaligned<int>(committed_after_own_abort->data + columns[1].offset), 77);
     EXPECT_FLOAT_EQ(read_float(committed_after_own_abort->data + columns[2].offset), 1.75F);
@@ -767,52 +713,29 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction* uncommitted_writer =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context uncommitted_context(&lock_manager, &log_manager, uncommitted_writer, buffer, &offset, &transaction_manager);
-    auto uncommitted_statement = portal_->start_prepared(
+    Context uncommitted_context(&lock_manager, &log_manager, uncommitted_writer, &transaction_manager);
+    EXPECT_FALSE(execute_prepared(
         *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &uncommitted_context);
-    uncommitted_statement->root->Next();
+        &uncommitted_context));
 
-    Context concurrent_context(&lock_manager, &log_manager, concurrent_transaction, buffer, &offset,
-                               &transaction_manager);
-    auto concurrent_statement = portal_->start_prepared(
-        *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &concurrent_context);
-
-    auto waiter_result = std::async(std::launch::async, [&] { concurrent_statement->root->Next(); });
-    const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    bool waiter_enqueued = false;
-    while (std::chrono::steady_clock::now() < enqueue_deadline) {
-        if (lock_manager.has_record_waiters_for_test()) {
-            waiter_enqueued = true;
-            break;
-        }
-        std::this_thread::yield();
+    Context concurrent_context(&lock_manager, &log_manager, concurrent_transaction, &transaction_manager);
+    try {
+        execute_prepared(
+            *descriptor,
+            ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
+            &concurrent_context);
+        FAIL() << "a concurrent SI first writer must abort immediately";
+    } catch (TransactionAbortException& error) {
+        EXPECT_EQ(error.GetAbortReason(), AbortReason::WW_CONFLICT);
     }
-    if (!waiter_enqueued) {
-        transaction_manager.abort(uncommitted_writer, &log_manager);
-        if (waiter_result.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
-            transaction_manager.abort(concurrent_transaction, &log_manager);
-        }
-        ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
-            << "SI first-lock waiter was not enqueued before the deadline";
-        EXPECT_NO_THROW(waiter_result.get());
-        transaction_manager.abort(concurrent_transaction, &log_manager);
-        return;
-    }
-
-    transaction_manager.abort(uncommitted_writer, &log_manager);
-    ASSERT_EQ(waiter_result.wait_for(std::chrono::seconds(2)), std::future_status::ready)
-        << "SI first-lock waiter did not finish after owner abort";
-    EXPECT_NO_THROW(waiter_result.get());
     transaction_manager.abort(concurrent_transaction, &log_manager);
+    transaction_manager.abort(uncommitted_writer, &log_manager);
 
     const int post_wait_id = 2;
-    const auto post_wait_lookup =
-        executable->indexes[0].handle->lookup_unique(reinterpret_cast<const char*>(&post_wait_id));
+    const auto post_wait_lookup = id_index->lookup_unique(reinterpret_cast<const char*>(&post_wait_id));
     ASSERT_EQ(post_wait_lookup.status, UniqueLookupStatus::Unique);
     EXPECT_EQ(post_wait_lookup.rid, changed_lookup.rid);
-    auto post_wait_record = executable->scan.table_handle->get_record(post_wait_lookup.rid, nullptr);
+    auto post_wait_record = fh->get_record(post_wait_lookup.rid, nullptr);
     ASSERT_NE(post_wait_record, nullptr);
     EXPECT_EQ(read_unaligned<int>(post_wait_record->data + columns[0].offset), 2);
     EXPECT_EQ(read_unaligned<int>(post_wait_record->data + columns[1].offset), 77);
@@ -822,24 +745,27 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     Transaction* delete_transaction =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context delete_context(&lock_manager, &log_manager, delete_transaction, buffer, &offset, &transaction_manager);
+    Context delete_context(&lock_manager, &log_manager, delete_transaction, &transaction_manager);
     Condition delete_by_id;
     delete_by_id.lhs_col = {.tab_name = "prepared_update_rows", .col_name = "id"};
     delete_by_id.op = OP_EQ;
     delete_by_id.is_rhs_val = true;
     delete_by_id.rhs_val = current_key;
-    DeleteExecutor delete_executor(sm_manager_.get(), "prepared_update_rows", {delete_by_id},
-                                   std::vector<Rid>{changed_lookup.rid}, &delete_context);
-    delete_executor.Next();
+    auto delete_scan = std::make_unique<ScanPlan>(T_IndexScan, sm_manager_.get(), "prepared_update_rows",
+                                                  std::vector<Condition>{delete_by_id}, std::vector<std::string>{"id"});
+    auto delete_plan =
+        std::make_unique<DMLPlan>(T_Delete, std::move(delete_scan), "prepared_update_rows", std::vector<Value>{},
+                                  std::vector<Condition>{delete_by_id}, std::vector<SetClause>{});
+    delete_plan->point_access_ = PointAccessPath{{"id"}, {0}};
+    EXPECT_FALSE(execute(std::move(delete_plan), &delete_context));
     transaction_manager.commit(delete_transaction, &log_manager);
 
-    Context stale_delete_context(&lock_manager, &log_manager, stale_delete_transaction, buffer, &offset,
-                                 &transaction_manager);
-    auto stale_delete_statement = portal_->start_prepared(
-        *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &stale_delete_context);
+    Context stale_delete_context(&lock_manager, &log_manager, stale_delete_transaction, &transaction_manager);
     try {
-        stale_delete_statement->root->Next();
+        execute_prepared(
+            *descriptor,
+            ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
+            &stale_delete_context);
         FAIL() << "a newer committed DELETE must abort the stale point writer";
     } catch (TransactionAbortException& error) {
         EXPECT_EQ(error.GetAbortReason(), AbortReason::WW_CONFLICT);
@@ -848,7 +774,7 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
 
     const std::string historical_id_index =
         sm_manager_->get_ix_manager()->get_index_name("prepared_update_rows", std::vector<std::string>{"id"});
-    ASSERT_TRUE(sm_manager_->has_historical_index_keys("prepared_update_rows", historical_id_index));
+    ASSERT_TRUE(sm_manager_->version_history().has_historical_index_keys("prepared_update_rows", historical_id_index));
     sm_manager_->drop_table("prepared_update_rows", nullptr);
     sm_manager_->create_table("prepared_update_rows",
                               {{"id", TYPE_INT, 4},
@@ -859,23 +785,60 @@ TEST_F(PortalAggregateTest, prepared_update_bound_path_preserves_index_heap_mvcc
                               nullptr);
     sm_manager_->create_index("prepared_update_rows", {"id"}, nullptr);
     sm_manager_->create_index("prepared_update_rows", {"code"}, nullptr);
-    EXPECT_FALSE(sm_manager_->has_historical_index_keys("prepared_update_rows", historical_id_index));
+    EXPECT_FALSE(sm_manager_->version_history().has_historical_index_keys("prepared_update_rows", historical_id_index));
     Value recreated_payload;
     recreated_payload.set_int(999);
     run_logged_write([&](Context* context) {
-        InsertExecutor recreated_insert(sm_manager_.get(), "prepared_update_rows",
-                                        {current_key, recreated_payload, original_amount, own_code, original_nullable},
-                                        context);
-        recreated_insert.Next();
+        execute_insert("prepared_update_rows",
+                       {current_key, recreated_payload, original_amount, own_code, original_nullable}, context);
     });
     Transaction* recreated_transaction =
         transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context recreated_context(&lock_manager, nullptr, recreated_transaction, buffer, &offset, &transaction_manager);
-    auto recreated_statement = portal_->start_prepared(
-        *descriptor, ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
-        &recreated_context);
-    recreated_statement->root->Next();
+    Context recreated_context(&lock_manager, nullptr, recreated_transaction, &transaction_manager);
+    EXPECT_THROW(execute_prepared(
+                     *descriptor,
+                     ParameterFrame({current_key, current_payload, one, quarter, current_key, own_code, null_value}),
+                     &recreated_context),
+                 RMDBError);
     transaction_manager.abort(recreated_transaction, nullptr);
+}
+
+TEST_F(PortalAggregateTest, prepared_update_rejects_char_value_wider_than_target_column) {
+    sm_manager_->create_table("prepared_update_overflow", {{"id", TYPE_INT, 4}, {"code", TYPE_STRING, 4}}, nullptr);
+    Value id;
+    id.set_int(1);
+    Value code;
+    code.set_str("ok");
+    char buffer[256]{};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr);
+    execute_insert("prepared_update_overflow", {id, code}, &context);
+
+    Condition match;
+    match.lhs_col = {.tab_name = "prepared_update_overflow", .col_name = "id"};
+    match.op = OP_EQ;
+    match.is_rhs_val = true;
+    match.rhs_val.type = TYPE_INT;
+    match.rhs_val.parameter_ordinal = 2;
+    auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "prepared_update_overflow",
+                                           std::vector<Condition>{match}, std::vector<std::string>{});
+    SetClause set_code;
+    set_code.lhs = {.tab_name = "prepared_update_overflow", .col_name = "code"};
+    set_code.rhs.type = TYPE_STRING;
+    set_code.rhs.parameter_ordinal = 1;
+    auto plan = std::make_unique<DMLPlan>(T_Update, std::move(scan), "prepared_update_overflow", std::vector<Value>{},
+                                          std::vector<Condition>{match}, std::vector<SetClause>{set_code});
+    auto descriptor = PreparedPlanDescriptor::Build(std::move(plan), PreparedStatementKind::Update, {}, {},
+                                                    TEST_DB_NAME, sm_manager_->get_catalog_generation());
+    ASSERT_TRUE(descriptor->eligible());
+
+    Value too_wide;
+    too_wide.set_str("wider");
+    EXPECT_THROW(execute_prepared(*descriptor, ParameterFrame({too_wide, id}), &context), StringOverflowError);
+
+    auto record = sm_manager_->fhs_.at("prepared_update_overflow")->get_record(Rid{1, 0}, &context);
+    ASSERT_NE(record, nullptr);
+    EXPECT_EQ(std::string(record->data + sizeof(int), 2), "ok");
 }
 
 TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_side_effects) {
@@ -890,10 +853,7 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     payload.set_int(10);
     Value code;
     code.set_str("stable");
-    run_logged_write([&](Context* context) {
-        InsertExecutor insert(sm_manager_.get(), "lock_only_rows", {id, payload, code}, context);
-        insert.Next();
-    });
+    run_logged_write([&](Context* context) { execute_insert("lock_only_rows", {id, payload, code}, context); });
 
     Condition point;
     point.lhs_col = {.tab_name = "lock_only_rows", .col_name = "id"};
@@ -926,17 +886,18 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     auto descriptor = PreparedPlanDescriptor::Build(std::move(plan), PreparedStatementKind::Update, {}, {},
                                                     TEST_DB_NAME, sm_manager_->get_catalog_generation());
     ASSERT_TRUE(descriptor->eligible());
-    ASSERT_NE(descriptor->update_executable(), nullptr);
-    ASSERT_TRUE(descriptor->update_executable()->point_update.has_value());
-
-    const auto* executable = descriptor->update_executable();
+    auto& table = sm_manager_->db_.get_table("lock_only_rows");
+    auto* fh = sm_manager_->fhs_.at("lock_only_rows").get();
+    const auto id_index_name = sm_manager_->get_ix_manager()->get_index_name("lock_only_rows", {"id"});
+    auto* id_index = sm_manager_->ihs_.at(id_index_name).get();
+    const auto* id_index_meta = &table.indexes[0];
     const int key = 1;
-    const auto lookup = executable->point_update->index_handle->lookup_unique(reinterpret_cast<const char*>(&key));
+    const auto lookup = id_index->lookup_unique(reinterpret_cast<const char*>(&key));
     ASSERT_EQ(lookup.status, UniqueLookupStatus::Unique);
     const Rid rid = lookup.rid;
-    const TupleMeta meta_before = executable->scan.table_handle->get_tuple_meta(rid);
-    const lsn_t page_lsn_before = executable->scan.table_handle->get_page_lsn(rid);
-    auto record_before = executable->scan.table_handle->get_record(rid, nullptr);
+    const TupleMeta meta_before = fh->get_tuple_meta(rid);
+    const lsn_t page_lsn_before = fh->get_page_lsn(rid);
+    auto record_before = fh->get_record(rid, nullptr);
     ASSERT_NE(record_before, nullptr);
 
     LockManager& lock_manager = *lock_manager_;
@@ -944,33 +905,29 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     Transaction* transaction = transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
     char buffer[256]{};
     int offset = 0;
-    Context context(&lock_manager, nullptr, transaction, buffer, &offset, &transaction_manager);
+    Context context(&lock_manager, nullptr, transaction, &transaction_manager);
     Value bound_id;
     bound_id.set_int(1);
     Value bound_payload;
     bound_payload.set_int(10);
-    auto statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &context);
-    statement->root->Next();
+    EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &context));
 
-    EXPECT_EQ(transaction->get_lock_set()->count(
-                  LockDataId(executable->scan.table_handle->GetFd(), rid, LockDataType::RECORD)),
-              1U);
+    EXPECT_EQ(transaction->get_lock_set()->count(LockDataId(fh->GetFd(), rid, LockDataType::RECORD)), 1U);
     EXPECT_EQ(transaction->GetUndoLogNum(), 0U);
     EXPECT_TRUE(transaction->get_write_set().empty());
     EXPECT_TRUE(transaction->modified_slots_.empty());
     EXPECT_EQ(transaction->get_prev_lsn(), INVALID_LSN);
-    EXPECT_EQ(executable->scan.table_handle->get_tuple_meta(rid), meta_before);
-    EXPECT_EQ(executable->scan.table_handle->get_page_lsn(rid), page_lsn_before);
-    auto record_after = executable->scan.table_handle->get_record(rid, nullptr);
+    EXPECT_EQ(fh->get_tuple_meta(rid), meta_before);
+    EXPECT_EQ(fh->get_page_lsn(rid), page_lsn_before);
+    auto record_after = fh->get_record(rid, nullptr);
     ASSERT_NE(record_after, nullptr);
     EXPECT_EQ(std::memcmp(record_after->data, record_before->data, record_before->size), 0);
-    EXPECT_EQ(executable->point_update->index_handle->lookup_unique(reinterpret_cast<const char*>(&key)).rid, rid);
+    EXPECT_EQ(id_index->lookup_unique(reinterpret_cast<const char*>(&key)).rid, rid);
 
     Transaction competing(100000, IsolationLevel::SNAPSHOT_ISOLATION);
-    const LockDataId record_lock(executable->scan.table_handle->GetFd(), rid, LockDataType::RECORD);
-    auto contender_result = std::async(std::launch::async, [&] {
-        return lock_manager.lock_exclusive_on_record(&competing, rid, executable->scan.table_handle->GetFd());
-    });
+    const LockDataId record_lock(fh->GetFd(), rid, LockDataType::RECORD);
+    auto contender_result = std::async(
+        std::launch::async, [&] { return lock_manager.lock_exclusive_on_record(&competing, rid, fh->GetFd()); });
     const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     bool contender_enqueued = false;
     while (std::chrono::steady_clock::now() < enqueue_deadline) {
@@ -997,42 +954,38 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     ASSERT_TRUE(lock_manager.unlock(&competing, record_lock));
 
     auto expect_context_fallback = [&](Context* incomplete_context) {
-        auto fallback =
-            portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), incomplete_context);
-        EXPECT_NE(fallback, nullptr);
+        EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), incomplete_context));
     };
-    Context null_transaction_context(&lock_manager, nullptr, nullptr, buffer, &offset, &transaction_manager);
+    Context null_transaction_context(&lock_manager, nullptr, nullptr, &transaction_manager);
     null_transaction_context.isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
     expect_context_fallback(&null_transaction_context);
     Transaction no_manager_transaction(100001, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context null_transaction_manager_context(&lock_manager, nullptr, &no_manager_transaction, buffer, &offset, nullptr);
+    Context null_transaction_manager_context(&lock_manager, nullptr, &no_manager_transaction, nullptr);
     expect_context_fallback(&null_transaction_manager_context);
     Transaction* no_lock_transaction = transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context null_lock_manager_context(nullptr, nullptr, no_lock_transaction, buffer, &offset, &transaction_manager);
+    Context null_lock_manager_context(nullptr, nullptr, no_lock_transaction, &transaction_manager);
     expect_context_fallback(&null_lock_manager_context);
     EXPECT_TRUE(no_lock_transaction->get_lock_set()->empty());
     transaction_manager.abort(no_lock_transaction, nullptr);
 
     LogManager& log_manager = *log_manager_;
     Transaction* wal_transaction = transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context wal_context(&lock_manager, &log_manager, wal_transaction, buffer, &offset, &transaction_manager);
+    Context wal_context(&lock_manager, &log_manager, wal_transaction, &transaction_manager);
     const lsn_t wal_global_before = log_manager.get_global_lsn();
     const int64_t wal_offset_before = log_manager.current_log_offset();
     const lsn_t txn_lsn_before = wal_transaction->get_prev_lsn();
-    auto wal_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &wal_context);
-    wal_statement->root->Next();
+    EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &wal_context));
     EXPECT_EQ(log_manager.get_global_lsn(), wal_global_before);
     EXPECT_EQ(log_manager.current_log_offset(), wal_offset_before);
     EXPECT_EQ(wal_transaction->get_prev_lsn(), txn_lsn_before);
-    EXPECT_EQ(executable->scan.table_handle->get_page_lsn(rid), page_lsn_before);
+    EXPECT_EQ(fh->get_page_lsn(rid), page_lsn_before);
     transaction_manager.abort(wal_transaction, &log_manager);
 
     Transaction* miss_transaction = transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context miss_context(&lock_manager, nullptr, miss_transaction, buffer, &offset, &transaction_manager);
+    Context miss_context(&lock_manager, nullptr, miss_transaction, &transaction_manager);
     Value false_residual;
     false_residual.set_int(999);
-    auto miss = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, false_residual}), &miss_context);
-    miss->root->Next();
+    EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, false_residual}), &miss_context));
     EXPECT_TRUE(miss_transaction->get_lock_set()->empty());
     EXPECT_TRUE(miss_transaction->get_write_set().empty());
     EXPECT_EQ(miss_transaction->GetUndoLogNum(), 0U);
@@ -1040,11 +993,8 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
 
     for (IsolationLevel level : {IsolationLevel::READ_COMMITTED, IsolationLevel::SERIALIZABLE}) {
         Transaction* fallback_transaction = transaction_manager.begin(nullptr, &log_manager, level);
-        Context fallback_context(&lock_manager, &log_manager, fallback_transaction, buffer, &offset,
-                                 &transaction_manager);
-        auto fallback =
-            portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &fallback_context);
-        fallback->root->Next();
+        Context fallback_context(&lock_manager, &log_manager, fallback_transaction, &transaction_manager);
+        EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &fallback_context));
         EXPECT_GT(fallback_transaction->GetUndoLogNum(), 0U);
         EXPECT_FALSE(fallback_transaction->get_write_set().empty());
         transaction_manager.abort(fallback_transaction, &log_manager);
@@ -1063,15 +1013,18 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
         add.rhs_col = add.lhs;
         add.op = UpdateOp::SELF_ADD;
         add.rhs.set_int(delta);
-        Context owner_context(&lock_manager, &log_manager, owner, buffer, &offset, &transaction_manager);
-        UpdateExecutor update(sm_manager_.get(), "lock_only_rows", {add}, {by_id}, std::vector<Rid>{rid},
-                              &owner_context);
-        update.Next();
+        Context owner_context(&lock_manager, &log_manager, owner, &transaction_manager);
+        auto scan = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "lock_only_rows",
+                                               std::vector<Condition>{by_id}, std::vector<std::string>{});
+        EXPECT_FALSE(
+            execute(std::make_unique<DMLPlan>(T_Update, std::move(scan), "lock_only_rows", std::vector<Value>{},
+                                              std::vector<Condition>{by_id}, std::vector<SetClause>{add}),
+                    &owner_context));
     };
     auto current_payload = [&] {
-        auto record = executable->scan.table_handle->get_record(rid, nullptr);
+        auto record = fh->get_record(rid, nullptr);
         EXPECT_NE(record, nullptr);
-        return record == nullptr ? -1 : read_unaligned<int>(record->data + executable->scan.table->cols[1].offset);
+        return record == nullptr ? -1 : read_unaligned<int>(record->data + table.cols[1].offset);
     };
 
     Transaction* stale = transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
@@ -1080,11 +1033,9 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     transaction_manager.commit(writer, &log_manager);
     ASSERT_EQ(current_payload(), 11);
 
-    Context stale_context(&lock_manager, nullptr, stale, buffer, &offset, &transaction_manager);
-    auto stale_statement =
-        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &stale_context);
+    Context stale_context(&lock_manager, nullptr, stale, &transaction_manager);
     try {
-        stale_statement->root->Next();
+        execute_prepared(*descriptor, ParameterFrame({bound_id, bound_payload}), &stale_context);
         FAIL() << "a newer committed writer must abort the stale snapshot";
     } catch (TransactionAbortException& error) {
         EXPECT_EQ(error.GetAbortReason(), AbortReason::WW_CONFLICT);
@@ -1097,29 +1048,26 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     const std::size_t writes_after_update = own_write->get_write_set().size();
     const std::size_t modified_after_update = own_write->modified_slots_.size();
     const lsn_t prev_lsn_after_update = own_write->get_prev_lsn();
-    const TupleMeta own_meta_after_update = executable->scan.table_handle->get_tuple_meta(rid);
-    const lsn_t own_page_lsn_after_update = executable->scan.table_handle->get_page_lsn(rid);
+    const TupleMeta own_meta_after_update = fh->get_tuple_meta(rid);
+    const lsn_t own_page_lsn_after_update = fh->get_page_lsn(rid);
     Value payload_15;
     payload_15.set_int(15);
-    Context own_context(&lock_manager, &log_manager, own_write, buffer, &offset, &transaction_manager);
-    auto own_statement = portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &own_context);
-    own_statement->root->Next();
+    Context own_context(&lock_manager, &log_manager, own_write, &transaction_manager);
+    EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &own_context));
     EXPECT_EQ(own_write->GetUndoLogNum(), undo_after_update);
     EXPECT_EQ(own_write->get_write_set().size(), writes_after_update);
     EXPECT_EQ(own_write->modified_slots_.size(), modified_after_update);
     EXPECT_EQ(own_write->get_prev_lsn(), prev_lsn_after_update);
-    EXPECT_EQ(executable->scan.table_handle->get_tuple_meta(rid), own_meta_after_update);
-    EXPECT_EQ(executable->scan.table_handle->get_page_lsn(rid), own_page_lsn_after_update);
+    EXPECT_EQ(fh->get_tuple_meta(rid), own_meta_after_update);
+    EXPECT_EQ(fh->get_page_lsn(rid), own_page_lsn_after_update);
     transaction_manager.abort(own_write, &log_manager);
     EXPECT_EQ(current_payload(), 11) << "the earlier real UPDATE undo must remain effective";
 
     Transaction* committing_own_write =
         transaction_manager.begin(nullptr, &log_manager, IsolationLevel::SNAPSHOT_ISOLATION);
     execute_relative_update(committing_own_write, 4);
-    Context commit_context(&lock_manager, &log_manager, committing_own_write, buffer, &offset, &transaction_manager);
-    auto commit_statement =
-        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &commit_context);
-    commit_statement->root->Next();
+    Context commit_context(&lock_manager, &log_manager, committing_own_write, &transaction_manager);
+    EXPECT_FALSE(execute_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &commit_context));
     transaction_manager.commit(committing_own_write, &log_manager);
     EXPECT_EQ(current_payload(), 15);
 
@@ -1129,42 +1077,34 @@ TEST_F(PortalAggregateTest, prepared_si_self_assignment_locks_without_mutation_s
     second_payload.set_int(15);
     Value second_code;
     second_code.set_str("second");
-    run_logged_write([&](Context* context) {
-        InsertExecutor second_insert(sm_manager_.get(), "lock_only_rows", {second_id, second_payload, second_code},
-                                     context);
-        second_insert.Next();
-    });
+    run_logged_write(
+        [&](Context* context) { execute_insert("lock_only_rows", {second_id, second_payload, second_code}, context); });
     const int second_key = 2;
-    const auto second_lookup =
-        executable->point_update->index_handle->lookup_unique(reinterpret_cast<const char*>(&second_key));
+    const auto second_lookup = id_index->lookup_unique(reinterpret_cast<const char*>(&second_key));
     ASSERT_EQ(second_lookup.status, UniqueLookupStatus::Unique);
     const Rid second_rid = second_lookup.rid;
 
-    executable->point_update->index_handle->insert_entry(reinterpret_cast<const char*>(&key), second_rid,
-                                                         IndexWriteWalContext::TestNoWal(), true);
-    ASSERT_EQ(executable->point_update->index_handle->lookup_unique(reinterpret_cast<const char*>(&key)).status,
-              UniqueLookupStatus::Duplicate);
+    id_index->insert_entry(reinterpret_cast<const char*>(&key), second_rid, IndexWriteWalContext::TestNoWal(), true);
+    ASSERT_EQ(id_index->lookup_unique(reinterpret_cast<const char*>(&key)).status, UniqueLookupStatus::Duplicate);
     Transaction* duplicate_transaction =
         transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context duplicate_context(&lock_manager, nullptr, duplicate_transaction, buffer, &offset, &transaction_manager);
-    auto duplicate_statement =
-        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &duplicate_context);
+    Context duplicate_context(&lock_manager, nullptr, duplicate_transaction, &transaction_manager);
+    EXPECT_NO_THROW(execute_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &duplicate_context));
     transaction_manager.abort(duplicate_transaction, nullptr);
-    ASSERT_TRUE(executable->point_update->index_handle->delete_entry(reinterpret_cast<const char*>(&key), second_rid,
-                                                                     IndexWriteWalContext::TestNoWal()));
+    ASSERT_TRUE(
+        id_index->delete_entry(reinterpret_cast<const char*>(&key), second_rid, IndexWriteWalContext::TestNoWal()));
 
-    auto second_record = executable->scan.table_handle->get_record(second_rid, nullptr);
+    auto second_record = fh->get_record(second_rid, nullptr);
     ASSERT_NE(second_record, nullptr);
-    write_unaligned(second_record->data + executable->scan.table->cols[0].offset, key);
-    executable->scan.table_handle->update_record(second_rid, second_record->data, nullptr);
+    write_unaligned(second_record->data + table.cols[0].offset, key);
+    fh->update_record(second_rid, second_record->data, nullptr);
     std::vector<char> historical_key(sizeof(int));
     std::memcpy(historical_key.data(), &key, sizeof(int));
-    sm_manager_->remember_historical_index_key(executable->scan.table_name, executable->point_update->index_name,
-                                               historical_key, second_rid, *executable->point_update->index);
+    sm_manager_->version_history().remember_historical_index_key("lock_only_rows", id_index_name, historical_key,
+                                                                 second_rid, *id_index_meta);
     Transaction* multiple_transaction = transaction_manager.begin(nullptr, nullptr, IsolationLevel::SNAPSHOT_ISOLATION);
-    Context multiple_context(&lock_manager, nullptr, multiple_transaction, buffer, &offset, &transaction_manager);
-    auto multiple_statement =
-        portal_->start_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &multiple_context);
+    Context multiple_context(&lock_manager, nullptr, multiple_transaction, &transaction_manager);
+    EXPECT_NO_THROW(execute_prepared(*descriptor, ParameterFrame({bound_id, payload_15}), &multiple_context));
     transaction_manager.abort(multiple_transaction, nullptr);
 }
 
@@ -1176,15 +1116,13 @@ TEST_F(PortalAggregateTest, point_dml_is_enabled_by_default_and_non_rc_isolation
     int offset = 0;
     Transaction* rc_transaction =
         transaction_manager_->begin(nullptr, log_manager_.get(), IsolationLevel::READ_COMMITTED);
-    Context rc_context(lock_manager_.get(), log_manager_.get(), rc_transaction, buffer, &offset,
-                       transaction_manager_.get());
+    Context rc_context(lock_manager_.get(), log_manager_.get(), rc_transaction, transaction_manager_.get());
     rc_context.isolation_level_ = IsolationLevel::READ_COMMITTED;
     Value id;
     id.set_int(7);
     Value payload;
     payload.set_int(11);
-    InsertExecutor insert(sm_manager_.get(), "point_rows", {id, payload}, &rc_context);
-    insert.Next();
+    execute_insert("point_rows", {id, payload}, &rc_context);
     transaction_manager_->commit(rc_transaction, log_manager_.get());
 
     Condition condition;
@@ -1195,17 +1133,22 @@ TEST_F(PortalAggregateTest, point_dml_is_enabled_by_default_and_non_rc_isolation
     DMLPlan plan(T_Delete, nullptr, "point_rows", {}, {condition}, {});
     plan.point_access_ = PointAccessPath{{"id"}, {0}};
 
-    auto rc_result = portal_->resolve_point_rid(plan, &rc_context);
-    ASSERT_TRUE(rc_result.has_value());
-    EXPECT_TRUE(rc_result->has_value());
+    auto rc_result =
+        ResolvePointMutationTarget(*sm_manager_, plan.tab_name_, plan.conds_, *plan.point_access_, &rc_context);
+    ASSERT_EQ(rc_result.kind, PointTargetLookupKind::ExactRid);
 
-    Context si_context(nullptr, nullptr, nullptr, buffer, &offset);
+    Context si_context(nullptr, nullptr, nullptr);
     si_context.isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
-    EXPECT_FALSE(portal_->resolve_point_rid(plan, &si_context).has_value());
+    EXPECT_EQ(
+        ResolvePointMutationTarget(*sm_manager_, plan.tab_name_, plan.conds_, *plan.point_access_, &si_context).kind,
+        PointTargetLookupKind::UnsafeFallback);
 
-    Context serializable_context(nullptr, nullptr, nullptr, buffer, &offset);
+    Context serializable_context(nullptr, nullptr, nullptr);
     serializable_context.isolation_level_ = IsolationLevel::SERIALIZABLE;
-    EXPECT_FALSE(portal_->resolve_point_rid(plan, &serializable_context).has_value());
+    EXPECT_EQ(ResolvePointMutationTarget(*sm_manager_, plan.tab_name_, plan.conds_, *plan.point_access_,
+                                         &serializable_context)
+                  .kind,
+              PointTargetLookupKind::UnsafeFallback);
 
     auto& table = sm_manager_->db_.get_table("point_rows");
     auto index = table.get_index_meta({"id"});
@@ -1213,12 +1156,15 @@ TEST_F(PortalAggregateTest, point_dml_is_enabled_by_default_and_non_rc_isolation
     const std::string index_name = ix_manager_->get_index_name("point_rows", index->cols);
     std::vector<char> historical_key(sizeof(int));
     std::memcpy(historical_key.data(), &id.int_val, sizeof(int));
-    sm_manager_->remember_historical_index_key("point_rows", index_name, historical_key, Rid{99, 1}, *index);
+    sm_manager_->version_history().remember_historical_index_key("point_rows", index_name, historical_key, Rid{99, 1},
+                                                                 *index);
 
     LockManager lock_manager;
     TransactionManager transaction_manager(&lock_manager, sm_manager_.get());
     Transaction transaction(17, IsolationLevel::READ_COMMITTED);
-    Context historical_context(&lock_manager, nullptr, &transaction, buffer, &offset, &transaction_manager);
-    EXPECT_FALSE(portal_->resolve_point_rid(plan, &historical_context).has_value())
-        << "a conflicting historical RID must use the scan fallback";
+    Context historical_context(&lock_manager, nullptr, &transaction, &transaction_manager);
+    EXPECT_EQ(
+        ResolvePointMutationTarget(*sm_manager_, plan.tab_name_, plan.conds_, *plan.point_access_, &historical_context)
+            .kind,
+        PointTargetLookupKind::UnsafeFallback);
 }

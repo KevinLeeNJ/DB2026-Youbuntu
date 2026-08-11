@@ -14,11 +14,29 @@ See the Mulan PSL v2 for more details.
 
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "execution_common.h"
+#include "execution_defs.h"
 #include "index/ix.h"
 #include "system/sm.h"
+
+enum class PointTargetLookupKind {
+    UnsafeFallback,
+    ExactNoMatch,
+    ExactRid,
+};
+
+struct PointTargetLookup {
+    PointTargetLookupKind kind = PointTargetLookupKind::UnsafeFallback;
+    std::optional<Rid> rid;
+};
+
+PointTargetLookup ResolvePointMutationTarget(SmManager& sm_manager, const std::string& tab_name,
+                                             const std::vector<Condition>& conditions, const PointAccessPath& path,
+                                             Context* context);
 
 struct RowMutationIndex {
     const IndexMeta* meta;

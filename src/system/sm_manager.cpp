@@ -160,17 +160,7 @@ void SmManager::open_db(const std::string& db_name) {
         throw UnixError();
     }
     std::string original_cwd = cwd_buf;
-    {
-        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        historical_index_keys_.clear();
-        historical_retire_queue_.clear();
-        historical_queued_generations_.clear();
-        historical_deferred_retire_queue_ = {};
-    }
-    {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        clear_deleted_tuple_candidates_locked();
-    }
+    version_history_->Clear();
     try {
         table_runtime_ids_.clear();
         if (chdir(db_name.c_str()) < 0) { // 进入名为db_name的目录
@@ -278,352 +268,9 @@ void SmManager::close_db() {
     table_runtime_ids_.clear();
     db_.name_.clear();
     db_.tabs_.clear();
-    {
-        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        historical_index_keys_.clear();
-        historical_retire_queue_.clear();
-        historical_queued_generations_.clear();
-        historical_deferred_retire_queue_ = {};
-    }
-    {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        clear_deleted_tuple_candidates_locked();
-    }
+    version_history_->Clear();
     if (chdir("..") < 0) { // 回到根目录
         throw UnixError();
-    }
-}
-
-void SmManager::prune_version_history(timestamp_t watermark) {
-    constexpr size_t kHistoryPruneBatch = 512;
-    // Hold the catalog lifetime guard while resolving table handles and
-    // touching their pages.  This is deliberately acquired only here: callers
-    // of this background GC path do not already own a catalog guard, avoiding
-    // recursive locking of catalog_latch_.
-    auto catalog_guard = acquire_catalog_shared();
-    // Historical entries are placed on a retire queue when created. Each GC
-    // pass examines only a bounded queue prefix; entries that are still
-    // visible to an active snapshot are requeued for a later watermark.
-    struct HistoricalProbeItem {
-        HistoricalRetireCandidate candidate;
-        bool requeue{false};
-    };
-    std::vector<HistoricalProbeItem> hist_snapshot;
-    {
-        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        while (!historical_deferred_retire_queue_.empty()) {
-            const auto& deferred = historical_deferred_retire_queue_.top();
-            if (!deferred.retry_after_watermark.has_value() || *deferred.retry_after_watermark >= watermark) {
-                break;
-            }
-            auto candidate = historical_deferred_retire_queue_.top();
-            historical_deferred_retire_queue_.pop();
-            const auto retire_key = make_historical_retire_key(candidate);
-            auto bucket_it = historical_index_keys_.find(candidate.bucket_key);
-            if (bucket_it == historical_index_keys_.end()) {
-                continue;
-            }
-            auto key_it = bucket_it->second.entries.find(candidate.encoded_key);
-            if (key_it == bucket_it->second.entries.end()) {
-                continue;
-            }
-            auto current = std::find_if(key_it->second.begin(), key_it->second.end(),
-                                        [&](const auto& entry) { return entry.rid == candidate.rid; });
-            if (current == key_it->second.end() ||
-                current->retire_state != HistoricalIndexBucket::RetireState::Deferred) {
-                continue;
-            }
-            current->retire_state = HistoricalIndexBucket::RetireState::Queued;
-            candidate.generation = current->generation;
-            candidate.retry_after_watermark.reset();
-            historical_queued_generations_.insert(retire_key);
-            historical_retire_queue_.push_back(std::move(candidate));
-        }
-        const size_t count = std::min(kHistoryPruneBatch, historical_retire_queue_.size());
-        hist_snapshot.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            auto candidate = std::move(historical_retire_queue_.front());
-            historical_retire_queue_.pop_front();
-            const auto retire_key = make_historical_retire_key(candidate);
-            auto queued_it = historical_queued_generations_.find(retire_key);
-            if (queued_it == historical_queued_generations_.end()) {
-                continue;
-            }
-            historical_queued_generations_.erase(queued_it);
-            auto bucket_it = historical_index_keys_.find(candidate.bucket_key);
-            if (bucket_it == historical_index_keys_.end()) {
-                continue;
-            }
-            auto key_it = bucket_it->second.entries.find(candidate.encoded_key);
-            if (key_it == bucket_it->second.entries.end()) {
-                continue;
-            }
-            auto current = std::find_if(key_it->second.begin(), key_it->second.end(),
-                                        [&](const auto& entry) { return entry.rid == candidate.rid; });
-            if (current == key_it->second.end() ||
-                current->retire_state != HistoricalIndexBucket::RetireState::Queued) {
-                continue;
-            }
-            // The queue node is only a logical ticket. A queued refresh may
-            // have advanced the Entry generation after the node was appended.
-            // Capture the current generation exactly when ownership changes to
-            // InFlight; no deque update or scan is needed on the foreground path.
-            candidate.generation = current->generation;
-            current->retire_state = HistoricalIndexBucket::RetireState::InFlight;
-            hist_snapshot.push_back(HistoricalProbeItem{std::move(candidate)});
-        }
-    }
-    struct PageProbeGroup {
-        RmFileHandle* file_handle;
-        page_id_t page_no;
-        std::vector<int> slots;
-        std::vector<size_t> candidate_indices;
-    };
-    struct PageProbeKey {
-        RmFileHandle* file_handle;
-        page_id_t page_no;
-
-        bool operator==(const PageProbeKey& other) const {
-            return file_handle == other.file_handle && page_no == other.page_no;
-        }
-    };
-    struct PageProbeKeyHash {
-        size_t operator()(const PageProbeKey& key) const noexcept {
-            const size_t handle_hash = std::hash<RmFileHandle*>{}(key.file_handle);
-            const size_t page_hash = std::hash<page_id_t>{}(key.page_no);
-            return handle_hash ^
-                   (page_hash + static_cast<size_t>(0x9e3779b9) + (handle_hash << 6) + (handle_hash >> 2));
-        }
-    };
-    std::vector<PageProbeGroup> hist_groups;
-    std::unordered_map<PageProbeKey, size_t, PageProbeKeyHash> hist_group_indices;
-    hist_groups.reserve(hist_snapshot.size());
-    hist_group_indices.reserve(hist_snapshot.size());
-    for (size_t i = 0; i < hist_snapshot.size(); ++i) {
-        const auto& candidate = hist_snapshot[i].candidate;
-        const size_t nul = candidate.bucket_key.find('\0');
-        const std::string tab_name = (nul != std::string::npos) ? candidate.bucket_key.substr(0, nul) : std::string{};
-        const auto fh_it = fhs_.find(tab_name);
-        if (fh_it == fhs_.end()) {
-            continue;
-        }
-        RmFileHandle* file_handle = fh_it->second.get();
-        const PageProbeKey key{file_handle, candidate.rid.page_no};
-        auto [group_it, inserted] = hist_group_indices.emplace(key, hist_groups.size());
-        if (inserted) {
-            hist_groups.push_back(PageProbeGroup{file_handle, candidate.rid.page_no, {}, {}});
-        }
-        auto& group = hist_groups[group_it->second];
-        group.slots.push_back(candidate.rid.slot_no);
-        group.candidate_indices.push_back(i);
-    }
-    for (const auto& group : hist_groups) {
-        group.file_handle->visit_tuple_meta_batch(
-            group.page_no, group.slots, [&](size_t j, RmTupleMetaProbeState state, const TupleMeta* meta) {
-                const size_t candidate_index = group.candidate_indices[j];
-                auto& item = hist_snapshot[candidate_index];
-                if (state == RmTupleMetaProbeState::Retry) {
-                    item.requeue = true;
-                    return;
-                }
-                if (state == RmTupleMetaProbeState::Absent) {
-                    return;
-                }
-                if (meta != nullptr && meta->is_committed_ && meta->commit_ts_ != INVALID_TS &&
-                    meta->commit_ts_ >= watermark) {
-                    item.candidate.retry_after_watermark = meta->commit_ts_;
-                    return;
-                }
-                if (meta == nullptr ||
-                    !(meta->is_committed_ && meta->commit_ts_ != INVALID_TS && meta->commit_ts_ < watermark)) {
-                    item.requeue = true;
-                }
-            });
-    }
-    if (!hist_snapshot.empty()) {
-        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (size_t i = 0; i < hist_snapshot.size(); ++i) {
-            auto candidate = hist_snapshot[i].candidate;
-            auto it = historical_index_keys_.find(candidate.bucket_key);
-            if (it == historical_index_keys_.end()) {
-                continue;
-            }
-            auto key_it = it->second.entries.find(candidate.encoded_key);
-            if (key_it == it->second.entries.end()) {
-                continue;
-            }
-            auto& entries = key_it->second;
-            const auto current = std::find_if(entries.begin(), entries.end(),
-                                              [&](const auto& entry) { return entry.rid == candidate.rid; });
-            if (current == entries.end()) {
-                continue;
-            }
-            if (current->generation != candidate.generation) {
-                current->retire_state = HistoricalIndexBucket::RetireState::Queued;
-                historical_queued_generations_.insert(make_historical_retire_key(candidate));
-                historical_retire_queue_.push_back(HistoricalRetireCandidate{
-                    candidate.bucket_key, candidate.encoded_key, candidate.rid, current->generation, {}});
-            } else if (!hist_snapshot[i].requeue) {
-                if (candidate.retry_after_watermark.has_value()) {
-                    current->retire_state = HistoricalIndexBucket::RetireState::Deferred;
-                    historical_deferred_retire_queue_.push(candidate);
-                } else {
-                    entries.erase(current);
-                    if (entries.empty()) {
-                        it->second.entries.erase(key_it);
-                    }
-                    if (it->second.entries.empty()) {
-                        historical_index_keys_.erase(it);
-                    }
-                }
-            } else {
-                current->retire_state = HistoricalIndexBucket::RetireState::Queued;
-                historical_queued_generations_.insert(make_historical_retire_key(candidate));
-                candidate.retry_after_watermark.reset();
-                historical_retire_queue_.push_back(candidate);
-            }
-        }
-    }
-
-    // Deleted-tuple candidates use a FIFO retire queue instead of repeatedly
-    // scanning the first keys in an unordered map. Entries which remain visible
-    // to an old snapshot rotate to the tail, so they cannot starve later safe
-    // entries. The candidate latch is never held while a page is fetched.
-    std::vector<DeletedTupleRetireCandidate> deleted_snapshot;
-    {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        while (!deleted_tuple_deferred_retire_queue_.empty()) {
-            const auto& deferred = deleted_tuple_deferred_retire_queue_.top();
-            if (!deferred.retry_after_watermark.has_value() || *deferred.retry_after_watermark >= watermark) {
-                break;
-            }
-            auto retired = deleted_tuple_deferred_retire_queue_.top();
-            deleted_tuple_deferred_retire_queue_.pop();
-            auto table_it = deleted_tuple_candidates_.find(retired.tab_name);
-            if (table_it == deleted_tuple_candidates_.end()) {
-                continue;
-            }
-            auto bucket_it = table_it->second.find(retired.row_key);
-            if (bucket_it == table_it->second.end()) {
-                continue;
-            }
-            const bool still_current =
-                std::any_of(bucket_it->second.begin(), bucket_it->second.end(), [&](const auto& current) {
-                    return current.candidate_id == retired.candidate.candidate_id &&
-                           current.writer_txn_id == retired.candidate.writer_txn_id &&
-                           current.version_chain_head == retired.candidate.version_chain_head;
-                });
-            if (!still_current) {
-                continue;
-            }
-            retired.retry_after_watermark.reset();
-            deleted_tuple_retire_queue_.push_back(std::move(retired));
-        }
-        const size_t count = std::min(kHistoryPruneBatch, deleted_tuple_retire_queue_.size());
-        deleted_snapshot.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            deleted_snapshot.push_back(std::move(deleted_tuple_retire_queue_.front()));
-            deleted_tuple_retire_queue_.pop_front();
-        }
-    }
-
-    std::vector<bool> deleted_requeue(deleted_snapshot.size(), false);
-    std::vector<std::optional<timestamp_t>> deleted_deferred_after(deleted_snapshot.size());
-    std::vector<PageProbeGroup> deleted_groups;
-    std::unordered_map<PageProbeKey, size_t, PageProbeKeyHash> deleted_group_indices;
-    deleted_groups.reserve(deleted_snapshot.size());
-    deleted_group_indices.reserve(deleted_snapshot.size());
-    for (size_t i = 0; i < deleted_snapshot.size(); ++i) {
-        const auto& retired = deleted_snapshot[i];
-        const auto fh_it = fhs_.find(retired.tab_name);
-        if (fh_it == fhs_.end()) {
-            continue;
-        }
-        RmFileHandle* file_handle = fh_it->second.get();
-        const PageProbeKey key{file_handle, retired.candidate.rid.page_no};
-        auto [group_it, inserted] = deleted_group_indices.emplace(key, deleted_groups.size());
-        if (inserted) {
-            deleted_groups.push_back(PageProbeGroup{file_handle, retired.candidate.rid.page_no, {}, {}});
-        }
-        auto& group = deleted_groups[group_it->second];
-        group.slots.push_back(retired.candidate.rid.slot_no);
-        group.candidate_indices.push_back(i);
-    }
-    for (const auto& group : deleted_groups) {
-        const auto probes = group.file_handle->probe_tuple_meta_batch(group.page_no, group.slots);
-        for (size_t j = 0; j < probes.size(); ++j) {
-            const auto& probe = probes[j];
-            const size_t candidate_index = group.candidate_indices[j];
-            if (probe.state == RmTupleMetaProbeState::Retry) {
-                deleted_requeue[candidate_index] = true;
-                continue;
-            }
-            if (probe.state == RmTupleMetaProbeState::Absent) {
-                continue;
-            }
-            const TupleMeta& meta = probe.meta;
-            // A stale queue item must not touch a newer deletion at a reused RID.
-            if (!deleted_tuple_candidate_matches_meta(deleted_snapshot[candidate_index].candidate, meta)) {
-                continue;
-            }
-            // Keep precisely the candidates that can still be seen as concurrent
-            // by an active snapshot. Equality is intentionally unsafe here.
-            if (meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ >= watermark) {
-                deleted_deferred_after[candidate_index] = meta.commit_ts_;
-            } else if (!(meta.is_committed_ && meta.commit_ts_ != INVALID_TS && meta.commit_ts_ < watermark)) {
-                deleted_requeue[candidate_index] = true;
-            }
-        }
-    }
-
-    if (!deleted_snapshot.empty()) {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        for (size_t i = 0; i < deleted_snapshot.size(); ++i) {
-            auto retired = deleted_snapshot[i];
-            if (deleted_requeue[i]) {
-                // Do not resurrect an entry removed by a concurrent foreground
-                // validation or by DROP TABLE while this batch touched pages.
-                auto table_it = deleted_tuple_candidates_.find(retired.tab_name);
-                if (table_it == deleted_tuple_candidates_.end()) {
-                    continue;
-                }
-                auto bucket_it = table_it->second.find(retired.row_key);
-                if (bucket_it == table_it->second.end()) {
-                    continue;
-                }
-                const bool still_current =
-                    std::any_of(bucket_it->second.begin(), bucket_it->second.end(), [&](const auto& current) {
-                        return current.candidate_id == retired.candidate.candidate_id &&
-                               current.writer_txn_id == retired.candidate.writer_txn_id &&
-                               current.version_chain_head == retired.candidate.version_chain_head;
-                    });
-                if (still_current) {
-                    retired.retry_after_watermark.reset();
-                    deleted_tuple_retire_queue_.push_back(retired);
-                }
-            } else if (deleted_deferred_after[i].has_value()) {
-                auto table_it = deleted_tuple_candidates_.find(retired.tab_name);
-                if (table_it == deleted_tuple_candidates_.end()) {
-                    continue;
-                }
-                auto bucket_it = table_it->second.find(retired.row_key);
-                if (bucket_it == table_it->second.end()) {
-                    continue;
-                }
-                const bool still_current =
-                    std::any_of(bucket_it->second.begin(), bucket_it->second.end(), [&](const auto& current) {
-                        return current.candidate_id == retired.candidate.candidate_id &&
-                               current.writer_txn_id == retired.candidate.writer_txn_id &&
-                               current.version_chain_head == retired.candidate.version_chain_head;
-                    });
-                if (still_current) {
-                    retired.retry_after_watermark = deleted_deferred_after[i];
-                    deleted_tuple_deferred_retire_queue_.push(std::move(retired));
-                }
-            } else {
-                erase_deleted_tuple_candidate_locked(retired.tab_name, retired.row_key, retired.candidate);
-            }
-        }
     }
 }
 
@@ -631,9 +278,9 @@ void SmManager::prune_version_history(timestamp_t watermark) {
  * @description: 显示所有的表,通过测试需要将其结果写入到output.txt,详情看题目文档
  * @param {Context*} context
  */
-void SmManager::show_tables(Context* context) {
-    const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
-                                         ? *context->output_file_enabled_
+void SmManager::show_tables(ExecutionOutput* output) {
+    const bool output_file_enabled = output != nullptr && output->output_file_enabled != nullptr
+                                         ? *output->output_file_enabled
                                          : output_file_enabled_;
     std::fstream outfile;
     if (output_file_enabled) {
@@ -641,33 +288,33 @@ void SmManager::show_tables(Context* context) {
         outfile << "| Tables |\n";
     }
     RecordPrinter printer(1);
-    printer.print_separator(context);
-    printer.print_record({"Tables"}, context);
-    printer.print_separator(context);
+    printer.print_separator(output);
+    printer.print_record({"Tables"}, output);
+    printer.print_separator(output);
     for (auto& entry : db_.tabs_) {
         auto& tab = entry.second;
-        printer.print_record({tab.name}, context);
+        printer.print_record({tab.name}, output);
         if (output_file_enabled) {
             outfile << "| " << tab.name << " |\n";
         }
     }
-    printer.print_separator(context);
+    printer.print_separator(output);
     if (output_file_enabled) {
         outfile.close();
     }
 }
 
-void SmManager::show_index(const std::string& tab_name, Context* context) {
+void SmManager::show_index(const std::string& tab_name, ExecutionOutput* output) {
     TabMeta& tab = db_.get_table(tab_name);
     std::vector<std::string> captions = {"Tables", "Type", "Column"};
     RecordPrinter printer(captions.size());
 
-    printer.print_separator(context);
-    printer.print_record(captions, context);
-    printer.print_separator(context);
+    printer.print_separator(output);
+    printer.print_record(captions, output);
+    printer.print_separator(output);
 
-    const bool output_file_enabled = context != nullptr && context->output_file_enabled_ != nullptr
-                                         ? *context->output_file_enabled_
+    const bool output_file_enabled = output != nullptr && output->output_file_enabled != nullptr
+                                         ? *output->output_file_enabled
                                          : output_file_enabled_;
     std::fstream outfile;
     if (output_file_enabled) {
@@ -695,13 +342,13 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
             outfile << ") |\n";
         }
 
-        printer.print_record({tab_name, "unique", cols}, context);
+        printer.print_record({tab_name, "unique", cols}, output);
     }
     if (output_file_enabled) {
         outfile.close();
     }
 
-    printer.print_separator(context);
+    printer.print_separator(output);
 }
 
 /**
@@ -709,22 +356,22 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
  * @param {string&} tab_name 表名称
  * @param {Context*} context
  */
-void SmManager::desc_table(const std::string& tab_name, Context* context) {
+void SmManager::desc_table(const std::string& tab_name, ExecutionOutput* output) {
     TabMeta& tab = db_.get_table(tab_name);
 
     std::vector<std::string> captions = {"Field", "Type", "Index"};
     RecordPrinter printer(captions.size());
     // Print header
-    printer.print_separator(context);
-    printer.print_record(captions, context);
-    printer.print_separator(context);
+    printer.print_separator(output);
+    printer.print_record(captions, output);
+    printer.print_separator(output);
     // Print fields
     for (auto& col : tab.cols) {
         std::vector<std::string> field_info = {col.name, coltype2str(col.type), col.index ? "YES" : "NO"};
-        printer.print_record(field_info, context);
+        printer.print_record(field_info, output);
     }
     // Print footer
-    printer.print_separator(context);
+    printer.print_separator(output);
 }
 
 /**
@@ -786,66 +433,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     table_runtime_ids_.erase(tab_name);
     flush_meta();
     bump_catalog_generation();
-    clear_table_runtime_history(tab_name);
-}
-
-void SmManager::clear_table_runtime_history(const std::string& tab_name) {
-    {
-        std::unique_lock<std::shared_mutex> lock(historical_index_keys_latch_);
-        for (auto it = historical_index_keys_.begin(); it != historical_index_keys_.end();) {
-            if (historical_bucket_belongs_to_table(it->first, tab_name)) {
-                it = historical_index_keys_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        historical_retire_queue_.erase(std::remove_if(historical_retire_queue_.begin(), historical_retire_queue_.end(),
-                                                      [&](const HistoricalRetireCandidate& candidate) {
-                                                          return historical_bucket_belongs_to_table(
-                                                              candidate.bucket_key, tab_name);
-                                                      }),
-                                       historical_retire_queue_.end());
-        for (auto it = historical_queued_generations_.begin(); it != historical_queued_generations_.end();) {
-            if (historical_bucket_belongs_to_table(it->bucket_key, tab_name)) {
-                it = historical_queued_generations_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        std::vector<HistoricalRetireCandidate> deferred;
-        while (!historical_deferred_retire_queue_.empty()) {
-            deferred.push_back(historical_deferred_retire_queue_.top());
-            historical_deferred_retire_queue_.pop();
-        }
-        for (const auto& candidate : deferred) {
-            if (!historical_bucket_belongs_to_table(candidate.bucket_key, tab_name)) {
-                historical_deferred_retire_queue_.push(candidate);
-            }
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(deleted_tuple_candidates_latch_);
-        auto table_it = deleted_tuple_candidates_.find(tab_name);
-        if (table_it != deleted_tuple_candidates_.end()) {
-            deleted_tuple_candidates_.erase(table_it);
-        }
-        deleted_tuple_retire_queue_.erase(std::remove_if(deleted_tuple_retire_queue_.begin(),
-                                                         deleted_tuple_retire_queue_.end(),
-                                                         [&](const DeletedTupleRetireCandidate& candidate) {
-                                                             return candidate.tab_name == tab_name;
-                                                         }),
-                                          deleted_tuple_retire_queue_.end());
-        std::vector<DeletedTupleRetireCandidate> deferred;
-        while (!deleted_tuple_deferred_retire_queue_.empty()) {
-            deferred.push_back(deleted_tuple_deferred_retire_queue_.top());
-            deleted_tuple_deferred_retire_queue_.pop();
-        }
-        for (const auto& candidate : deferred) {
-            if (candidate.tab_name != tab_name) {
-                deleted_tuple_deferred_retire_queue_.push(candidate);
-            }
-        }
-    }
+    version_history_->ClearTable(tab_name);
 }
 
 /**

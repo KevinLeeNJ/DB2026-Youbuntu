@@ -21,7 +21,8 @@ See the Mulan PSL v2 for more details. */
 #include "parser/ast.h"
 
 #include "parser/parser.h"
-#include "compiled_point_program.h"
+#include "system/sm.h"
+#include "execution/execution_defs.h"
 
 typedef enum PlanTag {
     T_Invalid = 1,
@@ -62,10 +63,7 @@ typedef enum PlanTag {
 class Plan {
 public:
     PlanTag tag;
-    size_t runtime_rows_ = 0;
-    // Non-owning catalog owner used only while compiling a generation-scoped
-    // PreparedPlanDescriptor. Runtime state must not be stored in a Plan.
-    SmManager* sm_manager_ = nullptr;
+    mutable size_t runtime_rows_ = 0;
     // Set when an index-backed child is configured to produce the requested
     // ORDER BY directly, so LIMIT can be pushed below the projection chain.
     bool order_satisfied_ = false;
@@ -78,7 +76,6 @@ public:
     ScanPlan(PlanTag tag, SmManager* sm_manager, std::string tab_name, std::vector<Condition> conds,
              std::vector<std::string> index_col_names) {
         Plan::tag = tag;
-        Plan::sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
         TabMeta& tab = sm_manager->db_.get_table(tab_name_);
@@ -219,11 +216,6 @@ public:
     std::vector<std::string> output_names_;
 };
 
-struct PointAccessPath {
-    std::vector<std::string> index_cols;
-    std::vector<size_t> condition_positions;
-};
-
 enum class UpdateExecutionMode {
     Mutating,
     LockOnlySelfAssignment,
@@ -236,9 +228,6 @@ public:
             std::vector<Condition> conds, std::vector<SetClause> set_clauses) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
-        if (subplan_ != nullptr) {
-            Plan::sm_manager_ = subplan_->sm_manager_;
-        }
         tab_name_ = std::move(tab_name);
         values_ = std::move(values);
         conds_ = std::move(conds);
@@ -252,7 +241,6 @@ public:
     std::vector<SetClause> set_clauses_;
     std::optional<PointAccessPath> point_access_;
     UpdateExecutionMode update_execution_mode_ = UpdateExecutionMode::Mutating;
-    CompiledPointProgramPtr compiled_point_program_;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;

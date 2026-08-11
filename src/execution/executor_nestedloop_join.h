@@ -15,7 +15,6 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 
 #include "execution_defs.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -54,9 +53,8 @@ private:
     std::vector<CompiledCondition> compiled_conds_;
     bool isend;
     std::unordered_map<std::string, std::vector<ColMeta>::iterator>
-        cols_map;                                  // 存储链接条件中涉及的列的偏移量和字段长度
-    TupleView current_left_view_{};                // 当前左表记录的 borrowed view
-    std::unique_ptr<RmRecord> current_left_owned_; // 仅兼容没有 current() 的旧 executor
+        cols_map;                   // 存储链接条件中涉及的列的偏移量和字段长度
+    TupleView current_left_view_{}; // 当前左表记录的 borrowed view
     Rid current_left_rid_{};
     std::unique_ptr<RmRecord> _buffered_record; // 复用的输出缓冲
     bool buffered_record_available_ = false;
@@ -259,7 +257,6 @@ private:
 
     void clear_current_left() {
         current_left_view_ = {};
-        current_left_owned_.reset();
     }
 
     bool load_current_left() {
@@ -269,11 +266,7 @@ private:
         }
         current_left_view_ = left_->current();
         if (!current_left_view_) {
-            current_left_owned_ = left_->Next();
-            if (current_left_owned_ != nullptr) {
-                current_left_view_ =
-                    TupleView{current_left_owned_->data, static_cast<uint32_t>(current_left_owned_->size)};
-            }
+            throw InternalError("cursor returned an empty tuple");
         }
         if (!current_left_view_) {
             return false;
@@ -426,19 +419,12 @@ public:
             // 用当前的左表记录，继续扫描右表
             while (true) {
                 if (right_->is_end()) {
-                    // Avoid invoking the compatibility Next() path after the
-                    // child has already reached its end marker.
                     advance_current_left();
                     break;
                 }
-                std::unique_ptr<RmRecord> fallback_right_record;
                 TupleView right_view = right_->current();
                 if (!right_view) {
-                    fallback_right_record = right_->Next();
-                    if (fallback_right_record != nullptr) {
-                        right_view =
-                            TupleView{fallback_right_record->data, static_cast<uint32_t>(fallback_right_record->size)};
-                    }
+                    throw InternalError("cursor returned an empty tuple");
                 }
                 if (right_->is_end() || !right_view) {
                     // 右表已为当前左表记录扫描完毕
@@ -464,19 +450,11 @@ public:
     /**
      * @brief 返回由 nextTuple() 准备好的记录，并触发下一次寻找。
      */
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || !buffered_record_available_ || _buffered_record == nullptr) {
-            return nullptr;
-        }
-        buffered_record_available_ = false;
-        return std::make_unique<RmRecord>(*_buffered_record);
-    }
+
     Rid& rid() override {
-        if (current_left_view_) {
-            return current_left_rid_;
-        }
         return _abstract_rid;
     }
+
     bool is_end() const override {
         return isend;
     }

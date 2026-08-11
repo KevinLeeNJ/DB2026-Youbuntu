@@ -40,13 +40,6 @@ public:
         prev_->nextTuple();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end()) {
-            return nullptr;
-        }
-        return prev_->Next();
-    }
-
     TupleView current() const override {
         if (is_end()) {
             return {};

@@ -11,13 +11,14 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <optional>
+#include <cstddef>
+#include <string>
+#include <vector>
 
 #include "defs.h"
 #include "errors.h"
 
-// A point DML target is intentionally distinct from the legacy vector-RID
-// constructor so braced vector arguments in existing callers remain unambiguous.
-struct PointMutationTarget {
-    std::optional<Rid> rid;
+struct PointAccessPath {
+    std::vector<std::string> index_cols;
+    std::vector<size_t> condition_positions;
 };

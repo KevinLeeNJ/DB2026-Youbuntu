@@ -1,3 +1,4 @@
+#include "execution/cursor_test_helper.h"
 /* Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -9,6 +10,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "execution/executor_insert.h"
+#include "execution/executor_seq_scan.h"
 #include "execution/executor_update.h"
 #include "index/ix.h"
 #include "record/rm.h"
@@ -87,17 +89,9 @@ protected:
     }
 
     void InsertRow(Transaction* txn, int id, int v) {
-        Context context(lock_mgr_.get(), log_mgr_.get(), txn, nullptr, &offset_, txn_mgr_.get());
+        Context context(lock_mgr_.get(), log_mgr_.get(), txn, txn_mgr_.get());
         InsertExecutor executor(sm_mgr_.get(), "t", {IntValue(id), IntValue(v)}, &context);
-        executor.Next();
-    }
-
-    std::vector<Rid> ScanRids() {
-        std::vector<Rid> rids;
-        for (RmScan scan(sm_mgr_->fhs_.at("t").get()); !scan.is_end(); scan.next()) {
-            rids.push_back(scan.rid());
-        }
-        return rids;
+        CopyCurrentTuple(executor);
     }
 
     int offset_{0};
@@ -148,11 +142,14 @@ TEST_F(UniqueKeyConflictTest, UpdateIntoExistingKeyInTransactionAborts) {
     txn_mgr_->commit(writer, log_mgr_.get());
 
     Transaction* loser = BeginExplicit();
-    Context context(lock_mgr_.get(), log_mgr_.get(), loser, nullptr, &offset_, txn_mgr_.get());
+    Context context(lock_mgr_.get(), log_mgr_.get(), loser, txn_mgr_.get());
     SetClause set_clause;
     set_clause.lhs = TabCol{"t", "id"};
     set_clause.rhs = IntValue(2);
-    UpdateExecutor update_executor(sm_mgr_.get(), "t", {set_clause}, {}, ScanRids(), &context);
-    EXPECT_THROW(update_executor.Next(), TransactionAbortException);
+    UpdateExecutor update_executor(
+        sm_mgr_.get(), "t", {set_clause}, {},
+        std::make_unique<SeqScanExecutor>(sm_mgr_.get(), "t", std::vector<Condition>{}, &context), std::nullopt,
+        UpdateExecutionMode::Mutating, &context);
+    EXPECT_THROW(CopyCurrentTuple(update_executor), TransactionAbortException);
     txn_mgr_->abort(loser, log_mgr_.get());
 }

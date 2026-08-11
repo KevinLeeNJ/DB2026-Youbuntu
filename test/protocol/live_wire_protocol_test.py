@@ -310,10 +310,10 @@ class Server:
             "rmdb never passed Wire SQL readiness: " + str(last_error)
         )
 
-    def stop(self, crash=False):
+    def stop(self, crash=False, stop_signal=signal.SIGINT):
         if self.process is None or self.process.poll() is not None:
             return
-        os.killpg(self.process.pid, signal.SIGKILL if crash else signal.SIGINT)
+        os.killpg(self.process.pid, signal.SIGKILL if crash else stop_signal)
         try:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -375,7 +375,7 @@ def test_stream_prepare_float_and_auto_abort(port):
             9,
             False,
             [FLOAT32, INT32, INT32],
-            "UPDATE stock SET s_ytd = s_ytd / $1 WHERE s_w_id = $2 AND s_i_id = $3;",
+            "UPDATE stock SET s_ytd = s_ytd + $1 WHERE s_w_id = $2 AND s_i_id = $3;",
         ),
     ]
     schemas = client.prepare(statements)
@@ -437,7 +437,7 @@ def test_stream_prepare_float_and_auto_abort(port):
     )
 
     executed, status, failed, diagnostic, results = client.batch(
-        [(7, []), (8, [0x3F800000, 1, 2]), (9, [0, 1, 2])], parameter_types, schemas
+        [(7, []), (8, [0x3F800000, 1, 2]), (9, [0x7FC00000, 1, 2])], parameter_types, schemas
     )
     require(
         executed == 2 and status == 2 and failed == 2 and results == [],
@@ -448,6 +448,13 @@ def test_stream_prepare_float_and_auto_abort(port):
     require(
         rows == [[0x3FA00000]],
         "AUTO_ABORT did not roll back the preceding prepared update",
+    )
+    executed, status, failed, diagnostic, results = client.batch(
+        [(2, [0x3F800000, 1, 2])], parameter_types, schemas
+    )
+    require(
+        (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", []),
+        "AUTO_ABORT did not clear the explicit transaction before the next operation",
     )
     client.close()
 
@@ -582,6 +589,47 @@ def test_prepared_and_explicit_transaction_ddl_rejection(port):
         client.close()
 
 
+def test_prepared_transaction_end_commands_share_wire_lifecycle(port):
+    client = WireClient(port)
+    try:
+        client.command("CREATE TABLE prepared_txn_end_probe (id INT);")
+        statements = [
+            (212, False, [], "BEGIN;"),
+            (213, False, [], "INSERT INTO prepared_txn_end_probe VALUES (1);"),
+            (214, False, [], "COMMIT;"),
+            (215, False, [], "INSERT INTO prepared_txn_end_probe VALUES (2);"),
+            (216, False, [], "ROLLBACK;"),
+            (217, False, [], "INSERT INTO prepared_txn_end_probe VALUES (3);"),
+            (218, False, [], "INSERT INTO prepared_txn_end_probe VALUES (4);"),
+            (219, False, [], "ABORT;"),
+            (220, False, [], "INSERT INTO prepared_txn_end_probe VALUES (5);"),
+        ]
+        parameter_types = {statement_id: [] for statement_id, _, _, _ in statements}
+        schemas = client.prepare(statements)
+
+        def run(operations, message):
+            result = client.batch(operations, parameter_types, schemas)
+            require(result == (len(operations), 0, 0xFFFF, "", []), message)
+
+        run([(212, []), (213, []), (214, [])], "prepared COMMIT batch failed")
+        _, rows = client.query("SELECT id FROM prepared_txn_end_probe WHERE id = 1;")
+        require(rows == [[1]], "prepared COMMIT did not persist its write")
+
+        run([(212, []), (215, []), (216, [])], "prepared ROLLBACK batch failed")
+        _, rows = client.query("SELECT id FROM prepared_txn_end_probe WHERE id = 2;")
+        require(rows == [], "prepared ROLLBACK did not discard its write")
+        run([(212, []), (217, []), (214, [])], "connection was not reusable after prepared ROLLBACK")
+
+        run([(212, []), (218, []), (219, [])], "prepared ABORT batch failed")
+        _, rows = client.query("SELECT id FROM prepared_txn_end_probe WHERE id = 4;")
+        require(rows == [], "prepared ABORT did not discard its write")
+        run([(220, [])], "connection was not reusable after prepared ABORT")
+        _, rows = client.query("SELECT id FROM prepared_txn_end_probe WHERE id = 5;")
+        require(rows == [[5]], "connection was not reusable after prepared ABORT")
+    finally:
+        client.close()
+
+
 def test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server):
     client = WireClient(server.port)
     try:
@@ -630,6 +678,10 @@ def test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server):
         ]
         fallback_parameter_types = {221: [INT32]}
         fallback_schemas = client.prepare(fallback_statements)
+        _, rows = client.query(
+            "SELECT value FROM compiled_fallback_probe WHERE id = 2;"
+        )
+        require(rows == [[20]], "PREPARE_SET executed unsupported DELETE")
         executed, status, failed, diagnostic, results = client.batch(
             [(221, [2])], fallback_parameter_types, fallback_schemas
         )
@@ -644,6 +696,29 @@ def test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server):
 
     finally:
         client.close()
+
+
+def test_prepared_revalidation_switches_to_generic_fallback_after_index_change(server):
+    client_a = WireClient(server.port)
+    client_b = WireClient(server.port)
+    try:
+        client_a.command("CREATE TABLE prepared_revalidate_probe (a INT, b INT, value INT);")
+        client_a.command("INSERT INTO prepared_revalidate_probe VALUES (1, 7, 10);")
+        client_a.command("INSERT INTO prepared_revalidate_probe VALUES (2, 7, 20);")
+        statements = [(240, True, [INT32], "SELECT value FROM prepared_revalidate_probe WHERE b = $1;")]
+        schemas = client_a.prepare(statements)
+        parameter_types = {240: [INT32]}
+        client_b.command("CREATE INDEX prepared_revalidate_probe(a, b);")
+        executed, status, failed, diagnostic, results = client_a.batch(
+            [(240, [7])], parameter_types, schemas
+        )
+        require(
+            (executed, status, failed, diagnostic, results) == (1, 0, 0xFFFF, "", [(0, [[10], [20]])]),
+            "revalidated prepared SELECT did not use its generic fallback after composite index planning changed",
+        )
+    finally:
+        client_a.close()
+        client_b.close()
 
 
 def test_snapshot_write_conflict(port):
@@ -1284,18 +1359,74 @@ def test_unique_index_auto_abort_then_sigkill_has_no_residue(server):
         verifier.close()
 
 
+def test_sigint_drains_connected_client_and_restarts(server):
+    client = WireClient(server.port)
+    try:
+        server.stop()
+        require(
+            server.process.poll() is not None,
+            "SIGINT did not stop server while a client was connected",
+        )
+        client.sock.settimeout(2)
+        try:
+            require(client.sock.recv(1) == b"", "SIGINT left connected client socket open")
+        except OSError:
+            pass
+    finally:
+        client.close()
+
+    server.start()
+    verifier = WireClient(server.port)
+    try:
+        verifier.readiness_probe()
+    finally:
+        verifier.close()
+
+
+def test_connection_churn_then_sigterm_restarts(server):
+    for _ in range(64):
+        client = WireClient(server.port)
+        try:
+            client.readiness_probe()
+        finally:
+            client.close()
+
+    client = WireClient(server.port)
+    try:
+        server.stop(stop_signal=signal.SIGTERM)
+        require(
+            server.process.poll() is not None,
+            "SIGTERM did not stop server after connection churn",
+        )
+        client.sock.settimeout(2)
+        require(client.sock.recv(1) == b"", "SIGTERM left connected client socket open")
+    finally:
+        client.close()
+
+    server.start()
+    verifier = WireClient(server.port)
+    try:
+        verifier.readiness_probe()
+    finally:
+        verifier.close()
+
+
 def main():
     require(len(sys.argv) == 2, "usage: live_wire_protocol_test.py <rmdb-binary>")
     server = Server(sys.argv[1])
     try:
         server.start()
+        test_sigint_drains_connected_client_and_restarts(server)
+        test_connection_churn_then_sigterm_restarts(server)
         test_stream_prepare_float_and_auto_abort(server.port)
         test_batch_result_payload_limit_rolls_back_without_partial_results(
             server.port
         )
         test_prepared_select_fast_route(server)
         test_prepared_and_explicit_transaction_ddl_rejection(server.port)
+        test_prepared_transaction_end_commands_share_wire_lifecycle(server.port)
         test_prepared_update_is_cold_hot_and_unsupported_shape_falls_back(server)
+        test_prepared_revalidation_switches_to_generic_fallback_after_index_change(server)
         test_snapshot_write_conflict(server.port)
         test_active_snapshot_delete_conflict_aborts_immediately(server.port)
         test_prepared_snapshot_write_conflict(server)

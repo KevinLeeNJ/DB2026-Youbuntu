@@ -89,8 +89,6 @@ static_assert(std::is_same_v<decltype(std::declval<const PreparedPlanDescriptor&
 static_assert(std::is_same_v<decltype(std::declval<const PreparedPlanDescriptor&>().dml_plan()), const DMLPlan*>);
 static_assert(std::is_same_v<decltype(std::declval<const PreparedPlanDescriptor&>().parameter_layout()),
                              const std::vector<PreparedParameterSlot>&>);
-static_assert(std::is_same_v<decltype(std::declval<const PreparedPlanDescriptor&>().insert_executable()),
-                             const PreparedInsertExecutable*>);
 static_assert(
     std::is_same_v<decltype(PreparedPlanDescriptor::Build(nullptr, PreparedStatementKind::Select, {}, {}, "", 0)),
                    std::unique_ptr<const PreparedPlanDescriptor>>);
@@ -220,9 +218,8 @@ TEST_F(PreparedPlanDescriptorTest, insert_preserves_values_and_collects_repeated
     EXPECT_EQ(descriptor->dml_plan()->tab_name_, "items");
     ASSERT_EQ(descriptor->dml_plan()->values_.size(), 3);
     EXPECT_EQ(descriptor->dml_plan()->values_[2].parameter_ordinal, 1);
-    // Synthetic descriptors without open generation-scoped handles retain the
-    // existing generic prepared runtime instead of caching invalid pointers.
-    EXPECT_EQ(descriptor->insert_executable(), nullptr);
+    // A descriptor owns only the immutable generic plan and parameter layout.
+    EXPECT_NE(descriptor->dml_plan(), nullptr);
 }
 
 TEST_F(PreparedPlanDescriptorTest, update_collects_conditions_self_reference_and_additional_terms) {

@@ -262,10 +262,10 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
     // This is an exact physical-row bucket lookup. The returned vector is a
     // copy, so neither page access nor transaction work is ever performed
     // while SmManager's candidate latch is held.
-    auto candidates = sm_manager->get_deleted_tuple_candidates(tab_name, inserted_rec);
+    auto candidates = sm_manager->version_history().get_deleted_tuple_candidates(tab_name, inserted_rec);
     for (const auto& candidate : candidates) {
         if (!fh->is_record(candidate.rid)) {
-            sm_manager->remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
+            sm_manager->version_history().remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
             continue;
         }
 
@@ -274,7 +274,7 @@ inline bool DeletedTupleCandidatesConflictWithInsert(RmFileHandle* fh, SmManager
         // a reused RID or a later delete cannot be removed by an old lookup.
         if (!meta.is_deleted_ || meta.writer_txn_id_ != candidate.writer_txn_id ||
             meta.version_chain_head_ != candidate.version_chain_head) {
-            sm_manager->remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
+            sm_manager->version_history().remove_deleted_tuple_candidate_if_current(tab_name, inserted_rec, candidate);
             continue;
         }
         if (meta.writer_txn_id_ == txn->get_transaction_id()) {

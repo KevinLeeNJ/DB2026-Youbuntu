@@ -226,30 +226,6 @@ void append_cache_key_part(std::string& key, bool value) {
     append_cache_key_part(key, std::string(value ? "1" : "0"));
 }
 
-void append_set_clause_shape(std::string& key, const SetClause& set_clause) {
-    append_cache_key_part(key, set_clause.lhs.tab_name);
-    append_cache_key_part(key, set_clause.lhs.col_name);
-    append_cache_key_part(key, set_clause.is_self_ref);
-    append_cache_key_part(key, static_cast<int>(set_clause.op));
-    if (set_clause.is_self_ref) {
-        append_cache_key_part(key, set_clause.rhs_col.tab_name);
-        append_cache_key_part(key, set_clause.rhs_col.col_name);
-        if (set_clause.op != UpdateOp::ASSIGNMENT) {
-            append_cache_key_part(key, set_clause.rhs.is_null);
-            append_cache_key_part(key, static_cast<int>(set_clause.rhs.type));
-        }
-    } else {
-        append_cache_key_part(key, set_clause.rhs.is_null);
-        append_cache_key_part(key, static_cast<int>(set_clause.rhs.type));
-    }
-    append_cache_key_part(key, static_cast<int>(set_clause.additional_terms.size()));
-    for (const auto& term : set_clause.additional_terms) {
-        append_cache_key_part(key, static_cast<int>(term.op));
-        append_cache_key_part(key, term.rhs.is_null);
-        append_cache_key_part(key, static_cast<int>(term.rhs.type));
-    }
-}
-
 void append_tab_col_shape(std::string& key, const TabCol& col) {
     append_cache_key_part(key, col.tab_name);
     append_cache_key_part(key, col.col_name);
@@ -1197,126 +1173,6 @@ std::unique_ptr<Plan> Planner::instantiate_physical_plan(const Query& query,
     return joined;
 }
 
-std::string Planner::make_point_program_cache_key(PointProgramKind kind, const std::string& tab_name,
-                                                  const PointAccessPath& point_access,
-                                                  const std::vector<Condition>& conditions,
-                                                  const std::vector<SetClause>& set_clauses,
-                                                  std::uint64_t catalog_generation) const {
-    std::string key;
-    append_cache_key_part(key, std::string("compiled-point-v1"));
-    append_cache_key_part(key, static_cast<int>(kind));
-    append_cache_key_part(key, std::to_string(catalog_generation));
-    append_cache_key_part(key, tab_name);
-    append_cache_key_part(key, static_cast<int>(point_access.index_cols.size()));
-    for (const auto& index_col : point_access.index_cols) {
-        append_cache_key_part(key, index_col);
-    }
-    // key_condition_positions refer to the analyzed condition vector. Keep
-    // condition order in v1; a different AND order is a safe cache miss.
-    append_cache_key_part(key, static_cast<int>(conditions.size()));
-    for (const auto& condition : conditions) {
-        append_cache_key_part(key, condition_shape_key(condition));
-    }
-    append_cache_key_part(key, static_cast<int>(set_clauses.size()));
-    for (const auto& set_clause : set_clauses) {
-        append_set_clause_shape(key, set_clause);
-    }
-    return key;
-}
-
-CompiledPointProgramPtr Planner::build_compiled_point_program(PointProgramKind kind, const std::string& tab_name,
-                                                              const PointAccessPath& point_access,
-                                                              const std::vector<Condition>& conditions,
-                                                              const std::vector<SetClause>& set_clauses,
-                                                              std::uint64_t catalog_generation) const {
-    auto program = std::make_shared<CompiledPointProgram>();
-    program->kind = kind;
-    program->catalog_generation = catalog_generation;
-    program->table_name = tab_name;
-    program->index_col_names = point_access.index_cols;
-    program->key_condition_positions = point_access.condition_positions;
-    program->conditions.reserve(conditions.size());
-    for (const auto& condition : conditions) {
-        program->conditions.push_back(CompiledCondition{condition.lhs_col, condition.op, condition.is_rhs_val,
-                                                        condition.rhs_col,
-                                                        condition.is_rhs_val ? condition.rhs_val.type : TYPE_INT});
-    }
-    program->set_ops.reserve(set_clauses.size());
-    for (const auto& set_clause : set_clauses) {
-        CompiledSetOp compiled{set_clause.lhs,
-                               set_clause.is_self_ref,
-                               set_clause.rhs_col,
-                               set_clause.op,
-                               set_clause.is_self_ref && set_clause.op == UpdateOp::ASSIGNMENT ? TYPE_INT
-                                                                                               : set_clause.rhs.type,
-                               {}};
-        compiled.additional_terms.reserve(set_clause.additional_terms.size());
-        for (const auto& term : set_clause.additional_terms) {
-            compiled.additional_terms.emplace_back(term.op, term.rhs.type);
-        }
-        program->set_ops.push_back(std::move(compiled));
-    }
-    return program;
-}
-
-std::optional<CompiledPointProgramPtr> Planner::find_compiled_point_program(const std::string& key,
-                                                                            std::uint64_t catalog_generation) {
-    std::unique_lock<std::shared_mutex> lock(point_program_cache_latch_);
-    if (point_program_cache_generation_ != catalog_generation) {
-        point_program_cache_.clear();
-        point_program_cache_lru_.clear();
-        point_program_cache_generation_ = catalog_generation;
-        return std::nullopt;
-    }
-    auto cache_pos = point_program_cache_.find(key);
-    if (cache_pos == point_program_cache_.end()) {
-        return std::nullopt;
-    }
-    point_program_cache_lru_.splice(point_program_cache_lru_.begin(), point_program_cache_lru_,
-                                    cache_pos->second.lru_position);
-    cache_pos->second.lru_position = point_program_cache_lru_.begin();
-    point_program_cache_hits_.fetch_add(1, std::memory_order_relaxed);
-    return cache_pos->second.program;
-}
-
-void Planner::cache_compiled_point_program(std::string key, std::uint64_t catalog_generation,
-                                           CompiledPointProgramPtr program) {
-    if (program == nullptr || sm_manager_->get_catalog_generation() != catalog_generation) {
-        return;
-    }
-
-    std::unique_lock<std::shared_mutex> lock(point_program_cache_latch_);
-    if (point_program_cache_generation_ != catalog_generation) {
-        point_program_cache_.clear();
-        point_program_cache_lru_.clear();
-        point_program_cache_generation_ = catalog_generation;
-    }
-
-    auto cache_pos = point_program_cache_.find(key);
-    if (cache_pos != point_program_cache_.end()) {
-        cache_pos->second.program = std::move(program);
-        point_program_cache_lru_.splice(point_program_cache_lru_.begin(), point_program_cache_lru_,
-                                        cache_pos->second.lru_position);
-        cache_pos->second.lru_position = point_program_cache_lru_.begin();
-        return;
-    }
-
-    point_program_cache_lru_.push_front(key);
-    auto lru_position = point_program_cache_lru_.begin();
-    try {
-        point_program_cache_.emplace(std::move(key), PointProgramCacheEntry{std::move(program), lru_position});
-    } catch (...) {
-        point_program_cache_lru_.pop_front();
-        throw;
-    }
-
-    while (point_program_cache_.size() > kCompiledPointProgramCacheCapacity) {
-        auto oldest = std::prev(point_program_cache_lru_.end());
-        point_program_cache_.erase(*oldest);
-        point_program_cache_lru_.pop_back();
-    }
-}
-
 std::optional<std::shared_ptr<const Planner::PhysicalPlanTemplate>>
 Planner::find_physical_plan_template(const std::string& key, std::uint64_t catalog_generation) {
     std::unique_lock<std::shared_mutex> lock(physical_plan_cache_latch_);
@@ -1489,11 +1345,6 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     if (parse == nullptr) {
         throw InternalError("Unexpected null AST root");
     }
-    const bool point_program_cache_eligible =
-        context == nullptr ||
-        (!context->preparing_statement_ &&
-         (context->txn_ == nullptr ? context->isolation_level_ == IsolationLevel::READ_COMMITTED
-                                   : context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED));
     switch (parse->type) {
     case ast::AstType::CreateTable: {
         auto x = static_cast<const ast::CreateTable*>(parse);
@@ -1553,35 +1404,12 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         // choose_scan_plan_tag may reorder equality predicates to match the
         // index column order; compile against this final condition vector.
         std::optional<PointAccessPath> point_access = find_point_access_path(sm_manager_, x->tab_name, query->conds);
-        CompiledPointProgramPtr compiled_program;
-        bool compiled_hit = false;
-        if (point_program_cache_eligible && point_access.has_value()) {
-            const auto catalog_generation = sm_manager_->get_catalog_generation();
-            const auto cache_key = make_point_program_cache_key(PointProgramKind::Delete, x->tab_name, *point_access,
-                                                                query->conds, query->set_clauses, catalog_generation);
-            auto cached = find_compiled_point_program(cache_key, catalog_generation);
-            if (cached.has_value() && cached.value() != nullptr) {
-                compiled_program = cached.value();
-                compiled_hit = true;
-            } else {
-                point_program_cache_misses_.fetch_add(1, std::memory_order_relaxed);
-                cache_compiled_point_program(cache_key, catalog_generation,
-                                             build_compiled_point_program(PointProgramKind::Delete, x->tab_name,
-                                                                          *point_access, query->conds,
-                                                                          query->set_clauses, catalog_generation));
-            }
-        }
-
-        if (!compiled_hit) {
-            // Cache misses intentionally use the existing scan-plan path.
-            table_scan_executors =
-                std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
-        }
+        table_scan_executors =
+            std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
 
         auto dml = std::make_unique<DMLPlan>(T_Delete, std::move(table_scan_executors), x->tab_name,
                                              std::vector<Value>(), query->conds, std::vector<SetClause>());
         dml->point_access_ = std::move(point_access);
-        dml->compiled_point_program_ = std::move(compiled_program);
         plannerRoot = std::move(dml);
         break;
     }
@@ -1596,37 +1424,14 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
             index_col_names.clear();
         }
         std::optional<PointAccessPath> point_access = find_point_access_path(sm_manager_, x->tab_name, query->conds);
-        CompiledPointProgramPtr compiled_program;
-        bool compiled_hit = false;
-        if (point_program_cache_eligible && point_access.has_value()) {
-            const auto catalog_generation = sm_manager_->get_catalog_generation();
-            const auto cache_key = make_point_program_cache_key(PointProgramKind::Update, x->tab_name, *point_access,
-                                                                query->conds, query->set_clauses, catalog_generation);
-            auto cached = find_compiled_point_program(cache_key, catalog_generation);
-            if (cached.has_value() && cached.value() != nullptr) {
-                compiled_program = cached.value();
-                compiled_hit = true;
-            } else {
-                point_program_cache_misses_.fetch_add(1, std::memory_order_relaxed);
-                cache_compiled_point_program(cache_key, catalog_generation,
-                                             build_compiled_point_program(PointProgramKind::Update, x->tab_name,
-                                                                          *point_access, query->conds,
-                                                                          query->set_clauses, catalog_generation));
-            }
-        }
-
-        if (!compiled_hit) {
-            // Cache misses intentionally use the existing scan-plan path.
-            table_scan_executors =
-                std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
-        }
+        table_scan_executors =
+            std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         auto dml = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
                                              std::vector<Value>(), query->conds, query->set_clauses);
         if (is_lock_only_self_assignment_update(x->tab_name, query->set_clauses, point_access)) {
             dml->update_execution_mode_ = UpdateExecutionMode::LockOnlySelfAssignment;
         }
         dml->point_access_ = std::move(point_access);
-        dml->compiled_point_program_ = std::move(compiled_program);
         plannerRoot = std::move(dml);
         break;
     }
@@ -1652,9 +1457,6 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     }
     default:
         throw InternalError("Unexpected AST root");
-    }
-    if (plannerRoot != nullptr) {
-        plannerRoot->sm_manager_ = sm_manager_;
     }
     return plannerRoot;
 }

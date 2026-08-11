@@ -59,6 +59,26 @@ const ColMeta& FindColumn(const TabMeta& tab, const TabCol& target) {
     throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
 }
 
+void WritePointKeyPart(char* dest, const Value& value, const ColMeta& col) {
+    std::memset(dest, 0, col.len);
+    switch (col.type) {
+    case TYPE_INT: {
+        const int converted = value.type == TYPE_FLOAT ? static_cast<int>(value.float_val) : value.int_val;
+        std::memcpy(dest, &converted, col.len);
+        break;
+    }
+    case TYPE_FLOAT: {
+        const float converted = value.type == TYPE_INT ? static_cast<float>(value.int_val) : value.float_val;
+        write_float(dest, converted);
+        break;
+    }
+    case TYPE_STRING:
+    case TYPE_DATETIME:
+        std::memcpy(dest, value.str_val.data(), std::min(static_cast<size_t>(col.len), value.str_val.size()));
+        break;
+    }
+}
+
 BoundMutationColumn BindColumn(const ColMeta& col) {
     return BoundMutationColumn{static_cast<uint32_t>(col.offset), static_cast<uint32_t>(col.len), col.type,
                                col.null_byte, col.null_mask};
@@ -374,7 +394,8 @@ void ApplyUpdate(RmRecord& record, const RmRecord& old_record, const UpdateRunti
 void CheckHistoricalIndexConflicts(const RowMutationRuntimeInfo& info, const RowMutationIndex& index,
                                    const std::vector<char>& key, const Rid& rid, Context* context) {
     auto* txn = context == nullptr ? nullptr : context->txn_;
-    for (const auto& candidate_rid : info.sm_manager->get_historical_index_key_rids(*info.tab_name, index.name, key)) {
+    for (const auto& candidate_rid :
+         info.sm_manager->version_history().get_historical_index_key_rids(*info.tab_name, index.name, key)) {
         if (candidate_rid != rid &&
             HistoricalIndexKeyConflictsWithTxn(info.fh, candidate_rid, *index.meta, key, context)) {
             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WW_CONFLICT);
@@ -401,6 +422,68 @@ void RollbackIndexUpdates(const std::vector<std::pair<const RowMutationIndex*, s
 }
 
 } // namespace
+
+PointTargetLookup ResolvePointMutationTarget(SmManager& sm_manager, const std::string& tab_name,
+                                             const std::vector<Condition>& conditions, const PointAccessPath& path,
+                                             Context* context) {
+    const IsolationLevel isolation_level =
+        context == nullptr
+            ? IsolationLevel::READ_COMMITTED
+            : (context->txn_ == nullptr ? context->isolation_level_ : context->txn_->get_isolation_level());
+    if (isolation_level != IsolationLevel::READ_COMMITTED) {
+        return {};
+    }
+
+    auto& table = sm_manager.db_.get_table(tab_name);
+    const auto index_it = table.get_index_meta(path.index_cols);
+    if (index_it == table.indexes.end() || path.condition_positions.size() != index_it->cols.size()) {
+        return {};
+    }
+    const IndexMeta& index = *index_it;
+    const std::string index_name = sm_manager.get_ix_manager()->get_index_name(tab_name, index.cols);
+    const auto handle_it = sm_manager.ihs_.find(index_name);
+    if (handle_it == sm_manager.ihs_.end()) {
+        return {};
+    }
+
+    std::vector<char> key(index.col_tot_len);
+    int key_offset = 0;
+    for (size_t i = 0; i < index.cols.size(); ++i) {
+        const size_t condition_index = path.condition_positions[i];
+        if (condition_index >= conditions.size()) {
+            return {};
+        }
+        const Condition& condition = conditions[condition_index];
+        if (!condition.is_rhs_val || condition.null_test != NullTest::NONE || condition.op != OP_EQ ||
+            condition.rhs_val.is_null || condition.lhs_col.tab_name != tab_name ||
+            condition.lhs_col.col_name != index.cols[i].name) {
+            return {};
+        }
+        WritePointKeyPart(key.data() + key_offset, condition.rhs_val, index.cols[i]);
+        key_offset += index.cols[i].len;
+    }
+
+    const auto lookup = handle_it->second->lookup_unique(key.data());
+    if (lookup.status == UniqueLookupStatus::Duplicate) {
+        return {};
+    }
+    std::optional<Rid> target;
+    if (lookup.status == UniqueLookupStatus::Unique) {
+        target = lookup.rid;
+    }
+    if (context != nullptr && context->txn_ != nullptr && context->txn_mgr_ != nullptr &&
+        sm_manager.version_history().has_historical_index_keys(tab_name, index_name)) {
+        for (const Rid& historical :
+             sm_manager.version_history().get_historical_index_key_rids(tab_name, index_name, key)) {
+            if (target.has_value() && *target != historical) {
+                return {};
+            }
+            target = historical;
+        }
+    }
+    return target.has_value() ? PointTargetLookup{PointTargetLookupKind::ExactRid, target}
+                              : PointTargetLookup{PointTargetLookupKind::ExactNoMatch, std::nullopt};
+}
 
 std::vector<BoundMutationCondition> BindMutationConditions(const TabMeta& tab,
                                                            const std::vector<Condition>& conditions) {
@@ -533,8 +616,8 @@ bool RowMutationEngine::UpdateOne(const Rid& rid, RmRecord& visible_record, cons
     }
     try {
         for (const auto& update : index_updates) {
-            info.sm_manager->remember_historical_index_key(*info.tab_name, update.index->name, update.old_key, rid,
-                                                           *update.index->meta);
+            info.sm_manager->version_history().remember_historical_index_key(*info.tab_name, update.index->name,
+                                                                             update.old_key, rid, *update.index->meta);
             update.index->handle->delete_entry(update.old_key.data(), rid, *wal_context);
             deleted.emplace_back(update.index, update.old_key);
             update.index->handle->insert_entry(update.new_key.data(), rid, *wal_context);
@@ -618,7 +701,8 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         // Publish the exact physical row key only after the tombstone is
         // visible. INSERT copies this small bucket under the candidate latch
         // and performs all page access after releasing it.
-        info.sm_manager->remember_deleted_tuple_candidate(*info.tab_name, rid, visible_record, tombstone);
+        info.sm_manager->version_history().remember_deleted_tuple_candidate(*info.tab_name, rid, visible_record,
+                                                                            tombstone);
 
         std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
         std::optional<IndexWriteWalContext> wal_context;
@@ -629,8 +713,8 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
             for (const auto& delete_entry : index_deletes) {
                 // GC may observe this history entry only after the tombstone
                 // above is visible, so an active delete always requeues it.
-                info.sm_manager->remember_historical_index_key(*info.tab_name, delete_entry.index->name,
-                                                               delete_entry.key, rid, *delete_entry.index->meta);
+                info.sm_manager->version_history().remember_historical_index_key(
+                    *info.tab_name, delete_entry.index->name, delete_entry.key, rid, *delete_entry.index->meta);
                 delete_entry.index->handle->delete_entry(delete_entry.key.data(), rid, *wal_context);
                 deleted.emplace_back(delete_entry.index, delete_entry.key);
             }
@@ -649,8 +733,8 @@ bool RowMutationEngine::DeleteOne(const Rid& rid, RmRecord& visible_record, cons
         std::vector<std::pair<const RowMutationIndex*, std::vector<char>>> deleted;
         try {
             for (const auto& delete_entry : index_deletes) {
-                info.sm_manager->remember_historical_index_key(*info.tab_name, delete_entry.index->name,
-                                                               delete_entry.key, rid, *delete_entry.index->meta);
+                info.sm_manager->version_history().remember_historical_index_key(
+                    *info.tab_name, delete_entry.index->name, delete_entry.key, rid, *delete_entry.index->meta);
                 delete_entry.index->handle->delete_entry(delete_entry.key.data(), rid, *wal_context);
                 deleted.emplace_back(delete_entry.index, delete_entry.key);
             }

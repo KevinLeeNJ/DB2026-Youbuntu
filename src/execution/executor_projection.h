@@ -13,7 +13,6 @@ See the Mulan PSL v2 for more details. */
 #include <type_traits>
 
 #include "execution_defs.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -26,7 +25,6 @@ private:
     size_t data_len_ = 0;                    // 输出元组数据区长度，即 null bitmap 的起始偏移
     std::vector<size_t> sel_idxs_;
     std::unique_ptr<RmRecord> current_output_;
-    std::unique_ptr<RmRecord> fallback_input_;
     TupleView current_view_;
 
     // 投影会重新打包元组，所以输出的 null bitmap 也要重排：输出列 i 的 NULL 位
@@ -180,30 +178,12 @@ public:
         materialize_current();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
-        if (prev_->is_end()) {
-            return nullptr; // 如果儿子节点已经结束，则返回nullptr
-        }
-        if (!current_view_) {
-            fallback_input_ = prev_->Next();
-            if (!fallback_input_) {
-                return nullptr;
-            }
-            if (!materialize_view(TupleView{fallback_input_->data, static_cast<uint32_t>(fallback_input_->size)})) {
-                return nullptr;
-            }
-        }
-        auto copy = std::make_unique<RmRecord>(static_cast<int>(current_view_.size));
-        std::memcpy(copy->data, current_view_.data, current_view_.size);
-        return copy;
-    }
-
     Rid& rid() override {
         return _abstract_rid;
     }
 
     bool is_end() const override {
-        return prev_->is_end(); // 判断儿子节点是否结束
+        return prev_->is_end();
     }
 
     TupleView current() const override {

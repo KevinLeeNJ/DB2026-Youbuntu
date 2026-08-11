@@ -1,3 +1,4 @@
+#include "execution/cursor_test_helper.h"
 /* Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -12,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include "recovery/index_smo_log.h"
 #include "execution/executor_delete.h"
 #include "execution/executor_insert.h"
+#include "execution/executor_seq_scan.h"
 #include "execution/executor_update.h"
 #include "index/ix.h"
 #include "record/rm.h"
@@ -839,8 +841,7 @@ TEST(LogManagerTest, BeginOnlyAbortSkipsWalWriteAndReleasesLocks) {
     LockAcquireResult lock_result = LockAcquireResult::Value::Granted;
     std::thread waiter([&] { lock_result = lock_mgr.lock_exclusive_on_record(txn, rid, 42); });
     const auto enqueue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!lock_mgr.has_record_waiters_for_test() &&
-           std::chrono::steady_clock::now() < enqueue_deadline) {
+    while (!lock_mgr.has_record_waiters_for_test() && std::chrono::steady_clock::now() < enqueue_deadline) {
         std::this_thread::yield();
     }
     if (!lock_mgr.has_record_waiters_for_test()) {
@@ -940,23 +941,23 @@ TEST(LogManagerTest, SecondIndexConflictWithEmptyWriteSetPersistsAbortWal) {
     Transaction* seed_txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
     seed_txn->set_txn_mode(true);
     int seed_offset = 0;
-    Context seed_context(&lock_mgr, &log_mgr, seed_txn, nullptr, &seed_offset, &txn_mgr);
+    Context seed_context(&lock_mgr, &log_mgr, seed_txn, &txn_mgr);
     InsertExecutor seed(&sm_mgr, "t", {one, ten, hundred}, &seed_context);
-    seed.Next();
+    CopyCurrentTuple(seed);
     const Rid seed_rid = seed.rid();
     txn_mgr.commit(seed_txn, &log_mgr);
 
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr, IsolationLevel::SNAPSHOT_ISOLATION);
     txn->set_txn_mode(true);
     int offset = 0;
-    Context context(&lock_mgr, &log_mgr, txn, nullptr, &offset, &txn_mgr);
+    Context context(&lock_mgr, &log_mgr, txn, &txn_mgr);
     Value two;
     two.set_int(2);
     Value two_hundred;
     two_hundred.set_int(200);
     InsertExecutor losing_insert(&sm_mgr, "t", {two, ten, two_hundred}, &context);
 
-    EXPECT_THROW(losing_insert.Next(), TransactionAbortException);
+    EXPECT_THROW(CopyCurrentTuple(losing_insert), TransactionAbortException);
     const Rid losing_rid = losing_insert.rid();
     ASSERT_TRUE(txn->get_write_set().empty());
     ASSERT_NE(txn->get_prev_lsn(), txn->get_begin_lsn());
@@ -1027,24 +1028,26 @@ TEST(LogManagerTest, ExecutorDmlWritesWalSequence) {
     sm_mgr.create_index("t", {"id"}, nullptr);
 
     Transaction* txn = txn_mgr.begin(nullptr, &log_mgr);
-    Context context(&lock_mgr, &log_mgr, txn, nullptr, &const_offset, &txn_mgr);
+    Context context(&lock_mgr, &log_mgr, txn, &txn_mgr);
 
     Value id;
     id.set_int(1);
     Value v;
     v.set_int(10);
     InsertExecutor insert_executor(&sm_mgr, "t", {id, v}, &context);
-    insert_executor.Next();
-    Rid rid = insert_executor.rid();
-
+    CopyCurrentTuple(insert_executor);
     Value new_v;
     new_v.set_int(20);
     SetClause set_clause{{"t", "v"}, new_v, false, {}, UpdateOp::ASSIGNMENT, {}};
-    UpdateExecutor update_executor(&sm_mgr, "t", {set_clause}, {}, {rid}, &context);
-    update_executor.Next();
+    UpdateExecutor update_executor(&sm_mgr, "t", {set_clause}, {},
+                                   std::make_unique<SeqScanExecutor>(&sm_mgr, "t", std::vector<Condition>{}, &context),
+                                   std::nullopt, UpdateExecutionMode::Mutating, &context);
+    CopyCurrentTuple(update_executor);
 
-    DeleteExecutor delete_executor(&sm_mgr, "t", {}, {rid}, &context);
-    delete_executor.Next();
+    DeleteExecutor delete_executor(&sm_mgr, "t", {},
+                                   std::make_unique<SeqScanExecutor>(&sm_mgr, "t", std::vector<Condition>{}, &context),
+                                   std::nullopt, &context);
+    CopyCurrentTuple(delete_executor);
 
     txn_mgr.commit(txn, &log_mgr);
 

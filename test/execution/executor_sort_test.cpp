@@ -1,3 +1,4 @@
+#include "execution/cursor_test_helper.h"
 /* Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -58,12 +59,11 @@ public:
         }
     }
 
-    std::unique_ptr<RmRecord> Next() override {
-        ++next_record_calls_;
+    TupleView current() const override {
         if (is_end()) {
-            return nullptr;
+            return {};
         }
-        return std::make_unique<RmRecord>(records_[cursor_]);
+        return TupleView{records_[cursor_].data, static_cast<uint32_t>(records_[cursor_].size)};
     }
 
     Rid& rid() override {
@@ -93,7 +93,6 @@ public:
 
     int begin_calls_ = 0;
     int next_calls_ = 0;
-    int next_record_calls_ = 0;
 
 private:
     std::vector<ColMeta> cols_;
@@ -123,9 +122,9 @@ TEST(SortExecutorFocusedTest, MaterializesOnlyOnceAndResetsCursorOnRebegin) {
     EXPECT_EQ(exec.cursor_, 0U);
     EXPECT_EQ(child_ptr->begin_calls_, 1);
     EXPECT_EQ(child_ptr->next_calls_, 3);
-    EXPECT_EQ(child_ptr->next_record_calls_, 3);
+    EXPECT_EQ(child_ptr->next_calls_, 3);
 
-    auto first = exec.Next();
+    auto first = CopyCurrentTuple(exec);
     ASSERT_NE(first, nullptr);
     EXPECT_EQ(read_int(*first, 0), 2);
     EXPECT_EQ(read_int(*first, sizeof(int)), 70);
@@ -135,9 +134,9 @@ TEST(SortExecutorFocusedTest, MaterializesOnlyOnceAndResetsCursorOnRebegin) {
     EXPECT_EQ(exec.cursor_, 0U);
     EXPECT_EQ(child_ptr->begin_calls_, 1);
     EXPECT_EQ(child_ptr->next_calls_, 3);
-    EXPECT_EQ(child_ptr->next_record_calls_, 3);
+    EXPECT_EQ(child_ptr->next_calls_, 3);
 
-    auto replayed_first = exec.Next();
+    auto replayed_first = CopyCurrentTuple(exec);
     ASSERT_NE(replayed_first, nullptr);
     EXPECT_EQ(read_int(*replayed_first, 0), 2);
     EXPECT_EQ(read_int(*replayed_first, sizeof(int)), 70);
@@ -163,7 +162,7 @@ TEST(SortExecutorFocusedTest, ResolvesAggregateAliasAndKeepsStableOrderForTies) 
 
     std::vector<std::pair<int, int>> rows;
     for (exec.beginTuple(); !exec.is_end(); exec.nextTuple()) {
-        auto rec = exec.Next();
+        auto rec = CopyCurrentTuple(exec);
         ASSERT_NE(rec, nullptr);
         rows.push_back({read_int(*rec, 0), read_int(*rec, sizeof(int))});
     }

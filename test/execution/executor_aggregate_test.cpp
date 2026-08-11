@@ -1,3 +1,4 @@
+#include "execution/cursor_test_helper.h"
 /* Copyright (c) 2026 Team Youbuntu
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -66,11 +67,11 @@ public:
         return cursor_ >= rows_.size();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    TupleView current() const override {
         if (is_end()) {
-            return nullptr;
+            return {};
         }
-        return std::make_unique<RmRecord>(rows_[cursor_]);
+        return TupleView{rows_[cursor_].data, static_cast<uint32_t>(rows_[cursor_].size)};
     }
 
     Rid& rid() override {
@@ -124,9 +125,8 @@ public:
         return cursor_ >= row_count_;
     }
 
-    std::unique_ptr<RmRecord> Next() override {
-        ADD_FAILURE() << "COUNT(*) should not materialize scan records";
-        return nullptr;
+    TupleView current() const override {
+        return is_end() ? TupleView{} : TupleView{row_.data, static_cast<uint32_t>(row_.size)};
     }
 
     Rid& rid() override {
@@ -147,6 +147,7 @@ public:
     }
 
 private:
+    RmRecord row_{sizeof(int)};
     size_t row_count_ = 0;
     size_t cursor_ = 0;
     Rid rid_{};
@@ -287,7 +288,7 @@ TEST(AggregateExecutorTest, GroupsRowsAndComputesCountStarAndSum) {
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    auto first = exec.Next();
+    auto first = CopyCurrentTuple(exec);
     ASSERT_NE(first, nullptr);
     EXPECT_EQ(read_string(*first, 0, 8), "eng");
     EXPECT_EQ(read_int(*first, 8), 2);
@@ -295,7 +296,7 @@ TEST(AggregateExecutorTest, GroupsRowsAndComputesCountStarAndSum) {
 
     exec.nextTuple();
     ASSERT_FALSE(exec.is_end());
-    auto second = exec.Next();
+    auto second = CopyCurrentTuple(exec);
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(read_string(*second, 0, 8), "ops");
     EXPECT_EQ(read_int(*second, 8), 1);
@@ -343,7 +344,7 @@ TEST(AggregateExecutorTest, CountDistinctUsesIndependentPerGroupStatesAndSemanti
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    auto first = exec.Next();
+    auto first = CopyCurrentTuple(exec);
     ASSERT_NE(first, nullptr);
     EXPECT_EQ(read_string(*first, 0, 8), "eng");
     EXPECT_EQ(read_int(*first, 8), 2);
@@ -352,7 +353,7 @@ TEST(AggregateExecutorTest, CountDistinctUsesIndependentPerGroupStatesAndSemanti
 
     exec.nextTuple();
     ASSERT_FALSE(exec.is_end());
-    auto second = exec.Next();
+    auto second = CopyCurrentTuple(exec);
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(read_string(*second, 0, 8), "ops");
     EXPECT_EQ(read_int(*second, 8), 1);
@@ -387,7 +388,7 @@ TEST(AggregateExecutorTest, HavingCanFilterOnAggregateResultAgainstIntegerLitera
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    auto row = exec.Next();
+    auto row = CopyCurrentTuple(exec);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_string(*row, 0, 8), "eng");
     EXPECT_FLOAT_EQ(read_float_value(*row, 8), 15.0f);
@@ -416,7 +417,7 @@ TEST(AggregateExecutorTest, EmptyInputWithoutGroupByStillEmitsAggregateRow) {
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    auto row = exec.Next();
+    auto row = CopyCurrentTuple(exec);
     ASSERT_NE(row, nullptr);
     // finalv3 A.3 allows the evaluator's aggregate-empty-set convention to use
     // INT32 zero. FLOAT AVG keeps its existing SQL NULL behavior.
@@ -471,7 +472,7 @@ TEST(AggregateExecutorTest, CountStarCountsRowsWithoutReadingADataColumn) {
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    auto row = exec.Next();
+    auto row = CopyCurrentTuple(exec);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_int(*row, 0), 3);
 }
@@ -485,7 +486,7 @@ TEST(AggregateExecutorTest, GlobalCountStarOverScanDoesNotMaterializeRows) {
 
     exec.beginTuple();
     ASSERT_FALSE(exec.is_end());
-    auto row = exec.Next();
+    auto row = CopyCurrentTuple(exec);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(read_int(*row, 0), 5);
 }

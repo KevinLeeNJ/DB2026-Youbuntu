@@ -48,7 +48,6 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
-#include "portal.h"
 #include "record/rm_manager.h"
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
@@ -474,12 +473,10 @@ public:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
-        ql_manager_ =
-            std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
+        ql_manager_ = std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get());
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
         recovery_ =
             std::make_unique<RecoveryManager>(disk_manager_.get(), buffer_pool_manager_.get(), sm_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
         analyze_ = std::make_unique<Analyze>(sm_manager_.get());
 
         sm_manager_->create_db(db_name_);
@@ -522,9 +519,6 @@ public:
     QlManager* ql() {
         return ql_manager_.get();
     }
-    Portal* portal() {
-        return portal_.get();
-    }
     Analyze* analyze() {
         return analyze_.get();
     }
@@ -544,7 +538,6 @@ private:
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<RecoveryManager> recovery_;
-    std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };
 
@@ -561,18 +554,16 @@ public:
     /// Returns the captured text output.
     /// Throws TransactionAbortException on abort, RMDBError on failure.
     std::string exec_sql(const std::string& sql) {
-        return exec_sql_with_portal_ready_hook(sql, {});
+        return exec_sql_impl(sql, true);
     }
 
-    /// Execute SQL after allowing a test to observe the fully resolved portal.
-    std::string exec_sql_with_portal_ready_hook(const std::string& sql,
-                                                const std::function<void(const PortalStmt&)>& portal_ready_hook,
-                                                bool clean_up_abort = true) {
+    std::string exec_sql_impl(const std::string& sql, bool clean_up_abort) {
         char data_send[BUFFER_LENGTH];
         memset(data_send, 0, BUFFER_LENGTH);
         int offset = 0;
 
-        Context context(db_->lock(), db_->log(), nullptr, data_send, &offset, db_->txn());
+        Context context(db_->lock(), db_->log(), nullptr, db_->txn());
+        ExecutionOutput output{data_send, &offset};
         context.isolation_level_ = session_isolation_;
         setup_transaction(&context);
 
@@ -585,12 +576,19 @@ public:
         try {
             std::unique_ptr<Query> query = db_->analyze()->do_analyze(std::move(parse_tree));
             std::unique_ptr<Plan> plan = db_->optimizer()->plan_query(std::move(query), &context);
-            std::unique_ptr<PortalStmt> portal_stmt = db_->portal()->start(std::move(plan), &context);
-            if (portal_ready_hook) {
-                portal_ready_hook(*portal_stmt);
+            const PlanTag tag = plan->tag;
+            // QlManager dispatches utility plans but transaction-end ownership
+            // belongs to the session lifecycle. This white-box session mirrors
+            // the live request lifecycle for explicit COMMIT/ROLLBACK.
+            if (tag == T_Transaction_commit && context.txn_ != nullptr) {
+                db_->txn()->commit(context.txn_, context.log_mgr_);
+                txn_id_ = INVALID_TXN_ID;
+            } else if ((tag == T_Transaction_abort || tag == T_Transaction_rollback) && context.txn_ != nullptr) {
+                db_->txn()->abort(context.txn_, context.log_mgr_);
+                txn_id_ = INVALID_TXN_ID;
+            } else {
+                db_->ql()->execute(std::move(plan), &txn_id_, &context, &output);
             }
-            db_->portal()->run(std::move(portal_stmt), db_->ql(), &txn_id_, &context);
-            db_->portal()->drop();
             // Persist isolation level change (SET TRANSACTION ISOLATION LEVEL)
             session_isolation_ = context.isolation_level_;
             finish_statement(&context);
@@ -610,7 +608,7 @@ public:
     // Used only by a cancellation-lifetime test in which another thread owns
     // the real TransactionManager::abort call.
     std::string exec_sql_without_abort_cleanup(const std::string& sql) {
-        return exec_sql_with_portal_ready_hook(sql, {}, false);
+        return exec_sql_impl(sql, false);
     }
 
     /// Execute SQL and expect TransactionAbortException (returns "abort\n").
@@ -706,8 +704,8 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockAbortsWhileOwnerRemainsActive)
     ASSERT_TRUE(victim.exec_sql_ok("begin;"));
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_immediate_conflict set val = 200 where id = 1;"));
 
-    const std::string victim_abort = victim.exec_sql_expect_abort(
-        "update si_first_immediate_conflict set val = val + 1 where id = 1;");
+    const std::string victim_abort =
+        victim.exec_sql_expect_abort("update si_first_immediate_conflict set val = val + 1 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
     ASSERT_NE(owner.current_transaction(), nullptr);
     EXPECT_NE(owner.current_transaction()->get_state(), TransactionState::ABORTED);
@@ -731,8 +729,8 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockOwnerAbortDoesNotReviveAborted
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_abort_owner_abort set val = 200 where id = 1;"));
     ASSERT_TRUE(victim.exec_sql_ok("begin;"));
 
-    const std::string victim_abort = victim.exec_sql_expect_abort(
-        "update si_first_abort_owner_abort set val = val + 1 where id = 1;");
+    const std::string victim_abort =
+        victim.exec_sql_expect_abort("update si_first_abort_owner_abort set val = val + 1 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
     ASSERT_TRUE(owner.exec_sql_ok("abort;"));
 
@@ -755,8 +753,8 @@ TEST(SnapshotIsolationConcurrencyTest, SiFirstLockOwnerCommitStillLeavesVictimAb
     ASSERT_TRUE(owner.exec_sql_ok("update si_first_abort_owner_commit set val = 200 where id = 1;"));
     ASSERT_TRUE(victim.exec_sql_ok("begin;"));
 
-    const std::string victim_abort = victim.exec_sql_expect_abort(
-        "update si_first_abort_owner_commit set val = val + 1 where id = 1;");
+    const std::string victim_abort =
+        victim.exec_sql_expect_abort("update si_first_abort_owner_commit set val = val + 1 where id = 1;");
     EXPECT_EQ(TestSession::trim_output(victim_abort), "abort");
 
     ASSERT_TRUE(owner.exec_sql_ok("commit;"));
@@ -1079,18 +1077,9 @@ TEST_F(SnapshotTest, RC_PointDmlRechecksResidualPredicateAfterRecordLockWait) {
         ASSERT_TRUE(owner->exec_sql_ok("update " + table + " set payload = 11 where id = 1;"));
         ASSERT_TRUE(waiter->exec_sql_ok("begin;"));
 
-        std::promise<void> candidate_resolved;
-        std::promise<void> release_waiter;
-        std::shared_future<void> release = release_waiter.get_future().share();
-        std::atomic<bool> has_point_access{false};
         auto mutation_result = std::async(std::launch::async, [&]() {
             try {
-                waiter->exec_sql_with_portal_ready_hook(mutation, [&](const PortalStmt& portal) {
-                    const auto* dml = static_cast<const DMLPlan*>(portal.plan.get());
-                    has_point_access.store(dml->point_access_.has_value(), std::memory_order_release);
-                    candidate_resolved.set_value();
-                    release.wait();
-                });
+                waiter->exec_sql(mutation);
                 return true;
             } catch (const RMDBError&) {
                 return false;
@@ -1099,13 +1088,6 @@ TEST_F(SnapshotTest, RC_PointDmlRechecksResidualPredicateAfterRecordLockWait) {
             }
         });
 
-        auto candidate = candidate_resolved.get_future();
-        const bool resolved = candidate.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-        EXPECT_TRUE(resolved) << "point DML did not resolve its indexed candidate";
-        EXPECT_TRUE(has_point_access.load(std::memory_order_acquire))
-            << "mutation must use indexed point access by default";
-
-        release_waiter.set_value();
         const bool blocked = mutation_result.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
         EXPECT_TRUE(blocked) << "mutation must wait for the owner's row lock";
 
@@ -2412,7 +2394,8 @@ TEST_F(SnapshotTest, SI_IndexedDeletePublishesTombstoneBeforeGcVisibleIndexRemov
 
     std::vector<Rid> physical_rids;
     EXPECT_FALSE(index_handle->get_value(key.data(), &physical_rids, nullptr));
-    const auto historical_rids = db_->sm()->get_historical_index_key_rids("p2b_delete_publish", index_name, key);
+    const auto historical_rids =
+        db_->sm()->version_history().get_historical_index_key_rids("p2b_delete_publish", index_name, key);
     ASSERT_EQ(historical_rids, original_rids);
     const TupleMeta tombstone = file_handle->get_tuple_meta(original_rids.front());
     EXPECT_FALSE(tombstone.is_committed_);
@@ -2420,7 +2403,8 @@ TEST_F(SnapshotTest, SI_IndexedDeletePublishesTombstoneBeforeGcVisibleIndexRemov
 
     ASSERT_TRUE(reader->exec_sql_ok("begin;"));
     db_->txn()->GarbageCollection();
-    EXPECT_EQ(db_->sm()->get_historical_index_key_rids("p2b_delete_publish", index_name, key), original_rids)
+    EXPECT_EQ(db_->sm()->version_history().get_historical_index_key_rids("p2b_delete_publish", index_name, key),
+              original_rids)
         << "GC must requeue a history entry whose current tuple meta is an active tombstone";
     const std::string old_visible = reader->exec_sql("select * from p2b_delete_publish where id = 1;");
     EXPECT_NE(old_visible.find("|                1 |              100 |"), std::string::npos);
@@ -2437,7 +2421,8 @@ TEST_F(SnapshotTest, SI_IndexedDeletePublishesTombstoneBeforeGcVisibleIndexRemov
     // historical entry and physical index entry are both gone before reuse.
     ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_publish values (2, 200);"));
     db_->txn()->GarbageCollection();
-    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("p2b_delete_publish", index_name, key).empty());
+    EXPECT_TRUE(
+        db_->sm()->version_history().get_historical_index_key_rids("p2b_delete_publish", index_name, key).empty());
     physical_rids.clear();
     EXPECT_FALSE(index_handle->get_value(key.data(), &physical_rids, nullptr));
     auto fresh_reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
@@ -2537,9 +2522,14 @@ TEST_F(SnapshotTest, SI_IndexedDeleteAbortRestoresOneExactIndexEntryAndGcRetires
     val_index_handle->insert_entry(other_val_key.data(), other_id_rids.front(), IndexWriteWalContext::TestNoWal());
     ASSERT_TRUE(setup->exec_sql_ok("insert into p2b_delete_abort values (3, 300);"));
     db_->txn()->GarbageCollection();
-    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("p2b_delete_abort", id_index_name, id_key).empty());
-    EXPECT_TRUE(db_->sm()->get_historical_index_key_rids("p2b_delete_abort", val_index_name, val_key).empty());
-    EXPECT_TRUE(db_->sm()->get_deleted_tuple_candidates("p2b_delete_abort", *restored_record).empty());
+    EXPECT_TRUE(
+        db_->sm()->version_history().get_historical_index_key_rids("p2b_delete_abort", id_index_name, id_key).empty());
+    EXPECT_TRUE(db_->sm()
+                    ->version_history()
+                    .get_historical_index_key_rids("p2b_delete_abort", val_index_name, val_key)
+                    .empty());
+    EXPECT_TRUE(
+        db_->sm()->version_history().get_deleted_tuple_candidates("p2b_delete_abort", *restored_record).empty());
 }
 
 TEST_F(SnapshotTest, SI_IndexedDeleteAbortRestoresIndexBeforePublishingOldMetaToGc) {
@@ -2616,7 +2606,8 @@ TEST_F(SnapshotTest, SI_IndexedDeleteAbortRestoresIndexBeforePublishingOldMetaTo
     auto reader = create_session(IsolationLevel::SNAPSHOT_ISOLATION);
     ASSERT_TRUE(reader->exec_sql_ok("begin;"));
     db_->txn()->GarbageCollection();
-    EXPECT_EQ(db_->sm()->get_historical_index_key_rids("p2b_delete_abort_publish", index_name, key), original_rids)
+    EXPECT_EQ(db_->sm()->version_history().get_historical_index_key_rids("p2b_delete_abort_publish", index_name, key),
+              original_rids)
         << "GC must retain history while DELETE undo still exposes its tombstone";
     EXPECT_NE(reader->exec_sql("select * from p2b_delete_abort_publish where id = 1;")
                   .find("|                1 |              100 |"),

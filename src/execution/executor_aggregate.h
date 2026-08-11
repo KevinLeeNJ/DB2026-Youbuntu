@@ -574,12 +574,8 @@ private:
             std::unordered_map<GroupKey, size_t, GroupKeyHash> group_indexes;
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 TupleView tuple = prev_->current();
-                std::unique_ptr<RmRecord> fallback;
                 if (!tuple) {
-                    fallback = prev_->Next();
-                    if (fallback != nullptr) {
-                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
-                    }
+                    throw InternalError("cursor returned an empty tuple");
                 }
                 if (!tuple) {
                     continue;
@@ -630,12 +626,8 @@ private:
         if (can_use_min_index_shortcut()) {
             for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
                 TupleView tuple = prev_->current();
-                std::unique_ptr<RmRecord> fallback;
                 if (!tuple) {
-                    fallback = prev_->Next();
-                    if (fallback != nullptr) {
-                        tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
-                    }
+                    throw InternalError("cursor returned an empty tuple");
                 }
                 if (!tuple) {
                     continue;
@@ -663,12 +655,8 @@ private:
 
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             TupleView tuple = prev_->current();
-            std::unique_ptr<RmRecord> fallback;
             if (!tuple) {
-                fallback = prev_->Next();
-                if (fallback != nullptr) {
-                    tuple = TupleView{fallback->data, static_cast<uint32_t>(fallback->size)};
-                }
+                throw InternalError("cursor returned an empty tuple");
             }
             if (!tuple) {
                 continue;
@@ -763,13 +751,6 @@ public:
         if (!is_end()) {
             ++cursor_;
         }
-    }
-
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end()) {
-            return nullptr;
-        }
-        return materialize_group_result(groups_[cursor_]);
     }
 
     TupleView current() const override {

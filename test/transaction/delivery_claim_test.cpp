@@ -56,7 +56,6 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
-#include "portal.h"
 #include "record/rm_manager.h"
 #include "recovery/log_manager.h"
 #include "storage/buffer_pool_manager.h"
@@ -95,10 +94,8 @@ public:
         txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), sm_manager_.get());
         planner_ = std::make_unique<Planner>(sm_manager_.get());
         optimizer_ = std::make_unique<Optimizer>(sm_manager_.get(), planner_.get());
-        ql_manager_ =
-            std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get(), static_cast<Planner*>(nullptr));
+        ql_manager_ = std::make_unique<QlManager>(sm_manager_.get(), txn_manager_.get());
         log_manager_ = std::make_unique<LogManager>(disk_manager_.get());
-        portal_ = std::make_unique<Portal>(sm_manager_.get());
         analyze_ = std::make_unique<Analyze>(sm_manager_.get());
 
         sm_manager_->create_db(db_name_);
@@ -125,8 +122,8 @@ public:
         std::string exec(const std::string& sql) {
             std::fill(response_.begin(), response_.end(), 0);
             int offset = 0;
-            Context context(db_->lock_manager_.get(), db_->log_manager_.get(), nullptr, response_.data(), &offset,
-                            db_->txn_manager_.get());
+            Context context(db_->lock_manager_.get(), db_->log_manager_.get(), nullptr, db_->txn_manager_.get());
+            ExecutionOutput output{response_.data(), &offset};
             auto parse_tree = ast::parse_sql(sql);
             if (parse_tree == nullptr) {
                 return "";
@@ -135,9 +132,16 @@ public:
             try {
                 std::unique_ptr<Query> query = db_->analyze_->do_analyze(std::move(parse_tree));
                 std::unique_ptr<Plan> plan = db_->optimizer_->plan_query(std::move(query), &context);
-                std::unique_ptr<PortalStmt> statement = db_->portal_->start(std::move(plan), &context);
-                db_->portal_->run(std::move(statement), db_->ql_manager_.get(), &txn_id_, &context);
-                db_->portal_->drop();
+                const PlanTag tag = plan->tag;
+                if (tag == T_Transaction_commit && context.txn_ != nullptr) {
+                    db_->txn_manager_->commit(context.txn_, context.log_mgr_);
+                    txn_id_ = INVALID_TXN_ID;
+                } else if ((tag == T_Transaction_abort || tag == T_Transaction_rollback) && context.txn_ != nullptr) {
+                    db_->txn_manager_->abort(context.txn_, context.log_mgr_);
+                    txn_id_ = INVALID_TXN_ID;
+                } else {
+                    db_->ql_manager_->execute(std::move(plan), &txn_id_, &context, &output);
+                }
                 finish_statement(&context);
             } catch (...) {
                 abort_failed_statement(&context);
@@ -204,7 +208,6 @@ private:
     std::unique_ptr<Optimizer> optimizer_;
     std::unique_ptr<QlManager> ql_manager_;
     std::unique_ptr<LogManager> log_manager_;
-    std::unique_ptr<Portal> portal_;
     std::unique_ptr<Analyze> analyze_;
 };
 
@@ -251,6 +254,19 @@ std::string ScalarOf(const std::string& output) {
     }
     return last_value;
 }
+
+class ThreadJoiner {
+public:
+    explicit ThreadJoiner(std::thread& thread) : thread_(thread) {}
+    ~ThreadJoiner() {
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    std::thread& thread_;
+};
 
 class DeliveryClaimTest : public ::testing::Test {
 protected:
@@ -348,15 +364,17 @@ TEST_F(DeliveryClaimTest, LockLoserSeesWinnersCommittedDelete) {
         }
         loser_finished.store(true);
     });
+    ThreadJoiner join_loser(loser_thread);
 
     // Give the loser time to reach the lock wait. If it finished early it did
     // not contend at all and the scenario under test did not happen.
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    ASSERT_FALSE(loser_finished.load()) << "loser did not block on the row lock; scenario not exercised";
+    const bool loser_blocked = !loser_finished.load();
 
     winner.exec("commit;");
     loser_thread.join();
 
+    EXPECT_TRUE(loser_blocked) << "loser did not block on the row lock; scenario not exercised";
     EXPECT_TRUE(loser_error.empty()) << "loser failed unexpectedly: " << loser_error;
     // The whole point: the statement that runs once the lock is finally granted
     // must see the winner's committed DELETE, so MIN over the now-empty match

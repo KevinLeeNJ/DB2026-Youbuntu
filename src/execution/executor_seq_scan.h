@@ -13,7 +13,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_defs.h"
 #include "execution_common.h"
-#include "execution_manager.h"
 #include "executor_abstract.h"
 #include "errors.h"
 #include "index/ix.h"
@@ -142,19 +141,6 @@ public:
             scan_->next();
         }
     }
-    /**
-     * @brief 返回下一个满足扫描条件的记录
-     *
-     * @return std::unique_ptr<RmRecord>
-     */
-    std::unique_ptr<RmRecord> Next() override {
-        if (is_end() || buffered_tuple_.view.data == nullptr)
-            return nullptr;
-        auto result = std::make_unique<RmRecord>(static_cast<int>(buffered_tuple_.view.size));
-        memcpy(result->data, buffered_tuple_.view.data, buffered_tuple_.view.size);
-        return result;
-    }
-
     TupleView current() const override {
         if (is_end() || buffered_tuple_.view.data == nullptr) {
             return {};
