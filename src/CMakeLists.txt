@@ -18,7 +18,14 @@ add_subdirectory(test)
 
 target_link_libraries(parser execution pthread)
 
-add_executable(rmdb rmdb.cpp server/database_instance.cpp server/wire_session.cpp server/server_runtime.cpp)
+add_executable(rmdb
+    rmdb.cpp
+    server/database_instance.cpp
+    server/wire_execution.cpp
+    server/wire_prepared.cpp
+    server/wire_session.cpp
+    server/wire_stream.cpp
+    server/server_runtime.cpp)
 target_link_libraries(rmdb parser execution pthread planner analyze wire_protocol)
 
 # Offline post-recovery structural verifier used by crash-consistency tests.
