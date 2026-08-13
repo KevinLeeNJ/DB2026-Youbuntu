@@ -30,7 +30,14 @@ Value convert_ast_value_node(const ast::Value* sv_val) {
         val.set_str(str_lit->val);
         break;
     }
-    case ast::AstType::BoolLit:
+    case ast::AstType::BoolLit: {
+        auto bool_lit = static_cast<const ast::BoolLit*>(sv_val);
+        val.set_int(bool_lit->val ? 1 : 0);
+        break;
+    }
+    case ast::AstType::NullLit:
+        val.set_null();
+        break;
     default:
         throw InternalError("Unexpected sv value type");
     }
@@ -144,6 +151,9 @@ std::string build_agg_display_name(const AggExpr& agg) {
     if (agg.is_star) {
         name += "*";
     } else {
+        if (agg.is_distinct) {
+            name += "DISTINCT ";
+        }
         name += agg.col.col_name;
     }
     name += ")";
@@ -204,6 +214,52 @@ void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols)
         break;
     case QueryExprType::VALUE:
         break;
+    case QueryExprType::ARITHMETIC:
+        if (expr.lhs == nullptr || expr.rhs == nullptr) {
+            throw InternalError("Arithmetic expression is missing an operand");
+        }
+        normalize_query_expr(*expr.lhs, all_cols);
+        normalize_query_expr(*expr.rhs, all_cols);
+        break;
+    case QueryExprType::LOGICAL:
+        for (auto& operand : expr.operands) {
+            if (operand == nullptr) {
+                throw InternalError("Logical expression is missing an operand");
+            }
+            normalize_query_expr(*operand, all_cols);
+        }
+        break;
+    case QueryExprType::CASE_EXPR:
+        for (auto& clause : expr.case_when) {
+            if (clause.first == nullptr || clause.second == nullptr) {
+                throw InternalError("CASE expression is missing an operand");
+            }
+            normalize_query_expr(*clause.first, all_cols);
+            normalize_query_expr(*clause.second, all_cols);
+        }
+        if (expr.else_expr != nullptr) {
+            normalize_query_expr(*expr.else_expr, all_cols);
+        }
+        break;
+    case QueryExprType::PREDICATE:
+        if (expr.lhs != nullptr) {
+            normalize_query_expr(*expr.lhs, all_cols);
+        }
+        if (expr.rhs != nullptr) {
+            normalize_query_expr(*expr.rhs, all_cols);
+        }
+        if (expr.rhs_upper != nullptr) {
+            normalize_query_expr(*expr.rhs_upper, all_cols);
+        }
+        for (auto& value : expr.rhs_values) {
+            normalize_query_expr(*value, all_cols);
+        }
+        break;
+    case QueryExprType::SUBQUERY:
+        if (expr.subquery == nullptr) {
+            throw InternalError("Subquery expression is missing its query");
+        }
+        break;
     }
 }
 
@@ -233,6 +289,64 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
             return col_meta->type;
         }
         }
+    case QueryExprType::ARITHMETIC: {
+        if (expr.lhs == nullptr || expr.rhs == nullptr) {
+            throw InternalError("Arithmetic expression is missing an operand");
+        }
+        ColType lhs_type = infer_expr_type(*expr.lhs, all_cols);
+        ColType rhs_type = infer_expr_type(*expr.rhs, all_cols);
+        if (!is_numeric_type(lhs_type) || !is_numeric_type(rhs_type)) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+        }
+        return lhs_type == TYPE_FLOAT || rhs_type == TYPE_FLOAT ? TYPE_FLOAT : TYPE_INT;
+    }
+    case QueryExprType::LOGICAL:
+    case QueryExprType::PREDICATE:
+        return TYPE_INT;
+    case QueryExprType::CASE_EXPR: {
+        ColType result_type = TYPE_INT;
+        bool have_result = false;
+        for (const auto& clause : expr.case_when) {
+            ColType clause_type = infer_expr_type(*clause.second, all_cols);
+            if (!have_result) {
+                result_type = clause_type;
+                have_result = true;
+            } else if (result_type != clause_type) {
+                if (!can_cast_types(result_type, clause_type)) {
+                    throw IncompatibleTypeError(coltype2str(result_type), coltype2str(clause_type));
+                }
+                if (result_type == TYPE_INT && clause_type == TYPE_FLOAT) {
+                    result_type = TYPE_FLOAT;
+                }
+            }
+        }
+        if (expr.else_expr != nullptr) {
+            ColType else_type = infer_expr_type(*expr.else_expr, all_cols);
+            if (!have_result) {
+                result_type = else_type;
+                have_result = true;
+            } else if (result_type != else_type) {
+                if (!can_cast_types(result_type, else_type)) {
+                    throw IncompatibleTypeError(coltype2str(result_type), coltype2str(else_type));
+                }
+                if (result_type == TYPE_INT && else_type == TYPE_FLOAT) {
+                    result_type = TYPE_FLOAT;
+                }
+            }
+        }
+        return result_type;
+    }
+    case QueryExprType::SUBQUERY:
+        if (expr.subquery == nullptr || expr.subquery->union_cols.empty() && expr.subquery->select_items.size() != 1) {
+            throw RMDBError("Scalar subquery must return exactly one column");
+        }
+        if (expr.subquery->is_union) {
+            if (expr.subquery->union_cols.size() != 1) {
+                throw RMDBError("Scalar subquery must return exactly one column");
+            }
+            return expr.subquery->union_cols[0].type;
+        }
+        return infer_expr_type(expr.subquery->select_items.front().expr, all_cols);
     }
     throw InternalError("Unexpected query expression type");
 }
@@ -248,7 +362,27 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return false;
     case QueryExprType::AGGREGATE:
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
+               lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+    case QueryExprType::ARITHMETIC:
+        return lhs.arithmetic_op == rhs.arithmetic_op && lhs.lhs != nullptr && lhs.rhs != nullptr &&
+               rhs.lhs != nullptr && rhs.rhs != nullptr && same_query_expr(*lhs.lhs, *rhs.lhs) &&
+               same_query_expr(*lhs.rhs, *rhs.rhs);
+    case QueryExprType::LOGICAL:
+        if (lhs.logical_op != rhs.logical_op || lhs.operands.size() != rhs.operands.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.operands.size(); ++i) {
+            if (lhs.operands[i] == nullptr || rhs.operands[i] == nullptr ||
+                !same_query_expr(*lhs.operands[i], *rhs.operands[i])) {
+                return false;
+            }
+        }
+        return true;
+    case QueryExprType::CASE_EXPR:
+    case QueryExprType::PREDICATE:
+    case QueryExprType::SUBQUERY:
+        return lhs.display_name == rhs.display_name;
     }
     return false;
 }

@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze_select_internal.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 using namespace analyze_internal;
@@ -52,6 +53,36 @@ void resolve_alias(QueryExpr& expr, const Query& query) {
     } else if (expr.type == QueryExprType::AGGREGATE && !expr.agg.is_star) {
         resolve_alias(expr.agg.col, query);
     }
+    if (expr.lhs != nullptr) {
+        resolve_alias(*expr.lhs, query);
+    }
+    if (expr.rhs != nullptr) {
+        resolve_alias(*expr.rhs, query);
+    }
+    if (expr.rhs_upper != nullptr) {
+        resolve_alias(*expr.rhs_upper, query);
+    }
+    for (auto& operand : expr.operands) {
+        if (operand != nullptr) {
+            resolve_alias(*operand, query);
+        }
+    }
+    for (auto& clause : expr.case_when) {
+        if (clause.first != nullptr) {
+            resolve_alias(*clause.first, query);
+        }
+        if (clause.second != nullptr) {
+            resolve_alias(*clause.second, query);
+        }
+    }
+    if (expr.else_expr != nullptr) {
+        resolve_alias(*expr.else_expr, query);
+    }
+    for (auto& value : expr.rhs_values) {
+        if (value != nullptr) {
+            resolve_alias(*value, query);
+        }
+    }
 }
 
 void resolve_aliases(Query& query) {
@@ -74,6 +105,140 @@ void resolve_aliases(Query& query) {
         resolve_alias(cond.lhs_col, query);
         if (!cond.is_rhs_val && cond.op != OP_IN && cond.op != OP_BETWEEN) {
             resolve_alias(cond.rhs_col, query);
+        }
+    }
+    if (query.where_expr != nullptr) {
+        resolve_alias(*query.where_expr, query);
+    }
+}
+
+void resolve_local_unqualified_columns(QueryExpr& expr, const std::vector<ColMeta>& local_cols) {
+    if (expr.type == QueryExprType::COLUMN && expr.col.tab_name.empty()) {
+        try {
+            resolve_column_meta(local_cols, expr.col);
+        } catch (const ColumnNotFoundError&) {
+            // An unresolved unqualified name may belong to a correlated outer scope.
+        }
+    } else if (expr.type == QueryExprType::AGGREGATE && !expr.agg.is_star && expr.agg.col.tab_name.empty()) {
+        try {
+            resolve_column_meta(local_cols, expr.agg.col);
+        } catch (const ColumnNotFoundError&) {
+            // An unresolved unqualified name may belong to a correlated outer scope.
+        }
+    }
+    if (expr.lhs != nullptr) {
+        resolve_local_unqualified_columns(*expr.lhs, local_cols);
+    }
+    if (expr.rhs != nullptr) {
+        resolve_local_unqualified_columns(*expr.rhs, local_cols);
+    }
+    if (expr.rhs_upper != nullptr) {
+        resolve_local_unqualified_columns(*expr.rhs_upper, local_cols);
+    }
+    for (auto& operand : expr.operands) {
+        resolve_local_unqualified_columns(*operand, local_cols);
+    }
+    for (auto& clause : expr.case_when) {
+        resolve_local_unqualified_columns(*clause.first, local_cols);
+        resolve_local_unqualified_columns(*clause.second, local_cols);
+    }
+    if (expr.else_expr != nullptr) {
+        resolve_local_unqualified_columns(*expr.else_expr, local_cols);
+    }
+    for (auto& value : expr.rhs_values) {
+        resolve_local_unqualified_columns(*value, local_cols);
+    }
+}
+
+void resolve_local_unqualified_columns(Query& query, const std::vector<ColMeta>& local_cols) {
+    for (auto& item : query.select_items) {
+        resolve_local_unqualified_columns(item.expr, local_cols);
+    }
+    for (auto& cond : query.having_conds) {
+        resolve_local_unqualified_columns(cond.lhs, local_cols);
+        if (!cond.is_rhs_val) {
+            resolve_local_unqualified_columns(cond.rhs_expr, local_cols);
+        }
+    }
+    for (auto& item : query.order_by_items) {
+        resolve_local_unqualified_columns(item.expr, local_cols);
+    }
+    if (query.where_expr != nullptr) {
+        resolve_local_unqualified_columns(*query.where_expr, local_cols);
+    }
+}
+
+bool is_outer_column(const ast::Col* column, const std::vector<ColMeta>& outer_cols,
+                     const std::unordered_map<std::string, std::string>& outer_aliases) {
+    if (column == nullptr) {
+        return false;
+    }
+    if (outer_aliases.find(column->tab_name) != outer_aliases.end()) {
+        return true;
+    }
+    return !column->tab_name.empty() &&
+           std::any_of(outer_cols.begin(), outer_cols.end(), [&](const ColMeta& col) {
+               return col.tab_name == column->tab_name;
+           });
+}
+
+bool is_legacy_condition_expression(const ast::Expr* expression, const std::vector<ColMeta>& outer_cols,
+                                    const std::unordered_map<std::string, std::string>& outer_aliases) {
+    if (expression == nullptr) {
+        return false;
+    }
+    if (auto logical = dynamic_cast<const ast::LogicalExpr*>(expression); logical != nullptr) {
+        return logical->op == ast::LogicalOp::AND && !logical->operands.empty() &&
+               std::all_of(logical->operands.begin(), logical->operands.end(), [&](const auto& operand) {
+                   return is_legacy_condition_expression(operand.get(), outer_cols, outer_aliases);
+               });
+    }
+
+    auto condition = dynamic_cast<const ast::BinaryExpr*>(expression);
+    if (condition == nullptr || condition->quantifier != ast::Quantifier::NONE) {
+        return false;
+    }
+    auto lhs = dynamic_cast<const ast::Col*>(condition->lhs.get());
+    if (lhs == nullptr || is_outer_column(lhs, outer_cols, outer_aliases)) {
+        return false;
+    }
+    if (condition->op == ast::SV_OP_IS_NULL || condition->op == ast::SV_OP_IS_NOT_NULL) {
+        return condition->rhs == nullptr;
+    }
+    if (condition->op == ast::SV_OP_EXISTS) {
+        return false;
+    }
+    if (!std::all_of(condition->rhs_list.begin(), condition->rhs_list.end(),
+                    [](const auto& value) { return dynamic_cast<const ast::Value*>(value.get()) != nullptr; })) {
+        return false;
+    }
+    if (condition->rhs_upper != nullptr && dynamic_cast<const ast::Value*>(condition->rhs_upper.get()) == nullptr) {
+        return false;
+    }
+    if (condition->rhs == nullptr) {
+        return condition->op == ast::SV_OP_IN || condition->op == ast::SV_OP_BETWEEN;
+    }
+    if (dynamic_cast<const ast::Value*>(condition->rhs.get()) != nullptr) {
+        return true;
+    }
+    auto rhs_col = dynamic_cast<const ast::Col*>(condition->rhs.get());
+    return rhs_col != nullptr && !is_outer_column(rhs_col, outer_cols, outer_aliases);
+}
+
+void resolve_local_condition_columns(std::vector<Condition>& conditions, const std::vector<ColMeta>& local_cols) {
+    for (auto& condition : conditions) {
+        if (condition.lhs_col.tab_name.empty()) {
+            resolve_column_meta(local_cols, condition.lhs_col);
+        }
+        if (!condition.is_rhs_val && condition.op != OP_IN && condition.op != OP_BETWEEN &&
+            condition.op != OP_IS_NULL && condition.op != OP_IS_NOT_NULL && condition.op != OP_EXISTS &&
+            condition.rhs_col.tab_name.empty()) {
+            try {
+                resolve_column_meta(local_cols, condition.rhs_col);
+            } catch (const ColumnNotFoundError&) {
+                // A qualified outer reference is already non-empty; only an unresolved
+                // unqualified reference can reach this path and is handled by the full expression.
+            }
         }
     }
 }
@@ -123,6 +288,10 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     if (root->type == ast::AstType::SelectFromUnionStmt) {
         return analyze_select_from_union_stmt(static_cast<const ast::SelectFromUnionStmt*>(root), std::move(parse));
     }
+    if (root->type == ast::AstType::UnionStmt) {
+        return analyze_union_stmt(static_cast<const ast::UnionStmt*>(root), "", {}, false, 0, false, 0,
+                                  std::move(parse), {}, {});
+    }
 
     if (root->type == ast::AstType::SetTransaction) {
         auto x = static_cast<const ast::SetTransaction*>(root);
@@ -137,6 +306,11 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     switch (root->type) {
     case ast::AstType::UpdateStmt: {
         auto x = static_cast<const ast::UpdateStmt*>(root);
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        std::vector<ColMeta> all_cols;
+        get_all_cols({x->tab_name}, all_cols);
         query->set_clauses.reserve(x->set_clauses.size());
         for (const auto& set_clause : x->set_clauses) {
             SetClause clause;
@@ -146,28 +320,57 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                 clause.rhs = convert_sv_value(set_clause->val.get());
             }
             clause.is_self_ref = set_clause->is_self_ref;
+            if (set_clause->rhs_expr != nullptr) {
+                if (auto value = dynamic_cast<const ast::Value*>(set_clause->rhs_expr.get()); value != nullptr) {
+                    clause.rhs = convert_sv_value(value);
+                } else {
+                    clause.rhs_expr = std::make_shared<QueryExpr>(
+                        convert_ast_expr(set_clause->rhs_expr.get(), "UPDATE", all_cols, {}));
+                }
+            }
+            clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
+            clause.lhs = check_column(all_cols, clause.lhs);
             if (set_clause->is_self_ref) {
                 clause.rhs_col = {.tab_name = set_clause->rhs_col->tab_name.empty() ? x->tab_name
                                                                                     : set_clause->rhs_col->tab_name,
                                   .col_name = set_clause->rhs_col->col_name};
-                std::vector<ColMeta> all_cols;
-                get_all_cols({x->tab_name}, all_cols);
                 clause.rhs_col = check_column(all_cols, clause.rhs_col);
             }
             query->set_clauses.push_back(clause);
         }
         get_clause(x->conds, query->conds);
+        if (x->where_expr != nullptr && !is_legacy_condition_expression(x->where_expr.get(), {}, {})) {
+            query->where_expr = std::make_shared<QueryExpr>(
+                convert_ast_expr(x->where_expr.get(), "WHERE", all_cols, {}));
+        }
         check_clause({x->tab_name}, query->conds);
         break;
     }
     case ast::AstType::DeleteStmt: {
         auto x = static_cast<const ast::DeleteStmt*>(root);
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
         get_clause(x->conds, query->conds);
+        if (x->where_expr != nullptr && !is_legacy_condition_expression(x->where_expr.get(), {}, {})) {
+            std::vector<ColMeta> all_cols;
+            get_all_cols({x->tab_name}, all_cols);
+            query->where_expr = std::make_shared<QueryExpr>(
+                convert_ast_expr(x->where_expr.get(), "WHERE", all_cols, {}));
+        }
         check_clause({x->tab_name}, query->conds);
         break;
     }
     case ast::AstType::InsertStmt: {
         auto x = static_cast<const ast::InsertStmt*>(root);
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        query->insert_col_names = x->col_names;
+        if (x->select != nullptr) {
+            query->insert_query = std::shared_ptr<Query>(analyze_subquery(x->select.get(), {}, {}));
+            break;
+        }
         query->values.reserve(x->vals.size());
         for (auto& sv_val : x->vals) {
             query->values.push_back(convert_sv_value(sv_val.get()));
@@ -181,9 +384,14 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
     return query;
 }
 
-std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner) {
+std::unique_ptr<Query> Analyze::analyze_select_stmt(
+    const ast::SelectStmt* x, std::unique_ptr<ast::TreeNode> owner, const std::vector<ColMeta>& outer_cols,
+    const std::unordered_map<std::string, std::string>& outer_aliases) {
     auto query = std::make_unique<Query>();
     populate_table_refs(*query, x->tabs);
+    for (const auto& [alias, table] : outer_aliases) {
+        query->table_alias_to_name.emplace(alias, table);
+    }
 
     for (const auto& tab_name : query->tables) {
         if (!sm_manager_->db_.is_table(tab_name)) {
@@ -193,12 +401,46 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, st
 
     std::vector<ColMeta> all_cols;
     get_all_cols(query->tables, all_cols);
+    std::unordered_set<std::string> natural_duplicate_columns;
+    for (const auto& join : x->jointree) {
+        if (join->join_type != NATURAL_JOIN) {
+            continue;
+        }
+        const auto& left_meta = sm_manager_->db_.get_table(join->left.table_name);
+        const auto& right_meta = sm_manager_->db_.get_table(join->right.table_name);
+        for (const auto& left_col : left_meta.cols) {
+            auto right_col = std::find_if(right_meta.cols.begin(), right_meta.cols.end(), [&](const ColMeta& col) {
+                return col.name == left_col.name;
+            });
+            if (right_col != right_meta.cols.end()) {
+                natural_duplicate_columns.insert(join->right.table_name + "." + right_col->name);
+            }
+        }
+    }
+    std::vector<ColMeta> visible_cols;
+    visible_cols.reserve(all_cols.size());
+    for (const auto& col : all_cols) {
+        if (natural_duplicate_columns.find(col.tab_name + "." + col.name) == natural_duplicate_columns.end()) {
+            visible_cols.push_back(col);
+        }
+    }
+    std::vector<ColMeta> scope_cols = all_cols;
+    scope_cols.insert(scope_cols.end(), outer_cols.begin(), outer_cols.end());
+    auto converter = [this, &scope_cols, &query](const ast::Expr* expr, const std::string& context_name) {
+        return convert_ast_expr(expr, context_name, scope_cols, query->table_alias_to_name);
+    };
 
-    populate_select_items_from_ast(*query, *x, all_cols);
+    populate_select_items_from_ast(*query, *x, visible_cols, converter);
     populate_group_by_from_ast(*query, *x);
-    populate_having_from_ast(*query, *x);
-    populate_order_by_from_ast(*query, *x);
+    populate_having_from_ast(*query, *x, converter);
+    populate_order_by_from_ast(*query, *x, converter);
     populate_limit_from_ast(*query, *x);
+    if (x->where_expr != nullptr) {
+        if (!is_legacy_condition_expression(x->where_expr.get(), outer_cols, outer_aliases)) {
+            query->where_expr = std::make_shared<QueryExpr>(
+                convert_ast_expr(x->where_expr.get(), "WHERE", scope_cols, query->table_alias_to_name));
+        }
+    }
     get_clause(x->conds, query->conds);
     query->join_types.reserve(x->jointree.size());
     size_t join_cond_offset = 0;
@@ -213,6 +455,24 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, st
         }
     }
     resolve_aliases(*query);
+    resolve_local_condition_columns(query->conds, all_cols);
+    query->conds.erase(std::remove_if(query->conds.begin(), query->conds.end(), [&](const Condition& cond) {
+                           auto is_local_table = [&](const std::string& table) {
+                               return std::find(query->tables.begin(), query->tables.end(), table) != query->tables.end();
+                           };
+                           auto is_outer_table = [&](const std::string& table) {
+                               return outer_aliases.find(table) != outer_aliases.end() ||
+                                      std::any_of(outer_cols.begin(), outer_cols.end(), [&](const ColMeta& col) {
+                                          return col.tab_name == table;
+                                      });
+                           };
+                           if (!is_local_table(cond.lhs_col.tab_name)) {
+                               return is_outer_table(cond.lhs_col.tab_name);
+                           }
+                           return !cond.is_rhs_val && cond.op != OP_IS_NULL && cond.op != OP_IS_NOT_NULL &&
+                                  !is_local_table(cond.rhs_col.tab_name) && is_outer_table(cond.rhs_col.tab_name);
+                       }),
+                       query->conds.end());
     check_clause(query->tables, query->conds);
     query->join_on_conds.reserve(x->jointree.size());
     join_cond_offset = 0;
@@ -223,7 +483,40 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, st
             query->join_on_conds.back().push_back(query->conds[join_cond_offset++]);
         }
     }
-    validate_select_query(*query, all_cols);
+    for (size_t join_idx = 0; join_idx < x->jointree.size(); ++join_idx) {
+        const auto& join = x->jointree[join_idx];
+        if (join->join_type != NATURAL_JOIN) {
+            continue;
+        }
+        const auto& left_meta = sm_manager_->db_.get_table(join->left.table_name);
+        const auto& right_meta = sm_manager_->db_.get_table(join->right.table_name);
+        for (const auto& left_col : left_meta.cols) {
+            auto right_col = std::find_if(right_meta.cols.begin(), right_meta.cols.end(), [&](const ColMeta& col) {
+                return col.name == left_col.name;
+            });
+            if (right_col == right_meta.cols.end()) {
+                continue;
+            }
+            Condition condition;
+            condition.lhs_col = {.tab_name = left_meta.name, .col_name = left_col.name};
+            condition.rhs_col = {.tab_name = right_meta.name, .col_name = right_col->name};
+            condition.op = OP_EQ;
+            condition.is_rhs_val = false;
+            condition.is_join_on = true;
+            query->join_on_conds[join_idx].push_back(std::move(condition));
+        }
+    }
+    resolve_local_unqualified_columns(*query, visible_cols);
+    for (auto& group_col : query->group_by_cols) {
+        if (group_col.tab_name.empty()) {
+            try {
+                resolve_column_meta(visible_cols, group_col);
+            } catch (const ColumnNotFoundError&) {
+                // Correlated GROUP BY references are rejected by normal validation.
+            }
+        }
+    }
+    validate_select_query(*query, scope_cols);
     query->parse = std::move(owner);
     return query;
 }
@@ -304,18 +597,44 @@ void Analyze::validate_union_order_by(Query& query) {
     }
 }
 
-std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* x,
-                                                               std::unique_ptr<ast::TreeNode> owner) {
-    if (x->union_stmt == nullptr || x->union_stmt->branches.size() < 2) {
+std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(
+    const ast::SelectFromUnionStmt* x, std::unique_ptr<ast::TreeNode> owner, const std::vector<ColMeta>& outer_cols,
+    const std::unordered_map<std::string, std::string>& outer_aliases) {
+    return analyze_union_stmt(x->union_stmt.get(), x->alias, x->order_by_items, x->has_limit, x->limit, x->has_offset,
+                              x->offset, std::move(owner), outer_cols, outer_aliases);
+}
+
+std::unique_ptr<Query> Analyze::analyze_union_stmt(
+    const ast::UnionStmt* union_stmt, std::string alias,
+    const std::vector<std::unique_ptr<ast::OrderByItem>>& order_by_items, bool has_limit, int limit, bool has_offset,
+    int query_offset, std::unique_ptr<ast::TreeNode> owner, const std::vector<ColMeta>& outer_cols,
+    const std::unordered_map<std::string, std::string>& outer_aliases) {
+    if (union_stmt == nullptr || union_stmt->branches.size() < 2) {
         throw RMDBError("UNION requires at least two SELECT branches");
     }
 
     auto query = std::make_unique<Query>();
     query->is_union = true;
     query->parse = std::move(owner);
-    query->union_alias = x->alias;
-    populate_order_by_from_ast(*query, *x);
-    populate_limit_from_ast(*query, *x);
+    query->union_alias = std::move(alias);
+    auto converter = [this, &outer_cols, &outer_aliases](const ast::Expr* expr, const std::string& context_name) {
+        return convert_ast_expr(expr, context_name, outer_cols, outer_aliases);
+    };
+    query->order_by_items.reserve(order_by_items.size());
+    for (const auto& raw_item : order_by_items) {
+        OrderByItem item;
+        item.expr = converter(raw_item->expr.get(), "ORDER BY");
+        item.is_desc = raw_item->orderby_dir == ast::OrderBy_DESC;
+        item.nulls_order = static_cast<int>(raw_item->nulls_order);
+        if (item.expr.type == QueryExprType::COLUMN && item.expr.col.tab_name.empty()) {
+            item.order_name = item.expr.col.col_name;
+        }
+        query->order_by_items.push_back(std::move(item));
+    }
+    query->has_limit = has_limit;
+    query->limit = limit;
+    query->has_offset = has_offset;
+    query->offset = query_offset;
     if (query->has_limit && query->limit < 0) {
         throw RMDBError("LIMIT must be non-negative");
     }
@@ -323,10 +642,23 @@ std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::Select
         throw RMDBError("OFFSET must be non-negative");
     }
 
-    query->union_branches.reserve(x->union_stmt->branches.size());
-    query->union_all = x->union_stmt->union_all;
-    for (const auto& branch : x->union_stmt->branches) {
-        auto branch_query = analyze_select_stmt(branch.get());
+    query->union_branches.reserve(union_stmt->branches.size());
+    query->union_all = union_stmt->union_all;
+    for (const auto& op : union_stmt->operators) {
+        switch (op) {
+        case ast::SetOperator::UNION:
+            query->set_operators.push_back(QuerySetOperator::UNION);
+            break;
+        case ast::SetOperator::INTERSECT:
+            query->set_operators.push_back(QuerySetOperator::INTERSECT);
+            break;
+        case ast::SetOperator::EXCEPT:
+            query->set_operators.push_back(QuerySetOperator::EXCEPT);
+            break;
+        }
+    }
+    for (const auto& branch : union_stmt->branches) {
+        auto branch_query = analyze_select_stmt(branch.get(), nullptr, outer_cols, outer_aliases);
         if (!branch_query->order_by_items.empty() || branch_query->has_limit || branch_query->has_offset) {
             throw RMDBError("UNION branches do not support ORDER BY or LIMIT");
         }
@@ -357,6 +689,163 @@ std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::Select
     return query;
 }
 
+QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& context_name,
+                                    const std::vector<ColMeta>& outer_cols,
+                                    const std::unordered_map<std::string, std::string>& outer_aliases) {
+    if (expr == nullptr) {
+        throw InternalError("Unexpected null expression node");
+    }
+
+    if (auto col = dynamic_cast<const ast::Col*>(expr); col != nullptr) {
+        return make_column_expr({.tab_name = col->tab_name, .col_name = col->col_name});
+    }
+    if (auto value = dynamic_cast<const ast::Value*>(expr); value != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::VALUE;
+        result.value = convert_ast_value_node(value);
+        return result;
+    }
+    if (auto agg = dynamic_cast<const ast::AggExpr*>(expr); agg != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::AGGREGATE;
+        result.agg.type = convert_ast_agg_type(agg->func);
+        result.agg.is_star = agg->is_star;
+        result.agg.is_distinct = agg->is_distinct;
+        if (!agg->is_star) {
+            if (agg->col == nullptr) {
+                throw InternalError("Unexpected null aggregate argument");
+            }
+            result.agg.col = {.tab_name = agg->col->tab_name, .col_name = agg->col->col_name};
+        }
+        result.agg.display_name = build_agg_display_name(result.agg);
+        result.display_name = result.agg.display_name;
+        return result;
+    }
+    if (auto arithmetic = dynamic_cast<const ast::ArithmeticExpr*>(expr); arithmetic != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::ARITHMETIC;
+        switch (arithmetic->op) {
+        case ast::ArithmeticOp::ADD:
+            result.arithmetic_op = QueryArithmeticOp::ADD;
+            break;
+        case ast::ArithmeticOp::SUB:
+            result.arithmetic_op = QueryArithmeticOp::SUB;
+            break;
+        case ast::ArithmeticOp::MUL:
+            result.arithmetic_op = QueryArithmeticOp::MUL;
+            break;
+        case ast::ArithmeticOp::DIV:
+            result.arithmetic_op = QueryArithmeticOp::DIV;
+            break;
+        }
+        result.lhs = std::make_shared<QueryExpr>(convert_ast_expr(arithmetic->lhs.get(), context_name, outer_cols,
+                                                                   outer_aliases));
+        result.rhs = std::make_shared<QueryExpr>(convert_ast_expr(arithmetic->rhs.get(), context_name, outer_cols,
+                                                                   outer_aliases));
+        return result;
+    }
+    if (auto logical = dynamic_cast<const ast::LogicalExpr*>(expr); logical != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::LOGICAL;
+        switch (logical->op) {
+        case ast::LogicalOp::AND:
+            result.logical_op = QueryLogicalOp::AND;
+            break;
+        case ast::LogicalOp::OR:
+            result.logical_op = QueryLogicalOp::OR;
+            break;
+        case ast::LogicalOp::NOT:
+            result.logical_op = QueryLogicalOp::NOT;
+            break;
+        }
+        result.operands.reserve(logical->operands.size());
+        for (const auto& operand : logical->operands) {
+            result.operands.push_back(
+                std::make_shared<QueryExpr>(convert_ast_expr(operand.get(), context_name, outer_cols, outer_aliases)));
+        }
+        return result;
+    }
+    if (auto case_expr = dynamic_cast<const ast::CaseExpr*>(expr); case_expr != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::CASE_EXPR;
+        result.display_name = "CASE";
+        result.case_when.reserve(case_expr->when_clauses.size());
+        for (const auto& clause : case_expr->when_clauses) {
+            result.case_when.emplace_back(
+                std::make_shared<QueryExpr>(convert_ast_expr(clause.condition.get(), context_name, outer_cols,
+                                                             outer_aliases)),
+                std::make_shared<QueryExpr>(convert_ast_expr(clause.result.get(), context_name, outer_cols,
+                                                             outer_aliases)));
+        }
+        if (case_expr->else_expr != nullptr) {
+            result.else_expr = std::make_shared<QueryExpr>(
+                convert_ast_expr(case_expr->else_expr.get(), context_name, outer_cols, outer_aliases));
+        }
+        return result;
+    }
+    if (auto binary = dynamic_cast<const ast::BinaryExpr*>(expr); binary != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::PREDICATE;
+        result.predicate_op = convert_sv_comp_op(binary->op);
+        result.negated = binary->negated;
+        switch (binary->quantifier) {
+        case ast::Quantifier::NONE:
+            result.quantifier = QueryQuantifier::NONE;
+            break;
+        case ast::Quantifier::ANY:
+            result.quantifier = QueryQuantifier::ANY;
+            break;
+        case ast::Quantifier::ALL:
+            result.quantifier = QueryQuantifier::ALL;
+            break;
+        }
+        if (binary->lhs != nullptr) {
+            result.lhs = std::make_shared<QueryExpr>(
+                convert_ast_expr(binary->lhs.get(), context_name, outer_cols, outer_aliases));
+        }
+        if (binary->rhs != nullptr) {
+            result.rhs = std::make_shared<QueryExpr>(
+                convert_ast_expr(binary->rhs.get(), context_name, outer_cols, outer_aliases));
+        }
+        if (binary->rhs_upper != nullptr) {
+            result.rhs_upper = std::make_shared<QueryExpr>(
+                convert_ast_expr(binary->rhs_upper.get(), context_name, outer_cols, outer_aliases));
+        }
+        result.rhs_values.reserve(binary->rhs_list.size());
+        for (const auto& rhs_value : binary->rhs_list) {
+            result.rhs_values.push_back(
+                std::make_shared<QueryExpr>(convert_ast_expr(rhs_value.get(), context_name, outer_cols, outer_aliases)));
+        }
+        return result;
+    }
+    if (auto subquery = dynamic_cast<const ast::SubqueryExpr*>(expr); subquery != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::SUBQUERY;
+        auto query = analyze_subquery(subquery->query.get(), outer_cols, outer_aliases);
+        result.subquery = std::shared_ptr<Query>(std::move(query));
+        result.display_name = "SUBQUERY";
+        return result;
+    }
+
+    throw InternalError(context_name + " contains an unsupported expression type");
+}
+
+std::unique_ptr<Query> Analyze::analyze_subquery(const ast::TreeNode* root,
+                                                 const std::vector<ColMeta>& outer_cols,
+                                                 const std::unordered_map<std::string, std::string>& outer_aliases) {
+    if (root == nullptr) {
+        throw InternalError("Unexpected null subquery");
+    }
+    if (root->type == ast::AstType::SelectStmt) {
+        return analyze_select_stmt(static_cast<const ast::SelectStmt*>(root), nullptr, outer_cols, outer_aliases);
+    }
+    if (root->type == ast::AstType::SelectFromUnionStmt) {
+        return analyze_select_from_union_stmt(static_cast<const ast::SelectFromUnionStmt*>(root), nullptr, outer_cols,
+                                              outer_aliases);
+    }
+    throw RMDBError("Subquery must be a SELECT statement");
+}
+
 TabCol Analyze::check_column(const std::vector<ColMeta>& all_cols, TabCol target) {
     resolve_column_meta(all_cols, target);
     return target;
@@ -373,10 +862,18 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
     conds.clear();
     conds.reserve(sv_conds.size());
     for (const auto& expr : sv_conds) {
+        if (dynamic_cast<const ast::Col*>(expr->lhs.get()) == nullptr) {
+            continue;
+        }
         Condition cond;
         cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
         cond.op = convert_sv_comp_op(expr->op);
         cond.negated = expr->negated;
+
+        if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL || cond.op == OP_EXISTS) {
+            conds.push_back(cond);
+            continue;
+        }
 
         for (const auto& raw_value : expr->rhs_list) {
             auto rhs_val = dynamic_cast<const ast::Value*>(raw_value.get());
@@ -418,6 +915,10 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
         cond.lhs_col = check_column(all_cols, cond.lhs_col);
         auto lhs_col = sm_manager_->db_.get_table(cond.lhs_col.tab_name).get_col(cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
+
+        if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL || cond.op == OP_EXISTS) {
+            continue;
+        }
 
         if (cond.op == OP_LIKE && lhs_type != TYPE_STRING && lhs_type != TYPE_DATETIME) {
             throw IncompatibleTypeError(coltype2str(lhs_type), "string");
@@ -518,6 +1019,12 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         return OP_IN;
     case ast::SV_OP_BETWEEN:
         return OP_BETWEEN;
+    case ast::SV_OP_IS_NULL:
+        return OP_IS_NULL;
+    case ast::SV_OP_IS_NOT_NULL:
+        return OP_IS_NOT_NULL;
+    case ast::SV_OP_EXISTS:
+        return OP_EXISTS;
     }
     throw InternalError("Unexpected comparison operator");
 }

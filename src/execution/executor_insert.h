@@ -177,3 +177,83 @@ public:
         return rid_;
     }
 };
+
+class InsertSelectExecutor : public AbstractExecutor {
+private:
+    SmManager* sm_manager_;
+    std::string tab_name_;
+    std::vector<std::string> target_col_names_;
+    std::unique_ptr<AbstractExecutor> source_;
+    Context* context_;
+    Rid rid_;
+
+    static Value read_value(const RmRecord& record, const ColMeta& col, bool is_null) {
+        Value value;
+        if (is_null) {
+            value.set_null();
+            return value;
+        }
+        const char* data = record.data + col.offset;
+        switch (col.type) {
+        case TYPE_INT:
+            value.set_int(*reinterpret_cast<const int*>(data));
+            break;
+        case TYPE_FLOAT:
+            value.set_float(*reinterpret_cast<const double*>(data));
+            break;
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            value.set_str(execution_scalar::trim_string(data, col.len));
+            value.type = col.type;
+            break;
+        }
+        return value;
+    }
+
+public:
+    InsertSelectExecutor(SmManager* sm_manager, std::string tab_name, std::vector<std::string> target_col_names,
+                         std::unique_ptr<AbstractExecutor> source, Context* context)
+        : sm_manager_(sm_manager), tab_name_(std::move(tab_name)), target_col_names_(std::move(target_col_names)),
+          source_(std::move(source)), context_(context) {
+        source_->beginTuple();
+    }
+
+    std::unique_ptr<RmRecord> Next() override {
+        const auto& table = sm_manager_->db_.get_table(tab_name_);
+        if (target_col_names_.empty() && source_->cols().size() != table.cols.size()) {
+            throw InvalidValueCountError();
+        }
+        if (!target_col_names_.empty() && target_col_names_.size() != source_->cols().size()) {
+            throw InvalidValueCountError();
+        }
+
+        for (; !source_->is_end(); source_->nextTuple()) {
+            auto source_record = source_->Next();
+            if (source_record == nullptr) {
+                continue;
+            }
+            std::vector<Value> values(table.cols.size());
+            for (size_t source_idx = 0; source_idx < source_->cols().size(); ++source_idx) {
+                std::string target_name = target_col_names_.empty() ? table.cols[source_idx].name
+                                                                     : target_col_names_[source_idx];
+                auto target = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
+                    return col.name == target_name;
+                });
+                if (target == table.cols.end()) {
+                    throw ColumnNotFoundError(target_name);
+                }
+                size_t target_idx = static_cast<size_t>(target - table.cols.begin());
+                bool is_null = source_idx < source_->nulls().size() && source_->nulls()[source_idx];
+                values[target_idx] = read_value(*source_record, source_->cols()[source_idx], is_null);
+            }
+            InsertExecutor insert(sm_manager_, tab_name_, std::move(values), context_);
+            insert.Next();
+            rid_ = insert.rid();
+        }
+        return nullptr;
+    }
+
+    Rid& rid() override {
+        return rid_;
+    }
+};

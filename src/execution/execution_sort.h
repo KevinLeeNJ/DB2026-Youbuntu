@@ -30,6 +30,7 @@ private:
     struct SortKey {
         ColMeta col;
         bool is_desc = false;
+        int nulls_order = 0;
         CompareFn compare_fn = nullptr;
     };
 
@@ -129,7 +130,11 @@ private:
     }
 
     void add_sort_key(const ColMeta& col, bool is_desc) {
-        sort_keys_.push_back({col, is_desc, bind_compare_fn(col.type)});
+        sort_keys_.push_back({col, is_desc, 0, bind_compare_fn(col.type)});
+    }
+
+    void add_sort_key(const ColMeta& col, bool is_desc, int nulls_order) {
+        sort_keys_.push_back({col, is_desc, nulls_order, bind_compare_fn(col.type)});
     }
 
     int compare_records(const RmRecord& lhs, const RmRecord& rhs) const {
@@ -143,9 +148,25 @@ private:
     }
 
     int compare_materialized(const MaterializedTuple& lhs, const MaterializedTuple& rhs) const {
-        int cmp = compare_records(lhs.record, rhs.record);
-        if (cmp != 0) {
-            return cmp;
+        for (size_t key_index = 0; key_index < sort_keys_.size(); ++key_index) {
+            const auto& key = sort_keys_[key_index];
+            auto col_pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta& col) {
+                return col.offset == key.col.offset && col.name == key.col.name;
+            });
+            size_t null_index = col_pos == cols_.end() ? cols_.size() : static_cast<size_t>(col_pos - cols_.begin());
+            bool lhs_null = null_index < lhs.nulls.size() && lhs.nulls[null_index];
+            bool rhs_null = null_index < rhs.nulls.size() && rhs.nulls[null_index];
+            if (lhs_null || rhs_null) {
+                if (lhs_null && rhs_null) {
+                    continue;
+                }
+                bool nulls_first = key.nulls_order == 1 || (key.nulls_order == 0 && !key.is_desc);
+                return lhs_null == nulls_first ? -1 : 1;
+            }
+            int cmp = key.compare_fn(lhs.record, rhs.record, key.col);
+            if (cmp != 0) {
+                return key.is_desc ? -cmp : cmp;
+            }
         }
         if (lhs.ordinal < rhs.ordinal) {
             return -1;
@@ -231,14 +252,8 @@ private:
         std::vector<size_t> order(tuples_.size());
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
-            for (const auto& key : sort_keys_) {
-                int cmp = key.compare_fn(tuples_[lhs], tuples_[rhs], key.col);
-                if (cmp == 0) {
-                    continue;
-                }
-                return key.is_desc ? (cmp > 0) : (cmp < 0);
-            }
-            return false;
+            return compare_materialized(MaterializedTuple{tuples_[lhs], tuple_nulls_[lhs], lhs},
+                                        MaterializedTuple{tuples_[rhs], tuple_nulls_[rhs], rhs}) < 0;
         });
         std::vector<RmRecord> sorted_tuples;
         std::vector<std::vector<bool>> sorted_nulls;
@@ -272,7 +287,7 @@ private:
             if (static_cast<int>(expr.type) == 0) {
                 try {
                     ColMeta col = resolve_col(expr.col);
-                    add_sort_key(col, item.is_desc);
+                    add_sort_key(col, item.is_desc, item.nulls_order);
                     continue;
                 } catch (const ColumnNotFoundError&) {
                     try_resolve_by_name(item.order_name) || try_resolve_by_name(expr.col.col_name);
@@ -287,7 +302,7 @@ private:
                                               ? item.order_name
                                               : (expr.display_name.empty() ? expr.col.col_name : expr.display_name));
             }
-            add_sort_key(*resolved, item.is_desc);
+            add_sort_key(*resolved, item.is_desc, item.nulls_order);
         }
     }
 

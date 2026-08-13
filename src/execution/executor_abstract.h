@@ -156,7 +156,17 @@ protected:
 
     bool compare(const Condition& cond, const RmRecord& rec, const std::vector<bool>& nulls) {
         ColMeta lhs_col_meta = get_col_offset(cond.lhs_col);
-        if (!nulls.empty() && is_null(nulls, cond.lhs_col)) {
+        bool lhs_is_null = !nulls.empty() && is_null(nulls, cond.lhs_col);
+        if (cond.op == OP_IS_NULL) {
+            return lhs_is_null;
+        }
+        if (cond.op == OP_IS_NOT_NULL) {
+            return !lhs_is_null;
+        }
+        if (cond.op == OP_EXISTS) {
+            return false;
+        }
+        if (lhs_is_null) {
             return false;
         }
 

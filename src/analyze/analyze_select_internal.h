@@ -72,41 +72,9 @@ template <typename ExprPtrT> TabCol extract_ast_column(const ExprPtrT& expr_node
     return {.tab_name = col->tab_name, .col_name = col->col_name};
 }
 
-template <typename ExprPtrT>
-QueryExpr convert_simple_ast_expr(const ExprPtrT& expr_node, const std::string& context_name) {
-    if (expr_node == nullptr) {
-        throw InternalError("Unexpected null expression node");
-    }
-    if (auto col = dynamic_cast<const ast::Col*>(expr_node.get()); col != nullptr) {
-        return make_column_expr({.tab_name = col->tab_name, .col_name = col->col_name});
-    }
-    if (auto val = dynamic_cast<const ast::Value*>(expr_node.get()); val != nullptr) {
-        QueryExpr expr;
-        expr.type = QueryExprType::VALUE;
-        expr.value = convert_ast_value_node(val);
-        return expr;
-    }
-    if (auto agg = dynamic_cast<const ast::AggExpr*>(expr_node.get()); agg != nullptr) {
-        QueryExpr expr;
-        expr.type = QueryExprType::AGGREGATE;
-        expr.agg.type = convert_ast_agg_type(agg->func);
-        expr.agg.is_star = agg->is_star;
-        if (!agg->is_star) {
-            if (agg->col == nullptr) {
-                throw InternalError("Unexpected null aggregate argument");
-            }
-            expr.agg.col = {.tab_name = agg->col->tab_name, .col_name = agg->col->col_name};
-        }
-        expr.agg.display_name = build_agg_display_name(expr.agg);
-        expr.display_name = expr.agg.display_name;
-        return expr;
-    }
-
-    throw InternalError(context_name + " contains an unsupported expression type");
-}
-
-template <typename SelectStmtT>
-void populate_select_items_from_ast(Query& query, const SelectStmtT& stmt, const std::vector<ColMeta>& all_cols) {
+template <typename SelectStmtT, typename Converter>
+void populate_select_items_from_ast(Query& query, const SelectStmtT& stmt, const std::vector<ColMeta>& all_cols,
+                                     Converter&& converter) {
     query.select_items.clear();
     query.has_select_star = stmt.has_select_star;
 
@@ -120,7 +88,7 @@ void populate_select_items_from_ast(Query& query, const SelectStmtT& stmt, const
             throw InternalError("Unexpected null select item");
         }
         SelectItem item;
-        item.expr = convert_simple_ast_expr(raw_item->expr, "SELECT");
+        item.expr = converter(raw_item->expr.get(), "SELECT");
         item.alias = raw_item->alias;
         query.select_items.push_back(std::move(item));
     }
@@ -139,7 +107,8 @@ template <typename SelectStmtT> void populate_group_by_from_ast(Query& query, co
     }
 }
 
-template <typename SelectStmtT> void populate_having_from_ast(Query& query, const SelectStmtT& stmt) {
+template <typename SelectStmtT, typename Converter>
+void populate_having_from_ast(Query& query, const SelectStmtT& stmt, Converter&& converter) {
     query.having_conds.clear();
     if constexpr (has_having_conds_member<SelectStmtT>::value) {
         query.having_conds.reserve(stmt.having_conds.size());
@@ -148,7 +117,7 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
                 throw InternalError("Unexpected null HAVING condition");
             }
             HavingCondition cond;
-            cond.lhs = convert_simple_ast_expr(raw_cond->lhs, "HAVING");
+            cond.lhs = converter(raw_cond->lhs.get(), "HAVING");
             cond.negated = raw_cond->negated;
             cond.op = static_cast<CompOp>(0); // overwritten below
             switch (raw_cond->op) {
@@ -194,7 +163,7 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
                 cond.rhs_val = convert_ast_value_node(rhs_val);
             } else {
                 cond.is_rhs_val = false;
-                cond.rhs_expr = convert_simple_ast_expr(raw_cond->rhs, "HAVING");
+                cond.rhs_expr = converter(raw_cond->rhs.get(), "HAVING");
             }
             if (raw_cond->rhs_upper != nullptr) {
                 auto rhs_upper = dynamic_cast<const ast::Value*>(raw_cond->rhs_upper.get());
@@ -209,7 +178,8 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
     }
 }
 
-template <typename SelectStmtT> void populate_order_by_from_ast(Query& query, const SelectStmtT& stmt) {
+template <typename SelectStmtT, typename Converter>
+void populate_order_by_from_ast(Query& query, const SelectStmtT& stmt, Converter&& converter) {
     query.order_by_items.clear();
     if constexpr (has_order_by_items_member<SelectStmtT>::value) {
         query.order_by_items.reserve(stmt.order_by_items.size());
@@ -218,8 +188,9 @@ template <typename SelectStmtT> void populate_order_by_from_ast(Query& query, co
                 throw InternalError("Unexpected null ORDER BY item");
             }
             OrderByItem item;
-            item.expr = convert_simple_ast_expr(raw_item->expr, "ORDER BY");
+            item.expr = converter(raw_item->expr.get(), "ORDER BY");
             item.is_desc = raw_item->orderby_dir == ast::OrderBy_DESC;
+            item.nulls_order = static_cast<int>(raw_item->nulls_order);
             if (item.expr.type == QueryExprType::COLUMN && item.expr.col.tab_name.empty()) {
                 item.order_name = item.expr.col.col_name;
             }

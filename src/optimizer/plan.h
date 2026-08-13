@@ -123,9 +123,15 @@ public:
         subplan_ = std::move(subplan);
         conds_ = std::move(conds);
     }
+    FilterPlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::shared_ptr<QueryExpr> expr) {
+        Plan::tag = tag;
+        subplan_ = std::move(subplan);
+        expr_ = std::move(expr);
+    }
     ~FilterPlan() {}
     std::unique_ptr<Plan> subplan_;
     std::vector<Condition> conds_;
+    std::shared_ptr<QueryExpr> expr_;
 };
 
 class ProjectionPlan : public Plan {
@@ -206,18 +212,21 @@ public:
 class UnionPlan : public Plan {
 public:
     UnionPlan(PlanTag tag, std::vector<std::unique_ptr<Plan>> branches, std::vector<ColMeta> cols,
-              std::vector<std::string> output_names, std::vector<bool> union_all = {}) {
+              std::vector<std::string> output_names, std::vector<bool> union_all = {},
+              std::vector<QuerySetOperator> operators = {}) {
         Plan::tag = tag;
         branches_ = std::move(branches);
         cols_ = std::move(cols);
         output_names_ = std::move(output_names);
         union_all_ = std::move(union_all);
+        operators_ = std::move(operators);
     }
     ~UnionPlan() {}
     std::vector<std::unique_ptr<Plan>> branches_;
     std::vector<ColMeta> cols_;
     std::vector<std::string> output_names_;
     std::vector<bool> union_all_;
+    std::vector<QuerySetOperator> operators_;
 };
 
 // dml语句，包括insert; delete; update; select语句　
@@ -236,8 +245,10 @@ public:
     std::unique_ptr<Plan> subplan_;
     std::string tab_name_;
     std::vector<Value> values_;
+    std::vector<std::string> insert_col_names_;
     std::vector<Condition> conds_;
     std::vector<SetClause> set_clauses_;
+    std::shared_ptr<QueryExpr> where_expr_;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;

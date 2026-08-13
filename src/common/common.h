@@ -31,6 +31,7 @@ struct TabCol {
 
 struct Value {
     ColType type; // type of value
+    bool is_null = false;
     union {
         int int_val;      // int value
         double float_val; // SQL FLOAT value
@@ -41,23 +42,34 @@ struct Value {
 
     void set_int(int int_val_) {
         type = TYPE_INT;
+        is_null = false;
         int_val = int_val_;
     }
 
     void set_float(double float_val_) {
         type = TYPE_FLOAT;
+        is_null = false;
         float_val = float_val_;
     }
 
     void set_str(std::string str_val_) {
         type = TYPE_STRING;
+        is_null = false;
         str_val = std::move(str_val_);
+    }
+
+    void set_null() {
+        type = TYPE_INT;
+        is_null = true;
+        int_val = 0;
     }
 
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
-        if (type == TYPE_INT) {
+        if (is_null) {
+            memset(raw->data, 0, len);
+        } else if (type == TYPE_INT) {
             assert(len == sizeof(int));
             *(int*)(raw->data) = int_val;
         } else if (type == TYPE_FLOAT) {
@@ -73,11 +85,32 @@ struct Value {
     }
 };
 
-enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE, OP_LIKE, OP_IN, OP_BETWEEN };
+enum CompOp {
+    OP_EQ,
+    OP_NE,
+    OP_LT,
+    OP_GT,
+    OP_LE,
+    OP_GE,
+    OP_LIKE,
+    OP_IN,
+    OP_BETWEEN,
+    OP_IS_NULL,
+    OP_IS_NOT_NULL,
+    OP_EXISTS
+};
 
 enum class AggType { COUNT, MAX, MIN, SUM, AVG };
 
-enum class QueryExprType { COLUMN, AGGREGATE, VALUE };
+enum class QueryExprType { COLUMN, AGGREGATE, VALUE, ARITHMETIC, LOGICAL, CASE_EXPR, PREDICATE, SUBQUERY };
+
+enum class QueryArithmeticOp { ADD, SUB, MUL, DIV };
+enum class QueryLogicalOp { AND, OR, NOT };
+enum class QueryQuantifier { NONE, ANY, ALL };
+enum class QuerySetOperator { UNION, INTERSECT, EXCEPT };
+
+class Query;
+class Plan;
 
 inline bool is_swappable_comp_op(CompOp op) {
     return op == OP_EQ || op == OP_NE || op == OP_LT || op == OP_GT || op == OP_LE || op == OP_GE;
@@ -107,6 +140,7 @@ inline CompOp swap_comp_op(CompOp op) {
 struct AggExpr {
     AggType type = AggType::COUNT;
     bool is_star = false;
+    bool is_distinct = false;
     TabCol col;
     std::string display_name;
 };
@@ -117,6 +151,20 @@ struct QueryExpr {
     AggExpr agg;
     Value value;
     std::string display_name;
+    QueryArithmeticOp arithmetic_op = QueryArithmeticOp::ADD;
+    QueryLogicalOp logical_op = QueryLogicalOp::AND;
+    CompOp predicate_op = OP_EQ;
+    QueryQuantifier quantifier = QueryQuantifier::NONE;
+    bool negated = false;
+    std::shared_ptr<QueryExpr> lhs;
+    std::shared_ptr<QueryExpr> rhs;
+    std::shared_ptr<QueryExpr> rhs_upper;
+    std::vector<std::shared_ptr<QueryExpr>> operands;
+    std::vector<std::pair<std::shared_ptr<QueryExpr>, std::shared_ptr<QueryExpr>>> case_when;
+    std::shared_ptr<QueryExpr> else_expr;
+    std::vector<std::shared_ptr<QueryExpr>> rhs_values;
+    std::shared_ptr<Query> subquery;
+    std::shared_ptr<Plan> subquery_plan;
 };
 
 struct SelectItem {
@@ -129,6 +177,7 @@ struct OrderByItem {
     QueryExpr expr;
     bool is_desc = false;
     std::string order_name;
+    int nulls_order = 0;
 };
 
 struct HavingCondition {
@@ -165,4 +214,5 @@ struct SetClause {
     bool is_self_ref = false;
     TabCol rhs_col;
     UpdateOp op = UpdateOp::ASSIGNMENT;
+    std::shared_ptr<QueryExpr> rhs_expr;
 };

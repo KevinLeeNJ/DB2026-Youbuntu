@@ -60,6 +60,7 @@ private:
     struct AggregateSpec {
         LocalAggType type = LocalAggType::COUNT;
         bool is_star = false;
+        bool is_distinct = false;
         TabCol col;
         std::string output_name;
         ColType input_type = TYPE_INT;
@@ -72,6 +73,7 @@ private:
         double sum = 0.0;
         bool has_value = false;
         CellValue value;
+        std::unordered_set<CellValue, CellValueHash> distinct_values;
     };
 
     struct GroupState {
@@ -273,9 +275,10 @@ private:
         AggregateSpec spec;
         spec.type = normalize_agg_type(static_cast<int>(agg_expr.type));
         spec.is_star = agg_expr.is_star;
+        spec.is_distinct = agg_expr.is_distinct;
         spec.col = agg_expr.col;
         spec.output_name = agg_expr.display_name;
-        if (spec.type == LocalAggType::COUNT) {
+        if (spec.type == LocalAggType::COUNT && spec.is_star) {
             spec.input_type = TYPE_INT;
             spec.input_len = static_cast<int>(sizeof(int));
         } else {
@@ -407,10 +410,27 @@ private:
         return state;
     }
 
-    void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec) const {
+    void update_aggregate_state(AggregateState& state, const AggregateSpec& spec, const RmRecord& rec,
+                                const std::vector<bool>& nulls) const {
         CellValue current_value;
-        if (!spec.is_star && spec.type != LocalAggType::COUNT) {
+        bool current_is_null = false;
+        if (!spec.is_star) {
             current_value = read_cell(rec, spec.input_col);
+            auto pos = std::find_if(prev_->cols().begin(), prev_->cols().end(), [&](const ColMeta& col) {
+                return col.tab_name == spec.input_col.tab_name && col.name == spec.input_col.name;
+            });
+            if (pos != prev_->cols().end()) {
+                size_t index = static_cast<size_t>(pos - prev_->cols().begin());
+                current_is_null = index < nulls.size() && nulls[index];
+            }
+        }
+        if (current_is_null) {
+            return;
+        }
+        if (spec.is_distinct) {
+            if (!state.distinct_values.insert(current_value).second) {
+                return;
+            }
         }
 
         switch (spec.type) {
@@ -631,7 +651,8 @@ private:
                     groups_.push_back(make_group_state(key.values, key.nulls));
                 }
                 for (size_t i = 0; i < aggregates_.size(); ++i) {
-                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec);
+                    update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec,
+                                            child_nulls);
                 }
             }
 
@@ -668,7 +689,7 @@ private:
                 if (rec == nullptr) {
                     continue;
                 }
-                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], *rec);
+                update_aggregate_state(global_state.aggregate_states[0], aggregates_[0], *rec, prev_->nulls());
                 groups_.push_back(std::move(global_state));
                 return;
             }
@@ -685,7 +706,7 @@ private:
                 continue;
             }
             for (size_t i = 0; i < aggregates_.size(); ++i) {
-                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], *rec);
+                update_aggregate_state(global_state.aggregate_states[i], aggregates_[i], *rec, prev_->nulls());
             }
         }
 

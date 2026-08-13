@@ -25,6 +25,7 @@ private:
     std::vector<std::unique_ptr<AbstractExecutor>> branches_;
     std::vector<ColMeta> cols_;
     std::vector<bool> union_all_;
+    std::vector<QuerySetOperator> operators_;
     size_t len_ = 0;
     std::vector<RmRecord> tuples_;
     std::vector<std::vector<bool>> tuple_nulls_;
@@ -78,57 +79,84 @@ private:
     void materialize() {
         tuples_.clear();
         tuple_nulls_.clear();
+        std::vector<std::vector<RmRecord>> branch_tuples(branches_.size());
+        std::vector<std::vector<std::vector<bool>>> branch_nulls(branches_.size());
         for (size_t branch_idx = 0; branch_idx < branches_.size(); ++branch_idx) {
             auto& branch = branches_[branch_idx];
             const auto& branch_cols = branch->cols();
-            std::vector<RmRecord> branch_tuples;
-            std::vector<std::vector<bool>> branch_nulls;
             for (branch->beginTuple(); !branch->is_end(); branch->nextTuple()) {
                 auto rec = branch->Next();
                 if (rec == nullptr) {
                     continue;
                 }
-                branch_tuples.push_back(convert_record(*rec, branch_cols));
-                branch_nulls.push_back(branch->nulls());
+                branch_tuples[branch_idx].push_back(convert_record(*rec, branch_cols));
+                branch_nulls[branch_idx].push_back(branch->nulls());
             }
+        }
+        if (branches_.empty()) {
+            materialized_ = true;
+            return;
+        }
 
-            bool keep_duplicates = (branch_idx == 0 && !union_all_.empty() && union_all_[0]) ||
-                                   (branch_idx > 0 && branch_idx - 1 < union_all_.size() && union_all_[branch_idx - 1]);
-            if (keep_duplicates) {
-                for (size_t i = 0; i < branch_tuples.size(); ++i) {
-                    tuples_.push_back(std::move(branch_tuples[i]));
-                    tuple_nulls_.push_back(std::move(branch_nulls[i]));
+        auto deduplicate = [&](std::vector<RmRecord> tuples, std::vector<std::vector<bool>> nulls) {
+            std::unordered_set<std::string> seen;
+            std::vector<RmRecord> unique_tuples;
+            std::vector<std::vector<bool>> unique_nulls;
+            for (size_t i = 0; i < tuples.size(); ++i) {
+                if (seen.insert(make_key(tuples[i], nulls[i])).second) {
+                    unique_tuples.push_back(std::move(tuples[i]));
+                    unique_nulls.push_back(std::move(nulls[i]));
+                }
+            }
+            return std::make_pair(std::move(unique_tuples), std::move(unique_nulls));
+        };
+
+        tuples_ = std::move(branch_tuples[0]);
+        tuple_nulls_ = std::move(branch_nulls[0]);
+        for (size_t branch_idx = 1; branch_idx < branches_.size(); ++branch_idx) {
+            QuerySetOperator op = QuerySetOperator::UNION;
+            if (branch_idx - 1 < operators_.size()) {
+                op = operators_[branch_idx - 1];
+            }
+            if (op == QuerySetOperator::UNION) {
+                bool keep_duplicates = branch_idx - 1 < union_all_.size() && union_all_[branch_idx - 1];
+                for (auto& tuple : branch_tuples[branch_idx]) {
+                    tuples_.push_back(std::move(tuple));
+                }
+                for (auto& nulls : branch_nulls[branch_idx]) {
+                    tuple_nulls_.push_back(std::move(nulls));
+                }
+                if (!keep_duplicates) {
+                    auto unique = deduplicate(std::move(tuples_), std::move(tuple_nulls_));
+                    tuples_ = std::move(unique.first);
+                    tuple_nulls_ = std::move(unique.second);
                 }
                 continue;
             }
 
-            std::unordered_set<std::string> unique_keys;
-            std::vector<RmRecord> unique_tuples;
-            std::vector<std::vector<bool>> unique_nulls;
-            unique_tuples.reserve(tuples_.size() + branch_tuples.size());
-            unique_nulls.reserve(tuple_nulls_.size() + branch_nulls.size());
-            for (size_t i = 0; i < tuples_.size(); ++i) {
-                if (unique_keys.insert(make_key(tuples_[i], tuple_nulls_[i])).second) {
-                    unique_tuples.push_back(std::move(tuples_[i]));
-                    unique_nulls.push_back(std::move(tuple_nulls_[i]));
+            auto left = deduplicate(std::move(tuples_), std::move(tuple_nulls_));
+            auto right = deduplicate(std::move(branch_tuples[branch_idx]), std::move(branch_nulls[branch_idx]));
+            std::unordered_set<std::string> right_keys;
+            for (size_t i = 0; i < right.first.size(); ++i) {
+                right_keys.insert(make_key(right.first[i], right.second[i]));
+            }
+            for (size_t i = 0; i < left.first.size(); ++i) {
+                bool present = right_keys.find(make_key(left.first[i], left.second[i])) != right_keys.end();
+                if ((op == QuerySetOperator::INTERSECT && present) ||
+                    (op == QuerySetOperator::EXCEPT && !present)) {
+                    tuples_.push_back(std::move(left.first[i]));
+                    tuple_nulls_.push_back(std::move(left.second[i]));
                 }
             }
-            for (size_t i = 0; i < branch_tuples.size(); ++i) {
-                if (unique_keys.insert(make_key(branch_tuples[i], branch_nulls[i])).second) {
-                    unique_tuples.push_back(std::move(branch_tuples[i]));
-                    unique_nulls.push_back(std::move(branch_nulls[i]));
-                }
-            }
-            tuples_ = std::move(unique_tuples);
-            tuple_nulls_ = std::move(unique_nulls);
         }
         materialized_ = true;
     }
 
 public:
     UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches, std::vector<ColMeta> cols,
-                  std::vector<bool> union_all = {})
-        : branches_(std::move(branches)), cols_(std::move(cols)), union_all_(std::move(union_all)) {
+                  std::vector<bool> union_all = {}, std::vector<QuerySetOperator> operators = {})
+        : branches_(std::move(branches)), cols_(std::move(cols)), union_all_(std::move(union_all)),
+          operators_(std::move(operators)) {
         if (!cols_.empty()) {
             len_ = static_cast<size_t>(cols_.back().offset + cols_.back().len);
         }

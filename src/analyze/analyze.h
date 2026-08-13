@@ -28,6 +28,8 @@ public:
     std::unique_ptr<ast::TreeNode> parse;
     // where条件
     std::vector<Condition> conds;
+    // 递归 WHERE 表达式；简单 AND/比较条件仍会同步保存在 conds 中供索引和连接优化使用
+    std::shared_ptr<QueryExpr> where_expr;
     // 投影列
     std::vector<TabCol> cols;
     // 聚合/分组查询的执行期输出描述
@@ -48,6 +50,7 @@ public:
     std::vector<ColMeta> union_cols;
     std::string union_alias;
     std::vector<bool> union_all;
+    std::vector<QuerySetOperator> set_operators;
     std::vector<JoinType> join_types;
     std::vector<std::vector<Condition>> join_on_conds;
     // 表名
@@ -62,6 +65,8 @@ public:
     std::vector<SetClause> set_clauses;
     // insert 的values值
     std::vector<Value> values;
+    std::vector<std::string> insert_col_names;
+    std::shared_ptr<Query> insert_query;
 
     Query() {}
 };
@@ -100,9 +105,25 @@ private:
     }
 
     std::unique_ptr<Query> analyze_select_stmt(const ast::SelectStmt* select,
-                                               std::unique_ptr<ast::TreeNode> owner = nullptr);
+                                               std::unique_ptr<ast::TreeNode> owner = nullptr,
+                                               const std::vector<ColMeta>& outer_cols = {},
+                                               const std::unordered_map<std::string, std::string>& outer_aliases = {});
     std::unique_ptr<Query> analyze_select_from_union_stmt(const ast::SelectFromUnionStmt* select,
-                                                          std::unique_ptr<ast::TreeNode> owner);
+                                                          std::unique_ptr<ast::TreeNode> owner,
+                                                          const std::vector<ColMeta>& outer_cols = {},
+                                                          const std::unordered_map<std::string, std::string>&
+                                                              outer_aliases = {});
+    std::unique_ptr<Query> analyze_union_stmt(const ast::UnionStmt* union_stmt, std::string alias,
+                                              const std::vector<std::unique_ptr<ast::OrderByItem>>& order_by_items,
+                                              bool has_limit, int limit, bool has_offset, int offset,
+                                              std::unique_ptr<ast::TreeNode> owner,
+                                              const std::vector<ColMeta>& outer_cols,
+                                              const std::unordered_map<std::string, std::string>& outer_aliases);
+    QueryExpr convert_ast_expr(const ast::Expr* expr, const std::string& context_name,
+                               const std::vector<ColMeta>& outer_cols,
+                               const std::unordered_map<std::string, std::string>& outer_aliases);
+    std::unique_ptr<Query> analyze_subquery(const ast::TreeNode* root, const std::vector<ColMeta>& outer_cols,
+                                            const std::unordered_map<std::string, std::string>& outer_aliases);
     std::vector<ColMeta> get_query_output_metas(const Query& query);
     ColMeta make_union_col_meta(const ColMeta& current, const ColMeta& next);
     void validate_union_order_by(Query& query);

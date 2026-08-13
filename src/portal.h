@@ -706,8 +706,14 @@ public:
             }
 
             case T_Insert: {
-                std::unique_ptr<AbstractExecutor> root =
-                    std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
+                std::unique_ptr<AbstractExecutor> root;
+                if (x->subplan_ != nullptr) {
+                    auto source = convert_plan_executor(x->subplan_.get(), context);
+                    root = std::make_unique<InsertSelectExecutor>(sm_manager_, x->tab_name_, x->insert_col_names_,
+                                                                   std::move(source), context);
+                } else {
+                    root = std::make_unique<InsertExecutor>(sm_manager_, x->tab_name_, x->values_, context);
+                }
 
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
@@ -764,11 +770,43 @@ public:
     // 清空资源
     void drop() {}
 
-    std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false) {
+    QueryExprEvaluator::SubqueryRunner make_subquery_runner(Context* context) {
+        return [this, context](const Plan& plan, const RmRecord& outer_record,
+                               const std::vector<ColMeta>& outer_cols,
+                               const std::vector<bool>& outer_nulls) {
+            QueryExprOuterContext outer_context{&outer_record, &outer_cols, &outer_nulls};
+            auto executor = convert_plan_executor(const_cast<Plan*>(&plan), context, false, &outer_context);
+            std::vector<EvaluatedValue> values;
+            for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) {
+                auto record = executor->Next();
+                if (record == nullptr || executor->cols().empty()) {
+                    continue;
+                }
+                const auto& col = executor->cols().front();
+                EvaluatedValue value;
+                value.cell.type = col.type;
+                if (!executor->nulls().empty() && executor->nulls().front()) {
+                    value.is_null = true;
+                } else if (col.type == TYPE_INT) {
+                    value.cell.int_val = *reinterpret_cast<const int*>(record->data + col.offset);
+                } else if (col.type == TYPE_FLOAT) {
+                    value.cell.float_val = *reinterpret_cast<const double*>(record->data + col.offset);
+                } else {
+                    value.cell.str_val = execution_scalar::trim_string(record->data + col.offset, col.len);
+                }
+                values.push_back(std::move(value));
+            }
+            return values;
+        };
+    }
+
+    std::unique_ptr<AbstractExecutor> convert_plan_executor(Plan* plan, Context* context, bool count_rows = false,
+                                                             const QueryExprOuterContext* outer_context = nullptr) {
         switch (plan->tag) {
         case T_Projection: {
             auto x = static_cast<ProjectionPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> subplan = convert_plan_executor(x->subplan_.get(), context, count_rows);
+            std::unique_ptr<AbstractExecutor> subplan =
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context);
             std::unique_ptr<AbstractExecutor> executor;
             if (x->preserve_col_names_) {
                 std::vector<TabCol> cols;
@@ -778,28 +816,37 @@ public:
                 }
                 executor = std::make_unique<ProjectionExecutor>(std::move(subplan), cols);
             } else {
-                auto select_items = to_executor_select_items(x->select_items_);
-                executor = std::make_unique<ProjectionExecutor>(std::move(subplan), select_items);
+                executor = std::make_unique<ProjectionExecutor>(std::move(subplan), x->select_items_,
+                                                                 make_subquery_runner(context), outer_context);
             }
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Distinct: {
             auto x = static_cast<DistinctPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor =
-                std::make_unique<DistinctExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows));
+                std::make_unique<DistinctExecutor>(
+                    convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context));
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Filter: {
             auto x = static_cast<FilterPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> executor = std::make_unique<FilterExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), x->conds_);
+            std::unique_ptr<AbstractExecutor> executor;
+            auto subplan = convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context);
+            if (x->expr_ != nullptr) {
+                executor = std::make_unique<FilterExecutor>(std::move(subplan), x->expr_, make_subquery_runner(context),
+                                                             outer_context);
+            } else {
+                executor = std::make_unique<FilterExecutor>(std::move(subplan), x->conds_);
+            }
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Aggregate: {
             auto x = static_cast<AggregatePlan*>(plan);
             auto having_conds = to_executor_having_conds(x->having_conds_);
             std::unique_ptr<AbstractExecutor> executor =
-                std::make_unique<AggregateExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows),
+                std::make_unique<AggregateExecutor>(
+                                                    convert_plan_executor(x->subplan_.get(), context, count_rows,
+                                                                          outer_context),
                                                     x->group_by_cols_, x->agg_exprs_, having_conds, context);
             return maybe_count(std::move(executor), plan, count_rows);
         }
@@ -822,8 +869,10 @@ public:
         case T_NestLoop:
         case T_SortMerge: {
             auto x = static_cast<JoinPlan*>(plan);
-            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_.get(), context, count_rows);
-            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_.get(), context, count_rows);
+            std::unique_ptr<AbstractExecutor> left =
+                convert_plan_executor(x->left_.get(), context, count_rows, outer_context);
+            std::unique_ptr<AbstractExecutor> right =
+                convert_plan_executor(x->right_.get(), context, count_rows, outer_context);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                 std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
                 x->inlj_index_col_name_, x->type);
@@ -832,13 +881,14 @@ public:
         case T_Sort: {
             auto x = static_cast<SortPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<SortExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), bind_sort_output_names(*x), x->limit_);
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context), bind_sort_output_names(*x),
+                x->limit_);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Limit: {
             auto x = static_cast<LimitPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<LimitExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), x->limit_, x->offset_);
+                convert_plan_executor(x->subplan_.get(), context, count_rows, outer_context), x->limit_, x->offset_);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Union: {
@@ -846,10 +896,11 @@ public:
             std::vector<std::unique_ptr<AbstractExecutor>> branches;
             branches.reserve(x->branches_.size());
             for (const auto& branch_plan : x->branches_) {
-                branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows));
+                branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows, outer_context));
             }
-            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), x->cols_, x->union_all_), plan,
-                               count_rows);
+            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), x->cols_, x->union_all_,
+                                                               x->operators_),
+                               plan, count_rows);
         }
         default:
             break;

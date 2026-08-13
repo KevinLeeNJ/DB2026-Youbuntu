@@ -11,12 +11,16 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "executor_abstract.h"
+#include "executor_expr.h"
 #include "transaction/transaction_manager.h"
 
 class FilterExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
     std::vector<Condition> conds_;
+    std::shared_ptr<QueryExpr> expr_;
+    QueryExprEvaluator::SubqueryRunner subquery_runner_;
+    const QueryExprOuterContext* outer_context_ = nullptr;
     std::vector<ColMeta> cols_;
     size_t len_;
     std::unique_ptr<RmRecord> buffered_record_;
@@ -40,6 +44,10 @@ private:
     }
 
     bool matches(const RmRecord& rec) {
+        if (expr_ != nullptr) {
+            QueryExprEvaluator evaluator(prev_->cols(), prev_->nulls(), &subquery_runner_, outer_context_);
+            return evaluator.matches(*expr_, rec);
+        }
         for (const auto& cond : conds_) {
             if (!compare(cond, rec, prev_->nulls())) {
                 return false;
@@ -69,6 +77,18 @@ public:
         prev_ = std::move(prev);
         context_ = prev_->context_;
         conds_ = std::move(conds);
+        cols_ = prev_->cols();
+        len_ = prev_->tupleLen();
+    }
+
+    FilterExecutor(std::unique_ptr<AbstractExecutor> prev, std::shared_ptr<QueryExpr> expr,
+                   QueryExprEvaluator::SubqueryRunner subquery_runner = {},
+                   const QueryExprOuterContext* outer_context = nullptr) {
+        prev_ = std::move(prev);
+        context_ = prev_->context_;
+        expr_ = std::move(expr);
+        subquery_runner_ = std::move(subquery_runner);
+        outer_context_ = outer_context;
         cols_ = prev_->cols();
         len_ = prev_->tupleLen();
     }

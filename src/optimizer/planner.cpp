@@ -36,7 +36,8 @@ bool same_tab_col(const TabCol& lhs, const TabCol& rhs) {
 }
 
 bool same_agg_expr(const AggExpr& lhs, const AggExpr& rhs) {
-    return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.display_name == rhs.display_name &&
+    return lhs.type == rhs.type && lhs.is_star == rhs.is_star && lhs.is_distinct == rhs.is_distinct &&
+           lhs.display_name == rhs.display_name &&
            (lhs.is_star || same_tab_col(lhs.col, rhs.col));
 }
 
@@ -324,7 +325,154 @@ std::vector<OrderByItem> bind_order_by_output_names(const Query& query) {
     return order_by_items;
 }
 
+QueryExpr clone_query_expr(const QueryExpr& source);
+
+std::unique_ptr<Query> clone_query(const Query& source) {
+    auto result = std::make_unique<Query>();
+    result->conds = source.conds;
+    result->cols = source.cols;
+    result->group_by_cols = source.group_by_cols;
+    result->has_limit = source.has_limit;
+    result->limit = source.limit;
+    result->has_offset = source.has_offset;
+    result->offset = source.offset;
+    result->has_distinct = source.has_distinct;
+    result->has_aggregate = source.has_aggregate;
+    result->has_select_star = source.has_select_star;
+    result->output_names = source.output_names;
+    result->is_union = source.is_union;
+    result->union_cols = source.union_cols;
+    result->union_alias = source.union_alias;
+    result->union_all = source.union_all;
+    result->set_operators = source.set_operators;
+    result->join_types = source.join_types;
+    result->join_on_conds = source.join_on_conds;
+    result->tables = source.tables;
+    result->table_display_names = source.table_display_names;
+    result->table_alias_to_name = source.table_alias_to_name;
+    result->table_name_to_display = source.table_name_to_display;
+    result->is_explain_analyze = source.is_explain_analyze;
+    result->is_set_transaction = source.is_set_transaction;
+    result->set_isolation_level = source.set_isolation_level;
+    result->values = source.values;
+    result->insert_col_names = source.insert_col_names;
+
+    result->select_items.reserve(source.select_items.size());
+    for (const auto& item : source.select_items) {
+        SelectItem clone = item;
+        clone.expr = clone_query_expr(item.expr);
+        result->select_items.push_back(std::move(clone));
+    }
+    result->having_conds.reserve(source.having_conds.size());
+    for (const auto& cond : source.having_conds) {
+        HavingCondition clone = cond;
+        clone.lhs = clone_query_expr(cond.lhs);
+        clone.rhs_expr = clone_query_expr(cond.rhs_expr);
+        result->having_conds.push_back(std::move(clone));
+    }
+    result->order_by_items.reserve(source.order_by_items.size());
+    for (const auto& item : source.order_by_items) {
+        OrderByItem clone = item;
+        clone.expr = clone_query_expr(item.expr);
+        result->order_by_items.push_back(std::move(clone));
+    }
+    if (source.where_expr != nullptr) {
+        result->where_expr = std::make_shared<QueryExpr>(clone_query_expr(*source.where_expr));
+    }
+    result->set_clauses.reserve(source.set_clauses.size());
+    for (const auto& clause : source.set_clauses) {
+        SetClause clone = clause;
+        if (clause.rhs_expr != nullptr) {
+            clone.rhs_expr = std::make_shared<QueryExpr>(clone_query_expr(*clause.rhs_expr));
+        }
+        result->set_clauses.push_back(std::move(clone));
+    }
+    result->union_branches.reserve(source.union_branches.size());
+    for (const auto& branch : source.union_branches) {
+        result->union_branches.push_back(clone_query(*branch));
+    }
+    if (source.insert_query != nullptr) {
+        result->insert_query = std::shared_ptr<Query>(clone_query(*source.insert_query));
+    }
+    return result;
+}
+
+QueryExpr clone_query_expr(const QueryExpr& source) {
+    QueryExpr result = source;
+    result.subquery_plan.reset();
+    if (source.lhs != nullptr) {
+        result.lhs = std::make_shared<QueryExpr>(clone_query_expr(*source.lhs));
+    }
+    if (source.rhs != nullptr) {
+        result.rhs = std::make_shared<QueryExpr>(clone_query_expr(*source.rhs));
+    }
+    if (source.rhs_upper != nullptr) {
+        result.rhs_upper = std::make_shared<QueryExpr>(clone_query_expr(*source.rhs_upper));
+    }
+    result.operands.clear();
+    for (const auto& operand : source.operands) {
+        result.operands.push_back(std::make_shared<QueryExpr>(clone_query_expr(*operand)));
+    }
+    result.case_when.clear();
+    for (const auto& clause : source.case_when) {
+        result.case_when.emplace_back(std::make_shared<QueryExpr>(clone_query_expr(*clause.first)),
+                                      std::make_shared<QueryExpr>(clone_query_expr(*clause.second)));
+    }
+    if (source.else_expr != nullptr) {
+        result.else_expr = std::make_shared<QueryExpr>(clone_query_expr(*source.else_expr));
+    }
+    result.rhs_values.clear();
+    for (const auto& value : source.rhs_values) {
+        result.rhs_values.push_back(std::make_shared<QueryExpr>(clone_query_expr(*value)));
+    }
+    if (source.subquery != nullptr) {
+        result.subquery = std::shared_ptr<Query>(clone_query(*source.subquery));
+    }
+    return result;
+}
+
 } // namespace
+
+void Planner::prepare_subquery_plans(QueryExpr& expr, Context* context) {
+    if (expr.lhs != nullptr) {
+        prepare_subquery_plans(*expr.lhs, context);
+    }
+    if (expr.rhs != nullptr) {
+        prepare_subquery_plans(*expr.rhs, context);
+    }
+    if (expr.rhs_upper != nullptr) {
+        prepare_subquery_plans(*expr.rhs_upper, context);
+    }
+    for (auto& operand : expr.operands) {
+        if (operand != nullptr) {
+            prepare_subquery_plans(*operand, context);
+        }
+    }
+    for (auto& clause : expr.case_when) {
+        if (clause.first != nullptr) {
+            prepare_subquery_plans(*clause.first, context);
+        }
+        if (clause.second != nullptr) {
+            prepare_subquery_plans(*clause.second, context);
+        }
+    }
+    if (expr.else_expr != nullptr) {
+        prepare_subquery_plans(*expr.else_expr, context);
+    }
+    for (auto& value : expr.rhs_values) {
+        if (value != nullptr) {
+            prepare_subquery_plans(*value, context);
+        }
+    }
+    if (expr.subquery == nullptr || expr.subquery_plan != nullptr) {
+        return;
+    }
+
+    auto nested = clone_query(*expr.subquery);
+    std::unique_ptr<Plan> plan = nested->is_union ? generate_union_plan(std::move(nested), context)
+                                                  : generate_select_plan(std::move(nested), context);
+    expr.subquery_plan = std::shared_ptr<Plan>(std::move(plan));
+}
 
 // 使用最左匹配原则选择索引：等值前缀后最多接一个范围列，其他条件留给执行器过滤。
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_conds,
@@ -673,6 +821,14 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
                 needed_cols[cond.rhs_col.tab_name].insert(cond.rhs_col);
             }
         }
+        for (const auto& join_conds_for_join : query->join_on_conds) {
+            for (const auto& cond : join_conds_for_join) {
+                needed_cols[cond.lhs_col.tab_name].insert(cond.lhs_col);
+                if (!cond.is_rhs_val) {
+                    needed_cols[cond.rhs_col.tab_name].insert(cond.rhs_col);
+                }
+            }
+        }
     }
 
     auto plan_tables = query->tables;
@@ -742,8 +898,12 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         throw InternalError("SELECT has no table plan");
     }
     if (table_plans.size() == 1) {
-        attach_display_names(table_plans[0].get(), query->table_name_to_display);
-        return std::move(table_plans[0]);
+        std::unique_ptr<Plan> single = std::move(table_plans[0]);
+        if (query->where_expr != nullptr) {
+            single = std::make_unique<FilterPlan>(T_Filter, std::move(single), query->where_expr);
+        }
+        attach_display_names(single.get(), query->table_name_to_display);
+        return single;
     }
 
     std::unique_ptr<Plan> joined = std::move(table_plans[0]);
@@ -835,6 +995,9 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
 
     if (!post_join_conds.empty()) {
         joined = std::make_unique<FilterPlan>(T_Filter, std::move(joined), std::move(post_join_conds));
+    }
+    if (query->where_expr != nullptr) {
+        joined = std::make_unique<FilterPlan>(T_Filter, std::move(joined), query->where_expr);
     }
     attach_display_names(joined.get(), query->table_name_to_display);
     return joined;
@@ -986,6 +1149,21 @@ std::unique_ptr<Plan> Planner::generate_limit_plan(const Query* query, std::uniq
  * @param conds select plan 选取条件
  */
 std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query, Context* context) {
+    for (auto& item : query->select_items) {
+        prepare_subquery_plans(item.expr, context);
+    }
+    if (query->where_expr != nullptr) {
+        prepare_subquery_plans(*query->where_expr, context);
+    }
+    for (auto& item : query->order_by_items) {
+        prepare_subquery_plans(item.expr, context);
+    }
+    for (auto& cond : query->having_conds) {
+        prepare_subquery_plans(cond.lhs, context);
+        if (!cond.is_rhs_val) {
+            prepare_subquery_plans(cond.rhs_expr, context);
+        }
+    }
     // 逻辑优化
     query = logical_optimization(std::move(query), context);
 
@@ -1023,7 +1201,8 @@ std::unique_ptr<Plan> Planner::generate_union_plan(std::unique_ptr<Query> query,
     }
 
     std::unique_ptr<Plan> plannerRoot = std::make_unique<UnionPlan>(T_Union, std::move(branch_plans), query->union_cols,
-                                                                     query->output_names, query->union_all);
+                                                                     query->output_names, query->union_all,
+                                                                     query->set_operators);
 
     plannerRoot = generate_sort_plan(query.get(), std::move(plannerRoot));
     plannerRoot = generate_limit_plan(query.get(), std::move(plannerRoot));
@@ -1078,9 +1257,15 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     }
     case ast::AstType::InsertStmt: {
         auto x = static_cast<const ast::InsertStmt*>(parse);
-        // insert;
-        plannerRoot = std::make_unique<DMLPlan>(T_Insert, std::unique_ptr<Plan>(), x->tab_name, query->values,
+        std::unique_ptr<Plan> insert_source;
+        if (query->insert_query != nullptr) {
+            auto nested = clone_query(*query->insert_query);
+            insert_source = nested->is_union ? generate_union_plan(std::move(nested), context)
+                                             : generate_select_plan(std::move(nested), context);
+        }
+        plannerRoot = std::make_unique<DMLPlan>(T_Insert, std::move(insert_source), x->tab_name, query->values,
                                                 std::vector<Condition>(), std::vector<SetClause>());
+        static_cast<DMLPlan*>(plannerRoot.get())->insert_col_names_ = query->insert_col_names;
         break;
     }
     case ast::AstType::DeleteStmt: {
@@ -1101,9 +1286,14 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
             table_scan_executors =
                 std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
+        if (query->where_expr != nullptr) {
+            table_scan_executors =
+                std::make_unique<FilterPlan>(T_Filter, std::move(table_scan_executors), query->where_expr);
+        }
 
         plannerRoot = std::make_unique<DMLPlan>(T_Delete, std::move(table_scan_executors), x->tab_name,
                                                 std::vector<Value>(), query->conds, std::vector<SetClause>());
+        static_cast<DMLPlan*>(plannerRoot.get())->where_expr_ = query->where_expr;
         break;
     }
     case ast::AstType::UpdateStmt: {
@@ -1123,8 +1313,13 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
             table_scan_executors =
                 std::make_unique<ScanPlan>(scan_tag, sm_manager_, x->tab_name, query->conds, index_col_names);
         }
+        if (query->where_expr != nullptr) {
+            table_scan_executors =
+                std::make_unique<FilterPlan>(T_Filter, std::move(table_scan_executors), query->where_expr);
+        }
         plannerRoot = std::make_unique<DMLPlan>(T_Update, std::move(table_scan_executors), x->tab_name,
                                                 std::vector<Value>(), query->conds, query->set_clauses);
+        static_cast<DMLPlan*>(plannerRoot.get())->where_expr_ = query->where_expr;
         break;
     }
     case ast::AstType::SelectStmt: {
@@ -1142,6 +1337,12 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
         break;
     }
     case ast::AstType::SelectFromUnionStmt: {
+        std::unique_ptr<Plan> union_plan = generate_union_plan(std::move(query), context);
+        plannerRoot = std::make_unique<DMLPlan>(T_select, std::move(union_plan), std::string(), std::vector<Value>(),
+                                                std::vector<Condition>(), std::vector<SetClause>());
+        break;
+    }
+    case ast::AstType::UnionStmt: {
         std::unique_ptr<Plan> union_plan = generate_union_plan(std::move(query), context);
         plannerRoot = std::make_unique<DMLPlan>(T_select, std::move(union_plan), std::string(), std::vector<Value>(),
                                                 std::vector<Condition>(), std::vector<SetClause>());

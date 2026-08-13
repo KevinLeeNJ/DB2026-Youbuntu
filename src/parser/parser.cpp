@@ -286,6 +286,15 @@ private:
         if (match(TokenType::INSERT)) {
             expect(TokenType::INTO, "expected INTO after INSERT");
             std::string table = parse_identifier();
+            std::vector<std::string> column_names;
+            if (match(TokenType::LPAREN)) {
+                column_names = parse_col_name_list();
+                expect(TokenType::RPAREN, "expected ')' after INSERT column list");
+            }
+            if (check(TokenType::SELECT)) {
+                auto select = parse_query_chain();
+                return std::make_unique<InsertStmt>(std::move(table), std::move(column_names), std::move(select));
+            }
             expect(TokenType::VALUES, "expected VALUES after table name");
             expect(TokenType::LPAREN, "expected '(' before values");
             auto values = parse_value_list();
@@ -295,14 +304,22 @@ private:
         if (match(TokenType::DELETE)) {
             expect(TokenType::FROM, "expected FROM after DELETE");
             std::string table = parse_identifier();
-            return std::make_unique<DeleteStmt>(std::move(table), parse_where_clause());
+            auto where_expr = parse_optional_boolean_expr(TokenType::WHERE);
+            auto conds = flatten_legacy_conditions(where_expr.get());
+            auto result = std::make_unique<DeleteStmt>(std::move(table), std::move(conds));
+            result->where_expr = std::move(where_expr);
+            return result;
         }
         // UPDATE
         expect(TokenType::UPDATE, "expected DML statement");
         std::string table = parse_identifier();
         expect(TokenType::SET, "expected SET after table name");
         auto clauses = parse_set_clause_list();
-        return std::make_unique<UpdateStmt>(std::move(table), std::move(clauses), parse_where_clause());
+        auto where_expr = parse_optional_boolean_expr(TokenType::WHERE);
+        auto conds = flatten_legacy_conditions(where_expr.get());
+        auto result = std::make_unique<UpdateStmt>(std::move(table), std::move(clauses), std::move(conds));
+        result->where_expr = std::move(where_expr);
+        return result;
     }
 
     std::unique_ptr<TreeNode> parse_dql() {
@@ -313,7 +330,7 @@ private:
         if (is_select_from_union_wrapper()) {
             return parse_select_from_union();
         }
-        return parse_select_stmt();
+        return parse_query_chain();
     }
 
     bool is_select_from_union_wrapper() {
@@ -355,9 +372,11 @@ private:
     std::unique_ptr<SelectStmt> parse_select_tail(bool has_star, bool has_distinct,
                                                   std::vector<std::unique_ptr<SelectItem>> items) {
         auto from = parse_from_clause();
+        auto where_expr = parse_optional_boolean_expr(TokenType::WHERE);
         auto conds = std::move(from->conds);
-        auto where = parse_where_clause();
-        conds.insert(conds.end(), std::make_move_iterator(where.begin()), std::make_move_iterator(where.end()));
+        auto where_conds = flatten_legacy_conditions(where_expr.get());
+        conds.insert(conds.end(), std::make_move_iterator(where_conds.begin()),
+                     std::make_move_iterator(where_conds.end()));
         auto group_by = parse_opt_group_clause();
         auto having = parse_opt_having_clause();
         auto order = parse_opt_order_clause();
@@ -365,22 +384,46 @@ private:
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
                                             std::move(having), std::move(order), pagination.has_limit, pagination.limit,
                                             has_star, std::move(from->jointree), has_distinct, pagination.has_offset,
-                                            pagination.offset);
+                                            pagination.offset, std::move(where_expr));
+    }
+
+    std::unique_ptr<TreeNode> parse_query_chain() {
+        auto first = parse_select_stmt();
+        if (!check(TokenType::UNION) && !check(TokenType::INTERSECT) && !check(TokenType::EXCEPT)) {
+            return first;
+        }
+
+        return parse_set_operation(std::move(first));
     }
 
     std::unique_ptr<UnionStmt> parse_union_query() {
         auto first = parse_select_stmt();
-        expect(TokenType::UNION, "expected UNION in union query");
+        return parse_set_operation(std::move(first));
+    }
+
+    std::unique_ptr<UnionStmt> parse_set_operation(std::unique_ptr<SelectStmt> first) {
         std::vector<std::unique_ptr<SelectStmt>> branches;
         std::vector<bool> union_all;
+        std::vector<SetOperator> operators;
         branches.push_back(std::move(first));
-        union_all.push_back(match(TokenType::ALL));
-        branches.push_back(parse_select_stmt());
-        while (match(TokenType::UNION)) {
-            union_all.push_back(match(TokenType::ALL));
+        while (check(TokenType::UNION) || check(TokenType::INTERSECT) || check(TokenType::EXCEPT)) {
+            SetOperator op;
+            if (match(TokenType::UNION)) {
+                op = SetOperator::UNION;
+            } else if (match(TokenType::INTERSECT)) {
+                op = SetOperator::INTERSECT;
+            } else {
+                expect(TokenType::EXCEPT, "expected set operator");
+                op = SetOperator::EXCEPT;
+            }
+            operators.push_back(op);
+            union_all.push_back(op == SetOperator::UNION && match(TokenType::ALL));
             branches.push_back(parse_select_stmt());
         }
-        return std::make_unique<UnionStmt>(std::move(branches), std::move(union_all));
+        if (branches.size() < 2) {
+            error("expected SELECT after set operator");
+        }
+        return std::make_unique<UnionStmt>(std::move(branches), std::move(union_all), std::move(operators));
     }
 
     std::vector<std::unique_ptr<Field>> parse_field_list() {
@@ -450,6 +493,9 @@ private:
         if (check(TokenType::VALUE_BOOL)) {
             return parse_bool_literal();
         }
+        if (match(TokenType::NULL_KW)) {
+            return std::make_unique<NullLit>();
+        }
         error("expected value");
     }
 
@@ -512,32 +558,84 @@ private:
         return std::make_unique<BoolLit>(token.bool_value, token_text(token));
     }
 
-    std::vector<std::unique_ptr<BinaryExpr>> parse_where_clause() {
-        if (!match(TokenType::WHERE)) {
-            return {};
-        }
-        std::vector<std::unique_ptr<BinaryExpr>> conds;
-        conds.push_back(parse_condition());
-        while (match(TokenType::AND)) {
-            conds.push_back(parse_condition());
-        }
-        return conds;
-    }
-
     std::unique_ptr<BinaryExpr> parse_condition() {
-        auto lhs = parse_col();
-        return parse_predicate_after_lhs(std::move(lhs));
+        auto expression = parse_boolean_primary();
+        auto* condition = dynamic_cast<BinaryExpr*>(expression.get());
+        if (condition == nullptr) {
+            error("expected comparison condition");
+        }
+        expression.release();
+        return std::unique_ptr<BinaryExpr>(condition);
     }
 
     std::unique_ptr<BinaryExpr> parse_general_condition() {
-        auto lhs = parse_general_expr();
-        return parse_predicate_after_lhs(std::move(lhs));
+        return parse_condition();
     }
 
-    std::unique_ptr<BinaryExpr> parse_predicate_after_lhs(std::unique_ptr<Expr> lhs) {
+    std::unique_ptr<Expr> parse_optional_boolean_expr(TokenType marker) {
+        if (!match(marker)) {
+            return nullptr;
+        }
+        return parse_boolean_expr();
+    }
+
+    std::unique_ptr<Expr> parse_boolean_expr() {
+        return parse_or_expr();
+    }
+
+    std::unique_ptr<Expr> parse_or_expr() {
+        auto lhs = parse_and_expr();
+        while (match(TokenType::OR)) {
+            auto rhs = parse_and_expr();
+            std::vector<std::unique_ptr<Expr>> operands;
+            operands.push_back(std::move(lhs));
+            operands.push_back(std::move(rhs));
+            lhs = std::make_unique<LogicalExpr>(LogicalOp::OR, std::move(operands));
+        }
+        return lhs;
+    }
+
+    std::unique_ptr<Expr> parse_and_expr() {
+        auto lhs = parse_not_expr();
+        while (match(TokenType::AND)) {
+            auto rhs = parse_not_expr();
+            std::vector<std::unique_ptr<Expr>> operands;
+            operands.push_back(std::move(lhs));
+            operands.push_back(std::move(rhs));
+            lhs = std::make_unique<LogicalExpr>(LogicalOp::AND, std::move(operands));
+        }
+        return lhs;
+    }
+
+    std::unique_ptr<Expr> parse_not_expr() {
+        if (match(TokenType::NOT)) {
+            std::vector<std::unique_ptr<Expr>> operands;
+            operands.push_back(parse_not_expr());
+            return std::make_unique<LogicalExpr>(LogicalOp::NOT, std::move(operands));
+        }
+        return parse_boolean_primary();
+    }
+
+    std::unique_ptr<Expr> parse_boolean_primary() {
+        if (match(TokenType::LPAREN)) {
+            auto expression = parse_boolean_expr();
+            expect(TokenType::RPAREN, "expected ')' after boolean expression");
+            return expression;
+        }
+
+        if (match(TokenType::EXISTS)) {
+            return std::make_unique<BinaryExpr>(nullptr, SV_OP_EXISTS, parse_subquery_expr());
+        }
+
+        auto lhs = parse_value_expr();
         bool negated = match(TokenType::NOT);
+        if (match(TokenType::IS)) {
+            bool is_not = match(TokenType::NOT);
+            expect(TokenType::NULL_KW, "expected NULL after IS");
+            return std::make_unique<BinaryExpr>(std::move(lhs), is_not ? SV_OP_IS_NOT_NULL : SV_OP_IS_NULL, nullptr);
+        }
         if (match(TokenType::LIKE)) {
-            return std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_LIKE, parse_general_expr(), negated);
+            return std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_LIKE, parse_value_expr(), negated);
         }
         if (match(TokenType::IN)) {
             auto result = std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_IN, nullptr, negated);
@@ -545,45 +643,183 @@ private:
             if (check(TokenType::RPAREN)) {
                 error("expected value in IN list");
             }
-            result->rhs_list.push_back(parse_value());
+            result->rhs_list.push_back(parse_value_expr());
             while (match(TokenType::COMMA)) {
-                result->rhs_list.push_back(parse_value());
+                result->rhs_list.push_back(parse_value_expr());
             }
             expect(TokenType::RPAREN, "expected ')' after IN list");
             return result;
         }
         if (match(TokenType::BETWEEN)) {
-            auto result = std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_BETWEEN, parse_general_expr(), negated);
+            auto result = std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_BETWEEN, parse_value_expr(), negated);
             expect(TokenType::AND, "expected AND in BETWEEN predicate");
-            result->rhs_upper = parse_general_expr();
+            result->rhs_upper = parse_value_expr();
+            return result;
+        }
+        SvCompOp op;
+        if (try_parse_op(op)) {
+            auto result = std::make_unique<BinaryExpr>(std::move(lhs), op, nullptr);
+            if (match(TokenType::ANY)) {
+                result->quantifier = Quantifier::ANY;
+                result->rhs = parse_subquery_expr();
+            } else if (match(TokenType::ALL)) {
+                result->quantifier = Quantifier::ALL;
+                result->rhs = parse_subquery_expr();
+            } else {
+                result->rhs = parse_value_expr();
+            }
             return result;
         }
         if (negated) {
             error("expected LIKE, IN, or BETWEEN after NOT");
         }
-        auto op = parse_op();
-        auto rhs = parse_general_expr();
-        return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
+        return lhs;
     }
 
-    SvCompOp parse_op() {
+    std::vector<std::unique_ptr<BinaryExpr>> flatten_legacy_conditions(const Expr* expression) {
+        std::vector<std::unique_ptr<BinaryExpr>> result;
+        if (expression == nullptr) {
+            return result;
+        }
+        if (auto condition = dynamic_cast<const BinaryExpr*>(expression); condition != nullptr) {
+            if (condition->lhs == nullptr ||
+                (condition->rhs != nullptr && condition->rhs->type == AstType::SubqueryExpr)) {
+                return result;
+            }
+            result.push_back(clone_binary_expr(*condition));
+            return result;
+        }
+        auto logical = dynamic_cast<const LogicalExpr*>(expression);
+        if (logical == nullptr || logical->op != LogicalOp::AND) {
+            return result;
+        }
+        for (const auto& operand : logical->operands) {
+            auto nested = flatten_legacy_conditions(operand.get());
+            result.insert(result.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
+        }
+        return result;
+    }
+
+    bool try_parse_op(SvCompOp& op) {
         if (match(TokenType::EQ)) {
-            return SV_OP_EQ;
+            op = SV_OP_EQ;
+            return true;
         }
         if (match(TokenType::LT)) {
-            return SV_OP_LT;
+            op = SV_OP_LT;
+            return true;
         }
         if (match(TokenType::GT)) {
-            return SV_OP_GT;
+            op = SV_OP_GT;
+            return true;
         }
         if (match(TokenType::NEQ)) {
-            return SV_OP_NE;
+            op = SV_OP_NE;
+            return true;
         }
         if (match(TokenType::LEQ)) {
-            return SV_OP_LE;
+            op = SV_OP_LE;
+            return true;
         }
-        expect(TokenType::GEQ, "expected comparison operator");
-        return SV_OP_GE;
+        if (match(TokenType::GEQ)) {
+            op = SV_OP_GE;
+            return true;
+        }
+        return false;
+    }
+
+    std::unique_ptr<Expr> parse_subquery_expr() {
+        expect(TokenType::LPAREN, "expected '(' before subquery");
+        if (!check(TokenType::SELECT)) {
+            error("expected SELECT in subquery");
+        }
+        auto query = parse_query_chain();
+        expect(TokenType::RPAREN, "expected ')' after subquery");
+        return std::make_unique<SubqueryExpr>(std::move(query));
+    }
+
+    std::unique_ptr<Expr> parse_value_expr() {
+        auto expression = parse_value_primary();
+        while (check(TokenType::PLUS) || check(TokenType::MINUS) || check(TokenType::STAR) ||
+               check(TokenType::SLASH)) {
+            TokenType op = current_.type;
+            advance();
+            auto rhs = parse_value_primary();
+            ArithmeticOp arithmetic_op;
+            switch (op) {
+            case TokenType::PLUS:
+                arithmetic_op = ArithmeticOp::ADD;
+                break;
+            case TokenType::MINUS:
+                arithmetic_op = ArithmeticOp::SUB;
+                break;
+            case TokenType::STAR:
+                arithmetic_op = ArithmeticOp::MUL;
+                break;
+            case TokenType::SLASH:
+                arithmetic_op = ArithmeticOp::DIV;
+                break;
+            default:
+                error("expected arithmetic operator");
+            }
+            auto is_numeric_literal = [](const Expr* value) {
+                return value != nullptr && (value->type == AstType::IntLit || value->type == AstType::FloatLit);
+            };
+            if (!is_numeric_literal(expression.get()) || !is_numeric_literal(rhs.get())) {
+                error("arithmetic on non-numeric constant");
+            }
+            expression = std::make_unique<ArithmeticExpr>(arithmetic_op, std::move(expression), std::move(rhs));
+        }
+        return expression;
+    }
+
+    std::unique_ptr<Expr> parse_value_primary() {
+        if (is_aggregate_start(current_.type)) {
+            return parse_aggregate_expr();
+        }
+        if (check(TokenType::CASE)) {
+            return parse_case_expr();
+        }
+        if (check(TokenType::IDENTIFIER)) {
+            return parse_col();
+        }
+        if (check(TokenType::LPAREN)) {
+            if (peek(1).type == TokenType::SELECT) {
+                return parse_subquery_expr();
+            }
+            if (peek(1).type == TokenType::VALUE_INT || peek(1).type == TokenType::VALUE_FLOAT ||
+                peek(1).type == TokenType::MINUS || peek(1).type == TokenType::LPAREN) {
+                return parse_constant_arith_expr();
+            }
+            expect(TokenType::LPAREN, "expected '(' before expression");
+            auto expression = parse_value_expr();
+            expect(TokenType::RPAREN, "expected ')' after expression");
+            return expression;
+        }
+        if (check(TokenType::VALUE_INT) || check(TokenType::VALUE_FLOAT) || check(TokenType::MINUS)) {
+            return parse_constant_arith_expr();
+        }
+        return parse_value();
+    }
+
+    std::unique_ptr<Expr> parse_case_expr() {
+        expect(TokenType::CASE, "expected CASE");
+        std::vector<CaseWhen> when_clauses;
+        while (match(TokenType::WHEN)) {
+            auto condition = parse_boolean_expr();
+            expect(TokenType::THEN, "expected THEN in CASE expression");
+            auto result = parse_value_expr();
+            when_clauses.emplace_back(std::move(condition), std::move(result));
+        }
+        if (when_clauses.empty()) {
+            error("CASE requires at least one WHEN clause");
+        }
+        std::unique_ptr<Expr> else_expr;
+        if (match(TokenType::ELSE)) {
+            else_expr = parse_value_expr();
+        }
+        expect(TokenType::END, "expected END after CASE expression");
+        return std::make_unique<CaseExpr>(std::move(when_clauses), std::move(else_expr));
     }
 
     std::unique_ptr<Col> parse_col() {
@@ -655,7 +891,7 @@ private:
             }
             return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), nullptr, SetOp::ASSIGNMENT);
         }
-        return std::make_unique<SetClause>(std::move(column), parse_value());
+        return std::make_unique<SetClause>(std::move(column), parse_value_expr());
     }
 
     std::vector<std::unique_ptr<SelectItem>> parse_select_item_list() {
@@ -668,16 +904,11 @@ private:
     }
 
     std::unique_ptr<SelectItem> parse_select_item() {
-        std::unique_ptr<Expr> expr;
-        if (is_aggregate_start(current_.type)) {
-            expr = parse_aggregate_expr();
-        } else if (check(TokenType::IDENTIFIER)) {
-            expr = parse_col();
-        } else {
-            expr = parse_value();
-        }
+        auto expr = parse_value_expr();
         std::string alias;
         if (match(TokenType::AS)) {
+            alias = parse_identifier();
+        } else if (check(TokenType::IDENTIFIER)) {
             alias = parse_identifier();
         }
         return std::make_unique<SelectItem>(std::move(expr), std::move(alias));
@@ -707,9 +938,10 @@ private:
             expect(TokenType::RPAREN, "expected ')' after COUNT(*)");
             return std::make_unique<AggExpr>(func, true, nullptr);
         }
+        bool is_distinct = match(TokenType::DISTINCT);
         auto column = parse_col();
         expect(TokenType::RPAREN, "expected ')' after aggregate argument");
-        return std::make_unique<AggExpr>(func, false, std::move(column));
+        return std::make_unique<AggExpr>(func, false, std::move(column), is_distinct);
     }
 
     std::vector<std::unique_ptr<Col>> parse_opt_group_clause() {
@@ -741,16 +973,7 @@ private:
     }
 
     std::unique_ptr<Expr> parse_general_expr() {
-        if (is_aggregate_start(current_.type)) {
-            return parse_aggregate_expr();
-        }
-        if (check(TokenType::IDENTIFIER)) {
-            return parse_col();
-        }
-        // Constant path: parentheses / arithmetic / nesting are supported and folded
-        // into a single IntLit/FloatLit at parse time (constant folding). Columns and
-        // other non-constant operands fall through to parse_value, which rejects them.
-        return parse_constant_arith_expr();
+        return parse_value_expr();
     }
 
     // Constant arithmetic expression entry: handles + - (left associative), folding
@@ -870,7 +1093,20 @@ private:
                 continue;
             }
             JoinType join_type = INNER_JOIN;
-            if (match(TokenType::RIGHT)) {
+            bool requires_on = true;
+            if (match(TokenType::CROSS)) {
+                expect(TokenType::JOIN, "expected JOIN after CROSS");
+                join_type = CROSS_JOIN;
+                requires_on = false;
+            } else if (match(TokenType::NATURAL)) {
+                expect(TokenType::JOIN, "expected JOIN after NATURAL");
+                join_type = NATURAL_JOIN;
+                requires_on = false;
+            } else if (match(TokenType::LEFT)) {
+                match(TokenType::OUTER);
+                expect(TokenType::JOIN, "expected JOIN after LEFT");
+                join_type = LEFT_JOIN;
+            } else if (match(TokenType::RIGHT)) {
                 match(TokenType::OUTER);
                 expect(TokenType::JOIN, "expected JOIN after RIGHT");
                 join_type = RIGHT_JOIN;
@@ -887,7 +1123,7 @@ private:
                 TableRef left = from->tables.back();
                 TableRef right = parse_table_ref();
                 from->tables.push_back(right);
-                auto join_conds = parse_opt_join_on_clause();
+                auto join_conds = requires_on ? parse_opt_join_on_clause() : std::vector<std::unique_ptr<BinaryExpr>>();
                 std::vector<std::unique_ptr<BinaryExpr>> join_tree_conds;
                 join_tree_conds.reserve(join_conds.size());
                 for (const auto& cond : join_conds) {
@@ -947,7 +1183,16 @@ private:
         } else if (match(TokenType::DESC)) {
             dir = OrderBy_DESC;
         }
-        return std::make_unique<OrderByItem>(std::move(expr), dir);
+        NullsOrder nulls_order = NullsOrder::DEFAULT;
+        if (match(TokenType::NULLS)) {
+            if (match(TokenType::FIRST)) {
+                nulls_order = NullsOrder::FIRST;
+            } else {
+                expect(TokenType::LAST, "expected FIRST or LAST after NULLS");
+                nulls_order = NullsOrder::LAST;
+            }
+        }
+        return std::make_unique<OrderByItem>(std::move(expr), dir, nulls_order);
     }
 
     PaginationClause parse_opt_pagination_clause() {
