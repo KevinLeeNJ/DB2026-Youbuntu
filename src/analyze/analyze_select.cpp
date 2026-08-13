@@ -46,6 +46,31 @@ void validate_having(Query& query, const std::vector<ColMeta>& all_cols) {
         query.has_aggregate = query.has_aggregate || cond.lhs.type == QueryExprType::AGGREGATE;
 
         ColType lhs_type = infer_expr_type(cond.lhs, all_cols);
+        if (cond.op == OP_LIKE && lhs_type != TYPE_STRING && lhs_type != TYPE_DATETIME) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), "string");
+        }
+        if (cond.op == OP_IN) {
+            if (cond.rhs_vals.empty()) {
+                throw RMDBError("HAVING IN list must not be empty");
+            }
+            for (const auto& rhs_val : cond.rhs_vals) {
+                if (!can_cast_types(lhs_type, rhs_val.type)) {
+                    throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_val.type));
+                }
+            }
+            continue;
+        }
+        if (cond.op == OP_BETWEEN) {
+            if (!cond.has_rhs_upper) {
+                throw RMDBError("HAVING BETWEEN requires two bounds");
+            }
+            for (const auto* bound : {&cond.rhs_val, &cond.rhs_upper}) {
+                if (!can_cast_types(lhs_type, bound->type)) {
+                    throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(bound->type));
+                }
+            }
+            continue;
+        }
         ColType rhs_type = TYPE_INT;
         if (cond.is_rhs_val) {
             rhs_type = cond.rhs_val.type;
@@ -53,6 +78,10 @@ void validate_having(Query& query, const std::vector<ColMeta>& all_cols) {
             normalize_query_expr(cond.rhs_expr, all_cols);
             query.has_aggregate = query.has_aggregate || cond.rhs_expr.type == QueryExprType::AGGREGATE;
             rhs_type = infer_expr_type(cond.rhs_expr, all_cols);
+        }
+
+        if (cond.op == OP_LIKE && rhs_type != TYPE_STRING && rhs_type != TYPE_DATETIME) {
+            throw IncompatibleTypeError(coltype2str(rhs_type), "string");
         }
 
         if (!can_cast_types(lhs_type, rhs_type)) {
@@ -156,6 +185,9 @@ void validate_select_query(Query& query, const std::vector<ColMeta>& all_cols) {
 
     if (query.has_limit && query.limit < 0) {
         throw RMDBError("LIMIT must be non-negative");
+    }
+    if (query.has_offset && query.offset < 0) {
+        throw RMDBError("OFFSET must be non-negative");
     }
 }
 

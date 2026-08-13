@@ -34,6 +34,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_abstract.h"
 #include "execution/executor_aggregate.h"
 #include "execution/executor_delete.h"
+#include "execution/executor_distinct.h"
 #include "execution/executor_filter.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_index_skip_scan.h"
@@ -96,6 +97,10 @@ private:
         bool is_rhs_value = false;
         ExecutorQueryExpr rhs_expr;
         Value rhs_val;
+        Value rhs_upper;
+        std::vector<Value> rhs_vals;
+        bool has_rhs_upper = false;
+        bool negated = false;
     };
 
     class CountingExecutor : public AbstractExecutor {
@@ -145,6 +150,10 @@ private:
                 ++plan_->runtime_rows_;
             }
             return rec;
+        }
+
+        const std::vector<bool>& nulls() const override {
+            return inner_->nulls();
         }
 
         ColMeta get_col_offset(const TabCol& target) override {
@@ -212,6 +221,10 @@ private:
             executor_cond.is_rhs_value = cond.is_rhs_val;
             executor_cond.rhs_expr = to_executor_query_expr(cond.rhs_expr);
             executor_cond.rhs_val = cond.rhs_val;
+            executor_cond.rhs_upper = cond.rhs_upper;
+            executor_cond.rhs_vals = cond.rhs_vals;
+            executor_cond.has_rhs_upper = cond.has_rhs_upper;
+            executor_cond.negated = cond.negated;
             executor_conds.push_back(std::move(executor_cond));
         }
         return executor_conds;
@@ -313,6 +326,8 @@ private:
         switch (plan->tag) {
         case T_Projection:
             return build_projection_output_names(*static_cast<ProjectionPlan*>(plan));
+        case T_Distinct:
+            return get_plan_output_names(static_cast<DistinctPlan*>(plan)->subplan_.get());
         case T_Sort:
             return get_plan_output_names(static_cast<SortPlan*>(plan)->subplan_.get());
         case T_Limit:
@@ -381,6 +396,12 @@ private:
             return "<=";
         case OP_GE:
             return ">=";
+        case OP_LIKE:
+            return " LIKE ";
+        case OP_IN:
+            return " IN ";
+        case OP_BETWEEN:
+            return " BETWEEN ";
         }
         throw InternalError("Unexpected comparison operator");
     }
@@ -406,9 +427,27 @@ private:
     }
 
     static std::string condition_to_string(const Plan& plan, const Condition& cond) {
-        std::string result = display_col(plan, cond.lhs_col) + comp_op_to_string(cond.op);
+        std::string op = comp_op_to_string(cond.op);
+        if (cond.negated && (cond.op == OP_LIKE || cond.op == OP_IN || cond.op == OP_BETWEEN)) {
+            op.insert(0, " NOT");
+        }
+        std::string result = display_col(plan, cond.lhs_col) + op;
         if (cond.is_rhs_val) {
-            result += cond.rhs_display.empty() ? value_to_string(cond.rhs_val) : cond.rhs_display;
+            if (cond.op == OP_IN) {
+                result += "(";
+                for (size_t i = 0; i < cond.rhs_vals.size(); ++i) {
+                    if (i != 0) {
+                        result += ", ";
+                    }
+                    result += value_to_string(cond.rhs_vals[i]);
+                }
+                result += ")";
+            } else {
+                result += cond.rhs_display.empty() ? value_to_string(cond.rhs_val) : cond.rhs_display;
+                if (cond.op == OP_BETWEEN && cond.has_rhs_upper) {
+                    result += " AND " + value_to_string(cond.rhs_upper);
+                }
+            }
         } else {
             result += display_col(plan, cond.rhs_col);
         }
@@ -450,6 +489,9 @@ private:
         case T_Projection:
             collect_tables(static_cast<ProjectionPlan*>(plan)->subplan_.get(), tables);
             break;
+        case T_Distinct:
+            collect_tables(static_cast<DistinctPlan*>(plan)->subplan_.get(), tables);
+            break;
         case T_NestLoop:
         case T_SortMerge: {
             auto join = static_cast<JoinPlan*>(plan);
@@ -473,6 +515,9 @@ private:
             break;
         case T_Projection:
             reset_runtime_rows(static_cast<ProjectionPlan*>(plan)->subplan_.get());
+            break;
+        case T_Distinct:
+            reset_runtime_rows(static_cast<DistinctPlan*>(plan)->subplan_.get());
             break;
         case T_NestLoop:
         case T_SortMerge: {
@@ -533,6 +578,12 @@ private:
             out << "Project(columns=[" << join_strings(projection_columns(*projection))
                 << "], rows=" << plan->runtime_rows_ << ")\n";
             render_explain_plan(projection->subplan_.get(), depth + 1, out);
+            break;
+        }
+        case T_Distinct: {
+            auto distinct = static_cast<DistinctPlan*>(plan);
+            out << "Distinct(rows=" << plan->runtime_rows_ << ")\n";
+            render_explain_plan(distinct->subplan_.get(), depth + 1, out);
             break;
         }
         case T_NestLoop:
@@ -732,6 +783,12 @@ public:
             }
             return maybe_count(std::move(executor), plan, count_rows);
         }
+        case T_Distinct: {
+            auto x = static_cast<DistinctPlan*>(plan);
+            std::unique_ptr<AbstractExecutor> executor =
+                std::make_unique<DistinctExecutor>(convert_plan_executor(x->subplan_.get(), context, count_rows));
+            return maybe_count(std::move(executor), plan, count_rows);
+        }
         case T_Filter: {
             auto x = static_cast<FilterPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<FilterExecutor>(
@@ -769,7 +826,7 @@ public:
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_.get(), context, count_rows);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                 std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
-                x->inlj_index_col_name_);
+                x->inlj_index_col_name_, x->type);
             return maybe_count(std::move(join), plan, count_rows);
         }
         case T_Sort: {
@@ -781,7 +838,7 @@ public:
         case T_Limit: {
             auto x = static_cast<LimitPlan*>(plan);
             std::unique_ptr<AbstractExecutor> executor = std::make_unique<LimitExecutor>(
-                convert_plan_executor(x->subplan_.get(), context, count_rows), static_cast<size_t>(x->limit_));
+                convert_plan_executor(x->subplan_.get(), context, count_rows), x->limit_, x->offset_);
             return maybe_count(std::move(executor), plan, count_rows);
         }
         case T_Union: {
@@ -791,7 +848,8 @@ public:
             for (const auto& branch_plan : x->branches_) {
                 branches.push_back(convert_plan_executor(branch_plan.get(), context, count_rows));
             }
-            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), x->cols_), plan, count_rows);
+            return maybe_count(std::make_unique<UnionExecutor>(std::move(branches), x->cols_, x->union_all_), plan,
+                               count_rows);
         }
         default:
             break;

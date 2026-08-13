@@ -169,6 +169,11 @@ public:
         }
         return nullptr;
     }
+
+    const std::vector<ColMeta>& cols() const override {
+        return tab_.cols;
+    }
+
     std::string getType() override {
         return "DeleteExecutor"; // 返回执行器的名称
     }

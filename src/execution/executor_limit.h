@@ -16,15 +16,23 @@ See the Mulan PSL v2 for more details. */
 class LimitExecutor : public AbstractExecutor {
 private:
     std::unique_ptr<AbstractExecutor> prev_;
-    size_t limit_ = 0;
+    int limit_ = -1;
+    size_t offset_ = 0;
+    size_t skipped_ = 0;
     size_t returned_ = 0;
 
 public:
-    LimitExecutor(std::unique_ptr<AbstractExecutor> prev, size_t limit) : prev_(std::move(prev)), limit_(limit) {}
+    LimitExecutor(std::unique_ptr<AbstractExecutor> prev, int limit, int offset = 0)
+        : prev_(std::move(prev)), limit_(limit), offset_(static_cast<size_t>(offset)) {}
 
     void beginTuple() override {
+        skipped_ = 0;
         returned_ = 0;
         prev_->beginTuple();
+        while (skipped_ < offset_ && !prev_->is_end()) {
+            prev_->nextTuple();
+            ++skipped_;
+        }
     }
 
     void nextTuple() override {
@@ -43,7 +51,7 @@ public:
     }
 
     bool is_end() const override {
-        return returned_ >= limit_ || prev_->is_end();
+        return (limit_ >= 0 && returned_ >= static_cast<size_t>(limit_)) || prev_->is_end();
     }
 
     Rid& rid() override {
@@ -63,6 +71,10 @@ public:
 
     size_t tupleLen() const override {
         return prev_->tupleLen();
+    }
+
+    const std::vector<bool>& nulls() const override {
+        return prev_->nulls();
     }
 
     ColMeta get_col_offset(const TabCol& target) override {

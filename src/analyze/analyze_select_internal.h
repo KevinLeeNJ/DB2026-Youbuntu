@@ -149,6 +149,7 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
             }
             HavingCondition cond;
             cond.lhs = convert_simple_ast_expr(raw_cond->lhs, "HAVING");
+            cond.negated = raw_cond->negated;
             cond.op = static_cast<CompOp>(0); // overwritten below
             switch (raw_cond->op) {
             case ast::SV_OP_EQ:
@@ -169,13 +170,39 @@ template <typename SelectStmtT> void populate_having_from_ast(Query& query, cons
             case ast::SV_OP_GE:
                 cond.op = OP_GE;
                 break;
+            case ast::SV_OP_LIKE:
+                cond.op = OP_LIKE;
+                break;
+            case ast::SV_OP_IN:
+                cond.op = OP_IN;
+                break;
+            case ast::SV_OP_BETWEEN:
+                cond.op = OP_BETWEEN;
+                break;
             }
-            if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
+            for (const auto& raw_value : raw_cond->rhs_list) {
+                auto rhs_val = dynamic_cast<const ast::Value*>(raw_value.get());
+                if (rhs_val == nullptr) {
+                    throw RMDBError("HAVING IN list only supports scalar values");
+                }
+                cond.rhs_vals.push_back(convert_ast_value_node(rhs_val));
+            }
+            if (!cond.rhs_vals.empty()) {
+                cond.is_rhs_val = true;
+            } else if (auto rhs_val = dynamic_cast<const ast::Value*>(raw_cond->rhs.get()); rhs_val != nullptr) {
                 cond.is_rhs_val = true;
                 cond.rhs_val = convert_ast_value_node(rhs_val);
             } else {
                 cond.is_rhs_val = false;
                 cond.rhs_expr = convert_simple_ast_expr(raw_cond->rhs, "HAVING");
+            }
+            if (raw_cond->rhs_upper != nullptr) {
+                auto rhs_upper = dynamic_cast<const ast::Value*>(raw_cond->rhs_upper.get());
+                if (rhs_upper == nullptr) {
+                    throw RMDBError("HAVING BETWEEN bounds only support scalar values");
+                }
+                cond.rhs_upper = convert_ast_value_node(rhs_upper);
+                cond.has_rhs_upper = true;
             }
             query.having_conds.push_back(std::move(cond));
         }
@@ -205,10 +232,16 @@ template <typename SelectStmtT> void populate_order_by_from_ast(Query& query, co
 template <typename SelectStmtT> void populate_limit_from_ast(Query& query, const SelectStmtT& stmt) {
     query.has_limit = false;
     query.limit = 0;
+    query.has_offset = false;
+    query.offset = 0;
+    query.has_distinct = false;
     if constexpr (has_has_limit_member<SelectStmtT>::value && has_limit_member<SelectStmtT>::value) {
         query.has_limit = stmt.has_limit;
         query.limit = stmt.limit;
     }
+    query.has_offset = stmt.has_offset;
+    query.offset = stmt.offset;
+    query.has_distinct = stmt.has_distinct;
 }
 
 } // namespace analyze_internal

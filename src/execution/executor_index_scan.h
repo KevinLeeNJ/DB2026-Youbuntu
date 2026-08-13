@@ -194,6 +194,9 @@ protected:
             if (meta_it == col_meta.end() || cond.op == OP_NE) {
                 continue;
             }
+            if (!is_swappable_comp_op(cond.op)) {
+                continue;
+            }
             const auto& col = meta_it->second;
             auto value = value_to_key_part(cond.rhs_val, col);
             auto& constraint = constraints[col.name];
@@ -220,6 +223,9 @@ protected:
                 break;
             }
             case OP_NE:
+            case OP_LIKE:
+            case OP_IN:
+            case OP_BETWEEN:
                 break;
             }
         }
@@ -260,12 +266,14 @@ public:
         len_ = cols_.back().offset + cols_.back().len;
 
         for (auto& cond : conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
+            if (cond.lhs_col.tab_name != tab_name_ && is_swappable_comp_op(cond.op)) {
                 // lhs is on other table, now rhs must be on this table
                 assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
-                cond.op = swap_comp_op(cond.op);
+                if (is_swappable_comp_op(cond.op)) {
+                    cond.op = swap_comp_op(cond.op);
+                }
             }
         }
         fed_conds_ = conds_;
@@ -451,9 +459,12 @@ public:
         conds_ = base_conds_;
         for (auto& kc : key_conds) {
             // Ensure lhs points to this table
-            if (kc.lhs_col.tab_name != tab_name_ && !kc.is_rhs_val && kc.rhs_col.tab_name == tab_name_) {
+            if (kc.lhs_col.tab_name != tab_name_ && !kc.is_rhs_val && kc.rhs_col.tab_name == tab_name_ &&
+                is_swappable_comp_op(kc.op)) {
                 std::swap(kc.lhs_col, kc.rhs_col);
-                kc.op = swap_comp_op(kc.op);
+                if (is_swappable_comp_op(kc.op)) {
+                    kc.op = swap_comp_op(kc.op);
+                }
             }
             conds_.push_back(std::move(kc));
         }

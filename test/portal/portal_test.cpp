@@ -105,7 +105,11 @@ protected:
              .op = OP_GT,
              .is_rhs_val = true,
              .rhs_expr = {},
-             .rhs_val = {}},
+             .rhs_val = {},
+             .rhs_upper = {},
+             .rhs_vals = {},
+             .has_rhs_upper = false,
+             .negated = false},
         };
         having_conds[0].rhs_val.set_int(90);
 

@@ -21,7 +21,7 @@ namespace ast {
 
 enum SvType { SV_TYPE_INT, SV_TYPE_FLOAT, SV_TYPE_STRING, SV_TYPE_BOOL, SV_TYPE_DATETIME };
 
-enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE };
+enum SvCompOp { SV_OP_EQ, SV_OP_NE, SV_OP_LT, SV_OP_GT, SV_OP_LE, SV_OP_GE, SV_OP_LIKE, SV_OP_IN, SV_OP_BETWEEN };
 
 enum OrderByDir { OrderBy_DEFAULT, OrderBy_ASC, OrderBy_DESC };
 
@@ -269,24 +269,37 @@ struct BinaryExpr : public TreeNode {
     std::unique_ptr<Expr> lhs;
     SvCompOp op;
     std::unique_ptr<Expr> rhs;
+    std::unique_ptr<Expr> rhs_upper;
+    std::vector<std::unique_ptr<Expr>> rhs_list;
+    bool negated = false;
 
-    BinaryExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_)
-        : TreeNode(AstType::BinaryExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
+    BinaryExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_, bool negated_ = false)
+        : TreeNode(AstType::BinaryExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)), negated(negated_) {}
 };
 
 inline std::unique_ptr<Expr> clone_expr(const Expr& expr);
 
 inline std::unique_ptr<BinaryExpr> clone_binary_expr(const BinaryExpr& expr) {
-    return std::make_unique<BinaryExpr>(clone_expr(*expr.lhs), expr.op, clone_expr(*expr.rhs));
+    auto result = std::make_unique<BinaryExpr>(clone_expr(*expr.lhs), expr.op,
+                                               expr.rhs == nullptr ? nullptr : clone_expr(*expr.rhs), expr.negated);
+    result->rhs_upper = expr.rhs_upper == nullptr ? nullptr : clone_expr(*expr.rhs_upper);
+    result->rhs_list.reserve(expr.rhs_list.size());
+    for (const auto& value : expr.rhs_list) {
+        result->rhs_list.push_back(clone_expr(*value));
+    }
+    return result;
 }
 
 struct HavingExpr : public TreeNode {
     std::unique_ptr<Expr> lhs;
     SvCompOp op;
     std::unique_ptr<Expr> rhs;
+    std::unique_ptr<Expr> rhs_upper;
+    std::vector<std::unique_ptr<Expr>> rhs_list;
+    bool negated = false;
 
-    HavingExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_)
-        : TreeNode(AstType::HavingExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
+    HavingExpr(std::unique_ptr<Expr> lhs_, SvCompOp op_, std::unique_ptr<Expr> rhs_, bool negated_ = false)
+        : TreeNode(AstType::HavingExpr), lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)), negated(negated_) {}
 };
 
 struct OrderByItem : public TreeNode {
@@ -391,17 +404,21 @@ struct SelectStmt : public TreeNode {
     std::vector<std::unique_ptr<OrderByItem>> order_by_items;
     bool has_limit;
     int limit;
+    bool has_distinct;
+    bool has_offset;
+    int offset;
 
     SelectStmt(std::vector<std::unique_ptr<SelectItem>> select_items_, std::vector<TableRef> tabs_,
                std::vector<std::unique_ptr<BinaryExpr>> conds_, std::vector<std::unique_ptr<Col>> group_by_cols_,
                std::vector<std::unique_ptr<HavingExpr>> having_conds_,
                std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_, int limit_,
-               bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {})
+               bool has_select_star_, std::vector<std::unique_ptr<JoinExpr>> jointree_ = {}, bool has_distinct_ = false,
+               bool has_offset_ = false, int offset_ = 0)
         : TreeNode(AstType::SelectStmt), select_items(std::move(select_items_)), tabs(std::move(tabs_)),
           conds(std::move(conds_)), jointree(std::move(jointree_)), has_select_star(has_select_star_),
           group_by_cols(std::move(group_by_cols_)), having_conds(std::move(having_conds_)),
           has_sort(!order_by_items_.empty()), order_by_items(std::move(order_by_items_)), has_limit(has_limit_),
-          limit(limit_) {
+          limit(limit_), has_distinct(has_distinct_), has_offset(has_offset_), offset(offset_) {
         if (!order_by_items.empty()) {
             std::vector<std::unique_ptr<OrderByItem>> order_items;
             order_items.reserve(order_by_items.size());
@@ -415,9 +432,10 @@ struct SelectStmt : public TreeNode {
 
 struct UnionStmt : public TreeNode {
     std::vector<std::unique_ptr<SelectStmt>> branches;
+    std::vector<bool> union_all;
 
-    explicit UnionStmt(std::vector<std::unique_ptr<SelectStmt>> branches_)
-        : TreeNode(AstType::UnionStmt), branches(std::move(branches_)) {}
+    explicit UnionStmt(std::vector<std::unique_ptr<SelectStmt>> branches_, std::vector<bool> union_all_ = {})
+        : TreeNode(AstType::UnionStmt), branches(std::move(branches_)), union_all(std::move(union_all_)) {}
 };
 
 struct SelectFromUnionStmt : public TreeNode {
@@ -426,11 +444,18 @@ struct SelectFromUnionStmt : public TreeNode {
     std::unique_ptr<OrderBy> order;
     std::vector<std::unique_ptr<OrderByItem>> order_by_items;
     bool has_sort;
+    bool has_limit = false;
+    int limit = 0;
+    bool has_distinct = false;
+    bool has_offset = false;
+    int offset = 0;
 
     SelectFromUnionStmt(std::unique_ptr<UnionStmt> union_stmt_, std::string alias_,
-                        std::vector<std::unique_ptr<OrderByItem>> order_by_items_)
+                        std::vector<std::unique_ptr<OrderByItem>> order_by_items_, bool has_limit_ = false,
+                        int limit_ = 0, bool has_offset_ = false, int offset_ = 0)
         : TreeNode(AstType::SelectFromUnionStmt), union_stmt(std::move(union_stmt_)), alias(std::move(alias_)),
-          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()) {
+          order_by_items(std::move(order_by_items_)), has_sort(!order_by_items.empty()), has_limit(has_limit_),
+          limit(limit_), has_offset(has_offset_), offset(offset_) {
         if (!order_by_items.empty()) {
             std::vector<std::unique_ptr<OrderByItem>> order_items;
             order_items.reserve(order_by_items.size());

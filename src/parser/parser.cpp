@@ -31,6 +31,13 @@ struct FromClause {
     std::vector<std::unique_ptr<JoinExpr>> jointree;
 };
 
+struct PaginationClause {
+    bool has_limit = false;
+    int limit = 0;
+    bool has_offset = false;
+    int offset = 0;
+};
+
 class SqlParser {
 public:
     explicit SqlParser(std::string_view sql) : lexer_(sql) {
@@ -327,21 +334,26 @@ private:
         expect(TokenType::AS, "expected AS after union query");
         std::string alias = parse_identifier();
         auto order = parse_opt_order_clause();
-        return std::make_unique<SelectFromUnionStmt>(std::move(union_stmt), std::move(alias), std::move(order));
+        auto pagination = parse_opt_pagination_clause();
+        return std::make_unique<SelectFromUnionStmt>(std::move(union_stmt), std::move(alias), std::move(order),
+                                                     pagination.has_limit, pagination.limit, pagination.has_offset,
+                                                     pagination.offset);
     }
 
     std::unique_ptr<SelectStmt> parse_select_stmt() {
         expect(TokenType::SELECT, "expected SELECT");
+        bool has_distinct = match(TokenType::DISTINCT);
         bool has_star = match(TokenType::STAR);
         std::vector<std::unique_ptr<SelectItem>> items;
         if (!has_star) {
             items = parse_select_item_list();
         }
         expect(TokenType::FROM, "expected FROM in SELECT");
-        return parse_select_tail(has_star, std::move(items));
+        return parse_select_tail(has_star, has_distinct, std::move(items));
     }
 
-    std::unique_ptr<SelectStmt> parse_select_tail(bool has_star, std::vector<std::unique_ptr<SelectItem>> items) {
+    std::unique_ptr<SelectStmt> parse_select_tail(bool has_star, bool has_distinct,
+                                                  std::vector<std::unique_ptr<SelectItem>> items) {
         auto from = parse_from_clause();
         auto conds = std::move(from->conds);
         auto where = parse_where_clause();
@@ -349,22 +361,26 @@ private:
         auto group_by = parse_opt_group_clause();
         auto having = parse_opt_having_clause();
         auto order = parse_opt_order_clause();
-        auto [has_limit, limit_value] = parse_opt_limit_clause();
+        auto pagination = parse_opt_pagination_clause();
         return std::make_unique<SelectStmt>(std::move(items), from->tables, std::move(conds), std::move(group_by),
-                                            std::move(having), std::move(order), has_limit, limit_value, has_star,
-                                            std::move(from->jointree));
+                                            std::move(having), std::move(order), pagination.has_limit, pagination.limit,
+                                            has_star, std::move(from->jointree), has_distinct, pagination.has_offset,
+                                            pagination.offset);
     }
 
     std::unique_ptr<UnionStmt> parse_union_query() {
         auto first = parse_select_stmt();
         expect(TokenType::UNION, "expected UNION in union query");
         std::vector<std::unique_ptr<SelectStmt>> branches;
+        std::vector<bool> union_all;
         branches.push_back(std::move(first));
+        union_all.push_back(match(TokenType::ALL));
         branches.push_back(parse_select_stmt());
         while (match(TokenType::UNION)) {
+            union_all.push_back(match(TokenType::ALL));
             branches.push_back(parse_select_stmt());
         }
-        return std::make_unique<UnionStmt>(std::move(branches));
+        return std::make_unique<UnionStmt>(std::move(branches), std::move(union_all));
     }
 
     std::vector<std::unique_ptr<Field>> parse_field_list() {
@@ -510,13 +526,41 @@ private:
 
     std::unique_ptr<BinaryExpr> parse_condition() {
         auto lhs = parse_col();
-        auto op = parse_op();
-        auto rhs = parse_general_expr();
-        return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
+        return parse_predicate_after_lhs(std::move(lhs));
     }
 
     std::unique_ptr<BinaryExpr> parse_general_condition() {
         auto lhs = parse_general_expr();
+        return parse_predicate_after_lhs(std::move(lhs));
+    }
+
+    std::unique_ptr<BinaryExpr> parse_predicate_after_lhs(std::unique_ptr<Expr> lhs) {
+        bool negated = match(TokenType::NOT);
+        if (match(TokenType::LIKE)) {
+            return std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_LIKE, parse_general_expr(), negated);
+        }
+        if (match(TokenType::IN)) {
+            auto result = std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_IN, nullptr, negated);
+            expect(TokenType::LPAREN, "expected '(' after IN");
+            if (check(TokenType::RPAREN)) {
+                error("expected value in IN list");
+            }
+            result->rhs_list.push_back(parse_value());
+            while (match(TokenType::COMMA)) {
+                result->rhs_list.push_back(parse_value());
+            }
+            expect(TokenType::RPAREN, "expected ')' after IN list");
+            return result;
+        }
+        if (match(TokenType::BETWEEN)) {
+            auto result = std::make_unique<BinaryExpr>(std::move(lhs), SV_OP_BETWEEN, parse_general_expr(), negated);
+            expect(TokenType::AND, "expected AND in BETWEEN predicate");
+            result->rhs_upper = parse_general_expr();
+            return result;
+        }
+        if (negated) {
+            error("expected LIKE, IN, or BETWEEN after NOT");
+        }
         auto op = parse_op();
         auto rhs = parse_general_expr();
         return std::make_unique<BinaryExpr>(std::move(lhs), op, std::move(rhs));
@@ -690,7 +734,10 @@ private:
 
     std::unique_ptr<HavingExpr> parse_having_condition() {
         auto cond = parse_general_condition();
-        return std::make_unique<HavingExpr>(std::move(cond->lhs), cond->op, std::move(cond->rhs));
+        auto result = std::make_unique<HavingExpr>(std::move(cond->lhs), cond->op, std::move(cond->rhs), cond->negated);
+        result->rhs_upper = std::move(cond->rhs_upper);
+        result->rhs_list = std::move(cond->rhs_list);
+        return result;
     }
 
     std::unique_ptr<Expr> parse_general_expr() {
@@ -822,7 +869,21 @@ private:
                 from->tables.push_back(parse_table_ref());
                 continue;
             }
-            if (match(TokenType::JOIN)) {
+            JoinType join_type = INNER_JOIN;
+            if (match(TokenType::RIGHT)) {
+                match(TokenType::OUTER);
+                expect(TokenType::JOIN, "expected JOIN after RIGHT");
+                join_type = RIGHT_JOIN;
+            } else if (match(TokenType::FULL)) {
+                match(TokenType::OUTER);
+                expect(TokenType::JOIN, "expected JOIN after FULL");
+                join_type = FULL_JOIN;
+            } else if (match(TokenType::JOIN)) {
+                join_type = INNER_JOIN;
+            } else {
+                break;
+            }
+            {
                 TableRef left = from->tables.back();
                 TableRef right = parse_table_ref();
                 from->tables.push_back(right);
@@ -833,12 +894,11 @@ private:
                     join_tree_conds.push_back(clone_binary_expr(*cond));
                 }
                 from->jointree.push_back(std::make_unique<JoinExpr>(std::move(left), std::move(right),
-                                                                    std::move(join_tree_conds), INNER_JOIN));
+                                                                    std::move(join_tree_conds), join_type));
                 from->conds.insert(from->conds.end(), std::make_move_iterator(join_conds.begin()),
                                    std::make_move_iterator(join_conds.end()));
                 continue;
             }
-            break;
         }
         return from;
     }
@@ -890,12 +950,25 @@ private:
         return std::make_unique<OrderByItem>(std::move(expr), dir);
     }
 
-    std::pair<bool, int> parse_opt_limit_clause() {
-        if (!match(TokenType::LIMIT)) {
-            return {false, 0};
+    PaginationClause parse_opt_pagination_clause() {
+        PaginationClause result;
+        while (check(TokenType::LIMIT) || check(TokenType::OFFSET)) {
+            if (match(TokenType::LIMIT)) {
+                if (result.has_limit) {
+                    error("duplicate LIMIT clause");
+                }
+                result.has_limit = true;
+                result.limit = parse_int_literal()->val;
+            } else {
+                expect(TokenType::OFFSET, "expected OFFSET");
+                if (result.has_offset) {
+                    error("duplicate OFFSET clause");
+                }
+                result.has_offset = true;
+                result.offset = parse_int_literal()->val;
+            }
         }
-        auto lit = parse_int_literal();
-        return {true, lit->val};
+        return result;
     }
 
     std::string parse_identifier() {

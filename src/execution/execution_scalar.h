@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "defs.h"
 #include "errors.h"
@@ -44,6 +45,29 @@ inline std::string trim_string(const char* data, int len) {
     return std::string(view.data(), view.size());
 }
 
+inline bool like_match(std::string_view value, std::string_view pattern) {
+    std::vector<bool> previous(pattern.size() + 1, false);
+    std::vector<bool> current(pattern.size() + 1, false);
+    previous[0] = true;
+    for (size_t pattern_pos = 1; pattern_pos <= pattern.size(); ++pattern_pos) {
+        previous[pattern_pos] = previous[pattern_pos - 1] && pattern[pattern_pos - 1] == '%';
+    }
+
+    for (size_t value_pos = 1; value_pos <= value.size(); ++value_pos) {
+        current.assign(pattern.size() + 1, false);
+        for (size_t pattern_pos = 1; pattern_pos <= pattern.size(); ++pattern_pos) {
+            char pattern_char = pattern[pattern_pos - 1];
+            if (pattern_char == '%') {
+                current[pattern_pos] = current[pattern_pos - 1] || previous[pattern_pos];
+            } else if (pattern_char == '_' || pattern_char == value[value_pos - 1]) {
+                current[pattern_pos] = previous[pattern_pos - 1];
+            }
+        }
+        previous.swap(current);
+    }
+    return previous[pattern.size()];
+}
+
 struct CellValue {
     ColType type = TYPE_INT;
     int int_val = 0;
@@ -65,6 +89,16 @@ inline int compare_cells(const CellValue& lhs, const CellValue& rhs) {
             return -1;
         }
         if (lhs_val > rhs_val) {
+            return 1;
+        }
+        return 0;
+    }
+    if ((lhs.type == TYPE_STRING || lhs.type == TYPE_DATETIME) &&
+        (rhs.type == TYPE_STRING || rhs.type == TYPE_DATETIME)) {
+        if (lhs.str_val < rhs.str_val) {
+            return -1;
+        }
+        if (lhs.str_val > rhs.str_val) {
             return 1;
         }
         return 0;

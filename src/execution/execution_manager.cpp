@@ -265,18 +265,27 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     // 执行query_plan
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
+        if (Tuple == nullptr) {
+            continue;
+        }
+        const auto& nulls = executorTreeRoot->nulls();
         std::vector<std::string> columns;
         columns.reserve(result_cols.size());
-        for (auto& col : result_cols) {
+        for (size_t col_idx = 0; col_idx < result_cols.size(); ++col_idx) {
+            auto& col = result_cols[col_idx];
             std::string col_str;
-            char* rec_buf = Tuple->data + col.offset;
-            if (col.type == TYPE_INT) {
-                col_str = std::to_string(*(int*)rec_buf);
-            } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(*(double*)rec_buf);
-            } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
-                col_str = std::string((char*)rec_buf, col.len);
-                col_str.resize(strlen(col_str.c_str()));
+            if (col_idx < nulls.size() && nulls[col_idx]) {
+                col_str = "NULL";
+            } else {
+                char* rec_buf = Tuple->data + col.offset;
+                if (col.type == TYPE_INT) {
+                    col_str = std::to_string(*(int*)rec_buf);
+                } else if (col.type == TYPE_FLOAT) {
+                    col_str = std::to_string(*(double*)rec_buf);
+                } else if (col.type == TYPE_STRING || col.type == TYPE_DATETIME) {
+                    col_str = std::string((char*)rec_buf, col.len);
+                    col_str.resize(strlen(col_str.c_str()));
+                }
             }
             columns.push_back(col_str);
         }

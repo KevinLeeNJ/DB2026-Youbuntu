@@ -11,12 +11,16 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstring>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
+#include "parser/ast.h"
 #include "system/sm.h"
 
 class NestedLoopJoinExecutor : public AbstractExecutor {
@@ -52,6 +56,17 @@ private:
     std::unique_ptr<RmRecord> current_left_rec_; // 当前缓存的左表记录
     std::unique_ptr<RmRecord> _buffered_record;  // 复用的输出缓冲
     bool buffered_record_available_ = false;
+    JoinType join_type_ = INNER_JOIN;
+    bool has_extended_condition_ = false;
+
+    struct OuterTuple {
+        RmRecord record;
+        std::vector<bool> nulls;
+    };
+    std::vector<OuterTuple> outer_tuples_;
+    size_t outer_cursor_ = 0;
+    std::vector<bool> current_left_nulls_;
+    std::vector<bool> current_output_nulls_;
 
     // INLJ support
     bool inlj_mode_ = false;
@@ -132,6 +147,8 @@ private:
         compiled_conds_.clear();
         compiled_conds_.reserve(fed_conds_.size());
         for (const auto& cond : fed_conds_) {
+            has_extended_condition_ = has_extended_condition_ || cond.op == OP_LIKE || cond.op == OP_IN ||
+                                     cond.op == OP_BETWEEN;
             CompiledCondition compiled;
             compiled.op = cond.op;
             compiled.lhs = compile_column_operand(cond.lhs_col);
@@ -181,7 +198,26 @@ private:
         return std::string_view(data, operand.len);
     }
 
-    bool is_condition(const RmRecord& left_rec, const RmRecord& right_rec) const {
+    bool is_condition(const RmRecord& left_rec, const RmRecord& right_rec,
+                      const std::vector<bool>& left_nulls = {}, const std::vector<bool>& right_nulls = {}) {
+        if (has_extended_condition_ || !left_nulls.empty() || !right_nulls.empty()) {
+            RmRecord joined(static_cast<int>(len_));
+            std::memcpy(joined.data, left_rec.data, left_tuple_len_);
+            std::memcpy(joined.data + left_tuple_len_, right_rec.data, right_tuple_len_);
+            std::vector<bool> joined_nulls(cols_.size(), false);
+            for (size_t i = 0; i < left_nulls.size() && i < left_->cols().size(); ++i) {
+                joined_nulls[i] = left_nulls[i];
+            }
+            for (size_t i = 0; i < right_nulls.size() && i < right_->cols().size(); ++i) {
+                joined_nulls[left_->cols().size() + i] = right_nulls[i];
+            }
+            for (const auto& cond : fed_conds_) {
+                if (!compare(cond, joined, joined_nulls)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         for (const auto& cond : compiled_conds_) {
             const auto lhs_type = cond.lhs.type;
             const auto rhs_type = cond.rhs.type;
@@ -211,6 +247,104 @@ private:
     void reset_buffered_record() {
         _buffered_record = nullptr;
         buffered_record_available_ = false;
+    }
+
+    static std::vector<bool> copy_nulls(const AbstractExecutor& executor) {
+        return executor.nulls();
+    }
+
+    std::vector<std::pair<RmRecord, std::vector<bool>>> materialize_child(AbstractExecutor& child) {
+        std::vector<std::pair<RmRecord, std::vector<bool>>> rows;
+        for (child.beginTuple(); !child.is_end(); child.nextTuple()) {
+            auto record = child.Next();
+            if (record != nullptr) {
+                rows.emplace_back(*record, copy_nulls(child));
+            }
+        }
+        return rows;
+    }
+
+    bool is_outer_join() const {
+        return join_type_ == LEFT_JOIN || join_type_ == RIGHT_JOIN || join_type_ == FULL_JOIN;
+    }
+
+    void append_outer_tuple(const std::pair<RmRecord, std::vector<bool>>* left,
+                            const std::pair<RmRecord, std::vector<bool>>* right, bool left_null, bool right_null) {
+        RmRecord output(static_cast<int>(len_));
+        std::memset(output.data, 0, len_);
+        std::vector<bool> nulls(cols_.size(), false);
+        if (left != nullptr && !left_null) {
+            std::memcpy(output.data, left->first.data, left_tuple_len_);
+            for (size_t i = 0; i < left->second.size() && i < left_->cols().size(); ++i) {
+                nulls[i] = left->second[i];
+            }
+        } else {
+            for (size_t i = 0; i < left_->cols().size(); ++i) {
+                nulls[i] = true;
+            }
+        }
+        if (right != nullptr && !right_null) {
+            std::memcpy(output.data + left_tuple_len_, right->first.data, right_tuple_len_);
+            for (size_t i = 0; i < right->second.size() && i < right_->cols().size(); ++i) {
+                nulls[left_->cols().size() + i] = right->second[i];
+            }
+        } else {
+            for (size_t i = 0; i < right_->cols().size(); ++i) {
+                nulls[left_->cols().size() + i] = true;
+            }
+        }
+        outer_tuples_.push_back(OuterTuple{std::move(output), std::move(nulls)});
+    }
+
+    void materialize_outer_join() {
+        auto left_rows = materialize_child(*left_);
+        auto right_rows = materialize_child(*right_);
+        std::vector<bool> matched_left(left_rows.size(), false);
+        std::vector<bool> matched_right(right_rows.size(), false);
+        outer_tuples_.clear();
+
+        auto append_left_or_right_matches = [&](size_t left_index, size_t right_index) {
+            if (is_condition(left_rows[left_index].first, right_rows[right_index].first,
+                             left_rows[left_index].second, right_rows[right_index].second)) {
+                matched_left[left_index] = true;
+                matched_right[right_index] = true;
+                append_outer_tuple(&left_rows[left_index], &right_rows[right_index], false, false);
+                return true;
+            }
+            return false;
+        };
+
+        if (join_type_ == RIGHT_JOIN) {
+            for (size_t right_index = 0; right_index < right_rows.size(); ++right_index) {
+                bool matched = false;
+                for (size_t left_index = 0; left_index < left_rows.size(); ++left_index) {
+                    bool current_match = append_left_or_right_matches(left_index, right_index);
+                    matched = current_match || matched;
+                }
+                if (!matched) {
+                    append_outer_tuple(nullptr, &right_rows[right_index], true, false);
+                }
+            }
+            return;
+        }
+
+        for (size_t left_index = 0; left_index < left_rows.size(); ++left_index) {
+            bool matched = false;
+            for (size_t right_index = 0; right_index < right_rows.size(); ++right_index) {
+                bool current_match = append_left_or_right_matches(left_index, right_index);
+                matched = current_match || matched;
+            }
+            if (!matched && (join_type_ == LEFT_JOIN || join_type_ == FULL_JOIN)) {
+                append_outer_tuple(&left_rows[left_index], nullptr, false, true);
+            }
+        }
+        if (join_type_ == FULL_JOIN) {
+            for (size_t right_index = 0; right_index < right_rows.size(); ++right_index) {
+                if (!matched_right[right_index]) {
+                    append_outer_tuple(nullptr, &right_rows[right_index], true, false);
+                }
+            }
+        }
     }
 
     void ensure_output_buffer() {
@@ -251,10 +385,11 @@ private:
 public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
                            std::vector<Condition> conds, TabCol inlj_left_col = {}, TabCol inlj_right_col = {},
-                           const std::string& inlj_index_col_name = "") {
+                           const std::string& inlj_index_col_name = "", JoinType join_type = INNER_JOIN) {
         (void)inlj_index_col_name;
         left_ = std::move(left);
         right_ = std::move(right);
+        join_type_ = join_type;
         left_tuple_len_ = left_->tupleLen();
         right_tuple_len_ = right_->tupleLen();
         len_ = left_tuple_len_ + right_tuple_len_;
@@ -295,12 +430,20 @@ public:
     }
 
     void beginTuple() override {
+        if (is_outer_join()) {
+            materialize_outer_join();
+            outer_cursor_ = 0;
+            isend = outer_tuples_.empty();
+            return;
+        }
         left_->beginTuple();
         right_->set_counting_enabled(false);
         right_->beginTuple();
         right_->set_counting_enabled(true);
         isend = false;
         current_left_rec_ = nullptr; // 获取左表的第一条记录
+        current_left_nulls_.clear();
+        current_output_nulls_.clear();
         reset_buffered_record();
         nextTuple();
     }
@@ -309,6 +452,13 @@ public:
      * @brief 寻找下一个匹配的记录对，并将结果存储在 _buffered_record 中。
      */
     void nextTuple() override {
+        if (is_outer_join()) {
+            if (!isend) {
+                ++outer_cursor_;
+                isend = outer_cursor_ >= outer_tuples_.size();
+            }
+            return;
+        }
         if (isend) {
             reset_buffered_record();
             return;
@@ -323,9 +473,11 @@ public:
                 current_left_rec_ = left_->Next();
                 if (left_->is_end() || current_left_rec_ == nullptr) {
                     isend = true;
+                    current_output_nulls_.clear();
                     reset_buffered_record();
                     return;
                 }
+                current_left_nulls_ = left_->nulls();
                 left_->nextTuple();
                 // INLJ: inject join key before resetting inner scan
                 if (inlj_mode_) {
@@ -343,11 +495,19 @@ public:
                     break;                       // 退出内层循环，回到外层循环
                 }
 
-                if (is_condition(*current_left_rec_, *right_rec)) {
+                auto right_nulls = right_->nulls();
+                if (is_condition(*current_left_rec_, *right_rec, current_left_nulls_, right_nulls)) {
                     // 找到一个匹配项
                     ensure_output_buffer();
                     memcpy(_buffered_record->data, current_left_rec_->data, left_tuple_len_);
                     memcpy(_buffered_record->data + left_tuple_len_, right_rec->data, right_tuple_len_);
+                    current_output_nulls_.assign(cols_.size(), false);
+                    for (size_t i = 0; i < current_left_nulls_.size() && i < left_->cols().size(); ++i) {
+                        current_output_nulls_[i] = current_left_nulls_[i];
+                    }
+                    for (size_t i = 0; i < right_nulls.size() && i < right_->cols().size(); ++i) {
+                        current_output_nulls_[left_->cols().size() + i] = right_nulls[i];
+                    }
                     buffered_record_available_ = true;
                     right_->nextTuple(); // 继续扫描右表的下一条记录
 
@@ -362,6 +522,12 @@ public:
      * @brief 返回由 nextTuple() 准备好的记录，并触发下一次寻找。
      */
     std::unique_ptr<RmRecord> Next() override {
+        if (is_outer_join()) {
+            if (isend) {
+                return nullptr;
+            }
+            return std::make_unique<RmRecord>(outer_tuples_[outer_cursor_].record);
+        }
         if (is_end() || !buffered_record_available_ || _buffered_record == nullptr) {
             return nullptr;
         }
@@ -386,5 +552,23 @@ public:
     }
     size_t tupleLen() const override {
         return len_;
+    }
+
+    ColMeta get_col_offset(const TabCol& target) override {
+        auto pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta& col) {
+            return (target.tab_name.empty() || col.tab_name == target.tab_name) && col.name == target.col_name;
+        });
+        if (pos == cols_.end()) {
+            throw ColumnNotFoundError(target.col_name);
+        }
+        return *pos;
+    }
+
+    const std::vector<bool>& nulls() const override {
+        static const std::vector<bool> no_nulls;
+        if (is_outer_join()) {
+            return !isend ? outer_tuples_[outer_cursor_].nulls : no_nulls;
+        }
+        return current_output_nulls_;
     }
 };

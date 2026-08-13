@@ -361,20 +361,67 @@ TEST(ParserTest, SelectRoutingKeepsUnionWrapperBehavior) {
 }
 
 TEST(ParserTest, ParsesKeywordExpansionForms) {
-    EXPECT_EQ(parse_ok("select distinct name from people;")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select name from people where name like 'A%';")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select id from people where id not like 1;")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select id from people where id in (1, 3, 5);")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select id from people where id not in (2, 4);")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select id from people where id between 2 and 4;")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select id from people where id not between 2 and 4;")->type, ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select * from left_t right join right_t on left_t.id = right_t.id;")->type,
-              ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select * from left_t full outer join right_t on left_t.id = right_t.id;")->type,
-              ast::AstType::SelectStmt);
-    EXPECT_EQ(parse_ok("select * from (select id from left_t union all select id from right_t) as u;")->type,
-              ast::AstType::SelectFromUnionStmt);
-    EXPECT_EQ(parse_ok("select id from people order by id offset 1 limit 2;")->type, ast::AstType::SelectStmt);
+    auto distinct_parse = parse_ok("select distinct name from people;");
+    auto distinct = as_node<ast::SelectStmt>(distinct_parse);
+    ASSERT_NE(distinct, nullptr);
+    EXPECT_TRUE(distinct->has_distinct);
+
+    auto like_parse = parse_ok("select name from people where name not like 'A%';");
+    auto like = as_node<ast::SelectStmt>(like_parse);
+    ASSERT_NE(like, nullptr);
+    ASSERT_EQ(like->conds.size(), 1);
+    EXPECT_EQ(like->conds[0]->op, ast::SV_OP_LIKE);
+    EXPECT_TRUE(like->conds[0]->negated);
+
+    auto in_parse = parse_ok("select id from people where id not in (2, 4);");
+    auto in = as_node<ast::SelectStmt>(in_parse);
+    ASSERT_NE(in, nullptr);
+    ASSERT_EQ(in->conds.size(), 1);
+    EXPECT_EQ(in->conds[0]->op, ast::SV_OP_IN);
+    EXPECT_TRUE(in->conds[0]->negated);
+    EXPECT_EQ(in->conds[0]->rhs_list.size(), 2);
+
+    auto between_parse = parse_ok("select id from people where id between 2 and 4;");
+    auto between = as_node<ast::SelectStmt>(between_parse);
+    ASSERT_NE(between, nullptr);
+    ASSERT_EQ(between->conds.size(), 1);
+    EXPECT_EQ(between->conds[0]->op, ast::SV_OP_BETWEEN);
+    ASSERT_NE(between->conds[0]->rhs_upper, nullptr);
+
+    auto having_parse = parse_ok("select count(*) from people group by id having count(*) not between 1 and 2;");
+    auto having = as_node<ast::SelectStmt>(having_parse);
+    ASSERT_NE(having, nullptr);
+    ASSERT_EQ(having->having_conds.size(), 1);
+    EXPECT_EQ(having->having_conds[0]->op, ast::SV_OP_BETWEEN);
+    EXPECT_TRUE(having->having_conds[0]->negated);
+
+    auto right_join_parse = parse_ok("select * from left_t right join right_t on left_t.id = right_t.id;");
+    auto right_join = as_node<ast::SelectStmt>(right_join_parse);
+    ASSERT_NE(right_join, nullptr);
+    ASSERT_EQ(right_join->jointree.size(), 1);
+    EXPECT_EQ(right_join->jointree[0]->join_type, RIGHT_JOIN);
+
+    auto full_join_parse = parse_ok("select * from left_t full outer join right_t on left_t.id = right_t.id;");
+    auto full_join = as_node<ast::SelectStmt>(full_join_parse);
+    ASSERT_NE(full_join, nullptr);
+    ASSERT_EQ(full_join->jointree.size(), 1);
+    EXPECT_EQ(full_join->jointree[0]->join_type, FULL_JOIN);
+
+    auto union_wrapper_parse = parse_ok("select * from (select id from left_t union all select id from right_t) as u;");
+    auto union_wrapper = as_node<ast::SelectFromUnionStmt>(union_wrapper_parse);
+    ASSERT_NE(union_wrapper, nullptr);
+    ASSERT_NE(union_wrapper->union_stmt, nullptr);
+    ASSERT_EQ(union_wrapper->union_stmt->union_all.size(), 1);
+    EXPECT_TRUE(union_wrapper->union_stmt->union_all[0]);
+
+    auto pagination_parse = parse_ok("select id from people order by id offset 1 limit 2;");
+    auto pagination = as_node<ast::SelectStmt>(pagination_parse);
+    ASSERT_NE(pagination, nullptr);
+    EXPECT_TRUE(pagination->has_offset);
+    EXPECT_EQ(pagination->offset, 1);
+    EXPECT_TRUE(pagination->has_limit);
+    EXPECT_EQ(pagination->limit, 2);
+
     expect_parse_error("select id from people where id in (); ");
     expect_parse_error("select id from people where id between 1; ");
     expect_parse_error("select id from people where id like; ");

@@ -10,6 +10,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
+#include "execution/execution_scalar.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 
@@ -88,78 +89,88 @@ bool CompareCondition(const Condition& cond, const RmRecord& rec, const std::vec
         return *it;
     };
 
-    const ColMeta& lhs_col_meta = get_col_meta(cond.lhs_col);
-    char* lhs_data = rec.data + lhs_col_meta.offset;
-    ColType lhs_type = lhs_col_meta.type;
-    ColType rhs_type;
-    char* rhs_data = nullptr;
-    const ColMeta* rhs_col_meta = nullptr;
-    if (cond.is_rhs_val) {
-        rhs_type = cond.rhs_val.type;
-    } else {
-        rhs_col_meta = &get_col_meta(cond.rhs_col);
-        rhs_data = rec.data + rhs_col_meta->offset;
-        rhs_type = rhs_col_meta->type;
-    }
-
-    bool can_cast = lhs_type == rhs_type || (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-                    (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
-                    ((lhs_type == TYPE_STRING || lhs_type == TYPE_DATETIME) &&
-                     (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME));
-    if (!can_cast) {
-        throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
-    }
-
-    switch (lhs_type) {
-    case TYPE_INT:
-    case TYPE_FLOAT: {
-        double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(lhs_data))
-                                              : *reinterpret_cast<double*>(lhs_data);
-        double rhs_val;
-        if (cond.is_rhs_val) {
-            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
+    auto from_value = [](const Value& value) {
+        execution_scalar::CellValue result;
+        result.type = value.type;
+        if (value.type == TYPE_INT) {
+            result.int_val = value.int_val;
+        } else if (value.type == TYPE_FLOAT) {
+            result.float_val = value.float_val;
         } else {
-            rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<int*>(rhs_data))
-                                           : *reinterpret_cast<double*>(rhs_data);
+            result.str_val = value.str_val;
         }
-        switch (cond.op) {
+        return result;
+    };
+    auto from_record = [](const RmRecord& record, const ColMeta& col) {
+        execution_scalar::CellValue result;
+        result.type = col.type;
+        const char* data = record.data + col.offset;
+        if (col.type == TYPE_INT) {
+            result.int_val = *reinterpret_cast<const int*>(data);
+        } else if (col.type == TYPE_FLOAT) {
+            result.float_val = *reinterpret_cast<const double*>(data);
+        } else {
+            result.str_val = execution_scalar::trim_string(data, col.len);
+        }
+        return result;
+    };
+    auto compare_simple = [](const execution_scalar::CellValue& lhs, const execution_scalar::CellValue& rhs,
+                             CompOp op) {
+        if (op == OP_LIKE) {
+            if ((lhs.type != TYPE_STRING && lhs.type != TYPE_DATETIME) ||
+                (rhs.type != TYPE_STRING && rhs.type != TYPE_DATETIME)) {
+                throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
+            }
+            return execution_scalar::like_match(lhs.str_val, rhs.str_val);
+        }
+        int cmp = execution_scalar::compare_cells(lhs, rhs);
+        switch (op) {
         case OP_EQ:
-            return lhs_val == rhs_val;
+            return cmp == 0;
         case OP_NE:
-            return lhs_val != rhs_val;
+            return cmp != 0;
         case OP_LT:
-            return lhs_val < rhs_val;
+            return cmp < 0;
         case OP_GT:
-            return lhs_val > rhs_val;
+            return cmp > 0;
         case OP_LE:
-            return lhs_val <= rhs_val;
+            return cmp <= 0;
         case OP_GE:
-            return lhs_val >= rhs_val;
+            return cmp >= 0;
+        case OP_LIKE:
+        case OP_IN:
+        case OP_BETWEEN:
+            break;
         }
-        break;
-    }
-    case TYPE_STRING:
-    case TYPE_DATETIME: {
-        std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
-        std::string rhs_val =
-            cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta->len));
-        switch (cond.op) {
-        case OP_EQ:
-            return lhs_val == rhs_val;
-        case OP_NE:
-            return lhs_val != rhs_val;
-        case OP_LT:
-            return lhs_val < rhs_val;
-        case OP_GT:
-            return lhs_val > rhs_val;
-        case OP_LE:
-            return lhs_val <= rhs_val;
-        case OP_GE:
-            return lhs_val >= rhs_val;
+        throw InternalError("Unexpected comparison operator");
+    };
+
+    const auto& lhs_meta = get_col_meta(cond.lhs_col);
+    auto lhs = from_record(rec, lhs_meta);
+    if (cond.op == OP_IN) {
+        bool matched = false;
+        for (const auto& value : cond.rhs_vals) {
+            if (compare_simple(lhs, from_value(value), OP_EQ)) {
+                matched = true;
+                break;
+            }
         }
+        return cond.negated ? !matched : matched;
     }
+    if (cond.op == OP_BETWEEN) {
+        bool matched = compare_simple(lhs, from_value(cond.rhs_val), OP_GE) &&
+                       compare_simple(lhs, from_value(cond.rhs_upper), OP_LE);
+        return cond.negated ? !matched : matched;
     }
-    return false;
+
+    execution_scalar::CellValue rhs;
+    if (cond.is_rhs_val) {
+        rhs = from_value(cond.rhs_val);
+    } else {
+        rhs = from_record(rec, get_col_meta(cond.rhs_col));
+    }
+    bool matched = compare_simple(lhs, rhs, cond.op);
+    return cond.negated ? !matched : matched;
 }
 
 bool MatchesConditions(const std::vector<Condition>& conds, const RmRecord& rec, const std::vector<ColMeta>& cols) {
@@ -555,79 +566,13 @@ TransactionManager::FindVisibleVersion(const TupleMeta& start_meta, timestamp_t 
 // ---- SSI Helper ----
 
 bool TransactionManager::TupleMatches(const std::string& tab_name, const std::vector<Condition>& conds,
-                                      const RmRecord& rec) {
+                                       const RmRecord& rec) {
     if (conds.empty()) {
         return true;
     }
     const auto& tab = sm_manager_->db_.get_table(tab_name);
-    auto get_col_meta = [&](const TabCol& target) -> const ColMeta& {
-        auto iter = std::find_if(tab.cols.begin(), tab.cols.end(), [&](const ColMeta& col) {
-            return col.tab_name == target.tab_name && col.name == target.col_name;
-        });
-        if (iter == tab.cols.end()) {
-            throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
-        }
-        return *iter;
-    };
     for (const auto& cond : conds) {
-        const auto& lhs_col = get_col_meta(cond.lhs_col);
-        const char* lhs_data = rec.data + lhs_col.offset;
-        ColType rhs_type;
-        const char* rhs_data = nullptr;
-        ColMeta rhs_col{};
-        if (cond.is_rhs_val) {
-            rhs_type = cond.rhs_val.type;
-        } else {
-            rhs_col = get_col_meta(cond.rhs_col);
-            rhs_type = rhs_col.type;
-            rhs_data = rec.data + rhs_col.offset;
-        }
-        if (!((lhs_col.type == rhs_type) || (lhs_col.type == TYPE_INT && rhs_type == TYPE_FLOAT) ||
-              (lhs_col.type == TYPE_FLOAT && rhs_type == TYPE_INT) ||
-              ((lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) &&
-               (rhs_type == TYPE_STRING || rhs_type == TYPE_DATETIME)))) {
-            throw IncompatibleTypeError(coltype2str(lhs_col.type), coltype2str(rhs_type));
-        }
-        int cmp = 0;
-        if (lhs_col.type == TYPE_STRING || lhs_col.type == TYPE_DATETIME) {
-            std::string lhs(lhs_data, strnlen(lhs_data, lhs_col.len));
-            std::string rhs =
-                cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col.len));
-            cmp = lhs.compare(rhs);
-        } else {
-            double lhs = lhs_col.type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(lhs_data))
-                                                  : *reinterpret_cast<const double*>(lhs_data);
-            double rhs;
-            if (cond.is_rhs_val) {
-                rhs = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
-            } else {
-                rhs = rhs_type == TYPE_INT ? static_cast<double>(*reinterpret_cast<const int*>(rhs_data))
-                                           : *reinterpret_cast<const double*>(rhs_data);
-            }
-            cmp = lhs == rhs ? 0 : (lhs < rhs ? -1 : 1);
-        }
-        bool ok = false;
-        switch (cond.op) {
-        case OP_EQ:
-            ok = cmp == 0;
-            break;
-        case OP_NE:
-            ok = cmp != 0;
-            break;
-        case OP_LT:
-            ok = cmp < 0;
-            break;
-        case OP_GT:
-            ok = cmp > 0;
-            break;
-        case OP_LE:
-            ok = cmp <= 0;
-            break;
-        case OP_GE:
-            ok = cmp >= 0;
-            break;
-        }
-        if (!ok) {
+        if (!CompareCondition(cond, rec, tab.cols)) {
             return false;
         }
     }

@@ -48,6 +48,7 @@ typedef enum PlanTag {
     T_SortMerge, // sort merge join
     T_Sort,
     T_Projection,
+    T_Distinct,
     T_Aggregate,
     T_Limit,
     T_Union,
@@ -92,12 +93,13 @@ public:
 
 class JoinPlan : public Plan {
 public:
-    JoinPlan(PlanTag tag, std::unique_ptr<Plan> left, std::unique_ptr<Plan> right, std::vector<Condition> conds) {
+    JoinPlan(PlanTag tag, std::unique_ptr<Plan> left, std::unique_ptr<Plan> right, std::vector<Condition> conds,
+             JoinType join_type = INNER_JOIN) {
         Plan::tag = tag;
         left_ = std::move(left);
         right_ = std::move(right);
         conds_ = std::move(conds);
-        type = INNER_JOIN;
+        type = join_type;
     }
     ~JoinPlan() {}
     // 左节点
@@ -146,6 +148,16 @@ public:
     bool is_select_star_ = false;
 };
 
+class DistinctPlan : public Plan {
+public:
+    DistinctPlan(PlanTag tag, std::unique_ptr<Plan> subplan) {
+        Plan::tag = tag;
+        subplan_ = std::move(subplan);
+    }
+    ~DistinctPlan() {}
+    std::unique_ptr<Plan> subplan_;
+};
+
 class AggregatePlan : public Plan {
 public:
     AggregatePlan(PlanTag tag, std::unique_ptr<Plan> subplan, std::vector<TabCol> group_by_cols,
@@ -179,29 +191,33 @@ public:
 
 class LimitPlan : public Plan {
 public:
-    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit) {
+    LimitPlan(PlanTag tag, std::unique_ptr<Plan> subplan, int limit, int offset = 0) {
         Plan::tag = tag;
         subplan_ = std::move(subplan);
         limit_ = limit;
+        offset_ = offset;
     }
     ~LimitPlan() {}
     std::unique_ptr<Plan> subplan_;
     int limit_;
+    int offset_ = 0;
 };
 
 class UnionPlan : public Plan {
 public:
     UnionPlan(PlanTag tag, std::vector<std::unique_ptr<Plan>> branches, std::vector<ColMeta> cols,
-              std::vector<std::string> output_names) {
+              std::vector<std::string> output_names, std::vector<bool> union_all = {}) {
         Plan::tag = tag;
         branches_ = std::move(branches);
         cols_ = std::move(cols);
         output_names_ = std::move(output_names);
+        union_all_ = std::move(union_all);
     }
     ~UnionPlan() {}
     std::vector<std::unique_ptr<Plan>> branches_;
     std::vector<ColMeta> cols_;
     std::vector<std::string> output_names_;
+    std::vector<bool> union_all_;
 };
 
 // dml语句，包括insert; delete; update; select语句　

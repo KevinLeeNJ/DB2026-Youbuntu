@@ -90,7 +90,7 @@ TEST(ExecutionScalarTest, HashesTreatEquivalentMixedNumericValuesConsistently) {
     EXPECT_EQ(AggregateExecutor::compare_cells(as_int, as_float), 0);
     EXPECT_EQ(CellValueHash{}(as_int), CellValueHash{}(as_float));
 
-    GroupKey int_key{{as_int}};
-    GroupKey float_key{{as_float}};
+    GroupKey int_key{{as_int}, {}};
+    GroupKey float_key{{as_float}, {}};
     EXPECT_EQ(GroupKeyHash{}(int_key), GroupKeyHash{}(float_key));
 }

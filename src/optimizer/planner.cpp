@@ -78,8 +78,26 @@ std::string condition_sort_key(const Condition& cond) {
     case OP_GE:
         key += ">=";
         break;
+    case OP_LIKE:
+        key += cond.negated ? " NOT LIKE " : " LIKE ";
+        break;
+    case OP_IN:
+        key += cond.negated ? " NOT IN " : " IN ";
+        break;
+    case OP_BETWEEN:
+        key += cond.negated ? " NOT BETWEEN " : " BETWEEN ";
+        break;
     }
     if (cond.is_rhs_val) {
+        if (cond.op == OP_IN) {
+            for (const auto& value : cond.rhs_vals) {
+                key += value.type == TYPE_INT ? std::to_string(value.int_val)
+                                              : value.type == TYPE_FLOAT ? std::to_string(value.float_val)
+                                                                          : value.str_val;
+                key += ",";
+            }
+            return key;
+        }
         if (!cond.rhs_display.empty()) {
             key += cond.rhs_display;
         } else {
@@ -94,6 +112,16 @@ std::string condition_sort_key(const Condition& cond) {
             case TYPE_DATETIME:
                 key += cond.rhs_val.str_val;
                 break;
+            }
+        }
+        if (cond.op == OP_BETWEEN && cond.has_rhs_upper) {
+            key += " AND ";
+            if (cond.rhs_upper.type == TYPE_INT) {
+                key += std::to_string(cond.rhs_upper.int_val);
+            } else if (cond.rhs_upper.type == TYPE_FLOAT) {
+                key += std::to_string(cond.rhs_upper.float_val);
+            } else {
+                key += cond.rhs_upper.str_val;
             }
         }
     } else {
@@ -121,6 +149,9 @@ void attach_display_names(Plan* plan, const std::unordered_map<std::string, std:
         break;
     case T_Projection:
         attach_display_names(static_cast<ProjectionPlan*>(plan)->subplan_.get(), table_name_to_display);
+        break;
+    case T_Distinct:
+        attach_display_names(static_cast<DistinctPlan*>(plan)->subplan_.get(), table_name_to_display);
         break;
     case T_NestLoop:
     case T_SortMerge: {
@@ -190,7 +221,8 @@ bool has_value_equality(const std::vector<Condition>& conds, const std::string& 
 
 bool has_value_range(const std::vector<Condition>& conds, const std::string& tab_name, const std::string& col_name) {
     return std::any_of(conds.begin(), conds.end(), [&](const Condition& cond) {
-        return cond.is_rhs_val && cond.op != OP_EQ && cond.op != OP_NE && cond.lhs_col.tab_name == tab_name &&
+        bool is_range = cond.op == OP_LT || cond.op == OP_GT || cond.op == OP_LE || cond.op == OP_GE;
+        return cond.is_rhs_val && is_range && cond.lhs_col.tab_name == tab_name &&
                cond.lhs_col.col_name == col_name;
     });
 }
@@ -308,6 +340,9 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_
 
     for (auto& cond : curr_conds) {
         if (cond.lhs_col.tab_name != tab_name && !cond.is_rhs_val && cond.rhs_col.tab_name == tab_name) {
+            if (!is_swappable_comp_op(cond.op)) {
+                continue;
+            }
             std::swap(cond.lhs_col, cond.rhs_col);
             cond.op = swap_comp_op(cond.op);
         }
@@ -330,7 +365,8 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition>& curr_
             for (size_t cond_no = 0; cond_no < curr_conds.size(); ++cond_no) {
                 const auto& cond = curr_conds[cond_no];
                 if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name || cond.lhs_col.col_name != index_col.name ||
-                    cond.op == OP_NE) {
+                    (cond.op != OP_EQ && cond.op != OP_LT && cond.op != OP_GT && cond.op != OP_LE &&
+                     cond.op != OP_GE)) {
                     continue;
                 }
                 if (cond.op == OP_EQ) {
@@ -402,6 +438,9 @@ bool Planner::get_skip_scan_index_cols(std::string tab_name, std::vector<Conditi
 
     for (auto& cond : curr_conds) {
         if (cond.lhs_col.tab_name != tab_name && !cond.is_rhs_val && cond.rhs_col.tab_name == tab_name) {
+            if (!is_swappable_comp_op(cond.op)) {
+                continue;
+            }
             std::swap(cond.lhs_col, cond.rhs_col);
             cond.op = swap_comp_op(cond.op);
         }
@@ -560,8 +599,10 @@ int push_conds(Condition* cond, Plan* plan) {
         // 左子节点匹配到条件的右边
         if (left_res == 2) {
             // 需要将左右两边的条件变换位置
-            std::swap(cond->lhs_col, cond->rhs_col);
-            cond->op = swap_comp_op(cond->op);
+            if (is_swappable_comp_op(cond->op)) {
+                std::swap(cond->lhs_col, cond->rhs_col);
+                cond->op = swap_comp_op(cond->op);
+            }
         }
         x->conds_.emplace_back(std::move(*cond));
         return 3;
@@ -596,10 +637,17 @@ std::unique_ptr<Query> Planner::logical_optimization(std::unique_ptr<Query> quer
 
 std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* context) {
     (void)context;
+    bool has_outer_join = std::any_of(query->join_types.begin(), query->join_types.end(),
+                                      [](JoinType type) { return type != INNER_JOIN; });
     std::map<std::string, std::vector<Condition>> table_filters;
     std::vector<Condition> join_conds;
+    std::vector<Condition> post_join_conds;
     for (const auto& cond : query->conds) {
-        if (cond.is_rhs_val || cond.lhs_col.tab_name == cond.rhs_col.tab_name) {
+        if (has_outer_join) {
+            if (!cond.is_join_on) {
+                post_join_conds.push_back(cond);
+            }
+        } else if (cond.is_rhs_val || cond.lhs_col.tab_name == cond.rhs_col.tab_name) {
             table_filters[cond.lhs_col.tab_name].push_back(cond);
         } else {
             join_conds.push_back(cond);
@@ -616,6 +664,12 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         for (const auto& cond : query->conds) {
             if (!cond.is_rhs_val) {
                 needed_cols[cond.lhs_col.tab_name].insert(cond.lhs_col);
+                needed_cols[cond.rhs_col.tab_name].insert(cond.rhs_col);
+            }
+        }
+        for (const auto& cond : post_join_conds) {
+            needed_cols[cond.lhs_col.tab_name].insert(cond.lhs_col);
+            if (!cond.is_rhs_val) {
                 needed_cols[cond.rhs_col.tab_name].insert(cond.rhs_col);
             }
         }
@@ -665,8 +719,10 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
 
     std::vector<size_t> table_order(table_plans.size());
     std::iota(table_order.begin(), table_order.end(), 0);
-    std::stable_sort(table_order.begin(), table_order.end(),
-                     [&](size_t lhs, size_t rhs) { return table_access_scores[lhs] > table_access_scores[rhs]; });
+    if (!has_outer_join) {
+        std::stable_sort(table_order.begin(), table_order.end(),
+                         [&](size_t lhs, size_t rhs) { return table_access_scores[lhs] > table_access_scores[rhs]; });
+    }
     std::vector<std::string> ordered_plan_tables;
     std::vector<std::unique_ptr<Plan>> ordered_table_plans;
     std::vector<std::vector<Condition>> ordered_table_scan_conds;
@@ -695,12 +751,16 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     for (size_t i = 1; i < table_plans.size(); ++i) {
         const auto& next_table = plan_tables[i];
         std::vector<Condition> curr_join_conds;
-        for (const auto& cond : join_conds) {
-            bool lhs_joined = joined_tables.find(cond.lhs_col.tab_name) != joined_tables.end();
-            bool rhs_joined = joined_tables.find(cond.rhs_col.tab_name) != joined_tables.end();
-            if ((lhs_joined && cond.rhs_col.tab_name == next_table) ||
-                (rhs_joined && cond.lhs_col.tab_name == next_table)) {
-                curr_join_conds.push_back(cond);
+        if (has_outer_join && i - 1 < query->join_on_conds.size()) {
+            curr_join_conds = query->join_on_conds[i - 1];
+        } else {
+            for (const auto& cond : join_conds) {
+                bool lhs_joined = joined_tables.find(cond.lhs_col.tab_name) != joined_tables.end();
+                bool rhs_joined = joined_tables.find(cond.rhs_col.tab_name) != joined_tables.end();
+                if ((lhs_joined && cond.rhs_col.tab_name == next_table) ||
+                    (rhs_joined && cond.lhs_col.tab_name == next_table)) {
+                    curr_join_conds.push_back(cond);
+                }
             }
         }
         std::stable_sort(curr_join_conds.begin(), curr_join_conds.end(),
@@ -752,11 +812,17 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
             right_plan = rebuild_right_plan_with_index(std::move(right_plan), std::move(new_scan));
         }
 
-        if (!query->is_explain_analyze && curr_join_conds.empty()) {
-            joined = std::make_unique<JoinPlan>(T_NestLoop, std::move(right_plan), std::move(joined), curr_join_conds);
+        JoinType join_type = INNER_JOIN;
+        if (i - 1 < query->join_types.size()) {
+            join_type = query->join_types[i - 1];
+        }
+        if (!query->is_explain_analyze && curr_join_conds.empty() && join_type == INNER_JOIN) {
+            joined = std::make_unique<JoinPlan>(T_NestLoop, std::move(right_plan), std::move(joined), curr_join_conds,
+                                                join_type);
         } else {
             auto join_plan =
-                std::make_unique<JoinPlan>(T_NestLoop, std::move(joined), std::move(right_plan), curr_join_conds);
+                std::make_unique<JoinPlan>(T_NestLoop, std::move(joined), std::move(right_plan), curr_join_conds,
+                                            join_type);
             if (!inlj_index_col_names.empty()) {
                 join_plan->inlj_left_col_ = inlj_left_col;
                 join_plan->inlj_right_col_ = inlj_right_col;
@@ -767,6 +833,9 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
         joined_tables.insert(next_table);
     }
 
+    if (!post_join_conds.empty()) {
+        joined = std::make_unique<FilterPlan>(T_Filter, std::move(joined), std::move(post_join_conds));
+    }
     attach_display_names(joined.get(), query->table_name_to_display);
     return joined;
 }
@@ -858,9 +927,11 @@ std::unique_ptr<Plan> Planner::make_one_rel(Query* query) {
                     std::make_unique<JoinPlan>(T_NestLoop, std::move(temp_join_executors),
                                                std::move(table_join_executors), std::vector<Condition>());
             } else if (left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
-                if (isneedreverse) {
+                if (isneedreverse && is_swappable_comp_op(it->op)) {
                     std::swap(it->lhs_col, it->rhs_col);
                     it->op = swap_comp_op(it->op);
+                    left_need_to_join_executors = std::move(right_need_to_join_executors);
+                } else if (isneedreverse) {
                     left_need_to_join_executors = std::move(right_need_to_join_executors);
                 }
                 std::vector<Condition> join_conds{*it};
@@ -892,18 +963,19 @@ std::unique_ptr<Plan> Planner::generate_sort_plan(const Query* query, std::uniqu
     if (query->order_by_items.empty()) {
         return plan;
     }
-    int sort_limit = query->has_limit ? query->limit : -1;
+    int sort_limit = query->has_limit && !query->has_offset ? query->limit : -1;
     return std::make_unique<SortPlan>(T_Sort, std::move(plan), bind_order_by_output_names(*query), sort_limit);
 }
 
 std::unique_ptr<Plan> Planner::generate_limit_plan(const Query* query, std::unique_ptr<Plan> plan) {
-    if (!query->has_limit) {
+    if (!query->has_limit && !query->has_offset) {
         return plan;
     }
-    if (!query->order_by_items.empty()) {
+    if (!query->order_by_items.empty() && query->has_limit && !query->has_offset) {
         return plan;
     }
-    return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->limit);
+    return std::make_unique<LimitPlan>(T_Limit, std::move(plan), query->has_limit ? query->limit : -1,
+                                       query->has_offset ? query->offset : 0);
 }
 
 /**
@@ -929,6 +1001,9 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
     // final select projection
     plannerRoot = std::make_unique<ProjectionPlan>(T_Projection, std::move(plannerRoot), query->select_items,
                                                    query->output_names, false, query->has_select_star);
+    if (query->has_distinct) {
+        plannerRoot = std::make_unique<DistinctPlan>(T_Distinct, std::move(plannerRoot));
+    }
     attach_display_names(plannerRoot.get(), query->table_name_to_display);
 
     // final order by
@@ -947,12 +1022,11 @@ std::unique_ptr<Plan> Planner::generate_union_plan(std::unique_ptr<Query> query,
         branch_plans.push_back(generate_select_plan(std::move(branch_query), context));
     }
 
-    std::unique_ptr<Plan> plannerRoot =
-        std::make_unique<UnionPlan>(T_Union, std::move(branch_plans), query->union_cols, query->output_names);
+    std::unique_ptr<Plan> plannerRoot = std::make_unique<UnionPlan>(T_Union, std::move(branch_plans), query->union_cols,
+                                                                     query->output_names, query->union_all);
 
-    if (!query->order_by_items.empty()) {
-        plannerRoot = std::make_unique<SortPlan>(T_Sort, std::move(plannerRoot), query->order_by_items);
-    }
+    plannerRoot = generate_sort_plan(query.get(), std::move(plannerRoot));
+    plannerRoot = generate_limit_plan(query.get(), std::move(plannerRoot));
     return plannerRoot;
 }
 

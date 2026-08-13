@@ -72,7 +72,7 @@ void resolve_aliases(Query& query) {
     }
     for (auto& cond : query.conds) {
         resolve_alias(cond.lhs_col, query);
-        if (!cond.is_rhs_val) {
+        if (!cond.is_rhs_val && cond.op != OP_IN && cond.op != OP_BETWEEN) {
             resolve_alias(cond.rhs_col, query);
         }
     }
@@ -199,10 +199,30 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(const ast::SelectStmt* x, st
     populate_having_from_ast(*query, *x);
     populate_order_by_from_ast(*query, *x);
     populate_limit_from_ast(*query, *x);
-
     get_clause(x->conds, query->conds);
+    query->join_types.reserve(x->jointree.size());
+    size_t join_cond_offset = 0;
+    for (const auto& join : x->jointree) {
+        query->join_types.push_back(join->join_type);
+        for (size_t cond_idx = 0; cond_idx < join->conds.size(); ++cond_idx) {
+            if (join_cond_offset >= query->conds.size()) {
+                throw InternalError("Join condition metadata does not match SELECT conditions");
+            }
+            query->conds[join_cond_offset].is_join_on = true;
+            ++join_cond_offset;
+        }
+    }
     resolve_aliases(*query);
     check_clause(query->tables, query->conds);
+    query->join_on_conds.reserve(x->jointree.size());
+    join_cond_offset = 0;
+    for (const auto& join : x->jointree) {
+        query->join_on_conds.emplace_back();
+        query->join_on_conds.back().reserve(join->conds.size());
+        for (size_t cond_idx = 0; cond_idx < join->conds.size(); ++cond_idx) {
+            query->join_on_conds.back().push_back(query->conds[join_cond_offset++]);
+        }
+    }
     validate_select_query(*query, all_cols);
     query->parse = std::move(owner);
     return query;
@@ -295,11 +315,19 @@ std::unique_ptr<Query> Analyze::analyze_select_from_union_stmt(const ast::Select
     query->parse = std::move(owner);
     query->union_alias = x->alias;
     populate_order_by_from_ast(*query, *x);
+    populate_limit_from_ast(*query, *x);
+    if (query->has_limit && query->limit < 0) {
+        throw RMDBError("LIMIT must be non-negative");
+    }
+    if (query->has_offset && query->offset < 0) {
+        throw RMDBError("OFFSET must be non-negative");
+    }
 
     query->union_branches.reserve(x->union_stmt->branches.size());
+    query->union_all = x->union_stmt->union_all;
     for (const auto& branch : x->union_stmt->branches) {
         auto branch_query = analyze_select_stmt(branch.get());
-        if (!branch_query->order_by_items.empty() || branch_query->has_limit) {
+        if (!branch_query->order_by_items.empty() || branch_query->has_limit || branch_query->has_offset) {
             throw RMDBError("UNION branches do not support ORDER BY or LIMIT");
         }
         query->union_branches.push_back(std::move(branch_query));
@@ -348,8 +376,19 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
         Condition cond;
         cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
         cond.op = convert_sv_comp_op(expr->op);
+        cond.negated = expr->negated;
 
-        if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
+        for (const auto& raw_value : expr->rhs_list) {
+            auto rhs_val = dynamic_cast<const ast::Value*>(raw_value.get());
+            if (rhs_val == nullptr) {
+                throw RMDBError("WHERE IN list only supports scalar values");
+            }
+            cond.rhs_vals.push_back(convert_sv_value(rhs_val));
+        }
+
+        if (!cond.rhs_vals.empty()) {
+            cond.is_rhs_val = true;
+        } else if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
             cond.is_rhs_val = true;
             cond.rhs_val = convert_sv_value(rhs_val);
             cond.rhs_display = rhs_val->display_text;
@@ -358,6 +397,14 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
         } else {
             throw RMDBError("WHERE clause does not allow aggregate expressions");
+        }
+        if (expr->rhs_upper != nullptr) {
+            auto rhs_upper = dynamic_cast<const ast::Value*>(expr->rhs_upper.get());
+            if (rhs_upper == nullptr) {
+                throw RMDBError("WHERE BETWEEN bounds only support scalar values");
+            }
+            cond.rhs_upper = convert_sv_value(rhs_upper);
+            cond.has_rhs_upper = true;
         }
         conds.push_back(cond);
     }
@@ -372,7 +419,39 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
         auto lhs_col = sm_manager_->db_.get_table(cond.lhs_col.tab_name).get_col(cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
 
+        if (cond.op == OP_LIKE && lhs_type != TYPE_STRING && lhs_type != TYPE_DATETIME) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), "string");
+        }
+
         ColType rhs_type;
+        if (cond.op == OP_IN) {
+            if (cond.rhs_vals.empty()) {
+                throw RMDBError("IN list must not be empty");
+            }
+            for (auto& rhs_val : cond.rhs_vals) {
+                rhs_type = rhs_val.type;
+                if (!can_cast(lhs_type, rhs_type)) {
+                    throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+                }
+                cast_value(rhs_val, lhs_type);
+                rhs_val.init_raw(lhs_col->len);
+            }
+            continue;
+        }
+        if (cond.op == OP_BETWEEN) {
+            if (!cond.has_rhs_upper) {
+                throw RMDBError("BETWEEN requires two bounds");
+            }
+            for (Value* bound : {&cond.rhs_val, &cond.rhs_upper}) {
+                rhs_type = bound->type;
+                if (!can_cast(lhs_type, rhs_type)) {
+                    throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+                }
+                cast_value(*bound, lhs_type);
+                bound->init_raw(lhs_col->len);
+            }
+            continue;
+        }
         if (cond.is_rhs_val) {
             rhs_type = cond.rhs_val.type;
             if (!can_cast(lhs_type, rhs_type)) {
@@ -385,6 +464,9 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
             cond.rhs_col = check_column(all_cols, cond.rhs_col);
             auto rhs_col = sm_manager_->db_.get_table(cond.rhs_col.tab_name).get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
+            if (cond.op == OP_LIKE && rhs_type != TYPE_STRING && rhs_type != TYPE_DATETIME) {
+                throw IncompatibleTypeError(coltype2str(rhs_type), "string");
+            }
         }
 
         if (!can_cast(lhs_type, rhs_type)) {
@@ -430,6 +512,12 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         return OP_LE;
     case ast::SV_OP_GE:
         return OP_GE;
+    case ast::SV_OP_LIKE:
+        return OP_LIKE;
+    case ast::SV_OP_IN:
+        return OP_IN;
+    case ast::SV_OP_BETWEEN:
+        return OP_BETWEEN;
     }
     throw InternalError("Unexpected comparison operator");
 }

@@ -73,11 +73,15 @@ struct Value {
     }
 };
 
-enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
+enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE, OP_LIKE, OP_IN, OP_BETWEEN };
 
 enum class AggType { COUNT, MAX, MIN, SUM, AVG };
 
 enum class QueryExprType { COLUMN, AGGREGATE, VALUE };
+
+inline bool is_swappable_comp_op(CompOp op) {
+    return op == OP_EQ || op == OP_NE || op == OP_LT || op == OP_GT || op == OP_LE || op == OP_GE;
+}
 
 inline CompOp swap_comp_op(CompOp op) {
     switch (op) {
@@ -92,6 +96,10 @@ inline CompOp swap_comp_op(CompOp op) {
         return OP_GE;
     case OP_GE:
         return OP_LE;
+    case OP_LIKE:
+    case OP_IN:
+    case OP_BETWEEN:
+        throw InternalError("Cannot swap non-comparison predicate");
     }
     throw InternalError("Unexpected comparison operator");
 }
@@ -129,6 +137,10 @@ struct HavingCondition {
     bool is_rhs_val = false;
     QueryExpr rhs_expr;
     Value rhs_val;
+    Value rhs_upper;
+    std::vector<Value> rhs_vals;
+    bool has_rhs_upper = false;
+    bool negated = false;
 };
 
 struct Condition {
@@ -138,6 +150,11 @@ struct Condition {
     TabCol rhs_col;  // right-hand side column
     Value rhs_val;   // right-hand side value
     std::string rhs_display;
+    Value rhs_upper;
+    std::vector<Value> rhs_vals;
+    bool has_rhs_upper = false;
+    bool negated = false;
+    bool is_join_on = false;
 };
 
 enum class UpdateOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };

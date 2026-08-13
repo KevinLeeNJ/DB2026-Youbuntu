@@ -24,6 +24,7 @@ private:
     std::vector<ColMeta> cols_;              // 需要投影的字段
     size_t len_;                             // 字段总长度
     std::vector<size_t> sel_idxs_;
+    std::vector<bool> nulls_;
 
     void append_projection_col(size_t prev_idx, const std::string& output_name = "") {
         auto col = prev_->cols()[prev_idx];
@@ -130,11 +131,16 @@ public:
 
         // 创建一个新的记录，用于存储投影后的结果
         auto new_rec = std::make_unique<RmRecord>(len_);
+        nulls_.assign(sel_idxs_.size(), false);
         // 将投影的字段从儿子节点的记录中复制到新的记录中
         for (size_t i = 0; i < sel_idxs_.size(); ++i) {
             auto& col = cols_[i];
             auto& src_col = prev_->cols()[sel_idxs_[i]];
             std::memcpy(new_rec->data + col.offset, rec->data + src_col.offset, col.len);
+            const auto& prev_nulls = prev_->nulls();
+            if (sel_idxs_[i] < prev_nulls.size()) {
+                nulls_[i] = prev_nulls[sel_idxs_[i]];
+            }
         }
         return new_rec;
     }
@@ -151,6 +157,10 @@ public:
     }
     const std::vector<ColMeta>& cols() const override {
         return cols_;
+    }
+
+    const std::vector<bool>& nulls() const override {
+        return nulls_;
     }
     size_t tupleLen() const override {
         return len_;

@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <queue>
 #include <type_traits>
 
@@ -34,6 +35,7 @@ private:
 
     struct MaterializedTuple {
         RmRecord record;
+        std::vector<bool> nulls;
         size_t ordinal = 0;
     };
 
@@ -42,6 +44,7 @@ private:
     size_t len_ = 0;
     std::vector<SortKey> sort_keys_;
     std::vector<RmRecord> tuples_;
+    std::vector<std::vector<bool>> tuple_nulls_;
     size_t cursor_ = 0;
     bool materialized_ = false;
     int limit_ = -1;
@@ -159,10 +162,12 @@ private:
 
     void materialize_all() {
         tuples_.clear();
+        tuple_nulls_.clear();
         for (prev_->beginTuple(); !prev_->is_end(); prev_->nextTuple()) {
             auto rec = prev_->Next();
             if (rec != nullptr) {
                 tuples_.emplace_back(*rec);
+                tuple_nulls_.push_back(prev_->nulls());
             }
         }
     }
@@ -177,6 +182,7 @@ private:
         };
 
         tuples_.clear();
+        tuple_nulls_.clear();
         if (top_k == 0) {
             return;
         }
@@ -189,7 +195,7 @@ private:
                 continue;
             }
 
-            MaterializedTuple tuple{*rec, ordinal++};
+            MaterializedTuple tuple{*rec, prev_->nulls(), ordinal++};
             if (heap.size() < top_k) {
                 heap.push(std::move(tuple));
                 continue;
@@ -209,8 +215,10 @@ private:
         std::sort(top_tuples.begin(), top_tuples.end(),
                   [&](const MaterializedTuple& lhs, const MaterializedTuple& rhs) { return comes_before(lhs, rhs); });
         tuples_.reserve(top_tuples.size());
+        tuple_nulls_.reserve(top_tuples.size());
         for (const auto& tuple : top_tuples) {
             tuples_.push_back(tuple.record);
+            tuple_nulls_.push_back(tuple.nulls);
         }
     }
 
@@ -220,9 +228,11 @@ private:
         } else {
             materialize_all();
         }
-        std::stable_sort(tuples_.begin(), tuples_.end(), [&](const RmRecord& lhs, const RmRecord& rhs) {
+        std::vector<size_t> order(tuples_.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
             for (const auto& key : sort_keys_) {
-                int cmp = key.compare_fn(lhs, rhs, key.col);
+                int cmp = key.compare_fn(tuples_[lhs], tuples_[rhs], key.col);
                 if (cmp == 0) {
                     continue;
                 }
@@ -230,6 +240,16 @@ private:
             }
             return false;
         });
+        std::vector<RmRecord> sorted_tuples;
+        std::vector<std::vector<bool>> sorted_nulls;
+        sorted_tuples.reserve(order.size());
+        sorted_nulls.reserve(order.size());
+        for (size_t index : order) {
+            sorted_tuples.push_back(std::move(tuples_[index]));
+            sorted_nulls.push_back(std::move(tuple_nulls_[index]));
+        }
+        tuples_ = std::move(sorted_tuples);
+        tuple_nulls_ = std::move(sorted_nulls);
         materialized_ = true;
     }
 
@@ -308,6 +328,11 @@ public:
             return nullptr;
         }
         return std::make_unique<RmRecord>(tuples_[cursor_]);
+    }
+
+    const std::vector<bool>& nulls() const override {
+        static const std::vector<bool> no_nulls;
+        return is_end() ? no_nulls : tuple_nulls_[cursor_];
     }
 
     Rid& rid() override {

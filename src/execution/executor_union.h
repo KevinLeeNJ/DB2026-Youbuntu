@@ -24,9 +24,10 @@ class UnionExecutor : public AbstractExecutor {
 private:
     std::vector<std::unique_ptr<AbstractExecutor>> branches_;
     std::vector<ColMeta> cols_;
+    std::vector<bool> union_all_;
     size_t len_ = 0;
     std::vector<RmRecord> tuples_;
-    std::unordered_set<std::string> seen_;
+    std::vector<std::vector<bool>> tuple_nulls_;
     size_t cursor_ = 0;
     bool materialized_ = false;
 
@@ -66,29 +67,68 @@ private:
         return dst_rec;
     }
 
+    static std::string make_key(const RmRecord& record, const std::vector<bool>& nulls) {
+        std::string key(record.data, static_cast<size_t>(record.size));
+        for (bool is_null : nulls) {
+            key.push_back(is_null ? '\1' : '\0');
+        }
+        return key;
+    }
+
     void materialize() {
         tuples_.clear();
-        seen_.clear();
-        for (auto& branch : branches_) {
+        tuple_nulls_.clear();
+        for (size_t branch_idx = 0; branch_idx < branches_.size(); ++branch_idx) {
+            auto& branch = branches_[branch_idx];
             const auto& branch_cols = branch->cols();
+            std::vector<RmRecord> branch_tuples;
+            std::vector<std::vector<bool>> branch_nulls;
             for (branch->beginTuple(); !branch->is_end(); branch->nextTuple()) {
                 auto rec = branch->Next();
                 if (rec == nullptr) {
                     continue;
                 }
-                RmRecord converted = convert_record(*rec, branch_cols);
-                std::string key(converted.data, static_cast<size_t>(converted.size));
-                if (seen_.insert(key).second) {
-                    tuples_.push_back(converted);
+                branch_tuples.push_back(convert_record(*rec, branch_cols));
+                branch_nulls.push_back(branch->nulls());
+            }
+
+            bool keep_duplicates = (branch_idx == 0 && !union_all_.empty() && union_all_[0]) ||
+                                   (branch_idx > 0 && branch_idx - 1 < union_all_.size() && union_all_[branch_idx - 1]);
+            if (keep_duplicates) {
+                for (size_t i = 0; i < branch_tuples.size(); ++i) {
+                    tuples_.push_back(std::move(branch_tuples[i]));
+                    tuple_nulls_.push_back(std::move(branch_nulls[i]));
+                }
+                continue;
+            }
+
+            std::unordered_set<std::string> unique_keys;
+            std::vector<RmRecord> unique_tuples;
+            std::vector<std::vector<bool>> unique_nulls;
+            unique_tuples.reserve(tuples_.size() + branch_tuples.size());
+            unique_nulls.reserve(tuple_nulls_.size() + branch_nulls.size());
+            for (size_t i = 0; i < tuples_.size(); ++i) {
+                if (unique_keys.insert(make_key(tuples_[i], tuple_nulls_[i])).second) {
+                    unique_tuples.push_back(std::move(tuples_[i]));
+                    unique_nulls.push_back(std::move(tuple_nulls_[i]));
                 }
             }
+            for (size_t i = 0; i < branch_tuples.size(); ++i) {
+                if (unique_keys.insert(make_key(branch_tuples[i], branch_nulls[i])).second) {
+                    unique_tuples.push_back(std::move(branch_tuples[i]));
+                    unique_nulls.push_back(std::move(branch_nulls[i]));
+                }
+            }
+            tuples_ = std::move(unique_tuples);
+            tuple_nulls_ = std::move(unique_nulls);
         }
         materialized_ = true;
     }
 
 public:
-    UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches, std::vector<ColMeta> cols)
-        : branches_(std::move(branches)), cols_(std::move(cols)) {
+    UnionExecutor(std::vector<std::unique_ptr<AbstractExecutor>> branches, std::vector<ColMeta> cols,
+                  std::vector<bool> union_all = {})
+        : branches_(std::move(branches)), cols_(std::move(cols)), union_all_(std::move(union_all)) {
         if (!cols_.empty()) {
             len_ = static_cast<size_t>(cols_.back().offset + cols_.back().len);
         }
@@ -116,6 +156,11 @@ public:
             return nullptr;
         }
         return std::make_unique<RmRecord>(tuples_[cursor_]);
+    }
+
+    const std::vector<bool>& nulls() const override {
+        static const std::vector<bool> no_nulls;
+        return is_end() ? no_nulls : tuple_nulls_[cursor_];
     }
 
     Rid& rid() override {

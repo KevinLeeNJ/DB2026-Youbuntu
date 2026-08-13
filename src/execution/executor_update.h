@@ -234,6 +234,10 @@ public:
         return nullptr;
     }
 
+    const std::vector<ColMeta>& cols() const override {
+        return tab_.cols;
+    }
+
     Rid& rid() override {
         return _abstract_rid;
     }

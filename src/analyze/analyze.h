@@ -37,6 +37,9 @@ public:
     std::vector<OrderByItem> order_by_items;
     bool has_limit = false;
     int limit = 0;
+    bool has_offset = false;
+    int offset = 0;
+    bool has_distinct = false;
     bool has_aggregate = false;
     bool has_select_star = false;
     std::vector<std::string> output_names;
@@ -44,6 +47,9 @@ public:
     std::vector<std::unique_ptr<Query>> union_branches;
     std::vector<ColMeta> union_cols;
     std::string union_alias;
+    std::vector<bool> union_all;
+    std::vector<JoinType> join_types;
+    std::vector<std::vector<Condition>> join_on_conds;
     // 表名
     std::vector<std::string> tables;
     std::vector<std::string> table_display_names;

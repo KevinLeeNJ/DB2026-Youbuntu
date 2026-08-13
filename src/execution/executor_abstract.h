@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "execution_defs.h"
+#include "execution_scalar.h"
 #include "common/common.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -29,8 +30,8 @@ public:
     };
 
     virtual const std::vector<ColMeta>& cols() const {
-        std::vector<ColMeta>* _cols = nullptr;
-        return *_cols;
+        static const std::vector<ColMeta> no_cols;
+        return no_cols;
     };
 
     virtual std::string getType() {
@@ -48,6 +49,14 @@ public:
     virtual Rid& rid() = 0;
 
     virtual std::unique_ptr<RmRecord> Next() = 0;
+
+    // NULL values produced by an outer join are transient execution metadata;
+    // ordinary table records have an empty bitmap, which means all columns are
+    // non-NULL.
+    virtual const std::vector<bool>& nulls() const {
+        static const std::vector<bool> no_nulls;
+        return no_nulls;
+    }
 
     virtual ColMeta get_col_offset(const TabCol& target) {
         (void)target;
@@ -80,7 +89,7 @@ public:
         return false;
     }
 
-    std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) {
+    std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta>& rec_cols, const TabCol& target) const {
         auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta& col) {
             return col.tab_name == target.tab_name && col.name == target.col_name;
         });
@@ -97,71 +106,120 @@ protected:
      * @param rec 记录
      * @return true if rec matches cond, false otherwise
      */
-    bool compare(const Condition& cond, const RmRecord& rec) {
-        ColMeta lhs_col_meta = get_col_offset(cond.lhs_col);
-        ColMeta rhs_col_meta;
-        char* lhs_data = rec.data + lhs_col_meta.offset;
-        ColType lhs_type, rhs_type;
-        lhs_type = get_col_offset(cond.lhs_col).type;
-        char* rhs_data = nullptr;
-        if (!cond.is_rhs_val) {
-            rhs_col_meta = get_col_offset(cond.rhs_col);
-            rhs_data = rec.data + rhs_col_meta.offset;
-            rhs_type = rhs_col_meta.type;
-        } else {
-            rhs_type = cond.rhs_val.type;
-        }
-        if (can_cast(lhs_type, rhs_type) == false) {
-            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
-        }
-        switch (lhs_type) {
+    static execution_scalar::CellValue read_cell(const char* data, const ColMeta& col) {
+        execution_scalar::CellValue value;
+        value.type = col.type;
+        switch (col.type) {
         case TYPE_INT:
-        case TYPE_FLOAT: {
-            double lhs_val = lhs_type == TYPE_INT ? static_cast<double>(*(int*)lhs_data) : *(double*)lhs_data;
-            double rhs_val;
-            if (cond.is_rhs_val) {
-                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(cond.rhs_val.int_val) : cond.rhs_val.float_val;
-            } else {
-                rhs_val = rhs_type == TYPE_INT ? static_cast<double>(*(int*)rhs_data) : *(double*)rhs_data;
-            }
-            switch (cond.op) {
-            case OP_EQ:
-                return lhs_val == rhs_val;
-            case OP_NE:
-                return lhs_val != rhs_val;
-            case OP_LT:
-                return lhs_val < rhs_val;
-            case OP_GT:
-                return lhs_val > rhs_val;
-            case OP_LE:
-                return lhs_val <= rhs_val;
-            case OP_GE:
-                return lhs_val >= rhs_val;
-            }
+            value.int_val = *reinterpret_cast<const int*>(data);
+            break;
+        case TYPE_FLOAT:
+            value.float_val = *reinterpret_cast<const double*>(data);
+            break;
+        case TYPE_STRING:
+        case TYPE_DATETIME:
+            value.str_val = execution_scalar::trim_string(data, col.len);
             break;
         }
-        case TYPE_STRING:
-        case TYPE_DATETIME: {
-            std::string lhs_val(lhs_data, strnlen(lhs_data, lhs_col_meta.len));
-            std::string rhs_val =
-                cond.is_rhs_val ? cond.rhs_val.str_val : std::string(rhs_data, strnlen(rhs_data, rhs_col_meta.len));
-            switch (cond.op) {
-            case OP_EQ:
-                return lhs_val == rhs_val;
-            case OP_NE:
-                return lhs_val != rhs_val;
-            case OP_LT:
-                return lhs_val < rhs_val;
-            case OP_GT:
-                return lhs_val > rhs_val;
-            case OP_LE:
-                return lhs_val <= rhs_val;
-            case OP_GE:
-                return lhs_val >= rhs_val;
+        return value;
+    }
+
+    bool is_null(const std::vector<bool>& nulls, const TabCol& target) const {
+        auto pos = get_col(cols(), target);
+        size_t index = static_cast<size_t>(pos - cols().begin());
+        return index < nulls.size() && nulls[index];
+    }
+
+    static bool compare_order(CompOp op, int cmp) {
+        switch (op) {
+        case OP_EQ:
+            return cmp == 0;
+        case OP_NE:
+            return cmp != 0;
+        case OP_LT:
+            return cmp < 0;
+        case OP_GT:
+            return cmp > 0;
+        case OP_LE:
+            return cmp <= 0;
+        case OP_GE:
+            return cmp >= 0;
+        default:
+            throw InternalError("Unexpected comparison operator");
+        }
+    }
+
+    bool compare(const Condition& cond, const RmRecord& rec) {
+        static const std::vector<bool> no_nulls;
+        return compare(cond, rec, no_nulls);
+    }
+
+    bool compare(const Condition& cond, const RmRecord& rec, const std::vector<bool>& nulls) {
+        ColMeta lhs_col_meta = get_col_offset(cond.lhs_col);
+        if (!nulls.empty() && is_null(nulls, cond.lhs_col)) {
+            return false;
+        }
+
+        const auto lhs = read_cell(rec.data + lhs_col_meta.offset, lhs_col_meta);
+        auto value_from_literal = [](const Value& value) {
+            execution_scalar::CellValue result;
+            result.type = value.type;
+            if (value.type == TYPE_INT) {
+                result.int_val = value.int_val;
+            } else if (value.type == TYPE_FLOAT) {
+                result.float_val = value.float_val;
+            } else {
+                result.str_val = value.str_val;
             }
+            return result;
+        };
+
+        auto matches_simple = [&](const execution_scalar::CellValue& rhs, CompOp op) {
+            if (!can_cast(lhs.type, rhs.type)) {
+                throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
+            }
+            if (op == OP_LIKE) {
+                if ((lhs.type != TYPE_STRING && lhs.type != TYPE_DATETIME) ||
+                    (rhs.type != TYPE_STRING && rhs.type != TYPE_DATETIME)) {
+                    throw IncompatibleTypeError(coltype2str(lhs.type), coltype2str(rhs.type));
+                }
+                bool matches = execution_scalar::like_match(lhs.str_val, rhs.str_val);
+                return cond.negated ? !matches : matches;
+            }
+            return compare_order(op, execution_scalar::compare_cells(lhs, rhs));
+        };
+
+        if (cond.op == OP_IN) {
+            bool matched = false;
+            for (const auto& rhs_val : cond.rhs_vals) {
+                if (matches_simple(value_from_literal(rhs_val), OP_EQ)) {
+                    matched = true;
+                    break;
+                }
+            }
+            return cond.negated ? !matched : matched;
         }
+
+        if (cond.op == OP_BETWEEN) {
+            if (!cond.has_rhs_upper) {
+                throw InternalError("BETWEEN predicate is missing its upper bound");
+            }
+            bool matches = matches_simple(value_from_literal(cond.rhs_val), OP_GE) &&
+                           matches_simple(value_from_literal(cond.rhs_upper), OP_LE);
+            return cond.negated ? !matches : matches;
         }
-        return false;
+
+        execution_scalar::CellValue rhs;
+        if (cond.is_rhs_val) {
+            rhs = value_from_literal(cond.rhs_val);
+        } else {
+            ColMeta rhs_col_meta = get_col_offset(cond.rhs_col);
+            if (!nulls.empty() && is_null(nulls, cond.rhs_col)) {
+                return false;
+            }
+            rhs = read_cell(rec.data + rhs_col_meta.offset, rhs_col_meta);
+        }
+        return matches_simple(rhs, cond.op);
     }
     /**
      * @brief 判断两个列类型是否可以进行转换

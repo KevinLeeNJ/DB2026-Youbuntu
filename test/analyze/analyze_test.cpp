@@ -293,3 +293,27 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_mixed_aggregate_without_group_by
                   std::string::npos);
     }
 }
+
+TEST_F(AnalyzeAggregateTest, do_analyze_accepts_expanded_predicates) {
+    const std::vector<std::string> sqls = {
+        "select id from grade where id in (1, 3);",
+        "select id from grade where id not in (2, 4);",
+        "select course from grade where course like 'Data%';",
+        "select course from grade where course not like 'C%';",
+        "select id from grade where id between 1 and 2;",
+        "select id from grade where id not between 1 and 2;",
+    };
+
+    for (const auto& sql : sqls) {
+        auto parse = ast::parse_sql(sql);
+        EXPECT_NO_THROW((void)analyze_.do_analyze(std::move(parse))) << sql;
+    }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_like_on_numeric_column) {
+    auto parse = ast::parse_sql("select id from grade where id like '1%';");
+    EXPECT_THROW((void)analyze_.do_analyze(std::move(parse)), RMDBError);
+
+    parse = ast::parse_sql("select id from grade where id like course;");
+    EXPECT_THROW((void)analyze_.do_analyze(std::move(parse)), RMDBError);
+}

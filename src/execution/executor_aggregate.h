@@ -36,9 +36,10 @@ private:
 
     struct GroupKey {
         std::vector<CellValue> values;
+        std::vector<bool> nulls;
 
         bool operator==(const GroupKey& other) const {
-            return values == other.values;
+            return values == other.values && nulls == other.nulls;
         }
     };
 
@@ -48,6 +49,9 @@ private:
             CellValueHash hash_cell;
             for (const auto& value : key.values) {
                 execution_scalar::hash_combine(seed, hash_cell(value));
+            }
+            for (bool is_null : key.nulls) {
+                execution_scalar::hash_combine(seed, std::hash<bool>()(is_null));
             }
             return seed;
         }
@@ -72,7 +76,13 @@ private:
 
     struct GroupState {
         std::vector<CellValue> group_values;
+        std::vector<bool> group_nulls;
         std::vector<AggregateState> aggregate_states;
+    };
+
+    struct ResolvedHavingOperand {
+        CellValue value;
+        bool is_null = false;
     };
 
     struct HavingOperand {
@@ -85,6 +95,10 @@ private:
         HavingOperand lhs;
         CompOp op = OP_EQ;
         HavingOperand rhs;
+        HavingOperand rhs_upper;
+        std::vector<HavingOperand> rhs_values;
+        bool has_rhs_upper = false;
+        bool negated = false;
     };
 
     template <typename T, typename = void> struct has_member_val : std::false_type {};
@@ -102,6 +116,27 @@ private:
     template <typename T>
     struct has_member_agg<T, std::void_t<decltype(std::declval<const T&>().agg)>> : std::true_type {};
 
+    template <typename T, typename = void> struct has_member_rhs_vals : std::false_type {};
+
+    template <typename T>
+    struct has_member_rhs_vals<T, std::void_t<decltype(std::declval<const T&>().rhs_vals)>> : std::true_type {};
+
+    template <typename T, typename = void> struct has_member_rhs_upper : std::false_type {};
+
+    template <typename T>
+    struct has_member_rhs_upper<T, std::void_t<decltype(std::declval<const T&>().rhs_upper)>> : std::true_type {};
+
+    template <typename T, typename = void> struct has_member_has_rhs_upper : std::false_type {};
+
+    template <typename T>
+    struct has_member_has_rhs_upper<T, std::void_t<decltype(std::declval<const T&>().has_rhs_upper)>>
+        : std::true_type {};
+
+    template <typename T, typename = void> struct has_member_negated : std::false_type {};
+
+    template <typename T>
+    struct has_member_negated<T, std::void_t<decltype(std::declval<const T&>().negated)>> : std::true_type {};
+
     std::unique_ptr<AbstractExecutor> prev_;
     Context* context_ = nullptr;
     std::vector<ColMeta> cols_;
@@ -110,6 +145,7 @@ private:
     std::vector<AggregateSpec> aggregates_;
     std::vector<HavingSpec> having_conds_;
     std::vector<GroupState> groups_;
+    std::vector<bool> nulls_;
     size_t cursor_ = 0;
     bool materialized_ = false;
     bool has_group_by_ = false;
@@ -172,6 +208,10 @@ private:
             return cmp <= 0;
         case OP_GE:
             return cmp >= 0;
+        case OP_LIKE:
+        case OP_IN:
+        case OP_BETWEEN:
+            break;
         }
         throw InternalError("Unexpected comparison operator");
     }
@@ -310,6 +350,41 @@ private:
         HavingSpec spec;
         spec.lhs = make_operand_from_expr(cond.lhs);
         spec.op = cond.op;
+        if constexpr (has_member_negated<HavingCondT>::value) {
+            spec.negated = cond.negated;
+        }
+        if constexpr (has_member_rhs_vals<HavingCondT>::value) {
+            for (const auto& rhs_value : cond.rhs_vals) {
+                HavingOperand operand;
+                operand.kind = OperandKind::VALUE;
+                operand.literal.type = rhs_value.type;
+                if (rhs_value.type == TYPE_INT) {
+                    operand.literal.int_val = rhs_value.int_val;
+                } else if (rhs_value.type == TYPE_FLOAT) {
+                    operand.literal.float_val = rhs_value.float_val;
+                } else {
+                    operand.literal.str_val = rhs_value.str_val;
+                }
+                spec.rhs_values.push_back(std::move(operand));
+            }
+        }
+        if constexpr (has_member_has_rhs_upper<HavingCondT>::value && has_member_rhs_upper<HavingCondT>::value) {
+            if (cond.has_rhs_upper) {
+                spec.has_rhs_upper = true;
+                spec.rhs_upper.kind = OperandKind::VALUE;
+                spec.rhs_upper.literal.type = cond.rhs_upper.type;
+                if (cond.rhs_upper.type == TYPE_INT) {
+                    spec.rhs_upper.literal.int_val = cond.rhs_upper.int_val;
+                } else if (cond.rhs_upper.type == TYPE_FLOAT) {
+                    spec.rhs_upper.literal.float_val = cond.rhs_upper.float_val;
+                } else {
+                    spec.rhs_upper.literal.str_val = cond.rhs_upper.str_val;
+                }
+            }
+        }
+        if (!spec.rhs_values.empty()) {
+            return spec;
+        }
         if (cond.is_rhs_value) {
             spec.rhs.kind = OperandKind::VALUE;
             spec.rhs.literal.type = cond.rhs_val.type;
@@ -409,25 +484,71 @@ private:
         throw InternalError("Unexpected aggregate type");
     }
 
-    CellValue resolve_having_operand(const HavingOperand& operand, const std::vector<CellValue>& group_values,
-                                     const std::vector<CellValue>& aggregate_values) const {
+    ResolvedHavingOperand resolve_having_operand(const HavingOperand& operand,
+                                                 const std::vector<CellValue>& group_values,
+                                                 const std::vector<bool>& group_nulls,
+                                                 const std::vector<CellValue>& aggregate_values) const {
         switch (operand.kind) {
         case OperandKind::GROUP_COL:
-            return group_values.at(operand.index);
+            return {group_values.at(operand.index), operand.index < group_nulls.size() && group_nulls[operand.index]};
         case OperandKind::AGG_RESULT:
-            return aggregate_values.at(operand.index);
+            return {aggregate_values.at(operand.index), false};
         case OperandKind::VALUE:
-            return operand.literal;
+            return {operand.literal, false};
         }
         throw InternalError("Unexpected HAVING operand kind");
     }
 
     bool passes_having(const std::vector<CellValue>& group_values,
+                       const std::vector<bool>& group_nulls,
                        const std::vector<CellValue>& aggregate_values) const {
         for (const auto& cond : having_conds_) {
-            CellValue lhs = resolve_having_operand(cond.lhs, group_values, aggregate_values);
-            CellValue rhs = resolve_having_operand(cond.rhs, group_values, aggregate_values);
-            if (!compare_with_op(cond.op, compare_cells(lhs, rhs))) {
+            auto lhs = resolve_having_operand(cond.lhs, group_values, group_nulls, aggregate_values);
+            if (lhs.is_null) {
+                return false;
+            }
+            if (cond.op == OP_IN) {
+                bool matched = false;
+                for (const auto& rhs_operand : cond.rhs_values) {
+                    auto rhs = resolve_having_operand(rhs_operand, group_values, group_nulls, aggregate_values);
+                    if (!rhs.is_null && compare_cells(lhs.value, rhs.value) == 0) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (cond.negated ? matched : !matched) {
+                    return false;
+                }
+                continue;
+            }
+            if (cond.op == OP_BETWEEN) {
+                if (!cond.has_rhs_upper) {
+                    throw InternalError("HAVING BETWEEN predicate is missing its upper bound");
+                }
+                auto lower = resolve_having_operand(cond.rhs, group_values, group_nulls, aggregate_values);
+                auto upper = resolve_having_operand(cond.rhs_upper, group_values, group_nulls, aggregate_values);
+                bool matched = !lower.is_null && !upper.is_null && compare_cells(lhs.value, lower.value) >= 0 &&
+                               compare_cells(lhs.value, upper.value) <= 0;
+                if (cond.negated ? matched : !matched) {
+                    return false;
+                }
+                continue;
+            }
+            auto rhs = resolve_having_operand(cond.rhs, group_values, group_nulls, aggregate_values);
+            if (rhs.is_null) {
+                return false;
+            }
+            bool matched;
+            if (cond.op == OP_LIKE) {
+                if ((lhs.value.type != TYPE_STRING && lhs.value.type != TYPE_DATETIME) ||
+                    (rhs.value.type != TYPE_STRING && rhs.value.type != TYPE_DATETIME)) {
+                    throw IncompatibleTypeError(coltype2str(lhs.value.type), coltype2str(rhs.value.type));
+                }
+                matched = execution_scalar::like_match(lhs.value.str_val, rhs.value.str_val);
+            } else {
+                matched = compare_with_op(cond.op, compare_cells(lhs.value, rhs.value));
+            }
+            if (cond.negated ? matched : !matched) {
                 return false;
             }
         }
@@ -436,7 +557,7 @@ private:
 
     bool passes_having(const GroupState& group_state) const {
         std::vector<CellValue> aggregate_values = finalize_aggregate_values(group_state);
-        return passes_having(group_state.group_values, aggregate_values);
+        return passes_having(group_state.group_values, group_state.group_nulls, aggregate_values);
     }
 
     bool can_count_star_by_cursor_only() const {
@@ -471,9 +592,10 @@ private:
         return std::make_unique<RmRecord>(rec);
     }
 
-    GroupState make_group_state(const std::vector<CellValue>& group_values) const {
+    GroupState make_group_state(const std::vector<CellValue>& group_values, const std::vector<bool>& group_nulls = {}) const {
         GroupState state;
         state.group_values = group_values;
+        state.group_nulls = group_nulls;
         state.aggregate_states.reserve(aggregates_.size());
         for (const auto& aggregate : aggregates_) {
             state.aggregate_states.push_back(init_aggregate_state(aggregate));
@@ -493,13 +615,20 @@ private:
 
                 GroupKey key;
                 key.values.reserve(group_cols_.size());
+                key.nulls.reserve(group_cols_.size());
+                const auto& child_nulls = prev_->nulls();
                 for (const auto& col : group_cols_) {
                     key.values.push_back(read_cell(*rec, col));
+                    auto col_pos = std::find_if(prev_->cols().begin(), prev_->cols().end(), [&](const ColMeta& input) {
+                        return input.name == col.name && input.offset == col.offset;
+                    });
+                    size_t col_index = static_cast<size_t>(col_pos - prev_->cols().begin());
+                    key.nulls.push_back(col_index < child_nulls.size() && child_nulls[col_index]);
                 }
 
                 auto [it, inserted] = group_indexes.emplace(key, groups_.size());
                 if (inserted) {
-                    groups_.push_back(make_group_state(key.values));
+                    groups_.push_back(make_group_state(key.values, key.nulls));
                 }
                 for (size_t i = 0; i < aggregates_.size(); ++i) {
                     update_aggregate_state(groups_[it->second].aggregate_states[i], aggregates_[i], *rec);
@@ -650,6 +779,10 @@ public:
         if (is_end()) {
             return nullptr;
         }
+        nulls_.assign(cols_.size(), false);
+        for (size_t i = 0; i < groups_[cursor_].group_nulls.size() && i < nulls_.size(); ++i) {
+            nulls_[i] = groups_[cursor_].group_nulls[i];
+        }
         return materialize_group_result(groups_[cursor_]);
     }
 
@@ -684,5 +817,10 @@ public:
             throw ColumnNotFoundError(target.col_name);
         }
         return *pos;
+    }
+
+    const std::vector<bool>& nulls() const override {
+        static const std::vector<bool> no_nulls;
+        return is_end() ? no_nulls : nulls_;
     }
 };

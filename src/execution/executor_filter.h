@@ -41,7 +41,7 @@ private:
 
     bool matches(const RmRecord& rec) {
         for (const auto& cond : conds_) {
-            if (!compare(cond, rec)) {
+            if (!compare(cond, rec, prev_->nulls())) {
                 return false;
             }
         }
@@ -123,6 +123,10 @@ public:
 
     const std::vector<ColMeta>& cols() const override {
         return cols_;
+    }
+
+    const std::vector<bool>& nulls() const override {
+        return prev_->nulls();
     }
 
     size_t tupleLen() const override {
