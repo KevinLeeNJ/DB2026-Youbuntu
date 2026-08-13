@@ -427,6 +427,35 @@ TEST(ParserTest, ParsesKeywordExpansionForms) {
     expect_parse_error("select id from people where id like; ");
 }
 
+TEST(ParserTest, ParsesAdvancedSqlForms) {
+    const std::vector<std::string> forms = {
+        "select id, case when score >= 20 then 'pass' else 'fail' end as status from people;",
+        "select id from people where id is null;",
+        "select id from people where id is not null;",
+        "select id from people p where exists (select 1 from other o where o.id = p.id);",
+        "select id from people where score > any (select score from other);",
+        "select id from people where score >= all (select score from other);",
+        "select id from people intersect select id from other;",
+        "select id from people except select id from other;",
+        "select p.id, o.id from people p cross join other o;",
+        "select p.id from people p natural join other o;",
+        "select p.id from people p order by p.score desc nulls last, p.id asc nulls first;",
+        "select count(distinct score) as distinct_scores from people;",
+        "select p.id as person_id, p.score points from people as p order by points, person_id;",
+        "insert into target (id, score) select id, score from people where score > 10;",
+        "update people set score = score + 1 where (id = 1 or id = 2) and score is not null;",
+    };
+
+    for (const auto& sql : forms) {
+        try {
+            auto node = ast::parse_sql(sql);
+            EXPECT_NE(node, nullptr) << sql;
+        } catch (const std::exception& error) {
+            ADD_FAILURE() << "Advanced SQL form was rejected: " << sql << " (" << error.what() << ")";
+        }
+    }
+}
+
 TEST(ParserTest, ParsesOptionalWhereAndNegativeLiterals) {
     auto no_where = parse_ok("delete from tb;");
     auto delete_stmt = as_node<ast::DeleteStmt>(no_where);

@@ -317,3 +317,16 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_like_on_numeric_column) {
     parse = ast::parse_sql("select id from grade where id like course;");
     EXPECT_THROW((void)analyze_.do_analyze(std::move(parse)), RMDBError);
 }
+
+TEST_F(AnalyzeAggregateTest, do_analyze_builds_recursive_expression_tree) {
+    auto parse = ast::parse_sql(
+        "select case when score >= 90 then 'A' else 'F' end as band from grade "
+        "where score is not null and (id = 1 or id = 2);");
+
+    EXPECT_NO_THROW({
+        auto query = analyze_.do_analyze(std::move(parse));
+        ASSERT_NE(query, nullptr);
+        ASSERT_EQ(query->select_items.size(), 1);
+        EXPECT_EQ(query->select_items[0].alias, "band");
+    });
+}
