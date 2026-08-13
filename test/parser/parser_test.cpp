@@ -360,6 +360,26 @@ TEST(ParserTest, SelectRoutingKeepsUnionWrapperBehavior) {
     EXPECT_EQ(parse_ok("explain analyze select a from tb;")->type, ast::AstType::ExplainAnalyze);
 }
 
+TEST(ParserTest, ParsesKeywordExpansionForms) {
+    EXPECT_EQ(parse_ok("select distinct name from people;")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select name from people where name like 'A%';")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select id from people where id not like 1;")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select id from people where id in (1, 3, 5);")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select id from people where id not in (2, 4);")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select id from people where id between 2 and 4;")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select id from people where id not between 2 and 4;")->type, ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select * from left_t right join right_t on left_t.id = right_t.id;")->type,
+              ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select * from left_t full outer join right_t on left_t.id = right_t.id;")->type,
+              ast::AstType::SelectStmt);
+    EXPECT_EQ(parse_ok("select * from (select id from left_t union all select id from right_t) as u;")->type,
+              ast::AstType::SelectFromUnionStmt);
+    EXPECT_EQ(parse_ok("select id from people order by id offset 1 limit 2;")->type, ast::AstType::SelectStmt);
+    expect_parse_error("select id from people where id in (); ");
+    expect_parse_error("select id from people where id between 1; ");
+    expect_parse_error("select id from people where id like; ");
+}
+
 TEST(ParserTest, ParsesOptionalWhereAndNegativeLiterals) {
     auto no_where = parse_ok("delete from tb;");
     auto delete_stmt = as_node<ast::DeleteStmt>(no_where);

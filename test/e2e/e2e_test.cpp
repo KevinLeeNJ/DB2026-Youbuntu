@@ -490,6 +490,10 @@ TEST_F(SltFileTest, Union) {
     run_slt_file("union.slt");
 }
 
+TEST_F(SltFileTest, KeywordExpansion) {
+    run_slt_file("keyword_expansion.slt");
+}
+
 TEST_F(SltFileTest, QueryOptimize) {
     run_slt_file("query_optimize.slt");
 }
