@@ -50,6 +50,9 @@ public:
 
     const char* record_bytes(int64_t offset, uint32_t length, std::vector<char>* scratch,
                              WalSnapshotAccess* access = nullptr) const;
+    // Drops file-backed PTEs without changing the immutable mapping. Future
+    // record_bytes() calls fault the same bytes back from the page cache.
+    bool discard_resident_pages() const noexcept;
     int64_t begin_offset() const noexcept { return begin_offset_; }
     int64_t end_offset() const noexcept { return end_offset_; }
 

@@ -99,6 +99,7 @@ public:
 
     RecoveryIndexGate(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, IxIndexHandle* index,
                       std::string index_name);
+    ~RecoveryIndexGate();
 
     Setup setup() const {
         return setup_;
@@ -122,6 +123,14 @@ public:
      * current leaf), they only cost extra descents.
      */
     bool check_key(const char* key);
+
+    /**
+     * Validate one key and, when successful, return the complete RID multiset
+     * currently stored for that key. The result is copied from the validated
+     * leaf, so it remains valid after the gate releases the page. On failure
+     * the output is cleared and must not be used.
+     */
+    bool check_key(const char* key, std::vector<Rid>* existing_rids);
 
     const Stats& stats() const {
         return stats_;
@@ -148,15 +157,24 @@ private:
     bool page_in_range(page_id_t page_no) const;
     int compare(const char* left, const char* right) const;
 
-    bool descend(const char* key);
+    bool descend(const char* key, std::vector<Rid>* existing_rids);
     // Per-page invariants that hold for every node on a descent path. Sets
     // *dirty when it repaired the parent back pointer in place.
     bool validate_node(IxNodeHandle& node, page_id_t page_no, page_id_t expected_parent, bool* dirty);
     // Leaf-only invariants plus the bookkeeping that lets the next key skip its
     // descent. `key` is the key this descent was issued for.
-    bool validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t page_no, const char* key);
+    bool validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t page_no, const char* key,
+                                    std::vector<Rid>* existing_rids);
     bool covered_by_current_leaf(const char* key) const;
+    bool collect_current_leaf_rids(const char* key, std::vector<Rid>* existing_rids);
     void remember_bound(std::vector<char>* slot, bool* have, const char* key);
+    void release_cached_path() noexcept;
+
+    struct CachedPathEntry {
+        Page* page{nullptr};
+        page_id_t page_no{INVALID_PAGE_ID};
+        bool dirty{false};
+    };
 
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
@@ -176,6 +194,10 @@ private:
     // plain set - is what detects a page reachable from two different parents,
     // which is validate_structure()'s "page reachable more than once".
     std::unordered_map<page_id_t, page_id_t> validated_parent_;
+    // Keep only the previous root-to-internal path pinned. Sorted repair keys
+    // usually share most of this prefix; caching the whole tree would make RSS
+    // proportional to the index instead of the change set.
+    std::vector<CachedPathEntry> cached_path_;
 
     // The leaf the last descent validated, and the two bounds that let a
     // following key skip its own descent. See covered_by_current_leaf().
@@ -185,6 +207,15 @@ private:
     bool have_leaf_max_{false};
     std::vector<char> leaf_upper_key_; // first key of the next non-empty leaf
     bool have_leaf_upper_{false};
+
+    // A single leaf snapshot lets covered keys return their existing RID
+    // multiset without re-fetching the leaf. It is replaced on every descent
+    // and is bounded by one index page.
+    std::vector<char> current_leaf_keys_;
+    std::vector<Rid> current_leaf_rids_;
+    page_id_t current_leaf_page_no_{INVALID_PAGE_ID};
+    page_id_t current_leaf_prev_{IX_LEAF_HEADER_PAGE};
+    page_id_t current_leaf_next_{IX_LEAF_HEADER_PAGE};
 
     Stats stats_;
 };

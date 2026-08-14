@@ -31,6 +31,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm.h"
 #include "recovery/log_manager.h"
 #include "recovery/log_recovery.h"
+#include "recovery/index_structure_gate.h"
 #include "storage/buffer_pool_manager.h"
 #include "system/sm.h"
 
@@ -460,6 +461,76 @@ TEST(IndexStructureGateTest, TheInPlaceRepairIsIdempotentAcrossRepeatedRecovery)
     EXPECT_EQ(first.rebuilds, 0u);
     EXPECT_TRUE(first.structure_valid);
     EXPECT_TRUE(first.all_keys_resolve);
+}
+
+TEST(IndexStructureGateTest, ReusesTheValidatedInternalPathForAscendingKeys) {
+    ScopedGateTestDir test_dir("index_gate_path_cache_root");
+    const std::string db_name = "index_gate_path_cache_db";
+    CreateLoadedDb(db_name);
+
+    OpenDb db(db_name);
+    RecoveryIndexGate gate(&db.disk_, &db.bpm_, db.index(), "t_id.idx");
+    for (int key = 0; key < kRowCount; ++key) {
+        ASSERT_TRUE(gate.check_key(MakeKey(key).data()));
+    }
+
+    const auto& stats = gate.stats();
+    EXPECT_GT(stats.descents, 1u);
+    EXPECT_GT(stats.keys_covered, 0u);
+    EXPECT_LT(stats.page_fetches, stats.descents * 2 + 2)
+        << "the cached root/internal path should avoid fetching every level for each leaf";
+}
+
+TEST(IndexStructureGateTest, ReturnsExistingRidMultisetForDescentAndCoveredKeys) {
+    ScopedGateTestDir test_dir("index_gate_existing_rids_root");
+    const std::string db_name = "index_gate_existing_rids_db";
+    const std::vector<Rid> rids = CreateLoadedDb(db_name);
+
+    OpenDb db(db_name);
+    ASSERT_TRUE(db.index()->insert_entry(MakeKey(100).data(), rids[100], IndexWriteWalContext::TestNoWal(), true));
+
+    RecoveryIndexGate gate(&db.disk_, &db.bpm_, db.index(), "t_id.idx");
+    std::vector<Rid> existing;
+    ASSERT_TRUE(gate.check_key(MakeKey(100).data(), &existing));
+    ASSERT_EQ(existing.size(), 2u);
+    EXPECT_EQ(existing[0], rids[100]);
+    EXPECT_EQ(existing[1], rids[100]);
+
+    const uint64_t fetches_after_descent = gate.stats().page_fetches;
+    existing.clear();
+    ASSERT_TRUE(gate.check_key(MakeKey(101).data(), &existing));
+    ASSERT_EQ(existing.size(), 1u);
+    EXPECT_EQ(existing[0], rids[101]);
+    EXPECT_GT(gate.stats().keys_covered, 0u);
+    EXPECT_EQ(gate.stats().page_fetches, fetches_after_descent)
+        << "a key strictly inside the current leaf must not fetch adjacent leaves";
+}
+
+TEST(IndexStructureGateTest, ReturnsDuplicateRidsAcrossLeafBoundaries) {
+    ScopedGateTestDir test_dir("index_gate_cross_leaf_duplicates_root");
+    const std::string db_name = "index_gate_cross_leaf_duplicates_db";
+    const std::vector<Rid> rids = CreateLoadedDb(db_name);
+
+    // Duplicate keys are legal for the recovery path. Insert enough copies to
+    // force the equal-key run across at least one leaf boundary, then reopen so
+    // the gate and its live handle observe the same persisted header.
+    constexpr int kDuplicates = 500;
+    {
+        OpenDb db(db_name);
+        for (int copy = 0; copy < kDuplicates; ++copy) {
+            ASSERT_NE(db.index()->insert_entry(MakeKey(100).data(), rids[100], IndexWriteWalContext::TestNoWal(), true),
+                      IX_NO_PAGE);
+        }
+    }
+
+    OpenDb db(db_name);
+    const size_t expected_count = static_cast<size_t>(kDuplicates + 1);
+
+    RecoveryIndexGate gate(&db.disk_, &db.bpm_, db.index(), "t_id.idx");
+    std::vector<Rid> existing;
+    ASSERT_TRUE(gate.check_key(MakeKey(100).data(), &existing));
+    ASSERT_EQ(existing.size(), expected_count) << "the fixture did not cross a leaf boundary";
+    EXPECT_TRUE(std::all_of(existing.begin(), existing.end(), [&](const Rid& rid) { return rid == rids[100]; }));
 }
 
 // The gate reads the root page number from page 0 of the index file. If page 0

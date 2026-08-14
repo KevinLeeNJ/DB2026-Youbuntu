@@ -98,6 +98,17 @@ WalReadSnapshot::~WalReadSnapshot() {
     }
 }
 
+bool WalReadSnapshot::discard_resident_pages() const noexcept {
+    bool discarded = true;
+    for (const Span& span : spans_) {
+        if (span.mapping != nullptr && span.mapping != MAP_FAILED &&
+            madvise(span.mapping, span.mapping_length, MADV_DONTNEED) != 0) {
+            discarded = false;
+        }
+    }
+    return discarded;
+}
+
 const char* WalReadSnapshot::record_bytes(int64_t offset, uint32_t length, std::vector<char>* scratch,
                                           WalSnapshotAccess* access) const {
     if (access != nullptr) *access = WalSnapshotAccess{};
@@ -1079,6 +1090,10 @@ std::unique_ptr<WalReadSnapshot> DiskManager::create_wal_read_snapshot(int64_t b
             errno = saved_errno;
             throw UnixError();
         }
+        // Recovery reads page-sorted records at scattered WAL offsets. Disable
+        // mmap readahead so an accessed record does not make unrelated WAL pages
+        // resident before the bounded residency trim can discard them.
+        (void)madvise(mapping, static_cast<size_t>(mapping_bytes), MADV_RANDOM);
         snapshot->add_span(WalReadSnapshot::Span{fd, mapping, static_cast<size_t>(mapping_bytes),
                                                  mapping_logical_begin, range_begin, range_end});
     };

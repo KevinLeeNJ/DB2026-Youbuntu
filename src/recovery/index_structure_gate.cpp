@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "minilog.h"
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -75,6 +76,21 @@ RecoveryIndexGate::RecoveryIndexGate(DiskManager* disk_manager, BufferPoolManage
     setup_ = Setup::Ready;
 }
 
+RecoveryIndexGate::~RecoveryIndexGate() {
+    release_cached_path();
+}
+
+void RecoveryIndexGate::release_cached_path() noexcept {
+    for (auto it = cached_path_.rbegin(); it != cached_path_.rend(); ++it) {
+        if (it->page == nullptr) continue;
+        try {
+            (void)buffer_pool_manager_->unpin_page(it->page->get_page_id(), it->dirty);
+        } catch (...) {
+        }
+    }
+    cached_path_.clear();
+}
+
 bool RecoveryIndexGate::reject(const char* invariant, page_id_t page_no) {
     // Every rejection names the invariant, because the only consequence of a
     // rejection is a full index rebuild - a decision nobody can review after the
@@ -121,6 +137,13 @@ void RecoveryIndexGate::remember_bound(std::vector<char>* slot, bool* have, cons
 }
 
 bool RecoveryIndexGate::check_key(const char* key) {
+    return check_key(key, nullptr);
+}
+
+bool RecoveryIndexGate::check_key(const char* key, std::vector<Rid>* existing_rids) {
+    if (existing_rids != nullptr) {
+        existing_rids->clear();
+    }
     switch (setup_) {
     case Setup::EmptyTree:
         return true;
@@ -131,9 +154,9 @@ bool RecoveryIndexGate::check_key(const char* key) {
     }
     if (covered_by_current_leaf(key)) {
         ++stats_.keys_covered;
-        return true;
+        return collect_current_leaf_rids(key, existing_rids);
     }
-    return descend(key);
+    return descend(key, existing_rids);
 }
 
 /**
@@ -162,36 +185,208 @@ bool RecoveryIndexGate::covered_by_current_leaf(const char* key) const {
     return have_leaf_max_ && compare(key, leaf_max_key_.data()) <= 0;
 }
 
-bool RecoveryIndexGate::descend(const char* key) {
+bool RecoveryIndexGate::collect_current_leaf_rids(const char* key, std::vector<Rid>* existing_rids) {
+    if (existing_rids == nullptr) {
+        return true;
+    }
+    const size_t key_len = static_cast<size_t>(hdr_.col_tot_len_);
+    for (size_t index = 0; index < current_leaf_rids_.size(); ++index) {
+        const char* current_key = current_leaf_keys_.data() + index * key_len;
+        if (compare(current_key, key) == 0) {
+            existing_rids->push_back(current_leaf_rids_[index]);
+        }
+    }
+
+    // A predecessor can contain an equal key only when the target is at or
+    // before this leaf's first key; a successor can contain one only when the
+    // target is at or after its last key. A strict interior key is therefore
+    // complete from this leaf alone. This is the common path during recovery.
+    const bool need_predecessor = current_leaf_rids_.empty() ||
+                                  compare(current_leaf_keys_.data(), key) >= 0;
+    const bool need_successor = current_leaf_rids_.empty() ||
+                                compare(current_leaf_keys_.data() +
+                                            (current_leaf_rids_.size() - 1) * key_len,
+                                        key) <= 0;
+
+    // Equal keys may straddle either side of the leaf selected by the gate.
+    // lookup_equal starts at the leftmost equal leaf, while the gate's
+    // internal_lookup can land on a later equal leaf. Collect predecessor
+    // chunks first, then successor chunks, preserving lookup_equal order.
+    std::vector<Rid> predecessor_rids;
+    std::vector<std::pair<size_t, size_t>> predecessor_chunks;
+    size_t hops = 0;
+    page_id_t cursor = current_leaf_prev_;
+    page_id_t ahead = current_leaf_page_no_;
+    while (need_predecessor && cursor != IX_LEAF_HEADER_PAGE) {
+        if (!page_in_range(cursor) || ++hops > static_cast<size_t>(hdr_.num_pages_)) {
+            return reject("INV-5 duplicate-key predecessor chain is out of range or cyclic", cursor);
+        }
+        Page* raw = fetch(cursor);
+        if (raw == nullptr) {
+            return reject("INV-5 duplicate-key predecessor leaf could not be fetched", cursor);
+        }
+        IxNodeHandle leaf(&hdr_, raw);
+        const auto release_and_reject = [&](const char* reason) {
+            release(raw, false);
+            return reject(reason, cursor);
+        };
+        if (!leaf.is_leaf_page()) {
+            return release_and_reject("INV-6 duplicate-key predecessor is not a leaf");
+        }
+        if (leaf.get_next_leaf() != ahead) {
+            return release_and_reject("INV-6 duplicate-key predecessor does not link forward");
+        }
+        const int size = leaf.get_size();
+        if (size < 0 || size > hdr_.btree_order_ + 1) {
+            return release_and_reject("INV-1 duplicate-key chain leaf size is invalid");
+        }
+        for (int index = 1; index < size; ++index) {
+            if (compare(leaf.get_key(index - 1), leaf.get_key(index)) > 0) {
+                return release_and_reject("INV-2 duplicate-key predecessor keys are not ordered");
+            }
+        }
+        page_id_t previous = leaf.get_prev_leaf();
+        if (previous != IX_LEAF_HEADER_PAGE && !page_in_range(previous)) {
+            return release_and_reject("INV-5 duplicate-key predecessor link leaves the index file");
+        }
+        bool found_less = false;
+        size_t chunk_begin = predecessor_rids.size();
+        for (int index = 0; index < size; ++index) {
+            const int cmp = compare(leaf.get_key(index), key);
+            if (cmp == 0) {
+                predecessor_rids.push_back(*leaf.get_rid(index));
+            } else if (cmp < 0) {
+                found_less = true;
+            } else {
+                return release_and_reject("INV-7 duplicate-key predecessor is above the target key");
+            }
+        }
+        release(raw, false);
+        if (predecessor_rids.size() > chunk_begin) {
+            predecessor_chunks.emplace_back(chunk_begin, predecessor_rids.size());
+        }
+        if (found_less) {
+            break;
+        }
+        ahead = cursor;
+        cursor = previous;
+    }
+
+    // Reverse the predecessor chunks without reversing entries within a leaf.
+    // This uses one temporary vector for the returned key's RIDs, not a tree-
+    // sized cache; the caller already owns the same-sized result contract.
+    for (const auto& chunk : predecessor_chunks) {
+        std::reverse(predecessor_rids.begin() + static_cast<std::ptrdiff_t>(chunk.first),
+                     predecessor_rids.begin() + static_cast<std::ptrdiff_t>(chunk.second));
+    }
+    std::reverse(predecessor_rids.begin(), predecessor_rids.end());
+
+    std::vector<Rid> suffix_rids;
+    cursor = current_leaf_next_;
+    page_id_t behind = current_leaf_page_no_;
+    while (need_successor && cursor != IX_LEAF_HEADER_PAGE) {
+        if (!page_in_range(cursor) || ++hops > static_cast<size_t>(hdr_.num_pages_)) {
+            return reject("INV-5 duplicate-key successor chain is out of range or cyclic", cursor);
+        }
+        Page* raw = fetch(cursor);
+        if (raw == nullptr) {
+            return reject("INV-5 duplicate-key successor leaf could not be fetched", cursor);
+        }
+        IxNodeHandle leaf(&hdr_, raw);
+        const auto release_and_reject = [&](const char* reason) {
+            release(raw, false);
+            return reject(reason, cursor);
+        };
+        if (!leaf.is_leaf_page() || leaf.get_prev_leaf() != behind) {
+            return release_and_reject("INV-6 duplicate-key successor does not link back");
+        }
+        const int size = leaf.get_size();
+        if (size < 0 || size > hdr_.btree_order_ + 1) {
+            return release_and_reject("INV-1 duplicate-key successor leaf size is invalid");
+        }
+        for (int index = 1; index < size; ++index) {
+            if (compare(leaf.get_key(index - 1), leaf.get_key(index)) > 0) {
+                return release_and_reject("INV-2 duplicate-key successor keys are not ordered");
+            }
+        }
+        page_id_t next = leaf.get_next_leaf();
+        if (next != IX_LEAF_HEADER_PAGE && !page_in_range(next)) {
+            return release_and_reject("INV-5 duplicate-key successor link leaves the index file");
+        }
+        bool found_greater = false;
+        for (int index = 0; index < size; ++index) {
+            const int cmp = compare(leaf.get_key(index), key);
+            if (cmp > 0) {
+                found_greater = true;
+                break;
+            }
+            if (cmp == 0) {
+                suffix_rids.push_back(*leaf.get_rid(index));
+            } else {
+                return release_and_reject("INV-7 duplicate-key successor regressed before the target key");
+            }
+        }
+        release(raw, false);
+        if (found_greater || next == IX_LEAF_HEADER_PAGE) {
+            break;
+        }
+        behind = cursor;
+        cursor = next;
+    }
+
+    predecessor_rids.insert(predecessor_rids.end(), existing_rids->begin(), existing_rids->end());
+    predecessor_rids.insert(predecessor_rids.end(), suffix_rids.begin(), suffix_rids.end());
+    existing_rids->swap(predecessor_rids);
+    return true;
+}
+
+bool RecoveryIndexGate::descend(const char* key, std::vector<Rid>* existing_rids) {
     ++stats_.descents;
     have_leaf_ = false;
     have_leaf_max_ = false;
     have_leaf_upper_ = false;
+    current_leaf_keys_.clear();
+    current_leaf_rids_.clear();
+    current_leaf_prev_ = IX_LEAF_HEADER_PAGE;
+    current_leaf_next_ = IX_LEAF_HEADER_PAGE;
 
     page_id_t page_no = hdr_.root_page_;
     page_id_t expected_parent = IX_NO_PAGE;
     for (int level = 0; level <= kMaxDescentLevels; ++level) {
-        Page* raw = fetch(page_no);
+        Page* raw = nullptr;
+        bool cached = level < static_cast<int>(cached_path_.size()) && cached_path_[level].page_no == page_no;
+        if (cached) {
+            raw = cached_path_[level].page;
+        } else {
+            while (cached_path_.size() > static_cast<size_t>(level)) {
+                CachedPathEntry entry = cached_path_.back();
+                cached_path_.pop_back();
+                if (entry.page != nullptr) {
+                    (void)buffer_pool_manager_->unpin_page(entry.page->get_page_id(), entry.dirty);
+                }
+            }
+            raw = fetch(page_no);
+        }
         if (raw == nullptr) {
             return reject("page could not be fetched", page_no);
         }
         IxNodeHandle node(&hdr_, raw);
         bool dirty = false;
         if (!validate_node(node, page_no, expected_parent, &dirty)) {
-            release(raw, dirty);
+            if (!cached) release(raw, dirty);
             return false;
         }
         if (node.is_leaf_page()) {
-            const bool valid = validate_leaf_and_remember(node, page_no, key);
-            release(raw, dirty);
+            const bool valid = validate_leaf_and_remember(node, page_no, key, existing_rids);
+            if (!cached) release(raw, dirty);
             return valid;
         }
+        if (!cached) cached_path_.push_back(CachedPathEntry{raw, page_no, dirty});
         // Deliberately IxNodeHandle::internal_lookup(): the gate must validate
         // the very path a lookup takes, and that is the routine
         // find_leaf_page()/lookup_equal()/get_value() and every insert use.
         // Re-deriving the child index here would let the two drift apart.
         const page_id_t child = node.internal_lookup(key);
-        release(raw, dirty);
         if (!page_in_range(child)) {
             return reject("INV-0 child pointer leaves the index file", child);
         }
@@ -280,7 +475,8 @@ bool RecoveryIndexGate::validate_node(IxNodeHandle& node, page_id_t page_no, pag
     return true;
 }
 
-bool RecoveryIndexGate::validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t page_no, const char* key) {
+bool RecoveryIndexGate::validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t page_no, const char* key,
+                                                   std::vector<Rid>* existing_rids) {
     const int size = leaf.get_size();
     const page_id_t previous = leaf.get_prev_leaf();
     const page_id_t next = leaf.get_next_leaf();
@@ -294,12 +490,26 @@ bool RecoveryIndexGate::validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t
         return reject("INV-5 leaf chain link leaves the index file", page_no);
     }
 
+    const auto remember_leaf_snapshot = [&] {
+        const size_t key_len = static_cast<size_t>(hdr_.col_tot_len_);
+        current_leaf_keys_.resize(static_cast<size_t>(size) * key_len);
+        current_leaf_rids_.resize(static_cast<size_t>(size));
+        for (int index = 0; index < size; ++index) {
+            memcpy(current_leaf_keys_.data() + static_cast<size_t>(index) * key_len, leaf.get_key(index), key_len);
+            current_leaf_rids_[static_cast<size_t>(index)] = *leaf.get_rid(index);
+        }
+        current_leaf_page_no_ = page_no;
+        current_leaf_prev_ = previous;
+        current_leaf_next_ = next;
+        return collect_current_leaf_rids(key, existing_rids);
+    };
+
     remember_bound(&leaf_descent_key_, &have_leaf_, key);
     if (size > 0) {
         remember_bound(&leaf_max_key_, &have_leaf_max_, leaf.get_key(size - 1));
     }
     if (next == IX_LEAF_HEADER_PAGE) {
-        return true;
+        return remember_leaf_snapshot();
     }
 
     // Walk forward to the first non-empty successor to obtain the upper bound.
@@ -351,20 +561,33 @@ bool RecoveryIndexGate::validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t
             // implemented, because after 64bd297 (SMO whole-dirty-set write-out)
             // it was not observed once in 10 real SIGKILL recoveries. The
             // fallback is the full rebuild, which is correct but slow.
-            const bool agrees = compare(key, successor.get_key(0)) < 0;
-            if (agrees) {
+            const int key_order = compare(key, successor.get_key(0));
+            bool current_leaf_has_key = false;
+            for (int index = 0; index < size; ++index) {
+                if (compare(leaf.get_key(index), key) == 0) {
+                    current_leaf_has_key = true;
+                    break;
+                }
+            }
+            // Equality across the boundary is valid only when this leaf also
+            // contains the target. Otherwise the successor is an orphan (the
+            // existing gate test deliberately constructs exactly that shape).
+            const bool agrees = key_order < 0 || (key_order == 0 && current_leaf_has_key);
+            if (key_order < 0) {
                 remember_bound(&leaf_upper_key_, &have_leaf_upper_, successor.get_key(0));
             }
             release(raw, false);
-            return agrees ? true
-                          : reject("INV-7 the leaf chain places this key right of where the descent landed "
-                                   "(orphan leaf or stale separator)",
-                                   cursor);
+            if (agrees) {
+                return remember_leaf_snapshot();
+            }
+            return reject("INV-7 the leaf chain places this key right of where the descent landed "
+                          "(orphan leaf or stale separator)",
+                          cursor);
         }
 
         release(raw, false);
         if (successor_next == IX_LEAF_HEADER_PAGE) {
-            return true;
+            return remember_leaf_snapshot();
         }
         if (!page_in_range(successor_next)) {
             return reject("INV-5 leaf chain link leaves the index file", cursor);
@@ -376,5 +599,5 @@ bool RecoveryIndexGate::validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t
     // so the next key simply pays for its own descent; nothing is asserted and
     // nothing is skipped.
     ++stats_.chain_bounds_unknown;
-    return true;
+    return remember_leaf_snapshot();
 }

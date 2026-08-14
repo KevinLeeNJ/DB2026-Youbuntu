@@ -79,7 +79,7 @@ public:
     void redo();
     void undo();
 
-    // Test-only bounded-output override for exercising the verified-stream
+    // Test-only output bound for forcing the parallel collector's streaming
     // fallback; zero keeps the production limit.
     void set_index_key_parallel_scratch_limit_for_test(size_t bytes) noexcept {
         index_key_parallel_scratch_limit_for_test_ = bytes;
@@ -120,13 +120,17 @@ public:
         return index_smo_logical_image_bytes_;
     }
     uint64_t get_dml_record_count() const {
-        return touched_.size();
+        return log_type_record_counts_[LogType::UPDATE] + log_type_record_counts_[LogType::INSERT] +
+               log_type_record_counts_[LogType::DELETE];
     }
     uint64_t get_redo_applied_count() const {
         return redo_applied_count_;
     }
     uint64_t get_redo_skipped_count() const {
         return redo_skipped_count_;
+    }
+    uint64_t get_redo_wal_mapped_count() const {
+        return redo_wal_mapped_count_;
     }
     // Number of existing-page runs and pins consumed by the grouped heap-redo
     // path.  They are deliberately separate from extension anchors, whose
@@ -143,11 +147,17 @@ public:
     uint64_t get_loser_transaction_count() const {
         return static_cast<uint64_t>(active_txn_last_lsn_.size());
     }
+    size_t get_undo_location_count_for_test() const {
+        return record_locations_.size();
+    }
     uint64_t get_pruned_no_undo_transaction_count() const {
         return pruned_no_undo_transaction_count_;
     }
     uint64_t get_undo_chain_record_read_count() const {
         return undo_chain_record_read_count_;
+    }
+    uint64_t get_index_key_collection_count_for_test() const {
+        return index_key_collection_count_;
     }
     uint64_t get_index_probe_count() const {
         return index_probe_count_;
@@ -251,6 +261,7 @@ private:
         txn_id_t txn_id{INVALID_TXN_ID};
         uint32_t total_len{0};
         int64_t offset{0};
+        uint32_t wal_identity{0};
         size_t name_offset{0};
         uint32_t name_len{0};
         Rid rid{};
@@ -303,9 +314,11 @@ private:
     // without keeping the records themselves.
     struct WalRecordLocation {
         lsn_t lsn{INVALID_LSN};
-        int64_t offset{0};
         uint32_t length{0};
+        int64_t offset{0};
+        txn_id_t txn_id{INVALID_TXN_ID};
     };
+    static_assert(sizeof(WalRecordLocation) <= 24, "WAL undo locations must remain compact");
 
     // Location and target of one heap DML record. Sorting these by table/page
     // makes every page's records consecutive while WAL offset preserves their
@@ -314,6 +327,8 @@ private:
     struct HeapRedoRecord {
         int64_t wal_offset{0};
         uint32_t wal_length{0};
+        uint32_t wal_identity{0};
+        lsn_t lsn{INVALID_LSN};
         uint16_t table_id{0};
         int16_t slot_no{0};
         int32_t page_no{0};
@@ -358,6 +373,13 @@ private:
         bool from_heap{false}; // true: must be present afterwards
     };
 
+    struct IndexRepairAction {
+        uint32_t entry_begin{0};
+        uint32_t entry_end{0};
+        uint32_t existing_begin{0};
+        uint32_t existing_end{0};
+    };
+
     // Analyze records immutable WAL-aligned ranges for the later key scan.
     // They hold only record boundaries, never WAL payloads.
     struct IndexKeyStreamSegment {
@@ -375,6 +397,11 @@ private:
         int key_len{0};
         std::vector<char> key_arena;
         std::vector<IndexRepairEntry> entries;
+        std::vector<IndexRepairAction> repair_actions;
+        std::vector<Rid> existing_rid_arena;
+        bool existing_snapshot_complete{false};
+        uint64_t snapshot_unchanged_keys{0};
+        uint64_t snapshot_duplicate_entries{0};
     };
 
     // Index repair phases run independently per index. Keep their counters
@@ -485,9 +512,16 @@ private:
     std::vector<RecoveryTable> tables_;
     std::unordered_map<std::string, uint16_t> table_ids_;
     std::string table_name_scratch_;           // reused, so name lookups do not allocate
-    std::vector<TouchedTuple> touched_;        // one entry per DML record, WAL order
+    std::vector<TouchedTuple> touched_;        // analyze-only input for touched_sorted_
     std::vector<TouchedTuple> touched_sorted_; // distinct, ordered by table and page
     std::vector<HeapRedoRecord> heap_redo_records_;
+    // Empty checkpoint-active set means all loser DML is represented in the
+    // page-local catalogue and can be completed while its page is pinned.
+    bool page_owned_recovery_{false};
+    bool redo_completed_{false};
+    bool collect_record_locations_{false};
+    bool page_owned_keys_complete_{false};
+    std::map<std::string, IndexRepairPlan> page_owned_index_plans_;
     std::vector<IndexKeyStreamSegment> index_key_stream_segments_;
     bool index_key_stream_segments_complete_{true};
     size_t index_key_parallel_scratch_limit_for_test_{0};
@@ -528,6 +562,7 @@ private:
     uint64_t index_smo_logical_image_bytes_{0};
     uint64_t redo_applied_count_{0};
     uint64_t redo_skipped_count_{0};       // committed records with no open table
+    uint64_t redo_wal_mapped_count_{0};    // WAL payloads mapped during heap redo
     uint64_t redo_missing_table_count_{0}; // subset of the above whose table is not open
     uint64_t redo_candidate_count_{0};     // committed descriptors after compaction
     uint64_t redo_loser_count_{0};         // DML retained for undo, not heap redo
@@ -536,6 +571,7 @@ private:
     uint64_t undo_applied_count_{0};
     uint64_t pruned_no_undo_transaction_count_{0};
     uint64_t undo_chain_record_read_count_{0};
+    uint64_t index_key_collection_count_{0};
     uint64_t index_probe_count_{0};
     uint64_t index_mutation_count_{0};
     uint64_t index_unchanged_key_count_{0};
