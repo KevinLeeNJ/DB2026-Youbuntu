@@ -364,6 +364,21 @@ TEST(IndexStructureGateTest, AnEmptiedLeafIsNotReportedAsDamage) {
         AppendCommittedDelete(*db.log_mgr_, rids[0], 0, 0);
     }
 
+    // The leftmost empty leaf has no predecessor. Once key 0 validates the
+    // empty-to-successor gap, the next deleted key must not walk that same
+    // chain again.
+    {
+        OpenDb db(db_name);
+        RecoveryIndexGate gate(&db.disk_, &db.bpm_, db.index(), "t_id.idx");
+        std::vector<Rid> existing;
+        ASSERT_TRUE(gate.check_key(MakeKey(0).data(), &existing));
+        ASSERT_TRUE(existing.empty());
+        const uint64_t fetches_after_first_empty_key = gate.stats().page_fetches;
+        ASSERT_TRUE(gate.check_key(MakeKey(1).data(), &existing));
+        EXPECT_TRUE(existing.empty());
+        EXPECT_EQ(gate.stats().page_fetches, fetches_after_first_empty_key);
+    }
+
     const RecoveryOutcome outcome = RunRecoveryAndInspect(db_name, rids, deleted_keys);
     EXPECT_EQ(outcome.rebuilds, 0u) << "an empty leaf was mistaken for damage";
     EXPECT_EQ(outcome.parent_pointer_repairs, 0u);

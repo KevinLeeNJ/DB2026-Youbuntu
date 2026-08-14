@@ -73,6 +73,8 @@ RecoveryIndexGate::RecoveryIndexGate(DiskManager* disk_manager, BufferPoolManage
     leaf_descent_key_.resize(static_cast<size_t>(hdr_.col_tot_len_));
     leaf_max_key_.resize(static_cast<size_t>(hdr_.col_tot_len_));
     leaf_upper_key_.resize(static_cast<size_t>(hdr_.col_tot_len_));
+    empty_gap_lower_key_.resize(static_cast<size_t>(hdr_.col_tot_len_));
+    empty_gap_upper_key_.resize(static_cast<size_t>(hdr_.col_tot_len_));
     setup_ = Setup::Ready;
 }
 
@@ -153,6 +155,12 @@ bool RecoveryIndexGate::check_key(const char* key, std::vector<Rid>* existing_ri
     case Setup::Ready:
         break;
     }
+    if (empty_gap_valid_ && current_leaf_page_no_ == empty_gap_page_no_ &&
+        compare(key, leaf_descent_key_.data()) >= 0 && compare(key, empty_gap_upper_key_.data()) < 0 &&
+        (!empty_gap_has_lower_ || compare(key, empty_gap_lower_key_.data()) > 0)) {
+        ++stats_.keys_covered;
+        return true;
+    }
     if (covered_by_current_leaf(key)) {
         ++stats_.keys_covered;
         return collect_current_leaf_rids(key, existing_rids);
@@ -228,6 +236,7 @@ bool RecoveryIndexGate::collect_current_leaf_rids(const char* key, std::vector<R
     // chunks first, then successor chunks, preserving lookup_equal order.
     std::vector<Rid> predecessor_rids;
     std::vector<std::pair<size_t, size_t>> predecessor_chunks;
+    bool empty_gap_has_lower = false;
     size_t hops = 0;
     page_id_t cursor = current_leaf_prev_;
     page_id_t ahead = current_leaf_page_no_;
@@ -274,6 +283,10 @@ bool RecoveryIndexGate::collect_current_leaf_rids(const char* key, std::vector<R
             } else {
                 return release_and_reject("INV-7 duplicate-key predecessor is above the target key");
             }
+        }
+        if (size > 0 && !empty_gap_has_lower) {
+            memcpy(empty_gap_lower_key_.data(), leaf.get_key(size - 1), empty_gap_lower_key_.size());
+            empty_gap_has_lower = true;
         }
         release(raw, false);
         if (predecessor_rids.size() > chunk_begin) {
@@ -351,6 +364,12 @@ bool RecoveryIndexGate::collect_current_leaf_rids(const char* key, std::vector<R
     predecessor_rids.insert(predecessor_rids.end(), existing_rids->begin(), existing_rids->end());
     predecessor_rids.insert(predecessor_rids.end(), suffix_rids.begin(), suffix_rids.end());
     existing_rids->swap(predecessor_rids);
+    if (current_leaf_rids_.empty() && have_leaf_upper_) {
+        empty_gap_valid_ = true;
+        empty_gap_has_lower_ = empty_gap_has_lower;
+        empty_gap_page_no_ = current_leaf_page_no_;
+        memcpy(empty_gap_upper_key_.data(), leaf_upper_key_.data(), empty_gap_upper_key_.size());
+    }
     return true;
 }
 
@@ -606,6 +625,7 @@ bool RecoveryIndexGate::validate_node(IxNodeHandle& node, page_id_t page_no, pag
 
 bool RecoveryIndexGate::validate_leaf_and_remember(IxNodeHandle& leaf, page_id_t page_no, const char* key,
                                                    std::vector<Rid>* existing_rids) {
+    empty_gap_valid_ = false;
     const int size = leaf.get_size();
     const page_id_t previous = leaf.get_prev_leaf();
     const page_id_t next = leaf.get_next_leaf();

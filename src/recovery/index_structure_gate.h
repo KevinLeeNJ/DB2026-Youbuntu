@@ -222,5 +222,14 @@ private:
     page_id_t current_leaf_prev_{IX_LEAF_HEADER_PAGE};
     page_id_t current_leaf_next_{IX_LEAF_HEADER_PAGE};
 
+    // A validated empty leaf plus its first non-empty successor defines a
+    // stable gap. Strictly interior keys cannot occur in this gap; boundary
+    // keys still use the duplicate-aware path below.
+    bool empty_gap_valid_{false};
+    bool empty_gap_has_lower_{false};
+    page_id_t empty_gap_page_no_{INVALID_PAGE_ID};
+    std::vector<char> empty_gap_lower_key_;
+    std::vector<char> empty_gap_upper_key_;
+
     Stats stats_;
 };
