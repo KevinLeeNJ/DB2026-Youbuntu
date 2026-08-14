@@ -1054,6 +1054,7 @@ TEST(RecoveryManagerTest, BeginOnlyTransactionsDoNotExpandLoserUndoWork) {
         // Heap redo now replays committed and loser DML in WAL order. The two
         // loser rows are then removed by page-local reverse undo.
         EXPECT_EQ(recovery.get_redo_applied_count(), 3u);
+        EXPECT_EQ(recovery.get_loser_transaction_count(), 2u);
         EXPECT_EQ(recovery.get_redo_skipped_count(), 0u);
         EXPECT_EQ(recovery.get_undo_applied_count(), 2u);
         EXPECT_EQ(recovery.get_undo_chain_record_read_count(), 0u);

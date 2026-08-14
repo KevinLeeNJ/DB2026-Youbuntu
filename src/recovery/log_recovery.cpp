@@ -770,6 +770,7 @@ void RecoveryManager::swap_analysis_state(RecoveryManager& staged) noexcept {
     swap(redo_missing_table_count_, staged.redo_missing_table_count_);
     swap(redo_candidate_count_, staged.redo_candidate_count_);
     swap(redo_loser_count_, staged.redo_loser_count_);
+    swap(loser_transaction_count_, staged.loser_transaction_count_);
     swap(redo_resident_page_run_count_, staged.redo_resident_page_run_count_);
     swap(redo_resident_page_pin_count_, staged.redo_resident_page_pin_count_);
     swap(undo_applied_count_, staged.undo_applied_count_);
@@ -1066,6 +1067,7 @@ void RecoveryManager::analyze_into_staged() {
     redo_missing_table_count_ = 0;
     redo_candidate_count_ = 0;
     redo_loser_count_ = 0;
+    loser_transaction_count_ = 0;
     redo_resident_page_run_count_ = 0;
     redo_resident_page_pin_count_ = 0;
     undo_applied_count_ = 0;
@@ -1255,6 +1257,7 @@ void RecoveryManager::analyze_into_staged() {
             ++it;
         }
     }
+    loser_transaction_count_ = active_txn_last_lsn_.size();
     page_owned_recovery_ = checkpoint_active_txns.empty();
     if (page_owned_recovery_) {
         std::vector<WalRecordLocation>().swap(record_locations_);
@@ -1384,6 +1387,14 @@ void RecoveryManager::redo() {
     // Compatibility for direct unit-test users of RecoveryManager. Production
     // calls this explicitly between finalize and redo.
     prepare_pages_for_redo();
+    if (page_owned_recovery_) {
+        // Page-owned redo has the committed/loser bit in every heap descriptor
+        // and never follows transaction maps. Keep the scalar loser count for
+        // observability, but release the hash/map buckets before workers and
+        // historical-key collection can grow their plans.
+        std::unordered_set<txn_id_t>().swap(committed_txns_);
+        std::map<txn_id_t, lsn_t>().swap(active_txn_last_lsn_);
+    }
     const auto redo_begin = std::chrono::steady_clock::now();
     if (!page_owned_recovery_) {
         // A checkpoint-seeded loser may have WAL before scan_begin_offset_.

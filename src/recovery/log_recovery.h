@@ -145,7 +145,7 @@ public:
         return undo_applied_count_;
     }
     uint64_t get_loser_transaction_count() const {
-        return static_cast<uint64_t>(active_txn_last_lsn_.size());
+        return loser_transaction_count_;
     }
     size_t get_undo_location_count_for_test() const {
         return record_locations_.size();
@@ -566,6 +566,7 @@ private:
     uint64_t redo_missing_table_count_{0}; // subset of the above whose table is not open
     uint64_t redo_candidate_count_{0};     // committed descriptors after compaction
     uint64_t redo_loser_count_{0};         // DML retained for undo, not heap redo
+    uint64_t loser_transaction_count_{0};
     uint64_t redo_resident_page_run_count_{0};
     uint64_t redo_resident_page_pin_count_{0};
     uint64_t undo_applied_count_{0};
