@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_common.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "executor_expr.h"
 #include "index/ix.h"
 #include "system/sm.h"
 #include <algorithm>
@@ -27,6 +28,7 @@ private:
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager* sm_manager_;
+    QueryExprEvaluator::SubqueryRunner subquery_runner_;
 
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
         std::vector<char> key(index.col_tot_len);
@@ -40,7 +42,8 @@ private:
 
 public:
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conds, std::vector<Rid> rids, Context* context) {
+                   std::vector<Condition> conds, std::vector<Rid> rids, Context* context,
+                   QueryExprEvaluator::SubqueryRunner subquery_runner = {}) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         set_clauses_ = set_clauses;
@@ -49,6 +52,7 @@ public:
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        subquery_runner_ = std::move(subquery_runner);
     }
     std::unique_ptr<RmRecord> Next() override {
         bool has_non_self_ref_set = std::any_of(set_clauses_.begin(), set_clauses_.end(),
@@ -252,6 +256,36 @@ public:
         for (const auto& set_clause : set_clauses_) {
             auto col_meta = get_col_offset(set_clause.lhs);
             char* data = rec->data + col_meta.offset;
+            if (set_clause.rhs_expr != nullptr) {
+                static const std::vector<bool> no_nulls;
+                QueryExprEvaluator evaluator(tab_.cols, no_nulls, &subquery_runner_);
+                EvaluatedValue value = evaluator.evaluate(*set_clause.rhs_expr, old_rec);
+                if (value.is_null) {
+                    throw RMDBError("UPDATE cannot store NULL values");
+                }
+                if (!can_cast(col_meta.type, value.cell.type)) {
+                    throw IncompatibleTypeError(coltype2str(col_meta.type), coltype2str(value.cell.type));
+                }
+                switch (col_meta.type) {
+                case TYPE_INT:
+                    *reinterpret_cast<int*>(data) = value.cell.type == TYPE_FLOAT
+                                                        ? static_cast<int>(value.cell.float_val)
+                                                        : value.cell.int_val;
+                    break;
+                case TYPE_FLOAT:
+                    *reinterpret_cast<double*>(data) = value.cell.type == TYPE_FLOAT
+                                                           ? value.cell.float_val
+                                                           : static_cast<double>(value.cell.int_val);
+                    break;
+                case TYPE_STRING:
+                case TYPE_DATETIME:
+                    std::memset(data, 0, col_meta.len);
+                    std::memcpy(data, value.cell.str_val.data(),
+                                std::min<int>(col_meta.len, value.cell.str_val.size()));
+                    break;
+                }
+                continue;
+            }
             if (set_clause.is_self_ref) {
                 auto rhs_col_meta = get_col_offset(set_clause.rhs_col);
                 if (set_clause.op == UpdateOp::ASSIGNMENT) {

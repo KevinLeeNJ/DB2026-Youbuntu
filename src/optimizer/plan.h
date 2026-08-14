@@ -94,11 +94,12 @@ public:
 class JoinPlan : public Plan {
 public:
     JoinPlan(PlanTag tag, std::unique_ptr<Plan> left, std::unique_ptr<Plan> right, std::vector<Condition> conds,
-             JoinType join_type = INNER_JOIN) {
+             JoinType join_type = INNER_JOIN, std::vector<std::shared_ptr<QueryExpr>> exprs = {}) {
         Plan::tag = tag;
         left_ = std::move(left);
         right_ = std::move(right);
         conds_ = std::move(conds);
+        exprs_ = std::move(exprs);
         type = join_type;
     }
     ~JoinPlan() {}
@@ -108,6 +109,7 @@ public:
     std::unique_ptr<Plan> right_;
     // 连接条件
     std::vector<Condition> conds_;
+    std::vector<std::shared_ptr<QueryExpr>> exprs_;
     // future TODO: 后续可以支持的连接类型
     // INLJ binding: set by planner when right table join column has an index
     TabCol inlj_left_col_;            // left-side column providing lookup key (empty tab_name = NLJ mode)

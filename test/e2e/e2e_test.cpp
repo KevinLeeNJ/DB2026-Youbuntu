@@ -514,6 +514,10 @@ TEST_F(SltFileTest, ArithConstant) {
     run_slt_file("arith_constant.slt");
 }
 
+TEST_F(SltFileTest, IssueReviewFixes) {
+    run_slt_file("issue_review_fixes.slt");
+}
+
 TEST_F(SltFileTest, PerformanceLoadQuery) {
     run_slt_file("performance_load_query.slt");
 }

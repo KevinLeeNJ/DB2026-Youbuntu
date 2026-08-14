@@ -474,8 +474,9 @@ struct InsertStmt : public TreeNode {
     std::vector<std::unique_ptr<Value>> vals;
     std::unique_ptr<TreeNode> select;
 
-    InsertStmt(std::string tab_name_, std::vector<std::unique_ptr<Value>> vals_)
-        : TreeNode(AstType::InsertStmt), tab_name(std::move(tab_name_)), vals(std::move(vals_)) {}
+    InsertStmt(std::string tab_name_, std::vector<std::string> col_names_, std::vector<std::unique_ptr<Value>> vals_)
+        : TreeNode(AstType::InsertStmt), tab_name(std::move(tab_name_)), col_names(std::move(col_names_)),
+          vals(std::move(vals_)) {}
 
     InsertStmt(std::string tab_name_, std::vector<std::string> col_names_, std::unique_ptr<TreeNode> select_)
         : TreeNode(AstType::InsertStmt), tab_name(std::move(tab_name_)), col_names(std::move(col_names_)),

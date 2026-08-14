@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "executor_expr.h"
 #include "index/ix.h"
 #include "parser/ast.h"
 #include "system/sm.h"
@@ -49,6 +50,9 @@ private:
     };
 
     std::vector<Condition> fed_conds_; // join条件
+    std::vector<std::shared_ptr<QueryExpr>> exprs_;
+    QueryExprEvaluator::SubqueryRunner subquery_runner_;
+    const QueryExprOuterContext* outer_context_ = nullptr;
     std::vector<CompiledCondition> compiled_conds_;
     bool isend;
     std::unordered_map<std::string, std::vector<ColMeta>::iterator>
@@ -200,7 +204,7 @@ private:
 
     bool is_condition(const RmRecord& left_rec, const RmRecord& right_rec,
                       const std::vector<bool>& left_nulls = {}, const std::vector<bool>& right_nulls = {}) {
-        if (has_extended_condition_ || !left_nulls.empty() || !right_nulls.empty()) {
+        if (has_extended_condition_ || !exprs_.empty() || !left_nulls.empty() || !right_nulls.empty()) {
             RmRecord joined(static_cast<int>(len_));
             std::memcpy(joined.data, left_rec.data, left_tuple_len_);
             std::memcpy(joined.data + left_tuple_len_, right_rec.data, right_tuple_len_);
@@ -214,6 +218,14 @@ private:
             for (const auto& cond : fed_conds_) {
                 if (!compare(cond, joined, joined_nulls)) {
                     return false;
+                }
+            }
+            if (!exprs_.empty()) {
+                QueryExprEvaluator evaluator(cols_, joined_nulls, &subquery_runner_, outer_context_);
+                for (const auto& expr : exprs_) {
+                    if (expr != nullptr && !evaluator.matches(*expr, joined)) {
+                        return false;
+                    }
                 }
             }
             return true;
@@ -385,7 +397,10 @@ private:
 public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right,
                            std::vector<Condition> conds, TabCol inlj_left_col = {}, TabCol inlj_right_col = {},
-                           const std::string& inlj_index_col_name = "", JoinType join_type = INNER_JOIN) {
+                           const std::string& inlj_index_col_name = "", JoinType join_type = INNER_JOIN,
+                           std::vector<std::shared_ptr<QueryExpr>> exprs = {},
+                           QueryExprEvaluator::SubqueryRunner subquery_runner = {},
+                           const QueryExprOuterContext* outer_context = nullptr) {
         (void)inlj_index_col_name;
         left_ = std::move(left);
         right_ = std::move(right);
@@ -407,7 +422,11 @@ public:
 
         isend = false;
         fed_conds_ = std::move(conds);
+        exprs_ = std::move(exprs);
+        subquery_runner_ = std::move(subquery_runner);
+        outer_context_ = outer_context;
         compile_conditions();
+        has_extended_condition_ = has_extended_condition_ || !exprs_.empty();
 
         // INLJ initialization
         if (!inlj_right_col.tab_name.empty()) {

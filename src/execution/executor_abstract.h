@@ -201,11 +201,19 @@ protected:
 
         if (cond.op == OP_IN) {
             bool matched = false;
+            bool has_null = false;
             for (const auto& rhs_val : cond.rhs_vals) {
+                if (rhs_val.is_null) {
+                    has_null = true;
+                    continue;
+                }
                 if (matches_simple(value_from_literal(rhs_val), OP_EQ)) {
                     matched = true;
                     break;
                 }
+            }
+            if (has_null && !matched) {
+                return false;
             }
             return cond.negated ? !matched : matched;
         }
@@ -214,6 +222,9 @@ protected:
             if (!cond.has_rhs_upper) {
                 throw InternalError("BETWEEN predicate is missing its upper bound");
             }
+            if (cond.rhs_val.is_null || cond.rhs_upper.is_null) {
+                return false;
+            }
             bool matches = matches_simple(value_from_literal(cond.rhs_val), OP_GE) &&
                            matches_simple(value_from_literal(cond.rhs_upper), OP_LE);
             return cond.negated ? !matches : matches;
@@ -221,6 +232,9 @@ protected:
 
         execution_scalar::CellValue rhs;
         if (cond.is_rhs_val) {
+            if (cond.rhs_val.is_null) {
+                return false;
+            }
             rhs = value_from_literal(cond.rhs_val);
         } else {
             ColMeta rhs_col_meta = get_col_offset(cond.rhs_col);

@@ -52,7 +52,9 @@ public:
     std::vector<bool> union_all;
     std::vector<QuerySetOperator> set_operators;
     std::vector<JoinType> join_types;
+    std::vector<std::string> join_right_tables;
     std::vector<std::vector<Condition>> join_on_conds;
+    std::vector<std::vector<std::shared_ptr<QueryExpr>>> join_on_exprs;
     // 表名
     std::vector<std::string> tables;
     std::vector<std::string> table_display_names;
@@ -85,6 +87,8 @@ private:
     TabCol check_column(const std::vector<ColMeta>& all_cols, TabCol target);
     void get_all_cols(const std::vector<std::string>& tab_names, std::vector<ColMeta>& all_cols);
     void get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv_conds, std::vector<Condition>& conds);
+    void append_clause(const ast::BinaryExpr* sv_cond, std::vector<Condition>& conds);
+    void get_legacy_clauses(const ast::Expr* expression, std::vector<Condition>& conds);
     void check_clause(const std::vector<std::string>& tab_names, std::vector<Condition>& conds);
     Value convert_sv_value(const ast::Value* sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);

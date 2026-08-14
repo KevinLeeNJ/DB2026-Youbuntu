@@ -346,7 +346,15 @@ std::unique_ptr<Query> clone_query(const Query& source) {
     result->union_all = source.union_all;
     result->set_operators = source.set_operators;
     result->join_types = source.join_types;
+    result->join_right_tables = source.join_right_tables;
     result->join_on_conds = source.join_on_conds;
+    result->join_on_exprs.resize(source.join_on_exprs.size());
+    for (size_t join_idx = 0; join_idx < source.join_on_exprs.size(); ++join_idx) {
+        for (const auto& expr : source.join_on_exprs[join_idx]) {
+            result->join_on_exprs[join_idx].push_back(
+                expr == nullptr ? nullptr : std::make_shared<QueryExpr>(clone_query_expr(*expr)));
+        }
+    }
     result->tables = source.tables;
     result->table_display_names = source.table_display_names;
     result->table_alias_to_name = source.table_alias_to_name;
@@ -787,6 +795,8 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     (void)context;
     bool has_outer_join = std::any_of(query->join_types.begin(), query->join_types.end(),
                                       [](JoinType type) { return type != INNER_JOIN; });
+    bool has_expression_join = std::any_of(query->join_on_exprs.begin(), query->join_on_exprs.end(),
+                                           [](const auto& exprs) { return !exprs.empty(); });
     std::map<std::string, std::vector<Condition>> table_filters;
     std::vector<Condition> join_conds;
     std::vector<Condition> post_join_conds;
@@ -803,7 +813,8 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     }
 
     std::map<std::string, std::set<TabCol>> needed_cols;
-    if (query->tables.size() > 1 && !query->has_select_star && !needs_aggregate_plan(*query)) {
+    if (query->tables.size() > 1 && !query->has_select_star && !needs_aggregate_plan(*query) &&
+        !has_expression_join) {
         for (const auto& item : query->select_items) {
             if (item.expr.type == QueryExprType::COLUMN) {
                 needed_cols[item.expr.col.tab_name].insert(item.expr.col);
@@ -875,7 +886,7 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
 
     std::vector<size_t> table_order(table_plans.size());
     std::iota(table_order.begin(), table_order.end(), 0);
-    if (!has_outer_join) {
+    if (!has_outer_join && !has_expression_join) {
         std::stable_sort(table_order.begin(), table_order.end(),
                          [&](size_t lhs, size_t rhs) { return table_access_scores[lhs] > table_access_scores[rhs]; });
     }
@@ -911,10 +922,41 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
     for (size_t i = 1; i < table_plans.size(); ++i) {
         const auto& next_table = plan_tables[i];
         std::vector<Condition> curr_join_conds;
-        if (has_outer_join && i - 1 < query->join_on_conds.size()) {
-            curr_join_conds = query->join_on_conds[i - 1];
-        } else {
+        std::vector<std::shared_ptr<QueryExpr>> curr_join_exprs;
+        size_t join_metadata_idx = query->join_right_tables.size();
+        if (has_outer_join || has_expression_join) {
+            if (!query->join_right_tables.empty()) {
+                auto metadata_pos =
+                    std::find(query->join_right_tables.begin(), query->join_right_tables.end(), next_table);
+                if (metadata_pos != query->join_right_tables.end()) {
+                    join_metadata_idx = static_cast<size_t>(metadata_pos - query->join_right_tables.begin());
+                }
+            } else if (i - 1 < query->join_on_conds.size() || i - 1 < query->join_on_exprs.size()) {
+                // Keep manually constructed Query objects compatible with the old parallel-vector contract.
+                join_metadata_idx = i - 1;
+            }
+        }
+        if (join_metadata_idx < query->join_on_conds.size()) {
+            curr_join_conds = query->join_on_conds[join_metadata_idx];
+        }
+        if (join_metadata_idx < query->join_on_exprs.size()) {
+            curr_join_exprs = query->join_on_exprs[join_metadata_idx];
+        }
+
+        if (!has_outer_join && !has_expression_join) {
             for (const auto& cond : join_conds) {
+                bool lhs_joined = joined_tables.find(cond.lhs_col.tab_name) != joined_tables.end();
+                bool rhs_joined = joined_tables.find(cond.rhs_col.tab_name) != joined_tables.end();
+                if ((lhs_joined && cond.rhs_col.tab_name == next_table) ||
+                    (rhs_joined && cond.lhs_col.tab_name == next_table)) {
+                    curr_join_conds.push_back(cond);
+                }
+            }
+        } else if (!has_outer_join) {
+            for (const auto& cond : join_conds) {
+                if (cond.is_join_on) {
+                    continue;
+                }
                 bool lhs_joined = joined_tables.find(cond.lhs_col.tab_name) != joined_tables.end();
                 bool rhs_joined = joined_tables.find(cond.rhs_col.tab_name) != joined_tables.end();
                 if ((lhs_joined && cond.rhs_col.tab_name == next_table) ||
@@ -928,11 +970,16 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
                              return condition_sort_key(lhs) < condition_sort_key(rhs);
                          });
 
+        JoinType join_type = INNER_JOIN;
+        if (join_metadata_idx < query->join_types.size()) {
+            join_type = query->join_types[join_metadata_idx];
+        }
+
         // INLJ detection: find if right table has index on a join column
         TabCol inlj_left_col;
         TabCol inlj_right_col;
         std::vector<std::string> inlj_index_col_names;
-        if (!curr_join_conds.empty()) {
+        if (join_type == INNER_JOIN && curr_join_exprs.empty() && !curr_join_conds.empty()) {
             TabMeta& next_tab = sm_manager_->db_.get_table(next_table);
             for (const auto& cond : curr_join_conds) {
                 if (cond.op != OP_EQ || cond.is_rhs_val) {
@@ -972,17 +1019,14 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
             right_plan = rebuild_right_plan_with_index(std::move(right_plan), std::move(new_scan));
         }
 
-        JoinType join_type = INNER_JOIN;
-        if (i - 1 < query->join_types.size()) {
-            join_type = query->join_types[i - 1];
-        }
-        if (!query->is_explain_analyze && curr_join_conds.empty() && join_type == INNER_JOIN) {
+        if (!query->is_explain_analyze && curr_join_conds.empty() && curr_join_exprs.empty() &&
+            join_type == INNER_JOIN) {
             joined = std::make_unique<JoinPlan>(T_NestLoop, std::move(right_plan), std::move(joined), curr_join_conds,
                                                 join_type);
         } else {
             auto join_plan =
                 std::make_unique<JoinPlan>(T_NestLoop, std::move(joined), std::move(right_plan), curr_join_conds,
-                                            join_type);
+                                            join_type, std::move(curr_join_exprs));
             if (!inlj_index_col_names.empty()) {
                 join_plan->inlj_left_col_ = inlj_left_col;
                 join_plan->inlj_right_col_ = inlj_right_col;
@@ -1164,6 +1208,13 @@ std::unique_ptr<Plan> Planner::generate_select_plan(std::unique_ptr<Query> query
             prepare_subquery_plans(cond.rhs_expr, context);
         }
     }
+    for (auto& join_exprs : query->join_on_exprs) {
+        for (auto& join_expr : join_exprs) {
+            if (join_expr != nullptr) {
+                prepare_subquery_plans(*join_expr, context);
+            }
+        }
+    }
     // 逻辑优化
     query = logical_optimization(std::move(query), context);
 
@@ -1298,6 +1349,11 @@ std::unique_ptr<Plan> Planner::do_planner(std::unique_ptr<Query> query, Context*
     }
     case ast::AstType::UpdateStmt: {
         auto x = static_cast<const ast::UpdateStmt*>(parse);
+        for (const auto& clause : query->set_clauses) {
+            if (clause.rhs_expr != nullptr) {
+                prepare_subquery_plans(*clause.rhs_expr, context);
+            }
+        }
         // update;
         // 生成表扫描方式
         std::unique_ptr<Plan> table_scan_executors;

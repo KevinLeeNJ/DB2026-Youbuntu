@@ -317,7 +317,33 @@ private:
         if (expr.predicate_op == OP_IN || expr.predicate_op == OP_BETWEEN) {
             TruthValue result = TruthValue::FALSE_VALUE;
             if (expr.predicate_op == OP_IN) {
+                std::vector<EvaluatedValue> subquery_values;
+                if (expr.rhs != nullptr) {
+                    if (expr.rhs->type != QueryExprType::SUBQUERY || expr.rhs->subquery_plan == nullptr ||
+                        subquery_runner_ == nullptr) {
+                        throw InternalError("IN predicate has an invalid subquery");
+                    }
+                    subquery_values =
+                        (*subquery_runner_)(*expr.rhs->subquery_plan, rec, cols_, nulls_);
+                }
+                auto compare_values = [&](const EvaluatedValue& value) {
+                    TruthValue current = compare_one(value, OP_EQ);
+                    if (current == TruthValue::TRUE_VALUE) {
+                        result = TruthValue::TRUE_VALUE;
+                    } else if (current == TruthValue::UNKNOWN) {
+                        result = TruthValue::UNKNOWN;
+                    }
+                };
+                for (const auto& value : subquery_values) {
+                    compare_values(value);
+                    if (result == TruthValue::TRUE_VALUE) {
+                        break;
+                    }
+                }
                 for (const auto& value : expr.rhs_values) {
+                    if (result == TruthValue::TRUE_VALUE) {
+                        break;
+                    }
                     TruthValue current = compare_one(evaluate(*value, rec), OP_EQ);
                     if (current == TruthValue::TRUE_VALUE) {
                         result = TruthValue::TRUE_VALUE;

@@ -72,6 +72,9 @@ public:
         for (size_t i = 0; i < values_.size(); i++) {
             auto& col = tab_.cols[i];
             auto& val = values_[i];
+            if (val.is_null) {
+                throw RMDBError("INSERT cannot store NULL values");
+            }
             if (col.type != val.type) {
                 if (!can_cast(col.type, val.type)) {
                     throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
@@ -223,8 +226,24 @@ public:
         if (target_col_names_.empty() && source_->cols().size() != table.cols.size()) {
             throw InvalidValueCountError();
         }
-        if (!target_col_names_.empty() && target_col_names_.size() != source_->cols().size()) {
+        if (!target_col_names_.empty() &&
+            (target_col_names_.size() != table.cols.size() || target_col_names_.size() != source_->cols().size())) {
             throw InvalidValueCountError();
+        }
+        if (!target_col_names_.empty()) {
+            for (size_t i = 0; i < target_col_names_.size(); ++i) {
+                for (size_t j = 0; j < i; ++j) {
+                    if (target_col_names_[i] == target_col_names_[j]) {
+                        throw RMDBError("Duplicate INSERT target column: " + target_col_names_[i]);
+                    }
+                }
+                auto target = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
+                    return col.name == target_col_names_[i];
+                });
+                if (target == table.cols.end()) {
+                    throw ColumnNotFoundError(target_col_names_[i]);
+                }
+            }
         }
 
         for (; !source_->is_end(); source_->nextTuple()) {

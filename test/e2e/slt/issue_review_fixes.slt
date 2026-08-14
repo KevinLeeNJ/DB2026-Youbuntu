@@ -1,0 +1,351 @@
+# issue_review_fixes.slt — regression coverage for confirmed review findings
+
+statement ok
+CREATE TABLE review_people (id INT, score INT, ratio FLOAT);
+
+statement ok
+INSERT INTO review_people VALUES (1, 10, 1.5);
+
+statement ok
+INSERT INTO review_people VALUES (2, 20, 2.5);
+
+statement ok
+UPDATE review_people SET score = CASE WHEN id = 1 THEN 30 ELSE 40 END;
+
+query
+SELECT id, score FROM review_people ORDER BY id;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |               30 |
+|                2 |               40 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, score + 1 AS next_score FROM review_people ORDER BY id;
+----
++------------------+------------------+
+|               id |       next_score |
++------------------+------------------+
+|                1 |               31 |
+|                2 |               41 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, ratio + score AS total FROM review_people ORDER BY id;
+----
++------------------+------------------+
+|               id |            total |
++------------------+------------------+
+|                1 |        31.500000 |
+|                2 |        42.500000 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, 1 + 2 * 3 AS value FROM review_people WHERE id = 1;
+----
++------------------+------------------+
+|               id |            value |
++------------------+------------------+
+|                1 |                7 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE review_expr_source (value INT);
+
+statement ok
+INSERT INTO review_expr_source VALUES (77);
+
+statement ok
+CREATE TABLE review_expr_target (id INT, score INT);
+
+statement ok
+INSERT INTO review_expr_target VALUES (1, 0);
+
+statement ok
+INSERT INTO review_expr_target VALUES (2, 0);
+
+statement ok
+UPDATE review_expr_target SET score = id + 1;
+
+query
+SELECT id, score FROM review_expr_target ORDER BY id;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |                2 |
+|                2 |                3 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+UPDATE review_expr_target SET score = (SELECT value FROM review_expr_source);
+
+query
+SELECT id, score FROM review_expr_target ORDER BY id;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |               77 |
+|                2 |               77 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE review_scalar_source (first_value INT, second_value INT);
+
+statement ok
+INSERT INTO review_scalar_source VALUES (11, 22);
+
+statement error
+UPDATE review_expr_target SET score = (SELECT first_value, second_value FROM review_scalar_source);
+
+query
+SELECT id, score FROM review_expr_target ORDER BY id;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |               77 |
+|                2 |               77 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE review_insert (id INT, score INT);
+
+statement ok
+INSERT INTO review_insert (score, id) VALUES (90, 7);
+
+query
+SELECT id, score FROM review_insert;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                7 |               90 |
++------------------+------------------+
+Total record(s): 1
+
+statement error
+SELECT id FROM review_people WHERE id IN (SELECT id, score FROM review_people);
+
+statement ok
+CREATE TABLE review_null (id INT, score INT);
+
+statement ok
+INSERT INTO review_null VALUES (1, 0);
+
+statement ok
+INSERT INTO review_null VALUES (2, 5);
+
+query
+SELECT id FROM review_null WHERE score = NULL ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
++------------------+
+Total record(s): 0
+
+query
+SELECT id FROM review_null WHERE score != NULL ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
++------------------+
+Total record(s): 0
+
+statement ok
+CREATE TABLE review_ids (id INT);
+
+statement ok
+INSERT INTO review_ids VALUES (2);
+
+statement ok
+INSERT INTO review_ids VALUES (1);
+
+query
+SELECT id FROM review_people WHERE id IN (SELECT id FROM review_ids) ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+query
+SELECT id FROM review_people WHERE score BETWEEN id AND score ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
+|                2 |
++------------------+
+Total record(s): 2
+
+statement error
+SELECT id FROM review_people WHERE score NOT > ANY (SELECT score FROM review_people);
+
+statement ok
+CREATE TABLE review_target (id INT, score INT, marker INT);
+
+statement error
+INSERT INTO review_target (id, score) SELECT id, score FROM review_people;
+
+statement ok
+CREATE TABLE review_left (id INT);
+
+statement ok
+INSERT INTO review_left VALUES (1);
+
+statement ok
+INSERT INTO review_left VALUES (2);
+
+statement ok
+CREATE TABLE review_right (id INT);
+
+statement ok
+INSERT INTO review_right VALUES (2);
+
+query
+SELECT l.id AS left_id, r.id AS right_id
+FROM review_left AS l LEFT JOIN review_right AS r ON l.id + 0 = r.id
+ORDER BY l.id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |             NULL |
+|                2 |                2 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE review_join_left (id INT);
+
+statement ok
+INSERT INTO review_join_left VALUES (1);
+
+statement ok
+INSERT INTO review_join_left VALUES (2);
+
+statement ok
+CREATE TABLE review_join_right (id INT, marker INT);
+
+statement ok
+INSERT INTO review_join_right VALUES (1, 1);
+
+statement ok
+INSERT INTO review_join_right VALUES (2, 99);
+
+query
+SELECT l.id AS left_id, r.id AS right_id
+FROM review_join_left AS l JOIN review_join_right AS r ON l.id + 0 = r.id
+WHERE l.id = r.marker
+ORDER BY l.id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |                1 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE review_join_a (id INT);
+
+statement ok
+INSERT INTO review_join_a VALUES (1);
+
+statement ok
+INSERT INTO review_join_a VALUES (2);
+
+statement ok
+CREATE TABLE review_join_b (id INT);
+
+statement ok
+INSERT INTO review_join_b VALUES (1);
+
+statement ok
+INSERT INTO review_join_b VALUES (2);
+
+statement ok
+CREATE TABLE review_join_c (id INT);
+
+statement ok
+INSERT INTO review_join_c VALUES (2);
+
+query
+SELECT a.id AS a_id, b.id AS b_id, c.id AS c_id
+FROM review_join_a AS a, review_join_b AS b
+JOIN review_join_c AS c ON b.id + 0 = c.id
+WHERE a.id = b.id
+ORDER BY a.id;
+----
++------------------+------------------+------------------+
+|             a_id |             b_id |             c_id |
++------------------+------------------+------------------+
+|                2 |                2 |                2 |
++------------------+------------------+------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE review_union_insert (id INT, score INT);
+
+statement ok
+INSERT INTO review_union_insert
+SELECT id, score FROM review_people
+UNION
+SELECT id, score FROM review_expr_target;
+
+query
+SELECT id, score FROM review_union_insert ORDER BY id, score;
+----
++------------------+------------------+
+|               id |            score |
++------------------+------------------+
+|                1 |               30 |
+|                1 |               77 |
+|                2 |               40 |
+|                2 |               77 |
++------------------+------------------+
+Total record(s): 4
+
+query
+SELECT l.id AS left_id, r.id AS right_id
+FROM review_left AS l JOIN review_right AS r
+ON EXISTS (SELECT 1 FROM review_ids WHERE review_ids.id = l.id)
+ORDER BY l.id;
+----
++------------------+------------------+
+|          left_id |         right_id |
++------------------+------------------+
+|                1 |                2 |
+|                2 |                2 |
++------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE INDEX review_right(id);
+
+query
+EXPLAIN ANALYZE SELECT l.id, r.id FROM review_left AS l LEFT JOIN review_right AS r ON l.id = r.id;
+----
+Project(columns=[l.id, r.id], rows=2)
+	Join(tables=[review_left, review_right], condition=[l.id=r.id], rows=2)
+		Project(columns=[l.id], rows=2)
+			Scan(table=review_left, type=SeqScan, rows=2)
+		Project(columns=[r.id], rows=1)
+			Scan(table=review_right, type=SeqScan, rows=1)

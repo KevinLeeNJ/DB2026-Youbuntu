@@ -55,11 +55,7 @@ private:
             }
             return expr.value.type == TYPE_FLOAT ? sizeof(double) : sizeof(int);
         case QueryExprType::ARITHMETIC:
-            return (expr.lhs != nullptr && expr.rhs != nullptr &&
-                    (expr.lhs->type == QueryExprType::VALUE && expr.lhs->value.type == TYPE_FLOAT ||
-                     expr.rhs->type == QueryExprType::VALUE && expr.rhs->value.type == TYPE_FLOAT))
-                       ? sizeof(double)
-                       : sizeof(int);
+            return expression_type(expr, source_cols) == TYPE_FLOAT ? sizeof(double) : sizeof(int);
         case QueryExprType::LOGICAL:
         case QueryExprType::PREDICATE:
             return sizeof(int);

@@ -132,6 +132,33 @@ TEST(ParserTest, ParsesCompoundAssignmentUpdateSetClauses) {
     EXPECT_DOUBLE_EQ(bonus_delta->val, 0.5);
 }
 
+TEST(ParserTest, ParsesCompleteArithmeticRhsStartingWithAnotherColumn) {
+    auto parsed = parse_ok("update score_tab set score = ratio * 2, ratio = score / 4;");
+    auto update = as_node<ast::UpdateStmt>(parsed);
+    ASSERT_NE(update, nullptr);
+    ASSERT_EQ(update->set_clauses.size(), 2);
+
+    const auto* multiply = update->set_clauses[0].get();
+    ASSERT_NE(multiply->rhs_expr, nullptr);
+    const auto* multiply_expr = dynamic_cast<const ast::ArithmeticExpr*>(multiply->rhs_expr.get());
+    ASSERT_NE(multiply_expr, nullptr);
+    EXPECT_EQ(multiply_expr->op, ast::ArithmeticOp::MUL);
+    EXPECT_EQ(multiply_expr->lhs->type, ast::AstType::Col);
+    const auto* multiply_rhs = dynamic_cast<const ast::IntLit*>(multiply_expr->rhs.get());
+    ASSERT_NE(multiply_rhs, nullptr);
+    EXPECT_EQ(multiply_rhs->val, 2);
+
+    const auto* divide = update->set_clauses[1].get();
+    ASSERT_NE(divide->rhs_expr, nullptr);
+    const auto* divide_expr = dynamic_cast<const ast::ArithmeticExpr*>(divide->rhs_expr.get());
+    ASSERT_NE(divide_expr, nullptr);
+    EXPECT_EQ(divide_expr->op, ast::ArithmeticOp::DIV);
+    EXPECT_EQ(divide_expr->lhs->type, ast::AstType::Col);
+    const auto* divide_rhs = dynamic_cast<const ast::IntLit*>(divide_expr->rhs.get());
+    ASSERT_NE(divide_rhs, nullptr);
+    EXPECT_EQ(divide_rhs->val, 4);
+}
+
 TEST(ParserTest, FoldsConstantArithmeticExpressions) {
     // 括号常量算术:折叠成 IntLit,display_text 保留原始表达式文本
     {
@@ -191,11 +218,19 @@ TEST(ParserTest, FoldsConstantArithmeticExpressions) {
         auto sel = as_node<ast::SelectStmt>(parsed);
         EXPECT_EQ(sel->conds.front()->rhs->type, ast::AstType::StringLit);
     }
-    // 除零、溢出、非数值、列参与算术 均应解析失败
+    // 除零、溢出、字面量非数值应解析失败；列参与算术应生成表达式节点
     expect_parse_error("select * from t where id >= (100/0);");
     expect_parse_error("select * from t where id >= (2000000000+2000000000);");
     expect_parse_error("select * from t where id >= ('a'-1);");
-    expect_parse_error("select * from t where id >= (col-20);");
+    {
+        auto parsed = parse_ok("select * from t where id >= (col-20);");
+        auto sel = as_node<ast::SelectStmt>(parsed);
+        auto arithmetic = dynamic_cast<const ast::ArithmeticExpr*>(sel->conds.front()->rhs.get());
+        ASSERT_NE(arithmetic, nullptr);
+        EXPECT_EQ(arithmetic->op, ast::ArithmeticOp::SUB);
+        EXPECT_EQ(arithmetic->lhs->type, ast::AstType::Col);
+        EXPECT_EQ(arithmetic->rhs->type, ast::AstType::IntLit);
+    }
 }
 
 TEST(ParserTest, ParsesRushdbCompatibleUpdateSetOperators) {
@@ -283,6 +318,22 @@ TEST(ParserTest, ParsesSelectFeaturesUsedByCompetition) {
     EXPECT_EQ(aggregate_node->limit, 10);
 }
 
+TEST(ParserTest, ParsesExistsJoinCondition) {
+    try {
+        auto parsed = ast::parse_sql(
+            "select l.id, r.id from review_left as l join review_right as r "
+            "on exists (select 1 from review_ids where review_ids.id = l.id) order by l.id;");
+        ASSERT_NE(parsed, nullptr);
+        auto select = as_node<ast::SelectStmt>(parsed);
+        ASSERT_NE(select, nullptr);
+        ASSERT_EQ(select->jointree.size(), 1);
+        ASSERT_EQ(select->jointree[0]->conds.size(), 1);
+        EXPECT_EQ(select->jointree[0]->conds[0]->op, ast::SV_OP_EXISTS);
+    } catch (const std::exception& error) {
+        FAIL() << error.what();
+    }
+}
+
 TEST(ParserTest, ParsesUnionWrapperAndExplainAnalyze) {
     auto union_wrapper = parse_ok("select * from (select a from t1 union select a from t2) as u order by a;");
     auto union_node = as_node<ast::SelectFromUnionStmt>(union_wrapper);
@@ -314,7 +365,12 @@ TEST(ParserTest, RejectsMalformedStatements) {
     expect_parse_error("select from tb;");
     expect_parse_error("insert into tb values (1, );");
     expect_parse_error("set enable_nestloop = maybe;");
-    expect_parse_error("update tb set a = b where x = 1;");
+    auto different_column = parse_ok("update tb set a = b where x = 1;");
+    auto different_column_update = as_node<ast::UpdateStmt>(different_column);
+    ASSERT_NE(different_column_update, nullptr);
+    ASSERT_EQ(different_column_update->set_clauses.size(), 1);
+    ASSERT_NE(different_column_update->set_clauses[0]->rhs_expr, nullptr);
+    EXPECT_EQ(different_column_update->set_clauses[0]->rhs_expr->type, ast::AstType::Col);
     EXPECT_EQ(parse_ok("update tb set a = a where x = 1;")->type, ast::AstType::UpdateStmt);
     expect_parse_error("update tb set a = b * 'bad' where x = 1;");
 }

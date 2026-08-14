@@ -107,8 +107,23 @@ void resolve_aliases(Query& query) {
             resolve_alias(cond.rhs_col, query);
         }
     }
+    for (auto& join_conds : query.join_on_conds) {
+        for (auto& cond : join_conds) {
+            resolve_alias(cond.lhs_col, query);
+            if (!cond.is_rhs_val && cond.op != OP_IN && cond.op != OP_BETWEEN) {
+                resolve_alias(cond.rhs_col, query);
+            }
+        }
+    }
     if (query.where_expr != nullptr) {
         resolve_alias(*query.where_expr, query);
+    }
+    for (auto& join_exprs : query.join_on_exprs) {
+        for (auto& join_expr : join_exprs) {
+            if (join_expr != nullptr) {
+                resolve_alias(*join_expr, query);
+            }
+        }
     }
 }
 
@@ -166,6 +181,13 @@ void resolve_local_unqualified_columns(Query& query, const std::vector<ColMeta>&
     if (query.where_expr != nullptr) {
         resolve_local_unqualified_columns(*query.where_expr, local_cols);
     }
+    for (auto& join_exprs : query.join_on_exprs) {
+        for (auto& join_expr : join_exprs) {
+            if (join_expr != nullptr) {
+                resolve_local_unqualified_columns(*join_expr, local_cols);
+            }
+        }
+    }
 }
 
 bool is_outer_column(const ast::Col* column, const std::vector<ColMeta>& outer_cols,
@@ -212,7 +234,17 @@ bool is_legacy_condition_expression(const ast::Expr* expression, const std::vect
                     [](const auto& value) { return dynamic_cast<const ast::Value*>(value.get()) != nullptr; })) {
         return false;
     }
+    if (std::any_of(condition->rhs_list.begin(), condition->rhs_list.end(), [](const auto& value) {
+            auto literal = dynamic_cast<const ast::Value*>(value.get());
+            return literal != nullptr && literal->type == ast::AstType::NullLit;
+        })) {
+        return false;
+    }
     if (condition->rhs_upper != nullptr && dynamic_cast<const ast::Value*>(condition->rhs_upper.get()) == nullptr) {
+        return false;
+    }
+    if (auto rhs_value = dynamic_cast<const ast::Value*>(condition->rhs.get()); rhs_value != nullptr &&
+        rhs_value->type == ast::AstType::NullLit) {
         return false;
     }
     if (condition->rhs == nullptr) {
@@ -324,8 +356,12 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
                 if (auto value = dynamic_cast<const ast::Value*>(set_clause->rhs_expr.get()); value != nullptr) {
                     clause.rhs = convert_sv_value(value);
                 } else {
-                    clause.rhs_expr = std::make_shared<QueryExpr>(
-                        convert_ast_expr(set_clause->rhs_expr.get(), "UPDATE", all_cols, {}));
+                    auto rhs_expr = convert_ast_expr(set_clause->rhs_expr.get(), "UPDATE", all_cols, {});
+                    if (rhs_expr.type == QueryExprType::SUBQUERY &&
+                        get_query_output_metas(*rhs_expr.subquery).size() != 1) {
+                        throw RMDBError("Scalar subquery must return exactly one column");
+                    }
+                    clause.rhs_expr = std::make_shared<QueryExpr>(std::move(rhs_expr));
                 }
             }
             clause.lhs = {.tab_name = x->tab_name, .col_name = set_clause->col_name};
@@ -366,14 +402,62 @@ std::unique_ptr<Query> Analyze::do_analyze(std::unique_ptr<ast::TreeNode> parse)
         if (!sm_manager_->db_.is_table(x->tab_name)) {
             throw TableNotFoundError(x->tab_name);
         }
+        const auto& table = sm_manager_->db_.get_table(x->tab_name);
         query->insert_col_names = x->col_names;
         if (x->select != nullptr) {
             query->insert_query = std::shared_ptr<Query>(analyze_subquery(x->select.get(), {}, {}));
+            const auto source_cols = get_query_output_metas(*query->insert_query);
+            if (query->insert_col_names.empty()) {
+                if (source_cols.size() != table.cols.size()) {
+                    throw InvalidValueCountError();
+                }
+            } else {
+                if (query->insert_col_names.size() != table.cols.size() ||
+                    query->insert_col_names.size() != source_cols.size()) {
+                    throw InvalidValueCountError();
+                }
+                std::unordered_set<std::string> seen;
+                for (const auto& name : query->insert_col_names) {
+                    if (!seen.insert(name).second) {
+                        throw RMDBError("Duplicate INSERT target column: " + name);
+                    }
+                    if (std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& col) {
+                            return col.name == name;
+                        }) == table.cols.end()) {
+                        throw ColumnNotFoundError(name);
+                    }
+                }
+            }
             break;
         }
-        query->values.reserve(x->vals.size());
-        for (auto& sv_val : x->vals) {
-            query->values.push_back(convert_sv_value(sv_val.get()));
+        if (x->col_names.empty()) {
+            if (x->vals.size() != table.cols.size()) {
+                throw InvalidValueCountError();
+            }
+            query->values.reserve(x->vals.size());
+            for (const auto& sv_val : x->vals) {
+                query->values.push_back(convert_sv_value(sv_val.get()));
+            }
+        } else {
+            if (x->col_names.size() != table.cols.size() || x->col_names.size() != x->vals.size()) {
+                throw InvalidValueCountError();
+            }
+            query->values.resize(table.cols.size());
+            std::vector<bool> filled(table.cols.size(), false);
+            for (size_t value_idx = 0; value_idx < x->col_names.size(); ++value_idx) {
+                auto col = std::find_if(table.cols.begin(), table.cols.end(), [&](const ColMeta& meta) {
+                    return meta.name == x->col_names[value_idx];
+                });
+                if (col == table.cols.end()) {
+                    throw ColumnNotFoundError(x->col_names[value_idx]);
+                }
+                size_t col_idx = static_cast<size_t>(col - table.cols.begin());
+                if (filled[col_idx]) {
+                    throw RMDBError("Duplicate INSERT target column: " + x->col_names[value_idx]);
+                }
+                filled[col_idx] = true;
+                query->values[col_idx] = convert_sv_value(x->vals[value_idx].get());
+            }
         }
         break;
     }
@@ -441,21 +525,41 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
                 convert_ast_expr(x->where_expr.get(), "WHERE", scope_cols, query->table_alias_to_name));
         }
     }
-    get_clause(x->conds, query->conds);
+    query->conds.clear();
     query->join_types.reserve(x->jointree.size());
-    size_t join_cond_offset = 0;
+    query->join_right_tables.reserve(x->jointree.size());
+    query->join_on_conds.reserve(x->jointree.size());
+    query->join_on_exprs.reserve(x->jointree.size());
     for (const auto& join : x->jointree) {
         query->join_types.push_back(join->join_type);
-        for (size_t cond_idx = 0; cond_idx < join->conds.size(); ++cond_idx) {
-            if (join_cond_offset >= query->conds.size()) {
-                throw InternalError("Join condition metadata does not match SELECT conditions");
+        query->join_right_tables.push_back(join->right.table_name);
+
+        std::vector<Condition> join_conds;
+        std::vector<std::shared_ptr<QueryExpr>> join_exprs;
+        for (const auto& raw_condition : join->conds) {
+            if (is_legacy_condition_expression(raw_condition.get(), outer_cols, outer_aliases)) {
+                append_clause(raw_condition.get(), join_conds);
+                continue;
             }
-            query->conds[join_cond_offset].is_join_on = true;
-            ++join_cond_offset;
+            join_exprs.push_back(std::make_shared<QueryExpr>(
+                convert_ast_expr(raw_condition.get(), "JOIN ON", scope_cols, query->table_alias_to_name)));
         }
+        for (auto& condition : join_conds) {
+            condition.is_join_on = true;
+            query->conds.push_back(condition);
+        }
+        query->join_on_conds.push_back(std::move(join_conds));
+        query->join_on_exprs.push_back(std::move(join_exprs));
     }
+
+    std::vector<Condition> where_conds;
+    get_legacy_clauses(x->where_expr.get(), where_conds);
+    query->conds.insert(query->conds.end(), where_conds.begin(), where_conds.end());
     resolve_aliases(*query);
     resolve_local_condition_columns(query->conds, all_cols);
+    for (auto& join_conds : query->join_on_conds) {
+        resolve_local_condition_columns(join_conds, all_cols);
+    }
     query->conds.erase(std::remove_if(query->conds.begin(), query->conds.end(), [&](const Condition& cond) {
                            auto is_local_table = [&](const std::string& table) {
                                return std::find(query->tables.begin(), query->tables.end(), table) != query->tables.end();
@@ -474,13 +578,13 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
                        }),
                        query->conds.end());
     check_clause(query->tables, query->conds);
-    query->join_on_conds.reserve(x->jointree.size());
-    join_cond_offset = 0;
-    for (const auto& join : x->jointree) {
-        query->join_on_conds.emplace_back();
-        query->join_on_conds.back().reserve(join->conds.size());
-        for (size_t cond_idx = 0; cond_idx < join->conds.size(); ++cond_idx) {
-            query->join_on_conds.back().push_back(query->conds[join_cond_offset++]);
+    for (auto& join_conds : query->join_on_conds) {
+        check_clause(query->tables, join_conds);
+    }
+    for (auto& join_exprs : query->join_on_exprs) {
+        for (auto& join_expr : join_exprs) {
+            resolve_local_unqualified_columns(*join_expr, visible_cols);
+            normalize_query_expr(*join_expr, scope_cols);
         }
     }
     for (size_t join_idx = 0; join_idx < x->jointree.size(); ++join_idx) {
@@ -522,6 +626,10 @@ std::unique_ptr<Query> Analyze::analyze_select_stmt(
 }
 
 std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query) {
+    if (query.is_union) {
+        return query.union_cols;
+    }
+
     std::vector<ColMeta> all_cols;
     get_all_cols(query.tables, all_cols);
 
@@ -806,6 +914,11 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
         if (binary->rhs != nullptr) {
             result.rhs = std::make_shared<QueryExpr>(
                 convert_ast_expr(binary->rhs.get(), context_name, outer_cols, outer_aliases));
+            if ((result.predicate_op == OP_IN || result.quantifier != QueryQuantifier::NONE) &&
+                result.rhs->type == QueryExprType::SUBQUERY &&
+                get_query_output_metas(*result.rhs->subquery).size() != 1) {
+                throw RMDBError("Subquery predicate must return exactly one column");
+            }
         }
         if (binary->rhs_upper != nullptr) {
             result.rhs_upper = std::make_shared<QueryExpr>(
@@ -843,6 +956,10 @@ std::unique_ptr<Query> Analyze::analyze_subquery(const ast::TreeNode* root,
         return analyze_select_from_union_stmt(static_cast<const ast::SelectFromUnionStmt*>(root), nullptr, outer_cols,
                                               outer_aliases);
     }
+    if (root->type == ast::AstType::UnionStmt) {
+        return analyze_union_stmt(static_cast<const ast::UnionStmt*>(root), "", {}, false, 0, false, 0, nullptr,
+                                  outer_cols, outer_aliases);
+    }
     throw RMDBError("Subquery must be a SELECT statement");
 }
 
@@ -862,48 +979,90 @@ void Analyze::get_clause(const std::vector<std::unique_ptr<ast::BinaryExpr>>& sv
     conds.clear();
     conds.reserve(sv_conds.size());
     for (const auto& expr : sv_conds) {
-        if (dynamic_cast<const ast::Col*>(expr->lhs.get()) == nullptr) {
-            continue;
-        }
-        Condition cond;
-        cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
-        cond.op = convert_sv_comp_op(expr->op);
-        cond.negated = expr->negated;
+        append_clause(expr.get(), conds);
+    }
+}
 
-        if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL || cond.op == OP_EXISTS) {
-            conds.push_back(cond);
-            continue;
+void Analyze::append_clause(const ast::BinaryExpr* expr, std::vector<Condition>& conds) {
+    if (expr == nullptr || dynamic_cast<const ast::Col*>(expr->lhs.get()) == nullptr) {
+        return;
+    }
+    if (expr->op != ast::SV_OP_IS_NULL && expr->op != ast::SV_OP_IS_NOT_NULL && expr->op != ast::SV_OP_EXISTS) {
+        if (std::any_of(expr->rhs_list.begin(), expr->rhs_list.end(), [](const auto& raw_value) {
+                auto value = dynamic_cast<const ast::Value*>(raw_value.get());
+                return value == nullptr || value->type == ast::AstType::NullLit;
+            })) {
+            return;
         }
+        if (expr->rhs_upper != nullptr && dynamic_cast<const ast::Value*>(expr->rhs_upper.get()) == nullptr) {
+            return;
+        }
+        if (expr->rhs != nullptr && dynamic_cast<const ast::Value*>(expr->rhs.get()) == nullptr &&
+            dynamic_cast<const ast::Col*>(expr->rhs.get()) == nullptr) {
+            return;
+        }
+        if (auto rhs_value = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_value != nullptr &&
+            rhs_value->type == ast::AstType::NullLit) {
+            return;
+        }
+    }
 
-        for (const auto& raw_value : expr->rhs_list) {
-            auto rhs_val = dynamic_cast<const ast::Value*>(raw_value.get());
-            if (rhs_val == nullptr) {
-                throw RMDBError("WHERE IN list only supports scalar values");
-            }
-            cond.rhs_vals.push_back(convert_sv_value(rhs_val));
-        }
+    Condition cond;
+    cond.lhs_col = extract_ast_column(expr->lhs, "WHERE");
+    cond.op = convert_sv_comp_op(expr->op);
+    cond.negated = expr->negated;
 
-        if (!cond.rhs_vals.empty()) {
-            cond.is_rhs_val = true;
-        } else if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
-            cond.is_rhs_val = true;
-            cond.rhs_val = convert_sv_value(rhs_val);
-            cond.rhs_display = rhs_val->display_text;
-        } else if (auto rhs_col = dynamic_cast<const ast::Col*>(expr->rhs.get()); rhs_col != nullptr) {
-            cond.is_rhs_val = false;
-            cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
-        } else {
-            throw RMDBError("WHERE clause does not allow aggregate expressions");
-        }
-        if (expr->rhs_upper != nullptr) {
-            auto rhs_upper = dynamic_cast<const ast::Value*>(expr->rhs_upper.get());
-            if (rhs_upper == nullptr) {
-                throw RMDBError("WHERE BETWEEN bounds only support scalar values");
-            }
-            cond.rhs_upper = convert_sv_value(rhs_upper);
-            cond.has_rhs_upper = true;
-        }
+    if (cond.op == OP_IS_NULL || cond.op == OP_IS_NOT_NULL || cond.op == OP_EXISTS) {
         conds.push_back(cond);
+        return;
+    }
+
+    for (const auto& raw_value : expr->rhs_list) {
+        auto rhs_val = dynamic_cast<const ast::Value*>(raw_value.get());
+        if (rhs_val == nullptr) {
+            return;
+        }
+        cond.rhs_vals.push_back(convert_sv_value(rhs_val));
+    }
+
+    if (!cond.rhs_vals.empty()) {
+        cond.is_rhs_val = true;
+    } else if (auto rhs_val = dynamic_cast<const ast::Value*>(expr->rhs.get()); rhs_val != nullptr) {
+        cond.is_rhs_val = true;
+        cond.rhs_val = convert_sv_value(rhs_val);
+        cond.rhs_display = rhs_val->display_text;
+    } else if (auto rhs_col = dynamic_cast<const ast::Col*>(expr->rhs.get()); rhs_col != nullptr) {
+        cond.is_rhs_val = false;
+        cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
+    } else {
+        return;
+    }
+    if (expr->rhs_upper != nullptr) {
+        auto rhs_upper = dynamic_cast<const ast::Value*>(expr->rhs_upper.get());
+        if (rhs_upper == nullptr) {
+            return;
+        }
+        cond.rhs_upper = convert_sv_value(rhs_upper);
+        cond.has_rhs_upper = true;
+    }
+    conds.push_back(cond);
+}
+
+void Analyze::get_legacy_clauses(const ast::Expr* expression, std::vector<Condition>& conds) {
+    if (expression == nullptr) {
+        return;
+    }
+    if (auto logical = dynamic_cast<const ast::LogicalExpr*>(expression); logical != nullptr) {
+        if (logical->op != ast::LogicalOp::AND) {
+            return;
+        }
+        for (const auto& operand : logical->operands) {
+            get_legacy_clauses(operand.get(), conds);
+        }
+        return;
+    }
+    if (auto binary = dynamic_cast<const ast::BinaryExpr*>(expression); binary != nullptr) {
+        append_clause(binary, conds);
     }
 }
 

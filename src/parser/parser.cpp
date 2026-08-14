@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "lexer.h"
 
+#include <algorithm>
 #include <climits>
 #include <iterator>
 #include <limits>
@@ -299,7 +300,7 @@ private:
             expect(TokenType::LPAREN, "expected '(' before values");
             auto values = parse_value_list();
             expect(TokenType::RPAREN, "expected ')' after values");
-            return std::make_unique<InsertStmt>(std::move(table), std::move(values));
+            return std::make_unique<InsertStmt>(std::move(table), std::move(column_names), std::move(values));
         }
         if (match(TokenType::DELETE)) {
             expect(TokenType::FROM, "expected FROM after DELETE");
@@ -630,6 +631,9 @@ private:
         auto lhs = parse_value_expr();
         bool negated = match(TokenType::NOT);
         if (match(TokenType::IS)) {
+            if (negated) {
+                error("expected LIKE, IN, or BETWEEN after NOT");
+            }
             bool is_not = match(TokenType::NOT);
             expect(TokenType::NULL_KW, "expected NULL after IS");
             return std::make_unique<BinaryExpr>(std::move(lhs), is_not ? SV_OP_IS_NOT_NULL : SV_OP_IS_NULL, nullptr);
@@ -642,6 +646,12 @@ private:
             expect(TokenType::LPAREN, "expected '(' after IN");
             if (check(TokenType::RPAREN)) {
                 error("expected value in IN list");
+            }
+            if (check(TokenType::SELECT)) {
+                auto query = parse_query_chain();
+                expect(TokenType::RPAREN, "expected ')' after IN subquery");
+                result->rhs = std::make_unique<SubqueryExpr>(std::move(query));
+                return result;
             }
             result->rhs_list.push_back(parse_value_expr());
             while (match(TokenType::COMMA)) {
@@ -658,6 +668,9 @@ private:
         }
         SvCompOp op;
         if (try_parse_op(op)) {
+            if (negated) {
+                error("expected LIKE, IN, or BETWEEN after NOT");
+            }
             auto result = std::make_unique<BinaryExpr>(std::move(lhs), op, nullptr);
             if (match(TokenType::ANY)) {
                 result->quantifier = Quantifier::ANY;
@@ -739,41 +752,48 @@ private:
     }
 
     std::unique_ptr<Expr> parse_value_expr() {
-        auto expression = parse_value_primary();
-        while (check(TokenType::PLUS) || check(TokenType::MINUS) || check(TokenType::STAR) ||
-               check(TokenType::SLASH)) {
-            TokenType op = current_.type;
-            advance();
-            auto rhs = parse_value_primary();
-            ArithmeticOp arithmetic_op;
-            switch (op) {
-            case TokenType::PLUS:
-                arithmetic_op = ArithmeticOp::ADD;
-                break;
-            case TokenType::MINUS:
-                arithmetic_op = ArithmeticOp::SUB;
-                break;
-            case TokenType::STAR:
-                arithmetic_op = ArithmeticOp::MUL;
-                break;
-            case TokenType::SLASH:
-                arithmetic_op = ArithmeticOp::DIV;
-                break;
-            default:
-                error("expected arithmetic operator");
-            }
-            auto is_numeric_literal = [](const Expr* value) {
-                return value != nullptr && (value->type == AstType::IntLit || value->type == AstType::FloatLit);
-            };
-            if (!is_numeric_literal(expression.get()) || !is_numeric_literal(rhs.get())) {
-                error("arithmetic on non-numeric constant");
-            }
-            expression = std::make_unique<ArithmeticExpr>(arithmetic_op, std::move(expression), std::move(rhs));
+        const char* start = current_.text.data();
+        auto expression = parse_arithmetic_additive();
+        if (auto value = dynamic_cast<Value*>(expression.get()); value != nullptr) {
+            const char* end = prev_token_.text.data() + prev_token_.text.size();
+            value->display_text = std::string(start, static_cast<size_t>(end - start));
         }
         return expression;
     }
 
-    std::unique_ptr<Expr> parse_value_primary() {
+    std::unique_ptr<Expr> parse_arithmetic_additive(std::unique_ptr<Expr> expression = nullptr) {
+        expression = parse_arithmetic_multiplicative(std::move(expression));
+        while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
+            TokenType op = current_.type;
+            advance();
+            expression = make_arithmetic_expr(op, std::move(expression), parse_arithmetic_multiplicative());
+        }
+        return expression;
+    }
+
+    std::unique_ptr<Expr> parse_arithmetic_multiplicative(std::unique_ptr<Expr> expression = nullptr) {
+        if (expression == nullptr) {
+            expression = parse_arithmetic_atom();
+        }
+        while (check(TokenType::STAR) || check(TokenType::SLASH)) {
+            TokenType op = current_.type;
+            advance();
+            expression = make_arithmetic_expr(op, std::move(expression), parse_arithmetic_atom());
+        }
+        return expression;
+    }
+
+    std::unique_ptr<Expr> parse_arithmetic_atom() {
+        if (match(TokenType::MINUS)) {
+            if (check(TokenType::VALUE_INT)) {
+                return parse_int_literal(true);
+            }
+            if (check(TokenType::VALUE_FLOAT)) {
+                return parse_float_literal(true);
+            }
+            auto zero = std::make_unique<IntLit>(0);
+            return make_arithmetic_expr(TokenType::MINUS, std::move(zero), parse_arithmetic_atom());
+        }
         if (is_aggregate_start(current_.type)) {
             return parse_aggregate_expr();
         }
@@ -783,23 +803,52 @@ private:
         if (check(TokenType::IDENTIFIER)) {
             return parse_col();
         }
-        if (check(TokenType::LPAREN)) {
-            if (peek(1).type == TokenType::SELECT) {
-                return parse_subquery_expr();
+        if (match(TokenType::LPAREN)) {
+            if (check(TokenType::SELECT)) {
+                auto query = parse_query_chain();
+                expect(TokenType::RPAREN, "expected ')' after subquery");
+                return std::make_unique<SubqueryExpr>(std::move(query));
             }
-            if (peek(1).type == TokenType::VALUE_INT || peek(1).type == TokenType::VALUE_FLOAT ||
-                peek(1).type == TokenType::MINUS || peek(1).type == TokenType::LPAREN) {
-                return parse_constant_arith_expr();
-            }
-            expect(TokenType::LPAREN, "expected '(' before expression");
             auto expression = parse_value_expr();
             expect(TokenType::RPAREN, "expected ')' after expression");
             return expression;
         }
-        if (check(TokenType::VALUE_INT) || check(TokenType::VALUE_FLOAT) || check(TokenType::MINUS)) {
-            return parse_constant_arith_expr();
-        }
         return parse_value();
+    }
+
+    std::unique_ptr<Expr> make_arithmetic_expr(TokenType token, std::unique_ptr<Expr> lhs,
+                                                std::unique_ptr<Expr> rhs) {
+        ArithmeticOp op;
+        switch (token) {
+        case TokenType::PLUS:
+            op = ArithmeticOp::ADD;
+            break;
+        case TokenType::MINUS:
+            op = ArithmeticOp::SUB;
+            break;
+        case TokenType::STAR:
+            op = ArithmeticOp::MUL;
+            break;
+        case TokenType::SLASH:
+            op = ArithmeticOp::DIV;
+            break;
+        default:
+            error("expected arithmetic operator");
+        }
+
+        auto is_numeric_literal = [](const Expr* value) {
+            return value != nullptr && (value->type == AstType::IntLit || value->type == AstType::FloatLit);
+        };
+        if (lhs->type == AstType::StringLit || lhs->type == AstType::BoolLit || lhs->type == AstType::NullLit ||
+            rhs->type == AstType::StringLit || rhs->type == AstType::BoolLit || rhs->type == AstType::NullLit) {
+            error("arithmetic requires numeric operands");
+        }
+        if (is_numeric_literal(lhs.get()) && is_numeric_literal(rhs.get())) {
+            std::unique_ptr<Value> lhs_value(static_cast<Value*>(lhs.release()));
+            std::unique_ptr<Value> rhs_value(static_cast<Value*>(rhs.release()));
+            return fold_binary(token, std::move(lhs_value), std::move(rhs_value));
+        }
+        return std::make_unique<ArithmeticExpr>(op, std::move(lhs), std::move(rhs));
     }
 
     std::unique_ptr<Expr> parse_case_expr() {
@@ -870,6 +919,9 @@ private:
         // disjoint FIRST sets, so a single token decides -- no speculative parse needed.
         if (check(TokenType::IDENTIFIER)) {
             auto rhs_col = parse_col();
+            if (rhs_col->col_name != column) {
+                return std::make_unique<SetClause>(std::move(column), parse_arithmetic_additive(std::move(rhs_col)));
+            }
             if (match(TokenType::PLUS)) {
                 return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
                                                    parse_numeric_delta_after(TokenType::PLUS), SetOp::SELF_ADD);
@@ -885,9 +937,6 @@ private:
             if (match(TokenType::SLASH)) {
                 return std::make_unique<SetClause>(std::move(column), std::move(rhs_col),
                                                    parse_numeric_delta_after(TokenType::SLASH), SetOp::SELF_DIV);
-            }
-            if (rhs_col->col_name != column) {
-                error("expected arithmetic operator after different column reference in SET clause");
             }
             return std::make_unique<SetClause>(std::move(column), std::move(rhs_col), nullptr, SetOp::ASSIGNMENT);
         }
@@ -974,46 +1023,6 @@ private:
 
     std::unique_ptr<Expr> parse_general_expr() {
         return parse_value_expr();
-    }
-
-    // Constant arithmetic expression entry: handles + - (left associative), folding
-    // the whole expression into a single IntLit/FloatLit. display_text preserves the
-    // raw source text of the expression (e.g. "(100 - 20)").
-    std::unique_ptr<Value> parse_constant_arith_expr() {
-        const char* start = current_.text.data();
-        auto result = parse_arith_term();
-        while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
-            TokenType op = current_.type;
-            advance();
-            auto rhs = parse_arith_term();
-            result = fold_binary(op, std::move(result), std::move(rhs));
-        }
-        const char* end = prev_token_.text.data() + prev_token_.text.size();
-        result->display_text = std::string(start, static_cast<size_t>(end - start));
-        return result;
-    }
-
-    // Term: handles * / (left associative).
-    std::unique_ptr<Value> parse_arith_term() {
-        auto result = parse_arith_factor();
-        while (check(TokenType::STAR) || check(TokenType::SLASH)) {
-            TokenType op = current_.type;
-            advance();
-            auto rhs = parse_arith_factor();
-            result = fold_binary(op, std::move(result), std::move(rhs));
-        }
-        return result;
-    }
-
-    // Factor: a parenthesized sub-expression (supports nesting) or a plain literal via
-    // parse_value (int/float/string/bool, with a leading unary '-').
-    std::unique_ptr<Value> parse_arith_factor() {
-        if (match(TokenType::LPAREN)) {
-            auto inner = parse_constant_arith_expr();
-            expect(TokenType::RPAREN, "expected ')' in constant expression");
-            return inner;
-        }
-        return parse_value();
     }
 
     // Fold a binary arithmetic op of two constant literals into a single literal.
@@ -1126,17 +1135,51 @@ private:
                 auto join_conds = requires_on ? parse_opt_join_on_clause() : std::vector<std::unique_ptr<BinaryExpr>>();
                 std::vector<std::unique_ptr<BinaryExpr>> join_tree_conds;
                 join_tree_conds.reserve(join_conds.size());
-                for (const auto& cond : join_conds) {
-                    join_tree_conds.push_back(clone_binary_expr(*cond));
+                for (auto& cond : join_conds) {
+                    if (!contains_subquery(cond.get())) {
+                        from->conds.push_back(clone_binary_expr(*cond));
+                    }
+                    join_tree_conds.push_back(std::move(cond));
                 }
                 from->jointree.push_back(std::make_unique<JoinExpr>(std::move(left), std::move(right),
                                                                     std::move(join_tree_conds), join_type));
-                from->conds.insert(from->conds.end(), std::make_move_iterator(join_conds.begin()),
-                                   std::make_move_iterator(join_conds.end()));
                 continue;
             }
         }
         return from;
+    }
+
+    bool contains_subquery(const Expr* expression) const {
+        if (expression == nullptr) {
+            return false;
+        }
+        if (expression->type == AstType::SubqueryExpr) {
+            return true;
+        }
+        if (auto binary = dynamic_cast<const BinaryExpr*>(expression); binary != nullptr) {
+            if (contains_subquery(binary->lhs.get()) || contains_subquery(binary->rhs.get()) ||
+                contains_subquery(binary->rhs_upper.get())) {
+                return true;
+            }
+            return std::any_of(binary->rhs_list.begin(), binary->rhs_list.end(),
+                               [&](const auto& value) { return contains_subquery(value.get()); });
+        }
+        if (auto arithmetic = dynamic_cast<const ArithmeticExpr*>(expression); arithmetic != nullptr) {
+            return contains_subquery(arithmetic->lhs.get()) || contains_subquery(arithmetic->rhs.get());
+        }
+        if (auto logical = dynamic_cast<const LogicalExpr*>(expression); logical != nullptr) {
+            return std::any_of(logical->operands.begin(), logical->operands.end(),
+                               [&](const auto& operand) { return contains_subquery(operand.get()); });
+        }
+        if (auto case_expr = dynamic_cast<const CaseExpr*>(expression); case_expr != nullptr) {
+            for (const auto& clause : case_expr->when_clauses) {
+                if (contains_subquery(clause.condition.get()) || contains_subquery(clause.result.get())) {
+                    return true;
+                }
+            }
+            return contains_subquery(case_expr->else_expr.get());
+        }
+        return false;
     }
 
     TableRef parse_table_ref() {

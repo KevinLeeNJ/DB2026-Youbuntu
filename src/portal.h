@@ -687,7 +687,8 @@ public:
                     rids.push_back(scan->rid());
                 }
                 std::unique_ptr<AbstractExecutor> root = std::make_unique<UpdateExecutor>(
-                    sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context);
+                    sm_manager_, x->tab_name_, x->set_clauses_, x->conds_, rids, context,
+                    make_subquery_runner(context));
                 return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>(),
                                                     std::move(root), std::move(plan));
             }
@@ -875,7 +876,7 @@ public:
                 convert_plan_executor(x->right_.get(), context, count_rows, outer_context);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                 std::move(left), std::move(right), x->conds_, x->inlj_left_col_, x->inlj_right_col_,
-                x->inlj_index_col_name_, x->type);
+                x->inlj_index_col_name_, x->type, x->exprs_, make_subquery_runner(context), outer_context);
             return maybe_count(std::move(join), plan, count_rows);
         }
         case T_Sort: {
