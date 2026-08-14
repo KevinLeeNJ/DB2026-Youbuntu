@@ -285,10 +285,10 @@ DiskManager::FileLease DiskManager::FileWriteClaim::acquire_lease() {
 }
 
 DiskManager::RecoveryWalReader::RecoveryWalReader(
-    DiskManager* disk_manager, int64_t begin_offset, int64_t end_offset, FileLease legacy_lease,
-    int64_t segment_bytes, std::vector<SegmentIdentity> segments)
-    : disk_manager_(disk_manager), begin_offset_(begin_offset), end_offset_(end_offset),
-      legacy_lease_(std::move(legacy_lease)), segment_bytes_(segment_bytes), segments_(std::move(segments)) {}
+    int64_t begin_offset, int64_t end_offset, FileLease legacy_lease, int64_t segment_bytes,
+    std::vector<SegmentIdentity> segments)
+    : begin_offset_(begin_offset), end_offset_(end_offset), legacy_lease_(std::move(legacy_lease)),
+      segment_bytes_(segment_bytes), segments_(std::move(segments)) {}
 
 DiskManager::RecoveryWalReader::~RecoveryWalReader() {
     for (const SegmentIdentity& segment : segments_) {
@@ -314,41 +314,39 @@ void DiskManager::RecoveryWalReader::read_exact(char* data, uint32_t length, int
     if (data == nullptr || length == 0 || offset < begin_offset_ || offset > end_offset_ - bytes) {
         throw InternalError("recovery WAL read leaves the accepted prefix; WAL retained");
     }
-    int completed = 0;
+    uint32_t completed = 0;
     if (segment_bytes_ == 0) {
         const int fd = legacy_lease_.fd();
         if (fd < 0) {
             throw InternalError("recovery legacy WAL identity changed; WAL retained");
         }
-        while (completed < static_cast<int>(length)) {
-            const ssize_t got = pread(fd, data + completed, length - static_cast<uint32_t>(completed), offset + completed);
+        while (completed < length) {
+            const ssize_t got = pread(fd, data + completed, length - completed, offset + completed);
             if (got < 0 && errno == EINTR) continue;
             if (got < 0) throw UnixError();
             if (got == 0) throw InternalError("recovery legacy WAL read was short; WAL retained");
-            completed += static_cast<int>(got);
+            completed += static_cast<uint32_t>(got);
         }
     } else {
-        while (completed < static_cast<int>(length)) {
+        while (completed < length) {
             const int64_t logical = offset + completed;
             const uint64_t segment = static_cast<uint64_t>(logical / segment_bytes_);
             const off_t segment_offset = static_cast<off_t>(logical % segment_bytes_);
-            const int chunk = static_cast<int>(std::min<int64_t>(length - static_cast<uint32_t>(completed),
-                                                                 segment_bytes_ - segment_offset));
+            const uint32_t chunk = static_cast<uint32_t>(
+                std::min<int64_t>(length - completed, segment_bytes_ - segment_offset));
             const int fd = segment_identity(segment).fd;
-            int chunk_read = 0;
+            uint32_t chunk_read = 0;
             while (chunk_read < chunk) {
                 const ssize_t got = pread(fd, data + completed + chunk_read, static_cast<size_t>(chunk - chunk_read),
                                           segment_offset + chunk_read);
                 if (got < 0 && errno == EINTR) continue;
                 if (got < 0) throw UnixError();
                 if (got == 0) throw InternalError("recovery segmented WAL read was short; WAL retained");
-                chunk_read += static_cast<int>(got);
+                chunk_read += static_cast<uint32_t>(got);
             }
             completed += chunk;
         }
     }
-    disk_manager_->log_read_count_.fetch_add(1, std::memory_order_relaxed);
-    disk_manager_->log_read_bytes_.fetch_add(length, std::memory_order_relaxed);
 }
 
 std::shared_ptr<DiskManager::FileState> DiskManager::find_open_file_locked(
@@ -1146,29 +1144,22 @@ DiskManager::open_recovery_wal_reader(int64_t begin_offset, int64_t end_offset) 
         }
         const uint64_t first = static_cast<uint64_t>(begin_offset / wal_segment_bytes_);
         const uint64_t last = static_cast<uint64_t>((end_offset - 1) / wal_segment_bytes_);
-        std::vector<RecoveryWalReader::SegmentIdentity> identities;
-        identities.reserve(static_cast<size_t>(last - first + 1));
-        try {
-            for (uint64_t segment = first;; ++segment) {
-                const std::string name = SegmentedWalName(wal_generation_, segment);
-                const int fd = open(name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-                if (fd < 0) throw UnixError();
-                struct stat st {};
-                if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > wal_segment_bytes_) {
-                    const int saved_errno = errno;
-                    close(fd);
-                    errno = saved_errno;
-                    throw InternalError("recovery WAL reader found an invalid segment; WAL retained");
-                }
-                identities.push_back(RecoveryWalReader::SegmentIdentity{segment, fd});
-                if (segment == last) break;
+        std::unique_ptr<RecoveryWalReader> reader(
+            new RecoveryWalReader(begin_offset, end_offset, FileLease{}, wal_segment_bytes_, {}));
+        reader->segments_.reserve(static_cast<size_t>(last - first + 1));
+        for (uint64_t segment = first;; ++segment) {
+            reader->segments_.push_back(RecoveryWalReader::SegmentIdentity{segment, -1});
+            const std::string name = SegmentedWalName(wal_generation_, segment);
+            const int fd = open(name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0) throw UnixError();
+            reader->segments_.back().fd = fd;
+            struct stat st {};
+            if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > wal_segment_bytes_) {
+                throw InternalError("recovery WAL reader found an invalid segment; WAL retained");
             }
-        } catch (...) {
-            for (const auto& identity : identities) (void)close(identity.fd);
-            throw;
+            if (segment == last) break;
         }
-        return std::unique_ptr<RecoveryWalReader>(new RecoveryWalReader(
-            this, begin_offset, end_offset, FileLease{}, wal_segment_bytes_, std::move(identities)));
+        return reader;
     }
 
     open_log_fd(operation);
@@ -1183,7 +1174,7 @@ DiskManager::open_recovery_wal_reader(int64_t begin_offset, int64_t end_offset) 
         throw InternalError("recovery WAL reader range disagrees with finalized legacy WAL; WAL retained");
     }
     return std::unique_ptr<RecoveryWalReader>(
-        new RecoveryWalReader(this, begin_offset, end_offset, std::move(lease), 0, {}));
+        new RecoveryWalReader(begin_offset, end_offset, std::move(lease), 0, {}));
 }
 
 std::unique_ptr<WalReadSnapshot> DiskManager::create_wal_read_snapshot(int64_t begin_offset, int64_t end_offset) {

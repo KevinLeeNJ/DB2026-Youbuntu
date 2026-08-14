@@ -376,11 +376,10 @@ private:
         int fd{-1};
     };
 
-    RecoveryWalReader(DiskManager* disk_manager, int64_t begin_offset, int64_t end_offset, FileLease legacy_lease,
-                      int64_t segment_bytes, std::vector<SegmentIdentity> segments);
+    RecoveryWalReader(int64_t begin_offset, int64_t end_offset, FileLease legacy_lease, int64_t segment_bytes,
+                      std::vector<SegmentIdentity> segments);
     const SegmentIdentity& segment_identity(uint64_t segment) const;
 
-    DiskManager* disk_manager_{nullptr};
     int64_t begin_offset_{0};
     int64_t end_offset_{0};
     FileLease legacy_lease_;
