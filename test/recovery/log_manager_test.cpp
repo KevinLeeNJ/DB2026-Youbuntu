@@ -1658,6 +1658,12 @@ TEST(LogManagerTest, SegmentedWalReadSnapshotCopiesOnlyCrossSegmentRecords) {
     EXPECT_EQ(std::memcmp(snapshot->record_bytes(60, 12, &scratch, &access), bytes.data() + 60, 12), 0);
     EXPECT_TRUE(access.copied);
     EXPECT_EQ(access.copied_bytes, 12U);
+
+    auto reader = disk.open_recovery_wal_reader(3, static_cast<int64_t>(bytes.size()));
+    std::array<char, 12> crossing{};
+    reader->read_exact(crossing.data(), crossing.size(), 60);
+    EXPECT_EQ(std::memcmp(crossing.data(), bytes.data() + 60, crossing.size()), 0);
+    EXPECT_THROW(reader->read_exact(crossing.data(), crossing.size(), 2), InternalError);
 }
 
 TEST(LogManagerTest, SegmentedWalReadSnapshotRejectsShortMissingAndSymlinkSpans) {

@@ -48,7 +48,6 @@ constexpr size_t kRepairSpotCheckLimit = 64;
 constexpr size_t kDefaultRecoveryWorkers = 16;
 constexpr size_t kMaxRecoveryWorkers = 16;
 constexpr size_t kRunClaimBatch = 8;
-constexpr uint64_t kWalResidencyTrimBytes = 256ULL * 1024 * 1024;
 constexpr int64_t kRecoveryWalWindowBytes = 64LL * 1024 * 1024;
 constexpr int64_t kIndexKeySegmentBytes = 16LL * 1024 * 1024;
 constexpr size_t kIndexKeySegmentDescriptorLimitBytes = 256ULL * 1024 * 1024;
@@ -1449,37 +1448,7 @@ void RecoveryManager::redo() {
     std::vector<size_t> selected_smo_record_positions(index_smo_records_.size(), std::numeric_limits<size_t>::max());
     std::unordered_map<std::string, std::unordered_set<page_id_t>> seen_smo_pages;
     std::unordered_map<std::string, SelectedSmoHeader> final_smo_headers;
-    std::unique_ptr<WalReadSnapshot> wal_snapshot;
-    if (!heap_redo_records_.empty()) {
-        wal_snapshot = disk_manager_->create_wal_read_snapshot(scan_begin_offset_, scan_end_offset_);
-    }
     RecoveryWalWindow smo_wal_window(disk_manager_, scan_begin_offset_, scan_end_offset_);
-    const long wal_page_size_long = sysconf(_SC_PAGESIZE);
-    if (wal_snapshot != nullptr && wal_page_size_long <= 0) {
-        throw InternalError("could not determine WAL mmap page size; WAL retained");
-    }
-    const uint64_t wal_page_size = static_cast<uint64_t>(wal_page_size_long);
-    std::atomic<uint64_t> wal_bytes_since_residency_trim{0};
-    std::atomic<uint64_t> wal_residency_trim_count{0};
-    std::atomic<uint64_t> wal_residency_trim_failures{0};
-    std::mutex wal_residency_trim_latch;
-    const auto maybe_trim_wal_residency = [&](int64_t offset, uint32_t length) {
-        const uint64_t first_page = static_cast<uint64_t>(offset) / wal_page_size;
-        const uint64_t last_page = (static_cast<uint64_t>(offset) + length - 1) / wal_page_size;
-        const uint64_t bytes = (last_page - first_page + 1) * wal_page_size;
-        const uint64_t accumulated = wal_bytes_since_residency_trim.fetch_add(bytes, std::memory_order_relaxed) + bytes;
-        if (accumulated < kWalResidencyTrimBytes) return;
-        std::unique_lock<std::mutex> lock(wal_residency_trim_latch, std::try_to_lock);
-        if (!lock.owns_lock() || wal_bytes_since_residency_trim.exchange(0, std::memory_order_relaxed) <
-                                     kWalResidencyTrimBytes) {
-            return;
-        }
-        if (wal_snapshot->discard_resident_pages()) {
-            wal_residency_trim_count.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            wal_residency_trim_failures.fetch_add(1, std::memory_order_relaxed);
-        }
-    };
     std::chrono::steady_clock::time_point validate_select_begin;
     std::chrono::steady_clock::time_point validate_select_end;
     std::chrono::steady_clock::time_point smo_end;
@@ -1781,6 +1750,8 @@ void RecoveryManager::redo() {
     const size_t selected_worker_limit = RecoveryWorkerLimit();
     const size_t worker_count = std::min(selected_worker_limit, page_runs.size());
     std::vector<HeapRedoWorker> workers(worker_count);
+    std::unique_ptr<DiskManager::RecoveryWalReader> heap_wal_reader;
+    if (worker_count != 0) heap_wal_reader = disk_manager_->open_recovery_wal_reader(scan_begin_offset_, scan_end_offset_);
     if (page_owned_recovery_) {
         for (auto& worker : workers) {
             worker.local_plan_keys.resize(page_owned_plan_order.size());
@@ -1790,6 +1761,17 @@ void RecoveryManager::redo() {
     std::atomic<bool> stop{false};
     std::mutex exception_latch;
     std::exception_ptr first_exception;
+    const auto read_heap_record = [&](DiskManager::RecoveryWalReader* wal_reader, const HeapRedoRecord& location,
+                                      std::vector<char>* scratch) {
+        if (wal_reader == nullptr || scratch == nullptr || location.wal_offset < scan_begin_offset_ ||
+            location.wal_offset > scan_end_offset_ || location.wal_length < static_cast<uint32_t>(LOG_HEADER_SIZE) ||
+            static_cast<int64_t>(location.wal_length) > scan_end_offset_ - location.wal_offset) {
+            throw InternalError("recovery heap-redo descriptor leaves the WAL range; WAL retained");
+        }
+        scratch->resize(location.wal_length);
+        wal_reader->read_exact(scratch->data(), location.wal_length, location.wal_offset);
+        return scratch->data();
+    };
     // Heap records are already grouped by (table,page) and ordered by WAL
     // offset.  The run owns exactly one pin and one exclusive latch.  Redo all
     // records first so page-LSN is meaningful, undo loser records in reverse
@@ -1841,15 +1823,8 @@ void RecoveryManager::redo() {
                 if (location.table_id != first.table_id || location.page_no != first.page_no) {
                     throw InternalError("recovery heap-redo page run is not homogeneous; WAL retained");
                 }
-                WalSnapshotAccess access;
-                const char* bytes =
-                    wal_snapshot->record_bytes(location.wal_offset, location.wal_length, &worker.scratch, &access);
-                if (access.copied) {
-                    ++worker.cross_segment_records;
-                    worker.cross_segment_copy_bytes += access.copied_bytes;
-                } else {
-                    ++worker.mapped_hits;
-                }
+                const char* bytes = read_heap_record(heap_wal_reader.get(), location, &worker.scratch);
+                ++worker.mapped_hits;
                 const WalRecordView mapped = mapped_heap_redo_record(location, bytes);
                 if (!ParseWalDmlForRedo(mapped, &worker.dml)) {
                     throw InternalError("recovery failed to parse mapped DML at WAL offset " +
@@ -1939,7 +1914,6 @@ void RecoveryManager::redo() {
                 // Account for every descriptor once, including records already
                 // covered by the pageLSN. Later loser undo and committed replay
                 // reads are intentionally not counted again.
-                maybe_trim_wal_residency(location.wal_offset, location.wal_length);
                 max_replayed_lsn = std::max(max_replayed_lsn, location.lsn);
                 if (location.lsn <= initial_page_lsn) {
                     ++worker.skipped;
@@ -2068,15 +2042,8 @@ void RecoveryManager::redo() {
     auto process_run = [&](HeapRedoWorker& worker, const HeapRedoRun& run) {
         for (size_t index = run.begin; index < run.end; ++index) {
             const HeapRedoRecord& location = heap_redo_records_[index];
-            WalSnapshotAccess access;
-            const char* bytes =
-                wal_snapshot->record_bytes(location.wal_offset, location.wal_length, &worker.scratch, &access);
-            if (access.copied) {
-                ++worker.cross_segment_records;
-                worker.cross_segment_copy_bytes += access.copied_bytes;
-            } else {
-                ++worker.mapped_hits;
-            }
+            const char* bytes = read_heap_record(heap_wal_reader.get(), location, &worker.scratch);
+            ++worker.mapped_hits;
             const WalRecordView mapped = mapped_heap_redo_record(location, bytes);
             if (!ParseWalDmlForRedo(mapped, &worker.dml)) {
                 throw InternalError("recovery failed to parse mapped DML at WAL offset " +
@@ -2094,7 +2061,6 @@ void RecoveryManager::redo() {
             if (table->file_handle == nullptr) {
                 ++worker.skipped;
                 ++worker.missing;
-                maybe_trim_wal_residency(location.wal_offset, location.wal_length);
                 continue;
             }
             ++worker.applied;
@@ -2121,7 +2087,6 @@ void RecoveryManager::redo() {
             default:
                 break;
             }
-            maybe_trim_wal_residency(location.wal_offset, location.wal_length);
         }
     };
     auto process_extension_run = [&](HeapRedoWorker& worker, const HeapRedoRun& run) {
@@ -2304,7 +2269,7 @@ void RecoveryManager::redo() {
         "selected records/pages/headers %zu/%llu/%zu, old-generation records/pages %llu/%llu, "
         "superseded current pages %llu, smo validation window/copies/bytes %llu/%llu/%llu, "
         "smo reparse window/copies/bytes %llu/%llu/%llu, selected workers %zu, active workers %zu, "
-        "page runs %zu, resident page runs/pins %llu/%llu, mapped hits %llu, "
+        "page runs %zu, resident page runs/pins %llu/%llu, bounded WAL reads %llu, "
         "cross-segment records %llu (%llu bytes)",
         static_cast<unsigned long long>(redo_applied_count_), static_cast<unsigned long long>(redo_skipped_count_),
         static_cast<unsigned long long>(redo_missing_table_count_),
@@ -2341,10 +2306,6 @@ void RecoveryManager::redo() {
         static_cast<long long>(elapsed_ms(parallel_end, extension_end)),
         static_cast<long long>(elapsed_ms(extension_end, sync_end)),
         static_cast<long long>(elapsed_ms(redo_begin, sync_end)));
-    LOG_INFO("recovery redo WAL residency: trim-threshold=%llu trims=%llu failures=%llu",
-             static_cast<unsigned long long>(kWalResidencyTrimBytes),
-             static_cast<unsigned long long>(wal_residency_trim_count.load(std::memory_order_relaxed)),
-             static_cast<unsigned long long>(wal_residency_trim_failures.load(std::memory_order_relaxed)));
     redo_completed_ = true;
 }
 
@@ -4097,8 +4058,8 @@ void RecoveryManager::replay_deferred_committed_deltas() {
     // The remaining descriptors therefore form the suffix of committed v2
     // assignments after the last full anchor and can be applied directly in
     // their original per-RID WAL order once all loser effects are undone.
-    std::unique_ptr<WalReadSnapshot> wal_snapshot =
-        disk_manager_->create_wal_read_snapshot(scan_begin_offset_, scan_end_offset_);
+    std::unique_ptr<DiskManager::RecoveryWalReader> wal_reader =
+        disk_manager_->open_recovery_wal_reader(scan_begin_offset_, scan_end_offset_);
     std::vector<char> scratch;
     WalDmlView dml;
     for (const auto& [target, records] : deferred_committed_deltas_) {
@@ -4116,7 +4077,9 @@ void RecoveryManager::replay_deferred_committed_deltas() {
                 throw InternalError("recovery deferred UPDATE descriptors are inconsistent; WAL retained");
             }
             previous_offset = location.wal_offset;
-            const char* bytes = wal_snapshot->record_bytes(location.wal_offset, location.wal_length, &scratch);
+            scratch.resize(location.wal_length);
+            wal_reader->read_exact(scratch.data(), location.wal_length, location.wal_offset);
+            const char* bytes = scratch.data();
             const WalRecordView record = mapped_heap_redo_record(location, bytes);
             if (record.log_type != LogType::UPDATE || committed_txns_.count(record.txn_id) == 0 ||
                 !ParseWalDmlForRedo(record, &dml) || !dml.update_delta.present() || dml.table_name != table.name ||

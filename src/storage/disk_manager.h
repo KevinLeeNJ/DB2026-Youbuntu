@@ -85,6 +85,7 @@ public:
     struct FileIdentityForTest { int fd; uint64_t generation; };
     class FileLease;
     class FileWriteClaim;
+    class RecoveryWalReader;
     static constexpr int64_t kWalSegmentBytes = 64LL * 1024 * 1024;
     explicit DiskManager();
 
@@ -169,6 +170,10 @@ public:
     // caller owns the scan bound. Returns the number of bytes read, which is
     // short only at end of file.
     int read_log_chunk(char* log_data, int size, int64_t offset);
+
+    // Capture the finalized WAL identity, then serve bounded random reads
+    // without mapping the entire recovery prefix into the process.
+    std::unique_ptr<RecoveryWalReader> open_recovery_wal_reader(int64_t begin_offset, int64_t end_offset);
 
     // Must be created after recovery analyze succeeded and startup finalize
     // truncated any physical tail. The returned object pins read-only inode
@@ -354,4 +359,31 @@ private:
     std::shared_ptr<RegistryState> registry_;
     std::shared_ptr<FileState> state_;
     uint64_t generation_{0};
+};
+
+class DiskManager::RecoveryWalReader {
+public:
+    ~RecoveryWalReader();
+    RecoveryWalReader(const RecoveryWalReader&) = delete;
+    RecoveryWalReader& operator=(const RecoveryWalReader&) = delete;
+
+    void read_exact(char* data, uint32_t length, int64_t offset) const;
+
+private:
+    friend class DiskManager;
+    struct SegmentIdentity {
+        uint64_t segment{0};
+        int fd{-1};
+    };
+
+    RecoveryWalReader(DiskManager* disk_manager, int64_t begin_offset, int64_t end_offset, FileLease legacy_lease,
+                      int64_t segment_bytes, std::vector<SegmentIdentity> segments);
+    const SegmentIdentity& segment_identity(uint64_t segment) const;
+
+    DiskManager* disk_manager_{nullptr};
+    int64_t begin_offset_{0};
+    int64_t end_offset_{0};
+    FileLease legacy_lease_;
+    int64_t segment_bytes_{0};
+    std::vector<SegmentIdentity> segments_;
 };
