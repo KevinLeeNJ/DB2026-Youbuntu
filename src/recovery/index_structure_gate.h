@@ -95,6 +95,8 @@ public:
         // agreement check (INV-7) had to be skipped for them. Expected to be
         // small and non-zero on TPC-C: new_orders accumulates empty leaves.
         uint64_t chain_bounds_unknown = 0;
+        uint64_t cursor_advances = 0;
+        uint64_t cursor_fallbacks = 0;
     };
 
     RecoveryIndexGate(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, IxIndexHandle* index,
@@ -158,6 +160,8 @@ private:
     int compare(const char* left, const char* right) const;
 
     bool descend(const char* key, std::vector<Rid>* existing_rids);
+    enum class CursorResult { NotApplicable, Advanced, Rejected };
+    CursorResult advance_leaf_cursor(const char* key, std::vector<Rid>* existing_rids);
     // Per-page invariants that hold for every node on a descent path. Sets
     // *dirty when it repaired the parent back pointer in place.
     bool validate_node(IxNodeHandle& node, page_id_t page_no, page_id_t expected_parent, bool* dirty);
@@ -174,6 +178,7 @@ private:
         Page* page{nullptr};
         page_id_t page_no{INVALID_PAGE_ID};
         bool dirty{false};
+        int child_index{-1};
     };
 
     DiskManager* disk_manager_;

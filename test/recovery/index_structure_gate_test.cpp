@@ -475,10 +475,42 @@ TEST(IndexStructureGateTest, ReusesTheValidatedInternalPathForAscendingKeys) {
     }
 
     const auto& stats = gate.stats();
-    EXPECT_GT(stats.descents, 1u);
+    EXPECT_EQ(stats.descents, 1u);
     EXPECT_GT(stats.keys_covered, 0u);
-    EXPECT_LT(stats.page_fetches, stats.descents * 2 + 2)
-        << "the cached root/internal path should avoid fetching every level for each leaf";
+    EXPECT_GT(stats.cursor_advances, 1u);
+    EXPECT_EQ(stats.cursor_fallbacks, 0u);
+}
+
+TEST(IndexStructureGateTest, DescendingKeysFallBackToRootDescent) {
+    ScopedGateTestDir test_dir("index_gate_cursor_fallback_root");
+    const std::string db_name = "index_gate_cursor_fallback_db";
+    CreateLoadedDb(db_name);
+
+    OpenDb db(db_name);
+    RecoveryIndexGate gate(&db.disk_, &db.bpm_, db.index(), "t_id.idx");
+    ASSERT_TRUE(gate.check_key(MakeKey(kRowCount - 1).data()));
+    ASSERT_TRUE(gate.check_key(MakeKey(0).data()));
+
+    const auto& stats = gate.stats();
+    EXPECT_EQ(stats.cursor_advances, 0u);
+    EXPECT_GT(stats.cursor_fallbacks, 0u);
+    EXPECT_GT(stats.descents, 1u);
+}
+
+TEST(IndexStructureGateTest, CursorCrossesAnIntermediateLeafForAscendingGap) {
+    ScopedGateTestDir test_dir("index_gate_cursor_gap");
+    const std::string db_name = "index_gate_cursor_gap_db";
+    CreateLoadedDb(db_name);
+
+    OpenDb db(db_name);
+    RecoveryIndexGate gate(&db.disk_, &db.bpm_, db.index(), "t_id.idx");
+    ASSERT_TRUE(gate.check_key(MakeKey(0).data()));
+    ASSERT_TRUE(gate.check_key(MakeKey(kRowCount - 1).data()));
+
+    const auto& stats = gate.stats();
+    EXPECT_EQ(stats.descents, 1u);
+    EXPECT_EQ(stats.cursor_advances, 1u);
+    EXPECT_EQ(stats.cursor_fallbacks, 0u);
 }
 
 TEST(IndexStructureGateTest, ReturnsExistingRidMultisetForDescentAndCoveredKeys) {

@@ -82,7 +82,8 @@ RecoveryIndexGate::~RecoveryIndexGate() {
 
 void RecoveryIndexGate::release_cached_path() noexcept {
     for (auto it = cached_path_.rbegin(); it != cached_path_.rend(); ++it) {
-        if (it->page == nullptr) continue;
+        if (it->page == nullptr)
+            continue;
         try {
             (void)buffer_pool_manager_->unpin_page(it->page->get_page_id(), it->dirty);
         } catch (...) {
@@ -156,6 +157,21 @@ bool RecoveryIndexGate::check_key(const char* key, std::vector<Rid>* existing_ri
         ++stats_.keys_covered;
         return collect_current_leaf_rids(key, existing_rids);
     }
+    if (have_leaf_ && compare(key, leaf_descent_key_.data()) < 0) {
+        ++stats_.cursor_fallbacks;
+    }
+    if (have_leaf_ && have_leaf_upper_ && compare(key, leaf_upper_key_.data()) >= 0) {
+        const CursorResult cursor = advance_leaf_cursor(key, existing_rids);
+        if (cursor == CursorResult::Advanced) {
+            ++stats_.cursor_advances;
+            ++stats_.keys_covered;
+            return true;
+        }
+        if (cursor == CursorResult::Rejected) {
+            return false;
+        }
+        ++stats_.cursor_fallbacks;
+    }
     return descend(key, existing_rids);
 }
 
@@ -201,12 +217,10 @@ bool RecoveryIndexGate::collect_current_leaf_rids(const char* key, std::vector<R
     // before this leaf's first key; a successor can contain one only when the
     // target is at or after its last key. A strict interior key is therefore
     // complete from this leaf alone. This is the common path during recovery.
-    const bool need_predecessor = current_leaf_rids_.empty() ||
-                                  compare(current_leaf_keys_.data(), key) >= 0;
-    const bool need_successor = current_leaf_rids_.empty() ||
-                                compare(current_leaf_keys_.data() +
-                                            (current_leaf_rids_.size() - 1) * key_len,
-                                        key) <= 0;
+    const bool need_predecessor = current_leaf_rids_.empty() || compare(current_leaf_keys_.data(), key) >= 0;
+    const bool need_successor =
+        current_leaf_rids_.empty() ||
+        compare(current_leaf_keys_.data() + (current_leaf_rids_.size() - 1) * key_len, key) <= 0;
 
     // Equal keys may straddle either side of the leaf selected by the gate.
     // lookup_equal starts at the leftmost equal leaf, while the gate's
@@ -340,6 +354,104 @@ bool RecoveryIndexGate::collect_current_leaf_rids(const char* key, std::vector<R
     return true;
 }
 
+RecoveryIndexGate::CursorResult RecoveryIndexGate::advance_leaf_cursor(const char* key,
+                                                                       std::vector<Rid>* existing_rids) {
+    if (cached_path_.empty() || !have_leaf_ || !have_leaf_upper_ || compare(key, leaf_upper_key_.data()) < 0) {
+        return CursorResult::NotApplicable;
+    }
+
+    while (true) {
+        int sibling_level = -1;
+        for (int level = static_cast<int>(cached_path_.size()) - 1; level >= 0; --level) {
+            CachedPathEntry& entry = cached_path_[static_cast<size_t>(level)];
+            if (entry.page == nullptr)
+                return CursorResult::NotApplicable;
+            IxNodeHandle parent(&hdr_, entry.page);
+            if (entry.child_index < 0 || entry.child_index + 1 >= parent.get_size())
+                continue;
+            sibling_level = level;
+            break;
+        }
+        if (sibling_level < 0) {
+            return current_leaf_next_ == IX_LEAF_HEADER_PAGE ? CursorResult::NotApplicable : CursorResult::Rejected;
+        }
+
+        while (cached_path_.size() > static_cast<size_t>(sibling_level + 1)) {
+            CachedPathEntry entry = cached_path_.back();
+            cached_path_.pop_back();
+            if (entry.page != nullptr) {
+                (void)buffer_pool_manager_->unpin_page(entry.page->get_page_id(), entry.dirty);
+            }
+        }
+
+        CachedPathEntry& sibling_parent = cached_path_[static_cast<size_t>(sibling_level)];
+        IxNodeHandle parent(&hdr_, sibling_parent.page);
+        const int child_index = sibling_parent.child_index + 1;
+        const page_id_t old_leaf = current_leaf_page_no_;
+        page_id_t page_no = parent.value_at(child_index);
+        sibling_parent.child_index = child_index;
+        if (!page_in_range(page_no)) {
+            reject("INV-0 cursor sibling leaves the index file", page_no);
+            return CursorResult::Rejected;
+        }
+
+        bool continue_cursor = false;
+        for (int level = sibling_level + 1; level <= kMaxDescentLevels; ++level) {
+            Page* raw = fetch(page_no);
+            if (raw == nullptr) {
+                reject("cursor page could not be fetched", page_no);
+                return CursorResult::Rejected;
+            }
+            IxNodeHandle node(&hdr_, raw);
+            bool dirty = false;
+            if (!validate_node(node, page_no, parent.get_page_no(), &dirty)) {
+                release(raw, dirty);
+                return CursorResult::Rejected;
+            }
+            if (node.is_leaf_page()) {
+                const page_id_t previous = node.get_prev_leaf();
+                if (previous != old_leaf || current_leaf_next_ != page_no) {
+                    release(raw, dirty);
+                    reject("INV-6 cursor leaf successor does not match the tree and leaf chain", page_no);
+                    return CursorResult::Rejected;
+                }
+                const int size = node.get_size();
+                if (size == 0) {
+                    release(raw, dirty);
+                    return CursorResult::NotApplicable;
+                }
+                std::vector<char> first_key(static_cast<size_t>(hdr_.col_tot_len_));
+                memcpy(first_key.data(), node.get_key(0), first_key.size());
+                const bool valid = validate_leaf_and_remember(node, page_no, first_key.data(), nullptr);
+                release(raw, dirty);
+                if (!valid)
+                    return CursorResult::Rejected;
+                if (covered_by_current_leaf(key)) {
+                    if (!collect_current_leaf_rids(key, existing_rids))
+                        return CursorResult::Rejected;
+                    return CursorResult::Advanced;
+                }
+                continue_cursor = true;
+                break;
+            }
+
+            const page_id_t child = node.value_at(0);
+            if (!page_in_range(child)) {
+                release(raw, dirty);
+                reject("INV-0 cursor leftmost child leaves the index file", child);
+                return CursorResult::Rejected;
+            }
+            cached_path_.push_back(CachedPathEntry{raw, page_no, dirty, 0});
+            parent = node;
+            page_no = child;
+        }
+        if (continue_cursor)
+            continue;
+        reject("INV-0 cursor exceeded the maximum tree height", page_no);
+        return CursorResult::Rejected;
+    }
+}
+
 bool RecoveryIndexGate::descend(const char* key, std::vector<Rid>* existing_rids) {
     ++stats_.descents;
     have_leaf_ = false;
@@ -373,15 +485,18 @@ bool RecoveryIndexGate::descend(const char* key, std::vector<Rid>* existing_rids
         IxNodeHandle node(&hdr_, raw);
         bool dirty = false;
         if (!validate_node(node, page_no, expected_parent, &dirty)) {
-            if (!cached) release(raw, dirty);
+            if (!cached)
+                release(raw, dirty);
             return false;
         }
         if (node.is_leaf_page()) {
             const bool valid = validate_leaf_and_remember(node, page_no, key, existing_rids);
-            if (!cached) release(raw, dirty);
+            if (!cached)
+                release(raw, dirty);
             return valid;
         }
-        if (!cached) cached_path_.push_back(CachedPathEntry{raw, page_no, dirty});
+        if (!cached)
+            cached_path_.push_back(CachedPathEntry{raw, page_no, dirty});
         // Deliberately IxNodeHandle::internal_lookup(): the gate must validate
         // the very path a lookup takes, and that is the routine
         // find_leaf_page()/lookup_equal()/get_value() and every insert use.
@@ -389,6 +504,20 @@ bool RecoveryIndexGate::descend(const char* key, std::vector<Rid>* existing_rids
         const page_id_t child = node.internal_lookup(key);
         if (!page_in_range(child)) {
             return reject("INV-0 child pointer leaves the index file", child);
+        }
+        int child_index = -1;
+        for (int index = 0; index < node.get_size(); ++index) {
+            if (node.value_at(index) == child) {
+                child_index = index;
+                break;
+            }
+        }
+        if (child_index < 0)
+            return reject("INV-0 internal lookup child is not in the node", child);
+        if (cached) {
+            cached_path_[static_cast<size_t>(level)].child_index = child_index;
+        } else {
+            cached_path_.back().child_index = child_index;
         }
         expected_parent = page_no;
         page_no = child;
