@@ -959,6 +959,8 @@ private:
         enum class State : uint8_t { Waiting, Promoted, Done };
         lsn_t target_lsn{INVALID_LSN};
         bool require_sync{true};
+        // FIFO age survives leader rotation and bounds total coalescing delay.
+        std::chrono::steady_clock::time_point enqueued_at{};
         // Kept for the default-off path so its waiter protocol stays byte-for-
         // byte equivalent to the established implementation.
         bool done{false};

@@ -47,9 +47,8 @@ constexpr lsn_t LSN_EXHAUSTION_MARGIN = 1 << 24;
 // fdatasync amortization. Larger waves wait too long; smaller waves leave the
 // WAL device saturated with roughly half as many commits per sync.
 constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 8;
-// Upper bound on the coalescing window, reachable only below saturation where
-// no other committer is competing for the disk. PostgreSQL's commit_delay plays
-// the same role and is likewise capped in the millisecond range.
+// Maximum total queueing time of the oldest pending request. Leader rotation
+// carries the request's elapsed wait forward instead of restarting this window.
 constexpr std::chrono::milliseconds GROUP_COMMIT_BATCH_WINDOW{2};
 constexpr std::chrono::milliseconds kSlowWalFdatasyncThreshold{20};
 
@@ -833,6 +832,7 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
             }
             return;
         }
+        waiter->enqueued_at = std::chrono::steady_clock::now();
         group_commit_waiters_.push_back(waiter);
         if (!group_commit_leader_active_) {
             group_commit_leader_active_ = true;
@@ -893,7 +893,10 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
             // low-contention path does not poll.
             {
                 std::unique_lock<std::mutex> group_lock(group_commit_latch_);
-                const auto deadline = batch_wait_begin + GROUP_COMMIT_BATCH_WINDOW;
+                // Bound the oldest request's total queueing time. A follower
+                // promoted after the previous fdatasync keeps the time it has
+                // already spent waiting instead of paying a fresh window.
+                const auto deadline = group_commit_waiters_.front()->enqueued_at + GROUP_COMMIT_BATCH_WINDOW;
                 group_commit_cv_.wait_until(group_lock, deadline, [this] {
                     return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
                 });
@@ -1004,6 +1007,7 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
             }
             return;
         }
+        waiter->enqueued_at = std::chrono::steady_clock::now();
         group_commit_waiters_.push_back(waiter);
         if (!group_commit_leader_active_) {
             group_commit_leader_active_ = true;
@@ -1078,7 +1082,10 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
             const auto batch_wait_begin = std::chrono::steady_clock::now();
             {
                 std::unique_lock<std::mutex> group_lock(group_commit_latch_);
-                const auto deadline = batch_wait_begin + GROUP_COMMIT_BATCH_WINDOW;
+                // Slow storage naturally accumulates an old, wide next batch;
+                // fast storage waits only for the oldest request's remaining
+                // coalescing budget instead of restarting the full window.
+                const auto deadline = group_commit_waiters_.front()->enqueued_at + GROUP_COMMIT_BATCH_WINDOW;
                 group_commit_cv_.wait_until(group_lock, deadline, [this] {
                     return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
                 });
