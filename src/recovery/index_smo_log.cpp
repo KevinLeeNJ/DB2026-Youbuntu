@@ -126,9 +126,10 @@ bool ReadHeaderLayout(const char* header, IndexLayout* layout) {
     const int num_pages = read_unaligned<int>(header + sizeof(int) * 2);
     const page_id_t root_page = read_unaligned<page_id_t>(header + sizeof(int) * 3);
     const int col_num = read_unaligned<int>(header + sizeof(int) * 4);
-    if (col_num <= 0 || col_num > 256 || total_length != 40 + col_num * static_cast<int>(sizeof(ColType) + sizeof(int)) ||
-        total_length > PAGE_SIZE || num_pages < IX_INIT_NUM_PAGES || root_page < IX_INIT_ROOT_PAGE ||
-        root_page >= num_pages || first_free < IX_NO_PAGE || first_free >= num_pages) {
+    if (col_num <= 0 || col_num > 256 ||
+        total_length != 40 + col_num * static_cast<int>(sizeof(ColType) + sizeof(int)) || total_length > PAGE_SIZE ||
+        num_pages < IX_INIT_NUM_PAGES || root_page < IX_INIT_ROOT_PAGE || root_page >= num_pages ||
+        first_free < IX_NO_PAGE || first_free >= num_pages) {
         return false;
     }
     const uint64_t types_offset = sizeof(int) * 5;
@@ -299,7 +300,8 @@ bool TransformIxPage(const IndexLayout& layout, const char* raw, std::array<char
         const char* source = raw + key_begin + static_cast<size_t>(key) * layout.col_tot_len;
         char* destination = transformed->data() + key_begin + static_cast<size_t>(key) * layout.col_tot_len;
         for (int byte = 0; byte < layout.col_tot_len; ++byte) {
-            destination[byte] = key == 0 ? source[byte] : static_cast<char>(source[byte] ^ source[byte - layout.col_tot_len]);
+            destination[byte] =
+                key == 0 ? source[byte] : static_cast<char>(source[byte] ^ source[byte - layout.col_tot_len]);
         }
         source = raw + rid_begin + static_cast<size_t>(key) * sizeof(Rid);
         destination = transformed->data() + rid_begin + static_cast<size_t>(key) * sizeof(Rid);
@@ -334,38 +336,47 @@ bool UntransformIxPage(const IndexLayout& layout, std::array<char, PAGE_SIZE>* i
 }
 
 ImageCodec AppendStructuredPageImage(std::vector<char>* dest, const char* raw, const IndexLayout& layout) {
-    std::array<char, kMaxRleBytes> rle{};
+    std::array<char, kMaxRleBytes> rle;
     const uint32_t rle_length = EncodeZeroLiteralRleInto(raw, &rle);
-    std::array<char, PAGE_SIZE> transformed{};
-    std::array<char, kMaxRleBytes> transformed_rle{};
-    std::array<char, kMaxBitmapBytes> bitmap{};
-    std::array<char, kMaxWordBitmapBytes> word_bitmap{};
+    std::array<char, PAGE_SIZE> transformed;
+    std::array<char, kMaxRleBytes> transformed_rle;
+    std::array<char, kMaxBitmapBytes> bitmap;
+    std::array<char, kMaxWordBitmapBytes> word_bitmap;
     uint32_t transformed_length = PAGE_SIZE;
     uint32_t bitmap_length = PAGE_SIZE;
     uint32_t word_bitmap_length = PAGE_SIZE;
     const bool can_transform = TransformIxPage(layout, raw, &transformed);
     if (can_transform) {
         transformed_length = EncodeZeroLiteralRleInto(transformed.data(), &transformed_rle);
-        bitmap_length = EncodeBitmapInto(transformed.data(), &bitmap);
-        word_bitmap_length = EncodeWordBitmapInto(transformed.data(), &word_bitmap);
+        const uint32_t best_rle_length = std::min(rle_length, transformed_length);
+        if (best_rle_length > kBitmapBytes) {
+            bitmap_length = EncodeBitmapInto(transformed.data(), &bitmap);
+        }
+        if (best_rle_length > kWordBitmapBytes) {
+            word_bitmap_length = EncodeWordBitmapInto(transformed.data(), &word_bitmap);
+        }
     }
-    const bool use_word_bitmap = can_transform && word_bitmap_length < PAGE_SIZE && word_bitmap_length < bitmap_length &&
-                                 word_bitmap_length < transformed_length && word_bitmap_length < rle_length;
-    const bool use_bitmap = !use_word_bitmap && can_transform && bitmap_length < PAGE_SIZE && bitmap_length < transformed_length &&
-                            bitmap_length < rle_length;
+    const bool use_word_bitmap = can_transform && word_bitmap_length < PAGE_SIZE &&
+                                 word_bitmap_length < bitmap_length && word_bitmap_length < transformed_length &&
+                                 word_bitmap_length < rle_length;
+    const bool use_bitmap = !use_word_bitmap && can_transform && bitmap_length < PAGE_SIZE &&
+                            bitmap_length < transformed_length && bitmap_length < rle_length;
     const bool use_transformed = !use_word_bitmap && !use_bitmap && can_transform && transformed_length < PAGE_SIZE &&
                                  transformed_length < rle_length;
     const bool use_rle = !use_word_bitmap && !use_bitmap && !use_transformed && rle_length < PAGE_SIZE;
-    AppendScalar(dest, static_cast<uint8_t>(use_word_bitmap ? ImageCodec::STRUCTURED_XOR_WORD_BITMAP
-                                         : use_bitmap       ? ImageCodec::STRUCTURED_XOR_BITMAP
-                                         : use_transformed ? ImageCodec::STRUCTURED_XOR_RLE
-                                         : use_rle         ? ImageCodec::ZERO_LITERAL_RLE
-                                                           : ImageCodec::RAW));
+    AppendScalar(dest, static_cast<uint8_t>(use_word_bitmap   ? ImageCodec::STRUCTURED_XOR_WORD_BITMAP
+                                            : use_bitmap      ? ImageCodec::STRUCTURED_XOR_BITMAP
+                                            : use_transformed ? ImageCodec::STRUCTURED_XOR_RLE
+                                            : use_rle         ? ImageCodec::ZERO_LITERAL_RLE
+                                                              : ImageCodec::RAW));
     AppendScalar(dest, static_cast<uint8_t>(0));
     AppendScalar(dest, static_cast<uint16_t>(0));
     AppendScalar(dest, static_cast<uint32_t>(PAGE_SIZE));
-    AppendScalar(dest, static_cast<uint32_t>(use_word_bitmap ? word_bitmap_length : use_bitmap ? bitmap_length : use_transformed ? transformed_length
-                                                                    : use_rle ? rle_length : PAGE_SIZE));
+    AppendScalar(dest, static_cast<uint32_t>(use_word_bitmap   ? word_bitmap_length
+                                             : use_bitmap      ? bitmap_length
+                                             : use_transformed ? transformed_length
+                                             : use_rle         ? rle_length
+                                                               : PAGE_SIZE));
     if (use_word_bitmap) {
         AppendBytes(dest, word_bitmap.data(), word_bitmap_length);
     } else if (use_bitmap) {
@@ -377,21 +388,22 @@ ImageCodec AppendStructuredPageImage(std::vector<char>* dest, const char* raw, c
     } else {
         AppendBytes(dest, raw, PAGE_SIZE);
     }
-    return use_word_bitmap ? ImageCodec::STRUCTURED_XOR_WORD_BITMAP
-                      : use_bitmap ? ImageCodec::STRUCTURED_XOR_BITMAP
-                      : use_transformed ? ImageCodec::STRUCTURED_XOR_RLE
-                                        : use_rle ? ImageCodec::ZERO_LITERAL_RLE : ImageCodec::RAW;
+    return use_word_bitmap   ? ImageCodec::STRUCTURED_XOR_WORD_BITMAP
+           : use_bitmap      ? ImageCodec::STRUCTURED_XOR_BITMAP
+           : use_transformed ? ImageCodec::STRUCTURED_XOR_RLE
+           : use_rle         ? ImageCodec::ZERO_LITERAL_RLE
+                             : ImageCodec::RAW;
 }
 
 void RecordStructuredFormatMetrics(uint64_t old_bytes, uint64_t new_bytes, uint64_t encode_ns, ImageCodec codec) {
     StructuredFormatMetrics& metrics = GetStructuredFormatMetrics();
     metrics.old_bytes.fetch_add(old_bytes, std::memory_order_relaxed);
     metrics.new_bytes.fetch_add(new_bytes, std::memory_order_relaxed);
-    (codec == ImageCodec::RAW   ? metrics.raw
-     : codec == ImageCodec::ZERO_LITERAL_RLE ? metrics.rle
-     : codec == ImageCodec::STRUCTURED_XOR_RLE ? metrics.xor_rle
+    (codec == ImageCodec::RAW                     ? metrics.raw
+     : codec == ImageCodec::ZERO_LITERAL_RLE      ? metrics.rle
+     : codec == ImageCodec::STRUCTURED_XOR_RLE    ? metrics.xor_rle
      : codec == ImageCodec::STRUCTURED_XOR_BITMAP ? metrics.bitmap
-                                                    : metrics.word_bitmap)
+                                                  : metrics.word_bitmap)
         .fetch_add(1, std::memory_order_relaxed);
     metrics.encode_ns.fetch_add(encode_ns, std::memory_order_relaxed);
     uint64_t previous = metrics.max_ns.load(std::memory_order_relaxed);
@@ -768,9 +780,9 @@ bool InspectIndexSmoWal(const WalRecordView& record, IndexSmoWalLayout* out) noe
         !ReadScalar(record.bytes, payload_limit, &offset, &generation) || magic != INDEX_SMO_MAGIC ||
         (format_tag != INDEX_SMO_FORMAT_LEGACY_RAW && format_tag != INDEX_SMO_FORMAT_COMPRESSED &&
          format_tag != INDEX_SMO_FORMAT_STRUCTURED) ||
-        flags != INDEX_SMO_FLAG_HEADER_IMAGE || name_bytes == 0 ||
-        name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES || page_count == 0 || page_count > MAX_INDEX_SMO_PAGE_COUNT ||
-        page_size != PAGE_SIZE || header_size != PAGE_SIZE || generation == 0)
+        flags != INDEX_SMO_FLAG_HEADER_IMAGE || name_bytes == 0 || name_bytes > MAX_INDEX_SMO_FILE_NAME_BYTES ||
+        page_count == 0 || page_count > MAX_INDEX_SMO_PAGE_COUNT || page_size != PAGE_SIZE ||
+        header_size != PAGE_SIZE || generation == 0)
         return false;
     if (format_tag == INDEX_SMO_FORMAT_LEGACY_RAW) {
         uint32_t expected = 0;
@@ -886,8 +898,8 @@ bool AnalyzeIndexSmoWal(const WalRecordView& record, const IndexSmoWalAnalysisSt
         return false;
     IndexSmoWalLayout layout;
     if (!InspectIndexSmoWal(record, &layout) || storage.index_name_capacity < layout.name_bytes_ ||
-        storage.page_capacity < layout.page_count_ || storage.index_name == nullptr || storage.page_numbers == nullptr ||
-        layout.page_count_ > MAX_INDEX_SMO_PAGE_COUNT ||
+        storage.page_capacity < layout.page_count_ || storage.index_name == nullptr ||
+        storage.page_numbers == nullptr || layout.page_count_ > MAX_INDEX_SMO_PAGE_COUNT ||
         layout.page_count_ > std::numeric_limits<size_t>::max() / sizeof(page_id_t)) {
         return false;
     }
@@ -977,8 +989,8 @@ bool IndexSmoWalLayout::decode_materialized(const WalRecordView& record, const I
     }
     if (decoded != decoded_count_ || cursor.offset() != payload_limit_)
         return false;
-    IndexSmoWalDecodedView decoded_view{std::string_view(record.bytes + name_offset_, name_bytes_), generation_, page_count_,
-                                        header_image, storage.pages};
+    IndexSmoWalDecodedView decoded_view{std::string_view(record.bytes + name_offset_, name_bytes_), generation_,
+                                        page_count_, header_image, storage.pages};
     *out = decoded_view;
     return true;
 }

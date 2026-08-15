@@ -562,6 +562,20 @@ private:
         return bound;
     }
 
+    std::vector<ExecutorHavingCondition> bind_prepared_having_conds(const std::vector<HavingCondition>& conditions,
+                                                                    const ParameterFrame& parameters) const {
+        std::vector<HavingCondition> bound = conditions;
+        for (auto& condition : bound) {
+            condition.lhs = bind_prepared_query_expr(condition.lhs, parameters);
+            if (condition.is_rhs_val) {
+                condition.rhs_val = bind_prepared_value(condition.rhs_val, parameters);
+            } else {
+                condition.rhs_expr = bind_prepared_query_expr(condition.rhs_expr, parameters);
+            }
+        }
+        return to_executor_having_conds(bound);
+    }
+
     std::vector<Value> bind_prepared_insert_values(const DMLPlan& dml, const ParameterFrame& parameters) const {
         const auto& table = sm_manager_->db_.get_table(dml.tab_name_);
         if (dml.values_.size() != table.cols.size()) {
@@ -769,6 +783,14 @@ private:
                 bind_prepared_conditions(filter->conds_, parameters));
             return executor;
         }
+        case T_Aggregate: {
+            const auto* aggregate = static_cast<const AggregatePlan*>(plan);
+            auto executor = std::make_unique<AggregateExecutor>(
+                convert_prepared_plan_executor(aggregate->subplan_.get(), parameters, context),
+                aggregate->group_by_cols_, aggregate->agg_exprs_,
+                bind_prepared_having_conds(aggregate->having_conds_, parameters), context);
+            return executor;
+        }
         case T_SeqScan:
         case T_IndexScan: {
             const auto* scan = static_cast<const ScanPlan*>(plan);
@@ -782,6 +804,15 @@ private:
                     sm_manager_, scan->tab_name_, std::move(conditions), scan->index_col_names_, context,
                     scan->scan_backward_ ? ScanDirection::Backward : ScanDirection::Forward);
             }
+            return executor;
+        }
+        case T_NestLoop: {
+            const auto* join = static_cast<const JoinPlan*>(plan);
+            auto executor = std::make_unique<NestedLoopJoinExecutor>(
+                convert_prepared_plan_executor(join->left_.get(), parameters, context),
+                convert_prepared_plan_executor(join->right_.get(), parameters, context),
+                bind_prepared_conditions(join->conds_, parameters), join->inlj_left_col_, join->inlj_right_col_,
+                join->inlj_index_col_name_);
             return executor;
         }
         case T_Sort: {

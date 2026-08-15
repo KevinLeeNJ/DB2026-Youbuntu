@@ -1557,15 +1557,15 @@ TEST(LogManagerTest, LeaderRotationHandsOffUncoveredFollowerAfterFirstBatch) {
 }
 
 TEST(LogManagerTest, SlowWaiterReportingRunsOutsideLegacyAndRotationGroupLatch) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_legacy_reporter_lock_test_db",
-                              RunLegacySlowWaiterReporterOutsideGroupLatch));
-    EXPECT_TRUE(RunInWatchdog("log_manager_rotation_reporter_lock_test_db",
-                              RunRotationSlowWaiterReporterOutsideGroupLatch));
+    EXPECT_TRUE(
+        RunInWatchdog("log_manager_legacy_reporter_lock_test_db", RunLegacySlowWaiterReporterOutsideGroupLatch));
+    EXPECT_TRUE(
+        RunInWatchdog("log_manager_rotation_reporter_lock_test_db", RunRotationSlowWaiterReporterOutsideGroupLatch));
 }
 
 TEST(LogManagerTest, PromotedWaiterDefersReportingUntilAfterItsLeaderTenure) {
-    EXPECT_TRUE(RunInWatchdog("log_manager_promoted_reporter_order_test_db",
-                              RunPromotedWaiterReportsOnlyAfterLeaderTenure));
+    EXPECT_TRUE(
+        RunInWatchdog("log_manager_promoted_reporter_order_test_db", RunPromotedWaiterReportsOnlyAfterLeaderTenure));
 }
 
 TEST(LogManagerTest, LeaderRotationFailureOnlyFailsUncoveredWaitersAndRecovers) {
@@ -2006,6 +2006,65 @@ TEST(IndexSmoWalTest, RoundTripAndChecksumAreBounded) {
     EXPECT_FALSE(ParseIndexSmoWal(raw, &parsed));
 }
 
+TEST(IndexSmoWalTest, StructuredSparseAndDensePagesRoundTrip) {
+    constexpr int column_length = sizeof(int);
+    int order = static_cast<int>((PAGE_SIZE - sizeof(IxPageHdr)) / (column_length + sizeof(Rid)) - 1);
+    while (order > 2 && IxNodeUsedBytes(order + 1, column_length) > PAGE_SIZE) {
+        --order;
+    }
+    IxFileHdr header(IX_NO_PAGE, IX_INIT_NUM_PAGES, IX_INIT_ROOT_PAGE, 1, column_length, order,
+                     IxKeysSize(order + 1, column_length), IX_INIT_ROOT_PAGE, IX_INIT_ROOT_PAGE);
+    header.col_types_.push_back(TYPE_INT);
+    header.col_lens_.push_back(column_length);
+    header.update_tot_len();
+
+    IndexSmoWalData data;
+    data.index_file_name = "structured.idx";
+    data.index_generation = 9;
+    header.serialize(data.header.data());
+    data.pages.resize(2);
+    data.pages[0].page_no = 2;
+    auto* sparse_header = reinterpret_cast<IxPageHdr*>(data.pages[0].bytes.data());
+    *sparse_header = {.next_free_page_no = IX_NO_PAGE,
+                      .parent = IX_NO_PAGE,
+                      .num_key = 0,
+                      .is_leaf = true,
+                      .prev_leaf = IX_LEAF_HEADER_PAGE,
+                      .next_leaf = IX_LEAF_HEADER_PAGE};
+    data.pages[1].page_no = 3;
+    uint32_t state = 0x9e3779b9U;
+    for (char& byte : data.pages[1].bytes) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<char>(state);
+    }
+    auto* dense_header = reinterpret_cast<IxPageHdr*>(data.pages[1].bytes.data());
+    *dense_header = {.next_free_page_no = IX_NO_PAGE,
+                     .parent = IX_INIT_ROOT_PAGE,
+                     .num_key = order,
+                     .is_leaf = true,
+                     .prev_leaf = 2,
+                     .next_leaf = IX_LEAF_HEADER_PAGE};
+
+    IndexSmoLogRecord record(data);
+    record.lsn_ = 13;
+    std::vector<char> bytes(record.log_tot_len_);
+    record.serialize(bytes.data());
+    WalRecordView raw;
+    raw.log_type = LogType::INDEX_SMO;
+    raw.lsn = record.lsn_;
+    raw.prev_lsn = record.prev_lsn_;
+    raw.txn_id = record.log_tid_;
+    raw.total_len = record.log_tot_len_;
+    raw.bytes = bytes.data();
+    IndexSmoWalView parsed;
+    ASSERT_TRUE(ParseIndexSmoWal(raw, &parsed));
+    ASSERT_EQ(parsed.page_count, 2U);
+    EXPECT_EQ(std::memcmp(parsed.page_image(0), data.pages[0].bytes.data(), PAGE_SIZE), 0);
+    EXPECT_EQ(std::memcmp(parsed.page_image(1), data.pages[1].bytes.data(), PAGE_SIZE), 0);
+}
+
 TEST(IndexSmoWalTest, AppendSupportsARecordLargerThanTheOrdinaryBuffer) {
     ScopedTestDir test_dir("large_index_smo_wal_test");
     DiskManager disk;
@@ -2360,11 +2419,17 @@ TEST(LogManagerTest, LegacyWalSnapshotRejectsReusedDescriptorGeneration) {
         cv.wait(lock, [&] { return release; });
     });
     auto old_size = std::async(std::launch::async, [&] { return disk.get_log_file_size(); });
-    { std::unique_lock<std::mutex> lock(mutex); ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(2), [&] { return captured; })); }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(2), [&] { return captured; }));
+    }
     disk.close_file(old_fd);
     const int reused = disk.open_file(LOG_FILE_NAME);
     ASSERT_EQ(reused, old_fd);
-    { std::lock_guard<std::mutex> lock(mutex); release = true; }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
     cv.notify_all();
     EXPECT_THROW(old_size.get(), InternalError);
     disk.set_wal_lease_test_hook({});

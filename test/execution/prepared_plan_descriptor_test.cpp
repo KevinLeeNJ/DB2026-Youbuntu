@@ -121,12 +121,37 @@ TEST_F(PreparedPlanDescriptorTest, supported_select_retains_immutable_topology_a
     EXPECT_FALSE(descriptor->limit_offset_layout().offset_ordinal.has_value());
 }
 
-TEST_F(PreparedPlanDescriptorTest, unsupported_node_rejects_whole_descriptor) {
-    auto aggregate =
-        std::make_unique<AggregatePlan>(T_Aggregate, make_scan({parameter_condition(1, TYPE_INT)}),
-                                        std::vector<TabCol>{}, std::vector<AggExpr>{}, std::vector<HavingCondition>{});
+TEST_F(PreparedPlanDescriptorTest, aggregate_join_collects_runtime_parameters) {
+    auto join = std::make_unique<JoinPlan>(T_NestLoop, make_scan(), make_scan(),
+                                           std::vector<Condition>{parameter_condition(1, TYPE_INT)});
+    AggExpr count;
+    count.type = AggType::COUNT;
+    count.is_distinct = true;
+    count.col = {"items", "id"};
+    HavingCondition having;
+    having.lhs.type = QueryExprType::AGGREGATE;
+    having.lhs.agg = count;
+    having.is_rhs_val = true;
+    having.rhs_val = parameter_value(2, TYPE_INT);
+    auto aggregate = std::make_unique<AggregatePlan>(T_Aggregate, std::move(join), std::vector<TabCol>{},
+                                                     std::vector<AggExpr>{count}, std::vector<HavingCondition>{having});
 
     auto descriptor = build(make_select(std::move(aggregate)));
+
+    ASSERT_TRUE(descriptor->eligible());
+    ASSERT_EQ(descriptor->parameter_layout().size(), 2);
+    EXPECT_EQ(descriptor->parameter_layout()[0].type, TYPE_INT);
+    EXPECT_EQ(descriptor->parameter_layout()[1].type, TYPE_INT);
+    EXPECT_EQ(descriptor->select_executable(), nullptr);
+}
+
+TEST_F(PreparedPlanDescriptorTest, unsupported_node_rejects_whole_descriptor) {
+    std::vector<std::unique_ptr<Plan>> branches;
+    branches.push_back(make_scan());
+    auto unsupported =
+        std::make_unique<UnionPlan>(T_Union, std::move(branches), std::vector<ColMeta>{}, std::vector<std::string>{});
+
+    auto descriptor = build(make_select(std::move(unsupported)));
 
     EXPECT_FALSE(descriptor->eligible());
     EXPECT_EQ(descriptor->fallback_reason(), PreparedPlanFallbackReason::UnsupportedShape);

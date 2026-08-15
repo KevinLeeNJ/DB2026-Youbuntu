@@ -66,6 +66,17 @@ bool add_query_expression_parameter(ParameterTypes& parameters, const QueryExpr&
     return expression.type != QueryExprType::VALUE || add_value_parameter(parameters, expression.value);
 }
 
+bool add_having_parameters(ParameterTypes& parameters, const std::vector<HavingCondition>& conditions) {
+    for (const auto& condition : conditions) {
+        if (!add_query_expression_parameter(parameters, condition.lhs) ||
+            (condition.is_rhs_val ? !add_value_parameter(parameters, condition.rhs_val)
+                                  : !add_query_expression_parameter(parameters, condition.rhs_expr))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool inspect_plan(const Plan& plan, ParameterTypes& parameters, PreparedLimitOffsetLayout& limit_offset_layout,
                   bool& parameter_error) {
     switch (plan.tag) {
@@ -104,6 +115,17 @@ bool inspect_plan(const Plan& plan, ParameterTypes& parameters, PreparedLimitOff
         }
         return inspect_plan(*filter->subplan_, parameters, limit_offset_layout, parameter_error);
     }
+    case T_Aggregate: {
+        const auto* aggregate = dynamic_cast<const AggregatePlan*>(&plan);
+        if (aggregate == nullptr || aggregate->subplan_ == nullptr) {
+            return false;
+        }
+        if (!add_having_parameters(parameters, aggregate->having_conds_)) {
+            parameter_error = true;
+            return false;
+        }
+        return inspect_plan(*aggregate->subplan_, parameters, limit_offset_layout, parameter_error);
+    }
     case T_SeqScan:
     case T_IndexScan: {
         const auto* scan = dynamic_cast<const ScanPlan*>(&plan);
@@ -116,6 +138,18 @@ bool inspect_plan(const Plan& plan, ParameterTypes& parameters, PreparedLimitOff
             return false;
         }
         return true;
+    }
+    case T_NestLoop: {
+        const auto* join = dynamic_cast<const JoinPlan*>(&plan);
+        if (join == nullptr || join->left_ == nullptr || join->right_ == nullptr) {
+            return false;
+        }
+        if (!add_condition_parameters(parameters, join->conds_)) {
+            parameter_error = true;
+            return false;
+        }
+        return inspect_plan(*join->left_, parameters, limit_offset_layout, parameter_error) &&
+               inspect_plan(*join->right_, parameters, limit_offset_layout, parameter_error);
     }
     case T_Limit: {
         const auto* limit = dynamic_cast<const LimitPlan*>(&plan);

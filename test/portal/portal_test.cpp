@@ -375,6 +375,76 @@ TEST_F(PortalAggregateTest, prepared_select_binds_request_local_conditions_and_l
     EXPECT_TRUE(descriptor->eligible());
 }
 
+TEST_F(PortalAggregateTest, prepared_aggregate_join_binds_join_and_having_parameters) {
+    sm_manager_->create_table("grade_peer", {{"id", TYPE_INT, 4}}, nullptr);
+    auto left = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade", std::vector<Condition>{},
+                                           std::vector<std::string>{});
+    auto right = std::make_unique<ScanPlan>(T_SeqScan, sm_manager_.get(), "grade_peer", std::vector<Condition>{},
+                                            std::vector<std::string>{});
+    Condition key;
+    key.lhs_col = {"grade", "id"};
+    key.op = OP_EQ;
+    key.is_rhs_val = false;
+    key.rhs_col = {"grade_peer", "id"};
+    Condition threshold;
+    threshold.lhs_col = {"grade", "id"};
+    threshold.op = OP_GE;
+    threshold.is_rhs_val = true;
+    threshold.rhs_val.type = TYPE_INT;
+    threshold.rhs_val.parameter_ordinal = 1;
+    auto join = std::make_unique<JoinPlan>(T_NestLoop, std::move(left), std::move(right),
+                                           std::vector<Condition>{key, threshold});
+
+    AggExpr count;
+    count.type = AggType::COUNT;
+    count.is_distinct = true;
+    count.col = {"grade", "score"};
+    count.display_name = "COUNT(DISTINCT score)";
+    HavingCondition having;
+    having.lhs.type = QueryExprType::AGGREGATE;
+    having.lhs.agg = count;
+    having.lhs.display_name = count.display_name;
+    having.op = OP_GT;
+    having.is_rhs_val = true;
+    having.rhs_val.type = TYPE_INT;
+    having.rhs_val.parameter_ordinal = 2;
+    auto aggregate = std::make_unique<AggregatePlan>(T_Aggregate, std::move(join), std::vector<TabCol>{},
+                                                     std::vector<AggExpr>{count}, std::vector<HavingCondition>{having});
+    auto plan = std::make_unique<DMLPlan>(T_select, std::move(aggregate), std::string(), std::vector<Value>{},
+                                          std::vector<Condition>{}, std::vector<SetClause>{});
+    auto descriptor = PreparedPlanDescriptor::Build(
+        std::move(plan), PreparedStatementKind::Select, std::vector<std::string>{count.display_name},
+        std::vector<ColMeta>{}, TEST_DB_NAME, sm_manager_->get_catalog_generation());
+    ASSERT_TRUE(descriptor->eligible());
+    EXPECT_EQ(descriptor->select_executable(), nullptr);
+
+    Value runtime_threshold;
+    runtime_threshold.set_int(7);
+    Value runtime_having;
+    runtime_having.set_int(1);
+    char buffer[256]{};
+    int offset = 0;
+    Context context(nullptr, nullptr, nullptr, buffer, &offset);
+    auto statement =
+        portal_->start_prepared(*descriptor, ParameterFrame({runtime_threshold, runtime_having}), &context);
+
+    auto* runtime_aggregate = dynamic_cast<AggregateExecutor*>(statement->root.get());
+    ASSERT_NE(runtime_aggregate, nullptr);
+    ASSERT_EQ(runtime_aggregate->having_conds_.size(), 1);
+    EXPECT_EQ(runtime_aggregate->having_conds_[0].rhs.literal.int_val, 1);
+    auto* runtime_join = dynamic_cast<NestedLoopJoinExecutor*>(runtime_aggregate->prev_.get());
+    ASSERT_NE(runtime_join, nullptr);
+    ASSERT_EQ(runtime_join->fed_conds_.size(), 2);
+    EXPECT_EQ(runtime_join->fed_conds_[1].rhs_val.int_val, 7);
+    EXPECT_EQ(runtime_join->fed_conds_[1].rhs_val.parameter_ordinal, 0u);
+
+    const auto* immutable_select = static_cast<const DMLPlan*>(descriptor->plan());
+    const auto* immutable_aggregate = static_cast<const AggregatePlan*>(immutable_select->subplan_.get());
+    const auto* immutable_join = static_cast<const JoinPlan*>(immutable_aggregate->subplan_.get());
+    EXPECT_EQ(immutable_aggregate->having_conds_[0].rhs_val.parameter_ordinal, 2u);
+    EXPECT_EQ(immutable_join->conds_[1].rhs_val.parameter_ordinal, 1u);
+}
+
 TEST_F(PortalAggregateTest, prepared_insert_uses_bound_metadata_without_visiting_plan_or_catalog) {
     sm_manager_->create_table("prepared_insert_rows",
                               {{"id", TYPE_INT, 4},
