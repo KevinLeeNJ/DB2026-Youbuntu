@@ -79,32 +79,6 @@ private:
 };
 
 class BufferPoolManager {
-public:
-    // Recovery is single-purpose before sessions are admitted. Keep this
-    // instrumentation explicitly opt-in so ordinary fetches only perform one
-    // relaxed phase load and do not allocate or format diagnostics.
-    enum class RecoveryAccessPhase : uint8_t {
-        Disabled = 0,
-        Redo,
-        PageFinalize,
-        IndexGate,
-    };
-
-    struct RecoveryAccessMetrics {
-        uint64_t resident_fast_hits{0};
-        uint64_t resident_slow_hits{0};
-        // Counts completed BPM read_page calls, not physical device I/O.
-        // Linux may satisfy each call from the OS page cache.
-        uint64_t page_read_calls{0};
-        uint64_t inflight_waits{0};
-        uint64_t inflight_wait_ns{0};
-        uint64_t replacements{0};
-    };
-
-    struct RecoveryAccessToken {
-        uint64_t value{0};
-    };
-
 private:
     enum class DependencyWriteOrigin : uint8_t { Foreground, Background, Checkpoint };
     using FlushPageTestHook = std::function<void(PageId, Page*)>;
@@ -168,20 +142,6 @@ private:
     // counters represent neither pages nor physical fdatasync operations.
     std::atomic<uint64_t> checkpoint_dependency_already_durable_{0};
     std::atomic<uint64_t> checkpoint_dependency_durable_advance_requested_{0};
-    struct RecoveryAccessCounters {
-        std::atomic<uint64_t> resident_fast_hits{0};
-        std::atomic<uint64_t> resident_slow_hits{0};
-        std::atomic<uint64_t> page_read_calls{0};
-        std::atomic<uint64_t> inflight_waits{0};
-        std::atomic<uint64_t> inflight_wait_ns{0};
-        std::atomic<uint64_t> replacements{0};
-    };
-    std::array<RecoveryAccessCounters, 3> recovery_access_counters_{};
-    std::atomic<uint64_t> recovery_access_token_{0};
-    std::atomic<uint64_t> next_recovery_access_generation_{0};
-    std::atomic<uint64_t> recovery_access_bindings_{0};
-    std::atomic<uint64_t> recovery_access_conflicts_{0};
-    std::mutex recovery_access_phase_latch_;
     frame_id_t next_unused_frame_{0};
     std::vector<frame_id_t> recycled_frames_; // 已回收的空闲帧编号，按栈使用
     // Reused only while latch_ is held by take_unblocked_victim_locked().
@@ -362,12 +322,6 @@ public:
     Page* fetch_page(PageId page_id);
     FrameOperationToken acquire_frame_operation(size_t minimum_available_frames = 2);
 
-    RecoveryAccessToken begin_recovery_access_phase(RecoveryAccessPhase phase) noexcept;
-    bool end_recovery_access_phase(RecoveryAccessPhase phase, RecoveryAccessToken token,
-                                   RecoveryAccessMetrics* metrics) noexcept;
-    void bind_recovery_access_token(RecoveryAccessToken token) noexcept;
-    void clear_recovery_access_token() noexcept;
-
     bool is_page_resident(PageId page_id);
     size_t pool_size() const noexcept {
         return pool_size_;
@@ -542,13 +496,6 @@ private:
     bool restore_deferred_victims_locked(const std::vector<frame_id_t>& deferred) noexcept;
     bool rollback_claimed_victim_locked(PageId page_id, frame_id_t frame_id) noexcept;
     bool resident_directory_is_consistent_for_test();
-    static size_t recovery_access_phase_index(RecoveryAccessPhase phase) noexcept;
-    RecoveryAccessCounters* active_recovery_access_counters() noexcept;
-    void record_recovery_resident_fast_hit() noexcept;
-    void record_recovery_resident_slow_hit() noexcept;
-    void record_recovery_page_read_call() noexcept;
-    void record_recovery_inflight_wait(uint64_t elapsed_ns) noexcept;
-    void record_recovery_replacement() noexcept;
     Page* fetch_resident_page_fast(PageId page_id, const FrameOperationToken* operation);
     FastUnpinResult unpin_clean_page_fast(PageId page_id);
     Page* fetch_page_impl(PageId page_id, const FrameOperationToken* operation);

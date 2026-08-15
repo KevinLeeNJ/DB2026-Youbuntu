@@ -139,67 +139,6 @@ private:
 
 class IndexKeyParallelScratchLimit final : public std::exception {};
 
-class RecoveryAccessPhaseGuard {
-public:
-    RecoveryAccessPhaseGuard(BufferPoolManager* buffer_pool_manager, BufferPoolManager::RecoveryAccessPhase phase,
-                             const char* name)
-        : buffer_pool_manager_(buffer_pool_manager), phase_(phase), name_(name) {
-        if (buffer_pool_manager_ != nullptr) token_ = buffer_pool_manager_->begin_recovery_access_phase(phase_);
-    }
-
-    ~RecoveryAccessPhaseGuard() {
-        if (buffer_pool_manager_ == nullptr) return;
-        BufferPoolManager::RecoveryAccessMetrics metrics;
-        if (token_.value == 0) {
-            LOG_ERROR("recovery bpm-access phase=%s status=not-started", name_);
-            return;
-        }
-        if (!buffer_pool_manager_->end_recovery_access_phase(phase_, token_, &metrics)) {
-            LOG_ERROR("recovery bpm-access phase=%s status=not-closed", name_);
-            return;
-        }
-        LOG_INFO("recovery bpm-access phase=%s resident-fast-hits=%llu resident-slow-hits=%llu "
-                 "page-read-calls=%llu pread-completed=1 os-page-cache-vs-device-io=unknown "
-                 "inflight-waits=%llu inflight-wait-us=%llu replacements=%llu",
-                 name_, static_cast<unsigned long long>(metrics.resident_fast_hits),
-                 static_cast<unsigned long long>(metrics.resident_slow_hits),
-                 static_cast<unsigned long long>(metrics.page_read_calls),
-                 static_cast<unsigned long long>(metrics.inflight_waits),
-                 static_cast<unsigned long long>(metrics.inflight_wait_ns / 1000),
-                 static_cast<unsigned long long>(metrics.replacements));
-    }
-
-    RecoveryAccessPhaseGuard(const RecoveryAccessPhaseGuard&) = delete;
-    RecoveryAccessPhaseGuard& operator=(const RecoveryAccessPhaseGuard&) = delete;
-
-    void bind_current_thread() const {
-        if (buffer_pool_manager_ != nullptr) buffer_pool_manager_->bind_recovery_access_token(token_);
-    }
-
-    void clear_current_thread() const {
-        if (buffer_pool_manager_ != nullptr) buffer_pool_manager_->clear_recovery_access_token();
-    }
-
-private:
-    BufferPoolManager* buffer_pool_manager_;
-    BufferPoolManager::RecoveryAccessPhase phase_;
-    BufferPoolManager::RecoveryAccessToken token_;
-    const char* name_;
-};
-
-class RecoveryAccessWorkerBinding {
-public:
-    explicit RecoveryAccessWorkerBinding(const RecoveryAccessPhaseGuard& phase) : phase_(phase) {
-        phase_.bind_current_thread();
-    }
-    ~RecoveryAccessWorkerBinding() { phase_.clear_current_thread(); }
-    RecoveryAccessWorkerBinding(const RecoveryAccessWorkerBinding&) = delete;
-    RecoveryAccessWorkerBinding& operator=(const RecoveryAccessWorkerBinding&) = delete;
-
-private:
-    const RecoveryAccessPhaseGuard& phase_;
-};
-
 // Owns one record-aligned analysis batch. WalReader views are borrowed and
 // expire on its next read, so the batch copies each validated record before
 // parsing it. Normal batches stop at WalFramer's soft limits; a legal oversize
@@ -1382,7 +1321,6 @@ void RecoveryManager::redo() {
         redo_completed_ = true;
         return;
     }
-    RecoveryAccessPhaseGuard access_phase(buffer_pool_manager_, BufferPoolManager::RecoveryAccessPhase::Redo, "redo");
     // Compatibility for direct unit-test users of RecoveryManager. Production
     // calls this explicitly between finalize and redo.
     prepare_pages_for_redo();
@@ -2142,7 +2080,6 @@ void RecoveryManager::redo() {
     try {
         for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
             threads.emplace_back([&, worker_index] {
-                RecoveryAccessWorkerBinding access_binding(access_phase);
                 auto& worker = workers[worker_index];
                 try {
                     while (!stop.load(std::memory_order_acquire)) {
@@ -2506,8 +2443,6 @@ void RecoveryManager::repair_touched_file_headers() {
 }
 
 void RecoveryManager::finalize_touched_pages() {
-    RecoveryAccessPhaseGuard access_phase(buffer_pool_manager_, BufferPoolManager::RecoveryAccessPhase::PageFinalize,
-                                          "page-finalize");
     fused_live_index_key_count_ = 0;
     fused_live_index_key_bytes_ = 0;
     const auto phase_begin = std::chrono::steady_clock::now();
@@ -2806,7 +2741,6 @@ void RecoveryManager::finalize_touched_pages() {
         RunRecoveryTasks(
             physical_tasks.size(), requested_workers,
             [&](size_t worker_index, size_t physical_task_index) {
-                RecoveryAccessWorkerBinding access_binding(access_phase);
                 const PhysicalTask& physical_task = physical_tasks[physical_task_index];
                 const PageTask& task = tasks[physical_task.task_index];
                 std::optional<RecoveryPinnedFinalizePage> pinned;
@@ -3603,10 +3537,7 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes(
         // repair keys are a sufficient cover for everything an interrupted SMO can
         // damage. It runs before any mutation, so a tree the repair cannot fix key
         // by key never gets written to.
-        {
         LOG_INFO("recovery undo phase: gate begin");
-        RecoveryAccessPhaseGuard gate_access_phase(buffer_pool_manager_,
-                                                   BufferPoolManager::RecoveryAccessPhase::IndexGate, "index-gate");
         const auto gate_begin = std::chrono::steady_clock::now();
         struct GateResult {
             bool rebuild{false};
@@ -3623,7 +3554,6 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes(
         const size_t gate_configured_workers = RecoveryWorkerLimit();
         const size_t gate_workers =
             RunRecoveryTasks(gate_plans.size(), gate_configured_workers, [&](size_t, size_t task_index) {
-                RecoveryAccessWorkerBinding access_binding(gate_access_phase);
                 IndexRepairPlan* plan = gate_plans[task_index];
                 GateResult& result = gate_results[task_index];
                 const auto index_begin = std::chrono::steady_clock::now();
@@ -3675,7 +3605,6 @@ std::unordered_set<std::string> RecoveryManager::repair_touched_indexes(
         LOG_INFO("recovery undo phase: gate end");
         LOG_INFO("recovery index structure gate workers: configured=%zu active=%zu max-index=%lld ms",
                  gate_configured_workers, gate_workers, static_cast<long long>(gate_max_index_ms));
-        }
 
         for (auto it = plans->begin(); it != plans->end();) {
             it = indexes_to_rebuild.count(it->first) != 0 ? plans->erase(it) : std::next(it);

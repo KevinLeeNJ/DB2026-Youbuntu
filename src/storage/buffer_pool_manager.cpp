@@ -105,142 +105,6 @@ BufferPoolManager::ReplacementTransitionTestHook BufferPoolManager::replacement_
 std::atomic<bool> BufferPoolManager::replacement_transition_test_hook_enabled_{false};
 std::atomic<bool> BufferPoolManager::flush_claim_test_hook_enabled_{false};
 
-namespace {
-thread_local BufferPoolManager* recovery_access_owner = nullptr;
-thread_local uint64_t recovery_access_token = 0;
-thread_local bool recovery_access_bound = false;
-} // namespace
-
-size_t BufferPoolManager::recovery_access_phase_index(RecoveryAccessPhase phase) noexcept {
-    switch (phase) {
-    case RecoveryAccessPhase::Redo:
-        return 0;
-    case RecoveryAccessPhase::PageFinalize:
-        return 1;
-    case RecoveryAccessPhase::IndexGate:
-        return 2;
-    case RecoveryAccessPhase::Disabled:
-        break;
-    }
-    return 3;
-}
-
-BufferPoolManager::RecoveryAccessCounters* BufferPoolManager::active_recovery_access_counters() noexcept {
-    if (recovery_access_owner != this) return nullptr;
-    const uint64_t token = recovery_access_token_.load(std::memory_order_acquire);
-    if (token == 0 || token != recovery_access_token) return nullptr;
-    const size_t index = static_cast<size_t>((token & 0x3U) - 1U);
-    return index < recovery_access_counters_.size() ? &recovery_access_counters_[index] : nullptr;
-}
-
-BufferPoolManager::RecoveryAccessToken BufferPoolManager::begin_recovery_access_phase(RecoveryAccessPhase phase) noexcept {
-    const size_t index = recovery_access_phase_index(phase);
-    if (index >= recovery_access_counters_.size()) return {};
-    std::scoped_lock phase_lock{recovery_access_phase_latch_};
-    if (recovery_access_token_.load(std::memory_order_acquire) != 0) {
-        recovery_access_conflicts_.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR("recovery bpm-access phase conflict requested=%zu", index);
-        return {};
-    }
-    const uint64_t generation = next_recovery_access_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
-    const RecoveryAccessToken token{(generation << 2U) | static_cast<uint64_t>(index + 1)};
-    RecoveryAccessCounters& counters = recovery_access_counters_[index];
-    counters.resident_fast_hits.store(0, std::memory_order_relaxed);
-    counters.resident_slow_hits.store(0, std::memory_order_relaxed);
-    counters.page_read_calls.store(0, std::memory_order_relaxed);
-    counters.inflight_waits.store(0, std::memory_order_relaxed);
-    counters.inflight_wait_ns.store(0, std::memory_order_relaxed);
-    counters.replacements.store(0, std::memory_order_relaxed);
-    // Publish only after every counter has been reset under the phase latch.
-    recovery_access_token_.store(token.value, std::memory_order_release);
-    bind_recovery_access_token(token);
-    return token;
-}
-
-bool BufferPoolManager::end_recovery_access_phase(RecoveryAccessPhase phase, RecoveryAccessToken token,
-                                                  RecoveryAccessMetrics* metrics) noexcept {
-    const size_t index = recovery_access_phase_index(phase);
-    if (metrics == nullptr || index >= recovery_access_counters_.size() || token.value == 0 ||
-        (token.value & 0x3U) != index + 1) {
-        return false;
-    }
-    std::scoped_lock phase_lock{recovery_access_phase_latch_};
-    uint64_t expected = token.value;
-    if (recovery_access_bindings_.load(std::memory_order_acquire) != 1) {
-        recovery_access_conflicts_.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR("recovery bpm-access phase end before workers drained");
-        return false;
-    }
-    if (!recovery_access_token_.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
-                                                         std::memory_order_acquire)) {
-        return false;
-    }
-    const RecoveryAccessCounters& counters = recovery_access_counters_[index];
-    metrics->resident_fast_hits = counters.resident_fast_hits.load(std::memory_order_relaxed);
-    metrics->resident_slow_hits = counters.resident_slow_hits.load(std::memory_order_relaxed);
-    metrics->page_read_calls = counters.page_read_calls.load(std::memory_order_relaxed);
-    metrics->inflight_waits = counters.inflight_waits.load(std::memory_order_relaxed);
-    metrics->inflight_wait_ns = counters.inflight_wait_ns.load(std::memory_order_relaxed);
-    metrics->replacements = counters.replacements.load(std::memory_order_relaxed);
-    clear_recovery_access_token();
-    return true;
-}
-
-void BufferPoolManager::bind_recovery_access_token(RecoveryAccessToken token) noexcept {
-    if (token.value == 0 || recovery_access_token_.load(std::memory_order_acquire) != token.value) return;
-    if (recovery_access_owner == this && recovery_access_bound && recovery_access_token == token.value) return;
-    recovery_access_owner = this;
-    recovery_access_token = token.value;
-    recovery_access_bound = true;
-    recovery_access_bindings_.fetch_add(1, std::memory_order_acq_rel);
-    if (recovery_access_token_.load(std::memory_order_acquire) != token.value) {
-        recovery_access_bindings_.fetch_sub(1, std::memory_order_acq_rel);
-        recovery_access_owner = nullptr;
-        recovery_access_token = 0;
-        recovery_access_bound = false;
-    }
-}
-
-void BufferPoolManager::clear_recovery_access_token() noexcept {
-    if (recovery_access_owner == this && recovery_access_bound) {
-        recovery_access_bindings_.fetch_sub(1, std::memory_order_acq_rel);
-        recovery_access_owner = nullptr;
-        recovery_access_token = 0;
-        recovery_access_bound = false;
-    }
-}
-
-void BufferPoolManager::record_recovery_resident_fast_hit() noexcept {
-    if (RecoveryAccessCounters* counters = active_recovery_access_counters()) {
-        counters->resident_fast_hits.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-void BufferPoolManager::record_recovery_resident_slow_hit() noexcept {
-    if (RecoveryAccessCounters* counters = active_recovery_access_counters()) {
-        counters->resident_slow_hits.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-void BufferPoolManager::record_recovery_page_read_call() noexcept {
-    if (RecoveryAccessCounters* counters = active_recovery_access_counters()) {
-        counters->page_read_calls.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-void BufferPoolManager::record_recovery_inflight_wait(uint64_t elapsed_ns) noexcept {
-    if (RecoveryAccessCounters* counters = active_recovery_access_counters()) {
-        counters->inflight_waits.fetch_add(1, std::memory_order_relaxed);
-        counters->inflight_wait_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
-    }
-}
-
-void BufferPoolManager::record_recovery_replacement() noexcept {
-    if (RecoveryAccessCounters* counters = active_recovery_access_counters()) {
-        counters->replacements.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 bool BufferPoolManager::shard_metrics_enabled() const noexcept {
     return shard_read_metrics_.enabled() || shard_write_metrics_.enabled();
 }
@@ -789,7 +653,6 @@ Page* BufferPoolManager::fetch_resident_page_fast(PageId page_id, const FrameOpe
         replacer_->pin(frame_id);
     }
     ++page->pin_count_;
-    record_recovery_resident_fast_hit();
     return page;
 }
 
@@ -1157,7 +1020,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                         replacer_->pin(hit->second);
                     }
                     ++target_page->pin_count_;
-                    record_recovery_resident_slow_hit();
                     return target_page;
                 }
             } else {
@@ -1170,7 +1032,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
         }
 
         if (wait_page != nullptr) {
-            const auto wait_begin = std::chrono::steady_clock::now();
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             if (wait_transition_generation != 0) {
                 if (transition_wait_test_hook_)
@@ -1185,9 +1046,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                     return state == FrameState::FREE || state == FrameState::VALID;
                 });
             }
-            record_recovery_inflight_wait(static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
-                    .count()));
             continue;
         }
 
@@ -1209,7 +1067,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
                         replacer_->pin(hit->second);
                     }
                     ++target_page->pin_count_;
-                    record_recovery_resident_slow_hit();
                     return target_page;
                 }
             } else {
@@ -1296,15 +1153,11 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
         }
 
         if (wait_page != nullptr) {
-            const auto wait_begin = std::chrono::steady_clock::now();
             std::unique_lock<std::mutex> wait_lock(wait_page->io_latch_);
             wait_page->io_cv_.wait_for(wait_lock, std::chrono::milliseconds(1), [wait_page] {
                 FrameState state = wait_page->state_.load(std::memory_order_acquire);
                 return state == FrameState::FREE || state == FrameState::VALID;
             });
-            record_recovery_inflight_wait(static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_begin)
-                    .count()));
             continue;
         }
 
@@ -1344,9 +1197,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
             const auto read_started =
                 record_eviction ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             disk_manager_->read_page(page_id.fd, page_id.page_no, target_page->data_, PAGE_SIZE);
-            // Count only after DiskManager has completed its pread/read call.
-            // This does not distinguish an OS page-cache hit from device I/O.
-            record_recovery_page_read_call();
             if (record_eviction)
                 background_preclean_metrics_.foreground_read(
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1437,7 +1287,6 @@ Page* BufferPoolManager::fetch_page_impl(PageId page_id, const FrameOperationTok
             }
             if (IsValidPageId(old_page_id)) {
                 replacement_transition.finish_locked();
-                if (finalized) record_recovery_replacement();
             }
         }
         target_page->io_cv_.notify_all();
