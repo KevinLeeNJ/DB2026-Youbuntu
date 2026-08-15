@@ -57,10 +57,10 @@ private:
     bool had_previous_{false};
 };
 
-TEST(CheckpointOptionsTest, ProductionDefaultTargetIsFourGiB) {
+TEST(CheckpointOptionsTest, ProductionDefaultTargetIsSixGiB) {
     const CheckpointOptions options;
-    EXPECT_EQ(options.auto_checkpoint_bytes, 4LL * 1024 * 1024 * 1024);
-    EXPECT_EQ(options.tick_bytes, 1ULL * 1024 * 1024);
+    EXPECT_EQ(options.auto_checkpoint_bytes, 6LL * 1024 * 1024 * 1024);
+    EXPECT_EQ(options.tick_bytes, 3ULL * 1024 * 1024);
     EXPECT_EQ(options.tick_time_us, 5000u);
     EXPECT_EQ(options.io_quantum_pages, 64u);
     EXPECT_FALSE(options.background_preclean_enabled);

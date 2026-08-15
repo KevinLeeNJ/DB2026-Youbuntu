@@ -25,8 +25,8 @@ class CheckpointPhaseMetrics;
 struct CheckpointOptions {
     // These defaults bound each 100ms scheduler invocation instead of letting a
     // large dirty cut turn into one foreground-visible I/O burst.
-    int64_t auto_checkpoint_bytes = 4LL * 1024 * 1024 * 1024;
-    size_t tick_bytes = 1ULL * 1024 * 1024;
+    int64_t auto_checkpoint_bytes = 6LL * 1024 * 1024 * 1024;
+    size_t tick_bytes = 3ULL * 1024 * 1024;
     uint64_t tick_time_us = 5000;
     size_t io_quantum_pages = 64;
     bool background_preclean_enabled = false;
