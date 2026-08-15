@@ -17,17 +17,30 @@ auto Watermark::AddTxn(timestamp_t read_ts) -> void {
 
 size_t Watermark::AddTxnSlot(timestamp_t read_ts) {
     std::lock_guard<std::mutex> lock(latch_);
-    auto it = std::find(active_read_ts_.begin(), active_read_ts_.end(), inactive_read_ts());
-    size_t slot;
-    if (it == active_read_ts_.end()) {
-        slot = active_read_ts_.size();
+    timestamp_t minimum = commit_ts_;
+    size_t free_slot = active_read_ts_.size();
+    const size_t size = active_read_ts_.size();
+    for (size_t offset = 0; offset < size; ++offset) {
+        const size_t index = (next_slot_hint_ + offset) % size;
+        const timestamp_t ts = active_read_ts_[index];
+        if (ts == inactive_read_ts()) {
+            if (free_slot == active_read_ts_.size()) {
+                free_slot = index;
+            }
+        } else {
+            minimum = std::min(minimum, ts);
+        }
+    }
+    if (free_slot == active_read_ts_.size()) {
+        free_slot = active_read_ts_.size();
         active_read_ts_.push_back(read_ts);
     } else {
-        slot = static_cast<size_t>(it - active_read_ts_.begin());
-        *it = read_ts;
+        active_read_ts_[free_slot] = read_ts;
+        next_slot_hint_ = (free_slot + 1) % active_read_ts_.size();
     }
-    recompute_watermark_locked();
-    return slot;
+    minimum = std::min(minimum, read_ts);
+    watermark_ = minimum;
+    return free_slot;
 }
 
 void Watermark::RemoveTxnSlot(size_t slot) {
@@ -36,7 +49,13 @@ void Watermark::RemoveTxnSlot(size_t slot) {
         return;
     }
     active_read_ts_[slot] = inactive_read_ts();
-    recompute_watermark_locked();
+    timestamp_t minimum = commit_ts_;
+    for (timestamp_t read_ts : active_read_ts_) {
+        if (read_ts != inactive_read_ts()) {
+            minimum = std::min(minimum, read_ts);
+        }
+    }
+    watermark_ = minimum;
 }
 
 void Watermark::UpdateTxnReadTsSlot(size_t slot, timestamp_t new_read_ts) {

@@ -72,4 +72,7 @@ private:
     // allocation for every transaction.
     std::vector<timestamp_t> active_read_ts_;
     std::mutex latch_;
+    // Hint for the next empty-slot scan so slot reuse does not always start
+    // at index zero.
+    size_t next_slot_hint_{0};
 };

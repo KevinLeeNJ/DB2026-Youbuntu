@@ -576,6 +576,15 @@ PreparedPlanDescriptor::PreparedPlanDescriptor(std::unique_ptr<const Plan> plan,
         fallback_reason_ = PreparedPlanFallbackReason::NullPlan;
         return;
     }
+    if (statement_kind_ == PreparedStatementKind::TxnControl) {
+        if (plan_->tag != T_Transaction_begin && plan_->tag != T_Transaction_commit &&
+            plan_->tag != T_Transaction_abort && plan_->tag != T_Transaction_rollback) {
+            fallback_reason_ = PreparedPlanFallbackReason::UnsupportedStatement;
+            return;
+        }
+        // No parameters, no executables: the runtime executes the tag directly.
+        return;
+    }
     const auto* dml = dynamic_cast<const DMLPlan*>(plan_.get());
     if (dml == nullptr) {
         fallback_reason_ = PreparedPlanFallbackReason::UnsupportedStatement;
@@ -586,6 +595,9 @@ PreparedPlanDescriptor::PreparedPlanDescriptor(std::unique_ptr<const Plan> plan,
     bool parameter_error = false;
     bool supported = false;
     switch (statement_kind_) {
+    case PreparedStatementKind::TxnControl:
+        // Handled above: a tag-only control statement is always eligible.
+        break;
     case PreparedStatementKind::Select:
         if (plan_->tag != T_select) {
             fallback_reason_ = PreparedPlanFallbackReason::UnsupportedStatement;

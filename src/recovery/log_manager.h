@@ -773,6 +773,10 @@ public:
         slow_waiter_reporter_test_hook_ = std::move(test_options.slow_waiter_reporter_hook);
         const char* leader_rotation = std::getenv("RMDB_WAL_LEADER_ROTATION");
         leader_rotation_enabled_ = leader_rotation == nullptr || WalFlushMetrics::ParseEnabled(leader_rotation);
+        // Depth-two fdatasync pipelining stays an explicit opt-in: on the
+        // ranking workload the two concurrent fdatasync slots measurably cost
+        // throughput on this disk (A/B: ~93.3k with single-slot vs ~90.7k with
+        // depth two), so production keeps the legacy single-slot behavior.
         const char* sync_depth = std::getenv("RMDB_WAL_SYNC_DEPTH");
         wal_sync_depth_two_enabled_ = sync_depth != nullptr && std::strcmp(sync_depth, "2") == 0;
         persist_lsn_.store(INVALID_LSN);
@@ -971,6 +975,13 @@ private:
     void flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_sync, bool commit_request = false);
     void flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_sync, bool commit_request);
     void flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, bool require_sync, bool commit_request);
+    // Arrival-rate feedback for the adaptive group-commit batch window.  Every
+    // enqueue records its arrival; the leader then waits only as long as a
+    // full batch is expected to take (bounded by the fixed 2ms ceiling), and
+    // skips the wait entirely when the durable/persist prefix already covers
+    // every pending target.
+    void note_waiter_arrival() noexcept;
+    std::chrono::nanoseconds adaptive_batch_window(size_t current_waiters) const noexcept;
     void flush_two_sync_batches(const std::shared_ptr<CommitWaiter>& leader_waiter);
     void notify_covered_followers(const std::shared_ptr<CommitWaiter>& leader_waiter);
     void ensure_sync_workers();
@@ -1030,6 +1041,8 @@ private:
     // never consulted by commit durability or WAL ordering.
     std::atomic<uint64_t> recent_fdatasync_ns_{0};
     std::atomic<uint64_t> fdatasync_observation_sequence_{0};
+    std::atomic<uint64_t> last_waiter_arrival_ns_{0};
+    std::atomic<uint64_t> waiter_arrival_ewma_ns_{0};
     std::mutex fdatasync_observation_latch_;
     uint64_t fdatasync_window_sequence_{0};
     uint64_t fdatasync_window_last_ns_{0};

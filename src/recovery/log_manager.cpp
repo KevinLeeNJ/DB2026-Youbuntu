@@ -51,6 +51,7 @@ constexpr size_t GROUP_COMMIT_BATCH_WAITERS = 8;
 // no other committer is competing for the disk. PostgreSQL's commit_delay plays
 // the same role and is likewise capped in the millisecond range.
 constexpr std::chrono::milliseconds GROUP_COMMIT_BATCH_WINDOW{2};
+constexpr std::chrono::nanoseconds GROUP_COMMIT_MIN_BATCH_WINDOW{100000};
 constexpr std::chrono::milliseconds kSlowWalFdatasyncThreshold{20};
 
 void LogSlowWalWaiter(uint64_t elapsed_ns, const char* role, int slot, uint64_t wave) noexcept {
@@ -415,6 +416,48 @@ void LogManager::flush_log_to_disk_up_to_impl(lsn_t target_lsn, bool require_syn
         return;
     }
     flush_log_to_disk_up_to_with_leader_rotation(target_lsn, require_sync, commit_request);
+}
+
+void LogManager::note_waiter_arrival() noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t now_ns = static_cast<uint64_t>(now.time_since_epoch().count());
+    const uint64_t prev = last_waiter_arrival_ns_.exchange(now_ns, std::memory_order_relaxed);
+    if (prev == 0) {
+        waiter_arrival_ewma_ns_.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t interval = now_ns - prev;
+    // A long idle gap resets the estimate; the next burst starts fresh.
+    if (interval >= 2ULL * 1000 * 1000 * 1000) {
+        waiter_arrival_ewma_ns_.store(0, std::memory_order_relaxed);
+        return;
+    }
+    uint64_t ewma = waiter_arrival_ewma_ns_.load(std::memory_order_relaxed);
+    if (ewma == 0) {
+        ewma = interval;
+    } else {
+        ewma = (ewma * 9 + interval) / 10;
+    }
+    waiter_arrival_ewma_ns_.store(ewma, std::memory_order_relaxed);
+}
+
+std::chrono::nanoseconds LogManager::adaptive_batch_window(size_t current_waiters) const noexcept {
+    constexpr std::chrono::nanoseconds kMaxWindow(2 * 1000 * 1000);
+    const uint64_t ewma = waiter_arrival_ewma_ns_.load(std::memory_order_relaxed);
+    if (ewma == 0) {
+        return GROUP_COMMIT_BATCH_WINDOW;
+    }
+    const size_t missing =
+        current_waiters >= GROUP_COMMIT_BATCH_WAITERS ? 0 : GROUP_COMMIT_BATCH_WAITERS - current_waiters;
+    // Expected time to gather a full batch, with a 1.2x safety margin.
+    uint64_t expected_ns = static_cast<uint64_t>(missing) * ewma * 12 / 10;
+    if (expected_ns <= static_cast<uint64_t>(GROUP_COMMIT_MIN_BATCH_WINDOW.count())) {
+        return GROUP_COMMIT_MIN_BATCH_WINDOW;
+    }
+    if (expected_ns >= static_cast<uint64_t>(kMaxWindow.count())) {
+        return kMaxWindow;
+    }
+    return std::chrono::nanoseconds(expected_ns);
 }
 
 bool LogManager::can_use_sync_pipeline() const noexcept {
@@ -834,6 +877,7 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
             return;
         }
         group_commit_waiters_.push_back(waiter);
+        note_waiter_arrival();
         if (!group_commit_leader_active_) {
             group_commit_leader_active_ = true;
             become_leader = true;
@@ -893,10 +937,23 @@ void LogManager::flush_log_to_disk_up_to_legacy(lsn_t target_lsn, bool require_s
             // low-contention path does not poll.
             {
                 std::unique_lock<std::mutex> group_lock(group_commit_latch_);
-                const auto deadline = batch_wait_begin + GROUP_COMMIT_BATCH_WINDOW;
-                group_commit_cv_.wait_until(group_lock, deadline, [this] {
-                    return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
-                });
+                const lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+                const lsn_t persist = persist_lsn_.load(std::memory_order_acquire);
+                bool all_covered = true;
+                for (const auto& pending : group_commit_waiters_) {
+                    const lsn_t completed = pending->require_sync ? durable : persist;
+                    if (pending->target_lsn > completed) {
+                        all_covered = false;
+                        break;
+                    }
+                }
+                if (!all_covered) {
+                    const auto deadline =
+                        batch_wait_begin + adaptive_batch_window(group_commit_waiters_.size());
+                    group_commit_cv_.wait_until(group_lock, deadline, [this] {
+                        return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
+                    });
+                }
                 sync_batch = false;
                 for (const auto& pending : group_commit_waiters_) {
                     sync_batch = sync_batch || pending->require_sync;
@@ -1005,6 +1062,7 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
             return;
         }
         group_commit_waiters_.push_back(waiter);
+        note_waiter_arrival();
         if (!group_commit_leader_active_) {
             group_commit_leader_active_ = true;
             waiter->state = CommitWaiter::State::Promoted;
@@ -1078,10 +1136,23 @@ void LogManager::flush_log_to_disk_up_to_with_leader_rotation(lsn_t target_lsn, 
             const auto batch_wait_begin = std::chrono::steady_clock::now();
             {
                 std::unique_lock<std::mutex> group_lock(group_commit_latch_);
-                const auto deadline = batch_wait_begin + GROUP_COMMIT_BATCH_WINDOW;
-                group_commit_cv_.wait_until(group_lock, deadline, [this] {
-                    return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
-                });
+                const lsn_t durable = durable_lsn_.load(std::memory_order_acquire);
+                const lsn_t persist = persist_lsn_.load(std::memory_order_acquire);
+                bool all_covered = true;
+                for (const auto& pending : group_commit_waiters_) {
+                    const lsn_t completed = pending->require_sync ? durable : persist;
+                    if (pending->target_lsn > completed) {
+                        all_covered = false;
+                        break;
+                    }
+                }
+                if (!all_covered) {
+                    const auto deadline =
+                        batch_wait_begin + adaptive_batch_window(group_commit_waiters_.size());
+                    group_commit_cv_.wait_until(group_lock, deadline, [this] {
+                        return group_commit_waiters_.size() >= GROUP_COMMIT_BATCH_WAITERS;
+                    });
+                }
                 for (const auto& pending : group_commit_waiters_)
                     sync_batch = sync_batch || pending->require_sync;
             }

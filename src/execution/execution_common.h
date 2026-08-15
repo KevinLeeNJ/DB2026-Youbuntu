@@ -177,7 +177,7 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
         final_shadow_candidate = shadow_candidate;
         final_shadow_meta = meta;
         auto base_record = std::move(record_with_meta.record);
-        std::optional<UndoLog> current_undo;
+        std::optional<UndoLink> current_link;
         bool retry = false;
         auto finish = [&](std::unique_ptr<RmRecord> result, const TupleMeta& legacy_meta, int legacy_depth,
                           bool legacy_deleted) {
@@ -202,12 +202,13 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
                 if (!meta.version_chain_head_.IsValid()) {
                     return finish(nullptr, meta, depth, false);
                 }
-                current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
-                if (!current_undo.has_value()) {
+                current_link = meta.version_chain_head_;
+                auto old_meta = txn_mgr->GetUndoMetaOptional(*current_link);
+                if (!old_meta.has_value()) {
                     retry = true;
                     break;
                 }
-                meta = current_undo->old_meta_;
+                meta = *old_meta;
                 continue;
             }
 
@@ -216,8 +217,13 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
             }
 
             if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-                if (!current_undo.has_value()) {
+                if (!current_link.has_value()) {
                     return finish(std::move(base_record), meta, depth, false);
+                }
+                auto current_undo = txn_mgr->GetUndoLogOptional(*current_link);
+                if (!current_undo.has_value()) {
+                    retry = true;
+                    break;
                 }
                 const auto& log = *current_undo;
                 auto rec = std::make_unique<RmRecord>(static_cast<int>(log.old_tuple_data_.size()));
@@ -228,12 +234,13 @@ inline std::unique_ptr<RmRecord> GetVisibleRecord(RmFileHandle* fh, const Rid& r
             if (!meta.version_chain_head_.IsValid()) {
                 return finish(nullptr, meta, depth, false);
             }
-            current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
-            if (!current_undo.has_value()) {
+            current_link = meta.version_chain_head_;
+            auto old_meta = txn_mgr->GetUndoMetaOptional(*current_link);
+            if (!old_meta.has_value()) {
                 retry = true;
                 break;
             }
-            meta = current_undo->old_meta_;
+            meta = *old_meta;
         }
 
         if (!retry) {
@@ -268,7 +275,7 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
         auto shadow_candidate = PrepareReadViewShadowCandidate(txn_mgr, *txn, meta, base.view.data, base.view.size);
         final_shadow_candidate = shadow_candidate;
         final_shadow_meta = meta;
-        std::optional<UndoLog> current_undo;
+        std::optional<UndoLink> current_link;
         bool retry = false;
         auto finish = [&](RmRecordViewWithMeta result, const TupleMeta& legacy_meta, int depth, bool deleted) {
             result.meta = legacy_meta;
@@ -289,12 +296,13 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
                 if (!meta.version_chain_head_.IsValid()) {
                     return finish({}, meta, depth, false);
                 }
-                current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
-                if (!current_undo.has_value()) {
+                current_link = meta.version_chain_head_;
+                auto old_meta = txn_mgr->GetUndoMetaOptional(*current_link);
+                if (!old_meta.has_value()) {
                     retry = true;
                     break;
                 }
-                meta = current_undo->old_meta_;
+                meta = *old_meta;
                 continue;
             }
 
@@ -303,9 +311,14 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
             }
 
             if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-                if (!current_undo.has_value()) {
+                if (!current_link.has_value()) {
                     base.meta = meta;
                     return finish(std::move(base), meta, depth, false);
+                }
+                auto current_undo = txn_mgr->GetUndoLogOptional(*current_link);
+                if (!current_undo.has_value()) {
+                    retry = true;
+                    break;
                 }
                 auto owned = std::make_unique<RmRecord>(static_cast<int>(current_undo->old_tuple_data_.size()));
                 memcpy(owned->data, current_undo->old_tuple_data_.data(), current_undo->old_tuple_data_.size());
@@ -319,12 +332,13 @@ inline RmRecordViewWithMeta GetVisibleTuple(RmFileHandle* fh, const Rid& rid, Co
             if (!meta.version_chain_head_.IsValid()) {
                 return finish({}, meta, depth, false);
             }
-            current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
-            if (!current_undo.has_value()) {
+            current_link = meta.version_chain_head_;
+            auto old_meta = txn_mgr->GetUndoMetaOptional(*current_link);
+            if (!old_meta.has_value()) {
                 retry = true;
                 break;
             }
-            meta = current_undo->old_meta_;
+            meta = *old_meta;
         }
 
         if (!retry) {
@@ -360,7 +374,7 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
     const txn_id_t self_id = txn->get_transaction_id();
     TupleMeta meta = base_meta;
     auto shadow_candidate = PrepareReadViewShadowCandidate(txn_mgr, *txn, base_meta, base_data, base_size);
-    std::optional<UndoLog> current_undo;
+    std::optional<UndoLink> current_link;
     auto finish = [&](RmRecordViewWithMeta result, const TupleMeta& legacy_meta, int depth, bool deleted) {
         result.meta = legacy_meta;
         FinishReadViewShadowCandidate(txn_mgr, shadow_candidate, result, deleted, depth);
@@ -382,13 +396,14 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
             if (!meta.version_chain_head_.IsValid()) {
                 return finish({}, meta, depth, false);
             }
-            current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
-            if (!current_undo.has_value()) {
+            current_link = meta.version_chain_head_;
+            auto old_meta = txn_mgr->GetUndoMetaOptional(*current_link);
+            if (!old_meta.has_value()) {
                 *needs_heap_reread = true;
                 // The heap reread owns the sole final shadow observation.
                 return {};
             }
-            meta = current_undo->old_meta_;
+            meta = *old_meta;
             continue;
         }
 
@@ -397,10 +412,15 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
         }
 
         if (!meta.is_deleted_ && meta.commit_ts_ <= read_ts) {
-            if (!current_undo.has_value()) {
+            if (!current_link.has_value()) {
                 auto result = copied_base();
                 result.meta = meta;
                 return finish(std::move(result), meta, depth, false);
+            }
+            auto current_undo = txn_mgr->GetUndoLogOptional(*current_link);
+            if (!current_undo.has_value()) {
+                *needs_heap_reread = true;
+                return {};
             }
             auto owned = std::make_unique<RmRecord>(static_cast<int>(current_undo->old_tuple_data_.size()));
             memcpy(owned->data, current_undo->old_tuple_data_.data(), current_undo->old_tuple_data_.size());
@@ -414,13 +434,14 @@ inline RmRecordViewWithMeta GetVisibleTupleFromCopiedBase(const TupleMeta& base_
         if (!meta.version_chain_head_.IsValid()) {
             return finish({}, meta, depth, false);
         }
-        current_undo = txn_mgr->GetUndoLogOptional(meta.version_chain_head_);
-        if (!current_undo.has_value()) {
+        current_link = meta.version_chain_head_;
+        auto old_meta = txn_mgr->GetUndoMetaOptional(*current_link);
+        if (!old_meta.has_value()) {
             *needs_heap_reread = true;
             // The heap reread owns the sole final shadow observation.
             return {};
         }
-        meta = current_undo->old_meta_;
+        meta = *old_meta;
     }
     return finish({}, meta, MAX_DEPTH, false);
 }

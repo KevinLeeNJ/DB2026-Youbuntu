@@ -25,6 +25,7 @@ enum class PreparedStatementKind {
     Select,
     Insert,
     Update,
+    TxnControl,
     Unsupported,
 };
 

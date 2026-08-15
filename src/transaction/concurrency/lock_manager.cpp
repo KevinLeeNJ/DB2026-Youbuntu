@@ -177,7 +177,7 @@ void LockManager::unregister_pending_lock(txn_id_t txn_id, const LockDataId& loc
     unregister_waiting_txn_locked(txn_id);
 }
 
-bool LockManager::register_waiting_txn(Transaction* txn) {
+bool LockManager::register_waiting_txn(Transaction* txn, std::optional<size_t> unique_key_shard) {
     if (txn == nullptr) {
         return false;
     }
@@ -186,9 +186,16 @@ bool LockManager::register_waiting_txn(Transaction* txn) {
         return false;
     }
     txn->pin_lock_operation();
-    auto [it, inserted] = waiting_txns_.try_emplace(txn->get_transaction_id(), WaitingTxn{txn, 0});
+    auto [it, inserted] = waiting_txns_.try_emplace(txn->get_transaction_id(), WaitingTxn{txn, 0, {}});
     assert(inserted || it->second.txn == txn);
     ++it->second.registrations;
+    if (unique_key_shard.has_value()) {
+        const size_t shard_index = *unique_key_shard;
+        auto& shards = it->second.unique_key_shards;
+        if (std::find(shards.begin(), shards.end(), shard_index) == shards.end()) {
+            shards.push_back(shard_index);
+        }
+    }
     return true;
 }
 
@@ -581,8 +588,10 @@ bool LockManager::cancel_waiting_transaction(txn_id_t txn_id) {
     }
 
     // Unique-key waiters are represented by transaction IDs rather than
-    // LockRequest objects, so remove the selected victim from every shard and
-    // wake its waiter through the transaction cancellation flag.
+    // LockRequest objects.  The victim may still be between queue insertion and
+    // waiter-registration (the edge is already in the wait-for graph), so the
+    // cancellation scan must stay exhaustive: a registration-window miss would
+    // leave the victim waiting forever without the cancellation flag.
     for (auto& shard : unique_key_shards_) {
         std::lock_guard<std::mutex> lock(shard.latch);
         for (auto it = shard.queues.begin(); it != shard.queues.end();) {
@@ -877,7 +886,8 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
         return false;
     }
 
-    auto& shard = unique_key_shards_[std::hash<std::string>{}(lock_id) % UNIQUE_KEY_SHARD_COUNT];
+    const size_t shard_index = std::hash<std::string>{}(lock_id) % UNIQUE_KEY_SHARD_COUNT;
+    auto& shard = unique_key_shards_[shard_index];
     std::unique_lock<std::mutex> lock(shard.latch);
     auto& queue = shard.queues[lock_id];
     if (queue == nullptr) {
@@ -905,7 +915,7 @@ bool LockManager::lock_exclusive_on_unique_key_id(Transaction* txn, const std::s
     }
     queue->waiters.push_back(txn_id);
     note_wait_topology_change();
-    if (!register_waiting_txn(txn)) {
+    if (!register_waiting_txn(txn, shard_index)) {
         queue->waiters.erase(std::find(queue->waiters.begin(), queue->waiters.end(), txn_id));
         note_wait_topology_change();
         queue->cv.notify_all();
@@ -985,18 +995,28 @@ void LockManager::cancel_transaction(Transaction* txn) {
 
     const txn_id_t txn_id = txn->get_transaction_id();
     txn->mark_lock_cancellation_requested();
-    for (auto& shard : unique_key_shards_) {
-        std::lock_guard<std::mutex> lock(shard.latch);
-        for (auto& [_, queue] : shard.queues) {
-            queue->cv.notify_all();
-        }
-    }
+    std::vector<size_t> unique_key_shards;
     std::vector<PendingLock> pending;
     {
         std::lock_guard<std::mutex> lock(pending_latch_);
+        auto waiting_it = waiting_txns_.find(txn_id);
+        if (waiting_it != waiting_txns_.end()) {
+            unique_key_shards = waiting_it->second.unique_key_shards;
+        }
         auto it = pending_locks_.find(txn_id);
         if (it != pending_locks_.end()) {
             pending = it->second;
+        }
+    }
+    // A unique-key waiter wakes through its own queue cv.  Only shards where
+    // this transaction is actually waiting need a notification; the
+    // cancellation flag makes the wait predicate return even when the wake
+    // races registration.
+    for (const size_t shard_index : unique_key_shards) {
+        auto& shard = unique_key_shards_[shard_index];
+        std::lock_guard<std::mutex> lock(shard.latch);
+        for (auto& [_, queue] : shard.queues) {
+            queue->cv.notify_all();
         }
     }
 

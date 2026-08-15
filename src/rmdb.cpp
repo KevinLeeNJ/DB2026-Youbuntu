@@ -10,6 +10,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -1138,6 +1139,54 @@ ExecutionOutcome execute_prepared_operation(PreparedStatement& prepared_statemen
             throw RMDBError("prepared parameter count does not match descriptor");
         }
         bool is_query = false;
+        if (descriptor.statement_kind() == PreparedStatementKind::TxnControl) {
+            // Direct transaction-control fast path.  The generic pipeline
+            // clones the bound tree, re-analyzes and re-plans every
+            // BEGIN/COMMIT/ABORT and then looks the transaction up in the
+            // global txn_map; this path uses the session's cached transaction
+            // and only the tag stored in the descriptor.
+            const Plan* plan = descriptor.plan();
+            if (plan == nullptr) {
+                throw InternalError("txn-control prepared descriptor has no plan");
+            }
+            Transaction* txn = session.running_transaction();
+            if (txn == nullptr && session.txn_id != INVALID_TXN_ID) {
+                txn = txn_manager->get_transaction(session.txn_id);
+            }
+            switch (plan->tag) {
+            case T_Transaction_begin: {
+                if (txn == nullptr) {
+                    txn = txn_manager->begin(nullptr, context.log_mgr_, context.isolation_level_);
+                    session.txn_id = txn->get_transaction_id();
+                    session.remember_running_transaction(txn);
+                }
+                txn->set_txn_mode(true);
+                txn->set_isolation_level(context.isolation_level_);
+                context.txn_ = txn;
+                break;
+            }
+            case T_Transaction_commit:
+                if (txn != nullptr) {
+                    txn_manager->commit(txn, context.log_mgr_);
+                }
+                session.forget_running_transaction();
+                session.txn_id = INVALID_TXN_ID;
+                context.txn_ = nullptr;
+                break;
+            case T_Transaction_abort:
+            case T_Transaction_rollback:
+                if (txn != nullptr) {
+                    txn_manager->abort(txn, context.log_mgr_);
+                }
+                session.forget_running_transaction();
+                session.txn_id = INVALID_TXN_ID;
+                context.txn_ = nullptr;
+                break;
+            default:
+                throw InternalError("unexpected txn-control plan tag");
+            }
+            return {false, false};
+        }
         const PreparedSelectExecutable* select_executable = descriptor.select_executable();
         const bool reusable_select =
             descriptor.statement_kind() == PreparedStatementKind::Select && select_executable != nullptr &&
@@ -1242,6 +1291,9 @@ PreparedStatement inspect_prepared(std::uint16_t id, bool query, std::vector<Typ
         statement_kind = PreparedStatementKind::Insert;
     } else if (plan->tag == T_Update) {
         statement_kind = PreparedStatementKind::Update;
+    } else if (plan->tag == T_Transaction_begin || plan->tag == T_Transaction_commit ||
+               plan->tag == T_Transaction_abort || plan->tag == T_Transaction_rollback) {
+        statement_kind = PreparedStatementKind::TxnControl;
     }
     if (actual_query) {
         auto [output_names, result_schema] = portal->inspect_select_plan(plan.get(), &context);
@@ -1776,6 +1828,8 @@ void start_server(std::uint16_t port) {
             continue; // ignore current socket ,continue while loop.
         }
 
+        int tcp_no_delay = 1;
+        (void)setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &tcp_no_delay, sizeof(tcp_no_delay));
         reap_finished_clients();
         try {
             auto done = std::make_shared<std::atomic<bool>>(false);

@@ -29,6 +29,9 @@ struct CheckpointOptions {
     size_t tick_bytes = 1ULL * 1024 * 1024;
     uint64_t tick_time_us = 5000;
     size_t io_quantum_pages = 64;
+    // Background preclean stays opt-in: on the ranking workload it adds
+    // continuous dirty-page I/O and WAL dependency waits that measurably
+    // reduce commit throughput (A/B: ~90k with it off vs ~84k with it on).
     bool background_preclean_enabled = false;
     uint8_t background_preclean_low_percent = 10;
     uint8_t background_preclean_high_percent = 15;

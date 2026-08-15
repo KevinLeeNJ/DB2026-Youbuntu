@@ -316,13 +316,15 @@ bool read_frame(int fd, Frame& frame) {
     const auto tag = static_cast<Tag>(header[4]);
     validate_frame_fields(tag, header[5]);
 
-    std::vector<std::uint8_t> payload(payload_size);
-    if (payload_size != 0 && !read_exact(fd, payload.data(), payload_size)) {
+    // Reuse the frame's payload buffer across requests: resize keeps the
+    // previous capacity (bounded by the 1 MiB frame limit), and read_exact
+    // overwrites every byte, so no zero-fill is needed.
+    frame.payload.resize(payload_size);
+    if (payload_size != 0 && !read_exact(fd, frame.payload.data(), payload_size)) {
         throw ProtocolError("connection closed in frame payload");
     }
     frame.tag = tag;
     frame.flags = header[5];
-    frame.payload = std::move(payload);
     return true;
 }
 

@@ -57,7 +57,7 @@ private:
     bool had_previous_{false};
 };
 
-TEST(CheckpointOptionsTest, ProductionDefaultTargetIsFourGiB) {
+TEST(CheckpointOptionsTest, ProductionDefaultTargetIsFourGiBWithPrecleanOff) {
     const CheckpointOptions options;
     EXPECT_EQ(options.auto_checkpoint_bytes, 4LL * 1024 * 1024 * 1024);
     EXPECT_EQ(options.tick_bytes, 1ULL * 1024 * 1024);

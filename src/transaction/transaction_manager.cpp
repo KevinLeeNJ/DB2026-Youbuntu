@@ -26,6 +26,8 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 
 std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> TransactionManager::txn_map = {};
+std::array<TransactionManager::UndoRegistryShard, TransactionManager::UNDO_REGISTRY_SHARD_COUNT>
+    TransactionManager::undo_registry_shards{};
 
 TransactionManager::~TransactionManager() {
     {
@@ -540,7 +542,13 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
         }
         WriteBeginLog(txn, log_manager);
         std::unique_lock<std::mutex> lock(latch_);
-        if (created) txn_map[txn->get_transaction_id()] = std::move(created);
+        std::unique_lock<std::shared_mutex> map_lock(txn_map_mutex_);
+        if (created) {
+            txn_map[txn->get_transaction_id()] = std::move(created);
+            auto& registry_shard = undo_registry_shards[undo_registry_shard_index(txn->get_transaction_id())];
+            std::unique_lock<std::shared_mutex> registry_lock(registry_shard.latch);
+            registry_shard.txns[txn->get_transaction_id()] = txn;
+        }
         if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE)
             active_serializable_txns_.insert(txn->get_transaction_id());
         return txn;
@@ -608,8 +616,12 @@ Transaction* TransactionManager::begin(Transaction* txn, LogManager* log_manager
     WriteBeginLog(txn, log_manager);
 
     std::unique_lock<std::mutex> lock(latch_);
+    std::unique_lock<std::shared_mutex> map_lock(txn_map_mutex_);
     if (created) {
         txn_map[txn->get_transaction_id()] = std::move(created);
+        auto& registry_shard = undo_registry_shards[undo_registry_shard_index(txn->get_transaction_id())];
+        std::unique_lock<std::shared_mutex> registry_lock(registry_shard.latch);
+        registry_shard.txns[txn->get_transaction_id()] = txn;
     }
     if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
         active_serializable_txns_.insert(txn->get_transaction_id());
@@ -1236,21 +1248,33 @@ void TransactionManager::seed_counters_after_recovery(timestamp_t next_timestamp
 }
 
 UndoLog TransactionManager::GetUndoLog(UndoLink link) {
-    std::unique_lock<std::mutex> lock(latch_);
-    auto it = txn_map.find(link.undo_txn_id_);
-    if (it == txn_map.end()) {
+    auto& shard = undo_registry_shards[undo_registry_shard_index(link.undo_txn_id_)];
+    std::shared_lock<std::shared_mutex> lock(shard.latch);
+    auto it = shard.txns.find(link.undo_txn_id_);
+    if (it == shard.txns.end()) {
         throw InternalError("GetUndoLog: transaction not found");
     }
     return it->second->GetUndoLog(link.undo_slot_offset_);
 }
 
 std::optional<UndoLog> TransactionManager::GetUndoLogOptional(UndoLink link) {
-    std::unique_lock<std::mutex> lock(latch_);
-    auto it = txn_map.find(link.undo_txn_id_);
-    if (it == txn_map.end()) {
+    auto& shard = undo_registry_shards[undo_registry_shard_index(link.undo_txn_id_)];
+    std::shared_lock<std::shared_mutex> lock(shard.latch);
+    auto it = shard.txns.find(link.undo_txn_id_);
+    if (it == shard.txns.end()) {
         return std::nullopt;
     }
     return it->second->GetUndoLog(link.undo_slot_offset_);
+}
+
+std::optional<TupleMeta> TransactionManager::GetUndoMetaOptional(UndoLink link) {
+    auto& shard = undo_registry_shards[undo_registry_shard_index(link.undo_txn_id_)];
+    std::shared_lock<std::shared_mutex> lock(shard.latch);
+    auto it = shard.txns.find(link.undo_txn_id_);
+    if (it == shard.txns.end()) {
+        return std::nullopt;
+    }
+    return it->second->GetUndoMeta(link.undo_slot_offset_);
 }
 
 std::optional<std::pair<TupleMeta, std::vector<char>>>
@@ -1707,6 +1731,10 @@ void TransactionManager::RetireTransactionIfSafe(Transaction* txn) {
 
         std::unique_lock<std::mutex> lock(latch_);
         if (CanRetireTransactionUnlocked(txn)) {
+            std::unique_lock<std::shared_mutex> map_lock(txn_map_mutex_);
+            auto& registry_shard = undo_registry_shards[undo_registry_shard_index(txn->get_transaction_id())];
+            std::unique_lock<std::shared_mutex> registry_lock(registry_shard.latch);
+            registry_shard.txns.erase(txn->get_transaction_id());
             auto it = txn_map.find(txn->get_transaction_id());
             if (it != txn_map.end() && it->second.get() == txn) {
                 txn_map.erase(it);
@@ -1803,6 +1831,7 @@ bool TransactionManager::GarbageCollectionBatch() {
     std::vector<txn_id_t> to_erase;
     {
         std::unique_lock<std::mutex> lock(latch_);
+        std::unique_lock<std::shared_mutex> map_lock(txn_map_mutex_);
         size_t scanned = 0;
         for (auto it = txn_map.begin(); it != txn_map.end() && scanned < GC_SCAN_LIMIT; ++it, ++scanned) {
             Transaction* txn = it->second.get();
@@ -1842,6 +1871,9 @@ bool TransactionManager::GarbageCollectionBatch() {
             }
         }
         for (txn_id_t txn_id : to_erase) {
+            auto& registry_shard = undo_registry_shards[undo_registry_shard_index(txn_id)];
+            std::unique_lock<std::shared_mutex> registry_lock(registry_shard.latch);
+            registry_shard.txns.erase(txn_id);
             txn_map.erase(txn_id);
         }
     }

@@ -47,10 +47,57 @@ public:
      * @return 找到了就返回偏移位置，没找到就返回max_n
      */
     static int next_bit(bool bit, const char* bm, int max_n, int curr) {
-        for (int i = curr + 1; i < max_n; i++) {
-            if (is_set(bm, i) == bit) {
-                return i;
+        const int start = curr + 1;
+        if (start >= max_n) {
+            return max_n;
+        }
+        const auto* bytes = reinterpret_cast<const unsigned char*>(bm);
+        int byte = start / 8;
+        const int limit_byte = (max_n + 7) / 8;
+        // Within a byte, bit index 0 is the most significant bit, so the first
+        // matching bit is the highest set bit of the (possibly inverted) byte:
+        // p = 7 - highest_value_bit = clz(byte) - 24.
+        unsigned mask = (1u << (8 - (start % 8))) - 1;
+        auto try_byte = [&](int index) -> int {
+            unsigned target = bit ? bytes[index] : static_cast<unsigned char>(~bytes[index]);
+            const unsigned bits = target & mask;
+            if (bits == 0) {
+                return -1;
             }
+            const int found = index * 8 + (__builtin_clz(bits) - 24);
+            return found < max_n ? found : max_n;
+        };
+        const int first = try_byte(byte);
+        if (first >= 0) {
+            return first;
+        }
+        ++byte;
+        mask = 0xFFu;
+        // Scan 64-bit words: byte k of the bitmap is the k-th least significant
+        // byte of the word, so ctzll finds the lowest matching bit in order.
+        while (byte + 8 <= limit_byte) {
+            uint64_t word = 0;
+            std::memcpy(&word, bytes + byte, sizeof(word));
+            const uint64_t bits = bit ? word : ~word;
+            if (bits != 0) {
+                // The lowest set bit picks the first (lowest memory-order)
+                // byte with a match; within that byte the first matching bit
+                // is its most significant bit.
+                const int rel = __builtin_ctzll(bits);
+                const int byte_rel = rel / 8;
+                const unsigned char byte_val =
+                    static_cast<unsigned char>((bits >> (8 * byte_rel)) & 0xFF);
+                const int found = (byte + byte_rel) * 8 + (__builtin_clz(byte_val) - 24);
+                return found < max_n ? found : max_n;
+            }
+            byte += 8;
+        }
+        while (byte < limit_byte) {
+            const int found = try_byte(byte);
+            if (found >= 0) {
+                return found;
+            }
+            ++byte;
         }
         return max_n;
     }

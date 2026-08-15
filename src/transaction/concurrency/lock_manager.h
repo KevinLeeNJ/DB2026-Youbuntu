@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "common/shard_acquisition_metrics.h"
@@ -170,6 +171,9 @@ private:
     struct WaitingTxn {
         Transaction* txn;
         size_t registrations{0};
+        // Unique-key shards where this transaction is currently waiting.
+        // Abort/deadlock cancellation only needs to notify these shards.
+        std::vector<size_t> unique_key_shards;
     };
 
     size_t get_shard_index(const LockDataId& lock_data_id) const;
@@ -186,7 +190,7 @@ private:
     WaitForGraph build_wait_for_graph_snapshot();
     txn_id_t find_youngest_cycle_victim(txn_id_t requester);
     void note_wait_topology_change();
-    bool register_waiting_txn(Transaction* txn);
+    bool register_waiting_txn(Transaction* txn, std::optional<size_t> unique_key_shard = std::nullopt);
     void unregister_waiting_txn(txn_id_t txn_id);
     void unregister_waiting_txn_locked(txn_id_t txn_id);
     bool cancel_waiting_transaction(txn_id_t txn_id);

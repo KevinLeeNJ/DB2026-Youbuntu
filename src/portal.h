@@ -1422,6 +1422,10 @@ public:
                 bind_prepared_conditions(dml->conds_, parameters), std::move(rids), context);
             return std::make_unique<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<std::string>{}, std::move(root));
         }
+        case PreparedStatementKind::TxnControl:
+            // Handled directly by execute_prepared_operation; never reaches the
+            // portal runtime.
+            break;
         case PreparedStatementKind::Unsupported:
             break;
         }

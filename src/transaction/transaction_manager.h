@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -25,6 +26,7 @@ See the Mulan PSL v2 for more details. */
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "transaction.h"
 #include "common/transaction_phase_metrics.h"
@@ -273,7 +275,9 @@ public:
 
         // Counts only the lookups that reach the global txn_map mutex, which is
         // the cost a session avoids by caching the transaction it is running.
-        std::unique_lock<std::mutex> lock(latch_);
+        // A shared lock lets concurrent version-chain readers traverse undo
+        // logs in parallel; only begin/GC/retire serialize on the registry.
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
         auto it = TransactionManager::txn_map.find(txn_id);
         if (it == TransactionManager::txn_map.end())
             return nullptr;
@@ -287,6 +291,20 @@ public:
 
     static std::unordered_map<txn_id_t, std::unique_ptr<Transaction>>
         txn_map; // 全局事务表，存放事务ID与事务对象的映射关系
+    // Sharded read-only registry for MVCC undo-chain traversal.  Version-chain
+    // readers (GetUndoLog*/GetUndoMetaOptional) take a per-shard shared lock,
+    // so hot undo hops never serialize on the global txn_map latch.  Writers
+    // remove the raw pointer under the shard's unique lock before txn_map
+    // destroys the Transaction object, which closes the in-flight-reader race.
+    struct UndoRegistryShard {
+        std::shared_mutex latch;
+        std::unordered_map<txn_id_t, Transaction*> txns;
+    };
+    static constexpr size_t UNDO_REGISTRY_SHARD_COUNT = 64;
+    static std::array<UndoRegistryShard, UNDO_REGISTRY_SHARD_COUNT> undo_registry_shards;
+    static size_t undo_registry_shard_index(txn_id_t txn_id) noexcept {
+        return static_cast<size_t>(txn_id) % UNDO_REGISTRY_SHARD_COUNT;
+    }
     std::shared_mutex txn_map_mutex_;
     /** ------------------------以下函数仅可能在MVCC当中使用------------------------------------------*/
 
@@ -313,6 +331,8 @@ public:
     /** @brief 访问事务撤销日志缓冲区并获取撤销日志。如果事务不存在，返回 nullopt。
      * 如果索引超出范围仍然会抛出异常。 */
     std::optional<UndoLog> GetUndoLogOptional(UndoLink link);
+    /** @brief 仅获取版本链一跳的 old_meta_，避免整行拷贝。事务不存在返回 nullopt。 */
+    std::optional<TupleMeta> GetUndoMetaOptional(UndoLink link);
 
     /** @brief 访问事务撤销日志缓冲区并获取撤销日志。除非访问当前事务缓冲区，
      * 否则应该始终调用此函数以获取撤销日志，而不是手动检索事务 shared_ptr 并访问缓冲区。 */

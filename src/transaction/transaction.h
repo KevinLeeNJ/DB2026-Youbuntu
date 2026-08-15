@@ -469,6 +469,18 @@ public:
         return undo_logs_[log_id];
     }
 
+    // Meta-only view for version-chain hops that do not need the old row
+    // bytes (visibility traversal).  Avoids copying old_tuple_data_ at every
+    // chain hop; the full UndoLog is fetched only when the visible version is
+    // materialized.
+    inline auto GetUndoMeta(size_t log_id) -> TupleMeta {
+        std::scoped_lock<std::mutex> lck(latch_);
+        if (log_id >= undo_logs_.size()) {
+            throw InternalError("GetUndoMeta: undo log index out of range");
+        }
+        return undo_logs_[log_id].old_meta_;
+    }
+
     /** @return 撤销日志的数量 */
     inline auto GetUndoLogNum() -> size_t {
         std::scoped_lock<std::mutex> lck(latch_);
