@@ -557,6 +557,9 @@ bool BufferPoolManager::restore_deferred_victims_locked(const std::vector<frame_
     bool restored_all = true;
     // victim() returns oldest-first. Restoring to the victim end therefore
     // runs newest-first so the original oldest remains the next victim.
+    // The caller holds latch_ exclusively, so page identity, mapping and
+    // residency cannot change here. Fast fetch/unpin can still change the pin
+    // count, which is why the per-page pin latch remains necessary.
     for (auto deferred_it = deferred.rbegin(); deferred_it != deferred.rend(); ++deferred_it) {
         const frame_id_t frame_id = *deferred_it;
         try {
@@ -564,20 +567,9 @@ bool BufferPoolManager::restore_deferred_victims_locked(const std::vector<frame_
                 continue;
             }
             Page* page = &pages_[frame_id];
-            const PageId page_id = page->id_;
-            if (!IsValidPageId(page_id)) {
-                continue;
-            }
-
-            const size_t shard_index = resident_directory_shard_index(page_id);
-            ResidentDirectoryShard& shard = resident_directory_[shard_index];
-            auto shard_lock = shard_write_metrics_.acquire_exclusive(shard.latch, shard_index);
-            auto authoritative = page_table_.find(page_id);
-            auto resident = shard.entries.find(page_id);
             std::scoped_lock pin_lock{page->pin_latch_};
-            if (authoritative != page_table_.end() && authoritative->second == frame_id &&
-                resident != shard.entries.end() && resident->second == frame_id && page->id_ == page_id &&
-                page->state_.load(std::memory_order_acquire) == FrameState::VALID && page->pin_count_ == 0 &&
+            if (IsValidPageId(page->id_) && page->state_.load(std::memory_order_acquire) == FrameState::VALID &&
+                page->pin_count_ == 0 &&
                 residency_classes_[frame_id] == ResidencyClass::Normal) {
                 replacer_->restore(frame_id);
             }
