@@ -673,7 +673,7 @@ private:
                 error("expected LIKE, IN, or BETWEEN after NOT");
             }
             auto result = std::make_unique<BinaryExpr>(std::move(lhs), op, nullptr);
-            if (match(TokenType::ANY)) {
+            if (match(TokenType::ANY) || match(TokenType::SOME)) {
                 result->quantifier = Quantifier::ANY;
                 result->rhs = parse_subquery_expr();
             } else if (match(TokenType::ALL)) {
@@ -807,6 +807,9 @@ private:
         if (check(TokenType::CASE)) {
             return parse_case_expr();
         }
+        if (check(TokenType::IDENTIFIER) && peek(1).type == TokenType::LPAREN) {
+            return parse_scalar_function_expr();
+        }
         if (check(TokenType::IDENTIFIER)) {
             return parse_col();
         }
@@ -821,6 +824,43 @@ private:
             return expression;
         }
         return parse_value();
+    }
+
+    std::unique_ptr<Expr> parse_scalar_function_expr() {
+        Token name = expect(TokenType::IDENTIFIER, "expected scalar function name");
+        ScalarFuncType func;
+        if (parser::CIEqual{}(name.text, "ABS")) {
+            func = ScalarFuncType::ABS;
+        } else if (parser::CIEqual{}(name.text, "LENGTH")) {
+            func = ScalarFuncType::LENGTH;
+        } else if (parser::CIEqual{}(name.text, "COALESCE")) {
+            func = ScalarFuncType::COALESCE;
+        } else if (parser::CIEqual{}(name.text, "LOWER")) {
+            func = ScalarFuncType::LOWER;
+        } else if (parser::CIEqual{}(name.text, "UPPER")) {
+            func = ScalarFuncType::UPPER;
+        } else if (parser::CIEqual{}(name.text, "TRIM")) {
+            func = ScalarFuncType::TRIM;
+        } else if (parser::CIEqual{}(name.text, "ROUND")) {
+            func = ScalarFuncType::ROUND;
+        } else if (parser::CIEqual{}(name.text, "NULLIF")) {
+            func = ScalarFuncType::NULLIF;
+        } else if (parser::CIEqual{}(name.text, "CHAR_LENGTH")) {
+            func = ScalarFuncType::LENGTH;
+        } else {
+            error("unsupported scalar function");
+        }
+
+        expect(TokenType::LPAREN, "expected '(' after scalar function");
+        std::vector<std::unique_ptr<Expr>> args;
+        if (!check(TokenType::RPAREN)) {
+            args.push_back(parse_value_expr());
+            while (match(TokenType::COMMA)) {
+                args.push_back(parse_value_expr());
+            }
+        }
+        expect(TokenType::RPAREN, "expected ')' after scalar function arguments");
+        return std::make_unique<ScalarFuncExpr>(func, std::move(args));
     }
 
     std::unique_ptr<Expr> make_arithmetic_expr(TokenType token, std::unique_ptr<Expr> lhs, std::unique_ptr<Expr> rhs) {
@@ -923,7 +963,7 @@ private:
         // A column reference on the rhs starts the self-referential form
         // (col = col +/- value); any other rhs is a plain value. The two forms have
         // disjoint FIRST sets, so a single token decides -- no speculative parse needed.
-        if (check(TokenType::IDENTIFIER)) {
+        if (check(TokenType::IDENTIFIER) && peek(1).type != TokenType::LPAREN) {
             auto rhs_col = parse_col();
             if (rhs_col->col_name != column) {
                 return std::make_unique<SetClause>(std::move(column), parse_arithmetic_additive(std::move(rhs_col)));
@@ -1222,6 +1262,9 @@ private:
                 match(TokenType::OUTER);
                 expect(TokenType::JOIN, "expected JOIN after FULL");
                 join_type = FULL_JOIN;
+            } else if (match(TokenType::INNER)) {
+                expect(TokenType::JOIN, "expected JOIN after INNER");
+                join_type = INNER_JOIN;
             } else if (match(TokenType::JOIN)) {
                 join_type = INNER_JOIN;
             } else {
@@ -1316,7 +1359,20 @@ private:
     }
 
     std::unique_ptr<OrderByItem> parse_order_item() {
-        auto expr = parse_general_expr();
+        std::unique_ptr<Expr> expr;
+        int output_ordinal = -1;
+        if (check(TokenType::VALUE_INT)) {
+            auto literal = parse_int_literal();
+            if (check(TokenType::PLUS) || check(TokenType::MINUS) || check(TokenType::STAR) ||
+                check(TokenType::SLASH)) {
+                expr = parse_arithmetic_additive(std::move(literal));
+            } else {
+                output_ordinal = literal->val;
+                expr = std::move(literal);
+            }
+        } else {
+            expr = parse_general_expr();
+        }
         OrderByDir dir = OrderBy_DEFAULT;
         if (match(TokenType::ASC)) {
             dir = OrderBy_ASC;
@@ -1332,7 +1388,7 @@ private:
                 nulls_order = NullsOrder::LAST;
             }
         }
-        return std::make_unique<OrderByItem>(std::move(expr), dir, nulls_order);
+        return std::make_unique<OrderByItem>(std::move(expr), dir, nulls_order, output_ordinal);
     }
 
     PaginationClause parse_opt_pagination_clause() {

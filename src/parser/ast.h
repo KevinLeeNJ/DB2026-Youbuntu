@@ -52,6 +52,8 @@ enum AggFuncType { AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
 
 enum class WindowFuncType { ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM, AVG };
 
+enum class ScalarFuncType { ABS, LENGTH, COALESCE, LOWER, UPPER, TRIM, ROUND, NULLIF };
+
 enum SetKnobType { EnableNestLoop, EnableSortMerge };
 
 enum class SetOp { SELF_ADD, SELF_SUB, SELF_MUL, SELF_DIV, ASSIGNMENT };
@@ -80,6 +82,7 @@ enum class AstType {
     NullLit,
     Col,
     AggExpr,
+    ScalarFuncExpr,
     WindowExpr,
     ArithmeticExpr,
     LogicalExpr,
@@ -277,6 +280,14 @@ struct AggExpr : public Expr {
         : Expr(AstType::AggExpr), func(func_), is_star(is_star_), is_distinct(is_distinct_), col(std::move(col_)) {}
 };
 
+struct ScalarFuncExpr : public Expr {
+    ScalarFuncType func;
+    std::vector<std::unique_ptr<Expr>> args;
+
+    ScalarFuncExpr(ScalarFuncType func_, std::vector<std::unique_ptr<Expr>> args_)
+        : Expr(AstType::ScalarFuncExpr), func(func_), args(std::move(args_)) {}
+};
+
 struct ArithmeticExpr : public Expr {
     ArithmeticOp op;
     std::unique_ptr<Expr> lhs;
@@ -389,10 +400,12 @@ struct OrderByItem : public TreeNode {
     std::unique_ptr<Expr> expr;
     OrderByDir orderby_dir;
     NullsOrder nulls_order;
+    int output_ordinal;
 
-    OrderByItem(std::unique_ptr<Expr> expr_, OrderByDir orderby_dir_, NullsOrder nulls_order_ = NullsOrder::DEFAULT)
-        : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_), nulls_order(nulls_order_) {
-    }
+    OrderByItem(std::unique_ptr<Expr> expr_, OrderByDir orderby_dir_, NullsOrder nulls_order_ = NullsOrder::DEFAULT,
+                int output_ordinal_ = -1)
+        : TreeNode(AstType::OrderByItem), expr(std::move(expr_)), orderby_dir(orderby_dir_), nulls_order(nulls_order_),
+          output_ordinal(output_ordinal_) {}
 };
 
 struct WindowExpr : public Expr {
@@ -408,7 +421,8 @@ struct WindowExpr : public Expr {
 };
 
 inline std::unique_ptr<OrderByItem> clone_order_by_item(const OrderByItem& item) {
-    return std::make_unique<OrderByItem>(clone_expr(*item.expr), item.orderby_dir, item.nulls_order);
+    return std::make_unique<OrderByItem>(clone_expr(*item.expr), item.orderby_dir, item.nulls_order,
+                                         item.output_ordinal);
 }
 
 struct OrderBy : public TreeNode {
@@ -428,6 +442,15 @@ inline std::unique_ptr<Expr> clone_expr(const Expr& expr) {
         auto& agg = static_cast<const AggExpr&>(expr);
         return std::make_unique<AggExpr>(agg.func, agg.is_star, agg.col == nullptr ? nullptr : clone_col(*agg.col),
                                          agg.is_distinct);
+    }
+    case AstType::ScalarFuncExpr: {
+        auto& function = static_cast<const ScalarFuncExpr&>(expr);
+        std::vector<std::unique_ptr<Expr>> args;
+        args.reserve(function.args.size());
+        for (const auto& arg : function.args) {
+            args.push_back(clone_expr(*arg));
+        }
+        return std::make_unique<ScalarFuncExpr>(function.func, std::move(args));
     }
     case AstType::WindowExpr: {
         auto& window = static_cast<const WindowExpr&>(expr);

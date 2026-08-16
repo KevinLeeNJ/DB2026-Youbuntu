@@ -4,6 +4,9 @@ RMDB is licensed under Mulan PSL v2.
 
 #pragma once
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <string>
@@ -290,6 +293,95 @@ private:
         return result;
     }
 
+    EvaluatedValue evaluate_scalar_function(const QueryExpr& expr, const RmRecord& rec) const {
+        if (expr.scalar_func == ScalarFuncType::COALESCE) {
+            if (expr.operands.size() < 2) {
+                throw InternalError("COALESCE requires at least two arguments");
+            }
+            ColType null_type = TYPE_INT;
+            for (const auto& arg : expr.operands) {
+                auto value = evaluate(*arg, rec);
+                if (!value.is_null) {
+                    return value;
+                }
+                if (null_type == TYPE_INT || value.cell.type == TYPE_FLOAT) {
+                    null_type = value.cell.type;
+                }
+            }
+            return null_value(null_type);
+        }
+        if (expr.scalar_func == ScalarFuncType::NULLIF) {
+            if (expr.operands.size() != 2) {
+                throw InternalError("NULLIF requires exactly two arguments");
+            }
+            auto lhs = evaluate(*expr.operands[0], rec);
+            if (lhs.is_null) {
+                return lhs;
+            }
+            auto rhs = evaluate(*expr.operands[1], rec);
+            if (!rhs.is_null && execution_scalar::compare_cells(lhs.cell, rhs.cell) == 0) {
+                return null_value(lhs.cell.type);
+            }
+            return lhs;
+        }
+        if (expr.operands.size() != 1) {
+            throw InternalError("Scalar function requires exactly one argument");
+        }
+
+        auto value = evaluate(*expr.operands.front(), rec);
+        if (expr.scalar_func == ScalarFuncType::LENGTH) {
+            if (value.is_null) {
+                return null_value(TYPE_INT);
+            }
+            if (value.cell.type != TYPE_STRING && value.cell.type != TYPE_DATETIME) {
+                throw IncompatibleTypeError(coltype2str(value.cell.type), "string");
+            }
+            EvaluatedValue result;
+            result.cell.type = TYPE_INT;
+            result.cell.int_val = static_cast<int>(value.cell.str_val.size());
+            return result;
+        }
+
+        if (expr.scalar_func == ScalarFuncType::LOWER || expr.scalar_func == ScalarFuncType::UPPER ||
+            expr.scalar_func == ScalarFuncType::TRIM) {
+            if (value.is_null) {
+                return null_value(TYPE_STRING);
+            }
+            if (value.cell.type != TYPE_STRING) {
+                throw IncompatibleTypeError(coltype2str(value.cell.type), "string");
+            }
+            if (expr.scalar_func == ScalarFuncType::TRIM) {
+                auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+                auto first = std::find_if_not(value.cell.str_val.begin(), value.cell.str_val.end(), is_space);
+                auto last = std::find_if_not(value.cell.str_val.rbegin(), value.cell.str_val.rend(), is_space).base();
+                value.cell.str_val = first < last ? std::string(first, last) : std::string();
+            } else {
+                const bool lower = expr.scalar_func == ScalarFuncType::LOWER;
+                std::transform(value.cell.str_val.begin(), value.cell.str_val.end(), value.cell.str_val.begin(),
+                               [lower](unsigned char ch) {
+                                   return static_cast<char>(lower ? std::tolower(ch) : std::toupper(ch));
+                               });
+            }
+            return value;
+        }
+
+        if (value.is_null) {
+            return null_value(value.cell.type);
+        }
+        if (!execution_scalar::is_numeric_type(value.cell.type)) {
+            throw IncompatibleTypeError(coltype2str(value.cell.type), "numeric");
+        }
+        if (value.cell.type == TYPE_FLOAT) {
+            value.cell.float_val = expr.scalar_func == ScalarFuncType::ROUND ? std::round(value.cell.float_val)
+                                                                             : std::fabs(value.cell.float_val);
+        } else if (expr.scalar_func == ScalarFuncType::ROUND) {
+            return value;
+        } else if (value.cell.int_val < 0) {
+            value.cell.int_val = checked_int_cast(-static_cast<double>(value.cell.int_val));
+        }
+        return value;
+    }
+
     /**
      * @brief 计算 NOT、AND 或 OR 逻辑表达式。
      * @param expr 逻辑操作符和操作数列表。
@@ -570,6 +662,8 @@ public:
             return literal_value(expr.value);
         case QueryExprType::ARITHMETIC:
             return evaluate_arithmetic(expr, rec);
+        case QueryExprType::SCALAR_FUNCTION:
+            return evaluate_scalar_function(expr, rec);
         case QueryExprType::LOGICAL:
             return evaluate_logical(expr, rec);
         case QueryExprType::CASE_EXPR:

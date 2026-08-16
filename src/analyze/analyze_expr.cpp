@@ -217,6 +217,28 @@ std::string window_func_to_string(WindowFuncType type) {
     throw InternalError("Unexpected window function type");
 }
 
+std::string scalar_func_to_string(ScalarFuncType type) {
+    switch (type) {
+    case ScalarFuncType::ABS:
+        return "ABS";
+    case ScalarFuncType::LENGTH:
+        return "LENGTH";
+    case ScalarFuncType::COALESCE:
+        return "COALESCE";
+    case ScalarFuncType::LOWER:
+        return "LOWER";
+    case ScalarFuncType::UPPER:
+        return "UPPER";
+    case ScalarFuncType::TRIM:
+        return "TRIM";
+    case ScalarFuncType::ROUND:
+        return "ROUND";
+    case ScalarFuncType::NULLIF:
+        return "NULLIF";
+    }
+    throw InternalError("Unexpected scalar function type");
+}
+
 void validate_window_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols) {
     const auto function_name = window_func_to_string(expr.window_func);
     for (const auto& arg : expr.window_args) {
@@ -332,6 +354,15 @@ void normalize_query_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols)
         break;
     case QueryExprType::VALUE:
         break;
+    case QueryExprType::SCALAR_FUNCTION:
+        for (auto& arg : expr.operands) {
+            if (arg == nullptr) {
+                throw InternalError("Scalar function is missing an argument");
+            }
+            normalize_query_expr(*arg, all_cols);
+        }
+        (void)infer_expr_type(expr, all_cols);
+        break;
     case QueryExprType::ARITHMETIC:
         if (expr.lhs == nullptr || expr.rhs == nullptr) {
             throw InternalError("Arithmetic expression is missing an operand");
@@ -388,6 +419,19 @@ bool is_null_query_expr(const QueryExpr& expr) {
     if (expr.type == QueryExprType::VALUE) {
         return expr.value.is_null;
     }
+    if (expr.type == QueryExprType::SCALAR_FUNCTION) {
+        if (expr.operands.empty()) {
+            return false;
+        }
+        if (expr.scalar_func == ScalarFuncType::COALESCE) {
+            return std::all_of(expr.operands.begin(), expr.operands.end(),
+                               [](const auto& arg) { return arg != nullptr && is_null_query_expr(*arg); });
+        }
+        if (expr.scalar_func == ScalarFuncType::NULLIF) {
+            return expr.operands.front() != nullptr && is_null_query_expr(*expr.operands.front());
+        }
+        return is_null_query_expr(*expr.operands.front());
+    }
     if (expr.type != QueryExprType::CASE_EXPR) {
         return false;
     }
@@ -443,6 +487,91 @@ ColType infer_expr_type(const QueryExpr& expr, const std::vector<ColMeta>& all_c
             return TYPE_FLOAT;
         }
         throw InternalError("Unexpected window function type");
+    case QueryExprType::SCALAR_FUNCTION: {
+        const std::string function_name = scalar_func_to_string(expr.scalar_func);
+        if (expr.scalar_func == ScalarFuncType::COALESCE) {
+            if (expr.operands.size() < 2) {
+                throw RMDBError("COALESCE requires at least two arguments");
+            }
+            ColType result_type = TYPE_INT;
+            bool have_result = false;
+            for (const auto& arg : expr.operands) {
+                if (arg == nullptr) {
+                    throw InternalError("Scalar function is missing an argument");
+                }
+                if (is_null_query_expr(*arg)) {
+                    continue;
+                }
+                ColType arg_type = infer_expr_type(*arg, all_cols);
+                if (!have_result) {
+                    result_type = arg_type;
+                    have_result = true;
+                    continue;
+                }
+                if (result_type != arg_type) {
+                    if (!can_cast_types(result_type, arg_type)) {
+                        throw IncompatibleTypeError(coltype2str(result_type), coltype2str(arg_type));
+                    }
+                    if (result_type == TYPE_INT && arg_type == TYPE_FLOAT) {
+                        result_type = TYPE_FLOAT;
+                    }
+                }
+            }
+            return result_type;
+        }
+        if (expr.scalar_func == ScalarFuncType::NULLIF) {
+            if (expr.operands.size() != 2) {
+                throw RMDBError("NULLIF requires exactly two arguments");
+            }
+            const auto& lhs = *expr.operands[0];
+            const auto& rhs = *expr.operands[1];
+            const bool lhs_is_null = is_null_query_expr(lhs);
+            const bool rhs_is_null = is_null_query_expr(rhs);
+            if (lhs_is_null && rhs_is_null) {
+                return TYPE_INT;
+            }
+            ColType lhs_type = infer_expr_type(lhs, all_cols);
+            ColType rhs_type = infer_expr_type(rhs, all_cols);
+            if (lhs_is_null) {
+                return rhs_type;
+            }
+            if (rhs_is_null) {
+                return lhs_type;
+            }
+            if (!can_cast_types(lhs_type, rhs_type)) {
+                throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+            }
+            return lhs_type;
+        }
+        if (expr.operands.size() != 1) {
+            throw RMDBError(function_name + " requires exactly one argument");
+        }
+        const auto& arg = *expr.operands.front();
+        if (is_null_query_expr(arg)) {
+            if (expr.scalar_func == ScalarFuncType::LOWER || expr.scalar_func == ScalarFuncType::UPPER ||
+                expr.scalar_func == ScalarFuncType::TRIM) {
+                return TYPE_STRING;
+            }
+            return TYPE_INT;
+        }
+        ColType arg_type = infer_expr_type(arg, all_cols);
+        if (expr.scalar_func == ScalarFuncType::ABS || expr.scalar_func == ScalarFuncType::ROUND) {
+            if (!is_numeric_type(arg_type)) {
+                throw RMDBError(function_name + " requires a numeric argument");
+            }
+            return arg_type;
+        }
+        if (expr.scalar_func == ScalarFuncType::LENGTH) {
+            if (arg_type != TYPE_STRING && arg_type != TYPE_DATETIME) {
+                throw RMDBError("LENGTH requires a string argument");
+            }
+            return TYPE_INT;
+        }
+        if (arg_type != TYPE_STRING) {
+            throw RMDBError(function_name + " requires a string argument");
+        }
+        return TYPE_STRING;
+    }
     case QueryExprType::ARITHMETIC: {
         if (expr.lhs == nullptr || expr.rhs == nullptr) {
             throw InternalError("Arithmetic expression is missing an operand");
@@ -535,6 +664,17 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
                lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+    case QueryExprType::SCALAR_FUNCTION:
+        if (lhs.scalar_func != rhs.scalar_func || lhs.operands.size() != rhs.operands.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.operands.size(); ++i) {
+            if (lhs.operands[i] == nullptr || rhs.operands[i] == nullptr ||
+                !same_query_expr(*lhs.operands[i], *rhs.operands[i])) {
+                return false;
+            }
+        }
+        return true;
     case QueryExprType::WINDOW:
         if (lhs.window_func != rhs.window_func || lhs.window_args.size() != rhs.window_args.size() ||
             lhs.window_partition_by.size() != rhs.window_partition_by.size() ||

@@ -246,6 +246,7 @@ private:
             return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
                    (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
         case QueryExprType::ARITHMETIC:
+        case QueryExprType::SCALAR_FUNCTION:
         case QueryExprType::LOGICAL:
         case QueryExprType::CASE_EXPR:
         case QueryExprType::PREDICATE:
@@ -453,6 +454,16 @@ private:
             return expr.agg.display_name;
         case QueryExprType::WINDOW:
             return expr.display_name;
+        case QueryExprType::SCALAR_FUNCTION: {
+            std::string result = expr.display_name.substr(0, expr.display_name.find('(')) + "(";
+            for (size_t i = 0; i < expr.operands.size(); ++i) {
+                if (i != 0) {
+                    result += ", ";
+                }
+                result += query_expr_to_string(plan, *expr.operands[i]);
+            }
+            return result + ")";
+        }
         case QueryExprType::ARITHMETIC: {
             static constexpr const char* operators[] = {"+", "-", "*", "/"};
             return "(" + query_expr_to_string(plan, *expr.lhs) + operators[static_cast<int>(expr.arithmetic_op)] +

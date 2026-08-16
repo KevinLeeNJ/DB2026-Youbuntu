@@ -58,6 +58,28 @@ WindowFuncType convert_ast_window_func_type(ast::WindowFuncType type) {
     throw InternalError("Unexpected AST window function type");
 }
 
+ScalarFuncType convert_ast_scalar_func_type(ast::ScalarFuncType type) {
+    switch (type) {
+    case ast::ScalarFuncType::ABS:
+        return ScalarFuncType::ABS;
+    case ast::ScalarFuncType::LENGTH:
+        return ScalarFuncType::LENGTH;
+    case ast::ScalarFuncType::COALESCE:
+        return ScalarFuncType::COALESCE;
+    case ast::ScalarFuncType::LOWER:
+        return ScalarFuncType::LOWER;
+    case ast::ScalarFuncType::UPPER:
+        return ScalarFuncType::UPPER;
+    case ast::ScalarFuncType::TRIM:
+        return ScalarFuncType::TRIM;
+    case ast::ScalarFuncType::ROUND:
+        return ScalarFuncType::ROUND;
+    case ast::ScalarFuncType::NULLIF:
+        return ScalarFuncType::NULLIF;
+    }
+    throw InternalError("Unexpected AST scalar function type");
+}
+
 void resolve_alias(TabCol& col, const Query& query) {
     if (col.tab_name.empty()) {
         return;
@@ -740,6 +762,16 @@ std::vector<ColMeta> Analyze::get_query_output_metas(const Query& query, const s
             if (expr.type == QueryExprType::WINDOW && !expr.window_args.empty()) {
                 return expression_len(*expr.window_args.front());
             }
+            if (expr.type == QueryExprType::SCALAR_FUNCTION) {
+                if (expr.scalar_func == ScalarFuncType::NULLIF && !expr.operands.empty()) {
+                    return expression_len(*expr.operands.front());
+                }
+                int len = 1;
+                for (const auto& arg : expr.operands) {
+                    len = std::max(len, expression_len(*arg));
+                }
+                return len;
+            }
             return 1;
         };
         int len = expression_len(item.expr);
@@ -779,6 +811,14 @@ ColMeta Analyze::make_union_col_meta(const ColMeta& current, const ColMeta& next
 
 void Analyze::validate_union_order_by(Query& query) {
     for (auto& item : query.order_by_items) {
+        if (item.output_ordinal >= 0) {
+            int ordinal = item.output_ordinal;
+            if (ordinal <= 0 || static_cast<size_t>(ordinal) > query.union_cols.size()) {
+                throw RMDBError("ORDER BY position is out of range");
+            }
+            item.expr = make_column_expr({.tab_name = "", .col_name = query.union_cols[ordinal - 1].name});
+            item.order_name = query.union_cols[ordinal - 1].name;
+        }
         if (item.expr.type != QueryExprType::COLUMN) {
             throw RMDBError("ORDER BY must reference Union output columns");
         }
@@ -827,6 +867,7 @@ std::unique_ptr<Query> Analyze::analyze_union_stmt(const ast::UnionStmt* union_s
     for (const auto& raw_item : order_by_items) {
         OrderByItem item;
         item.expr = converter(raw_item->expr.get(), "ORDER BY");
+        item.output_ordinal = raw_item->output_ordinal;
         item.is_desc = raw_item->orderby_dir == ast::OrderBy_DESC;
         item.nulls_order = static_cast<int>(raw_item->nulls_order);
         if (item.expr.type == QueryExprType::COLUMN && item.expr.col.tab_name.empty()) {
@@ -940,6 +981,18 @@ QueryExpr Analyze::convert_ast_expr(const ast::Expr* expr, const std::string& co
         }
         result.agg.display_name = build_agg_display_name(result.agg);
         result.display_name = result.agg.display_name;
+        return result;
+    }
+    if (auto function = dynamic_cast<const ast::ScalarFuncExpr*>(expr); function != nullptr) {
+        QueryExpr result;
+        result.type = QueryExprType::SCALAR_FUNCTION;
+        result.scalar_func = convert_ast_scalar_func_type(function->func);
+        result.display_name = scalar_func_to_string(result.scalar_func) + "(...)";
+        result.operands.reserve(function->args.size());
+        for (const auto& arg : function->args) {
+            result.operands.push_back(
+                std::make_shared<QueryExpr>(convert_ast_expr(arg.get(), context_name, outer_cols, outer_aliases)));
+        }
         return result;
     }
     if (auto window = dynamic_cast<const ast::WindowExpr*>(expr); window != nullptr) {

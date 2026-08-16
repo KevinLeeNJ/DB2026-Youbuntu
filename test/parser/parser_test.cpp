@@ -489,12 +489,15 @@ TEST(ParserTest, ParsesAdvancedSqlForms) {
         "select id from people where id is not null;",
         "select id from people p where exists (select 1 from other o where o.id = p.id);",
         "select id from people where score > any (select score from other);",
+        "select id from people where score > some (select score from other);",
         "select id from people where score >= all (select score from other);",
         "select id from people intersect select id from other;",
         "select id from people except select id from other;",
         "select p.id, o.id from people p cross join other o;",
         "select p.id from people p natural join other o;",
+        "select p.id from people p inner join other o on p.id = o.id;",
         "select p.id from people p order by p.score desc nulls last, p.id asc nulls first;",
+        "select p.id, p.score from people p order by 2 desc, 1;",
         "select count(distinct score) as distinct_scores from people;",
         "select p.id as person_id, p.score points from people as p order by points, person_id;",
         "insert into target (id, score) select id, score from people where score > 10;",
@@ -522,6 +525,42 @@ TEST(ParserTest, ParsesWindowFunctionExpressions) {
     auto select = as_node<ast::SelectStmt>(parsed);
     ASSERT_NE(select, nullptr);
     ASSERT_EQ(select->select_items.size(), 7);
+}
+
+TEST(ParserTest, ParsesScalarFunctionExpressions) {
+    auto parsed = parse_ok("select ABS(score + 1), LENGTH(name), COALESCE(NULL, score, 0) from people;");
+    auto select = as_node<ast::SelectStmt>(parsed);
+    ASSERT_NE(select, nullptr);
+    ASSERT_EQ(select->select_items.size(), 3);
+
+    auto absolute = dynamic_cast<const ast::ScalarFuncExpr*>(select->select_items[0]->expr.get());
+    ASSERT_NE(absolute, nullptr);
+    EXPECT_EQ(absolute->func, ast::ScalarFuncType::ABS);
+    ASSERT_EQ(absolute->args.size(), 1);
+    EXPECT_EQ(absolute->args[0]->type, ast::AstType::ArithmeticExpr);
+
+    auto coalesce = dynamic_cast<const ast::ScalarFuncExpr*>(select->select_items[2]->expr.get());
+    ASSERT_NE(coalesce, nullptr);
+    EXPECT_EQ(coalesce->func, ast::ScalarFuncType::COALESCE);
+    EXPECT_EQ(coalesce->args.size(), 3);
+
+    const std::vector<std::string> forms = {
+        "select abs(score), length(name), coalesce(nickname, name) from people;",
+        "select ABS(score + 1), LeNgTh(name), CoAlEsCe(NULL, score, 0) from people;",
+        "select lower(name), upper(name), trim(name), round(score), nullif(score, 0), char_length(name) from people;",
+        "select id from people where abs(score) > 10 order by length(name);",
+        "update people set score = abs(score) where id = 1;",
+    };
+
+    for (const auto& sql : forms) {
+        EXPECT_NO_THROW((void)parse_ok(sql)) << sql;
+    }
+}
+
+TEST(ParserTest, RejectsMalformedScalarFunctionSyntax) {
+    expect_parse_error("select abs(score from people;");
+    expect_parse_error("select coalesce(score,) from people;");
+    expect_parse_error("select unknown_function(score) from people;");
 }
 
 TEST(ParserTest, RejectsMalformedWindowFunctionSyntax) {

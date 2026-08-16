@@ -22,9 +22,10 @@ See the Mulan PSL v2 for more details. */
 /**
  * @brief 更新指定 RID 集合中满足条件的记录。
  *
- * 更新会重新读取可见版本并验证谓词，计算新记录后检查旧/新记录的
- * SSI 写冲突，
- * 再同步维护 MVCC undo、WAL 和所有受影响的索引键。
+ *
+ * 更新会重新读取可见版本并验证谓词，计算新记录后检查旧/新记录的 SSI 写冲突，
+ * 再同步维护 MVCC undo、WAL
+ * 和所有受影响的索引键。
  */
 class UpdateExecutor : public AbstractExecutor {
 private:
@@ -41,8 +42,8 @@ private:
     /**
      * @brief 按索引列顺序从记录中拼接复合索引键。
      * @param index 索引元数据。
-     * @param rec_data
-     * 记录数据首地址。
+     * @param
+     * rec_data 记录数据首地址。
      * @return 固定长度的索引键字节数组。
      */
     static std::vector<char> make_index_key(const IndexMeta& index, const char* rec_data) {
@@ -60,13 +61,15 @@ public:
      * @brief 创建更新执行器。
      * @param sm_manager 系统管理器。
      * @param tab_name 目标表名。
-     *
+
+     * *
      * @param set_clauses SET 子句列表。
      * @param conds 更新前需要满足的条件。
-     * @param rids 待检查的记录 RID
-     * 列表。
+     * @param rids 待检查的记录
+     * RID 列表。
      * @param context 当前执行上下文。
-     * @param subquery_runner SET 表达式内部子查询执行回调。
+     * @param subquery_runner SET
+     * 表达式内部子查询执行回调。
 
      */
     UpdateExecutor(SmManager* sm_manager, const std::string& tab_name, std::vector<SetClause> set_clauses,
@@ -96,12 +99,14 @@ public:
     /**
      * @brief 执行更新操作。
      * @return DML 不产生上层数据行，始终返回 nullptr。
-     * @throws
-     * TransactionAbortException 锁、MVCC 或 SSI 冲突时抛出。
+     *
+     * @throws TransactionAbortException 锁、MVCC 或 SSI 冲突时抛出。
+     *
      *
      * 流程依次为：读取可见版本并过滤、加写锁及刷新
      * RC 版本、计算新记录、
-     * 原子检查 SSI、预检查新索引键、记录 WAL/undo、替换索引并最终写回记录。
+     * 原子检查 SSI、预检查新索引键、记录
+     * WAL/undo、替换索引并最终写回记录。
 
      */
     std::unique_ptr<RmRecord> Next() override {
@@ -301,10 +306,12 @@ public:
     /**
      * @brief 按 SET 子句把旧记录更新为新记录。
      * @param rec 待原地修改的新记录缓冲区。
+     *
      * @param
      * old_rec 更新前的旧记录，用于自引用和表达式求值。
      * @throws RMDBError SET 表达式结果为 NULL 时抛出。
-     *
+
+     * *
      * @throws IncompatibleTypeError 目标列与赋值类型不可转换时抛出。
      *
      * SET
@@ -460,7 +467,8 @@ public:
      * @brief 查找目标表列的元数据及偏移。
      * @param target 目标列。
      * @return 匹配的列元数据。
-     *
+
+     * *
      * @throws ColumnNotFoundError 找不到目标列时抛出。
      */
     ColMeta get_col_offset(const TabCol& target) override {

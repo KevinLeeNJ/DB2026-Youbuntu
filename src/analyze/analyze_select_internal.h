@@ -198,7 +198,15 @@ void populate_order_by_from_ast(Query& query, const SelectStmtT& stmt, Converter
                 throw InternalError("Unexpected null ORDER BY item");
             }
             OrderByItem item;
-            item.expr = converter(raw_item->expr.get(), "ORDER BY");
+            item.output_ordinal = raw_item->output_ordinal;
+            if (item.output_ordinal >= 0) {
+                if (item.output_ordinal <= 0 || static_cast<size_t>(item.output_ordinal) > query.select_items.size()) {
+                    throw RMDBError("ORDER BY position is out of range");
+                }
+                item.expr = query.select_items[item.output_ordinal - 1].expr;
+            } else {
+                item.expr = converter(raw_item->expr.get(), "ORDER BY");
+            }
             item.is_desc = raw_item->orderby_dir == ast::OrderBy_DESC;
             item.nulls_order = static_cast<int>(raw_item->nulls_order);
             if (item.expr.type == QueryExprType::COLUMN && item.expr.col.tab_name.empty()) {

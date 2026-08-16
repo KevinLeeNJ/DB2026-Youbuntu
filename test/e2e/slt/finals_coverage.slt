@@ -1,0 +1,218 @@
+# High-yield finals coverage: common scalar functions and compatibility syntax.
+
+statement ok
+CREATE TABLE fc_values (id INT, score FLOAT, name CHAR(12));
+
+statement ok
+INSERT INTO fc_values VALUES (1, -2.6, ' Alice ');
+
+statement ok
+INSERT INTO fc_values VALUES (2, 2.4, 'bOB');
+
+statement ok
+INSERT INTO fc_values VALUES (3, 2.4, ' CAROL ');
+
+query
+SELECT id, LOWER(TRIM(name)) AS lower_name, UPPER(TRIM(name)) AS upper_name,
+       TRIM(name) AS trimmed, ROUND(score) AS rounded, NULLIF(id, 1.0) AS nullable_id
+FROM fc_values ORDER BY 1;
+----
++------------------+------------------+------------------+------------------+------------------+------------------+
+|               id |       lower_name |       upper_name |          trimmed |          rounded |      nullable_id |
++------------------+------------------+------------------+------------------+------------------+------------------+
+|                1 |            alice |            ALICE |            Alice |        -3.000000 |             NULL |
+|                2 |              bob |              BOB |              bOB |         2.000000 |                2 |
+|                3 |            carol |            CAROL |            CAROL |         2.000000 |                3 |
++------------------+------------------+------------------+------------------+------------------+------------------+
+Total record(s): 3
+
+query
+SELECT id, CHAR_LENGTH(TRIM(name)) AS name_len, ROUND(id) AS rounded_id
+FROM fc_values ORDER BY 2 DESC, 1 DESC;
+----
++------------------+------------------+------------------+
+|               id |         name_len |       rounded_id |
++------------------+------------------+------------------+
+|                3 |                5 |                3 |
+|                1 |                5 |                1 |
+|                2 |                3 |                2 |
++------------------+------------------+------------------+
+Total record(s): 3
+
+query
+SELECT id FROM fc_values WHERE LOWER(TRIM(name)) = 'alice' ORDER BY 1;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+query
+SELECT ROUND(AVG(score)) AS rounded_avg, LOWER(TRIM(MIN(name))) AS first_name FROM fc_values;
+----
++------------------+------------------+
+|      rounded_avg |       first_name |
++------------------+------------------+
+|         1.000000 |            alice |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT id, ROUND(AVG(score) OVER ()) AS rounded_avg,
+       SUM(NULLIF(id, 2)) OVER () AS sum_without_two
+FROM fc_values ORDER BY 1;
+----
++------------------+------------------+------------------+
+|               id |      rounded_avg |  sum_without_two |
++------------------+------------------+------------------+
+|                1 |         1.000000 |                4 |
+|                2 |         1.000000 |                4 |
+|                3 |         1.000000 |                4 |
++------------------+------------------+------------------+
+Total record(s): 3
+
+query
+SELECT LOWER(TRIM(name)) AS label FROM fc_values WHERE id = 1
+UNION SELECT LOWER(TRIM(name)) FROM fc_values WHERE id = 2;
+----
++------------------+
+|            label |
++------------------+
+|            alice |
+|              bob |
++------------------+
+Total record(s): 2
+
+query
+SELECT NULLIF(NULL, 1) AS null_left, NULLIF(1, NULL) AS null_right FROM fc_values WHERE id = 1;
+----
++------------------+------------------+
+|        null_left |       null_right |
++------------------+------------------+
+|             NULL |                1 |
++------------------+------------------+
+Total record(s): 1
+
+statement ok
+UPDATE fc_values SET name = UPPER(TRIM(name)) WHERE id = 2;
+
+query
+SELECT TRIM(name) AS updated_name FROM fc_values WHERE id = 2;
+----
++------------------+
+|     updated_name |
++------------------+
+|              BOB |
++------------------+
+Total record(s): 1
+
+statement ok
+CREATE TABLE fc_thresholds (score FLOAT);
+
+statement ok
+INSERT INTO fc_thresholds VALUES (0.0);
+
+statement ok
+INSERT INTO fc_thresholds VALUES (3.0);
+
+query
+SELECT id FROM fc_values WHERE score > SOME (SELECT score FROM fc_thresholds) ORDER BY 1;
+----
++------------------+
+|               id |
++------------------+
+|                2 |
+|                3 |
++------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE fc_left (id INT, label CHAR(8));
+
+statement ok
+INSERT INTO fc_left VALUES (1, 'L1');
+
+statement ok
+INSERT INTO fc_left VALUES (2, 'L2');
+
+statement ok
+CREATE TABLE fc_right (id INT, label CHAR(8));
+
+statement ok
+INSERT INTO fc_right VALUES (2, 'R2');
+
+statement ok
+INSERT INTO fc_right VALUES (3, 'R3');
+
+query
+SELECT l.id, LOWER(r.label) AS label FROM fc_left AS l INNER JOIN fc_right AS r ON l.id = r.id ORDER BY 1;
+----
++------------------+------------------+
+|               id |            label |
++------------------+------------------+
+|                2 |               r2 |
++------------------+------------------+
+Total record(s): 1
+
+query
+SELECT l.id, LOWER(r.label) AS label
+FROM fc_left AS l LEFT JOIN fc_right AS r ON l.id = r.id ORDER BY 1;
+----
++------------------+------------------+
+|               id |            label |
++------------------+------------------+
+|                1 |             NULL |
+|                2 |               r2 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT SUM(DISTINCT score) AS distinct_sum, AVG(DISTINCT score) AS distinct_avg,
+       MIN(DISTINCT score) AS distinct_min, MAX(DISTINCT score) AS distinct_max
+FROM fc_values;
+----
++------------------+------------------+------------------+------------------+
+|     distinct_sum |     distinct_avg |     distinct_min |     distinct_max |
++------------------+------------------+------------------+------------------+
+|        -0.200000 |        -0.100000 |        -2.600000 |         2.400000 |
++------------------+------------------+------------------+------------------+
+Total record(s): 1
+
+query
+SELECT * FROM (SELECT id FROM fc_values WHERE id < 3 UNION SELECT id FROM fc_values WHERE id = 3) AS u
+ORDER BY 1 DESC;
+----
++------------------+
+|               id |
++------------------+
+|                3 |
+|                2 |
+|                1 |
++------------------+
+Total record(s): 3
+
+statement error
+SELECT LOWER(id) FROM fc_values;
+
+statement error
+SELECT ROUND(name) FROM fc_values;
+
+statement error
+SELECT NULLIF(id) FROM fc_values;
+
+statement error
+SELECT NULLIF(id, name) FROM fc_values;
+
+statement error
+SELECT id FROM fc_values ORDER BY 0;
+
+statement error
+SELECT id FROM fc_values ORDER BY 2;
+
+statement error
+SELECT id, score FROM fc_values ORDER BY 1 + 1;
+
+statement error
+SELECT TRIM() FROM fc_values;

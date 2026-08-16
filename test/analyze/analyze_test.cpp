@@ -374,3 +374,57 @@ TEST_F(AnalyzeAggregateTest, do_analyze_rejects_invalid_window_arguments) {
         }
     }
 }
+
+TEST_F(AnalyzeAggregateTest, do_analyze_accepts_scalar_functions) {
+    const std::vector<std::string> sqls = {
+        "select abs(score), length(course), coalesce(NULL, course, 'unknown') from grade;",
+        "select lower(course), upper(course), trim(course), round(score), nullif(score, 0), "
+        "char_length(course) from grade;",
+        "select id, length(course) as len from grade where abs(score) >= 60 order by len;",
+        "select id from grade where score > some (select score from grade);",
+        "select id, course from grade order by 2 desc, 1;",
+        "update grade set score = abs(score) where id = 1;",
+    };
+
+    for (const auto& sql : sqls) {
+        auto parse = ast::parse_sql(sql);
+        EXPECT_NO_THROW((void)analyze_.do_analyze(std::move(parse))) << sql;
+    }
+
+    auto parse = ast::parse_sql("select abs(score) as magnitude, coalesce(NULL, course) as label from grade;");
+    auto query = analyze_.do_analyze(std::move(parse));
+    ASSERT_NE(query, nullptr);
+    ASSERT_EQ(query->select_items.size(), 2);
+    EXPECT_EQ(query->select_items[0].expr.type, QueryExprType::SCALAR_FUNCTION);
+    EXPECT_EQ(query->select_items[0].expr.scalar_func, ScalarFuncType::ABS);
+    EXPECT_EQ(query->output_cols[0].type, TYPE_INT);
+    EXPECT_EQ(query->output_cols[1].type, TYPE_STRING);
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_rejects_invalid_scalar_functions) {
+    const std::vector<std::string> sqls = {
+        "select abs(course) from grade;",     "select length(score) from grade;",
+        "select abs(score, id) from grade;",  "select length() from grade;",
+        "select coalesce(score) from grade;", "select coalesce(score, course) from grade;",
+        "select lower(score) from grade;",    "select upper(score) from grade;",
+        "select trim(score) from grade;",     "select round(course) from grade;",
+        "select nullif(score) from grade;",   "select nullif(score, course) from grade;",
+        "select id from grade order by 0;",   "select id from grade order by 2;",
+    };
+
+    for (const auto& sql : sqls) {
+        auto parse = ast::parse_sql(sql);
+        EXPECT_THROW((void)analyze_.do_analyze(std::move(parse)), RMDBError) << sql;
+    }
+}
+
+TEST_F(AnalyzeAggregateTest, do_analyze_distinguishes_order_by_positions_from_constant_expressions) {
+    auto positional = analyze_.do_analyze(ast::parse_sql("select id, course from grade order by 2 desc, 1;"));
+    ASSERT_EQ(positional->order_by_items.size(), 2);
+    EXPECT_EQ(positional->order_by_items[0].expr.type, QueryExprType::COLUMN);
+    EXPECT_EQ(positional->order_by_items[0].expr.col.col_name, "course");
+    EXPECT_EQ(positional->order_by_items[1].expr.type, QueryExprType::COLUMN);
+    EXPECT_EQ(positional->order_by_items[1].expr.col.col_name, "id");
+
+    EXPECT_THROW((void)analyze_.do_analyze(ast::parse_sql("select id, course from grade order by 1 + 1;")), RMDBError);
+}

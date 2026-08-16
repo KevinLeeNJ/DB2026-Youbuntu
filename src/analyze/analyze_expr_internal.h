@@ -36,6 +36,7 @@ std::string build_agg_display_name(const AggExpr& agg);
 void validate_agg_expr(AggExpr& agg, const std::vector<ColMeta>& all_cols);
 std::string window_func_to_string(WindowFuncType type);
 void validate_window_expr(QueryExpr& expr, const std::vector<ColMeta>& all_cols);
+std::string scalar_func_to_string(ScalarFuncType type);
 
 // --- TabCol utilities ---
 bool same_tab_col(const TabCol& lhs, const TabCol& rhs);

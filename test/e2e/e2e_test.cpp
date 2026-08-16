@@ -506,6 +506,14 @@ TEST_F(SltFileTest, ExpansionRegression) {
     run_slt_file("expansion_regression.slt");
 }
 
+TEST_F(SltFileTest, ScalarFunctions) {
+    run_slt_file("scalar_functions.slt");
+}
+
+TEST_F(SltFileTest, FinalsCoverage) {
+    run_slt_file("finals_coverage.slt");
+}
+
 TEST_F(SltFileTest, QueryOptimize) {
     run_slt_file("query_optimize.slt");
 }

@@ -114,7 +114,20 @@ enum class AggType { COUNT, MAX, MIN, SUM, AVG };
 
 enum class WindowFuncType { ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM, AVG };
 
-enum class QueryExprType { COLUMN, AGGREGATE, VALUE, ARITHMETIC, LOGICAL, CASE_EXPR, PREDICATE, SUBQUERY, WINDOW };
+enum class ScalarFuncType { ABS, LENGTH, COALESCE, LOWER, UPPER, TRIM, ROUND, NULLIF };
+
+enum class QueryExprType {
+    COLUMN,
+    AGGREGATE,
+    VALUE,
+    ARITHMETIC,
+    LOGICAL,
+    CASE_EXPR,
+    PREDICATE,
+    SUBQUERY,
+    WINDOW,
+    SCALAR_FUNCTION
+};
 
 enum class QueryArithmeticOp { ADD, SUB, MUL, DIV };
 enum class QueryLogicalOp { AND, OR, NOT };
@@ -166,6 +179,7 @@ struct QueryExpr {
     AggExpr agg;
     Value value;
     std::string display_name;
+    ScalarFuncType scalar_func = ScalarFuncType::ABS;
     WindowFuncType window_func = WindowFuncType::ROW_NUMBER;
     std::vector<std::shared_ptr<QueryExpr>> window_args;
     std::vector<std::shared_ptr<QueryExpr>> window_partition_by;
@@ -200,6 +214,7 @@ struct OrderByItem {
     bool is_desc = false;
     std::string order_name;
     int nulls_order = 0;
+    int output_ordinal = -1;
 };
 
 struct HavingCondition {

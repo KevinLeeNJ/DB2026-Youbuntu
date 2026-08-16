@@ -77,6 +77,23 @@ private:
             return expr.value.type == TYPE_FLOAT ? sizeof(double) : sizeof(int);
         case QueryExprType::ARITHMETIC:
             return expression_type(expr, source_cols) == TYPE_FLOAT ? sizeof(double) : sizeof(int);
+        case QueryExprType::SCALAR_FUNCTION:
+            if (expr.scalar_func == ScalarFuncType::LENGTH) {
+                return sizeof(int);
+            }
+            if (expr.scalar_func == ScalarFuncType::ABS || expr.scalar_func == ScalarFuncType::ROUND) {
+                return expression_type(expr, source_cols) == TYPE_FLOAT ? sizeof(double) : sizeof(int);
+            }
+            if (expr.scalar_func == ScalarFuncType::NULLIF && !expr.operands.empty()) {
+                return expression_length(*expr.operands.front(), source_cols);
+            }
+            {
+                int len = 1;
+                for (const auto& arg : expr.operands) {
+                    len = std::max(len, expression_length(*arg, source_cols));
+                }
+                return len;
+            }
         case QueryExprType::LOGICAL:
         case QueryExprType::PREDICATE:
             return sizeof(int);
@@ -133,6 +150,31 @@ private:
                 return TYPE_FLOAT;
             }
             return TYPE_INT;
+        case QueryExprType::SCALAR_FUNCTION:
+            if (expr.scalar_func == ScalarFuncType::LENGTH) {
+                return TYPE_INT;
+            }
+            if (expr.scalar_func == ScalarFuncType::LOWER || expr.scalar_func == ScalarFuncType::UPPER ||
+                expr.scalar_func == ScalarFuncType::TRIM) {
+                return TYPE_STRING;
+            }
+            if (expr.scalar_func == ScalarFuncType::ABS || expr.scalar_func == ScalarFuncType::ROUND ||
+                expr.scalar_func == ScalarFuncType::NULLIF) {
+                return expr.operands.empty() ? TYPE_INT : expression_type(*expr.operands.front(), source_cols);
+            }
+            {
+                ColType type = TYPE_INT;
+                for (const auto& arg : expr.operands) {
+                    ColType arg_type = expression_type(*arg, source_cols);
+                    if (arg_type == TYPE_STRING || arg_type == TYPE_DATETIME) {
+                        return arg_type;
+                    }
+                    if (arg_type == TYPE_FLOAT) {
+                        type = TYPE_FLOAT;
+                    }
+                }
+                return type;
+            }
         case QueryExprType::LOGICAL:
         case QueryExprType::PREDICATE:
             return TYPE_INT;

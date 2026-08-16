@@ -57,6 +57,17 @@ bool same_query_expr(const QueryExpr& lhs, const QueryExpr& rhs) {
         return lhs.agg.type == rhs.agg.type && lhs.agg.is_star == rhs.agg.is_star &&
                lhs.agg.is_distinct == rhs.agg.is_distinct &&
                (lhs.agg.is_star || same_tab_col(lhs.agg.col, rhs.agg.col));
+    case QueryExprType::SCALAR_FUNCTION:
+        if (lhs.scalar_func != rhs.scalar_func || lhs.operands.size() != rhs.operands.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < lhs.operands.size(); ++i) {
+            if (lhs.operands[i] == nullptr || rhs.operands[i] == nullptr ||
+                !same_query_expr(*lhs.operands[i], *rhs.operands[i])) {
+                return false;
+            }
+        }
+        return true;
     case QueryExprType::WINDOW:
         if (lhs.window_func != rhs.window_func || lhs.window_args.size() != rhs.window_args.size() ||
             lhs.window_partition_by.size() != rhs.window_partition_by.size() ||
@@ -962,7 +973,9 @@ std::unique_ptr<Plan> Planner::physical_optimization(Query* query, Context* cont
 
     std::map<std::string, std::set<TabCol>> needed_cols;
     if (query->tables.size() > 1 && !query->has_select_star && !needs_aggregate_plan(*query) && !query->has_window &&
-        !has_expression_join) {
+        !has_expression_join && query->where_expr == nullptr &&
+        std::all_of(query->select_items.begin(), query->select_items.end(),
+                    [](const SelectItem& item) { return item.expr.type == QueryExprType::COLUMN; })) {
         for (const auto& item : query->select_items) {
             if (item.expr.type == QueryExprType::COLUMN) {
                 needed_cols[item.expr.col.tab_name].insert(item.expr.col);

@@ -67,9 +67,7 @@ void rebuild_select_outputs(Query& query, const std::vector<ColMeta>& all_cols) 
         if (item.expr.type == QueryExprType::COLUMN) {
             query.cols.push_back(item.expr.col);
         }
-        if (item.expr.type == QueryExprType::AGGREGATE) {
-            query.has_aggregate = true;
-        }
+        query.has_aggregate = query.has_aggregate || contains_aggregate(item.expr);
         query.has_window = query.has_window || contains_window_expr(item.expr);
         if (item.output_name.empty()) {
             item.output_name = item.alias.empty() ? item.expr.display_name : item.alias;
@@ -81,7 +79,7 @@ void rebuild_select_outputs(Query& query, const std::vector<ColMeta>& all_cols) 
 void validate_having(Query& query, const std::vector<ColMeta>& all_cols) {
     for (auto& cond : query.having_conds) {
         normalize_query_expr(cond.lhs, all_cols);
-        query.has_aggregate = query.has_aggregate || cond.lhs.type == QueryExprType::AGGREGATE;
+        query.has_aggregate = query.has_aggregate || contains_aggregate(cond.lhs);
 
         ColType lhs_type = infer_expr_type(cond.lhs, all_cols);
         if (cond.op == OP_LIKE && lhs_type != TYPE_STRING && lhs_type != TYPE_DATETIME) {
@@ -114,7 +112,7 @@ void validate_having(Query& query, const std::vector<ColMeta>& all_cols) {
             rhs_type = cond.rhs_val.type;
         } else {
             normalize_query_expr(cond.rhs_expr, all_cols);
-            query.has_aggregate = query.has_aggregate || cond.rhs_expr.type == QueryExprType::AGGREGATE;
+            query.has_aggregate = query.has_aggregate || contains_aggregate(cond.rhs_expr);
             rhs_type = infer_expr_type(cond.rhs_expr, all_cols);
         }
 
@@ -138,7 +136,7 @@ void validate_order_by(Query& query, const std::vector<ColMeta>& all_cols) {
         }
 
         normalize_query_expr(item.expr, all_cols);
-        query.has_aggregate = query.has_aggregate || item.expr.type == QueryExprType::AGGREGATE;
+        query.has_aggregate = query.has_aggregate || contains_aggregate(item.expr);
         query.has_window = query.has_window || contains_window_expr(item.expr);
 
         if (item.expr.type == QueryExprType::VALUE) {
@@ -157,9 +155,11 @@ void validate_group_by(Query& query) {
     }
 
     for (const auto& item : query.select_items) {
-        if (item.expr.type == QueryExprType::COLUMN && !contains_group_col(query.group_by_cols, item.expr.col)) {
-            throw RMDBError("SELECT list contains a non-aggregated column that is not in GROUP BY");
-        }
+        visit_expr(item.expr, [&](const QueryExpr& expr) {
+            if (expr.type == QueryExprType::COLUMN && !contains_group_col(query.group_by_cols, expr.col)) {
+                throw RMDBError("SELECT list contains a non-aggregated column that is not in GROUP BY");
+            }
+        });
     }
 
     for (const auto& cond : query.having_conds) {
@@ -188,8 +188,10 @@ void validate_select_without_group_by(const Query& query) {
     bool has_plain_col = false;
     bool has_agg_col = false;
     for (const auto& item : query.select_items) {
-        has_plain_col = has_plain_col || item.expr.type == QueryExprType::COLUMN;
-        has_agg_col = has_agg_col || item.expr.type == QueryExprType::AGGREGATE;
+        visit_expr(item.expr, [&](const QueryExpr& expr) {
+            has_plain_col = has_plain_col || expr.type == QueryExprType::COLUMN;
+            has_agg_col = has_agg_col || expr.type == QueryExprType::AGGREGATE;
+        });
     }
 
     if (has_plain_col && has_agg_col) {

@@ -1,0 +1,160 @@
+# Scalar function coverage: numeric, string, NULL, nesting, predicates, DML, and validation.
+
+statement ok
+CREATE TABLE sf_values (id INT, i INT, f FLOAT, name CHAR(10));
+
+statement ok
+INSERT INTO sf_values VALUES (1, -7, -2.5, 'Alice');
+
+statement ok
+INSERT INTO sf_values VALUES (2, 3, 4.25, 'Bob');
+
+query
+SELECT id, ABS(i) AS abs_i, ABS(f) AS abs_f, LENGTH(name) AS len FROM sf_values ORDER BY id;
+----
++------------------+------------------+------------------+------------------+
+|               id |            abs_i |            abs_f |              len |
++------------------+------------------+------------------+------------------+
+|                1 |                7 |         2.500000 |                5 |
+|                2 |                3 |         4.250000 |                3 |
++------------------+------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, COALESCE(NULL, f, 1) AS promoted,
+       COALESCE(i, f) AS widened,
+       COALESCE(i, i / 0) AS short_circuit
+FROM sf_values ORDER BY id;
+----
++------------------+------------------+------------------+------------------+
+|               id |         promoted |          widened |    short_circuit |
++------------------+------------------+------------------+------------------+
+|                1 |        -2.500000 |        -7.000000 |               -7 |
+|                2 |         4.250000 |         3.000000 |                3 |
++------------------+------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT COALESCE(MIN(name), 'none') AS first_name FROM sf_values WHERE id < 0;
+----
++------------------+
+|       first_name |
++------------------+
+|             none |
++------------------+
+Total record(s): 1
+
+query
+SELECT id, SUM(ABS(i)) OVER () AS total_abs FROM sf_values ORDER BY id;
+----
++------------------+------------------+
+|               id |        total_abs |
++------------------+------------------+
+|                1 |               10 |
+|                2 |               10 |
++------------------+------------------+
+Total record(s): 2
+
+query
+SELECT id, ABS(SUM(i) OVER ()) AS absolute_sum,
+       COALESCE(LAG(i) OVER (ORDER BY id), 0) AS previous
+FROM sf_values ORDER BY id;
+----
++------------------+------------------+------------------+
+|               id |     absolute_sum |         previous |
++------------------+------------------+------------------+
+|                1 |                4 |                0 |
+|                2 |                4 |               -7 |
++------------------+------------------+------------------+
+Total record(s): 2
+
+statement ok
+CREATE TABLE sf_right (id INT, label CHAR(10), delta INT);
+
+statement ok
+INSERT INTO sf_right VALUES (2, 'joined', -9);
+
+query
+SELECT l.id, COALESCE(r.label, 'missing') AS label,
+       ABS(COALESCE(r.delta, -5)) AS magnitude
+FROM sf_values AS l LEFT JOIN sf_right AS r ON l.id = r.id
+ORDER BY l.id;
+----
++------------------+------------------+------------------+
+|               id |            label |        magnitude |
++------------------+------------------+------------------+
+|                1 |          missing |                5 |
+|                2 |           joined |                9 |
++------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT l.id, ABS(r.delta) AS abs_delta, LENGTH(r.label) AS label_len
+FROM sf_values AS l LEFT JOIN sf_right AS r ON l.id = r.id
+ORDER BY l.id;
+----
++------------------+------------------+------------------+
+|               id |        abs_delta |        label_len |
++------------------+------------------+------------------+
+|                1 |             NULL |             NULL |
+|                2 |                9 |                6 |
++------------------+------------------+------------------+
+Total record(s): 2
+
+query
+SELECT COALESCE(NULL, NULL) AS fallback FROM sf_values WHERE id = 1;
+----
++------------------+
+|         fallback |
++------------------+
+|             NULL |
++------------------+
+Total record(s): 1
+
+query
+SELECT id FROM sf_values WHERE ABS(i) >= 7 ORDER BY id;
+----
++------------------+
+|               id |
++------------------+
+|                1 |
++------------------+
+Total record(s): 1
+
+statement ok
+UPDATE sf_values SET i = ABS(i) WHERE id = 1;
+
+query
+SELECT id, i FROM sf_values ORDER BY id;
+----
++------------------+------------------+
+|               id |                i |
++------------------+------------------+
+|                1 |                7 |
+|                2 |                3 |
++------------------+------------------+
+Total record(s): 2
+
+statement error
+SELECT ABS(name) FROM sf_values;
+
+statement error
+SELECT LENGTH(i) FROM sf_values;
+
+statement error
+SELECT ABS(i, id) FROM sf_values;
+
+statement error
+SELECT LENGTH() FROM sf_values;
+
+statement error
+SELECT COALESCE(i) FROM sf_values;
+
+statement error
+SELECT COALESCE(i, name) FROM sf_values;
+
+statement error
+SELECT ABS(-2147483648) FROM sf_values;
+
+statement error
+SELECT unknown_function(i) FROM sf_values;
