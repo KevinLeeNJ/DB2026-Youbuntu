@@ -192,14 +192,7 @@ EpochSiEngine::EpochSiEngine(BaseImage base, ImmutableTables tables, Epoch base_
     for (const auto& [table_id, table] : immutable_tables_) {
         if (!table || table_id == 0 || table_id != table->table_id())
             throw std::invalid_argument("invalid immutable table source");
-        table->Visit([&](uint64_t local_id, Row&& row) {
-            ValidateRow(row);
-            if (!row.claims.empty())
-                throw std::invalid_argument("immutable table claims are not supported");
-            if (local_id == std::numeric_limits<uint64_t>::max())
-                throw std::invalid_argument("exhausted immutable RowId");
-            next_row_id_[table_id] = std::max(next_row_id_[table_id], local_id + 1);
-        });
+        next_row_id_[table_id] = table->next_local_id();
     }
 }
 
@@ -576,6 +569,12 @@ void EpochSiEngine::VisitScan(const Txn& txn, TableId table_id,
             visitor(id, *visible);
 }
 
+void EpochSiEngine::VisitLatestVersions(const std::function<void(RowId, const Row&)>& visitor) const {
+    for (const auto& [id, versions] : versions_)
+        if (!versions.empty() && !versions.back().row.deleted)
+            visitor(id, versions.back().row);
+}
+
 bool EpochSiEngine::CanInstallPristineTable(TableId table_id) const {
     if (table_id == 0 || immutable_tables_.count(table_id) || next_row_id_.count(table_id))
         return false;
@@ -792,16 +791,7 @@ EpochSiEngine::PrepareTableInstall(std::shared_ptr<const ImmutableTable> table) 
         throw std::logic_error("immutable table install requires a pristine table");
     PreparedTableInstall prepared{immutable_tables_, last_row_epoch_, last_claim_epoch_, claim_owner_, next_row_id_};
     prepared.tables.emplace(table->table_id(), table);
-    uint64_t next_local_id = 0;
-    table->Visit([&](uint64_t local_id, Row&& row) {
-        ValidateRow(row);
-        if (!row.claims.empty())
-            throw std::invalid_argument("immutable table claims are not supported");
-        if (local_id == std::numeric_limits<uint64_t>::max())
-            throw std::overflow_error("immutable table RowId exhausted");
-        next_local_id = std::max(next_local_id, local_id + 1);
-    });
-    prepared.next_row_id[table->table_id()] = next_local_id;
+    prepared.next_row_id[table->table_id()] = table->next_local_id();
     return prepared;
 }
 

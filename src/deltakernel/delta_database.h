@@ -2,10 +2,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "checkpoint_db.h"
@@ -27,9 +29,13 @@ public:
     explicit DeltaTransactionAbort(const std::string& message) : std::runtime_error(message) {}
 };
 
+using DeltaOverlay =
+    std::map<std::tuple<epoch_si_poc::TableId, epoch_si_poc::ConstraintId, uint64_t>, std::vector<uint64_t>>;
+
 struct DeltaSession {
     std::optional<epoch_si_poc::EpochSiEngine::Txn> txn;
     bool explicit_txn = false;
+    DeltaOverlay overlay;
 };
 
 class DeltaDatabase {
@@ -55,6 +61,9 @@ public:
     }
     void SetExecuteLockHookForTest(std::function<void()> hook) {
         execute_lock_hook_for_test_ = std::move(hook);
+    }
+    size_t SidecarValidationCountForTest() const {
+        return sidecar_validation_count_;
     }
 
 private:
@@ -84,6 +93,18 @@ private:
         std::string text;
     };
     using Catalog = std::map<std::string, TableSchema>;
+    struct SidecarEntry {
+        uint64_t key_offset;
+        uint64_t local_id;
+    };
+    struct SidecarBuildEntry {
+        std::vector<uint8_t> key;
+        uint64_t local_id;
+    };
+    struct SidecarDescriptor {
+        uint64_t count;
+        uint64_t key_bytes;
+    };
 
     explicit DeltaDatabase(epoch_si_poc::CheckpointDb db);
     void RequireUsable() const;
@@ -92,11 +113,13 @@ private:
                      epoch_si_poc::ConstraintId next_constraint_id, uint64_t catalog_generation);
     void LoadCatalog();
     const TableSchema& Table(const std::string& name) const;
+    const TableSchema* TableById(epoch_si_poc::TableId id) const;
     epoch_si_poc::EpochSiEngine::Txn& Txn(DeltaSession& session);
     void Commit(DeltaSession& session);
     epoch_si_poc::RowImage EncodeRow(const TableSchema& schema, const std::vector<Cell>& cells) const;
     std::vector<Cell> DecodeRow(const TableSchema& schema, const epoch_si_poc::RowImage& image) const;
-    std::vector<uint8_t> EncodeKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells) const;
+    std::vector<uint8_t> EncodeKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells,
+                                   size_t columns = std::numeric_limits<size_t>::max()) const;
     Cell Literal(const Column& column, const ast::Value& value) const;
     bool Matches(const TableSchema& schema, const std::vector<Cell>& cells,
                  const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions) const;
@@ -106,10 +129,27 @@ private:
                    QueryResultSink* sink) const;
     void EmitTables(QueryResultSink* sink) const;
     void LoadCsv(const ast::LoadStmt& load, DeltaSession& session);
+    uint64_t HashKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& cells) const;
+    bool SameKey(const TableSchema& schema, const Index& index, const std::vector<Cell>& left,
+                 const std::vector<Cell>& right) const;
+    void BuildSidecars(const TableSchema& schema, std::vector<std::vector<SidecarBuildEntry>> entries,
+                       uint64_t generation);
+    bool ValidateSidecar(const TableSchema& schema, const Index& index);
+    void RebuildSidecars(const TableSchema& schema);
+    void CheckpointSidecars();
+    std::vector<epoch_si_poc::RowId> IndexedCandidates(const DeltaSession& session, const TableSchema& schema,
+                                                       const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
+                                                       bool* usable) const;
+    void AddOverlay(DeltaOverlay& overlay, const TableSchema& schema, const std::vector<Cell>& cells,
+                    epoch_si_poc::RowId id, const std::vector<Cell>* previous = nullptr);
+    void VisitRows(DeltaSession& session, const TableSchema& schema,
+                   const std::vector<std::unique_ptr<ast::BinaryExpr>>& conditions,
+                   const std::function<void(epoch_si_poc::RowId, const epoch_si_poc::RowImage&)>& visitor);
 
     std::string directory_;
     epoch_si_poc::CheckpointDb db_;
     Catalog tables_;
+    std::map<epoch_si_poc::TableId, const TableSchema*> table_by_id_;
     epoch_si_poc::TableId next_table_id_ = 1;
     epoch_si_poc::ConstraintId next_constraint_id_ = 1;
     uint64_t catalog_generation_ = 1;
@@ -118,6 +158,9 @@ private:
     bool poisoned_ = false;
     std::function<void()> load_before_publish_hook_for_test_;
     std::function<void()> execute_lock_hook_for_test_;
+    mutable std::map<epoch_si_poc::ConstraintId, SidecarDescriptor> sidecars_;
+    DeltaOverlay overlay_;
+    size_t sidecar_validation_count_ = 0;
     mutable std::mutex mutex_; // ponytail: one interpreter lock; split only when measured contention requires it.
 };
 

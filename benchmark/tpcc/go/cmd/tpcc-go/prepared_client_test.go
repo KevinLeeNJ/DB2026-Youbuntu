@@ -517,3 +517,16 @@ func TestExecBatchAutoAbortDoesNotSendRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClosedRankingClientReturnsErrorAndRollbackDoesNotPanic(t *testing.T) {
+	c := &rankingClient{
+		client: &client{timeout: time.Second},
+		statements: map[string]rankingStatement{
+			"rollback;": {id: 1},
+		},
+	}
+	if _, err := c.exec("rollback;"); err == nil || !strings.Contains(err.Error(), "connection is closed") {
+		t.Fatalf("closed client exec error = %v", err)
+	}
+	c.rollback()
+}

@@ -181,6 +181,9 @@ func (c *rankingClient) writeRequest(tag, flags byte, payload []byte) error {
 	if len(payload) > maxWirePayload {
 		return errors.New("RMDB wire request payload exceeds 1 MiB")
 	}
+	if c == nil || c.client == nil || c.conn == nil {
+		return errors.New("rmdb connection is closed")
+	}
 	if err := c.conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
 		return err
 	}

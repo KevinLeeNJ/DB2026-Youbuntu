@@ -353,6 +353,24 @@ TEST(CheckpointDbTest, DirectTablePublishUsesSparseDiskBaseWithoutWalOrMetadata)
     db.engine().Abort(snapshot);
 }
 
+TEST(CheckpointDbTest, ImmutableTableOpenPreservesNextIdAfterHoles) {
+    TempDbDirectory temp;
+    {
+        auto db = CheckpointDb::Create(temp.path(), {});
+        auto writer = db.BeginTableBase(kAccounts);
+        writer.Append(Plain(1));
+        writer.Append(Plain(2));
+        writer.Append(Plain(3));
+        db.PublishTableBase(std::move(writer));
+    }
+    auto reopened = CheckpointDb::Open(temp.path());
+    auto txn = reopened.engine().Begin();
+    reopened.engine().Erase(txn, {kAccounts, 1});
+    const RowId inserted = reopened.engine().InsertImage(txn, kAccounts, Plain(4));
+    EXPECT_EQ(inserted.local_id, 3U);
+    ASSERT_EQ(reopened.engine().CommitBatch({&txn})[0].status, CommitStatus::kCommitted);
+}
+
 TEST(CheckpointDbTest, ImmutablePointReadsCrossSparseBlocksAndMisses) {
     TempDbDirectory temp;
     BaseImage initial;

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace epoch_si_poc {
@@ -60,6 +61,11 @@ public:
     uint64_t generation() const {
         RequireUsable();
         return generation_;
+    }
+    std::optional<uint64_t> TableGeneration(TableId table_id) const {
+        RequireUsable();
+        const auto found = tables_.find(table_id);
+        return found == tables_.end() ? std::nullopt : std::optional<uint64_t>(found->second.file_generation);
     }
     Epoch base_epoch() const {
         RequireUsable();

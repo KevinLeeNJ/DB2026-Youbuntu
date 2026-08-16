@@ -475,7 +475,8 @@ std::optional<Row> ImmutableTable::Read(uint64_t local_id) const {
     const uint64_t offset = kTableHeaderBytes + block_offsets_[block];
     const uint64_t stop = block + 1 < block_offsets_.size() ? kTableHeaderBytes + block_offsets_[block + 1]
                                                             : kTableHeaderBytes + payload_bytes_;
-    if (offset >= stop || stop > kTableHeaderBytes + payload_bytes_ || stop - offset > std::vector<uint8_t>().max_size())
+    if (offset >= stop || stop > kTableHeaderBytes + payload_bytes_ ||
+        stop - offset > std::vector<uint8_t>().max_size())
         throw std::runtime_error("invalid immutable table block range");
     std::vector<uint8_t> bytes(static_cast<size_t>(stop - offset));
     PreadLoop(fd_, bytes.data(), bytes.size(), offset);
@@ -554,6 +555,16 @@ void ImmutableTable::Visit(const std::function<void(uint64_t, Row&&)>& visitor) 
         throw std::runtime_error("immutable table row count mismatch");
 }
 
+void ImmutableTable::ValidateRowsForInstall() {
+    next_local_id_ = 0;
+    Visit([&](uint64_t local_id, Row&& row) {
+        if (row.bytes.size() > 16U * 1024U * 1024U || !row.claims.empty() ||
+            local_id == std::numeric_limits<uint64_t>::max())
+            throw std::invalid_argument("invalid immutable table row");
+        next_local_id_ = local_id + 1;
+    });
+}
+
 namespace {
 
 std::shared_ptr<const ImmutableTable> OpenTable(const std::string& directory, const CheckpointDb::TableRef& ref) {
@@ -627,9 +638,9 @@ std::shared_ptr<const ImmutableTable> OpenTable(const std::string& directory, co
         }
         if (~crc != payload_crc)
             throw std::runtime_error("invalid immutable table payload CRC");
-        auto table = std::shared_ptr<const ImmutableTable>(new ImmutableTable(
-            path, fd, table_id, generation, visible, rows, payload, total, std::move(first_ids), std::move(offsets)));
-        table->Visit([](uint64_t, Row&&) {}); // Structural validation is bounded and fail-closed.
+        auto table = std::make_shared<ImmutableTable>(path, fd, table_id, generation, visible, rows, payload, total,
+                                                      std::move(first_ids), std::move(offsets));
+        table->ValidateRowsForInstall(); // Structural validation is bounded and fail-closed.
         return table;
     } catch (...) {
         close(fd);

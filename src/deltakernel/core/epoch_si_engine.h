@@ -82,12 +82,16 @@ public:
     uint64_t file_bytes() const {
         return file_bytes_;
     }
+    uint64_t next_local_id() const {
+        return next_local_id_;
+    }
     size_t index_bytes() const {
         return (block_first_ids_.size() + block_offsets_.size()) * sizeof(uint64_t);
     }
     std::optional<Row> Read(uint64_t local_id) const;
     bool Contains(uint64_t local_id) const;
     void Visit(const std::function<void(uint64_t, Row&&)>& visitor) const;
+    void ValidateRowsForInstall();
 
     // CheckpointDb is the only production caller; public keeps the concrete file reader factory trivial.
     ImmutableTable(std::string path, int fd, TableId table_id, uint64_t generation, Epoch visible_from,
@@ -103,6 +107,7 @@ private:
     uint64_t row_count_ = 0;
     uint64_t payload_bytes_ = 0;
     uint64_t file_bytes_ = 0;
+    uint64_t next_local_id_ = 0;
     std::vector<uint64_t> block_first_ids_;
     std::vector<uint64_t> block_offsets_;
 };
@@ -215,6 +220,10 @@ public:
     size_t immutable_index_bytes() const;
     size_t immutable_table_count() const {
         return immutable_tables_.size();
+    }
+    void VisitLatestVersions(const std::function<void(RowId, const Row&)>& visitor) const;
+    std::set<TableId> DirtyTableIds() const {
+        return dirty_tables_;
     }
 
 private:

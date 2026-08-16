@@ -652,6 +652,131 @@ TEST(DeltaDatabaseTest, IndexedLoadUsesImmutableTable) {
               (std::vector<std::vector<std::string>>{{"1"}, {"2"}}));
 }
 
+TEST(DeltaDatabaseTest, LoadedCompositeIndexRechecksAndOverlayIsSafe) {
+    TempDelta temp;
+    const std::string csv = temp.path() + "/rows.csv";
+    {
+        std::ofstream output(csv);
+        output << "a,b,v\n1,2,10\n1,2,11\n1,3,12\n";
+    }
+    ASSERT_TRUE(std::filesystem::create_directory(temp.path() + "/db"));
+    auto db = deltakernel::DeltaDatabase::Create(temp.path() + "/db");
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table loaded(a int, b int, v int);");
+    RunSql(*db, session, "create index loaded_ab on loaded(a, b);");
+    RunSql(*db, session, ("load " + csv + " into loaded;").c_str());
+    const size_t validations = db->SidecarValidationCountForTest();
+    EXPECT_EQ(Query(*db, session, "select v from loaded where b = 2 and a = 1 and v = 11;").rows,
+              (std::vector<std::vector<std::string>>{{"11"}}));
+    EXPECT_EQ(Query(*db, session, "select v from loaded where b = 2 and a = 1;").rows.size(), 2U);
+    EXPECT_EQ(db->SidecarValidationCountForTest(), validations);
+    EXPECT_EQ(Query(*db, session, "select v from loaded where a = 1;").rows.size(), 3U);
+    RunSql(*db, session, "begin;");
+    RunSql(*db, session, "insert into loaded values(1, 2, 13);");
+    EXPECT_EQ(Query(*db, session, "select v from loaded where a = 1 and b = 2;").rows.size(), 3U);
+    RunSql(*db, session, "rollback;");
+    RunSql(*db, session, "update loaded set b = 4 where a = 1 and b = 3;");
+    EXPECT_TRUE(Query(*db, session, "select v from loaded where a = 1 and b = 3;").rows.empty());
+    EXPECT_EQ(Query(*db, session, "select v from loaded where a = 1 and b = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"12"}}));
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path() + "/db");
+    EXPECT_EQ(Query(*db, session, "select v from loaded where a = 1 and b = 4;").rows,
+              (std::vector<std::vector<std::string>>{{"12"}}));
+}
+
+TEST(DeltaDatabaseTest, OrderedSidecarCoversPrefixRangeAggregateAndJoinSources) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table line(w int, d int, o int, n int, item int);");
+    RunSql(*db, session, "create table stock(w int, item int, quantity int);");
+    RunSql(*db, session, "create index line_wdo on line(w, d, o, n);");
+    RunSql(*db, session, "create index stock_wi on stock(w, item);");
+    RunSql(*db, session, "insert into line values(1, 1, 10, 1, 4);");
+    RunSql(*db, session, "insert into line values(1, 1, 11, 1, 5);");
+    RunSql(*db, session, "insert into line values(1, 1, 12, 1, 6);");
+    RunSql(*db, session, "insert into line values(2, 1, 10, 1, 4);");
+    RunSql(*db, session, "insert into stock values(1, 4, 7);");
+    RunSql(*db, session, "insert into stock values(1, 5, 30);");
+    db->Checkpoint();
+    EXPECT_EQ(Query(*db, session, "select item from line where w = 1 and d = 1 and o >= 10 and o < 12;").rows,
+              (std::vector<std::vector<std::string>>{{"4"}, {"5"}}));
+    EXPECT_EQ(Query(*db, session, "select min(o) from line where w = 1 and d = 1;").rows,
+              (std::vector<std::vector<std::string>>{{"10"}}));
+    EXPECT_EQ(Query(*db, session, "select o from line where w = 1 and d = 1 order by o desc limit 1;").rows,
+              (std::vector<std::vector<std::string>>{{"12"}}));
+    EXPECT_EQ(
+        Query(*db, session,
+              "select count(distinct line.item) from line, stock where line.w = 1 and line.d = 1 and line.o >= 10 "
+              "and line.o < 12 and stock.w = 1 and stock.item = line.item and stock.quantity < 20;")
+            .rows,
+        (std::vector<std::vector<std::string>>{{"1"}}));
+    db.reset();
+    db = deltakernel::DeltaDatabase::Open(temp.path());
+    EXPECT_EQ(Query(*db, session, "select item from line where w = 1 and d = 1 and o >= 10 and o < 12;").rows.size(),
+              2U);
+}
+
+TEST(DeltaDatabaseTest, IndexedTransactionOverlayPublishesOnlyOnCommit) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession writer, reader;
+    RunSql(*db, writer, "create table t(k int, v int);");
+    RunSql(*db, writer, "create index t_k on t(k);");
+    RunSql(*db, writer, "begin;");
+    RunSql(*db, writer, "insert into t values(7, 1);");
+    EXPECT_EQ(Query(*db, writer, "select v from t where k = 7;").rows, (std::vector<std::vector<std::string>>{{"1"}}));
+    EXPECT_TRUE(Query(*db, reader, "select v from t where k = 7;").rows.empty());
+    RunSql(*db, writer, "rollback;");
+    EXPECT_TRUE(Query(*db, reader, "select v from t where k = 7;").rows.empty());
+    RunSql(*db, writer, "insert into t values(7, 2);");
+    EXPECT_EQ(Query(*db, reader, "select v from t where k = 7;").rows, (std::vector<std::vector<std::string>>{{"2"}}));
+}
+
+TEST(DeltaDatabaseTest, OpenRebuildsMissingSidecarOnce) {
+    TempDelta temp;
+    const std::string csv = temp.path() + "/rows.csv";
+    {
+        std::ofstream output(csv);
+        output << "k,v\n1,9\n";
+    }
+    ASSERT_TRUE(std::filesystem::create_directory(temp.path() + "/db"));
+    auto db = deltakernel::DeltaDatabase::Create(temp.path() + "/db");
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    RunSql(*db, session, ("load " + csv + " into t;").c_str());
+    db.reset();
+    ASSERT_TRUE(std::filesystem::remove(temp.path() + "/db/deltaidx.1.1"));
+    db = deltakernel::DeltaDatabase::Open(temp.path() + "/db");
+    const size_t validations = db->SidecarValidationCountForTest();
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 1;").rows, (std::vector<std::vector<std::string>>{{"9"}}));
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 1;").rows.size(), 1U);
+    EXPECT_EQ(db->SidecarValidationCountForTest(), validations);
+}
+
+TEST(DeltaDatabaseTest, CheckpointRebuildsDirtyIndexedTable) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    RunSql(*db, session, "insert into t values(3, 8);");
+    db->Checkpoint();
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 3;").rows, (std::vector<std::vector<std::string>>{{"8"}}));
+}
+
+TEST(DeltaDatabaseTest, CreateIndexRebuildsExistingTable) {
+    TempDelta temp;
+    auto db = deltakernel::DeltaDatabase::Create(temp.path());
+    deltakernel::DeltaSession session;
+    RunSql(*db, session, "create table t(k int, v int);");
+    RunSql(*db, session, "insert into t values(4, 6);");
+    RunSql(*db, session, "create index t_k on t(k);");
+    EXPECT_EQ(Query(*db, session, "select v from t where k = 4;").rows, (std::vector<std::vector<std::string>>{{"6"}}));
+}
+
 TEST(DeltaDatabaseTest, PreparedDescriptionDryValidatesSchemaAndParameters) {
     TempDelta temp;
     auto db = deltakernel::DeltaDatabase::Create(temp.path());
